@@ -210,6 +210,8 @@ def _run_installer(
     curl_mode: str = "good",
     install_root_name: str = "install-root",
     extra_env: dict[str, str] | None = None,
+    remove_from_path: tuple[str, ...] = (),
+    minimal_path: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
     fakebin = tmp_path / "fakebin"
     logs = tmp_path / "logs"
@@ -222,12 +224,17 @@ def _run_installer(
     install_root.mkdir(parents=True, exist_ok=True)
     tmpdir.mkdir(parents=True, exist_ok=True)
     _write_fake_host_commands(fakebin)
+    # Simulate a host missing certain tools (e.g. no rustup). minimal_path also
+    # drops the system PATH so a real rustup in ~/.cargo/bin can't leak in.
+    for name in remove_from_path:
+        (fakebin / name).unlink(missing_ok=True)
 
     env = os.environ.copy()
+    path_value = f"{fakebin}:/usr/bin:/bin" if minimal_path else f"{fakebin}:{env['PATH']}"
     env.update(
         {
             "HOME": str(home),
-            "PATH": f"{fakebin}:{env['PATH']}",
+            "PATH": path_value,
             "SPAWN_FAKE_LOG_DIR": str(logs),
             "SPAWN_FAKE_UNAME_S": os_name,
             "SPAWN_FAKE_UNAME_M": arch,
@@ -447,9 +454,11 @@ async def test_installer_bad_prebuilt_falls_back_to_source_build(client, tmp_pat
     assert (install_root / "bin" / "spawn-worker").is_file()
 
 
-async def test_installer_updates_stale_cargo_before_source_build(client, tmp_path: Path):
-    # A pre-existing toolchain too old to read the lock file (v4 ⇒ Cargo >= 1.78)
-    # must be bumped via rustup, not left to die on "lock file version `4`".
+async def test_installer_refreshes_rust_via_rustup_before_source_build(client, tmp_path: Path):
+    # With rustup available, the installer brings stable current before the
+    # --locked source build, so a lagging toolchain — too old for the lock file
+    # (format v4) or a dependency's rising MSRV (home 0.5.12 wants rustc 1.88) —
+    # can't break the build. 1.86 reads the lock file fine but fails that MSRV.
     script = await _install_script_file(client, tmp_path)
 
     result, logs, _home, install_root = _run_installer(
@@ -459,16 +468,18 @@ async def test_installer_updates_stale_cargo_before_source_build(client, tmp_pat
         arch="aarch64",
         args=["--no-login", "--no-start", "--no-service"],
         curl_mode="bad",  # force the source build
-        extra_env={"SPAWN_FAKE_CARGO_VERSION": "1.75.0"},
+        extra_env={"SPAWN_FAKE_CARGO_VERSION": "1.86.0"},
     )
 
     assert result.returncode == 0, result.stderr
-    assert "cargo 1.75.0 is too old for this lock file; updating Rust" in result.stdout
+    assert "ensuring a current Rust toolchain" in result.stdout
     assert "update stable" in _log(logs, "rustup.log")
     assert (install_root / "bin" / "spawnd").is_file()
 
 
-async def test_installer_leaves_recent_cargo_untouched(client, tmp_path: Path):
+async def test_installer_without_rustup_stops_on_too_old_cargo(client, tmp_path: Path):
+    # No rustup to self-update: an existing cargo below the floor must stop with
+    # guidance, not crash mid-build on a lock file / MSRV it can't satisfy.
     script = await _install_script_file(client, tmp_path)
 
     result, logs, _home, install_root = _run_installer(
@@ -479,12 +490,14 @@ async def test_installer_leaves_recent_cargo_untouched(client, tmp_path: Path):
         args=["--no-login", "--no-start", "--no-service"],
         curl_mode="bad",
         extra_env={"SPAWN_FAKE_CARGO_VERSION": "1.86.0"},
+        remove_from_path=("rustup",),
+        minimal_path=True,
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "updating Rust" not in result.stdout
-    assert _log(logs, "rustup.log") == ""
-    assert (install_root / "bin" / "spawnd").is_file()
+    assert result.returncode != 0
+    assert "too old" in result.stderr
+    assert "install --path" not in _log(logs, "cargo.log")
+    assert not (install_root / "bin" / "spawnd").is_file()
 
 
 async def test_installer_writes_and_starts_macos_launchagent(client, tmp_path: Path):

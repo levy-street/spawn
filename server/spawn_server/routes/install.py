@@ -318,14 +318,21 @@ INSTALL_SCRIPT = dedent(
       fi
     }
 
-    # The source build runs with --locked, so cargo must understand the repo's
-    # lock file (format v4 ⇒ Cargo >= 1.78). A stale pre-existing toolchain —
-    # common on macOS, where an old rustup 'stable' or a Homebrew rust lingers —
-    # dies on "lock file version `4`". A freshly installed toolchain is always
-    # new enough; an old one we bump when rustup can, else stop with guidance.
-    MIN_CARGO_MINOR=78
+    # A from-source build has a rising rustc floor: the lock file is format v4
+    # (Cargo >= 1.78) and its pinned deps push it further (home 0.5.12 needs
+    # rustc 1.88). Chasing exact versions is a losing game, so when rustup is
+    # present we just refresh stable to latest before building; hosts without
+    # rustup get a clear error when their existing cargo is too old.
+    MIN_CARGO_MINOR=88
 
     ensure_cargo_recent() {
+      if need rustup; then
+        say "ensuring a current Rust toolchain"
+        rustup update stable || die "failed to update Rust; run 'rustup update' and rerun"
+        return 0
+      fi
+      # No rustup to self-update: fail early when the existing cargo is too old
+      # for the lock file or a dependency's MSRV, with actionable guidance.
       _ver=$(cargo --version 2>/dev/null | awk '{print $2}')
       _major=$(printf '%s' "$_ver" | cut -d. -f1)
       _minor=$(printf '%s' "$_ver" | cut -d. -f2)
@@ -336,12 +343,7 @@ INSTALL_SCRIPT = dedent(
       esac
       case "$_minor" in *[!0-9]*) return 0 ;; esac
       [ "$_minor" -ge "$MIN_CARGO_MINOR" ] && return 0
-      if need rustup; then
-        say "cargo $_ver is too old for this lock file; updating Rust"
-        rustup update stable || die "failed to update Rust; run 'rustup update' and rerun"
-      else
-        die "cargo $_ver is too old (need >= 1.$MIN_CARGO_MINOR); update Rust (e.g. 'rustup update' or 'brew upgrade rust') and rerun"
-      fi
+      die "cargo $_ver is too old (need >= 1.$MIN_CARGO_MINOR); update Rust (e.g. 'brew upgrade rust') and rerun"
     }
 
     ensure_rust() {
