@@ -270,8 +270,18 @@ fn launchd_uninstall(config_dir: &Path) -> Result<()> {
 // platform-neutral entry points
 // ---------------------------------------------------------------------------
 
+/// Whether service management is disabled (`SPAWND_NO_SERVICE=1`) — for tests
+/// and for running `possess`/`exorcise` on a host without touching its service
+/// manager. Mirrors `SPAWND_NO_CPU_SCOPES`.
+fn service_disabled() -> bool {
+    std::env::var_os("SPAWND_NO_SERVICE").is_some_and(|v| !v.is_empty())
+}
+
 /// Write + enable the background service for `config_dir` against `server`.
 pub fn install(config_dir: &Path, server: &str) -> Result<()> {
+    if service_disabled() {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         return launchd_install(config_dir, server);
@@ -289,6 +299,9 @@ pub fn install(config_dir: &Path, server: &str) -> Result<()> {
 
 /// Stop + remove the background service for `config_dir`. Best-effort.
 pub fn uninstall(config_dir: &Path) -> Result<()> {
+    if service_disabled() {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         return launchd_uninstall(config_dir);
