@@ -230,13 +230,16 @@ Both must pass the shared fixture suite **`proto/layout-v2-fixtures.json`** (own
 
 Functions (deterministic, no randomness):
 - `validate(layout)` — the invariants above.
-- `autoPlace(tiles) -> tile` — first free 3×3 position scanning `y` then `x`; greedily expand `w` rightward while free, then `h` downward. If no 3×3 is free: take the largest-area tile, split it along its longer axis (ties → vertical split), shrink it to the first half, return the second half as the new tile. (Cap of 8 tiles on a 12×12 canvas guarantees this terminates.)
-- `move(tiles, id, x, y) -> tiles` — place the tile at the target; tiles it overlaps are pushed down (increasing `y`), cascading; then `compact`.
-- `resize(tiles, id, w, h) -> tiles` — clamp to invariants, push collisions down, `compact`.
+- `autoPlace(tiles) -> {tile, tiles} | {tile: null}` — first free 3×3 position scanning `y` then `x`; greedily expand `w` rightward while free, then `h` downward. If no 3×3 is free: take the largest-area tile that can be split (both halves ≥3 along its longer axis; ties → vertical split), shrink it to the first half, return the second half as the new tile — the split modifies an existing tile, hence the `{tile, tiles}` return. If no 3×3 is free **and** no tile is splittable (e.g. four 5×5 tiles), return `{tile: null}`: the workspace is full — the server responds **409 `workspace_full`** and the client disables `+` for that workspace with an explanatory tooltip.
+- `move(tiles, id, x, y) -> tiles` — place the tile at the target; tiles it overlaps are pushed down (increasing `y`), cascading; then `compact`. If the cascade ends out of bounds **or** the result is identical to the input (the push had no legal effect — e.g. dragging one full-height column onto another), fall back to **swap**: let T = the tile with the greatest area overlap with the dragged tile's target rect; the dragged tile takes T's rect and T takes the dragged tile's original rect (both rects were valid, so the swap is valid). No overlapped tile and no legal push → no-op returning the input.
+- `resize(tiles, id, w, h) -> tiles` — clamp to invariants, push collisions down, `compact`; if the cascade ends out of bounds → no-op returning the input.
 - `remove(tiles, id) -> tiles` — drop the tile, `compact`, then greedily expand remaining tiles (in reading order) into freed space (right, then down) so the canvas stays filled where possible.
-- `compact(tiles) -> tiles` — gravity: sort by `(y, x)`, move each tile up as far as it goes, then left.
+- `compact(tiles) -> tiles` — sequential physical gravity in `(y, x)` order: each tile slides up then left only through space that is free at the moment it moves (no pass-through), so intermediate states are never overlapping.
+- Rounding rule everywhere (incl. `fromSplitTree`): edges (not widths) rounded with `floor(v + 0.5)` — identical in TS and Python (no banker's rounding).
+
+Where this prose and `proto/layout-v2-fixtures.json` disagree, **the fixtures win** — they are hand-verified and both implementations must pass them. UX note for B2: `compact` is unconditional, so `move` is a *packing reorder + swap* operation — free-floating gaps are never a legal end state; the drag preview must always show the post-compact result, and a swap drop highlights the tile being exchanged.
 - `readingOrder(tiles) -> id[]` — sort by `(y, x)`. Used for the mobile stack and keyboard focus order.
-- `fromSplitTree(v1root) -> tiles` — migration converter: recursively assign float rects starting from `(0,0,12,12)`, `row` split gives `a` `ratio*w`; round to ints; if any resulting tile violates `w≥3 || h≥3` or overlaps after rounding, **fall back** to placing the panes in v1 DFS order (a-then-b) with repeated `autoPlace`. Deterministic either way.
+- `fromSplitTree(v1root) -> tiles` — migration converter: recursively assign float rects starting from `(0,0,12,12)`, `row` split gives `a` `ratio*w`; round edges to ints per the rounding rule; if any resulting tile violates `w≥3 || h≥3` or overlaps after rounding, **fall back** to placing the panes in v1 DFS order (a-then-b) with repeated `autoPlace`. Trees with >8 panes keep the first 8 in DFS order. Deterministic either way.
 
 ### 4.5 Web route map
 
