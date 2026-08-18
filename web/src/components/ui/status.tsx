@@ -2,37 +2,32 @@ import { agentActivityDetail, agentActivityLabel } from "@/lib/agents";
 import type { Agent } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-export type DotTone = "green" | "sky" | "violet" | "yellow" | "zinc" | "dim" | "red";
+export type DotTone = "active" | "waiting" | "idle" | "offline";
 
 const TONE_CLASS: Record<DotTone, string> = {
-  green: "bg-emerald-500",
-  sky: "bg-sky-400",
-  violet: "bg-violet-400",
-  yellow: "bg-amber-400",
-  zinc: "bg-zinc-400",
-  dim: "bg-zinc-600",
-  red: "bg-red-500",
+  active: "bg-tone-active",
+  waiting: "bg-tone-waiting",
+  idle: "bg-tone-idle",
+  offline: "bg-tone-offline",
 };
 
 export function agentActivityTone(agent: Agent): DotTone {
   switch (agent.activity_state) {
     case "active":
-      return "green";
+      return "active";
     case "waiting":
-      return "sky";
     case "input_sent":
-      return "violet";
     case "starting":
-      return "yellow";
+      return "waiting";
     case "quiet":
-      return "zinc";
+      return "idle";
     default:
-      return agent.status === "running" ? "zinc" : "dim";
+      return agent.status === "running" ? "idle" : "offline";
   }
 }
 
 export function hostStatusTone(status: string): DotTone {
-  return status === "online" ? "green" : "dim";
+  return status === "online" ? "active" : "offline";
 }
 
 export function StatusDot({

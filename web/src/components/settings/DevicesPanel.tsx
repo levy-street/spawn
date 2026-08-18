@@ -294,7 +294,7 @@ export function DevicesPanel() {
                       trusted · {trustedCount} host{trustedCount === 1 ? "" : "s"}
                     </span>
                   ) : (
-                    <span className="rounded border border-amber-600/50 px-1.5 py-0.5 text-[11px] text-amber-700 dark:text-amber-300">
+                    <span className="rounded border border-warning/50 px-1.5 py-0.5 text-[11px] text-warning">
                       not trusted yet
                     </span>
                   ))}
@@ -406,7 +406,7 @@ export function DevicesPanel() {
       )}
       {registration.data?.status === "cleanup_pending" && (
         <div className="space-y-2 rounded-md border border-border p-3" role="alert">
-          <p className="text-sm text-amber-700 dark:text-amber-300">
+          <p className="text-sm text-warning">
             This browser&apos;s key is revoked on the server, but deleting the local copy failed.
             Nothing can use it anymore; retry to finish cleaning up.
           </p>
@@ -451,7 +451,7 @@ export function DevicesPanel() {
         currentTrustedHosts.length === 0 &&
         registration.data?.status === "ready" && (
           <div
-            className="space-y-2 rounded-md border border-amber-600/50 p-3"
+            className="space-y-2 rounded-md border border-warning/50 p-3"
             data-testid="untrusted-callout"
           >
             <p className="text-sm font-medium">This browser can&apos;t open terminals yet</p>

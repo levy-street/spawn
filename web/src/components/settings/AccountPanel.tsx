@@ -49,7 +49,7 @@ export function AccountPanel() {
 
       {user !== null && user.email_verified_at === null && (
         <div
-          className="space-y-2 rounded-md border border-amber-600/50 p-3"
+          className="space-y-2 rounded-md border border-warning/50 p-3"
           data-testid="verify-email-callout"
         >
           <p className="text-sm font-medium">Confirm your email address</p>

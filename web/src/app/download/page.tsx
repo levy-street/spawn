@@ -107,10 +107,10 @@ export default function DownloadPage() {
 
   const statusIcon = useMemo(() => {
     if (supported)
-      return <CheckCircle2 className="size-5 text-emerald-600 dark:text-emerald-300" />;
+      return <CheckCircle2 className="size-5 text-success" />;
     if (detected.status === "unsupported")
-      return <AlertTriangle className="size-5 text-amber-600 dark:text-amber-300" />;
-    return <Laptop className="size-5 text-sky-600 dark:text-sky-300" />;
+      return <AlertTriangle className="size-5 text-warning" />;
+    return <Laptop className="size-5 text-info" />;
   }, [detected.status, supported]);
 
   return (
@@ -132,7 +132,7 @@ export default function DownloadPage() {
         <div className="mx-auto grid w-full max-w-7xl gap-8 lg:grid-cols-[0.9fr_1.1fr] lg:items-center">
           <div>
             <p className="mb-4 inline-flex items-center gap-2 rounded-md border border-brand-hairline bg-brand-panel/70 px-3 py-1 text-sm text-foreground/85">
-              <Download className="size-4 text-sky-600 dark:text-sky-300" />
+              <Download className="size-4 text-info" />
               Possess a host
             </p>
             <h1 className="text-4xl font-semibold leading-tight sm:text-5xl">
@@ -175,7 +175,7 @@ export default function DownloadPage() {
             </div>
 
             <div className="mt-5 rounded-md border border-brand-hairline bg-brand-well p-3 font-mono text-sm text-foreground">
-              <span className="mr-2 text-emerald-600 dark:text-emerald-300">$</span>
+              <span className="mr-2 text-success">$</span>
               <code className="break-all">{command}</code>
             </div>
 
@@ -193,7 +193,7 @@ export default function DownloadPage() {
             </div>
 
             {!supported && (
-              <p className="mt-4 rounded-md border border-amber-300/25 bg-amber-600 dark:bg-amber-300/10 px-3 py-2 text-sm text-amber-100">
+              <p className="mt-4 rounded-md border border-warning/25 bg-warning-soft px-3 py-2 text-sm text-warning">
                 Use this command from a supported macOS or Linux terminal, not from this browser OS.
               </p>
             )}
@@ -219,7 +219,7 @@ export default function DownloadPage() {
             </p>
           </div>
           <div className="rounded-md border border-brand-hairline bg-brand-well p-3 font-mono text-sm text-foreground">
-            <span className="mr-2 text-emerald-600 dark:text-emerald-300">$</span>
+            <span className="mr-2 text-success">$</span>
             <code className="break-all">{prebuiltCommand}</code>
           </div>
         </div>

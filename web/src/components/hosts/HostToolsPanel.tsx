@@ -174,7 +174,7 @@ export function HostToolsPanel({ host }: { host: Host }) {
       {lastResult && (
         <div className="border-t border-border px-4 py-3">
           <div
-            className={`mb-2 text-sm ${lastResult.success ? "text-emerald-400" : "text-destructive"}`}
+            className={`mb-2 text-sm ${lastResult.success ? "text-success" : "text-destructive"}`}
           >
             {lastResult.preset_name}: {lastResult.success ? "completed" : "failed"}
             {lastResult.error ? ` · ${lastResult.error}` : ""}
@@ -192,10 +192,10 @@ export function HostToolsPanel({ host }: { host: Host }) {
 
 function ToolStatusIcon({ tool }: { tool: HostToolStatus }) {
   if (tool.error) {
-    return <AlertCircle className="size-4 shrink-0 text-amber-400" aria-label="Target warning" />;
+    return <AlertCircle className="size-4 shrink-0 text-warning" aria-label="Target warning" />;
   }
   if (tool.installed) {
-    return <CheckCircle2 className="size-4 shrink-0 text-emerald-400" aria-label="Installed" />;
+    return <CheckCircle2 className="size-4 shrink-0 text-success" aria-label="Installed" />;
   }
   return <X className="size-4 shrink-0 text-muted-foreground" aria-label="Missing" />;
 }

@@ -886,9 +886,9 @@ export function FileExplorer({
                 )}
                 {isDir ? (
                   isExpanded ? (
-                    <FolderOpen className="z-10 size-4 shrink-0 text-sky-400" aria-hidden />
+                    <FolderOpen className="z-10 size-4 shrink-0 text-info" aria-hidden />
                   ) : (
-                    <Folder className="z-10 size-4 shrink-0 text-sky-400" aria-hidden />
+                    <Folder className="z-10 size-4 shrink-0 text-info" aria-hidden />
                   )
                 ) : (
                   <File className="z-10 size-4 shrink-0 text-muted-foreground" aria-hidden />
@@ -1023,7 +1023,7 @@ function NewFolderRow({
       className="flex h-7 items-center gap-1 pr-2"
       style={{ paddingLeft: 6 + depth * INDENT_PX + 14 }}
     >
-      <Folder className="size-4 shrink-0 text-sky-400" aria-hidden />
+      <Folder className="size-4 shrink-0 text-info" aria-hidden />
       <input
         ref={(el) => el?.focus()}
         aria-label="Folder name"
