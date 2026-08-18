@@ -95,6 +95,7 @@ fn systemd_unit_contents(config_dir: &Path, bin: &Path, server: &str) -> String 
          \n\
          [Service]\n\
          Environment=PATH={path}\n\
+         Environment=SPAWN_DISABLE_KEYRING=1\n\
          ExecStart={bin} --config-dir {config_dir} --server {server} run\n\
          Restart=on-failure\n\
          RestartSec=3\n\
@@ -194,7 +195,7 @@ fn launchd_plist(config_dir: &Path, bin: &Path, server: &str, state: &Path) -> S
          \t\t<string>run</string>\n\
          \t</array>\n\
          \t<key>EnvironmentVariables</key>\n\
-         \t<dict><key>PATH</key><string>{path}</string></dict>\n\
+         \t<dict><key>PATH</key><string>{path}</string><key>SPAWN_DISABLE_KEYRING</key><string>1</string></dict>\n\
          \t<key>RunAtLoad</key><true/>\n\
          \t<key>KeepAlive</key><true/>\n\
          \t<key>StandardOutPath</key><string>{out}</string>\n\

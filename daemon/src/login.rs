@@ -25,7 +25,13 @@ use crate::proto::{
     DeviceStartRequest, DeviceStartResponse,
 };
 
-pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
+/// What a successful login learned — enough for `possess` to place this
+/// registration in the authenticated account's config dir.
+pub struct LoginOutcome {
+    pub account_id: Option<String>,
+}
+
+pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOutcome> {
     let server = config::server_url(server_cli)?;
 
     // Persist before starting the ceremony so retries and interrupted logins
@@ -151,6 +157,7 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
             resp.json().await.context("decoding device/poll response")?;
 
         if poll_has_success_fields(&body) {
+            let account_id = body.account_id.clone();
             let host_id = commit_poll_success(
                 &mut stored,
                 body,
@@ -160,7 +167,7 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
                 creds::save,
             )?;
             println!("spawn: logged in. host_id = {host_id}");
-            return Ok(());
+            return Ok(LoginOutcome { account_id });
         }
 
         match body.error.as_deref() {
