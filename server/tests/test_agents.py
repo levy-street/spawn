@@ -1,10 +1,6 @@
-"""Agent metadata and lifecycle API behavior."""
+"""Agent definition API behavior (`/api/agents` — shortcuts, not processes)."""
 
 from __future__ import annotations
-
-import json
-from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
 
 
 async def _signup(client, email: str) -> str:
@@ -13,383 +9,123 @@ async def _signup(client, email: str) -> str:
     return r.json()["access_token"]
 
 
-@dataclass
-class _FakeWS:
-    sent_text: list[str] = field(default_factory=list)
-    sent_bytes: list[bytes] = field(default_factory=list)
-
-    async def send_text(self, value: str) -> None:
-        self.sent_text.append(value)
-
-    async def send_bytes(self, value: bytes) -> None:
-        self.sent_bytes.append(value)
-
-    async def close(self, code: int = 1000, reason: str = "") -> None:
-        pass
-
-
-async def _accept_daemon(daemon, *, generation: int = 1) -> None:
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host
-    from spawn_server.redis import get_backend
-    from spawn_server.ws.broker import get_broker
-    from spawn_server.ws.host_signal import (
-        HOST_DAEMON_PRESENCE_TTL_SECONDS,
-        HostPresenceOwner,
-        encode_host_presence_owner,
-        host_presence_key,
-    )
-
-    daemon.host_generation = generation
-    async with get_sessionmaker()() as session:
-        host = await session.get(Host, daemon.host_id)
-        assert host is not None
-        host.daemon_connection_id = daemon.id
-        host.daemon_generation = generation
-        host.daemon_generation_counter = generation
-        host.daemon_pending_connection_id = None
-        host.daemon_pending_generation = None
-        await session.commit()
-    await get_backend().set_ephemeral(
-        host_presence_key(daemon.host_id),
-        encode_host_presence_owner(HostPresenceOwner(daemon.id, generation)),
-        ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
-    )
-    assert await get_broker().accept_daemon_owner(daemon, generation)
-
-
-async def test_agent_patch_name_archive_and_delete(client):
-    token = await _signup(client, "agent-owner@example.com")
+async def test_builtins_are_seeded_without_shell(client):
+    token = await _signup(client, "agent-defs-builtin-list@example.com")
     auth = {"Authorization": f"Bearer {token}"}
-
-    from sqlalchemy import select
-
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Agent, Host, User
-
-    sm = get_sessionmaker()
-    async with sm() as session:
-        user = (
-            await session.execute(select(User).where(User.email == "agent-owner@example.com"))
-        ).scalar_one()
-        host = Host(owner_user_id=user.id, name="box", status="offline")
-        session.add(host)
-        await session.flush()
-        agent = Agent(
-            owner_user_id=user.id,
-            host_id=host.id,
-            cwd="/repo",
-            argv=["codex"],
-            env={},
-            status="running",
-        )
-        session.add(agent)
-        await session.commit()
-        agent_id = agent.id
-
-    r = await client.patch(f"/api/agents/{agent_id}", json={"name": "  ui work  "}, headers=auth)
-    assert r.status_code == 200, r.text
-    assert r.json()["name"] == "ui work"
-    assert r.json()["archived_at"] is None
-    assert r.json()["pinned_at"] is None
-
-    r = await client.patch(f"/api/agents/{agent_id}", json={"pinned": True}, headers=auth)
-    assert r.status_code == 200, r.text
-    assert r.json()["pinned_at"] is not None
-
-    r = await client.patch(f"/api/agents/{agent_id}", json={"pinned": False}, headers=auth)
-    assert r.status_code == 200, r.text
-    assert r.json()["pinned_at"] is None
-
-    r = await client.patch(f"/api/agents/{agent_id}", json={"archived": True}, headers=auth)
-    assert r.status_code == 200, r.text
-    assert r.json()["archived_at"] is not None
 
     r = await client.get("/api/agents", headers=auth)
     assert r.status_code == 200
-    assert all(a["id"] != agent_id for a in r.json())
+    builtins = {a["name"]: a for a in r.json() if a["owner_user_id"] is None}
+    assert set(builtins) == {"claude-code", "codex", "opencode", "aider-sonnet"}
+    assert builtins["claude-code"]["command"] == "claude"
+    assert builtins["aider-sonnet"]["command"] == "aider --model claude-sonnet-4-6"
+    assert builtins["codex"]["install"].startswith("curl -fsSL")
+    for agent in builtins.values():
+        assert isinstance(agent["command"], str)
+        assert "default_argv" not in agent
+        assert "env_template" not in agent
 
-    r = await client.get("/api/agents?include_archived=true", headers=auth)
+
+async def test_user_agent_can_be_created_and_updated(client):
+    token = await _signup(client, "agent-defs-owner@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    r = await client.post(
+        "/api/agents",
+        json={
+            "name": "custom-codex",
+            "kind": "codex",
+            "command": "codex --yolo",
+            "env": {"FOO": "bar"},
+            "install": "npm install -g codex",
+        },
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    agent_id = r.json()["id"]
+    assert r.json()["command"] == "codex --yolo"
+    assert r.json()["env"] == {"FOO": "bar"}
+
+    r = await client.patch(
+        f"/api/agents/{agent_id}",
+        json={
+            "name": "custom-claude",
+            "kind": "claude-code",
+            "command": "claude --continue",
+            "env": {"BAZ": "qux"},
+            "install": None,
+        },
+        headers=auth,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name"] == "custom-claude"
+    assert body["kind"] == "claude-code"
+    assert body["command"] == "claude --continue"
+    assert body["env"] == {"BAZ": "qux"}
+    assert body["install"] is None
+
+
+async def test_agent_requires_nonempty_command(client):
+    token = await _signup(client, "agent-defs-command@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    r = await client.post(
+        "/api/agents",
+        json={"name": "empty", "kind": "custom", "command": "   "},
+        headers=auth,
+    )
+    assert r.status_code == 400
+
+
+async def test_builtin_agents_cannot_be_updated_or_deleted(client):
+    token = await _signup(client, "agent-defs-builtins@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+
+    r = await client.get("/api/agents", headers=auth)
     assert r.status_code == 200
-    assert any(a["id"] == agent_id for a in r.json())
+    builtin = next(a for a in r.json() if a["owner_user_id"] is None)
 
-    r = await client.delete(f"/api/agents/{agent_id}", headers=auth)
-    assert r.status_code == 204, r.text
-
-    r = await client.get(f"/api/agents/{agent_id}", headers=auth)
+    r = await client.patch(f"/api/agents/{builtin['id']}", json={"name": "renamed"}, headers=auth)
+    assert r.status_code == 404
+    r = await client.delete(f"/api/agents/{builtin['id']}", headers=auth)
     assert r.status_code == 404
 
 
-async def test_agent_create_defaults_name_from_host_and_cwd(client):
-    token = await _signup(client, "default-name@example.com")
-    auth = {"Authorization": f"Bearer {token}"}
-
-    from sqlalchemy import select
-
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, User
-
-    sm = get_sessionmaker()
-    async with sm() as session:
-        user = (
-            await session.execute(select(User).where(User.email == "default-name@example.com"))
-        ).scalar_one()
-        host = Host(owner_user_id=user.id, name="dream", status="offline")
-        session.add(host)
-        await session.commit()
-        host_id = host.id
+async def test_other_users_agent_cannot_be_updated(client):
+    owner_token = await _signup(client, "agent-defs-owner-2@example.com")
+    other_token = await _signup(client, "agent-defs-other@example.com")
 
     r = await client.post(
         "/api/agents",
-        json={"host_id": host_id, "cwd": "/home/oem/projects/spawn", "argv": ["codex"]},
-        headers=auth,
+        json={"name": "private", "kind": "codex", "command": "codex"},
+        headers={"Authorization": f"Bearer {owner_token}"},
     )
     assert r.status_code == 201, r.text
-    body = r.json()
-    assert body["name"] == "dream - spawn"
-    assert body["host_name"] == "dream"
+    agent_id = r.json()["id"]
 
-
-async def test_agent_create_dispatches_managed_skills(client):
-    token = await _signup(client, "agent-capabilities@example.com")
-    auth = {"Authorization": f"Bearer {token}"}
-
-    from sqlalchemy import select
-
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, User
-    from spawn_server.ws.broker import DaemonConn, get_broker
-
-    skill = await client.post(
-        "/api/skills",
-        json={
-            "name": "spawn-test",
-            "description": "test skill",
-            "content": "# Spawn Test\nUse Spawn.",
-        },
-        headers=auth,
-    )
-    assert skill.status_code == 201, skill.text
-
-    sm = get_sessionmaker()
-    async with sm() as session:
-        user = (
-            await session.execute(
-                select(User).where(User.email == "agent-capabilities@example.com")
-            )
-        ).scalar_one()
-        host = Host(owner_user_id=user.id, name="box", status="online")
-        session.add(host)
-        await session.commit()
-        host_id = host.id
-
-    broker = get_broker()
-    fake_ws = _FakeWS()
-    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
-    await broker.register_daemon(daemon)
-
-    r = await client.post(
-        "/api/agents",
-        json={
-            "name": "capability agent",
-            "host_id": host_id,
-            "cwd": "/tmp",
-            "argv": ["bash", "-lc", "cat"],
-            "skill_ids": [skill.json()["id"]],
-        },
-        headers=auth,
-    )
-    assert r.status_code == 201, r.text
-
-    sent = json.loads(fake_ws.sent_text[-1])
-    assert sent["type"] == "agent.create"
-    assert "mcp_servers" not in sent
-    assert sent["skills"][0]["name"] == "spawn-test"
-    assert sent["skills"][0]["content"] == "# Spawn Test\nUse Spawn."
-
-    access = await client.get(f"/api/agents/{r.json()['id']}/access", headers=auth)
-    assert access.status_code == 200, access.text
-    assert access.json()["skills"][0]["id"] == skill.json()["id"]
-
-    await broker.unregister_daemon(daemon)
-
-
-async def test_agent_activity_fields(client):
-    token = await _signup(client, "agent-activity@example.com")
-    auth = {"Authorization": f"Bearer {token}"}
-
-    from sqlalchemy import select
-
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Agent, Host, User
-
-    now = datetime.now(UTC)
-    sm = get_sessionmaker()
-    async with sm() as session:
-        user = (
-            await session.execute(select(User).where(User.email == "agent-activity@example.com"))
-        ).scalar_one()
-        host = Host(owner_user_id=user.id, name="box", status="online")
-        session.add(host)
-        await session.flush()
-        agent = Agent(
-            owner_user_id=user.id,
-            host_id=host.id,
-            cwd="/repo",
-            argv=["codex"],
-            env={},
-            status="running",
-            last_output_at=now - timedelta(seconds=30),
-        )
-        session.add(agent)
-        await session.commit()
-        agent_id = agent.id
-
-    r = await client.get(f"/api/agents/{agent_id}", headers=auth)
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["activity_state"] == "waiting"
-    assert body["activity_label"] == "Awaiting input"
-    assert body["last_output_at"] is not None
-    assert body["last_activity_at"] is not None
-
-
-async def test_agent_restart_dispatches_existing_agent(client):
-    token = await _signup(client, "agent-restart@example.com")
-    auth = {"Authorization": f"Bearer {token}"}
-
-    from sqlalchemy import select
-
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Agent, Host, Preset, User
-    from spawn_server.ws.broker import DaemonConn, get_broker
-
-    sm = get_sessionmaker()
-    async with sm() as session:
-        user = (
-            await session.execute(select(User).where(User.email == "agent-restart@example.com"))
-        ).scalar_one()
-        host = Host(owner_user_id=user.id, name="box", status="online")
-        preset = (
-            await session.execute(select(Preset).where(Preset.name == "codex"))
-        ).scalar_one()
-        session.add(host)
-        await session.flush()
-        agent = Agent(
-            owner_user_id=user.id,
-            host_id=host.id,
-            preset_id=preset.id,
-            cwd="/repo",
-            argv=["codex", "--yolo"],
-            env={"A": "B"},
-            status="running",
-        )
-        session.add(agent)
-        await session.commit()
-        host_id = host.id
-        agent_id = agent.id
-
-    broker = get_broker()
-    fake_ws = _FakeWS()
-    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
-    await broker.register_daemon(daemon)
-
-    r = await client.post(
-        f"/api/agents/{agent_id}/restart",
-        json={"cols": 100, "rows": 40},
-        headers=auth,
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["status"] == "starting"
-    sent = json.loads(fake_ws.sent_text[-1])
-    assert sent["type"] == "agent.restart"
-    assert sent["agent_id"] == agent_id
-    assert "cols" not in sent
-    assert "rows" not in sent
-    assert sent["cwd"] == "/repo"
-    assert sent["argv"] == ["codex", "--yolo"]
-
-    await broker.unregister_daemon(daemon)
-
-
-async def test_agent_terminal_content_routes_are_removed(client):
-    token = await _signup(client, "agent-rest-control@example.com")
-    auth = {"Authorization": f"Bearer {token}"}
-
-    from sqlalchemy import select
-
-    from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Agent, Host, User
-    from spawn_server.ws.broker import DaemonConn, get_broker
-
-    sm = get_sessionmaker()
-    async with sm() as session:
-        user = (
-            await session.execute(select(User).where(User.email == "agent-rest-control@example.com"))
-        ).scalar_one()
-        host = Host(owner_user_id=user.id, name="box", status="online")
-        session.add(host)
-        await session.flush()
-        agent = Agent(
-            owner_user_id=user.id,
-            host_id=host.id,
-            cwd="/repo",
-            argv=["codex", "--yolo"],
-            env={},
-            name="palette",
-            status="running",
-        )
-        session.add(agent)
-        await session.commit()
-        host_id = host.id
-        agent_id = agent.id
-
-    broker = get_broker()
-    fake_ws = _FakeWS()
-    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=fake_ws)  # type: ignore[arg-type]
-    await broker.register_daemon(daemon)
-    await _accept_daemon(daemon)
-    await broker.attach_agent_to_daemon(agent_id, daemon)
-
-    for path, body in (
-        ("input", {"text": "hello\n"}),
-        ("resize", {"cols": 100, "rows": 40}),
-        ("scroll", {"lines": -20}),
-        ("redraw", None),
-        ("snapshot", {"lines": 123, "plain": True}),
-    ):
-        r = await client.post(f"/api/agents/{agent_id}/{path}", json=body, headers=auth)
-        assert r.status_code == 404
-    assert fake_ws.sent_bytes == []
-    assert all(
-        json.loads(frame).get("type")
-        not in {"agent.resize", "agent.scroll", "agent.redraw", "agent.snapshot"}
-        for frame in fake_ws.sent_text
-    )
-
-    r = await client.post(
-        f"/api/agents/{agent_id}/upload",
-        json={
-            "destination": "cwd",
-            "name": "secret-rest-name.txt",
-            "mime_type": "text/plain",
-            "bytes_b64": "c2VjcmV0LXJlc3QtY29udGVudA==",
-        },
-        headers=auth,
+    r = await client.patch(
+        f"/api/agents/{agent_id}",
+        json={"name": "stolen"},
+        headers={"Authorization": f"Bearer {other_token}"},
     )
     assert r.status_code == 404
-    r = await client.post(
-        f"/api/agents/{agent_id}/upload-file",
-        files={
-            "file": (
-                "secret-multipart-name.txt",
-                b"secret-multipart-content",
-                "text/plain",
-            )
-        },
-        headers=auth,
-    )
-    assert r.status_code == 404
-    assert all(json.loads(frame).get("type") != "agent.upload" for frame in fake_ws.sent_text)
 
-    await broker.unregister_daemon(daemon)
+
+async def test_duplicate_user_agent_name_returns_conflict(client):
+    token = await _signup(client, "agent-defs-dupe@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    second_id = ""
+
+    for name in ("first", "second"):
+        r = await client.post(
+            "/api/agents",
+            json={"name": name, "kind": "codex", "command": "codex"},
+            headers=auth,
+        )
+        assert r.status_code == 201, r.text
+        if name == "second":
+            second_id = r.json()["id"]
+
+    r = await client.patch(f"/api/agents/{second_id}", json={"name": "first"}, headers=auth)
+    assert r.status_code == 409

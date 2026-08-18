@@ -29,10 +29,10 @@ os.environ["SPAWN_PUBLIC_URL"] = "http://localhost:8000"
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
 
 import spawn_server.db as db_mod  # noqa: E402
+from spawn_server.agents_builtin import seed_builtin_agents  # noqa: E402
 from spawn_server.config import get_settings  # noqa: E402
 from spawn_server.db import Base  # noqa: E402
 from spawn_server.main import app as fastapi_app  # noqa: E402
-from spawn_server.presets import seed_builtin_presets  # noqa: E402
 from spawn_server.redis import get_backend  # noqa: E402
 from spawn_server.routes import hosts as hosts_routes  # noqa: E402
 from spawn_server.ws.broker import get_broker  # noqa: E402
@@ -74,7 +74,7 @@ async def app():
     await get_backend().startup()
 
     async with sm() as session:
-        await seed_builtin_presets(session)
+        await seed_builtin_agents(session)
 
     yield fastapi_app
 
@@ -118,7 +118,7 @@ async def file_sqlite_client(app, tmp_path):
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         async with sessionmaker() as session:
-            await seed_builtin_presets(session)
+            await seed_builtin_agents(session)
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://testserver") as ac:

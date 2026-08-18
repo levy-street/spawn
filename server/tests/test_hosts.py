@@ -178,14 +178,14 @@ async def test_host_revocation_closes_daemon_only_after_database_commit(client):
     assert observer.close_reason == "host revoked"
 
 
-async def test_host_tool_check_roundtrip(client):
+async def test_host_agent_check_roundtrip(client):
     token = await _signup(client, "host-tools@example.com")
     auth = {"Authorization": f"Bearer {token}"}
 
     from sqlalchemy import select
 
     from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, Preset, User
+    from spawn_server.models import Host, Agent, User
     from spawn_server.ws.broker import DaemonConn, get_broker
 
     sm = get_sessionmaker()
@@ -195,12 +195,12 @@ async def test_host_tool_check_roundtrip(client):
         ).scalar_one()
         host = Host(owner_user_id=user.id, name="tool-box", status="online")
         session.add(host)
-        preset = (
-            await session.execute(select(Preset).where(Preset.name == "codex"))
+        agent = (
+            await session.execute(select(Agent).where(Agent.name == "codex"))
         ).scalar_one()
         await session.commit()
         host_id = host.id
-        preset_id = preset.id
+        agent_id = agent.id
 
     broker = get_broker()
     fake_ws = _FakeWS()
@@ -208,7 +208,7 @@ async def test_host_tool_check_roundtrip(client):
     await broker.register_daemon(daemon)
     await _accept_daemon(daemon)
 
-    task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/tools", headers=auth))
+    task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/agents", headers=auth))
     for _ in range(100):
         if fake_ws.sent_text:
             break
@@ -217,27 +217,27 @@ async def test_host_tool_check_roundtrip(client):
         await asyncio.sleep(0.01)
     assert fake_ws.sent_text, (await task).text
     sent = json.loads(fake_ws.sent_text[-1])
-    assert sent["type"] == "host.tools.check"
-    assert any(t["preset_id"] == preset_id and t["command"] == "codex" for t in sent["targets"])
+    assert sent["type"] == "host.agents.check"
+    assert any(t["agent_id"] == agent_id and t["command"] == "codex" for t in sent["targets"])
     async with sm() as session:
-        from spawn_server.models import HostToolPolicy
+        from spawn_server.models import HostAgentPolicy
 
         policy_count = (
             await session.execute(
-                select(HostToolPolicy).where(HostToolPolicy.host_id == host_id)
+                select(HostAgentPolicy).where(HostAgentPolicy.host_id == host_id)
             )
         ).scalars().all()
     assert policy_count
 
-    await broker.resolve_tool_check(
+    await broker.resolve_agent_check(
         sent["request_id"],
         {
-            "type": "host.tools.check_result",
+            "type": "host.agents.check_result",
             "request_id": sent["request_id"],
-            "tools": [
+            "agents": [
                 {
-                    "preset_id": preset_id,
-                    "preset_name": "codex",
+                    "agent_id": agent_id,
+                    "agent_name": "codex",
                     "agent_kind": "codex",
                     "command": "codex",
                     "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
@@ -253,10 +253,10 @@ async def test_host_tool_check_roundtrip(client):
     )
     r = await task
     assert r.status_code == 200, r.text
-    assert r.json()["tools"][0]["version"] == "codex 1.2.3"
+    assert r.json()["agents"][0]["version"] == "codex 1.2.3"
 
     install_task = asyncio.create_task(
-        client.post(f"/api/hosts/{host_id}/tools/{preset_id}/install", headers=auth)
+        client.post(f"/api/hosts/{host_id}/agents/{agent_id}/install", headers=auth)
     )
     sent_count = len(fake_ws.sent_text)
     for _ in range(100):
@@ -267,17 +267,17 @@ async def test_host_tool_check_roundtrip(client):
         await asyncio.sleep(0.01)
     assert len(fake_ws.sent_text) > sent_count, (await install_task).text
     install_sent = json.loads(fake_ws.sent_text[-1])
-    assert install_sent["type"] == "host.tools.install"
-    assert install_sent["target"]["preset_id"] == preset_id
+    assert install_sent["type"] == "host.agents.install"
+    assert install_sent["target"]["agent_id"] == agent_id
 
-    await broker.resolve_tool_install(
+    await broker.resolve_agent_install(
         install_sent["request_id"],
         {
-            "type": "host.tools.install_result",
+            "type": "host.agents.install_result",
             "request_id": install_sent["request_id"],
             "result": {
-                "preset_id": preset_id,
-                "preset_name": "codex",
+                "agent_id": agent_id,
+                "agent_name": "codex",
                 "agent_kind": "codex",
                 "command": "codex",
                 "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
@@ -317,7 +317,7 @@ async def test_host_tools_require_online_daemon(client):
         await session.commit()
         host_id = host.id
 
-    r = await client.get(f"/api/hosts/{host_id}/tools", headers=auth)
+    r = await client.get(f"/api/hosts/{host_id}/agents", headers=auth)
     assert r.status_code == 409
 
 
@@ -445,14 +445,14 @@ async def test_host_file_rest_surfaces_are_retired_without_content_forwarding(cl
     await broker.unregister_daemon(daemon)
 
 
-async def test_host_tool_policy_auto_update_schedules_install(client):
+async def test_host_agent_policy_auto_update_schedules_install(client):
     token = await _signup(client, "host-tools-auto@example.com")
     auth = {"Authorization": f"Bearer {token}"}
 
     from sqlalchemy import select
 
     from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, Preset, User
+    from spawn_server.models import Host, Agent, User
     from spawn_server.ws.broker import DaemonConn, get_broker
 
     sm = get_sessionmaker()
@@ -462,12 +462,12 @@ async def test_host_tool_policy_auto_update_schedules_install(client):
         ).scalar_one()
         host = Host(owner_user_id=user.id, name="auto-box", status="online")
         session.add(host)
-        preset = (
-            await session.execute(select(Preset).where(Preset.name == "codex"))
+        agent = (
+            await session.execute(select(Agent).where(Agent.name == "codex"))
         ).scalar_one()
         await session.commit()
         host_id = host.id
-        preset_id = preset.id
+        agent_id = agent.id
 
     broker = get_broker()
     fake_ws = _FakeWS()
@@ -476,29 +476,29 @@ async def test_host_tool_policy_auto_update_schedules_install(client):
     await _accept_daemon(daemon)
 
     r = await client.patch(
-        f"/api/hosts/{host_id}/tools/{preset_id}/policy",
+        f"/api/hosts/{host_id}/agents/{agent_id}/policy",
         json={"auto_update": True},
         headers=auth,
     )
     assert r.status_code == 200, r.text
     assert r.json()["auto_update"] is True
 
-    check_task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/tools", headers=auth))
+    check_task = asyncio.create_task(client.get(f"/api/hosts/{host_id}/agents", headers=auth))
     for _ in range(100):
         if fake_ws.sent_text:
             break
         await asyncio.sleep(0.01)
     sent = json.loads(fake_ws.sent_text[-1])
-    assert sent["type"] == "host.tools.check"
-    await broker.resolve_tool_check(
+    assert sent["type"] == "host.agents.check"
+    await broker.resolve_agent_check(
         sent["request_id"],
         {
-            "type": "host.tools.check_result",
+            "type": "host.agents.check_result",
             "request_id": sent["request_id"],
-            "tools": [
+            "agents": [
                 {
-                    "preset_id": preset_id,
-                    "preset_name": "codex",
+                    "agent_id": agent_id,
+                    "agent_name": "codex",
                     "agent_kind": "codex",
                     "command": "codex",
                     "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
@@ -516,26 +516,26 @@ async def test_host_tool_policy_auto_update_schedules_install(client):
     )
     r = await check_task
     assert r.status_code == 200, r.text
-    tool = r.json()["tools"][0]
+    tool = r.json()["agents"][0]
     assert tool["auto_update"] is True
     assert tool["update_available"] is True
 
     for _ in range(100):
-        if any(json.loads(text)["type"] == "host.tools.install" for text in fake_ws.sent_text):
+        if any(json.loads(text)["type"] == "host.agents.install" for text in fake_ws.sent_text):
             break
         await asyncio.sleep(0.01)
     sent_frames = [json.loads(text) for text in fake_ws.sent_text]
-    install_sent = next(frame for frame in sent_frames if frame["type"] == "host.tools.install")
-    assert install_sent["target"]["preset_id"] == preset_id
+    install_sent = next(frame for frame in sent_frames if frame["type"] == "host.agents.install")
+    assert install_sent["target"]["agent_id"] == agent_id
 
-    await broker.resolve_tool_install(
+    await broker.resolve_agent_install(
         install_sent["request_id"],
         {
-            "type": "host.tools.install_result",
+            "type": "host.agents.install_result",
             "request_id": install_sent["request_id"],
             "result": {
-                "preset_id": preset_id,
-                "preset_name": "codex",
+                "agent_id": agent_id,
+                "agent_name": "codex",
                 "agent_kind": "codex",
                 "command": "codex",
                 "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
@@ -561,7 +561,7 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
     from sqlalchemy import select
 
     from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, HostToolPolicy, Preset, User
+    from spawn_server.models import Host, HostAgentPolicy, Agent, User
     from spawn_server.routes import hosts as hosts_routes
     from spawn_server.ws.broker import DaemonConn, get_broker
 
@@ -573,22 +573,22 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
             )
         ).scalar_one()
         host = Host(owner_user_id=user.id, name="background-auto-box", status="online")
-        preset = (
-            await session.execute(select(Preset).where(Preset.name == "codex"))
+        agent = (
+            await session.execute(select(Agent).where(Agent.name == "codex"))
         ).scalar_one()
         session.add(host)
         await session.flush()
-        policy = HostToolPolicy(
+        policy = HostAgentPolicy(
             owner_user_id=user.id,
             host_id=host.id,
-            preset_id=preset.id,
+            agent_id=agent.id,
             auto_update=True,
         )
         session.add(policy)
         await session.commit()
         user_id = user.id
         host_id = host.id
-        preset_id = preset.id
+        agent_id = agent.id
         policy_id = policy.id
 
     broker = get_broker()
@@ -600,17 +600,17 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
     try:
         first_start = len(fake_ws.sent_text)
         first_task = asyncio.create_task(hosts_routes.run_auto_update_checks_once())
-        check = await _wait_for_text_frame(fake_ws, "host.tools.check", start=first_start)
-        assert any(target["preset_id"] == preset_id for target in check["targets"])
-        await broker.resolve_tool_check(
+        check = await _wait_for_text_frame(fake_ws, "host.agents.check", start=first_start)
+        assert any(target["agent_id"] == agent_id for target in check["targets"])
+        await broker.resolve_agent_check(
             check["request_id"],
             {
-                "type": "host.tools.check_result",
+                "type": "host.agents.check_result",
                 "request_id": check["request_id"],
-                "tools": [
+                "agents": [
                     {
-                        "preset_id": preset_id,
-                        "preset_name": "codex",
+                        "agent_id": agent_id,
+                        "agent_name": "codex",
                         "agent_kind": "codex",
                         "command": "codex",
                         "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
@@ -628,16 +628,16 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
         )
         await first_task
 
-        install = await _wait_for_text_frame(fake_ws, "host.tools.install", start=first_start)
-        assert install["target"]["preset_id"] == preset_id
-        await broker.resolve_tool_install(
+        install = await _wait_for_text_frame(fake_ws, "host.agents.install", start=first_start)
+        assert install["target"]["agent_id"] == agent_id
+        await broker.resolve_agent_install(
             install["request_id"],
             {
-                "type": "host.tools.install_result",
+                "type": "host.agents.install_result",
                 "request_id": install["request_id"],
                 "result": {
-                    "preset_id": preset_id,
-                    "preset_name": "codex",
+                    "agent_id": agent_id,
+                    "agent_name": "codex",
                     "agent_kind": "codex",
                     "command": "codex",
                     "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
@@ -653,7 +653,7 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
         )
         assert await hosts_routes.wait_for_auto_update_tasks_idle(timeout=1.0)
         async with sm() as session:
-            stored = await session.get(HostToolPolicy, policy_id)
+            stored = await session.get(HostAgentPolicy, policy_id)
             assert stored is not None
             last_auto_update_at = stored.last_auto_update_at
             last_auto_update_error = stored.last_auto_update_error
@@ -662,16 +662,16 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
 
         second_start = len(fake_ws.sent_text)
         second_task = asyncio.create_task(hosts_routes.run_auto_update_checks_once())
-        check = await _wait_for_text_frame(fake_ws, "host.tools.check", start=second_start)
-        await broker.resolve_tool_check(
+        check = await _wait_for_text_frame(fake_ws, "host.agents.check", start=second_start)
+        await broker.resolve_agent_check(
             check["request_id"],
             {
-                "type": "host.tools.check_result",
+                "type": "host.agents.check_result",
                 "request_id": check["request_id"],
-                "tools": [
+                "agents": [
                     {
-                        "preset_id": preset_id,
-                        "preset_name": "codex",
+                        "agent_id": agent_id,
+                        "agent_name": "codex",
                         "agent_kind": "codex",
                         "command": "codex",
                         "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
@@ -689,7 +689,7 @@ async def test_background_auto_update_checker_records_result_and_throttles(clien
         )
         await second_task
         assert not any(
-            json.loads(raw).get("type") == "host.tools.install"
+            json.loads(raw).get("type") == "host.agents.install"
             for raw in fake_ws.sent_text[second_start:]
         )
     finally:
@@ -708,12 +708,12 @@ async def test_auto_update_task_registry_observes_errors_and_clears_inflight(
 
     monkeypatch.setattr(hosts_routes, "_run_auto_update", fail_update)
     caplog.set_level("ERROR", logger="spawn.routes.hosts")
-    key = ("user", "host", "preset")
+    key = ("user", "host", "agent")
 
     assert hosts_routes._start_auto_update(
         user_id=key[0],
         host_id=key[1],
-        preset_id=key[2],
+        agent_id=key[2],
         target={},
     )
     await started.wait()
@@ -740,11 +740,11 @@ async def test_auto_update_shutdown_drains_owned_tasks(client, monkeypatch):
             raise
 
     monkeypatch.setattr(hosts_routes, "_run_auto_update", drain_update)
-    key = ("user-drain", "host-drain", "preset-drain")
+    key = ("user-drain", "host-drain", "agent-drain")
     assert hosts_routes._start_auto_update(
         user_id=key[0],
         host_id=key[1],
-        preset_id=key[2],
+        agent_id=key[2],
         target={},
     )
     await started.wait()
@@ -775,11 +775,11 @@ async def test_auto_update_shutdown_cancels_after_drain_and_clears_inflight(
 
     monkeypatch.setattr(hosts_routes, "_run_auto_update", blocked_update)
     monkeypatch.setattr(hosts_routes, "AUTO_UPDATE_SHUTDOWN_DRAIN_SECONDS", 0.01)
-    key = ("user-cancel", "host-cancel", "preset-cancel")
+    key = ("user-cancel", "host-cancel", "agent-cancel")
     assert hosts_routes._start_auto_update(
         user_id=key[0],
         host_id=key[1],
-        preset_id=key[2],
+        agent_id=key[2],
         target={},
     )
     await started.wait()

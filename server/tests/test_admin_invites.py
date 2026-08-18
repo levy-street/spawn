@@ -174,7 +174,7 @@ async def test_admin_user_list_reports_account_details(client):
     assert rows["guest@example.com"]["is_admin"] is False
     for row in rows.values():
         assert row["host_count"] == 0
-        assert row["agent_count"] == 0
+        assert row["session_count"] == 0
         assert row["browser_device_count"] == 0
         assert "email_verified_at" in row
 

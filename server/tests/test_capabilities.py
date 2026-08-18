@@ -88,7 +88,7 @@ async def test_mcp_surface_is_gone(client):
     assert (await client.post("/api/oauth/register", json={})).status_code == 404
 
 
-async def test_default_skills_launch_with_agent_and_cross_user_grants_do_not_leak(
+async def test_default_skills_launch_with_session_and_cross_user_grants_do_not_leak(
     client,
 ):
     a_token = await _signup(client, "cap-launch-a@example.com")
@@ -137,22 +137,21 @@ async def test_default_skills_launch_with_agent_and_cross_user_grants_do_not_lea
     await broker.register_daemon(daemon)
 
     created = await client.post(
-        "/api/agents",
-        json={"host_id": host_id, "cwd": "/repo", "argv": ["codex"]},
+        "/api/sessions",
+        json={"host_id": host_id, "cwd": "/repo"},
         headers=a_auth,
     )
     assert created.status_code == 201, created.text
     sent = json.loads(fake_ws.sent_text[-1])
-    assert sent["type"] == "agent.create"
+    assert sent["type"] == "session.create"
     assert "mcp_servers" not in sent
     assert [skill["id"] for skill in sent["skills"]] == [a_skill.json()["id"]]
 
     denied = await client.post(
-        "/api/agents",
+        "/api/sessions",
         json={
             "host_id": host_id,
             "cwd": "/repo",
-            "argv": ["codex"],
             "skill_ids": [b_skill.json()["id"]],
         },
         headers=a_auth,
@@ -160,7 +159,7 @@ async def test_default_skills_launch_with_agent_and_cross_user_grants_do_not_lea
     assert denied.status_code == 404
     assert "skill not found" in denied.text
 
-    access = await client.get(f"/api/agents/{created.json()['id']}/access", headers=b_auth)
+    access = await client.get(f"/api/sessions/{created.json()['id']}/access", headers=b_auth)
     assert access.status_code == 404
 
     await broker.unregister_daemon(daemon)
@@ -168,17 +167,17 @@ async def test_default_skills_launch_with_agent_and_cross_user_grants_do_not_lea
     from sqlalchemy import func, select
 
     from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Agent
+    from spawn_server.models import Session
 
     sm = get_sessionmaker()
     async with sm() as session:
         count = (
-            await session.execute(select(func.count()).select_from(Agent))
+            await session.execute(select(func.count()).select_from(Session))
         ).scalar_one()
     assert count == 1
 
 
-async def test_agent_access_patch_replaces_skills(client):
+async def test_session_access_patch_replaces_skills(client):
     token = await _signup(client, "cap-access-patch@example.com")
     auth = {"Authorization": f"Bearer {token}"}
     host_id = await _create_host_for_user("cap-access-patch@example.com")
@@ -197,26 +196,25 @@ async def test_agent_access_patch_replaces_skills(client):
     assert skill_b.status_code == 201, skill_b.text
 
     created = await client.post(
-        "/api/agents",
+        "/api/sessions",
         json={
             "host_id": host_id,
             "cwd": "/repo",
-            "argv": ["codex"],
             "skill_ids": [skill_a.json()["id"]],
         },
         headers=auth,
     )
     assert created.status_code == 201, created.text
-    agent_id = created.json()["id"]
+    session_id = created.json()["id"]
 
     updated = await client.patch(
-        f"/api/agents/{agent_id}/access",
+        f"/api/sessions/{session_id}/access",
         json={"skill_ids": [skill_b.json()["id"]]},
         headers=auth,
     )
     assert updated.status_code == 200, updated.text
     assert [skill["id"] for skill in updated.json()["skills"]] == [skill_b.json()["id"]]
 
-    unchanged = await client.patch(f"/api/agents/{agent_id}/access", json={}, headers=auth)
+    unchanged = await client.patch(f"/api/sessions/{session_id}/access", json={}, headers=auth)
     assert unchanged.status_code == 200, unchanged.text
     assert [skill["id"] for skill in unchanged.json()["skills"]] == [skill_b.json()["id"]]

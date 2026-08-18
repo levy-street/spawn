@@ -39,7 +39,15 @@ def _init_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
     local = tmp_path / "local"
     remote = tmp_path / "remote"
 
-    assert _run(["git", "init", "--bare", str(origin)], tmp_path).returncode == 0
+    # Pin the bare repo's HEAD: with an unset init.defaultBranch the machine
+    # default may be "main", leaving clones of this master-only origin
+    # branchless (and the remote deploy step on an unborn HEAD).
+    assert (
+        _run(
+            ["git", "init", "--bare", "--initial-branch=master", str(origin)], tmp_path
+        ).returncode
+        == 0
+    )
     assert _run(["git", "clone", str(origin), str(local)], tmp_path).returncode == 0
     _git(["config", "user.email", "test@example.com"], local)
     _git(["config", "user.name", "Test User"], local)
@@ -83,6 +91,10 @@ exit 0
 def _fake_ssh(tmp_path: Path, remote_home: Path) -> Path:
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
+    # Mask any real gh on the invoking machine: the darwin prebuilt publish
+    # step must deterministically skip instead of hitting the network and
+    # issuing extra ssh calls that clobber the recorded logs.
+    _write_executable(fakebin / "gh", "#!/usr/bin/env bash\nexit 1\n")
     _write_executable(
         fakebin / "ssh",
         f"""#!/usr/bin/env bash
