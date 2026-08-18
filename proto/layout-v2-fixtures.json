@@ -1,0 +1,2877 @@
+{
+  "_doc": "Cross-language conformance suite for the 12x12 packed-grid algebra of workspace layout schema v2 (docs/OVERHAUL.md section 4.4). Each case names one operation (validate | autoPlace | move | resize | remove | compact | readingOrder | fromSplitTree), the exact input, and the exact expected result; web/src/lib/grid.ts and server/spawn_server/grid.py must both reproduce every expected value byte-for-byte after JSON normalization (deep equality on parsed values, array order included). Inputs to every op except validate are valid layouts per the section 4.4 invariants (integers, 12x12 bounds, min 3x3, no overlaps, max 8 tiles, unique session ids); validate cases probe arbitrary values. Where the section 4.4 prose is ambiguous, the `_rules` list below pins the behavior — together with the cases it is the authority both implementations follow.",
+  "_rules": [
+    "Every tile array returned by any operation is sorted in reading order — (y, x) ascending. Expected arrays compare exactly, order included.",
+    "validate returns {ok, errors}; error codes: shape (layout not an object or tiles not an array; reported alone), version (version !== 2), count (more than 8 tiles), session_id (missing or not a non-empty string; id FORMAT is deliberately not checked — pruning unknown/foreign ids is server policy upstream of the algebra), integer (x/y/w/h not all integers), bounds (outside the canvas), size (w or h < 3; at most one size error per tile), duplicate (same session_id as an earlier tile; index = later tile, other_index = first occurrence), overlap (index < other_index). Emission order: version, count, then per-tile errors in tile order (session_id, integer, bounds, size; an integer failure suppresses bounds/size for that tile), then duplicates in tile order, then overlaps for index pairs i<j in lexicographic order. Tiles failing integer or bounds checks are excluded from overlap checking.",
+    "autoPlace returns {tile, tiles}: tile is the new geometry (no session_id — the caller appends it), tiles the possibly-updated list. Scan: first free 3x3 by y then x; expand w rightward at height 3, then h downward at the expanded width. Fallback when no 3x3 is free: split candidates are tiles with max(w, h) >= 6; pick the largest area, ties broken by reading order; cut along the longer axis — vertical cut (side-by-side halves) when w >= h — the existing tile keeps ceil(side/2), the new tile gets floor(side/2). tile is null (tiles returned unchanged, sorted) when the input already has 8 tiles or no split candidate exists.",
+    "move(tiles, id, x, y): clamp the target into the canvas (x to [0, 12-w], y to [0, 12-h]); fix the moved tile there; every other tile keeps its x and is pushed down in reading order, cascading, transiently allowed past row 12; then compact everything (the moved tile is not pinned — compaction may relocate it). If any tile still ends past row 12, the move does not fit and the input is returned unchanged (sorted). Unknown id: input returned unchanged (sorted).",
+    "resize(tiles, id, w, h): clamp w to [3, 12-x] and h to [3, 12-y]; then the same fixed-tile cascade-and-compact pipeline and the same does-not-fit and unknown-id rules as move. Shrinking leaves freed space empty — only remove grows neighbors.",
+    "compact: process tiles in reading order of their input positions; each tile slides up as far as it can, then left, one continuous slide each, checked against ALL other tiles at their current positions (already-processed tiles at settled spots, later tiles at original spots). Tiles never pass through occupied cells, so validity is preserved at every step.",
+    "remove: drop the tile, compact, then one expansion pass over the survivors in reading order — each expands w rightward while the next column strip is free, then h downward, against the current (already expanded) sizes of the others. Unknown id: input returned unchanged (sorted), with no compaction.",
+    "fromSplitTree: assign float rects from (0, 0, 12, 12); a row split puts a left and b right at s = x0 + ratio*(x1 - x0), a column split puts a top and b bottom (same formula on y); ratio is clamped to [0, 1]; each split position is computed once and shared by both children. Pane EDGES are rounded with floor(v + 0.5) — round half UP, not Python's banker's round(). If any rounded tile has w < 3 or h < 3, lies outside the canvas, or overlaps another, the whole layout falls back to repeated autoPlace from an empty canvas over the panes in v1 DFS order (a then b). Trees with more than 8 panes keep the first 8 in DFS order and drop the rest. Null root yields []. Pane agent_id becomes tile session_id verbatim.",
+    "All operations except validate assume valid input and are deterministic and free of randomness; both implementations must never mutate their inputs."
+  ],
+  "cases": [
+    {
+      "name": "validate-ok-full-single",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": 0,
+              "y": 0,
+              "w": 12,
+              "h": 12
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": true,
+        "errors": []
+      }
+    },
+    {
+      "name": "validate-ok-empty",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2,
+          "tiles": []
+        }
+      },
+      "expected": {
+        "ok": true,
+        "errors": []
+      }
+    },
+    {
+      "name": "validate-ok-eight-tiles",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": 0,
+              "y": 0,
+              "w": 3,
+              "h": 6
+            },
+            {
+              "session_id": "b",
+              "x": 3,
+              "y": 0,
+              "w": 3,
+              "h": 6
+            },
+            {
+              "session_id": "c",
+              "x": 6,
+              "y": 0,
+              "w": 3,
+              "h": 6
+            },
+            {
+              "session_id": "d",
+              "x": 9,
+              "y": 0,
+              "w": 3,
+              "h": 6
+            },
+            {
+              "session_id": "e",
+              "x": 0,
+              "y": 6,
+              "w": 3,
+              "h": 6
+            },
+            {
+              "session_id": "f",
+              "x": 3,
+              "y": 6,
+              "w": 3,
+              "h": 6
+            },
+            {
+              "session_id": "g",
+              "x": 6,
+              "y": 6,
+              "w": 3,
+              "h": 6
+            },
+            {
+              "session_id": "h",
+              "x": 9,
+              "y": 6,
+              "w": 3,
+              "h": 6
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": true,
+        "errors": []
+      }
+    },
+    {
+      "name": "validate-bad-version",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 1,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": 0,
+              "y": 0,
+              "w": 12,
+              "h": 12
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "version"
+          }
+        ]
+      }
+    },
+    {
+      "name": "validate-overlap-pair",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": 0,
+              "y": 0,
+              "w": 6,
+              "h": 6
+            },
+            {
+              "session_id": "b",
+              "x": 3,
+              "y": 3,
+              "w": 6,
+              "h": 6
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "overlap",
+            "index": 0,
+            "other_index": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "validate-too-small",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": 0,
+              "y": 0,
+              "w": 2,
+              "h": 2
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "size",
+            "index": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "validate-out-of-bounds",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": 10,
+              "y": 0,
+              "w": 6,
+              "h": 6
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "bounds",
+            "index": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "validate-bounds-negative",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": -1,
+              "y": 0,
+              "w": 6,
+              "h": 6
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "bounds",
+            "index": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "validate-non-integer",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": 0.5,
+              "y": 0,
+              "w": 6,
+              "h": 6
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "integer",
+            "index": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "validate-duplicate-id",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": 0,
+              "y": 0,
+              "w": 6,
+              "h": 12
+            },
+            {
+              "session_id": "a",
+              "x": 6,
+              "y": 0,
+              "w": 6,
+              "h": 12
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "duplicate",
+            "index": 1,
+            "other_index": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "validate-too-many-tiles",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": 0,
+              "y": 0,
+              "w": 3,
+              "h": 3
+            },
+            {
+              "session_id": "b",
+              "x": 3,
+              "y": 0,
+              "w": 3,
+              "h": 3
+            },
+            {
+              "session_id": "c",
+              "x": 6,
+              "y": 0,
+              "w": 3,
+              "h": 3
+            },
+            {
+              "session_id": "d",
+              "x": 9,
+              "y": 0,
+              "w": 3,
+              "h": 3
+            },
+            {
+              "session_id": "e",
+              "x": 0,
+              "y": 3,
+              "w": 3,
+              "h": 3
+            },
+            {
+              "session_id": "f",
+              "x": 3,
+              "y": 3,
+              "w": 3,
+              "h": 3
+            },
+            {
+              "session_id": "g",
+              "x": 6,
+              "y": 3,
+              "w": 3,
+              "h": 3
+            },
+            {
+              "session_id": "h",
+              "x": 9,
+              "y": 3,
+              "w": 3,
+              "h": 3
+            },
+            {
+              "session_id": "i",
+              "x": 0,
+              "y": 6,
+              "w": 3,
+              "h": 3
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "count"
+          }
+        ]
+      }
+    },
+    {
+      "name": "validate-shape-tiles-missing",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 2
+        }
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "shape"
+          }
+        ]
+      }
+    },
+    {
+      "name": "validate-shape-not-object",
+      "op": "validate",
+      "input": {
+        "layout": "not a layout"
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "shape"
+          }
+        ]
+      }
+    },
+    {
+      "name": "validate-multi-error-order",
+      "op": "validate",
+      "input": {
+        "layout": {
+          "version": 1,
+          "tiles": [
+            {
+              "session_id": "a",
+              "x": 0,
+              "y": 0,
+              "w": 2,
+              "h": 3
+            },
+            {
+              "session_id": "b",
+              "x": 0,
+              "y": 0,
+              "w": 3,
+              "h": 3
+            }
+          ]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "errors": [
+          {
+            "code": "version"
+          },
+          {
+            "code": "size",
+            "index": 0
+          },
+          {
+            "code": "overlap",
+            "index": 0,
+            "other_index": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "autoplace-empty",
+      "op": "autoPlace",
+      "input": {
+        "tiles": []
+      },
+      "expected": {
+        "tile": {
+          "x": 0,
+          "y": 0,
+          "w": 12,
+          "h": 12
+        },
+        "tiles": []
+      }
+    },
+    {
+      "name": "autoplace-beside-left-column",
+      "op": "autoPlace",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ]
+      },
+      "expected": {
+        "tile": {
+          "x": 6,
+          "y": 0,
+          "w": 6,
+          "h": 12
+        },
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "autoplace-below-top-row",
+      "op": "autoPlace",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 6
+          }
+        ]
+      },
+      "expected": {
+        "tile": {
+          "x": 0,
+          "y": 6,
+          "w": 12,
+          "h": 6
+        },
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "autoplace-into-corner-gap",
+      "op": "autoPlace",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      },
+      "expected": {
+        "tile": {
+          "x": 6,
+          "y": 6,
+          "w": 6,
+          "h": 6
+        },
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "autoplace-greedy-expansion",
+      "op": "autoPlace",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 3,
+            "w": 3,
+            "h": 9
+          }
+        ]
+      },
+      "expected": {
+        "tile": {
+          "x": 3,
+          "y": 3,
+          "w": 9,
+          "h": 9
+        },
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 3,
+            "w": 3,
+            "h": 9
+          }
+        ]
+      }
+    },
+    {
+      "name": "autoplace-split-fallback-7-to-8",
+      "op": "autoPlace",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 3,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 6,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 9,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "e",
+            "x": 0,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "f",
+            "x": 3,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "g",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      },
+      "expected": {
+        "tile": {
+          "x": 9,
+          "y": 6,
+          "w": 3,
+          "h": 6
+        },
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 3,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 6,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 9,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "e",
+            "x": 0,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "f",
+            "x": 3,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "g",
+            "x": 6,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "autoplace-split-tie-reading-order",
+      "op": "autoPlace",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      },
+      "expected": {
+        "tile": {
+          "x": 3,
+          "y": 0,
+          "w": 3,
+          "h": 6
+        },
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "autoplace-split-odd-width",
+      "op": "autoPlace",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 3,
+            "y": 0,
+            "w": 9,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 3,
+            "y": 6,
+            "w": 9,
+            "h": 6
+          }
+        ]
+      },
+      "expected": {
+        "tile": {
+          "x": 8,
+          "y": 0,
+          "w": 4,
+          "h": 6
+        },
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 3,
+            "y": 0,
+            "w": 5,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 3,
+            "y": 6,
+            "w": 9,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "autoplace-unsplittable-null",
+      "op": "autoPlace",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 5,
+            "h": 5
+          },
+          {
+            "session_id": "b",
+            "x": 5,
+            "y": 0,
+            "w": 5,
+            "h": 5
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 5,
+            "w": 5,
+            "h": 5
+          },
+          {
+            "session_id": "d",
+            "x": 5,
+            "y": 5,
+            "w": 5,
+            "h": 5
+          }
+        ]
+      },
+      "expected": {
+        "tile": null,
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 5,
+            "h": 5
+          },
+          {
+            "session_id": "b",
+            "x": 5,
+            "y": 0,
+            "w": 5,
+            "h": 5
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 5,
+            "w": 5,
+            "h": 5
+          },
+          {
+            "session_id": "d",
+            "x": 5,
+            "y": 5,
+            "w": 5,
+            "h": 5
+          }
+        ]
+      }
+    },
+    {
+      "name": "autoplace-at-cap-null",
+      "op": "autoPlace",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 3,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 6,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 9,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "e",
+            "x": 0,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "f",
+            "x": 3,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "g",
+            "x": 6,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "h",
+            "x": 9,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          }
+        ]
+      },
+      "expected": {
+        "tile": null,
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 3,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 6,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 9,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "e",
+            "x": 0,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "f",
+            "x": 3,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "g",
+            "x": 6,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "h",
+            "x": 9,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-swap-columns-no-op",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ],
+        "id": "b",
+        "x": 0,
+        "y": 0
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-cascade-rescued-by-compact",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 3,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          }
+        ],
+        "id": "a",
+        "x": 0,
+        "y": 9
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 3,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-reorder-rows",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 3,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 12,
+            "h": 3
+          }
+        ],
+        "id": "c",
+        "x": 0,
+        "y": 0
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 3,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 6,
+            "w": 12,
+            "h": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-compact-repacks",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "b",
+            "x": 3,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          }
+        ],
+        "id": "a",
+        "x": 9,
+        "y": 9
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "a",
+            "x": 3,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-clamp-target",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 9
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 9,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "c",
+            "x": 3,
+            "y": 9,
+            "w": 3,
+            "h": 3
+          }
+        ],
+        "id": "b",
+        "x": 99,
+        "y": 99
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 9
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 9,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "b",
+            "x": 3,
+            "y": 9,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-single-tile-compacts-home",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 3,
+            "y": 3,
+            "w": 3,
+            "h": 3
+          }
+        ],
+        "id": "a",
+        "x": 3,
+        "y": 3
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-unknown-id",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 12
+          }
+        ],
+        "id": "zz",
+        "x": 0,
+        "y": 0
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "resize-grow-pushes-down",
+      "op": "resize",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 3,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 12,
+            "h": 3
+          }
+        ],
+        "id": "a",
+        "w": 12,
+        "h": 6
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 6,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 9,
+            "w": 12,
+            "h": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "resize-grow-impossible-no-op",
+      "op": "resize",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ],
+        "id": "a",
+        "w": 12,
+        "h": 12
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "resize-clamp",
+      "op": "resize",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 12
+          }
+        ],
+        "id": "a",
+        "w": 2,
+        "h": 20
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "resize-shrink-neighbor-slides-left",
+      "op": "resize",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ],
+        "id": "a",
+        "w": 3,
+        "h": 12
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 3,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "resize-clamp-at-position",
+      "op": "resize",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 9,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 9,
+            "y": 0,
+            "w": 3,
+            "h": 12
+          }
+        ],
+        "id": "b",
+        "w": 6,
+        "h": 12
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 9,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 9,
+            "y": 0,
+            "w": 3,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "resize-unknown-id",
+      "op": "resize",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 12
+          }
+        ],
+        "id": "zz",
+        "w": 6,
+        "h": 6
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "remove-expands-into-freed-column",
+      "op": "remove",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ],
+        "id": "b"
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "remove-reading-order-priority",
+      "op": "remove",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ],
+        "id": "d"
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "remove-middle-row-gravity-then-grow",
+      "op": "remove",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 4
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 4,
+            "w": 12,
+            "h": 4
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 8,
+            "w": 12,
+            "h": 4
+          }
+        ],
+        "id": "b"
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 4
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 4,
+            "w": 12,
+            "h": 8
+          }
+        ]
+      }
+    },
+    {
+      "name": "remove-last-tile-empty",
+      "op": "remove",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 12
+          }
+        ],
+        "id": "a"
+      },
+      "expected": {
+        "tiles": []
+      }
+    },
+    {
+      "name": "remove-height-expansion",
+      "op": "remove",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ],
+        "id": "c"
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "remove-unknown-id",
+      "op": "remove",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 3,
+            "y": 3,
+            "w": 3,
+            "h": 3
+          }
+        ],
+        "id": "zz"
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 3,
+            "y": 3,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "compact-slides-up-left",
+      "op": "compact",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 3,
+            "y": 3,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "compact-no-pass-through",
+      "op": "compact",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "t1",
+            "x": 3,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "t2",
+            "x": 0,
+            "y": 3,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "t2",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "t1",
+            "x": 3,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "compact-up-then-left",
+      "op": "compact",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "blocker",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "t",
+            "x": 6,
+            "y": 6,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "blocker",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "t",
+            "x": 6,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "compact-identity-on-packed",
+      "op": "compact",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "compact-input-order-irrelevant",
+      "op": "compact",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "p",
+            "x": 6,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "q",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "q",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          },
+          {
+            "session_id": "p",
+            "x": 3,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "reading-order-by-y-then-x",
+      "op": "readingOrder",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 12,
+            "h": 6
+          },
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      },
+      "expected": {
+        "order": [
+          "a",
+          "b",
+          "c"
+        ]
+      }
+    },
+    {
+      "name": "reading-order-empty",
+      "op": "readingOrder",
+      "input": {
+        "tiles": []
+      },
+      "expected": {
+        "order": []
+      }
+    },
+    {
+      "name": "fst-null-root",
+      "op": "fromSplitTree",
+      "input": {
+        "root": null
+      },
+      "expected": {
+        "tiles": []
+      }
+    },
+    {
+      "name": "fst-single-pane",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "pane",
+          "agent_id": "a"
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-row-even",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "row",
+          "ratio": 0.5,
+          "a": {
+            "type": "pane",
+            "agent_id": "a"
+          },
+          "b": {
+            "type": "pane",
+            "agent_id": "b"
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-column-even",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "column",
+          "ratio": 0.5,
+          "a": {
+            "type": "pane",
+            "agent_id": "a"
+          },
+          "b": {
+            "type": "pane",
+            "agent_id": "b"
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 6,
+            "w": 12,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-main-plus-stack",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "row",
+          "ratio": 0.5,
+          "a": {
+            "type": "pane",
+            "agent_id": "a"
+          },
+          "b": {
+            "type": "split",
+            "direction": "column",
+            "ratio": 0.5,
+            "a": {
+              "type": "pane",
+              "agent_id": "b"
+            },
+            "b": {
+              "type": "pane",
+              "agent_id": "c"
+            }
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-third-ratio-rounding",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "row",
+          "ratio": 0.3333333333333333,
+          "a": {
+            "type": "pane",
+            "agent_id": "a"
+          },
+          "b": {
+            "type": "pane",
+            "agent_id": "b"
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 4,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 4,
+            "y": 0,
+            "w": 8,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-main-stack-ratio-06",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "row",
+          "ratio": 0.6,
+          "a": {
+            "type": "pane",
+            "agent_id": "a"
+          },
+          "b": {
+            "type": "split",
+            "direction": "column",
+            "ratio": 0.5,
+            "a": {
+              "type": "pane",
+              "agent_id": "b"
+            },
+            "b": {
+              "type": "pane",
+              "agent_id": "c"
+            }
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 7,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 7,
+            "y": 0,
+            "w": 5,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 7,
+            "y": 6,
+            "w": 5,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-ratio-005-falls-back",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "row",
+          "ratio": 0.05,
+          "a": {
+            "type": "pane",
+            "agent_id": "a"
+          },
+          "b": {
+            "type": "pane",
+            "agent_id": "b"
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-ratio-095-column-falls-back",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "column",
+          "ratio": 0.95,
+          "a": {
+            "type": "pane",
+            "agent_id": "a"
+          },
+          "b": {
+            "type": "pane",
+            "agent_id": "b"
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-degenerate-depth-falls-back",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "row",
+          "ratio": 0.5,
+          "a": {
+            "type": "pane",
+            "agent_id": "a"
+          },
+          "b": {
+            "type": "split",
+            "direction": "row",
+            "ratio": 0.5,
+            "a": {
+              "type": "pane",
+              "agent_id": "b"
+            },
+            "b": {
+              "type": "split",
+              "direction": "row",
+              "ratio": 0.5,
+              "a": {
+                "type": "pane",
+                "agent_id": "c"
+              },
+              "b": {
+                "type": "pane",
+                "agent_id": "d"
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-depth-12-caps-at-8",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "row",
+          "ratio": 0.5,
+          "a": {
+            "type": "pane",
+            "agent_id": "p01"
+          },
+          "b": {
+            "type": "split",
+            "direction": "row",
+            "ratio": 0.5,
+            "a": {
+              "type": "pane",
+              "agent_id": "p02"
+            },
+            "b": {
+              "type": "split",
+              "direction": "row",
+              "ratio": 0.5,
+              "a": {
+                "type": "pane",
+                "agent_id": "p03"
+              },
+              "b": {
+                "type": "split",
+                "direction": "row",
+                "ratio": 0.5,
+                "a": {
+                  "type": "pane",
+                  "agent_id": "p04"
+                },
+                "b": {
+                  "type": "split",
+                  "direction": "row",
+                  "ratio": 0.5,
+                  "a": {
+                    "type": "pane",
+                    "agent_id": "p05"
+                  },
+                  "b": {
+                    "type": "split",
+                    "direction": "row",
+                    "ratio": 0.5,
+                    "a": {
+                      "type": "pane",
+                      "agent_id": "p06"
+                    },
+                    "b": {
+                      "type": "split",
+                      "direction": "row",
+                      "ratio": 0.5,
+                      "a": {
+                        "type": "pane",
+                        "agent_id": "p07"
+                      },
+                      "b": {
+                        "type": "split",
+                        "direction": "row",
+                        "ratio": 0.5,
+                        "a": {
+                          "type": "pane",
+                          "agent_id": "p08"
+                        },
+                        "b": {
+                          "type": "split",
+                          "direction": "row",
+                          "ratio": 0.5,
+                          "a": {
+                            "type": "pane",
+                            "agent_id": "p09"
+                          },
+                          "b": {
+                            "type": "split",
+                            "direction": "row",
+                            "ratio": 0.5,
+                            "a": {
+                              "type": "pane",
+                              "agent_id": "p10"
+                            },
+                            "b": {
+                              "type": "split",
+                              "direction": "row",
+                              "ratio": 0.5,
+                              "a": {
+                                "type": "pane",
+                                "agent_id": "p11"
+                              },
+                              "b": {
+                                "type": "split",
+                                "direction": "row",
+                                "ratio": 0.5,
+                                "a": {
+                                  "type": "pane",
+                                  "agent_id": "p12"
+                                },
+                                "b": {
+                                  "type": "pane",
+                                  "agent_id": "p13"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "p01",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "p05",
+            "x": 3,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "p02",
+            "x": 6,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "p06",
+            "x": 9,
+            "y": 0,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "p03",
+            "x": 0,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "p07",
+            "x": 3,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "p04",
+            "x": 6,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          },
+          {
+            "session_id": "p08",
+            "x": 9,
+            "y": 6,
+            "w": 3,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-four-rows-buildeven",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "column",
+          "ratio": 0.25,
+          "a": {
+            "type": "pane",
+            "agent_id": "a"
+          },
+          "b": {
+            "type": "split",
+            "direction": "column",
+            "ratio": 0.3333333333333333,
+            "a": {
+              "type": "pane",
+              "agent_id": "b"
+            },
+            "b": {
+              "type": "split",
+              "direction": "column",
+              "ratio": 0.5,
+              "a": {
+                "type": "pane",
+                "agent_id": "c"
+              },
+              "b": {
+                "type": "pane",
+                "agent_id": "d"
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 3,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 12,
+            "h": 3
+          },
+          {
+            "session_id": "d",
+            "x": 0,
+            "y": 9,
+            "w": 12,
+            "h": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "fst-grid-2x2-ratios",
+      "op": "fromSplitTree",
+      "input": {
+        "root": {
+          "type": "split",
+          "direction": "column",
+          "ratio": 0.5,
+          "a": {
+            "type": "split",
+            "direction": "row",
+            "ratio": 0.5,
+            "a": {
+              "type": "pane",
+              "agent_id": "a"
+            },
+            "b": {
+              "type": "pane",
+              "agent_id": "b"
+            }
+          },
+          "b": {
+            "type": "split",
+            "direction": "row",
+            "ratio": 0.5,
+            "a": {
+              "type": "pane",
+              "agent_id": "c"
+            },
+            "b": {
+              "type": "pane",
+              "agent_id": "d"
+            }
+          }
+        }
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      }
+    }
+  ]
+}
