@@ -12,6 +12,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
+import type { PromptState } from "@/components/terminal/prompt-state";
 import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
 import type { DisplayControlState } from "@/lib/ws";
 
@@ -25,6 +26,14 @@ const WARM_LIMIT = 6;
 export type SessionLive = {
   connInfo: SessionConnectionInfo | null;
   displayState: DisplayControlState | null;
+  /** Empty-prompt heuristic state (§5.5); "empty" until the terminal reports. */
+  promptState: PromptState;
+};
+
+const EMPTY_SESSION_LIVE: SessionLive = {
+  connInfo: null,
+  displayState: null,
+  promptState: "empty",
 };
 
 /** Stable actions — this context value never changes, so a placeholder's
@@ -33,6 +42,9 @@ type Actions = {
   claim: (sessionId: string, container: HTMLElement, token: symbol) => void;
   release: (sessionId: string, token: symbol) => void;
   getHandle: (sessionId: string) => TerminalHandle | null;
+  /** Cursor moves are too frequent for reactive state: subscribe per session
+   *  and read positions imperatively via the handle's getCursorRect(). */
+  subscribeCursorMove: (sessionId: string, callback: () => void) => () => void;
 };
 /** Reactive state — changes as terminals connect / move foreground. */
 type State = {
@@ -132,19 +144,49 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
   const onInfo = useCallback((sessionId: string, connInfo: SessionConnectionInfo) => {
     setLive((m) => ({
       ...m,
-      [sessionId]: { ...m[sessionId], connInfo, displayState: m[sessionId]?.displayState ?? null },
+      [sessionId]: { ...EMPTY_SESSION_LIVE, ...m[sessionId], connInfo },
     }));
   }, []);
   const onDisplay = useCallback((sessionId: string, displayState: DisplayControlState) => {
     setLive((m) => ({
       ...m,
-      [sessionId]: { ...m[sessionId], displayState, connInfo: m[sessionId]?.connInfo ?? null },
+      [sessionId]: { ...EMPTY_SESSION_LIVE, ...m[sessionId], displayState },
+    }));
+  }, []);
+  const onPromptState = useCallback((sessionId: string, promptState: PromptState) => {
+    setLive((m) => ({
+      ...m,
+      [sessionId]: { ...EMPTY_SESSION_LIVE, ...m[sessionId], promptState },
     }));
   }, []);
 
+  // Cursor-move fan-out: per-session listener sets, emitted synchronously from
+  // the pooled terminal's onCursorMove. Never React state — xterm fires this
+  // per echoed keystroke and per output write.
+  const cursorListenersRef = useRef<Map<string, Set<() => void>>>(new Map());
+  const emitCursorMove = useCallback((sessionId: string) => {
+    const listeners = cursorListenersRef.current.get(sessionId);
+    if (!listeners) return;
+    for (const listener of listeners) listener();
+  }, []);
+  const subscribeCursorMove = useCallback((sessionId: string, callback: () => void) => {
+    let listeners = cursorListenersRef.current.get(sessionId);
+    if (!listeners) {
+      listeners = new Set();
+      cursorListenersRef.current.set(sessionId, listeners);
+    }
+    listeners.add(callback);
+    return () => {
+      const current = cursorListenersRef.current.get(sessionId);
+      if (!current) return;
+      current.delete(callback);
+      if (current.size === 0) cursorListenersRef.current.delete(sessionId);
+    };
+  }, []);
+
   const actions = useMemo<Actions>(
-    () => ({ claim, release, getHandle }),
-    [claim, release, getHandle],
+    () => ({ claim, release, getHandle, subscribeCursorMove }),
+    [claim, release, getHandle, subscribeCursorMove],
   );
   const warm = useMemo(() => Object.fromEntries(warmIds.map((id) => [id, true])), [warmIds]);
   const state = useMemo<State>(() => ({ live, warm, claimed }), [live, warm, claimed]);
@@ -182,6 +224,8 @@ export function LiveTerminalProvider({ children }: { children: ReactNode }) {
               handleRef={entry.handleRef}
               onInfo={onInfo}
               onDisplay={onDisplay}
+              onPromptState={onPromptState}
+              onCursorMove={emitCursorMove}
             />
           );
         })}
@@ -197,6 +241,8 @@ function PooledTerminal({
   handleRef,
   onInfo,
   onDisplay,
+  onPromptState,
+  onCursorMove,
 }: {
   sessionId: string;
   active: boolean;
@@ -204,6 +250,8 @@ function PooledTerminal({
   handleRef: { current: TerminalHandle | null };
   onInfo: (sessionId: string, info: SessionConnectionInfo) => void;
   onDisplay: (sessionId: string, state: DisplayControlState) => void;
+  onPromptState: (sessionId: string, state: PromptState) => void;
+  onCursorMove: (sessionId: string) => void;
 }) {
   return createPortal(
     <div className="size-full @container/term">
@@ -218,6 +266,8 @@ function PooledTerminal({
         autoTakeControl={active}
         onConnectionInfo={(info) => onInfo(sessionId, info)}
         onDisplayControl={(state) => onDisplay(sessionId, state)}
+        onPromptStateChange={(state) => onPromptState(sessionId, state)}
+        onCursorMove={() => onCursorMove(sessionId)}
       />
     </div>,
     host,
@@ -259,13 +309,21 @@ export function useLiveTerminal(sessionId: string | null) {
     ),
     connInfo: info.connInfo,
     displayState: info.displayState,
+    promptState: info.promptState,
+    /** Subscribe to cursor moves for this session; returns an unsubscribe.
+     *  Read the new position via getHandle()?.getCursorRect(). */
+    subscribeCursorMove: useCallback(
+      (callback: () => void) =>
+        sessionId ? actions.subscribeCursorMove(sessionId, callback) : () => {},
+      [sessionId, actions],
+    ),
   };
 }
 
 /** Reactive live info for one session (connInfo/displayState); {} if not warm. */
 export function useSessionLive(sessionId: string | null): SessionLive {
   const { live } = useContext(StateCtx);
-  return (sessionId ? live[sessionId] : null) ?? { connInfo: null, displayState: null };
+  return (sessionId ? live[sessionId] : null) ?? EMPTY_SESSION_LIVE;
 }
 
 /** Connection state for a session, for indicators. */
