@@ -542,8 +542,8 @@ the daemon can distinguish healthy idle connections from dead sockets.
 ## Browser WebSocket — `/ws/browser?session_id=<uuid>`
 
 - Auth: session cookie (or `?token=` for testing).
-- Required subprotocol: `spawn.v2`. An old/missing subprotocol receives only
-  `{"type":"protocol.required","protocol":"spawn.v2","version":2}` and
+- Required subprotocol: `spawn.v3`. An old/missing subprotocol receives only
+  `{"type":"protocol.required","protocol":"spawn.v3","version":3}` and
   closes with `4003`.
 - The query parameter is `session_id` (was `agent_id` before v3).
 - This WebSocket is content-free signaling plus disclosed lifecycle/status. It
@@ -559,7 +559,7 @@ The browser additionally sends
 `rtc.offer`, `rtc.candidate`, and `rtc.close` JSON frames over this websocket.
 The server authorizes the browser against the session, forwards signaling to
 the owning daemon over `/ws/daemon`, and keeps this websocket open as the
-signaling/status plane. A `spawn.v2` websocket never becomes a terminal relay.
+signaling/status plane. A `spawn.v3` websocket never becomes a terminal relay.
 
 ### Server → browser
 
@@ -589,7 +589,7 @@ vocabulary was renamed.
 - DataChannel messages are raw binary PTY bytes:
   - browser → daemon: stdin bytes for the authorized session
   - daemon → browser: stdout/stderr PTY bytes for that session
-- `spawn.ctl` carries the versioned bounded control protocol below. A v2
+- `spawn.ctl` carries the versioned bounded control protocol below. A
   terminal is ready only after both channels open and its initial history
   response is applied.
 - Missing, duplicate, closed, or unknown session channels close the peer;
@@ -1042,7 +1042,7 @@ corruption, or offline host fails closed as defined by the ADR.
 ## Versioning
 
 - The WS subprotocol literal is the version handle. The browser WS
-  requires `spawn.v2`; the daemon WS requires `spawn.control.v3`. Older or
+  requires `spawn.v3`; the daemon WS requires `spawn.control.v3`. Older or
   missing subprotocols receive a content-free protocol-required close. There
   is deliberately no mixed-version rollout or terminal relay fallback.
 - The private spawnd ↔ spawn-worker wire stays `PROTO_VERSION 5` across the
