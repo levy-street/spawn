@@ -202,7 +202,7 @@ function Users() {
               <th className="px-3 py-2 font-medium">Joined</th>
               <th className="px-3 py-2 font-medium">Verified</th>
               <th className="px-3 py-2 text-right font-medium">Hosts</th>
-              <th className="px-3 py-2 text-right font-medium">Agents</th>
+              <th className="px-3 py-2 text-right font-medium">Sessions</th>
               <th className="px-3 py-2 text-right font-medium">Devices</th>
             </tr>
           </thead>
@@ -236,7 +236,7 @@ function Users() {
                   )}
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums">{user.host_count}</td>
-                <td className="px-3 py-2 text-right tabular-nums">{user.agent_count}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{user.session_count}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{user.browser_device_count}</td>
               </tr>
             ))}

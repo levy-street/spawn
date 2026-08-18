@@ -5,164 +5,163 @@ import { AlertCircle, CheckCircle2, Download, RefreshCw, X } from "lucide-react"
 import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { confirm } from "@/components/ui/confirm";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   ApiError,
   type Host,
-  type HostToolInstallResult,
-  type HostToolStatus,
+  type HostAgentInstallResult,
+  type HostAgentStatus,
   hosts,
 } from "@/lib/api";
 
 export function HostToolsPanel({ host }: { host: Host }) {
   const qc = useQueryClient();
-  const [lastResult, setLastResult] = useState<HostToolInstallResult | null>(null);
-  const toolsQ = useQuery({
-    queryKey: ["host-tools", host.id],
-    queryFn: () => hosts.tools(host.id),
+  const [lastResult, setLastResult] = useState<HostAgentInstallResult | null>(null);
+  const agentsQ = useQuery({
+    queryKey: ["host-agents", host.id],
+    queryFn: () => hosts.agents(host.id),
     enabled: host.status === "online",
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
+  const failureResult = (name: string, err: unknown): HostAgentInstallResult => ({
+    agent_id: "",
+    agent_name: name,
+    agent_kind: "",
+    command: "",
+    success: false,
+    output: "",
+    error: err instanceof ApiError ? err.message : String(err),
+  });
   const installM = useMutation({
-    mutationFn: (tool: HostToolStatus) => hosts.installTool(host.id, tool.preset_id),
+    mutationFn: (agent: HostAgentStatus) => hosts.installAgent(host.id, agent.agent_id),
     onSuccess: (result) => {
       setLastResult(result);
-      qc.invalidateQueries({ queryKey: ["host-tools", host.id] });
+      qc.invalidateQueries({ queryKey: ["host-agents", host.id] });
     },
     onError: (err) => {
-      setLastResult({
-        preset_id: "",
-        preset_name: "Install",
-        agent_kind: "",
-        command: "",
-        success: false,
-        output: "",
-        error: err instanceof ApiError ? err.message : String(err),
-      });
+      setLastResult(failureResult("Install", err));
     },
   });
   const policyM = useMutation({
-    mutationFn: ({ tool, autoUpdate }: { tool: HostToolStatus; autoUpdate: boolean }) =>
-      hosts.updateToolPolicy(host.id, tool.preset_id, { auto_update: autoUpdate }),
+    mutationFn: ({ agent, autoUpdate }: { agent: HostAgentStatus; autoUpdate: boolean }) =>
+      hosts.updateAgentPolicy(host.id, agent.agent_id, { auto_update: autoUpdate }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["host-tools", host.id] });
+      qc.invalidateQueries({ queryKey: ["host-agents", host.id] });
     },
     onError: (err) => {
-      setLastResult({
-        preset_id: "",
-        preset_name: "Policy",
-        agent_kind: "",
-        command: "",
-        success: false,
-        output: "",
-        error: err instanceof ApiError ? err.message : String(err),
-      });
+      setLastResult(failureResult("Policy", err));
     },
   });
 
   if (host.status !== "online") {
     return (
       <div className="rounded-xl border border-border px-4 py-3 text-sm text-muted-foreground">
-        Tool status is unavailable while the daemon is offline.
+        Agent status is unavailable while the daemon is offline.
       </div>
     );
   }
 
-  const installingId = installM.variables?.preset_id;
-  const tools = toolsQ.data?.tools ?? [];
+  const installingId = installM.variables?.agent_id;
+  const agents = agentsQ.data?.agents ?? [];
 
   return (
     <div className="overflow-hidden rounded-xl border border-border">
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-        <h2 className="text-sm font-medium">Tools</h2>
+        <h2 className="text-sm font-medium">Agents</h2>
         <Button
           variant="ghost"
           size="icon"
           className="size-7"
-          aria-label={`Refresh tools for ${host.name}`}
+          aria-label={`Refresh agents for ${host.name}`}
           title="Refresh"
-          onClick={() => toolsQ.refetch()}
-          disabled={toolsQ.isFetching}
+          onClick={() => agentsQ.refetch()}
+          disabled={agentsQ.isFetching}
         >
-          <RefreshCw className={`size-3.5 ${toolsQ.isFetching ? "animate-spin" : ""}`} />
+          <RefreshCw className={`size-3.5 ${agentsQ.isFetching ? "animate-spin" : ""}`} />
         </Button>
       </div>
 
-      {toolsQ.isLoading && (
+      {agentsQ.isLoading && (
         <div className="space-y-3 p-4">
           <Skeleton className="h-5 w-2/3" />
           <Skeleton className="h-5 w-1/2" />
         </div>
       )}
-      {toolsQ.error && (
+      {agentsQ.error && (
         <div className="px-4 py-3 text-sm text-destructive">
-          {toolsQ.error instanceof ApiError ? toolsQ.error.message : String(toolsQ.error)}
+          {agentsQ.error instanceof ApiError ? agentsQ.error.message : String(agentsQ.error)}
         </div>
       )}
-      {!toolsQ.isLoading && !toolsQ.error && tools.length === 0 && (
-        <div className="px-4 py-3 text-sm text-muted-foreground">No preset targets.</div>
+      {!agentsQ.isLoading && !agentsQ.error && agents.length === 0 && (
+        <div className="px-4 py-3 text-sm text-muted-foreground">No agents defined.</div>
       )}
 
-      {tools.length > 0 && (
+      {agents.length > 0 && (
         <ul className="divide-y divide-border">
-          {tools.map((tool) => (
-            <li key={tool.preset_id} className="flex flex-wrap items-center gap-3 px-4 py-3">
-              <ToolStatusIcon tool={tool} />
+          {agents.map((agent) => (
+            <li key={agent.agent_id} className="flex flex-wrap items-center gap-3 px-4 py-3">
+              <AgentStatusIcon agent={agent} />
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-sm font-medium">{tool.preset_name}</span>
-                  {tool.installed && tool.version && (
+                  <span className="text-sm font-medium">{agent.agent_name}</span>
+                  {agent.installed && agent.version && (
                     <span className="truncate font-mono text-[11px] text-muted-foreground">
-                      {tool.version}
+                      {agent.version}
                     </span>
                   )}
-                  {tool.update_available && (
+                  {agent.update_available && (
                     <Badge variant="warning">
-                      update{tool.latest_version ? ` ${tool.latest_version}` : ""}
+                      update{agent.latest_version ? ` ${agent.latest_version}` : ""}
                     </Badge>
                   )}
-                  {!tool.installed && <Badge variant="outline">not installed</Badge>}
+                  {!agent.installed && <Badge variant="outline">not installed</Badge>}
                 </div>
                 <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                  {tool.error ? (
-                    <span className="text-destructive">{tool.error}</span>
-                  ) : tool.last_auto_update_error ? (
+                  {agent.error ? (
+                    <span className="text-destructive">{agent.error}</span>
+                  ) : agent.last_auto_update_error ? (
                     <span className="text-destructive">
-                      auto update failed: {tool.last_auto_update_error}
+                      auto update failed: {agent.last_auto_update_error}
                     </span>
                   ) : (
-                    (tool.path ?? tool.install ?? tool.command)
+                    (agent.path ?? agent.install ?? agent.command)
                   )}
                 </div>
               </div>
               <label className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
                 <input
                   type="checkbox"
-                  checked={tool.auto_update}
-                  disabled={!tool.install || policyM.isPending}
+                  checked={agent.auto_update}
+                  disabled={!agent.install || policyM.isPending}
                   onChange={(event) =>
-                    policyM.mutate({ tool, autoUpdate: event.currentTarget.checked })
+                    policyM.mutate({ agent, autoUpdate: event.currentTarget.checked })
                   }
                 />
                 Auto update
               </label>
               <Button
-                variant={tool.installed && !tool.update_available ? "outline" : "secondary"}
+                variant={agent.installed && !agent.update_available ? "outline" : "secondary"}
                 size="sm"
                 className="shrink-0"
-                disabled={!tool.install || installM.isPending}
-                onClick={() => {
-                  if (confirm(`Run install/update for ${tool.preset_name} on ${host.name}?`)) {
+                disabled={!agent.install || installM.isPending}
+                onClick={async () => {
+                  const ok = await confirm({
+                    title: `${agent.installed ? "Update" : "Install"} ${agent.agent_name}?`,
+                    body: `Runs the install command on ${host.name}.`,
+                    confirmLabel: agent.installed ? "Update" : "Install",
+                  });
+                  if (ok) {
                     setLastResult(null);
-                    installM.mutate(tool);
+                    installM.mutate(agent);
                   }
                 }}
               >
                 <Download className="size-3.5" />
-                {installingId === tool.preset_id
+                {installingId === agent.agent_id
                   ? "Running..."
-                  : tool.installed
+                  : agent.installed
                     ? "Update"
                     : "Install"}
               </Button>
@@ -176,7 +175,7 @@ export function HostToolsPanel({ host }: { host: Host }) {
           <div
             className={`mb-2 text-sm ${lastResult.success ? "text-success" : "text-destructive"}`}
           >
-            {lastResult.preset_name}: {lastResult.success ? "completed" : "failed"}
+            {lastResult.agent_name}: {lastResult.success ? "completed" : "failed"}
             {lastResult.error ? ` · ${lastResult.error}` : ""}
           </div>
           {lastResult.output && (
@@ -190,11 +189,11 @@ export function HostToolsPanel({ host }: { host: Host }) {
   );
 }
 
-function ToolStatusIcon({ tool }: { tool: HostToolStatus }) {
-  if (tool.error) {
+function AgentStatusIcon({ agent }: { agent: HostAgentStatus }) {
+  if (agent.error) {
     return <AlertCircle className="size-4 shrink-0 text-warning" aria-label="Target warning" />;
   }
-  if (tool.installed) {
+  if (agent.installed) {
     return <CheckCircle2 className="size-4 shrink-0 text-success" aria-label="Installed" />;
   }
   return <X className="size-4 shrink-0 text-muted-foreground" aria-label="Missing" />;

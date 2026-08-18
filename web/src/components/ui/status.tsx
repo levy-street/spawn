@@ -1,7 +1,8 @@
-import { agentActivityDetail, agentActivityLabel } from "@/lib/agents";
-import type { Agent } from "@/lib/api";
+import type { Session } from "@/lib/api";
+import { sessionActivityDetail, sessionActivityLabel, sessionActivityTone } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 
+/** Maps 1:1 to the `--tone-*` design tokens (see docs/DESIGN.md). */
 export type DotTone = "active" | "waiting" | "idle" | "offline";
 
 const TONE_CLASS: Record<DotTone, string> = {
@@ -10,21 +11,6 @@ const TONE_CLASS: Record<DotTone, string> = {
   idle: "bg-tone-idle",
   offline: "bg-tone-offline",
 };
-
-export function agentActivityTone(agent: Agent): DotTone {
-  switch (agent.activity_state) {
-    case "active":
-      return "active";
-    case "waiting":
-    case "input_sent":
-    case "starting":
-      return "waiting";
-    case "quiet":
-      return "idle";
-    default:
-      return agent.status === "running" ? "idle" : "offline";
-  }
-}
 
 export function hostStatusTone(status: string): DotTone {
   return status === "online" ? "active" : "offline";
@@ -64,13 +50,13 @@ export function StatusDot({
   );
 }
 
-export function AgentStatusDot({ agent, className }: { agent: Agent; className?: string }) {
+export function SessionStatusDot({ session, className }: { session: Session; className?: string }) {
   return (
     <StatusDot
-      tone={agentActivityTone(agent)}
-      label={agentActivityLabel(agent)}
-      title={agentActivityDetail(agent)}
-      pulse={agent.activity_state === "active"}
+      tone={sessionActivityTone(session)}
+      label={sessionActivityLabel(session)}
+      title={sessionActivityDetail(session)}
+      pulse={session.activity_state === "active"}
       className={cn("border border-card", className)}
     />
   );

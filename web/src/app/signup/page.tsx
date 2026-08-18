@@ -48,10 +48,7 @@ function SignupForm() {
         <CardContent>
           <div className="space-y-4">
             {invite !== null && (
-              <p
-                className="rounded-md border border-success/50 px-3 py-2 text-sm"
-                role="status"
-              >
+              <p className="rounded-md border border-success/50 px-3 py-2 text-sm" role="status">
                 You have an invite — finish creating your account below.
               </p>
             )}

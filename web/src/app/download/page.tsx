@@ -106,10 +106,8 @@ export default function DownloadPage() {
   };
 
   const statusIcon = useMemo(() => {
-    if (supported)
-      return <CheckCircle2 className="size-5 text-success" />;
-    if (detected.status === "unsupported")
-      return <AlertTriangle className="size-5 text-warning" />;
+    if (supported) return <CheckCircle2 className="size-5 text-success" />;
+    if (detected.status === "unsupported") return <AlertTriangle className="size-5 text-warning" />;
     return <Laptop className="size-5 text-info" />;
   }, [detected.status, supported]);
 
