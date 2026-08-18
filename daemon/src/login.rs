@@ -97,29 +97,28 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         ));
     }
 
-    // Match a browser login's ease: open the approval page with the code
-    // prefilled and poll to completion ourselves. On a headless host we fall
-    // back to printing the link. The host-key possession proof above is
+    // Match a browser login's ease: open the approval page directly, carrying a
+    // handle so it lands on the fingerprint check with nothing to type, and poll
+    // to completion ourselves. We bake the opaque approval_ref into the URL (the
+    // short user_code never appears in a link); a pre-0029 server without a ref
+    // falls back to the user_code. The host-key possession proof above is
     // unchanged — this only touches how the human reaches the approval page.
     let approve_url = match url::Url::parse(&start.verification_uri) {
         Ok(mut parsed) => {
-            parsed
-                .query_pairs_mut()
-                .append_pair("code", &start.user_code);
+            match start.approval_ref.as_deref() {
+                Some(reference) => parsed.query_pairs_mut().append_pair("ref", reference),
+                None => parsed.query_pairs_mut().append_pair("code", &start.user_code),
+            };
             parsed.to_string()
         }
         Err(_) => start.verification_uri.clone(),
     };
     if open_browser(&approve_url) {
         println!("spawn: opened your browser to approve this host.");
-        println!(
-            "spawn:   code {}   (didn't open? visit {})",
-            start.user_code, approve_url
-        );
+        println!("spawn:   didn't open? visit {approve_url}");
     } else {
         println!("spawn: approve this host in your browser:");
         println!("spawn:   {approve_url}");
-        println!("spawn:   code {}", start.user_code);
     }
     println!("spawn: verify host fingerprint: {}", identity.fingerprint);
     println!("spawn: waiting for approval…");

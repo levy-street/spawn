@@ -417,6 +417,10 @@ pub struct DeviceStartRequest<'a> {
 pub struct DeviceStartResponse {
     pub device_code: String,
     pub user_code: String,
+    /// Opaque handle we bake into the browser URL (`/device?ref=…`) so the short
+    /// user_code never rides in a link. Absent from a pre-0029 server.
+    #[serde(default)]
+    pub approval_ref: Option<String>,
     pub approval_nonce: String,
     pub verification_uri: String,
     pub interval: u64,
