@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pytest
 from sqlalchemy import select
 
 from spawn_server import auth
@@ -1172,6 +1173,42 @@ async def test_started_publish_failure_fences_without_broker_deadlock(client, mo
     )
     other.queue_disconnect()
     await asyncio.wait_for(other_task, timeout=1)
+
+
+@pytest.mark.parametrize(
+    ("frame", "reason", "secret"),
+    [
+        (
+            {"type": "agent.uploaded", "path": "/secret/daemon-upload-path"},
+            "agent upload acknowledgements belong on spawn.ctl",
+            "/secret/daemon-upload-path",
+        ),
+        (
+            {
+                "type": "error",
+                "code": "upload_failed",
+                "message": "secret daemon upload failure",
+            },
+            "agent upload errors belong on spawn.ctl",
+            "secret daemon upload failure",
+        ),
+    ],
+)
+async def test_daemon_upload_frames_fail_closed_without_logging_content(
+    client, caplog, frame, reason, secret
+):
+    slug = frame["type"].replace(".", "-")
+    user_id, _ = await _signup(client, f"ws-daemon-retired-{slug}@example.com")
+    host_id = await _create_host(user_id)
+    pty_id = await _create_session_row(user_id, host_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    ws.queue_text({"type": "register", "existing_sessions": [pty_id]})
+    ws.queue_text({**frame, "session_id": pty_id})
+    await daemon_ws(ws, token=None)  # type: ignore[arg-type]
+    assert ws.closed == (4002, reason)
+    assert secret not in caplog.text
 
 
 async def test_fence_closes_before_stalled_rtc_revocation_and_keeps_broker_usable(app):

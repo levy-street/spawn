@@ -382,10 +382,10 @@ async def browser_ws(
                     )
                     break
                 if ftype == "upload":
-                    log.warning("retired server-visible upload frame; closing")
+                    log.warning("retired server-visible agent upload frame; closing")
                     await websocket.close(
                         code=WS_CLOSE_CONTENT_FORBIDDEN,
-                        reason="uploads belong on spawn.ctl",
+                        reason="agent uploads belong on spawn.ctl",
                     )
                     break
                 elif ftype == "rtc.offer":

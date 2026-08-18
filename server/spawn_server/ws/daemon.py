@@ -1642,6 +1642,14 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             await _fence_superseded_daemon(conn)
                             break
 
+                elif ftype == "agent.uploaded":
+                    log.warning("retired server-visible agent upload acknowledgement; closing")
+                    await websocket.close(
+                        code=WS_CLOSE_CONTENT_FORBIDDEN,
+                        reason="agent upload acknowledgements belong on spawn.ctl",
+                    )
+                    break
+
                 elif ftype == "rtc.answer":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
                     if session_id:
@@ -1770,6 +1778,13 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             continue
 
                 elif ftype == "error":
+                    if obj.get("code") == "upload_failed":
+                        log.warning("retired server-visible agent upload error; closing")
+                        await websocket.close(
+                            code=WS_CLOSE_CONTENT_FORBIDDEN,
+                            reason="agent upload errors belong on spawn.ctl",
+                        )
+                        break
                     log.warning(
                         "daemon error host=%s session=%s code=%s msg=%s",
                         host.id,

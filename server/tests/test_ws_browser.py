@@ -275,7 +275,7 @@ async def test_browser_upload_frame_fails_closed_without_forwarding_content(clie
         }
     )
     await asyncio.wait_for(task, timeout=1)
-    assert ws.closed == (4002, "uploads belong on spawn.ctl")
+    assert ws.closed == (4002, "agent uploads belong on spawn.ctl")
     assert secret_name not in caplog.text
     assert secret_body not in caplog.text
 
