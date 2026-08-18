@@ -4,8 +4,8 @@
     "Every tile array returned by any operation is sorted in reading order — (y, x) ascending. Expected arrays compare exactly, order included.",
     "validate returns {ok, errors}; error codes: shape (layout not an object or tiles not an array; reported alone), version (version !== 2), count (more than 8 tiles), session_id (missing or not a non-empty string; id FORMAT is deliberately not checked — pruning unknown/foreign ids is server policy upstream of the algebra), integer (x/y/w/h not all integers), bounds (outside the canvas), size (w or h < 3; at most one size error per tile), duplicate (same session_id as an earlier tile; index = later tile, other_index = first occurrence), overlap (index < other_index). Emission order: version, count, then per-tile errors in tile order (session_id, integer, bounds, size; an integer failure suppresses bounds/size for that tile), then duplicates in tile order, then overlaps for index pairs i<j in lexicographic order. Tiles failing integer or bounds checks are excluded from overlap checking.",
     "autoPlace returns {tile, tiles}: tile is the new geometry (no session_id — the caller appends it), tiles the possibly-updated list. Scan: first free 3x3 by y then x; expand w rightward at height 3, then h downward at the expanded width. Fallback when no 3x3 is free: split candidates are tiles with max(w, h) >= 6; pick the largest area, ties broken by reading order; cut along the longer axis — vertical cut (side-by-side halves) when w >= h — the existing tile keeps ceil(side/2), the new tile gets floor(side/2). tile is null (tiles returned unchanged, sorted) when the input already has 8 tiles or no split candidate exists.",
-    "move(tiles, id, x, y): clamp the target into the canvas (x to [0, 12-w], y to [0, 12-h]); fix the moved tile there; every other tile keeps its x and is pushed down in reading order, cascading, transiently allowed past row 12; then compact everything (the moved tile is not pinned — compaction may relocate it). If any tile still ends past row 12, the move does not fit and the input is returned unchanged (sorted). Unknown id: input returned unchanged (sorted).",
-    "resize(tiles, id, w, h): clamp w to [3, 12-x] and h to [3, 12-y]; then the same fixed-tile cascade-and-compact pipeline and the same does-not-fit and unknown-id rules as move. Shrinking leaves freed space empty — only remove grows neighbors.",
+    "move(tiles, id, x, y): clamp the target into the canvas (x to [0, 12-w], y to [0, 12-h]); fix the moved tile there; every other tile keeps its x and is pushed down in reading order, cascading, transiently allowed past row 12; then compact everything (the moved tile is not pinned — compaction may relocate it). If the cascade cannot resolve inside 12 rows OR the compacted result is identical to the input (deep equality of the reading-order lists, ids and geometry), move falls back to SWAP: among the other tiles, T = the tile with the greatest intersection area with the dragged tile's clamped target rect, ties broken by reading order — lowest (y, x) first; the dragged tile adopts T's rect wholesale (x, y, w, AND h) and T adopts the dragged tile's original rect; the swapped layout is returned WITHOUT further compaction (its rect set equals the input's, so validity and packing are preserved). A swap exchanges sizes between the two tiles — move preserves the multiset of sizes, not per-tile sizes. If no tile intersects the target rect either, the move is a no-op returning the input unchanged (sorted). Unknown id: input returned unchanged (sorted).",
+    "resize(tiles, id, w, h): clamp w to [3, 12-x] and h to [3, 12-y]; then the same fixed-tile cascade-and-compact pipeline as move, but with NO swap fallback: if the cascade cannot resolve inside 12 rows the input is returned unchanged (sorted). Unknown id: input returned unchanged (sorted). Shrinking leaves freed space empty — only remove grows neighbors.",
     "compact: process tiles in reading order of their input positions; each tile slides up as far as it can, then left, one continuous slide each, checked against ALL other tiles at their current positions (already-processed tiles at settled spots, later tiles at original spots). Tiles never pass through occupied cells, so validity is preserved at every step.",
     "remove: drop the tile, compact, then one expansion pass over the survivors in reading order — each expands w rightward while the next column strip is free, then h downward, against the current (already expanded) sizes of the others. Unknown id: input returned unchanged (sorted), with no compaction.",
     "fromSplitTree: assign float rects from (0, 0, 12, 12); a row split puts a left and b right at s = x0 + ratio*(x1 - x0), a column split puts a top and b bottom (same formula on y); ratio is clamped to [0, 1]; each split position is computed once and shared by both children. Pane EDGES are rounded with floor(v + 0.5) — round half UP, not Python's banker's round(). If any rounded tile has w < 3 or h < 3, lies outside the canvas, or overlaps another, the whole layout falls back to repeated autoPlace from an empty canvas over the panes in v1 DFS order (a then b). Trees with more than 8 panes keep the first 8 in DFS order and drop the rest. Null root yields []. Pane agent_id becomes tile session_id verbatim.",
@@ -1110,7 +1110,7 @@
       }
     },
     {
-      "name": "move-swap-columns-no-op",
+      "name": "move-swap-full-height-columns",
       "op": "move",
       "input": {
         "tiles": [
@@ -1136,18 +1136,204 @@
       "expected": {
         "tiles": [
           {
-            "session_id": "a",
+            "session_id": "b",
             "x": 0,
             "y": 0,
             "w": 6,
             "h": 12
           },
           {
-            "session_id": "b",
+            "session_id": "a",
             "x": 6,
             "y": 0,
             "w": 6,
             "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-swap-full-width-rows",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 6,
+            "w": 12,
+            "h": 6
+          }
+        ],
+        "id": "a",
+        "x": 0,
+        "y": 6
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 6
+          },
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 6,
+            "w": 12,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-swap-differing-sizes",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 4,
+            "h": 12
+          },
+          {
+            "session_id": "b",
+            "x": 4,
+            "y": 0,
+            "w": 8,
+            "h": 12
+          }
+        ],
+        "id": "a",
+        "x": 4,
+        "y": 0
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "b",
+            "x": 0,
+            "y": 0,
+            "w": 4,
+            "h": 12
+          },
+          {
+            "session_id": "a",
+            "x": 4,
+            "y": 0,
+            "w": 8,
+            "h": 12
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-swap-tie-break-reading-order",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "d",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ],
+        "id": "d",
+        "x": 3,
+        "y": 3
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "d",
+            "x": 0,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "b",
+            "x": 6,
+            "y": 0,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "c",
+            "x": 0,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          },
+          {
+            "session_id": "a",
+            "x": 6,
+            "y": 6,
+            "w": 6,
+            "h": 6
+          }
+        ]
+      }
+    },
+    {
+      "name": "move-into-empty-space-no-op",
+      "op": "move",
+      "input": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
+          }
+        ],
+        "id": "a",
+        "x": 6,
+        "y": 6
+      },
+      "expected": {
+        "tiles": [
+          {
+            "session_id": "a",
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 3
           }
         ]
       }

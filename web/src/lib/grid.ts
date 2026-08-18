@@ -259,11 +259,33 @@ function reflowAround(fixed: Tile, others: Tile[]): Tile[] | null {
   return result;
 }
 
+function intersectionArea(a: Rect, b: Rect): number {
+  const w = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+  const h = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+  return w > 0 && h > 0 ? w * h : 0;
+}
+
+/** Deep equality of two reading-order tile lists (ids and geometry). */
+function sameTiles(a: Tile[], b: Tile[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((t, i) => {
+    const o = b[i];
+    return t.session_id === o.session_id && t.x === o.x && t.y === o.y && t.w === o.w && t.h === o.h;
+  });
+}
+
 /**
  * Moves a tile to (x, y) (clamped into the canvas); tiles it overlaps are
- * pushed down, cascading, then the layout is compacted. When no valid layout
- * exists with the tile at the target (the cascade cannot resolve inside 12
- * rows), the input is returned unchanged. Unknown ids return the input
+ * pushed down, cascading, then the layout is compacted. When the cascade
+ * cannot resolve inside 12 rows, or the result is identical to the input (the
+ * push had no legal effect — e.g. dragging one full-height column onto
+ * another), the move falls back to a SWAP: T = the tile with the greatest
+ * area overlap with the dragged tile's clamped target rect (ties broken by
+ * reading order); the dragged tile adopts T's rect wholesale — position AND
+ * size — and T adopts the dragged tile's original rect. The rect set equals
+ * the input's, so the swap is valid by construction and is returned without
+ * further compaction. If no tile overlaps the target rect either, the move is
+ * a no-op returning the input unchanged. Unknown ids return the input
  * unchanged.
  */
 export function move(tiles: Tile[], id: string, x: number, y: number): Tile[] {
@@ -275,11 +297,32 @@ export function move(tiles: Tile[], id: string, x: number, y: number): Tile[] {
     x: clamp(x, 0, GRID_SIZE - target.w),
     y: clamp(y, 0, GRID_SIZE - target.h),
   };
-  const result = reflowAround(
-    moved,
-    original.filter((t) => t.session_id !== id),
-  );
-  return result ?? original;
+  const others = original.filter((t) => t.session_id !== id);
+  const result = reflowAround(moved, others);
+  if (result && !sameTiles(result, original)) return result;
+
+  let victim: Tile | null = null;
+  let bestArea = 0;
+  for (const t of others) {
+    // others is in reading order; strictly-greater keeps the first of any tie
+    const area = intersectionArea(moved, t);
+    if (area > bestArea) {
+      bestArea = area;
+      victim = t;
+    }
+  }
+  if (!victim) return original;
+  const swappedWith = victim;
+  const swapped = original.map((t) => {
+    if (t.session_id === id) {
+      return { ...t, x: swappedWith.x, y: swappedWith.y, w: swappedWith.w, h: swappedWith.h };
+    }
+    if (t.session_id === swappedWith.session_id) {
+      return { ...t, x: target.x, y: target.y, w: target.w, h: target.h };
+    }
+    return { ...t };
+  });
+  return sortTiles(swapped);
 }
 
 /**

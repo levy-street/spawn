@@ -256,7 +256,7 @@ describe("move", () => {
     assert.deepStrictEqual(move(tiles, "a", 0, 0), tiles);
   });
 
-  test("preserves every tile's size", () => {
+  test("a pipeline move (no swap) preserves every tile's size", () => {
     const tiles = [T("a", 0, 0, 12, 3), T("b", 0, 3, 12, 3), T("c", 0, 6, 6, 6)];
     const moved = move(tiles, "b", 0, 0);
     for (const t of tiles) {
@@ -265,6 +265,22 @@ describe("move", () => {
       assert.strictEqual(after.w, t.w);
       assert.strictEqual(after.h, t.h);
     }
+  });
+
+  test("swap fallback exchanges rects wholesale, including sizes", () => {
+    const tiles = [T("a", 0, 0, 4, 12), T("b", 4, 0, 8, 12)];
+    assert.deepStrictEqual(move(tiles, "a", 4, 0), [T("b", 0, 0, 4, 12), T("a", 4, 0, 8, 12)]);
+  });
+
+  test("swap fallback is skipped when the pipeline produces a real change", () => {
+    // Reordering rows succeeds via push-down, so no rects are exchanged even
+    // though the dragged tile fully overlaps another at its target.
+    const tiles = [T("a", 0, 0, 12, 3), T("b", 0, 3, 12, 3), T("c", 0, 6, 12, 3)];
+    assert.deepStrictEqual(move(tiles, "c", 0, 0), [
+      T("c", 0, 0, 12, 3),
+      T("a", 0, 3, 12, 3),
+      T("b", 0, 6, 12, 3),
+    ]);
   });
 });
 
@@ -402,22 +418,15 @@ describe("property: op sequences", () => {
         } else {
           const id = tiles[int(tiles.length)].session_id;
           if (op === 1) {
-            const before = new Map(tiles.map((t) => [t.session_id, { w: t.w, h: t.h }]));
+            // A swap may exchange sizes between two tiles, so move preserves
+            // the multiset of sizes and the set of ids, not per-tile sizes.
+            const sizesOf = (list: Tile[]) => list.map((t) => `${t.w}x${t.h}`).sort();
+            const idsOf = (list: Tile[]) => list.map((t) => t.session_id).sort();
+            const sizesBefore = sizesOf(tiles);
+            const idsBefore = idsOf(tiles);
             tiles = move(tiles, id, int(GRID_SIZE + 2) - 1, int(GRID_SIZE + 2) - 1);
-            for (const t of tiles) {
-              const size = before.get(t.session_id);
-              assert.ok(size);
-              assert.strictEqual(
-                t.w,
-                size.w,
-                `step ${step}: move changed width of ${t.session_id}`,
-              );
-              assert.strictEqual(
-                t.h,
-                size.h,
-                `step ${step}: move changed height of ${t.session_id}`,
-              );
-            }
+            assert.deepStrictEqual(sizesOf(tiles), sizesBefore, `step ${step}: sizes changed`);
+            assert.deepStrictEqual(idsOf(tiles), idsBefore, `step ${step}: ids changed`);
           } else if (op === 2) {
             tiles = resize(tiles, id, int(GRID_SIZE + 2), int(GRID_SIZE + 2));
           } else {
