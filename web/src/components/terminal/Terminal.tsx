@@ -1294,7 +1294,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   socketRef.current = socket;
 
   // Surface the live transport for connection indicators without forcing the
-  // callback identity into effect deps (screen panes pass inline closures).
+  // callback identity into effect deps (workspace panes pass inline closures).
   const onConnectionInfoRef = useRef(onConnectionInfo);
   onConnectionInfoRef.current = onConnectionInfo;
   useEffect(() => {
