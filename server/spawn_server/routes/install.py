@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shlex
 import sys
 from pathlib import Path
@@ -60,6 +61,29 @@ def _binary_candidates(target: str, name: str) -> list[Path]:
     return candidates
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _prebuilt_sha256_cases() -> str:
+    """Shell `case` arms mapping "<kind>:<target>" to the sha256 of the binary
+    this server will actually serve, for every prebuilt present. Absent targets
+    emit no arm, so the installer skips verification on a source-build host
+    (there is nothing to pin against). Templated into `install.sh` at render."""
+    arms: list[str] = []
+    for target in SUPPORTED_TARGETS:
+        for kind in ("spawnd", "spawn-worker"):
+            binary = next((p for p in _binary_candidates(target, kind) if p.is_file()), None)
+            if binary is None:
+                continue
+            arms.append(f"        {kind}:{target}) printf %s {_sha256_file(binary)} ;;")
+    return "\n".join(arms)
+
+
 @router.get("/api/install/spawnd/{target}")
 async def spawnd_binary(target: str) -> FileResponse:
     """Serve the locally-built daemon binary for quick installs."""
@@ -110,6 +134,8 @@ async def install_script() -> PlainTextResponse:
     script = INSTALL_SCRIPT.replace("__DEFAULT_SERVER__", shlex.quote(server))
     script = script.replace("__DEFAULT_REPO__", shlex.quote(DEFAULT_REPO))
     script = script.replace("__DEFAULT_BRANCH__", shlex.quote(DEFAULT_BRANCH))
+    # Injected as case arms, so this must land after the literal-string replaces.
+    script = script.replace("__PREBUILT_SHA256__", _prebuilt_sha256_cases())
     return PlainTextResponse(
         script,
         media_type="text/x-shellscript; charset=utf-8",
@@ -401,6 +427,39 @@ INSTALL_SCRIPT = dedent(
       esac
     }
 
+    prebuilt_sha256() {
+      # Expected sha256 for "<kind> <target>", templated from the binaries this
+      # server serves. No arm ⇒ nothing to verify (source-build host).
+      case "$1:$2" in
+        __PREBUILT_SHA256__
+        *) return 1 ;;
+      esac
+    }
+
+    sha256_of() {
+      if need shasum; then
+        shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+      elif need sha256sum; then
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+      else
+        return 1
+      fi
+    }
+
+    verify_prebuilt() {
+      # $1 = downloaded file, $2 = kind. Fails only on a real mismatch; a missing
+      # pin or absent hash tool skips verification (fail-open — the binary still
+      # arrives over the server's TLS, and gets a `--version` sanity check).
+      _want=$(prebuilt_sha256 "$2" "$TARGET") || return 0
+      [ -n "$_want" ] || return 0
+      _got=$(sha256_of "$1") || { say "no sha256 tool; skipping prebuilt verification"; return 0; }
+      if [ "$_got" = "$_want" ]; then
+        return 0
+      fi
+      say "prebuilt $2 sha256 mismatch (want $_want, got $_got)"
+      return 1
+    }
+
     install_prebuilt_spawnd() {
       TARGET=$(host_target) || return 1
       need curl || return 1
@@ -410,6 +469,11 @@ INSTALL_SCRIPT = dedent(
       TMP_WORKER="$WORKER_BIN.tmp.$$"
       say "downloading prebuilt spawnd + spawn-worker for $TARGET"
       if curl -fsSL "$URL" -o "$TMP_BIN" && curl -fsSL "$WORKER_URL" -o "$TMP_WORKER"; then
+        if ! verify_prebuilt "$TMP_BIN" spawnd || ! verify_prebuilt "$TMP_WORKER" spawn-worker; then
+          rm -f "$TMP_BIN" "$TMP_WORKER"
+          say "prebuilt checksum verification failed; falling back to source"
+          return 1
+        fi
         chmod 755 "$TMP_BIN"
         chmod 755 "$TMP_WORKER"
         if "$TMP_BIN" --version >/dev/null 2>&1; then

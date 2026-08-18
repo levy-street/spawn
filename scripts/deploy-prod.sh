@@ -166,6 +166,34 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
       die "cargo is required to build the hosted spawnd binary"
     fi
   fi
+
+  # Pull macOS prebuilt daemon binaries so the installer can serve them: this
+  # Linux host can't build Darwin, and without a prebuilt every Mac install
+  # falls back to a fragile from-source toolchain build. Best-effort — a miss
+  # just restores that fallback. Needs an authed `gh` (private repo) with
+  # contents:read; the checksum gate refuses a corrupt or partial release.
+  if command -v gh >/dev/null 2>&1; then
+    darwin_tmp="$(mktemp -d)"
+    if gh release download prebuilt-latest --repo levy-street/spawn --dir "$darwin_tmp" --clobber >/dev/null 2>&1 \
+      && [[ -f "$darwin_tmp/SHA256SUMS" ]] \
+      && ( cd "$darwin_tmp" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
+      for arch in aarch64 x86_64; do
+        triple="$arch-apple-darwin"
+        if [[ -f "$darwin_tmp/spawnd-$triple" && -f "$darwin_tmp/spawn-worker-$triple" ]]; then
+          dest="daemon/target/prebuilt/darwin-$arch"
+          mkdir -p "$dest"
+          install -m 0755 "$darwin_tmp/spawnd-$triple" "$dest/spawnd"
+          install -m 0755 "$darwin_tmp/spawn-worker-$triple" "$dest/spawn-worker"
+          printf 'remote deploy: installed darwin-%s prebuilt\n' "$arch"
+        fi
+      done
+    else
+      printf 'remote deploy: darwin prebuilt unavailable/unverified; Mac installs use source build\n'
+    fi
+    rm -rf "$darwin_tmp"
+  else
+    printf 'remote deploy: gh not found; skipping darwin prebuilt pull\n'
+  fi
 fi
 
 for service in $SPAWN_DEPLOY_SERVICES; do

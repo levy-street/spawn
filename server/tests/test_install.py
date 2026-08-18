@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import subprocess
@@ -12,6 +13,17 @@ from pathlib import Path
 import pytest
 
 from spawn_server.routes import install as install_routes
+
+
+@pytest.fixture(autouse=True)
+def _isolate_repo_root(monkeypatch, tmp_path):
+    # Keep install.sh rendering hermetic: point the prebuilt lookup at an empty
+    # dir so a locally-built daemon/target/release/* can't leak sha256 pins into
+    # tests (a real pin would fail-verify the fabricated fake downloads). Tests
+    # that need a staged prebuilt override _repo_root themselves afterwards.
+    empty = tmp_path / "empty-repo"
+    empty.mkdir()
+    monkeypatch.setattr(install_routes, "_repo_root", lambda: empty)
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -378,6 +390,27 @@ async def test_unsupported_daemon_binary_target_404(client):
 
     assert r.status_code == 404
     assert r.json()["detail"] == "unsupported daemon target"
+
+
+async def test_install_script_pins_prebuilt_sha256(client, tmp_path: Path, monkeypatch):
+    # A present prebuilt gets its sha256 templated into the script so the
+    # installer verifies the download; a target with no prebuilt emits no pin.
+    repo = tmp_path / "repo-with-prebuilt"
+    prebuilt = repo / "daemon" / "target" / "prebuilt" / "darwin-aarch64"
+    prebuilt.mkdir(parents=True)
+    (prebuilt / "spawnd").write_bytes(b"fake-spawnd")
+    (prebuilt / "spawn-worker").write_bytes(b"fake-worker")
+    monkeypatch.setattr(install_routes, "_repo_root", lambda: repo)
+
+    want_spawnd = hashlib.sha256(b"fake-spawnd").hexdigest()
+    want_worker = hashlib.sha256(b"fake-worker").hexdigest()
+
+    r = await client.get("/install.sh")
+
+    assert r.status_code == 200
+    assert f"spawnd:darwin-aarch64) printf %s {want_spawnd} ;;" in r.text
+    assert f"spawn-worker:darwin-aarch64) printf %s {want_worker} ;;" in r.text
+    assert "linux-x86_64) printf" not in r.text  # not staged → not pinned
 
 
 @pytest.mark.parametrize(
