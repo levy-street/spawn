@@ -45,7 +45,7 @@ interface GoldenFile {
   intended_peer_public_key_wire: string;
   mutation_fields: string[];
   protocol_version_json_tokens: {
-    agent_accepted: string[];
+    session_accepted: string[];
     host_accepted: string[];
     rejected: string[];
   };
@@ -332,7 +332,7 @@ describe("signed RTC JSON wire adapter", () => {
 
   test("uses the shared value-semantic JSON number contract", async () => {
     for (const [vector, tokens] of [
-      [golden.vectors[0], golden.protocol_version_json_tokens.agent_accepted],
+      [golden.vectors[0], golden.protocol_version_json_tokens.session_accepted],
       [golden.vectors[1], golden.protocol_version_json_tokens.host_accepted],
     ] as const) {
       const canonical = JSON.stringify(vector.envelope);
@@ -366,7 +366,7 @@ describe("signed RTC JSON wire adapter", () => {
     }
   });
 
-  test("rejects correctly signed agent v1 and host v2 envelopes", async () => {
+  test("rejects correctly signed session v1 and host v2 envelopes", async () => {
     const sender = await importEd25519PublicKeyWire(golden.sender_public_key_wire);
     expect(golden.wrong_topology_vectors).toHaveLength(2);
     for (const vector of golden.wrong_topology_vectors) {
