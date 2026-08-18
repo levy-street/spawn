@@ -1,9 +1,10 @@
-"""`/api/hosts` — list, get, rename, delete."""
+"""`/api/hosts` — list, get, rename, delete, agent availability, recent dirs."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -14,14 +15,23 @@ from fastapi import (
     Response,
     status,
 )
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
 from ..db import get_session, get_sessionmaker
 from ..host_identity import host_key_fingerprint
 from ..host_key_claims import lock_host_key_claim
-from ..models import Agent, DeviceCode, Host, HostBrowserPin, HostToolPolicy, Preset, User
+from ..models import (
+    Agent,
+    DeviceCode,
+    Host,
+    HostAgentPolicy,
+    HostBrowserPin,
+    RecentDir,
+    Session,
+    User,
+)
 from ..ws.broker import get_broker
 
 router = APIRouter(prefix="/api/hosts", tags=["hosts"])
@@ -29,6 +39,7 @@ log = logging.getLogger("spawn.routes.hosts")
 AUTO_UPDATE_THROTTLE = timedelta(minutes=30)
 AUTO_UPDATE_CHECK_INTERVAL_SECONDS = 10 * 60
 AUTO_UPDATE_SHUTDOWN_DRAIN_SECONDS = 5.0
+MAX_RECENT_DIRS = 8
 _AUTO_UPDATE_IN_FLIGHT: set[tuple[str, str, str]] = set()
 _AUTO_UPDATE_TASKS: set[asyncio.Task[None]] = set()
 _AUTO_UPDATE_CHECK_TASK: asyncio.Task[None] | None = None
@@ -46,7 +57,7 @@ def _aware(dt: datetime | None) -> datetime | None:
     return dt
 
 
-def _to_out(host: Host, agent_count: int) -> schemas.HostOut:
+def _to_out(host: Host, session_count: int) -> schemas.HostOut:
     fingerprint = (
         host_key_fingerprint(host.host_key_algorithm, host.host_public_key)
         if host.host_key_algorithm is not None and host.host_public_key is not None
@@ -63,19 +74,38 @@ def _to_out(host: Host, agent_count: int) -> schemas.HostOut:
         host_key_fingerprint=fingerprint,
         status=host.status,
         last_seen_at=host.last_seen_at,
-        agent_count=agent_count,
+        session_count=session_count,
     )
 
 
-def _preset_to_tool_target(preset: Preset) -> schemas.HostToolTarget:
-    command = str((preset.default_argv or [""])[0]).strip()
-    return schemas.HostToolTarget(
-        preset_id=preset.id,
-        preset_name=preset.name,
-        agent_kind=preset.agent_kind,
-        command=command,
-        install=preset.install,
+def _command_binary(command: str) -> str:
+    """First word of the agent's command string — the binary to `which`."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    return tokens[0] if tokens else ""
+
+
+def _agent_to_target(agent: Agent) -> schemas.HostAgentTarget:
+    return schemas.HostAgentTarget(
+        agent_id=agent.id,
+        agent_name=agent.name,
+        agent_kind=agent.kind,
+        command=_command_binary(agent.command),
+        install=agent.install,
     )
+
+
+async def _session_count(session: AsyncSession, host: Host, user: User) -> int:
+    return (
+        await session.execute(
+            select(func.count(Session.id)).where(
+                Session.host_id == host.id,
+                Session.owner_user_id == user.id,
+            )
+        )
+    ).scalar_one()
 
 
 async def _get_owned_host(session: AsyncSession, host_id: str, user: User) -> Host:
@@ -85,12 +115,12 @@ async def _get_owned_host(session: AsyncSession, host_id: str, user: User) -> Ho
     return host
 
 
-async def _list_accessible_presets(session: AsyncSession, user: User) -> list[Preset]:
+async def _list_accessible_agents(session: AsyncSession, user: User) -> list[Agent]:
     return (
         (
             await session.execute(
-                select(Preset).where(
-                    or_(Preset.owner_user_id.is_(None), Preset.owner_user_id == user.id)
+                select(Agent).where(
+                    or_(Agent.owner_user_id.is_(None), Agent.owner_user_id == user.id)
                 )
             )
         )
@@ -99,33 +129,33 @@ async def _list_accessible_presets(session: AsyncSession, user: User) -> list[Pr
     )
 
 
-async def _get_accessible_preset(session: AsyncSession, preset_id: str, user: User) -> Preset:
-    preset = await session.get(Preset, preset_id)
-    if preset is None or (preset.owner_user_id is not None and preset.owner_user_id != user.id):
-        raise HTTPException(status_code=404, detail="preset not found")
-    return preset
+async def _get_accessible_agent(session: AsyncSession, agent_id: str, user: User) -> Agent:
+    agent = await session.get(Agent, agent_id)
+    if agent is None or (agent.owner_user_id is not None and agent.owner_user_id != user.id):
+        raise HTTPException(status_code=404, detail="agent not found")
+    return agent
 
 
-async def _policy_for_preset(
-    session: AsyncSession, *, user: User, host_id: str, preset_id: str
-) -> HostToolPolicy:
+async def _policy_for_agent(
+    session: AsyncSession, *, user: User, host_id: str, agent_id: str
+) -> HostAgentPolicy:
     policy = (
         await session.execute(
-            select(HostToolPolicy).where(
-                HostToolPolicy.owner_user_id == user.id,
-                HostToolPolicy.host_id == host_id,
-                HostToolPolicy.preset_id == preset_id,
+            select(HostAgentPolicy).where(
+                HostAgentPolicy.owner_user_id == user.id,
+                HostAgentPolicy.host_id == host_id,
+                HostAgentPolicy.agent_id == agent_id,
             )
         )
     ).scalar_one_or_none()
     if policy is not None:
         return policy
 
-    policy = HostToolPolicy(
+    policy = HostAgentPolicy(
         id=str(uuid.uuid4()),
         owner_user_id=user.id,
         host_id=host_id,
-        preset_id=preset_id,
+        agent_id=agent_id,
         auto_update=False,
     )
     session.add(policy)
@@ -133,44 +163,44 @@ async def _policy_for_preset(
     return policy
 
 
-async def _policies_for_presets(
-    session: AsyncSession, *, user: User, host_id: str, presets: list[Preset]
-) -> dict[str, HostToolPolicy]:
-    preset_ids = [p.id for p in presets]
-    if not preset_ids:
+async def _policies_for_agents(
+    session: AsyncSession, *, user: User, host_id: str, agents: list[Agent]
+) -> dict[str, HostAgentPolicy]:
+    agent_ids = [agent.id for agent in agents]
+    if not agent_ids:
         return {}
 
     existing = (
         (
             await session.execute(
-                select(HostToolPolicy).where(
-                    HostToolPolicy.owner_user_id == user.id,
-                    HostToolPolicy.host_id == host_id,
-                    HostToolPolicy.preset_id.in_(preset_ids),
+                select(HostAgentPolicy).where(
+                    HostAgentPolicy.owner_user_id == user.id,
+                    HostAgentPolicy.host_id == host_id,
+                    HostAgentPolicy.agent_id.in_(agent_ids),
                 )
             )
         )
         .scalars()
         .all()
     )
-    by_preset = {p.preset_id: p for p in existing}
-    for preset in presets:
-        if preset.id in by_preset:
+    by_agent = {policy.agent_id: policy for policy in existing}
+    for agent in agents:
+        if agent.id in by_agent:
             continue
-        policy = HostToolPolicy(
+        policy = HostAgentPolicy(
             id=str(uuid.uuid4()),
             owner_user_id=user.id,
             host_id=host_id,
-            preset_id=preset.id,
+            agent_id=agent.id,
             auto_update=False,
         )
         session.add(policy)
-        by_preset[preset.id] = policy
+        by_agent[agent.id] = policy
     await session.flush()
-    return by_preset
+    return by_agent
 
 
-def _merge_tool_policy(status: schemas.HostToolStatus, policy: HostToolPolicy) -> None:
+def _merge_agent_policy(status: schemas.HostAgentStatus, policy: HostAgentPolicy) -> None:
     status.auto_update = policy.auto_update
     status.last_checked_at = policy.last_checked_at
     status.last_auto_update_at = policy.last_auto_update_at
@@ -178,22 +208,22 @@ def _merge_tool_policy(status: schemas.HostToolStatus, policy: HostToolPolicy) -
 
 
 def _should_auto_update(
-    status: schemas.HostToolStatus, policy: HostToolPolicy, now: datetime
+    status: schemas.HostAgentStatus, policy: HostAgentPolicy, now: datetime
 ) -> bool:
     if not policy.auto_update or status.update_available is not True:
         return False
     if not (status.install or "").strip():
         return False
-    key = (policy.owner_user_id, policy.host_id, policy.preset_id)
+    key = (policy.owner_user_id, policy.host_id, policy.agent_id)
     if key in _AUTO_UPDATE_IN_FLIGHT:
         return False
     last_attempt = _aware(policy.last_auto_update_at)
     return last_attempt is None or now - last_attempt >= AUTO_UPDATE_THROTTLE
 
 
-def _auto_update_error_from_result(result: schemas.HostToolInstallResult | None) -> str | None:
+def _auto_update_error_from_result(result: schemas.HostAgentInstallResult | None) -> str | None:
     if result is None:
-        return "host tool install timed out"
+        return "host agent install timed out"
     if result.success:
         return None
     if result.error:
@@ -203,30 +233,32 @@ def _auto_update_error_from_result(result: schemas.HostToolInstallResult | None)
     return "install failed"
 
 
-async def _run_auto_update(*, user_id: str, host_id: str, preset_id: str, target: dict) -> None:
+async def _run_auto_update(*, user_id: str, host_id: str, agent_id: str, target: dict) -> None:
     try:
         daemon = get_broker().get_daemon_for_host(host_id)
         if daemon is None:
             error = "host daemon is offline"
         else:
-            raw_result = await get_broker().request_tool_install(daemon, target=target)
+            raw_result = await get_broker().request_agent_install(daemon, target=target)
             result = (
-                schemas.HostToolInstallResult.model_validate(raw_result.get("result", raw_result))
+                schemas.HostAgentInstallResult.model_validate(
+                    raw_result.get("result", raw_result)
+                )
                 if raw_result is not None
                 else None
             )
             error = _auto_update_error_from_result(result)
     except Exception as e:  # noqa: BLE001
-        log.warning("auto update failed host=%s preset=%s: %s", host_id, preset_id, e)
+        log.warning("auto update failed host=%s agent=%s: %s", host_id, agent_id, e)
         error = str(e)
     sm = get_sessionmaker()
     async with sm() as session:
         policy = (
             await session.execute(
-                select(HostToolPolicy).where(
-                    HostToolPolicy.owner_user_id == user_id,
-                    HostToolPolicy.host_id == host_id,
-                    HostToolPolicy.preset_id == preset_id,
+                select(HostAgentPolicy).where(
+                    HostAgentPolicy.owner_user_id == user_id,
+                    HostAgentPolicy.host_id == host_id,
+                    HostAgentPolicy.agent_id == agent_id,
                 )
             )
         ).scalar_one_or_none()
@@ -236,13 +268,13 @@ async def _run_auto_update(*, user_id: str, host_id: str, preset_id: str, target
             await session.commit()
 
 
-async def _owned_auto_update(*, user_id: str, host_id: str, preset_id: str, target: dict) -> None:
-    key = (user_id, host_id, preset_id)
+async def _owned_auto_update(*, user_id: str, host_id: str, agent_id: str, target: dict) -> None:
+    key = (user_id, host_id, agent_id)
     try:
         await _run_auto_update(
             user_id=user_id,
             host_id=host_id,
-            preset_id=preset_id,
+            agent_id=agent_id,
             target=target,
         )
     finally:
@@ -263,8 +295,8 @@ def _auto_update_task_done(task: asyncio.Task[None]) -> None:
         )
 
 
-def _start_auto_update(*, user_id: str, host_id: str, preset_id: str, target: dict) -> bool:
-    key = (user_id, host_id, preset_id)
+def _start_auto_update(*, user_id: str, host_id: str, agent_id: str, target: dict) -> bool:
+    key = (user_id, host_id, agent_id)
     if key in _AUTO_UPDATE_IN_FLIGHT:
         return False
     _AUTO_UPDATE_IN_FLIGHT.add(key)
@@ -273,10 +305,10 @@ def _start_auto_update(*, user_id: str, host_id: str, preset_id: str, target: di
             _owned_auto_update(
                 user_id=user_id,
                 host_id=host_id,
-                preset_id=preset_id,
+                agent_id=agent_id,
                 target=target,
             ),
-            name=f"auto-update:{host_id}:{preset_id}",
+            name=f"auto-update:{host_id}:{agent_id}",
         )
     except BaseException:
         _AUTO_UPDATE_IN_FLIGHT.discard(key)
@@ -304,17 +336,17 @@ async def run_auto_update_checks_once() -> None:
     async with sm() as session:
         rows = (
             await session.execute(
-                select(HostToolPolicy, Preset)
-                .join(Preset, HostToolPolicy.preset_id == Preset.id)
-                .where(HostToolPolicy.auto_update.is_(True))
+                select(HostAgentPolicy, Agent)
+                .join(Agent, HostAgentPolicy.agent_id == Agent.id)
+                .where(HostAgentPolicy.auto_update.is_(True))
             )
         ).all()
 
     by_host: dict[str, list[tuple[str, str, str, dict]]] = {}
-    for policy, preset in rows:
-        target = _preset_to_tool_target(preset).model_dump()
+    for policy, agent in rows:
+        target = _agent_to_target(agent).model_dump()
         by_host.setdefault(policy.host_id, []).append(
-            (policy.id, policy.owner_user_id, policy.preset_id, target)
+            (policy.id, policy.owner_user_id, policy.agent_id, target)
         )
 
     for host_id, items in by_host.items():
@@ -322,31 +354,31 @@ async def run_auto_update_checks_once() -> None:
         if daemon is None:
             continue
         targets = [target for _, _, _, target in items]
-        result = await get_broker().request_tool_check(daemon, targets=targets)
+        result = await get_broker().request_agent_check(daemon, targets=targets)
         if result is None:
             continue
-        checked = schemas.HostToolList.model_validate(result)
+        checked = schemas.HostAgentList.model_validate(result)
         now = _utcnow()
-        by_preset = {
-            preset_id: (policy_id, user_id, target)
-            for policy_id, user_id, preset_id, target in items
+        by_agent = {
+            agent_id: (policy_id, user_id, target)
+            for policy_id, user_id, agent_id, target in items
         }
 
         async with sm() as session:
-            for tool in checked.tools:
-                policy_info = by_preset.get(tool.preset_id)
+            for agent_status in checked.agents:
+                policy_info = by_agent.get(agent_status.agent_id)
                 if policy_info is None:
                     continue
                 policy_id, user_id, target = policy_info
-                policy = await session.get(HostToolPolicy, policy_id)
+                policy = await session.get(HostAgentPolicy, policy_id)
                 if policy is None or not policy.auto_update:
                     continue
                 policy.last_checked_at = now
-                if _should_auto_update(tool, policy, now):
+                if _should_auto_update(agent_status, policy, now):
                     if _start_auto_update(
                         user_id=user_id,
                         host_id=host_id,
-                        preset_id=tool.preset_id,
+                        agent_id=agent_status.agent_id,
                         target=target,
                     ):
                         policy.last_auto_update_at = now
@@ -404,16 +436,7 @@ async def list_hosts(
     )
     out: list[schemas.HostOut] = []
     for h in rows:
-        ac = (
-            await session.execute(
-                select(func.count(Agent.id)).where(
-                    Agent.host_id == h.id,
-                    Agent.owner_user_id == user.id,
-                    Agent.archived_at.is_(None),
-                )
-            )
-        ).scalar_one()
-        out.append(_to_out(h, ac))
+        out.append(_to_out(h, await _session_count(session, h, user)))
     return out
 
 
@@ -424,16 +447,7 @@ async def get_host(
     user: User = Depends(auth.current_user),
 ) -> schemas.HostOut:
     h = await _get_owned_host(session, host_id, user)
-    ac = (
-        await session.execute(
-            select(func.count(Agent.id)).where(
-                Agent.host_id == h.id,
-                Agent.owner_user_id == user.id,
-                Agent.archived_at.is_(None),
-            )
-        )
-    ).scalar_one()
-    return _to_out(h, ac)
+    return _to_out(h, await _session_count(session, h, user))
 
 
 @router.patch("/{host_id}", response_model=schemas.HostOut)
@@ -448,60 +462,77 @@ async def patch_host(
         h.name = body.name
     await session.commit()
     await session.refresh(h)
-    ac = (
-        await session.execute(
-            select(func.count(Agent.id)).where(
-                Agent.host_id == h.id,
-                Agent.owner_user_id == user.id,
-                Agent.archived_at.is_(None),
-            )
-        )
-    ).scalar_one()
-    return _to_out(h, ac)
+    return _to_out(h, await _session_count(session, h, user))
 
 
-@router.get("/{host_id}/tools", response_model=schemas.HostToolList)
-async def list_host_tools(
+@router.get("/{host_id}/agents", response_model=schemas.HostAgentList)
+async def list_host_agents(
     host_id: str,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
-) -> schemas.HostToolList:
+) -> schemas.HostAgentList:
     await _get_owned_host(session, host_id, user)
 
     daemon = get_broker().get_daemon_for_host(host_id)
     if daemon is None:
         raise HTTPException(status_code=409, detail="host daemon is offline")
 
-    presets = await _list_accessible_presets(session, user)
-    policies = await _policies_for_presets(session, user=user, host_id=host_id, presets=presets)
-    targets_by_preset = {p.id: _preset_to_tool_target(p) for p in presets}
-    targets = [target.model_dump() for target in targets_by_preset.values()]
+    agents = await _list_accessible_agents(session, user)
+    policies = await _policies_for_agents(session, user=user, host_id=host_id, agents=agents)
+    targets_by_agent = {agent.id: _agent_to_target(agent) for agent in agents}
+    targets = [target.model_dump() for target in targets_by_agent.values()]
     await session.commit()
 
-    result = await get_broker().request_tool_check(daemon, targets=targets)
+    result = await get_broker().request_agent_check(daemon, targets=targets)
     if result is None:
-        raise HTTPException(status_code=504, detail="host tool check timed out")
-    checked = schemas.HostToolList.model_validate(result)
+        raise HTTPException(status_code=504, detail="host agent check timed out")
+    checked = schemas.HostAgentList.model_validate(result)
     now = _utcnow()
-    for tool in checked.tools:
-        policy = policies.get(tool.preset_id)
+    for agent_status in checked.agents:
+        policy = policies.get(agent_status.agent_id)
         if policy is None:
             continue
         policy.last_checked_at = now
-        _merge_tool_policy(tool, policy)
-        if _should_auto_update(tool, policy, now):
-            target = targets_by_preset.get(tool.preset_id)
+        _merge_agent_policy(agent_status, policy)
+        if _should_auto_update(agent_status, policy, now):
+            target = targets_by_agent.get(agent_status.agent_id)
             if target is not None and _start_auto_update(
                 user_id=policy.owner_user_id,
                 host_id=policy.host_id,
-                preset_id=policy.preset_id,
+                agent_id=policy.agent_id,
                 target=target.model_dump(),
             ):
                 policy.last_auto_update_at = now
                 policy.last_auto_update_error = None
-                _merge_tool_policy(tool, policy)
+                _merge_agent_policy(agent_status, policy)
     await session.commit()
     return checked
+
+
+@router.get("/{host_id}/recent-dirs", response_model=schemas.RecentDirList)
+async def list_recent_dirs(
+    host_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.RecentDirList:
+    await _get_owned_host(session, host_id, user)
+    rows = (
+        (
+            await session.execute(
+                select(RecentDir)
+                .where(RecentDir.owner_user_id == user.id, RecentDir.host_id == host_id)
+                .order_by(desc(RecentDir.last_used_at), RecentDir.id)
+                .limit(MAX_RECENT_DIRS)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return schemas.RecentDirList(
+        dirs=[
+            schemas.RecentDirOut(path=row.path, last_used_at=row.last_used_at) for row in rows
+        ]
+    )
 
 
 @router.post("/{host_id}/control/ping", status_code=status.HTTP_204_NO_CONTENT)
@@ -520,52 +551,54 @@ async def ping_host_control(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/{host_id}/tools/{preset_id}/install", response_model=schemas.HostToolInstallResult)
-async def install_host_tool(
+@router.post(
+    "/{host_id}/agents/{agent_id}/install", response_model=schemas.HostAgentInstallResult
+)
+async def install_host_agent(
     host_id: str,
-    preset_id: str,
+    agent_id: str,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
-) -> schemas.HostToolInstallResult:
+) -> schemas.HostAgentInstallResult:
     await _get_owned_host(session, host_id, user)
-    preset = await _get_accessible_preset(session, preset_id, user)
-    target = _preset_to_tool_target(preset)
+    agent = await _get_accessible_agent(session, agent_id, user)
+    target = _agent_to_target(agent)
 
     if not (target.install or "").strip():
-        raise HTTPException(status_code=400, detail="preset has no install command")
+        raise HTTPException(status_code=400, detail="agent has no install command")
     await session.commit()
 
     daemon = get_broker().get_daemon_for_host(host_id)
     if daemon is None:
         raise HTTPException(status_code=409, detail="host daemon is offline")
 
-    result = await get_broker().request_tool_install(daemon, target=target.model_dump())
+    result = await get_broker().request_agent_install(daemon, target=target.model_dump())
     if result is None:
-        raise HTTPException(status_code=504, detail="host tool install timed out")
-    return schemas.HostToolInstallResult.model_validate(result.get("result", result))
+        raise HTTPException(status_code=504, detail="host agent install timed out")
+    return schemas.HostAgentInstallResult.model_validate(result.get("result", result))
 
 
 @router.patch(
-    "/{host_id}/tools/{preset_id}/policy",
-    response_model=schemas.HostToolPolicyOut,
+    "/{host_id}/agents/{agent_id}/policy",
+    response_model=schemas.HostAgentPolicyOut,
 )
-async def patch_host_tool_policy(
+async def patch_host_agent_policy(
     host_id: str,
-    preset_id: str,
-    body: schemas.HostToolPolicyPatch,
+    agent_id: str,
+    body: schemas.HostAgentPolicyPatch,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
-) -> schemas.HostToolPolicyOut:
+) -> schemas.HostAgentPolicyOut:
     await _get_owned_host(session, host_id, user)
-    await _get_accessible_preset(session, preset_id, user)
-    policy = await _policy_for_preset(session, user=user, host_id=host_id, preset_id=preset_id)
+    await _get_accessible_agent(session, agent_id, user)
+    policy = await _policy_for_agent(session, user=user, host_id=host_id, agent_id=agent_id)
     if body.auto_update is not None:
         policy.auto_update = body.auto_update
         if not body.auto_update:
             policy.last_auto_update_error = None
     await session.commit()
     await session.refresh(policy)
-    return schemas.HostToolPolicyOut.model_validate(policy)
+    return schemas.HostAgentPolicyOut.model_validate(policy)
 
 
 @router.delete("/{host_id}", status_code=status.HTTP_204_NO_CONTENT)

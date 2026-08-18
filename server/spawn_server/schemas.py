@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
@@ -138,7 +138,7 @@ class AdminUserOut(BaseModel):
     email_verified_at: datetime | None = None
     is_admin: bool = False
     host_count: int = 0
-    agent_count: int = 0
+    session_count: int = 0
     browser_device_count: int = 0
 
 
@@ -193,8 +193,16 @@ class AuthProviderOut(BaseModel):
     name: str
 
 
-class AuthProviderList(BaseModel):
+class AuthConfigOut(BaseModel):
+    """Everything the login/signup/onboarding surfaces need in one request.
+
+    `email_verification_required` mirrors the exact condition `auth.verified_user`
+    enforces, so onboarding never shows a gate the server won't enforce.
+    """
+
     providers: list[AuthProviderOut] = Field(default_factory=list)
+    email_verification_required: bool = False
+    invite_only: bool = False
 
 
 # ---------- device code ----------
@@ -414,7 +422,7 @@ class HostOut(BaseModel):
     host_key_fingerprint: str | None = None
     status: str
     last_seen_at: datetime | None = None
-    agent_count: int = 0
+    session_count: int = 0
 
 
 class HostPatch(BaseModel):
@@ -423,15 +431,17 @@ class HostPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
 
 
-class HostToolTarget(BaseModel):
-    preset_id: str
-    preset_name: str
+class HostAgentTarget(BaseModel):
+    agent_id: str
+    agent_name: str
     agent_kind: str
+    # The binary to `which` on the host: the first word of the agent's
+    # command string, computed server-side.
     command: str
     install: str | None = None
 
 
-class HostToolStatus(HostToolTarget):
+class HostAgentStatus(HostAgentTarget):
     installed: bool = False
     path: str | None = None
     version: str | None = None
@@ -444,13 +454,13 @@ class HostToolStatus(HostToolTarget):
     last_auto_update_error: str | None = None
 
 
-class HostToolList(BaseModel):
-    tools: list[HostToolStatus] = Field(default_factory=list)
+class HostAgentList(BaseModel):
+    agents: list[HostAgentStatus] = Field(default_factory=list)
 
 
-class HostToolInstallResult(BaseModel):
-    preset_id: str
-    preset_name: str
+class HostAgentInstallResult(BaseModel):
+    agent_id: str
+    agent_name: str
     agent_kind: str
     command: str
     install: str | None = None
@@ -458,49 +468,59 @@ class HostToolInstallResult(BaseModel):
     exit_code: int | None = None
     output: str = ""
     error: str | None = None
-    status: HostToolStatus | None = None
+    status: HostAgentStatus | None = None
 
 
-class HostToolPolicyPatch(BaseModel):
+class HostAgentPolicyPatch(BaseModel):
     auto_update: bool | None = None
 
 
-class HostToolPolicyOut(BaseModel):
+class HostAgentPolicyOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    preset_id: str
+    agent_id: str
     auto_update: bool = False
     last_checked_at: datetime | None = None
     last_auto_update_at: datetime | None = None
     last_auto_update_error: str | None = None
 
 
-# ---------- presets ----------
+class RecentDirOut(BaseModel):
+    path: str
+    last_used_at: datetime
 
 
-class PresetCreate(BaseModel):
+class RecentDirList(BaseModel):
+    dirs: list[RecentDirOut] = Field(default_factory=list)
+
+
+# ---------- agents (definitions) ----------
+
+
+class AgentCreate(BaseModel):
     name: str = Field(max_length=128)
-    agent_kind: str = Field(max_length=64)
-    default_argv: list[str] = Field(default_factory=list)
-    env_template: dict[str, str] = Field(default_factory=dict)
+    kind: str = Field(max_length=64)
+    command: str = Field(max_length=1024)
+    env: dict[str, str] = Field(default_factory=dict)
     install: str | None = Field(default=None, max_length=2048)
 
 
-class PresetPatch(BaseModel):
+class AgentPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
-    agent_kind: str | None = Field(default=None, max_length=64)
-    default_argv: list[str] | None = None
-    env_template: dict[str, str] | None = None
+    kind: str | None = Field(default=None, max_length=64)
+    command: str | None = Field(default=None, max_length=1024)
+    env: dict[str, str] | None = None
     install: str | None = Field(default=None, max_length=2048)
 
 
-class PresetOut(BaseModel):
+class AgentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
+    # None marks a built-in (immutable via the API).
     owner_user_id: str | None
     name: str
-    agent_kind: str
-    default_argv: list[str]
-    env_template: dict[str, str]
+    kind: str
+    command: str
+    env: dict[str, str]
     install: str | None = None
 
 
@@ -532,113 +552,125 @@ class SkillOut(BaseModel):
     created_at: datetime
 
 
-class AgentAccessPatch(BaseModel):
+class SessionAccessPatch(BaseModel):
     skill_ids: list[str] | None = None
 
 
-class AgentAccessOut(BaseModel):
-    agent_id: str
+class SessionAccessOut(BaseModel):
+    session_id: str
     skills: list[SkillOut] = Field(default_factory=list)
 
 
-class AgentSkillConfig(BaseModel):
+class SkillLaunchConfig(BaseModel):
     id: str
     name: str
     description: str
     content: str
 
 
-# ---------- agents ----------
+# ---------- sessions ----------
 
 
-class AgentCreate(BaseModel):
-    name: str | None = Field(default=None, max_length=128)
+class TilePlacement(BaseModel):
+    """An explicit grid position for a newly created session's tile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+class SessionCreate(BaseModel):
     host_id: str
-    preset_id: str | None = None
     cwd: str
-    argv: list[str] | None = None
-    env: dict[str, str] | None = None
-    skill_ids: list[str] | None = None
-    create_cwd: bool = True
-
-
-class AgentRestart(BaseModel):
-    create_cwd: bool = True
-
-
-class AgentPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
-    archived: bool | None = None
-    pinned: bool | None = None
+    # Omitted -> all skills marked enabled_by_default.
+    skill_ids: list[str] | None = None
+    # Optional: transactionally append a tile for this session to a workspace.
+    workspace_id: str | None = None
+    # Only meaningful with workspace_id; omitted -> server auto-places (§4.4).
+    tile: TilePlacement | None = None
 
 
-class AgentOut(BaseModel):
+class SessionPatch(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+
+
+class SessionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     name: str | None = None
     host_id: str
     host_name: str | None = None
-    preset_id: str | None = None
     cwd: str
-    argv: list[str]
-    env: dict[str, str]
     status: str
     started_at: datetime
     exited_at: datetime | None = None
+    exit_code: int | None = None
     last_output_at: datetime | None = None
     last_input_at: datetime | None = None
     last_activity_at: datetime | None = None
     activity_state: str = "unknown"
     activity_label: str = "Unknown"
-    exit_code: int | None = None
-    pinned_at: datetime | None = None
-    archived_at: datetime | None = None
+    foreground_command: str | None = None
 
 
-# ---------- screens ----------
+# ---------- workspaces ----------
 
 
-class LayoutPane(BaseModel):
-    type: Literal["pane"]
-    agent_id: str
+class WorkspaceTile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    x: int
+    y: int
+    w: int
+    h: int
 
 
-class LayoutSplit(BaseModel):
-    type: Literal["split"]
-    direction: Literal["row", "column"]
-    ratio: float = Field(default=0.5, ge=0.05, le=0.95)
-    a: LayoutNode
-    b: LayoutNode
+class WorkspaceLayout(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[2]
+    tiles: list[WorkspaceTile] = Field(default_factory=list)
 
 
-LayoutNode = Annotated[LayoutPane | LayoutSplit, Field(discriminator="type")]
+class WorkspaceFirstSession(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    host_id: str
+    cwd: str
+    skill_ids: list[str] | None = None
 
 
-class ScreenLayout(BaseModel):
-    root: LayoutNode | None = None
-
-
-class ScreenCreate(BaseModel):
-    name: str = Field(max_length=128)
-    layout: ScreenLayout = Field(default_factory=ScreenLayout)
-    ephemeral: bool = False
-
-
-class ScreenPatch(BaseModel):
+class WorkspaceCreate(BaseModel):
+    # Omitted -> the server names it "Workspace N" (next free N).
     name: str | None = Field(default=None, max_length=128)
-    layout: ScreenLayout | None = None
-    ephemeral: bool | None = None
-    pinned: bool | None = None
+    # Optional: create the workspace and its first shell session atomically;
+    # the session gets the full-canvas tile {0, 0, 12, 12}.
+    first_session: WorkspaceFirstSession | None = None
 
 
-class ScreenOut(BaseModel):
+class WorkspacePatch(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+    layout: WorkspaceLayout | None = None
+    position: int | None = Field(default=None, ge=0)
+
+
+class WorkspaceOut(BaseModel):
     id: str
     name: str
-    layout: ScreenLayout
-    ephemeral: bool = False
-    pinned_at: datetime | None = None
+    layout: WorkspaceLayout
+    position: int = 0
     created_at: datetime
     updated_at: datetime
+
+
+class WorkspaceCreateResponse(BaseModel):
+    workspace: WorkspaceOut
+    session: SessionOut | None = None
 
 
 class TrustBundleOut(BaseModel):
@@ -698,7 +730,7 @@ class BrowserEndorsementRecord(BaseModel):
     browser re-encodes the endorsement transcript from these claims plus its
     OWN key and device id, verifies the signature against the endorser key
     whose fingerprint the operator confirmed on the endorsing browser's
-    screen, and only then treats `host_public_key` as introduced.
+    display, and only then treats `host_public_key` as introduced.
     """
 
     host_id: str

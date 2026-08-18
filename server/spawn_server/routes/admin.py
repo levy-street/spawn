@@ -20,7 +20,7 @@ from ..config import get_settings
 from ..db import get_session
 from ..invites import create_invite, invite_state, invite_url
 from ..mail import mailer_ready, send_email
-from ..models import Agent, BrowserDevice, EmailLog, Host, Invite, User
+from ..models import BrowserDevice, EmailLog, Host, Invite, Session, User
 
 log = logging.getLogger(__name__)
 
@@ -72,10 +72,10 @@ async def list_users(
             )
         ).all()
     )
-    agent_counts = dict(
+    session_counts = dict(
         (
             await session.execute(
-                select(Agent.owner_user_id, func.count()).group_by(Agent.owner_user_id)
+                select(Session.owner_user_id, func.count()).group_by(Session.owner_user_id)
             )
         ).all()
     )
@@ -97,7 +97,7 @@ async def list_users(
             email_verified_at=user.email_verified_at,
             is_admin=user.is_admin,
             host_count=int(host_counts.get(user.id, 0)),
-            agent_count=int(agent_counts.get(user.id, 0)),
+            session_count=int(session_counts.get(user.id, 0)),
             browser_device_count=int(device_counts.get(user.id, 0)),
         )
         for user in users
