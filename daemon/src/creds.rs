@@ -1523,13 +1523,22 @@ where
 }
 
 fn keyring_disabled() -> bool {
-    std::env::var("SPAWN_DISABLE_KEYRING")
-        .ok()
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            matches!(value.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+    // An explicit override wins in both directions.
+    if let Ok(value) = std::env::var("SPAWN_DISABLE_KEYRING") {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    // Default off on macOS: the login Keychain re-prompts on every access for a
+    // binary without a stable Developer ID signature (our prebuilts are only
+    // ad-hoc signed), and the daemon's 500 ms live-reload monitor turns that
+    // into an unusable password-prompt storm. The complete mode-0600 file is
+    // the authoritative credential record on Unix regardless, so fall to it.
+    // Other platforms keep the keyring by default; a signed macOS build can opt
+    // back in with SPAWN_DISABLE_KEYRING=0.
+    cfg!(target_os = "macos")
 }
 
 /// `spawnd status` — print what we know.
