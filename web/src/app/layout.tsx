@@ -7,17 +7,17 @@ import "./globals.css";
 export const metadata: Metadata = {
   metadataBase: new URL("https://spawnd.dev"),
   title: {
-    default: "spawnd — possess your machines",
+    default: "spawnd — a daemon on every host you own",
     template: "%s · spawnd",
   },
   description:
-    "The open-source control plane that possesses every machine you own with a single daemon. Summon, drive, and banish CLI coding agents from any browser — while the server that coordinates it all is structurally unable to read your terminal.",
+    "The open-source control plane for CLI coding agents. A daemon on every host you own — summon your agents, reach them from any browser, and the server that connects you never hears a word.",
   applicationName: "spawnd",
   manifest: "/manifest.webmanifest",
   openGraph: {
-    title: "spawnd — possess your machines",
+    title: "spawnd — a daemon on every host you own",
     description:
-      "A daemon on every host you own. Summon CLI coding agents from any browser. The server can't read your terminal — cryptography, not policy.",
+      "A daemon on every host you own. Summon coding agents, reach them from any browser — the server that connects you never hears a word.",
     url: "https://spawnd.dev",
     siteName: "spawnd",
     images: [{ url: "/og.jpg", width: 1200, height: 630 }],
@@ -25,9 +25,9 @@ export const metadata: Metadata = {
   },
   twitter: {
     card: "summary_large_image",
-    title: "spawnd — possess your machines",
+    title: "spawnd — a daemon on every host you own",
     description:
-      "A daemon on every host you own. The server can't read your terminal — cryptography, not policy.",
+      "A daemon on every host you own. The server that connects you can't read your terminal.",
     images: ["/og.jpg"],
   },
   appleWebApp: {

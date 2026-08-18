@@ -1,17 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import {
-  ArrowRight,
-  ChevronRight,
-  Flame,
-  Ghost,
-  KeyRound,
-  Lock,
-  Server,
-  Smartphone,
-  Terminal,
-} from "lucide-react";
+import { ArrowRight, ChevronRight, Flame, Server, Smartphone } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import type { ReactNode } from "react";
@@ -90,10 +80,10 @@ function LandingPage() {
           </Link>
           <div className="flex items-center gap-4 font-sigil text-[12px] tracking-[0.18em] uppercase sm:gap-5">
             <Link
-              href="/veil"
+              href="/security"
               className="hidden text-ash transition-colors hover:text-bone sm:inline"
             >
-              The&nbsp;Veil
+              Security
             </Link>
             <Link
               href="/login"
@@ -111,32 +101,28 @@ function LandingPage() {
         </nav>
 
         <div className="relative z-10 mx-auto flex min-h-[86svh] w-full max-w-6xl flex-col justify-center px-5 pt-10 pb-20 sm:px-8">
-          <p className="mb-6 font-sigil text-[12px] tracking-[0.34em] text-hellfire uppercase">
-            <span className="text-ash">daemon</span> · <span className="text-ash">host</span> ·
-            possession
+          <p className="mb-6 font-sigil text-[13px] tracking-[0.12em] text-ash">
+            Open-source control plane for CLI coding agents
           </p>
-          <h1 className="max-w-3xl font-grimoire text-[clamp(44px,9vw,92px)] font-medium leading-[0.98] text-bone [text-wrap:balance]">
-            Possess your machines.
+          <h1 className="max-w-3xl font-grimoire text-[clamp(42px,8vw,84px)] font-medium leading-[1.0] text-bone [text-wrap:balance]">
+            A daemon on every host you own.
           </h1>
-          <p className="mt-7 max-w-[54ch] text-[18px] leading-8 text-ash sm:text-[19px]">
-            The open-source control plane that possesses every machine you own with a single daemon
-            — <em className="text-bone not-italic">summon, drive, and banish</em> CLI coding agents
-            from any browser, including your phone, while the server that coordinates it all is{" "}
-            <em className="text-bone not-italic">
-              structurally unable to read a byte of your terminal.
-            </em>
+          <p className="mt-7 max-w-[56ch] text-[18px] leading-8 text-ash sm:text-[19px]">
+            It <em className="text-bone not-italic">answers only to you</em>. Summon your agents
+            onto hosts you own and reach them from any browser — the server that connects you{" "}
+            <em className="text-bone not-italic">never hears a word</em>.
           </p>
 
           <div className="mt-9 flex flex-col gap-3 sm:flex-row sm:items-center">
             <Link
-              href="/signup"
+              href="/download"
               className="group inline-flex items-center justify-center gap-2 rounded-sm bg-hellfire px-6 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-void uppercase transition-colors hover:bg-ember"
             >
-              Begin the possession
+              Install the daemon
               <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
             <Link
-              href="/veil"
+              href="/security"
               className="inline-flex items-center justify-center gap-2 rounded-sm border border-line-strong px-6 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-bone uppercase transition-colors hover:border-ember hover:text-ember"
             >
               Read the threat model
@@ -146,155 +132,67 @@ function LandingPage() {
           <div className="mt-8 inline-flex max-w-full items-center gap-3 overflow-x-auto rounded-sm border border-line-g bg-char/80 px-4 py-3 font-sigil text-[13px] text-bone backdrop-blur-sm">
             <span className="text-hellfire">$</span>
             <code className="whitespace-nowrap">{installCommand}</code>
-            <span className="whitespace-nowrap text-ash">
-              &nbsp;&nbsp;# the possession takes one line
-            </span>
           </div>
         </div>
       </section>
 
-      {/* ── Pillars ──────────────────────────────────────────── */}
+      {/* ── How it works ─────────────────────────────────────── */}
       <section className="border-line-g border-b px-5 py-24 sm:px-8">
         <div className="mx-auto w-full max-w-6xl">
-          <p className="mb-3 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
-            One roof, three pillars
+          <p className="mb-12 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
+            How it works
           </p>
-          <h2 className="mb-14 max-w-2xl font-grimoire text-[clamp(28px,4.4vw,40px)] font-medium leading-[1.12] text-bone">
-            A demon in your house that answers only to you.
-          </h2>
           <div className="grid gap-px overflow-hidden rounded-md border border-line-g bg-line-g md:grid-cols-3">
-            <Pillar
-              icon={<Server className="size-5" />}
-              kicker="Sovereignty"
-              title="The demon lives in your house."
-            >
-              Agents run on hardware you own, signed into the subscriptions you already pay for.
-              Each CLI does its own <code className="text-ember">claude /login</code>. We never
-              touch your API keys, because we never <em className="text-bone not-italic">have</em>{" "}
-              them.
-            </Pillar>
-            <Pillar
-              icon={<Lock className="size-5" />}
-              kicker="Silence"
-              title="It answers only to you."
-            >
-              Terminal I/O runs end-to-end encrypted, browser to daemon, over WebRTC. The control
-              plane carries signaling only — there is no server code path for terminal content. The
-              server <em className="text-bone not-italic">cannot</em> read your terminal.
-              Cryptography, not a pinky promise.
-            </Pillar>
-            <Pillar
-              icon={<Smartphone className="size-5" />}
-              kicker="Ubiquity"
-              title="Any demon, any host, any circle."
-            >
-              claude, codex, opencode, aider, a bare shell — if it runs in a PTY, it can be
-              possessed. macOS and Linux hosts, one installer, outbound-only. The real TUI over
-              xterm.js, phone in hand, a second device taking control mid-keystroke.
-            </Pillar>
+            <Step icon={<Server className="size-5" />} title="One daemon per host.">
+              Installs with a line. It dials out — no inbound ports, no SSH, no tailnet — and
+              registers the host as yours.
+            </Step>
+            <Step icon={<Flame className="size-5" />} title="Summon agents into it.">
+              claude, codex, opencode, aider, a bare shell — anything that runs in a PTY. Each runs
+              on your hardware, on the subscriptions you already pay for. We never hold your keys.
+            </Step>
+            <Step icon={<Smartphone className="size-5" />} title="Reach them from anywhere.">
+              The real terminal, in any browser, down to the one in your pocket. A second device can
+              take the session mid-keystroke.
+            </Step>
           </div>
         </div>
       </section>
 
-      {/* ── The objection / inversion ────────────────────────── */}
-      <section className="relative overflow-hidden border-line-g border-b px-5 py-24 sm:px-8">
-        <div
-          aria-hidden
-          className="absolute inset-0"
-          style={{
-            background:
-              "radial-gradient(ellipse 70% 60% at 50% 120%, rgba(142,31,22,.4), transparent 62%)",
-          }}
-        />
-        <div className="relative mx-auto w-full max-w-3xl text-center">
-          <Flame className="mx-auto mb-6 size-8 text-hellfire" aria-hidden />
-          <p className="mb-3 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
-            The objection
-          </p>
-          <h2 className="mb-7 font-grimoire text-[clamp(26px,4.4vw,38px)] font-medium leading-[1.15] text-bone">
-            “This is literally what malware does.”
-          </h2>
-          <p className="mx-auto max-w-[62ch] text-[17px] leading-8 text-ash">
-            A botnet is possession <em className="text-bone not-italic">without</em> consent, run
-            from a C2 server that reads everything. spawnd is the inversion on every axis:{" "}
-            <span className="text-bone">you</span> run the installer,{" "}
-            <span className="text-bone">you</span> approve the pairing ceremony against a key
-            fingerprint, and the coordinating server is engineered to be unable to read the session.
-            The daemon opens no inbound ports; it only dials out. Revocation is one click and the
-            socket dies. And it is open source — so you don’t have to take a single sentence of this
-            on faith, including this one.
-          </p>
-          <p className="mt-8 font-sigil text-[13px] tracking-[0.08em] text-ember">
-            We simply reversed every axis of evil.
-          </p>
-        </div>
-      </section>
-
-      {/* ── Lexicon: every term teaches a mechanism ──────────── */}
+      {/* ── It answers only to you ───────────────────────────── */}
       <section className="border-line-g border-b px-5 py-24 sm:px-8">
         <div className="mx-auto w-full max-w-6xl">
-          <p className="mb-3 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
-            The lexicon
-          </p>
-          <h2 className="mb-4 max-w-2xl font-grimoire text-[clamp(28px,4.4vw,40px)] font-medium leading-[1.12] text-bone">
-            Every term earns its mechanism.
-          </h2>
-          <p className="mb-12 max-w-[60ch] text-[16px] leading-7 text-ash">
-            The theme is a mnemonic system, not paint. A word is admitted only if it teaches real
-            architecture. If it maps to nothing, it gets cut.
-          </p>
-          <div className="grid gap-px overflow-hidden rounded-md border border-line-g bg-line-g sm:grid-cols-2">
-            <Lex icon={<Ghost className="size-4" />} term="revenants">
-              Session workers that survive the daemon’s death and are re-adopted on restart. Your
-              agent outlives its daemon; the work does not stop.
-            </Lex>
-            <Lex icon={<KeyRound className="size-4" />} term="the sigil">
-              An Ed25519 key fingerprint. You verify the sigil before trust is granted; a changed
-              sigil is refused, loudly.
-            </Lex>
-            <Lex icon={<Lock className="size-4" />} term="the veil">
-              The control plane. It introduces your browser to the daemon, then goes deaf —
-              signaling only, never content.
-            </Lex>
-            <Lex icon={<Terminal className="size-4" />} term="the circle">
-              The terminal pane — the summoning circle where the agent appears. A real PTY, the raw
-              TUI, every keybinding and color intact.
-            </Lex>
+          <div className="grid gap-12 lg:grid-cols-[1fr_1fr] lg:items-center">
+            <div>
+              <p className="mb-3 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
+                It answers only to you
+              </p>
+              <h2 className="mb-6 font-grimoire text-[clamp(28px,4.4vw,40px)] font-medium leading-[1.12] text-bone">
+                The server can’t read your terminal.
+              </h2>
+              <p className="max-w-[56ch] text-[17px] leading-8 text-ash">
+                Your terminal runs straight from the browser to the daemon, end-to-end encrypted.
+                When your network forces a relay, it carries ciphertext the relay can’t read. No
+                server-side path to your terminal, no transcript, nothing to hand over — and the
+                threat model names our own servers as the adversary, because you should treat them
+                as one.
+              </p>
+            </div>
+            <ul className="space-y-px overflow-hidden rounded-md border border-line-g bg-line-g">
+              <Claim>No plaintext ever reaches our servers.</Claim>
+              <Claim>No inbound ports, no SSH, no tailnet — the daemon dials out.</Claim>
+              <Claim>No credential store — every agent uses its own login.</Claim>
+              <Claim>Revoke a host and the socket dies.</Claim>
+            </ul>
           </div>
+          <p className="mx-auto mt-14 max-w-[62ch] text-center font-grimoire text-[19px] text-ash italic leading-[1.4]">
+            A daemon that dials out and answers to one master sounds ominous — until you notice the
+            master is you.
+          </p>
         </div>
       </section>
 
-      {/* ── Silence / claims ─────────────────────────────────── */}
-      <section className="border-line-g border-b px-5 py-24 sm:px-8">
-        <div className="mx-auto grid w-full max-w-6xl gap-12 lg:grid-cols-[1fr_1fr] lg:items-center">
-          <div>
-            <p className="mb-3 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
-              We introduce. We never listen.
-            </p>
-            <h2 className="mb-6 font-grimoire text-[clamp(28px,4.4vw,40px)] font-medium leading-[1.12] text-bone">
-              End-to-end encrypted, browser to daemon.
-            </h2>
-            <p className="max-w-[56ch] text-[17px] leading-8 text-ash">
-              Session traffic runs directly between your browser and the daemon over encrypted
-              WebRTC DataChannels. The relay is a fallback only — when NAT demands it, TURN carries
-              ciphertext it cannot decrypt. Either way, there is no server code path for terminal
-              content, no transcript store, nothing to subpoena. The threat model in the repo names
-              our own infrastructure as an adversary, because you should treat it as one.
-            </p>
-          </div>
-          <ul className="space-y-px overflow-hidden rounded-md border border-line-g bg-line-g">
-            <Claim>Terminal traffic never touches our server in plaintext.</Claim>
-            <Claim>
-              The relay, when NAT forces one, carries only ciphertext it cannot decrypt.
-            </Claim>
-            <Claim>No inbound ports. No exposed SSH. No tailnet. The daemon dials out.</Claim>
-            <Claim>No central credential store — each agent uses its own login on the host.</Claim>
-            <Claim>Consensual. Auditable. Revocable — one click and the socket dies.</Claim>
-          </ul>
-        </div>
-      </section>
-
-      {/* ── Final CTA ────────────────────────────────────────── */}
+      {/* ── Close ────────────────────────────────────────────── */}
       <section className="relative overflow-hidden px-5 py-28 sm:px-8">
         <div
           aria-hidden
@@ -307,11 +205,11 @@ function LandingPage() {
         <div className="relative mx-auto w-full max-w-3xl text-center">
           <Trident className="mx-auto mb-8 size-16" />
           <h2 className="mb-5 font-grimoire text-[clamp(32px,5.5vw,52px)] font-medium leading-[1.05] text-bone">
-            Your legion awaits.
+            Bring a host online.
           </h2>
-          <p className="mx-auto mb-9 max-w-[46ch] text-[17px] leading-8 text-ash">
-            One line to possess the first host. A ceremony you control, a key you verify, a demon
-            that answers only to you.
+          <p className="mx-auto mb-9 max-w-[48ch] text-[17px] leading-8 text-ash">
+            One line installs the daemon; you approve it against a fingerprint you can see. From
+            then on, it answers only to you.
           </p>
           <div className="mb-8 inline-flex max-w-full items-center gap-3 overflow-x-auto rounded-sm border border-line-g bg-char px-4 py-3 font-sigil text-[13px] text-bone">
             <span className="text-hellfire">$</span>
@@ -322,14 +220,14 @@ function LandingPage() {
               href="/signup"
               className="group inline-flex items-center justify-center gap-2 rounded-sm bg-hellfire px-7 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-void uppercase transition-colors hover:bg-ember"
             >
-              Begin the possession
+              Sign up
               <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
             <Link
               href="/download"
               className="inline-flex items-center justify-center gap-2 rounded-sm border border-line-strong px-7 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-bone uppercase transition-colors hover:border-ember hover:text-ember"
             >
-              Possess a host
+              Install the daemon
             </Link>
           </div>
         </div>
@@ -341,8 +239,8 @@ function LandingPage() {
             <span className="text-hellfire">spawnd</span> · consensual · auditable · revocable
           </span>
           <div className="flex items-center gap-5">
-            <Link href="/veil" className="transition-colors hover:text-bone">
-              The Veil
+            <Link href="/security" className="transition-colors hover:text-bone">
+              Security
             </Link>
             <Link href="/download" className="transition-colors hover:text-bone">
               Install
@@ -357,38 +255,15 @@ function LandingPage() {
   );
 }
 
-function Pillar({
-  icon,
-  kicker,
-  title,
-  children,
-}: {
-  icon: ReactNode;
-  kicker: string;
-  title: string;
-  children: ReactNode;
-}) {
+function Step({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
   return (
     <div className="bg-void p-8">
       <div className="mb-5 flex size-10 items-center justify-center rounded-sm border border-hellfire/40 text-hellfire">
         {icon}
       </div>
-      <p className="mb-2 font-sigil text-[11px] tracking-[0.24em] text-ember uppercase">{kicker}</p>
       <h3 className="mb-3 font-grimoire text-[21px] font-medium leading-tight text-bone">
         {title}
       </h3>
-      <p className="text-[15px] leading-7 text-ash">{children}</p>
-    </div>
-  );
-}
-
-function Lex({ icon, term, children }: { icon: ReactNode; term: string; children: ReactNode }) {
-  return (
-    <div className="bg-void p-7">
-      <div className="mb-3 flex items-center gap-3">
-        <span className="text-hellfire">{icon}</span>
-        <span className="font-sigil text-[14px] tracking-[0.06em] text-hellfire">{term}</span>
-      </div>
       <p className="text-[15px] leading-7 text-ash">{children}</p>
     </div>
   );
