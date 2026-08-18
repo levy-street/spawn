@@ -84,6 +84,12 @@ function DeviceInner() {
   const { user } = useAuth();
   const registration = useBrowserDeviceRegistration(user?.id);
   const [code, setCode] = useState("");
+  // The identifier a successful review was loaded with, reused verbatim by
+  // approve: the opaque URL ref (normal auto-open path) or the typed user_code.
+  const [identifier, setIdentifier] = useState<{
+    user_code?: string;
+    approval_ref?: string;
+  } | null>(null);
   const [hostName, setHostName] = useState<string | null>(null);
   const [pending, setPending] = useState<DevicePendingApproval | null>(null);
   const [localPinState, setLocalPinState] = useState<BrowserHostPinState | "new" | null>(null);
@@ -91,17 +97,18 @@ function DeviceInner() {
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  // Load the pending approval for a code and land on the fingerprint screen.
-  // Extracted from the form handler so the auto-flow (code baked into the URL
-  // by `spawnd possess`) can call it directly — the operator types nothing.
-  const reviewCode = async (rawCode: string) => {
-    const userCode = rawCode.trim().toUpperCase();
-    if (!userCode) return;
-    setCode(userCode);
+  // Load the pending approval and land on the fingerprint screen. Takes either
+  // the opaque URL ref (auto-open path — nothing typed) or a typed user_code,
+  // and remembers which so approve reuses the exact same identifier.
+  const review = async (id: { user_code?: string; approval_ref?: string }) => {
+    const lookup = id.approval_ref
+      ? { approval_ref: id.approval_ref }
+      : { user_code: (id.user_code ?? "").trim().toUpperCase() };
+    if (!lookup.approval_ref && !lookup.user_code) return;
     setError(null);
     setSubmitting(true);
     try {
-      const r = await auth.pendingDevice({ user_code: userCode });
+      const r = await auth.pendingDevice(lookup);
       const expectedFingerprint = await ed25519PublicKeyFingerprint(r.host_public_key);
       if (r.host_key_fingerprint !== expectedFingerprint) {
         throw new ApprovalIdentityError(
@@ -115,6 +122,7 @@ function DeviceInner() {
         hostPublicKey: r.host_public_key,
         hostFingerprint: expectedFingerprint,
       });
+      setIdentifier(lookup);
       setPending(r);
       setLocalPinState(existing?.state ?? "new");
       setLocalPinCommitted(existing?.state === "active");
@@ -133,20 +141,23 @@ function DeviceInner() {
 
   const onReview = (e: FormEvent) => {
     e.preventDefault();
-    void reviewCode(code);
+    void review({ user_code: code });
   };
 
-  // The daemon opens this page with the pending code baked into the URL
-  // (`/device?code=…`), so an approval needs nothing typed. Auto-load it once,
-  // as soon as the account is known, landing straight on the fingerprint check.
+  // The daemon opens this page with an opaque handle baked into the URL
+  // (`/device?ref=…`, or `?code=…` from a pre-0029 server), so an approval needs
+  // nothing typed. Auto-load it once, as soon as the account is known, landing
+  // straight on the fingerprint check.
   const autoTriedRef = useRef(false);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: one-shot guarded by a ref; reviewCode intentionally omitted
+  // biome-ignore lint/correctness/useExhaustiveDependencies: one-shot guarded by a ref; review intentionally omitted
   useEffect(() => {
     if (autoTriedRef.current || !user) return;
-    const urlCode = new URLSearchParams(window.location.search).get("code");
-    if (!urlCode) return;
+    const params = new URLSearchParams(window.location.search);
+    const ref = params.get("ref");
+    const urlCode = params.get("code");
+    if (!ref && !urlCode) return;
     autoTriedRef.current = true;
-    void reviewCode(urlCode);
+    void review(ref ? { approval_ref: ref } : { user_code: urlCode ?? undefined });
   }, [user]);
 
   const onApprove = async () => {
@@ -186,7 +197,7 @@ function DeviceInner() {
         pending.host_public_key,
       );
       const r = await auth.approveDevice({
-        user_code: code.trim().toUpperCase(),
+        ...(identifier ?? { user_code: code.trim().toUpperCase() }),
         approval_nonce: pending.approval_nonce,
         host_key_algorithm: pending.host_key_algorithm,
         host_public_key: pending.host_public_key,
@@ -223,6 +234,7 @@ function DeviceInner() {
       setLocalPinState(null);
       setLocalPinCommitted(false);
       setCode("");
+      setIdentifier(null);
     } catch (err) {
       const message =
         err instanceof ApiError || err instanceof ApprovalIdentityError
@@ -266,6 +278,7 @@ function DeviceInner() {
                 value={code}
                 onChange={(e) => {
                   setCode(e.target.value);
+                  setIdentifier(null);
                   setPending(null);
                   setLocalPinState(null);
                   setLocalPinCommitted(false);

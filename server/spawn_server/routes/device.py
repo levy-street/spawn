@@ -53,6 +53,10 @@ def _gen_device_code() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _gen_approval_ref() -> str:
+    return secrets.token_urlsafe(32)
+
+
 def _gen_approval_nonce() -> str:
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
 
@@ -121,6 +125,7 @@ async def device_start(
     dc = DeviceCode(
         device_code=_gen_device_code(),
         user_code=user_code,
+        approval_ref=_gen_approval_ref(),
         host_name=body.host_name,
         os=body.os,
         arch=body.arch,
@@ -139,9 +144,11 @@ async def device_start(
         raise HTTPException(status_code=409, detail="could not allocate device code; retry") from exc
 
     assert dc.approval_nonce is not None
+    assert dc.approval_ref is not None
     return schemas.DeviceStartResponse(
         device_code=dc.device_code,
         user_code=dc.user_code,
+        approval_ref=dc.approval_ref,
         approval_nonce=dc.approval_nonce,
         verification_uri=f"{get_settings().public_url.rstrip('/')}/device",
         interval=POLL_INTERVAL_SECONDS,
@@ -637,13 +644,23 @@ def _pending_response(dc: DeviceCode) -> schemas.DevicePendingResponse:
     )
 
 
-async def _pending_device_code(session: AsyncSession, user_code: str) -> DeviceCode:
-    code = user_code.strip().upper()
-    dc = (
-        await session.execute(select(DeviceCode).where(DeviceCode.user_code == code))
-    ).scalar_one_or_none()
+async def _pending_device_code(
+    session: AsyncSession,
+    *,
+    user_code: str | None = None,
+    approval_ref: str | None = None,
+) -> DeviceCode:
+    # Identify by exactly one of the two handles (the schema guarantees this):
+    # the opaque URL ref the browser normally sends, or the short user_code from
+    # the manual-entry form.
+    if approval_ref:
+        where = DeviceCode.approval_ref == approval_ref.strip()
+    else:
+        assert user_code is not None
+        where = DeviceCode.user_code == user_code.strip().upper()
+    dc = (await session.execute(select(DeviceCode).where(where))).scalar_one_or_none()
     if dc is None:
-        raise HTTPException(status_code=404, detail="unknown user code")
+        raise HTTPException(status_code=404, detail="unknown device code")
     expires = _aware(dc.expires_at)
     if expires is not None and expires <= _utcnow():
         raise HTTPException(status_code=400, detail="user code expired")
@@ -663,7 +680,9 @@ async def device_pending(
 ) -> schemas.DevicePendingResponse:
     """Inspect the server-derived identity before the user confirms approval."""
 
-    dc = await _pending_device_code(session, body.user_code)
+    dc = await _pending_device_code(
+        session, user_code=body.user_code, approval_ref=body.approval_ref
+    )
     return _pending_response(dc)
 
 
@@ -673,7 +692,9 @@ async def device_approve(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.verified_user),
 ) -> schemas.DeviceApproveResponse:
-    dc = await _pending_device_code(session, body.user_code)
+    dc = await _pending_device_code(
+        session, user_code=body.user_code, approval_ref=body.approval_ref
+    )
     assert dc.host_key_algorithm is not None
     assert dc.host_public_key is not None
     reviewed = _pending_response(dc)
