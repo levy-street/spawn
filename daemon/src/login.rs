@@ -107,7 +107,9 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         Ok(mut parsed) => {
             match start.approval_ref.as_deref() {
                 Some(reference) => parsed.query_pairs_mut().append_pair("ref", reference),
-                None => parsed.query_pairs_mut().append_pair("code", &start.user_code),
+                None => parsed
+                    .query_pairs_mut()
+                    .append_pair("code", &start.user_code),
             };
             parsed.to_string()
         }
@@ -120,7 +122,13 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         println!("spawn: approve this host in your browser:");
         println!("spawn:   {approve_url}");
     }
-    println!("spawn: verify host fingerprint: {}", identity.fingerprint);
+    println!();
+    println!(
+        "spawn:   verification code   {}",
+        creds::verification_code(&identity.fingerprint)
+    );
+    println!("spawn:   confirm it matches the code shown in your browser, then approve.");
+    println!();
     println!("spawn: waiting for approval…");
 
     // 2. poll

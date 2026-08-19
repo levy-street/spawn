@@ -4,7 +4,7 @@ import { type FormEvent, useEffect, useRef, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ApiError, auth, type DevicePendingApproval, hosts } from "@/lib/api";
@@ -21,6 +21,7 @@ import {
   loadBrowserHostPin,
 } from "@/lib/browser-host-pins";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
+import { verificationCode } from "@/lib/verification-code";
 
 class ApprovalIdentityError extends Error {}
 
@@ -90,6 +91,10 @@ function DeviceInner() {
     user_code?: string;
     approval_ref?: string;
   } | null>(null);
+  // "init" until the effect reads the URL: "auto" when a handle was baked in
+  // (nothing to type), "manual" when the page was opened bare.
+  const [phase, setPhase] = useState<"init" | "auto" | "manual">("init");
+  const [verifyCode, setVerifyCode] = useState<string | null>(null);
   const [hostName, setHostName] = useState<string | null>(null);
   const [pending, setPending] = useState<DevicePendingApproval | null>(null);
   const [localPinState, setLocalPinState] = useState<BrowserHostPinState | "new" | null>(null);
@@ -122,6 +127,7 @@ function DeviceInner() {
         hostPublicKey: r.host_public_key,
         hostFingerprint: expectedFingerprint,
       });
+      setVerifyCode(await verificationCode(r.host_key_fingerprint));
       setIdentifier(lookup);
       setPending(r);
       setLocalPinState(existing?.state ?? "new");
@@ -146,16 +152,17 @@ function DeviceInner() {
 
   // The daemon opens this page with an opaque handle baked into the URL
   // (`/device?ref=…`, or `?code=…` from a pre-0029 server), so an approval needs
-  // nothing typed. Auto-load it once, as soon as the account is known, landing
-  // straight on the fingerprint check.
+  // nothing typed. Set the phase from the URL, then auto-load once the account
+  // is known, landing straight on the verification screen.
   const autoTriedRef = useRef(false);
   // biome-ignore lint/correctness/useExhaustiveDependencies: one-shot guarded by a ref; review intentionally omitted
   useEffect(() => {
-    if (autoTriedRef.current || !user) return;
     const params = new URLSearchParams(window.location.search);
     const ref = params.get("ref");
     const urlCode = params.get("code");
-    if (!ref && !urlCode) return;
+    const hasHandle = Boolean(ref || urlCode);
+    setPhase(hasHandle ? "auto" : "manual");
+    if (!hasHandle || !user || autoTriedRef.current) return;
     autoTriedRef.current = true;
     void review(ref ? { approval_ref: ref } : { user_code: urlCode ?? undefined });
   }, [user]);
@@ -254,151 +261,143 @@ function DeviceInner() {
 
   const deviceLabel =
     registration.data?.status === "ready" ? (registration.data.device.label ?? null) : null;
+  const registrationBlocked =
+    registration.isError || (registration.data && registration.data.status !== "ready");
+  const busy = phase === "init" || (phase === "auto" && !pending && !hostName && !error);
 
   return (
-    <div className="mx-auto max-w-md p-4">
+    <div className="mx-auto flex min-h-[60vh] max-w-md flex-col justify-center p-4">
       <Card>
-        <CardHeader>
-          <CardTitle>Connect a host</CardTitle>
-          <CardDescription>
-            Run <code>spawnd possess</code> on the host you want to reach. It opens this page for
-            you — check that the fingerprint here matches the one in your terminal, then approve.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form className="space-y-3" onSubmit={onReview}>
-            <div className="space-y-1">
-              <Label htmlFor="user_code">Code from the terminal</Label>
-              <Input
-                id="user_code"
-                placeholder="QZ4K-7HMT"
-                inputMode="text"
-                autoCapitalize="characters"
-                autoComplete="one-time-code"
-                value={code}
-                onChange={(e) => {
-                  setCode(e.target.value);
-                  setIdentifier(null);
-                  setPending(null);
-                  setLocalPinState(null);
-                  setLocalPinCommitted(false);
-                  setHostName(null);
-                }}
-                required
-                disabled={pending !== null}
-              />
+        <CardContent className="space-y-5 p-6">
+          {hostName ? (
+            <div className="space-y-1 text-center" role="status">
+              <p className="text-lg font-medium text-foreground">
+                <code>{hostName}</code> is connected.
+              </p>
+              <p className="text-sm text-muted-foreground">
+                Its terminals are on the Agents page in a few seconds.
+              </p>
             </div>
-            {error && (
-              <p className="text-sm text-destructive" role="alert">
-                {error}
-              </p>
-            )}
-            {registration.isError && (
-              <p className="text-sm text-destructive" role="alert">
-                This browser&apos;s identity registration failed, so it cannot approve hosts. Reload
-                to retry.
-              </p>
-            )}
-            {registration.data && registration.data.status !== "ready" && (
-              <p className="text-sm text-destructive" role="alert">
-                This browser&apos;s identity is {registration.data.status.replace("_", " ")}, so it
-                cannot approve hosts.
-              </p>
-            )}
-            {hostName && (
-              <p className="text-sm text-foreground" role="status">
-                <code>{hostName}</code> is connected. Its terminals are available from the Agents
-                page within a few seconds.
-              </p>
-            )}
-            {pending ? (
-              <div className="space-y-3 rounded-md border p-3">
-                <div className="space-y-1">
-                  <p className="text-sm font-medium">
-                    Check the fingerprint for <code>{pending.host_name}</code>
-                  </p>
-                  <p
-                    className="break-all rounded bg-muted px-2 py-1.5 font-mono text-sm font-semibold"
-                    data-testid="host-key-fingerprint"
-                  >
-                    {pending.host_key_fingerprint}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    The terminal running <code>spawnd login</code> printed the same value. If the
-                    two differ, stop — someone may be between you and the host.
-                  </p>
-                </div>
-                {localPinState === "active" && (
-                  <p className="text-xs text-muted-foreground" data-testid="local-pin-state">
-                    This host key is already active in this browser, so approving again only
-                    completes the server side — local trust is unchanged.
-                  </p>
-                )}
-                {localPinState === "revoked" && (
-                  <p className="text-xs text-destructive" data-testid="local-pin-state">
-                    You previously removed this exact host key from this browser (a deletion
-                    tombstone remains). Approving now deliberately trusts this same key again.
-                  </p>
-                )}
-                {localPinState === "new" && (
-                  <p className="text-xs text-muted-foreground" data-testid="local-pin-state">
-                    Approving saves this host key in this browser first, then registers the approval
-                    with the server.
-                  </p>
-                )}
-                {localPinCommitted && (
-                  <p className="text-xs font-medium text-foreground" role="status">
-                    Host key saved in this browser. If the server step fails, retrying is safe.
-                  </p>
-                )}
-                <div className="space-y-1 border-t border-border pt-2">
-                  <p className="text-xs text-muted-foreground">
-                    Approving as{deviceLabel ? ` ${deviceLabel},` : ""} this browser&apos;s key:
-                  </p>
-                  <p
-                    className="break-all font-mono text-xs text-muted-foreground"
-                    data-testid="browser-key-fingerprint"
-                  >
-                    {registration.data?.status === "ready"
-                      ? registration.data.device.fingerprint
-                      : "unavailable"}
-                  </p>
-                </div>
-                <div className="flex gap-2">
-                  <Button
-                    type="button"
-                    className="flex-1"
-                    disabled={submitting || registration.data?.status !== "ready"}
-                    onClick={onApprove}
-                  >
-                    {submitting
-                      ? "Approving..."
-                      : localPinCommitted
-                        ? "Retry server approval"
-                        : localPinState === "revoked"
-                          ? "Approve this host again"
-                          : "Fingerprint matches — approve"}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={submitting}
-                    onClick={() => {
-                      setPending(null);
-                      setLocalPinState(null);
-                      setLocalPinCommitted(false);
-                    }}
-                  >
-                    Back
-                  </Button>
-                </div>
+          ) : pending ? (
+            <div className="space-y-5">
+              <div className="text-center">
+                <p className="text-sm text-muted-foreground">Approve this host</p>
+                <p className="text-xl font-semibold text-foreground">{pending.host_name}</p>
               </div>
-            ) : (
+
+              <div className="space-y-2 rounded-lg border p-4 text-center">
+                <p className="text-sm text-muted-foreground">
+                  Confirm this matches the code in your terminal
+                </p>
+                <p
+                  className="font-mono text-4xl font-semibold tracking-[0.15em] text-foreground tabular-nums"
+                  data-testid="verification-code"
+                >
+                  {verifyCode ?? "— — —"}
+                </p>
+                <p
+                  className="break-all font-mono text-[11px] text-muted-foreground/70"
+                  data-testid="host-key-fingerprint"
+                >
+                  {pending.host_key_fingerprint}
+                </p>
+              </div>
+
+              {localPinState === "revoked" && (
+                <p className="text-xs text-destructive" data-testid="local-pin-state">
+                  You previously removed this key from this browser. Approving trusts it again.
+                </p>
+              )}
+              {error && (
+                <p className="text-sm text-destructive" role="alert">
+                  {error}
+                </p>
+              )}
+              {localPinCommitted && (
+                <p className="text-xs text-muted-foreground" role="status">
+                  Saved in this browser — retrying is safe.
+                </p>
+              )}
+
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  className="flex-1"
+                  disabled={submitting || registration.data?.status !== "ready"}
+                  onClick={onApprove}
+                >
+                  {submitting
+                    ? "Approving…"
+                    : localPinCommitted
+                      ? "Retry server approval"
+                      : "Approve"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={submitting}
+                  onClick={() => {
+                    setPending(null);
+                    setVerifyCode(null);
+                    setLocalPinState(null);
+                    setLocalPinCommitted(false);
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : busy ? (
+            <p className="py-6 text-center text-sm text-muted-foreground">Loading host…</p>
+          ) : (
+            <form className="space-y-4" onSubmit={onReview}>
+              <div className="space-y-1 text-center">
+                <p className="text-lg font-medium text-foreground">Connect a host</p>
+                <p className="text-sm text-muted-foreground">
+                  Enter the code from <code>spawnd possess</code>.
+                </p>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="user_code" className="sr-only">
+                  Code from the terminal
+                </Label>
+                <Input
+                  id="user_code"
+                  placeholder="QZ4K-7HMT"
+                  inputMode="text"
+                  autoCapitalize="characters"
+                  autoComplete="one-time-code"
+                  className="text-center font-mono text-lg tracking-[0.2em]"
+                  value={code}
+                  onChange={(e) => {
+                    setCode(e.target.value);
+                    setIdentifier(null);
+                    setPending(null);
+                    setVerifyCode(null);
+                    setLocalPinState(null);
+                    setLocalPinCommitted(false);
+                    setHostName(null);
+                  }}
+                  required
+                />
+              </div>
+              {error && (
+                <p className="text-sm text-destructive" role="alert">
+                  {error}
+                </p>
+              )}
               <Button type="submit" className="w-full" disabled={submitting}>
-                {submitting ? "Checking..." : "Look up host"}
+                {submitting ? "Checking…" : "Look up host"}
               </Button>
-            )}
-          </form>
+            </form>
+          )}
+
+          {registrationBlocked && (
+            <p className="text-center text-xs text-destructive" role="alert">
+              This browser can&apos;t approve hosts{deviceLabel ? ` (${deviceLabel})` : ""}. Reload
+              to retry.
+            </p>
+          )}
         </CardContent>
       </Card>
     </div>
