@@ -35,9 +35,47 @@ if (
     raise RuntimeError("signed RTC relay bounds do not fit the routing frame")
 
 SIGNED_ENVELOPE_FIELD = "signed_envelope"
-_CANONICAL_UUID = re.compile(
-    r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z"
+
+# A device carries its account endorsement edge-set on an offer so a daemon can
+# admit it via a chain to an anchor (device mesh §3). The server relays these
+# opaquely — the daemon re-verifies every signature and finds the chain — and
+# only bounds the shape so a hostile client cannot inflate a routing frame. The
+# path a daemon accepts is short, but the carried SET is the account's edges, so
+# the cap is generous.
+CARRIED_ENDORSEMENTS_FIELD = "carried_endorsements"
+MAX_RELAYED_ENDORSEMENTS = 64
+_ENDORSEMENT_KEYS = (
+    "account_id",
+    "endorser_public_key",
+    "endorsed_public_key",
+    "endorsed_device_id",
+    "signature",
 )
+_MAX_ENDORSEMENT_FIELD_LEN = 128
+
+
+def sanitize_carried_endorsements(value: Any) -> list[dict[str, str]] | None:
+    """Structural check only — never a signature or key check. Returns the edge
+    list to relay, or None if the shape is unusable (then the relay omits the
+    field and the daemon falls back to its directly-pinned keys)."""
+
+    if not isinstance(value, list) or not value or len(value) > MAX_RELAYED_ENDORSEMENTS:
+        return None
+    sanitized: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        edge: dict[str, str] = {}
+        for key in _ENDORSEMENT_KEYS:
+            field = item.get(key)
+            if not isinstance(field, str) or not 1 <= len(field) <= _MAX_ENDORSEMENT_FIELD_LEN:
+                return None
+            edge[key] = field
+        sanitized.append(edge)
+    return sanitized
+
+
+_CANONICAL_UUID = re.compile(r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
 _FIELDS = frozenset(
     {
         "type",
