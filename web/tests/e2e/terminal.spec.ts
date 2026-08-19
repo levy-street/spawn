@@ -1,5 +1,12 @@
-import { devices, expect, type Page, test, type WebSocketRoute } from "@playwright/test";
-import { mockApp, SESSION_B_ID, SESSION_ID, session, workspace } from "./app-mocks";
+import {
+  devices,
+  expect,
+  type Locator,
+  type Page,
+  test,
+  type WebSocketRoute,
+} from "@playwright/test";
+import { mockApp, SESSION_B_ID, SESSION_ID, session, WORKSPACE_ID, workspace } from "./app-mocks";
 import {
   handleSessionRtcSignal,
   installSessionRtcMock,
@@ -233,8 +240,13 @@ async function liveViewportMetrics(page: Page) {
     });
 }
 
-async function dragTouchInTerminal(page: Page, startYRatio: number, endYRatio: number) {
-  const box = await liveTerminal(page).boundingBox();
+async function dragTouchInTerminal(
+  page: Page,
+  startYRatio: number,
+  endYRatio: number,
+  target?: Locator,
+) {
+  const box = await (target ?? liveTerminal(page)).boundingBox();
   if (!box) throw new Error("terminal is not visible");
   const x = Math.round(box.x + box.width / 2);
   const startY = Math.round(box.y + box.height * startYRatio);
@@ -1272,6 +1284,61 @@ test.describe("mobile terminal touch", () => {
         return text.split("MOBILE-LIVE-WHILE-SCROLLED").length - 1;
       })
       .toBe(1);
+  });
+
+  // A pane is terminal from edge to edge bar its header, so a terminal that
+  // swallows the drags it cannot use leaves the stack unscrollable by finger —
+  // which is every stack whose panes run full-screen TUIs.
+  test("a drag the terminal cannot use scrolls the pane stack instead", async ({ page }) => {
+    const messages: Array<string | Buffer> = [];
+    await installSessionRtcMock(page, messages, {
+      // The alternate buffer has no scrollback of its own to give.
+      history: "\x1b[?1049hALT-SCREEN-ALPHA\r\n",
+      secondHistory: "\x1b[?1049hALT-SCREEN-BETA\r\n",
+    });
+    await mockApp(page, {
+      sessions: [session(), session({ id: SESSION_B_ID, name: "beta" })],
+      workspaces: [
+        workspace({
+          layout: {
+            version: 2,
+            tiles: [
+              { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 6 },
+              { session_id: SESSION_B_ID, x: 0, y: 6, w: 12, h: 6 },
+            ],
+          },
+        }),
+      ],
+    });
+    await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
+      ws.onMessage((message) => {
+        messages.push(message);
+        handleSessionRtcSignal(ws, message);
+      });
+      ws.send(
+        JSON.stringify({
+          type: "rtc.config",
+          enabled: true,
+          ice_servers: [],
+          binding_nonce_required: true,
+        }),
+      );
+      ws.send(JSON.stringify({ type: "session.status", status: "running" }));
+    });
+
+    await page.goto(`/w/${WORKSPACE_ID}`);
+    const stack = page.locator("[data-pane-stack]");
+    // Either session may answer first; both panes are alternate-buffer.
+    await expect(liveTerminalRows(page).first()).toContainText(/ALT-SCREEN-(ALPHA|BETA)/);
+    // Two panes at 55dvh apiece: the stack is taller than the viewport.
+    await expect
+      .poll(() => stack.evaluate((el) => el.scrollHeight - el.clientHeight))
+      .toBeGreaterThan(0);
+    expect(await stack.evaluate((el) => el.scrollTop)).toBe(0);
+
+    await dragTouchInTerminal(page, 0.8, 0.2, liveTerminal(page).first());
+
+    await expect.poll(() => stack.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
   });
 });
 

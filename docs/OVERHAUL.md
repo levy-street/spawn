@@ -231,8 +231,12 @@ Frame renames (all payload fields `agent_id → session_id`):
 > per switch), and a dragged pane carries across tabs — hovering a strip tab
 > for 250 ms mid-drag switches the view and re-seeds the gesture there;
 > dropping commits one envelope write that removes the tile from its source
-> tab and lands it in the target. The sidebar nests Workspace → Tab →
-> Session once a workspace has more than one tab.
+> tab and lands it in the target. Tabs themselves reorder by dragging one
+> along the strip — past a neighbour's middle it takes that slot, the passed
+> tabs sliding the other way — or with Alt+Shift+Arrow from the keyboard;
+> either way the new order rides the same envelope PATCH (`reorderTab`). The
+> sidebar nests Workspace → Tab → Session once a workspace has more than one
+> tab.
 
 **Schema (wire + DB):**
 

@@ -12,7 +12,7 @@ import {
   useState,
 } from "react";
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
-import { WORDMARK_CLASS } from "@/components/icons/BrandMark";
+import { Wordmark } from "@/components/icons/BrandMark";
 import { Sidebar } from "@/components/nav/Sidebar";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { Button } from "@/components/ui/button";
@@ -189,9 +189,7 @@ export function AppShell({
                   {currentWorkspaceName ? (
                     <span className="block truncate">{currentWorkspaceName}</span>
                   ) : (
-                    <span className={cn("block truncate text-brand-accent", WORDMARK_CLASS)}>
-                      spawnd
-                    </span>
+                    <Wordmark className="h-3.5 text-brand-accent" />
                   )}
                 </div>
                 <NewSessionMenu

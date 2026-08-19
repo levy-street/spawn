@@ -91,6 +91,20 @@ const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 
 type TouchVelocitySample = { time: number; y: number };
+
+/**
+ * Where a touch drag's vertical pixels go. Decided once per gesture, the
+ * moment it clears the tap slop, and held until the finger lifts (momentum
+ * included) so a flick never changes hands halfway down.
+ *
+ * "terminal" is this terminal's own scrollback; "page" is the pane stack it
+ * sits in. A terminal that cannot use the drag — the alternate buffer, which
+ * has no scrollback at all, or a normal buffer already at the end the finger
+ * is pulling toward — hands it to the stack instead of swallowing it. On
+ * mobile that handoff is the only way to scroll the stack: bar a 36px header,
+ * a pane is terminal from edge to edge.
+ */
+type TouchScrollRoute = "undecided" | "terminal" | "page";
 type MobileReturnMode = "submit" | "newline";
 type ImagePasteMode = "deferred" | "bracketed-path";
 type PendingAttachmentStatus = "uploading" | "ready" | "error";
@@ -419,6 +433,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     momentumLastTime: number;
     scrollRemainderPx: number;
     openedScrollback: boolean;
+    route: TouchScrollRoute;
+    pageScroller: HTMLElement | null;
   }>({
     active: false,
     startX: 0,
@@ -436,6 +452,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     momentumLastTime: 0,
     scrollRemainderPx: 0,
     openedScrollback: false,
+    route: "undecided",
+    pageScroller: null,
   });
   const [exitBanner, setExitBanner] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
@@ -1556,6 +1574,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return maxTop <= 0 || terminalViewport.scrollTop >= maxTop - 1;
     };
 
+    /** Is there frame left to pan in the direction this drag is pulling? */
+    const canPanFrameVertically = (deltaY: number) => {
+      const maxTop = maxFrameScrollTop();
+      if (maxTop <= 0 || deltaY === 0) return false;
+      return deltaY > 0
+        ? terminalViewport.scrollTop < maxTop - 0.5
+        : terminalViewport.scrollTop > 0.5;
+    };
+
     const layoutTerminalSurface = (pinToBottom = false) => {
       if (!usesViewerPanFrame()) {
         viewerPanFrameActiveRef.current = false;
@@ -1705,28 +1732,77 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return deltaY > 0 ? viewport.scrollTop < maxTop - 0.5 : viewport.scrollTop > 0.5;
     };
 
+    /**
+     * The scroller the pane stack lives in, found by walking out of the portal
+     * this terminal is rendered into. Resolved per gesture rather than cached:
+     * the pane moves between the mobile stack and the desktop grid, and only
+     * one of those layouts has a scrolling ancestor at all.
+     */
+    const findPageScroller = () => {
+      let node: HTMLElement | null = terminalElement.parentElement;
+      while (node) {
+        const overflowY = window.getComputedStyle(node).overflowY;
+        if ((overflowY === "auto" || overflowY === "scroll") && maxElementScrollTop(node) > 1) {
+          return node;
+        }
+        node = node.parentElement;
+      }
+      return null;
+    };
+
+    /**
+     * Can this terminal itself use a drag of `deltaY`? The same order the
+     * gesture is actually applied in: pan the frozen frame, then this
+     * terminal's scrollback. False means nothing here moves and the pane
+     * stack should have it.
+     */
+    const terminalCanTakeDrag = (deltaY: number) => {
+      if (coarsePointerRef.current && usesViewerPanFrame() && canPanFrameVertically(deltaY)) {
+        return true;
+      }
+      // The alternate buffer has no scrollback — a full-screen TUI owns the
+      // whole grid, which is most of what runs in these panes.
+      if (activeBufferIsAlternate()) return false;
+      return canScrollViewport(deltaY);
+    };
+
+    /**
+     * Settle the route from the gesture's NET travel, not the last frame's
+     * delta: which end of the scrollback a drag is pulling toward is the whole
+     * question, and a few pixels of jitter at the start point the wrong way.
+     * Called once the drag clears the tap slop; sub-slop pixels stay with the
+     * terminal, where they have always gone.
+     */
+    const routeTouchScroll = (netDeltaY: number) => {
+      const state = touchScrollRef.current;
+      if (state.route !== "undecided" || netDeltaY === 0) return state.route;
+      if (terminalCanTakeDrag(netDeltaY)) {
+        state.route = "terminal";
+      } else {
+        state.route = "page";
+        state.pageScroller = findPageScroller();
+      }
+      return state.route;
+    };
+
     const applyTouchScrollDelta = (deltaX: number, deltaY: number) => {
       const state = touchScrollRef.current;
+      state.scrollRemainderPx = 0;
+
+      if (state.route === "page") {
+        const scroller = state.pageScroller;
+        return scroller ? scrollElementPixels(scroller, deltaY) : false;
+      }
 
       if (coarsePointerRef.current && usesViewerPanFrame()) {
         const frameScroll = scrollViewerPanFrame(deltaX, deltaY);
-        if (frameScroll.movedX || frameScroll.movedY) {
-          state.scrollRemainderPx = 0;
-          return true;
-        }
+        if (frameScroll.movedX || frameScroll.movedY) return true;
       }
 
-      if (activeBufferIsAlternate()) {
-        state.scrollRemainderPx = 0;
-        return true;
-      }
+      if (activeBufferIsAlternate()) return false;
 
-      if (!scrollTerminalViewportPixels(deltaY)) {
-        state.scrollRemainderPx = 0;
-        return canScrollViewport(deltaY);
-      }
+      if (!scrollTerminalViewportPixels(deltaY)) return canScrollViewport(deltaY);
 
-      state.scrollRemainderPx = 0;
       return true;
     };
 
@@ -1738,7 +1814,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       state.momentumLastTime = 0;
       state.scrollRemainderPx = 0;
-      if (!usesViewerPanFrame()) alignViewportToRows();
+      // Row-snapping is the terminal's own tidy-up; a drag that went to the
+      // pane stack must not jog this terminal's viewport on the way out.
+      if (state.route !== "page" && !usesViewerPanFrame()) alignViewportToRows();
     };
 
     const sendMobilePromptNewline = () => {
@@ -1830,6 +1908,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       touchScrollRef.current.pointerCaptured = false;
       touchScrollRef.current.scrollRemainderPx = 0;
       touchScrollRef.current.openedScrollback = false;
+      touchScrollRef.current.route = "undecided";
+      touchScrollRef.current.pageScroller = null;
     };
 
     const moveTouchScroll = (x: number, y: number, time: number) => {
@@ -1837,6 +1917,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!state.active) return;
 
       state.movedPx = Math.max(state.movedPx, Math.hypot(x - state.startX, y - state.startY));
+      if (state.movedPx > TOUCH_TAP_SLOP_PX) routeTouchScroll(state.startY - y);
       const deltaX = state.lastX - x;
       const deltaY = state.lastY - y;
       state.lastX = x;
@@ -1884,7 +1965,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         state.momentumFrame = requestAnimationFrame(stepTouchMomentum);
       } else {
         state.scrollRemainderPx = 0;
-        if (!usesViewerPanFrame()) alignViewportToRows();
+        if (state.route !== "page" && !usesViewerPanFrame()) alignViewportToRows();
       }
     };
 
@@ -2236,6 +2317,31 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (document.visibilityState === "visible") scheduleFit();
     };
     document.addEventListener("visibilitychange", onVisibility);
+
+    /*
+     * devicePixelRatio moves without a reload — browser zoom, dragging the
+     * window to a display with a different scale, DevTools device emulation.
+     * The GPU renderer rasterized its glyph atlas for the old ratio and has no
+     * idea, so every glyph keeps its old device-pixel size while the canvas is
+     * now measured against a new one: 2 -> 3 paints type half again as large
+     * as its cell, and lines run off the pane instead of wrapping. Clear the
+     * atlas (it re-rasterizes at the current ratio) and refit.
+     *
+     * A media query is the only DPR change event there is, and it has to be
+     * rebuilt each time because the ratio it tests for is baked into it.
+     */
+    let dprQuery: MediaQueryList | null = null;
+    const onDevicePixelRatioChange = () => {
+      webglAddonRef.current?.clearTextureAtlas();
+      watchDevicePixelRatio();
+      scheduleFit();
+    };
+    function watchDevicePixelRatio() {
+      dprQuery?.removeEventListener("change", onDevicePixelRatioChange);
+      dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      dprQuery.addEventListener("change", onDevicePixelRatioChange);
+    }
+    watchDevicePixelRatio();
     document.fonts?.ready
       .then(() => {
         scheduleFit();
@@ -2249,6 +2355,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       vv?.removeEventListener("resize", onVisualViewport);
       vv?.removeEventListener("scroll", onVisualViewport);
       document.removeEventListener("visibilitychange", onVisibility);
+      dprQuery?.removeEventListener("change", onDevicePixelRatioChange);
       term.attachCustomKeyEventHandler(() => true);
       term.textarea?.removeEventListener("beforeinput", onBeforeInput, { capture: true });
       term.textarea?.removeEventListener("input", onInput, { capture: true });

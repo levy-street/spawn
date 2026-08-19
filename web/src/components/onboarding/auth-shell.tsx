@@ -1,6 +1,6 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
-import { Trident, WORDMARK_CLASS } from "@/components/icons/BrandMark";
+import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { ONBOARDING_STEPS, type OnboardingStep } from "./step-machine";
@@ -38,7 +38,7 @@ export function AuthShell({ title, description, children, step, cardClassName }:
           className="mx-auto flex min-h-11 items-center gap-2.5 px-2 text-hellfire transition-colors hover:text-ember focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ember"
         >
           <Trident className="size-8" />
-          <span className={cn(WORDMARK_CLASS, "text-[19px]")}>spawnd</span>
+          <Wordmark className="h-7" />
         </Link>
 
         {step ? <StepIndicator current={step} /> : null}

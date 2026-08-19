@@ -5,7 +5,7 @@ import { LogOut, PanelLeftClose, PanelLeftOpen, Plus, Settings, X } from "lucide
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
-import { Trident, WORDMARK_CLASS } from "@/components/icons/BrandMark";
+import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
 import { SidebarIconSlot, SidebarRowLabel, sidebarRowClass } from "@/components/nav/sidebar-parts";
 import { openSettings } from "@/components/settings/settings-dialog-store";
@@ -271,11 +271,8 @@ export function Sidebar({
               <Trident className="size-6" />
             </Link>
           )}
-          <SidebarRowLabel
-            collapsed={collapsed}
-            className={cn(WORDMARK_CLASS, "text-[17px] text-brand-accent")}
-          >
-            spawnd
+          <SidebarRowLabel collapsed={collapsed} className="text-brand-accent">
+            <Wordmark className="h-5" />
           </SidebarRowLabel>
           {showCollapseControl ? (
             <Button

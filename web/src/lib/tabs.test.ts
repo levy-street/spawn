@@ -10,6 +10,7 @@ import {
   nextTabName,
   removeTab,
   renameTab,
+  reorderTab,
   tabOfSession,
   tabTiles,
   withActiveTab,
@@ -81,6 +82,23 @@ describe("tab envelope", () => {
     const swapped = withTabTiles(layout, "b", [tile("s2", 0, 0, 12, 12)]);
     expect(tabTiles(swapped, "b").map((t) => t.session_id)).toEqual(["s2"]);
     expect(tabTiles(swapped, "a").map((t) => t.session_id)).toEqual(["s1"]);
+  });
+
+  test("reorderTab moves a tab, clamping the index and keeping the rest in order", () => {
+    const layout = withActiveTab(envelope([{ id: "a" }, { id: "b" }, { id: "c" }]), "b");
+    expect(reorderTab(layout, "a", 2)?.tabs.map((tab) => tab.id)).toEqual(["b", "c", "a"]);
+    expect(reorderTab(layout, "c", 0)?.tabs.map((tab) => tab.id)).toEqual(["c", "a", "b"]);
+    // Past either end lands in the end slot; the selection rides along.
+    const clamped = reorderTab(layout, "b", 9);
+    expect(clamped?.tabs.map((tab) => tab.id)).toEqual(["a", "c", "b"]);
+    expect(clamped?.active_tab).toBe("b");
+    // Nothing to persist: a no-op move, an unknown id, a single tab.
+    expect(reorderTab(layout, "b", 1)).toBeNull();
+    expect(reorderTab(layout, "a", -3)).toBeNull();
+    expect(reorderTab(layout, "ghost", 0)).toBeNull();
+    expect(reorderTab(envelope([{ id: "only" }]), "only", 1)).toBeNull();
+    // The input is untouched.
+    expect(layout.tabs.map((tab) => tab.id)).toEqual(["a", "b", "c"]);
   });
 
   test("nextTabName picks the next free number", () => {

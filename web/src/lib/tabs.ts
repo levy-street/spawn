@@ -114,6 +114,22 @@ export function renameTab(layout: LayoutV3, tabId: string, name: string): Layout
 }
 
 /**
+ * Move a tab to another slot in the strip, the index clamped to it. Null when
+ * the id is unknown or the order would not change — callers treat null as
+ * "nothing to persist".
+ */
+export function reorderTab(layout: LayoutV3, tabId: string, toIndex: number): LayoutV3 | null {
+  const from = layout.tabs.findIndex((tab) => tab.id === tabId);
+  if (from === -1) return null;
+  const to = Math.min(Math.max(toIndex, 0), layout.tabs.length - 1);
+  if (to === from) return null;
+  const tabs = [...layout.tabs];
+  const [moved] = tabs.splice(from, 1);
+  tabs.splice(to, 0, moved as WorkspaceTab);
+  return { ...layout, tabs };
+}
+
+/**
  * Move a session's tile into another tab, auto-placed. Null when the session
  * has no tile, the target does not exist, is its current tab, or is full —
  * callers treat null as "nothing to persist".

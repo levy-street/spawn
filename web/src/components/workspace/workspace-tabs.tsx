@@ -13,7 +13,15 @@ import {
   X,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { type FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  type FormEvent,
+  type PointerEvent as ReactPointerEvent,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
@@ -52,17 +60,50 @@ import {
   nextTabName,
   removeTab,
   renameTab,
+  reorderTab,
   tabById,
+  type WorkspaceTab,
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { templateSpecFromWorkspace } from "@/lib/workspace-templates";
 import { tabAttentionCount } from "@/lib/workspaces";
 import { FolderPickerDialog } from "./folder-picker-dialog";
 
+/** Travel that tells a reorder drag apart from a click, as in the grid. */
+const DRAG_THRESHOLD_PX = 4;
+
+/** A pointerdown on a tab, waiting to see whether it becomes a reorder. */
+type ArmedTabDrag = {
+  move: (event: PointerEvent) => void;
+  end: () => void;
+};
+
+/** One tab's resting geometry, measured when a reorder drag begins. */
+type TabSlot = { id: string; left: number; width: number };
+
+type TabDrag = {
+  tabId: string;
+  from: number;
+  /** The slot the tab would land in were the pointer lifted now. */
+  to: number;
+  startClientX: number;
+  /** Travel bounds that keep the dragged tab inside the strip's own tabs. */
+  minDx: number;
+  maxDx: number;
+  /** What a passed-over tab gives up: the dragged tab's width plus the gap. */
+  step: number;
+  move: (event: PointerEvent) => void;
+  end: () => void;
+  cancel: () => void;
+};
+
+const slotMiddle = (slot: TabSlot) => slot.left + slot.width / 2;
+
 /**
  * The workspace's tab strip: one button per tab — click to switch, click the
- * active tab again to rename it in place — an always-visible x to close, and
- * a trailing + to add. Every button carries
+ * active tab again to rename it in place, drag it sideways to reorder the
+ * strip (Alt+Shift+Arrow does the same from the keyboard) — an always-visible
+ * x to close, and a trailing + to add. Every button carries
  * `data-workspace-tab` so the grid's pane drag can hit-test the strip —
  * hovering a tab mid-drag switches to it, dropping on one moves the pane
  * into it (see WorkspaceGrid).
@@ -149,6 +190,191 @@ export function WorkspaceTabs({
       setRenamingId(null);
     }
   }, [renamingId, workspace.layout.tabs]);
+
+  /*
+   * Reorder by drag. The tab itself is the drag surface, so the gesture only
+   * commits past a few px of travel — anything shorter stays a click, which
+   * switches tabs or opens the rename. Dragging, the grabbed tab tracks the
+   * pointer while the tabs it passes slide one slot the other way; the drop
+   * writes the new order through the same envelope PATCH as the rest of tab
+   * CRUD. Touch is left alone so the strip still scrolls.
+   */
+  const tabElementsRef = useRef(new Map<string, HTMLElement>());
+  const armedDragRef = useRef<ArmedTabDrag | null>(null);
+  const dragRef = useRef<TabDrag | null>(null);
+  /** A drag just ran: swallow the click that closes the same gesture. */
+  const draggedRef = useRef(false);
+  /** The strip's live layout, for the drag's reads between renders. */
+  const layoutRef = useRef(workspace.layout);
+  /** The dropped order, held until the optimistic write carries it — without
+   *  it the strip paints one frame of the old order and reads as a snap-back. */
+  const [droppedOrder, setDroppedOrder] = useState<string[] | null>(null);
+
+  useEffect(() => {
+    layoutRef.current = workspace.layout;
+    // Whatever the patch settled on — the dropped order or a rollback — is the
+    // truth now, so the local hold has done its one frame of work.
+    setDroppedOrder(null);
+  }, [workspace.layout]);
+
+  // Unmounting mid-drag — a workspace switch, say — must not leave listeners
+  // or a grabbing cursor behind.
+  useEffect(
+    () => () => {
+      const drag = dragRef.current;
+      if (drag) {
+        document.removeEventListener("pointermove", drag.move);
+        document.removeEventListener("pointerup", drag.end);
+        document.removeEventListener("pointercancel", drag.cancel);
+      }
+      const armed = armedDragRef.current;
+      if (armed) {
+        document.removeEventListener("pointermove", armed.move);
+        document.removeEventListener("pointerup", armed.end);
+        document.removeEventListener("pointercancel", armed.end);
+      }
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    },
+    [],
+  );
+
+  const orderedTabs = useMemo(() => {
+    const list = workspace.layout.tabs;
+    if (!droppedOrder) return list;
+    const held = droppedOrder
+      .map((id) => list.find((tab) => tab.id === id))
+      .filter((tab): tab is WorkspaceTab => Boolean(tab));
+    return held.length === list.length ? held : list;
+  }, [droppedOrder, workspace.layout.tabs]);
+
+  const disarmDrag = () => {
+    const armed = armedDragRef.current;
+    if (!armed) return;
+    armedDragRef.current = null;
+    document.removeEventListener("pointermove", armed.move);
+    document.removeEventListener("pointerup", armed.end);
+    document.removeEventListener("pointercancel", armed.end);
+  };
+
+  const finishDrag = (commit: boolean) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    dragRef.current = null;
+    document.removeEventListener("pointermove", drag.move);
+    document.removeEventListener("pointerup", drag.end);
+    document.removeEventListener("pointercancel", drag.cancel);
+    for (const element of tabElementsRef.current.values()) {
+      // Order: dropping the transition first means clearing the transform is
+      // an instant jump, not an animation back from the drag's offset while
+      // the reordered strip has already moved underneath it.
+      element.style.removeProperty("transition");
+      element.style.transform = "";
+      element.removeAttribute("data-dragging");
+    }
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    const next = commit ? reorderTab(layoutRef.current, drag.tabId, drag.to) : null;
+    if (!next) return;
+    setDroppedOrder(next.tabs.map((tab) => tab.id));
+    patchM.mutate(next);
+  };
+
+  const beginDrag = (tabId: string, startClientX: number) => {
+    const list = layoutRef.current.tabs;
+    const from = list.findIndex((tab) => tab.id === tabId);
+    const elements = list.map((tab) => tabElementsRef.current.get(tab.id));
+    if (from === -1 || elements.length < 2 || elements.some((element) => !element)) return;
+    const slots: TabSlot[] = elements.map((element, index) => {
+      const rect = (element as HTMLElement).getBoundingClientRect();
+      return { id: list[index].id, left: rect.left, width: rect.width };
+    });
+    const first = slots[0];
+    const last = slots[slots.length - 1];
+    const grabbed = slots[from];
+    const move = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      event.preventDefault();
+      const dx = Math.min(drag.maxDx, Math.max(drag.minDx, event.clientX - drag.startClientX));
+      // The slot the tab has taken over: its leading edge against the resting
+      // middles either side, so covering half a neighbour claims it. Middle
+      // against middle would want a whole tab of travel, which the clamp at
+      // each end of the strip never allows — the end slots were unreachable.
+      const left = grabbed.left + dx;
+      const right = left + grabbed.width;
+      let to = drag.from;
+      while (to > 0 && left < slotMiddle(slots[to - 1])) to -= 1;
+      while (to < slots.length - 1 && right > slotMiddle(slots[to + 1])) to += 1;
+      drag.to = to;
+      for (const [index, slot] of slots.entries()) {
+        const element = tabElementsRef.current.get(slot.id);
+        if (!element) continue;
+        let shift = 0;
+        if (index === drag.from) shift = dx;
+        else if (index > drag.from && index <= to) shift = -drag.step;
+        else if (index < drag.from && index >= to) shift = drag.step;
+        element.style.transform = shift === 0 ? "" : `translate3d(${shift}px, 0, 0)`;
+      }
+    };
+    const drag: TabDrag = {
+      tabId,
+      from,
+      to: from,
+      startClientX,
+      minDx: first.left - grabbed.left,
+      maxDx: last.left + last.width - (grabbed.left + grabbed.width),
+      step: grabbed.width + Math.max(0, slots[1].left - (first.left + first.width)),
+      move,
+      end: () => finishDrag(true),
+      cancel: () => finishDrag(false),
+    };
+    dragRef.current = drag;
+    draggedRef.current = true;
+    for (const [index, element] of elements.entries()) {
+      // The tabs being passed ease into their new slot; the grabbed one rides
+      // the pointer, so it stays untransitioned.
+      if (index !== from) (element as HTMLElement).style.transition = "transform 150ms ease-out";
+    }
+    elements[from]?.setAttribute("data-dragging", "true");
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+    document.addEventListener("pointermove", drag.move, { passive: false });
+    document.addEventListener("pointerup", drag.end, { once: true });
+    document.addEventListener("pointercancel", drag.cancel, { once: true });
+  };
+
+  const armDrag = (tabId: string, event: ReactPointerEvent<HTMLElement>) => {
+    draggedRef.current = false;
+    if (event.button !== 0 || event.pointerType === "touch") return;
+    if (renamingId || layoutRef.current.tabs.length < 2) return;
+    disarmDrag();
+    const startClientX = event.clientX;
+    const startClientY = event.clientY;
+    const move = (moveEvent: PointerEvent) => {
+      if (
+        Math.abs(moveEvent.clientX - startClientX) < DRAG_THRESHOLD_PX &&
+        Math.abs(moveEvent.clientY - startClientY) < DRAG_THRESHOLD_PX
+      ) {
+        return;
+      }
+      disarmDrag();
+      beginDrag(tabId, startClientX);
+    };
+    const armed: ArmedTabDrag = { move, end: disarmDrag };
+    armedDragRef.current = armed;
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", armed.end, { once: true });
+    document.addEventListener("pointercancel", armed.end, { once: true });
+  };
+
+  /** The same reorder without a pointer. Alt+Arrow alone walks the grid's
+   *  panes, so the shift keeps the two apart. */
+  const nudge = (tabId: string, delta: number) => {
+    const from = layoutRef.current.tabs.findIndex((tab) => tab.id === tabId);
+    const next = from === -1 ? null : reorderTab(layoutRef.current, tabId, from + delta);
+    if (next) patchM.mutate(next);
+  };
 
   // biome-ignore lint/correctness/useExhaustiveDependencies(renamingId): the rename input swaps a tab for an input, changing every tab's width — re-measure.
   useLayoutEffect(() => {
@@ -326,7 +552,7 @@ export function WorkspaceTabs({
       aria-label="Workspace tabs"
       className="flex h-11 shrink-0 items-end gap-1.5 overflow-x-auto bg-shell pr-1.5 pb-1.5"
     >
-      {workspace.layout.tabs.map((tab) => {
+      {orderedTabs.map((tab) => {
         const active = tab.id === activeTabId;
         const attention = tabAttentionCount(tab, sessionsById);
         if (renamingId === tab.id) {
@@ -356,13 +582,37 @@ export function WorkspaceTabs({
           );
         }
         return (
-          <div key={tab.id} className="relative shrink-0">
+          // The wrapper is what a reorder slides: the dragged tab rides the
+          // pointer with no transition, the tabs it passes ease into its slot.
+          <div
+            key={tab.id}
+            ref={(element) => {
+              if (element) tabElementsRef.current.set(tab.id, element);
+              else tabElementsRef.current.delete(tab.id);
+            }}
+            className="relative shrink-0 data-[dragging]:z-10"
+          >
             <button
               type="button"
               role="tab"
               aria-selected={active}
+              aria-keyshortcuts="Alt+Shift+ArrowLeft Alt+Shift+ArrowRight"
               data-workspace-tab={tab.id}
+              onPointerDown={(event) => armDrag(tab.id, event)}
+              onKeyDown={(event) => {
+                if (!event.altKey || !event.shiftKey || event.ctrlKey || event.metaKey) return;
+                const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
+                if (delta === 0) return;
+                event.preventDefault();
+                event.stopPropagation();
+                nudge(tab.id, delta);
+              }}
               onClick={() => {
+                // The pointerup that ends a reorder still fires a click here.
+                if (draggedRef.current) {
+                  draggedRef.current = false;
+                  return;
+                }
                 if (active) {
                   setDraft(tab.name);
                   setRenamingId(tab.id);

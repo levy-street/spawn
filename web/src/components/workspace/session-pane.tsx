@@ -244,7 +244,7 @@ export function SessionPane({
       ref={sectionRef}
       aria-label={title}
       className={cn(
-        "relative flex size-full min-h-0 min-w-0 flex-col overflow-hidden bg-background",
+        "relative isolate flex size-full min-h-0 min-w-0 flex-col overflow-hidden bg-background",
         stacked && "rounded-md",
         // Focus is the pane's background, not an outline — see the wash below.
         highlighted === sessionId && !selfHovered && "ring-2 ring-ring",
@@ -253,19 +253,22 @@ export function SessionPane({
       {/*
        * Which pane has focus, read at a glance. xterm paints its own opaque
        * canvas background, so the section's `bg-background` never shows through
-       * the terminal itself — the only way to tint a pane is over the top. The
-       * focused pane is left exactly as it is; every other one is washed
-       * *down*, away from the light: a black scrim in dark (the ground is
-       * already near-black, so what visibly recedes is the pane's content) and
-       * the same move in light, where washing toward the near-black foreground
-       * greys it. Sits under the exited-state scrim (z-20) and the shortcut bar
-       * (z-30), and takes no pointer events, so nothing about interacting with
-       * the pane changes.
+       * the terminal — the only way to tint a pane is over the top, and a plain
+       * scrim there greys the terminal's text along with its ground. So the
+       * unfocused pane's layer blends instead of covering: `--shell` (the
+       * chrome ground) taken as a floor in dark and a ceiling in light, which
+       * moves every pixel between it and the pane's ground — the terminal's
+       * background, the header, the gutters — while leaving anything with more
+       * contrast than the chrome, the output itself, exactly as it was. The
+       * pane rises to chrome; its content stays legible. `isolate` on the
+       * section keeps the blend inside the pane. Sits under the exited-state
+       * scrim (z-20) and the shortcut bar (z-30), and takes no pointer events,
+       * so nothing about interacting with the pane changes.
        */}
       {!focused && paneCount > 1 && (
         <div
           aria-hidden
-          className="pointer-events-none absolute inset-0 z-10 bg-foreground/[0.035] dark:bg-black/25"
+          className="pointer-events-none absolute inset-0 z-10 bg-shell mix-blend-darken dark:mix-blend-lighten"
         />
       )}
 

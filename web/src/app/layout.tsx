@@ -7,7 +7,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   metadataBase: new URL("https://spawnd.dev"),
   title: {
-    default: "spawnd — a daemon on every host you own",
+    default: "SPAWN D - Host your daemons",
     template: "%s · spawnd",
   },
   description:
@@ -54,7 +54,7 @@ export const viewport: Viewport = {
   // A single tag rather than a light/dark media pair: an explicit theme choice
   // has to beat the OS preference, and only script can express that. applyTheme
   // rewrites this on load and on every change.
-  themeColor: "#0A0607",
+  themeColor: "#000000",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

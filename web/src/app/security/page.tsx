@@ -12,6 +12,7 @@ import {
 import type { Metadata } from "next";
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { Wordmark } from "@/components/icons/BrandMark";
 
 export const metadata: Metadata = {
   title: "Security — the server that can't read your terminal",
@@ -29,7 +30,7 @@ export default function SecurityPage() {
           className="inline-flex items-center gap-2 font-sigil text-[12px] tracking-[0.18em] text-ash uppercase transition-colors hover:text-bone"
         >
           <ArrowLeft className="size-4" />
-          spawnd
+          <Wordmark className="h-2.5" />
         </Link>
         <Link
           href="/signup"
@@ -46,7 +47,7 @@ export default function SecurityPage() {
           className="absolute inset-0"
           style={{
             background:
-              "radial-gradient(ellipse 60% 55% at 50% 0%, rgba(255,73,48,.1), transparent 60%)",
+              "radial-gradient(ellipse 60% 55% at 50% 0%, rgba(225,30,21,.12), transparent 60%)",
           }}
         />
         <div className="relative mx-auto w-full max-w-3xl text-center">
@@ -232,7 +233,7 @@ export default function SecurityPage() {
       <footer className="border-line-g border-t px-5 py-10 sm:px-8">
         <div className="mx-auto flex w-full max-w-5xl items-center justify-center font-sigil text-[12px] tracking-[0.08em] text-ash">
           <span>
-            <span className="text-hellfire">spawnd</span> · consensual · auditable · revocable
+            <Wordmark className="h-2.5 text-hellfire" /> · consensual · auditable · revocable
           </span>
         </div>
       </footer>

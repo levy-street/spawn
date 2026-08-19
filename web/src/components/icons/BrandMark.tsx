@@ -2,25 +2,60 @@ import Image from "next/image";
 import { cn } from "@/lib/utils";
 
 /**
- * The spawnd trident — the mark from the landing hero, shared by the marketing
- * pages and the app chrome so both wear the same logo. Fits inside a square
- * `size-N` box (the art is portrait, so it letterboxes rather than crops).
+ * The spawnd trident — the ink-blob mark from the brand kit, shared by the
+ * marketing pages and the app chrome so both wear the same logo. Fits inside a
+ * square `size-N` box (the art is square, drawn as merged wet-ink droplets).
  *
- * The art is fixed hellfire, like the third-party plates in `AgentIcon`: a
- * logo keeps its identity in both themes, and #ff4930 clears 3:1 against the
+ * The art is fixed brand red, like the third-party plates in `AgentIcon`: a
+ * logo keeps its identity in both themes, and #E11E15 clears 3:1 against the
  * light and the dark ground alike.
  */
 export function Trident({ className }: { className?: string }) {
   return (
     <span className={cn("relative inline-block", className)}>
-      <Image src="/trident.png" alt="" aria-hidden fill sizes="64px" className="object-contain" />
+      <Image
+        src="/brand/spawnd-icon.svg"
+        alt=""
+        aria-hidden
+        fill
+        sizes="64px"
+        className="object-contain"
+      />
     </span>
   );
 }
 
+const WORDMARK_MASK: React.CSSProperties = {
+  WebkitMaskImage: "url(/brand/spawnd-wordmark.svg)",
+  maskImage: "url(/brand/spawnd-wordmark.svg)",
+  WebkitMaskRepeat: "no-repeat",
+  maskRepeat: "no-repeat",
+  WebkitMaskSize: "contain",
+  maskSize: "contain",
+  WebkitMaskPosition: "left center",
+  maskPosition: "left center",
+};
+
 /**
- * The `spawnd` wordmark's typography — sigil mono, lowercase, wide tracking,
- * as set on the landing nav. Colour is left to the call site: app chrome uses
- * `text-brand-accent` (theme-swapped), `.grimoire` surfaces use `text-hellfire`.
+ * The drawn `spawnd` wordmark from the brand kit — blocky letterforms built
+ * from the same merged ink droplets as the trident. Rendered as a CSS mask
+ * filled with `currentColor`, so call sites colour it exactly like text:
+ * app chrome uses `text-brand-accent` (theme-swapped), `.grimoire` surfaces
+ * use `text-hellfire`, and hover transitions on a parent tint it live.
+ *
+ * Size it by height (`h-3.5`, `h-[19px]`…); the width follows from the
+ * lockup's fixed 1753:370 aspect ratio.
  */
-export const WORDMARK_CLASS = "font-sigil lowercase tracking-[0.22em]";
+export function Wordmark({
+  className,
+  "aria-hidden": ariaHidden,
+}: {
+  className?: string;
+  "aria-hidden"?: boolean;
+}) {
+  const classes = cn("inline-block aspect-[1753/370] shrink-0 bg-current", className);
+  if (ariaHidden) {
+    return <span aria-hidden className={classes} style={WORDMARK_MASK} />;
+  }
+  return <span role="img" aria-label="spawnd" className={classes} style={WORDMARK_MASK} />;
+}

@@ -1352,7 +1352,10 @@ export function WorkspaceGrid({
       );
     }
     return (
-      <div className="flex min-h-0 flex-1 flex-col gap-(--pane-gap) overflow-y-auto p-[calc(var(--pane-gap)/2)]">
+      <div
+        data-pane-stack
+        className="flex min-h-0 flex-1 flex-col gap-(--pane-gap) overflow-y-auto p-[calc(var(--pane-gap)/2)]"
+      >
         {orderedIds.map((sessionId) => {
           const widget = tiles.find((tile) => tile.session_id === sessionId)?.widget;
           return (
