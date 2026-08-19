@@ -393,6 +393,57 @@ class DeviceEndorsement(Base):
     )
 
 
+class DevicePairing(Base):
+    """A browser↔browser committed-ephemeral SAS ceremony to admit a new device
+    to the account's trust mesh (docs/TRUST_DEVICE_MESH.md §4, Appendix A).
+
+    An existing device (the *initiator*, in the daemon's commit-first role) and a
+    new device (the *joiner*) each contribute a fresh 32-byte ephemeral nonce and
+    their own public key. The initiator commits to its nonce before the joiner
+    reveals, so a substituting server cannot grind the short number. The server is
+    a dumb relay: it stores and forwards these opaque base64url values (32-byte
+    keys / nonces / SHA-256 commitment, 43 chars each) and can neither forge a
+    matching number nor read anything. On a human number-match both devices sign a
+    MUTUAL account endorsement (POST /api/trust/account-endorsements).
+
+    The nonce/key fields nullable until each move lands; each is set-once so a
+    relay cannot swap a value after seeing the opposing fresh nonce.
+    """
+
+    __tablename__ = "device_pairings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    initiator_device_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("browser_devices.id", ondelete="CASCADE"), nullable=False
+    )
+    joiner_device_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("browser_devices.id", ondelete="CASCADE"), nullable=False
+    )
+    # Move 1 (initiator, at start): its key K_I and commit Cd = SHA256(tag‖K_I‖N_I).
+    initiator_public_key: Mapped[str] = mapped_column(String(43), nullable=False)
+    initiator_commit: Mapped[str] = mapped_column(String(43), nullable=False)
+    # Move 2 (joiner): its key K_J and fresh nonce N_J.
+    joiner_public_key: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    joiner_nonce: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    # Move 3 (initiator opens): its nonce N_I, accepted only after the joiner
+    # contributed and only if it opens the commitment.
+    initiator_nonce: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "initiator_device_id <> joiner_device_id",
+            name="ck_device_pairings_distinct",
+        ),
+    )
+
+
 class Preset(Base):
     __tablename__ = "presets"
 

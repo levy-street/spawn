@@ -22,6 +22,7 @@ from .routes import auth_providers as auth_providers_routes
 from .routes import browser_devices as browser_devices_routes
 from .routes import capabilities as capabilities_routes
 from .routes import device as device_routes
+from .routes import device_pairing as device_pairing_routes
 from .routes import hosts as hosts_routes
 from .routes import install as install_routes
 from .routes import presets as presets_routes
@@ -80,6 +81,7 @@ def create_app() -> FastAPI:
     app.include_router(browser_devices_routes.router)
     app.include_router(capabilities_routes.router)
     app.include_router(device_routes.router)
+    app.include_router(device_pairing_routes.router)
     app.include_router(hosts_routes.router)
     app.include_router(agents_routes.router)
     app.include_router(presets_routes.router)
