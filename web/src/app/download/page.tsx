@@ -7,6 +7,8 @@ import {
   CheckCircle2,
   Copy,
   Download,
+  Fingerprint,
+  KeySquare,
   Laptop,
   MonitorCog,
   Server,
@@ -161,45 +163,81 @@ export default function DownloadPage() {
         </div>
       </section>
 
+      {/* The two things you actually do, in order. Before this, the page
+          handed over a command and then stopped: the installer prints a code,
+          and there was nothing here to redeem it with. */}
       <section className="px-4 py-10 sm:px-6 lg:px-8">
-        <div className="mx-auto grid w-full max-w-7xl gap-6 lg:grid-cols-[1.25fr_0.75fr]">
-          <div className="rounded-md border border-brand-hairline bg-brand-panel p-4 sm:p-6">
-            <div className="flex items-center gap-3">
-              <div className="flex size-10 items-center justify-center rounded-md bg-white text-black">
-                <Terminal className="size-5" />
+        <div className="mx-auto w-full max-w-7xl">
+          {/* items-start: step 1 is the shorter card, and stretching it to
+              match leaves a dead void under the command block. */}
+          <ol className="grid items-start gap-6 lg:grid-cols-2">
+            <Step
+              n={1}
+              icon={<Terminal className="size-5" />}
+              title={detected.title}
+              blurb="Run this in the host terminal."
+            >
+              <div className="mt-5 rounded-md border border-brand-hairline bg-brand-well p-3 font-mono text-sm text-foreground">
+                <span className="mr-2 text-emerald-600 dark:text-emerald-300">$</span>
+                <code className="break-all">{command}</code>
               </div>
-              <div>
-                <h2 className="text-xl font-semibold">{detected.title}</h2>
-                <p className="text-sm text-muted-foreground">Run this in the host terminal.</p>
+
+              <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+                <Button type="button" onClick={copyCommand} disabled={!canCopy}>
+                  <Copy className="size-4" />
+                  {copied ? "Copied" : "Copy command"}
+                </Button>
+                <Button asChild variant="outline">
+                  <Link href="/signup">
+                    Create account
+                    <CheckCircle2 className="size-4" />
+                  </Link>
+                </Button>
               </div>
-            </div>
 
-            <div className="mt-5 rounded-md border border-brand-hairline bg-brand-well p-3 font-mono text-sm text-foreground">
-              <span className="mr-2 text-emerald-600 dark:text-emerald-300">$</span>
-              <code className="break-all">{command}</code>
-            </div>
+              {!supported && (
+                <p className="mt-4 rounded-md border border-amber-300/25 bg-amber-600 dark:bg-amber-300/10 px-3 py-2 text-sm text-amber-100">
+                  Use this command from a supported macOS or Linux terminal, not from this browser
+                  OS.
+                </p>
+              )}
+            </Step>
 
-            <div className="mt-4 flex flex-col gap-3 sm:flex-row">
-              <Button type="button" onClick={copyCommand} disabled={!canCopy}>
-                <Copy className="size-4" />
-                {copied ? "Copied" : "Copy command"}
-              </Button>
-              <Button asChild variant="outline">
-                <Link href="/signup">
-                  Create account
-                  <CheckCircle2 className="size-4" />
-                </Link>
-              </Button>
-            </div>
-
-            {!supported && (
-              <p className="mt-4 rounded-md border border-amber-300/25 bg-amber-600 dark:bg-amber-300/10 px-3 py-2 text-sm text-amber-100">
-                Use this command from a supported macOS or Linux terminal, not from this browser OS.
+            <Step
+              n={2}
+              icon={<KeySquare className="size-5" />}
+              title="Approve the host"
+              blurb="The installer opens this page for you."
+            >
+              <p className="mt-5 text-sm leading-6 text-foreground/85">
+                Possession is proven by the host&apos;s own key before anything is shown, so the
+                link the installer prints names a ceremony your machine started. Landed here some
+                other way? Redeem the code it printed.
               </p>
-            )}
-          </div>
 
-          <div className="grid gap-3">
+              <div className="mt-4">
+                <Button asChild>
+                  <Link href="/device">
+                    <KeySquare className="size-4" />
+                    Enter code
+                  </Link>
+                </Button>
+              </div>
+
+              {/* The step-2 card is where the ceremony actually happens, so
+                  the reminder belongs here rather than buried in prose. */}
+              <div className="mt-5 flex gap-3 rounded-md border border-brand-hairline bg-brand-well p-3">
+                <Fingerprint className="mt-0.5 size-4 shrink-0 text-sky-600 dark:text-sky-300" />
+                <p className="text-sm leading-6 text-muted-foreground">
+                  Check the verification code in the browser matches the one in the terminal before
+                  you approve. That comparison is the part only you can do — approving binds this
+                  host to your account.
+                </p>
+              </div>
+            </Step>
+          </ol>
+
+          <div className="mt-6 grid gap-3 sm:grid-cols-3">
             {OPTIONS.map((option) => (
               <InstallOption key={option.title} icon={option.icon} title={option.title}>
                 {option.body}
@@ -237,6 +275,45 @@ function detectPlatform(): DetectedPlatform {
   if (platform.includes("linux") || userAgent.includes("linux")) return "linux";
   if (platform.includes("win") || userAgent.includes("windows")) return "windows";
   return "unknown";
+}
+
+/** One numbered step. The ordinal is the point, so it carries the emphasis. */
+function Step({
+  n,
+  icon,
+  title,
+  blurb,
+  children,
+}: {
+  n: number;
+  icon: ReactNode;
+  title: string;
+  blurb: string;
+  children: ReactNode;
+}) {
+  return (
+    <li className="rounded-md border border-brand-hairline bg-brand-panel p-4 sm:p-6">
+      <div className="flex items-center gap-3">
+        <div className="relative flex size-10 shrink-0 items-center justify-center rounded-md bg-white text-black">
+          {icon}
+          <span
+            aria-hidden
+            className="absolute -left-2 -top-2 grid size-5 place-items-center rounded-full bg-hellfire font-sigil text-[11px] text-void"
+          >
+            {n}
+          </span>
+        </div>
+        <div className="min-w-0">
+          <h2 className="text-xl font-semibold">
+            <span className="sr-only">Step {n}: </span>
+            {title}
+          </h2>
+          <p className="text-sm text-muted-foreground">{blurb}</p>
+        </div>
+      </div>
+      {children}
+    </li>
+  );
 }
 
 function InstallOption({

@@ -157,3 +157,123 @@ test("download page does not overflow on desktop or mobile", async ({ browser })
     await context.close();
   }
 });
+
+const SIGNED_IN_USER = {
+  id: "00000000-0000-4000-8000-000000000001",
+  email: "tester@example.com",
+  created_at: "2026-05-24T00:00:00Z",
+  email_verified_at: null,
+  is_admin: false,
+};
+
+test("the lander carries the pairing step, not just the command", async ({ browser }) => {
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "MacIntel",
+    userAgent: MAC_USER_AGENT,
+  });
+
+  await page.goto("/download");
+
+  // Two ordered steps, not one command block and unrelated buttons.
+  const steps = page.getByRole("listitem").filter({ has: page.getByRole("heading") });
+  await expect(steps.first().getByRole("heading", { name: "Install on this Mac" })).toBeVisible();
+  await expect(steps.nth(1).getByRole("heading", { name: "Approve the host" })).toBeVisible();
+
+  // The fingerprint reminder lives on the step where the ceremony happens.
+  await expect(steps.nth(1)).toContainText("verification code in the browser matches");
+
+  await page.getByRole("link", { name: "Enter code" }).click();
+  await expect(page).toHaveURL(/\/device/u);
+
+  await context.close();
+});
+
+test("Enter code from the lander survives the sign-in it is gated behind", async ({ browser }) => {
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "MacIntel",
+    userAgent: MAC_USER_AGENT,
+  });
+  // /download is a public lander; /device is not. A logged-out visitor must
+  // come back to the pairing page after signing in, not be dumped elsewhere.
+  await page.route("**/api/me", async (route) => {
+    await route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "not authenticated" }),
+    });
+  });
+
+  await page.goto("/download");
+  await page.getByRole("link", { name: "Enter code" }).click();
+
+  await expect(page).toHaveURL(/\/login\?next=%2Fdevice$/u);
+  await expect(page.getByText("Sign in to spawn")).toBeVisible();
+
+  // Signing in lands back on /device.
+  await page.route("**/api/auth/login", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        access_token: "token",
+        user: SIGNED_IN_USER,
+      }),
+    });
+  });
+  await page.unroute("**/api/me");
+  await page.route("**/api/me", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        user: SIGNED_IN_USER,
+      }),
+    });
+  });
+  await page.getByLabel("Email").fill("tester@example.com");
+  await page.getByLabel("Password").fill("passpasspass");
+  await page.getByRole("button", { name: "Sign in" }).click();
+
+  await expect(page).toHaveURL(/\/device$/u);
+
+  await context.close();
+});
+
+test("a hostile next= is not honored", async ({ browser, baseURL }) => {
+  const baseUrl = baseURL ?? "http://127.0.0.1:3302";
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "MacIntel",
+    userAgent: MAC_USER_AGENT,
+  });
+  await page.route("**/api/auth/login", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        access_token: "token",
+        user: SIGNED_IN_USER,
+      }),
+    });
+  });
+  await page.route("**/api/me", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        user: SIGNED_IN_USER,
+      }),
+    });
+  });
+
+  await page.goto("/login?next=https%3A%2F%2Fevil.example.com%2Fphish");
+  await page.getByLabel("Email").fill("tester@example.com");
+  await page.getByLabel("Password").fill("passpasspass");
+  await page.getByRole("button", { name: "Sign in" }).click();
+
+  // Home, not the attacker's origin. Polled, because the assertion would
+  // otherwise be satisfied by /login before the redirect even runs.
+  await expect.poll(() => new URL(page.url()).pathname).toBe("/");
+  expect(new URL(page.url()).host).toBe(new URL(baseUrl).host);
+
+  await context.close();
+});
