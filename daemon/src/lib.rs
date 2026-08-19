@@ -7,6 +7,7 @@
 
 pub mod browser_endorsement;
 pub mod host_pair_approval;
+pub mod sas;
 pub mod host_pair_possession;
 pub mod sessiond;
 pub mod signed_signal;

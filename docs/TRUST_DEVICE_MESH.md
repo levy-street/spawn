@@ -424,3 +424,78 @@ into shipped code and needs a product decision.
 - `Rev` delivery detail: full list vs. delta, and its authentication to the host
   (the host must accept `Rev` as subtract-only regardless of its authentication).
 - Re-anchoring triggers: eager on every passkey presence vs. periodic.
+
+---
+
+## Appendix A — The committed-ephemeral SAS (concrete protocol)
+
+This is the construction A5 requires: a 6-digit number a substituting server
+**cannot grind**. It is Bluetooth Secure Simple Pairing "Numeric Comparison" /
+MANA-III, adapted to our relay-mediated flow. Used at `possess` (host↔browser)
+and at `add-device` (browser↔browser); below is the host↔browser instance.
+
+### Values
+
+- `H` — the host identity public key (32 B), as *each endpoint sees it*.
+- `B` — the browser device public key (32 B), as *each endpoint sees it*.
+- `Nd`, `Nb` — fresh 32-byte random nonces from the daemon and browser.
+- All hashes are SHA-256; `‖` is concatenation of fixed-width fields.
+
+### Messages (relayed verbatim by the server; it may substitute, not forge)
+
+1. **Commit (daemon → browser):** the daemon sends `H` and
+   `Cd = SHA256("SPAWN-SAS-COMMIT-V1" ‖ H ‖ Nd)`. `Cd` *hides* `Nd`.
+2. **Reveal-B (browser → daemon):** the browser — having seen only `Cd` — sends
+   `B` and its nonce `Nb`.
+3. **Open-D (daemon → browser):** the daemon sends `Nd`. The browser checks
+   `Cd == SHA256("SPAWN-SAS-COMMIT-V1" ‖ H ‖ Nd)` and aborts on mismatch.
+
+Both endpoints then compute, using the `H`/`B` values *they* hold:
+
+```
+digest = SHA256("SPAWN-SAS-V1" ‖ H ‖ B ‖ Nd ‖ Nb)
+SAS    = ( u32_be(digest[0..4]) mod 1_000_000 )   ->  "NNN NNN"
+```
+
+The daemon prints `SAS`; the browser shows it; the human compares. On match the
+existing approval + possession proof proceed unchanged (they bind the pairing;
+the SAS authenticates the *keys* against substitution).
+
+### Why the server cannot grind (security argument)
+
+A MITM `S` plays *browser* toward the daemon and *daemon* toward the browser.
+
+- Toward the browser it must send `Cd'` in msg 1 — committing to *its* nonce
+  `Nd'` (and its substituted `H'`) **before** it sees `Nb` (msg 2).
+- Toward the daemon it must send `Nb'` in msg 2 — chosen **before** it learns
+  `Nd` (the daemon opens only in msg 3, and msg 1's `Cd` hid it).
+
+So the two SAS values `S` induces —
+`SAS_browser = f(H', B, Nd', Nb)` and `SAS_daemon = f(H, B', Nd, Nb')` — are each
+fixed by `S` **before** the opposing fresh nonce is revealed. `S` controls
+`H', B', Nd', Nb'` but not `Nd` or `Nb`, and commitment ordering forbids it from
+adapting `Nd'`/`Nb'` afterward. Under SHA-256-as-random-oracle the two numbers
+collide with probability `2⁻²⁰ ≈ 10⁻⁶` per one-shot ceremony — **not grindable**,
+because grinding requires choosing a substitute *after* seeing the target, which
+the commitment forbids. (Contrast the shipped code: no `Nd`/`Nb`, `SAS` a
+function of the long-lived `H` alone → `S` grinds a matching `H'` in ~`10⁶` work.)
+
+### Flow integration (relay-mediated, poll-based)
+
+The three moves layer onto the existing device-code exchange:
+`Cd` rides `device/start`; `Nb` rides the browser's pending/approve step; `Nd` is
+revealed to the browser via a poll/fetch before it displays the SAS. Exact wire
+fields are an implementation detail; the hash inputs above are normative.
+
+### Rollout & backward-compatibility (resolves R9)
+
+Both sides advertise SAS support. **If both support it → SAS mode** (sound 6
+digits). **If either is old → fall back to the full 96-bit fingerprint compare**,
+never to the grindable short code. The weak short code is thus never the
+comparison value in any version combination; mixed fleets degrade to the
+*stronger* check, not the weaker.
+
+### Test vectors
+
+Normative cross-implementation vectors (Rust `sas` module ⟷ web `sas.ts`) live
+with the code and are asserted in both; a drift there silently weakens the check.
