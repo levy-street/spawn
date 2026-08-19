@@ -230,9 +230,7 @@ async def _attempt_host_activation(
     active = await get_backend().get_ephemeral(host_presence_key(host_id))
     if active is not None:
         active_owner = decode_host_presence_owner(active)
-        if active_owner is None or (
-            active_owner.generation >= generation and active != value
-        ):
+        if active_owner is None or (active_owner.generation >= generation and active != value):
             return
     async with _bounded_host_ownership_session() as session:
         if not await _prepare_host_activation(
@@ -685,12 +683,16 @@ def _agent_owner_exists(conn: DaemonConn) -> Any:
 async def _redis_owner_is_current(conn: DaemonConn) -> bool:
     expected = _host_presence_value(conn)
     generation = conn.host_generation
-    return expected is not None and generation is not None and (
-        await get_backend().host_owner_is_current(
-            host_presence_key(conn.host_id),
-            host_pending_presence_key(conn.host_id),
-            expected,
-            generation=generation,
+    return (
+        expected is not None
+        and generation is not None
+        and (
+            await get_backend().host_owner_is_current(
+                host_presence_key(conn.host_id),
+                host_pending_presence_key(conn.host_id),
+                expected,
+                generation=generation,
+            )
         )
     )
 
@@ -802,6 +804,23 @@ async def _live_browser_device_ids(host_id: str) -> list[str]:
 
     async with _bounded_host_ownership_session() as session:
         return sorted(await _live_browser_device_id_set(session, host_id))
+
+
+async def _revoked_browser_keys(account_id: str) -> list[str]:
+    """Public keys of the account's revoked browser devices — the deny-list a
+    host subtracts from acceptance (device mesh §3). Account-scoped, not
+    host-scoped: a revoked device must be denied even where it would connect via
+    a chain to another host's anchor. Add-only in effect (a device is tombstoned,
+    never un-revoked), and the daemon can only reject with it, never admit."""
+
+    async with _bounded_host_ownership_session() as session:
+        rows = await session.execute(
+            select(BrowserDevice.public_key).where(
+                BrowserDevice.owner_user_id == account_id,
+                BrowserDevice.revoked_at.is_not(None),
+            )
+        )
+        return sorted(row[0] for row in rows)
 
 
 async def _bounded_send_text(target: Any, payload: dict[str, object]) -> None:
@@ -978,9 +997,7 @@ async def _process_host_rtc_signal(
                 frame_type == "rtc.close"
                 and isinstance(binding_nonce, str)
                 and signal.get("binding_generation") == generation
-                and await broker.rtc_binding_identity_is_retired(
-                    session_id, conn, binding_nonce
-                )
+                and await broker.rtc_binding_identity_is_retired(session_id, conn, binding_nonce)
             ):
                 await _bounded_send_text(conn, signal)
             return True
@@ -1343,6 +1360,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 "account_id": host.owner_user_id,
                                 "browser_device_ids": await _live_browser_device_ids(host.id),
                                 "browser_pins": await _live_browser_pins(host.id),
+                                "revoked_browser_keys": await _revoked_browser_keys(
+                                    host.owner_user_id
+                                ),
                             },
                         )
                         registered = True
@@ -1806,6 +1826,7 @@ async def _browser_pins_frame(host_id: str) -> dict[str, Any] | None:
         "account_id": owner_user_id,
         "browser_device_ids": await _live_browser_device_ids(host_id),
         "browser_pins": await _live_browser_pins(host_id),
+        "revoked_browser_keys": await _revoked_browser_keys(owner_user_id),
     }
 
 

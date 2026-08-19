@@ -206,6 +206,12 @@ pub enum Inbound {
         // every local pin to be dropped.
         #[serde(default)]
         browser_device_ids: Option<Vec<String>>,
+        /// Account deny-list (device mesh §3): wire keys of revoked devices this
+        /// host must subtract from acceptance, so a revoked device cannot connect
+        /// even through a chain to an anchor. Server-delivered, add-only for the
+        /// owner, subtract-only here; a wrong value can only DENY, never grant.
+        #[serde(default)]
+        revoked_browser_keys: Option<Vec<String>>,
     },
     /// Pushed when a host's browser pin set changes, so an endorsement takes
     /// effect without waiting for the daemon to reconnect.
@@ -217,6 +223,8 @@ pub enum Inbound {
         browser_pins: Option<Vec<InboundBrowserPin>>,
         #[serde(default)]
         browser_device_ids: Option<Vec<String>>,
+        #[serde(default)]
+        revoked_browser_keys: Option<Vec<String>>,
     },
     #[serde(rename = "host.heartbeat")]
     HostHeartbeat,
