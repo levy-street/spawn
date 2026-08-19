@@ -29,6 +29,17 @@ async function newPlatformPage(
   return { context, page };
 }
 
+/**
+ * Pick a host OS. The radio itself is `sr-only`, so its hit box sits under
+ * the label text — click the label, which is what a person does anyway.
+ */
+function selectOs(page: Page, name: RegExp) {
+  return page
+    .locator("label")
+    .filter({ has: page.getByRole("radio", { name }) })
+    .click();
+}
+
 async function expectNoHorizontalOverflow(page: Page) {
   const metrics = await page.evaluate(() => ({
     width: window.innerWidth,
@@ -274,6 +285,118 @@ test("a hostile next= is not honored", async ({ browser, baseURL }) => {
   // otherwise be satisfied by /login before the redirect even runs.
   await expect.poll(() => new URL(page.url()).pathname).toBe("/");
   expect(new URL(page.url()).host).toBe(new URL(baseUrl).host);
+
+  await context.close();
+});
+
+test("detection picks the default tab, and the reader can leave it", async ({ browser }) => {
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "MacIntel",
+    userAgent: MAC_USER_AGENT,
+  });
+
+  await page.goto("/download");
+  const panel = page.locator("section").first();
+
+  // Detected wins on arrival, and says so.
+  await expect(panel.getByRole("radio", { name: /macOS/u })).toBeChecked();
+  await expect(page.getByText("Detected browser OS")).toBeVisible();
+
+  // The host I want to possess is a Linux box. Switching swaps the heading,
+  // the service line, the prose and the notes.
+  await selectOs(page, /Linux/u);
+  await expect(panel.getByRole("heading", { name: "Linux" })).toBeVisible();
+  await expect(page.getByText("systemd user service: spawnd.service")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Install on this Linux host" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Remote hosts" })).toBeVisible();
+  await expect(page.getByText("LaunchAgent: app.spawn.spawnd")).toHaveCount(0);
+
+  // And it still tells you what it detected, so the nicety is not lost.
+  await expect(page.getByText("Showing Linux · detected macOS")).toBeVisible();
+  await expect(panel.getByRole("radio", { name: /macOS/u })).not.toBeChecked();
+
+  await selectOs(page, /macOS/u);
+  await expect(panel.getByRole("heading", { name: "macOS" })).toBeVisible();
+  await expect(page.getByText("Detected browser OS")).toBeVisible();
+
+  await context.close();
+});
+
+test("the Windows tab is reachable and honest from any browser", async ({ browser }) => {
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "MacIntel",
+    userAgent: MAC_USER_AGENT,
+  });
+
+  await page.goto("/download");
+  await selectOs(page, /Windows/u);
+
+  await expect(
+    page.locator("section").first().getByRole("heading", { name: "Windows" }),
+  ).toBeVisible();
+  await expect(page.getByText("no native Windows daemon build")).toBeVisible();
+  await expect(page.getByText("Windows service support is not available yet.")).toBeVisible();
+  // Reachable and explanatory, pointing at WSL2 rather than dead-ending.
+  await expect(page.getByRole("heading", { name: "WSL2 is the way in" })).toBeVisible();
+  await expect(
+    page.getByText("Use this command from a supported macOS or Linux terminal"),
+  ).toBeVisible();
+
+  await context.close();
+});
+
+test("the OS selector is a keyboard-navigable radio group", async ({ browser }) => {
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "MacIntel",
+    userAgent: MAC_USER_AGENT,
+  });
+
+  await page.goto("/download");
+  await page.getByRole("radio", { name: /macOS/u }).focus();
+  // Arrow keys inside a radiogroup — free from the fieldset pattern.
+  await page.keyboard.press("ArrowRight");
+  await expect(page.getByRole("radio", { name: /Linux/u })).toBeChecked();
+  await expect(
+    page.locator("section").first().getByRole("heading", { name: "Linux" }),
+  ).toBeVisible();
+  await page.keyboard.press("ArrowRight");
+  await expect(page.getByRole("radio", { name: /Windows/u })).toBeChecked();
+
+  await context.close();
+});
+
+test("an unknown OS preselects nothing and still explains itself", async ({ browser }) => {
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "FreeBSD amd64",
+    userAgent: UNKNOWN_USER_AGENT,
+  });
+
+  await page.goto("/download");
+
+  // Nothing is claimed that is not known — but every tab is one click away.
+  for (const name of [/macOS/u, /Linux/u, /Windows/u]) {
+    await expect(page.getByRole("radio", { name })).not.toBeChecked();
+  }
+  await expect(page.getByText("will detect the actual host when it runs")).toBeVisible();
+
+  await selectOs(page, /Linux/u);
+  await expect(page.getByRole("heading", { name: "Install on this Linux host" })).toBeVisible();
+
+  await context.close();
+});
+
+test("switching tabs does not overflow on mobile", async ({ browser }) => {
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "MacIntel",
+    userAgent: MAC_USER_AGENT,
+    viewport: { width: 390, height: 844 },
+  });
+
+  await page.goto("/download");
+  for (const name of [/Linux/u, /Windows/u, /macOS/u]) {
+    await selectOs(page, name);
+    await expectNoHorizontalOverflow(page);
+  }
 
   await context.close();
 });

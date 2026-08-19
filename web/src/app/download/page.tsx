@@ -19,8 +19,14 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 
 type DetectedPlatform = "macos" | "linux" | "windows" | "unknown";
+
+/** The three a person can choose. "unknown" is a detection outcome, not a choice. */
+const SELECTABLE: Array<Exclude<DetectedPlatform, "unknown">> = ["macos", "linux", "windows"];
+
+type PlatformNote = { icon: ReactNode; title: string; body: string };
 
 const PLATFORM_COPY: Record<
   DetectedPlatform,
@@ -30,6 +36,8 @@ const PLATFORM_COPY: Record<
     recommendation: string;
     service: string;
     status: "supported" | "unsupported" | "unknown";
+    /** Replaces the old fixed macOS/Linux/Remote trio, which was the same on every OS. */
+    notes: PlatformNote[];
   }
 > = {
   macos: {
@@ -39,6 +47,18 @@ const PLATFORM_COPY: Record<
       "Run the installer in Terminal. It downloads the macOS daemon build and starts a LaunchAgent after login.",
     service: "LaunchAgent: app.spawn.spawnd",
     status: "supported",
+    notes: [
+      {
+        icon: <Apple className="size-5" />,
+        title: "Apple Silicon and Intel",
+        body: "Downloads the matching Darwin build, then starts a LaunchAgent that comes back after a reboot.",
+      },
+      {
+        icon: <MonitorCog className="size-5" />,
+        title: "Another Mac",
+        body: "SSH into the Mac that should run agents and run the same line there — the installer resolves the host it lands on.",
+      },
+    ],
   },
   linux: {
     label: "Linux",
@@ -47,14 +67,48 @@ const PLATFORM_COPY: Record<
       "Run the installer in a shell on the Linux machine. It downloads the Linux daemon build and starts a user systemd service when available.",
     service: "systemd user service: spawnd.service",
     status: "supported",
+    notes: [
+      {
+        icon: <Server className="size-5" />,
+        title: "x86_64 and arm64",
+        body: "Downloads the matching Linux build, then starts a user systemd service when one is available.",
+      },
+      {
+        icon: <MonitorCog className="size-5" />,
+        title: "Remote hosts",
+        body: "SSH into the box that should run agents — a dev box, a GPU host — then run the same command there.",
+      },
+      {
+        icon: <Terminal className="size-5" />,
+        title: "Headless boxes",
+        body: "Nothing here needs a display: the installer prints an approval link you open from any browser.",
+      },
+    ],
   },
   windows: {
     label: "Windows",
     title: "Use a macOS or Linux host",
     recommendation:
-      "The daemon does not ship a Windows build yet. Install spawn from a Mac, Linux workstation, or Linux server.",
+      "There is no native Windows daemon build yet. Run the installer inside WSL2, or from a Mac, Linux workstation, or Linux server.",
     service: "Windows service support is not available yet.",
     status: "unsupported",
+    notes: [
+      {
+        icon: <MonitorCog className="size-5" />,
+        title: "WSL2 is the way in",
+        body: "A WSL2 distro is a Linux host as far as spawn is concerned: open its shell and run the Linux command above.",
+      },
+      {
+        icon: <Server className="size-5" />,
+        title: "Or possess a Linux box",
+        body: "SSH into a Linux machine and install there. Then drive it from this Windows browser like any other host.",
+      },
+      {
+        icon: <AlertTriangle className="size-5" />,
+        title: "No native service yet",
+        body: "There is no Windows service to register, so nothing runs outside WSL2 or the remote host you chose.",
+      },
+    ],
   },
   unknown: {
     label: "Unknown OS",
@@ -63,43 +117,48 @@ const PLATFORM_COPY: Record<
       "The browser could not identify this OS. The installer supports macOS and Linux, and will detect the actual host when it runs.",
     service: "macOS LaunchAgent or Linux user systemd, depending on the host.",
     status: "unknown",
+    notes: [
+      {
+        icon: <Apple className="size-5" />,
+        title: "macOS",
+        body: "Downloads a Darwin build for Apple Silicon or Intel, then starts a LaunchAgent.",
+      },
+      {
+        icon: <Server className="size-5" />,
+        title: "Linux",
+        body: "Downloads an x86_64 or arm64 build, then starts user systemd when available.",
+      },
+      {
+        icon: <MonitorCog className="size-5" />,
+        title: "Remote hosts",
+        body: "SSH into the machine that should run agents, then run the same command there.",
+      },
+    ],
   },
 };
 
-const OPTIONS = [
-  {
-    icon: <Apple className="size-5" />,
-    title: "macOS",
-    body: "Downloads a Darwin build for Apple Silicon or Intel, then starts a LaunchAgent.",
-  },
-  {
-    icon: <Server className="size-5" />,
-    title: "Linux",
-    body: "Downloads an x86_64 or arm64 Linux build, then starts user systemd when available.",
-  },
-  {
-    icon: <MonitorCog className="size-5" />,
-    title: "Remote hosts",
-    body: "SSH into the machine that should run agents, then run the same command there.",
-  },
-];
-
 export default function DownloadPage() {
   const [origin, setOrigin] = useState("https://spawnd.dev");
-  const [platform, setPlatform] = useState<DetectedPlatform>("unknown");
+  // What the browser reports, and what the reader chose. Detection picks the
+  // default; it does not get to be the only answer. The host you want to
+  // possess is frequently not the machine you are reading this on.
+  const [detectedPlatform, setDetectedPlatform] = useState<DetectedPlatform>("unknown");
+  const [chosenPlatform, setChosenPlatform] = useState<DetectedPlatform | null>(null);
   const [copied, setCopied] = useState(false);
   const [canCopy, setCanCopy] = useState(false);
 
   useEffect(() => {
     setOrigin(window.location.origin);
-    setPlatform(detectPlatform());
+    setDetectedPlatform(detectPlatform());
     setCanCopy(Boolean(navigator.clipboard));
   }, []);
 
+  const platform = chosenPlatform ?? detectedPlatform;
   const command = `curl -fsSL ${origin}/install.sh | sh`;
   const prebuiltCommand = `curl -fsSL ${origin}/install.sh | sh -s -- --prebuilt-only`;
-  const detected = PLATFORM_COPY[platform];
-  const supported = detected.status === "supported";
+  const active = PLATFORM_COPY[platform];
+  const supported = active.status === "supported";
+  const showingDetected = platform === detectedPlatform;
 
   const copyCommand = async () => {
     await navigator.clipboard?.writeText(command);
@@ -110,10 +169,10 @@ export default function DownloadPage() {
   const statusIcon = useMemo(() => {
     if (supported)
       return <CheckCircle2 className="size-5 text-emerald-600 dark:text-emerald-300" />;
-    if (detected.status === "unsupported")
+    if (active.status === "unsupported")
       return <AlertTriangle className="size-5 text-amber-600 dark:text-amber-300" />;
     return <Laptop className="size-5 text-sky-600 dark:text-sky-300" />;
-  }, [detected.status, supported]);
+  }, [active.status, supported]);
 
   return (
     <main className="min-h-vv bg-brand-bg text-foreground">
@@ -148,15 +207,62 @@ export default function DownloadPage() {
           </div>
 
           <div className="rounded-md border border-brand-hairline bg-brand-panel/60 p-4 sm:p-5">
-            <div className="flex items-start gap-3">
+            {/* Real radios in a fieldset, as in Settings -> Appearance: arrow-key
+                navigation, form semantics and screen-reader grouping all come
+                free, and the input is only hidden visually. */}
+            <fieldset>
+              <legend className="text-sm text-muted-foreground">Host OS</legend>
+              <div className="mt-2 grid grid-cols-3 gap-2">
+                {SELECTABLE.map((option) => {
+                  const copy = PLATFORM_COPY[option];
+                  const selected = platform === option;
+                  return (
+                    <label
+                      key={option}
+                      className={cn(
+                        "flex cursor-pointer flex-col items-center gap-1 rounded-md border px-2 py-2 text-center transition-colors",
+                        "focus-within:ring-2 focus-within:ring-ring",
+                        selected
+                          ? "border-ring bg-brand-panel text-foreground"
+                          : "border-brand-hairline text-muted-foreground hover:bg-brand-panel/60 hover:text-foreground",
+                      )}
+                    >
+                      <input
+                        type="radio"
+                        name="spawn-host-os"
+                        value={option}
+                        checked={selected}
+                        onChange={() => setChosenPlatform(option)}
+                        className="sr-only"
+                      />
+                      <span className="text-sm font-medium">{copy.label}</span>
+                      <span
+                        className={cn(
+                          "text-[10px] uppercase tracking-wide",
+                          option === detectedPlatform
+                            ? "text-sky-600 dark:text-sky-300"
+                            : "invisible",
+                        )}
+                      >
+                        detected
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            </fieldset>
+
+            <div className="mt-4 flex items-start gap-3 border-t border-brand-hairline pt-4">
               <div className="mt-1">{statusIcon}</div>
               <div>
-                <p className="text-sm text-muted-foreground">Detected browser OS</p>
-                <h2 className="mt-1 text-2xl font-semibold">{detected.label}</h2>
-                <p className="mt-3 text-sm leading-6 text-foreground/85">
-                  {detected.recommendation}
+                <p className="text-sm text-muted-foreground">
+                  {showingDetected
+                    ? "Detected browser OS"
+                    : `Showing ${active.label} · detected ${PLATFORM_COPY[detectedPlatform].label}`}
                 </p>
-                <p className="mt-3 text-sm text-muted-foreground">{detected.service}</p>
+                <h2 className="mt-1 text-2xl font-semibold">{active.label}</h2>
+                <p className="mt-3 text-sm leading-6 text-foreground/85">{active.recommendation}</p>
+                <p className="mt-3 text-sm text-muted-foreground">{active.service}</p>
               </div>
             </div>
           </div>
@@ -174,7 +280,7 @@ export default function DownloadPage() {
             <Step
               n={1}
               icon={<Terminal className="size-5" />}
-              title={detected.title}
+              title={active.title}
               blurb="Run this in the host terminal."
             >
               <div className="mt-5 rounded-md border border-brand-hairline bg-brand-well p-3 font-mono text-sm text-foreground">
@@ -237,10 +343,13 @@ export default function DownloadPage() {
             </Step>
           </ol>
 
+          {/* Per-OS, so the cards say something the selected tab does not
+              already say. They used to be a fixed macOS/Linux/Remote trio that
+              looked like a chooser and was not one. */}
           <div className="mt-6 grid gap-3 sm:grid-cols-3">
-            {OPTIONS.map((option) => (
-              <InstallOption key={option.title} icon={option.icon} title={option.title}>
-                {option.body}
+            {active.notes.map((note) => (
+              <InstallOption key={note.title} icon={note.icon} title={note.title}>
+                {note.body}
               </InstallOption>
             ))}
           </div>
