@@ -29,7 +29,7 @@
 //! admit a key reachable through a carried chain instead; that wiring is the next
 //! step, held for review.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use thiserror::Error;
@@ -113,6 +113,8 @@ pub enum ChainError {
     Cycle,
     #[error("a key on the chain has been revoked")]
     Revoked,
+    #[error("no valid endorsement chain reaches an anchor from the connecting key")]
+    NoValidChain,
 }
 
 /// Validate that `connecting_key` (whose possession was already proven by the
@@ -215,6 +217,109 @@ pub fn validate_chain(
     }
 
     Ok(())
+}
+
+/// Decide admission from an *unordered set* of endorsement edges (what a device
+/// carries and presents on connect): is there **some** valid, unrevoked, simple
+/// endorsement path from one of the host's `anchors` to `connecting_key`, within
+/// `max_edges`?
+///
+/// The device does not know which of its keys are a given host's anchors, so it
+/// presents its whole account edge-set and the host searches. This is the
+/// admission entry point for the connect path; `validate_chain` is the check for
+/// a single pre-ordered chain and this composes the same per-edge rules over a
+/// graph search. Only edges whose signature verifies against their own named
+/// endorser, are scoped to `account_id`, and touch no revoked key become graph
+/// edges — so a forged or foreign or revoked edge can never be part of a path.
+pub fn find_valid_chain(
+    account_id: &[u8; UUID_BYTES],
+    anchors: &[VerifyingKey],
+    revoked: &RevocationSet,
+    connecting_key: &VerifyingKey,
+    edges: &[ChainEdge],
+    max_edges: usize,
+) -> Result<(), ChainError> {
+    let target = connecting_key.to_bytes();
+    if revoked.contains(&target) {
+        return Err(ChainError::Revoked);
+    }
+    // Length-0: the connecting device is itself an anchor.
+    if anchors.iter().any(|anchor| anchor.to_bytes() == target) {
+        return Ok(());
+    }
+
+    // Directed adjacency (endorser → endorsed) over edges that individually pass
+    // every non-structural rule. Verifying here means a graph edge is always a
+    // genuine, in-account, unrevoked endorsement; the search only has to find a
+    // path to an anchor and keep it simple and bounded.
+    let mut adjacency: HashMap<[u8; PUBLIC_KEY_BYTES], Vec<[u8; PUBLIC_KEY_BYTES]>> =
+        HashMap::new();
+    for edge in edges {
+        if &edge.transcript.account_id != account_id {
+            continue;
+        }
+        let endorser = edge.transcript.endorser_public_key;
+        let endorsed = edge.transcript.endorsed_public_key;
+        if revoked.contains(&endorser) || revoked.contains(&endorsed) {
+            continue;
+        }
+        let Ok(endorser_key) = VerifyingKey::from_bytes(&endorser) else {
+            continue;
+        };
+        if verify_endorsement(
+            &edge.transcript,
+            &edge.signature,
+            std::slice::from_ref(&endorser_key),
+        )
+        .is_err()
+        {
+            continue;
+        }
+        adjacency.entry(endorser).or_default().push(endorsed);
+    }
+
+    // Depth-first from each unrevoked anchor toward the connecting key. The graph
+    // is tiny (account devices) and depth is capped at `max_edges`, so this is
+    // cheap; `visited` keeps the path simple (no laundering through a cycle).
+    for anchor in anchors {
+        let start = anchor.to_bytes();
+        if revoked.contains(&start) {
+            continue;
+        }
+        let mut visited: HashSet<[u8; PUBLIC_KEY_BYTES]> = HashSet::new();
+        visited.insert(start);
+        if reaches(&adjacency, start, &target, &mut visited, max_edges) {
+            return Ok(());
+        }
+    }
+    Err(ChainError::NoValidChain)
+}
+
+/// Whether `target` is reachable from `node` in `remaining` edges along a simple
+/// path (no vertex repeated). `visited` holds the current path's vertices.
+fn reaches(
+    adjacency: &HashMap<[u8; PUBLIC_KEY_BYTES], Vec<[u8; PUBLIC_KEY_BYTES]>>,
+    node: [u8; PUBLIC_KEY_BYTES],
+    target: &[u8; PUBLIC_KEY_BYTES],
+    visited: &mut HashSet<[u8; PUBLIC_KEY_BYTES]>,
+    remaining: usize,
+) -> bool {
+    if &node == target {
+        return true;
+    }
+    if remaining == 0 {
+        return false;
+    }
+    for &next in adjacency.get(&node).into_iter().flatten() {
+        if !visited.insert(next) {
+            continue; // already on this path — keep it simple
+        }
+        if reaches(adjacency, next, target, visited, remaining - 1) {
+            return true;
+        }
+        visited.remove(&next);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -528,5 +633,139 @@ mod tests {
         assert!(!revoked.insert(k));
         assert!(revoked.contains(&k));
         assert_eq!(revoked.len(), 1);
+    }
+
+    // ---- find_valid_chain: admission from an unordered presented edge-set ----
+
+    fn find(
+        anchors: &[SigningKey],
+        revoked: &RevocationSet,
+        connecting: &SigningKey,
+        edges: &[ChainEdge],
+    ) -> Result<(), ChainError> {
+        let anchor_keys: Vec<_> = anchors.iter().map(SigningKey::verifying_key).collect();
+        find_valid_chain(
+            &account_bytes(USER),
+            &anchor_keys,
+            revoked,
+            &connecting.verifying_key(),
+            edges,
+            DEFAULT_MAX_CHAIN_EDGES,
+        )
+    }
+
+    #[test]
+    fn a_connecting_anchor_needs_no_edges() {
+        let device = key(1);
+        find(&[device.clone()], &RevocationSet::new(), &device, &[]).expect("anchor admitted");
+    }
+
+    #[test]
+    fn a_path_is_found_among_unrelated_edges() {
+        // Graph: A(anchor) → B → D, plus noise edges B→C and E→F. Target D.
+        let (a, b, c, d, e, f) = (key(1), key(2), key(3), key(4), key(5), key(6));
+        let edges = [
+            edge(USER, &b, &c, DEVICES[0]),
+            edge(USER, &a, &b, DEVICES[1]),
+            edge(USER, &e, &f, DEVICES[2]),
+            edge(USER, &b, &d, DEVICES[3]),
+        ];
+        find(&[a], &RevocationSet::new(), &d, &edges).expect("A→B→D found among noise");
+    }
+
+    #[test]
+    fn an_unreachable_device_is_refused() {
+        let (a, b, stranger) = (key(1), key(2), key(9));
+        let edges = [edge(USER, &a, &b, DEVICES[0])];
+        assert_eq!(
+            find(&[a], &RevocationSet::new(), &stranger, &edges),
+            Err(ChainError::NoValidChain)
+        );
+    }
+
+    #[test]
+    fn a_forged_edge_never_forms_a_path() {
+        // A "B→D" edge signed by an impostor must not connect D to the anchor.
+        let (a, b, d, impostor) = (key(1), key(2), key(4), key(7));
+        let good = edge(USER, &a, &b, DEVICES[0]);
+        let forged_transcript =
+            AcctEndorsementTranscript::from_wire(USER, &wire(&b), &wire(&d), DEVICES[1]).unwrap();
+        let forged = ChainEdge {
+            signature: sign_transcript(&impostor, &forged_transcript),
+            transcript: forged_transcript,
+        };
+        assert_eq!(
+            find(&[a], &RevocationSet::new(), &d, &[good, forged]),
+            Err(ChainError::NoValidChain)
+        );
+    }
+
+    #[test]
+    fn a_revoked_intermediate_breaks_the_only_path() {
+        // A → B → D, but B is revoked: the only path is severed.
+        let (a, b, d) = (key(1), key(2), key(4));
+        let edges = [
+            edge(USER, &a, &b, DEVICES[0]),
+            edge(USER, &b, &d, DEVICES[1]),
+        ];
+        let revoked = RevocationSet::from_keys([b.verifying_key().to_bytes()]);
+        assert_eq!(
+            find(&[a], &revoked, &d, &edges),
+            Err(ChainError::NoValidChain)
+        );
+    }
+
+    #[test]
+    fn a_revoked_connecting_key_is_refused_outright() {
+        let (a, d) = (key(1), key(4));
+        let edges = [edge(USER, &a, &d, DEVICES[0])];
+        let revoked = RevocationSet::from_keys([d.verifying_key().to_bytes()]);
+        assert_eq!(find(&[a], &revoked, &d, &edges), Err(ChainError::Revoked));
+    }
+
+    #[test]
+    fn a_foreign_account_edge_is_ignored() {
+        let (a, d) = (key(1), key(4));
+        let edges = [edge(OTHER_USER, &a, &d, DEVICES[0])];
+        assert_eq!(
+            find(&[a], &RevocationSet::new(), &d, &edges),
+            Err(ChainError::NoValidChain)
+        );
+    }
+
+    #[test]
+    fn a_path_longer_than_the_bound_is_refused() {
+        let (a, b, c, d) = (key(1), key(2), key(3), key(4));
+        let edges = [
+            edge(USER, &a, &b, DEVICES[0]),
+            edge(USER, &b, &c, DEVICES[1]),
+            edge(USER, &c, &d, DEVICES[2]),
+        ];
+        let anchors = [a.verifying_key()];
+        assert_eq!(
+            find_valid_chain(
+                &account_bytes(USER),
+                &anchors,
+                &RevocationSet::new(),
+                &d.verifying_key(),
+                &edges,
+                2, // A→B→C→D needs 3 edges
+            ),
+            Err(ChainError::NoValidChain)
+        );
+    }
+
+    #[test]
+    fn mutual_edges_do_not_loop_forever_and_still_admit() {
+        // A↔B (both directions) present; target B reachable via A→B. The reverse
+        // edge B→A and a dead-end cycle must not hang the search.
+        let (a, b, c) = (key(1), key(2), key(3));
+        let edges = [
+            edge(USER, &a, &b, DEVICES[0]),
+            edge(USER, &b, &a, DEVICES[1]),
+            edge(USER, &b, &c, DEVICES[2]),
+            edge(USER, &c, &b, DEVICES[3]),
+        ];
+        find(&[a], &RevocationSet::new(), &b, &edges).expect("A→B admits B despite cycles");
     }
 }
