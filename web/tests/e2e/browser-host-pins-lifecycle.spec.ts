@@ -130,11 +130,8 @@ async function approveExactHost(page: Page): Promise<void> {
   await page.goto("/device");
   await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
   await page.getByRole("button", { name: "Look up host" }).click();
-  await page
-    .getByRole("button", {
-      name: /Fingerprint matches — approve|Approve this host again|Retry server approval/u,
-    })
-    .click();
+  // Exact match: "Approving…" is the same button mid-flight.
+  await page.getByRole("button", { name: /^(?:Approve|Retry server approval)$/u }).click();
   await expect(page.getByRole("status")).toContainText("is connected");
 }
 
@@ -414,8 +411,11 @@ test("server delete failure retains tombstone across disappearance, reload, retr
   await page.goto("/device");
   await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
   await page.getByRole("button", { name: "Look up host" }).click();
-  await expect(page.getByTestId("local-pin-state")).toContainText("deletion tombstone");
-  await page.getByRole("button", { name: "Approve this host again" }).click();
+  // Still the tombstone warning, in the approval page's current wording.
+  await expect(page.getByTestId("local-pin-state")).toContainText(
+    "You previously removed this key from this browser",
+  );
+  await page.getByRole("button", { name: /^(?:Approve|Retry server approval)$/u }).click();
   await expect(page.getByRole("status")).toContainText("is connected");
   expect(await readHostPins(page)).toMatchObject([
     { hostIds: [HOST_ID], hostPublicKey: HOST_PUBLIC_KEY, state: "active" },
