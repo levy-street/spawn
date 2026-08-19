@@ -56,6 +56,7 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
         LoginArgs {
             host_name: args.host_name,
             no_run: true,
+            no_browser: args.no_browser,
         },
     )
     .await
@@ -106,6 +107,7 @@ async fn possess_dir(
             LoginArgs {
                 host_name: args.host_name,
                 no_run: true,
+                no_browser: args.no_browser,
             },
         )
         .await

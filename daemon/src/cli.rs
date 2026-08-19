@@ -51,6 +51,11 @@ pub struct PossessArgs {
     /// hostname).
     #[arg(long)]
     pub host_name: Option<String>,
+
+    /// Print the approval link instead of opening a browser. Also honored as
+    /// SPAWN_NO_BROWSER=1, which is the only way through `curl … | sh`.
+    #[arg(long, env = "SPAWN_NO_BROWSER")]
+    pub no_browser: bool,
 }
 
 #[derive(Debug, Args)]
@@ -70,6 +75,11 @@ pub struct LoginArgs {
     /// Just store the token; don't transition to `run` after login succeeds.
     #[arg(long)]
     pub no_run: bool,
+
+    /// Print the approval link instead of opening a browser. Also honored as
+    /// SPAWN_NO_BROWSER=1, which is the only way through `curl … | sh`.
+    #[arg(long, env = "SPAWN_NO_BROWSER")]
+    pub no_browser: bool,
 }
 
 #[derive(Debug, Args)]

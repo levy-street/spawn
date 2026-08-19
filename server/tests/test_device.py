@@ -2092,3 +2092,58 @@ async def test_revoking_the_browser_clears_the_retained_approval_proof(client):
         assert row is not None
         assert row.browser_device_id is None
         assert row.browser_approval_signature is None
+
+
+async def test_device_start_returns_a_link_handle_distinct_from_the_typed_code(client):
+    """The link the daemon prints must not carry the hand-typable code.
+
+    RFC 8628 §3.3.1 permits embedding `user_code` in the URI and calls out the
+    usability-versus-phishing tradeoff. `approval_ref` sidesteps it: the short
+    code stays something a person reads off their own terminal, and the link
+    carries an opaque per-ceremony handle instead.
+    """
+
+    start = await _start(client, _public_key(1))
+
+    assert start["verification_uri"].endswith("/device")
+    assert start["approval_ref"]
+    assert start["approval_ref"] != start["user_code"]
+    assert start["approval_ref"] != start["device_code"]
+    # Long enough that guessing it is not a strategy.
+    assert len(start["approval_ref"]) >= 32
+    # And the short code keeps its human-readable shape.
+    assert len(start["user_code"]) == 9 and start["user_code"][4] == "-"
+
+    # Two ceremonies never share a handle.
+    other = await _start(client, _public_key(2))
+    assert other["approval_ref"] != start["approval_ref"]
+
+
+async def test_pending_accepts_either_identifier_and_refuses_a_bogus_one(client):
+    """A link and a typed code name the same ceremony; neither approves it."""
+
+    await _signup(client, "device-ref@example.com")
+    start = await _start(client, _public_key(1))
+
+    by_ref = await client.post(
+        "/api/auth/device/pending", json={"approval_ref": start["approval_ref"]}
+    )
+    assert by_ref.status_code == 200, by_ref.text
+    by_code = await client.post("/api/auth/device/pending", json={"user_code": start["user_code"]})
+    assert by_code.status_code == 200, by_code.text
+    assert by_ref.json() == by_code.json()
+
+    # Reviewing is not approving: the ceremony is still pending either way.
+    async with get_sessionmaker()() as session:
+        row = (
+            await session.execute(
+                select(DeviceCode).where(DeviceCode.user_code == start["user_code"])
+            )
+        ).scalar_one()
+        assert row.status == "pending"
+
+    # A stale or invented handle degrades to an error the page can show, not
+    # to some other host's ceremony.
+    for bogus in ({"approval_ref": "not-a-real-ref"}, {"user_code": "ZZZZ-ZZZZ"}):
+        response = await client.post("/api/auth/device/pending", json=bogus)
+        assert response.status_code in (400, 404), response.text
