@@ -163,6 +163,23 @@ revocation blast radius to zero** — Proof of P3′ depends on it.
   no session may be established through any path that skips server signaling
   (LAN/mDNS direct, cached/pre-issued offers, a future "local mode"). This must
   be *enforced*; P3 is false the moment any such bypass exists. See **R3**.
+- **A7 — signed-RTC enforcement is on** (`SPAWND_REQUIRE_SIGNED_RTC ≠ 0`, the
+  built default; prod pins it via a drop-in). A daemon refuses an unsigned RTC
+  offer; with the escape hatch set, it accepts raw first-contact and **P5 below
+  is false at its first step**. Load-bearing — treat any path that weakens it as
+  A6 treats a signaling bypass. *(Code-verified 2026-08-19; see **R12**.)*
+
+*Verification status (2026-08-19): A2 and the P5 enforcement path were audited in
+code by two subagents that cross-reviewed each other — A2 holds for both the
+browser key `sk_B` (non-extractable, `web/src/lib/signed-signal.ts`) and the host
+seed `sk_H` (`daemon/src/creds.rs`); only signatures + public keys ever leave.
+Defense-in-depth notes (not A2 violations): the host seed is stored plaintext at
+rest in the headless 0600-file fallback (keyring elsewhere) and is not `mlock`ed.
+`StoredCreds` derives `Serialize` and the seed IS serialized — but only to local
+at-rest stores (keyring/file), never a network body; the outbound file projection
+already strips it (`file_creds_without_private_seed`). The safe future-proofing is
+that projection/wrapper pattern — **not** `#[serde(skip)]`, which would break
+keyring persistence and lose the host identity across restarts.*
 
 ---
 
@@ -300,6 +317,72 @@ no further human action. Healing and re-anchoring are machine operations
 authorized by the passkey (a consent tap, not a per-host comparison). Human cost
 is therefore 1, independent of |H|. ∎
 
+### P5 — Authentication soundness (proof-of-possession admission)
+
+*Code-verified against the shipped enforcement path (2026-08-19), cross-reviewed
+by two independent subagents. This theorem is about the **connect** step; it is
+what makes "public keys are safe for the server to see" a proven property, not an
+assertion.*
+
+> **Theorem.** Under A1, A2, and **A7** (signed-RTC enforcement on), a party
+> completes a data-plane (WebRTC) connection to host `h` only by proving
+> possession of a private key `sk` whose public key `pk` is pinned by `h` — where
+> `pk` is an anchor of `h` or was admitted by an endorsement signed by a key `h`
+> already pins. Consequently a party holding only *public* keys — in particular
+> the relay/signaling server — **cannot connect to `h` as a trusted client**,
+> except by the same `≤ 10⁻ᵏ`-per-attempt SAS substitution already bounded in P2.
+
+**Proof.** Let party `P` complete a connection to `h`.
+
+*Every accepted offer carries a signature over the connection's own key material.*
+Under A7 `h` refuses an unsigned offer outright (and refuses a mixed signed+raw
+offer before reading either), building an answer only through the signed path. So
+`P`'s offer was an envelope carrying an Ed25519 signature `σ` over a transcript
+`T` that **includes the offer SDP** — hence the browser's fresh per-connection
+DTLS fingerprint `F` — and names `h` as intended peer, bound to the session id.
+
+*`h` accepts only if `σ` verifies (`verify_strict`) against a key `h` has pinned.*
+`h` checks `σ` against its own host key (as intended peer) and against each key in
+its pinned browser set, accepting on the first `pk` that verifies, else rejecting.
+The verify is strict and keys are canonicality/small-order-checked, so A1's
+EUF-CMA guarantee is realized, not voided by a malleable encoding. By A1+A2 the
+server holds no `sk` and cannot forge `σ` for a `pk` it does not possess; so
+acceptance implies `σ` was produced by the holder of `sk` for a pinned `pk`.
+
+*A pinned `pk` is anchored or validly endorsed — the server cannot inject one.* A
+key enters `h`'s pinned set only via (i) an operator-approved pairing whose
+browser signature `h` verifies (an **anchor**, human-gated per §3/§4), or (ii)
+endorsement adoption, which verifies the endorsement against a key **already in
+`h`'s pinned set**, snapshotting the trusted set *before* the pass so a key
+admitted this pass cannot bootstrap another within it. This is P2 applied to the
+connect step. *(Scope note: the shipped enforcement is **single-hop, per-host** —
+the endorser must itself be directly pinned on this host. The account-scoped,
+multi-hop carried chain of §3 is the target model and future work per §8; the
+theorem holds for both, with "validly chained" read as chain-length-1 for shipped
+code — which is strictly safer, no multi-hop laundering.)*
+
+*Possession of `sk` alone can't hijack — the channel binds to the media key.*
+Because `σ` covers the SDP, `F` is authenticated under `pk`, and `P` completes the
+connection only by finishing the DTLS handshake with the private key whose
+fingerprint is `F`. A party that merely **replays** a captured envelope (the
+server) cannot: it lacks that ephemeral media key, and substituting its own
+fingerprint breaks `σ`. So the identity signature and the DTLS handshake are one
+**channel-bound** proof-of-possession, from `pk` down to the live media key.
+
+Combining: `P` connected ⇒ `h` accepted `σ` under a pinned `pk` (anchored or
+validly endorsed) ⇒ `P` held `sk` **and** the bound media key. A party with only
+public keys satisfies neither. The sole residual is substituting a key *during*
+the anchor/endorsement ceremony, bounded by A5's committed SAS to `≤ 10⁻ᵏ`
+per one-shot attempt (P2). ∎
+
+**What this made explicit.** (1) **A7 is load-bearing** — with enforcement off,
+`h` accepts a raw unsigned offer and this theorem fails at step 1; the
+browser-side pin gate does not stop a server opening its own unsigned session.
+(2) **The "fresh challenge" of §3 clause 1 is realized as channel-binding, not a
+host-issued nonce** — freshness/anti-replay rests on WebRTC minting a fresh
+ephemeral DTLS key per connection and on `σ` covering the session id + intended
+peer (which blocks cross-session/cross-host splicing), not on a nonce `h` picks.
+
 ---
 
 ## 7. What is *not* proven / out of scope
@@ -412,9 +495,21 @@ un-revoking.
 endorsements, so it learns device topology (who endorsed whom). Consistent with
 TRUST.md's metadata stance; noted so it is not mistaken for a leak of content.
 
+**R12 — Host-side proof-of-possession is enforcement-gated (A7).** P5 holds only
+while `SPAWND_REQUIRE_SIGNED_RTC ≠ 0`. It is the built default and prod pins it
+on, but with the escape hatch set a daemon accepts a raw unsigned offer and a
+server can open its own unsigned session — the browser-side pin gate does not stop
+that. **Resolution:** A7 is a stated premise of P5; treat any future path that
+weakens enforcement as A6 treats a signaling bypass. *(Code-verified 2026-08-19;
+also fixed a stale "off by default" comment in daemon/src/run.rs.)*
+
 **Verdict.** The core claim — *the server can slam doors, never open them* —
-survives. With R1–R3 folded in, P1–P4 hold under §5. R2 is the one that reaches
-into shipped code and needs a product decision.
+survives, and now with code-level backing: A2 (private keys never leave) and P5
+(connection requires proof-of-possession of a pinned key) were audited in the
+shipped code by two cross-reviewing subagents. R2 is **resolved** (committed SAS,
+built + validated). The remaining gap to the *target* mesh is structural
+(account-scoped multi-hop chains, root/star, fail-closed `Rev`), not a hole in
+what ships.
 
 ## 10. Open questions
 
