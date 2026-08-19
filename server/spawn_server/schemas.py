@@ -462,6 +462,77 @@ class DeviceSasHostResponse(BaseModel):
     sas_host_nonce: str | None = None
 
 
+# ---------- browser-to-browser add-device pairing (device mesh §4) ----------
+
+
+class DevicePairingStart(BaseModel):
+    """Initiator opens a committed-ephemeral SAS ceremony to admit a new device.
+
+    It sends its own key K_I and the commitment Cd = SHA256(tag ‖ K_I ‖ N_I),
+    hiding its fresh nonce N_I until the joiner has contributed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    initiator_device_id: str = Field(min_length=36, max_length=36)
+    joiner_device_id: str = Field(min_length=36, max_length=36)
+    initiator_public_key: str = Field(min_length=43, max_length=43)
+    initiator_commit: str = Field(min_length=43, max_length=43)
+
+    @field_validator("initiator_public_key")
+    @classmethod
+    def _validate_initiator_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class DevicePairingContribute(BaseModel):
+    """Joiner's move: its own key K_J and a fresh nonce N_J (sent before it can
+    learn the initiator's opened nonce, so it cannot adapt N_J to the number)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    joiner_public_key: str = Field(min_length=43, max_length=43)
+    joiner_nonce: str = Field(min_length=43, max_length=43)
+
+    @field_validator("joiner_public_key")
+    @classmethod
+    def _validate_joiner_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class DevicePairingReveal(BaseModel):
+    """Initiator opens its commitment by revealing N_I (only accepted after the
+    joiner has contributed, and only if it opens Cd)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    initiator_nonce: str = Field(min_length=43, max_length=43)
+
+
+class DevicePairingOut(BaseModel):
+    id: str
+    expires_at: datetime
+
+
+class DevicePairingState(BaseModel):
+    """The relayed ceremony state, polled by both devices. Every value is
+    server-relayed and untrusted on its own — the SAS number each side derives
+    from it, compared by the human across both screens, is the check."""
+
+    id: str
+    initiator_device_id: str
+    joiner_device_id: str
+    initiator_public_key: str
+    initiator_commit: str
+    joiner_public_key: str | None = None
+    joiner_nonce: str | None = None
+    initiator_nonce: str | None = None
+    created_at: datetime
+    expires_at: datetime
+
+
 # ---------- hosts ----------
 
 
