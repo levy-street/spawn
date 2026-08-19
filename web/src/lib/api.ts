@@ -358,7 +358,8 @@ export const auth = {
       schema: AuthProviderListSchema,
     }),
   approveDevice: (body: {
-    user_code: string;
+    user_code?: string;
+    approval_ref?: string;
     approval_nonce: string;
     host_key_algorithm: "ed25519";
     host_public_key: string;
@@ -374,7 +375,7 @@ export const auth = {
       body: JSON.stringify(body),
       schema: DeviceApproveResponseSchema,
     }),
-  pendingDevice: (body: { user_code: string }) =>
+  pendingDevice: (body: { user_code?: string; approval_ref?: string }) =>
     api("/api/auth/device/pending", {
       method: "POST",
       body: JSON.stringify(body),

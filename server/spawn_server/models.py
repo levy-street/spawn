@@ -467,6 +467,12 @@ class DeviceCode(Base):
 
     device_code: Mapped[str] = mapped_column(String(64), primary_key=True)
     user_code: Mapped[str] = mapped_column(String(16), unique=True, nullable=False, index=True)
+    # High-entropy handle for URL-based browser lookup (`/device?ref=…`), so the
+    # short human user_code never rides in a link. Nullable only for rows from an
+    # interrupted pre-0029 ceremony; device/start always sets it.
+    approval_ref: Mapped[str | None] = mapped_column(
+        String(43), unique=True, nullable=True, index=True
+    )
     host_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     os: Mapped[str | None] = mapped_column(String(64), nullable=True)
     arch: Mapped[str | None] = mapped_column(String(64), nullable=True)

@@ -220,6 +220,8 @@ class DeviceStartRequest(BaseModel):
 class DeviceStartResponse(BaseModel):
     device_code: str
     user_code: str
+    # Opaque handle the daemon bakes into the browser URL (`/device?ref=…`).
+    approval_ref: str
     approval_nonce: str
     verification_uri: str
     interval: int
@@ -314,7 +316,17 @@ class DevicePollPending(BaseModel):
 class DevicePendingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    user_code: str
+    # Identify the pending ceremony by either the short human code OR the opaque
+    # URL handle. Exactly one is required; the browser normally sends the ref it
+    # read from the URL, the manual-entry form sends the user_code.
+    user_code: str | None = None
+    approval_ref: str | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_identifier(self) -> DevicePendingRequest:
+        if bool(self.user_code) == bool(self.approval_ref):
+            raise ValueError("provide exactly one of user_code or approval_ref")
+        return self
 
 
 class DeviceApproveRequest(DevicePendingRequest):

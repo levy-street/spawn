@@ -25,7 +25,13 @@ use crate::proto::{
     DeviceStartRequest, DeviceStartResponse,
 };
 
-pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
+/// What a successful login learned — enough for `possess` to place this
+/// registration in the authenticated account's config dir.
+pub struct LoginOutcome {
+    pub account_id: Option<String>,
+}
+
+pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOutcome> {
     let server = config::server_url(server_cli)?;
 
     // Persist before starting the ceremony so retries and interrupted logins
@@ -91,11 +97,39 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
         ));
     }
 
+    // Match a browser login's ease: open the approval page directly, carrying a
+    // handle so it lands on the fingerprint check with nothing to type, and poll
+    // to completion ourselves. We bake the opaque approval_ref into the URL (the
+    // short user_code never appears in a link); a pre-0029 server without a ref
+    // falls back to the user_code. The host-key possession proof above is
+    // unchanged — this only touches how the human reaches the approval page.
+    let approve_url = match url::Url::parse(&start.verification_uri) {
+        Ok(mut parsed) => {
+            match start.approval_ref.as_deref() {
+                Some(reference) => parsed.query_pairs_mut().append_pair("ref", reference),
+                None => parsed
+                    .query_pairs_mut()
+                    .append_pair("code", &start.user_code),
+            };
+            parsed.to_string()
+        }
+        Err(_) => start.verification_uri.clone(),
+    };
+    if open_browser(&approve_url) {
+        println!("spawn: opened your browser to approve this host.");
+        println!("spawn:   didn't open? visit {approve_url}");
+    } else {
+        println!("spawn: approve this host in your browser:");
+        println!("spawn:   {approve_url}");
+    }
+    println!();
     println!(
-        "spawn: open {} and enter code:  {}",
-        start.verification_uri, start.user_code
+        "spawn:   verification code   {}",
+        creds::verification_code(&identity.fingerprint)
     );
-    println!("spawn: verify host fingerprint: {}", identity.fingerprint);
+    println!("spawn:   confirm it matches the code shown in your browser, then approve.");
+    println!();
+    println!("spawn: waiting for approval…");
 
     // 2. poll
     let poll_url = config::api_url(&server, "/api/auth/device/poll")?;
@@ -130,6 +164,7 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
             resp.json().await.context("decoding device/poll response")?;
 
         if poll_has_success_fields(&body) {
+            let account_id = body.account_id.clone();
             let host_id = commit_poll_success(
                 &mut stored,
                 body,
@@ -139,7 +174,7 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
                 creds::save,
             )?;
             println!("spawn: logged in. host_id = {host_id}");
-            return Ok(());
+            return Ok(LoginOutcome { account_id });
         }
 
         match body.error.as_deref() {
@@ -160,6 +195,35 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
                 return Err(anyhow!("device/poll returned error: {other}"));
             }
         }
+    }
+}
+
+/// Best-effort: open `url` in the operator's default browser. Returns whether a
+/// launcher was started. Never blocks and never fails login — on a headless host
+/// (no display) or where no opener exists, the caller prints the URL instead.
+fn open_browser(url: &str) -> bool {
+    use std::process::{Command, Stdio};
+    let mut _cmd: Option<Command> = None;
+    #[cfg(target_os = "macos")]
+    {
+        _cmd = Some(Command::new("open"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // No display ⇒ headless (SSH/server): don't try; the caller prints it.
+        if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            _cmd = Some(Command::new("xdg-open"));
+        }
+    }
+    match _cmd {
+        Some(mut cmd) => cmd
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok(),
+        None => false,
     }
 }
 
