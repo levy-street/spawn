@@ -1211,15 +1211,30 @@ async fn dispatch_loop(
                     // device takes effect immediately instead of waiting for the
                     // daemon to happen to reconnect -- which could be hours.
                     daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
-                    daemon_revoked = revocation_set_from_wire(revoked_browser_keys.as_deref());
+                    let updated_revoked = revocation_set_from_wire(revoked_browser_keys.as_deref());
+                    let newly_revoked = updated_revoked.revokes_beyond(&daemon_revoked);
+                    daemon_revoked = updated_revoked;
                     reconcile_browser_pins(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
                         browser_device_ids.as_deref(),
                     )
                     .await;
-                    // TODO(mesh stage 4c / R1): tear down live sessions whose
-                    // admitting key is now revoked, not only block new connects.
+                    if newly_revoked {
+                        // R1: a device revoked mid-session must lose its live
+                        // channel NOW, not only be blocked from new connects.
+                        // Close every session and force re-admission under the
+                        // new deny-list: the revoked device's re-offer is
+                        // rejected while legitimate devices reconnect. Blunt but
+                        // fail-closed and reuses the trust-invalidation path; a
+                        // future refinement could tear down only sessions whose
+                        // chain includes a revoked key by tracking admitting keys
+                        // per session.
+                        tracing::info!(
+                            "revocation update: closing live RTC sessions for re-admission"
+                        );
+                        rtc_sessions.invalidate_trust_and_close_all().await;
+                    }
                 }
                 Inbound::HostHeartbeat => {
                     tracing::trace!("host heartbeat ack");
