@@ -2,10 +2,31 @@
 
 import { Slot } from "@radix-ui/react-slot";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FolderClock, FolderOpen, FolderTree, Home, Plus, SquareTerminal } from "lucide-react";
-import { isValidElement, type JSX, type ReactNode, useEffect, useMemo, useState } from "react";
+import {
+  FolderClock,
+  FolderOpen,
+  FolderTree,
+  Home,
+  Plus,
+  Server,
+  SquareTerminal,
+} from "lucide-react";
+import {
+  isValidElement,
+  type JSX,
+  type MouseEvent as ReactMouseEvent,
+  type ReactNode,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { AgentIcon } from "@/components/icons/AgentIcon";
-import { CascadeMenu, type CascadePanel } from "@/components/ui/cascade-menu";
+import {
+  CascadeMenu,
+  type CascadeMenuHandle,
+  type CascadePanel,
+} from "@/components/ui/cascade-menu";
 import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import { type Agent, ApiError, agents, type Host, hosts, sessions, workspaces } from "@/lib/api";
 import { autoPlace, type Rect } from "@/lib/grid";
@@ -26,12 +47,19 @@ export function NewSessionMenu(props: {
   trigger: React.ReactNode;
   mode: "session" | "workspace";
   workspaceId?: string;
+  /**
+   * "pointer" opens the menu at the click instead of under the trigger — for
+   * triggers that are areas rather than buttons (an empty grid opening can be
+   * half the canvas, so its corner is nowhere near the cursor).
+   */
+  anchor?: "trigger" | "pointer";
   /** Drop the new pane at this exact rect instead of auto-placing it. */
   placement?: Rect;
   /** `sessionId` is null when the menu added a widget rather than a session. */
   onCreated?: (r: { workspaceId: string; sessionId: string | null }) => void;
 }): JSX.Element {
-  const { trigger, mode, workspaceId, placement, onCreated } = props;
+  const { trigger, mode, workspaceId, placement, anchor = "trigger", onCreated } = props;
+  const menuRef = useRef<CascadeMenuHandle>(null);
   const queryClient = useQueryClient();
   const [pickerHost, setPickerHost] = useState<Host | null>(null);
   const [pickerChoice, setPickerChoice] = useState<Choice>({ kind: "shell" });
@@ -241,6 +269,20 @@ export function NewSessionMenu(props: {
         detail: home && home.host.status !== "online" ? "host offline" : "A plain login shell",
         ...target({ kind: "shell" }),
       },
+      // Home answers "where" for everything above, so a workspace with one
+      // needs this escape hatch to open a shell on another host (or just
+      // another folder) without giving up the one-click default.
+      ...(home
+        ? [
+            {
+              key: "shell-elsewhere",
+              icon: hostList.length > 1 ? <Server /> : <FolderOpen />,
+              label: hostList.length > 1 ? "Shell on another host" : "Shell in another folder",
+              detail: hostList.length > 1 ? "Pick a host and folder" : "Pick a folder",
+              panel: wherePanel({ kind: "shell" }),
+            },
+          ]
+        : []),
       ...agentList.map((agent) => ({
         key: agent.id,
         icon: <AgentIcon kind={agent.kind} size={18} className="rounded" />,
@@ -272,6 +314,7 @@ export function NewSessionMenu(props: {
   return (
     <span className="relative inline-flex" title={tooltip}>
       <CascadeMenu
+        ref={menuRef}
         root={root}
         sheetTitle={mode === "workspace" ? "New workspace" : "Add a pane"}
         renderTrigger={(triggerProps) =>
@@ -282,7 +325,19 @@ export function NewSessionMenu(props: {
               data-disabled={disabled || undefined}
               tabIndex={disabled ? -1 : undefined}
               className={disabled ? "pointer-events-none opacity-50" : undefined}
-              onClick={disabled ? undefined : triggerProps.onClick}
+              onClick={
+                disabled
+                  ? undefined
+                  : (event: ReactMouseEvent) => {
+                      // detail === 0 is keyboard activation: keep that anchored
+                      // to the trigger, where focus already is.
+                      if (anchor === "pointer" && event.detail > 0) {
+                        menuRef.current?.openAt(event.clientX, event.clientY);
+                        return;
+                      }
+                      triggerProps.onClick();
+                    }
+              }
               onKeyDown={disabled ? undefined : triggerProps.onKeyDown}
             >
               {trigger}

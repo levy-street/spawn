@@ -4,6 +4,7 @@ import type { Session, Workspace } from "@/lib/api";
 import type { Tile } from "@/lib/grid";
 import {
   defaultWorkspaceName,
+  tabAttentionCount,
   workspaceAttentionCount,
   workspaceRecency,
   workspaceSessionIds,
@@ -92,6 +93,50 @@ describe("workspaceAttentionCount", () => {
     ]);
     expect(workspaceAttentionCount(workspace, sessionsById)).toBe(2);
     expect(workspaceAttentionCount(makeWorkspace([]), sessionsById)).toBe(0);
+  });
+});
+
+describe("tabAttentionCount", () => {
+  test("counts only the sessions in that tab, skipping widgets", () => {
+    const layout = {
+      version: 3 as const,
+      active_tab: "tab-1",
+      tabs: [
+        {
+          id: "tab-1",
+          name: "Tab 1",
+          layout: {
+            version: 2 as const,
+            tiles: [
+              { session_id: S1, x: 0, y: 0, w: 6, h: 12 },
+              {
+                session_id: S3,
+                x: 6,
+                y: 0,
+                w: 6,
+                h: 12,
+                widget: { kind: "files" as const, host_id: "h", path: "~" },
+              },
+            ],
+          },
+        },
+        {
+          id: "tab-2",
+          name: "Tab 2",
+          layout: { version: 2 as const, tiles: [{ session_id: S2, x: 0, y: 0, w: 12, h: 12 }] },
+        },
+      ],
+    };
+    const sessionsById = new Map<string, Session>([
+      [S1, makeSession(S1, { activity_state: "waiting" })],
+      [S2, makeSession(S2, { status: "exited" })],
+      [S3, makeSession(S3, { activity_state: "waiting" })],
+    ]);
+    expect(tabAttentionCount(layout.tabs[0]!, sessionsById)).toBe(1);
+    expect(tabAttentionCount(layout.tabs[1]!, sessionsById)).toBe(1);
+    expect(
+      tabAttentionCount({ ...layout.tabs[0]!, layout: { version: 2, tiles: [] } }, sessionsById),
+    ).toBe(0);
   });
 });
 

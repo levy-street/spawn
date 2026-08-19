@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FolderTree, Plus, SquareTerminal } from "lucide-react";
+import { FolderTree, Plus, SquareTerminal, Trash2 } from "lucide-react";
 import {
   type ReactNode,
   type PointerEvent as ReactPointerEvent,
@@ -204,6 +204,7 @@ export function LauncherFab({
     document.removeEventListener("pointerup", drag.up);
     document.removeEventListener("pointercancel", drag.cancel);
     clearDropTarget(drag);
+    document.querySelector("[data-launcher-fab]")?.removeAttribute("data-trash-hover");
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
     setDragging(null);
@@ -237,6 +238,9 @@ export function LauncherFab({
         ghost.style.top = `${moveEvent.clientY + 14}px`;
       }
       const under = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY);
+      document
+        .querySelector("[data-launcher-fab]")
+        ?.toggleAttribute("data-trash-hover", Boolean(under?.closest?.("[data-launcher-fab]")));
       const openingElement = under?.closest?.("[data-grid-opening]") ?? null;
       const opening = openingElement?.querySelector("button") ?? null;
       if (opening !== drag.target) {
@@ -368,7 +372,7 @@ export function LauncherFab({
         // One pill that grows from a circle: the items sit inside it and are
         // revealed by the container's own width, not a separate tray.
         className={cn(
-          "fixed right-4 z-40 flex items-center rounded-2xl border border-border bg-popover shadow-lg",
+          "group/fab fixed right-4 z-40 flex items-center rounded-2xl border border-border bg-popover shadow-lg",
           "bottom-[calc(1rem+var(--safe-bottom))]",
           // Clear of the touch modifier bar on phones.
           "[@media(pointer:coarse)]:bottom-[calc(4.5rem+var(--safe-bottom))]",
@@ -382,7 +386,9 @@ export function LauncherFab({
             "flex items-center gap-0.5 overflow-hidden transition-[max-width,padding] duration-200 ease-swift",
             // Enough of an inset that the first icon's plate clears the
             // container's rounded corner.
-            open ? "max-w-96 pl-3" : "max-w-0 pl-0",
+            // The 44px item buttons carry ~11px of their own slack around the
+            // icon, so the wrapper adds none and pulls the first plate in.
+            open ? "max-w-96 pl-0.5 pr-2" : "max-w-0 pl-0",
           )}
         >
           {[...items].reverse().map((item, index, list) => (
@@ -427,13 +433,20 @@ export function LauncherFab({
           className={cn(
             // The one primary action on the canvas: a filled square button,
             // easing into its hover tint rather than snapping to it.
-            "grid size-12 shrink-0 place-items-center rounded-2xl bg-primary text-primary-foreground",
-            "transition-all duration-200 ease-swift hover:opacity-90",
-            "hover:scale-105 active:scale-95",
-            open && "rotate-45",
+            "grid size-12 shrink-0 place-items-center rounded-2xl",
+            "transition-all duration-200 ease-swift",
+            dragging
+              ? // Mid-drag it is the bin: drop here to change your mind.
+                "bg-destructive/15 text-destructive group-data-[trash-hover]/fab:scale-110 group-data-[trash-hover]/fab:bg-destructive/30"
+              : "bg-primary text-primary-foreground hover:scale-105 hover:opacity-90 active:scale-95",
+            open && !dragging && "rotate-45",
           )}
         >
-          <Plus className="size-5" aria-hidden />
+          {dragging ? (
+            <Trash2 className="size-5" aria-hidden />
+          ) : (
+            <Plus className="size-5" aria-hidden />
+          )}
         </button>
       </div>
       {dragging && (

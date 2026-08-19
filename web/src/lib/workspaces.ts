@@ -1,6 +1,6 @@
 import type { Session, Workspace } from "@/lib/api";
 import { sessionNeedsAttention } from "@/lib/sessions";
-import { allSessionIds, allTiles } from "@/lib/tabs";
+import { allSessionIds, allTiles, type WorkspaceTab } from "@/lib/tabs";
 
 /**
  * Pure derivation helpers for workspaces: default naming, per-workspace
@@ -32,6 +32,16 @@ export function workspaceAttentionCount(
   return workspaceSessionIds(workspace).filter((id) => {
     const session = sessionsById.get(id);
     return session && sessionNeedsAttention(session) !== null;
+  }).length;
+}
+
+/** Sessions in one tab that want attention — the same rollup as the sidebar's
+ *  workspace badge, so a tab can say what is waiting behind it. */
+export function tabAttentionCount(tab: WorkspaceTab, sessionsById: Map<string, Session>): number {
+  return tab.layout.tiles.filter((tile) => {
+    if (tile.widget) return false;
+    const session = sessionsById.get(tile.session_id);
+    return session ? sessionNeedsAttention(session) !== null : false;
   }).length;
 }
 

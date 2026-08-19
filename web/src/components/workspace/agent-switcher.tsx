@@ -1,10 +1,15 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, ChevronDown, Download } from "lucide-react";
+import { Check, ChevronDown, Download, FolderTree, SquareTerminal } from "lucide-react";
 import { AgentIcon, agentDisplayName, commandBasename } from "@/components/icons/AgentIcon";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
-import { DropdownMenu, DropdownMenuItem, DropdownMenuLabel } from "@/components/ui/dropdown-menu";
+import {
+  DropdownMenu,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { type Agent, agents, hosts, type Session } from "@/lib/api";
 import { sessionAtShell } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
@@ -28,11 +33,15 @@ export function AgentSwitcher({
   getHandle,
   size = 22,
   className,
+  onConvertToFiles,
 }: {
   session: Session;
   getHandle: () => TerminalHandle | null;
   size?: number;
   className?: string;
+  /** Offered as "File explorer" in the menu: replace this pane with a files
+   *  widget (workspace panes only — the grid owns the layout surgery). */
+  onConvertToFiles?: () => void;
 }) {
   const queryClient = useQueryClient();
   const definitionsQ = useQuery({
@@ -97,6 +106,17 @@ export function AgentSwitcher({
     );
   };
 
+  /** Back to a bare prompt: interrupt the agent, land on a cleared shell. */
+  const stopToShell = () => {
+    const handle = getHandle();
+    if (!handle || !running) return;
+    void runInShell({ session, handle, command: "", purpose: "Returning to the shell" }).then(
+      (result) => {
+        if (result === "sent") writeForegroundToCache(queryClient, session.id, null);
+      },
+    );
+  };
+
   const foregroundName = agentDisplayName(foreground);
   const label = !running
     ? "Agent types (the shell is not running)"
@@ -151,6 +171,13 @@ export function AgentSwitcher({
             ? "Run in this shell"
             : `Stop ${foregroundName} and run`}
       </DropdownMenuLabel>
+      <DropdownMenuItem disabled={!running || atShell} onSelect={stopToShell}>
+        <SquareTerminal className="size-5 shrink-0 p-0.5 text-muted-foreground" aria-hidden />
+        <span className="min-w-0 flex-1 truncate">Shell</span>
+        {atShell && running && (
+          <Check className="size-3.5 shrink-0 text-muted-foreground" aria-label="Running" />
+        )}
+      </DropdownMenuItem>
       {definitions.map((agent) => {
         const installed = availability.get(agent.id)?.installed === true;
         const installable = Boolean(agent.install?.trim());
@@ -170,6 +197,15 @@ export function AgentSwitcher({
           </DropdownMenuItem>
         );
       })}
+      {onConvertToFiles && (
+        <>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={onConvertToFiles}>
+            <FolderTree className="size-5 shrink-0 p-0.5 text-muted-foreground" aria-hidden />
+            <span className="min-w-0 flex-1 truncate">File explorer</span>
+          </DropdownMenuItem>
+        </>
+      )}
     </DropdownMenu>
   );
 }
@@ -178,7 +214,7 @@ export function AgentSwitcher({
 function writeForegroundToCache(
   queryClient: ReturnType<typeof useQueryClient>,
   sessionId: string,
-  foregroundCommand: string,
+  foregroundCommand: string | null,
 ): void {
   queryClient.setQueryData<Session>(["session", sessionId], (current) =>
     current ? { ...current, foreground_command: foregroundCommand } : current,

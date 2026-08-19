@@ -1,9 +1,20 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Ellipsis, FolderOpen, LayoutTemplate, Pencil, Plus, Trash2, X } from "lucide-react";
+import {
+  Check,
+  Ellipsis,
+  FolderOpen,
+  LayoutTemplate,
+  Pencil,
+  Plus,
+  Server,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useRouter } from "next/navigation";
-import { type FormEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { type FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
 import {
@@ -19,8 +30,17 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
-import { agents, hosts, sessions, type Workspace, workspaces, workspaceTemplates } from "@/lib/api";
+import {
+  agents,
+  type Host,
+  hosts,
+  sessions,
+  type Workspace,
+  workspaces,
+  workspaceTemplates,
+} from "@/lib/api";
 import type { Tile } from "@/lib/grid";
 import { GRID_SIZE } from "@/lib/grid";
 import { basename } from "@/lib/paths";
@@ -36,6 +56,7 @@ import {
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { templateSpecFromWorkspace } from "@/lib/workspace-templates";
+import { tabAttentionCount } from "@/lib/workspaces";
 import { FolderPickerDialog } from "./folder-picker-dialog";
 
 /**
@@ -90,12 +111,17 @@ export function WorkspaceTabs({
   const [renameWorkspaceOpen, setRenameWorkspaceOpen] = useState(false);
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
+  const [hostPickerOpen, setHostPickerOpen] = useState(false);
+  /** A home-host change in flight: picked in the host dialog, committed only
+   *  once its folder is chosen — cancelling the folder picker drops it. */
+  const [pendingHomeHost, setPendingHomeHost] = useState<Host | null>(null);
   const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
   const [templateNameDraft, setTemplateNameDraft] = useState("");
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
   const sessionsQ = useQuery({ queryKey: ["sessions"], queryFn: () => sessions.list() });
   const agentsQ = useQuery({ queryKey: ["agents"], queryFn: agents.list, staleTime: 60_000 });
-  const homeHost = (hostsQ.data ?? []).find((host) => host.id === workspace.host_id) ?? null;
+  const hostList = hostsQ.data ?? [];
+  const homeHost = hostList.find((host) => host.id === workspace.host_id) ?? null;
 
   const writeCaches = (next: Workspace) => {
     queryClient.setQueryData(["workspace", next.id], next);
@@ -203,7 +229,8 @@ export function WorkspaceTabs({
   };
 
   const settingsM = useMutation({
-    mutationFn: (body: { name?: string; cwd?: string }) => workspaces.update(workspace.id, body),
+    mutationFn: (body: { name?: string; cwd?: string; host_id?: string }) =>
+      workspaces.update(workspace.id, body),
     onSuccess: (saved) => {
       writeCaches(saved);
       onError?.(null);
@@ -280,6 +307,10 @@ export function WorkspaceTabs({
   };
 
   const canClose = workspace.layout.tabs.length > 1;
+  const sessionsById = useMemo(
+    () => new Map((sessionsQ.data ?? []).map((session) => [session.id, session])),
+    [sessionsQ.data],
+  );
 
   return (
     /*
@@ -297,6 +328,7 @@ export function WorkspaceTabs({
     >
       {workspace.layout.tabs.map((tab) => {
         const active = tab.id === activeTabId;
+        const attention = tabAttentionCount(tab, sessionsById);
         if (renamingId === tab.id) {
           return (
             // The strip has no left padding, so the first tab's input would
@@ -339,8 +371,8 @@ export function WorkspaceTabs({
                 }
               }}
               className={cn(
-                "flex h-8 min-w-32 items-center rounded-md pl-3.5 text-xs font-medium transition-colors",
-                canClose ? "pr-8" : "pr-3.5",
+                "flex h-8 min-w-40 items-center gap-1.5 rounded-md pl-3 text-xs font-medium transition-colors",
+                canClose ? "pr-6.5" : "pr-3.5",
                 // The label stays level with the resting tabs: the extra
                 // height is all bottom padding, swallowed by flex centering.
                 // A connected tab continues the surface directly beneath it:
@@ -357,9 +389,19 @@ export function WorkspaceTabs({
                 // `tab-connected` flares the foot into the panel: see globals.
                 active && look.connected && "tab-connected -mb-1.5 h-[38px] rounded-b-none pb-1.5",
                 !active &&
-                  "bg-background/40 pl-4 text-muted-foreground hover:bg-background/60 hover:text-foreground",
+                  "bg-background/40 text-muted-foreground hover:bg-background/60 hover:text-foreground",
+                // The badge is its own visual edge, so it sits closer in than
+                // a bare label wants to.
+                attention > 0 && "pl-2",
               )}
             >
+              {/* What is waiting behind this tab, the same rollup the sidebar
+                  puts on a workspace row — read before the name. */}
+              {attention > 0 && (
+                <Badge variant="warning" className="shrink-0 px-1.5 py-0 text-[10px] leading-4">
+                  {attention}
+                </Badge>
+              )}
               <span className="max-w-48 truncate">{tab.name}</span>
             </button>
             {canClose && (
@@ -416,6 +458,15 @@ export function WorkspaceTabs({
         >
           <Pencil className="size-4" aria-hidden />
           Rename workspace
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          disabled={hostList.length === 0 || (hostList.length === 1 && Boolean(homeHost))}
+          onSelect={() => setHostPickerOpen(true)}
+        >
+          <Server className="size-4" aria-hidden />
+          <span className="min-w-0 flex-1 truncate">
+            {homeHost ? `Host: ${homeHost.name}` : "Set host…"}
+          </span>
         </DropdownMenuItem>
         <DropdownMenuItem disabled={!homeHost} onSelect={() => setFolderPickerOpen(true)}>
           <FolderOpen className="size-4" aria-hidden />
@@ -499,12 +550,66 @@ export function WorkspaceTabs({
         </DialogContent>
       </Dialog>
 
+      <Dialog open={hostPickerOpen} onOpenChange={setHostPickerOpen}>
+        <DialogContent size="sm">
+          <DialogHeader>
+            <DialogTitle>Choose this workspace's host</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-1 px-6 py-2">
+            <p className="pb-1 text-xs text-muted-foreground">
+              New panes open on this host. Existing panes stay where they are.
+            </p>
+            {hostList.map((host) => {
+              const current = host.id === workspace.host_id;
+              return (
+                <button
+                  key={host.id}
+                  type="button"
+                  disabled={host.status !== "online"}
+                  onClick={() => {
+                    setHostPickerOpen(false);
+                    if (current) return;
+                    // The change lands with its folder: the picker that
+                    // follows browses the new host, and committing both at
+                    // once means cancelling it changes nothing.
+                    setPendingHomeHost(host);
+                    setFolderPickerOpen(true);
+                  }}
+                  className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-sm hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
+                >
+                  <StatusDot tone={hostStatusTone(host.status)} label={host.status} />
+                  <span className="min-w-0 flex-1 truncate">{host.name}</span>
+                  {host.status !== "online" && (
+                    <span className="shrink-0 text-xs text-muted-foreground">offline</span>
+                  )}
+                  {current && (
+                    <Check className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="secondary" onClick={() => setHostPickerOpen(false)}>
+              Cancel
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <FolderPickerDialog
-        key={`${homeHost?.id ?? "none"}:${folderPickerOpen ? "open" : "closed"}`}
+        key={`${(pendingHomeHost ?? homeHost)?.id ?? "none"}:${folderPickerOpen ? "open" : "closed"}`}
         open={folderPickerOpen}
-        host={homeHost}
-        onOpenChange={setFolderPickerOpen}
-        onSelect={(path) => settingsM.mutate({ cwd: path })}
+        host={pendingHomeHost ?? homeHost}
+        onOpenChange={(open) => {
+          setFolderPickerOpen(open);
+          if (!open) setPendingHomeHost(null);
+        }}
+        onSelect={(path) =>
+          settingsM.mutate(
+            pendingHomeHost ? { host_id: pendingHomeHost.id, cwd: path } : { cwd: path },
+          )
+        }
       />
     </div>
   );

@@ -17,8 +17,15 @@ import { flushSync } from "react-dom";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import { Button } from "@/components/ui/button";
+import { confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
-import { type Session, type Workspace, workspaces } from "@/lib/api";
+import {
+  type Host,
+  type Session,
+  sessions as sessionsApi,
+  type Workspace,
+  workspaces,
+} from "@/lib/api";
 import {
   autoPlace,
   GRID_SIZE,
@@ -1080,6 +1087,84 @@ export function WorkspaceGrid({
     [commitLayout],
   );
 
+  /** Swap a session pane for a file explorer rooted at its folder: the tile
+   *  keeps its rect, the session is closed (confirmed first). */
+  const convertToFiles = useCallback(
+    async (sessionId: string) => {
+      const session = sessionsById.get(sessionId);
+      if (!session) return;
+      const accepted = await confirm({
+        title: `Replace ${sessionTitle(session)} with a file explorer?`,
+        body: "The session will be closed and its running process killed; a file explorer for its folder takes over the pane.",
+        confirmLabel: "Replace pane",
+        destructive: true,
+      });
+      if (!accepted) return;
+      commitLayout(
+        latestTilesRef.current.map((tile) =>
+          tile.session_id === sessionId
+            ? {
+                ...tile,
+                session_id: crypto.randomUUID(),
+                widget: { kind: "files" as const, host_id: session.host_id, path: session.cwd },
+              }
+            : tile,
+        ),
+      );
+      try {
+        await sessionsApi.remove(sessionId);
+      } catch (error) {
+        onErrorRef.current?.(error instanceof Error ? error.message : String(error));
+      }
+      queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    },
+    [commitLayout, queryClient, sessionsById],
+  );
+
+  /** Swap a session pane for a fresh shell on another host: the tile keeps
+   *  its rect, the old session is closed (confirmed first) and the new shell
+   *  starts in the picked host's home folder. */
+  const moveToHost = useCallback(
+    async (sessionId: string, host: Host) => {
+      const session = sessionsById.get(sessionId);
+      if (!session || session.host_id === host.id) return;
+      const accepted = await confirm({
+        title: `Move ${sessionTitle(session)} to ${host.name}?`,
+        body: `This shell will be closed and its running process killed; a new shell starts in your home folder on ${host.name}.`,
+        confirmLabel: "Move pane",
+        destructive: true,
+      });
+      if (!accepted) return;
+      let created: Session;
+      try {
+        // Created before anything is torn down, so a failure (host dropped
+        // offline, say) leaves the pane exactly as it was.
+        created = await sessionsApi.create({ host_id: host.id, cwd: "~" });
+      } catch (error) {
+        onErrorRef.current?.(error instanceof Error ? error.message : String(error));
+        return;
+      }
+      // Seed the cache so the swapped tile finds its session immediately
+      // instead of flashing "missing" until the next sessions poll.
+      queryClient.setQueryData<Session[]>(["sessions"], (current) =>
+        current ? [...current, created] : [created],
+      );
+      commitLayout(
+        latestTilesRef.current.map((tile) =>
+          tile.session_id === sessionId ? { ...tile, session_id: created.id } : tile,
+        ),
+      );
+      setFocus(created.id, true);
+      try {
+        await sessionsApi.remove(sessionId);
+      } catch (error) {
+        onErrorRef.current?.(error instanceof Error ? error.message : String(error));
+      }
+      queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    },
+    [commitLayout, queryClient, sessionsById, setFocus],
+  );
+
   const moveMobile = useCallback(
     (sessionId: string, delta: -1 | 1) => {
       const currentOrder = readingOrder(latestTilesRef.current);
@@ -1183,6 +1268,8 @@ export function WorkspaceGrid({
                   mode="session"
                   workspaceId={workspace.id}
                   placement={rect}
+                  // The trigger is the whole opening, so anchor to the click.
+                  anchor="pointer"
                   trigger={
                     <button
                       type="button"
@@ -1376,6 +1463,8 @@ export function WorkspaceGrid({
           onMoveUp={(id) => moveMobile(id, -1)}
           onMoveDown={(id) => moveMobile(id, 1)}
           onRemoveFromWorkspace={removeFromWorkspace}
+          onConvertToFiles={(id) => void convertToFiles(id)}
+          onMoveToHost={(id, host) => void moveToHost(id, host)}
           registerHandle={registerHandle}
           onError={onError ?? (() => {})}
         />

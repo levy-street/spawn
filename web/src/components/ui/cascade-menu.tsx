@@ -58,7 +58,12 @@ export type CascadePanel = {
   items: CascadeItem[];
 };
 
-export type CascadeMenuHandle = { open: () => void; close: () => void };
+export type CascadeMenuHandle = {
+  open: () => void;
+  /** Open anchored to a viewport point (a click) rather than the trigger. */
+  openAt: (x: number, y: number) => void;
+  close: () => void;
+};
 
 type TriggerProps = {
   onClick: () => void;
@@ -112,6 +117,9 @@ export const CascadeMenu = forwardRef<
   const [path, setPath] = useState<string[]>([]);
   const [direction, setDirection] = useState<"forward" | "back">("forward");
   const [coords, setCoords] = useState<CSSProperties | null>(null);
+  // Set when opened at a click: the menu hangs off that point instead of the
+  // trigger, which matters when the trigger is a whole empty grid opening.
+  const [point, setPoint] = useState<{ x: number; y: number } | null>(null);
   const [smallViewport, setSmallViewport] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -123,6 +131,8 @@ export const CascadeMenu = forwardRef<
       if (next) {
         setPath([]);
         setDirection("forward");
+      } else {
+        setPoint(null);
       }
       onOpenChange?.(next);
     },
@@ -130,10 +140,21 @@ export const CascadeMenu = forwardRef<
   );
   const close = useCallback(() => setOpenState(false), [setOpenState]);
 
-  useImperativeHandle(ref, () => ({ open: () => setOpenState(true), close }), [
-    setOpenState,
-    close,
-  ]);
+  useImperativeHandle(
+    ref,
+    () => ({
+      open: () => {
+        setPoint(null);
+        setOpenState(true);
+      },
+      openAt: (x: number, y: number) => {
+        setPoint({ x, y });
+        setOpenState(true);
+      },
+      close,
+    }),
+    [setOpenState, close],
+  );
 
   useEffect(() => {
     const query = window.matchMedia("(max-width: 767px)");
@@ -180,28 +201,47 @@ export const CascadeMenu = forwardRef<
       return;
     }
     const place = () => {
+      // Layout size, not the rendered rect: the open animation scales the
+      // menu, and a measurement taken mid-zoom places it a few px off.
+      const menu = menuRef.current;
+      const menuH = menu?.offsetHeight ?? 0;
+      const menuW = menu?.offsetWidth ?? 256;
+      const style: CSSProperties = { position: "fixed" };
+      // Click-anchored: drop from the cursor, flipping above it when the menu
+      // would run past the bottom, and never past either side.
+      if (point) {
+        if (point.y + menuH + 4 > window.innerHeight - 8 && point.y - menuH - 4 > 8) {
+          style.bottom = window.innerHeight - point.y + 4;
+        } else {
+          style.top = Math.max(8, Math.min(point.y + 4, window.innerHeight - menuH - 8));
+        }
+        style.left = Math.max(8, Math.min(point.x, window.innerWidth - menuW - 8));
+        setCoords(style);
+        return;
+      }
       const anchor = rootRef.current?.getBoundingClientRect();
       if (!anchor) return;
-      const menu = menuRef.current?.getBoundingClientRect();
-      const menuH = menu?.height ?? 0;
-      const menuW = menu?.width ?? 256;
-      const style: CSSProperties = { position: "fixed" };
       const opensUp =
         anchor.bottom + menuH + 4 > window.innerHeight - 8 && anchor.top - menuH - 4 > 8;
       if (opensUp) style.bottom = window.innerHeight - anchor.top + 4;
       else style.top = anchor.bottom + 4;
       if (align === "end") style.right = Math.max(8, window.innerWidth - anchor.right);
-      else style.left = Math.min(anchor.left, window.innerWidth - menuW - 8);
+      else style.left = Math.max(8, Math.min(anchor.left, window.innerWidth - menuW - 8));
       setCoords(style);
     };
     place();
+    // Panels differ in height and async content lands late, so re-place on any
+    // size change: a deeper step must not spill off the bottom of the screen.
+    const observer = new ResizeObserver(place);
+    if (menuRef.current) observer.observe(menuRef.current);
     window.addEventListener("scroll", place, true);
     window.addEventListener("resize", place);
     return () => {
+      observer.disconnect();
       window.removeEventListener("scroll", place, true);
       window.removeEventListener("resize", place);
     };
-  }, [open, asSheet, align]);
+  }, [open, asSheet, align, point]);
 
   // Close on outside pointerdown / Escape (menu mode; the sheet handles its
   // own scrim and Escape).

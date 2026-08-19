@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowDown,
   ArrowUp,
+  Check,
   ChevronDown,
   Ellipsis,
   ExternalLink,
@@ -31,8 +32,8 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { SessionStatusDot } from "@/components/ui/status";
-import { hosts, type Session, sessions } from "@/lib/api";
+import { hostStatusTone, SessionStatusDot, StatusDot } from "@/components/ui/status";
+import { type Host, hosts, type Session, sessions } from "@/lib/api";
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
 import { basename } from "@/lib/paths";
 import { sessionTitle, sessionTitleDetail } from "@/lib/sessions";
@@ -70,6 +71,8 @@ export function SessionPane({
   onMoveUp,
   onMoveDown,
   onRemoveFromWorkspace,
+  onConvertToFiles,
+  onMoveToHost,
   registerHandle,
   onError,
 }: {
@@ -87,6 +90,11 @@ export function SessionPane({
   onMoveUp: (sessionId: string) => void;
   onMoveDown: (sessionId: string) => void;
   onRemoveFromWorkspace: (sessionId: string) => void;
+  /** Replace this pane with a file explorer widget (workspace grid only). */
+  onConvertToFiles?: (sessionId: string) => void;
+  /** Swap this pane's shell for a fresh one on another host (workspace grid
+   *  only — the grid owns the tile swap). */
+  onMoveToHost?: (sessionId: string, host: Host) => void;
   registerHandle: (sessionId: string, getHandle: () => TerminalHandle | null) => void;
   onError: (message: string | null) => void;
 }) {
@@ -96,7 +104,8 @@ export function SessionPane({
   const [selfHovered, setSelfHovered] = useState(false);
   const [cwdPickerOpen, setCwdPickerOpen] = useState(false);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
-  const paneHost = (hostsQ.data ?? []).find((host) => host.id === session?.host_id) ?? null;
+  const hostList = hostsQ.data ?? [];
+  const paneHost = hostList.find((host) => host.id === session?.host_id) ?? null;
   const [draftName, setDraftName] = useState("");
   const hostRef = useRef<HTMLDivElement | null>(null);
   const { attach, connInfo, getHandle } = useLiveTerminal(session ? sessionId : null);
@@ -275,7 +284,11 @@ export function SessionPane({
       >
         <span className="relative shrink-0">
           {session ? (
-            <AgentSwitcher session={session} getHandle={getHandle} />
+            <AgentSwitcher
+              session={session}
+              getHandle={getHandle}
+              onConvertToFiles={onConvertToFiles ? () => onConvertToFiles(sessionId) : undefined}
+            />
           ) : (
             <AgentIcon size={22} className="rounded-md" />
           )}
@@ -307,6 +320,42 @@ export function SessionPane({
           >
             {title}
           </span>
+        )}
+        {session && paneHost && hostList.length > 1 && onMoveToHost && (
+          /* The pane's host, as a control: with more than one host connected
+             this is a dropdown — picking another machine swaps this pane's
+             shell for a fresh one over there (the grid confirms first). */
+          <DropdownMenu
+            align="end"
+            renderTrigger={(props) => (
+              <button
+                {...props}
+                type="button"
+                aria-label="Change host"
+                title={`Running on ${paneHost.name}`}
+                onDoubleClick={(event) => event.stopPropagation()}
+                className="flex h-7 max-w-36 shrink-0 items-center gap-1.5 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                <StatusDot tone={hostStatusTone(paneHost.status)} label={paneHost.status} />
+                <span className="truncate">{paneHost.name}</span>
+                <ChevronDown className="size-3 shrink-0" aria-hidden />
+              </button>
+            )}
+          >
+            {hostList.map((host) => (
+              <DropdownMenuItem
+                key={host.id}
+                disabled={host.status !== "online" && host.id !== session.host_id}
+                onSelect={() => {
+                  if (host.id !== session.host_id) onMoveToHost(sessionId, host);
+                }}
+              >
+                <StatusDot tone={hostStatusTone(host.status)} label={host.status} />
+                <span className="min-w-0 flex-1 truncate">{host.name}</span>
+                {host.id === session.host_id && <Check className="size-3.5 shrink-0" aria-hidden />}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenu>
         )}
         {session && (
           /* The pane's folder, as a control: pick a directory and the shell

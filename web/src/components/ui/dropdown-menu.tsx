@@ -86,9 +86,11 @@ export const DropdownMenu = forwardRef<
       return;
     }
     const place = () => {
-      const menu = menuRef.current?.getBoundingClientRect();
-      const menuH = menu?.height ?? 0;
-      const menuW = menu?.width ?? 176;
+      // Layout size, not the rendered rect: the open animation scales the
+      // menu, and a measurement taken mid-zoom places it a few px off.
+      const menu = menuRef.current;
+      const menuH = menu?.offsetHeight ?? 0;
+      const menuW = menu?.offsetWidth ?? 176;
       const style: CSSProperties = { position: "fixed" };
       if (point) {
         // Cursor-anchored (right-click): drop below-right, flipping near the
