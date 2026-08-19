@@ -350,15 +350,15 @@ channel — the exact "kill it *now*" case. **Resolved:** added the
 continuous-enforcement rule (§3) and the live-session half of P3.
 
 **R2 — The shipped 6-digit code is grindable; soundness rested on it (threatened
-P2 at the anchor).** The host key is a long-lived identity and the pairing has no
-ephemeral/commitment, so a 20-bit number over it can be brute-forced by a
-substituting server in ~seconds. The real anchor is the **96-bit fingerprint**,
-which the shipped UI now demotes to fine print. **Resolved in model:** A5 rewritten
-to require a committed *ephemeral* SAS for a short code to be sound, and possess
-marked as an anchor ceremony that must meet A5. **Action item (touches prod):**
-either restore the full fingerprint as the primary compare, or add a committed
-ephemeral exchange so the short code is genuinely sound. Until then the 6-digit
-is *convenience, not security*.
+P2 at the anchor).** The host key is a long-lived identity and the pairing had no
+ephemeral/commitment, so a 20-bit number over it could be brute-forced by a
+substituting server in ~seconds. **RESOLVED (built + validated, branch
+`feat/sas-pairing`):** implemented the committed-ephemeral SAS of Appendix A
+across server (relay endpoints, migration 0030), daemon, and browser; deleted the
+grindable code; every path now shows the sound SAS or the 96-bit fingerprint,
+never the weak code. Unit + integration + adversarial e2e green, and validated
+**live end-to-end on dev** — daemon and browser independently computed the same
+number (`923 579`) over the real relay. Not yet on master/prod.
 
 **R3 — A6 was assumed, not enforced (P3 silently voidable).** Any connection path
 that skips server-mediated signaling (LAN direct, cached offers, "local mode")
