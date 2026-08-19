@@ -13,6 +13,7 @@ import {
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
 import { BottomTabs } from "@/components/nav/BottomTabs";
 import { SIDEBAR_RAIL_WIDTH, Sidebar } from "@/components/nav/Sidebar";
+import { ThemeToggle } from "@/components/nav/ThemeToggle";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
@@ -148,14 +149,17 @@ export function AppShell({
               <Link href="/" className="text-base font-semibold tracking-tight">
                 spawn
               </Link>
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label="Settings"
-                onClick={() => openSettings("account")}
-              >
-                <Settings className="size-4.5" />
-              </Button>
+              <div className="flex items-center gap-0.5">
+                <ThemeToggle />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Settings"
+                  onClick={() => openSettings("account")}
+                >
+                  <Settings className="size-4.5" />
+                </Button>
+              </div>
             </div>
           </header>
 
