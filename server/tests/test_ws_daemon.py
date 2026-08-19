@@ -1100,11 +1100,11 @@ async def test_dequeued_stale_exit_cannot_mutate_or_detach_replacement(client, m
 
     release_old_exit.set()
     await asyncio.wait_for(old_task, timeout=1)
-    async with get_sessionmaker()() as session:
-        agent = await session.get(Session, pty_id)
-        assert agent is not None
-        assert agent.status == "running"
-        assert agent.exit_code is None
+    async with get_sessionmaker()() as db:
+        pty = await db.get(Session, pty_id)
+        assert pty is not None
+        assert pty.status == "running"
+        assert pty.exit_code is None
     assert broker.get_daemon_for_session(pty_id) is new_conn
 
     new.queue_disconnect()

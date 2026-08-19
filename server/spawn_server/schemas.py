@@ -435,8 +435,8 @@ class HostAgentTarget(BaseModel):
     agent_id: str
     agent_name: str
     # Deliberate asymmetry: the agents table (and AgentOut) call this `kind`,
-    # but the host-availability wire keeps v2's `agent_kind` — §4.2 renames
-    # only preset_id/preset_name, and daemon + web encode this name.
+    # but the host-availability wire keeps `agent_kind`, which the daemon and
+    # web both encode by that name.
     agent_kind: str
     # The binary to `which` on the host: the first word of the agent's
     # command string, computed server-side.

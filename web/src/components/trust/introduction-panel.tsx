@@ -82,7 +82,7 @@ export function IntroductionPanel({
 
   return (
     <div
-      className="space-y-3 rounded-md border border-emerald-600/50 p-3"
+      className="space-y-3 rounded-md border border-success/50 p-3"
       data-testid="introduction-panel"
     >
       <div>

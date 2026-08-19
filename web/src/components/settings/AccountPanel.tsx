@@ -85,7 +85,7 @@ export function AccountPanel() {
         <div>
           <p className="text-sm font-medium">Delete account</p>
           <p className="text-sm text-muted-foreground">
-            Permanently deletes this account: every host pairing, agent, screen, preset, skill,
+            Permanently deletes this account: every host pairing, session, workspace, agent, skill,
             device identity, and saved trust. Daemons on your machines keep running but lose this
             server. This cannot be undone.
           </p>

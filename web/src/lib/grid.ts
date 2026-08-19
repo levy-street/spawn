@@ -270,7 +270,9 @@ function sameTiles(a: Tile[], b: Tile[]): boolean {
   if (a.length !== b.length) return false;
   return a.every((t, i) => {
     const o = b[i];
-    return t.session_id === o.session_id && t.x === o.x && t.y === o.y && t.w === o.w && t.h === o.h;
+    return (
+      t.session_id === o.session_id && t.x === o.x && t.y === o.y && t.w === o.w && t.h === o.h
+    );
   });
 }
 

@@ -65,6 +65,22 @@ const nextConfig: NextConfig = {
       { source: "/install.sh", destination: `${API_PROXY_TARGET}/install.sh` },
     ];
   },
+  // The overhaul collapsed five nav destinations into one workspace page plus a
+  // settings modal. These keep bookmarks and daemon-printed links from 404ing;
+  // an agent id still resolves because agents became sessions one-for-one.
+  async redirects() {
+    return [
+      { source: "/agents/:id", destination: "/sessions/:id", permanent: false },
+      { source: "/agents", destination: "/", permanent: false },
+      { source: "/agents/new", destination: "/", permanent: false },
+      { source: "/screens", destination: "/", permanent: false },
+      { source: "/screens/:id", destination: "/w/:id", permanent: false },
+      { source: "/presets", destination: "/", permanent: false },
+      { source: "/hosts", destination: "/", permanent: false },
+      { source: "/settings", destination: "/", permanent: false },
+      { source: "/trust", destination: "/", permanent: false },
+    ];
+  },
 };
 
 export default nextConfig;

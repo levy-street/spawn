@@ -34,7 +34,7 @@ export function BrowserDeviceRegistrationStatus() {
 
   const cleanupPending = registration.data?.status === "cleanup_pending";
   return (
-    <div className="border-amber-500/40 border-b bg-amber-500/10 px-4 py-3" role="alert">
+    <div className="border-warning/40 border-b bg-warning-soft px-4 py-3" role="alert">
       <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3">
         <p className="text-sm">
           {cleanupPending
