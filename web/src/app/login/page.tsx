@@ -11,6 +11,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ApiError, auth } from "@/lib/api";
 
+/**
+ * Where to land after login: the `?next=` AuthGate set, but only when it is a
+ * same-origin absolute path. Rejects protocol-relative (`//host`) and absolute
+ * URLs so `next` can't become an open redirect.
+ */
+function safeNext(raw: string | null): string {
+  if (!raw || !raw.startsWith("/") || raw.startsWith("//")) return "/";
+  return raw;
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
@@ -27,7 +37,7 @@ export default function LoginPage() {
       const result = await auth.login({ email, password });
       queryClient.setQueryData(["me"], { user: result.user });
       void queryClient.invalidateQueries({ queryKey: ["me"] });
-      router.replace("/");
+      router.replace(safeNext(new URLSearchParams(window.location.search).get("next")));
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "Login failed";
       setError(message);

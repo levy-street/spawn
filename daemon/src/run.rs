@@ -831,15 +831,16 @@ async fn clear_session_sinks(registry: &AgentRegistry) {
 /// Whether this daemon refuses RTC offers that carry no verified signed
 /// envelope.
 ///
-/// Off by default, and deliberately so: turning it on locks out any browser
-/// that cannot do signed signaling at all, which today includes every origin
-/// that is not a secure context (plain-HTTP access by IP has no WebCrypto, so
-/// it can neither hold a pin nor sign an offer). Enable it only once every
-/// browser that must reach this host is served over HTTPS.
+/// On by default (see `require_signed_rtc_offers`): an unsigned offer to a
+/// daemon that has never pinned the offering browser is exactly the attack
+/// signed signaling refuses. `SPAWND_REQUIRE_SIGNED_RTC=0` is the escape hatch
+/// for operators who accept raw first-contact (e.g. recovering a deployment
+/// whose browser identities were lost).
 ///
-/// While it is off, the browser-side pin gate protects the operator's own
+/// While it is off, the browser-side pin gate still protects the operator's own
 /// browser from being downgraded, but does not stop a server from opening its
-/// own unsigned session to this daemon.
+/// own unsigned session to this daemon — so authentication soundness (P5 in
+/// docs/TRUST_DEVICE_MESH.md) holds only with enforcement on (assumption A7).
 
 /// Run one blocking credential mutation off the Tokio dispatch task with the
 /// exact isolation the single-flight loader uses for the same backend:

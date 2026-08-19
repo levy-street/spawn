@@ -74,3 +74,17 @@ export async function sas(
   const s = code.toString().padStart(6, "0");
   return `${s.slice(0, 3)} ${s.slice(3)}`;
 }
+
+/** base64url (no padding) helpers for the 32-byte SAS wire values. */
+export function b64urlEncode(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+export function b64urlDecode(value: string): Uint8Array {
+  const bin = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
+  return out;
+}
