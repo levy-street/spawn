@@ -318,6 +318,18 @@ pub fn validate_login_access_token(access_token: &str) -> Result<()> {
     Ok(())
 }
 
+/// A short, human-comparable verification code derived from a host-key
+/// fingerprint. The daemon prints it and the browser shows it, so the operator
+/// matches two 6-digit numbers instead of two base64 fingerprints. It is a
+/// presentation of the same pinned identity — deterministic from the exact
+/// fingerprint string both sides already display — not a new secret. The web
+/// side must compute this identically (see web/src/lib/verification-code.ts).
+pub fn verification_code(fingerprint: &str) -> String {
+    let digest = Sha256::digest(fingerprint.as_bytes());
+    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{:03} {:03}", n / 1000, n % 1000)
+}
+
 pub fn browser_key_fingerprint(public_key: &str) -> Result<String> {
     if public_key.len() != PUBLIC_KEY_WIRE_BYTES {
         bail!("approved browser public key has the wrong encoded length")
@@ -2247,6 +2259,15 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    #[test]
+    fn verification_code_matches_the_shared_vectors() {
+        // Must stay identical to web/src/lib/verification-code.ts. These vectors
+        // are also computed there; a drift here silently breaks number matching.
+        assert_eq!(verification_code("SHA256:WpbwJ-66BpwGjk7s"), "757 961");
+        assert_eq!(verification_code("SHA256:AAAAAAAAAAAAAAAA"), "130 179");
+        assert_eq!(verification_code("SHA256:PUAXw-hDiVqStwqn"), "282 487");
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
