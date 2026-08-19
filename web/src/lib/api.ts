@@ -546,6 +546,20 @@ export const account = {
     api<void>("/api/account/delete", { method: "POST", body: JSON.stringify(body) }),
 };
 
+const PairingStateSchema = z.object({
+  id: z.string(),
+  initiator_device_id: z.string(),
+  joiner_device_id: z.string(),
+  initiator_public_key: z.string(),
+  initiator_commit: z.string(),
+  joiner_public_key: z.string().nullable().optional(),
+  joiner_nonce: z.string().nullable().optional(),
+  initiator_nonce: z.string().nullable().optional(),
+  created_at: z.string(),
+  expires_at: z.string(),
+});
+export type PairingState = z.infer<typeof PairingStateSchema>;
+
 export const trust = {
   /** null when this account has never sealed a bundle. */
   getBundle: () =>
@@ -616,6 +630,75 @@ export const trust = {
         created_at: z.string(),
       }),
     }),
+
+  // ----- device mesh: account-scoped endorsements (§3) -----
+
+  /**
+   * Every account-scoped endorsement edge, for a device to assemble the carried
+   * chain it presents on connect. Server-claimed; the daemon re-verifies each.
+   */
+  accountEndorsements: () =>
+    api("/api/trust/account-endorsements", {
+      method: "GET",
+      schema: z.array(
+        z.object({
+          endorser_device_id: z.string(),
+          endorser_public_key: z.string(),
+          endorsed_device_id: z.string(),
+          endorsed_public_key: z.string(),
+          signature: z.string(),
+          created_at: z.string(),
+        }),
+      ),
+    }),
+  createAccountEndorsement: (body: {
+    endorser_device_id: string;
+    endorsed_device_id: string;
+    signature: string;
+  }) =>
+    api("/api/trust/account-endorsements", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: z.object({
+        id: z.string(),
+        endorser_device_id: z.string(),
+        endorsed_device_id: z.string(),
+        created_at: z.string(),
+      }),
+    }),
+
+  // ----- device mesh: browser↔browser add-device SAS ceremony (§4) -----
+
+  startPairing: (body: {
+    initiator_device_id: string;
+    joiner_device_id: string;
+    initiator_public_key: string;
+    initiator_commit: string;
+  }) =>
+    api("/api/trust/pairing", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: z.object({ id: z.string(), expires_at: z.string() }),
+    }),
+  listPairings: (deviceId: string) =>
+    api(`/api/trust/pairing?device_id=${encodeURIComponent(deviceId)}`, {
+      method: "GET",
+      schema: z.array(PairingStateSchema),
+    }),
+  contributePairing: (id: string, body: { joiner_public_key: string; joiner_nonce: string }) =>
+    api(`/api/trust/pairing/${id}/contribute`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: PairingStateSchema,
+    }),
+  revealPairing: (id: string, body: { initiator_nonce: string }) =>
+    api(`/api/trust/pairing/${id}/reveal`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: PairingStateSchema,
+    }),
+  cancelPairing: (id: string) =>
+    api(`/api/trust/pairing/${id}`, { method: "DELETE", schema: z.unknown() }),
 };
 
 export const agents = {

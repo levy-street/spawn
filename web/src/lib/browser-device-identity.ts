@@ -1,3 +1,4 @@
+import { encodeAcctEndorsementTranscript } from "./acct-endorsement-transcript";
 import { encodeBrowserDeviceRegistrationTranscript } from "./browser-device-registration-transcript";
 import { encodeBrowserEndorsementTranscript } from "./browser-endorsement-transcript";
 import { encodeHostPairApprovalTranscript } from "./host-pair-approval-transcript";
@@ -497,6 +498,49 @@ export async function createBrowserEndorsementProof(
     throw new BrowserDeviceIdentityError(
       "corrupt_record",
       "browser endorsement signer returned an invalid signature length",
+    );
+  }
+  return encodeBase64Url(signature);
+}
+
+/**
+ * Sign an ACCOUNT-scoped endorsement of another device's key (device mesh §3).
+ *
+ * Unlike {@link createBrowserEndorsementProof} there is no host: the same signed
+ * edge is valid toward every host of the account, carried by the endorsed device
+ * and presented on connect. The endorsed key must be the one the operator
+ * confirmed via the SAS number-match; signing does not establish where it came
+ * from, only that this device vouched for it account-wide.
+ */
+export async function createAccountEndorsementProof(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+  endorsedPublicKey: string,
+  endorsedDeviceId: string,
+): Promise<string> {
+  assertAccountId(accountId);
+  const record = privateIdentityRecords.get(identity);
+  if (record === undefined || record.accountId !== accountId) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not belong to the authenticated account",
+    );
+  }
+  const transcript = encodeAcctEndorsementTranscript(
+    accountId,
+    record.publicKeyWire,
+    endorsedPublicKey,
+    endorsedDeviceId,
+  );
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new BrowserDeviceIdentityError(
+      "corrupt_record",
+      "account endorsement signer returned an invalid signature length",
     );
   }
   return encodeBase64Url(signature);
