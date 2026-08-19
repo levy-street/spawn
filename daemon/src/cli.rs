@@ -54,7 +54,9 @@ pub struct PossessArgs {
 
     /// Print the approval link instead of opening a browser. Also honored as
     /// SPAWN_NO_BROWSER=1, which is the only way through `curl … | sh`.
-    #[arg(long, env = "SPAWN_NO_BROWSER")]
+    /// The env var is read in login.rs with shell semantics rather than by
+    /// clap, which would demand a literal `true`/`false`.
+    #[arg(long)]
     pub no_browser: bool,
 }
 
@@ -78,7 +80,9 @@ pub struct LoginArgs {
 
     /// Print the approval link instead of opening a browser. Also honored as
     /// SPAWN_NO_BROWSER=1, which is the only way through `curl … | sh`.
-    #[arg(long, env = "SPAWN_NO_BROWSER")]
+    /// The env var is read in login.rs with shell semantics rather than by
+    /// clap, which would demand a literal `true`/`false`.
+    #[arg(long)]
     pub no_browser: bool,
 }
 

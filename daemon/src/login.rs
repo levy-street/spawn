@@ -210,10 +210,26 @@ pub struct BrowserEnv {
     pub over_ssh: bool,
 }
 
+/// Shell semantics for a boolean environment variable.
+///
+/// `SPAWN_NO_BROWSER=1` is what the README and every piped installer would
+/// naturally write, and it is what a person types. Letting clap parse the env
+/// var instead rejects it outright, demanding a literal `true` -- so the
+/// documented usage would have failed with `invalid value '1'`.
+pub fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
 impl BrowserEnv {
     fn from_process(opted_out: bool) -> Self {
         Self {
-            opted_out,
+            opted_out: opted_out || env_flag_enabled("SPAWN_NO_BROWSER"),
             // Installing on a box you reached over SSH is the case where
             // "opened your browser" is actively wrong: on macOS `open` targets
             // the console session, so a browser appears on someone else's
@@ -469,6 +485,35 @@ mod tests {
             opted_out: false,
             over_ssh: false,
         }));
+    }
+
+    #[test]
+    fn env_flag_uses_shell_semantics_not_rust_bool_parsing() {
+        // The regression this exists for: `SPAWN_NO_BROWSER=1` is what the
+        // README documents and what anyone would type, and clap's own env
+        // parsing rejects it with "invalid value '1'".
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("yes", true),
+            ("anything", true),
+            ("0", false),
+            ("false", false),
+            ("off", false),
+            ("no", false),
+            ("", false),
+            ("  ", false),
+        ] {
+            std::env::set_var("SPAWN_TEST_BROWSER_FLAG", value);
+            assert_eq!(
+                env_flag_enabled("SPAWN_TEST_BROWSER_FLAG"),
+                expected,
+                "value {value:?}"
+            );
+        }
+        std::env::remove_var("SPAWN_TEST_BROWSER_FLAG");
+        assert!(!env_flag_enabled("SPAWN_TEST_BROWSER_FLAG"));
     }
 
     #[test]
