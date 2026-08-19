@@ -82,6 +82,14 @@ impl RevocationSet {
         self.keys.contains(key)
     }
 
+    /// True if this set holds any key not in `previous` — i.e. a revocation
+    /// landed since `previous` was current. The deny-list is add-only, so this
+    /// is exactly "did a new device get revoked", the signal to tear down live
+    /// sessions (R1) rather than only block new connections.
+    pub fn revokes_beyond(&self, previous: &RevocationSet) -> bool {
+        self.keys.iter().any(|key| !previous.contains(key))
+    }
+
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -633,6 +641,16 @@ mod tests {
         assert!(!revoked.insert(k));
         assert!(revoked.contains(&k));
         assert_eq!(revoked.len(), 1);
+    }
+
+    #[test]
+    fn revokes_beyond_detects_only_new_revocations() {
+        let a = key(2).verifying_key().to_bytes();
+        let b = key(3).verifying_key().to_bytes();
+        let prev = RevocationSet::from_keys([a]);
+        assert!(!RevocationSet::from_keys([a]).revokes_beyond(&prev)); // unchanged
+        assert!(RevocationSet::from_keys([a, b]).revokes_beyond(&prev)); // b is new
+        assert!(!RevocationSet::new().revokes_beyond(&prev)); // add-only: never shrinks
     }
 
     // ---- find_valid_chain: admission from an unordered presented edge-set ----
