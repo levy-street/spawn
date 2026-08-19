@@ -1,5 +1,13 @@
 # Trust Phase 3 — independent security audit (signed signaling + fingerprint pinning)
 
+> **Historical audit:** this report correctly described the audited July 2026
+> commit, where the signed path had no live callers. It does not describe the
+> shipped August tree: live browser and daemon signaling now consume signed
+> envelopes, session scopes use `scope_type:"session"`, and the browser and
+> daemon control WebSockets require v3 subprotocols. The findings remain
+> immutable audit evidence; consult `TRUST.md` and `proto/README.md` for current
+> claims and limitations.
+
 **Date:** 2026-07-17
 **Branch audited:** `master`
 **Scope:** the Phase 3 "signed RTC signaling + Ed25519 host identity + fingerprint pinning"

@@ -439,7 +439,28 @@ error detail is not placed on the signaling websocket.
 ### Server → daemon JSON frames
 
 ```json
-{"type": "registered", "host_id": "uuid"}
+{"type": "registered",
+ "host_id": "uuid",
+ "account_id": "uuid",
+ "browser_device_ids": ["uuid", ...],
+ "browser_pins": [{
+   "browser_device_id": "uuid",
+   "browser_key_algorithm": "ed25519",
+   "browser_public_key": "canonical-base64url",
+   "browser_key_fingerprint": "SHA256:short-base64url",
+   "endorser_public_key": "canonical-base64url|null",
+   "endorsement_signature": "canonical-base64url|null"}]}
+
+{"type": "host.browser_pins",
+ "account_id": "uuid",
+ "browser_device_ids": ["uuid", ...],
+ "browser_pins": [{
+   "browser_device_id": "uuid",
+   "browser_key_algorithm": "ed25519",
+   "browser_public_key": "canonical-base64url",
+   "browser_key_fingerprint": "SHA256:short-base64url",
+   "endorser_public_key": "canonical-base64url|null",
+   "endorsement_signature": "canonical-base64url|null"}]}
 
 {"type": "host.heartbeat"}
 
@@ -478,6 +499,13 @@ error detail is not placed on the signaling websocket.
 
 {"type": "session.kill", "session_id": "uuid", "signal": "TERM"}
 ```
+
+`registered` carries the authoritative live browser-device set and the full
+pin records for initial reconciliation. `host.browser_pins` pushes the same
+state after a pin change; additions are still accepted only when their
+endorsement verifies against a key the daemon already pins, while absence from
+`browser_device_ids` drives revocation. The fields are optional on decode; a
+missing device-id set never revokes local pins.
 
 `host.agents.*` targets identify **agent definitions** (`agent_id` is the
 agents-table id, not a session); `command` is the single binary name to

@@ -3,9 +3,13 @@
 The living design-system reference for `spawn-web`. Every visual decision
 flows through the tokens in `web/src/app/globals.css` and the primitives in
 `web/src/components/ui/` — this document is the inventory of both and the
-rules for extending them. Product/feature specs live in `docs/OVERHAUL.md`
-while the overhaul is in flight; system architecture lives in `README.md`,
+rules for extending them. The shipped product/feature decision record lives in
+`docs/OVERHAUL.md`; system architecture lives in `README.md`,
 `docs/TRUST.md`, and `proto/README.md`.
+
+The endpoint-local protected-data proposal in
+`DURABLE_SENSITIVE_DATA.md` remains review-pending and unimplemented; do not
+add UI for that store until a current shell-session design is accepted.
 
 ## Rules
 
@@ -125,7 +129,7 @@ tokens only.
 | `input.tsx`, `textarea.tsx`, `label.tsx` | form fields | all text entry |
 | `badge.tsx` | `Badge` (`variant`: default/outline/success/warning/info/destructive) | status chips |
 | `status.tsx` | `DotTone`, `StatusDot`, `SessionStatusDot`, `hostStatusTone` | activity/presence dots |
-| `card.tsx` | `Card`, `CardHeader`, `CardTitle`, `CardContent` | grouped content panels |
+| `card.tsx` | `Card`, `CardHeader`, `CardTitle`, `CardDescription`, `CardContent`, `CardFooter` | grouped content panels |
 | `skeleton.tsx` | `Skeleton` | loading placeholders for known layouts |
 | `spinner.tsx` | `Spinner` (`size`, `label`) | indeterminate loading; replaces "Loading..." text |
 | `empty-state.tsx` | `EmptyState` (`icon`, `title`, `body`, `action`) | empty workspace, no hosts, empty lists |
@@ -135,7 +139,7 @@ tokens only.
 | `cascade-menu.tsx` | `CascadeMenu`, `CascadePanel`, `CascadeItem` | multi-step pick-one flows (the `+` new-session cascade). Panels are data; per-panel `loading`; renders as a bottom sheet on small viewports |
 | `sheet.tsx` | `BottomSheet` | mobile bottom-sheet container (drag handle, scrim, `--vv-height` cap) |
 | `drawer.tsx` | `Drawer` | left slide-in panel (the mobile sidebar): scrim, drag-to-dismiss, focus trap |
-| `tooltip.tsx` | tooltip primitives | hover/focus hints |
+| `tooltip.tsx` | `RailTooltip` | collapsed-sidebar hover/focus hints |
 
 Usage rules:
 

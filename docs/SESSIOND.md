@@ -1,6 +1,6 @@
 # sessiond — replacing tmux with purpose-built session workers
 
-**Status: implemented as the mandatory backend; cutover review pending.**
+**Status: implemented, independently reviewed, and mandatory.**
 `spawn-worker` plus `spawnd` supervision is the only production session path.
 There is no backend selector, per-session escape hatch, or fallback. The accepted
 cutover boundary and old-session drain procedure are in
@@ -36,8 +36,7 @@ everything else.
 
 ## 2. Design principles
 
-1. **The session terminal path is endpoint-owned at the P2-AGENT-02
-   implementation checkpoint** (review pending; TRUST.md). The worker protocol stays on a Unix
+1. **The session terminal path is endpoint-owned.** The worker protocol stays on a Unix
    socket in a `0700` directory, and the browser's low-latency copy travels over
    mandatory WebRTC DataChannels. `spawnd` sends only content-free activity and
    signaling/lifecycle JSON over its server control socket.
@@ -156,7 +155,7 @@ guessed at.
 |---|---|---|---|
 | `T_HELLO` 0x01 | w→d | JSON `{version, session_id, instance_id, state, pid?, cols, rows, cwd?, history?}` | first frame on **every** accepted connection; enables stateless adoption, binds lifecycle to this exact worker instance, and in v5 retains the canonical absolute cwd capability required by direct session uploads. `history: true` advertises the committed-history delta stream (§8.4). Decoders accept the pre-v3 `agent_id` spelling as an alias so a new spawnd adopts workers started before the rename |
 | `T_START` 0x02 | d→w | JSON `{cwd, argv, env, cols, rows}` | spawn the session command (spawnd always sends the user's login shell with `-l`). Env goes over the private socket, not argv, so secrets never appear in `/proc/*/cmdline` |
-| `T_STARTED` 0x03 | w→d | JSON `{pid}` | session is running (the **real** shell pid, unlike the tmux backend's attach pid) |
+| `T_STARTED` 0x03 | w→d | JSON `{pid, cwd}` | session is running; `cwd` is the canonical absolute capability root retained by the worker |
 | `T_OUTPUT` 0x04 | w→d | `watermark u64 LE ‖ raw bytes` | live PTY output with the same durable producer coordinate used by replay |
 | `T_INPUT` 0x05 | d→w | raw bytes | PTY stdin |
 | `T_RESIZE` 0x06 | d→w | `cols u16 LE, rows u16 LE` | PTY resize (kernel sends SIGWINCH); lines displaced by a narrowing reflow commit to history |
@@ -252,12 +251,14 @@ Restart checks TERM delivery and deterministically escalates to KILL. `spawnd`
 does not hold a local session PTY, a child process handle, or a backend
 discriminator.
 
-The Unix-socket hop adds no control-plane exposure. P2-AGENT-02 removes daemon
+The Unix-socket hop adds no control-plane exposure. P2-AGENT-02 removed daemon
 WS terminal binary frames, browser relay/history/snapshot frames, transcripts,
 and content pubsub. `spawn.ctl` replay carries a stream-position watermark
-directly to the browser. This cut does not make all of Phase 2 true:
-uploads, host operations, launch manifests, error detail, historical purge,
-and the final audit remain separate tracked tasks.
+directly to the browser. Session uploads now use that direct channel, and host
+file operations use `spawn.host.ctl`. The broader Phase 2 claim remains
+incomplete because session directories, agent-definition values, skill bodies,
+host-agent operations, some detailed errors, and historical purge still have
+server-readable or unfinished paths; see `TRUST.md`.
 
 ## 6. Encrypted-at-rest scrollback
 
@@ -376,12 +377,12 @@ Why this is the right default — the alternatives and their tradeoffs:
 
 | Key scheme | Survives worker restart | Blast radius if key leaks | Server involvement | Notes |
 |---|---|---|---|---|
-| **Per-worker ephemeral (chosen)** | no — but the PTY and agent died with the worker anyway, so the log has nothing meaningful left to replay | one agent's current session | none | zero key-management surface; nonce safety trivial; cleanup = forget |
-| Host key (spawnd keyring) | yes | every agent's scrollback on the host | none | requires spawnd→worker key delivery (over the socket, fine) and rotation story; buys persistence of logs whose PTY is gone — mostly useful for a future "transcript archive" feature, not live reattach |
-| Per-agent derived key (HKDF from host key + agent_id) | yes | one agent's full history | none | same delivery/rotation cost as host key with a smaller blast radius; the natural upgrade path if worker-restart-with-history ever becomes a feature |
+| **Per-worker ephemeral (chosen)** | no — but the PTY and session process tree died with the worker anyway, so the log has nothing meaningful left to replay | one current session | none | zero key-management surface; nonce safety trivial; cleanup = forget |
+| Host key (spawnd keyring) | yes | every session's scrollback on the host | none | requires spawnd→worker key delivery (over the socket, fine) and rotation story; buys persistence of logs whose PTY is gone — mostly useful for a future "transcript archive" feature, not live reattach |
+| Per-session derived key (HKDF from host key + session ID) | yes | one session's full history | none | same delivery/rotation cost as host key with a smaller blast radius; the natural upgrade path if worker-restart-with-history ever becomes a feature |
 | Sealed to browser device keys (Phase-3 WebCrypto identities) | yes | nothing on the host can read it — including the worker | pub-key registry only | the strongest story ("host stores what only your devices can open") but the worker could no longer *serve* replay; replay/serialization logic would move client-side, multi-device needs key-wrapping fan-out. This is the TRUST.md "client-side-encrypted transcript backup" (Later) item, not the live-session log |
 
-The live-session log exists to serve reattach while the agent is alive; the
+The live-session log exists to serve reattach while the session is alive; the
 ephemeral key covers exactly that lifetime with the smallest possible surface.
 When TRUST.md's optional encrypted transcript backup lands, it should be a
 *separate* artifact sealed to device keys, not a repurposing of this log.
@@ -403,9 +404,10 @@ never commit; a resize cannot retroactively reflow committed lines (narrowing
 commits the displaced rows once, widening finds an empty drain window and has
 nothing to un-commit); `ED 3` (`/clear` in claude/codex emits `2J 3J H`)
 physically truncates the log (`scrollback_wipe_erases_replayed_history`).
-Segment rotation is purely a storage/eviction concern — **the agent process
+Segment rotation is purely a storage/eviction concern — **the session process
 is never signaled, resized, or otherwise disturbed by it**
-(`scrollback_rotation_must_not_disturb_the_agent`).
+(`scrollback_rotation_must_not_disturb_the_agent`; the test name is retained
+for compatibility history).
 
 Replay concatenates the newest run of whole segments whose plaintext fits the
 caller's `max_bytes` (failing closed rather than splitting a segment), then
@@ -465,7 +467,7 @@ provoke.
 `T_REPLAY_REQ(max_bytes)` → `T_REPLAY(watermark ‖ bytes)`. The watermark is
 the cumulative lifetime count of output bytes logged at capture time; it is a
 monotonic source coordinate, not the size of the retained replay tail. spawnd's
-snapshot handler (`handle_agent_snapshot`, worker branch) samples the
+worker-backed replay path samples the
 requesting viewer's DataChannel byte offset *before* issuing the replay;
 because the worker logs before forwarding, everything counted at that offset
 is guaranteed to be covered by the replay, and the browser can drop already
@@ -510,7 +512,7 @@ frame-type surprises.
 
 ## 9. Resize, flow control, multi-viewer
 
-**Resize.** `AgentHandle::resize` dedupes unchanged geometry (as today) and
+**Resize.** `SessionHandle::resize` dedupes unchanged geometry and
 sends `T_RESIZE`; the worker applies it to the PTY master and the emulator,
 committing any lines a narrowing reflow displaces. Resize *authority* is
 negotiated endpoint-to-endpoint over `spawn.ctl`: the daemon's display-control
@@ -545,12 +547,12 @@ described in §6.2, including checkpoint and framing charges.
 
 | Event | Outcome |
 |---|---|
-| **Agent exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, identity-checks and unlinks both sockets, releases its lifetime lock, and exits; spawnd forwards `agent.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit. |
-| **Worker crashes** | the agent dies with it (it held the PTY master) — identical blast radius to "tmux server crashed" but scoped to **one** agent instead of every agent on the host. spawnd's connection reader reports `worker_lost`. The kernel releases the lifetime flock; the next launch, or a failed adoption that can acquire that lock, ownership-checks and removes the crashed worker's stale endpoints. Restart policy stays where it is today (user-driven `agent.restart`), which for agentic CLIs is the honest choice — blind auto-respawn of a stateful agent process is not a recovery. |
-| **spawnd restarts / upgrades** | workers keep running (own process group). On startup `rediscover_existing_agents` scans the socket dir (`discover_ids`), connects, verifies `Hello.agent_id`, and adopts from the `Hello` (instance identity, state, pid, geometry), then derives the independent lifecycle socket — no persistent supervisor state. The same lazy adoption path (`ensure_agent_attached`) recovers an agent on first use if startup discovery raced. A reconnect displaces no agent state; viewers re-seed from emulator-synthesized snapshots on demand. |
-| **spawnd upgrade + protocol change** | `Hello.version` gates adoption; private worker protocol version 5 additionally requires the worker's retained canonical cwd capability root for direct agent uploads. A mismatched or cwd-less worker is left untouched (its agent keeps running) and surfaced in logs rather than driven with a protocol it doesn't speak or falling back to a server upload path. Old workers drain away as their agents exit. |
-| **Worker binary upgrade** | applies to newly launched agents only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`. |
-| **Host reboot** | workers and agents die. Runtime-dir sockets/ciphertext evaporate with tmpfs. |
+| **Session exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, identity-checks and unlinks both sockets, releases its lifetime lock, and exits; spawnd forwards `session.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit. |
+| **Worker crashes** | the session process tree dies with it (the worker held the PTY master) — identical blast radius to "tmux server crashed" but scoped to **one** session instead of every session on the host. spawnd's connection reader reports `worker_lost`. The kernel releases the lifetime flock; the next launch, or a failed adoption that can acquire that lock, ownership-checks and removes the crashed worker's stale endpoints. Restart policy is user-driven `session.restart`; blind auto-respawn of stateful work inside the shell is not a recovery. |
+| **spawnd restarts / upgrades** | workers keep running in their own process groups. On startup `rediscover_existing_sessions` scans the socket directory via `discover_ids`, connects, verifies `Hello.session_id`, and adopts from `Hello` (instance identity, state, pid, geometry, cwd) — no persistent supervisor state. The same lazy path (`ensure_session_attached`) recovers a session on first use if startup discovery raced. A reconnect displaces no session state; viewers re-seed from emulator-synthesized snapshots on demand. `Hello` accepts the former identity-key spelling as an adoption-only serde alias. |
+| **spawnd upgrade + protocol change** | `Hello.version` gates adoption; private worker protocol version 5 additionally requires the worker's retained canonical cwd capability root for direct session uploads. A mismatched or cwd-less worker is left untouched (its session keeps running) and surfaced in logs rather than driven with a protocol it does not speak or falling back to a server upload path. Old workers drain away as their sessions exit. |
+| **Worker binary upgrade** | applies to newly launched sessions only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`. |
+| **Host reboot** | workers and their session process trees die. Runtime-dir sockets/ciphertext evaporate with tmpfs. |
 
 The only launch-time fd inheritance is the already-locked reservation, exposed
 to that one post-fork child and immediately restored to close-on-exec inside
@@ -562,7 +564,7 @@ and survives on its own. Adoption-by-reconnect has no listener handoff window.
 P2-TMUX-01 is the hard cutover, not a default flip. The daemon module,
 subprocess calls, selector and escape hatch, creation/attach/discovery,
 capture/repaint/copy-mode behavior, session label, and exact replay buffer are
-removed. Agent restart performs escalating TERM→KILL through the worker before
+removed. Session restart performs escalating TERM→KILL through the worker before
 creating a replacement; startup discovery scans worker sockets only.
 
 A live pre-cutover session cannot be adopted or transformed into a worker
@@ -580,17 +582,17 @@ the same checkpoint. They are absent from daemon runtime structs as well.
 | | shpool (Google) | wezterm-mux-server | zellij server | **spawn-worker** |
 |---|---|---|---|---|
 | Language | Rust | Rust | Rust | Rust |
-| Model | one daemon, N named sessions | one mux server, own client protocol | one server per session group, plugin runtime | **one process per agent** |
+| Model | one daemon, N named sessions | one mux server, own client protocol | one server per session group, plugin runtime | **one worker process per session** |
 | Server-side emulation | minimal (keeps a restore buffer; explicitly *not* a multiplexer) | full (termwiz grid; clients render grid deltas) | full (its own grid + layout engine) | **headless checkpoint emulator only (alacritty core, plaintext current-screen grids); live path is raw bytes, user-facing rendering is xterm.js** |
 | Reattach story | replays restore buffer | grid sync | grid sync | encrypted geometry-tagged byte replay opening with an emulator-serialized checkpoint (the iTerm2 restoration model, encrypted at rest) |
 | Scrollback at rest | plaintext in memory | plaintext (grid) | plaintext (grid) | **ChaCha20-Poly1305 on disk, ephemeral key; transient owned replay buffers wiped, plaintext current grids disclosed above** |
-| Crash blast radius | all sessions in daemon | all clients of the mux | session group | one agent |
+| Crash blast radius | all sessions in daemon | all clients of the mux | session group | one session |
 | Remote transport | ssh | ssh/TLS, own protocol | ssh | WebRTC DataChannel (already existed; unchanged) |
 
 shpool is the closest relative — it also concluded that "session persistence
 without a multiplexer" is the right shape, and its restore-buffer replay is
 the plaintext cousin of our checkpoint replay. We diverge where the operator
-model demands it: per-agent process isolation, encryption at rest, and keeping
+model demands it: per-session process isolation, encryption at rest, and keeping
 the worker's plaintext grid state to the current checkpoint screens rather
 than a user-facing or deep-history multiplexer. wezterm/zellij solve a
 different problem (rich multiplexing UX) with a server-side renderer in the
@@ -644,8 +646,8 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 
 | TRUST.md phase | sessiond contribution |
 |---|---|
-| **Phase 1** (shipped) — DataChannel-only PTY | worker backend removed tmux as a plaintext holder; P2-AGENT-02 now removes the legacy server mirror at its review-pending implementation checkpoint |
-| **Phase 2** — endpoint-owned data, server stores deleted | scrollback/history/snapshot are worker-owned encrypted artifacts with watermarked replay over `spawn.ctl`; `StartSpec.env` over the private socket keeps spawn-time secrets out of `/proc`, while later tasks must still make launch and host paths E2E and purge historical copies |
+| **Phase 1** (shipped) — DataChannel-only PTY | worker backend removed tmux as a plaintext holder; P2-AGENT-02 removed the legacy server mirror |
+| **Phase 2** — endpoint-owned data, server stores deleted | scrollback/history/snapshot and session uploads are worker-owned and use `spawn.ctl`; host file operations use `spawn.host.ctl`. Session directories, agent-definition values, skill bodies, host-agent operations, some detailed errors, and historical purge still prevent a complete Phase 2 claim |
 | **Phase 3** — signed signaling | orthogonal to sessiond (signaling-layer); nothing here assumes server-trusted introductions |
 | **Phase 4 / Later** — open source; encrypted transcript backup | worker is self-contained and auditable (`daemon/src/sessiond/` has no control-plane deps); device-key-sealed backup slots in as a separate artifact per §7 |
 
@@ -654,14 +656,10 @@ for the corpus: xterm.js(serialize(emulator(case))) ≡ xterm.js(case).
 - **Backpressure follow-up** (§9): Phase 2 uses bounded per-viewer sinks,
   disconnect-on-stall and replay-based catch-up; future work may add adaptive
   queue sizing and transport telemetry.
-- **History over DataChannel review** (Phase 2): `spawn.ctl` carries
-  worker-backed connect history and snapshots using request-bound chunks
-  and explicit PTY byte anchors; the legacy base64-WS leg is removed in the
-  P2-AGENT-02 implementation and independent review remains.
 - **Replay-fidelity conformance test** (§13): grid-diff live vs replayed
   streams via the harness.
-- **Worker resource limits**: per-worker RLIMIT/cgroup knobs if agents start
-  sharing hosts with untrusted workloads (out of scope for the current
+- **Worker resource limits**: per-worker RLIMIT/cgroup knobs if session
+  workloads start sharing hosts with untrusted workloads (out of scope for the current
   single-user host model).
-- **`spawnd status` integration**: list worker-backed agents with pid/state
+- **`spawnd status` integration**: list worker-backed sessions with pid/state
   from `Hello` without attaching.

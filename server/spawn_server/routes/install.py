@@ -577,8 +577,8 @@ INSTALL_SCRIPT = dedent(
     ExecStart="$BIN" --server "$SERVER" run
     Restart=always
     RestartSec=2
-    # Only kill spawnd itself on stop/restart: per-agent session workers live
-    # in this cgroup and must survive supervisor updates.
+    # Only kill spawnd itself on stop/restart: the per-session workers live in
+    # this cgroup and must survive supervisor updates.
     KillMode=process
     # Headroom against fd exhaustion taking the host offline.
     LimitNOFILE=65536

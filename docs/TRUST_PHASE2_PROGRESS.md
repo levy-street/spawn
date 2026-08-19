@@ -1,5 +1,12 @@
 # Trust Phase 2/3 — progress + resume notes
 
+> **Historical checkpoint:** this savefile records the pre-overhaul trust
+> work and its then-current vocabulary. The shipped product uses login-shell
+> sessions, agent shortcut definitions, `spawn.v3` browser signaling,
+> `spawn.control.v3` daemon control, and `session.*` lifecycle frames. See
+> `INTERFACE_MATRIX.md`, `proto/README.md`, and `TRUST.md` for current behavior;
+> do not treat present tense below as a description of the August 2026 tree.
+
 Working savefile for the "operator model" migration. Design spec:
 `docs/TRUST_PHASE2.md`. Governing doc: `docs/TRUST.md`. Tracked execution
 schedule: `docs/TRUST_PHASE2_TASKS.md`. Read all three first.

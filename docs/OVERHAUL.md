@@ -1,10 +1,20 @@
 # UI/UX Overhaul — Workspaces, Sessions, Onboarding
 
-**Status:** approved spec, ready for implementation
+**Status:** shipped (implemented 2026-08-19)
 **Date:** 2026-08-19
 **Scope:** full-stack (web, server, daemon, proto, docs). Pre-release: breaking changes are allowed, **data loss is not** — internal users' accounts, hosts, pairings, trust state, and running PTYs must survive every migration.
 
-This document is the single coordination artifact for parallel implementation. Every interface that two workstreams share is **locked here** (§4). A workstream builds against the contracts in this doc, not against another workstream's branch. If a contract turns out to be wrong, fix the contract in this doc first, then the code.
+> **As built:** the overhaul is implemented. Start with
+> [`RELEASE_NOTES_OVERHAUL.md`](RELEASE_NOTES_OVERHAUL.md) for rollout and
+> user-visible changes, [`INTERFACE_MATRIX.md`](INTERFACE_MATRIX.md) and
+> [`../proto/README.md`](../proto/README.md) for current interfaces,
+> [`DESIGN.md`](DESIGN.md) for UI standards, and [`SESSIOND.md`](SESSIOND.md)
+> / [`TRUST.md`](TRUST.md) for the worker and trust models. This specification
+> and its decision log remain the durable record of why the shipped
+> architecture has this shape; §4.3 and §9 record known implementation drift.
+
+This document was the coordination artifact for parallel implementation. Its
+locked contracts describe the build target and are retained for archaeology.
 
 ---
 

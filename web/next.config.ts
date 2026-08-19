@@ -70,9 +70,11 @@ const nextConfig: NextConfig = {
   // an agent id still resolves because agents became sessions one-for-one.
   async redirects() {
     return [
+      // Order matters: the literal /agents/new must precede /agents/:id, or the
+      // dynamic rule swallows it and sends it to a session that cannot exist.
+      { source: "/agents/new", destination: "/", permanent: false },
       { source: "/agents/:id", destination: "/sessions/:id", permanent: false },
       { source: "/agents", destination: "/", permanent: false },
-      { source: "/agents/new", destination: "/", permanent: false },
       { source: "/screens", destination: "/", permanent: false },
       { source: "/screens/:id", destination: "/w/:id", permanent: false },
       { source: "/presets", destination: "/", permanent: false },
