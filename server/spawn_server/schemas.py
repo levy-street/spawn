@@ -771,3 +771,45 @@ class BrowserEndorsementRecord(BaseModel):
     endorser_public_key: str
     endorser_label: str | None = None
     signature: str
+
+
+class AccountEndorsementCreate(BaseModel):
+    """One device account-endorsing another (no host — docs §3).
+
+    The signature is over the SPAWN-ACCT-ENDORSE-V1 transcript
+    (account_id, endorser_pk, endorsed_pk, endorsed_device_id).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    endorser_device_id: str = Field(min_length=36, max_length=36)
+    endorsed_device_id: str = Field(min_length=36, max_length=36)
+    signature: str = Field(
+        min_length=ED25519_SIGNATURE_B64URL_LENGTH,
+        max_length=ED25519_SIGNATURE_B64URL_LENGTH,
+    )
+
+
+class AccountEndorsementOut(BaseModel):
+    id: str
+    endorser_device_id: str
+    endorsed_device_id: str
+    created_at: datetime
+
+
+class AccountEndorsementRecord(BaseModel):
+    """One account-scoped endorsement edge, as served to a device assembling its
+    carried chain.
+
+    Untrusted on its own, exactly like BrowserEndorsementRecord: the consumer
+    re-encodes the SPAWN-ACCT-ENDORSE-V1 transcript from these claims and
+    verifies the signature against the endorser key. The account has no host in
+    the transcript, so the same edge is valid toward every host.
+    """
+
+    endorser_device_id: str
+    endorser_public_key: str
+    endorsed_device_id: str
+    endorsed_public_key: str
+    signature: str
+    created_at: datetime

@@ -9,19 +9,29 @@ serve at all.
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from .. import auth, schemas
+from ..acct_endorsement import verify_acct_endorsement_proof
 from ..browser_endorsement import verify_browser_endorsement_proof
 from ..db import get_session
 from ..host_identity import ed25519_key_fingerprint
-from ..models import BrowserDevice, Host, HostBrowserPin, PasskeyCredential, TrustBundle, User
+from ..models import (
+    BrowserDevice,
+    DeviceEndorsement,
+    Host,
+    HostBrowserPin,
+    PasskeyCredential,
+    TrustBundle,
+    User,
+)
 from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/trust", tags=["trust"])
@@ -211,6 +221,10 @@ async def delete_passkey(
 
 MAX_BROWSER_PINS_PER_HOST = 32
 
+# Bounds a hostile client's storage of account-scoped endorsement edges. The
+# real device graph is tiny; this leaves generous headroom.
+MAX_ACCOUNT_ENDORSEMENTS = 256
+
 
 @router.get("/endorsements", response_model=list[schemas.BrowserEndorsementRecord])
 async def list_endorsements_for_device(
@@ -387,6 +401,169 @@ async def create_browser_endorsement(
         endorser_device_id=body.endorser_device_id,
         created_at=created_at,
     )
+
+
+@router.post("/account-endorsements", response_model=schemas.AccountEndorsementOut)
+async def create_account_endorsement(
+    body: schemas.AccountEndorsementCreate,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.AccountEndorsementOut:
+    """Record one device account-endorsing another (docs §3, no host binding).
+
+    Unlike the per-host endorsement this does NOT require the endorser to be
+    trusted by anything: account trust is decided by the daemon when it validates
+    a carried chain against its own anchors, never by this table. A stored edge
+    from a device that chains to no anchor is inert. The server verifies the
+    signature only to keep malformed rows out; the daemon re-verifies it.
+    """
+
+    user_id = user.id
+    if body.endorser_device_id == body.endorsed_device_id:
+        raise HTTPException(status_code=422, detail="a device may not endorse itself")
+
+    devices = {
+        row.id: row
+        for row in (
+            await session.execute(
+                select(BrowserDevice).where(
+                    BrowserDevice.owner_user_id == user_id,
+                    BrowserDevice.id.in_([body.endorser_device_id, body.endorsed_device_id]),
+                )
+            )
+        ).scalars()
+    }
+    endorser = devices.get(body.endorser_device_id)
+    endorsed = devices.get(body.endorsed_device_id)
+    if endorser is None or endorsed is None:
+        raise HTTPException(status_code=404, detail="browser device not found")
+    for device in (endorser, endorsed):
+        if device.revoked_at is not None:
+            raise HTTPException(
+                status_code=409, detail="revoked browser devices cannot endorse or be endorsed"
+            )
+
+    verify_acct_endorsement_proof(
+        account_id=user_id,
+        endorser_public_key_wire=endorser.public_key,
+        endorsed_public_key_wire=endorsed.public_key,
+        endorsed_device_id=endorsed.id,
+        signature_wire=body.signature,
+    )
+
+    # Idempotent: re-recording the same directed edge is a retry.
+    existing = (
+        await session.execute(
+            select(DeviceEndorsement).where(
+                DeviceEndorsement.endorser_device_id == endorser.id,
+                DeviceEndorsement.endorsed_device_id == endorsed.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return schemas.AccountEndorsementOut(
+            id=existing.id,
+            endorser_device_id=existing.endorser_device_id,
+            endorsed_device_id=existing.endorsed_device_id,
+            created_at=existing.created_at,
+        )
+
+    count = (
+        await session.execute(
+            select(func.count())
+            .select_from(DeviceEndorsement)
+            .where(DeviceEndorsement.owner_user_id == user_id)
+        )
+    ).scalar_one()
+    if count >= MAX_ACCOUNT_ENDORSEMENTS:
+        raise HTTPException(status_code=409, detail="account endorsement capacity is exhausted")
+
+    record_id = str(uuid.uuid4())
+    created_at = datetime.now(UTC)
+    session.add(
+        DeviceEndorsement(
+            id=record_id,
+            owner_user_id=user_id,
+            endorser_device_id=endorser.id,
+            endorsed_device_id=endorsed.id,
+            signature=body.signature,
+            created_at=created_at,
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        # A concurrent insert of the same pair won the race: return theirs.
+        await session.rollback()
+        winner = (
+            await session.execute(
+                select(DeviceEndorsement).where(
+                    DeviceEndorsement.endorser_device_id == endorser.id,
+                    DeviceEndorsement.endorsed_device_id == endorsed.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if winner is None:
+            raise HTTPException(status_code=409, detail="endorsement could not be stored") from None
+        return schemas.AccountEndorsementOut(
+            id=winner.id,
+            endorser_device_id=winner.endorser_device_id,
+            endorsed_device_id=winner.endorsed_device_id,
+            created_at=winner.created_at,
+        )
+
+    return schemas.AccountEndorsementOut(
+        id=record_id,
+        endorser_device_id=body.endorser_device_id,
+        endorsed_device_id=body.endorsed_device_id,
+        created_at=created_at,
+    )
+
+
+@router.get("/account-endorsements", response_model=list[schemas.AccountEndorsementRecord])
+async def list_account_endorsements(
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[schemas.AccountEndorsementRecord]:
+    """Every account-scoped endorsement edge whose endpoints are both live, so a
+    device can assemble a carried chain from a host's anchor down to itself.
+
+    Edges touching a revoked device are omitted (the daemon would reject a chain
+    through a revoked key anyway). Nothing here is trusted as served — each edge
+    carries a signature the consumer re-verifies against the endorser key.
+    """
+
+    endorser = aliased(BrowserDevice)
+    endorsed = aliased(BrowserDevice)
+    rows = await session.execute(
+        select(
+            DeviceEndorsement.endorser_device_id,
+            endorser.public_key.label("endorser_public_key"),
+            DeviceEndorsement.endorsed_device_id,
+            endorsed.public_key.label("endorsed_public_key"),
+            DeviceEndorsement.signature,
+            DeviceEndorsement.created_at,
+        )
+        .join(endorser, endorser.id == DeviceEndorsement.endorser_device_id)
+        .join(endorsed, endorsed.id == DeviceEndorsement.endorsed_device_id)
+        .where(
+            DeviceEndorsement.owner_user_id == user.id,
+            endorser.revoked_at.is_(None),
+            endorsed.revoked_at.is_(None),
+        )
+        .order_by(DeviceEndorsement.created_at)
+    )
+    return [
+        schemas.AccountEndorsementRecord(
+            endorser_device_id=row.endorser_device_id,
+            endorser_public_key=row.endorser_public_key,
+            endorsed_device_id=row.endorsed_device_id,
+            endorsed_public_key=row.endorsed_public_key,
+            signature=row.signature,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
 
 
 @router.get("/hosts/{host_id}/pins", response_model=list[str])
