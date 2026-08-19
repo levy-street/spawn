@@ -6,7 +6,7 @@ import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { openSettings, type SettingsTab } from "@/components/settings/settings-dialog-store";
 
-const TAB_KEYS: SettingsTab[] = ["account", "devices", "trust", "skills"];
+const TAB_KEYS: SettingsTab[] = ["account", "appearance", "devices", "trust", "skills"];
 
 /**
  * Settings lives in the app-wide modal now. This route stays as the stable
