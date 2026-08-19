@@ -36,6 +36,7 @@ import {
   TERMINAL_LINE_HEIGHT,
   TERMINAL_SCROLLBACK_LINES,
   TERMINAL_SNAPSHOT_LINES,
+  terminalFontStack,
   terminalTheme,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
@@ -43,7 +44,7 @@ import { DirectAgentUploadError } from "@/lib/agent-ctl";
 import { agents, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
-import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
+import { getResolvedTheme, getTerminalAppearance, subscribeToTheme } from "@/lib/theme";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
@@ -471,18 +472,52 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // full history depth (the connect seed carries only a shallow prefix).
   const unifiedDeepSeededRef = useRef(false);
 
-  // Restyle both terminals in place when the theme changes. Terminals are kept
+  // Restyle both terminals in place when appearance changes. Terminals are kept
   // warm across navigation and portaled from the root, so tearing them down to
   // pick up a colour would drop the session — and this component is outside
   // the tree the settings dialog lives in, hence the external subscription
   // rather than a prop.
+  //
+  // Colour is free: it repaints, and cell metrics do not move. Font family,
+  // size and line height are not — they change the cell box, hence rows/cols,
+  // hence the committed-history↔live-screen seam. So those go through exactly
+  // the same fit + reseed path a container resize does, rather than being set
+  // and hoped for.
   useEffect(() => {
-    const applyThemeToTerminals = () => {
+    let lastMetrics = "";
+    const applyAppearanceToTerminals = () => {
       const live = termRef.current;
-      if (live) live.options.theme = { ...terminalTheme(getResolvedTheme()) };
+      if (!live) return;
+      const appearance = getTerminalAppearance();
+      live.options.theme = { ...terminalTheme(getResolvedTheme(), appearance.themeId) };
+
+      const metrics = `${appearance.fontId}|${appearance.fontSize}|${appearance.lineHeight}`;
+      if (metrics === lastMetrics) return;
+      const first = lastMetrics === "";
+      lastMetrics = metrics;
+      live.options.fontFamily = terminalFontStack(appearance.fontId);
+      live.options.fontSize = appearance.fontSize;
+      live.options.lineHeight = appearance.lineHeight;
+      // The local-echo overlay draws over the grid and has to be measured in
+      // the same face at the same size, or predicted characters land beside
+      // the cells they are predicting.
+      const overlay = predictionOverlayRef.current;
+      if (overlay) {
+        overlay.style.fontFamily = terminalFontStack(appearance.fontId);
+        overlay.style.fontSize = `${appearance.fontSize}px`;
+      }
+      // On the very first pass the bootstrap effect has not fitted yet; its
+      // own initial fit covers it.
+      if (first) return;
+      // A newly selected face may still be loading, in which case fitting now
+      // measures the fallback's cell. Wait for it, then fit — and fit again
+      // regardless, so a font that never resolves still lands correctly.
+      const refit = () => fitTerminalRef.current?.(true);
+      requestAnimationFrame(refit);
+      void document.fonts?.ready?.then(() => requestAnimationFrame(refit));
     };
-    applyThemeToTerminals();
-    return subscribeToTheme(applyThemeToTerminals);
+    applyAppearanceToTerminals();
+    return subscribeToTheme(applyAppearanceToTerminals);
   }, []);
   const scrollbackSnapshotInFlightRef = useRef(false);
   const scrollbackSnapshotTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1402,16 +1437,23 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const term = new XTerm({
       ...XTERM_EMULATION_OPTIONS,
       cursorBlink: true,
-      fontFamily: TERMINAL_FONT_FAMILY,
-      fontSize: TERMINAL_FONT_SIZE,
-      lineHeight: TERMINAL_LINE_HEIGHT,
+      fontFamily: terminalFontStack(getTerminalAppearance().fontId),
+      fontSize: getTerminalAppearance().fontSize,
+      lineHeight: getTerminalAppearance().lineHeight,
+      // Powerline and devicon glyphs from a patched Nerd Font are frequently
+      // wider than the cell the Unicode 11 tables assign them. Without this
+      // they bleed into the neighbouring column and smear a prompt; with it
+      // xterm squeezes the glyph back into its cell. Renderer-side only —
+      // cell *widths* still come from the Unicode tables, so emulation and
+      // the conformance envelope are untouched.
+      rescaleOverlappingGlyphs: true,
       // Keep a large local buffer for endpoint replay and non-wheel access.
       // Wheel/touch scrollback is rendered from fresh worker snapshots so it
       // reflects the current worker checkpoint rather than browser replay artifacts.
       scrollback: TERMINAL_SCROLLBACK_LINES,
       scrollOnUserInput: true,
       smoothScrollDuration: 0,
-      theme: { ...terminalTheme(getResolvedTheme()) },
+      theme: { ...terminalTheme(getResolvedTheme(), getTerminalAppearance().themeId) },
     });
     const fit = new FitAddon();
     const links = new WebLinksAddon();
