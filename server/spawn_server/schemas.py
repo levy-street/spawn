@@ -209,6 +209,9 @@ class DeviceStartRequest(BaseModel):
     version: str | None = None
     host_key_algorithm: Literal["ed25519"]
     host_public_key: str = Field(min_length=43, max_length=43)
+    # Committed-ephemeral SAS: the daemon's commitment Cd = H(domain ‖ H ‖ Nd),
+    # opaque to the server. Absent from a pre-SAS daemon.
+    sas_commit: str | None = Field(default=None, min_length=43, max_length=43)
 
     @field_validator("host_public_key")
     @classmethod
@@ -409,6 +412,54 @@ class DevicePendingResponse(BaseModel):
     host_key_algorithm: Literal["ed25519"]
     host_public_key: str
     host_key_fingerprint: str
+    # SAS relay: the daemon's commitment (present ⇒ the browser runs the SAS and
+    # contributes Nb via POST /sas), and the daemon's opened nonce Nd once it has
+    # revealed it (present ⇒ the browser can verify the commit and show the SAS).
+    sas_commit: str | None = None
+    sas_host_nonce: str | None = None
+
+
+class DeviceSasRequest(DevicePendingRequest):
+    """Browser's SAS contribution: its fresh nonce Nb and its public key B, so
+    the daemon can compute the number before the human approves. Identified like
+    pending, by exactly one of user_code / approval_ref."""
+
+    sas_browser_nonce: str = Field(min_length=43, max_length=43)
+    browser_public_key: str = Field(min_length=43, max_length=43)
+
+    @field_validator("browser_public_key")
+    @classmethod
+    def validate_browser_public_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class DeviceSasResponse(BaseModel):
+    # Echoed back so the browser can confirm its contribution landed; the daemon
+    # nonce Nd arrives later via DevicePendingResponse.sas_host_nonce.
+    ok: bool = True
+
+
+class DeviceSasHostRequest(BaseModel):
+    """Daemon's side of the SAS handshake, authenticated by the device_code
+    (like poll — no user session). The daemon calls this to fetch the browser's
+    Nb/B and, once it has them, to reveal its own Nd. Kept off the poll's
+    approval CAS so the pairing race logic is untouched."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    device_code: str
+    host_key_algorithm: Literal["ed25519"]
+    host_public_key: str = Field(min_length=43, max_length=43)
+    # The daemon's opened nonce Nd — sent only after it has seen Nb here
+    # (commit-reveal ordering). Omitted until then.
+    sas_host_nonce: str | None = Field(default=None, min_length=43, max_length=43)
+
+
+class DeviceSasHostResponse(BaseModel):
+    sas_browser_nonce: str | None = None
+    sas_browser_key: str | None = None
+    sas_host_nonce: str | None = None
 
 
 # ---------- hosts ----------
