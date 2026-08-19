@@ -380,6 +380,11 @@ class Preset(Base):
     # Optional shell command run by the daemon when `default_argv[0]` is not
     # on PATH at agent.create time. Output streams into the agent's PTY.
     install: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # Argv appended when an agent is created with YOLO on. NULL means this
+    # tool has no such flag (or we have not confirmed one), which is not the
+    # same as an empty list: the UI hides the toggle rather than offering
+    # something that would silently do nothing.
+    yolo_argv: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
 
     __table_args__ = (UniqueConstraint("owner_user_id", "name", name="uq_presets_owner_name"),)
 

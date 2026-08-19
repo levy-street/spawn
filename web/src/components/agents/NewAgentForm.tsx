@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { KindIcon } from "@/components/agents/AgentKindIcon";
 import { DirectoryPicker } from "@/components/agents/DirectoryPicker";
+import { YoloBadge } from "@/components/agents/YoloBadge";
 import { HostGpuBadge } from "@/components/hosts/HostGpuBadge";
 import { HostOsIcon, hostOsLabel } from "@/components/hosts/HostOsIcon";
 import { Button } from "@/components/ui/button";
@@ -21,6 +22,7 @@ import { normalizeCwdForHost, withTrailingSlash } from "@/lib/paths";
 import { cn } from "@/lib/utils";
 
 const PRESET_ORDER = ["codex", "claude-code", "opencode", "aider-sonnet", "shell"];
+const YOLO_STORAGE_KEY = "spawn.newAgent.yolo";
 
 function kindForPreset(agentKind: string): AgentKind {
   const kind = agentKind.toLowerCase();
@@ -51,10 +53,18 @@ export function NewAgentForm({
   const [cwd, setCwd] = useState("");
   const [argv, setArgv] = useState("");
   const [skillIds, setSkillIds] = useState<string[]>([]);
+  // Remembered per browser rather than per account: it is a habit, and the
+  // people who want it want it every time.
+  const [yolo, setYolo] = useState(true);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastAutoCwd, setLastAutoCwd] = useState("");
   const [presetTouched, setPresetTouched] = useState(false);
+
+  useEffect(() => {
+    const stored = window.localStorage.getItem(YOLO_STORAGE_KEY);
+    if (stored !== null) setYolo(stored === "true");
+  }, []);
   const { client: hostControl, state: hostControlState } = useHostControl(hostId || null);
   const homeQ = useQuery({
     queryKey: ["host-home", hostId],
@@ -108,6 +118,21 @@ export function NewAgentForm({
   const selectedHost = hostOptions.find((h) => h.id === hostId);
   const selectedHostHomeDir = homeQ.data?.home_dir;
   const selectedPreset = presetOptions.find((p) => p.id === presetId);
+  const customArgv = argv.trim().length > 0;
+  // Only offered when the selected tool actually has a flag for it, and never
+  // alongside a hand-written command — a toggle that silently does nothing is
+  // worse than no toggle.
+  const yoloAvailable = Boolean(selectedPreset?.yolo_argv?.length) && !customArgv;
+  const composedArgv = selectedPreset
+    ? [
+        ...selectedPreset.default_argv,
+        ...(yolo && yoloAvailable
+          ? (selectedPreset.yolo_argv ?? []).filter(
+              (flag) => !selectedPreset.default_argv.includes(flag),
+            )
+          : []),
+      ]
+    : [];
   const skillOptions = skillsQ.data ?? [];
 
   useEffect(() => {
@@ -162,6 +187,7 @@ export function NewAgentForm({
       preset_id: presetId || undefined,
       cwd: normalizeCwdForHost(cwd, selectedHostHomeDir),
       argv: argvArr,
+      yolo: yolo && yoloAvailable,
       skill_ids: skillIds,
       create_cwd: true,
     });
@@ -253,13 +279,51 @@ export function NewAgentForm({
         </div>
         {selectedPreset ? (
           <p className="text-xs text-muted-foreground">
-            Runs <code className="text-foreground">{selectedPreset.default_argv.join(" ")}</code>
+            {/* The exact command, flag included, stays visible before you
+                spawn — the toggle must never be the only place it is said. */}
+            Runs <code className="text-foreground">{composedArgv.join(" ")}</code>
             {selectedPreset.install && <> — installed automatically when missing</>}.
           </p>
         ) : (
           <p className="text-xs text-muted-foreground">
             No preset selected — provide a custom command under advanced options.
           </p>
+        )}
+
+        {yoloAvailable && (
+          <label
+            className={cn(
+              "flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-colors",
+              yolo ? "border-ring bg-accent/40" : "border-border hover:border-ring/50",
+            )}
+          >
+            <input
+              type="checkbox"
+              className="mt-0.5 size-4 accent-[var(--color-primary)]"
+              checked={yolo}
+              disabled={disabled}
+              onChange={(e) => {
+                setYolo(e.target.checked);
+                window.localStorage.setItem(YOLO_STORAGE_KEY, String(e.target.checked));
+              }}
+            />
+            <span className="min-w-0">
+              <span className="flex items-center gap-2 text-sm font-medium">
+                YOLO mode
+                <YoloBadge />
+              </span>
+              <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">
+                Adds{" "}
+                <code className="text-foreground">
+                  {(selectedPreset?.yolo_argv ?? []).join(" ")}
+                </code>{" "}
+                so the agent does not stop to ask before it acts. Each tool means something slightly
+                different by it — {selectedPreset?.name} decides what that covers, not spawn. It
+                runs unattended inside a host you have already possessed, so anything the agent
+                reads — a repo, an issue, a web page — is acting on your machine.
+              </span>
+            </span>
+          </label>
         )}
       </section>
 

@@ -31,6 +31,28 @@ export function agentKindLabel(kind: AgentKind): string {
   }
 }
 
+/**
+ * Flags that mean "this agent does not stop to ask".
+ *
+ * Deliberately a display heuristic read off the *command that ran*, not off
+ * how the agent was created — so a hand-typed `codex --yolo` under Advanced
+ * options is marked exactly like one created with the toggle. The server owns
+ * argv composition (`preset.yolo_argv`); this only decides whether to draw a
+ * badge, and being over-inclusive here is much better than a gated and an
+ * ungated agent looking identical.
+ */
+const AUTONOMY_FLAGS = new Set([
+  "--dangerously-skip-permissions",
+  "--yolo",
+  "--yes-always",
+  "--full-auto",
+  "--dangerously-bypass-approvals-and-sandbox",
+]);
+
+export function isYoloArgv(argv: readonly string[]): boolean {
+  return argv.some((arg) => AUTONOMY_FLAGS.has(arg));
+}
+
 export function agentTitle(agent: Agent): string {
   const name = agent.name?.trim();
   if (name) return name;

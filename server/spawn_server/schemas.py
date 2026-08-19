@@ -530,6 +530,10 @@ class PresetOut(BaseModel):
     default_argv: list[str]
     env_template: dict[str, str]
     install: str | None = None
+    # Null when this tool has no confirmed "skip the prompts" flag. The create
+    # form keys the YOLO toggle off exactly this, so a preset without one
+    # never offers a control that would do nothing.
+    yolo_argv: list[str] | None = None
 
 
 # ---------- managed skills ----------
@@ -588,6 +592,10 @@ class AgentCreate(BaseModel):
     env: dict[str, str] | None = None
     skill_ids: list[str] | None = None
     create_cwd: bool = True
+    # Append the preset's autonomy flag. Ignored when `argv` is given: a
+    # hand-written command is already exactly what the operator asked for,
+    # and appending to it would be editing someone else's sentence.
+    yolo: bool = False
 
 
 class AgentRestart(BaseModel):

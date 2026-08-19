@@ -393,3 +393,132 @@ async def test_agent_terminal_content_routes_are_removed(client):
     assert all(json.loads(frame).get("type") != "agent.upload" for frame in fake_ws.sent_text)
 
     await broker.unregister_daemon(daemon)
+
+
+async def _host_and_preset(client, email: str, preset_name: str) -> tuple[dict, str, str]:
+    """A signed-in account with a host, plus the id of one built-in preset."""
+
+    token = await _signup(client, email)
+    auth = {"Authorization": f"Bearer {token}"}
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, Preset, User
+
+    async with get_sessionmaker()() as session:
+        user = (await session.execute(select(User).where(User.email == email))).scalar_one()
+        host = Host(owner_user_id=user.id, name="box", status="offline")
+        session.add(host)
+        await session.commit()
+        preset = (
+            await session.execute(
+                select(Preset).where(Preset.owner_user_id.is_(None), Preset.name == preset_name)
+            )
+        ).scalar_one()
+        return auth, host.id, preset.id
+
+
+async def test_yolo_appends_the_presets_flag_and_keeps_the_preset(client):
+    """The point of composing server-side rather than sending a custom argv.
+
+    A custom argv replaces the preset wholesale and loses `preset_id`, and
+    with it the daemon's install-when-missing path.
+    """
+
+    auth, host_id, preset_id = await _host_and_preset(client, "yolo-on@example.com", "codex")
+
+    r = await client.post(
+        "/api/agents",
+        json={"host_id": host_id, "cwd": "/repo", "preset_id": preset_id, "yolo": True},
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["argv"] == ["codex", "--yolo"]
+    assert r.json()["preset_id"] == preset_id
+
+
+async def test_yolo_off_is_the_untouched_preset_command(client):
+    auth, host_id, preset_id = await _host_and_preset(client, "yolo-off@example.com", "codex")
+
+    r = await client.post(
+        "/api/agents",
+        json={"host_id": host_id, "cwd": "/repo", "preset_id": preset_id, "yolo": False},
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["argv"] == ["codex"]
+
+    # Omitting the field entirely is the same as off: an API client that
+    # predates this must not silently start ungating agents.
+    r = await client.post(
+        "/api/agents",
+        json={"host_id": host_id, "cwd": "/repo", "preset_id": preset_id},
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["argv"] == ["codex"]
+
+
+async def test_yolo_on_a_preset_with_no_flag_changes_nothing(client):
+    """opencode is config-driven and a shell was never gated."""
+
+    for email, preset_name, expected in (
+        ("yolo-opencode@example.com", "opencode", ["opencode"]),
+        ("yolo-shell@example.com", "shell", ["bash", "-l"]),
+    ):
+        auth, host_id, preset_id = await _host_and_preset(client, email, preset_name)
+        r = await client.post(
+            "/api/agents",
+            json={"host_id": host_id, "cwd": "/repo", "preset_id": preset_id, "yolo": True},
+            headers=auth,
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["argv"] == expected
+
+
+async def test_yolo_never_edits_a_hand_written_command(client):
+    """A custom argv is exactly what the operator asked for."""
+
+    auth, host_id, _ = await _host_and_preset(client, "yolo-custom@example.com", "codex")
+
+    r = await client.post(
+        "/api/agents",
+        json={
+            "host_id": host_id,
+            "cwd": "/repo",
+            "argv": ["codex", "--search"],
+            "yolo": True,
+        },
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["argv"] == ["codex", "--search"]
+
+
+async def test_a_yolo_agent_still_runs_ungated_after_a_restart(client):
+    """The flag lives in the stored argv, so a restart cannot quietly drop it."""
+
+    auth, host_id, preset_id = await _host_and_preset(client, "yolo-restart@example.com", "codex")
+    created = await client.post(
+        "/api/agents",
+        json={"host_id": host_id, "cwd": "/repo", "preset_id": preset_id, "yolo": True},
+        headers=auth,
+    )
+    assert created.status_code == 201, created.text
+    agent_id = created.json()["id"]
+
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    broker = get_broker()
+    ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id="user", websocket=ws)  # type: ignore[arg-type]
+    await broker.register_daemon(daemon)
+
+    restarted = await client.post(f"/api/agents/{agent_id}/restart", json={}, headers=auth)
+    assert restarted.status_code == 200, restarted.text
+    assert restarted.json()["argv"] == ["codex", "--yolo"]
+    dispatched = [json.loads(frame) for frame in ws.sent_text]
+    launch = next(frame for frame in dispatched if frame.get("type") == "agent.restart")
+    assert launch["argv"] == ["codex", "--yolo"]
+    await broker.unregister_daemon(daemon)
