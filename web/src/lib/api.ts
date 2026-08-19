@@ -74,12 +74,23 @@ export const UserSchema = z.object({
 });
 export type User = z.infer<typeof UserSchema>;
 
+export const HostGpuSchema = z.object({
+  vendor: z.enum(["nvidia", "amd", "intel", "apple", "other"]),
+  name: z.string(),
+  /** Absent on integrated and unified-memory parts, where there is no figure. */
+  vram_mb: z.number().int().nullable().optional(),
+  count: z.number().int().default(1),
+});
+export type HostGpu = z.infer<typeof HostGpuSchema>;
+
 export const HostSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
   os: z.string().nullable().optional(),
   arch: z.string().nullable().optional(),
   version: z.string().nullable().optional(),
+  /** Null for no GPU, failed detection, and pre-0030 daemons alike. */
+  gpu: HostGpuSchema.nullable().optional(),
   host_key_algorithm: z.literal("ed25519").nullable().optional(),
   host_public_key: z.string().nullable().optional(),
   host_key_fingerprint: z.string().nullable().optional(),

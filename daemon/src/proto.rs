@@ -61,6 +61,11 @@ pub enum Outbound {
         os: String,
         arch: String,
         version: String,
+        /// Best-effort hardware class. Absent when there is no GPU, when
+        /// detection failed, and on any daemon older than this field — all of
+        /// which every consumer must render identically: as nothing.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        gpu: Option<crate::gpu::GpuInfo>,
         existing_agents: Vec<Uuid>,
     },
     #[serde(rename = "host.heartbeat")]

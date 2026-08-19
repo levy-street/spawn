@@ -1,9 +1,11 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ChevronRight, Download, FolderOpen, KeySquare, Server } from "lucide-react";
+import { ChevronRight, Download, FolderOpen, KeySquare } from "lucide-react";
 import Link from "next/link";
 import { AuthGate } from "@/components/auth/AuthGate";
+import { HostGpuBadge } from "@/components/hosts/HostGpuBadge";
+import { HostOsIcon, hostOsLabel } from "@/components/hosts/HostOsIcon";
 import { AppShell } from "@/components/nav/AppShell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -112,7 +114,7 @@ function HostRow({ host }: { host: Host }) {
         className="group flex items-center gap-3 px-4 py-3.5 pr-12 transition-colors hover:bg-accent/40"
       >
         <span className="relative grid size-9 shrink-0 place-items-center rounded-lg border border-border bg-muted/50 text-muted-foreground">
-          <Server className="size-4" aria-hidden />
+          <HostOsIcon os={host.os} />
           <StatusDot
             tone={hostStatusTone(host.status)}
             label={host.status}
@@ -128,9 +130,10 @@ function HostRow({ host }: { host: Host }) {
             ) : (
               <Badge variant="outline">offline</Badge>
             )}
+            <HostGpuBadge gpu={host.gpu} />
           </span>
           <span className="mt-0.5 block truncate text-xs text-muted-foreground">
-            {host.os ?? "unknown"}/{host.arch ?? "unknown"} · spawnd {host.version ?? "?"}
+            {hostOsLabel(host.os)}/{host.arch ?? "unknown"} · spawnd {host.version ?? "?"}
           </span>
         </span>
         <span className="shrink-0 text-right">

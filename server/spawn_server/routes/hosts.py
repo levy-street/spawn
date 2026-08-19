@@ -58,6 +58,7 @@ def _to_out(host: Host, agent_count: int) -> schemas.HostOut:
         os=host.os,
         arch=host.arch,
         version=host.version,
+        gpu=host.gpu,
         host_key_algorithm=host.host_key_algorithm,
         host_public_key=host.host_public_key,
         host_key_fingerprint=fingerprint,

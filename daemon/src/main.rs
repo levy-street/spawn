@@ -17,6 +17,7 @@ mod cli;
 mod config;
 mod cpu_scopes;
 mod creds;
+mod gpu;
 mod host_control;
 mod host_direct;
 mod host_files;

@@ -414,6 +414,19 @@ class DevicePendingResponse(BaseModel):
 # ---------- hosts ----------
 
 
+class HostGpu(BaseModel):
+    """Best-effort hardware class, never a machine identifier."""
+
+    model_config = ConfigDict(from_attributes=True)
+    vendor: Literal["nvidia", "amd", "intel", "apple", "other"]
+    name: str
+    # Absent on integrated and unified-memory parts, where a figure would be
+    # invented rather than reported.
+    vram_mb: int | None = None
+    # Adapters detected in total, so a multi-GPU box can render "+N".
+    count: int = 1
+
+
 class HostOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -421,6 +434,9 @@ class HostOut(BaseModel):
     os: str | None = None
     arch: str | None = None
     version: str | None = None
+    # Null for a host with no GPU, a host whose detection failed, and a host
+    # on a daemon too old to report one. All three render identically.
+    gpu: HostGpu | None = None
     host_key_algorithm: Literal["ed25519"] | None = None
     host_public_key: str | None = None
     host_key_fingerprint: str | None = None

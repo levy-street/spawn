@@ -1,11 +1,13 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronDown, Server } from "lucide-react";
+import { ChevronDown } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { KindIcon } from "@/components/agents/AgentKindIcon";
 import { DirectoryPicker } from "@/components/agents/DirectoryPicker";
+import { HostGpuBadge } from "@/components/hosts/HostGpuBadge";
+import { HostOsIcon, hostOsLabel } from "@/components/hosts/HostOsIcon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -196,7 +198,7 @@ export function NewAgentForm({
                 )}
               >
                 <span className="relative grid size-9 shrink-0 place-items-center rounded-lg border border-border bg-muted/50 text-muted-foreground">
-                  <Server className="size-4" aria-hidden />
+                  <HostOsIcon os={h.os} />
                   <StatusDot
                     tone={hostStatusTone(h.status)}
                     label={h.status}
@@ -204,8 +206,15 @@ export function NewAgentForm({
                   />
                 </span>
                 <span className="min-w-0">
-                  <span className="block truncate text-sm font-medium">{h.name}</span>
-                  <span className="block truncate text-xs text-muted-foreground">{h.status}</span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="truncate text-sm font-medium">{h.name}</span>
+                    {/* The reason to pick one box over another is usually
+                        right here: which OS it is, and whether it has a GPU. */}
+                    <HostGpuBadge gpu={h.gpu} />
+                  </span>
+                  <span className="block truncate text-xs text-muted-foreground">
+                    {hostOsLabel(h.os)} · {h.status}
+                  </span>
                 </span>
               </button>
             );

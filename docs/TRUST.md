@@ -111,7 +111,10 @@ always refuse service).
 Honest inventory, from the current wire protocol:
 
 **Metadata the server keeps seeing by design** — accounts and password hashes;
-host names/OS/arch/version/last-seen; explicit or neutral agent names and
+host names/OS/arch/version/last-seen; best-effort GPU *class* per host (vendor,
+adapter model, VRAM, adapter count — deliberately no serials or device UUIDs,
+so it distinguishes a GPU box from a laptop without fingerprinting a specific
+machine); explicit or neutral agent names and
 lifecycle status; preset and skill names/descriptions; exit codes; presence;
 connection and signaling timing; IP addresses; and per-agent timestamps for
 meaningful output and user input. For unattended tool updates it may also keep

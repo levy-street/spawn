@@ -171,6 +171,43 @@ async def _host_activation_predecessor(
     return HostPresenceOwner(row[0], int(row[1]))
 
 
+# Vendors we can draw a mark for; anything else is a neutral chip, and
+# anything unrecognized is dropped rather than stored as a logo hint.
+GPU_VENDORS = frozenset({"nvidia", "amd", "intel", "apple", "other"})
+MAX_GPU_NAME_LENGTH = 128
+MAX_GPU_COUNT = 64
+
+
+def _gpu_values(reported: object) -> dict[str, object]:
+    """Normalize the daemon's optional GPU report into Host columns.
+
+    A daemon predating the field sends nothing, which must leave whatever is
+    already stored alone rather than blanking it on every reconnect. Anything
+    malformed is treated the same way: this is a cosmetic badge, and refusing
+    a registration over it would be absurd.
+    """
+
+    if not isinstance(reported, dict):
+        return {}
+    vendor = reported.get("vendor")
+    name = reported.get("name")
+    if vendor not in GPU_VENDORS or not isinstance(name, str) or not name.strip():
+        return {}
+    return {
+        "gpu_vendor": vendor,
+        "gpu_name": name.strip()[:MAX_GPU_NAME_LENGTH],
+        "gpu_vram_mb": _positive_int(reported.get("vram_mb")),
+        "gpu_count": min(_positive_int(reported.get("count")) or 1, MAX_GPU_COUNT),
+    }
+
+
+def _positive_int(value: object) -> int | None:
+    # `isinstance(True, int)` is True, and a bool here is a bug upstream.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 async def _prepare_host_activation(
     session: AsyncSession,
     host_id: str,
@@ -191,6 +228,7 @@ async def _prepare_host_activation(
         value = registration.get(field)
         if isinstance(value, str) and value:
             values[field] = value
+    values.update(_gpu_values(registration.get("gpu")))
     result = await session.execute(
         update(Host)
         .where(

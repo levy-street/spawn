@@ -708,6 +708,9 @@ async fn serve_one_connection_with_loader(
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        // Cached after the first probe: hardware does not change under a
+        // running daemon, and the reconnect loop must not re-shell out.
+        gpu: crate::gpu::detect_cached().await,
         existing_agents: registry.ids(),
     };
     let register_json = serde_json::to_string(&register)?;
@@ -1914,14 +1917,14 @@ fn compare_versions(left: &[u64], right: &[u64]) -> std::cmp::Ordering {
 }
 
 #[derive(Debug)]
-struct CommandCapture {
-    success: bool,
+pub(crate) struct CommandCapture {
+    pub(crate) success: bool,
     exit_code: Option<i32>,
-    output: String,
+    pub(crate) output: String,
     error: Option<String>,
 }
 
-async fn run_program_capture(
+pub(crate) async fn run_program_capture(
     program: &str,
     args: &[&str],
     timeout: Duration,
