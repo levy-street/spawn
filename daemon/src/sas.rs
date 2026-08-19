@@ -9,9 +9,9 @@
 //! can adapt its contribution after seeing the target — the two displayed SAS
 //! values then collide only with probability 2^-20 ≈ 1e-6 per one-shot ceremony.
 //!
-//! Contrast the earlier `creds::verification_code`, a function of the long-lived
-//! host key alone: a server grinds a matching key in ~1e6 work. That code is
-//! convenience only; THIS is the security check.
+//! Contrast a bare code derived from the long-lived host key alone (the earlier
+//! grindable approach): a server grinds a matching key in ~1e6 work. THIS is the
+//! sound security check.
 //!
 //! The web side must compute these identically (see web/src/lib/sas.ts); the
 //! shared test vectors below are asserted in both and must never drift.
