@@ -17,11 +17,10 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
-
-type DetectedPlatform = "macos" | "linux" | "windows" | "unknown";
+import { detectPlatform, type PlatformOS, UNDETECTED_PLATFORM } from "@/lib/platform";
 
 const PLATFORM_COPY: Record<
-  DetectedPlatform,
+  PlatformOS,
   {
     label: string;
     title: string;
@@ -83,20 +82,18 @@ const OPTIONS = [
 ];
 
 export default function DownloadPage() {
-  const [origin, setOrigin] = useState("https://spawnd.dev");
-  const [platform, setPlatform] = useState<DetectedPlatform>("unknown");
+  const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
   const [copied, setCopied] = useState(false);
   const [canCopy, setCanCopy] = useState(false);
 
   useEffect(() => {
-    setOrigin(window.location.origin);
     setPlatform(detectPlatform());
     setCanCopy(Boolean(navigator.clipboard));
   }, []);
 
-  const command = `curl -fsSL ${origin}/install.sh | sh`;
-  const prebuiltCommand = `curl -fsSL ${origin}/install.sh | sh -s -- --prebuilt-only`;
-  const detected = PLATFORM_COPY[platform];
+  const command = platform.installCommand;
+  const prebuiltCommand = platform.prebuiltInstallCommand;
+  const detected = PLATFORM_COPY[platform.os];
   const supported = detected.status === "supported";
 
   const copyCommand = async () => {
@@ -224,17 +221,6 @@ export default function DownloadPage() {
       </section>
     </main>
   );
-}
-
-function detectPlatform(): DetectedPlatform {
-  const nav = window.navigator;
-  const userAgent = nav.userAgent.toLowerCase();
-  const platform = nav.platform.toLowerCase();
-
-  if (platform.includes("mac") || userAgent.includes("mac os x")) return "macos";
-  if (platform.includes("linux") || userAgent.includes("linux")) return "linux";
-  if (platform.includes("win") || userAgent.includes("windows")) return "windows";
-  return "unknown";
 }
 
 function InstallOption({

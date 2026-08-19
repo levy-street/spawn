@@ -1,108 +1,74 @@
 "use client";
 
-import { useQueryClient } from "@tanstack/react-query";
-import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { type FormEvent, Suspense, useState } from "react";
-import { SocialLoginButtons } from "@/components/auth/SocialLoginButtons";
+import { Suspense } from "react";
+import { AuthShell } from "@/components/onboarding/auth-shell";
+import { SignupForm } from "@/components/onboarding/signup-form";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { ApiError, auth } from "@/lib/api";
+import { Spinner } from "@/components/ui/spinner";
+import { useAuthConfig } from "@/lib/auth";
 
-function SignupForm() {
+function SignupPageContent() {
   const router = useRouter();
-  const queryClient = useQueryClient();
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  // Carried from the invite link. A closed deployment refuses signup without
-  // it; an open one ignores it.
-  const invite = useSearchParams().get("invite");
+  const searchParams = useSearchParams();
+  const { config, loading, error, refetch } = useAuthConfig();
+  const invite = searchParams.get("invite");
 
-  const onSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    setSubmitting(true);
-    try {
-      const result = await auth.signup({ email, password, invite });
-      queryClient.setQueryData(["me"], { user: result.user });
-      void queryClient.invalidateQueries({ queryKey: ["me"] });
-      router.replace("/");
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : "Signup failed";
-      setError(message);
-    } finally {
-      setSubmitting(false);
+  if (loading || config === null) {
+    if (error) {
+      return (
+        <AuthShell
+          title="Couldn’t load signup"
+          description="The server’s signup settings are unavailable."
+        >
+          <Button className="h-11 w-full" onClick={() => void refetch()}>
+            Try again
+          </Button>
+        </AuthShell>
+      );
     }
-  };
+    return <SignupLoading />;
+  }
 
   return (
-    <div className="flex min-h-vv items-center justify-center px-4 pad-safe-top pad-safe-bottom">
-      <Card className="w-full max-w-sm">
-        <CardHeader>
-          <CardTitle>Create your spawn account</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            {invite !== null && (
-              <p className="rounded-md border border-success/50 px-3 py-2 text-sm" role="status">
-                You have an invite — finish creating your account below.
-              </p>
-            )}
-            <SocialLoginButtons />
-            <form className="space-y-3" onSubmit={onSubmit}>
-              <div className="space-y-1">
-                <Label htmlFor="email">Email</Label>
-                <Input
-                  id="email"
-                  type="email"
-                  autoComplete="email"
-                  required
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                />
-              </div>
-              <div className="space-y-1">
-                <Label htmlFor="password">Password</Label>
-                <Input
-                  id="password"
-                  type="password"
-                  autoComplete="new-password"
-                  required
-                  minLength={8}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                />
-              </div>
-              {error && (
-                <p className="text-sm text-destructive" role="alert">
-                  {error}
-                </p>
-              )}
-              <Button type="submit" className="w-full" disabled={submitting}>
-                {submitting ? "Creating..." : "Create account"}
-              </Button>
-              <p className="text-center text-xs text-muted-foreground">
-                Already have an account?{" "}
-                <Link href="/login" className="text-foreground underline">
-                  Sign in
-                </Link>
-              </p>
-            </form>
-          </div>
-        </CardContent>
-      </Card>
-    </div>
+    <AuthShell
+      title="Create your account"
+      description="Start with an account, then connect the machine where your agents work."
+    >
+      <div className="space-y-5">
+        {invite !== null ? (
+          <p
+            className="rounded-md border border-success/40 bg-success-soft px-3 py-2 text-sm"
+            role="status"
+          >
+            You have an invite — finish creating your account below.
+          </p>
+        ) : null}
+        <SignupForm
+          config={config}
+          initialInvite={invite}
+          oauthReturnTo="/onboarding"
+          onSuccess={() => router.replace("/onboarding")}
+        />
+      </div>
+    </AuthShell>
+  );
+}
+
+function SignupLoading() {
+  return (
+    <AuthShell title="Create your account">
+      <div className="flex min-h-28 items-center justify-center">
+        <Spinner size={20} label="Loading signup" />
+      </div>
+    </AuthShell>
   );
 }
 
 export default function SignupPage() {
   return (
-    <Suspense fallback={null}>
-      <SignupForm />
+    <Suspense fallback={<SignupLoading />}>
+      <SignupPageContent />
     </Suspense>
   );
 }

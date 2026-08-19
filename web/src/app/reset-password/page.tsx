@@ -4,10 +4,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { type FormEvent, Suspense, useState } from "react";
+import { AuthShell } from "@/components/onboarding/auth-shell";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Spinner } from "@/components/ui/spinner";
 import { ApiError, auth } from "@/lib/api";
 
 const MIN_PASSWORD_LENGTH = 12;
@@ -26,6 +27,7 @@ function ResetPasswordForm() {
 
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
+    if (password.length < MIN_PASSWORD_LENGTH || password !== confirm) return;
     setError(null);
     setSubmitting(true);
     try {
@@ -46,7 +48,7 @@ function ResetPasswordForm() {
         <p className="text-sm" role="alert">
           This link is missing its token. Request a new one.
         </p>
-        <Button asChild className="w-full">
+        <Button asChild className="h-11 w-full">
           <Link href="/forgot-password">Request a reset link</Link>
         </Button>
       </div>
@@ -54,47 +56,53 @@ function ResetPasswordForm() {
   }
 
   return (
-    <form className="space-y-4" onSubmit={onSubmit}>
-      <div className="space-y-1">
+    <form className="space-y-5" onSubmit={onSubmit}>
+      <div className="space-y-2">
         <Label htmlFor="new-password">New password</Label>
         <Input
           id="new-password"
+          className="h-11"
           type="password"
           autoComplete="new-password"
           autoFocus
           required
+          minLength={MIN_PASSWORD_LENGTH}
           value={password}
           onChange={(event) => setPassword(event.target.value)}
           disabled={submitting}
         />
-        <p className="text-xs text-muted-foreground">At least {MIN_PASSWORD_LENGTH} characters.</p>
+        <p className="text-xs leading-5 text-muted-foreground">
+          At least {MIN_PASSWORD_LENGTH} characters.
+        </p>
       </div>
-      <div className="space-y-1">
+      <div className="space-y-2">
         <Label htmlFor="confirm-password">Confirm new password</Label>
         <Input
           id="confirm-password"
+          className="h-11"
           type="password"
           autoComplete="new-password"
           required
+          minLength={MIN_PASSWORD_LENGTH}
           value={confirm}
           onChange={(event) => setConfirm(event.target.value)}
           disabled={submitting}
         />
       </div>
-      {(tooShort || mismatch || error !== null) && (
+      {tooShort || mismatch || error !== null ? (
         <p className="text-sm text-destructive" role="alert">
           {error ??
             (tooShort
               ? `Use at least ${MIN_PASSWORD_LENGTH} characters.`
               : "Both passwords must match.")}
         </p>
-      )}
-      <p className="text-xs text-muted-foreground">
+      ) : null}
+      <p className="text-xs leading-5 text-muted-foreground">
         Every device currently signed in to this account will be signed out.
       </p>
       <Button
         type="submit"
-        className="w-full"
+        className="h-11 w-full"
         disabled={submitting || password.length < MIN_PASSWORD_LENGTH || password !== confirm}
       >
         {submitting ? "Resetting…" : "Set new password"}
@@ -105,17 +113,13 @@ function ResetPasswordForm() {
 
 export default function ResetPasswordPage() {
   return (
-    <div className="flex min-h-vv items-center justify-center px-4 pad-safe-top pad-safe-bottom">
-      <Card className="w-full max-w-sm">
-        <CardHeader>
-          <CardTitle>Choose a new password</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <Suspense fallback={null}>
-            <ResetPasswordForm />
-          </Suspense>
-        </CardContent>
-      </Card>
-    </div>
+    <AuthShell
+      title="Choose a new password"
+      description="Use a unique password with at least 12 characters."
+    >
+      <Suspense fallback={<Spinner size={20} label="Loading password reset" />}>
+        <ResetPasswordForm />
+      </Suspense>
+    </AuthShell>
   );
 }
