@@ -12,8 +12,9 @@ from typing import Any
 from spawn_server import auth
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
-from spawn_server.models import Agent, Host
+from spawn_server.models import Agent, Host, User
 from spawn_server.redis import get_backend
+from spawn_server.ws import browser as browser_ws_mod
 from spawn_server.ws.broker import DaemonConn, get_broker
 from spawn_server.ws.browser import browser_ws
 from spawn_server.ws.daemon import _pump_host_rtc_signals
@@ -722,3 +723,74 @@ async def test_browser_ws_v2_rejects_server_visible_viewport_control(client):
     await asyncio.wait_for(task, timeout=1)
 
     assert ws.closed == (4002, "terminal control belongs on spawn.ctl")
+
+
+async def test_browser_ws_refuses_a_token_from_before_the_password_reset(client):
+    """A password reset must evict the sockets, not only the REST surface.
+
+    `issue_session_token` mints KIND_ACCESS, so the 30-day session cookie is
+    itself a valid credential here. Without the epoch check, the one action
+    the product offers against a stolen session leaves terminal signaling,
+    TURN credentials and host-control participation authenticated for the
+    full cookie lifetime.
+    """
+
+    user_id, token = await _signup(client, "ws-browser-epoch@example.com")
+    _host_id, agent_id = await _create_host_and_agent(user_id)
+
+    # The stolen credential is the long-lived session cookie, not the
+    # 15-minute access token.
+    session_cookie = auth.issue_session_token(user_id, 0)
+    live = FakeBrowserWebSocket(cookies={"spawn_session": session_cookie})
+    live.queue_disconnect()
+    await browser_ws(live, agent_id=agent_id, token=None)  # type: ignore[arg-type]
+    assert live.closed is None
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        user.session_epoch = user.session_epoch + 1
+        await session.commit()
+
+    for label, socket in (
+        ("cookie", FakeBrowserWebSocket(cookies={"spawn_session": session_cookie})),
+        ("bearer", FakeBrowserWebSocket(authorization=f"Bearer {token}")),
+    ):
+        await browser_ws(socket, agent_id=agent_id, token=None)  # type: ignore[arg-type]
+        assert socket.closed == (4001, "session ended; sign in again"), label
+        # Nothing content-free-but-useful leaks before the close either: no
+        # TURN credentials, no confirmation that the agent exists.
+        assert socket.sent_text == [], label
+
+    # The query-parameter path is the same door.
+    via_query = FakeBrowserWebSocket()
+    await browser_ws(via_query, agent_id=agent_id, token=session_cookie)  # type: ignore[arg-type]
+    assert via_query.closed == (4001, "session ended; sign in again")
+
+
+async def test_browser_ws_hangs_up_when_the_epoch_moves_mid_connection(client, monkeypatch):
+    """A socket opened one second before the reset must not outlive it."""
+
+    monkeypatch.setattr(browser_ws_mod, "SESSION_EPOCH_RECHECK_SECONDS", 0.01)
+    user_id, token = await _signup(client, "ws-browser-epoch-live@example.com")
+    _host_id, agent_id = await _create_host_and_agent(user_id)
+
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(
+        browser_ws(ws, agent_id=agent_id, token=None)  # type: ignore[arg-type]
+    )
+    await _wait_until(lambda: bool(_messages_of_type(ws, "agent.status")))
+    assert ws.closed is None
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        user.session_epoch = user.session_epoch + 1
+        await session.commit()
+
+    await _wait_until(lambda: ws.closed is not None, timeout=3.0)
+    assert ws.closed == (4001, "session ended; sign in again")
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=2)

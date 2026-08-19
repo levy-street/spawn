@@ -9,6 +9,24 @@ from typing import Any
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The published default, plus the placeholder `.env.example` used to carry.
+# Both are in the repository, so both are public knowledge and neither can
+# authenticate anything.
+INSECURE_JWT_SECRETS = frozenset(
+    {
+        "change-me-in-prod",
+        "change-me-in-prod-please-this-is-only-for-local",
+    }
+)
+# HS256 keys shorter than the hash output add nothing over a 32-byte one and
+# are the length at which offline guessing becomes realistic. RFC 7518 §3.2
+# names the same floor.
+MIN_JWT_SECRET_BYTES = 32
+
+
+class InsecureJwtSecretError(RuntimeError):
+    """Raised at startup when the signing key cannot authenticate anything."""
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -24,6 +42,10 @@ class Settings(BaseSettings):
     )
     redis_url: str = Field(default="redis://localhost:6379/0")
     jwt_secret: str = Field(default="change-me-in-prod")
+    # Explicit opt-in that lets a throwaway signing key boot. Only ever set on
+    # a local dev box: the whole point of the startup check is that a
+    # deployment cannot reach production with a guessable key by omission.
+    allow_insecure_jwt_secret: bool = Field(default=False)
     jwt_algorithm: str = "HS256"
     jwt_access_ttl_minutes: int = 15
     jwt_refresh_ttl_days: int = 30
@@ -140,6 +162,38 @@ class Settings(BaseSettings):
                 server["credential"] = credential
             out.append(server)
         return out
+
+
+def assert_jwt_secret_usable(settings: Settings) -> None:
+    """Refuse to serve with a signing key anyone can guess.
+
+    `jwt_secret` is the single HS256 key behind every session cookie and every
+    365-day daemon token. Booting on the published default is a silent
+    full-impersonation hole -- including admin -- with no credential theft
+    required, and nothing else in the tree would report it. So this fails
+    closed, the way `web/next.config.ts` already refuses a production build
+    with no proxy target.
+    """
+
+    secret = settings.jwt_secret or ""
+    if settings.allow_insecure_jwt_secret:
+        return
+    hint = (
+        "Generate one with: python -c 'import secrets; print(secrets.token_urlsafe(64))' "
+        "and set SPAWN_JWT_SECRET. Rotating it invalidates every session and daemon "
+        "token, so hosts must be re-paired. Set SPAWN_ALLOW_INSECURE_JWT_SECRET=1 to "
+        "override on a local dev box only."
+    )
+    if not secret.strip():
+        raise InsecureJwtSecretError(f"SPAWN_JWT_SECRET is not set. {hint}")
+    if secret in INSECURE_JWT_SECRETS:
+        raise InsecureJwtSecretError(
+            f"SPAWN_JWT_SECRET is still the placeholder shipped in this repository. {hint}"
+        )
+    if len(secret.encode("utf-8")) < MIN_JWT_SECRET_BYTES:
+        raise InsecureJwtSecretError(
+            f"SPAWN_JWT_SECRET is shorter than {MIN_JWT_SECRET_BYTES} bytes. {hint}"
+        )
 
 
 @lru_cache

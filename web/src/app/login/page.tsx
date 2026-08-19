@@ -2,8 +2,8 @@
 
 import { useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { type FormEvent, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { type FormEvent, Suspense, useState } from "react";
 import { SocialLoginButtons } from "@/components/auth/SocialLoginButtons";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -12,11 +12,27 @@ import { Label } from "@/components/ui/label";
 import { ApiError, auth } from "@/lib/api";
 
 export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
+  );
+}
+
+/** Cap what a redirect can paint into the page; the copy comes from us, not the provider. */
+const MAX_REDIRECT_ERROR_LENGTH = 200;
+
+function LoginForm() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  // A refused provider sign-in (e.g. the address already has a password
+  // account) lands back here rather than on a raw JSON error.
+  const redirectError = useSearchParams().get("error")?.slice(0, MAX_REDIRECT_ERROR_LENGTH) ?? null;
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  // Seeded once so submitting the form clears it, rather than having the
+  // redirect message reappear under every later attempt.
+  const [error, setError] = useState<string | null>(redirectError);
   const [submitting, setSubmitting] = useState(false);
 
   const onSubmit = async (e: FormEvent) => {
