@@ -1,5 +1,6 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
@@ -83,8 +84,15 @@ export default function DevicePage() {
 
 function DeviceInner() {
   const { user } = useAuth();
+  const router = useRouter();
   const registration = useBrowserDeviceRegistration(user?.id);
   const [code, setCode] = useState("");
+  // Set on a successful approval; drives the "connected" screen and the
+  // hand-off to the host's page once its id is known.
+  const [connected, setConnected] = useState<{
+    hostPublicKey: string;
+    hostId: string | null;
+  } | null>(null);
   // The identifier a successful review was loaded with, reused verbatim by
   // approve: the opaque URL ref (normal auto-open path) or the typed user_code.
   const [identifier, setIdentifier] = useState<{
@@ -167,6 +175,30 @@ function DeviceInner() {
     void review(ref ? { approval_ref: ref } : { user_code: urlCode ?? undefined });
   }, [user]);
 
+  // After a successful approval, hand the operator off to the new host's page.
+  // Wait a beat so they read "connected", and — on a first pairing, where the
+  // approve response has no host id yet — poll briefly for the Host row the
+  // daemon's next poll creates. Falls back to the hosts list if it never lands.
+  useEffect(() => {
+    if (!connected) return;
+    let cancelled = false;
+    const run = async () => {
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      await sleep(3000);
+      let hostId = connected.hostId;
+      for (let attempt = 0; attempt < 6 && !hostId && !cancelled; attempt += 1) {
+        const listed = await hosts.list().catch(() => null);
+        hostId = listed?.find((h) => h.host_public_key === connected.hostPublicKey)?.id ?? null;
+        if (!hostId) await sleep(2000);
+      }
+      if (!cancelled) router.push(hostId ? `/hosts/${hostId}` : "/hosts");
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [connected, router]);
+
   const onApprove = async () => {
     if (!pending || !user || registration.data?.status !== "ready") return;
     setError(null);
@@ -231,6 +263,7 @@ function DeviceInner() {
         );
       }
       setHostName(r.host_name);
+      setConnected({ hostPublicKey: pending.host_public_key, hostId: r.host_id ?? null });
       void seedApprovedHostBinding({
         accountId: user.id,
         hostPublicKey: pending.host_public_key,
@@ -274,9 +307,7 @@ function DeviceInner() {
               <p className="text-lg font-medium text-foreground">
                 <code>{hostName}</code> is connected.
               </p>
-              <p className="text-sm text-muted-foreground">
-                Its terminals are on the Agents page in a few seconds.
-              </p>
+              <p className="text-sm text-muted-foreground">Taking you to it…</p>
             </div>
           ) : pending ? (
             <div className="space-y-5">
