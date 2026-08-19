@@ -10,10 +10,14 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use reqwest::StatusCode;
+use tokio::time::Instant;
 use zeroize::{Zeroize, Zeroizing};
 
 use spawnd::host_pair_approval::{self, HostPairApprovalTranscript};
+use spawnd::sas;
 use spawnd::signed_signal::public_key_from_wire;
 
 use crate::cli::LoginArgs;
@@ -22,7 +26,7 @@ use crate::creds;
 use crate::creds::HostIdentity;
 use crate::proto::{
     DevicePollRequest, DevicePollResponse, DevicePossessionRequest, DevicePossessionResponse,
-    DeviceStartRequest, DeviceStartResponse,
+    DeviceSasHostRequest, DeviceSasHostResponse, DeviceStartRequest, DeviceStartResponse,
 };
 
 /// What a successful login learned — enough for `possess` to place this
@@ -50,21 +54,46 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    // 1. start
+    // Committed-ephemeral SAS: our fresh nonce Nd and its commitment Cd, sent in
+    // start. The browser cannot make its number match ours without the Nd we
+    // reveal only after it has committed to its own nonce (Appendix A). The host
+    // key bytes anchor the SAS to this exact host.
+    let host_key_bytes = public_key_from_wire(&identity.public_key)
+        .context("decoding our host public key")?
+        .to_bytes();
+    let mut host_nonce = [0u8; sas::FIELD_BYTES];
+    getrandom::getrandom(&mut host_nonce).context("generating the SAS host nonce")?;
+    let commit_wire = URL_SAFE_NO_PAD.encode(sas::commit(&host_key_bytes, &host_nonce));
+
+    // 1. start — offer the SAS commitment; a pre-SAS server (unknown-field 422)
+    // makes us retry without it and fall back to the full fingerprint compare.
     let start_url = config::api_url(&server, "/api/auth/device/start")?;
-    let start: DeviceStartResponse = client
+    let mut start_req = DeviceStartRequest {
+        host_name: &host_name,
+        os: &os,
+        arch: &arch,
+        version: &version,
+        host_key_algorithm: identity.algorithm,
+        host_public_key: &identity.public_key,
+        sas_commit: Some(&commit_wire),
+    };
+    let mut resp = client
         .post(start_url.as_str())
-        .json(&DeviceStartRequest {
-            host_name: &host_name,
-            os: &os,
-            arch: &arch,
-            version: &version,
-            host_key_algorithm: identity.algorithm,
-            host_public_key: &identity.public_key,
-        })
+        .json(&start_req)
         .send()
         .await
-        .context("POST /api/auth/device/start")?
+        .context("POST /api/auth/device/start")?;
+    if resp.status() == StatusCode::UNPROCESSABLE_ENTITY {
+        start_req.sas_commit = None;
+        resp = client
+            .post(start_url.as_str())
+            .json(&start_req)
+            .send()
+            .await
+            .context("POST /api/auth/device/start (no-SAS retry)")?;
+    }
+    let sas_offered = start_req.sas_commit.is_some();
+    let start: DeviceStartResponse = resp
         .error_for_status()?
         .json()
         .await
@@ -123,11 +152,42 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         println!("spawn:   {approve_url}");
     }
     println!();
-    println!(
-        "spawn:   verification code   {}",
-        creds::verification_code(&identity.fingerprint)
-    );
-    println!("spawn:   confirm it matches the code shown in your browser, then approve.");
+
+    // Always print the fingerprint first: it is sound, immediate, and the value
+    // the browser also shows — so there is something to compare even before the
+    // shorter SAS number is ready, and the two screens can never desync. When a
+    // commitment was offered, run the SAS handshake *concurrently* with the
+    // approval poll below; it prints the short code the moment the browser
+    // contributes, however long the human takes to open the page.
+    println!("spawn:   verify host fingerprint   {}", identity.fingerprint);
+    if sas_offered {
+        println!(
+            "spawn:   (a shorter 6-digit code appears here once your browser loads — match either)"
+        );
+        let sas_client = client.clone();
+        let sas_server = server.clone();
+        let sas_device_code = start.device_code.clone();
+        let sas_public_key = identity.public_key.clone();
+        let sas_algorithm = identity.algorithm;
+        tokio::spawn(async move {
+            if let Ok(Some(code)) = run_sas_handshake(
+                &sas_client,
+                &sas_server,
+                &sas_device_code,
+                sas_algorithm,
+                &sas_public_key,
+                &host_key_bytes,
+                &host_nonce,
+            )
+            .await
+            {
+                println!("spawn:   verification code   {code}");
+                println!("spawn:   confirm it matches the code in your browser, then approve.");
+            }
+        });
+    } else {
+        println!("spawn:   confirm it matches the fingerprint in your browser, then approve.");
+    }
     println!();
     println!("spawn: waiting for approval…");
 
@@ -196,6 +256,82 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
             }
         }
     }
+}
+
+/// Drive the daemon's side of the committed-ephemeral SAS: poll for the
+/// browser's nonce `Nb` and key `B`, and once present compute the number, reveal
+/// our own `Nd`, and return the number. Returns `Ok(None)` if the browser never
+/// contributes within the window (old page, or a server without the endpoint) —
+/// the caller then falls back to the fingerprint.
+async fn run_sas_handshake(
+    client: &reqwest::Client,
+    server: &url::Url,
+    device_code: &str,
+    host_key_algorithm: &str,
+    host_public_key: &str,
+    host_key_bytes: &[u8; sas::FIELD_BYTES],
+    host_nonce: &[u8; sas::FIELD_BYTES],
+) -> Result<Option<String>> {
+    let url = config::api_url(server, "/api/auth/device/sas-host")?;
+    let nd_wire = URL_SAFE_NO_PAD.encode(host_nonce);
+    // Keep trying for most of the ceremony window, not a few seconds: the human
+    // may take a while to open the page, and giving up early would desync (the
+    // daemon on the fingerprint, the browser stuck waiting for a code).
+    let deadline = Instant::now() + Duration::from_secs(20 * 60);
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let resp = client
+            .post(url.as_str())
+            .json(&DeviceSasHostRequest {
+                device_code,
+                host_key_algorithm,
+                host_public_key,
+                sas_host_nonce: None,
+            })
+            .send()
+            .await
+            .context("POST /api/auth/device/sas-host")?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None); // pre-SAS server / unknown ceremony
+        }
+        let body: DeviceSasHostResponse = resp
+            .error_for_status()?
+            .json()
+            .await
+            .context("decoding device/sas-host response")?;
+        if let (Some(nb_wire), Some(b_wire)) = (body.sas_browser_nonce, body.sas_browser_key) {
+            let browser_nonce = decode_sas_field(&nb_wire).context("decoding browser SAS nonce")?;
+            let browser_key = public_key_from_wire(&b_wire)
+                .context("decoding approved browser key")?
+                .to_bytes();
+            let code = sas::sas(host_key_bytes, &browser_key, host_nonce, &browser_nonce);
+            // Reveal Nd only now — after Nb — so a relay cannot rush our open.
+            let _ = client
+                .post(url.as_str())
+                .json(&DeviceSasHostRequest {
+                    device_code,
+                    host_key_algorithm,
+                    host_public_key,
+                    sas_host_nonce: Some(&nd_wire),
+                })
+                .send()
+                .await;
+            return Ok(Some(code));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn decode_sas_field(wire: &str) -> Result<[u8; sas::FIELD_BYTES]> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(wire)
+        .context("SAS field is not canonical base64url")?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("SAS field has the wrong length"))
 }
 
 /// Best-effort: open `url` in the operator's default browser. Returns whether a

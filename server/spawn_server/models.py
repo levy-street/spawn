@@ -473,6 +473,15 @@ class DeviceCode(Base):
     approval_ref: Mapped[str | None] = mapped_column(
         String(43), unique=True, nullable=True, index=True
     )
+    # Committed-ephemeral SAS relay fields (docs/TRUST_DEVICE_MESH.md App. A). The
+    # server only stores and forwards these; it cannot forge a matching number.
+    # sas_commit (Cd) is set by the daemon at start; sas_browser_nonce (Nb) +
+    # sas_browser_key (B) by the browser; sas_host_nonce (Nd) by the daemon after
+    # it sees Nb. Absent ⇒ a peer that doesn't speak SAS ⇒ fingerprint fallback.
+    sas_commit: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    sas_browser_nonce: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    sas_browser_key: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    sas_host_nonce: Mapped[str | None] = mapped_column(String(43), nullable=True)
     host_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     os: Mapped[str | None] = mapped_column(String(64), nullable=True)
     arch: Mapped[str | None] = mapped_column(String(64), nullable=True)
