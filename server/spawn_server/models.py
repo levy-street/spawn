@@ -342,6 +342,57 @@ class HostBrowserPin(Base):
     )
 
 
+class DeviceEndorsement(Base):
+    """One device account-endorsing another: a directed edge in the account's
+    device trust graph, with NO host binding (docs/TRUST_DEVICE_MESH.md §3).
+
+    This is the account-scoped successor to the per-host endorsement stored on
+    HostBrowserPin. The server stores and relays these but is NOT their
+    authority and does not gate on the endorser being "trusted" — in the mesh,
+    trust is decided by the daemon when it validates a carried chain against its
+    own anchors, not by this table. Storing an edge grants nothing: an edge from
+    a device that does not chain to a host's anchor is inert. Retained as an
+    immutable record; trust is withdrawn via the revocation deny-list on keys,
+    not by deleting rows.
+    """
+
+    __tablename__ = "device_endorsements"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    endorser_device_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("browser_devices.id", ondelete="CASCADE"), nullable=False
+    )
+    endorsed_device_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("browser_devices.id", ondelete="CASCADE"), nullable=False
+    )
+    # base64url of the 64-byte Ed25519 signature over the SPAWN-ACCT-ENDORSE-V1
+    # transcript (86 chars). The daemon re-verifies this; the server only checks
+    # it to keep malformed rows out.
+    signature: Mapped[str] = mapped_column(String(86), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "endorser_device_id",
+            "endorsed_device_id",
+            name="uq_device_endorsements_pair",
+        ),
+        CheckConstraint(
+            "endorser_device_id <> endorsed_device_id",
+            name="ck_device_endorsements_not_self",
+        ),
+        CheckConstraint(
+            "length(signature) = 86",
+            name="ck_device_endorsements_signature",
+        ),
+    )
+
+
 class Preset(Base):
     __tablename__ = "presets"
 
