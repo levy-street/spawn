@@ -312,10 +312,19 @@ asyncio.run(main())
                 install
                 == "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
             )
-            count = conn.execute(
-                text("select count(*) from presets where owner_user_id is null")
-            ).scalar_one()
-            assert count == 5
+            # Derived from the declaration rather than a literal, so adding a
+            # built-in does not silently require editing an unrelated test --
+            # and so this keeps asserting what it means: the startup seed is
+            # exactly the declared set.
+            from spawn_server.presets import BUILTIN_PRESETS
+
+            seeded = {
+                row[0]
+                for row in conn.execute(
+                    text("select name from presets where owner_user_id is null")
+                )
+            }
+            assert seeded == {spec["name"] for spec in BUILTIN_PRESETS}
     finally:
         engine.dispose()
 

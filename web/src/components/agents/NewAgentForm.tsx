@@ -21,7 +21,15 @@ import { insertAtEdge } from "@/lib/layout";
 import { normalizeCwdForHost, withTrailingSlash } from "@/lib/paths";
 import { cn } from "@/lib/utils";
 
-const PRESET_ORDER = ["codex", "claude-code", "opencode", "aider-sonnet", "shell"];
+const PRESET_ORDER = [
+  "codex",
+  "claude-code",
+  "opencode",
+  "aider-sonnet",
+  "hermes",
+  "grok",
+  "shell",
+];
 const YOLO_STORAGE_KEY = "spawn.newAgent.yolo";
 
 function kindForPreset(agentKind: string): AgentKind {
@@ -30,6 +38,8 @@ function kindForPreset(agentKind: string): AgentKind {
   if (kind.includes("claude")) return "claude";
   if (kind.includes("opencode")) return "opencode";
   if (kind.includes("aider")) return "aider";
+  if (kind.includes("hermes")) return "hermes";
+  if (kind.includes("grok")) return "grok";
   if (kind.includes("shell")) return "shell";
   return "custom";
 }

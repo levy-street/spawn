@@ -216,7 +216,15 @@ Built-in presets (server-seeded, `owner_user_id = null`):
 - **codex** — `argv=["codex"]`, yolo `--yolo`, install `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`
 - **opencode** — `argv=["opencode"]`, no yolo flag (autonomy is `permission` in `opencode.json`, host-side config spawn does not write), install `npm install -g opencode-ai`
 - **aider-sonnet** — `argv=["aider","--model","claude-sonnet-4-6"]`, yolo `--yes-always`, install `pipx install aider-chat || pip install --user aider-chat`
+- **hermes** — `argv=["hermes"]`, yolo `--yolo`, install `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`
+- **grok** — `argv=["grok"]`, no yolo flag, install `npm install -g @xai-official/grok`
 - **shell** — `argv=["bash","-l"]`, no yolo flag (nothing was ever gated), no install needed
+
+`hermes` installs from a vendor script rather than a registry, so
+`latest_tool_version` cannot resolve an update target for it and the tools
+panel shows its installed version with no "latest" — the only npm package
+carrying that name is an unofficial third-party bridge, and pointing a
+built-in at one would be a supply-chain decision, not a version check.
 
 Server-owned fields on a built-in (`agent_kind`, `default_argv`,
 `env_template`, `install`, `yolo_argv`) are reconciled on every startup.

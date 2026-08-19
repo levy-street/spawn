@@ -1,6 +1,6 @@
 "use client";
 
-import { Bot, GitBranch, TerminalSquare } from "lucide-react";
+import { Bot, Feather, GitBranch, Orbit, TerminalSquare } from "lucide-react";
 import { useId } from "react";
 import { type AgentKind, agentKind, agentKindLabel } from "@/lib/agents";
 import type { Agent } from "@/lib/api";
@@ -59,6 +59,14 @@ function BrandMark({ kind, className }: { kind: AgentKind; className?: string })
       return <OpenCodeMark className={className} />;
     case "aider":
       return <GitBranch className={className} aria-hidden />;
+    // Hermes and Grok get distinctive lucide glyphs rather than invented
+    // logos: an approximated trademark is worse than an honest icon, and this
+    // is the same fallback treatment aider and shell already get. Swap in a
+    // real mark if we ever have the asset and the permission.
+    case "hermes":
+      return <Feather className={className} aria-hidden />;
+    case "grok":
+      return <Orbit className={className} aria-hidden />;
     case "shell":
       return <TerminalSquare className={className} aria-hidden />;
     default:
@@ -131,6 +139,10 @@ function classForKind(kind: AgentKind): string {
       return "bg-black text-white ring-white/20";
     case "aider":
       return "bg-gradient-to-br from-fuchsia-500 to-purple-700 text-white";
+    case "hermes":
+      return "bg-indigo-600 text-white";
+    case "grok":
+      return "bg-zinc-950 text-white ring-white/20";
     case "shell":
       return "bg-zinc-800 text-emerald-300";
     default:

@@ -191,7 +191,6 @@ async def test_seeding_reconciles_a_corrected_builtin_onto_an_existing_deploymen
 async def test_a_user_preset_is_never_touched_by_seeding(client):
     """Reconciliation is scoped to built-ins, which nobody can edit anyway."""
 
-    from sqlalchemy import select
 
     from spawn_server.db import get_sessionmaker
     from spawn_server.models import Preset
@@ -223,3 +222,50 @@ async def test_a_user_preset_is_never_touched_by_seeding(client):
         assert untouched is not None
         assert untouched.default_argv == ["codex", "--my-flag"]
         assert untouched.yolo_argv is None
+
+
+async def test_the_new_builtins_are_seeded_with_a_working_shape(client):
+    """A wrong binary or install ships a preset that fails on every host.
+
+    Each of these was confirmed against the vendor's current docs; this pins
+    them so a later edit has to be deliberate.
+    """
+
+    token = await _signup(client, "builtin-shape@example.com")
+    listed = await client.get("/api/presets", headers={"Authorization": f"Bearer {token}"})
+    assert listed.status_code == 200, listed.text
+    by_name = {item["name"]: item for item in listed.json()}
+
+    hermes = by_name["hermes"]
+    assert hermes["agent_kind"] == "hermes"
+    assert hermes["default_argv"] == ["hermes"]
+    assert hermes["install"] == (
+        "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+    )
+    assert hermes["yolo_argv"] == ["--yolo"]
+
+    grok = by_name["grok"]
+    assert grok["agent_kind"] == "grok"
+    assert grok["default_argv"] == ["grok"]
+    # The vendor-preferred install, and an npm package so the existing parser
+    # can resolve a latest version without a special case.
+    assert grok["install"] == "npm install -g @xai-official/grok"
+    assert grok["yolo_argv"] is None
+
+    # Neither carries credentials: each CLI handles its own login on the host.
+    assert hermes["env_template"] == {}
+    assert grok["env_template"] == {}
+
+
+async def test_no_builtin_smuggles_credentials_into_the_server(client):
+    """spawn deliberately does not manage agent provider credentials.
+
+    Both new tools *can* read an API key from the environment, so this is the
+    invariant worth pinning rather than assuming.
+    """
+
+    token = await _signup(client, "builtin-creds@example.com")
+    listed = await client.get("/api/presets", headers={"Authorization": f"Bearer {token}"})
+    assert listed.status_code == 200, listed.text
+    for item in listed.json():
+        assert item["env_template"] == {}, item["name"]

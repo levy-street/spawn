@@ -55,6 +55,31 @@ BUILTIN_PRESETS: list[dict] = [
         "yolo_argv": ["--yes-always"],
     },
     {
+        # Nous Research's agent. Installs its own dependencies and puts a
+        # `hermes` binary on PATH; plain `hermes` is the documented entry
+        # point for an interactive session (`--tui` is the fuller terminal
+        # UI, one word away if we prefer it).
+        "name": "hermes",
+        "agent_kind": "hermes",
+        "default_argv": ["hermes"],
+        "env_template": {},
+        "install": "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash",
+        "yolo_argv": ["--yolo"],
+    },
+    {
+        # xAI's coding agent. The npm package is the vendor-preferred install
+        # -- it avoids depending on x.ai, which is Cloudflare-walled in some
+        # environments -- and it also gives latest-version detection for free
+        # through the existing npm parser.
+        "name": "grok",
+        "agent_kind": "grok",
+        "default_argv": ["grok"],
+        "env_template": {},
+        "install": "npm install -g @xai-official/grok",
+        # No documented flag: Grok Build has no auto-approve switch today.
+        "yolo_argv": None,
+    },
+    {
         "name": "shell",
         "agent_kind": "shell",
         "default_argv": ["bash", "-l"],
