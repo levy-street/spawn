@@ -37,6 +37,7 @@ export const preset = {
   default_argv: ["codex"],
   env_template: {},
   install: "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
+  yolo_argv: ["--yolo"],
 };
 
 export function agent(overrides: Record<string, unknown> = {}) {
@@ -131,6 +132,7 @@ export async function mockAuthenticatedApi(
     createScreen?: (body: unknown, route: Route) => Promise<void> | void;
     restartAgent?: (id: string, route: Route) => Promise<void> | void;
     skills?: unknown[];
+    presets?: unknown[];
     createAgent?: (body: unknown, route: Route) => Promise<void> | void;
     updateAgent?: (id: string, body: unknown, route: Route) => Promise<void> | void;
     createSkill?: (body: unknown, route: Route) => Promise<void> | void;
@@ -156,6 +158,7 @@ export async function mockAuthenticatedApi(
   const hostList = options.hosts ?? [host];
   const screenList = options.screens ?? [];
   const skillList = options.skills ?? [];
+  const presetList = options.presets ?? [preset];
   const browserDeviceList: Array<Record<string, unknown>> = [
     ...(options.extraBrowserDevices ?? []),
   ];
@@ -699,7 +702,7 @@ export async function mockAuthenticatedApi(
       return;
     }
     if (path === "/api/presets") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: [preset] });
+      await route.fulfill({ status: 200, contentType: "application/json", json: presetList });
       return;
     }
     if (path === "/api/skills" && method === "GET") {

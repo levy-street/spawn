@@ -100,3 +100,126 @@ async def test_duplicate_user_preset_name_returns_conflict(client):
 
     r = await client.patch(f"/api/presets/{second_id}", json={"name": "first"}, headers=auth)
     assert r.status_code == 409
+
+
+def test_every_builtin_declares_its_autonomy_flag_explicitly():
+    """`None` and "not written down" must not be the same thing.
+
+    A preset that quietly lacks the key would hide the toggle for a tool that
+    does have a flag, which is indistinguishable from a tool that does not.
+    """
+
+    from spawn_server.presets import BUILTIN_PRESETS
+
+    for spec in BUILTIN_PRESETS:
+        assert "yolo_argv" in spec, spec["name"]
+        assert spec["yolo_argv"] is None or (
+            isinstance(spec["yolo_argv"], list)
+            and spec["yolo_argv"]
+            and all(isinstance(flag, str) and flag.startswith("-") for flag in spec["yolo_argv"])
+        ), spec["name"]
+
+    by_name = {spec["name"]: spec["yolo_argv"] for spec in BUILTIN_PRESETS}
+    assert by_name["claude-code"] == ["--dangerously-skip-permissions"]
+    assert by_name["codex"] == ["--yolo"]
+    assert by_name["aider-sonnet"] == ["--yes-always"]
+    # No CLI flag exists for either: opencode is config-driven, and a shell
+    # never had a permission model to skip.
+    assert by_name["opencode"] is None
+    assert by_name["shell"] is None
+
+
+def test_compose_argv_appends_rather_than_replaces():
+    from spawn_server.presets import compose_argv
+
+    assert compose_argv(["codex"], ["--yolo"], yolo=True) == ["codex", "--yolo"]
+    assert compose_argv(["codex"], ["--yolo"], yolo=False) == ["codex"]
+    # The preset's own arguments survive; the flag lands after them.
+    assert compose_argv(["aider", "--model", "x"], ["--yes-always"], yolo=True) == [
+        "aider",
+        "--model",
+        "x",
+        "--yes-always",
+    ]
+    # A preset with no flag is unchanged even when asked.
+    assert compose_argv(["opencode"], None, yolo=True) == ["opencode"]
+    assert compose_argv(["bash", "-l"], None, yolo=True) == ["bash", "-l"]
+    # Idempotent, so a default_argv that already carries it stays clean.
+    assert compose_argv(["codex", "--yolo"], ["--yolo"], yolo=True) == ["codex", "--yolo"]
+    # And it never mutates the caller's list.
+    default = ["codex"]
+    compose_argv(default, ["--yolo"], yolo=True)
+    assert default == ["codex"]
+
+
+async def test_seeding_reconciles_a_corrected_builtin_onto_an_existing_deployment(client):
+    """Seeding used to only ever fix `install`.
+
+    Everything else was write-once, so a wrong `default_argv` shipped once
+    would have been wrong forever on every deployment that already ran.
+    """
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Preset
+    from spawn_server.presets import seed_builtin_presets
+
+    async with get_sessionmaker()() as session:
+        row = (
+            await session.execute(
+                select(Preset).where(Preset.owner_user_id.is_(None), Preset.name == "codex")
+            )
+        ).scalar_one()
+        row.default_argv = ["codex", "--wrong"]
+        row.yolo_argv = None
+        row.install = "echo nope"
+        await session.commit()
+
+        await seed_builtin_presets(session)
+
+        corrected = (
+            await session.execute(
+                select(Preset).where(Preset.owner_user_id.is_(None), Preset.name == "codex")
+            )
+        ).scalar_one()
+        assert corrected.default_argv == ["codex"]
+        assert corrected.yolo_argv == ["--yolo"]
+        assert corrected.install.startswith("curl -fsSL https://chatgpt.com/codex/install.sh")
+
+
+async def test_a_user_preset_is_never_touched_by_seeding(client):
+    """Reconciliation is scoped to built-ins, which nobody can edit anyway."""
+
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Preset
+    from spawn_server.presets import seed_builtin_presets
+
+    signup = await client.post(
+        "/api/auth/signup", json={"email": "preset-owner@example.com", "password": "passpasspass"}
+    )
+    assert signup.status_code == 200
+    user_id = signup.json()["user"]["id"]
+
+    async with get_sessionmaker()() as session:
+        mine = Preset(
+            owner_user_id=user_id,
+            name="codex",
+            agent_kind="codex",
+            default_argv=["codex", "--my-flag"],
+            env_template={},
+            install=None,
+            yolo_argv=None,
+        )
+        session.add(mine)
+        await session.commit()
+        preset_id = mine.id
+
+        await seed_builtin_presets(session)
+
+        untouched = await session.get(Preset, preset_id)
+        assert untouched is not None
+        assert untouched.default_argv == ["codex", "--my-flag"]
+        assert untouched.yolo_argv is None

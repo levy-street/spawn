@@ -13,6 +13,11 @@ CODEX_INSTALL_COMMAND = "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX
 # spawn does not manage agent credentials; each agent CLI handles its own
 # auth interactively on the host (e.g. `claude /login`). The optional
 # `install` command is run by the daemon when default_argv[0] isn't on PATH.
+#
+# `yolo_argv` is the tool's own "stop asking me" flag, appended when an agent
+# is created with the YOLO toggle on. `None` means the tool has no such flag
+# -- not that it has an empty one -- and the create form hides the toggle
+# entirely rather than offering a control that would do nothing.
 BUILTIN_PRESETS: list[dict] = [
     {
         "name": "claude-code",
@@ -20,6 +25,7 @@ BUILTIN_PRESETS: list[dict] = [
         "default_argv": ["claude"],
         "env_template": {},
         "install": "npm install -g @anthropic-ai/claude-code",
+        "yolo_argv": ["--dangerously-skip-permissions"],
     },
     {
         "name": "codex",
@@ -27,6 +33,7 @@ BUILTIN_PRESETS: list[dict] = [
         "default_argv": ["codex"],
         "env_template": {},
         "install": CODEX_INSTALL_COMMAND,
+        "yolo_argv": ["--yolo"],
     },
     {
         "name": "opencode",
@@ -34,6 +41,9 @@ BUILTIN_PRESETS: list[dict] = [
         "default_argv": ["opencode"],
         "env_template": {},
         "install": "npm install -g opencode-ai",
+        # No CLI flag exists: opencode drives autonomy from `permission` in
+        # opencode.json, which is host-side config spawn does not write.
+        "yolo_argv": None,
     },
     {
         "name": "aider-sonnet",
@@ -42,6 +52,7 @@ BUILTIN_PRESETS: list[dict] = [
         "env_template": {},
         # pipx is the cleanest install path; fall back to a user pip if not.
         "install": "pipx install aider-chat || pip install --user aider-chat",
+        "yolo_argv": ["--yes-always"],
     },
     {
         "name": "shell",
@@ -49,8 +60,42 @@ BUILTIN_PRESETS: list[dict] = [
         "default_argv": ["bash", "-l"],
         "env_template": {},
         "install": None,
+        # A shell has no permission model to skip; it was never gated.
+        "yolo_argv": None,
     },
 ]
+
+# Server-owned fields on a built-in. Built-ins are `owner_user_id IS NULL` and
+# the preset routes refuse to edit or delete them, so reconciling all of these
+# on startup cannot clobber anything a user wrote -- and without it, a
+# correction after release would never reach an existing deployment.
+RECONCILED_FIELDS = ("agent_kind", "default_argv", "env_template", "install", "yolo_argv")
+
+
+def compose_argv(default_argv: list[str], yolo_argv: list[str] | None, *, yolo: bool) -> list[str]:
+    """The command an agent actually runs.
+
+    Appending rather than replacing is the whole point: the preset keeps its
+    identity, so `preset_id` survives and with it the daemon's
+    install-when-missing path -- which typing a full custom command loses.
+    """
+
+    argv = list(default_argv)
+    if not yolo or not yolo_argv:
+        return argv
+    # Idempotent: a preset whose default_argv already carries the flag must
+    # not end up passing it twice.
+    return argv + [flag for flag in yolo_argv if flag not in argv]
+
+
+def _copy(value: object) -> object:
+    """Never hand a mutable module constant to the ORM."""
+
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
 
 
 async def seed_builtin_presets(session: AsyncSession) -> None:
@@ -73,13 +118,15 @@ async def seed_builtin_presets(session: AsyncSession) -> None:
                     default_argv=list(spec["default_argv"]),
                     env_template=dict(spec["env_template"]),
                     install=spec.get("install"),
+                    yolo_argv=_copy(spec.get("yolo_argv")),
                 )
             )
             changed = True
-        else:
-            install = spec.get("install")
-            if row.install != install:
-                row.install = install
+            continue
+        for field in RECONCILED_FIELDS:
+            wanted = _copy(spec.get(field))
+            if getattr(row, field) != wanted:
+                setattr(row, field, wanted)
                 changed = True
     if changed:
         await session.commit()

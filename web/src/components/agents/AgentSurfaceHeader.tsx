@@ -5,11 +5,12 @@ import type { HTMLAttributes, ReactNode } from "react";
 import { useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { AgentPaneMenuItems } from "@/components/agents/AgentPaneMenu";
+import { YoloBadge } from "@/components/agents/YoloBadge";
 import { type AgentConnectionInfo, ConnectionChip } from "@/components/terminal/ConnectionChip";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
 import { DropdownMenu } from "@/components/ui/dropdown-menu";
 import { AgentStatusDot } from "@/components/ui/status";
-import { agentActivityDetail, agentNeedsAttention, agentTitle } from "@/lib/agents";
+import { agentActivityDetail, agentNeedsAttention, agentTitle, isYoloArgv } from "@/lib/agents";
 import type { Agent } from "@/lib/api";
 import { runDiagnosticRefresh } from "@/lib/diagnostics";
 import { cn } from "@/lib/utils";
@@ -117,6 +118,7 @@ export function AgentSurfaceHeader({
             )}
           >
             <span className="truncate">{agentTitle(agent)}</span>
+            {isYoloArgv(agent.argv) && <YoloBadge />}
             {attention && (
               <span
                 title={attention === "dead" ? "Agent exited" : "Awaiting input"}

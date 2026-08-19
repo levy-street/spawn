@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import auth, schemas
 from ..db import get_session
 from ..models import Agent, Host, Preset, User
+from ..presets import compose_argv
 from ..ws.broker import get_broker
 from . import capabilities
 
@@ -210,7 +211,15 @@ async def create_agent(
 
     preset = await _resolve_agent_preset(session, body.preset_id, user)
 
-    argv = list(body.argv) if body.argv else (list(preset.default_argv) if preset else [])
+    # A hand-written argv is taken exactly as written; YOLO only ever composes
+    # onto a preset, which is what keeps `preset_id` (and with it the daemon's
+    # install-when-missing path) instead of replacing the command wholesale.
+    if body.argv:
+        argv = list(body.argv)
+    elif preset is not None:
+        argv = compose_argv(preset.default_argv, preset.yolo_argv, yolo=body.yolo)
+    else:
+        argv = []
     if not argv:
         raise HTTPException(status_code=400, detail="resolved argv is empty")
 

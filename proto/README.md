@@ -203,12 +203,26 @@ Each preset may also carry an optional `install` shell command. The daemon
 runs it (via `bash -c`) when `argv[0]` isn't on PATH, streaming stdout into
 the agent's PTY so the user sees install progress in the terminal view.
 
+Each preset may also carry `yolo_argv`: the tool's own "stop asking me" flag,
+appended to `default_argv` when `POST /api/agents` is sent `yolo: true`.
+Appending rather than replacing is what keeps `preset_id` — and with it the
+install-when-missing path — instead of losing both to a custom command. `null`
+means the tool has no such flag, which is not the same as an empty list: the
+create form hides the toggle entirely rather than offering one that does
+nothing. `yolo` is ignored when the request carries an explicit `argv`.
+
 Built-in presets (server-seeded, `owner_user_id = null`):
-- **claude-code** — `argv=["claude"]`, install `npm install -g @anthropic-ai/claude-code`
-- **codex** — `argv=["codex"]`, install `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`
-- **opencode** — `argv=["opencode"]`, install `npm install -g opencode-ai`
-- **aider-sonnet** — `argv=["aider","--model","claude-sonnet-4-6"]`, install `pipx install aider-chat || pip install --user aider-chat`
-- **shell** — `argv=["bash","-l"]`, no install needed
+- **claude-code** — `argv=["claude"]`, yolo `--dangerously-skip-permissions`, install `npm install -g @anthropic-ai/claude-code`
+- **codex** — `argv=["codex"]`, yolo `--yolo`, install `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`
+- **opencode** — `argv=["opencode"]`, no yolo flag (autonomy is `permission` in `opencode.json`, host-side config spawn does not write), install `npm install -g opencode-ai`
+- **aider-sonnet** — `argv=["aider","--model","claude-sonnet-4-6"]`, yolo `--yes-always`, install `pipx install aider-chat || pip install --user aider-chat`
+- **shell** — `argv=["bash","-l"]`, no yolo flag (nothing was ever gated), no install needed
+
+Server-owned fields on a built-in (`agent_kind`, `default_argv`,
+`env_template`, `install`, `yolo_argv`) are reconciled on every startup.
+Built-ins cannot be edited or deleted through the preset routes, so this
+cannot clobber user data — and without it a correction after release would
+never reach a deployment that had already seeded.
 
 > spawn does not manage agent provider credentials. Each agent CLI handles
 > its own login interactively on the host (e.g. `claude /login` writes

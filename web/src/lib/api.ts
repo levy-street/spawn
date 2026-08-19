@@ -180,6 +180,8 @@ export const PresetSchema = z.object({
   default_argv: z.array(z.string()),
   env_template: z.record(z.string(), z.string()).default({}),
   install: z.string().nullable().optional(),
+  /** Null when this tool has no "skip the prompts" flag; the toggle hides. */
+  yolo_argv: z.array(z.string()).nullable().optional(),
 });
 export type Preset = z.infer<typeof PresetSchema>;
 
@@ -638,6 +640,8 @@ export const agents = {
     env?: Record<string, string>;
     skill_ids?: string[];
     create_cwd?: boolean;
+    /** Append the preset's autonomy flag. Ignored when `argv` is given. */
+    yolo?: boolean;
   }) =>
     api("/api/agents", {
       method: "POST",

@@ -4,6 +4,7 @@ import { Pin } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
+import { YoloBadge } from "@/components/agents/YoloBadge";
 import { type AgentConnState, useAgentConnState } from "@/components/terminal/LiveTerminalProvider";
 import { AgentStatusDot } from "@/components/ui/status";
 import {
@@ -11,6 +12,7 @@ import {
   agentActivityLabel,
   agentNeedsAttention,
   agentTitle,
+  isYoloArgv,
 } from "@/lib/agents";
 import type { Agent } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -90,6 +92,7 @@ export function AgentListRow({
             {agent.pinned_at && (
               <Pin className="size-3 shrink-0 text-muted-foreground" aria-label="Pinned" />
             )}
+            {isYoloArgv(agent.argv) && <YoloBadge />}
             {badges}
           </span>
           <span className="mt-0.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
