@@ -311,7 +311,12 @@ wait_for_login() {
 
 wait_for_login
 
-grep -F "enter code:" "$login_out" >/dev/null
+# The approval affordance the human actually uses. `spawnd login` no longer
+# prints a code to retype -- it links straight to the approval page and shows
+# the verification code to compare against the browser -- so assert on the
+# two lines that are printed on every path (browser opened or not).
+grep -F "verification code" "$login_out" >/dev/null
+grep -F "then approve." "$login_out" >/dev/null
 grep -F "logged in. host_id =" "$login_out" >/dev/null
 
 printf '%s\n' "smoke-local-login: re-running login in the same scoped keyring namespace"
@@ -358,7 +363,8 @@ PY
 printf '%s\n' "smoke-local-login: approving second device code"
 approve_device_code "$user_code_2" "$approved_browser_2"
 wait_for_login
-grep -F "enter code:" "$login_out_2" >/dev/null
+grep -F "verification code" "$login_out_2" >/dev/null
+grep -F "then approve." "$login_out_2" >/dev/null
 grep -F "logged in. host_id =" "$login_out_2" >/dev/null
 
 printf '%s\n' "smoke-local-login: verifying stored credentials and host"
