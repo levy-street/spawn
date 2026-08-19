@@ -1,28 +1,27 @@
 "use client";
 
-import { Settings } from "lucide-react";
-import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { useQuery } from "@tanstack/react-query";
+import { Menu, Plus } from "lucide-react";
+import { usePathname, useRouter } from "next/navigation";
 import {
   type ReactNode,
   type PointerEvent as ReactPointerEvent,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useState,
 } from "react";
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
-import { BottomTabs } from "@/components/nav/BottomTabs";
-import { SIDEBAR_RAIL_WIDTH, Sidebar } from "@/components/nav/Sidebar";
+import { Sidebar } from "@/components/nav/Sidebar";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
-import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
+import { ConfirmHost } from "@/components/ui/confirm";
+import { Drawer } from "@/components/ui/drawer";
+import { NewSessionMenu } from "@/components/workspace/new-session-menu";
+import { workspaces } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-// Runs before paint on the client, falls back to a no-op-ish effect on the
-// server (avoids the useLayoutEffect SSR warning).
 const useIsoLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
-
-const SIDEBAR_DEFAULT_WIDTH = 264;
 const SIDEBAR_MIN_WIDTH = 216;
 const SIDEBAR_MAX_WIDTH = 420;
 
@@ -30,11 +29,6 @@ function clampSidebarWidth(width: number): number {
   return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, width));
 }
 
-/**
- * Responsive shell: a left rail at >=md (container query), and a top bar +
- * bottom tab bar below that. The shell itself is a top-level container so
- * children can use `@md:` variants on container queries.
- */
 export function AppShell({
   children,
   hideMobileNav = false,
@@ -45,16 +39,24 @@ export function AppShell({
   mainClassName?: string;
 }) {
   const pathname = usePathname();
-  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
+  const router = useRouter();
+  const [sidebarWidth, setSidebarWidth] = useState<number | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [resizing, setResizing] = useState(false);
-  // Width transitions only after the first paint. AppShell remounts on
-  // cross-route navigation, and applying the saved width would otherwise glide
-  // from the default every time — jerking the terminal that resizes with it.
   const [transitionReady, setTransitionReady] = useState(false);
 
-  // Apply the persisted width BEFORE paint so a remount snaps straight to the
-  // saved size (no visible default frame, no glide).
+  const workspacesQ = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: workspaces.list,
+    staleTime: 30_000,
+  });
+  const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
+  const currentWorkspaceName = useMemo(
+    () => workspacesQ.data?.find((workspace) => workspace.id === currentWorkspaceId)?.name,
+    [currentWorkspaceId, workspacesQ.data],
+  );
+
   useIsoLayoutEffect(() => {
     const savedWidth = Number(window.localStorage.getItem("spawn.sidebar.width"));
     if (Number.isFinite(savedWidth) && savedWidth > 0) {
@@ -63,26 +65,34 @@ export function AppShell({
     setSidebarCollapsed(window.localStorage.getItem("spawn.sidebar.collapsed") === "true");
   }, []);
 
-  // Enable the width transition one frame later, so collapse/drag still glide
-  // but the initial saved-width application does not.
   useEffect(() => {
     const id = requestAnimationFrame(() => setTransitionReady(true));
     return () => cancelAnimationFrame(id);
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem("spawn.sidebar.width", String(sidebarWidth));
+    if (sidebarWidth !== null) {
+      window.localStorage.setItem("spawn.sidebar.width", String(sidebarWidth));
+    }
   }, [sidebarWidth]);
 
   useEffect(() => {
     window.localStorage.setItem("spawn.sidebar.collapsed", String(sidebarCollapsed));
   }, [sidebarCollapsed]);
 
+  useEffect(() => {
+    // Reading the route is intentional: the drawer must close even when the
+    // navigation came from browser history rather than a sidebar link.
+    void pathname;
+    setMobileSidebarOpen(false);
+  }, [pathname]);
+
   const startSidebarResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
     if (sidebarCollapsed) return;
     event.preventDefault();
     const startX = event.clientX;
-    const startWidth = sidebarWidth;
+    const startWidth = event.currentTarget.parentElement?.getBoundingClientRect().width;
+    if (!startWidth) return;
     setResizing(true);
 
     const onMove = (moveEvent: PointerEvent) => {
@@ -102,16 +112,30 @@ export function AppShell({
     document.addEventListener("pointerup", onUp, { once: true });
   };
 
+  const navigateToCreated = ({
+    workspaceId,
+    sessionId,
+  }: {
+    workspaceId: string;
+    sessionId: string;
+  }) => {
+    router.push(`/w/${workspaceId}?focus=${sessionId}`);
+  };
+
   return (
     <div className="@container/shell min-h-vv">
       <div className="flex min-h-vv">
-        {/* Side rail (desktop) */}
         <aside
           data-collapsed={sidebarCollapsed}
-          style={{ width: sidebarCollapsed ? SIDEBAR_RAIL_WIDTH : sidebarWidth }}
+          style={{
+            width: sidebarCollapsed
+              ? "var(--sidebar-rail-width)"
+              : sidebarWidth === null
+                ? "var(--sidebar-width)"
+                : `${sidebarWidth}px`,
+          }}
           className={cn(
-            "relative hidden h-vv shrink-0 flex-col border-r border-border bg-card @md/shell:flex pad-safe-top pad-safe-bottom",
-            "sticky top-0",
+            "pad-safe-top pad-safe-bottom sticky top-0 relative hidden h-vv shrink-0 flex-col border-r border-border bg-card @md/shell:flex",
             transitionReady && !resizing && "transition-[width] duration-200 ease-swift",
           )}
           aria-label="Primary"
@@ -119,7 +143,7 @@ export function AppShell({
           <Sidebar
             pathname={pathname}
             collapsed={sidebarCollapsed}
-            onToggle={() => setSidebarCollapsed((v) => !v)}
+            onToggle={() => setSidebarCollapsed((value) => !value)}
           />
           {!sidebarCollapsed && (
             <button
@@ -134,43 +158,65 @@ export function AppShell({
           )}
         </aside>
 
-        {/* Main column */}
         <div className="flex min-w-0 flex-1 flex-col">
           <BrowserDeviceRegistrationStatus />
-          {/* Top bar (mobile only) */}
-          <header
-            className={cn(
-              "@md/shell:hidden sticky top-0 z-30 border-b border-border bg-background/95 backdrop-blur pad-safe-top pad-safe-x",
-              hideMobileNav && "hidden",
-            )}
-          >
-            <div className="flex h-12 items-center justify-between px-4">
-              <Link href="/" className="text-base font-semibold tracking-tight">
-                spawn
-              </Link>
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label="Settings"
-                onClick={() => openSettings("account")}
-              >
-                <Settings className="size-4.5" />
-              </Button>
-            </div>
-          </header>
+          {!hideMobileNav && (
+            <header className="pad-safe-top pad-safe-x sticky top-0 z-30 border-b border-border bg-background/95 backdrop-blur @md/shell:hidden">
+              <div className="grid h-12 grid-cols-[2.5rem_1fr_2.5rem] items-center px-1.5">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Open sidebar"
+                  onClick={() => setMobileSidebarOpen(true)}
+                  className="size-9"
+                >
+                  <Menu className="size-4.5" aria-hidden />
+                </Button>
+                <div className="min-w-0 px-2 text-center text-sm font-medium">
+                  <span className="block truncate">{currentWorkspaceName ?? "spawnd"}</span>
+                </div>
+                <NewSessionMenu
+                  mode={currentWorkspaceId ? "session" : "workspace"}
+                  workspaceId={currentWorkspaceId ?? undefined}
+                  onCreated={navigateToCreated}
+                  trigger={
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label={currentWorkspaceId ? "Add session" : "New workspace"}
+                      className="size-9"
+                    >
+                      <Plus className="size-4.5" aria-hidden />
+                    </Button>
+                  }
+                />
+              </div>
+            </header>
+          )}
 
-          <main
-            className={cn(
-              "@md/shell:pb-0 flex-1 pb-20 pad-safe-x",
-              hideMobileNav && "pb-0",
-              mainClassName,
-            )}
-          >
-            {children}
-          </main>
+          <main className={cn("min-h-0 flex-1 pad-safe-x", mainClassName)}>{children}</main>
         </div>
       </div>
-      {!hideMobileNav && <BottomTabs />}
+
+      {!hideMobileNav && (
+        <Drawer
+          open={mobileSidebarOpen}
+          onClose={() => setMobileSidebarOpen(false)}
+          ariaLabel="Primary navigation"
+          contentClassName="overflow-hidden"
+        >
+          <Sidebar
+            pathname={pathname}
+            collapsed={false}
+            onToggle={() => setMobileSidebarOpen(false)}
+            onNavigate={() => setMobileSidebarOpen(false)}
+            showCollapseControl={false}
+          />
+        </Drawer>
+      )}
+      <ConfirmHost />
       <SettingsDialog />
     </div>
   );

@@ -1,31 +1,222 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, ChevronRight, Flame, Server, Smartphone } from "lucide-react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { ArrowRight, Flame, Server, Smartphone } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
-import { AgentListRow } from "@/components/agents/AgentListRow";
+import { useEffect, useMemo, useState } from "react";
 import { AppShell } from "@/components/nav/AppShell";
+import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { hostStatusTone, StatusDot } from "@/components/ui/status";
-import { type Agent, agents, type Host, hosts } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
+import { EmptyState } from "@/components/ui/empty-state";
+import { Spinner } from "@/components/ui/spinner";
+import { hosts, workspaces } from "@/lib/api";
+import { useAuth, useAuthConfig } from "@/lib/auth";
 
 export default function HomePage() {
-  const { user } = useAuth();
+  const router = useRouter();
+  const { user, loading: authLoading, error: authError } = useAuth();
+  const { config, loading: configLoading, error: configError } = useAuthConfig();
+  const [skippedHost, setSkippedHost] = useState<boolean | null>(null);
+  const hostsQ = useQuery({
+    queryKey: ["hosts"],
+    queryFn: hosts.list,
+    enabled: Boolean(user),
+  });
+  const workspacesQ = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: workspaces.list,
+    enabled: Boolean(user),
+  });
+  const createWorkspaceM = useMutation({
+    mutationFn: (hostId: string) =>
+      workspaces.create({
+        name: "Workspace 1",
+        first_session: { host_id: hostId, cwd: "~" },
+      }),
+    onSuccess: (result) => {
+      window.localStorage.setItem("spawn.workspaces.last", result.workspace.id);
+      router.replace(`/w/${result.workspace.id}`);
+    },
+  });
 
-  if (user) {
+  useEffect(() => {
+    if (!user) {
+      setSkippedHost(null);
+      return;
+    }
+    setSkippedHost(window.localStorage.getItem("spawn.onboarding.skippedHost") === "true");
+  }, [user]);
+
+  const listedHosts = useMemo(() => hostsQ.data ?? [], [hostsQ.data]);
+  const orderedWorkspaces = useMemo(
+    () => [...(workspacesQ.data ?? [])].sort((a, b) => a.position - b.position),
+    [workspacesQ.data],
+  );
+  const firstOnlineHost = listedHosts.find((host) => host.status === "online");
+  const verificationIncomplete = Boolean(
+    user && config?.email_verification_required && !user.email_verified_at,
+  );
+
+  useEffect(() => {
+    if (
+      !user ||
+      !config ||
+      skippedHost === null ||
+      hostsQ.isLoading ||
+      workspacesQ.isLoading ||
+      hostsQ.error ||
+      workspacesQ.error
+    ) {
+      return;
+    }
+    if (config.email_verification_required && !user.email_verified_at) {
+      router.replace("/onboarding");
+      return;
+    }
+    if (listedHosts.length === 0) {
+      if (!skippedHost) router.replace("/onboarding?step=host");
+      return;
+    }
+    if (orderedWorkspaces.length > 0) {
+      const savedId = window.localStorage.getItem("spawn.workspaces.last");
+      const target =
+        orderedWorkspaces.find((workspace) => workspace.id === savedId) ?? orderedWorkspaces[0];
+      if (target) {
+        window.localStorage.setItem("spawn.workspaces.last", target.id);
+        router.replace(`/w/${target.id}`);
+      }
+      return;
+    }
+    if (firstOnlineHost && createWorkspaceM.status === "idle") {
+      createWorkspaceM.mutate(firstOnlineHost.id);
+    }
+  }, [
+    config,
+    createWorkspaceM.mutate,
+    createWorkspaceM.status,
+    firstOnlineHost,
+    hostsQ.error,
+    hostsQ.isLoading,
+    listedHosts,
+    orderedWorkspaces,
+    router,
+    skippedHost,
+    user,
+    workspacesQ.error,
+    workspacesQ.isLoading,
+  ]);
+
+  if (authLoading) return <HomeSpinner />;
+  if (authError) {
+    return (
+      <EmptyState
+        title="Could not check your account"
+        body={authError instanceof Error ? authError.message : String(authError)}
+      />
+    );
+  }
+
+  if (!user) return <LandingPage />;
+
+  if (
+    configLoading ||
+    skippedHost === null ||
+    hostsQ.isLoading ||
+    workspacesQ.isLoading ||
+    verificationIncomplete
+  ) {
+    return <HomeSpinner />;
+  }
+
+  if (configError || hostsQ.error || workspacesQ.error) {
+    const error = configError ?? hostsQ.error ?? workspacesQ.error;
+    return (
+      <EmptyState
+        title="Could not load your workspace"
+        body={error instanceof Error ? error.message : String(error)}
+        action={
+          <Button
+            onClick={() => {
+              void hostsQ.refetch();
+              void workspacesQ.refetch();
+            }}
+          >
+            Try again
+          </Button>
+        }
+      />
+    );
+  }
+
+  if (listedHosts.length === 0 && skippedHost) {
     return (
       <AppShell>
-        <Dashboard />
+        <EmptyState
+          className="min-h-[calc(var(--vv-height)-3rem)]"
+          icon={<Server />}
+          title="Connect a host to start a session"
+          body="Install the daemon on a machine you control, then approve its pairing code."
+          action={<Button onClick={() => openSettings("hosts")}>Connect a host</Button>}
+        />
       </AppShell>
     );
   }
 
-  return <LandingPage />;
+  if (listedHosts.length > 0 && orderedWorkspaces.length === 0 && !firstOnlineHost) {
+    return (
+      <AppShell>
+        <EmptyState
+          className="min-h-[calc(var(--vv-height)-3rem)]"
+          icon={<Server />}
+          title="Your host is offline"
+          body="Bring a daemon online before creating the first workspace."
+          action={<Button onClick={() => openSettings("hosts")}>View hosts</Button>}
+        />
+      </AppShell>
+    );
+  }
+
+  if (createWorkspaceM.isError) {
+    return (
+      <AppShell>
+        <EmptyState
+          className="min-h-[calc(var(--vv-height)-3rem)]"
+          title="Could not create Workspace 1"
+          body={
+            createWorkspaceM.error instanceof Error
+              ? createWorkspaceM.error.message
+              : String(createWorkspaceM.error)
+          }
+          action={
+            <Button
+              disabled={!firstOnlineHost}
+              onClick={() => {
+                if (firstOnlineHost) {
+                  createWorkspaceM.reset();
+                  createWorkspaceM.mutate(firstOnlineHost.id);
+                }
+              }}
+            >
+              Try again
+            </Button>
+          }
+        />
+      </AppShell>
+    );
+  }
+
+  return <HomeSpinner />;
+}
+
+function HomeSpinner() {
+  return (
+    <div className="flex min-h-vv items-center justify-center">
+      <Spinner size={20} label="Opening your workspace" />
+    </div>
+  );
 }
 
 function LandingPage() {
@@ -284,112 +475,5 @@ function Trident({ className }: { className?: string }) {
     <span className={`relative inline-block ${className ?? ""}`}>
       <Image src="/trident.png" alt="" aria-hidden fill sizes="64px" className="object-contain" />
     </span>
-  );
-}
-
-function Dashboard() {
-  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, refetchInterval: 30_000 });
-  const agentsQ = useQuery({
-    queryKey: ["agents"],
-    queryFn: () => agents.list(),
-    refetchInterval: 5_000,
-  });
-  const recentAgents = [...(agentsQ.data ?? [])]
-    .sort((a, b) => (b.last_activity_at ?? "").localeCompare(a.last_activity_at ?? ""))
-    .slice(0, 6);
-
-  return (
-    <div className="mx-auto w-full max-w-5xl p-4 @container/dash">
-      <header className="mb-4 flex items-center justify-between gap-2">
-        <h1 className="text-xl font-semibold">Dashboard</h1>
-        <Button asChild size="sm">
-          <Link href="/agents/new">Summon</Link>
-        </Button>
-      </header>
-
-      <section className="grid gap-4 @md/dash:grid-cols-2">
-        <Card>
-          <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
-            <div className="min-w-0">
-              <CardTitle>Hosts</CardTitle>
-              <CardDescription>
-                {hostsQ.isLoading
-                  ? "Loading…"
-                  : hostsQ.error
-                    ? "Failed to load hosts"
-                    : `${hostsQ.data?.length ?? 0} possessed`}
-              </CardDescription>
-            </div>
-            <Button asChild variant="ghost" size="sm" className="shrink-0 text-muted-foreground">
-              <Link href="/hosts">All</Link>
-            </Button>
-          </CardHeader>
-          <CardContent className="p-0">
-            <ul className="border-t border-border">
-              {(hostsQ.data ?? []).slice(0, 5).map((h: Host) => (
-                <li key={h.id} className="border-b border-border last:border-b-0">
-                  <Link
-                    href={`/hosts/${h.id}`}
-                    className="flex items-center gap-3 px-4 py-3 transition-colors hover:bg-accent/40"
-                  >
-                    <StatusDot
-                      tone={hostStatusTone(h.status)}
-                      label={h.status}
-                      pulse={h.status === "online"}
-                    />
-                    <span className="min-w-0 flex-1 truncate text-sm font-medium">{h.name}</span>
-                    <span className="shrink-0 text-xs text-muted-foreground">
-                      {h.agent_count} agent{h.agent_count === 1 ? "" : "s"}
-                    </span>
-                    <ChevronRight
-                      className="size-4 shrink-0 text-muted-foreground/50"
-                      aria-hidden
-                    />
-                  </Link>
-                </li>
-              ))}
-              {!hostsQ.isLoading && (hostsQ.data?.length ?? 0) === 0 && (
-                <li className="px-4 py-3 text-sm text-muted-foreground">
-                  No hosts possessed yet. Run <code>spawnd login</code> on a machine and approve it
-                  at{" "}
-                  <Link href="/device" className="underline">
-                    /device
-                  </Link>
-                  .
-                </li>
-              )}
-            </ul>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
-            <div className="min-w-0">
-              <CardTitle>Recent agents</CardTitle>
-              <CardDescription>
-                {agentsQ.isLoading
-                  ? "Loading…"
-                  : agentsQ.error
-                    ? "Failed to load agents"
-                    : `${agentsQ.data?.length ?? 0} in the legion`}
-              </CardDescription>
-            </div>
-            <Button asChild variant="ghost" size="sm" className="shrink-0 text-muted-foreground">
-              <Link href="/agents">All</Link>
-            </Button>
-          </CardHeader>
-          <CardContent className="p-0">
-            <ul className="border-t border-border">
-              {recentAgents.map((a: Agent) => (
-                <AgentListRow key={a.id} agent={a} href={`/agents/${a.id}`} />
-              ))}
-              {!agentsQ.isLoading && recentAgents.length === 0 && (
-                <li className="px-4 py-3 text-sm text-muted-foreground">No agents summoned yet.</li>
-              )}
-            </ul>
-          </CardContent>
-        </Card>
-      </section>
-    </div>
   );
 }

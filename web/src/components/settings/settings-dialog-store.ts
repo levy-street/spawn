@@ -5,10 +5,16 @@ import { useSyncExternalStore } from "react";
 /**
  * Which settings tab is open, app-wide. A module singleton (not URL state) so
  * opening settings never navigates — the modal overlays whatever the user is
- * doing, and closing it returns them exactly there. /settings and /trust stay
- * deep-linkable via redirect pages that call `openSettings` on mount.
+ * doing, and closing it returns them exactly there.
  */
-export type SettingsTab = "account" | "appearance" | "devices" | "trust" | "skills";
+export type SettingsTab =
+  | "account"
+  | "appearance"
+  | "hosts"
+  | "agents"
+  | "skills"
+  | "devices"
+  | "trust";
 
 let openTab: SettingsTab | null = null;
 const listeners = new Set<() => void>();
