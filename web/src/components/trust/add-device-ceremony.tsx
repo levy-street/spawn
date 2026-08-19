@@ -13,6 +13,7 @@ import { type BrowserDevice, type PairingState, trust } from "@/lib/api";
 import {
   type BrowserDeviceIdentity,
   createAccountEndorsementProof,
+  loadBrowserDeviceIdentity,
 } from "@/lib/browser-device-identity";
 import { b64urlEncode } from "@/lib/sas";
 
@@ -163,8 +164,12 @@ export function AddDeviceCeremonyPanel({
         ? (pairing.joiner_public_key ?? "")
         : pairing.initiator_public_key;
       const endorsedDeviceId = amInitiator ? pairing.joiner_device_id : pairing.initiator_device_id;
+      // Load the identity fresh at sign time rather than trusting a long-lived
+      // prop: the signing key handle lives in a WeakMap keyed by the identity
+      // object, and a cached object's entry can be collected across reloads.
+      const signer = (await loadBrowserDeviceIdentity(accountId)) ?? identity;
       const signature = await createAccountEndorsementProof(
-        identity,
+        signer,
         accountId,
         endorsedPublicKey,
         endorsedDeviceId,
