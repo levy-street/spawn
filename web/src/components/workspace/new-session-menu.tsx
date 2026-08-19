@@ -2,25 +2,39 @@
 
 import { Slot } from "@radix-ui/react-slot";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FolderClock, FolderOpen, Home, Plus } from "lucide-react";
+import { FolderClock, FolderOpen, FolderTree, Home, Plus, SquareTerminal } from "lucide-react";
 import { isValidElement, type JSX, type ReactNode, useEffect, useMemo, useState } from "react";
+import { AgentIcon } from "@/components/icons/AgentIcon";
 import { CascadeMenu, type CascadePanel } from "@/components/ui/cascade-menu";
 import { hostStatusTone, StatusDot } from "@/components/ui/status";
-import { type Host, hosts, sessions, workspaces } from "@/lib/api";
-import { autoPlace } from "@/lib/grid";
+import { type Agent, ApiError, agents, type Host, hosts, sessions, workspaces } from "@/lib/api";
+import { autoPlace, type Rect } from "@/lib/grid";
 import { basename } from "@/lib/paths";
+import { activeTab, withTabTiles } from "@/lib/tabs";
 import { FolderPickerDialog } from "./folder-picker-dialog";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
+import { pendingLaunch } from "./pending-launch";
+
+/** What the menu is about to add: a shell, an agent in a shell, or a widget. */
+type Choice = { kind: "shell" } | { kind: "agent"; agent: Agent } | { kind: "files" };
+
+function choiceKey(choice: Choice): string {
+  return choice.kind === "agent" ? `agent-${choice.agent.id}` : choice.kind;
+}
 
 export function NewSessionMenu(props: {
   trigger: React.ReactNode;
   mode: "session" | "workspace";
   workspaceId?: string;
-  onCreated?: (r: { workspaceId: string; sessionId: string }) => void;
+  /** Drop the new pane at this exact rect instead of auto-placing it. */
+  placement?: Rect;
+  /** `sessionId` is null when the menu added a widget rather than a session. */
+  onCreated?: (r: { workspaceId: string; sessionId: string | null }) => void;
 }): JSX.Element {
-  const { trigger, mode, workspaceId, onCreated } = props;
+  const { trigger, mode, workspaceId, placement, onCreated } = props;
   const queryClient = useQueryClient();
   const [pickerHost, setPickerHost] = useState<Host | null>(null);
+  const [pickerChoice, setPickerChoice] = useState<Choice>({ kind: "shell" });
   const [pickerOpen, setPickerOpen] = useState(false);
   const [workspaceFull, setWorkspaceFull] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -31,7 +45,9 @@ export function NewSessionMenu(props: {
     enabled: mode === "session" && Boolean(workspaceId),
     staleTime: 10_000,
   });
+  const agentsQ = useQuery({ queryKey: ["agents"], queryFn: agents.list, staleTime: 60_000 });
   const hostList = hostsQ.data ?? [];
+  const agentList = agentsQ.data ?? [];
   const recentQueries = useQueries({
     queries: hostList.map((host) => ({
       queryKey: ["host-recent-dirs", host.id],
@@ -54,22 +70,65 @@ export function NewSessionMenu(props: {
     [hostList, recentQueries],
   );
   const workspaceHasRoom = workspaceQ.data
-    ? autoPlace(workspaceQ.data.layout.tiles).tile !== null
+    ? autoPlace(activeTab(workspaceQ.data.layout).layout.tiles).tile !== null
     : true;
+
+  /*
+   * The workspace's home: the host/folder chosen when it was created. When
+   * set, adding a pane never asks where — picking what (shell/agent/files)
+   * creates it at home immediately. The host+folder cascade remains only for
+   * workspaces without a home (pre-migration rows whose sessions are gone,
+   * or a home host that has been removed).
+   */
+  const homeHost =
+    mode === "session" && workspaceQ.data?.host_id
+      ? (hostList.find((host) => host.id === workspaceQ.data.host_id) ?? null)
+      : null;
+  const homeCwd = workspaceQ.data?.cwd ?? null;
+  const home = homeHost && homeCwd ? { host: homeHost, cwd: homeCwd } : null;
 
   useEffect(() => {
     if (workspaceHasRoom) setWorkspaceFull(false);
   }, [workspaceHasRoom]);
 
   const createM = useMutation({
-    mutationFn: async ({ host, cwd }: { host: Host; cwd: string }) => {
+    mutationFn: async ({ host, cwd, choice }: { host: Host; cwd: string; choice: Choice }) => {
+      if (choice.kind === "files") {
+        if (!workspaceId) throw new Error("A workspace is required to add a file explorer.");
+        // Widgets are layout, not sessions: place one in the active tab and
+        // PATCH the envelope.
+        const current = await workspaces.get(workspaceId);
+        const tab = activeTab(current.layout);
+        const placed = placement
+          ? { tile: placement, tiles: tab.layout.tiles }
+          : autoPlace(tab.layout.tiles);
+        if (!placed.tile) throw new ApiError(409, "workspace_full", "workspace_full");
+        const saved = await workspaces.update(workspaceId, {
+          layout: withTabTiles(current.layout, tab.id, [
+            ...placed.tiles,
+            {
+              session_id: crypto.randomUUID(),
+              ...placed.tile,
+              widget: { kind: "files" as const, host_id: host.id, path: cwd },
+            },
+          ]),
+        });
+        return { workspaceId: saved.id, sessionId: null };
+      }
       if (mode === "session") {
         if (!workspaceId) throw new Error("A workspace is required to create this session.");
-        const session = await sessions.create({ host_id: host.id, cwd, workspace_id: workspaceId });
+        const session = await sessions.create({
+          host_id: host.id,
+          cwd,
+          workspace_id: workspaceId,
+          tile: placement,
+        });
+        if (choice.kind === "agent") pendingLaunch.set(session.id, choice.agent.command);
         return { workspaceId, sessionId: session.id };
       }
       const result = await workspaces.create({ first_session: { host_id: host.id, cwd } });
       if (!result.session) throw new Error("The workspace was created without its first session.");
+      if (choice.kind === "agent") pendingLaunch.set(result.session.id, choice.agent.command);
       return { workspaceId: result.workspace.id, sessionId: result.session.id };
     },
     onSuccess: (result) => {
@@ -90,50 +149,52 @@ export function NewSessionMenu(props: {
     },
   });
 
-  const createAt = (host: Host, cwd: string) => {
+  const createAt = (host: Host, cwd: string, choice: Choice) => {
     if (host.status !== "online" || createM.isPending || workspaceFull) return;
     setErrorMessage(null);
-    createM.mutate({ host, cwd });
+    createM.mutate({ host, cwd, choice });
   };
 
-  const locationPanel = (host: Host): CascadePanel => {
+  const locationPanel = (host: Host, choice: Choice): CascadePanel => {
     const recent = recentByHost.get(host.id);
     const recentItems = recent?.dirs ?? [];
+    const scope = `${choiceKey(choice)}-${host.id}`;
     return {
-      id: `locations-${host.id}`,
+      id: `locations-${scope}`,
       title: hostList.length > 1 ? host.name : "Choose a location",
       items: [
         {
-          key: `${host.id}-home`,
+          key: `${scope}-home`,
           icon: <Home />,
           label: "Home",
           detail: "~",
           disabled: host.status !== "online",
-          onSelect: () => createAt(host, "~"),
+          onSelect: () => createAt(host, "~", choice),
         },
         ...(recentItems.length > 0
           ? [
               {
-                key: `${host.id}-recent-label`,
+                key: `${scope}-recent-label`,
                 icon: <FolderClock />,
                 label: "Recent",
                 disabled: true,
               },
               ...recentItems.map((item) => ({
-                key: `${host.id}-${item.path}`,
+                key: `${scope}-${item.path}`,
                 icon: <FolderOpen />,
                 label: basename(item.path) || item.path,
                 detail: item.path,
-                onSelect: () => createAt(host, item.path),
+                onSelect: () => createAt(host, item.path, choice),
               })),
             ]
           : []),
         {
-          key: `${host.id}-picker`,
+          key: `${scope}-picker`,
           icon: <FolderOpen />,
           label: "Select folder…",
           disabled: host.status !== "online",
           onSelect: () => {
+            setPickerChoice(choice);
             setPickerHost(host);
             setPickerOpen(true);
           },
@@ -142,11 +203,11 @@ export function NewSessionMenu(props: {
     };
   };
 
-  const root: CascadePanel =
-    hostList.length === 1
-      ? locationPanel(hostList[0])
+  const wherePanel = (choice: Choice): CascadePanel =>
+    hostList.length === 1 && hostList[0]
+      ? locationPanel(hostList[0], choice)
       : {
-          id: "hosts",
+          id: `hosts-${choiceKey(choice)}`,
           title: "Choose a host",
           loading: hostsQ.isLoading,
           emptyLabel: "Connect a host before creating a session.",
@@ -156,9 +217,50 @@ export function NewSessionMenu(props: {
             label: host.name,
             detail: host.status === "offline" ? "offline" : undefined,
             disabled: host.status === "offline",
-            panel: locationPanel(host),
+            panel: locationPanel(host, choice),
           })),
         };
+
+  // What goes in the pane; then where it points, unless home answers that.
+  const target = (choice: Choice) =>
+    home
+      ? {
+          disabled: home.host.status !== "online",
+          onSelect: () => createAt(home.host, home.cwd, choice),
+        }
+      : { panel: wherePanel(choice) };
+
+  const root: CascadePanel = {
+    id: "widgets",
+    title: mode === "workspace" ? "New workspace" : "Add a pane",
+    items: [
+      {
+        key: "shell",
+        icon: <SquareTerminal />,
+        label: "Shell",
+        detail: home && home.host.status !== "online" ? "host offline" : "A plain login shell",
+        ...target({ kind: "shell" }),
+      },
+      ...agentList.map((agent) => ({
+        key: agent.id,
+        icon: <AgentIcon kind={agent.kind} size={18} className="rounded" />,
+        label: agent.name,
+        detail: agent.command,
+        ...target({ kind: "agent", agent }),
+      })),
+      ...(mode === "session"
+        ? [
+            {
+              key: "files",
+              icon: <FolderTree />,
+              label: "File explorer",
+              detail: "Browse a folder in a pane",
+              ...target({ kind: "files" }),
+            },
+          ]
+        : []),
+    ],
+  };
 
   const disabled = workspaceFull || createM.isPending;
   const tooltip = workspaceFull
@@ -171,7 +273,7 @@ export function NewSessionMenu(props: {
     <span className="relative inline-flex" title={tooltip}>
       <CascadeMenu
         root={root}
-        sheetTitle={mode === "workspace" ? "New workspace" : "New session"}
+        sheetTitle={mode === "workspace" ? "New workspace" : "Add a pane"}
         renderTrigger={(triggerProps) =>
           isValidElement(trigger) ? (
             <Slot
@@ -212,7 +314,7 @@ export function NewSessionMenu(props: {
         host={pickerHost}
         onOpenChange={setPickerOpen}
         onSelect={(path) => {
-          if (pickerHost) createAt(pickerHost, path);
+          if (pickerHost) createAt(pickerHost, path, pickerChoice);
         }}
       />
     </span>

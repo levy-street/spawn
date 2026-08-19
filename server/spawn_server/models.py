@@ -554,13 +554,49 @@ class Workspace(Base):
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # Layout schema v2: {"version": 2, "tiles": [{"session_id", x, y, w, h}]}.
-    # Validated on every write by spawn_server.grid (docs/OVERHAUL.md §4.4).
+    # The workspace's home: the host and folder it was created in. New
+    # sessions default here so the folder is chosen once, at creation.
+    # Nullable: pre-0034 workspaces, or a deleted host (SET NULL).
+    host_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("hosts.id", ondelete="SET NULL"), nullable=True
+    )
+    cwd: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # Layout schema v3 (tabs over v2 grids), validated on every write by
+    # spawn_server.grid + routes/workspaces (docs/OVERHAUL.md §4.4).
     layout: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     # Sidebar ordering, contiguous from 0 per owner.
     position: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class WorkspaceTemplate(Base):
+    """A saved workspace shape: tabs, tile geometry, and what runs in each
+    tile (shell / agent command / files widget). No folder or host — those
+    are chosen when a workspace is created from it."""
+
+    __tablename__ = "workspace_templates"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # The folder the template was saved from: creating from the template goes
+    # straight there, no folder prompt. Nullable — the host may be gone.
+    host_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("hosts.id", ondelete="SET NULL"), nullable=True
+    )
+    cwd: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # {"version": 1, "tabs": [{"name", "tiles": [{x, y, w, h, "run"}]}]},
+    # validated by routes/workspace_templates on every write.
+    spec: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

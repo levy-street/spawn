@@ -1,3 +1,4 @@
+import { agentDisplayName } from "@/lib/agent-identity";
 import type { Session } from "@/lib/api";
 
 /**
@@ -8,15 +9,27 @@ import type { Session } from "@/lib/api";
 /** Status-dot tone; maps 1:1 to the `--tone-*` design tokens. */
 export type SessionActivityTone = "active" | "waiting" | "idle" | "offline";
 
-/** Display title: explicit name, else "host - folder", else a short id. */
+/**
+ * Display title: the explicit name when there is one, else the folder the
+ * session sits in and what is running there — "spawn · Claude Code" — which
+ * is what tells two panes apart at a glance. The host lives in the header's
+ * tooltip instead; it rarely differs between panes.
+ */
 export function sessionTitle(session: Session): string {
   const name = session.name?.trim();
   if (name) return name;
-  const hostName = session.host_name?.trim();
-  const folder = lastCwdDir(session.cwd);
-  if (hostName) return `${hostName} - ${folder}`;
-  if (session.cwd.trim()) return folder;
-  return session.id.slice(0, 8);
+  const folder = session.cwd.trim() ? lastCwdDir(session.cwd) : null;
+  const running = agentDisplayName(session.foreground_command);
+  if (folder) return `${folder} · ${running}`;
+  return `${session.id.slice(0, 8)} · ${running}`;
+}
+
+/** Full context for a title's tooltip: host, path, and what is running. */
+export function sessionTitleDetail(session: Session): string {
+  const host = session.host_name?.trim();
+  const cwd = session.cwd.trim() || "unknown folder";
+  const running = agentDisplayName(session.foreground_command);
+  return `${host ? `${host} · ` : ""}${cwd} · ${running}`;
 }
 
 function lastCwdDir(cwd: string): string {

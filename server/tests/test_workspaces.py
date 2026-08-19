@@ -1,4 +1,4 @@
-"""Workspace CRUD, grid-v2 layout validation, ordering, and deletion."""
+"""Workspace CRUD, layout-v3 tab envelopes, grid validation, ordering, deletion."""
 
 from __future__ import annotations
 
@@ -45,6 +45,18 @@ def _tile(session_id: str, x: int, y: int, w: int, h: int) -> dict:
     return {"session_id": session_id, "x": x, "y": y, "w": w, "h": h}
 
 
+def _envelope(tiles: list[dict], *, extra_tabs: list[dict] | None = None) -> dict:
+    """A v3 layout: `tiles` in the default tab, plus optional extra tabs."""
+    tabs = [{"id": "tab-1", "name": "Tab 1", "layout": {"version": 2, "tiles": tiles}}]
+    tabs.extend(extra_tabs or [])
+    return {"version": 3, "active_tab": "tab-1", "tabs": tabs}
+
+
+def _tab_tiles(workspace: dict, tab_id: str = "tab-1") -> list[dict]:
+    tab = next(t for t in workspace["layout"]["tabs"] if t["id"] == tab_id)
+    return tab["layout"]["tiles"]
+
+
 async def test_workspace_crud_and_cross_user_scoping(client):
     a_token = await _signup(client, "ws-a@example.com")
     b_token = await _signup(client, "ws-b@example.com")
@@ -58,15 +70,12 @@ async def test_workspace_crud_and_cross_user_scoping(client):
     assert created.status_code == 201, created.text
     workspace = created.json()["workspace"]
     assert workspace["name"] == "daily drive"
-    assert workspace["layout"] == {"version": 2, "tiles": []}
+    assert workspace["layout"] == _envelope([])
     assert workspace["position"] == 0
     assert created.json()["session"] is None
     workspace_id = workspace["id"]
 
-    layout = {
-        "version": 2,
-        "tiles": [_tile(one, 0, 0, 6, 12), _tile(two, 6, 0, 6, 12)],
-    }
+    layout = _envelope([_tile(one, 0, 0, 6, 12), _tile(two, 6, 0, 6, 12)])
     patched = await client.patch(
         f"/api/workspaces/{workspace_id}", json={"layout": layout}, headers=a_auth
     )
@@ -81,6 +90,29 @@ async def test_workspace_crud_and_cross_user_scoping(client):
     )
     assert renamed.status_code == 200
     assert renamed.json()["name"] == "focus"
+
+    # A workspace created without a first session has no home until patched.
+    assert renamed.json()["host_id"] is None
+    assert renamed.json()["cwd"] is None
+    rehomed = await client.patch(
+        f"/api/workspaces/{workspace_id}",
+        json={"host_id": host_id, "cwd": "/repo/app"},
+        headers=a_auth,
+    )
+    assert rehomed.status_code == 200
+    assert rehomed.json()["host_id"] == host_id
+    assert rehomed.json()["cwd"] == "/repo/app"
+    assert (
+        await client.patch(
+            f"/api/workspaces/{workspace_id}", json={"cwd": "   "}, headers=a_auth
+        )
+    ).status_code == 400
+    foreign_host = await _create_host("ws-b@example.com")
+    assert (
+        await client.patch(
+            f"/api/workspaces/{workspace_id}", json={"host_id": foreign_host}, headers=a_auth
+        )
+    ).status_code == 404
 
     blank = await client.patch(
         f"/api/workspaces/{workspace_id}", json={"name": "   "}, headers=a_auth
@@ -117,6 +149,21 @@ async def test_workspace_default_names_use_next_free_number(client):
     assert third.json()["workspace"]["name"] == "Workspace 1"
 
 
+def test_workspace_names_come_from_the_folder_they_open_in():
+    from spawn_server.routes.workspaces import _unique_name, name_from_cwd
+
+    assert name_from_cwd("/Users/charlie/dev/singingcoach") == "singingcoach"
+    assert name_from_cwd("~/dev/singingcoach/") == "singingcoach"
+    assert name_from_cwd("~") == "Home"
+    assert name_from_cwd("/") is None
+    assert name_from_cwd("   ") is None
+
+    # A second workspace in the same folder takes the next free suffix.
+    assert _unique_name("singingcoach", set()) == "singingcoach"
+    assert _unique_name("singingcoach", {"singingcoach"}) == "singingcoach 2"
+    assert _unique_name("singingcoach", {"singingcoach", "singingcoach 2"}) == "singingcoach 3"
+
+
 async def test_workspace_create_with_first_session(client):
     token = await _signup(client, "ws-first@example.com")
     auth = {"Authorization": f"Bearer {token}"}
@@ -148,9 +195,12 @@ async def test_workspace_create_with_first_session(client):
     session = body["session"]
     assert session is not None
     assert session["host_name"] == "dream"
-    assert body["workspace"]["layout"]["tiles"] == [
-        _tile(session["id"], 0, 0, 12, 12)
-    ]
+    # The workspace is named after the folder it was opened in, and that
+    # host/folder becomes its home for every later session.
+    assert body["workspace"]["name"] == "oem"
+    assert body["workspace"]["host_id"] == host_id
+    assert body["workspace"]["cwd"] == "/home/oem"
+    assert _tab_tiles(body["workspace"]) == [_tile(session["id"], 0, 0, 12, 12)]
     sent = json.loads(fake_ws.sent_text[-1])
     assert sent["type"] == "session.create"
     assert sent["session_id"] == session["id"]
@@ -174,29 +224,51 @@ async def test_workspace_layout_prunes_foreign_and_duplicate_sessions(client):
     r = await client.patch(
         f"/api/workspaces/{workspace_id}",
         json={
-            "layout": {
-                "version": 2,
-                "tiles": [_tile(own_session, 0, 0, 6, 12), _tile(foreign_session, 6, 0, 6, 12)],
-            }
+            "layout": _envelope(
+                [_tile(own_session, 0, 0, 6, 12), _tile(foreign_session, 6, 0, 6, 12)]
+            )
         },
         headers=a_auth,
     )
     assert r.status_code == 200, r.text
-    assert r.json()["layout"]["tiles"] == [_tile(own_session, 0, 0, 6, 12)]
+    assert _tab_tiles(r.json()) == [_tile(own_session, 0, 0, 6, 12)]
 
     # Duplicate tiles for one session keep only the first occurrence.
     r = await client.patch(
         f"/api/workspaces/{workspace_id}",
         json={
-            "layout": {
-                "version": 2,
-                "tiles": [_tile(own_session, 0, 0, 6, 12), _tile(own_session, 6, 0, 6, 12)],
-            }
+            "layout": _envelope(
+                [_tile(own_session, 0, 0, 6, 12), _tile(own_session, 6, 0, 6, 12)]
+            )
         },
         headers=a_auth,
     )
     assert r.status_code == 200
-    assert r.json()["layout"]["tiles"] == [_tile(own_session, 0, 0, 6, 12)]
+    assert _tab_tiles(r.json()) == [_tile(own_session, 0, 0, 6, 12)]
+
+    # A session in two tabs keeps only its first-tab tile: it lives in one tab.
+    r = await client.patch(
+        f"/api/workspaces/{workspace_id}",
+        json={
+            "layout": _envelope(
+                [_tile(own_session, 0, 0, 6, 12)],
+                extra_tabs=[
+                    {
+                        "id": "tab-2",
+                        "name": "Tab 2",
+                        "layout": {
+                            "version": 2,
+                            "tiles": [_tile(own_session, 0, 0, 12, 12)],
+                        },
+                    }
+                ],
+            )
+        },
+        headers=a_auth,
+    )
+    assert r.status_code == 200
+    assert _tab_tiles(r.json()) == [_tile(own_session, 0, 0, 6, 12)]
+    assert _tab_tiles(r.json(), "tab-2") == []
 
 
 async def test_workspace_layout_rejects_grid_invariant_violations(client):
@@ -211,7 +283,7 @@ async def test_workspace_layout_rejects_grid_invariant_violations(client):
     async def patch_layout(tiles):
         return await client.patch(
             f"/api/workspaces/{workspace_id}",
-            json={"layout": {"version": 2, "tiles": tiles}},
+            json={"layout": _envelope(tiles)},
             headers=auth,
         )
 
@@ -219,8 +291,8 @@ async def test_workspace_layout_rejects_grid_invariant_violations(client):
     r = await patch_layout([_tile(sessions[0], 0, 0, 6, 6), _tile(sessions[1], 3, 3, 6, 6)])
     assert r.status_code == 400
 
-    # Below the 3x3 minimum.
-    r = await patch_layout([_tile(sessions[0], 0, 0, 2, 12)])
+    # Below the 2x2 minimum.
+    r = await patch_layout([_tile(sessions[0], 0, 0, 1, 12)])
     assert r.status_code == 400
 
     # Out of bounds.
@@ -237,15 +309,55 @@ async def test_workspace_layout_rejects_grid_invariant_violations(client):
     # Wrong version marker fails schema validation.
     r = await client.patch(
         f"/api/workspaces/{workspace_id}",
-        json={"layout": {"version": 1, "tiles": []}},
+        json={"layout": {"version": 2, "tiles": []}},
         headers=auth,
     )
     assert r.status_code == 422
 
+    # A tabless envelope fails schema validation: a workspace always has a tab.
+    r = await client.patch(
+        f"/api/workspaces/{workspace_id}",
+        json={"layout": {"version": 3, "tabs": []}},
+        headers=auth,
+    )
+    assert r.status_code == 422
+
+    # Duplicate tab ids are rejected.
+    r = await client.patch(
+        f"/api/workspaces/{workspace_id}",
+        json={
+            "layout": {
+                "version": 3,
+                "tabs": [
+                    {"id": "t", "name": "A", "layout": {"version": 2, "tiles": []}},
+                    {"id": "t", "name": "B", "layout": {"version": 2, "tiles": []}},
+                ],
+            }
+        },
+        headers=auth,
+    )
+    assert r.status_code == 400
+
+    # active_tab must name a tab.
+    r = await client.patch(
+        f"/api/workspaces/{workspace_id}",
+        json={
+            "layout": {
+                "version": 3,
+                "active_tab": "ghost",
+                "tabs": [
+                    {"id": "t", "name": "A", "layout": {"version": 2, "tiles": []}}
+                ],
+            }
+        },
+        headers=auth,
+    )
+    assert r.status_code == 400
+
     # Emptying the layout is fine — no ephemeral/410 behavior anymore.
     r = await patch_layout([])
     assert r.status_code == 200
-    assert r.json()["layout"] == {"version": 2, "tiles": []}
+    assert r.json()["layout"] == _envelope([])
     assert (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).status_code == 200
 
 
@@ -295,7 +407,7 @@ async def test_workspace_delete_kills_and_deletes_its_sessions(client):
     workspace_id = created.json()["workspace"]["id"]
     r = await client.patch(
         f"/api/workspaces/{workspace_id}",
-        json={"layout": {"version": 2, "tiles": [_tile(inside, 0, 0, 12, 12)]}},
+        json={"layout": _envelope([_tile(inside, 0, 0, 12, 12)])},
         headers=auth,
     )
     assert r.status_code == 200

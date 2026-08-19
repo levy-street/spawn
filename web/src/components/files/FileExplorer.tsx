@@ -21,10 +21,12 @@ import {
 } from "lucide-react";
 import {
   type DragEvent,
+  forwardRef,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useMemo,
   useRef,
   useState,
@@ -106,23 +108,34 @@ export function formatSize(size: number | null | undefined): string {
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
-export function FileExplorer({
-  hostId,
-  rootPath,
-  rootLabel,
-  initialPath,
-  dense = false,
-  className,
-}: {
-  hostId: string;
-  /** Directory the tree is rooted at; defaults to the daemon home dir. */
-  rootPath?: string;
-  rootLabel?: string;
-  /** Deep link: ancestors are expanded and the entry selected once loaded. */
-  initialPath?: string;
-  dense?: boolean;
-  className?: string;
-}) {
+/** Imperative surface for hosts that fold the explorer's actions into their
+ *  own single header row (widget pane, files aside). */
+export type FileExplorerHandle = {
+  newFolder: () => void;
+  upload: () => void;
+  refresh: () => void;
+  collapseAll: () => void;
+};
+
+export const FileExplorer = forwardRef<
+  FileExplorerHandle,
+  {
+    hostId: string;
+    /** Directory the tree is rooted at; defaults to the daemon home dir. */
+    rootPath?: string;
+    rootLabel?: string;
+    /** Deep link: ancestors are expanded and the entry selected once loaded. */
+    initialPath?: string;
+    dense?: boolean;
+    /** The host renders its own single-row header (and reaches the actions
+     *  through the ref); the explorer's built-in header row is dropped. */
+    hideHeader?: boolean;
+    className?: string;
+  }
+>(function FileExplorer(
+  { hostId, rootPath, rootLabel, initialPath, dense = false, hideHeader = false, className },
+  handleRef,
+) {
   const qc = useQueryClient();
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -321,6 +334,30 @@ export function FileExplorer({
     setPageCursors({});
     qc.invalidateQueries({ queryKey: ["host-files", hostId] });
   }, [hostId, qc]);
+
+  useImperativeHandle(
+    handleRef,
+    () => ({
+      newFolder: () => {
+        if (resolvedRoot) {
+          setCreatingIn(resolvedRoot);
+          setFolderDraft("");
+        }
+      },
+      upload: () => {
+        uploadDirRef.current = resolvedRoot;
+        fileInputRef.current?.click();
+      },
+      refresh: refreshAll,
+      collapseAll: () => {
+        setExpanded([]);
+        setPageCursors((current) =>
+          resolvedRoot && current[resolvedRoot] ? { [resolvedRoot]: current[resolvedRoot] } : {},
+        );
+      },
+    }),
+    [refreshAll, resolvedRoot],
+  );
 
   const toggleDir = useCallback(
     (path: string) => {
@@ -688,79 +725,82 @@ export function FileExplorer({
 
   return (
     <div className={cn("flex min-h-0 flex-col", className)}>
-      {/* Header */}
-      <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1.5">
-        <span
-          className="min-w-0 flex-1 truncate text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"
-          title={resolvedRoot ?? undefined}
-        >
-          {label}
-        </span>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-6"
-          aria-label="New folder"
-          onClick={() => {
-            if (resolvedRoot) {
-              setCreatingIn(resolvedRoot);
-              setFolderDraft("");
-            }
-          }}
-        >
-          <FolderPlus className="size-3.5" />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-6"
-          aria-label="Upload files"
-          onClick={() => {
-            uploadDirRef.current = resolvedRoot;
-            fileInputRef.current?.click();
-          }}
-        >
-          <Upload className="size-3.5" />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-6"
-          aria-label="Refresh files"
-          onClick={refreshAll}
-        >
-          <RefreshCw className={cn("size-3.5", rootQ.isFetching && "animate-spin")} />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-6"
-          aria-label="Collapse all"
-          onClick={() => {
-            setExpanded([]);
-            setPageCursors((current) =>
-              resolvedRoot && current[resolvedRoot]
-                ? { [resolvedRoot]: current[resolvedRoot] }
-                : {},
-            );
-          }}
-        >
-          <ChevronsDownUp className="size-3.5" />
-        </Button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          className="hidden"
-          aria-label="Upload file input"
-          onChange={(e) => {
-            const files = Array.from(e.target.files ?? []);
-            e.target.value = "";
-            const dir = uploadDirRef.current ?? resolvedRoot;
-            if (dir) void uploadFiles(dir, files);
-          }}
-        />
-      </div>
+      {!hideHeader && (
+        <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1.5">
+          <span
+            className="min-w-0 flex-1 truncate text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"
+            title={resolvedRoot ?? undefined}
+          >
+            {label}
+          </span>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            aria-label="New folder"
+            onClick={() => {
+              if (resolvedRoot) {
+                setCreatingIn(resolvedRoot);
+                setFolderDraft("");
+              }
+            }}
+          >
+            <FolderPlus className="size-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            aria-label="Upload files"
+            onClick={() => {
+              uploadDirRef.current = resolvedRoot;
+              fileInputRef.current?.click();
+            }}
+          >
+            <Upload className="size-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            aria-label="Refresh files"
+            onClick={refreshAll}
+          >
+            <RefreshCw className={cn("size-3.5", rootQ.isFetching && "animate-spin")} />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            aria-label="Collapse all"
+            onClick={() => {
+              setExpanded([]);
+              setPageCursors((current) =>
+                resolvedRoot && current[resolvedRoot]
+                  ? { [resolvedRoot]: current[resolvedRoot] }
+                  : {},
+              );
+            }}
+          >
+            <ChevronsDownUp className="size-3.5" />
+          </Button>
+        </div>
+      )}
+      {/* Always mounted: hosts that hide the header still upload via the
+          ref's upload(), which clicks this input. */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        aria-label="Upload file input"
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? []);
+          e.target.value = "";
+          const dir = uploadDirRef.current ?? resolvedRoot;
+          if (dir) void uploadFiles(dir, files);
+        }}
+      />
 
       {/* Tree */}
       <div
@@ -1001,7 +1041,7 @@ export function FileExplorer({
       )}
     </div>
   );
-}
+});
 
 function NewFolderRow({
   depth,

@@ -1,6 +1,7 @@
 "use client";
 
 import { useId } from "react";
+import { type ResolvedAgentIcon, resolveAgentIcon } from "@/lib/agent-identity";
 import { cn } from "@/lib/utils";
 
 /**
@@ -12,45 +13,14 @@ import { cn } from "@/lib/utils";
  * Successor to `components/agents/AgentKindIcon.tsx`, which dies with the
  * old agents surface.
  */
-const SHELL_RE = /^(bash|zsh|fish|sh|dash)$/;
-
-export type ResolvedAgentIcon = {
-  icon: "claude-code" | "codex" | "opencode" | "aider" | "shell" | "monogram";
-  /** Tooltip / accessible name: brand name, shell name, or the raw input. */
-  label: string;
-  /** Monogram letter (only for `icon: "monogram"`). */
-  letter?: string;
-};
-
-/** First non-`KEY=value` token of a command string, path stripped. */
-function commandBasename(command: string): string {
-  const token = command
-    .trim()
-    .split(/\s+/)
-    .find((part) => part !== "" && !part.includes("="));
-  return token?.split(/[\\/]/).at(-1) ?? "";
-}
-
-function matchName(name: string): ResolvedAgentIcon | null {
-  const lower = name.toLowerCase();
-  if (lower.includes("claude")) return { icon: "claude-code", label: "Claude Code" };
-  if (lower.includes("codex")) return { icon: "codex", label: "Codex" };
-  if (lower.includes("opencode")) return { icon: "opencode", label: "OpenCode" };
-  if (lower.includes("aider")) return { icon: "aider", label: "Aider" };
-  if (SHELL_RE.test(lower)) return { icon: "shell", label: lower };
-  return null;
-}
-
-export function resolveAgentIcon(kind?: string | null, command?: string | null): ResolvedAgentIcon {
-  const fromKind = kind?.trim() ? matchName(kind.trim()) : null;
-  if (fromKind) return fromKind;
-  const basename = command ? commandBasename(command) : "";
-  const fromCommand = basename ? matchName(basename) : null;
-  if (fromCommand) return fromCommand;
-  const raw = kind?.trim() || basename;
-  const letter = raw.match(/[a-z0-9]/i)?.[0]?.toUpperCase() ?? "?";
-  return { icon: "monogram", label: raw || "Agent", letter };
-}
+/* The mapping itself is pure and lives in `lib/agent-identity`; re-exported
+ * here because this module is where callers have always found it. */
+export {
+  agentDisplayName,
+  commandBasename,
+  type ResolvedAgentIcon,
+  resolveAgentIcon,
+} from "@/lib/agent-identity";
 
 const PLATE_CLASS: Record<ResolvedAgentIcon["icon"], string> = {
   // Brand plates are fixed constants like the grimoire palette — third-party

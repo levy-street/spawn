@@ -12,11 +12,13 @@ import {
   useState,
 } from "react";
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
+import { WORDMARK_CLASS } from "@/components/icons/BrandMark";
 import { Sidebar } from "@/components/nav/Sidebar";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { Button } from "@/components/ui/button";
 import { ConfirmHost } from "@/components/ui/confirm";
 import { Drawer } from "@/components/ui/drawer";
+import { ToastHost } from "@/components/ui/toast";
 import { NewSessionMenu } from "@/components/workspace/new-session-menu";
 import { workspaces } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -117,13 +119,23 @@ export function AppShell({
     sessionId,
   }: {
     workspaceId: string;
-    sessionId: string;
+    sessionId: string | null;
   }) => {
-    router.push(`/w/${workspaceId}?focus=${sessionId}`);
+    router.push(sessionId ? `/w/${workspaceId}?focus=${sessionId}` : `/w/${workspaceId}`);
   };
 
   return (
-    <div className="@container/shell min-h-vv">
+    /*
+     * The sidebar is chrome and runs full-bleed; the content is a panel that
+     * floats on it, inset by --content-inset with its own border and radius.
+     * `<main>` raises the inset itself rather than the root doing it: an
+     * element cannot container-query the container it establishes, so the
+     * @md/shell variant only resolves on descendants. Keeping it there also
+     * keeps it 0 on mobile, where the panel is edge to edge and the gap would
+     * only cost width, and lets everything under main inherit the value for
+     * its own --vv-height math.
+     */
+    <div className="@container/shell min-h-vv bg-shell">
       <div className="flex min-h-vv">
         <aside
           data-collapsed={sidebarCollapsed}
@@ -135,7 +147,7 @@ export function AppShell({
                 : `${sidebarWidth}px`,
           }}
           className={cn(
-            "pad-safe-top pad-safe-bottom sticky top-0 relative hidden h-vv shrink-0 flex-col border-r border-border bg-card @md/shell:flex",
+            "pad-safe-top pad-safe-bottom sticky top-0 relative hidden h-vv shrink-0 flex-col bg-shell @md/shell:flex",
             transitionReady && !resizing && "transition-[width] duration-200 ease-swift",
           )}
           aria-label="Primary"
@@ -174,7 +186,13 @@ export function AppShell({
                   <Menu className="size-4.5" aria-hidden />
                 </Button>
                 <div className="min-w-0 px-2 text-center text-sm font-medium">
-                  <span className="block truncate">{currentWorkspaceName ?? "spawnd"}</span>
+                  {currentWorkspaceName ? (
+                    <span className="block truncate">{currentWorkspaceName}</span>
+                  ) : (
+                    <span className={cn("block truncate text-brand-accent", WORDMARK_CLASS)}>
+                      spawnd
+                    </span>
+                  )}
                 </div>
                 <NewSessionMenu
                   mode={currentWorkspaceId ? "session" : "workspace"}
@@ -196,7 +214,16 @@ export function AppShell({
             </header>
           )}
 
-          <main className={cn("min-h-0 flex-1 pad-safe-x", mainClassName)}>{children}</main>
+          <main
+            className={cn(
+              "min-h-0 flex-1 pad-safe-x bg-background",
+              "@md/shell:[--content-inset:8px] @md/shell:my-(--content-inset) @md/shell:mr-(--content-inset)",
+              "@md/shell:overflow-hidden @md/shell:rounded-xl",
+              mainClassName,
+            )}
+          >
+            {children}
+          </main>
         </div>
       </div>
 
@@ -217,6 +244,7 @@ export function AppShell({
         </Drawer>
       )}
       <ConfirmHost />
+      <ToastHost />
       <SettingsDialog />
     </div>
   );

@@ -1,16 +1,16 @@
 "use client";
 
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowDown,
   ArrowUp,
+  ChevronDown,
   Ellipsis,
   ExternalLink,
-  GripVertical,
+  Folder,
   Pencil,
   RotateCcw,
   Trash2,
-  Unlink,
 } from "lucide-react";
 import {
   type PointerEvent as ReactPointerEvent,
@@ -32,14 +32,18 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { SessionStatusDot } from "@/components/ui/status";
-import { type Session, sessions } from "@/lib/api";
+import { hosts, type Session, sessions } from "@/lib/api";
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
-import { sessionNeedsAttention, sessionTitle } from "@/lib/sessions";
+import { basename } from "@/lib/paths";
+import { sessionTitle, sessionTitleDetail } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
-import { ShortcutBar } from "./shortcut-bar";
+import { shellQuote } from "./agent-command";
+import { AgentSwitcher } from "./agent-switcher";
+import { FolderPickerDialog } from "./folder-picker-dialog";
+import { pendingLaunch } from "./pending-launch";
+import { runInShell, stillRunningMessage } from "./shell-handoff";
 
 export type PaneSlotTarget = { el: HTMLElement; stacked: boolean };
-export type PaneResizeEdge = "east" | "south" | "southeast";
 
 function writeSessionToCache(
   queryClient: ReturnType<typeof useQueryClient>,
@@ -56,7 +60,6 @@ export function SessionPane({
   session,
   slot,
   focused,
-  zoomed,
   paneCount,
   canDrag,
   canMoveUp,
@@ -64,7 +67,6 @@ export function SessionPane({
   onFocus,
   onToggleZoom,
   onMoveStart,
-  onResizeStart,
   onMoveUp,
   onMoveDown,
   onRemoveFromWorkspace,
@@ -75,7 +77,6 @@ export function SessionPane({
   session?: Session;
   slot?: PaneSlotTarget;
   focused: boolean;
-  zoomed: boolean;
   paneCount: number;
   canDrag: boolean;
   canMoveUp: boolean;
@@ -83,11 +84,6 @@ export function SessionPane({
   onFocus: (sessionId: string) => void;
   onToggleZoom: (sessionId: string) => void;
   onMoveStart: (sessionId: string, event: ReactPointerEvent<HTMLElement>) => void;
-  onResizeStart: (
-    sessionId: string,
-    edge: PaneResizeEdge,
-    event: ReactPointerEvent<HTMLElement>,
-  ) => void;
   onMoveUp: (sessionId: string) => void;
   onMoveDown: (sessionId: string) => void;
   onRemoveFromWorkspace: (sessionId: string) => void;
@@ -97,13 +93,14 @@ export function SessionPane({
   const queryClient = useQueryClient();
   const highlighted = useHighlightedSession();
   const [editingName, setEditingName] = useState(false);
+  const [selfHovered, setSelfHovered] = useState(false);
+  const [cwdPickerOpen, setCwdPickerOpen] = useState(false);
+  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
+  const paneHost = (hostsQ.data ?? []).find((host) => host.id === session?.host_id) ?? null;
   const [draftName, setDraftName] = useState("");
   const hostRef = useRef<HTMLDivElement | null>(null);
-  const terminalSurfaceRef = useRef<HTMLDivElement>(null);
-  const { attach, getHandle, promptState, subscribeCursorMove } = useLiveTerminal(
-    session ? sessionId : null,
-  );
-  const foregroundCommand = session?.foreground_command;
+  const { attach, connInfo, getHandle } = useLiveTerminal(session ? sessionId : null);
+  const launchedRef = useRef(false);
 
   useEffect(() => {
     registerHandle(sessionId, getHandle);
@@ -123,11 +120,17 @@ export function SessionPane({
     [sessionId],
   );
 
+  // An agent picked from the "+" menu starts by being typed into this shell,
+  // once its transport can actually carry the keystrokes.
   useEffect(() => {
-    if (foregroundCommand === undefined) return;
-    const frame = requestAnimationFrame(() => getHandle()?.resetPromptState());
-    return () => cancelAnimationFrame(frame);
-  }, [foregroundCommand, getHandle]);
+    if (launchedRef.current || !session || connInfo?.socketState !== "open") return;
+    launchedRef.current = true;
+    const command = pendingLaunch.take(sessionId);
+    if (!command) return;
+    const handle = getHandle();
+    handle?.sendInput(`${command}\r`);
+    requestAnimationFrame(() => handle?.focus());
+  }, [connInfo?.socketState, getHandle, session, sessionId]);
 
   const renameM = useMutation({
     mutationFn: (name: string | null) => sessions.update(sessionId, { name }),
@@ -188,8 +191,19 @@ export function SessionPane({
       sectionCleanupRef.current = null;
       if (!element) return;
       const focus = () => onFocus(sessionId);
-      const enter = () => highlightStore.set(sessionId);
+      /*
+       * The pane publishes its own hover so the matching sidebar row lights up,
+       * but it must not draw the highlight ring for it — pointing at a terminal
+       * is not a question about which terminal this is, and outlining whatever
+       * the mouse crosses is pure noise. `selfHovered` suppresses the ring for
+       * the hover this pane raised; a highlight from the sidebar still rings.
+       */
+      const enter = () => {
+        setSelfHovered(true);
+        highlightStore.set(sessionId);
+      };
       const leave = () => {
+        setSelfHovered(false);
         if (highlightStore.get() === sessionId) highlightStore.clear();
       };
       element.addEventListener("focusin", focus);
@@ -214,7 +228,6 @@ export function SessionPane({
   if (!hostRef.current) return null;
 
   const title = session ? sessionTitle(session) : "Missing session";
-  const attention = session ? sessionNeedsAttention(session) : "dead";
   const stacked = slot?.stacked ?? false;
 
   return createPortal(
@@ -222,33 +235,57 @@ export function SessionPane({
       ref={sectionRef}
       aria-label={title}
       className={cn(
-        "relative flex size-full min-h-0 min-w-0 flex-col overflow-hidden rounded-md border border-border bg-background",
-        focused && paneCount > 1 && "ring-1 ring-inset ring-ring/70",
-        highlighted === sessionId && "ring-2 ring-ring",
+        "relative flex size-full min-h-0 min-w-0 flex-col overflow-hidden bg-background",
+        stacked && "rounded-md",
+        // Focus is the pane's background, not an outline — see the wash below.
+        highlighted === sessionId && !selfHovered && "ring-2 ring-ring",
       )}
     >
-      {attention && <span aria-hidden className="absolute inset-x-0 top-0 z-30 h-px bg-warning" />}
+      {/*
+       * Which pane has focus, read at a glance. xterm paints its own opaque
+       * canvas background, so the section's `bg-background` never shows through
+       * the terminal itself — the only way to tint a pane is over the top. The
+       * focused pane is left exactly as it is (the deepest surface in the
+       * stack); every other one is washed toward the foreground, which reads as
+       * lighter in dark and greyer in light, i.e. receding in both. Sits under
+       * the exited-state scrim (z-20) and the shortcut bar (z-30), and takes no
+       * pointer events, so nothing about interacting with the pane changes.
+       */}
+      {!focused && paneCount > 1 && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 z-10 bg-foreground/[0.035]"
+        />
+      )}
+
       <header
         role="toolbar"
         aria-label={`${title} pane controls`}
-        className="flex h-9 shrink-0 items-center gap-1.5 border-b border-border bg-card/75 px-1.5 select-none"
+        title={canDrag ? "Drag to move" : undefined}
+        className={cn(
+          "group/pane-header flex h-9 shrink-0 items-center gap-2 border-b border-border bg-card/75 px-2 select-none",
+          canDrag && "cursor-grab active:cursor-grabbing",
+        )}
+        onPointerDown={(event) => {
+          // Anywhere on the bar starts a move — except the controls sitting on it.
+          if ((event.target as Element).closest?.("button, input, a")) return;
+          onMoveStart(sessionId, event);
+        }}
         onDoubleClick={() => !stacked && onToggleZoom(sessionId)}
       >
-        <button
-          type="button"
-          aria-label={`Move ${title}`}
-          title={canDrag ? "Drag to move" : "Pane order"}
-          tabIndex={canDrag ? 0 : -1}
-          disabled={!canDrag}
-          onPointerDown={(event) => onMoveStart(sessionId, event)}
-          className={cn(
-            "grid size-7 shrink-0 place-items-center rounded text-muted-foreground",
-            canDrag && "cursor-grab hover:bg-accent hover:text-foreground active:cursor-grabbing",
+        <span className="relative shrink-0">
+          {session ? (
+            <AgentSwitcher session={session} getHandle={getHandle} />
+          ) : (
+            <AgentIcon size={22} className="rounded-md" />
           )}
-        >
-          <GripVertical className="size-3.5" aria-hidden />
-        </button>
-        <AgentIcon command={session?.foreground_command} size={22} className="rounded-md" />
+          {session && (
+            <SessionStatusDot
+              session={session}
+              className="pointer-events-none absolute -right-0.5 -top-0.5"
+            />
+          )}
+        </span>
         {editingName && session ? (
           <Input
             autoFocus
@@ -264,9 +301,30 @@ export function SessionPane({
             className="h-7 min-w-0 flex-1 px-2 text-xs"
           />
         ) : (
-          <span className="min-w-0 flex-1 truncate text-xs font-medium">{title}</span>
+          <span
+            className="min-w-0 flex-1 truncate text-xs font-medium"
+            title={session ? sessionTitleDetail(session) : undefined}
+          >
+            {title}
+          </span>
         )}
-        {session && <SessionStatusDot session={session} />}
+        {session && (
+          /* The pane's folder, as a control: pick a directory and the shell
+             is sent a `cd` — the terminal changes where it points without
+             leaving the keyboard-first flow. */
+          <button
+            type="button"
+            aria-label="Change directory"
+            title={session.cwd}
+            onClick={() => setCwdPickerOpen(true)}
+            onDoubleClick={(event) => event.stopPropagation()}
+            className="flex h-7 max-w-40 shrink-0 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <Folder className="size-3.5 shrink-0" aria-hidden />
+            <span className="truncate">{basename(session.cwd) || session.cwd}</span>
+            <ChevronDown className="size-3 shrink-0" aria-hidden />
+          </button>
+        )}
         <DropdownMenu
           align="end"
           renderTrigger={(props) => (
@@ -324,23 +382,12 @@ export function SessionPane({
               Close session
             </DropdownMenuItem>
           )}
-          <DropdownMenuItem onSelect={() => onRemoveFromWorkspace(sessionId)}>
-            <Unlink className="size-4" aria-hidden />
-            Remove from workspace
-          </DropdownMenuItem>
         </DropdownMenu>
       </header>
 
       {session ? (
-        <div ref={terminalSurfaceRef} className="relative min-h-0 flex-1 @container/term">
+        <div className="relative min-h-0 flex-1 @container/term">
           <div ref={attach} className="size-full" />
-          <ShortcutBar
-            session={session}
-            promptState={promptState}
-            containerRef={terminalSurfaceRef}
-            getHandle={getHandle}
-            subscribeCursorMove={subscribeCursorMove}
-          />
           {(session.status === "exited" || session.status === "killed") && (
             <div className="absolute inset-0 z-20 grid place-items-center bg-background/75 backdrop-blur-[2px]">
               <div className="flex max-w-xs flex-col items-center gap-3 rounded-lg border border-border bg-popover p-4 text-center shadow-lg">
@@ -381,30 +428,25 @@ export function SessionPane({
         </div>
       )}
 
-      {canDrag && !zoomed && (
-        <>
-          <button
-            type="button"
-            aria-label={`Resize ${title} horizontally`}
-            onPointerDown={(event) => onResizeStart(sessionId, "east", event)}
-            className="absolute inset-y-10 right-0 z-20 w-2 cursor-col-resize touch-none opacity-0"
-          />
-          <button
-            type="button"
-            aria-label={`Resize ${title} vertically`}
-            onPointerDown={(event) => onResizeStart(sessionId, "south", event)}
-            className="absolute inset-x-0 bottom-0 z-20 h-2 cursor-row-resize touch-none opacity-0"
-          />
-          <button
-            type="button"
-            aria-label={`Resize ${title}`}
-            onPointerDown={(event) => onResizeStart(sessionId, "southeast", event)}
-            className="absolute bottom-0 right-0 z-30 size-4 cursor-nwse-resize touch-none"
-          >
-            <span className="absolute bottom-1 right-1 size-2 border-b border-r border-muted-foreground/70" />
-          </button>
-        </>
-      )}
+      <FolderPickerDialog
+        key={`${paneHost?.id ?? "none"}:${cwdPickerOpen ? "open" : "closed"}`}
+        open={cwdPickerOpen}
+        host={paneHost}
+        onOpenChange={setCwdPickerOpen}
+        onSelect={(path) => {
+          if (!session) return;
+          const purpose = "Changing this pane's folder";
+          void runInShell({
+            session,
+            handle: getHandle(),
+            command: `cd ${shellQuote(path)}`,
+            purpose,
+            onSession: (fresh) => writeSessionToCache(queryClient, fresh),
+          }).then((result) => {
+            if (result === "busy") onError(stillRunningMessage(session, purpose));
+          });
+        }}
+      />
     </section>,
     hostRef.current,
   );

@@ -1,5 +1,6 @@
 import { z } from "zod";
-import type { LayoutV2, Tile } from "@/lib/grid";
+import type { LayoutV2, Tile, TileWidget } from "@/lib/grid";
+import type { LayoutV3, WorkspaceTab } from "@/lib/tabs";
 
 /**
  * Typed REST helpers. Shapes mirror `/proto/README.md` exactly.
@@ -223,12 +224,19 @@ export const SessionAccessSchema = z.object({
 export type SessionAccess = z.infer<typeof SessionAccessSchema>;
 
 /** Grid layout v2 (§4.4): a 12×12 canvas of non-overlapping session tiles. */
+export const TileWidgetSchema: z.ZodType<TileWidget> = z.object({
+  kind: z.literal("files"),
+  host_id: z.string().uuid(),
+  path: z.string(),
+});
+
 export const TileSchema: z.ZodType<Tile> = z.object({
   session_id: z.string().uuid(),
   x: z.number().int(),
   y: z.number().int(),
   w: z.number().int(),
   h: z.number().int(),
+  widget: TileWidgetSchema.optional(),
 });
 
 export const LayoutV2Schema: z.ZodType<LayoutV2> = z.object({
@@ -236,10 +244,27 @@ export const LayoutV2Schema: z.ZodType<LayoutV2> = z.object({
   tiles: z.array(TileSchema),
 });
 
+/** Layout v3 (§4.4-tabs): ordered named tabs, each wrapping one v2 grid. */
+export const WorkspaceTabSchema: z.ZodType<WorkspaceTab> = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  layout: LayoutV2Schema,
+});
+
+export const LayoutV3Schema: z.ZodType<LayoutV3> = z.object({
+  version: z.literal(3),
+  active_tab: z.string().nullable().default(null),
+  tabs: z.array(WorkspaceTabSchema).min(1),
+});
+
 export const WorkspaceSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
-  layout: LayoutV2Schema,
+  /** The workspace's home: host and folder chosen at creation; new sessions
+   *  default here so the folder is picked once. */
+  host_id: z.string().uuid().nullable().default(null),
+  cwd: z.string().nullable().default(null),
+  layout: LayoutV3Schema,
   position: z.number().int().default(0),
   created_at: z.string(),
   updated_at: z.string(),
@@ -692,6 +717,44 @@ export const sessionAccess = {
     }),
 };
 
+/** A template tile's payload: what it launches when instantiated. */
+export const TemplateRunSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("shell"), command: z.null().optional() }),
+  z.object({ kind: z.literal("agent"), command: z.string().min(1) }),
+  z.object({ kind: z.literal("files"), command: z.null().optional() }),
+]);
+export type TemplateRun = z.infer<typeof TemplateRunSchema>;
+
+export const TemplateTileSchema = z.object({
+  x: z.number().int(),
+  y: z.number().int(),
+  w: z.number().int(),
+  h: z.number().int(),
+  run: TemplateRunSchema,
+});
+export type TemplateTile = z.infer<typeof TemplateTileSchema>;
+
+export const WorkspaceTemplateSpecSchema = z.object({
+  version: z.literal(1),
+  tabs: z
+    .array(z.object({ name: z.string(), tiles: z.array(TemplateTileSchema).default([]) }))
+    .min(1)
+    .max(8),
+});
+export type WorkspaceTemplateSpec = z.infer<typeof WorkspaceTemplateSpecSchema>;
+
+export const WorkspaceTemplateSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+  /** The folder the template remembers; instantiation goes straight there. */
+  host_id: z.string().uuid().nullable().default(null),
+  cwd: z.string().nullable().default(null),
+  spec: WorkspaceTemplateSpecSchema,
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+export type WorkspaceTemplate = z.infer<typeof WorkspaceTemplateSchema>;
+
 export const workspaces = {
   /** Ordered by `position`. */
   list: () =>
@@ -714,7 +777,10 @@ export const workspaces = {
       body: JSON.stringify(body ?? {}),
       schema: WorkspaceCreateResultSchema,
     }),
-  update: (id: string, body: { name?: string; layout?: LayoutV2; position?: number }) =>
+  update: (
+    id: string,
+    body: { name?: string; layout?: LayoutV3; position?: number; host_id?: string; cwd?: string },
+  ) =>
     api(`/api/workspaces/${id}`, {
       method: "PATCH",
       body: JSON.stringify(body),
@@ -722,6 +788,31 @@ export const workspaces = {
     }),
   /** Kills and deletes every session referenced by its tiles. Confirm first. */
   remove: (id: string) => api<void>(`/api/workspaces/${id}`, { method: "DELETE" }),
+};
+
+export const workspaceTemplates = {
+  /** Ordered by name. */
+  list: () =>
+    api("/api/workspace-templates", {
+      method: "GET",
+      schema: z.array(WorkspaceTemplateSchema),
+    }),
+  create: (body: { name: string; host_id?: string; cwd?: string; spec: WorkspaceTemplateSpec }) =>
+    api("/api/workspace-templates", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: WorkspaceTemplateSchema,
+    }),
+  update: (
+    id: string,
+    body: { name?: string; host_id?: string; cwd?: string; spec?: WorkspaceTemplateSpec },
+  ) =>
+    api(`/api/workspace-templates/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      schema: WorkspaceTemplateSchema,
+    }),
+  remove: (id: string) => api<void>(`/api/workspace-templates/${id}`, { method: "DELETE" }),
 };
 
 export const agents = {

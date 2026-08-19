@@ -47,45 +47,25 @@ async function setupSidebar(page: Page, attention = false) {
   return store;
 }
 
-test("workspace tree follows position and expansion persists across reload", async ({ page }) => {
+test("the sidebar lists workspaces only, ordered by position", async ({ page }) => {
   await setupSidebar(page);
   const nav = page.getByRole("navigation", { name: "Workspaces" });
   const alpha = nav.getByRole("link", { name: /Alpha desk/ });
   const zeta = nav.getByRole("link", { name: /Zeta desk/ });
   expect((await alpha.boundingBox())?.y).toBeLessThan((await zeta.boundingBox())?.y ?? 0);
-  await expect(nav.getByRole("link", { name: /palette/ })).toBeVisible();
 
-  await page.getByRole("button", { name: "Collapse Zeta desk" }).click();
+  // Sessions live in the workspace view now, not the sidebar tree.
   await expect(nav.getByRole("link", { name: /palette/ })).toHaveCount(0);
-  await page.reload();
-  await expect(page.getByRole("button", { name: "Expand Zeta desk" })).toBeVisible();
-  await expect(nav.getByRole("link", { name: /palette/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^(Collapse|Expand) / })).toHaveCount(0);
+
+  await alpha.click();
+  await expect(page).toHaveURL(`/w/${ALPHA_WORKSPACE_ID}`);
 });
 
-test("clicking a session navigates with focus and focuses its pane", async ({ page }) => {
-  await setupSidebar(page);
-  await page
-    .getByRole("navigation", { name: "Workspaces" })
-    .getByRole("link", { name: /beta/ })
-    .click();
-  await expect(page).toHaveURL(`/w/${WORKSPACE_ID}?focus=${SESSION_B_ID}`);
-  await expect(
-    page.getByRole("region", { name: "beta" }).locator(".xterm-helper-textarea"),
-  ).toBeFocused();
-});
-
-test("attention rolls up and hover highlighting works in both directions", async ({ page }) => {
+test("attention rolls up onto the workspace row", async ({ page }) => {
   await setupSidebar(page, true);
   const nav = page.getByRole("navigation", { name: "Workspaces" });
-  const workspaceLink = nav.getByRole("link", { name: /Zeta desk/ });
-  await expect(workspaceLink).toContainText("1");
-
-  const row = nav.getByRole("link", { name: /palette/ });
-  const pane = page.getByRole("region", { name: "palette" });
-  await row.hover();
-  await expect(pane).toHaveClass(/ring-2/);
-  await pane.hover();
-  await expect(row).toHaveClass(/bg-accent/);
+  await expect(nav.getByRole("listitem").filter({ hasText: "Zeta desk" })).toContainText("1");
 });
 
 test("workspace rename, reorder, and delete round-trip through the store", async ({ page }) => {
@@ -99,11 +79,8 @@ test("workspace rename, reorder, and delete round-trip through the store", async
     .poll(() => String(store.workspaces.find((item) => item.id === WORKSPACE_ID)?.name))
     .toBe("Build desk");
 
-  await page.getByRole("button", { name: "Build desk actions" }).click();
-  await page.getByRole("menuitem", { name: "Move up" }).click();
-  await expect
-    .poll(() => Number(store.workspaces.find((item) => item.id === WORKSPACE_ID)?.position))
-    .toBe(0);
+  // Reordering is drag-driven now (no Move up/down menu items).
+  await expect(page.getByRole("menuitem", { name: "Move up" })).toHaveCount(0);
 
   await page.getByRole("button", { name: "Build desk actions" }).click();
   await page.getByRole("menuitem", { name: "Delete" }).click();

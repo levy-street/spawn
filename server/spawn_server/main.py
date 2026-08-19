@@ -27,6 +27,7 @@ from .routes import hosts as hosts_routes
 from .routes import install as install_routes
 from .routes import sessions as sessions_routes
 from .routes import trust_bundle as trust_bundle_routes
+from .routes import workspace_templates as workspace_templates_routes
 from .routes import workspaces as workspaces_routes
 from .ws import browser as browser_ws
 from .ws import daemon as daemon_ws
@@ -84,6 +85,7 @@ def create_app() -> FastAPI:
     app.include_router(device_routes.router)
     app.include_router(hosts_routes.router)
     app.include_router(sessions_routes.router)
+    app.include_router(workspace_templates_routes.router)
     app.include_router(workspaces_routes.router)
     app.include_router(agents_routes.router)
     app.include_router(install_routes.router)

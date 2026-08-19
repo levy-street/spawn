@@ -3,6 +3,7 @@
 import {
   Bot,
   ExternalLink,
+  LayoutTemplate,
   MonitorSmartphone,
   Palette,
   Server,
@@ -24,6 +25,7 @@ import {
   type SettingsTab,
   useSettingsDialog,
 } from "@/components/settings/settings-dialog-store";
+import { TemplatesPanel } from "@/components/settings/TemplatesPanel";
 import { TrustPanel } from "@/components/settings/TrustPanel";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
@@ -40,6 +42,7 @@ const TABS: Array<{
   { key: "hosts", label: "Hosts", icon: Server },
   { key: "agents", label: "Agents", icon: Bot },
   { key: "skills", label: "Skills", icon: Wrench },
+  { key: "templates", label: "Templates", icon: LayoutTemplate },
   { key: "devices", label: "Browser devices", icon: MonitorSmartphone },
   { key: "trust", label: "Device trust", icon: ShieldCheck },
 ];
@@ -103,6 +106,7 @@ export function SettingsDialog() {
             {tab === "hosts" && <HostsPanel />}
             {tab === "agents" && <AgentsPanel />}
             {tab === "skills" && <SkillsPanel />}
+            {tab === "templates" && <TemplatesPanel />}
             {tab === "devices" && <DevicesPanel />}
             {tab === "trust" && <TrustPanel />}
           </div>

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolveAgentIcon } from "./AgentIcon";
+import { agentDisplayName, resolveAgentIcon } from "./AgentIcon";
 
 describe("resolveAgentIcon", () => {
   test("resolves brand marks from kind", () => {
@@ -38,10 +38,25 @@ describe("resolveAgentIcon", () => {
     expect(resolved.label).toBe("goose");
   });
 
-  test("empty input still renders something", () => {
+  test("nothing reported yet reads as a shell prompt", () => {
     const resolved = resolveAgentIcon(undefined, undefined);
-    expect(resolved.icon).toBe("monogram");
-    expect(resolved.letter).toBe("?");
-    expect(resolved.label).toBe("Agent");
+    expect(resolved.icon).toBe("shell");
+    expect(resolved.label).toBe("Shell");
+  });
+});
+
+describe("agentDisplayName", () => {
+  test("names known agents by brand", () => {
+    expect(agentDisplayName("claude")).toBe("Claude Code");
+    expect(agentDisplayName("/usr/local/bin/codex")).toBe("Codex");
+  });
+
+  test("nothing running reads as a shell", () => {
+    expect(agentDisplayName(null)).toBe("Shell");
+    expect(agentDisplayName("zsh")).toBe("zsh");
+  });
+
+  test("an unknown program keeps its own name", () => {
+    expect(agentDisplayName("vim")).toBe("vim");
   });
 });

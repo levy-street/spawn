@@ -34,7 +34,94 @@ pub fn foreground_basename(master_fd: RawFd) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(trimmed.chars().take(MAX_BASENAME_CHARS).collect())
+    // Some tools install each release as a version-named file — Claude Code
+    // runs `~/.local/share/claude/versions/2.1.235` — so the executable name
+    // the kernel reports is a version, not a name. Fall back to the directory
+    // that holds it, which is what the tool calls itself. Still a bare name:
+    // no arguments, no path, and never more than two levels up.
+    let resolved = if is_version_name(trimmed) {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        process_exe_path(pgid)
+            .as_deref()
+            .and_then(|path| tool_name_from_path(path, home.as_deref()))
+            .unwrap_or_else(|| trimmed.to_string())
+    } else {
+        trimmed.to_string()
+    };
+    Some(resolved.chars().take(MAX_BASENAME_CHARS).collect())
+}
+
+/// A name with no letters in it — "2.1.235", "1.0.0-rc1" — names a release,
+/// not a program.
+fn is_version_name(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(|c| c.is_alphabetic())
+}
+
+/// Directories that hold programs rather than name them.
+const GENERIC_DIRS: &[&str] = &[
+    "bin",
+    "sbin",
+    "libexec",
+    "lib",
+    "lib64",
+    "share",
+    "local",
+    "opt",
+    "usr",
+    "var",
+    "versions",
+    "version",
+    "releases",
+    "current",
+    "latest",
+    "stable",
+    "node_modules",
+    "dist",
+    "build",
+    "target",
+    "release",
+    "debug",
+    "contents",
+    "macos",
+    "resources",
+];
+
+/// How far above a version-named file to look for the tool's own name.
+const MAX_ANCESTOR_LEVELS: usize = 2;
+
+/// Home directories, whose names are people rather than programs.
+const HOME_PARENTS: &[&str] = &["users", "home"];
+
+/// The nearest ancestor directory that names the tool, e.g. `claude` from
+/// `/Users/x/.local/share/claude/versions/2.1.235`. `None` when only generic
+/// or version-like directories are within reach: the walk gives up rather
+/// than climbing into a home directory, whose name is a username.
+fn tool_name_from_path(path: &std::path::Path, home: Option<&std::path::Path>) -> Option<String> {
+    for ancestor in path.ancestors().skip(1).take(MAX_ANCESTOR_LEVELS) {
+        if home.is_some_and(|home| ancestor == home) {
+            return None;
+        }
+        let parent_name = ancestor
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .map(str::to_ascii_lowercase);
+        if parent_name.is_some_and(|name| HOME_PARENTS.contains(&name.as_str())) {
+            return None;
+        }
+        let Some(name) = ancestor.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let candidate = name.trim().trim_start_matches('.');
+        if candidate.is_empty() || is_version_name(candidate) {
+            continue;
+        }
+        if GENERIC_DIRS.contains(&candidate.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        return Some(candidate.to_string());
+    }
+    None
 }
 
 /// Kernel-maintained executable basename (`/proc/<pid>/comm`, truncated by
@@ -43,6 +130,13 @@ pub fn foreground_basename(master_fd: RawFd) -> Option<String> {
 fn process_basename(pid: nix::libc::pid_t) -> Option<String> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     Some(comm.trim_end_matches('\n').to_string())
+}
+
+/// Executable path, read only to name a version-named file after its
+/// directory; never reported as a path.
+#[cfg(target_os = "linux")]
+fn process_exe_path(pid: nix::libc::pid_t) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -80,17 +174,23 @@ fn libproc_name(pid: nix::libc::pid_t) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `proc_pidpath` fallback: the full executable path, reduced to its file
-/// name before it leaves this module.
+/// `proc_pidpath`: the full executable path, read only to name the process;
+/// callers reduce it to a single name before it leaves this module.
 #[cfg(target_os = "macos")]
-fn libproc_path_basename(pid: nix::libc::pid_t) -> Option<String> {
+fn process_exe_path(pid: nix::libc::pid_t) -> Option<std::path::PathBuf> {
     let mut buf = [0u8; 4096];
     let len = unsafe { proc_pidpath(pid as _, buf.as_mut_ptr().cast(), buf.len() as u32) };
     if len <= 0 {
         return None;
     }
     let path = std::str::from_utf8(&buf[..len as usize]).ok()?;
-    std::path::Path::new(path)
+    Some(std::path::PathBuf::from(path))
+}
+
+/// Path fallback for when `proc_name` has nothing to say.
+#[cfg(target_os = "macos")]
+fn libproc_path_basename(pid: nix::libc::pid_t) -> Option<String> {
+    process_exe_path(pid)?
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_owned)
@@ -98,6 +198,11 @@ fn libproc_path_basename(pid: nix::libc::pid_t) -> Option<String> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_basename(_pid: nix::libc::pid_t) -> Option<String> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_exe_path(_pid: nix::libc::pid_t) -> Option<std::path::PathBuf> {
     None
 }
 
@@ -110,6 +215,54 @@ mod tests {
         let name = process_basename(std::process::id() as nix::libc::pid_t)
             .expect("own pid must resolve");
         assert!(!name.trim().is_empty());
+    }
+
+    #[test]
+    fn version_named_files_are_named_after_their_directory() {
+        // Claude Code's real layout: every release is a version-named file.
+        assert_eq!(
+            tool_name_from_path(
+                std::path::Path::new("/Users/x/.local/share/claude/versions/2.1.235"),
+                Some(std::path::Path::new("/Users/x")),
+            )
+            .as_deref(),
+            Some("claude")
+        );
+        // A dot-directory names the tool just as well.
+        assert_eq!(
+            tool_name_from_path(
+                std::path::Path::new("/Users/x/.codex/bin/0.9.1"),
+                Some(std::path::Path::new("/Users/x")),
+            )
+            .as_deref(),
+            Some("codex")
+        );
+    }
+
+    #[test]
+    fn the_walk_stops_before_it_reaches_a_home_directory() {
+        // Two levels up is all it looks: a username is never a program name.
+        assert_eq!(
+            tool_name_from_path(
+                std::path::Path::new("/Users/x/bin/1.2.3"),
+                Some(std::path::Path::new("/Users/x"))
+            ),
+            None
+        );
+        // Even with no HOME to compare against, a home directory is off limits.
+        assert_eq!(
+            tool_name_from_path(std::path::Path::new("/home/deploy/bin/1.2.3"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn only_letterless_names_look_like_versions() {
+        assert!(is_version_name("2.1.235"));
+        assert!(is_version_name("1.0.0-4"));
+        assert!(!is_version_name("claude"));
+        assert!(!is_version_name("v2.1.235"));
+        assert!(!is_version_name(""));
     }
 
     #[test]

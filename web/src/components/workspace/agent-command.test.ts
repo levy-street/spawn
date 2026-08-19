@@ -4,7 +4,7 @@ import {
   agentRunCommand,
   envPrefix,
   shellQuote,
-} from "@/components/workspace/shortcut-command";
+} from "@/components/workspace/agent-command";
 
 describe("shellQuote", () => {
   test("passes safe words through bare", () => {

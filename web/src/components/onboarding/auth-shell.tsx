@@ -1,6 +1,6 @@
-import { SquareTerminal } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { Trident, WORDMARK_CLASS } from "@/components/icons/BrandMark";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { ONBOARDING_STEPS, type OnboardingStep } from "./step-machine";
@@ -35,10 +35,10 @@ export function AuthShell({ title, description, children, step, cardClassName }:
       <div className="relative mx-auto flex min-w-0 w-full max-w-md flex-1 flex-col justify-center gap-5 px-4 py-8 sm:py-12">
         <Link
           href="/"
-          className="mx-auto flex min-h-11 items-center gap-2 px-2 text-sm font-semibold tracking-wide text-bone transition-colors hover:text-ember focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ember"
+          className="mx-auto flex min-h-11 items-center gap-2.5 px-2 text-hellfire transition-colors hover:text-ember focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ember"
         >
-          <SquareTerminal className="size-5" aria-hidden />
-          <span>spawnd</span>
+          <Trident className="size-8" />
+          <span className={cn(WORDMARK_CLASS, "text-[19px]")}>spawnd</span>
         </Link>
 
         {step ? <StepIndicator current={step} /> : null}

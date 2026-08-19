@@ -1,5 +1,6 @@
 "use client";
 
+import { Check } from "lucide-react";
 import Link from "next/link";
 import {
   type CSSProperties,
@@ -141,8 +142,9 @@ export const DropdownMenu = forwardRef<
 
   const focusItem = (direction: 1 | -1) => {
     const items = Array.from(
-      rootRef.current?.querySelectorAll<HTMLElement>("[role='menuitem']:not([aria-disabled])") ??
-        [],
+      rootRef.current?.querySelectorAll<HTMLElement>(
+        "[role='menuitem']:not([aria-disabled]),[role='menuitemcheckbox']:not([aria-disabled])",
+      ) ?? [],
     );
     if (items.length === 0) return;
     const current = items.indexOf(document.activeElement as HTMLElement);
@@ -185,7 +187,9 @@ export const DropdownMenu = forwardRef<
             onClick={close}
             style={coords ?? { position: "fixed", visibility: "hidden" }}
             className={cn(
-              "z-[100] min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40",
+              // pointer-events-auto: a modal Radix dialog sets `pointer-events:
+              // none` on <body>, which this portal would otherwise inherit.
+              "pointer-events-auto z-[100] min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40",
               "animate-in fade-in-0 zoom-in-95 duration-100",
               menuClassName,
             )}
@@ -204,6 +208,7 @@ const ITEM_CLASS =
 export function DropdownMenuItem({
   onSelect,
   href,
+  checked,
   destructive = false,
   disabled = false,
   className,
@@ -211,6 +216,8 @@ export function DropdownMenuItem({
 }: {
   onSelect?: () => void;
   href?: string;
+  /** Pass to make the item a toggle: renders a checkbox showing its state. */
+  checked?: boolean;
   destructive?: boolean;
   disabled?: boolean;
   className?: string;
@@ -226,6 +233,29 @@ export function DropdownMenuItem({
       <Link role="menuitem" href={href} className={classes}>
         {children}
       </Link>
+    );
+  }
+  if (checked !== undefined) {
+    return (
+      <button
+        type="button"
+        role="menuitemcheckbox"
+        aria-checked={checked}
+        disabled={disabled}
+        onClick={onSelect}
+        className={classes}
+      >
+        <span
+          aria-hidden
+          className={cn(
+            "grid size-4 shrink-0 place-items-center rounded border",
+            checked ? "border-foreground bg-foreground text-background" : "border-border",
+          )}
+        >
+          {checked && <Check className="size-3" strokeWidth={3} />}
+        </span>
+        {children}
+      </button>
     );
   }
   return (

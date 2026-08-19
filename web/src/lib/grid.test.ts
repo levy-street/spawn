@@ -272,15 +272,18 @@ describe("move", () => {
     assert.deepStrictEqual(move(tiles, "a", 4, 0), [T("b", 0, 0, 4, 12), T("a", 4, 0, 8, 12)]);
   });
 
-  test("swap fallback is skipped when the pipeline produces a real change", () => {
-    // Reordering rows succeeds via push-down, so no rects are exchanged even
-    // though the dragged tile fully overlaps another at its target.
+  test("dropping onto a row swaps with it and leaves the rest alone", () => {
     const tiles = [T("a", 0, 0, 12, 3), T("b", 0, 3, 12, 3), T("c", 0, 6, 12, 3)];
     assert.deepStrictEqual(move(tiles, "c", 0, 0), [
       T("c", 0, 0, 12, 3),
-      T("a", 0, 3, 12, 3),
-      T("b", 0, 6, 12, 3),
+      T("b", 0, 3, 12, 3),
+      T("a", 0, 6, 12, 3),
     ]);
+  });
+
+  test("an empty target is taken as-is, gap and all", () => {
+    const tiles = [T("a", 0, 0, 6, 6), T("b", 6, 0, 6, 6)];
+    assert.deepStrictEqual(move(tiles, "a", 0, 6), [T("b", 6, 0, 6, 6), T("a", 0, 6, 6, 6)]);
   });
 });
 

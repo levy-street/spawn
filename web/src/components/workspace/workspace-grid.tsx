@@ -20,24 +20,45 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { type Session, type Workspace, workspaces } from "@/lib/api";
 import {
+  autoPlace,
   GRID_SIZE,
-  move as moveTile,
+  MAX_TILES,
+  MIN_TILE_SIZE,
   readingOrder,
   remove as removeTile,
-  resize as resizeTile,
   type Tile,
 } from "@/lib/grid";
+import { sessionTitle } from "@/lib/sessions";
+import { type LayoutV3, moveSessionToTab, tabTiles, withActiveTab, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { NewSessionMenu } from "./new-session-menu";
-import { type PaneResizeEdge, type PaneSlotTarget, SessionPane } from "./session-pane";
+import { type PaneSlotTarget, SessionPane } from "./session-pane";
+import { WidgetPane, widgetTitle } from "./widget-pane";
 import {
+  clampDividerLine,
+  dockPane,
+  dockZoneAt,
+  type EdgeTargets,
+  freeRects,
+  type GridDivider,
+  gridDividers,
+  moveDivider,
   moveIdInOrder,
-  moveSwapTarget,
+  movePane,
+  type ResizeEdges,
   repackMobileTiles,
+  resizeEdges,
   tilePixelRect,
 } from "./workspace-grid-helpers";
 
 const WIDE_CONTAINER_PX = 768;
+/** How long a dragged pane must hover a tab before the view switches to it. */
+const TAB_DWELL_MS = 250;
+/** Pointer travel that separates a click on the title bar from a drag. */
+const DRAG_THRESHOLD_PX = 4;
+/** Grab width of a seam, and how far it stops short of a pane corner. */
+const DIVIDER_HIT_PX = 8;
+const DIVIDER_INSET_PX = 8;
 
 type SlotRegistry = Record<string, PaneSlotTarget>;
 type HandleGetter = () => TerminalHandle | null;
@@ -51,27 +72,53 @@ type MoveGesture = {
   pointerOffsetY: number;
   lastX: number;
   lastY: number;
+  /** Live pointer position — cross-tab re-seeding restarts the drag here. */
+  lastClientX: number;
+  lastClientY: number;
+  /** Set once the drag has left its starting tab: where the tile came from. */
+  sourceTab: { tabId: string; tiles: Tile[] } | null;
+  /** `${targetId}:${zone}` while hovering another pane (dock mode). */
+  lastDock: string | null;
   before: Tile[];
   preview: Tile[];
   areaRect: DOMRect;
-  gap: number;
 };
 
 type ResizeGesture = {
   kind: "resize";
-  edge: PaneResizeEdge;
   sessionId: string;
+  /** Which edge(s) the drag grabbed; corners grab one per axis. */
+  edges: ResizeEdges;
   startClientX: number;
   startClientY: number;
-  lastW: number;
-  lastH: number;
+  /** Serialized last edge targets, so previews recompute only on cell change. */
+  lastKey: string;
   before: Tile[];
   preview: Tile[];
   areaRect: DOMRect;
-  gap: number;
 };
 
-type GridGesture = MoveGesture | ResizeGesture;
+type DividerGesture = {
+  kind: "divider";
+  divider: GridDivider;
+  startClientX: number;
+  startClientY: number;
+  lastLine: number;
+  before: Tile[];
+  preview: Tile[];
+  areaRect: DOMRect;
+};
+
+type GridGesture = MoveGesture | ResizeGesture | DividerGesture;
+
+/** A pointerdown on a title bar, waiting to see whether it becomes a drag. */
+type ArmedMove = {
+  sessionId: string;
+  clientX: number;
+  clientY: number;
+  move: (event: PointerEvent) => void;
+  end: () => void;
+};
 
 function tilesEqual(a: Tile[], b: Tile[]): boolean {
   return (
@@ -91,17 +138,12 @@ function tilesEqual(a: Tile[], b: Tile[]): boolean {
 
 function tileStyle(tile: Tile, zoomed: boolean): CSSProperties {
   const values = zoomed
-    ? {
-        left: "calc(var(--pane-gap) / 2)",
-        top: "calc(var(--pane-gap) / 2)",
-        width: "calc(100% - var(--pane-gap))",
-        height: "calc(100% - var(--pane-gap))",
-      }
+    ? { left: "0%", top: "0%", width: "100%", height: "100%" }
     : {
-        left: `calc(${(tile.x / GRID_SIZE) * 100}% + var(--pane-gap) / 2)`,
-        top: `calc(${(tile.y / GRID_SIZE) * 100}% + var(--pane-gap) / 2)`,
-        width: `calc(${(tile.w / GRID_SIZE) * 100}% - var(--pane-gap))`,
-        height: `calc(${(tile.h / GRID_SIZE) * 100}% - var(--pane-gap))`,
+        left: `${(tile.x / GRID_SIZE) * 100}%`,
+        top: `${(tile.y / GRID_SIZE) * 100}%`,
+        width: `${(tile.w / GRID_SIZE) * 100}%`,
+        height: `${(tile.h / GRID_SIZE) * 100}%`,
       };
   return {
     "--tile-left": values.left,
@@ -113,6 +155,76 @@ function tileStyle(tile: Tile, zoomed: boolean): CSSProperties {
     width: "var(--preview-width, var(--tile-width))",
     height: "var(--preview-height, var(--tile-height))",
   } as CSSProperties;
+}
+
+/**
+ * The eight grab surfaces of a pane: four edge strips and four corners.
+ * Rendered by the grid on the tile wrapper (above the pane's content, below
+ * the seam dividers), so session panes and widgets resize identically from
+ * any side. Edges facing a flush neighbour behave like a splitter — the
+ * neighbour gives up or takes back the space (see `resizeEdges`).
+ */
+const RESIZE_PARTS: Array<{ part: string; edges: ResizeEdges; className: string }> = [
+  {
+    part: "left edge",
+    edges: { h: -1, v: 0 },
+    className: "left-0 inset-y-3 w-1.5 cursor-ew-resize",
+  },
+  {
+    part: "right edge",
+    edges: { h: 1, v: 0 },
+    className: "right-0 inset-y-3 w-1.5 cursor-ew-resize",
+  },
+  { part: "top edge", edges: { h: 0, v: -1 }, className: "top-0 inset-x-3 h-1.5 cursor-ns-resize" },
+  {
+    part: "bottom edge",
+    edges: { h: 0, v: 1 },
+    className: "bottom-0 inset-x-3 h-1.5 cursor-ns-resize",
+  },
+  {
+    part: "top-left corner",
+    edges: { h: -1, v: -1 },
+    className: "left-0 top-0 size-3 cursor-nwse-resize",
+  },
+  {
+    part: "top-right corner",
+    edges: { h: 1, v: -1 },
+    className: "right-0 top-0 size-3 cursor-nesw-resize",
+  },
+  {
+    part: "bottom-left corner",
+    edges: { h: -1, v: 1 },
+    className: "left-0 bottom-0 size-3 cursor-nesw-resize",
+  },
+  {
+    part: "bottom-right corner",
+    edges: { h: 1, v: 1 },
+    className: "right-0 bottom-0 size-3 cursor-nwse-resize",
+  },
+];
+
+function TileResizeHandles({
+  sessionId,
+  title,
+  onStart,
+}: {
+  sessionId: string;
+  title: string;
+  onStart: (sessionId: string, edges: ResizeEdges, event: ReactPointerEvent<HTMLElement>) => void;
+}) {
+  return (
+    <>
+      {RESIZE_PARTS.map(({ part, edges, className }) => (
+        <button
+          key={part}
+          type="button"
+          aria-label={`Resize ${title} (${part})`}
+          onPointerDown={(event) => onStart(sessionId, edges, event)}
+          className={cn("absolute z-30 touch-none", className)}
+        />
+      ))}
+    </>
+  );
 }
 
 function PaneSlot({
@@ -133,17 +245,26 @@ function PaneSlot({
 
 export function WorkspaceGrid({
   workspace,
+  tabId,
   sessions,
   initialFocusId,
   onFocusChange,
-  onSavingChange,
+  onSwitchTab,
+  onPreviewTiles,
   onError,
 }: {
   workspace: Workspace;
+  /** The tab whose grid this renders; the envelope's other tabs pass through
+   *  every save untouched. */
+  tabId: string;
   sessions: Session[];
   initialFocusId?: string | null;
   onFocusChange?: (sessionId: string | null) => void;
-  onSavingChange?: (saving: boolean) => void;
+  /** Fired when a dragged pane dwells over another tab in the strip. */
+  onSwitchTab?: (tabId: string) => void;
+  /** Live gesture previews (move/resize/seam), null when no gesture is on.
+   *  The tab strip uses this to restyle the selected tab mid-drag. */
+  onPreviewTiles?: (tiles: Tile[] | null) => void;
   onError?: (message: string | null) => void;
 }) {
   const router = useRouter();
@@ -153,12 +274,14 @@ export function WorkspaceGrid({
   const tileElementsRef = useRef(new Map<string, HTMLDivElement>());
   const handleGettersRef = useRef(new Map<string, HandleGetter>());
   const gestureRef = useRef<GridGesture | null>(null);
+  const armedMoveRef = useRef<ArmedMove | null>(null);
+  const dividerElementRef = useRef<HTMLElement | null>(null);
   const gestureListenersRef = useRef<{
     move: ((event: PointerEvent) => void) | null;
-    up: (() => void) | null;
+    up: ((event: PointerEvent) => void) | null;
     cancel: (() => void) | null;
   }>({ move: null, up: null, cancel: null });
-  const [tiles, setTiles] = useState<Tile[]>(workspace.layout.tiles);
+  const [tiles, setTiles] = useState<Tile[]>(() => tabTiles(workspace.layout, tabId));
   const [slots, setSlots] = useState<SlotRegistry>({});
   const [wide, setWide] = useState(
     () => typeof window === "undefined" || window.matchMedia("(min-width: 768px)").matches,
@@ -166,16 +289,30 @@ export function WorkspaceGrid({
   const [finePointer, setFinePointer] = useState(
     () => typeof window === "undefined" || window.matchMedia("(pointer: fine)").matches,
   );
-  const [focusedId, setFocusedId] = useState<string | null>(
-    initialFocusId && workspace.layout.tiles.some((tile) => tile.session_id === initialFocusId)
+  const [focusedId, setFocusedId] = useState<string | null>(() => {
+    const initialTiles = tabTiles(workspace.layout, tabId);
+    return initialFocusId && initialTiles.some((tile) => tile.session_id === initialFocusId)
       ? initialFocusId
-      : (readingOrder(workspace.layout.tiles)[0] ?? null),
-  );
+      : (readingOrder(initialTiles)[0] ?? null);
+  });
   const [zoomedId, setZoomedId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [revision, setRevision] = useState(0);
 
   const latestTilesRef = useRef(tiles);
+  const onSwitchTabRef = useRef(onSwitchTab);
+  onSwitchTabRef.current = onSwitchTab;
+  // Read through a ref everywhere below: an inline onError prop must not
+  // change gesture-callback identities (that tore down live drag listeners).
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+  const onPreviewTilesRef = useRef(onPreviewTiles);
+  onPreviewTilesRef.current = onPreviewTiles;
+  /** The whole envelope with every local edit applied — what saves PATCH.
+   *  Commits fold the active tab's tiles (and any cross-tab removal) in. */
+  const latestLayoutRef = useRef<LayoutV3>(workspace.layout);
+  const tabIdRef = useRef(tabId);
+  const hoveredTabRef = useRef<{ id: string; since: number } | null>(null);
   const revisionRef = useRef(0);
   const persistedRevisionRef = useRef(0);
   const persistenceEpochRef = useRef(0);
@@ -187,19 +324,21 @@ export function WorkspaceGrid({
     [sessions],
   );
   const orderedIds = useMemo(() => readingOrder(tiles), [tiles]);
+  const dividers = useMemo(() => gridDividers(tiles), [tiles]);
+  const openings = useMemo(() => (tiles.length >= MAX_TILES ? [] : freeRects(tiles)), [tiles]);
+  const sessionTileIds = useMemo(() => readingOrder(tiles.filter((tile) => !tile.widget)), [tiles]);
   const allWorkspacesQ = useQuery({
     queryKey: ["workspaces"],
     queryFn: workspaces.list,
     staleTime: 30_000,
   });
 
-  useEffect(() => onSavingChange?.(saving), [onSavingChange, saving]);
-
   useEffect(() => {
     if (saving || workspace.updated_at === serverWorkspaceRef.current.updated_at) return;
     serverWorkspaceRef.current = workspace;
-    latestTilesRef.current = workspace.layout.tiles;
-    setTiles(workspace.layout.tiles);
+    latestLayoutRef.current = workspace.layout;
+    latestTilesRef.current = tabTiles(workspace.layout, tabIdRef.current);
+    setTiles(latestTilesRef.current);
   }, [saving, workspace]);
 
   useLayoutEffect(() => {
@@ -270,72 +409,77 @@ export function WorkspaceGrid({
     [queryClient, workspace.id],
   );
 
-  const commitLayout = useCallback(
-    (nextTiles: Tile[]) => {
-      latestTilesRef.current = nextTiles;
-      setTiles(nextTiles);
+  const commitEnvelope = useCallback(
+    (nextLayout: LayoutV3) => {
+      // Stamp the viewed tab as active so any layout write records where the
+      // operator is working (new sessions land there by default).
+      const stamped = withActiveTab(nextLayout, tabIdRef.current);
+      latestLayoutRef.current = stamped;
+      latestTilesRef.current = tabTiles(stamped, tabIdRef.current);
+      setTiles(latestTilesRef.current);
       revisionRef.current += 1;
       setRevision(revisionRef.current);
       setSaving(true);
-      onError?.(null);
+      onErrorRef.current?.(null);
       const current =
         queryClient.getQueryData<Workspace>(["workspace", workspace.id]) ??
         serverWorkspaceRef.current;
-      writeWorkspaceCaches({ ...current, layout: { version: 2, tiles: nextTiles } });
+      writeWorkspaceCaches({ ...current, layout: stamped });
     },
-    [onError, queryClient, workspace.id, writeWorkspaceCaches],
+    [queryClient, workspace.id, writeWorkspaceCaches],
+  );
+
+  const commitLayout = useCallback(
+    (nextTiles: Tile[]) =>
+      commitEnvelope(withTabTiles(latestLayoutRef.current, tabIdRef.current, nextTiles)),
+    [commitEnvelope],
   );
 
   useEffect(() => {
     if (revision === 0) return;
     const submittedRevision = revision;
-    const submittedTiles = latestTilesRef.current;
+    const submittedLayout = latestLayoutRef.current;
     const submittedEpoch = persistenceEpochRef.current;
     const timer = window.setTimeout(() => {
       saveChainRef.current = saveChainRef.current.then(async () => {
         if (submittedEpoch !== persistenceEpochRef.current) return;
         try {
-          const saved = await workspaces.update(workspace.id, {
-            layout: { version: 2, tiles: submittedTiles },
-          });
+          const saved = await workspaces.update(workspace.id, { layout: submittedLayout });
           if (submittedEpoch !== persistenceEpochRef.current) return;
           serverWorkspaceRef.current = saved;
           persistedRevisionRef.current = Math.max(persistedRevisionRef.current, submittedRevision);
           writeWorkspaceCaches(saved);
           if (revisionRef.current === submittedRevision) {
-            latestTilesRef.current = saved.layout.tiles;
-            setTiles(saved.layout.tiles);
+            latestLayoutRef.current = saved.layout;
+            latestTilesRef.current = tabTiles(saved.layout, tabIdRef.current);
+            setTiles(latestTilesRef.current);
             setSaving(false);
           } else {
-            writeWorkspaceCaches({
-              ...saved,
-              layout: { version: 2, tiles: latestTilesRef.current },
-            });
+            writeWorkspaceCaches({ ...saved, layout: latestLayoutRef.current });
           }
         } catch (error) {
           if (submittedEpoch !== persistenceEpochRef.current) return;
           persistenceEpochRef.current += 1;
           persistedRevisionRef.current = revisionRef.current;
           const rollback = serverWorkspaceRef.current;
-          latestTilesRef.current = rollback.layout.tiles;
-          setTiles(rollback.layout.tiles);
+          latestLayoutRef.current = rollback.layout;
+          latestTilesRef.current = tabTiles(rollback.layout, tabIdRef.current);
+          setTiles(latestTilesRef.current);
           writeWorkspaceCaches(rollback);
           setSaving(false);
-          onError?.(error instanceof Error ? error.message : String(error));
+          onErrorRef.current?.(error instanceof Error ? error.message : String(error));
         }
       });
     }, 500);
     return () => window.clearTimeout(timer);
-  }, [onError, revision, workspace.id, writeWorkspaceCaches]);
+  }, [revision, workspace.id, writeWorkspaceCaches]);
 
   useEffect(
     () => () => {
       if (revisionRef.current <= persistedRevisionRef.current) return;
       saveChainRef.current = saveChainRef.current.then(async () => {
         try {
-          await workspaces.update(workspace.id, {
-            layout: { version: 2, tiles: latestTilesRef.current },
-          });
+          await workspaces.update(workspace.id, { layout: latestLayoutRef.current });
         } catch (error) {
           console.warn("Could not persist the final workspace layout", error);
         }
@@ -365,41 +509,38 @@ export function WorkspaceGrid({
     handleGettersRef.current.set(sessionId, getter);
   }, []);
 
-  const readGap = useCallback(() => {
-    const value = areaRef.current
-      ? Number.parseFloat(getComputedStyle(areaRef.current).getPropertyValue("--pane-gap"))
-      : Number.NaN;
-    return Number.isFinite(value) ? value : 6;
-  }, []);
-
   const clearGestureStyles = useCallback(() => {
     for (const element of tileElementsRef.current.values()) {
       element.style.transform = "";
       element.style.removeProperty("--preview-width");
       element.style.removeProperty("--preview-height");
       element.style.removeProperty("transition");
-      element.removeAttribute("data-swap-target");
       element.removeAttribute("data-gesture-active");
     }
     const ghost = ghostRef.current;
-    if (ghost) {
-      ghost.hidden = true;
-      ghost.removeAttribute("data-swap");
+    if (ghost) ghost.hidden = true;
+    const divider = dividerElementRef.current;
+    if (divider) {
+      divider.style.transform = "";
+      divider.removeAttribute("data-dragging");
+      dividerElementRef.current = null;
     }
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
   }, []);
 
-  const previewLayout = useCallback((gesture: GridGesture, swapTarget: string | null) => {
-    const { before, preview, sessionId, areaRect, gap } = gesture;
+  const previewLayout = useCallback((gesture: GridGesture) => {
+    const { before, preview, areaRect } = gesture;
+    onPreviewTilesRef.current?.(preview);
+    // A seam drag has no dragged tile: every pane it touches previews in place.
+    const sessionId = gesture.kind === "divider" ? null : gesture.sessionId;
     for (const next of preview) {
       const element = tileElementsRef.current.get(next.session_id);
       const previous = before.find((tile) => tile.session_id === next.session_id);
       if (!element || !previous) continue;
-      element.toggleAttribute("data-swap-target", next.session_id === swapTarget);
       if (next.session_id === sessionId) continue;
-      const from = tilePixelRect(previous, areaRect.width, areaRect.height, gap);
-      const to = tilePixelRect(next, areaRect.width, areaRect.height, gap);
+      const from = tilePixelRect(previous, areaRect.width, areaRect.height);
+      const to = tilePixelRect(next, areaRect.width, areaRect.height);
       element.style.transform = `translate3d(${to.left - from.left}px, ${to.top - from.top}px, 0)`;
       element.style.setProperty("--preview-width", `${to.width}px`);
       element.style.setProperty("--preview-height", `${to.height}px`);
@@ -407,13 +548,12 @@ export function WorkspaceGrid({
     const target = preview.find((tile) => tile.session_id === sessionId);
     const ghost = ghostRef.current;
     if (!target || !ghost) return;
-    const rect = tilePixelRect(target, areaRect.width, areaRect.height, gap);
+    const rect = tilePixelRect(target, areaRect.width, areaRect.height);
     ghost.hidden = false;
     ghost.style.left = `${rect.left}px`;
     ghost.style.top = `${rect.top}px`;
     ghost.style.width = `${rect.width}px`;
     ghost.style.height = `${rect.height}px`;
-    ghost.toggleAttribute("data-swap", swapTarget !== null);
   }, []);
 
   const finishGesture = useCallback(
@@ -425,12 +565,36 @@ export function WorkspaceGrid({
       if (listeners.up) document.removeEventListener("pointerup", listeners.up);
       if (listeners.cancel) document.removeEventListener("pointercancel", listeners.cancel);
       gestureListenersRef.current = { move: null, up: null, cancel: null };
-      if (gesture && commit && !tilesEqual(gesture.before, gesture.preview)) {
+      if (gesture && commit && gesture.kind === "move" && gesture.sourceTab) {
+        // The drag crossed tabs: one envelope write removes the tile from its
+        // source tab and lands the previewed layout in the viewed tab.
+        const source = gesture.sourceTab;
+        flushSync(() =>
+          commitEnvelope(
+            withTabTiles(
+              withTabTiles(
+                latestLayoutRef.current,
+                source.tabId,
+                removeTile(tabTiles(latestLayoutRef.current, source.tabId), gesture.sessionId),
+              ),
+              tabIdRef.current,
+              gesture.preview,
+            ),
+          ),
+        );
+      } else if (gesture && commit && !tilesEqual(gesture.before, gesture.preview)) {
         flushSync(() => commitLayout(gesture.preview));
+      } else if (gesture && gesture.kind === "move" && gesture.sourceTab) {
+        // Cancelled mid-carry: the committed state never changed, so simply
+        // fall back to the viewed tab's committed tiles (the dragged pane is
+        // still in its source tab).
+        setTiles(latestTilesRef.current);
       }
+      hoveredTabRef.current = null;
+      onPreviewTilesRef.current?.(null);
       clearGestureStyles();
     },
-    [clearGestureStyles, commitLayout],
+    [clearGestureStyles, commitEnvelope, commitLayout],
   );
 
   const onGestureMove = useCallback(
@@ -438,6 +602,28 @@ export function WorkspaceGrid({
       const gesture = gestureRef.current;
       if (!gesture) return;
       event.preventDefault();
+
+      if (gesture.kind === "divider") {
+        const { divider, areaRect } = gesture;
+        const vertical = divider.axis === "vertical";
+        const cell = (vertical ? areaRect.width : areaRect.height) / GRID_SIZE;
+        const delta = vertical
+          ? event.clientX - gesture.startClientX
+          : event.clientY - gesture.startClientY;
+        const line = clampDividerLine(divider, divider.line + delta / cell);
+        const element = dividerElementRef.current;
+        if (element) {
+          element.style.transform = vertical
+            ? `translate3d(${(line - divider.line) * cell}px, 0, 0)`
+            : `translate3d(0, ${(line - divider.line) * cell}px, 0)`;
+        }
+        if (line === gesture.lastLine) return;
+        gesture.lastLine = line;
+        gesture.preview = moveDivider(gesture.before, divider, line);
+        previewLayout(gesture);
+        return;
+      }
+
       const active = tileElementsRef.current.get(gesture.sessionId);
       const original = gesture.before.find((tile) => tile.session_id === gesture.sessionId);
       if (!active || !original) return;
@@ -445,9 +631,60 @@ export function WorkspaceGrid({
       const dx = event.clientX - gesture.startClientX;
       const dy = event.clientY - gesture.startClientY;
       if (gesture.kind === "move") {
+        gesture.lastClientX = event.clientX;
+        gesture.lastClientY = event.clientY;
+        // Hovering another tab in the strip for a beat switches the view to
+        // it mid-drag; the tabId-change effect below re-seeds the gesture so
+        // the pane is carried into the newly visible grid.
+        const overTab = document
+          .elementFromPoint(event.clientX, event.clientY)
+          ?.closest?.("[data-workspace-tab]")
+          ?.getAttribute("data-workspace-tab");
+        if (overTab && overTab !== tabIdRef.current) {
+          const hovered = hoveredTabRef.current;
+          if (!hovered || hovered.id !== overTab) {
+            hoveredTabRef.current = { id: overTab, since: performance.now() };
+          } else if (performance.now() - hovered.since >= TAB_DWELL_MS) {
+            hoveredTabRef.current = null;
+            onSwitchTabRef.current?.(overTab);
+          }
+        } else {
+          hoveredTabRef.current = null;
+        }
         active.style.transform = `translate3d(${dx}px, ${dy}px, 0)`;
         const cellWidth = gesture.areaRect.width / GRID_SIZE;
         const cellHeight = gesture.areaRect.height / GRID_SIZE;
+
+        // Hovering another pane docks against its nearest edge (iTerm-style):
+        // the target splits in half and the ghost claims the hovered side.
+        const pointerX = (event.clientX - gesture.areaRect.left) / cellWidth;
+        const pointerY = (event.clientY - gesture.areaRect.top) / cellHeight;
+        const hovered = gesture.before.find(
+          (tile) =>
+            tile.session_id !== gesture.sessionId &&
+            pointerX >= tile.x &&
+            pointerX < tile.x + tile.w &&
+            pointerY >= tile.y &&
+            pointerY < tile.y + tile.h,
+        );
+        if (hovered) {
+          const zone = dockZoneAt(
+            (pointerX - hovered.x) / hovered.w,
+            (pointerY - hovered.y) / hovered.h,
+          );
+          const dockKey = `${hovered.session_id}:${zone}`;
+          if (dockKey === gesture.lastDock) return;
+          gesture.lastDock = dockKey;
+          // Leaving dock mode must recompute the cell path, whatever cell.
+          gesture.lastX = Number.NaN;
+          gesture.lastY = Number.NaN;
+          gesture.preview =
+            dockPane(gesture.before, gesture.sessionId, hovered.session_id, zone) ?? gesture.before;
+          previewLayout(gesture);
+          return;
+        }
+        gesture.lastDock = null;
+
         const x = Math.round(
           (event.clientX - gesture.areaRect.left - gesture.pointerOffsetX) / cellWidth,
         );
@@ -457,52 +694,175 @@ export function WorkspaceGrid({
         if (x === gesture.lastX && y === gesture.lastY) return;
         gesture.lastX = x;
         gesture.lastY = y;
-        gesture.preview = moveTile(gesture.before, gesture.sessionId, x, y);
-        previewLayout(gesture, moveSwapTarget(gesture.before, gesture.preview, gesture.sessionId));
+        gesture.preview = movePane(gesture.before, gesture.sessionId, x, y);
+        previewLayout(gesture);
         return;
       }
 
       const cellWidth = gesture.areaRect.width / GRID_SIZE;
       const cellHeight = gesture.areaRect.height / GRID_SIZE;
-      const adjustsWidth = gesture.edge === "east" || gesture.edge === "southeast";
-      const adjustsHeight = gesture.edge === "south" || gesture.edge === "southeast";
-      const requestedW = adjustsWidth ? Math.round(original.w + dx / cellWidth) : original.w;
-      const requestedH = adjustsHeight ? Math.round(original.h + dy / cellHeight) : original.h;
-      const minWidth = (3 / GRID_SIZE) * gesture.areaRect.width - gesture.gap;
-      const minHeight = (3 / GRID_SIZE) * gesture.areaRect.height - gesture.gap;
-      const maxWidth =
-        ((GRID_SIZE - original.x) / GRID_SIZE) * gesture.areaRect.width - gesture.gap;
-      const maxHeight =
-        ((GRID_SIZE - original.y) / GRID_SIZE) * gesture.areaRect.height - gesture.gap;
-      const originalRect = tilePixelRect(
-        original,
-        gesture.areaRect.width,
-        gesture.areaRect.height,
-        gesture.gap,
-      );
-      if (adjustsWidth) {
-        active.style.setProperty(
-          "--preview-width",
-          `${Math.min(maxWidth, Math.max(minWidth, originalRect.width + dx))}px`,
-        );
+      const { edges } = gesture;
+      const targets: EdgeTargets = {};
+      if (edges.h === -1) targets.left = Math.round(original.x + dx / cellWidth);
+      if (edges.h === 1) targets.right = Math.round(original.x + original.w + dx / cellWidth);
+      if (edges.v === -1) targets.top = Math.round(original.y + dy / cellHeight);
+      if (edges.v === 1) targets.bottom = Math.round(original.y + original.h + dy / cellHeight);
+
+      // Elastic pixel feedback on the grabbed pane; the ghost shows the snap.
+      const originalRect = tilePixelRect(original, gesture.areaRect.width, gesture.areaRect.height);
+      const minWidth = MIN_TILE_SIZE * cellWidth;
+      const minHeight = MIN_TILE_SIZE * cellHeight;
+      let left = originalRect.left;
+      let top = originalRect.top;
+      let width = originalRect.width;
+      let height = originalRect.height;
+      if (edges.h === 1) {
+        width = Math.min(gesture.areaRect.width - left, Math.max(minWidth, width + dx));
+      } else if (edges.h === -1) {
+        const nextLeft = Math.min(left + width - minWidth, Math.max(0, left + dx));
+        width += left - nextLeft;
+        left = nextLeft;
       }
-      if (adjustsHeight) {
-        active.style.setProperty(
-          "--preview-height",
-          `${Math.min(maxHeight, Math.max(minHeight, originalRect.height + dy))}px`,
-        );
+      if (edges.v === 1) {
+        height = Math.min(gesture.areaRect.height - top, Math.max(minHeight, height + dy));
+      } else if (edges.v === -1) {
+        const nextTop = Math.min(top + height - minHeight, Math.max(0, top + dy));
+        height += top - nextTop;
+        top = nextTop;
       }
-      if (requestedW === gesture.lastW && requestedH === gesture.lastH) return;
-      gesture.lastW = requestedW;
-      gesture.lastH = requestedH;
-      gesture.preview = resizeTile(gesture.before, gesture.sessionId, requestedW, requestedH);
-      previewLayout(gesture, null);
+      active.style.transform = `translate3d(${left - originalRect.left}px, ${top - originalRect.top}px, 0)`;
+      active.style.setProperty("--preview-width", `${width}px`);
+      active.style.setProperty("--preview-height", `${height}px`);
+
+      const key = `${targets.left ?? ""}:${targets.right ?? ""}:${targets.top ?? ""}:${targets.bottom ?? ""}`;
+      if (key === gesture.lastKey) return;
+      gesture.lastKey = key;
+      // Applied to the latest preview, not the gesture start: a drag that hits
+      // a gapped neighbour clamps there, and the next cell of travel starts
+      // pushing it — one continuous sweep closes the gap, then trades space.
+      gesture.preview = resizeEdges(gesture.preview, gesture.sessionId, targets);
+      previewLayout(gesture);
     },
     [previewLayout],
   );
 
-  const onGestureUp = useCallback(() => finishGesture(true), [finishGesture]);
+  const onGestureUp = useCallback(
+    (event: PointerEvent) => {
+      const gesture = gestureRef.current;
+      const overTab = document
+        .elementFromPoint(event.clientX, event.clientY)
+        ?.closest?.("[data-workspace-tab]")
+        ?.getAttribute("data-workspace-tab");
+      if (gesture?.kind === "move" && overTab && overTab !== tabIdRef.current) {
+        // Dropped on the strip before the dwell switch fired: move the pane
+        // into that tab directly, auto-placed, and follow it.
+        const moved = moveSessionToTab(latestLayoutRef.current, gesture.sessionId, overTab);
+        finishGesture(false);
+        if (moved) {
+          flushSync(() => commitEnvelope(moved));
+          onSwitchTabRef.current?.(overTab);
+        }
+        return;
+      }
+      finishGesture(true);
+    },
+    [commitEnvelope, finishGesture],
+  );
   const onGestureCancel = useCallback(() => finishGesture(false), [finishGesture]);
+
+  /*
+   * Tab switches. Normally: point the grid at the new tab's committed tiles.
+   * Mid-move-drag (the dwell switch above): carry the dragged pane along —
+   * auto-place it into the new tab and re-seed the live gesture there, so the
+   * drop commits one cross-tab envelope write. Dragging back to the source
+   * tab restores the original within-tab move. Resize and divider gestures
+   * cannot cross tabs; a switch simply cancels them.
+   */
+  useEffect(() => {
+    const previousTabId = tabIdRef.current;
+    if (previousTabId === tabId) return;
+    tabIdRef.current = tabId;
+    hoveredTabRef.current = null;
+    const gesture = gestureRef.current;
+    latestTilesRef.current = tabTiles(latestLayoutRef.current, tabId);
+
+    if (gesture?.kind === "move") {
+      const dragged = gesture.before.find((tile) => tile.session_id === gesture.sessionId);
+      const originTabId = gesture.sourceTab?.tabId ?? previousTabId;
+      if (tabId === originTabId && dragged) {
+        // Back home: the committed envelope still holds the tile here. The
+        // origin must be re-anchored to the home rect — it was rewritten for
+        // the tab the drag just left.
+        gesture.sourceTab = null;
+        gesture.lastDock = null;
+        gesture.before = latestTilesRef.current;
+        gesture.preview = latestTilesRef.current;
+        const home = latestTilesRef.current.find((tile) => tile.session_id === gesture.sessionId);
+        const area = areaRef.current;
+        if (home && area) {
+          gesture.areaRect = area.getBoundingClientRect();
+          const homeRect = tilePixelRect(home, gesture.areaRect.width, gesture.areaRect.height);
+          gesture.pointerOffsetX = Math.min(gesture.pointerOffsetX, homeRect.width);
+          gesture.pointerOffsetY = Math.min(gesture.pointerOffsetY, homeRect.height);
+          gesture.startClientX = gesture.areaRect.left + homeRect.left + gesture.pointerOffsetX;
+          gesture.startClientY = gesture.areaRect.top + homeRect.top + gesture.pointerOffsetY;
+          gesture.lastX = home.x;
+          gesture.lastY = home.y;
+        }
+      } else if (dragged) {
+        const targetTiles = latestTilesRef.current.filter(
+          (tile) => tile.session_id !== gesture.sessionId,
+        );
+        const placed = autoPlace(targetTiles);
+        if (placed.tile === null) {
+          // No room here: the view switches but the drag ends without effect.
+          finishGesture(false);
+          flushSync(() => setTiles(tabTiles(latestLayoutRef.current, tabId)));
+          return;
+        }
+        gesture.sourceTab ??= { tabId: originTabId, tiles: gesture.before };
+        const seeded = [...placed.tiles, { ...dragged, ...placed.tile }];
+        gesture.before = seeded;
+        gesture.preview = seeded;
+        gesture.lastX = placed.tile.x;
+        gesture.lastY = placed.tile.y;
+        gesture.lastDock = null;
+        flushSync(() => setTiles(seeded));
+        const area = areaRef.current;
+        const element = tileElementsRef.current.get(gesture.sessionId);
+        if (area && element) {
+          gesture.areaRect = area.getBoundingClientRect();
+          /*
+           * Keep the original grab point: anchor the gesture's origin to the
+           * seeded tile's layout rect — never the DOM rect, which still wears
+           * the previous tab's drag transform — and place the pane under the
+           * cursor immediately. Later moves recompute the same way (transform
+           * = cursor − origin), so there is no offset drift after the switch.
+           */
+          const seededRect = tilePixelRect(
+            placed.tile,
+            gesture.areaRect.width,
+            gesture.areaRect.height,
+          );
+          gesture.pointerOffsetX = Math.min(gesture.pointerOffsetX, seededRect.width);
+          gesture.pointerOffsetY = Math.min(gesture.pointerOffsetY, seededRect.height);
+          gesture.startClientX = gesture.areaRect.left + seededRect.left + gesture.pointerOffsetX;
+          gesture.startClientY = gesture.areaRect.top + seededRect.top + gesture.pointerOffsetY;
+          element.dataset.gestureActive = "true";
+          element.style.transition = "none";
+          element.style.transform = `translate3d(${gesture.lastClientX - gesture.startClientX}px, ${gesture.lastClientY - gesture.startClientY}px, 0)`;
+        }
+        previewLayout(gesture);
+        return;
+      }
+      flushSync(() => setTiles(latestTilesRef.current));
+      previewLayout(gesture);
+      return;
+    }
+    if (gesture) finishGesture(false);
+    setTiles(latestTilesRef.current);
+    setZoomedId(null);
+  }, [finishGesture, previewLayout, tabId]);
 
   const installGestureListeners = useCallback(() => {
     gestureListenersRef.current = {
@@ -515,31 +875,31 @@ export function WorkspaceGrid({
     document.addEventListener("pointercancel", onGestureCancel, { once: true });
   }, [onGestureCancel, onGestureMove, onGestureUp]);
 
-  const startMove = useCallback(
-    (sessionId: string, event: ReactPointerEvent<HTMLElement>) => {
-      if (!wide || !finePointer || zoomedId || event.pointerType === "touch") return;
+  const beginMove = useCallback(
+    (sessionId: string, startClientX: number, startClientY: number) => {
       const area = areaRef.current;
       const tileElement = tileElementsRef.current.get(sessionId);
       const tile = latestTilesRef.current.find((item) => item.session_id === sessionId);
       if (!area || !tileElement || !tile) return;
-      event.preventDefault();
-      event.stopPropagation();
       const areaRect = area.getBoundingClientRect();
       const tileRect = tileElement.getBoundingClientRect();
       const before = latestTilesRef.current;
       const gesture: MoveGesture = {
         kind: "move",
         sessionId,
-        startClientX: event.clientX,
-        startClientY: event.clientY,
-        pointerOffsetX: event.clientX - tileRect.left,
-        pointerOffsetY: event.clientY - tileRect.top,
+        startClientX,
+        startClientY,
+        pointerOffsetX: startClientX - tileRect.left,
+        pointerOffsetY: startClientY - tileRect.top,
         lastX: tile.x,
         lastY: tile.y,
+        lastClientX: startClientX,
+        lastClientY: startClientY,
+        sourceTab: null,
+        lastDock: null,
         before,
         preview: before,
         areaRect,
-        gap: readGap(),
       };
       gestureRef.current = gesture;
       tileElement.dataset.gestureActive = "true";
@@ -547,56 +907,138 @@ export function WorkspaceGrid({
       document.body.style.cursor = "grabbing";
       document.body.style.userSelect = "none";
       setFocus(sessionId);
-      previewLayout(gesture, null);
+      previewLayout(gesture);
       installGestureListeners();
     },
-    [finePointer, installGestureListeners, previewLayout, readGap, setFocus, wide, zoomedId],
+    [installGestureListeners, previewLayout, setFocus],
+  );
+
+  const disarmMove = useCallback(() => {
+    const armed = armedMoveRef.current;
+    if (!armed) return;
+    armedMoveRef.current = null;
+    document.removeEventListener("pointermove", armed.move);
+    document.removeEventListener("pointerup", armed.end);
+    document.removeEventListener("pointercancel", armed.end);
+  }, []);
+
+  /**
+   * The whole title bar is the drag surface, so the gesture only commits once
+   * the pointer has travelled far enough to rule out a click or a double-click
+   * (which zooms the pane).
+   */
+  const startMove = useCallback(
+    (sessionId: string, event: ReactPointerEvent<HTMLElement>) => {
+      if (!wide || !finePointer || zoomedId || event.pointerType === "touch") return;
+      if (!tileElementsRef.current.has(sessionId)) return;
+      disarmMove();
+      const clientX = event.clientX;
+      const clientY = event.clientY;
+      const onMove = (moveEvent: PointerEvent) => {
+        if (
+          Math.abs(moveEvent.clientX - clientX) < DRAG_THRESHOLD_PX &&
+          Math.abs(moveEvent.clientY - clientY) < DRAG_THRESHOLD_PX
+        ) {
+          return;
+        }
+        disarmMove();
+        beginMove(sessionId, clientX, clientY);
+      };
+      const armed: ArmedMove = { sessionId, clientX, clientY, move: onMove, end: disarmMove };
+      armedMoveRef.current = armed;
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", disarmMove, { once: true });
+      document.addEventListener("pointercancel", disarmMove, { once: true });
+    },
+    [beginMove, disarmMove, finePointer, wide, zoomedId],
   );
 
   const startResize = useCallback(
-    (sessionId: string, edge: PaneResizeEdge, event: ReactPointerEvent<HTMLElement>) => {
+    (sessionId: string, edges: ResizeEdges, event: ReactPointerEvent<HTMLElement>) => {
       if (!wide || !finePointer || zoomedId || event.pointerType === "touch") return;
       const area = areaRef.current;
       const tileElement = tileElementsRef.current.get(sessionId);
       const tile = latestTilesRef.current.find((item) => item.session_id === sessionId);
-      if (!area || !tileElement || !tile) return;
+      if (!area || !tileElement || !tile || (edges.h === 0 && edges.v === 0)) return;
       event.preventDefault();
       event.stopPropagation();
       const before = latestTilesRef.current;
       const gesture: ResizeGesture = {
         kind: "resize",
-        edge,
         sessionId,
+        edges,
         startClientX: event.clientX,
         startClientY: event.clientY,
-        lastW: tile.w,
-        lastH: tile.h,
+        lastKey: "",
         before,
         preview: before,
         areaRect: area.getBoundingClientRect(),
-        gap: readGap(),
       };
       gestureRef.current = gesture;
       tileElement.dataset.gestureActive = "true";
       tileElement.style.transition = "none";
       document.body.style.cursor =
-        edge === "east" ? "col-resize" : edge === "south" ? "row-resize" : "nwse-resize";
+        edges.h !== 0 && edges.v !== 0
+          ? edges.h === edges.v
+            ? "nwse-resize"
+            : "nesw-resize"
+          : edges.h !== 0
+            ? "ew-resize"
+            : "ns-resize";
       document.body.style.userSelect = "none";
       setFocus(sessionId);
-      previewLayout(gesture, null);
+      previewLayout(gesture);
       installGestureListeners();
     },
-    [finePointer, installGestureListeners, previewLayout, readGap, setFocus, wide, zoomedId],
+    [finePointer, installGestureListeners, previewLayout, setFocus, wide, zoomedId],
   );
 
+  const startDividerDrag = useCallback(
+    (divider: GridDivider, event: ReactPointerEvent<HTMLElement>) => {
+      if (!wide || !finePointer || zoomedId || event.pointerType === "touch") return;
+      const area = areaRef.current;
+      if (!area) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const element = event.currentTarget;
+      const before = latestTilesRef.current;
+      dividerElementRef.current = element;
+      element.dataset.dragging = "true";
+      gestureRef.current = {
+        kind: "divider",
+        divider,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        lastLine: divider.line,
+        before,
+        preview: before,
+        areaRect: area.getBoundingClientRect(),
+      };
+      for (const id of [...divider.before, ...divider.after]) {
+        const tileElement = tileElementsRef.current.get(id);
+        if (tileElement) tileElement.style.transition = "none";
+      }
+      document.body.style.cursor = divider.axis === "vertical" ? "col-resize" : "row-resize";
+      document.body.style.userSelect = "none";
+      installGestureListeners();
+    },
+    [finePointer, installGestureListeners, wide, zoomedId],
+  );
+
+  // Unmount-only: removes whatever listeners are actually installed. Keying
+  // this on the callbacks would re-run it on any re-render that changes their
+  // identity — which is exactly mid-gesture, when a debounced save lands.
   useEffect(
     () => () => {
-      document.removeEventListener("pointermove", onGestureMove);
-      document.removeEventListener("pointerup", onGestureUp);
-      document.removeEventListener("pointercancel", onGestureCancel);
+      const listeners = gestureListenersRef.current;
+      if (listeners.move) document.removeEventListener("pointermove", listeners.move);
+      if (listeners.up) document.removeEventListener("pointerup", listeners.up);
+      if (listeners.cancel) document.removeEventListener("pointercancel", listeners.cancel);
+      gestureListenersRef.current = { move: null, up: null, cancel: null };
+      disarmMove();
       clearGestureStyles();
     },
-    [clearGestureStyles, onGestureCancel, onGestureMove, onGestureUp],
+    [clearGestureStyles, disarmMove],
   );
 
   useEffect(() => {
@@ -649,6 +1091,8 @@ export function WorkspaceGrid({
     [commitLayout, setFocus],
   );
 
+  const canGesture = wide && finePointer && zoomedId === null;
+
   const renderPaneSlots = () => {
     if (wide) {
       return (
@@ -665,44 +1109,209 @@ export function WorkspaceGrid({
                 data-grid-tile={tile.session_id}
                 style={tileStyle(tile, zoomed)}
                 className={cn(
-                  "absolute z-10 min-h-0 min-w-0 will-change-transform transition-transform duration-150 ease-swift",
-                  "data-[swap-target]:z-20 data-[swap-target]:ring-2 data-[swap-target]:ring-warning",
+                  "absolute z-10 min-h-0 min-w-0 border-pane-divider will-change-transform transition-transform duration-150 ease-swift",
+                  // A divider only where two panes actually meet edge to edge;
+                  // edges facing empty canvas (or the border) draw nothing.
+                  !zoomed &&
+                    tiles.some(
+                      (other) =>
+                        other.session_id !== tile.session_id &&
+                        other.x === tile.x + tile.w &&
+                        other.y < tile.y + tile.h &&
+                        tile.y < other.y + other.h,
+                    ) &&
+                    "border-r",
+                  !zoomed &&
+                    tiles.some(
+                      (other) =>
+                        other.session_id !== tile.session_id &&
+                        other.y === tile.y + tile.h &&
+                        other.x < tile.x + tile.w &&
+                        tile.x < other.x + other.w,
+                    ) &&
+                    "border-b",
                   zoomedId && !zoomed && "hidden",
                   zoomed && "z-30",
                 )}
               >
-                <PaneSlot sessionId={tile.session_id} stacked={false} register={registerSlot} />
+                {tile.widget ? (
+                  <WidgetPane
+                    tile={tile}
+                    widget={tile.widget}
+                    focused={focusedId === tile.session_id}
+                    paneCount={tiles.length}
+                    canDrag={canGesture}
+                    onFocus={(id) => setFocus(id)}
+                    onToggleZoom={(id) => setZoomedId((current) => (current === id ? null : id))}
+                    onMoveStart={startMove}
+                    onRemove={removeFromWorkspace}
+                  />
+                ) : (
+                  <PaneSlot sessionId={tile.session_id} stacked={false} register={registerSlot} />
+                )}
+                {canGesture && !zoomed && (
+                  <TileResizeHandles
+                    sessionId={tile.session_id}
+                    title={
+                      tile.widget
+                        ? widgetTitle(tile.widget)
+                        : (() => {
+                            const session = sessionsById.get(tile.session_id);
+                            return session ? sessionTitle(session) : "pane";
+                          })()
+                    }
+                    onStart={startResize}
+                  />
+                )}
               </div>
             );
           })}
+          {!zoomedId &&
+            openings.map((rect) => (
+              <div
+                key={`opening-${rect.x}-${rect.y}-${rect.w}-${rect.h}`}
+                data-grid-opening={`${rect.x},${rect.y},${rect.w},${rect.h}`}
+                style={{
+                  left: `${(rect.x / GRID_SIZE) * 100}%`,
+                  top: `${(rect.y / GRID_SIZE) * 100}%`,
+                  width: `${(rect.w / GRID_SIZE) * 100}%`,
+                  height: `${(rect.h / GRID_SIZE) * 100}%`,
+                }}
+                className="absolute z-0 p-1 [&>span]:size-full [&>span>div]:size-full"
+              >
+                <NewSessionMenu
+                  mode="session"
+                  workspaceId={workspace.id}
+                  placement={rect}
+                  trigger={
+                    <button
+                      type="button"
+                      aria-label="Add a pane here"
+                      className={cn(
+                        "group/opening grid size-full place-items-center rounded-md border border-dashed border-transparent text-muted-foreground transition-colors hover:border-border hover:bg-background/80",
+                        // Lit up while a pane dragged off the launcher hovers it.
+                        "data-[drop-target]:border-ring/70 data-[drop-target]:bg-background/80",
+                      )}
+                    >
+                      <span className="flex items-center gap-1.5 text-xs opacity-0 transition-opacity group-hover/opening:opacity-100 group-data-[drop-target]/opening:opacity-100">
+                        <Plus className="size-4" aria-hidden />
+                        Add a pane
+                      </span>
+                    </button>
+                  }
+                  onCreated={({ sessionId }) => {
+                    if (sessionId) setFocus(sessionId, true);
+                  }}
+                />
+              </div>
+            ))}
+          {canGesture &&
+            dividers.map((divider) => {
+              const vertical = divider.axis === "vertical";
+              const along = `${(divider.start / GRID_SIZE) * 100}%`;
+              const span = `${((divider.end - divider.start) / GRID_SIZE) * 100}%`;
+              const across = `calc(${(divider.line / GRID_SIZE) * 100}% - ${DIVIDER_HIT_PX / 2}px)`;
+              return (
+                <button
+                  key={divider.id}
+                  type="button"
+                  aria-label={
+                    vertical
+                      ? "Resize the panes on either side"
+                      : "Resize the panes above and below"
+                  }
+                  data-grid-divider={divider.id}
+                  onPointerDown={(event) => startDividerDrag(divider, event)}
+                  style={
+                    vertical
+                      ? {
+                          left: across,
+                          top: `calc(${along} + ${DIVIDER_INSET_PX}px)`,
+                          width: DIVIDER_HIT_PX,
+                          height: `calc(${span} - ${DIVIDER_INSET_PX * 2}px)`,
+                        }
+                      : {
+                          top: across,
+                          left: `calc(${along} + ${DIVIDER_INSET_PX}px)`,
+                          height: DIVIDER_HIT_PX,
+                          width: `calc(${span} - ${DIVIDER_INSET_PX * 2}px)`,
+                        }
+                  }
+                  className={cn(
+                    "group/divider absolute z-40 touch-none",
+                    vertical ? "cursor-col-resize" : "cursor-row-resize",
+                  )}
+                >
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "absolute bg-transparent transition-colors",
+                      "group-hover/divider:bg-ring/70 group-data-[dragging]/divider:bg-ring",
+                      vertical
+                        ? "inset-y-0 left-1/2 w-0.5 -translate-x-1/2"
+                        : "inset-x-0 top-1/2 h-0.5 -translate-y-1/2",
+                    )}
+                  />
+                </button>
+              );
+            })}
           <div
             ref={ghostRef}
             hidden
             aria-hidden
-            className="pointer-events-none absolute z-40 rounded-md border-2 border-dashed border-ring bg-ring/10 data-[swap]:border-warning data-[swap]:bg-warning-soft"
+            className="pointer-events-none absolute z-50 border-2 border-dashed border-ring bg-ring/10"
           />
         </div>
       );
     }
     return (
       <div className="flex min-h-0 flex-1 flex-col gap-(--pane-gap) overflow-y-auto p-[calc(var(--pane-gap)/2)]">
-        {orderedIds.map((sessionId) => (
-          <div key={sessionId} className="min-h-[55dvh] w-full shrink-0">
-            <PaneSlot sessionId={sessionId} stacked register={registerSlot} />
-          </div>
-        ))}
+        {orderedIds.map((sessionId) => {
+          const widget = tiles.find((tile) => tile.session_id === sessionId)?.widget;
+          return (
+            <div
+              key={sessionId}
+              className="min-h-[55dvh] w-full shrink-0 overflow-hidden rounded-md border border-pane-divider"
+            >
+              {widget ? (
+                <WidgetPane
+                  tile={{ session_id: sessionId, x: 0, y: 0, w: GRID_SIZE, h: GRID_SIZE }}
+                  widget={widget}
+                  focused={focusedId === sessionId}
+                  paneCount={tiles.length}
+                  canDrag={false}
+                  onFocus={(id) => setFocus(id)}
+                  onToggleZoom={() => {}}
+                  onMoveStart={() => {}}
+                  onRemove={removeFromWorkspace}
+                />
+              ) : (
+                <PaneSlot sessionId={sessionId} stacked register={registerSlot} />
+              )}
+            </div>
+          );
+        })}
       </div>
     );
   };
 
   return (
-    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-background">
-      <div ref={areaRef} className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
+    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-shell">
+      <div
+        ref={areaRef}
+        data-workspace-canvas
+        className={cn(
+          "relative flex min-h-0 min-w-0 flex-1 overflow-hidden",
+          // An empty tab wears the selected tab's own surface, so the tab
+          // and its (empty) content read as one connected sheet.
+          tiles.length === 0 && "bg-background",
+        )}
+      >
         {tiles.length === 0 ? (
           <EmptyState
             icon={<Plus />}
             title="Start with a shell"
-            body="Choose a host and folder. The session appears here as soon as it is created."
+            body="New sessions open in this workspace's folder — no picking required."
             className="size-full"
             action={
               <NewSessionMenu
@@ -750,22 +1359,20 @@ export function WorkspaceGrid({
         />
       )}
 
-      {orderedIds.map((sessionId, index) => (
+      {sessionTileIds.map((sessionId, index) => (
         <SessionPane
           key={sessionId}
           sessionId={sessionId}
           session={sessionsById.get(sessionId)}
           slot={slots[sessionId]}
           focused={focusedId === sessionId}
-          zoomed={zoomedId === sessionId}
           paneCount={tiles.length}
-          canDrag={wide && finePointer && zoomedId === null}
+          canDrag={canGesture}
           canMoveUp={!wide && index > 0}
           canMoveDown={!wide && index < orderedIds.length - 1}
           onFocus={(id) => setFocus(id)}
           onToggleZoom={(id) => setZoomedId((current) => (current === id ? null : id))}
           onMoveStart={startMove}
-          onResizeStart={startResize}
           onMoveUp={(id) => moveMobile(id, -1)}
           onMoveDown={(id) => moveMobile(id, 1)}
           onRemoveFromWorkspace={removeFromWorkspace}

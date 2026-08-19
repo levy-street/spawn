@@ -1,10 +1,10 @@
 import type { Agent } from "@/lib/api";
 
 /**
- * Pure command construction for the agent shortcut bar (§5.5). Everything the
- * bar types into the PTY is built here so it can be unit-tested byte-for-byte:
- * env dicts become `KEY=value ` prefixes with shell-quoted values, and missing
- * agents get a fully visible `install && run` compound.
+ * Pure command construction for the agent switcher (§5.5). Everything the
+ * switcher types into the PTY is built here so it can be unit-tested
+ * byte-for-byte: env dicts become `KEY=value ` prefixes with shell-quoted
+ * values, and missing agents get a fully visible `install && run` compound.
  */
 
 /** Characters that never need quoting in a POSIX shell word. */
@@ -30,16 +30,16 @@ export function envPrefix(env: Record<string, string>): string {
     .join("");
 }
 
-/** What clicking an installed agent pill types (before the newline). */
+/** What picking an installed agent types (before the newline). */
 export function agentRunCommand(agent: Pick<Agent, "command" | "env">): string {
   return `${envPrefix(agent.env)}${agent.command}`;
 }
 
 /**
- * What clicking a missing agent's "install & run" pill types: the install
- * command, visibly chained into the run command. Null when the agent has no
- * install command (the pill then falls back to the plain run command, letting
- * the shell report command-not-found honestly).
+ * What picking a missing agent types: the install command, visibly chained
+ * into the run command. Null when the agent has no install command (the menu
+ * then falls back to the plain run command, letting the shell report
+ * command-not-found honestly).
  */
 export function agentInstallAndRunCommand(
   agent: Pick<Agent, "command" | "env" | "install">,

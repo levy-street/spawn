@@ -2,6 +2,7 @@ import { expect, type Page, test } from "@playwright/test";
 import { move, remove, resize, type Tile } from "../../src/lib/grid";
 import {
   type AppMockOptions,
+  envelope,
   mockApp,
   SESSION_B_ID,
   SESSION_ID,
@@ -54,6 +55,7 @@ async function setupGrid(
   return { store, connections };
 }
 
+/** Press the title bar itself — the whole bar is the drag surface. */
 async function dragTile(
   page: Page,
   sessionId: string,
@@ -65,10 +67,10 @@ async function dragTile(
   const area = element.locator("..");
   const tileBox = await element.boundingBox();
   const areaBox = await area.boundingBox();
-  const gripBox = await element.getByRole("button", { name: /^Move / }).boundingBox();
-  if (!tileBox || !areaBox || !gripBox) throw new Error("grid geometry unavailable");
-  const startX = gripBox.x + gripBox.width / 2;
-  const startY = gripBox.y + gripBox.height / 2;
+  const barBox = await element.getByRole("toolbar").boundingBox();
+  if (!tileBox || !areaBox || !barBox) throw new Error("grid geometry unavailable");
+  const startX = barBox.x + barBox.width * 0.4;
+  const startY = barBox.y + barBox.height / 2;
   const pointerOffsetX = startX - tileBox.x;
   const pointerOffsetY = startY - tileBox.y;
   await page.mouse.move(startX, startY);
@@ -96,34 +98,36 @@ test("renders layout v2 and persists drag output from grid.move", async ({ page 
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]).toEqual({
     id: WORKSPACE_ID,
-    body: { layout: { version: 2, tiles: move(initial, SESSION_ID, 0, 6) } },
+    body: { layout: envelope({ version: 2, tiles: move(initial, SESSION_ID, 0, 6) }) },
   });
 });
 
-test("a blocked full-height drag swaps columns and exposes the exchange highlight", async ({
-  page,
-}) => {
+test("dropping a pane onto another docks it against the hovered edge", async ({ page }) => {
   const initial: Tile[] = [
     { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
     { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
   ];
   const { store } = await setupGrid(page, initial);
-  await dragTile(page, SESSION_ID, 6, 0, async () => {
-    await expect(
-      page.locator(`[data-grid-tile="${SESSION_B_ID}"][data-swap-target]`),
-    ).toBeVisible();
-    await expect(page.locator("[data-swap]")).toBeVisible();
-  });
+  // The drag ends with the pointer in the second pane's top zone: the first
+  // pane's vacated column is absorbed, the target splits horizontally, and
+  // the dragged pane takes the top half (iTerm-style dock).
+  await dragTile(page, SESSION_ID, 6, 0);
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]?.body).toEqual({
-    layout: { version: 2, tiles: move(initial, SESSION_ID, 6, 0) },
+    layout: envelope({
+      version: 2,
+      tiles: [
+        { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 6 },
+        { session_id: SESSION_B_ID, x: 0, y: 6, w: 12, h: 6 },
+      ],
+    }),
   });
 });
 
 test("the southeast resize handle persists grid.resize output", async ({ page }) => {
   const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 6 }];
   const { store } = await setupGrid(page, initial, { sessionFixtures: [session()] });
-  const handle = page.getByRole("button", { name: "Resize palette" });
+  const handle = page.getByRole("button", { name: "Resize palette (bottom-right corner)" });
   const tileBox = await page.locator(`[data-grid-tile="${SESSION_ID}"]`).boundingBox();
   const handleBox = await handle.boundingBox();
   if (!tileBox || !handleBox) throw new Error("resize geometry unavailable");
@@ -133,8 +137,80 @@ test("the southeast resize handle persists grid.resize output", async ({ page })
   await page.mouse.up();
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]?.body).toEqual({
-    layout: { version: 2, tiles: resize(initial, SESSION_ID, 9, 9) },
+    layout: envelope({ version: 2, tiles: resize(initial, SESSION_ID, 9, 9) }),
   });
+});
+
+test("dragging the seam between two panes trades width between them", async ({ page }) => {
+  const initial: Tile[] = [
+    { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
+    { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+  ];
+  const { store } = await setupGrid(page, initial);
+  const seam = page.locator("[data-grid-divider='vertical-6-0']");
+  const seamBox = await seam.boundingBox();
+  const areaBox = await page
+    .locator(`[data-grid-tile="${SESSION_ID}"]`)
+    .locator("..")
+    .boundingBox();
+  if (!seamBox || !areaBox) throw new Error("seam geometry unavailable");
+
+  await page.mouse.move(seamBox.x + seamBox.width / 2, seamBox.y + seamBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(areaBox.x + (8 / 12) * areaBox.width, seamBox.y + seamBox.height / 2, {
+    steps: 4,
+  });
+  await page.mouse.up();
+
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  expect(store.requests.workspacePatches[0]?.body).toEqual({
+    layout: envelope({
+      version: 2,
+      tiles: [
+        { session_id: SESSION_ID, x: 0, y: 0, w: 8, h: 12 },
+        { session_id: SESSION_B_ID, x: 8, y: 0, w: 4, h: 12 },
+      ],
+    }),
+  });
+});
+
+test("clicking the title bar without moving is not a drag", async ({ page }) => {
+  const initial: Tile[] = [
+    { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
+    { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+  ];
+  const { store } = await setupGrid(page, initial);
+  const tile = page.locator(`[data-grid-tile="${SESSION_ID}"]`);
+  const before = await tile.boundingBox();
+  await page.getByRole("toolbar", { name: "palette pane controls" }).click();
+  // Long enough for the debounced layout save to have fired, had one been queued.
+  await page.waitForTimeout(700);
+  expect((await tile.boundingBox())?.x).toBeCloseTo(before?.x ?? -1, 0);
+  expect(store.requests.workspacePatches).toHaveLength(0);
+});
+
+test("shrinking a pane leaves empty canvas you can drop a pane into", async ({ page }) => {
+  const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }];
+  const { store } = await setupGrid(page, initial, { sessionFixtures: [session()] });
+  const handle = page.getByRole("button", { name: "Resize palette (bottom-right corner)" });
+  const areaBox = await page
+    .locator(`[data-grid-tile="${SESSION_ID}"]`)
+    .locator("..")
+    .boundingBox();
+  const handleBox = await handle.boundingBox();
+  if (!areaBox || !handleBox) throw new Error("resize geometry unavailable");
+
+  await page.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + handleBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(areaBox.x + areaBox.width / 2, areaBox.y + areaBox.height, { steps: 4 });
+  await page.mouse.up();
+
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  expect(store.requests.workspacePatches[0]?.body).toEqual({
+    layout: envelope({ version: 2, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 }] }),
+  });
+  // The freed half is offered as a drop target rather than being repacked.
+  await expect(page.locator("[data-grid-opening='6,0,6,12']")).toBeVisible();
 });
 
 test("removing a tile re-packs and expands the survivor", async ({ page }) => {
@@ -144,10 +220,14 @@ test("removing a tile re-packs and expands the survivor", async ({ page }) => {
   ];
   const { store } = await setupGrid(page, initial);
   await page.getByRole("button", { name: "palette options" }).click();
-  await page.getByRole("menuitem", { name: "Remove from workspace" }).click();
+  await page.getByRole("menuitem", { name: "Close session" }).click();
+  await page
+    .getByRole("dialog", { name: /^Close / })
+    .getByRole("button", { name: "Close session" })
+    .click();
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]?.body).toEqual({
-    layout: { version: 2, tiles: remove(initial, SESSION_ID) },
+    layout: envelope({ version: 2, tiles: remove(initial, SESSION_ID) }),
   });
 });
 
@@ -196,13 +276,13 @@ test("empty workspaces offer session creation", async ({ page }) => {
   await expect(page.getByRole("button", { name: "New session" })).toBeVisible();
 });
 
-test("a session needing attention gets a warning hairline", async ({ page }) => {
+test("a session needing attention says so on its icon badge", async ({ page }) => {
   await setupGrid(page, [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }], {
     sessionFixtures: [session({ activity_state: "waiting", activity_label: "Needs input" })],
   });
   await expect(
-    page.getByRole("region", { name: "palette" }).locator("span.bg-warning"),
-  ).toHaveCount(1);
+    page.getByRole("region", { name: "palette" }).getByRole("img", { name: "Needs input" }),
+  ).toBeVisible();
 });
 
 test("a failed layout PATCH rolls the optimistic drag back", async ({ page }) => {
@@ -211,12 +291,21 @@ test("a failed layout PATCH rolls the optimistic drag back", async ({ page }) =>
     { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 6 },
   ];
   const { store } = await setupGrid(page, initial);
-  const before = await page.locator(`[data-grid-tile="${SESSION_ID}"]`).boundingBox();
+  const tile = page.locator(`[data-grid-tile="${SESSION_ID}"]`);
+  const area = tile.locator("..");
   store.failNextWorkspacePatch(503, "layout unavailable");
   await dragTile(page, SESSION_ID, 0, 6);
-  await expect(page.getByRole("alert")).toContainText("layout unavailable");
+  await expect(page.locator("p[role='alert']")).toContainText("layout unavailable");
+  // Measured against the grid area: the error banner shifts the whole page.
   await expect
-    .poll(async () => (await page.locator(`[data-grid-tile="${SESSION_ID}"]`).boundingBox())?.y)
-    .toBeCloseTo(before?.y ?? 0, 0);
-  expect((store.workspaces[0]?.layout as { tiles: Tile[] }).tiles).toEqual(initial);
+    .poll(async () => {
+      const tileBox = await tile.boundingBox();
+      const areaBox = await area.boundingBox();
+      return tileBox && areaBox ? Math.round(tileBox.y - areaBox.y) : null;
+    })
+    .toBe(0);
+  expect(
+    (store.workspaces[0]?.layout as { tabs: Array<{ layout: { tiles: Tile[] } }> }).tabs[0]?.layout
+      .tiles,
+  ).toEqual(initial);
 });

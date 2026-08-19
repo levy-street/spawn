@@ -18,7 +18,7 @@ from typing import Any
 
 GRID_COLS = 12
 GRID_ROWS = 12
-MIN_TILE_SIZE = 3
+MIN_TILE_SIZE = 2
 MAX_TILES = 8
 
 Tile = dict[str, Any]
@@ -149,11 +149,11 @@ def _area_free(cells: set[tuple[int, int]], x: int, y: int, w: int, h: int) -> b
 
 
 def auto_place(tiles: list[Tile]) -> tuple[list[Tile], Rect | None]:
-    """Place a new tile: first free 3×3 scanning y then x, greedily grown.
+    """Place a new tile: first free 2×2 scanning y then x, greedily grown.
 
     Returns ``(tiles, rect)`` — the possibly-updated list plus the new
-    geometry (no session_id; the caller appends it). When no 3×3 is free,
-    the largest splittable tile (``max(w, h) >= 6``; ties broken by reading
+    geometry (no session_id; the caller appends it). When no 2×2 is free,
+    the largest splittable tile (``max(w, h) >= 4``; ties broken by reading
     order) is cut along its longer axis (vertical cut when ``w >= h``): it
     keeps ``ceil(side/2)`` and the new rect gets ``floor(side/2)``. At the
     MAX_TILES cap, or when nothing is splittable, the rect is ``None`` —
@@ -250,15 +250,30 @@ def _intersection_area(a: Tile, b: Rect) -> int:
     return dx * dy if dx > 0 and dy > 0 else 0
 
 
-def move(tiles: list[Tile], session_id: str, x: int, y: int) -> list[Tile]:
-    """Cascade-and-compact packing reorder with a swap fallback.
+def _fits(tiles: list[Tile], rect: Rect, skip_id: str | None = None) -> bool:
+    """True when `rect` overlaps no tile except the one named by `skip_id`."""
+    return not any(
+        tile["session_id"] != skip_id and _overlaps(tile, rect) for tile in tiles
+    )
 
-    The target is clamped into the canvas; overlapped tiles cascade down and
-    everything compacts (the moved tile is not pinned). When the cascade
-    cannot resolve inside the canvas, or the compacted result is identical
-    to the input, the move falls back to swapping rects with the tile that
-    overlaps the target rect most (ties → reading order). No overlapped tile
-    either → no-op. Unknown id → input unchanged (sorted).
+
+def _contains(outer: Rect, inner: Rect) -> bool:
+    return (
+        inner["x"] >= outer["x"]
+        and inner["y"] >= outer["y"]
+        and inner["x"] + inner["w"] <= outer["x"] + outer["w"]
+        and inner["y"] + inner["h"] <= outer["y"] + outer["h"]
+    )
+
+
+def move(tiles: list[Tile], session_id: str, x: int, y: int) -> list[Tile]:
+    """Free placement, with a swap when the target rect is occupied.
+
+    The target is clamped into the canvas. An empty target rect is simply
+    taken, and the gap the tile leaves behind stays a gap — nothing repacks.
+    An occupied one swaps rects (position AND size) with the tile that
+    overlaps the target most (ties → reading order). Unknown id → input
+    unchanged (sorted).
     """
     original = _copy_sorted(tiles)
     target = next((tile for tile in original if tile["session_id"] == session_id), None)
@@ -269,21 +284,13 @@ def move(tiles: list[Tile], session_id: str, x: int, y: int) -> list[Tile]:
     ty = max(0, min(y, GRID_ROWS - target["h"]))
     target_rect: Rect = {"x": tx, "y": ty, "w": target["w"], "h": target["h"]}
 
-    working = [dict(tile) for tile in original]
-    for tile in working:
-        if tile["session_id"] == session_id:
-            tile["x"] = tx
-            tile["y"] = ty
-    candidate = compact(_push_down(working, session_id))
-    if all(_in_bounds(tile) for tile in candidate) and candidate != original:
-        return candidate
+    others = [tile for tile in original if tile["session_id"] != session_id]
+    if _fits(others, target_rect):
+        moved = {**target, "x": tx, "y": ty}
+        return _sorted_reading([moved, *others])
 
-    overlapped = [
-        tile
-        for tile in original
-        if tile["session_id"] != session_id and _intersection_area(tile, target_rect) > 0
-    ]
-    if not overlapped:
+    overlapped = [tile for tile in others if _intersection_area(tile, target_rect) > 0]
+    if not overlapped:  # unreachable: an occupied rect intersects something
         return original
     best = overlapped[0]
     for tile in overlapped[1:]:
@@ -301,49 +308,74 @@ def move(tiles: list[Tile], session_id: str, x: int, y: int) -> list[Tile]:
 
 
 def resize(tiles: list[Tile], session_id: str, w: int, h: int) -> list[Tile]:
-    """Clamp to the invariants, cascade collisions down, compact. No swap
-    fallback: an unresolvable cascade returns the input unchanged (sorted)."""
+    """Resize about the tile's own origin, clamped to the invariants.
+
+    Nothing else moves: shrinking leaves empty canvas behind, and growing
+    succeeds only into space that is already empty — a growth that would
+    overlap returns the input unchanged (sorted). Unknown id likewise.
+    """
     original = _copy_sorted(tiles)
     target = next((tile for tile in original if tile["session_id"] == session_id), None)
     if target is None:
         return original
-    working = [dict(tile) for tile in original]
-    for tile in working:
-        if tile["session_id"] == session_id:
-            tile["w"] = max(MIN_TILE_SIZE, min(w, GRID_COLS - tile["x"]))
-            tile["h"] = max(MIN_TILE_SIZE, min(h, GRID_ROWS - tile["y"]))
-    candidate = compact(_push_down(working, session_id))
-    if not all(_in_bounds(tile) for tile in candidate):
+    resized: Tile = {
+        **target,
+        "w": max(MIN_TILE_SIZE, min(w, GRID_COLS - target["x"])),
+        "h": max(MIN_TILE_SIZE, min(h, GRID_ROWS - target["y"])),
+    }
+    others = [tile for tile in original if tile["session_id"] != session_id]
+    if not _fits(others, resized):
         return original
-    return candidate
-
-
-def _expand_into_free_space(tiles: list[Tile]) -> list[Tile]:
-    """One expansion pass in reading order: grow right, then down, against
-    the current (already expanded) sizes of the others."""
-    out = [dict(tile) for tile in tiles]
-    for tile in _sorted_reading(out):
-        others = [other for other in out if other is not tile]
-        cells = _occupied_cells(others)
-        while tile["x"] + tile["w"] < GRID_COLS and _area_free(
-            cells, tile["x"] + tile["w"], tile["y"], 1, tile["h"]
-        ):
-            tile["w"] += 1
-        while tile["y"] + tile["h"] < GRID_ROWS and _area_free(
-            cells, tile["x"], tile["y"] + tile["h"], tile["w"], 1
-        ):
-            tile["h"] += 1
-    return _sorted_reading(out)
+    return _sorted_reading([resized, *others])
 
 
 def remove(tiles: list[Tile], session_id: str) -> list[Tile]:
-    """Drop a tile, compact, then expand survivors to keep the canvas
-    filled. Unknown id → input unchanged (sorted), no compaction."""
+    """Drop a tile and let the survivors absorb the rectangle it freed.
+
+    Nothing else on the canvas moves. Survivors grow one cell at a time in
+    reading order, trying right, down, left, then up; a step is taken only
+    when every cell it gains lies inside the freed rectangle and is still
+    empty, and passes repeat until no tile can grow. Unknown id → input
+    unchanged (sorted).
+    """
     original = _copy_sorted(tiles)
-    if not any(tile["session_id"] == session_id for tile in original):
+    dropped = next((tile for tile in original if tile["session_id"] == session_id), None)
+    if dropped is None:
         return original
-    remaining = [tile for tile in original if tile["session_id"] != session_id]
-    return _expand_into_free_space(compact(remaining))
+    kept = [dict(tile) for tile in original if tile["session_id"] != session_id]
+    freed: Rect = {k: dropped[k] for k in ("x", "y", "w", "h")}
+
+    growing = True
+    while growing:
+        growing = False
+        for tile in kept:
+            steps: list[tuple[Rect, Rect]] = [
+                (
+                    {"x": tile["x"] + tile["w"], "y": tile["y"], "w": 1, "h": tile["h"]},
+                    {**tile, "w": tile["w"] + 1},
+                ),
+                (
+                    {"x": tile["x"], "y": tile["y"] + tile["h"], "w": tile["w"], "h": 1},
+                    {**tile, "h": tile["h"] + 1},
+                ),
+                (
+                    {"x": tile["x"] - 1, "y": tile["y"], "w": 1, "h": tile["h"]},
+                    {**tile, "x": tile["x"] - 1, "w": tile["w"] + 1},
+                ),
+                (
+                    {"x": tile["x"], "y": tile["y"] - 1, "w": tile["w"], "h": 1},
+                    {**tile, "y": tile["y"] - 1, "h": tile["h"] + 1},
+                ),
+            ]
+            for gained, grown in steps:
+                if not _contains(freed, gained):
+                    continue
+                if not _fits(kept, grown, tile["session_id"]):
+                    continue
+                tile.update(grown)
+                growing = True
+                break
+    return _sorted_reading(kept)
 
 
 def _round_half_up(value: float) -> int:
@@ -399,7 +431,7 @@ def from_split_tree(root: dict[str, Any] | None) -> list[Tile]:
     """Convert a v1 split tree to v2 tiles (migration 0031).
 
     Float edges are assigned recursively from ``(0, 0, 12, 12)`` and rounded
-    with ``floor(v + 0.5)``. If any rounded tile ends below the 3×3 minimum,
+    with ``floor(v + 0.5)``. If any rounded tile ends below the 2×2 minimum,
     out of bounds, or overlapping, the whole layout falls back to repeated
     ``auto_place`` over the panes in v1 DFS order. Trees with more than 8
     panes keep the first 8. The v1 pane ``agent_id`` becomes the tile

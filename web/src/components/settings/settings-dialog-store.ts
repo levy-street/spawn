@@ -13,6 +13,7 @@ export type SettingsTab =
   | "hosts"
   | "agents"
   | "skills"
+  | "templates"
   | "devices"
   | "trust";
 

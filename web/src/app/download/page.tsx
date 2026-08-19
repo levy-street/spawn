@@ -10,14 +10,15 @@ import {
   Laptop,
   MonitorCog,
   Server,
-  SquareTerminal,
   Terminal,
 } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
+import { Trident, WORDMARK_CLASS } from "@/components/icons/BrandMark";
 import { Button } from "@/components/ui/button";
 import { detectPlatform, type PlatformOS, UNDETECTED_PLATFORM } from "@/lib/platform";
+import { cn } from "@/lib/utils";
 
 const PLATFORM_COPY: Record<
   PlatformOS,
@@ -111,9 +112,9 @@ export default function DownloadPage() {
   return (
     <main className="min-h-vv bg-brand-bg text-foreground">
       <nav className="mx-auto flex w-full max-w-7xl items-center justify-between px-4 py-5 sm:px-6 lg:px-8">
-        <Link href="/" className="flex items-center gap-3 text-lg font-semibold">
-          <SquareTerminal className="size-7 shrink-0" aria-hidden />
-          <span>spawnd</span>
+        <Link href="/" className="flex items-center gap-2.5 text-brand-accent">
+          <Trident className="size-7 shrink-0" />
+          <span className={cn(WORDMARK_CLASS, "text-[19px]")}>spawnd</span>
         </Link>
         <Button asChild variant="ghost" size="sm">
           <Link href="/">

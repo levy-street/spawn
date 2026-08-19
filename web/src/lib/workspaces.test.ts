@@ -18,7 +18,13 @@ function makeWorkspace(tiles: Tile[], overrides: Partial<Workspace> = {}): Works
   return {
     id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
     name: "Workspace 1",
-    layout: { version: 2, tiles },
+    host_id: null,
+    cwd: null,
+    layout: {
+      version: 3,
+      active_tab: "tab-1",
+      tabs: [{ id: "tab-1", name: "Tab 1", layout: { version: 2, tiles } }],
+    },
     position: 0,
     created_at: "2026-08-19T00:00:00Z",
     updated_at: "2026-08-19T00:00:00Z",

@@ -45,10 +45,42 @@ add UI for that store until a current shell-session design is accepted.
 `--background`, `--foreground`, `--muted`, `--muted-foreground`, `--card`,
 `--card-foreground`, `--popover`, `--popover-foreground`, `--primary`,
 `--primary-foreground`, `--secondary`, `--secondary-foreground`, `--accent`,
-`--accent-foreground`, `--border`, `--input`, `--ring`, `--terminal-bg`, and
-the brand-page stack `--brand-bg` / `--brand-panel` / `--brand-well` /
-`--brand-hairline`. Both themes are pure neutral (`oklch(L 0 0)`); light is
-the same ramp read from the other end.
+`--accent-foreground`, `--border`, `--input`, `--ring`, `--terminal-bg`,
+`--shell`, and the brand-page stack `--brand-bg` / `--brand-panel` /
+`--brand-well` / `--brand-hairline`. `--shell` is the app-shell ground — the
+sidebar, the frame the content panel floats in, and the workspace grid's
+gutter — set a step off the content panel in each theme (lighter in dark at
+`oklch(0.225 0 0)`, darker in light at `oklch(0.945 0 0)`) so chrome and
+content never read as one surface.
+
+The workspace tab strip (`workspace-tabs.tsx`) is the same move again: the
+strip is a band of `--shell` and the selected tab is a `--background` shape
+cut into it (rounded top, flush bottom) — content rising into the chrome. An
+empty tab's canvas is `--card`, one step darker than the shell ground, so a
+fresh tab reads as a surface awaiting panes rather than more chrome.
+
+Pane focus rides the same figure/ground idea rather than a fourth token: the
+focused pane is left as `--background`, the deepest surface in the stack, and
+every other pane takes a `bg-foreground/[0.035]` wash on top — lighter in dark,
+greyer in light, receding in both. Focus draws **no ring**; the background is
+the whole signal. The only ring a pane draws is the cross-highlight from
+hovering its row in the sidebar, and a pane never draws it for its own hover. It has to be an overlay, not a background
+swap: xterm paints its own opaque canvas, so a pane's own `bg-*` never shows
+through the terminal. These are pure neutral (`oklch(L 0 0)`) in both themes;
+light is the same ramp read from the other end.
+
+### Brand accent (theme-swapped)
+
+`--brand-accent` / `--brand-accent-soft` — the landing page's hellfire
+(`#ff4930` = `oklch(0.666 0.222 31)`) carried into the app chrome as its one
+non-status accent. Light is `oklch(0.55 0.2 31)`, at the same L ≤ 0.55 the
+status hues use so it clears 4.5:1 on `--background`; dark is
+`oklch(0.67 0.22 31)`, the landing value. It is *not* a status color and
+carries no meaning — it is identity. Used by the `spawnd` wordmark, the
+launcher's `+`, and `::selection`. `--ring` is **neutral** — `--foreground`
+in both themes, ring width 1px on the form primitives — a focus ring is never
+the accent red. Do not reach for the accent to signal state; that is what the
+`success` / `warning` / `info` / `destructive` families are for.
 
 ### Semantic status (theme-swapped; the only chroma in the app palette)
 
@@ -91,6 +123,10 @@ text hues on purpose — an 8px dot needs punch, not reading contrast.
 | `--sidebar-rail-width` | `56px` | collapsed sidebar rail |
 | `--row-h` | `2.25rem` | the 36px nav-row rhythm (sidebar rows, list rows) |
 | `--pane-gap` | `6px` | workspace grid gutter |
+| `--content-inset` | `0px`, raised to `8px` by `<main>` at `@md/shell` | gap around the floating content panel. The sidebar is full-bleed chrome; `<main>` is a rounded panel on it. Nothing in this stack outlines itself
+with a hairline — figure and ground do the separating: `--shell` behind
+`--background` for the panel, and again for the workspace grid's gutter
+behind its session panes. Anything sizing itself off `--vv-height` inside the shell subtracts `2*var(--content-inset)`. Raised on `<main>`, **not** on the `@container/shell` root — an element cannot container-query the container it establishes, so an `@md/shell:` variant there never matches |
 
 No Tailwind utility names; consume as arbitrary values —
 `w-(--sidebar-width)`, `h-(--row-h)`, `gap-(--pane-gap)`. Never re-declare
@@ -105,16 +141,26 @@ these as TS constants in components.
   moves use `transform 150ms` with it.
 - `prefers-reduced-motion` collapses every animation/transition globally; do
   not add per-component motion opt-outs.
+- Cursors: Tailwind v4's Preflight sets `cursor: default` on buttons, so
+  `globals.css` restores `cursor: pointer` for `button`, `[role="button"]`,
+  `[role="menuitem"]`, `[role="option"]`, `[role="tab"]`, `label[for]`, and
+  `summary` in `@layer base`. Disabled controls are excluded. Because it is a
+  base rule, any explicit `cursor-*` utility still wins — that is how the
+  drag/resize grips and the deliberately arrow-cursored menu items keep their
+  own cursors. Do not add `cursor-pointer` to individual buttons.
 - `--vv-height` / `--vv-keyboard` track the visual viewport (on-screen
   keyboard); `--safe-*` are the safe-area insets. Utilities: `h-vv`,
   `min-h-vv`, `pad-safe-top/bottom/x`. Every full-height overlay (dialog,
   drawer, sheet) caps itself to `--vv-height`.
 
-### Grimoire (marketing only)
+### Grimoire (marketing surfaces)
 
 `--color-void/char/panelg/line-g/line-strong/bone/ash/hellfire/blood/ember`
 plus `--font-grimoire/sigil` — fixed constants for the `.grimoire` landing
-skin. Never used inside app chrome.
+skin. App chrome does not paint with these; it reaches the same brand through
+the theme-swapped `--brand-accent` above. The two sanctioned crossings are the
+shared brand lockup (`components/icons/BrandMark.tsx`) and `--font-sigil`,
+which the wordmark uses on every surface.
 
 ## Primitives (`web/src/components/ui/`)
 
@@ -135,8 +181,9 @@ tokens only.
 | `empty-state.tsx` | `EmptyState` (`icon`, `title`, `body`, `action`) | empty workspace, no hosts, empty lists |
 | `dialog.tsx` | `Dialog`, `DialogContent` (`size`: `sm`/`md`/`lg`/`full-mobile`), `DialogHeader/Title/Description/Footer/Trigger/Close` | every modal. `full-mobile` = full screen under `md:`, large panel above |
 | `confirm.tsx` | `confirm(opts): Promise<boolean>`, `useConfirm`, `ConfirmHost` | destructive/irreversible actions. `ConfirmHost` is mounted once in the app shell; never build ad-hoc confirm dialogs |
+| `toast.tsx` | `toast(msg)`, `toast.error(msg)`, `ToastHost` | transient outcome/error notices (replaces inline error banners). `ToastHost` is mounted once in the app shell; duplicates coalesce; errors linger longer. The stack sits above the pane launcher, bottom-right |
 | `dropdown-menu.tsx` | `DropdownMenu` (render-prop trigger, `openAt` handle), `DropdownMenuItem/Separator/Label` | single-level menus, kebabs, right-click menus |
-| `cascade-menu.tsx` | `CascadeMenu`, `CascadePanel`, `CascadeItem` | multi-step pick-one flows (the `+` new-session cascade). Panels are data; per-panel `loading`; renders as a bottom sheet on small viewports |
+| `cascade-menu.tsx` | `CascadeMenu`, `CascadePanel`, `CascadeItem` | multi-step pick-one flows (the `+` new-session cascade). Panels are data; per-panel `loading`; items can be `heading` section labels; renders as a bottom sheet on small viewports |
 | `sheet.tsx` | `BottomSheet` | mobile bottom-sheet container (drag handle, scrim, `--vv-height` cap) |
 | `drawer.tsx` | `Drawer` | left slide-in panel (the mobile sidebar): scrim, drag-to-dismiss, focus trap |
 | `tooltip.tsx` | `RailTooltip` | collapsed-sidebar hover/focus hints |
@@ -147,17 +194,27 @@ Usage rules:
   dropdowns manually.
 - Anything that asks "are you sure" goes through `confirm()`. `window.confirm`
   / `window.prompt` are banned.
+- Errors from background work (layout saves, polling, tab CRUD) go through
+  `toast.error()`, not inline banners — the surface that failed usually isn't
+  where the user is looking.
 - Overlays own their own scrim, Escape handling, focus behavior, and scroll
   locking — callers only control `open`.
 
 ## Icons
 
 - `components/icons/AgentIcon.tsx` — agent identity everywhere (sidebar
-  session rows, pane headers, shortcut bar). Resolves definition `kind`
+  session rows, pane headers, agent switcher). Resolves definition `kind`
   first, then the foreground/command basename: bundled marks for
   `claude-code`, `codex`, `opencode`, `aider`; terminal glyph for
   `bash|zsh|fish|sh|dash`; first-letter monogram otherwise. Props:
   `{kind?, command?, size?, className?}`.
+- `components/icons/BrandMark.tsx` — the spawnd trident (`Trident`) and the
+  wordmark's typography (`WORDMARK_CLASS`: sigil mono, lowercase, `0.22em`
+  tracking). One lockup for the landing nav, the download nav, the auth shell,
+  the sidebar header, and the mobile header. The trident art is fixed hellfire
+  like the `AgentIcon` plates — a logo keeps its identity in both themes — so
+  only the wordmark's color varies: `text-brand-accent` in app chrome,
+  `text-hellfire` on `.grimoire` grounds.
 - Everything else uses `lucide-react` at `size-4` (16px) inside `size-7`+
   hit areas.
 

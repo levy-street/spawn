@@ -10,6 +10,7 @@ import {
   sessionAtShell,
   sessionNeedsAttention,
   sessionTitle,
+  sessionTitleDetail,
 } from "./sessions";
 
 function makeSession(overrides: Partial<Session> = {}): Session {
@@ -38,15 +39,24 @@ describe("sessionTitle", () => {
     expect(sessionTitle(makeSession({ name: "  build box  " }))).toBe("build box");
   });
 
-  test("derives host - folder from the cwd", () => {
-    expect(sessionTitle(makeSession())).toBe("laptop - spawn");
-    expect(sessionTitle(makeSession({ cwd: "/Users/me/projects/spawn/" }))).toBe("laptop - spawn");
-    expect(sessionTitle(makeSession({ cwd: "C:\\Users\\me\\dev" }))).toBe("laptop - dev");
+  test("pairs the folder with what is running in it", () => {
+    expect(sessionTitle(makeSession())).toBe("spawn · Shell");
+    expect(sessionTitle(makeSession({ cwd: "/Users/me/projects/spawn/" }))).toBe("spawn · Shell");
+    expect(sessionTitle(makeSession({ cwd: "C:\\Users\\me\\dev" }))).toBe("dev · Shell");
+    expect(sessionTitle(makeSession({ foreground_command: "claude" }))).toBe("spawn · Claude Code");
+    expect(sessionTitle(makeSession({ foreground_command: "zsh" }))).toBe("spawn · zsh");
   });
 
-  test("falls back to the folder, then a short id, without a host name", () => {
-    expect(sessionTitle(makeSession({ host_name: null }))).toBe("spawn");
-    expect(sessionTitle(makeSession({ host_name: null, cwd: "" }))).toBe("0f9b2c69");
+  test("falls back to a short id when there is no folder", () => {
+    expect(sessionTitle(makeSession({ cwd: "" }))).toBe("0f9b2c69 · Shell");
+  });
+});
+
+describe("sessionTitleDetail", () => {
+  test("spells out host, path, and program for the tooltip", () => {
+    expect(sessionTitleDetail(makeSession({ foreground_command: "claude" }))).toBe(
+      "laptop · /Users/me/projects/spawn · Claude Code",
+    );
   });
 });
 

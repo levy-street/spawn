@@ -1,24 +1,20 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Ellipsis, FolderOpen, Pencil, Trash2 } from "lucide-react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
-import { SessionFilesAside } from "@/components/files/session-files-aside";
 import { AppShell } from "@/components/nav/AppShell";
-import { Button } from "@/components/ui/button";
-import { confirm } from "@/components/ui/confirm";
-import {
-  DropdownMenu,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-} from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { toast } from "@/components/ui/toast";
+import { LauncherFab } from "@/components/workspace/launcher-fab";
 import { WorkspaceGrid } from "@/components/workspace/workspace-grid";
-import { ApiError, sessions, type Workspace, workspaces } from "@/lib/api";
-import { readingOrder } from "@/lib/grid";
+import { WorkspaceTabs } from "@/components/workspace/workspace-tabs";
+import { ApiError, sessions, workspaces } from "@/lib/api";
+import { readingOrder, type Tile } from "@/lib/grid";
+import { activeTab, tabById, tabOfSession, tabTiles } from "@/lib/tabs";
+
+const TAB_STORAGE_PREFIX = "spawn.workspace.tab.";
 
 export default function WorkspacePage() {
   const params = useParams<{ id: string }>();
@@ -38,12 +34,16 @@ function WorkspaceView({ workspaceId }: { workspaceId: string }) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const queryClient = useQueryClient();
-  const [editingName, setEditingName] = useState(false);
-  const [draftName, setDraftName] = useState("");
-  const [filesOpen, setFilesOpen] = useState(false);
   const [focusedId, setFocusedId] = useState<string | null>(searchParams.get("focus"));
-  const [savingLayout, setSavingLayout] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // Errors surface as toasts; null clears nothing (toasts expire on their
+  // own). Stable identity: children key gesture listeners on this callback.
+  const reportError = useCallback((message: string | null) => {
+    if (message) toast.error(message);
+  }, []);
+  const [chosenTabId, setChosenTabId] = useState<string | null>(() => searchParams.get("tab"));
+  // The grid's live drag preview; the strip restyles the selected tab from it
+  // mid-gesture instead of waiting for the drop to commit.
+  const [previewTiles, setPreviewTiles] = useState<Tile[] | null>(null);
 
   const workspaceQ = useQuery({
     queryKey: ["workspace", workspaceId],
@@ -78,79 +78,57 @@ function WorkspaceView({ workspaceId }: { workspaceId: string }) {
   }, [queryClient, router, workspaceId, workspaceQ.error, workspacesQ.data, workspacesQ.isLoading]);
 
   const workspace = workspaceQ.data;
+
+  /*
+   * Which tab is open. Explicit choices (clicks, ?tab=, a ?focus= session's
+   * home tab) win; then the last tab used on this device; then the envelope's
+   * own active_tab. Choices persist per workspace in localStorage — the
+   * server's active_tab is only written as a side effect of layout writes, so
+   * two devices never fight over it.
+   */
+  const activeTabId = useMemo(() => {
+    if (!workspace) return null;
+    if (chosenTabId && tabById(workspace.layout, chosenTabId)) return chosenTabId;
+    const focusParam = searchParams.get("focus");
+    const focusTab = focusParam ? tabOfSession(workspace.layout, focusParam) : null;
+    if (focusTab) return focusTab.id;
+    const stored = window.localStorage.getItem(`${TAB_STORAGE_PREFIX}${workspaceId}`);
+    if (stored && tabById(workspace.layout, stored)) return stored;
+    return activeTab(workspace.layout).id;
+  }, [chosenTabId, searchParams, workspace, workspaceId]);
+
+  const switchTab = (tabId: string) => {
+    setChosenTabId(tabId);
+    window.localStorage.setItem(`${TAB_STORAGE_PREFIX}${workspaceId}`, tabId);
+  };
+
+  // The sidebar links sessions as /w/<id>?tab=<tabId>; honor param changes.
+  useEffect(() => {
+    const param = searchParams.get("tab");
+    if (param) setChosenTabId(param);
+  }, [searchParams]);
+
   const workspaceSessions = useMemo(() => {
     if (!workspace) return [];
-    const ids = new Set(workspace.layout.tiles.map((tile) => tile.session_id));
+    const ids = new Set(
+      workspace.layout.tabs.flatMap((tab) => tab.layout.tiles.map((tile) => tile.session_id)),
+    );
     return (sessionsQ.data ?? []).filter((session) => ids.has(session.id));
   }, [sessionsQ.data, workspace]);
-  const focusedSession =
-    workspaceSessions.find((session) => session.id === focusedId) ??
-    workspaceSessions.find(
-      (session) => session.id === readingOrder(workspace?.layout.tiles ?? [])[0],
-    ) ??
-    null;
 
   useEffect(() => {
-    if (!workspace) return;
-    const ids = readingOrder(workspace.layout.tiles);
+    if (!workspace || !activeTabId) return;
+    const ids = readingOrder(tabTiles(workspace.layout, activeTabId));
     if (ids.length === 0) {
       setFocusedId(null);
-      setFilesOpen(false);
     } else if (!focusedId || !ids.includes(focusedId)) {
       setFocusedId(ids[0] ?? null);
     }
-  }, [focusedId, workspace]);
-
-  const renameM = useMutation({
-    mutationFn: (name: string) => workspaces.update(workspaceId, { name }),
-    onSuccess: (saved) => {
-      queryClient.setQueryData(["workspace", workspaceId], saved);
-      queryClient.setQueryData<Workspace[]>(["workspaces"], (current) =>
-        current?.map((item) => (item.id === saved.id ? saved : item)),
-      );
-      setEditingName(false);
-      setErrorMessage(null);
-    },
-    onError: (error) => setErrorMessage(String(error)),
-  });
-  const deleteM = useMutation({
-    mutationFn: () => workspaces.remove(workspaceId),
-    onSuccess: () => {
-      queryClient.removeQueries({ queryKey: ["workspace", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["workspaces"] });
-      queryClient.invalidateQueries({ queryKey: ["sessions"] });
-      const remaining = [...(workspacesQ.data ?? [])]
-        .filter((item) => item.id !== workspaceId)
-        .sort((a, b) => a.position - b.position);
-      router.replace(remaining[0] ? `/w/${remaining[0].id}` : "/");
-    },
-    onError: (error) => setErrorMessage(String(error)),
-  });
-
-  const submitRename = () => {
-    if (!workspace) return;
-    const next = draftName.trim();
-    if (!next || next === workspace.name) {
-      setEditingName(false);
-      return;
-    }
-    renameM.mutate(next);
-  };
-
-  const deleteWorkspace = async () => {
-    if (!workspace) return;
-    const accepted = await confirm({
-      title: `Delete ${workspace.name}?`,
-      body: "Every session in this workspace will be closed and permanently removed.",
-      confirmLabel: "Delete workspace",
-      destructive: true,
-    });
-    if (accepted) deleteM.mutate();
-  };
+  }, [activeTabId, focusedId, workspace]);
 
   if (!workspace) {
     return (
-      <div className="grid h-[calc(var(--vv-height)-3rem)] place-items-center @md/shell:h-vv">
+      <div className="grid h-[calc(var(--vv-height)-3rem)] place-items-center @md/shell:h-[calc(var(--vv-height)-2*var(--content-inset))]">
         {workspaceQ.isLoading ? (
           <Spinner label="Loading workspace" />
         ) : workspaceQ.error &&
@@ -162,106 +140,36 @@ function WorkspaceView({ workspaceId }: { workspaceId: string }) {
   }
 
   return (
-    <div className="flex h-[calc(var(--vv-height)-3rem)] min-h-0 flex-col bg-background @md/shell:h-vv">
-      <header className="hidden h-12 shrink-0 items-center gap-2 border-b border-border bg-background/95 px-3 @md/shell:flex">
-        {editingName ? (
-          <Input
-            autoFocus
-            aria-label="Workspace name"
-            value={draftName}
-            disabled={renameM.isPending}
-            onChange={(event) => setDraftName(event.target.value)}
-            onBlur={submitRename}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") submitRename();
-              if (event.key === "Escape") setEditingName(false);
-            }}
-            className="h-8 max-w-72 text-sm"
-          />
-        ) : (
-          <button
-            type="button"
-            title="Double-click to rename"
-            onDoubleClick={() => {
-              setDraftName(workspace.name);
-              setEditingName(true);
-            }}
-            className="min-w-0 truncate rounded px-1 text-left text-sm font-semibold hover:bg-accent"
-          >
-            {workspace.name}
-          </button>
-        )}
-        <span
-          className={`text-[11px] text-muted-foreground transition-opacity ${savingLayout ? "opacity-100" : "opacity-0"}`}
-          aria-hidden={!savingLayout}
-        >
-          Saving…
-        </span>
-        <div className="flex-1" />
-        <Button
-          type="button"
-          variant={filesOpen ? "secondary" : "ghost"}
-          size="icon"
-          className="size-8"
-          aria-label="Toggle files panel"
-          aria-pressed={filesOpen}
-          disabled={!focusedSession}
-          onClick={() => setFilesOpen((value) => !value)}
-        >
-          <FolderOpen className="size-4" aria-hidden />
-        </Button>
-        <DropdownMenu
-          align="end"
-          renderTrigger={(props) => (
-            <Button
-              {...props}
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-8"
-              aria-label="Workspace options"
-            >
-              <Ellipsis className="size-4" aria-hidden />
-            </Button>
-          )}
-        >
-          <DropdownMenuItem
-            onSelect={() => {
-              setDraftName(workspace.name);
-              setEditingName(true);
-            }}
-          >
-            <Pencil className="size-4" aria-hidden />
-            Rename
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem destructive disabled={deleteM.isPending} onSelect={deleteWorkspace}>
-            <Trash2 className="size-4" aria-hidden />
-            Delete workspace
-          </DropdownMenuItem>
-        </DropdownMenu>
-      </header>
-
-      {errorMessage && (
-        <p
-          className="shrink-0 border-b border-destructive/25 px-3 py-2 text-xs text-destructive"
-          role="alert"
-        >
-          {errorMessage}
-        </p>
-      )}
+    <div className="flex h-[calc(var(--vv-height)-3rem)] min-h-0 flex-col bg-background @md/shell:h-[calc(var(--vv-height)-2*var(--content-inset))]">
+      <WorkspaceTabs
+        workspace={workspace}
+        activeTabId={activeTabId ?? activeTab(workspace.layout).id}
+        previewTiles={previewTiles}
+        focusedId={focusedId}
+        onSwitch={switchTab}
+        onError={reportError}
+      />
 
       <div className="flex min-h-0 flex-1">
         <WorkspaceGrid
           workspace={workspace}
+          tabId={activeTabId ?? activeTab(workspace.layout).id}
           sessions={workspaceSessions}
           initialFocusId={searchParams.get("focus")}
           onFocusChange={setFocusedId}
-          onSavingChange={setSavingLayout}
-          onError={setErrorMessage}
+          onSwitchTab={switchTab}
+          onPreviewTiles={setPreviewTiles}
+          onError={reportError}
         />
-        {filesOpen && focusedSession && <SessionFilesAside session={focusedSession} />}
       </div>
+
+      <LauncherFab
+        workspace={workspace}
+        tabId={activeTabId ?? activeTab(workspace.layout).id}
+        onCreated={({ sessionId }) => {
+          if (sessionId) router.push(`/w/${workspace.id}?focus=${sessionId}`);
+        }}
+      />
     </div>
   );
 }

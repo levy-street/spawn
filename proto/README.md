@@ -276,28 +276,59 @@ be launched, so every skilled session gets the projection.
 
 ### Workspaces
 
-A workspace is a named 12×12 packed grid of session tiles.
+A workspace is a named 12×12 canvas of tiles. Tiles hold a session terminal, or a widget.
 
 | Method | Path | Body |
 |--------|------|------|
 | GET | `/api/workspaces` | list, ordered by `position` |
 | POST | `/api/workspaces` | `{name?, first_session?: {host_id, cwd, skill_ids?}}` → `{workspace, session\|null}` |
 | GET | `/api/workspaces/{id}` | one workspace |
-| PATCH | `/api/workspaces/{id}` | `{name?, layout?, position?}` |
+| PATCH | `/api/workspaces/{id}` | `{name?, layout?, position?, host_id?, cwd?}` |
 | DELETE | `/api/workspaces/{id}` | kills and deletes every session referenced by its tiles, then the workspace (204) |
+| GET | `/api/workspace-templates` | the caller's saved templates, ordered by name |
+| POST | `/api/workspace-templates` | `{name, host_id?, cwd?, spec}` — host/cwd: the folder the template remembers (instantiation skips the picker);  spec: `{version: 1, tabs: [{name, tiles: [{x, y, w, h, run}]}]}` where `run` is `{kind: "shell"\|"agent"\|"files", command?}` (command required for agents); geometry validated per tab with the grid invariants |
+| PATCH | `/api/workspace-templates/{id}` | `{name?, host_id?, cwd?, spec?}` |
+| DELETE | `/api/workspace-templates/{id}` | 204 |
 
-Layout schema v2 (wire + DB):
+Layout schema v3 (wire + DB) — an envelope of named tabs, each wrapping one
+v2 tile grid:
 
 ```json
-{"version": 2,
- "tiles": [{"session_id": "uuid", "x": 0, "y": 0, "w": 6, "h": 12}]}
+{"version": 3,
+ "active_tab": "tab-1",
+ "tabs": [
+   {"id": "tab-1", "name": "Tab 1",
+    "layout": {"version": 2,
+               "tiles": [{"session_id": "uuid", "x": 0, "y": 0, "w": 6, "h": 12},
+                         {"session_id": "uuid", "x": 6, "y": 0, "w": 6, "h": 12,
+                          "widget": {"kind": "files", "host_id": "uuid", "path": "/home/me"}}]}}]}
 ```
 
-Invariants (server-validated on every write): integer geometry on a 12×12
-canvas, `w ≥ 3`, `h ≥ 3`, no overlap, max 8 tiles; duplicate/unowned
-`session_id`s are pruned. The shared fixture suite
+Envelope invariants (server-validated on every write): 1–8 tabs, unique
+non-empty tab `id`s (≤64 chars), non-empty `name`s (≤64), and `active_tab`
+must name a tab when set (it records the last-open tab; new sessions land
+there when no explicit target is given). A session lives in exactly one tab
+— duplicates across tabs are pruned, first tab wins. Migration `0033` wraps
+every stored v2 layout into a single `{"id": "tab-1", "name": "Tab 1"}` tab,
+and `parse_workspace_layout` performs the same upgrade at read time for any
+straggler rows.
+
+Workspace home (`0034`): each workspace carries a nullable `host_id` + `cwd`
+— the host and folder chosen when it was created (`first_session`), backfilled
+from the first session tile for existing rows. New sessions and widgets
+default there, so adding a pane never asks where; PATCH validates that
+`host_id` names one of the caller's hosts and that `cwd` is non-empty.
+
+Per-tab grid invariants (unchanged from v2): integer geometry on a 12×12
+canvas, `w ≥ 2`, `h ≥ 2`, no overlap, max 8 tiles; unowned `session_id`s on
+tiles without a `widget` are pruned. Tiles need not cover the canvas — gaps
+are a normal, persistable state. A `widget` tile renders that widget instead
+of a terminal and its `session_id` is simply its own tile id (the algebra
+only requires a unique non-empty string). The shared fixture suite
 `layout-v2-fixtures.json` keeps the TypeScript and Python grid
-implementations identical.
+implementations identical; the envelope logic lives in `web/src/lib/tabs.ts`
+and `spawn_server/routes/workspaces.py` and is deliberately simple enough
+not to need one.
 
 ## Daemon WebSocket — `/ws/daemon`
 

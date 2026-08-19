@@ -26,7 +26,6 @@ import {
 } from "react";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
-import { type PromptState, PromptStateTracker } from "@/components/terminal/prompt-state";
 import { useSessionSocket } from "@/components/terminal/useSessionSocket";
 // Terminal configuration shared with the conformance harness
 // (tools/term-conformance/); see xterm-config.mjs before changing options.
@@ -176,18 +175,6 @@ export interface TerminalHandle {
   openUpload: () => void;
   /** Scroll the viewport back to the live edge (bottom of the buffer). */
   snapToLiveEdge: () => void;
-  /** Pixel rect of the input cursor cell, relative to the terminal container;
-   *  null while the cursor row is scrolled out of view. Anchors the shortcut
-   *  bar (§5.5). */
-  getCursorRect: () => {
-    left: number;
-    top: number;
-    cellWidth: number;
-    cellHeight: number;
-  } | null;
-  /** Reset the empty-prompt heuristic to "empty" — called by the pane when
-   *  the foreground process changes (§5.5). */
-  resetPromptState: () => void;
 }
 
 export interface TerminalProps {
@@ -213,10 +200,6 @@ export interface TerminalProps {
   /** Live transport snapshot (path kind, RTT) for connection indicators. */
   onConnectionInfo?: (info: SessionConnectionInfo) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
-  /** xterm onCursorMove passthrough — reposition cursor-anchored overlays. */
-  onCursorMove?: () => void;
-  /** Empty-prompt heuristic transitions (§5.5), tracked from sent bytes. */
-  onPromptStateChange?: (state: PromptState) => void;
 }
 
 /**
@@ -236,8 +219,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     autoTakeControl = true,
     active = true,
     onExit,
-    onCursorMove,
-    onPromptStateChange,
   },
   ref,
 ) {
@@ -254,18 +235,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const firstControlSeenRef = useRef(false);
   const autoTakeControlRef = useRef(autoTakeControl);
   autoTakeControlRef.current = autoTakeControl;
-  // §5.5 shortcut-bar contract: cursor passthrough + empty-prompt heuristic.
-  const onCursorMoveRef = useRef(onCursorMove);
-  onCursorMoveRef.current = onCursorMove;
-  const onPromptStateChangeRef = useRef(onPromptStateChange);
-  onPromptStateChangeRef.current = onPromptStateChange;
-  const promptTrackerRef = useRef(new PromptStateTracker());
-  promptTrackerRef.current.onChange = (state) => onPromptStateChangeRef.current?.(state);
-  // Every user byte that reaches the PTY flows through here first, so the
-  // heuristic sees exactly what the shell sees.
-  const trackPromptBytes = useCallback((data: string | Uint8Array) => {
-    promptTrackerRef.current.feed(typeof data === "string" ? data : new TextDecoder().decode(data));
-  }, []);
   // Foreground/parked state for the warm pool. A parked instance stays
   // connected but never fits or resizes (see fitTerminal), so moving its host
   // into an offscreen park can't churn the PTY geometry.
@@ -941,7 +910,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (imagePasteMode === "bracketed-path") {
         removePendingAttachment(targetId);
         const pasted = bracketedPaste(shellSingleQuote(path));
-        trackPromptBytes(pasted);
         socketRef.current.sendBinary(pasted);
         showUploadStatus("Image pasted");
         termRef.current?.focus();
@@ -956,13 +924,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       });
       showUploadStatus("Image attached");
     },
-    [
-      imagePasteMode,
-      removePendingAttachment,
-      showUploadStatus,
-      updatePendingAttachments,
-      trackPromptBytes,
-    ],
+    [imagePasteMode, removePendingAttachment, showUploadStatus, updatePendingAttachments],
   );
 
   flushPendingLiveSeedWritesRef.current = () => {
@@ -1488,9 +1450,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const t = termRef.current;
       setLiveEdge(t ? ydisp >= t.buffer.active.baseY : true);
     });
-    const cursorDisposable = term.onCursorMove(() => {
-      onCursorMoveRef.current?.();
-    });
     const xtermViewportEl = containerRef.current?.querySelector<HTMLElement>(".xterm-viewport");
     xtermViewportEl?.addEventListener("scroll", refreshLiveEdge, { passive: true });
     // The renderer addon needs the opened element; the active-state effect
@@ -1551,18 +1510,35 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return keyboardPanActive();
     };
 
+    /** `.xterm`'s padding — the inset that keeps glyphs off the pane edge. */
+    const terminalInset = () => {
+      const xterm = terminalElement.querySelector<HTMLElement>(".xterm");
+      if (!xterm) return { x: 0, y: 0 };
+      const style = window.getComputedStyle(xterm);
+      const px = (value: string) => Number.parseFloat(value) || 0;
+      return {
+        x: px(style.paddingLeft) + px(style.paddingRight),
+        y: px(style.paddingTop) + px(style.paddingBottom),
+      };
+    };
+
     const getTerminalPixelSize = () => {
       const canvas = terminalElement.querySelector<HTMLCanvasElement>(".xterm-screen canvas");
       const canvasRect = canvas?.getBoundingClientRect();
       const elementRect = terminalElement.getBoundingClientRect();
+      // The canvas is the grid alone; the pan frame has to carry the inset
+      // around it too, or panning to the edge clips it. The element rect
+      // already includes the inset.
+      const inset = terminalInset();
+      const useCanvas = canvasRect && canvasRect.width > 0 && canvasRect.height > 0;
       return {
         width: Math.max(
           1,
-          Math.ceil(canvasRect && canvasRect.width > 0 ? canvasRect.width : elementRect.width),
+          Math.ceil(useCanvas ? canvasRect.width + inset.x : elementRect.width),
         ),
         height: Math.max(
           1,
-          Math.ceil(canvasRect && canvasRect.height > 0 ? canvasRect.height : elementRect.height),
+          Math.ceil(useCanvas ? canvasRect.height + inset.y : elementRect.height),
         ),
       };
     };
@@ -1775,7 +1751,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       lastMobileReturnAtRef.current = performance.now();
       snapToLiveEdge();
-      trackPromptBytes(mobileReturnBytesRef.current);
       socketRef.current.sendBinary(mobileReturnBytesRef.current);
       if (term.textarea) term.textarea.value = "";
       return true;
@@ -2063,7 +2038,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           // Also mute the textarea input fallback (virtual keyboards) for
           // this press so it cannot double-send.
           lastMobileReturnAtRef.current = performance.now();
-          trackPromptBytes(ALT_ENTER);
           socketRef.current.sendBinary(ALT_ENTER);
         }
         return false;
@@ -2271,7 +2245,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     return () => {
       ro.disconnect();
       scrollDisposable.dispose();
-      cursorDisposable.dispose();
       xtermViewportEl?.removeEventListener("scroll", refreshLiveEdge);
       vv?.removeEventListener("resize", onVisualViewport);
       vv?.removeEventListener("scroll", onVisualViewport);
@@ -2324,9 +2297,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       pinLiveViewportToBottomRef.current = () => {};
     };
     // Bootstrap effect: deliberately runs once on mount; the socket is read
-    // through `socketRef`, so it doesn't need to be in deps. pushOp and
-    // trackPromptBytes are stable.
-  }, [snapToLiveEdge, pushOp, trackPromptBytes]);
+    // through `socketRef`, so it doesn't need to be in deps. pushOp is stable.
+  }, [snapToLiveEdge, pushOp]);
 
   const uploadImages = useCallback(
     async (files: File[]) => {
@@ -2591,7 +2563,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (mapped !== filtered) lastMobileReturnAtRef.current = performance.now();
       const withAttachments = appendAttachmentsForSubmit(mapped);
       if (withAttachments) {
-        trackPromptBytes(withAttachments);
         socket.sendBinary(enc.encode(withAttachments));
       }
       if (latencyHudRef.current && withAttachments === d && /^[\x20-\x7e]$/.test(d)) {
@@ -2625,7 +2596,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       onDataDisposableRef.current?.dispose();
       onDataDisposableRef.current = null;
     };
-  }, [appendAttachmentsForSubmit, rawInput, socket, schedulePredictionSweep, trackPromptBytes]);
+  }, [appendAttachmentsForSubmit, rawInput, socket, schedulePredictionSweep]);
 
   // Resend the last known size on (re)connection so the daemon's PTY matches.
   useEffect(() => {
@@ -2640,7 +2611,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     () => ({
       sendInput: (data) => {
         snapToLiveEdge();
-        trackPromptBytes(data);
         socket.sendBinary(data);
       },
       resize: (cols, rows) => {
@@ -2886,7 +2856,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       submit: () => {
         snapToLiveEdge();
         const payload = appendAttachmentsForSubmit("\r");
-        trackPromptBytes(payload);
         socket.sendBinary(payload);
         termRef.current?.focus();
       },
@@ -2896,32 +2865,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       takeControl: () => takeControlNowRef.current(),
       openUpload: () => fileInputRef.current?.click(),
       snapToLiveEdge,
-      getCursorRect: () => {
-        const term = termRef.current;
-        const container = terminalViewportRef.current;
-        const screen = containerRef.current?.querySelector(".xterm-screen");
-        if (!term || !container || !screen) return null;
-        const buffer = term.buffer.active;
-        // cursorY is relative to the live edge (baseY); a reader scrolled up
-        // in history has the cursor row below the visible viewport.
-        const rowOnScreen = buffer.baseY + buffer.cursorY - buffer.viewportY;
-        if (rowOnScreen < 0 || rowOnScreen >= term.rows) return null;
-        const screenRect = screen.getBoundingClientRect();
-        const containerRect = container.getBoundingClientRect();
-        if (screenRect.width <= 0 || term.cols <= 0 || term.rows <= 0) return null;
-        const cellWidth = screenRect.width / term.cols;
-        const cellHeight =
-          terminalRowHeightRef.current > 0
-            ? terminalRowHeightRef.current
-            : screenRect.height / term.rows;
-        return {
-          left: screenRect.left - containerRect.left + buffer.cursorX * cellWidth,
-          top: screenRect.top - containerRect.top + rowOnScreen * cellHeight,
-          cellWidth,
-          cellHeight,
-        };
-      },
-      resetPromptState: () => promptTrackerRef.current.reset(),
     }),
     [
       appendAttachmentsForSubmit,
@@ -2935,7 +2878,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       reserveUploadReconciliation,
       socket,
       sessionId,
-      trackPromptBytes,
     ],
   );
 

@@ -1,6 +1,6 @@
 import type { Session, Workspace } from "@/lib/api";
-import { readingOrder } from "@/lib/grid";
 import { sessionNeedsAttention } from "@/lib/sessions";
+import { allSessionIds, allTiles } from "@/lib/tabs";
 
 /**
  * Pure derivation helpers for workspaces: default naming, per-workspace
@@ -15,13 +15,13 @@ export function defaultWorkspaceName(existing: Workspace[]): string {
   return `Workspace ${n}`;
 }
 
-/** Session ids on a workspace, in reading order (top-left to bottom-right). */
+/** Session ids across the workspace: tabs in order, reading order within. */
 export function workspaceSessionIds(workspace: Workspace): string[] {
-  return readingOrder(workspace.layout.tiles);
+  return allSessionIds(workspace.layout);
 }
 
 export function workspaceTileCount(workspace: Workspace): number {
-  return workspace.layout.tiles.length;
+  return allTiles(workspace.layout).length;
 }
 
 /** Sessions on the workspace that currently want the operator's attention. */

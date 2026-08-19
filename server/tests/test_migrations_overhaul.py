@@ -317,28 +317,36 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
                 "e empty": 4,
             }
 
-            even = json.loads(workspaces["b even"].layout)
+            # 0033 wraps every v2 grid into a single-tab v3 envelope.
+            def first_tab_grid(row) -> dict:
+                envelope = json.loads(row.layout)
+                assert envelope["version"] == 3
+                assert envelope["active_tab"] == "tab-1"
+                assert [tab["id"] for tab in envelope["tabs"]] == ["tab-1"]
+                return envelope["tabs"][0]["layout"]
+
+            even = first_tab_grid(workspaces["b even"])
             assert grid.validate(even)
             assert even["tiles"] == [
                 {"session_id": ids["a1"], "x": 0, "y": 0, "w": 6, "h": 12},
                 {"session_id": ids["a2"], "x": 6, "y": 0, "w": 6, "h": 12},
             ]
 
-            ratio = json.loads(workspaces["a ratio"].layout)
+            ratio = first_tab_grid(workspaces["a ratio"])
             assert grid.validate(ratio)
             assert [tile["session_id"] for tile in ratio["tiles"]] == [ids["a1"], ids["a2"]]
 
-            deep = json.loads(workspaces["c deep"].layout)
+            deep = first_tab_grid(workspaces["c deep"])
             assert grid.validate(deep)
             assert len(deep["tiles"]) == 8
 
-            dup = json.loads(workspaces["d dup"].layout)
+            dup = first_tab_grid(workspaces["d dup"])
             assert grid.validate(dup)
             assert dup["tiles"] == [
                 {"session_id": ids["a1"], "x": 0, "y": 0, "w": 12, "h": 12}
             ]
 
-            assert json.loads(workspaces["e empty"].layout) == {"version": 2, "tiles": []}
+            assert first_tab_grid(workspaces["e empty"]) == {"version": 2, "tiles": []}
 
             # 0032: recent dirs backfilled newest-first, capped at 8 per host,
             # and never from the deleted archived session.
@@ -396,13 +404,15 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
         with engine.begin() as conn:
             assert conn.execute(
                 text("select version_num from alembic_version")
-            ).scalar_one() == "0032"
-            relayout = json.loads(
+            ).scalar_one() == "0036"
+            envelope = json.loads(
                 conn.execute(
                     text("select layout from workspaces where id = :id"),
                     {"id": ids["screen_even"]},
                 ).scalar_one()
             )
+            assert envelope["version"] == 3
+            relayout = envelope["tabs"][0]["layout"]
             assert grid.validate(relayout)
             assert {tile["session_id"] for tile in relayout["tiles"]} == {
                 ids["a1"], ids["a2"]

@@ -25,7 +25,7 @@ The product today is fragmented: five nav destinations, a multi-screen agent-cre
 1. A **guided onboarding flow** on its own route that takes a new user from signup to a running shell.
 2. A **single main page**: a workspace with a grid of terminal panes, navigated by a left sidebar (workspaces → sessions tree).
 3. A **settings modal** (like the current account modal) holding everything that used to be a nav destination.
-4. **Shell-first sessions**: every pane is a shell; AI agents are one-click shortcuts typed into that shell; Ctrl+C returns to the shell.
+4. **Shell-first sessions**: every pane is a shell; AI agents are picked from the pane header's switcher and typed into that shell; Ctrl+C returns to the shell.
 5. A **free-form packed grid** with real-time drag, snap, and auto-sizing.
 
 Ground rules (from the project owner, non-negotiable):
@@ -70,8 +70,8 @@ Renaming order matters in the DB because `agents` is both an old and a new table
    │    · session (icon)    │  │ shell│ │claude│      │
    │    · session           │  └──────┘ └──────┘      │
    │    [+ add session]     │   $ ▍                    │
-   │  ▸ Workspace 2         │   [◆ codex][✳ claude]…  │ ← shortcut bar: overlay
-   │                        │                          │   under the shell cursor
+   │  ▸ Workspace 2         │  [✳ ˅] claude - ~        │ ← agent switcher: the
+   │                        │                          │   pane header's icon
    │  ──────────────        │                          │
    │  ⚙ Settings (modal)    │                          │
    │  ◉ account             │                          │
@@ -79,9 +79,9 @@ Renaming order matters in the DB because `agents` is both an old and a new table
 ```
 
 - A session is created by the **`+` cascade menu**: (host, if >1) → location (Home / Recent / Select folder…). No form, no separate page.
-- The daemon spawns the user's **login shell** — never an agent binary directly. The pane shows a **shortcut bar** of agent buttons (with logos) whenever the shell is in the foreground; clicking one types the agent's command into the PTY. Ctrl+C inside the agent returns to the shell naturally.
-- The daemon reports the **foreground process name** (basename only) so the UI knows what's running in each pane: sidebar icons, pane headers, and shortcut-bar visibility all derive from it.
-- The grid is a **12×12 packed grid** (no vertical scroll — every pane always visible), with drag-to-move, edge/corner resize, collision push, and gravity compaction.
+- The daemon spawns the user's **login shell** — never an agent binary directly. The pane header's identity icon is also the **agent switcher**: hovering the header grows a plate and a chevron under the icon, and picking an agent from its menu types that agent's command into the PTY. Ctrl+C inside the agent returns to the shell naturally.
+- The daemon reports the **foreground process name** (basename only) so the UI knows what's running in each pane: sidebar icons, pane header icons, and whether the switcher can switch all derive from it.
+- The grid is a **12×12 free canvas** (no scroll — every pane always visible), with drag-to-move, edge/corner resize, drag-the-seam resize, and push-on-drop. Panes stay where they are put: gaps between them are a normal, persistable state, and a `--pane-divider` hairline is drawn only where two panes actually meet edge to edge.
 
 Terminal transport (WebRTC DataChannels, warm pool, keep-alive portals) is **unchanged in behavior** — only renamed. The pool/portal mechanism in `LiveTerminalProvider` + the `ScreenPane` slot-portal pattern is load-bearing (it keeps sockets alive across layout changes) and must be preserved in the new `WorkspaceGrid`.
 
@@ -89,7 +89,7 @@ Terminal transport (WebRTC DataChannels, warm pool, keep-alive portals) is **unc
 
 ## 4. Locked contracts
 
-### 4.1 Database migrations (server, alembic `0029`–`0034`)
+### 4.1 Database migrations (server, alembic `0029`–`0034`; `0033` = workspace tabs)
 
 Current head is `0028`. All migrations must have working `upgrade()` **and** `downgrade()`, and a pytest that runs the chain against a fixture DB seeded with representative pre-overhaul data (split-tree layouts, archived agents, built-in + custom presets).
 
@@ -104,7 +104,7 @@ Current head is `0028`. All migrations must have working `upgrade()` **and** `do
 - Convert `default_argv JSON (list)` → `command VARCHAR(1024)` (shell-join with quoting; migration includes the join helper).
 - Rename `env_template → env`.
 - Keep `agent_kind → kind`, `install`, `owner_user_id`, `name` (unique per owner).
-- Delete the built-in `shell` row (sessions are shells; the shortcut is meaningless).
+- Delete the built-in `shell` row (sessions are shells; the entry is meaningless).
 - Rename table `host_tool_policies → host_agent_policies`; rename column `preset_id → agent_id`.
 
 **`0031_screens_to_workspaces`**
@@ -220,6 +220,20 @@ Frame renames (all payload fields `agent_id → session_id`):
 
 ### 4.4 Workspace grid — layout schema v2 and algebra
 
+> **Layout v3 (tabs).** The stored/wire layout is now an envelope of named
+> tabs — `{version: 3, active_tab, tabs: [{id, name, layout: <v2>}]}` — with
+> every invariant below applying **per tab** (see `proto/README.md` for the
+> envelope's own invariants). The v2 algebra and its fixtures are untouched;
+> the envelope logic is `web/src/lib/tabs.ts` / `routes/workspaces.py`, and
+> migration `0033` wraps existing rows. The workspace page renders a tab
+> strip (`workspace-tabs.tsx`): tabs switch client-side (per-device
+> localStorage; `active_tab` is stamped on layout writes rather than written
+> per switch), and a dragged pane carries across tabs — hovering a strip tab
+> for 250 ms mid-drag switches the view and re-seeds the gesture there;
+> dropping commits one envelope write that removes the tile from its source
+> tab and lands it in the target. The sidebar nests Workspace → Tab →
+> Session once a workspace has more than one tab.
+
 **Schema (wire + DB):**
 
 ```jsonc
@@ -242,16 +256,16 @@ Both must pass the shared fixture suite **`proto/layout-v2-fixtures.json`** (own
 
 Functions (deterministic, no randomness):
 - `validate(layout)` — the invariants above.
-- `autoPlace(tiles) -> {tile, tiles} | {tile: null}` — first free 3×3 position scanning `y` then `x`; greedily expand `w` rightward while free, then `h` downward. If no 3×3 is free: take the largest-area tile that can be split (both halves ≥3 along its longer axis; ties → vertical split), shrink it to the first half, return the second half as the new tile — the split modifies an existing tile, hence the `{tile, tiles}` return. If no 3×3 is free **and** no tile is splittable (e.g. four 5×5 tiles), return `{tile: null}`: the workspace is full — the server responds **409 `workspace_full`** and the client disables `+` for that workspace with an explanatory tooltip.
-- `move(tiles, id, x, y) -> tiles` — place the tile at the target; tiles it overlaps are pushed down (increasing `y`), cascading; then `compact`. If the cascade ends out of bounds **or** the result is identical to the input (the push had no legal effect — e.g. dragging one full-height column onto another), fall back to **swap**: let T = the tile with the greatest area overlap with the dragged tile's target rect (ties broken by reading order — lowest `(y, x)` wins); the dragged tile takes T's rect and T takes the dragged tile's original rect (both rects were valid, so the swap is valid; no re-compaction needed). No overlapped tile and no legal push → no-op returning the input. Consequence for consumers: `move` preserves the id set and the *multiset* of sizes, not per-tile sizes — a swap exchanges sizes between the two tiles.
-- `resize(tiles, id, w, h) -> tiles` — clamp to invariants, push collisions down, `compact`; if the cascade ends out of bounds → no-op returning the input.
-- `remove(tiles, id) -> tiles` — drop the tile, `compact`, then greedily expand remaining tiles (in reading order) into freed space (right, then down) so the canvas stays filled where possible.
-- `compact(tiles) -> tiles` — sequential physical gravity in `(y, x)` order: each tile slides up then left only through space that is free at the moment it moves (no pass-through), so intermediate states are never overlapping.
+- `autoPlace(tiles) -> {tile, tiles} | {tile: null}` — first free 2×2 position scanning `y` then `x`; greedily expand `w` rightward while free, then `h` downward. If no 2×2 is free: take the largest-area tile that can be split (both halves ≥2 along its longer axis; ties → vertical split), shrink it to the first half, return the second half as the new tile — the split modifies an existing tile, hence the `{tile, tiles}` return. If no 2×2 is free **and** no tile is splittable, return `{tile: null}`: the workspace is full — the server responds **409 `workspace_full`** and the client disables `+` for that workspace with an explanatory tooltip.
+- `move(tiles, id, x, y) -> tiles` — clamp the target into the canvas and place the tile there. A free target is simply taken and the gap left behind stays a gap. An occupied target is a **swap**: let T = the tile with the greatest area overlap with the dragged tile's target rect (ties broken by reading order — lowest `(y, x)` wins); the dragged tile takes T's rect and T takes the dragged tile's original rect (both rects were valid, so the swap is valid). Consequence for consumers: `move` preserves the id set and the *multiset* of sizes, not per-tile sizes — a swap exchanges sizes between the two tiles.
+- `resize(tiles, id, w, h) -> tiles` — clamp to invariants about the tile's own origin. Nothing else moves: shrinking leaves empty canvas behind, and a growth that would overlap another tile is refused (no-op returning the input).
+- `remove(tiles, id) -> tiles` — drop the tile, then let survivors absorb **only** the rectangle it freed: one cell at a time in reading order, trying right, down, left, up, taking a step only when the strip of cells gained lies wholly inside the freed rect and is free. Nothing else on the canvas moves.
+- `compact(tiles) -> tiles` — sequential physical gravity in `(y, x)` order: each tile slides up then left only through space that is free at the moment it moves (no pass-through), so intermediate states are never overlapping. No operation calls this; it remains a pure utility in the contract.
 - Rounding rule everywhere (incl. `fromSplitTree`): edges (not widths) rounded with `floor(v + 0.5)` — identical in TS and Python (no banker's rounding).
 
-Where this prose and `proto/layout-v2-fixtures.json` disagree, **the fixtures win** — they are hand-verified and both implementations must pass them. UX note for B2: `compact` is unconditional, so `move` is a *packing reorder + swap* operation — free-floating gaps are never a legal end state; the drag preview must always show the post-compact result, and a swap drop highlights the tile being exchanged.
+Where this prose and `proto/layout-v2-fixtures.json` disagree, **the fixtures win** — they are hand-verified and both implementations must pass them. UX note for B2: the canvas is free-form — gaps ARE a legal end state, and the empty space is itself a target (clicking it adds a pane there). The drag preview shows the post-move result, and a swap drop highlights the tile being exchanged.
 - `readingOrder(tiles) -> id[]` — sort by `(y, x)`. Used for the mobile stack and keyboard focus order.
-- `fromSplitTree(v1root) -> tiles` — migration converter: recursively assign float rects starting from `(0,0,12,12)`, `row` split gives `a` `ratio*w`; round edges to ints per the rounding rule; if any resulting tile violates `w≥3 || h≥3` or overlaps after rounding, **fall back** to placing the panes in v1 DFS order (a-then-b) with repeated `autoPlace`. Trees with >8 panes keep the first 8 in DFS order. Deterministic either way.
+- `fromSplitTree(v1root) -> tiles` — migration converter: recursively assign float rects starting from `(0,0,12,12)`, `row` split gives `a` `ratio*w`; round edges to ints per the rounding rule; if any resulting tile violates the minimum tile size or overlaps after rounding, **fall back** to placing the panes in v1 DFS order (a-then-b) with repeated `autoPlace`. Trees with >8 panes keep the first 8 in DFS order. Deterministic either way.
 
 ### 4.5 Web route map
 
@@ -301,7 +315,7 @@ Rules (add to `docs/DESIGN.md`):
 | `empty-state.tsx` | Icon + title + body + primary action. Used by empty workspace, no-hosts banner, etc. |
 | `spinner.tsx` | Single loading affordance (replaces ad-hoc "Loading..." text). |
 
-**Icons:** `web/src/components/icons/AgentIcon.tsx` (moved/rebuilt from `AgentKindIcon`) maps agent `kind` → bundled logo SVG (`claude-code`, `codex`, `opencode`, `aider`), shell kinds (`bash|zsh|fish|sh`) → terminal glyph, anything else → monogram. Used by the sidebar, pane headers, and the shortcut bar.
+**Icons:** `web/src/components/icons/AgentIcon.tsx` (moved/rebuilt from `AgentKindIcon`) maps agent `kind` → bundled logo SVG (`claude-code`, `codex`, `opencode`, `aider`), shell kinds (`bash|zsh|fish|sh`) → terminal glyph, anything else → monogram. Used by the sidebar, pane headers, and the agent switcher.
 
 ---
 
@@ -374,44 +388,37 @@ All `+` entry points (sidebar add-session row, sidebar new-workspace with >1 hos
 - Note: the daemon's fs capability is rooted at the host home — the picker browses the home tree. Paths outside home can still be typed into the path input and are passed through (session cwd is not home-restricted).
 - Mobile: `full-mobile` dialog size.
 
-### 5.5 Shell-first sessions and the agent shortcut bar
+### 5.5 Shell-first sessions and the agent switcher
 
 - Every session **is** the login shell. Killing a foreground agent (Ctrl+C / exit) drops back to the shell prompt — no code needed, it's how shells work. The session only exits when the shell itself exits; the pane then shows an exited state with Restart / Close actions.
-- **Shortcut bar** (`web/src/components/workspace/ShortcutBar.tsx`): an overlay **inside the terminal**, anchored directly **below the input cursor** — like an IDE autocomplete popup, not a pane toolbar. A compact, horizontally scrollable pill row (`bg-popover/90` + backdrop blur, `border-border`, max-width = pane width − 16px) that never takes focus; clicking a pill leaves the terminal focused.
-  - **Visible when all of:** `session.status === "running"`; `foreground_command` is null or a shell (`bash|zsh|fish|sh|dash|…` — matcher in `lib/sessions.ts`); the **input line is empty** (just-created shells start empty); and the cursor row is on-screen (hidden while scrolled back). It disappears the moment the user starts typing or an agent takes the foreground, and reappears on the next empty prompt.
-  - **Empty-input heuristic** (tracked inside `Terminal` from the bytes it sends — deterministic, no prompt parsing): printable bytes and pastes increment a pending-input count; Backspace/DEL decrement it; Enter, Ctrl+C, Ctrl+U, Ctrl+D, and any foreground change reset it to zero. Count 0 ⇔ empty.
-  - **Positioning:** top = cursor cell bottom + 4px, left = cursor x clamped to pane padding; flips above the cursor row when there's not enough room below. Repositions on cursor move, output, and resize.
-  - **Terminal interface contract** (A5 implements in `components/terminal/`, B2 consumes — locked here because it crosses workstreams):
-    ```ts
-    // TerminalProps additions
-    onCursorMove?: () => void;                              // xterm onCursorMove passthrough
-    onPromptStateChange?: (state: "empty" | "typing") => void;
-    // TerminalHandle addition
-    getCursorRect(): { left: number; top: number; cellWidth: number; cellHeight: number } | null;
-    // pixel rect relative to the terminal container; null when the cursor row is scrolled out of view
-    ```
-- One pill per agent definition (built-ins first, then custom): `AgentIcon` + name. Availability from `["host-agents", host_id]` (`GET /api/hosts/{id}/agents`, staleTime 5 min, refetched when a pane mounts):
-  - **Installed** → click focuses the pane and types `{env prefix}{command}\n` into the PTY via the terminal handle (`FOO=bar claude\n`). Env entries from the agent's `env` dict become `KEY=value ` prefixes.
-  - **Missing** → pill shows a download glyph + "install & run"; click types `{install} && {env prefix}{command}\n` — fully visible in the terminal, cancellable with Ctrl+C, no hidden execution.
-- Pane header shows what's running: `AgentIcon(foreground_command)` + session name + `StatusDot`; sidebar session rows use the same derivation (§5.2).
+- **Panes carry no border.** A session pane is `bg-background` on a `bg-shell` grid gutter; the darker tile on the lighter ground separates panes without a hairline, matching how the content panel sits on the shell. Focus is the brand-tinted `ring-ring`, which stays the only outline a pane ever draws.
+- **Agent switcher** (`web/src/components/workspace/agent-switcher.tsx`): the pane header's identity icon *is* the control. At rest it is the plain `AgentIcon` the header always drew; hovering the header — the pane's drag bar — fades in a `bg-accent` plate behind it and grows a `ChevronDown` from zero width beside it (`group/pane-header` on the header, a width+opacity transition on the chevron; coarse pointers, which have no hover to give, show the chevron permanently). Clicking opens a `DropdownMenu` (portalled, so it escapes the pane's overflow) listing every agent definition — built-ins first, then custom, each alphabetical — and picking one types that agent's command into this shell.
+  - **Why the header and not an overlay:** the bar that used to float under the shell cursor is gone, along with everything that positioned it (the empty-prompt heuristic, `getCursorRect`, `onCursorMove`, `onPromptStateChange`, `resetPromptState`). The switcher is always in the same place, costs the terminal nothing, and never has to guess whether the prompt is empty.
+  - **Availability** comes from `["host-agents", host_id]` (`GET /api/hosts/{id}/agents`, staleTime 5 min), exactly as before. Installed → the item types `{env prefix}{command}\n`. Missing → the item shows a download glyph + `install & run`, and typing is `{install} && {env prefix}{command}\n` — fully visible in the terminal, cancellable with Ctrl+C, no hidden execution. Commands are built by the pure helpers in `workspace/agent-command.ts` (`shellQuote`, `envPrefix`, `agentRunCommand`, `agentInstallAndRunCommand`), unit-tested byte-for-byte.
+  - **Switching needs a shell.** Entries are live only while `session.status === "running"` **and** the foreground is a shell (`foreground_command` null or a shell name — matcher in `lib/sessions.ts`). While an agent holds the foreground the menu still opens, showing a check against the running one and the header `Exit {foreground} to switch`, but its entries are disabled: typing `codex` into Claude Code's prompt is a message to Claude Code, and there is no safe, agent-agnostic way to quit an agent from a button. Ctrl+C (or the agent's own exit) hands the shell back and the entries come alive.
+  - **Launching claims the foreground.** Picking an agent writes the launched command's basename into the `["session", id]` / `["sessions"]` caches as `foreground_command`, so the header icon flips on the click rather than waiting for the next 5 s poll (the daemon reports the real basename within ~1 s, but nothing pushes it to the browser). The poll reconciles — a command that never took the foreground gets the server's value back and the icon reverts.
+  - Focus: picking an entry calls `handle.focus()` and re-focuses on the next frame, so the terminal is what the keyboard talks to when the menu closes.
+- Pane header shows what's running: the switcher's `AgentIcon(foreground_command)` + session name + `StatusDot` (the dot is `pointer-events-none` so it can't swallow clicks on the icon beneath it); sidebar session rows use the same derivation (§5.2).
 - The old silent install preflight in the daemon (`run_install`, output discarded) is **deleted** with the `install` field of `session.create`.
 
 ### 5.6 Grid interactions
 
 `web/src/components/workspace/WorkspaceGrid.tsx` renders `layout.tiles` as absolutely-positioned tiles (percentage geometry from the 12×12 units, `--pane-gap` gutters). **Terminal keep-alive is preserved**: the slot/portal pattern from the current screens page moves here — one `SessionPane` per session in a stable keyed layer, portaled into whichever tile slot the layout exposes; reshaping never remounts a terminal.
 
-- **Drag to move:** grab the pane header's grip zone. During drag the pane follows the pointer as a `transform` (60fps, no React state per move); a ghost outline shows the snapped target cell (`grid.move` computed live per pointer position, throttled to grid-cell changes); other tiles animate (`transition: transform 150ms var(--ease-swift)`) into their pushed/compacted positions in real time. Release commits.
-- **Resize:** SE-corner handle plus invisible edge handles; live ghost + neighbor animation identical to move (`grid.resize`).
+- **Drag to move:** press anywhere on the pane header that is not a control. During drag the pane follows the pointer as a `transform` (60fps, no React state per move); a ghost outline shows the snapped target cell (`movePane` in `workspace-grid-helpers.ts`, computed live per pointer position, throttled to grid-cell changes). Over empty canvas the ghost snaps to cells and the pane just goes there (`movePane`; a partial overlap pushes the blocking pane by the smallest in-bounds translation, or refuses). Hovering **another pane** switches to iTerm-style docking (`dockPane` + `dockZoneAt`): the pointer's nearest edge of the hovered pane picks a side, the dragged pane's vacated spot is absorbed by its neighbours (the same pass as `grid.remove`, so the canvas stays packed), and the target splits in half — the ghost claims the hovered side, so dropping a column onto the lower half of another stacks them vertically. Targets under 6 cells on the split axis refuse. Displaced panes animate (`transition: transform 150ms var(--ease-swift)`) in real time; release commits. `grid.move` (with its swap fallback) remains the fixture-pinned wire algebra; `movePane`/`dockPane` are view-layer only.
+- **Resize:** eight grab surfaces per pane — four edge strips and four corners (`TileResizeHandles`) — plus draggable seams where panes meet (`gridDividers`). An edge behaves like a splitter: flush neighbours in the pane's cross-range follow it (`resizeEdges` in `workspace-grid-helpers.ts` — shrinking to make room, growing to keep the seam where the swept cells are free), gapped neighbours clamp the drag, and the preview applies incrementally so one sweep closes a gap and then starts trading space. Live ghost + neighbor animation identical to move. `grid.resize` (about-the-origin, refuse-on-overlap) remains the fixture-pinned wire algebra; `resizeEdges` is view-layer only.
 - **Persistence:** commits are optimistic (`setQueryData`) and PATCHed with a 500ms debounce; a failed PATCH rolls back to the server copy and toasts the error. Concurrent-tab safety: `PATCH` responses are written back verbatim (server state wins).
 - **Zoom:** double-click pane header or `Alt+Z` — client-only fullscreen of one pane (non-zoomed tiles `hidden`, not unmounted). Keyboard: `Alt+arrows` move focus in `readingOrder`; `Alt+1..9` switch workspaces by position.
 - **Empty workspace:** `empty-state` with a big `+` opening the cascade menu.
+- **Templates:** a workspace's ⋯ menu saves its shape — tabs, tile geometry, what each tile runs (agent capture reads the daemon's `foreground_command` against installed agents' commands) — as a server-stored template (`/api/workspace-templates`, migration `0035`). The sidebar's New workspace button is a dropdown: "Select folder" (a fresh shell workspace) first, then the saved templates; picking one leads to the same folder cascade, and the client replays the spec against it (`instantiate-template.ts`: tabs + widget tiles in one envelope write, then per-tab session creation with `active_tab` pointed first; agent commands queue via `pendingLaunch`). Settings → Templates renames and deletes.
+- **Adding panes:** a floating launcher (`launcher-fab.tsx`) pinned to the viewport's bottom-right — a popover-grey pill with a brand-red `+` that expands in place on hover/focus to reveal one icon per runnable (shell, each installed agent, file explorer). Tap = create at the workspace home, auto-placed in the open tab (the launcher stamps `active_tab` first if the view drifted from it); drag an icon out and it lands at the cursor — an opening takes the whole rect, a hovered pane splits iTerm-style against the cursor's nearest edge (`dockSplitRect`; the occupant is shrunk in the same or a preceding layout write), and the dashed outline previews the exact target throughout. The tab strip keeps only tab CRUD on the left and the workspace ⋯ menu flush right.
 - **Attention:** panes whose session needs attention (existing `agentNeedsAttention` logic, moved to `lib/sessions.ts`) get a `--warning` top hairline; counts roll up to the sidebar.
 
 ### 5.7 Mobile
 
 - Sidebar → `drawer.tsx` (left slide-in) with identical content; opens via hamburger. Closes on navigation.
 - Workspace: no grid — vertical stack of panes in `readingOrder`, each `min-h-[55dvh]`, with the existing `ModifierBar` on coarse pointers. Drag/resize disabled; the session kebab offers Move up / Move down (swaps in reading order, persisted by re-packing tiles into a 12-wide, stacked layout only if the user reorders on mobile — desktop arrangement is otherwise untouched).
-- Shortcut bar: same behavior, larger touch targets (`h-11` pills).
+- Agent switcher: same behavior; with no hover to reveal it, the chevron is always visible.
 - Cascade menu renders as a bottom sheet (`ui/sheet.tsx`) instead of an anchored dropdown; folder picker is full-screen.
 - Settings modal: full-screen (existing behavior).
 - Onboarding: single column, works end-to-end on a phone (this is the "install on my laptop, approve from my phone" path — test it).
@@ -442,7 +449,7 @@ Ownership is **per-path**: a workstream may create/modify/delete only inside its
 | **A2** | **Daemon v3**: frame renames, shell resolution in `session.create`, drop argv/env/install, `T_FOREGROUND` + foreground poller (worker), `session.foreground` emit, `host.agents.*`, scope_type rename + signed-signal bump + regenerate vectors, subprotocol v3 | `daemon/**`, `proto/README.md`, `proto/*vectors*` | §4.3 | `proto/README.md` (rewrite), `docs/SESSIOND.md`, `docs/TRUST.md` (foreground disclosure note) |
 | **A3** | **Design system**: token additions + literal purge in *surviving* files (`ui/*`, `ConnectionChip`, `FileExplorer`, `HostToolsPanel`→ kept pieces, admin, download, settings panels), new primitives (`dialog`, `confirm`, `cascade-menu`, `drawer`, `empty-state`, `spinner`), `icons/AgentIcon.tsx` + bundled logo SVGs | `web/src/app/globals.css`, `web/src/components/ui/**`, `web/src/components/icons/**`, literal-purge edits in surviving components | §4.6 | `docs/DESIGN.md` (becomes the UI standards doc: tokens, primitives, container-query rules, no-literal rule) |
 | **A4** | **Grid engine**: `web/src/lib/grid.ts` + exhaustive unit tests + `proto/layout-v2-fixtures.json` | those files only | §4.4 | fixture file is the doc |
-| **A5** | **Web data layer**: rewrite `lib/api.ts` (new types/endpoints per §4.2), `lib/ws.ts` (v3 frames, `session_id`), `lib/auth.ts` (+config), new `lib/sessions.ts` (title/activity/attention/shell-matcher helpers) + `lib/workspaces.ts` (naming, recency) + `lib/highlight-store.ts`; mechanical `agent→session` rename through `components/terminal/**` (props, hooks, `useAgentSocket→useSessionSocket`, `LiveTerminalProvider` pool keys — behavior untouched) plus the cursor/prompt-state exposure for the shortcut bar (`getCursorRect`, `onCursorMove`, `onPromptStateChange` per §5.5); delete `lib/agents.ts`, `lib/screens.ts`, `lib/layout.ts`, `lib/dnd.ts` | `web/src/lib/**` (except grid.ts/theme), `web/src/components/terminal/**` | §4.2, §4.3 | — |
+| **A5** | **Web data layer**: rewrite `lib/api.ts` (new types/endpoints per §4.2), `lib/ws.ts` (v3 frames, `session_id`), `lib/auth.ts` (+config), new `lib/sessions.ts` (title/activity/attention/shell-matcher helpers) + `lib/workspaces.ts` (naming, recency) + `lib/highlight-store.ts`; mechanical `agent→session` rename through `components/terminal/**` (props, hooks, `useAgentSocket→useSessionSocket`, `LiveTerminalProvider` pool keys — behavior untouched); delete `lib/agents.ts`, `lib/screens.ts`, `lib/layout.ts`, `lib/dnd.ts` | `web/src/lib/**` (except grid.ts/theme), `web/src/components/terminal/**` | §4.2, §4.3 | — |
 
 Phase A gate: server tests green against migrated fixture DB; daemon `cargo test` green incl. a real-PTY foreground test; web `bun test src` green; grid fixtures pass in both TS and Python; e2e is expected red until C2.
 
@@ -451,17 +458,17 @@ Phase A gate: server tests green against migrated fixture DB; daemon `cargo test
 | ID | Workstream | Owns | Depends on |
 |---|---|---|---|
 | **B1** | **Shell, sidebar, settings**: `AppShell` v2, `Sidebar` v2 (+ row components, drawer wiring), `SettingsDialog` new tabs, `HostsPanel`, `AgentsPanel`, shared connect-a-host components, `app/page.tsx` redirect logic, `/hosts/[id]` restyle | `web/src/components/nav/**`, `web/src/components/settings/**`, `web/src/components/hosts/**`, `app/page.tsx`, `app/hosts/**`, `app/device/**` | A3, A5 |
-| **B2** | **Workspace experience**: `app/w/[id]`, `WorkspaceGrid` (+ drag/resize + keep-alive portals), `SessionPane`, `ShortcutBar`, `NewSessionMenu` (cascade flows incl. new-workspace variant), `FolderPickerDialog`, `app/sessions/[id]` (rebuilt full-screen view + `components/session/**`), mobile stack + ModifierBar wiring, files aside | `web/src/app/w/**`, `web/src/app/sessions/**`, `web/src/components/workspace/**`, `web/src/components/session/**`, `web/src/components/files/**` | A3, A4, A5 |
+| **B2** | **Workspace experience**: `app/w/[id]`, `WorkspaceGrid` (+ drag/resize + keep-alive portals), `SessionPane`, `AgentSwitcher`, `NewSessionMenu` (cascade flows incl. new-workspace variant), `FolderPickerDialog`, `app/sessions/[id]` (rebuilt full-screen view + `components/session/**`), mobile stack + ModifierBar wiring, files aside | `web/src/app/w/**`, `web/src/app/sessions/**`, `web/src/components/workspace/**`, `web/src/components/session/**`, `web/src/components/files/**` | A3, A4, A5 |
 | **B3** | **Onboarding + auth surfaces**: `app/onboarding/**`, `components/onboarding/**`, restyled `login/signup/forgot/reset/verify-email`, platform-detect shared lib extraction from `/download` | those paths + `web/src/lib/platform.ts` | A3, A5 |
 
-Phase B gate: `bun run build` green; manual walkthrough of onboarding → workspace → shortcut → settings on desktop and a phone viewport.
+Phase B gate: `bun run build` green; manual walkthrough of onboarding → workspace → agent switch → settings on desktop and a phone viewport.
 
 ### Phase C — convergence (serial, in this order)
 
 | ID | Workstream | Scope |
 |---|---|---|
 | **C1** | **Deletion + audit sweep**: delete every §6 item that still exists, add `next.config.ts` redirects, then run the grep gate (§9). Fix all hits. |
-| **C2** | **Test overhaul**: rewrite `tests/e2e/app-mocks.ts` for the new API; port surviving specs (terminal/scrollback/trust/device/admin/auth suites — mostly renames); replace `screens.spec.ts` with `workspace-grid.spec.ts` (drag/resize/pack/persist/zoom/attention); new specs: `onboarding.spec.ts`, `session-create.spec.ts` (cascade + folder picker), `shortcut-bar.spec.ts` (availability, type-through, install&&run, cursor anchoring: appears under the prompt cursor, hides on typing/scrollback/agent foreground, flips above near the pane bottom), `sidebar.spec.ts` (tree, hover-highlight, mobile drawer), `settings-modal.spec.ts`. Owns `web/tests/**`. |
+| **C2** | **Test overhaul**: rewrite `tests/e2e/app-mocks.ts` for the new API; port surviving specs (terminal/scrollback/trust/device/admin/auth suites — mostly renames); replace `screens.spec.ts` with `workspace-grid.spec.ts` (drag/resize/pack/persist/zoom/attention); new specs: `onboarding.spec.ts`, `session-create.spec.ts` (cascade + folder picker), `agent-switcher.spec.ts` (hover reveals the chevron, type-through, install&&run, inert while an agent holds the foreground), `sidebar.spec.ts` (tree, hover-highlight, mobile drawer), `settings-modal.spec.ts`. Owns `web/tests/**`. |
 | **C3** | **Docs + release**: `README.md` (architecture/vocabulary), final pass over `docs/DESIGN.md`, `proto/README.md`, `docs/INTERFACE_MATRIX.md`, `docs/TRUST.md`; write `docs/RELEASE_NOTES_OVERHAUL.md` (internal-user upgrade steps, §8); delete this spec's "status" header or mark shipped; final `/code-review` of the whole branch set. |
 
 ---
@@ -472,7 +479,7 @@ Deploy order: **database migrations → server+web together → daemons**.
 
 1. Server & web ship together (same deploy today). Migrations 0029–0032 run first; they are data-preserving (sessions, workspaces, agents defs, hosts, trust, users all carry over; archived agents are the one deliberate deletion).
 2. Old daemons (v2) are rejected with `protocol.required` and appear **offline** — running PTY workers keep running untouched. Each user re-runs `curl …/install.sh | sh`; the new spawnd **adopts the existing workers** over the private socket (worker wire stays compatible; old workers simply never report foreground). Sessions and scrollback survive.
-3. Post-deploy: existing sessions show their original process (a migrated `claude` session keeps running claude); its shortcut bar appears only after it exits to… nothing (old sessions weren't shells), so an exited migrated session's Restart spawns a **shell** in its cwd — this is the intended one-time behavior change; note it in the release notes.
+3. Post-deploy: existing sessions show their original process (a migrated `claude` session keeps running claude); its switcher can only switch after it exits to… nothing (old sessions weren't shells), so an exited migrated session's Restart spawns a **shell** in its cwd — this is the intended one-time behavior change; note it in the release notes.
 
 ---
 
@@ -502,7 +509,7 @@ Plus: `bun run lint && bun run test:unit && bun run test:e2e` (web), `pytest` (s
 
 ## 10. Decision log (for future archaeology)
 
-- Shell-first sessions; agents are typed shortcuts; foreground basename reported by the worker (deliberate, documented content-free exception).
+- Shell-first sessions; agents are typed into the shell from the pane header's switcher; foreground basename reported by the worker (deliberate, documented content-free exception).
 - Sessions stay standalone records; workspaces reference them via layout tiles; deleting a workspace closes its sessions (confirmed in UI).
 - `+ New workspace` immediately creates a shell session (host cascade when >1 host).
 - Full-stack rename (DB, API, protocol v3, web) with data-preserving migrations — pre-release with internal users.

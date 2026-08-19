@@ -10,6 +10,7 @@ import {
 } from "./app-mocks";
 
 const OFFLINE_HOST_ID = "00000000-0000-4000-8000-00000000000c";
+const SECOND_HOST_ID = "00000000-0000-4000-8000-00000000000e";
 
 async function openEmptyWorkspace(page: Page, options: Parameters<typeof mockApp>[1] = {}) {
   const store = await mockApp(page, {
@@ -94,8 +95,10 @@ test("folder picker browses the host control channel and selects the open folder
   });
   await page.getByRole("menuitem", { name: "Select folder…" }).click();
   const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
-  await dialog.getByRole("option", { name: "projects" }).dblclick();
-  await expect(dialog.getByLabel("Folder path")).toHaveValue("/Users/tester/projects");
+  await dialog.getByRole("option", { name: "projects" }).click();
+  await expect(
+    dialog.getByRole("listbox", { name: "Folders in /Users/tester/projects" }),
+  ).toBeVisible();
   await dialog.getByRole("button", { name: "Select this folder" }).click();
   await expect.poll(() => store.requests.sessions.length).toBe(1);
   expect(store.requests.sessions[0]).toMatchObject({
@@ -103,6 +106,29 @@ test("folder picker browses the host control channel and selects the open folder
     cwd: "/Users/tester/projects",
     workspace_id: WORKSPACE_ID,
   });
+});
+
+test("a new workspace is named after the folder it opens in", async ({ page }) => {
+  // Two hosts: "Select folder" hops through a host list before the modal.
+  const store = await mockApp(page, {
+    hosts: [host, { ...host, id: SECOND_HOST_ID, name: "Linux box" }],
+    workspaces: [workspace()],
+    sessions: [],
+    recentDirs: {
+      [HOST_ID]: [
+        { path: "/Users/tester/projects/singingcoach", last_used_at: "2026-08-19T01:00:00Z" },
+      ],
+    },
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  await page.getByRole("button", { name: "New workspace" }).click();
+  await page.getByRole("menuitem", { name: "Select folder" }).click();
+  // Two hosts: one hop picks the host, then the folder modal opens directly.
+  await page.getByRole("menuitem", { name: /^Mac/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Select this folder" }).click();
+  await expect.poll(() => store.workspaces.at(-1)?.name).toBe("tester");
 });
 
 test("workspace_full disables the plus with an explanation", async ({ page }) => {

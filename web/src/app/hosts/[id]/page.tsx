@@ -7,7 +7,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { HostAgentsPanel } from "@/components/hosts/HostAgentsPanel";
-import { AgentIcon } from "@/components/icons/AgentIcon";
+import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { AppShell } from "@/components/nav/AppShell";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Badge } from "@/components/ui/badge";
@@ -382,7 +382,7 @@ function HostDetail() {
                         {sessionTitle(session)}
                       </span>
                       <span className="block truncate font-mono text-[11px] text-muted-foreground">
-                        {session.foreground_command ?? "shell"} · {session.cwd}
+                        {agentDisplayName(session.foreground_command)} · {session.cwd}
                       </span>
                     </span>
                     <span className="hidden shrink-0 text-[11px] text-muted-foreground sm:block">

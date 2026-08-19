@@ -49,9 +49,16 @@
   --color-tone-idle: var(--tone-idle);
   --color-tone-offline: var(--tone-offline);
   --color-border: var(--border);
+  /* Seam between tiled panes. One step brighter than --border: at 1px against
+     a terminal's near-black ground the plain border reads as nothing. */
+  --color-pane-divider: var(--pane-divider);
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-terminal-bg: var(--terminal-bg);
+  /* The app-shell ground: the sidebar, and the frame the content panel floats
+     in. Sits one step off the content panel in both themes — lighter in dark,
+     darker in light — so chrome and content never read as the same surface. */
+  --color-shell: var(--shell);
   /* Brand surfaces: the landing and download pages are a darker, flatter
      stack than the app chrome, and they need to stay that way relative to
      whichever theme is active. */
@@ -59,6 +66,10 @@
   --color-brand-panel: var(--brand-panel);
   --color-brand-well: var(--brand-well);
   --color-brand-hairline: var(--brand-hairline);
+  /* The one non-status accent in the app palette: the landing page's hellfire,
+     theme-swapped so it stays legible on both grounds. */
+  --color-brand-accent: var(--brand-accent);
+  --color-brand-accent-soft: var(--brand-accent-soft);
 }
 
 @theme {
@@ -157,8 +168,17 @@
   --tone-idle: oklch(0.6 0 0);
   --tone-offline: oklch(0.78 0 0);
   --border: oklch(0.9 0 0);
+  --pane-divider: oklch(0.84 0 0);
   --input: oklch(0.9 0 0);
-  --ring: oklch(0.55 0 0);
+  /* Brand accent: the grimoire hellfire (#ff4930 = oklch(0.666 0.222 31))
+     pulled into the app chrome for the wordmark and text selection. Light sits
+     at L 0.55 like the status hues so it clears 4.5:1 on --background; dark is
+     the landing value verbatim. Focus rings stay neutral — foreground in both
+     themes — never the accent. */
+  --brand-accent: oklch(0.55 0.2 31);
+  --brand-accent-soft: oklch(0.55 0.2 31 / 0.12);
+  --ring: var(--foreground);
+  --shell: oklch(0.945 0 0);
   --terminal-bg: oklch(0.99 0 0);
 
   --brand-bg: oklch(0.97 0 0);
@@ -171,8 +191,13 @@
      h-(--row-h), gap-(--pane-gap). */
   --sidebar-width: 264px;
   --sidebar-rail-width: 56px;
-  --row-h: 2.25rem; /* the 36px nav row rhythm */
-  --pane-gap: 6px; /* workspace grid gutter */
+  --row-h: 2.5rem; /* the 40px nav row rhythm */
+  --pane-gap: 6px; /* gutter between stacked panes on narrow screens */
+  /* Gap around the floating content panel. 0 by default so full-bleed layouts
+     (and mobile, where a floating panel only wastes width) need no special
+     case; AppShell raises it at the @md/shell breakpoint, and anything sizing
+     itself off --vv-height subtracts 2x this. */
+  --content-inset: 0px;
 
   /* Updated by useViewportInset() to track on-screen keyboard. */
   --vv-height: 100dvh;
@@ -192,7 +217,9 @@
   --muted-foreground: oklch(0.71 0 0);
   --card: oklch(0.16 0 0);
   --card-foreground: oklch(0.97 0 0);
-  --popover: oklch(0.16 0 0);
+  /* Menus and popovers read as black cut into the surface, the same wherever
+     they open — over the lighter sidebar or over the panel ground. */
+  --popover: oklch(0.115 0 0);
   --popover-foreground: oklch(0.97 0 0);
   --primary: oklch(0.97 0 0);
   --primary-foreground: oklch(0.13 0 0);
@@ -214,8 +241,12 @@
   --tone-idle: oklch(0.68 0 0);
   --tone-offline: oklch(0.44 0 0);
   --border: oklch(0.27 0 0);
+  --pane-divider: oklch(0.38 0 0);
   --input: oklch(0.27 0 0);
-  --ring: oklch(0.55 0 0);
+  --brand-accent: oklch(0.67 0.22 31);
+  --brand-accent-soft: oklch(0.67 0.22 31 / 0.14);
+  --ring: var(--foreground);
+  --shell: oklch(0.225 0 0);
   --terminal-bg: oklch(0.145 0 0);
 
   --brand-bg: oklch(0.115 0 0);
@@ -240,6 +271,34 @@ body {
 body {
   /* Use the visualViewport-driven height so the layout shrinks with the keyboard. */
   min-height: var(--vv-height);
+}
+
+/* Selection picks up the brand accent app-wide, the same move `.grimoire`
+ * makes with raw hellfire. The terminal is excluded: xterm paints its own
+ * selection layer from its theme, and the WebGL renderer never sees this. */
+::selection {
+  background: var(--brand-accent);
+  color: var(--background);
+}
+
+/*
+ * Tailwind v4's Preflight gives buttons `cursor: default`, which left every
+ * clickable thing in the app without a pointer. Put it back for anything that
+ * behaves like a control. This lives in `base` so any explicit `cursor-*`
+ * utility still wins — the sidebar's `cursor-col-resize` grip, for one — and
+ * disabled controls are excluded so they keep the arrow. Anchors already get
+ * a pointer from the UA stylesheet.
+ */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="menuitem"]:not([aria-disabled="true"]),
+  [role="option"]:not([aria-disabled="true"]),
+  [role="tab"]:not([aria-disabled="true"]),
+  label[for],
+  summary {
+    cursor: pointer;
+  }
 }
 
 /*
@@ -283,11 +342,45 @@ body {
   touch-action: none;
 }
 
+/* A hair of breathing room so glyphs never sit hard against the pane edge.
+ * The fit addon subtracts this padding when it sizes the grid, so the columns
+ * still fill the pane exactly. */
+.xterm {
+  padding: 4px 6px;
+}
+
 .xterm .xterm-helper-textarea {
   touch-action: auto;
   -webkit-touch-callout: default;
   -webkit-user-select: text;
   user-select: text;
+}
+
+/* A selected tab and the panel under it are one sheet. Where the tab drops
+ * through the strip, these concave corners fill the notch either side of its
+ * foot — the surface curves out to the panel instead of stepping down. */
+.tab-connected {
+  position: relative;
+}
+.tab-connected::before,
+.tab-connected::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  width: 6px;
+  height: 6px;
+  background-color: var(--tab-surface);
+  pointer-events: none;
+}
+.tab-connected::before {
+  left: -6px;
+  -webkit-mask-image: radial-gradient(6px at 0 0, transparent 0 6px, #000 6px);
+  mask-image: radial-gradient(6px at 0 0, transparent 0 6px, #000 6px);
+}
+.tab-connected::after {
+  right: -6px;
+  -webkit-mask-image: radial-gradient(6px at 100% 0, transparent 0 6px, #000 6px);
+  mask-image: radial-gradient(6px at 100% 0, transparent 0 6px, #000 6px);
 }
 
 /* Swift, decelerating easing shared by shell chrome animations. */

@@ -45,7 +45,7 @@ def test_validate_layout_error_codes():
     }
     result = grid.validate_layout(layout(t("a", 0, 0, 6, 6), t("b", 3, 3, 6, 6)))
     assert result["errors"] == [{"code": "overlap", "index": 0, "other_index": 1}]
-    result = grid.validate_layout(layout(t("a", 0, 0, 2, 2)))
+    result = grid.validate_layout(layout(t("a", 0, 0, 1, 1)))
     assert result["errors"] == [{"code": "size", "index": 0}]
     result = grid.validate_layout(layout({"session_id": "a", "x": 0.5, "y": 0, "w": 6, "h": 6}))
     assert result["errors"] == [{"code": "integer", "index": 0}]
@@ -92,7 +92,10 @@ def test_auto_place_split_odd_side_keeps_ceil():
     assert rect == {"x": 0, "y": 6, "w": 9, "h": 6}
 
 
-def test_auto_place_returns_null_when_nothing_is_splittable():
+def test_auto_place_uses_a_two_wide_strip():
+    # With the 2x2 minimum, the leftover strip beside four 5x5 quads is a
+    # legal placement (an unsplittable-and-unplaceable canvas cannot exist
+    # below the tile cap any more).
     quads = [
         t("a", 0, 0, 5, 5),
         t("b", 5, 0, 5, 5),
@@ -100,7 +103,7 @@ def test_auto_place_returns_null_when_nothing_is_splittable():
         t("d", 5, 5, 5, 5),
     ]
     tiles, rect = grid.auto_place(quads)
-    assert rect is None
+    assert rect == {"x": 10, "y": 0, "w": 2, "h": 12}
     assert tiles == quads
 
 
@@ -159,9 +162,9 @@ def test_move_swap_exchanges_sizes():
     assert result == [t("b", 0, 0, 8, 12), t("a", 8, 0, 4, 12)]
 
 
-def test_move_into_empty_space_is_a_no_op_after_compact():
+def test_move_into_empty_space_leaves_the_gap_behind():
     tiles = [t("a", 0, 0, 6, 6)]
-    assert grid.move(tiles, "a", 6, 6) == [t("a", 0, 0, 6, 6)]
+    assert grid.move(tiles, "a", 6, 6) == [t("a", 6, 6, 6, 6)]
 
 
 def test_move_unknown_id_returns_sorted_input():
@@ -172,26 +175,23 @@ def test_move_unknown_id_returns_sorted_input():
 # ---------- resize ----------
 
 
-def test_resize_clamps_to_invariants():
+def test_resize_clamps_to_invariants_about_its_own_origin():
+    # The tile grows in place; it does not slide back to the origin.
     result = grid.resize([t("a", 6, 6, 3, 3)], "a", 99, 99)
-    assert result == [t("a", 0, 0, 6, 6)]
+    assert result == [t("a", 6, 6, 6, 6)]
     result = grid.resize([t("a", 0, 0, 6, 6)], "a", 1, 1)
-    assert result == [t("a", 0, 0, 3, 3)]
+    assert result == [t("a", 0, 0, 2, 2)]
 
 
-def test_resize_pushes_collisions_down():
+def test_resize_shrinking_leaves_empty_canvas():
+    tiles = [t("a", 0, 0, 12, 4), t("b", 0, 4, 12, 8)]
+    # b keeps its place: the freed strip stays empty, nothing repacks.
+    assert grid.resize(tiles, "b", 12, 4) == [t("a", 0, 0, 12, 4), t("b", 0, 4, 12, 4)]
+
+
+def test_resize_into_an_occupied_rect_is_a_no_op():
     tiles = [t("a", 0, 0, 12, 4), t("b", 0, 4, 12, 4)]
-    result = grid.resize(tiles, "a", 12, 8)
-    assert result == [t("a", 0, 0, 12, 8), t("b", 0, 8, 12, 4)]
-
-
-def test_resize_unresolvable_cascade_is_a_no_op():
-    tiles = [
-        t("a", 0, 0, 12, 4),
-        t("b", 0, 4, 12, 4),
-        t("c", 0, 8, 12, 4),
-    ]
-    # Growing a to h=8 forces b and c past the canvas with nowhere to go.
+    # Growing a onto b is refused; only free canvas can be taken.
     assert grid.resize(tiles, "a", 12, 8) == tiles
 
 

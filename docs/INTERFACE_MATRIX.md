@@ -81,8 +81,8 @@ As implemented:
 `session.foreground` contains only the foreground executable basename: at
 most 64 characters, no arguments, paths, titles, or output. It is emitted on
 change at no more than once per second and stored as
-`sessions.foreground_command` for pane/sidebar labeling and shortcut-bar
-visibility.
+`sessions.foreground_command` for pane/sidebar labeling and for whether the
+pane header's agent switcher can switch.
 
 ## Workspace layout v2
 

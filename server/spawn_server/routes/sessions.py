@@ -187,18 +187,31 @@ async def create_session_row(
 def _append_tile(
     layout: dict, *, session_id: str, tile: schemas.TilePlacement | None
 ) -> dict:
-    """Append the new session's tile, auto-placing when no explicit tile."""
-    tiles = layout["tiles"]
+    """Append the new session's tile to the envelope's active tab, auto-placing
+    when no explicit tile is given. `layout` is a v3 envelope (see
+    workspaces.parse_workspace_layout); the returned envelope shares every
+    other tab untouched."""
+    from . import workspaces as workspaces_routes
+
+    target = workspaces_routes.active_tab(layout)
+    tiles = target["layout"]["tiles"]
     if tile is not None:
-        candidate = tiles + [{"session_id": session_id, **tile.model_dump()}]
-        if not grid.validate_tiles(candidate):
+        placed_tiles = tiles + [{"session_id": session_id, **tile.model_dump()}]
+        if not grid.validate_tiles(placed_tiles):
             raise HTTPException(status_code=400, detail="tile placement is invalid")
-        return {"version": 2, "tiles": candidate}
-    placed, rect = grid.auto_place(tiles)
-    if rect is None:
-        raise HTTPException(status_code=409, detail="workspace_full")
-    placed.append({"session_id": session_id, **rect})
-    return {"version": 2, "tiles": placed}
+    else:
+        placed, rect = grid.auto_place(tiles)
+        if rect is None:
+            raise HTTPException(status_code=409, detail="workspace_full")
+        placed.append({"session_id": session_id, **rect})
+        placed_tiles = placed
+    tabs = [
+        {**item, "layout": {"version": 2, "tiles": placed_tiles}}
+        if item["id"] == target["id"]
+        else item
+        for item in layout["tabs"]
+    ]
+    return {"version": 3, "active_tab": layout.get("active_tab"), "tabs": tabs}
 
 
 @router.get("", response_model=list[schemas.SessionOut])

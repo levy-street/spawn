@@ -6,7 +6,15 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from .browser_registration import ED25519_SIGNATURE_B64URL_LENGTH
 from .host_identity import (
@@ -623,6 +631,16 @@ class SessionOut(BaseModel):
 # ---------- workspaces ----------
 
 
+class TileWidget(BaseModel):
+    """Non-session pane content. A widget tile's `session_id` is its own id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["files"]
+    host_id: str
+    path: str
+
+
 class WorkspaceTile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -631,6 +649,23 @@ class WorkspaceTile(BaseModel):
     y: int
     w: int
     h: int
+    # Set -> the tile renders a widget instead of a session terminal.
+    widget: TileWidget | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        # `widget` stays off the wire unless set: session tiles are the norm
+        # and their shape must not change.
+        tile: dict = {
+            "session_id": self.session_id,
+            "x": self.x,
+            "y": self.y,
+            "w": self.w,
+            "h": self.h,
+        }
+        if self.widget is not None:
+            tile["widget"] = self.widget.model_dump()
+        return tile
 
 
 class WorkspaceLayout(BaseModel):
@@ -638,6 +673,31 @@ class WorkspaceLayout(BaseModel):
 
     version: Literal[2]
     tiles: list[WorkspaceTile] = Field(default_factory=list)
+
+
+class WorkspaceTab(BaseModel):
+    """One named 12x12 grid inside a workspace (layout schema v3)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=64)
+    layout: WorkspaceLayout
+
+
+class WorkspaceLayoutV3(BaseModel):
+    """The workspace layout envelope: an ordered list of tabs, each holding a
+    v2 tile grid. The v2 algebra (grid.py / grid.ts and the shared fixtures)
+    is untouched — tabs sit above it. A workspace always has at least one tab.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[3]
+    # The tab the workspace last had open; must name a tab when set. Carried
+    # along on layout writes rather than written on every switch.
+    active_tab: str | None = None
+    tabs: list[WorkspaceTab] = Field(min_length=1, max_length=8)
 
 
 class WorkspaceFirstSession(BaseModel):
@@ -658,14 +718,20 @@ class WorkspaceCreate(BaseModel):
 
 class WorkspacePatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
-    layout: WorkspaceLayout | None = None
+    layout: WorkspaceLayoutV3 | None = None
     position: int | None = Field(default=None, ge=0)
+    # The workspace's home host/folder ("core settings"): both optional and
+    # independently patchable.
+    host_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=1024)
 
 
 class WorkspaceOut(BaseModel):
     id: str
     name: str
-    layout: WorkspaceLayout
+    host_id: str | None = None
+    cwd: str | None = None
+    layout: WorkspaceLayoutV3
     position: int = 0
     created_at: datetime
     updated_at: datetime
@@ -674,6 +740,71 @@ class WorkspaceOut(BaseModel):
 class WorkspaceCreateResponse(BaseModel):
     workspace: WorkspaceOut
     session: SessionOut | None = None
+
+
+class TemplateRun(BaseModel):
+    """What a template tile launches when instantiated."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["shell", "agent", "files"]
+    # Required (non-empty) when kind == "agent": the command typed into the
+    # freshly spawned shell.
+    command: str | None = Field(default=None, max_length=512)
+
+
+class TemplateTile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: int
+    y: int
+    w: int
+    h: int
+    run: TemplateRun
+
+
+class TemplateTab(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=64)
+    tiles: list[TemplateTile] = Field(default_factory=list, max_length=8)
+
+
+class WorkspaceTemplateSpec(BaseModel):
+    """A workspace's shape, portable across folders: geometry + what runs.
+    Tile geometry is validated against the same grid invariants as layouts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1]
+    tabs: list[TemplateTab] = Field(min_length=1, max_length=8)
+
+
+class WorkspaceTemplateCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    # The folder the template remembers: instantiation goes straight there.
+    host_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=1024)
+    spec: WorkspaceTemplateSpec
+
+
+class WorkspaceTemplatePatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    host_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=1024)
+    spec: WorkspaceTemplateSpec | None = None
+
+
+class WorkspaceTemplateOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    host_id: str | None = None
+    cwd: str | None = None
+    spec: WorkspaceTemplateSpec
+    created_at: datetime
+    updated_at: datetime
 
 
 class TrustBundleOut(BaseModel):

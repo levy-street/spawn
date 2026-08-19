@@ -1,17 +1,19 @@
 "use client";
 
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { ArrowRight, Flame, Server, Smartphone } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { ArrowRight, Flame, Plus, Server, Smartphone } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
+import { Trident, WORDMARK_CLASS } from "@/components/icons/BrandMark";
 import { AppShell } from "@/components/nav/AppShell";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
+import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
 import { hosts, workspaces } from "@/lib/api";
 import { useAuth, useAuthConfig } from "@/lib/auth";
 
@@ -29,17 +31,6 @@ export default function HomePage() {
     queryKey: ["workspaces"],
     queryFn: workspaces.list,
     enabled: Boolean(user),
-  });
-  const createWorkspaceM = useMutation({
-    mutationFn: (hostId: string) =>
-      workspaces.create({
-        name: "Workspace 1",
-        first_session: { host_id: hostId, cwd: "~" },
-      }),
-    onSuccess: (result) => {
-      window.localStorage.setItem("spawn.workspaces.last", result.workspace.id);
-      router.replace(`/w/${result.workspace.id}`);
-    },
   });
 
   useEffect(() => {
@@ -90,14 +81,8 @@ export default function HomePage() {
       }
       return;
     }
-    if (firstOnlineHost && createWorkspaceM.status === "idle") {
-      createWorkspaceM.mutate(firstOnlineHost.id);
-    }
   }, [
     config,
-    createWorkspaceM.mutate,
-    createWorkspaceM.status,
-    firstOnlineHost,
     hostsQ.error,
     hostsQ.isLoading,
     listedHosts,
@@ -179,29 +164,34 @@ export default function HomePage() {
     );
   }
 
-  if (createWorkspaceM.isError) {
+  if (orderedWorkspaces.length === 0) {
+    // No silent auto-create: the first workspace is a deliberate act — pick
+    // its folder (or replay a saved template) from the same menu the sidebar
+    // button opens.
     return (
       <AppShell>
         <EmptyState
           className="min-h-[calc(var(--vv-height)-3rem)]"
-          title="Could not create Workspace 1"
-          body={
-            createWorkspaceM.error instanceof Error
-              ? createWorkspaceM.error.message
-              : String(createWorkspaceM.error)
-          }
+          icon={<Trident className="size-8" />}
+          title="Create your first workspace"
+          body="A workspace is a grid of terminal panes rooted in one folder on your host. Shells, agents, and file explorers all open there."
           action={
-            <Button
-              disabled={!firstOnlineHost}
-              onClick={() => {
-                if (firstOnlineHost) {
-                  createWorkspaceM.reset();
-                  createWorkspaceM.mutate(firstOnlineHost.id);
-                }
+            <NewWorkspaceMenu
+              trigger={
+                <Button size="lg">
+                  <Plus className="size-4" aria-hidden />
+                  New workspace
+                </Button>
+              }
+              onCreated={({ workspaceId, focusSessionId }) => {
+                window.localStorage.setItem("spawn.workspaces.last", workspaceId);
+                router.replace(
+                  focusSessionId
+                    ? `/w/${workspaceId}?focus=${focusSessionId}`
+                    : `/w/${workspaceId}`,
+                );
               }}
-            >
-              Try again
-            </Button>
+            />
           }
         />
       </AppShell>
@@ -264,8 +254,8 @@ function LandingPage() {
 
         <nav className="relative z-10 mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-6 sm:px-8">
           <Link href="/" className="flex items-center gap-2.5">
-            <Trident className="size-7" />
-            <span className="font-sigil text-[15px] tracking-[0.3em] text-hellfire lowercase">
+            <Trident className="size-6" />
+            <span className={`${WORDMARK_CLASS} text-[19px] tracking-[0.3em] text-hellfire`}>
               spawnd
             </span>
           </Link>
@@ -466,14 +456,5 @@ function Claim({ children }: { children: ReactNode }) {
       <Flame className="mt-1 size-3.5 shrink-0 text-hellfire" aria-hidden />
       <span>{children}</span>
     </li>
-  );
-}
-
-/** The brand mark — the spawnd trident. Fits inside a square `size-N` box. */
-function Trident({ className }: { className?: string }) {
-  return (
-    <span className={`relative inline-block ${className ?? ""}`}>
-      <Image src="/trident.png" alt="" aria-hidden fill sizes="64px" className="object-contain" />
-    </span>
   );
 }

@@ -15,7 +15,6 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { SessionFilesAside, SessionFilesPanel } from "@/components/files/session-files-aside";
-import { AgentIcon } from "@/components/icons/AgentIcon";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Button } from "@/components/ui/button";
@@ -28,10 +27,19 @@ import {
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { SessionStatusDot } from "@/components/ui/status";
-import { ShortcutBar } from "@/components/workspace/shortcut-bar";
+import { AgentSwitcher } from "@/components/workspace/agent-switcher";
 import { ApiError, type Session, sessions, type Workspace, workspaces } from "@/lib/api";
 import { remove as removeTile } from "@/lib/grid";
 import { sessionTitle } from "@/lib/sessions";
+import { type LayoutV3, tabOfSession, withTabTiles } from "@/lib/tabs";
+import { cn } from "@/lib/utils";
+
+/** The envelope with `sessionId`'s tile removed from whichever tab holds it. */
+function layoutWithoutSession(layout: LayoutV3, sessionId: string): LayoutV3 {
+  const tab = tabOfSession(layout, sessionId);
+  if (!tab) return layout;
+  return withTabTiles(layout, tab.id, removeTile(tab.layout.tiles, sessionId));
+}
 
 function updateSessionCaches(
   queryClient: ReturnType<typeof useQueryClient>,
@@ -50,8 +58,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const [draftName, setDraftName] = useState("");
   const [filesOpen, setFilesOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const terminalSurfaceRef = useRef<HTMLDivElement>(null);
-  const { attach, getHandle, promptState, subscribeCursorMove } = useLiveTerminal(sessionId);
+  const { attach, getHandle } = useLiveTerminal(sessionId);
   const sessionQ = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
@@ -65,19 +72,12 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   });
   const memberWorkspace = useMemo(
     () =>
-      (workspacesQ.data ?? []).find((workspace) =>
-        workspace.layout.tiles.some((tile) => tile.session_id === sessionId),
+      (workspacesQ.data ?? []).find(
+        (workspace) => tabOfSession(workspace.layout, sessionId) !== null,
       ) ?? null,
     [sessionId, workspacesQ.data],
   );
   const session = sessionQ.data;
-  const foregroundCommand = session?.foreground_command;
-
-  useEffect(() => {
-    if (foregroundCommand === undefined) return;
-    const frame = requestAnimationFrame(() => getHandle()?.resetPromptState());
-    return () => cancelAnimationFrame(frame);
-  }, [foregroundCommand, getHandle]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -115,12 +115,12 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const removeFromWorkspaceM = useMutation({
     mutationFn: (workspace: Workspace) =>
       workspaces.update(workspace.id, {
-        layout: { version: 2, tiles: removeTile(workspace.layout.tiles, sessionId) },
+        layout: layoutWithoutSession(workspace.layout, sessionId),
       }),
     onMutate: (workspace) => {
       const optimistic = {
         ...workspace,
-        layout: { version: 2 as const, tiles: removeTile(workspace.layout.tiles, sessionId) },
+        layout: layoutWithoutSession(workspace.layout, sessionId),
       };
       queryClient.setQueryData(["workspace", workspace.id], optimistic);
       queryClient.setQueryData<Workspace[]>(["workspaces"], (current) =>
@@ -143,7 +143,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       if (memberWorkspace) {
         try {
           await workspaces.update(memberWorkspace.id, {
-            layout: { version: 2, tiles: removeTile(memberWorkspace.layout.tiles, sessionId) },
+            layout: layoutWithoutSession(memberWorkspace.layout, sessionId),
           });
         } catch (error) {
           // The session is already gone; a subsequent workspace read prunes
@@ -184,7 +184,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
 
   if (!session) {
     return (
-      <div className="grid h-vv place-items-center bg-background">
+      <div className="grid h-[calc(var(--vv-height)-2*var(--content-inset))] place-items-center bg-background">
         {sessionQ.isLoading ? (
           <Spinner label="Loading session" />
         ) : (
@@ -200,8 +200,15 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const backHref = memberWorkspace ? `/w/${memberWorkspace.id}?focus=${sessionId}` : "/";
 
   return (
-    <div className="relative flex h-vv min-h-0 flex-col overflow-hidden bg-background pad-safe-top">
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background/95 px-2 pad-safe-x sm:px-3">
+    <div className="relative flex h-[calc(var(--vv-height)-2*var(--content-inset))] min-h-0 flex-col overflow-hidden bg-background pad-safe-top">
+      {/* `pad-safe-x` alone would override px-* and leave the back button on
+          the window edge; fold the inset into the padding instead. */}
+      <header
+        className={cn(
+          "group/pane-header flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background/95",
+          "pl-[max(0.25rem,var(--safe-left))] pr-[max(0.5rem,var(--safe-right))]",
+        )}
+      >
         <Button asChild variant="ghost" size="icon" className="size-9 shrink-0">
           <Link
             href={backHref}
@@ -210,7 +217,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
             <ArrowLeft className="size-4" aria-hidden />
           </Link>
         </Button>
-        <AgentIcon command={session.foreground_command} size={26} className="rounded-md" />
+        <AgentSwitcher session={session} getHandle={getHandle} size={26} />
         {editingName ? (
           <Input
             autoFocus
@@ -302,15 +309,8 @@ export function SessionView({ sessionId }: { sessionId: string }) {
       )}
 
       <div className="flex min-h-0 flex-1">
-        <div ref={terminalSurfaceRef} className="relative min-h-0 min-w-0 flex-1 @container/term">
+        <div className="relative min-h-0 min-w-0 flex-1 @container/term">
           <div ref={attach} className="size-full" />
-          <ShortcutBar
-            session={session}
-            promptState={promptState}
-            containerRef={terminalSurfaceRef}
-            getHandle={getHandle}
-            subscribeCursorMove={subscribeCursorMove}
-          />
           {(session.status === "exited" || session.status === "killed") && (
             <div className="absolute inset-0 z-20 grid place-items-center bg-background/75 backdrop-blur-[2px]">
               <div className="flex flex-col items-center gap-3 rounded-lg border border-border bg-popover p-4 shadow-lg">

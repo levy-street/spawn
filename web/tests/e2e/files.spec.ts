@@ -268,7 +268,7 @@ test("session page toggles an inline files panel rooted at the cwd", async ({ pa
   await page.goto(`/sessions/${session().id}`);
   await page.getByRole("button", { name: "Toggle files", exact: true }).click();
 
-  const panel = page.getByRole("complementary", { name: "Files panel" });
+  const panel = page.getByRole("complementary", { name: "Files for palette" });
   await expect(panel).toBeVisible();
   await expect(panel.getByRole("treeitem").filter({ hasText: "main.rs" })).toBeVisible();
   await expect.poll(() => requestedPath).toBe("/Users/tester/projects/spawn");
@@ -277,13 +277,15 @@ test("session page toggles an inline files panel rooted at the cwd", async ({ pa
   await expect(panel).toHaveCount(0);
 });
 
-test("workspace files panel follows the focused session pane", async ({ page }) => {
+test("a file explorer is added to the workspace as its own pane", async ({ page }) => {
   const requested: Array<string | null> = [];
-  const { SESSION_B_ID, WORKSPACE_ID, workspace } = await import("./app-mocks");
+  const { HOST_ID, SESSION_B_ID, WORKSPACE_ID, workspace } = await import("./app-mocks");
   await mockApp(page, {
     sessions: [session(), session({ id: SESSION_B_ID, name: "beta", cwd: "/Users/tester/beta" })],
     workspaces: [
       workspace({
+        host_id: HOST_ID,
+        cwd: "/Users/tester/projects/spawn",
         layout: {
           version: 2,
           tiles: [
@@ -300,13 +302,13 @@ test("workspace files panel follows the focused session pane", async ({ page }) 
   });
 
   await page.goto(`/w/${WORKSPACE_ID}`);
-  await page.getByRole("button", { name: "Toggle files panel" }).click();
+  // A file explorer is a pane like any other, added from the floating
+  // launcher; the workspace's home answers where it points.
+  await page.getByRole("button", { name: "Add a pane" }).hover();
+  await page.getByRole("button", { name: "New file explorer pane" }).click();
 
-  const panel = page.getByRole("complementary", { name: "Files panel" });
-  await expect(panel).toBeVisible();
-  await expect.poll(() => requested.at(0)).toBe("/Users/tester/projects/spawn");
-
-  // Focusing the second pane re-roots the panel at that session's cwd.
-  await page.locator("section[aria-label='beta']").click();
-  await expect.poll(() => requested.at(-1)).toBe("/Users/tester/beta");
+  const pane = page.getByRole("region", { name: /^Files — / });
+  await expect(pane).toBeVisible();
+  await expect(pane.getByRole("tree", { name: "Files" })).toBeVisible();
+  await expect.poll(() => requested.length).toBeGreaterThan(0);
 });

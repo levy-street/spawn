@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Page, Route } from "@playwright/test";
 import { autoPlace, type LayoutV2, type Rect, remove as removeTile } from "../../src/lib/grid";
+import { activeTab, allTiles, type LayoutV3, tabOfSession, withTabTiles } from "../../src/lib/tabs";
 
 export const USER_ID = "00000000-0000-4000-8000-000000000001";
 export const HOST_ID = "00000000-0000-4000-8000-000000000002";
@@ -82,15 +83,39 @@ export function skill(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** Mirrors the server: a new workspace is named after the folder it opens in. */
+function workspaceNameFromCwd(cwd: string): string | null {
+  const trimmed = cwd.trim().replace(/\/+$/u, "");
+  if (!trimmed) return null;
+  if (trimmed === "~") return "Home";
+  return trimmed.split("/").at(-1) || null;
+}
+
+/** Wrap a spec's plain v2 layout into the wire's single-tab v3 envelope. */
+export function envelope(layout: LayoutV2): LayoutV3 {
+  return {
+    version: 3,
+    active_tab: "tab-1",
+    tabs: [{ id: "tab-1", name: "Tab 1", layout }],
+  };
+}
+
 export function workspace(overrides: Record<string, unknown> = {}) {
+  const { layout, ...rest } = overrides;
+  const wrapped =
+    layout && (layout as { version?: number }).version === 2
+      ? envelope(layout as LayoutV2)
+      : (layout as LayoutV3 | undefined);
   return {
     id: WORKSPACE_ID,
     name: "daily drive",
-    layout: { version: 2, tiles: [] } satisfies LayoutV2,
+    host_id: null,
+    cwd: null,
+    layout: wrapped ?? envelope({ version: 2, tiles: [] }),
     position: 0,
     created_at: CREATED_AT,
     updated_at: CREATED_AT,
-    ...overrides,
+    ...rest,
   };
 }
 
@@ -132,6 +157,7 @@ export interface AppMockStore {
   sessions: JsonRecord[];
   workspaces: JsonRecord[];
   agents: JsonRecord[];
+  workspaceTemplates: JsonRecord[];
   skills: JsonRecord[];
   recentDirs: Record<string, JsonRecord[]>;
   hostAgents: Record<string, JsonRecord[]>;
@@ -152,6 +178,7 @@ export interface AppMockOptions {
   hosts?: unknown[];
   workspaces?: unknown[];
   agents?: unknown[];
+  workspaceTemplates?: JsonRecord[];
   skills?: unknown[];
   config?: Partial<AppMockStore["config"]>;
   me?: Record<string, unknown> | null;
@@ -212,6 +239,9 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     sessions: (options.sessions ?? []).map((item) => ({ ...(item as JsonRecord) })),
     workspaces: (options.workspaces ?? [workspace()]).map((item) => ({ ...(item as JsonRecord) })),
     agents: (options.agents ?? [agent()]).map((item) => ({ ...(item as JsonRecord) })),
+    workspaceTemplates: (options.workspaceTemplates ?? []).map((item) => ({
+      ...(item as JsonRecord),
+    })),
     skills: (options.skills ?? []).map((item) => ({ ...(item as JsonRecord) })),
     recentDirs: Object.fromEntries(
       Object.entries(options.recentDirs ?? {}).map(([id, dirs]) => [
@@ -963,10 +993,10 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         typeof body.workspace_id === "string"
           ? findById(store.workspaces, body.workspace_id)
           : undefined;
+      const targetLayout = targetWorkspace?.layout as LayoutV3 | undefined;
+      const targetTab = targetLayout ? activeTab(targetLayout) : undefined;
       let geometry = body.tile as Rect | undefined;
-      let baseTiles = ((targetWorkspace?.layout as LayoutV2 | undefined)?.tiles ?? []).map(
-        (tile) => ({ ...tile }),
-      );
+      let baseTiles = (targetTab?.layout.tiles ?? []).map((tile) => ({ ...tile }));
       if (targetWorkspace && !geometry) {
         const placed = autoPlace(baseTiles);
         if (workspaceFull || !placed.tile) {
@@ -989,11 +1019,11 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       if (Array.isArray(body.skill_ids)) {
         store.sessionSkills[String(created.id)] = body.skill_ids.map(String);
       }
-      if (targetWorkspace && geometry) {
-        targetWorkspace.layout = {
-          version: 2,
-          tiles: [...baseTiles, { session_id: created.id as string, ...geometry }],
-        };
+      if (targetWorkspace && targetLayout && targetTab && geometry) {
+        targetWorkspace.layout = withTabTiles(targetLayout, targetTab.id, [
+          ...baseTiles,
+          { session_id: created.id as string, ...geometry },
+        ]);
         targetWorkspace.updated_at = new Date().toISOString();
       }
       await json(route, created, 201);
@@ -1052,8 +1082,15 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         delete store.sessionSkills[sessionMatch[1]];
         store.sessions.splice(store.sessions.indexOf(selected), 1);
         for (const target of store.workspaces) {
-          const layout = target.layout as LayoutV2;
-          target.layout = { version: 2, tiles: removeTile(layout.tiles, sessionMatch[1]) };
+          const layout = target.layout as LayoutV3;
+          const holder = tabOfSession(layout, sessionMatch[1]);
+          if (holder) {
+            target.layout = withTabTiles(
+              layout,
+              holder.id,
+              removeTile(holder.layout.tiles, sessionMatch[1]),
+            );
+          }
         }
         await route.fulfill({ status: 204, body: "" });
         return;
@@ -1073,14 +1110,22 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         await options.createWorkspace(body, route, store);
         return;
       }
+      const first =
+        body.first_session && typeof body.first_session === "object"
+          ? (body.first_session as JsonRecord)
+          : null;
       const createdWorkspace: JsonRecord = workspace({
         id: nextId(),
-        name: body.name ?? `Workspace ${store.workspaces.length + 1}`,
+        name:
+          body.name ??
+          workspaceNameFromCwd(typeof first?.cwd === "string" ? first.cwd : "") ??
+          `Workspace ${store.workspaces.length + 1}`,
         position: store.workspaces.length,
+        host_id: first?.host_id ?? null,
+        cwd: first?.cwd ?? null,
       });
       let createdSession: JsonRecord | null = null;
-      if (body.first_session && typeof body.first_session === "object") {
-        const first = body.first_session as JsonRecord;
+      if (first) {
         const selectedHost =
           typeof first.host_id === "string" ? findById(store.hosts, first.host_id) : undefined;
         createdSession = session({
@@ -1094,10 +1139,10 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         if (Array.isArray(first.skill_ids)) {
           store.sessionSkills[String(createdSession.id)] = first.skill_ids.map(String);
         }
-        createdWorkspace.layout = {
+        createdWorkspace.layout = envelope({
           version: 2,
           tiles: [{ session_id: createdSession.id as string, x: 0, y: 0, w: 12, h: 12 }],
-        };
+        });
       }
       store.workspaces.push(createdWorkspace);
       await json(route, { workspace: createdWorkspace, session: createdSession }, 201);
@@ -1132,9 +1177,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         return;
       }
       if (method === "DELETE") {
-        const ids = new Set(
-          ((selected.layout as LayoutV2 | undefined)?.tiles ?? []).map((tile) => tile.session_id),
-        );
+        const ids = new Set(allTiles(selected.layout as LayoutV3).map((tile) => tile.session_id));
         for (const id of ids) delete store.sessionSkills[id];
         store.sessions.splice(
           0,
@@ -1142,6 +1185,40 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
           ...store.sessions.filter((item) => !ids.has(String(item.id))),
         );
         store.workspaces.splice(store.workspaces.indexOf(selected), 1);
+        await route.fulfill({ status: 204, body: "" });
+        return;
+      }
+    }
+    if (path === "/api/workspace-templates" && method === "GET") {
+      await json(route, store.workspaceTemplates);
+      return;
+    }
+    if (path === "/api/workspace-templates" && method === "POST") {
+      const body = await readBody();
+      const created = {
+        id: nextId(),
+        created_at: "2026-08-19T00:00:00Z",
+        updated_at: "2026-08-19T00:00:00Z",
+        ...body,
+      };
+      store.workspaceTemplates.push(created);
+      await json(route, created, 201);
+      return;
+    }
+    const templateMatch = path.match(/^\/api\/workspace-templates\/([^/]+)$/);
+    if (templateMatch) {
+      const selected = findById(store.workspaceTemplates, templateMatch[1]);
+      if (!selected) {
+        await json(route, { detail: "template not found" }, 404);
+        return;
+      }
+      if (method === "PATCH") {
+        Object.assign(selected, await readBody());
+        await json(route, selected);
+        return;
+      }
+      if (method === "DELETE") {
+        store.workspaceTemplates.splice(store.workspaceTemplates.indexOf(selected), 1);
         await route.fulfill({ status: 204, body: "" });
         return;
       }

@@ -38,6 +38,8 @@ export type CascadeItem = {
   label: string;
   /** Secondary line, e.g. a full path under a folder name. */
   detail?: string;
+  /** Render as a non-interactive section label instead of a menu item. */
+  heading?: boolean;
   disabled?: boolean;
   /** Leaf action: runs and closes the menu. Ignored when `panel` is set. */
   onSelect?: () => void;
@@ -296,41 +298,56 @@ export const CascadeMenu = forwardRef<
           {panel.emptyLabel ?? "Nothing here"}
         </div>
       ) : (
-        panel.items.map((item, index) => (
-          <button
-            key={item.key ?? item.label}
-            type="button"
-            role="menuitem"
-            data-cascade-index={index}
-            disabled={item.disabled}
-            aria-haspopup={item.panel ? "menu" : undefined}
-            onClick={() => activate(item)}
-            className={cn(
-              "flex w-full cursor-default select-none items-center gap-2 rounded-md px-2 text-left text-sm outline-none transition-colors",
-              "hover:bg-accent focus-visible:bg-accent disabled:pointer-events-none disabled:opacity-50",
-              // Taller touch targets in the sheet presentation.
-              asSheet ? "min-h-11 py-2" : "py-1.5",
-            )}
-          >
-            {item.icon != null && (
-              <span
-                className="flex size-4 shrink-0 items-center justify-center [&>svg]:size-4"
-                aria-hidden
-              >
-                {item.icon}
-              </span>
-            )}
-            <span className="min-w-0 flex-1">
-              <span className="block truncate">{item.label}</span>
-              {item.detail != null && (
-                <span className="block truncate text-xs text-muted-foreground">{item.detail}</span>
+        panel.items.map((item, index) =>
+          item.heading ? (
+            <div
+              key={item.key ?? item.label}
+              role="presentation"
+              className={cn(
+                "select-none px-2 pb-1 pt-2 text-xs font-medium text-muted-foreground",
+                index > 0 && "mt-1 border-t border-border",
               )}
-            </span>
-            {item.panel != null && (
-              <ChevronRight className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-            )}
-          </button>
-        ))
+            >
+              {item.label}
+            </div>
+          ) : (
+            <button
+              key={item.key ?? item.label}
+              type="button"
+              role="menuitem"
+              data-cascade-index={index}
+              disabled={item.disabled}
+              aria-haspopup={item.panel ? "menu" : undefined}
+              onClick={() => activate(item)}
+              className={cn(
+                "flex w-full cursor-default select-none items-center gap-2 rounded-md px-2 text-left text-sm outline-none transition-colors",
+                "hover:bg-accent focus-visible:bg-accent disabled:pointer-events-none disabled:opacity-50",
+                // Taller touch targets in the sheet presentation.
+                asSheet ? "min-h-11 py-2" : "py-1.5",
+              )}
+            >
+              {item.icon != null && (
+                <span
+                  className="flex size-4 shrink-0 items-center justify-center [&>svg]:size-4"
+                  aria-hidden
+                >
+                  {item.icon}
+                </span>
+              )}
+              <span className="min-w-0 flex-1">
+                <span className="block truncate">{item.label}</span>
+                {item.detail != null && (
+                  <span className="block truncate text-xs text-muted-foreground">
+                    {item.detail}
+                  </span>
+                )}
+              </span>
+              {item.panel != null && (
+                <ChevronRight className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+              )}
+            </button>
+          ),
+        )
       )}
     </div>
   );

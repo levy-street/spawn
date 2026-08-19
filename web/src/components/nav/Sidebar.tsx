@@ -1,39 +1,23 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  LogOut,
-  PanelLeftClose,
-  PanelLeftOpen,
-  Plus,
-  Settings,
-  SquareTerminal,
-  X,
-} from "lucide-react";
+import { LogOut, PanelLeftClose, PanelLeftOpen, Plus, Settings, X } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
-import { SidebarSessionRow } from "@/components/nav/SidebarSessionRow";
+import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
+import { Trident, WORDMARK_CLASS } from "@/components/icons/BrandMark";
 import { SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
 import { SidebarIconSlot, SidebarRowLabel, sidebarRowClass } from "@/components/nav/sidebar-parts";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
-import {
-  DropdownMenu,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
-} from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { RailTooltip } from "@/components/ui/tooltip";
-import { NewSessionMenu } from "@/components/workspace/new-session-menu";
-import { hosts, type Session, sessions, type Workspace, workspaces } from "@/lib/api";
+import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
+import { hosts, sessions, type Workspace, workspaces } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
-import { sessionTitle } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
-import { workspaceAttentionCount, workspaceSessionIds } from "@/lib/workspaces";
-
-const EXPANDED_KEY_PREFIX = "spawn.sidebar.workspace.expanded.";
+import { workspaceAttentionCount } from "@/lib/workspaces";
 
 export function Sidebar({
   pathname,
@@ -52,7 +36,6 @@ export function Sidebar({
   const queryClient = useQueryClient();
   const { user } = useAuth();
   const [actionError, setActionError] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
@@ -81,51 +64,40 @@ export function Sidebar({
   const onlineHosts = (hostsQ.data ?? []).filter((host) => host.status === "online");
   const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
 
-  useEffect(() => {
-    if (orderedWorkspaces.length === 0) return;
-    setExpanded((current) => {
-      const next = { ...current };
-      let changed = false;
-      for (const workspace of orderedWorkspaces) {
-        if (workspace.id in next) continue;
-        next[workspace.id] =
-          window.localStorage.getItem(`${EXPANDED_KEY_PREFIX}${workspace.id}`) !== "false";
-        changed = true;
-      }
-      return changed ? next : current;
-    });
-  }, [orderedWorkspaces]);
-
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ["sessions"] });
     queryClient.invalidateQueries({ queryKey: ["workspaces"] });
     queryClient.invalidateQueries({ queryKey: ["hosts"] });
   };
 
-  const createWorkspaceM = useMutation({
-    mutationFn: (hostId: string) =>
-      workspaces.create({ first_session: { host_id: hostId, cwd: "~" } }),
-    onSuccess: (result) => {
-      setActionError(null);
-      refresh();
-      router.push(`/w/${result.workspace.id}`);
-      onNavigate?.();
-    },
-    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
-  });
   const renameWorkspaceM = useMutation({
     mutationFn: ({ id, name }: { id: string; name: string }) => workspaces.update(id, { name }),
     onSuccess: refresh,
     onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
   });
-  const moveWorkspaceM = useMutation({
-    mutationFn: ({ workspace, target }: { workspace: Workspace; target: Workspace }) =>
-      Promise.all([
-        workspaces.update(workspace.id, { position: target.position }),
-        workspaces.update(target.id, { position: workspace.position }),
-      ]),
+  const reorderWorkspaceM = useMutation({
+    // The server reorders by removal + reinsertion, so a single position
+    // write is a proper insert-at-index for the drag drop.
+    mutationFn: ({ id, position }: { id: string; position: number }) =>
+      workspaces.update(id, { position }),
+    // Optimistic: the drop lands instantly instead of snapping back for a
+    // round-trip; refresh reconciles either way.
+    onMutate: ({ id, position }) => {
+      queryClient.setQueryData<Workspace[]>(["workspaces"], (current) => {
+        if (!current) return current;
+        const ordered = [...current].sort((a, b) => a.position - b.position);
+        const moving = ordered.find((workspace) => workspace.id === id);
+        if (!moving) return current;
+        const without = ordered.filter((workspace) => workspace.id !== id);
+        without.splice(position, 0, moving);
+        return without.map((workspace, index) => ({ ...workspace, position: index }));
+      });
+    },
     onSuccess: refresh,
-    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
+    onError: (error) => {
+      refresh();
+      setActionError(error instanceof Error ? error.message : String(error));
+    },
   });
   const deleteWorkspaceM = useMutation({
     mutationFn: (id: string) => workspaces.remove(id),
@@ -136,33 +108,105 @@ export function Sidebar({
     },
     onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
   });
-  const renameSessionM = useMutation({
-    mutationFn: ({ id, name }: { id: string; name: string }) => sessions.rename(id, name),
-    onSuccess: refresh,
-    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
-  });
-  const restartSessionM = useMutation({
-    mutationFn: (id: string) => sessions.restart(id),
-    onSuccess: refresh,
-    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
-  });
-  const closeSessionM = useMutation({
-    mutationFn: (id: string) => sessions.remove(id),
-    onSuccess: refresh,
-    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
-  });
-
   const workspaceBusy =
-    renameWorkspaceM.isPending || moveWorkspaceM.isPending || deleteWorkspaceM.isPending;
-  const sessionBusy =
-    renameSessionM.isPending || restartSessionM.isPending || closeSessionM.isPending;
+    renameWorkspaceM.isPending || reorderWorkspaceM.isPending || deleteWorkspaceM.isPending;
 
-  const toggleWorkspace = (id: string) => {
-    setExpanded((current) => {
-      const value = !(current[id] ?? true);
-      window.localStorage.setItem(`${EXPANDED_KEY_PREFIX}${id}`, String(value));
-      return { ...current, [id]: value };
-    });
+  /**
+   * Drag a workspace row up or down to reorder. Pointer-based with a small
+   * threshold, so a plain click still navigates: past the threshold the row
+   * translates with the pointer, the drop index is the number of other rows
+   * whose midpoint sits above the release point, and the click that follows
+   * a real drag is swallowed.
+   */
+  const startWorkspaceDrag = (workspaceId: string, event: ReactPointerEvent<HTMLLIElement>) => {
+    if (event.button !== 0 || event.pointerType === "touch") return;
+    if ((event.target as Element).closest?.("button, input, [role='menu']")) return;
+    const rowElement = event.currentTarget;
+    const startY = event.clientY;
+    const startX = event.clientX;
+    let dragging = false;
+    // Geometry is captured up front: rows shift with transforms mid-drag, so
+    // both the target index and the shift math must use the resting rects.
+    const rows = Array.from(document.querySelectorAll<HTMLElement>("[data-workspace-row]"));
+    const restingRects = rows.map((row) => row.getBoundingClientRect());
+    const from = rows.indexOf(rowElement);
+    const fromRect = restingRects[from];
+    const rowStride = (fromRect?.height ?? 36) + 8; // + the list's space-y-2
+    let lastTarget = from;
+
+    const targetIndexFor = (clientY: number) => {
+      let target = 0;
+      for (const [index, row] of rows.entries()) {
+        const rect = restingRects[index];
+        if (row === rowElement || !rect) continue;
+        if (clientY > rect.top + rect.height / 2) target += 1;
+      }
+      return target;
+    };
+
+    const onMove = (moveEvent: PointerEvent) => {
+      if (!dragging) {
+        if (Math.abs(moveEvent.clientY - startY) < 5 && Math.abs(moveEvent.clientX - startX) < 5) {
+          return;
+        }
+        dragging = true;
+        rowElement.style.zIndex = "10";
+        rowElement.style.position = "relative";
+        rowElement.style.background = "var(--shell)";
+        rowElement.style.borderRadius = "0.5rem";
+        rowElement.style.boxShadow = "0 6px 16px rgb(0 0 0 / 0.35)";
+        document.body.style.cursor = "grabbing";
+        document.body.style.userSelect = "none";
+      }
+      moveEvent.preventDefault();
+      rowElement.style.transform = `translateY(${moveEvent.clientY - startY}px)`;
+      // Everything between the old and prospective slot slides one stride to
+      // make room, so the drop target is always visible.
+      const target = targetIndexFor(moveEvent.clientY);
+      if (target === lastTarget) return;
+      lastTarget = target;
+      rows.forEach((row, index) => {
+        if (row === rowElement) return;
+        let shift = 0;
+        if (from < target && index > from && index <= target) shift = -rowStride;
+        if (from > target && index < from && index >= target) shift = rowStride;
+        row.style.transition = "transform 150ms var(--ease-swift, ease-out)";
+        row.style.transform = shift === 0 ? "" : `translateY(${shift}px)`;
+      });
+    };
+    const finish = (commit: boolean, clientY: number) => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointercancel", onCancel);
+      for (const row of rows) {
+        row.style.transform = "";
+        row.style.transition = "";
+      }
+      rowElement.style.zIndex = "";
+      rowElement.style.position = "";
+      rowElement.style.background = "";
+      rowElement.style.borderRadius = "";
+      rowElement.style.boxShadow = "";
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      if (!dragging) return;
+      const swallowClick = (clickEvent: Event) => {
+        clickEvent.stopPropagation();
+        clickEvent.preventDefault();
+      };
+      document.addEventListener("click", swallowClick, { capture: true, once: true });
+      window.setTimeout(
+        () => document.removeEventListener("click", swallowClick, { capture: true }),
+        0,
+      );
+      if (!commit) return;
+      const target = targetIndexFor(clientY);
+      if (target !== from) reorderWorkspaceM.mutate({ id: workspaceId, position: target });
+    };
+    const onUp = (upEvent: PointerEvent) => finish(true, upEvent.clientY);
+    const onCancel = () => finish(false, startY);
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp, { once: true });
+    document.addEventListener("pointercancel", onCancel);
   };
 
   const requestWorkspaceDelete = async (workspace: Workspace) => {
@@ -175,44 +219,29 @@ export function Sidebar({
     if (accepted) deleteWorkspaceM.mutate(workspace.id);
   };
 
-  const requestSessionClose = async (session: Session) => {
-    const accepted = await confirm({
-      title: `Close ${sessionTitle(session)}?`,
-      body: "Closing this session kills its running process and cannot be undone.",
-      confirmLabel: "Close session",
-      destructive: true,
-    });
-    if (accepted) closeSessionM.mutate(session.id);
-  };
-
   const newWorkspaceButton = (
-    <Button
+    // Dressed exactly like the workspace rows below it.
+    <button
       type="button"
-      size="sm"
-      disabled={createWorkspaceM.isPending}
       onClick={
-        onlineHosts.length > 1
+        onlineHosts.length > 0
           ? undefined
           : () => {
-              if (onlineHosts.length === 1 && onlineHosts[0]) {
-                createWorkspaceM.mutate(onlineHosts[0].id);
-              } else {
-                onNavigate?.();
-                openSettings("hosts");
-              }
+              onNavigate?.();
+              openSettings("hosts");
             }
       }
-      className="group/new h-(--row-h) w-full justify-start px-0"
+      className={cn(sidebarRowClass(false), "group/new")}
     >
       <SidebarIconSlot>
         <Plus className="size-4 transition-transform duration-150 group-hover/new:rotate-90" />
       </SidebarIconSlot>
       <SidebarRowLabel collapsed={collapsed}>New workspace</SidebarRowLabel>
-    </Button>
+    </button>
   );
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-card">
+    <div className="flex h-full min-h-0 flex-col bg-shell">
       <div className="px-2.5 pb-1 pt-3">
         <div className="flex h-(--row-h) items-center">
           {collapsed ? (
@@ -225,7 +254,7 @@ export function Sidebar({
                 onClick={onToggle}
                 className="group/brand size-9 shrink-0"
               >
-                <SquareTerminal className="size-4.5 group-hover/brand:hidden" aria-hidden />
+                <Trident className="size-6 group-hover/brand:hidden" />
                 <PanelLeftOpen
                   className="hidden size-4.5 text-muted-foreground group-hover/brand:block"
                   aria-hidden
@@ -239,10 +268,13 @@ export function Sidebar({
               className="grid size-9 shrink-0 place-items-center rounded-lg text-foreground transition-colors hover:bg-accent/50"
               aria-label="Home"
             >
-              <SquareTerminal className="size-4.5" aria-hidden />
+              <Trident className="size-6" />
             </Link>
           )}
-          <SidebarRowLabel collapsed={collapsed} className="text-base font-semibold tracking-tight">
+          <SidebarRowLabel
+            collapsed={collapsed}
+            className={cn(WORDMARK_CLASS, "text-[17px] text-brand-accent")}
+          >
             spawnd
           </SidebarRowLabel>
           {showCollapseControl ? (
@@ -255,7 +287,9 @@ export function Sidebar({
               tabIndex={collapsed ? -1 : 0}
               onClick={onToggle}
               className={cn(
-                "size-7 shrink-0",
+                // Muted like the expand control it mirrors: chrome, not a
+                // destination.
+                "size-7 shrink-0 text-muted-foreground hover:text-foreground",
                 collapsed
                   ? "pointer-events-none opacity-0 duration-100"
                   : "opacity-100 delay-75 duration-150",
@@ -278,15 +312,18 @@ export function Sidebar({
         </div>
       </div>
 
-      <div className="px-2.5 pb-2">
+      <div className="border-y border-border px-2.5 py-2">
         <RailTooltip label="New workspace" disabled={!collapsed} className="[&>span]:w-full">
-          {onlineHosts.length > 1 ? (
-            <NewSessionMenu
-              mode="workspace"
+          {onlineHosts.length > 0 ? (
+            <NewWorkspaceMenu
               trigger={newWorkspaceButton}
-              onCreated={({ workspaceId }) => {
+              onCreated={({ workspaceId, focusSessionId }) => {
                 refresh();
-                router.push(`/w/${workspaceId}`);
+                router.push(
+                  focusSessionId
+                    ? `/w/${workspaceId}?focus=${focusSessionId}`
+                    : `/w/${workspaceId}`,
+                );
                 onNavigate?.();
               }}
             />
@@ -296,7 +333,7 @@ export function Sidebar({
         </RailTooltip>
       </div>
 
-      <nav aria-label="Workspaces" className="min-h-0 flex-1 overflow-y-auto px-2.5 pb-3">
+      <nav aria-label="Workspaces" className="min-h-0 flex-1 overflow-y-auto px-2.5 pb-3 pt-2.5">
         {actionError && !collapsed && (
           <p className="px-1.5 pb-2 text-xs text-destructive" role="alert">
             {actionError}
@@ -307,77 +344,27 @@ export function Sidebar({
             Your workspaces will appear here.
           </p>
         )}
-        <ul className="space-y-0.5">
-          {orderedWorkspaces.map((workspace, index) => {
-            const workspaceSessions = workspaceSessionIds(workspace)
-              .map((id) => sessionsById.get(id))
-              .filter((session): session is Session => session !== undefined);
+        <ul className="space-y-2">
+          {orderedWorkspaces.map((workspace) => {
             return (
               <SidebarWorkspaceRow
                 key={workspace.id}
                 workspace={workspace}
                 active={currentWorkspaceId === workspace.id}
                 collapsed={collapsed}
-                expanded={expanded[workspace.id] ?? true}
                 attentionCount={workspaceAttentionCount(workspace, sessionsById)}
                 busy={workspaceBusy}
-                canMoveUp={index > 0}
-                canMoveDown={index < orderedWorkspaces.length - 1}
                 onNavigate={onNavigate}
-                onToggle={() => toggleWorkspace(workspace.id)}
                 onRename={(name) => renameWorkspaceM.mutate({ id: workspace.id, name })}
-                onMoveUp={() => {
-                  const target = orderedWorkspaces[index - 1];
-                  if (target) moveWorkspaceM.mutate({ workspace, target });
-                }}
-                onMoveDown={() => {
-                  const target = orderedWorkspaces[index + 1];
-                  if (target) moveWorkspaceM.mutate({ workspace, target });
-                }}
                 onDelete={() => void requestWorkspaceDelete(workspace)}
-              >
-                {workspaceSessions.map((session) => (
-                  <SidebarSessionRow
-                    key={session.id}
-                    session={session}
-                    workspaceId={workspace.id}
-                    active={pathname === `/sessions/${session.id}`}
-                    busy={sessionBusy}
-                    onNavigate={onNavigate}
-                    onRename={(name) => renameSessionM.mutate({ id: session.id, name })}
-                    onRestart={() => restartSessionM.mutate(session.id)}
-                    onClose={() => void requestSessionClose(session)}
-                  />
-                ))}
-                <li className="pl-5 [&>span]:w-full">
-                  <NewSessionMenu
-                    mode="session"
-                    workspaceId={workspace.id}
-                    trigger={
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-8 w-full justify-start px-2 text-xs text-muted-foreground"
-                      >
-                        <Plus className="size-3.5" aria-hidden />
-                        add session
-                      </Button>
-                    }
-                    onCreated={({ workspaceId, sessionId }) => {
-                      refresh();
-                      router.push(`/w/${workspaceId}?focus=${sessionId}`);
-                      onNavigate?.();
-                    }}
-                  />
-                </li>
-              </SidebarWorkspaceRow>
+                onRowPointerDown={(event) => startWorkspaceDrag(workspace.id, event)}
+              />
             );
           })}
         </ul>
       </nav>
 
-      <div className="border-t border-border px-2.5 py-2">
+      <div className="border-y border-border px-2.5 py-2">
         <RailTooltip label="Settings" disabled={!collapsed}>
           <Button
             type="button"
@@ -423,17 +410,6 @@ export function Sidebar({
             </RailTooltip>
           )}
         >
-          <DropdownMenuLabel className="truncate">{user?.email ?? "—"}</DropdownMenuLabel>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            onSelect={() => {
-              onNavigate?.();
-              openSettings("account");
-            }}
-          >
-            <Settings className="size-4" aria-hidden />
-            Settings
-          </DropdownMenuItem>
           <DropdownMenuItem
             destructive
             onSelect={() => {

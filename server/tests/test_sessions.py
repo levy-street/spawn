@@ -231,7 +231,7 @@ async def test_session_create_appends_workspace_tile(client):
     )
     assert first.status_code == 201, first.text
     layout = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()["layout"]
-    assert layout["tiles"] == [
+    assert layout["tabs"][0]["layout"]["tiles"] == [
         {"session_id": first.json()["id"], "x": 0, "y": 0, "w": 12, "h": 12}
     ]
 
@@ -243,7 +243,7 @@ async def test_session_create_appends_workspace_tile(client):
     )
     assert second.status_code == 201, second.text
     layout = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()["layout"]
-    by_id = {tile["session_id"]: tile for tile in layout["tiles"]}
+    by_id = {tile["session_id"]: tile for tile in layout["tabs"][0]["layout"]["tiles"]}
     assert by_id[first.json()["id"]] == {
         "session_id": first.json()["id"], "x": 0, "y": 0, "w": 6, "h": 12
     }
