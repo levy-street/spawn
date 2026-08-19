@@ -126,6 +126,7 @@ async def device_start(
         device_code=_gen_device_code(),
         user_code=user_code,
         approval_ref=_gen_approval_ref(),
+        sas_commit=body.sas_commit,
         host_name=body.host_name,
         os=body.os,
         arch=body.arch,
@@ -141,7 +142,9 @@ async def device_start(
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise HTTPException(status_code=409, detail="could not allocate device code; retry") from exc
+        raise HTTPException(
+            status_code=409, detail="could not allocate device code; retry"
+        ) from exc
 
     assert dc.approval_nonce is not None
     assert dc.approval_ref is not None
@@ -208,18 +211,22 @@ async def device_possession(
     # An exact already-verified tuple is the sole idempotent retry case.
     await session.rollback()
     snapshot = (
-        await session.execute(
-            select(
-                DeviceCode.approval_nonce,
-                DeviceCode.host_key_algorithm,
-                DeviceCode.host_public_key,
-                DeviceCode.host_possession_version,
-                DeviceCode.host_possession_verified_at,
-                DeviceCode.status,
-                DeviceCode.expires_at,
-            ).where(DeviceCode.device_code == body.device_code)
+        (
+            await session.execute(
+                select(
+                    DeviceCode.approval_nonce,
+                    DeviceCode.host_key_algorithm,
+                    DeviceCode.host_public_key,
+                    DeviceCode.host_possession_version,
+                    DeviceCode.host_possession_verified_at,
+                    DeviceCode.status,
+                    DeviceCode.expires_at,
+                ).where(DeviceCode.device_code == body.device_code)
+            )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     if snapshot is None:
         raise HTTPException(status_code=404, detail="unknown device code")
     if (
@@ -549,9 +556,7 @@ async def device_poll(
         host.arch = claimed["arch"]
         host.version = claimed["version"]
 
-    existing_pin = await session.get(
-        HostBrowserPin, (host.id, claimed["browser_device_id"])
-    )
+    existing_pin = await session.get(HostBrowserPin, (host.id, claimed["browser_device_id"]))
     pin_values = (
         claimed["browser_key_algorithm"],
         claimed["browser_public_key"],
@@ -641,6 +646,8 @@ def _pending_response(dc: DeviceCode) -> schemas.DevicePendingResponse:
         host_key_algorithm=dc.host_key_algorithm,
         host_public_key=dc.host_public_key,
         host_key_fingerprint=host_key_fingerprint(dc.host_key_algorithm, dc.host_public_key),
+        sas_commit=dc.sas_commit,
+        sas_host_nonce=dc.sas_host_nonce,
     )
 
 
@@ -684,6 +691,97 @@ async def device_pending(
         session, user_code=body.user_code, approval_ref=body.approval_ref
     )
     return _pending_response(dc)
+
+
+@router.post("/sas", response_model=schemas.DeviceSasResponse)
+async def device_sas(
+    body: schemas.DeviceSasRequest,
+    session: AsyncSession = Depends(get_session),
+    _user: User = Depends(auth.current_user),
+) -> schemas.DeviceSasResponse:
+    """Browser's committed-ephemeral SAS contribution: its nonce Nb and key B.
+    The server only stores/forwards them (it is a dumb relay); the daemon reads
+    them on its next poll and reveals its own Nd. Set-once, and only while the
+    ceremony is still pending with a daemon commitment present."""
+
+    dc = await _pending_device_code(
+        session, user_code=body.user_code, approval_ref=body.approval_ref
+    )
+    if dc.sas_commit is None:
+        # No daemon commitment ⇒ this daemon doesn't speak SAS; nothing to relay.
+        raise HTTPException(status_code=409, detail="host did not offer a SAS commitment")
+    if dc.sas_browser_nonce is not None or dc.sas_browser_key is not None:
+        # Set-once: a second contribution would let a relay swap Nb after seeing Nd.
+        raise HTTPException(status_code=409, detail="SAS contribution already recorded")
+    await session.execute(
+        update(DeviceCode)
+        .where(
+            DeviceCode.device_code == dc.device_code,
+            DeviceCode.sas_browser_nonce.is_(None),
+        )
+        .values(
+            sas_browser_nonce=body.sas_browser_nonce,
+            sas_browser_key=body.browser_public_key,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    return schemas.DeviceSasResponse(ok=True)
+
+
+@router.post("/sas-host", response_model=schemas.DeviceSasHostResponse)
+async def device_sas_host(
+    body: schemas.DeviceSasHostRequest,
+    session: AsyncSession = Depends(get_session),
+) -> schemas.DeviceSasHostResponse:
+    """Daemon's SAS handshake, authenticated by the device_code (no user
+    session, like poll). Returns the browser's Nb/B once present, and — when the
+    daemon supplies its opened Nd (only after it has seen Nb) — records it once.
+    Deliberately independent of the approval CAS so the pairing race is untouched.
+
+    Commit-reveal ordering is enforced here: Nd is accepted only while Nb is
+    already present, and set-once, so a relay cannot make the daemon reveal Nd
+    before the browser has committed to Nb."""
+    dc = (
+        await session.execute(select(DeviceCode).where(DeviceCode.device_code == body.device_code))
+    ).scalar_one_or_none()
+    # Match on the daemon's own key; never echo which check failed.
+    if (
+        dc is None
+        or dc.host_key_algorithm != body.host_key_algorithm
+        or dc.host_public_key != body.host_public_key
+    ):
+        raise HTTPException(status_code=404, detail="unknown device code")
+    expires = _aware(dc.expires_at)
+    if expires is not None and expires <= _utcnow():
+        raise HTTPException(status_code=400, detail="device code expired")
+
+    if (
+        body.sas_host_nonce is not None
+        and dc.sas_browser_nonce is not None
+        and dc.sas_host_nonce is None
+    ):
+        await session.execute(
+            update(DeviceCode)
+            .where(
+                DeviceCode.device_code == dc.device_code,
+                DeviceCode.sas_browser_nonce.is_not(None),
+                DeviceCode.sas_host_nonce.is_(None),
+            )
+            .values(sas_host_nonce=body.sas_host_nonce)
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+        return schemas.DeviceSasHostResponse(
+            sas_browser_nonce=dc.sas_browser_nonce,
+            sas_browser_key=dc.sas_browser_key,
+            sas_host_nonce=body.sas_host_nonce,
+        )
+    return schemas.DeviceSasHostResponse(
+        sas_browser_nonce=dc.sas_browser_nonce,
+        sas_browser_key=dc.sas_browser_key,
+        sas_host_nonce=dc.sas_host_nonce,
+    )
 
 
 @router.post("/approve", response_model=schemas.DeviceApproveResponse)

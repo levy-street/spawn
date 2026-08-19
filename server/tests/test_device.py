@@ -271,6 +271,9 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
         "host_key_algorithm": "ed25519",
         "host_public_key": public_key,
         "host_key_fingerprint": fingerprint,
+        # No SAS in this ceremony (daemon sent no commitment) → both null.
+        "sas_commit": None,
+        "sas_host_nonce": None,
     }
 
     untrusted_fingerprint = await client.post(
@@ -293,7 +296,9 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
     approval = await _approve(client, start, user_id, auth, review, browser)
     assert approval.status_code == 200
     assert approval.json() == {
-        **review,
+        # The approve response mirrors the review minus the SAS relay fields,
+        # which live only on the pending response.
+        **{k: v for k, v in review.items() if k not in ("sas_commit", "sas_host_nonce")},
         # First pairing: the Host row does not exist yet, so no UUID to bind.
         "host_id": None,
         "browser_device_id": browser[0]["id"],
@@ -2092,3 +2097,80 @@ async def test_revoking_the_browser_clears_the_retained_approval_proof(client):
         assert row is not None
         assert row.browser_device_id is None
         assert row.browser_approval_signature is None
+
+
+async def test_sas_relay_forwards_nonces_and_enforces_commit_reveal_order(client):
+    # The server is a dumb relay for the committed-ephemeral SAS: it forwards Cd,
+    # Nb/B, and Nd, and enforces that Nd is only recorded once Nb is present
+    # (commit-reveal ordering) — see docs/TRUST_DEVICE_MESH.md Appendix A.
+    import os
+
+    user_id, auth = await _signup(client, "sas-relay@example.com")
+    browser, _bk = await _register_browser(client, user_id, auth)
+
+    host_pub = _wire(Ed25519PrivateKey.generate().public_key().public_bytes_raw())
+    cd = _wire(os.urandom(32))  # daemon commitment
+    nb = _wire(os.urandom(32))  # browser nonce
+    nd = _wire(os.urandom(32))  # daemon nonce
+
+    start = (
+        await client.post(
+            "/api/auth/device/start",
+            json={
+                "host_name": "sas-box",
+                "os": "linux",
+                "arch": "x86_64",
+                "version": "0.1.0",
+                "host_key_algorithm": "ed25519",
+                "host_public_key": host_pub,
+                "sas_commit": cd,
+            },
+        )
+    ).json()
+    await _mark_possession_verified(start["device_code"])
+    ref = start["approval_ref"]
+    host_body = {
+        "device_code": start["device_code"],
+        "host_key_algorithm": "ed25519",
+        "host_public_key": host_pub,
+    }
+
+    # Browser sees the commitment via pending.
+    pending = (await client.post("/api/auth/device/pending", json={"approval_ref": ref}, headers=auth)).json()
+    assert pending["sas_commit"] == cd
+    assert pending["sas_host_nonce"] is None
+
+    # Commit-reveal ordering: the daemon revealing Nd BEFORE the browser's Nb is
+    # present must NOT be recorded (a relay can't rush the reveal).
+    r = (await client.post("/api/auth/device/sas-host", json={**host_body, "sas_host_nonce": nd})).json()
+    assert r["sas_browser_nonce"] is None and r["sas_host_nonce"] is None
+
+    # Browser contributes Nb + B.
+    ok = await client.post(
+        "/api/auth/device/sas",
+        json={"approval_ref": ref, "sas_browser_nonce": nb, "browser_public_key": browser["public_key"]},
+        headers=auth,
+    )
+    assert ok.status_code == 200, ok.text
+
+    # Set-once: a second browser contribution is refused (no swapping Nb later).
+    dup = await client.post(
+        "/api/auth/device/sas",
+        json={"approval_ref": ref, "sas_browser_nonce": _wire(os.urandom(32)), "browser_public_key": browser["public_key"]},
+        headers=auth,
+    )
+    assert dup.status_code == 409
+
+    # Daemon fetches Nb/B (no reveal yet).
+    r = (await client.post("/api/auth/device/sas-host", json=host_body)).json()
+    assert r["sas_browser_nonce"] == nb
+    assert r["sas_browser_key"] == browser["public_key"]
+    assert r["sas_host_nonce"] is None
+
+    # Now the daemon reveals Nd (Nb present) — recorded and echoed.
+    r = (await client.post("/api/auth/device/sas-host", json={**host_body, "sas_host_nonce": nd})).json()
+    assert r["sas_host_nonce"] == nd
+
+    # Browser now sees Nd via pending; it can verify the commit and show the SAS.
+    pending = (await client.post("/api/auth/device/pending", json={"approval_ref": ref}, headers=auth)).json()
+    assert pending["sas_host_nonce"] == nd
