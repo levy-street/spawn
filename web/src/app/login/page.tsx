@@ -2,18 +2,31 @@
 
 import { useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { type FormEvent, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { type FormEvent, Suspense, useState } from "react";
 import { SocialLoginButtons } from "@/components/auth/SocialLoginButtons";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ApiError, auth } from "@/lib/api";
+import { DEFAULT_RETURN_PATH, returnPathFromParams } from "@/lib/return-path";
 
 export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
+  );
+}
+
+function LoginForm() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  // Set by AuthGate when a protected page bounced you here. Origin-relative
+  // paths only — an unchecked value would make this an open redirect, and
+  // "sign in to continue" is exactly when someone trusts where they land.
+  const returnTo = returnPathFromParams(useSearchParams()) ?? DEFAULT_RETURN_PATH;
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -27,7 +40,7 @@ export default function LoginPage() {
       const result = await auth.login({ email, password });
       queryClient.setQueryData(["me"], { user: result.user });
       void queryClient.invalidateQueries({ queryKey: ["me"] });
-      router.replace("/");
+      router.replace(returnTo);
     } catch (err) {
       const message = err instanceof ApiError ? err.message : "Login failed";
       setError(message);
@@ -44,7 +57,8 @@ export default function LoginPage() {
         </CardHeader>
         <CardContent>
           <div className="space-y-4">
-            <SocialLoginButtons />
+            {/* The provider round-trip has to come back to the same place. */}
+            <SocialLoginButtons returnTo={returnTo} />
             <form className="space-y-3" onSubmit={onSubmit}>
               <div className="space-y-1">
                 <Label htmlFor="email">Email</Label>
