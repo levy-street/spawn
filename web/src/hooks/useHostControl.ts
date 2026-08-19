@@ -3,9 +3,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { hosts } from "@/lib/api";
+import { hosts, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { HostControlClient, type HostControlState } from "@/lib/hostControl";
+import {
+  type CarriedEndorsement,
+  HostControlClient,
+  type HostControlState,
+} from "@/lib/hostControl";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 
 export function useHostControl(hostId: string | null, enabled = true) {
@@ -51,6 +55,18 @@ export function useHostControl(hostId: string | null, enabled = true) {
                 // signing identity.
                 isActive: () => trustRef.current.accountId === epochAccountId,
               });
+            },
+            loadCarriedEndorsements: async (): Promise<CarriedEndorsement[]> => {
+              const accountId = trustRef.current.accountId;
+              if (!accountId) return [];
+              const edges = await trust.accountEndorsements();
+              return edges.map((edge) => ({
+                account_id: accountId,
+                endorser_public_key: edge.endorser_public_key,
+                endorsed_public_key: edge.endorsed_public_key,
+                endorsed_device_id: edge.endorsed_device_id,
+                signature: edge.signature,
+              }));
             },
           })
         : null,
