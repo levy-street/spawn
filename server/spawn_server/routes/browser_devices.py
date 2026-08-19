@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,7 +14,7 @@ from .. import auth, schemas
 from ..browser_registration import verify_browser_registration_proof
 from ..db import get_session
 from ..host_identity import ed25519_key_fingerprint
-from ..models import BrowserDevice, HostBrowserPin, User
+from ..models import BrowserDevice, Host, User
 from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/browser-devices", tags=["browser-devices"])
@@ -192,18 +192,17 @@ async def revoke_browser_device(
     # endorsed OR as endorser). Best effort by design: registration
     # reconciliation is the hard guarantee, so an absent or failed push must
     # never fail the revoke.
+    #
+    # Push to EVERY host of the account, not just those with a per-host pin
+    # relationship to this device: the account deny-list (revoked_browser_keys)
+    # is account-wide, and a revoked device could otherwise connect to a host it
+    # was never directly pinned on via a carried endorsement chain to that host's
+    # anchor (device mesh §3). The per-host pin-pruning targets are a subset.
     affected_host_ids = (
-        await session.execute(
-            select(HostBrowserPin.host_id)
-            .where(
-                or_(
-                    HostBrowserPin.browser_device_id == device_id,
-                    HostBrowserPin.endorser_device_id == device_id,
-                )
-            )
-            .distinct()
-        )
-    ).scalars().all()
+        (await session.execute(select(Host.id).where(Host.owner_user_id == user.id)))
+        .scalars()
+        .all()
+    )
     for host_id in affected_host_ids:
         try:
             await push_browser_pins(host_id)

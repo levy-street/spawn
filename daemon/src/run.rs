@@ -1067,10 +1067,16 @@ fn verify_signed_rtc_offer_admitted(
     envelope: &str,
     record: &StoredCreds,
     account_id: Option<&[u8; 16]>,
+    revoked: &RevocationSet,
     carried: &[CarriedEndorsement],
 ) -> Option<VerifiedRtcSignal> {
-    // Fast path: a directly-pinned browser key (unchanged behaviour).
+    // Fast path: a directly-pinned browser key.
     if let Some(verified) = verify_signed_rtc_offer(envelope, record) {
+        // Fail-closed: a revoked key never connects, even if a pin still lingers
+        // (the deny-list is delivered independently of pin reconciliation).
+        if revoked.contains(&verified.sender_public_key().to_bytes()) {
+            return None;
+        }
         return Some(verified);
     }
     // Chain path only when the offer carries edges and we know our own account.
@@ -1090,12 +1096,12 @@ fn verify_signed_rtc_offer_admitted(
         .filter_map(|pin| public_key_from_wire(pin.public_key()).ok())
         .collect();
     let edges = parse_carried_endorsements(carried);
-    // Revocation delivery is a later stage; until then the deny-list is empty.
-    let revoked = RevocationSet::new();
+    // find_valid_chain rejects any chain whose keys (anchor, intermediates, or
+    // the connecting key) are on the deny-list.
     match find_valid_chain(
         account_id,
         &anchors,
-        &revoked,
+        revoked,
         verified.sender_public_key(),
         &edges,
         DEFAULT_MAX_CHAIN_EDGES,
@@ -1103,6 +1109,18 @@ fn verify_signed_rtc_offer_admitted(
         Ok(()) => Some(verified),
         Err(_) => None,
     }
+}
+
+/// Build the deny-list from the wire keys the server delivers. Malformed keys
+/// are skipped (they can never be a valid connecting key anyway).
+fn revocation_set_from_wire(keys: Option<&[String]>) -> RevocationSet {
+    let mut set = RevocationSet::new();
+    for key in keys.into_iter().flatten() {
+        if let Ok(verifying) = public_key_from_wire(key) {
+            set.insert(verifying.to_bytes());
+        }
+    }
+    set
 }
 
 /// Build the owned answer signer for a verified signed offer. The answer
@@ -1152,6 +1170,10 @@ async fn dispatch_loop(
     // wrong/absent value only denies the chain path — it never grants — so a
     // lying server can at most withhold chained admission, not forge it.
     let mut daemon_account: Option<[u8; 16]> = None;
+    // Account deny-list (device mesh §3): keys the server reports as revoked,
+    // subtracted from acceptance. Fail-closed and subtract-only — it can only
+    // reject a connection, never admit one, so server authority over it is safe.
+    let mut daemon_revoked = RevocationSet::new();
     while let Some(msg) = in_rx.recv().await {
         match msg {
             WsInbound::Closed => return Ok(()),
@@ -1161,6 +1183,7 @@ async fn dispatch_loop(
                     account_id,
                     browser_pins,
                     browser_device_ids,
+                    revoked_browser_keys,
                 } => {
                     if host_id != live_credentials.host_id {
                         return Err(anyhow!("server registered daemon as an unexpected host"));
@@ -1170,6 +1193,7 @@ async fn dispatch_loop(
                     }
                     tracing::info!(%host_id, "registered with server");
                     daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
+                    daemon_revoked = revocation_set_from_wire(revoked_browser_keys.as_deref());
                     reconcile_browser_pins(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
@@ -1181,17 +1205,21 @@ async fn dispatch_loop(
                     account_id,
                     browser_pins,
                     browser_device_ids,
+                    revoked_browser_keys,
                 } => {
-                    // Pushed when the set changes, so endorsing a device takes
-                    // effect immediately instead of waiting for the daemon to
-                    // happen to reconnect -- which could be hours.
+                    // Pushed when the set changes, so endorsing OR revoking a
+                    // device takes effect immediately instead of waiting for the
+                    // daemon to happen to reconnect -- which could be hours.
                     daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
+                    daemon_revoked = revocation_set_from_wire(revoked_browser_keys.as_deref());
                     reconcile_browser_pins(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
                         browser_device_ids.as_deref(),
                     )
                     .await;
+                    // TODO(mesh stage 4c / R1): tear down live sessions whose
+                    // admitting key is now revoked, not only block new connects.
                 }
                 Inbound::HostHeartbeat => {
                     tracing::trace!("host heartbeat ack");
@@ -1248,6 +1276,7 @@ async fn dispatch_loop(
                                 envelope,
                                 &live_credentials.record,
                                 daemon_account.as_ref(),
+                                &daemon_revoked,
                                 &carried_endorsements,
                             ) {
                                 Some(verified)
