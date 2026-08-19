@@ -1888,3 +1888,124 @@ async def test_pruning_a_revoked_endorser_keeps_its_subtree_severed(client):
     assert {row["browser_device_id"] for row in await _live_browser_pins(host_id)} == {
         direct_id
     }
+
+
+async def _register_with(ws_token: str, gpu: object, *, omit: bool = False) -> None:
+    """Run one register frame to completion, with or without a `gpu` field."""
+
+    frame: dict[str, object] = {
+        "type": "register",
+        "host_name": "gpu-box",
+        "os": "linux",
+        "arch": "x86_64",
+        "version": "0.1.0",
+    }
+    if not omit:
+        frame["gpu"] = gpu
+    ws = FakeDaemonWebSocket()
+    ws.queue_text(frame)
+    ws.queue_disconnect()
+    await daemon_ws(ws, token=ws_token)  # type: ignore[arg-type]
+
+
+async def _host_gpu(host_id: str) -> object:
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        return host.gpu
+
+
+async def test_daemon_register_records_the_reported_gpu(client):
+    user_id, _ = await _signup(client, "ws-daemon-gpu@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    await _register_with(
+        token,
+        {"vendor": "nvidia", "name": "NVIDIA H100 PCIe", "vram_mb": 81559, "count": 4},
+    )
+    assert await _host_gpu(host_id) == {
+        "vendor": "nvidia",
+        "name": "NVIDIA H100 PCIe",
+        "vram_mb": 81559,
+        "count": 4,
+    }
+
+    # And it reaches the client through the same shape it will render from.
+    listed = await client.get("/api/hosts")
+    assert listed.status_code == 200, listed.text
+    entry = next(item for item in listed.json() if item["id"] == host_id)
+    assert entry["gpu"] == {
+        "vendor": "nvidia",
+        "name": "NVIDIA H100 PCIe",
+        "vram_mb": 81559,
+        "count": 4,
+    }
+
+
+async def test_a_daemon_that_reports_no_gpu_is_not_a_broken_badge(client):
+    """Three different situations, one rendering: absent."""
+
+    user_id, _ = await _signup(client, "ws-daemon-nogpu@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    # A daemon older than the field sends nothing at all.
+    await _register_with(token, None, omit=True)
+    assert await _host_gpu(host_id) is None
+
+    # A daemon that looked and found nothing sends null.
+    await _register_with(token, None)
+    assert await _host_gpu(host_id) is None
+
+    listed = await client.get("/api/hosts")
+    entry = next(item for item in listed.json() if item["id"] == host_id)
+    assert entry["gpu"] is None
+
+
+async def test_a_malformed_gpu_report_never_overwrites_or_refuses(client):
+    """A cosmetic badge must not be able to break a registration."""
+
+    user_id, _ = await _signup(client, "ws-daemon-badgpu@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    good = {"vendor": "amd", "name": "AMD Instinct MI300X", "vram_mb": 196608, "count": 8}
+    await _register_with(token, good)
+    assert await _host_gpu(host_id) == good
+
+    for hostile in (
+        {"vendor": "definitely-not-a-vendor", "name": "Evil Corp X1"},
+        {"vendor": "nvidia"},
+        {"vendor": "nvidia", "name": "   "},
+        {"vendor": "nvidia", "name": 42},
+        "a string, not an object",
+        [],
+        42,
+    ):
+        await _register_with(token, hostile)
+        # Still registered, and still the last thing we actually believed.
+        assert await _host_gpu(host_id) == good
+
+    # Out-of-range numbers are dropped rather than stored or rejected.
+    await _register_with(
+        token,
+        {"vendor": "intel", "name": "Intel Arc A770", "vram_mb": -1, "count": 100_000},
+    )
+    assert await _host_gpu(host_id) == {
+        "vendor": "intel",
+        "name": "Intel Arc A770",
+        "vram_mb": None,
+        "count": 64,
+    }
+
+
+async def test_an_absurd_gpu_name_is_bounded_before_it_reaches_the_column(client):
+    user_id, _ = await _signup(client, "ws-daemon-longgpu@example.com")
+    host_id = await _create_host(user_id)
+    token = auth.issue_daemon_token(host_id, user_id)
+
+    await _register_with(token, {"vendor": "other", "name": "G" * 4096, "count": 1})
+    stored = await _host_gpu(host_id)
+    assert isinstance(stored, dict)
+    assert len(str(stored["name"])) == 128

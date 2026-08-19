@@ -1,20 +1,14 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  ArrowLeft,
-  FolderOpen,
-  MoreHorizontal,
-  Pencil,
-  Server,
-  SquarePen,
-  Trash2,
-} from "lucide-react";
+import { ArrowLeft, FolderOpen, MoreHorizontal, Pencil, SquarePen, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
 import { AuthGate } from "@/components/auth/AuthGate";
+import { formatVram, HostGpuBadge } from "@/components/hosts/HostGpuBadge";
+import { HostOsIcon, hostOsLabel } from "@/components/hosts/HostOsIcon";
 import { HostToolsPanel } from "@/components/hosts/HostToolsPanel";
 import { AppShell } from "@/components/nav/AppShell";
 import { Badge } from "@/components/ui/badge";
@@ -237,7 +231,7 @@ function HostDetail() {
           </Link>
         </Button>
         <span className="grid size-8 shrink-0 place-items-center rounded-lg border border-border bg-muted/50 text-muted-foreground">
-          <Server className="size-4" aria-hidden />
+          <HostOsIcon os={host?.os} />
         </span>
         <div className="flex min-w-0 flex-1 items-center gap-2">
           {editingName ? (
@@ -274,6 +268,7 @@ function HostDetail() {
             ) : (
               <Badge variant="outline">offline</Badge>
             ))}
+          {host && <HostGpuBadge gpu={host.gpu} />}
         </div>
         <Button asChild variant="outline" size="sm" className="shrink-0">
           <Link href={`/hosts/${id}/files`}>
@@ -353,8 +348,22 @@ function HostDetail() {
         <div className="space-y-4">
           {/* Facts */}
           <dl className="grid grid-cols-2 gap-x-6 gap-y-3 rounded-xl border border-border p-4 text-sm @md/shell:grid-cols-3 @xl/shell:grid-cols-6">
-            <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
+            <Fact label="System" value={`${hostOsLabel(host.os)}/${host.arch ?? "?"}`} />
             <Fact label="Daemon" value={`spawnd ${host.version ?? "?"}`} />
+            <Fact
+              label="GPU"
+              value={
+                host.gpu
+                  ? [
+                      host.gpu.name,
+                      formatVram(host.gpu.vram_mb),
+                      host.gpu.count > 1 ? `${host.gpu.count} adapters` : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")
+                  : "none detected"
+              }
+            />
             <Fact label="Files" value="end-to-end encrypted" />
             <Fact label="Host identity" value={host.host_key_algorithm ?? "legacy unpaired"} />
             <Fact label="Fingerprint" value={host.host_key_fingerprint ?? "not pinned"} mono />

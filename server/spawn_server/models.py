@@ -238,6 +238,13 @@ class Host(Base):
     os: Mapped[str | None] = mapped_column(String(64), nullable=True)
     arch: Mapped[str | None] = mapped_column(String(64), nullable=True)
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Best-effort hardware class from the daemon's register frame. Every one
+    # of these is nullable forever: no GPU, detection failed, and a daemon too
+    # old to report are three different situations that all read as "absent".
+    gpu_vendor: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    gpu_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    gpu_vram_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gpu_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Nullable only for hosts created before the 0017 pairing migration. Every
     # new device-code approval stores an immutable Ed25519 pin here.
     host_key_algorithm: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -305,6 +312,23 @@ class Host(Base):
             name="uq_hosts_host_public_key",
         ),
     )
+
+    @property
+    def gpu(self) -> dict[str, object] | None:
+        """The GPU as the API shapes it, or nothing at all.
+
+        A partial row -- a vendor with no model string, say -- reads as no
+        answer rather than as a half-rendered badge.
+        """
+
+        if not self.gpu_vendor or not self.gpu_name:
+            return None
+        return {
+            "vendor": self.gpu_vendor,
+            "name": self.gpu_name,
+            "vram_mb": self.gpu_vram_mb,
+            "count": self.gpu_count or 1,
+        }
 
 
 class HostBrowserPin(Base):
@@ -388,6 +412,7 @@ class HostToolPolicy(Base):
             name="uq_host_tool_policies_owner_host_preset",
         ),
     )
+
 
 
 class Agent(Base):

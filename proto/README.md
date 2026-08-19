@@ -270,12 +270,24 @@ at 8 panes, split ratios are clamped to 0.05–0.95.
 
 ### Daemon → server JSON frames
 
+`gpu` on `register` is optional at every level: omitted by daemons that predate
+it, `null` when there is no GPU or detection failed, and dropped by the server
+if malformed. All of those are the same thing to every consumer — no badge —
+and none of them may fail a registration. It is best-effort hardware *class*
+(adapter model, VRAM, adapter count), never a machine identifier: no serials,
+no UUIDs. It rides the disclosed-lifecycle side of the boundary, like `os` and
+`arch`, and is not terminal content.
+
 ```json
 {"type": "register",
  "host_name": "gpu-box-1",
  "os": "linux",
  "arch": "x86_64",
  "version": "0.1.0",
+ "gpu": {"vendor": "nvidia"|"amd"|"intel"|"apple"|"other",
+         "name": "NVIDIA H100 PCIe",
+         "vram_mb": 81559 | null,
+         "count": 4} | null,
  "existing_agents": ["uuid", ...]}
 
 {"type": "host.heartbeat"}
