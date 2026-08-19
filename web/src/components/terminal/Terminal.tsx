@@ -40,8 +40,9 @@ import {
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
 import { DirectAgentUploadError } from "@/lib/agent-ctl";
-import { agents, hosts } from "@/lib/api";
+import { agents, hosts, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import type { CarriedEndorsement } from "@/lib/hostControl";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
 import type { DisplayControlState } from "@/lib/ws";
@@ -1011,11 +1012,24 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }),
     [signalingAccountId, signalingHostId, claimedHostPublicKey, claimedHostFingerprint],
   );
+  const loadCarriedEndorsements = useCallback(async (): Promise<CarriedEndorsement[]> => {
+    const accountId = signalingAccountId;
+    if (!accountId) return [];
+    const edges = await trust.accountEndorsements();
+    return edges.map((edge) => ({
+      account_id: accountId,
+      endorser_public_key: edge.endorser_public_key,
+      endorsed_public_key: edge.endorsed_public_key,
+      endorsed_device_id: edge.endorsed_device_id,
+      signature: edge.signature,
+    }));
+  }, [signalingAccountId]);
 
   const socket = useAgentSocket({
     agentId,
     enabled: socketInitialSize !== null && signalingIdentityKnown,
     resolveSignedRtcTrust: signalingIdentityKnown ? resolveTrust : undefined,
+    loadCarriedEndorsements: signalingIdentityKnown ? loadCarriedEndorsements : undefined,
     initialSize: socketInitialSize,
     onData: (bytes, dcOffsetAfter) => {
       if (typeof dcOffsetAfter === "number") {
