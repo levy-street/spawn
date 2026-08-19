@@ -269,6 +269,11 @@ pub enum Inbound {
             deserialize_with = "deserialize_present_bounded_signed_envelope"
         )]
         signed_envelope: Option<String>,
+        /// Account endorsement edges the browser carries so a daemon that does
+        /// not directly pin the offering key can admit it via a chain to an
+        /// anchor (device mesh §3). Empty for a directly-pinned browser.
+        #[serde(default)]
+        carried_endorsements: Vec<CarriedEndorsement>,
         #[serde(default)]
         ice_servers: Vec<RtcIceServerConfig>,
         #[serde(default)]
@@ -320,6 +325,21 @@ pub struct RtcIceServerConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub credential: Option<String>,
+}
+
+/// One account-scoped endorsement edge a browser carries on an RTC offer so a
+/// daemon that does not directly pin the offering key can still admit it via a
+/// chain to a key it does pin (docs/TRUST_DEVICE_MESH.md §3). Every field is
+/// server-relayed and untrusted; the daemon re-verifies each signature and finds
+/// the chain (`endorsement_chain::find_valid_chain`). Wire strings, so the daemon
+/// reconstructs the exact `SPAWN-ACCT-ENDORSE-V1` transcript it re-verifies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CarriedEndorsement {
+    pub account_id: String,
+    pub endorser_public_key: String,
+    pub endorsed_public_key: String,
+    pub endorsed_device_id: String,
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

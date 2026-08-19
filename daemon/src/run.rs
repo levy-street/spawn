@@ -23,16 +23,22 @@ use crate::cli::RunArgs;
 use crate::config;
 use crate::creds::{self, CredentialRevision, StoredCreds};
 use crate::proto::{
-    AgentCreate, HostToolInstallResult, HostToolStatus, HostToolTarget, Inbound, Outbound,
+    AgentCreate, CarriedEndorsement, HostToolInstallResult, HostToolStatus, HostToolTarget,
+    Inbound, Outbound,
 };
 use crate::pty::{self, WsOutbound};
 use crate::rtc::{HostRtcSignal, RtcAnswerSigner, RtcSessions};
 use crate::worker_backend;
 use crate::ws::{self, WsInbound};
+use spawnd::acct_endorsement::{signature_from_wire, AcctEndorsementTranscript};
+use spawnd::endorsement_chain::{
+    find_valid_chain, ChainEdge, RevocationSet, DEFAULT_MAX_CHAIN_EDGES,
+};
+use spawnd::host_pair_approval::account_id_bytes;
 use spawnd::signed_signal::{
     public_key_from_wire, ScopeType, SenderRole, SignalKind, SignedSignalTranscript,
 };
-use spawnd::signed_signal_wire::{verify_rtc_signal_wire, VerifiedRtcSignal};
+use spawnd::signed_signal_wire::{envelope_sender, verify_rtc_signal_wire, VerifiedRtcSignal};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const OUTBOUND_CHANNEL_DEPTH: usize = 1024;
@@ -1022,6 +1028,83 @@ fn verify_signed_rtc_offer(envelope: &str, record: &StoredCreds) -> Option<Verif
     None
 }
 
+/// Reconstruct verifiable endorsement edges from the wire form carried on an
+/// offer. Malformed edges are dropped rather than fatal — the chain search
+/// simply won't use them, and a genuine chain is unaffected.
+fn parse_carried_endorsements(carried: &[CarriedEndorsement]) -> Vec<ChainEdge> {
+    carried
+        .iter()
+        .filter_map(|edge| {
+            let transcript = AcctEndorsementTranscript::from_wire(
+                &edge.account_id,
+                &edge.endorser_public_key,
+                &edge.endorsed_public_key,
+                &edge.endorsed_device_id,
+            )
+            .ok()?;
+            let signature = signature_from_wire(&edge.signature).ok()?;
+            Some(ChainEdge {
+                transcript,
+                signature,
+            })
+        })
+        .collect()
+}
+
+/// Admit a signed RTC offer either because the offering key is directly pinned
+/// (the shipped single-hop path) or because it reaches one of this host's pins —
+/// its anchors — through a carried account-endorsement chain (device mesh §3).
+///
+/// The chain path still proves possession: the offer must verify against its own
+/// claimed sender key (an EUF-CMA signature that binds the offer's DTLS
+/// fingerprint), exactly as the direct path proves it against a pinned key.
+/// `find_valid_chain` then decides whether that proven-possessed key is trusted
+/// for this account. So the server, holding no private key, can neither sign a
+/// valid offer nor forge a chain edge; carried edges only ever *extend reach*,
+/// never grant it. `None` (falling through to the caller's rejection) whenever
+/// the account is unknown, no edges are carried, or no chain reaches an anchor.
+fn verify_signed_rtc_offer_admitted(
+    envelope: &str,
+    record: &StoredCreds,
+    account_id: Option<&[u8; 16]>,
+    carried: &[CarriedEndorsement],
+) -> Option<VerifiedRtcSignal> {
+    // Fast path: a directly-pinned browser key (unchanged behaviour).
+    if let Some(verified) = verify_signed_rtc_offer(envelope, record) {
+        return Some(verified);
+    }
+    // Chain path only when the offer carries edges and we know our own account.
+    let account_id = account_id?;
+    if carried.is_empty() {
+        return None;
+    }
+    let host_identity = creds::host_identity(record).ok().flatten()?;
+    let host_key = public_key_from_wire(&host_identity.public_key).ok()?;
+    // Verify against the sender the envelope CLAIMS: this proves possession of
+    // that private key. Only a proven-possessed key is a candidate for a chain.
+    let claimed_sender = envelope_sender(envelope).ok()?;
+    let verified = verify_rtc_signal_wire(envelope, &claimed_sender, &host_key).ok()?;
+    let anchors: Vec<_> = record
+        .browser_pins()
+        .iter()
+        .filter_map(|pin| public_key_from_wire(pin.public_key()).ok())
+        .collect();
+    let edges = parse_carried_endorsements(carried);
+    // Revocation delivery is a later stage; until then the deny-list is empty.
+    let revoked = RevocationSet::new();
+    match find_valid_chain(
+        account_id,
+        &anchors,
+        &revoked,
+        verified.sender_public_key(),
+        &edges,
+        DEFAULT_MAX_CHAIN_EDGES,
+    ) {
+        Ok(()) => Some(verified),
+        Err(_) => None,
+    }
+}
+
 /// Build the owned answer signer for a verified signed offer. The answer
 /// transcript reuses the verified offer's exact session, scope, and protocol,
 /// and binds the browser (offer sender) as the intended peer. `None` only when
@@ -1064,6 +1147,11 @@ async fn dispatch_loop(
     out_tx: &mpsc::Sender<WsOutbound>,
     live_credentials: &LiveCredentialSnapshot,
 ) -> Result<()> {
+    // This host's account, as canonical UUID bytes, learned from registration.
+    // Used to scope carried endorsement chains at connect (device mesh §3). A
+    // wrong/absent value only denies the chain path — it never grants — so a
+    // lying server can at most withhold chained admission, not forge it.
+    let mut daemon_account: Option<[u8; 16]> = None;
     while let Some(msg) = in_rx.recv().await {
         match msg {
             WsInbound::Closed => return Ok(()),
@@ -1081,6 +1169,7 @@ async fn dispatch_loop(
                         return Err(anyhow!("server registered daemon as an unexpected host"));
                     }
                     tracing::info!(%host_id, "registered with server");
+                    daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
                     reconcile_browser_pins(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
@@ -1096,6 +1185,7 @@ async fn dispatch_loop(
                     // Pushed when the set changes, so endorsing a device takes
                     // effect immediately instead of waiting for the daemon to
                     // happen to reconnect -- which could be hours.
+                    daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
                     reconcile_browser_pins(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
@@ -1140,6 +1230,7 @@ async fn dispatch_loop(
                     protocol_version,
                     sdp,
                     signed_envelope,
+                    carried_endorsements,
                     ice_servers,
                     ice_transport_policy,
                 } => {
@@ -1147,12 +1238,18 @@ async fn dispatch_loop(
                         tracing::warn!("rejecting mixed signed/raw RTC offer");
                         continue;
                     }
-                    // A signed offer must verify against a locally-approved
-                    // browser pin and this host identity, and describe exactly
-                    // this session; it is never downgraded to a raw SDP.
+                    // A signed offer must prove possession of a key this host
+                    // trusts — directly pinned, or reached through a carried
+                    // endorsement chain to an anchor — and describe exactly this
+                    // session; it is never downgraded to a raw SDP.
                     let verified_offer = match &signed_envelope {
                         Some(envelope) => {
-                            match verify_signed_rtc_offer(envelope, &live_credentials.record) {
+                            match verify_signed_rtc_offer_admitted(
+                                envelope,
+                                &live_credentials.record,
+                                daemon_account.as_ref(),
+                                &carried_endorsements,
+                            ) {
                                 Some(verified)
                                     if verified.transcript().session_id()
                                         == session_id.as_str() =>
@@ -1160,7 +1257,8 @@ async fn dispatch_loop(
                                     tracing::info!(
                                         scope_type = ?verified.transcript().scope_type(),
                                         scope_id = %verified.transcript().scope_id(),
-                                        "verified signed RTC offer against a local browser pin"
+                                        chained = !carried_endorsements.is_empty(),
+                                        "verified signed RTC offer against a local browser pin or chain"
                                     );
                                     Some(verified)
                                 }
