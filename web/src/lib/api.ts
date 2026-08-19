@@ -258,6 +258,10 @@ export const DevicePendingResponseSchema = z.object({
   host_key_algorithm: z.literal("ed25519"),
   host_public_key: z.string(),
   host_key_fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
+  // Committed-ephemeral SAS: the daemon's commitment Cd (present ⇒ run the SAS)
+  // and its opened nonce Nd (present ⇒ verify the commit and show the number).
+  sas_commit: z.string().nullable().default(null),
+  sas_host_nonce: z.string().nullable().default(null),
 });
 export type DevicePendingApproval = z.infer<typeof DevicePendingResponseSchema>;
 
@@ -374,6 +378,18 @@ export const auth = {
       method: "POST",
       body: JSON.stringify(body),
       schema: DeviceApproveResponseSchema,
+    }),
+  // Browser's committed-ephemeral SAS contribution: its nonce Nb + key B.
+  contributeSas: (body: {
+    user_code?: string;
+    approval_ref?: string;
+    sas_browser_nonce: string;
+    browser_public_key: string;
+  }) =>
+    api("/api/auth/device/sas", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: z.object({ ok: z.boolean() }),
     }),
   pendingDevice: (body: { user_code?: string; approval_ref?: string }) =>
     api("/api/auth/device/pending", {

@@ -21,8 +21,14 @@ import {
   browserHostPinServerOrigin,
   loadBrowserHostPin,
 } from "@/lib/browser-host-pins";
+import {
+  b64urlDecode,
+  b64urlEncode,
+  sas as computeSas,
+  FIELD_BYTES,
+  verifyCommit,
+} from "@/lib/sas";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
-import { verificationCode } from "@/lib/verification-code";
 
 class ApprovalIdentityError extends Error {}
 
@@ -135,7 +141,11 @@ function DeviceInner() {
         hostPublicKey: r.host_public_key,
         hostFingerprint: expectedFingerprint,
       });
-      setVerifyCode(await verificationCode(r.host_key_fingerprint));
+      // The committed-ephemeral SAS number is computed by a separate effect once
+      // the browser identity is ready (it needs our key B). No grindable code:
+      // when the daemon offers no commitment we show the full fingerprint.
+      setVerifyCode(null);
+      sasStartedRef.current = false;
       setIdentifier(lookup);
       setPending(r);
       setLocalPinState(existing?.state ?? "new");
@@ -157,6 +167,61 @@ function DeviceInner() {
     e.preventDefault();
     void review({ user_code: code });
   };
+
+  // Committed-ephemeral SAS (docs/TRUST_DEVICE_MESH.md Appendix A). Once we hold
+  // a pending ceremony that carries the daemon's commitment Cd and our browser
+  // identity is ready, contribute our fresh nonce Nb + key B, wait for the daemon
+  // to reveal Nd, verify Cd opens, and compute the number both sides display.
+  const sasStartedRef = useRef(false);
+  const runSas = async (
+    p: DevicePendingApproval,
+    id: { user_code?: string; approval_ref?: string },
+    browserPublicKey: string,
+  ) => {
+    if (!p.sas_commit) return; // pre-SAS daemon → fingerprint fallback in the UI
+    try {
+      const hostKey = b64urlDecode(p.host_public_key);
+      const browserKey = b64urlDecode(browserPublicKey);
+      const commit = b64urlDecode(p.sas_commit);
+      const nb = crypto.getRandomValues(new Uint8Array(FIELD_BYTES));
+      await auth.contributeSas({
+        ...id,
+        sas_browser_nonce: b64urlEncode(nb),
+        browser_public_key: browserPublicKey,
+      });
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      let nd: Uint8Array | null = null;
+      for (let attempt = 0; attempt < 25 && !nd; attempt += 1) {
+        const fresh = await auth.pendingDevice(id).catch(() => null);
+        if (fresh?.sas_host_nonce) {
+          nd = b64urlDecode(fresh.sas_host_nonce);
+          break;
+        }
+        await sleep(1000);
+      }
+      if (!nd) return; // daemon never revealed (old/slow) → fingerprint fallback
+      if (!(await verifyCommit(commit, hostKey, nd))) {
+        throw new ApprovalIdentityError(
+          "The host's SAS commitment did not open — approval was blocked",
+        );
+      }
+      setVerifyCode(await computeSas(hostKey, browserKey, nd, nb));
+    } catch (err) {
+      setError(
+        err instanceof ApiError || err instanceof ApprovalIdentityError
+          ? err.message
+          : "Could not compute the verification code",
+      );
+    }
+  };
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: one-shot guarded by a ref; runSas intentionally omitted
+  useEffect(() => {
+    if (!pending?.sas_commit || verifyCode || sasStartedRef.current) return;
+    if (registration.data?.status !== "ready") return;
+    sasStartedRef.current = true;
+    void runSas(pending, identifier ?? {}, registration.data.device.public_key);
+  }, [pending, registration.data, verifyCode, identifier]);
 
   // The daemon opens this page with an opaque handle baked into the URL
   // (`/device?ref=…`, or `?code=…` from a pre-0029 server), so an approval needs
@@ -316,23 +381,40 @@ function DeviceInner() {
                 <p className="text-xl font-semibold text-foreground">{pending.host_name}</p>
               </div>
 
-              <div className="space-y-2 rounded-lg border p-4 text-center">
-                <p className="text-sm text-muted-foreground">
-                  Confirm this matches the code in your terminal
-                </p>
-                <p
-                  className="font-mono text-4xl font-semibold tracking-[0.15em] text-foreground tabular-nums"
-                  data-testid="verification-code"
-                >
-                  {verifyCode ?? "— — —"}
-                </p>
-                <p
-                  className="break-all font-mono text-[11px] text-muted-foreground/70"
-                  data-testid="host-key-fingerprint"
-                >
-                  {pending.host_key_fingerprint}
-                </p>
-              </div>
+              {pending.sas_commit ? (
+                <div className="space-y-2 rounded-lg border p-4 text-center">
+                  <p className="text-sm text-muted-foreground">
+                    Confirm this matches the code in your terminal
+                  </p>
+                  <p
+                    className="font-mono text-4xl font-semibold tracking-[0.15em] text-foreground tabular-nums"
+                    data-testid="verification-code"
+                  >
+                    {verifyCode ?? "· · ·"}
+                  </p>
+                  {!verifyCode && <p className="text-xs text-muted-foreground">computing…</p>}
+                  <p
+                    className="break-all font-mono text-[11px] text-muted-foreground/70"
+                    data-testid="host-key-fingerprint"
+                  >
+                    {pending.host_key_fingerprint}
+                  </p>
+                </div>
+              ) : (
+                // Pre-SAS daemon: no sound short code exists, so match the full
+                // fingerprint against the one printed in the terminal.
+                <div className="space-y-2 rounded-lg border p-4 text-center">
+                  <p className="text-sm text-muted-foreground">
+                    Confirm this fingerprint matches the one in your terminal
+                  </p>
+                  <p
+                    className="break-all font-mono text-sm font-semibold text-foreground"
+                    data-testid="host-key-fingerprint"
+                  >
+                    {pending.host_key_fingerprint}
+                  </p>
+                </div>
+              )}
 
               {localPinState === "revoked" && (
                 <p className="text-xs text-destructive" data-testid="local-pin-state">
@@ -354,7 +436,13 @@ function DeviceInner() {
                 <Button
                   type="button"
                   className="flex-1"
-                  disabled={submitting || registration.data?.status !== "ready"}
+                  // In SAS mode, don't let the human approve before the number is
+                  // shown — there's nothing to compare yet.
+                  disabled={
+                    submitting ||
+                    registration.data?.status !== "ready" ||
+                    (Boolean(pending.sas_commit) && !verifyCode)
+                  }
                   onClick={onApprove}
                 >
                   {submitting
