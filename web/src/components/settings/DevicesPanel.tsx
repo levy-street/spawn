@@ -5,6 +5,7 @@ import { Check, Pencil, X } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { closeSettings, openSettings } from "@/components/settings/settings-dialog-store";
+import { AddDeviceCeremonyPanel } from "@/components/trust/add-device-ceremony";
 import { EndorseDevicePanel, useDeviceTrustMap } from "@/components/trust/device-endorsement";
 import { IntroductionPanel } from "@/components/trust/introduction-panel";
 import { Button } from "@/components/ui/button";
@@ -443,6 +444,15 @@ export function DevicesPanel() {
           accepting them is strictly better than any first-contact path. */}
       {user && currentDevice && (
         <IntroductionPanel accountId={user.id} deviceId={currentDevice.id} />
+      )}
+
+      {user && currentDevice && localIdentity.data && (
+        <AddDeviceCeremonyPanel
+          accountId={user.id}
+          currentDevice={currentDevice as BrowserDevice}
+          identity={localIdentity.data}
+          devices={devices.data ?? []}
+        />
       )}
 
       {currentDevice &&
