@@ -16,7 +16,13 @@ from ..models import Host
 from ..redis import get_backend
 from ..turn import ice_servers_for_session
 from .broker import HostBrowserConn
-from .browser import _resolve_user, _valid_rtc_candidate, _valid_rtc_sdp, _valid_rtc_session_id
+from .browser import (
+    _resolve_user,
+    _valid_rtc_candidate,
+    _valid_rtc_sdp,
+    _valid_rtc_session_id,
+    watch_session_epoch,
+)
 from .host_signal import (
     HOST_CONTROL_PROTOCOL,
     HOST_CONTROL_VERSION,
@@ -427,6 +433,7 @@ async def host_ws(
             tombstones_changed,
         )
     )
+    epoch_task = asyncio.create_task(watch_session_epoch(websocket, user))
 
     try:
         await wait_for_signal_pump(pump_task, pump_ready)
@@ -660,5 +667,10 @@ async def host_ws(
         tombstone_cleanup_task.cancel()
         try:
             await tombstone_cleanup_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        epoch_task.cancel()
+        try:
+            await epoch_task
         except (asyncio.CancelledError, Exception):
             pass

@@ -155,16 +155,28 @@ async def current_user(
     return user
 
 
-def _assert_current_epoch(payload: dict[str, Any], user: User) -> None:
-    """Refuse tokens minted before the account's current session epoch.
+def session_epoch_matches(payload: dict[str, Any], user: User) -> bool:
+    """Whether a token was minted under the account's current session epoch.
 
     Tokens issued before this claim existed carry no epoch and read as 0,
     which is the epoch every account starts at -- so they keep working until
     something (a password reset) actually bumps it, and stop the moment it
     does.
+
+    The single place the comparison lives. Every entry point that turns a
+    caller-supplied token into a ``User`` must go through this or
+    ``_assert_current_epoch``; ``scripts/check-session-epoch-enforced.sh``
+    fails the build on one that does not, which is how the WebSocket paths
+    drifted away from the REST ones in the first place.
     """
 
-    if int(payload.get("epoch", 0) or 0) != int(user.session_epoch or 0):
+    return int(payload.get("epoch", 0) or 0) == int(user.session_epoch or 0)
+
+
+def _assert_current_epoch(payload: dict[str, Any], user: User) -> None:
+    """Raise 401 for a token that predates the account's current epoch."""
+
+    if not session_epoch_matches(payload, user):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="session ended; sign in again",
@@ -219,7 +231,7 @@ async def current_user_optional(
     if user is None:
         return None
     # An evicted session must read as anonymous here too, not as the user.
-    if int(payload.get("epoch", 0) or 0) != int(user.session_epoch or 0):
+    if not session_epoch_matches(payload, user):
         return None
     return user
 

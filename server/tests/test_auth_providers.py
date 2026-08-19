@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -103,11 +104,19 @@ async def test_provider_start_is_hidden_when_provider_is_not_configured(client):
     assert start.status_code == 404
 
 
-async def test_google_login_links_existing_manual_account_by_verified_email(
+async def test_google_login_refuses_to_adopt_an_unverified_manual_account(
     client,
     configured_providers,
     monkeypatch,
 ):
+    """Matching strings is not proof of ownership.
+
+    Signup enforces only that an address is unique, so anyone can park a row
+    on an address they do not own and wait for its real owner to arrive
+    through a provider -- and keep password access to whatever that account
+    later pairs. This is the account pre-hijacking case, and it must refuse.
+    """
+
     signup = await client.post(
         "/api/auth/signup",
         json={"email": "Person@Example.com", "password": "passpasspass"},
@@ -132,13 +141,70 @@ async def test_google_login_links_existing_manual_account_by_verified_email(
         params={"state": state, "code": "provider-code"},
         follow_redirects=False,
     )
+
+    # Refused, but not into a raw JSON error: this account holder has a
+    # password and a way in, so say so on the sign-in page.
+    assert callback.status_code == 302, callback.text
+    location = urlparse(callback.headers["location"])
+    assert location.path == "/login"
+    assert "person@example.com" in parse_qs(location.query)["error"][0]
+    assert "password" in parse_qs(location.query)["error"][0]
+
+    # No session was issued, and nothing was attached to the account.
+    me = await client.get("/api/me")
+    assert me.status_code == 401
+    assert await _identity_count() == 0
+    async with get_sessionmaker()() as session:
+        users = (await session.execute(select(User))).scalars().all()
+    assert [user.id for user in users] == [user_id]
+
+
+async def test_google_login_links_a_manual_account_that_verified_the_same_address(
+    client,
+    configured_providers,
+    monkeypatch,
+):
+    """Both sides independently proved they hold the address, so link them.
+
+    spawn's own verification mail is the out-of-band confirmation that makes
+    adoption safe -- an attacker parking the row never receives it.
+    """
+
+    signup = await client.post(
+        "/api/auth/signup",
+        json={"email": "Owner@Example.com", "password": "passpasspass"},
+    )
+    assert signup.status_code == 200
+    user_id = signup.json()["user"]["id"]
+    async with get_sessionmaker()() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        user.email_verified_at = datetime.now(UTC)
+        await session.commit()
+    await client.post("/api/auth/logout")
+    client.cookies.clear()
+
+    async def fake_exchange(**_kwargs):
+        return ProviderProfile(
+            provider="google",
+            provider_user_id="google-sub-owner",
+            email="owner@example.com",
+            email_verified=True,
+        )
+
+    monkeypatch.setattr(auth_providers, "_exchange_provider_code", fake_exchange)
+    state = await _provider_state(client, "google")
+    callback = await client.get(
+        "/api/auth/oauth/google/callback",
+        params={"state": state, "code": "provider-code"},
+        follow_redirects=False,
+    )
     assert callback.status_code == 302, callback.text
     assert callback.headers["location"] == "/"
 
     me = await client.get("/api/me")
     assert me.status_code == 200
     assert me.json()["user"]["id"] == user_id
-    assert me.json()["user"]["email"] == "person@example.com"
 
     async with get_sessionmaker()() as session:
         identity = (
@@ -146,8 +212,48 @@ async def test_google_login_links_existing_manual_account_by_verified_email(
         ).scalar_one()
         users = (await session.execute(select(User))).scalars().all()
     assert identity.user_id == user_id
-    assert identity.email == "person@example.com"
-    assert identity.email_verified is True
+    assert len(users) == 1
+
+
+async def test_provider_link_from_an_authenticated_session_still_works(
+    client,
+    configured_providers,
+    monkeypatch,
+):
+    """The explicit path -- start the flow while signed in -- is unaffected."""
+
+    signup = await client.post(
+        "/api/auth/signup",
+        json={"email": "linker@example.com", "password": "passpasspass"},
+    )
+    assert signup.status_code == 200
+    user_id = signup.json()["user"]["id"]
+
+    async def fake_exchange(**_kwargs):
+        return ProviderProfile(
+            provider="github",
+            provider_user_id="github-sub-linked",
+            # A different address on the provider side; the link is
+            # authorized by the session, not by the string.
+            email="linker-alias@example.com",
+            email_verified=True,
+        )
+
+    monkeypatch.setattr(auth_providers, "_exchange_provider_code", fake_exchange)
+    state = await _provider_state(client, "github")
+    callback = await client.get(
+        "/api/auth/oauth/github/callback",
+        params={"state": state, "code": "provider-code"},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302, callback.text
+
+    async with get_sessionmaker()() as session:
+        identity = (
+            await session.execute(select(AuthIdentity).where(AuthIdentity.provider == "github"))
+        ).scalar_one()
+        users = (await session.execute(select(User))).scalars().all()
+    assert identity.user_id == user_id
     assert len(users) == 1
 
 
@@ -262,3 +368,102 @@ async def test_provider_login_redirects_to_relative_return_to(
     )
     assert callback.status_code == 302, callback.text
     assert callback.headers["location"] == return_to
+
+
+class _FakeUserinfoResponse:
+    def __init__(self, body: dict) -> None:
+        self.status_code = 200
+        self._body = body
+
+    def json(self) -> dict:
+        return self._body
+
+
+class _FakeUserinfoClient:
+    """Stands in for the httpx client `_oidc_profile` calls."""
+
+    def __init__(self, body: dict) -> None:
+        self._body = body
+
+    async def get(self, _url: str, **_kwargs) -> _FakeUserinfoResponse:
+        return _FakeUserinfoResponse(self._body)
+
+
+async def _microsoft_profile(body: dict):
+    return await auth_providers._oidc_profile(
+        _FakeUserinfoClient(body),  # type: ignore[arg-type]
+        auth_providers.PROVIDER_DEFINITIONS["microsoft"],
+        "access-token",
+    )
+
+
+async def test_microsoft_email_is_not_verified_just_because_it_is_present():
+    """The nOAuth pattern: `mail` is a mutable directory attribute.
+
+    Any tenant admin can set it to any string, so treating "non-empty" as
+    "verified" hands over any account whose address they care to type.
+    """
+
+    with pytest.raises(auth_providers.ProviderAuthError) as excinfo:
+        await _microsoft_profile({"sub": "attacker-sub", "email": "victim@company.com"})
+    assert "verified email" in str(excinfo.value)
+
+
+async def test_microsoft_requires_the_tenants_domain_ownership_claim():
+    profile = await _microsoft_profile(
+        {"sub": "ms-sub", "email": "person@company.com", "xms_edov": True}
+    )
+    assert profile.provider == "microsoft"
+    assert profile.provider_user_id == "ms-sub"
+    assert profile.email == "person@company.com"
+    assert profile.email_verified is True
+
+    # Entra ID emits the claim stringly in some token versions.
+    stringly = await _microsoft_profile(
+        {"sub": "ms-sub", "email": "person@company.com", "xms_edov": "true"}
+    )
+    assert stringly.email_verified is True
+
+    # An explicit false is a refusal, not a missing claim.
+    with pytest.raises(auth_providers.ProviderAuthError):
+        await _microsoft_profile(
+            {"sub": "ms-sub", "email": "person@company.com", "xms_edov": False}
+        )
+
+
+async def test_microsoft_never_takes_identity_from_preferred_username_or_upn():
+    """Neither claim is an email address, verified or otherwise."""
+
+    with pytest.raises(auth_providers.ProviderAuthError) as excinfo:
+        await _microsoft_profile(
+            {
+                "sub": "ms-sub",
+                "xms_edov": True,
+                "preferred_username": "victim@company.com",
+                "upn": "victim@company.com",
+            }
+        )
+    assert "email address" in str(excinfo.value)
+
+
+async def test_google_still_requires_its_own_verified_claim():
+    async def google_profile(body: dict):
+        return await auth_providers._oidc_profile(
+            _FakeUserinfoClient(body),  # type: ignore[arg-type]
+            auth_providers.PROVIDER_DEFINITIONS["google"],
+            "access-token",
+        )
+
+    profile = await google_profile(
+        {"sub": "google-sub", "email": "person@example.com", "email_verified": True}
+    )
+    assert profile.email_verified is True
+
+    with pytest.raises(auth_providers.ProviderAuthError):
+        await google_profile({"sub": "google-sub", "email": "person@example.com"})
+
+    # And Google's `xms_edov` means nothing — it is an Entra ID claim.
+    with pytest.raises(auth_providers.ProviderAuthError):
+        await google_profile(
+            {"sub": "google-sub", "email": "person@example.com", "xms_edov": True}
+        )

@@ -52,6 +52,7 @@ def test_test_all_runs_required_local_smoke_matrix():
         "check-worker-only-daemon.sh --self-test",
         "check-no-server-terminal-content.sh",
         "check-no-server-agent-upload.sh",
+        "check-session-epoch-enforced.sh --self-test",
         "bun run test:e2e",
         "bun run build",
         "git diff --check",
