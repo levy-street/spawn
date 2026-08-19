@@ -31,6 +31,9 @@ export function DevicesPanel() {
     queryKey: ["browser-devices"],
     queryFn: browserDevices.list,
     enabled: user !== null,
+    // Poll while this panel is open so a device registering on another screen
+    // shows up here to approve, and a revocation reflects, without a reload.
+    refetchInterval: 4000,
   });
   const localIdentity = useQuery({
     queryKey: ["browser-device-local-identity", user?.id],
@@ -43,8 +46,12 @@ export function DevicesPanel() {
   useEffect(() => {
     if (registration.data?.status === "ready") {
       void qc.invalidateQueries({ queryKey: ["browser-devices"] });
+      // The local-identity read can resolve to null moments before registration
+      // finishes writing it; refetch so anything gated on the identity (e.g. the
+      // add-device ceremony) appears without a manual reload.
+      void qc.invalidateQueries({ queryKey: ["browser-device-local-identity", user?.id] });
     }
-  }, [qc, registration.data?.status]);
+  }, [qc, registration.data?.status, user?.id]);
 
   const currentPublicKey =
     registration.data?.publicKey ?? localIdentity.data?.publicKeyWire ?? null;
