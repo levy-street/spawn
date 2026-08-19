@@ -9,9 +9,7 @@ import {
 describe("shellQuote", () => {
   test("passes safe words through bare", () => {
     expect(shellQuote("bar")).toBe("bar");
-    expect(shellQuote("/usr/local/bin:x_1,y.z@host%2+=-")).toBe(
-      "/usr/local/bin:x_1,y.z@host%2+=-",
-    );
+    expect(shellQuote("/usr/local/bin:x_1,y.z@host%2+=-")).toBe("/usr/local/bin:x_1,y.z@host%2+=-");
   });
 
   test("quotes empty strings and words with unsafe characters", () => {
@@ -54,9 +52,9 @@ describe("agentRunCommand", () => {
   });
 
   test("prefixes env assignments", () => {
-    expect(agentRunCommand({ command: "aider --model sonnet", env: { AIDER_DARK_MODE: "true" } })).toBe(
-      "AIDER_DARK_MODE=true aider --model sonnet",
-    );
+    expect(
+      agentRunCommand({ command: "aider --model sonnet", env: { AIDER_DARK_MODE: "true" } }),
+    ).toBe("AIDER_DARK_MODE=true aider --model sonnet");
   });
 });
 
