@@ -153,38 +153,40 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
     }
     println!();
 
-    // The committed-ephemeral SAS number can only be computed once the browser
-    // has contributed its nonce, so we wait for that here (it happens the moment
-    // the human opens the page). A pre-SAS server, or a browser that never
-    // contributes (old page), falls back to the full — always sound — fingerprint.
-    let verification: Option<String> = if sas_offered {
-        println!("spawn: waiting for the browser…");
-        run_sas_handshake(
-            &client,
-            &server,
-            &start.device_code,
-            identity.algorithm,
-            &identity.public_key,
-            &host_key_bytes,
-            &host_nonce,
-        )
-        .await
-        .unwrap_or(None)
+    // Always print the fingerprint first: it is sound, immediate, and the value
+    // the browser also shows — so there is something to compare even before the
+    // shorter SAS number is ready, and the two screens can never desync. When a
+    // commitment was offered, run the SAS handshake *concurrently* with the
+    // approval poll below; it prints the short code the moment the browser
+    // contributes, however long the human takes to open the page.
+    println!("spawn:   verify host fingerprint   {}", identity.fingerprint);
+    if sas_offered {
+        println!(
+            "spawn:   (a shorter 6-digit code appears here once your browser loads — match either)"
+        );
+        let sas_client = client.clone();
+        let sas_server = server.clone();
+        let sas_device_code = start.device_code.clone();
+        let sas_public_key = identity.public_key.clone();
+        let sas_algorithm = identity.algorithm;
+        tokio::spawn(async move {
+            if let Ok(Some(code)) = run_sas_handshake(
+                &sas_client,
+                &sas_server,
+                &sas_device_code,
+                sas_algorithm,
+                &sas_public_key,
+                &host_key_bytes,
+                &host_nonce,
+            )
+            .await
+            {
+                println!("spawn:   verification code   {code}");
+                println!("spawn:   confirm it matches the code in your browser, then approve.");
+            }
+        });
     } else {
-        None
-    };
-    match verification {
-        Some(code) => {
-            println!("spawn:   verification code   {code}");
-            println!("spawn:   confirm it matches the code in your browser, then approve.");
-        }
-        None => {
-            println!(
-                "spawn:   verify host fingerprint   {}",
-                identity.fingerprint
-            );
-            println!("spawn:   confirm it matches the fingerprint in your browser, then approve.");
-        }
+        println!("spawn:   confirm it matches the fingerprint in your browser, then approve.");
     }
     println!();
     println!("spawn: waiting for approval…");
@@ -272,7 +274,10 @@ async fn run_sas_handshake(
 ) -> Result<Option<String>> {
     let url = config::api_url(server, "/api/auth/device/sas-host")?;
     let nd_wire = URL_SAFE_NO_PAD.encode(host_nonce);
-    let deadline = Instant::now() + Duration::from_secs(25);
+    // Keep trying for most of the ceremony window, not a few seconds: the human
+    // may take a while to open the page, and giving up early would desync (the
+    // daemon on the fingerprint, the browser stuck waiting for a code).
+    let deadline = Instant::now() + Duration::from_secs(20 * 60);
     loop {
         if Instant::now() >= deadline {
             return Ok(None);

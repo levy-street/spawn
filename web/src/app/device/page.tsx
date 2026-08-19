@@ -109,6 +109,9 @@ function DeviceInner() {
   // (nothing to type), "manual" when the page was opened bare.
   const [phase, setPhase] = useState<"init" | "auto" | "manual">("init");
   const [verifyCode, setVerifyCode] = useState<string | null>(null);
+  // Set if the SAS number never arrives (daemon gone/slow) — then we fall back
+  // to the always-sound fingerprint so the human is never stuck on "computing".
+  const [sasTimedOut, setSasTimedOut] = useState(false);
   const [hostName, setHostName] = useState<string | null>(null);
   const [pending, setPending] = useState<DevicePendingApproval | null>(null);
   const [localPinState, setLocalPinState] = useState<BrowserHostPinState | "new" | null>(null);
@@ -145,6 +148,7 @@ function DeviceInner() {
       // the browser identity is ready (it needs our key B). No grindable code:
       // when the daemon offers no commitment we show the full fingerprint.
       setVerifyCode(null);
+      setSasTimedOut(false);
       sasStartedRef.current = false;
       setIdentifier(lookup);
       setPending(r);
@@ -191,7 +195,7 @@ function DeviceInner() {
       });
       const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
       let nd: Uint8Array | null = null;
-      for (let attempt = 0; attempt < 25 && !nd; attempt += 1) {
+      for (let attempt = 0; attempt < 40 && !nd; attempt += 1) {
         const fresh = await auth.pendingDevice(id).catch(() => null);
         if (fresh?.sas_host_nonce) {
           nd = b64urlDecode(fresh.sas_host_nonce);
@@ -199,7 +203,12 @@ function DeviceInner() {
         }
         await sleep(1000);
       }
-      if (!nd) return; // daemon never revealed (old/slow) → fingerprint fallback
+      if (!nd) {
+        // The daemon never revealed its nonce — fall back to the fingerprint,
+        // which both sides show, instead of leaving the human on "computing".
+        setSasTimedOut(true);
+        return;
+      }
       if (!(await verifyCommit(commit, hostKey, nd))) {
         throw new ApprovalIdentityError(
           "The host's SAS commitment did not open — approval was blocked",
@@ -381,7 +390,7 @@ function DeviceInner() {
                 <p className="text-xl font-semibold text-foreground">{pending.host_name}</p>
               </div>
 
-              {pending.sas_commit ? (
+              {pending.sas_commit && !sasTimedOut ? (
                 <div className="space-y-2 rounded-lg border p-4 text-center">
                   <p className="text-sm text-muted-foreground">
                     Confirm this matches the code in your terminal
@@ -401,11 +410,13 @@ function DeviceInner() {
                   </p>
                 </div>
               ) : (
-                // Pre-SAS daemon: no sound short code exists, so match the full
-                // fingerprint against the one printed in the terminal.
+                // No sound short code (pre-SAS daemon, or the SAS never arrived):
+                // match the full fingerprint against the one in the terminal.
                 <div className="space-y-2 rounded-lg border p-4 text-center">
                   <p className="text-sm text-muted-foreground">
-                    Confirm this fingerprint matches the one in your terminal
+                    {sasTimedOut
+                      ? "Couldn't get the short code — confirm this fingerprint matches your terminal"
+                      : "Confirm this fingerprint matches the one in your terminal"}
                   </p>
                   <p
                     className="break-all font-mono text-sm font-semibold text-foreground"
@@ -436,12 +447,13 @@ function DeviceInner() {
                 <Button
                   type="button"
                   className="flex-1"
-                  // In SAS mode, don't let the human approve before the number is
-                  // shown — there's nothing to compare yet.
+                  // In SAS mode, don't let the human approve before there's
+                  // something to compare — the number, or (if it never arrived)
+                  // the fingerprint fallback.
                   disabled={
                     submitting ||
                     registration.data?.status !== "ready" ||
-                    (Boolean(pending.sas_commit) && !verifyCode)
+                    (Boolean(pending.sas_commit) && !verifyCode && !sasTimedOut)
                   }
                   onClick={onApprove}
                 >
