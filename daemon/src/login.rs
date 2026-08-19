@@ -115,7 +115,8 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         }
         Err(_) => start.verification_uri.clone(),
     };
-    if open_browser(&approve_url) {
+    if browser_open_allowed(&BrowserEnv::from_process(args.no_browser)) && open_browser(&approve_url)
+    {
         println!("spawn: opened your browser to approve this host.");
         println!("spawn:   didn't open? visit {approve_url}");
     } else {
@@ -196,6 +197,38 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
             }
         }
     }
+}
+
+/// The bits of the environment that decide whether opening a browser is a
+/// courtesy or a surprise. Split out from the process so the rule is testable
+/// without one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BrowserEnv {
+    /// `--no-browser`, or SPAWN_NO_BROWSER=1.
+    pub opted_out: bool,
+    /// This shell is on the far end of an SSH connection.
+    pub over_ssh: bool,
+}
+
+impl BrowserEnv {
+    fn from_process(opted_out: bool) -> Self {
+        Self {
+            opted_out,
+            // Installing on a box you reached over SSH is the case where
+            // "opened your browser" is actively wrong: on macOS `open` targets
+            // the console session, so a browser appears on someone else's
+            // screen — possibly nobody's.
+            over_ssh: std::env::var_os("SSH_CONNECTION").is_some()
+                || std::env::var_os("SSH_TTY").is_some()
+                || std::env::var_os("SSH_CLIENT").is_some(),
+        }
+    }
+}
+
+/// Whether to even attempt a browser. The link is always printed either way,
+/// so refusing here costs nothing — it only avoids a confusing surprise.
+pub fn browser_open_allowed(env: &BrowserEnv) -> bool {
+    !env.opted_out && !env.over_ssh
 }
 
 /// Best-effort: open `url` in the operator's default browser. Returns whether a
@@ -430,6 +463,37 @@ fn detect_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_plain_local_install_may_open_a_browser() {
+        assert!(browser_open_allowed(&BrowserEnv {
+            opted_out: false,
+            over_ssh: false,
+        }));
+    }
+
+    #[test]
+    fn opting_out_is_honored() {
+        // `--no-browser`, or SPAWN_NO_BROWSER=1 through `curl … | sh`.
+        assert!(!browser_open_allowed(&BrowserEnv {
+            opted_out: true,
+            over_ssh: false,
+        }));
+    }
+
+    #[test]
+    fn an_ssh_session_never_opens_someone_elses_browser() {
+        // On macOS `open` targets the console session, so possessing a remote
+        // box would pop a window on whoever is sitting at it.
+        assert!(!browser_open_allowed(&BrowserEnv {
+            opted_out: false,
+            over_ssh: true,
+        }));
+        assert!(!browser_open_allowed(&BrowserEnv {
+            opted_out: true,
+            over_ssh: true,
+        }));
+    }
+
     /// 32 zero bytes: a canonical 43-char base64url ceremony nonce.
     const TEST_ACCOUNT: &str = "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
     const TEST_APPROVAL_NONCE: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

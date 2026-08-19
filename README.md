@@ -64,6 +64,22 @@ curl -fsSL https://spawn.example.com/install.sh | sh -s -- --server https://spaw
 For CI or smoke tests that should prove the minimal binary path without a Rust
 fallback, add `--prebuilt-only`.
 
+Once the host proves possession of its own key, `spawnd` prints one clickable
+approval link and the verification code to compare against the browser, and
+opens the link for you when that makes sense. It deliberately does not when you
+are on the far end of an SSH connection — `open` would put a browser on the
+console user's screen, not yours. To always print instead of opening, pass
+`--no-browser`, or set `SPAWN_NO_BROWSER=1`, which is the way through a piped
+installer:
+
+```bash
+curl -fsSL https://spawn.example.com/install.sh | SPAWN_NO_BROWSER=1 sh
+```
+
+Approval itself never becomes automatic: the link names a ceremony a
+key-holding host started, and a human still has to compare the fingerprint and
+click.
+
 Interactive terminal sessions require direct browser↔daemon WebRTC
 fully reliable, ordered DataChannels: `spawn.pty` for bytes and `spawn.ctl` for
 endpoint replay, viewport control, and capability-bound agent uploads. Server

@@ -22,6 +22,7 @@ import {
   loadBrowserHostPin,
 } from "@/lib/browser-host-pins";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
+import { isCompleteUserCode, normalizeUserCode } from "@/lib/user-code";
 import { verificationCode } from "@/lib/verification-code";
 
 class ApprovalIdentityError extends Error {}
@@ -116,7 +117,7 @@ function DeviceInner() {
   const review = async (id: { user_code?: string; approval_ref?: string }) => {
     const lookup = id.approval_ref
       ? { approval_ref: id.approval_ref }
-      : { user_code: (id.user_code ?? "").trim().toUpperCase() };
+      : { user_code: normalizeUserCode(id.user_code ?? "") };
     if (!lookup.approval_ref && !lookup.user_code) return;
     setError(null);
     setSubmitting(true);
@@ -236,7 +237,7 @@ function DeviceInner() {
         pending.host_public_key,
       );
       const r = await auth.approveDevice({
-        ...(identifier ?? { user_code: code.trim().toUpperCase() }),
+        ...(identifier ?? { user_code: normalizeUserCode(code) }),
         approval_nonce: pending.approval_nonce,
         host_key_algorithm: pending.host_key_algorithm,
         host_public_key: pending.host_public_key,
@@ -401,7 +402,10 @@ function DeviceInner() {
                   className="text-center font-mono text-lg tracking-[0.2em]"
                   value={code}
                   onChange={(e) => {
-                    setCode(e.target.value);
+                    // Canonicalize as they type: lower case, a missing dash
+                    // and a stray space are all the same code, and the
+                    // alphabet deliberately has no 0/O/1/I to confuse.
+                    setCode(normalizeUserCode(e.target.value));
                     setIdentifier(null);
                     setPending(null);
                     setVerifyCode(null);
@@ -417,7 +421,11 @@ function DeviceInner() {
                   {error}
                 </p>
               )}
-              <Button type="submit" className="w-full" disabled={submitting}>
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={submitting || !isCompleteUserCode(code)}
+              >
                 {submitting ? "Checking…" : "Look up host"}
               </Button>
             </form>

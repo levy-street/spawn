@@ -40,11 +40,24 @@ also accepts `Bearer` for API testing).
 | POST   | `/api/auth/login`          | `{email, password}`                 | `{access_token, user}`                                                                                            |
 | POST   | `/api/auth/logout`         | —                                   | 204                                                                                                               |
 | GET    | `/api/me`                  | —                                   | `{user}`                                                                                                          |
-| POST   | `/api/auth/device/start`   | `{host_name, os, arch, version, host_key_algorithm:"ed25519", host_public_key}` | `{device_code, user_code, approval_nonce, verification_uri, interval, expires_in}` |
+| POST   | `/api/auth/device/start`   | `{host_name, os, arch, version, host_key_algorithm:"ed25519", host_public_key}` | `{device_code, user_code, approval_ref, approval_nonce, verification_uri, interval, expires_in}` |
 | POST   | `/api/auth/device/possession` | `{device_code, approval_nonce, host_key_algorithm:"ed25519", host_public_key, signature}` | `{verified:true, version:1}` after exact unexpired host-key proof |
 | POST   | `/api/auth/device/poll`    | `{device_code, host_key_algorithm:"ed25519", host_public_key}` | `{access_token, host_id, host_key_algorithm, host_public_key, host_key_fingerprint, browser_device_id, browser_key_algorithm:"ed25519", browser_public_key, browser_key_fingerprint}` containing the exact approving browser tuple on success; otherwise a device-flow `error` |
-| POST   | `/api/auth/device/pending` | `{user_code}`                       | `{host_name, approval_nonce, host_key_algorithm, host_public_key, host_key_fingerprint}` for authenticated pre-approval review |
+| POST   | `/api/auth/device/pending` | `{user_code}` **or** `{approval_ref}` | `{host_name, approval_nonce, host_key_algorithm, host_public_key, host_key_fingerprint}` for authenticated pre-approval review |
 | POST   | `/api/auth/device/approve` | reviewed host tuple/nonce plus `{browser_device_id, browser_key_algorithm, browser_public_key, browser_key_fingerprint, signature}` | the exact reviewed host and browser presentation after one-shot approval |
+
+`approval_ref` is an opaque per-ceremony handle the daemon puts in the link it
+prints (`{verification_uri}?ref=…`), so the human's only job is the part that
+needs a human: comparing the fingerprint. It is deliberately **not** the
+`user_code` — RFC 8628 §3.3.1 allows embedding the code in the URI, and this
+avoids that tradeoff entirely by never putting the short, hand-typable code in
+a link. Both identify the same ceremony to `pending` and `approve`, and neither
+changes what approval requires: an explicit click, from an authenticated
+account, against a fingerprint the operator compared. Possession is already
+proven by the host's key before either is shown (`/api/auth/device/possession`),
+so a link names a ceremony that a key-holding host started; it cannot create
+one. `user_code` remains for redeeming a ceremony on a machine that cannot
+follow the link.
 
 `host_public_key` is the canonical unpadded base64url encoding of the exact
 32-byte Ed25519 public key. The server derives `host_key_fingerprint` as

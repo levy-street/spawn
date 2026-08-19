@@ -564,3 +564,118 @@ test("two native Chromium tabs converge on one exact local pin", async ({ contex
   expect(await readHostPins(page)).toHaveLength(1);
   await secondPage.close();
 });
+
+/** Minimal ceremony mocks: enough to reach the fingerprint screen. */
+async function mockPairingCeremony(
+  page: Page,
+  options: { pendingStatus?: number; pendingDetail?: string } = {},
+): Promise<{ lookups: Array<Record<string, unknown>> }> {
+  const lookups: Array<Record<string, unknown>> = [];
+  await page.route("**/api/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/me") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: {
+          user: { id: USER_ID, email: "owner@example.com", created_at: "2026-07-17T00:00:00Z" },
+        },
+      });
+      return;
+    }
+    if (path === "/api/browser-devices/register") {
+      const body = request.postDataJSON() as { public_key: string };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: {
+          id: BROWSER_DEVICE_ID,
+          key_algorithm: "ed25519",
+          public_key: body.public_key,
+          fingerprint: fingerprint(body.public_key),
+          created_at: "2026-07-17T00:00:00Z",
+          revoked_at: null,
+        },
+      });
+      return;
+    }
+    if (path === "/api/auth/device/pending") {
+      lookups.push(request.postDataJSON() as Record<string, unknown>);
+      if (options.pendingStatus && options.pendingStatus >= 400) {
+        await route.fulfill({
+          status: options.pendingStatus,
+          contentType: "application/json",
+          json: { detail: options.pendingDetail ?? "invalid or expired code" },
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: {
+          host_name: "build-host",
+          approval_nonce: APPROVAL_NONCE,
+          host_key_algorithm: "ed25519",
+          host_public_key: HOST_PUBLIC_KEY,
+          host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
+        },
+      });
+      return;
+    }
+    await route.fulfill({ status: 404, json: { detail: "not mocked" } });
+  });
+  return { lookups };
+}
+
+test("the printed link lands on the fingerprint check with nothing typed", async ({ page }) => {
+  const { lookups } = await mockPairingCeremony(page);
+
+  // What `spawnd login` prints: one clickable line carrying an opaque handle.
+  await page.goto("/device?ref=aD114ddf156VAJJEVzpzNAstYsHFxeorag0a2pghXqc");
+
+  await expect(page.getByTestId("verification-code")).toBeVisible();
+  await expect(page.getByText("build-host")).toBeVisible();
+  // The opaque ref is what was looked up — the short code never enters a link.
+  await expect
+    .poll(() => lookups)
+    .toEqual([{ approval_ref: "aD114ddf156VAJJEVzpzNAstYsHFxeorag0a2pghXqc" }]);
+
+  // Prefilling is not approving: the deliberate act is still required, and
+  // the fingerprint is still there to compare first.
+  await expect(
+    page.getByRole("button", { name: /^(?:Approve|Retry server approval)$/u }),
+  ).toBeVisible();
+});
+
+test("an expired or invented handle degrades to the manual form", async ({ page }) => {
+  await mockPairingCeremony(page, { pendingStatus: 404, pendingDetail: "code expired" });
+
+  await page.goto("/device?ref=stale-handle-from-an-old-terminal");
+
+  // Says what happened, and leaves a way forward rather than a dead screen.
+  // Scoped: Next's route announcer is also role="alert".
+  await expect(page.locator("p[role=alert]")).toContainText("code expired");
+  await expect(page.getByLabel("Code from the terminal")).toBeVisible();
+  await expect(page.getByTestId("verification-code")).toHaveCount(0);
+});
+
+test("a retyped code is accepted however the human punctuates it", async ({ page }) => {
+  const { lookups } = await mockPairingCeremony(page);
+  await page.goto("/device");
+
+  const field = page.getByLabel("Code from the terminal");
+  const submit = page.getByRole("button", { name: "Look up host" });
+
+  // Nothing to send yet.
+  await expect(submit).toBeDisabled();
+
+  // Lower case, no dash, and a stray space are all the same code.
+  await field.fill("qz4k 7hmt");
+  await expect(field).toHaveValue("QZ4K-7HMT");
+  await expect(submit).toBeEnabled();
+  await submit.click();
+
+  await expect(page.getByTestId("verification-code")).toBeVisible();
+  await expect.poll(() => lookups).toEqual([{ user_code: "QZ4K-7HMT" }]);
+});
