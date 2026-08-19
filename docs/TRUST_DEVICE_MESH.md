@@ -89,7 +89,15 @@ received. The account owner may only *add* to `Rev`; the server may only
 **Admission rule.** A host `h` accepts a connection from `d` iff **all** hold:
 1. `d` proves possession of `sk_d` (signs a fresh challenge);
 2. `d` presents a valid endorsement chain from some `a₀ ∈ A(h)` to `pk_d`;
-3. no key on the chain (including `pk_d`) is in `Rev(h)`.
+3. no key on the chain (including `pk_d`) is in `Rev(h)`;
+4. the chain is a **simple path** — no key appears twice (mutual endorsements
+   create 2-cycles; trust must not launder through a loop) — and its length is
+   within a fixed bound `L_max` (validation-DoS cap).
+
+**Continuous-enforcement rule.** Admission is re-evaluated for the *life* of a
+session, not only at connect: on any `Rev` update, `h` immediately **terminates
+every live session** whose chain contains a newly-revoked key. Blocking new
+connections is not enough — see P3 and **R1**.
 
 **Number-match (the admission gate).** An endorsement of `pk_b` is *created* only
 after a **committed short-authentication-string (SAS)** ceremony between the
@@ -102,10 +110,12 @@ Commit-then-reveal is mandatory — see §6, Proof of P2.
 
 ## 4. Operations
 
-- **possess(h) by device d.** Human does the 6-digit host check; `h` sets
-  `A(h) ⊇ {pk_d}`. If a root exists, `d` also presents `R`'s endorsement of `d`
-  and `h` adds `R` to `A(h)` (so the host anchors on the account, surviving loss
-  of `d`).
+- **possess(h) by device d.** The human verifies the host↔device pairing — this
+  is an **anchor ceremony and must meet A5** (committed ephemeral SAS, or a
+  full-entropy fingerprint compare). `h` sets `A(h) ⊇ {pk_d}`. If a root exists,
+  `d` also presents `R`'s endorsement of `d` and `h` adds `R` to `A(h)` (so the
+  host anchors on the account, surviving loss of `d`). *The mesh's entire
+  soundness (P2) inherits from this check — see **R2**.*
 - **add-device(new = c, using existing = x).** One committed SAS number-match
   between `x` and `c`. On match, a **mutual** endorsement is created:
   `x → c` *and* `c → x` (both keys were verified in the same ceremony, so both
@@ -134,13 +144,25 @@ revocation blast radius to zero** — Proof of P3′ depends on it.
 - **A2.** Private keys are non-extractable and never leave their device/host; the
   server never holds any `sk`.
 - **A3.** Devices are honest: a device creates `endorse(pk_b)` only after a
-  successful human number-match confirming `pk_b`.
+  successful human number-match confirming `pk_b`. *(This is strong — a single
+  compromised trusted device becomes a mesh-wide rogue CA; see **R4** for the
+  detection/limitation defenses.)*
 - **A4.** The human compares the two numbers correctly and aborts on mismatch.
-- **A5.** The SAS ceremony is commit-then-reveal (keys committed before the
-  number is derivable), with a `k`-digit code (default `k = 6`), used one-shot.
-- **A6.** A host is reachable by a client *only while it is connected to the
-  server* (the server is the mandatory signaling/relay path). This is a property
-  of the transport, not an added assumption.
+- **A5.** The number-match is a **committed *ephemeral* SAS**: both endpoints
+  contribute a *fresh ephemeral* key, **commit** (hash) before reveal, and the
+  `k`-digit number is derived from *both* ephemerals (bound to the identity
+  keys). A substituting server must inject its own ephemerals and commit *blind*,
+  so it cannot grind — its per-ceremony success is `≤ 10⁻ᵏ` (one-shot).
+  **Corollary (critical):** a short number derived from a *long-lived* key with
+  **no** ephemeral + commitment is **grindable** — a server generates keys until
+  the number matches (~`10ᵏ` work ≈ *seconds* for `k=6`) — and provides *no*
+  security. In that construction the human MUST instead compare a full-entropy
+  fingerprint (`≥ 96` bits). See Red-team finding **R2**.
+- **A6 (enforced constraint, not merely assumed).** A host is reachable by a
+  client *only via a server-mediated step at which the host checks `Rev`* — i.e.
+  no session may be established through any path that skips server signaling
+  (LAN/mDNS direct, cached/pre-issued offers, a future "local mode"). This must
+  be *enforced*; P3 is false the moment any such bypass exists. See **R3**.
 
 ---
 
@@ -215,14 +237,22 @@ mandatory, not cosmetic. With `k = 6`, per-attempt substitution success is `10�
 
 ### P3 — Revocation: effectiveness
 
-> **Theorem.** Once `pk_d ∈ Rev`, no host accepts `d` from the moment that host
-> is next reachable by any client.
+> **Theorem.** Once `pk_d ∈ Rev`, no host accepts a *new* connection from `d`
+> from the moment that host is next reachable — and any *existing* session of
+> `d` is torn down as soon as its host receives the update.
 
-**Proof.** By A6 a client reaches `h` only while `h` is server-connected. The
-server delivers `Rev` to `h` on (re)connect, before brokering any client
+**Proof (new connections).** By A6 a client reaches `h` only via a server-mediated
+step, and the server delivers `Rev` to `h` at that step before brokering the
 session, so at every reachable state of `h`, `Rev(h) ∋ pk_d`. Admission clause 3
-rejects any chain containing `pk_d`. There is therefore no reachable state in
-which `h` is both reachable by `d` and unaware of the revocation. ∎
+rejects any chain containing `pk_d`. There is no reachable state in which `h` is
+both reachable by `d` and unaware of the revocation.
+
+**Proof (live sessions).** A live session persists only while `h` is
+server-connected (A6). The server pushes the `Rev` update to every connected
+host; on receipt the continuous-enforcement rule terminates any session whose
+chain contains `pk_d`. Absent that rule, a device revoked *mid-session* keeps its
+open channel indefinitely (**R1**) — which is precisely the "kill my stolen
+phone *now*" case revocation exists for. ∎
 
 ### P3′ — Revocation: safety of server delegation
 
@@ -299,8 +329,8 @@ is therefore 1, independent of |H|. ∎
 | Endorsement direction | one-way | **mutual** in the add ceremony (P1) |
 | Host anchors | possessing device's key | device key **and/or root**, multi-anchor chain validation |
 | Root | trust bundle is passkey-sealed (host keys) | add a passkey-sealed **root key** as universal anchor + healing |
-| Number-match | 6-digit host code shipped (host↔browser) | **committed SAS** extended device↔device (P2/A5) |
-| Revocation | browser-device revoke exists; delivery path partial | **account deny-list delivered to daemons on connect**, subtract-only |
+| Number-match | 6-digit host code shipped — **grindable, not the anchor (R2)** | committed *ephemeral* SAS (A5) for a sound short code, device↔device and at possess |
+| Revocation | browser-device revoke exists; delivery path partial | account deny-list delivered on connect, subtract-only, **+ live-session teardown (R1)** |
 
 The primitives (endorsement, passkey-sealed bundle, per-device keys, a 6-digit
 verification code) already exist; the work is re-scoping endorsement to the
@@ -309,7 +339,84 @@ and the fail-closed `Rev` channel.
 
 ---
 
-## 9. Open questions
+## 9. Red-team findings & resolutions
+
+Findings from adversarially attacking §6. **R1–R3 broke a stated property as
+written** and are now folded into the model above; the rest are sharpenings.
+
+**R1 — Revocation left live sessions open (broke P3).** The admission rule only
+governed *accepting* connections, so a device revoked mid-session kept its open
+channel — the exact "kill it *now*" case. **Resolved:** added the
+continuous-enforcement rule (§3) and the live-session half of P3.
+
+**R2 — The shipped 6-digit code is grindable; soundness rested on it (threatened
+P2 at the anchor).** The host key is a long-lived identity and the pairing has no
+ephemeral/commitment, so a 20-bit number over it can be brute-forced by a
+substituting server in ~seconds. The real anchor is the **96-bit fingerprint**,
+which the shipped UI now demotes to fine print. **Resolved in model:** A5 rewritten
+to require a committed *ephemeral* SAS for a short code to be sound, and possess
+marked as an anchor ceremony that must meet A5. **Action item (touches prod):**
+either restore the full fingerprint as the primary compare, or add a committed
+ephemeral exchange so the short code is genuinely sound. Until then the 6-digit
+is *convenience, not security*.
+
+**R3 — A6 was assumed, not enforced (P3 silently voidable).** Any connection path
+that skips server-mediated signaling (LAN direct, cached offers, "local mode")
+lets a revoked device connect before the host hears `Rev`. **Resolved:** A6
+restated as an enforced design constraint that any future connectivity feature
+must not violate.
+
+**R4 — A compromised (not stolen) trusted device is a mesh-wide rogue CA.** Any
+trusted device can endorse, so malware on one device can silently endorse the
+attacker's keys onto every host (and off `R` if it holds the passkey). Inherent
+to endorsement systems, but A3 buried it. **Resolution:** (a) keep a **visible,
+audited device/endorsement roster** so a rogue endorsement is *detectable* and
+revocable; (b) prefer **root-only endorsement when a passkey is present**,
+leaving device-endorsement as the no-passkey fallback — shrinking the rogue-CA
+surface to passkey-holders. Detection + fast revocation is the realistic defense.
+
+**R5 — Revoking a host's *sole* anchor orphans the host.** If `A(h) = {pk_d}` (no
+root) and `d` is revoked, every chain must pass the revoked anchor → `h` is
+unreachable; re-possess required. **Resolution:** healing a host to a root anchor
+is a **precondition** for cleanly revoking a device that is some host's sole
+anchor; the revoke flow must refuse or auto-heal first.
+
+**R6 — SAS `session` underspecified (relay/reflection).** A short SAS needs
+`session` to be a **fresh nonce with entropy contributed by both endpoints**, or
+a server can reflect one concurrent ceremony's commitment into another. Folded
+into A5's "ephemeral from both endpoints."
+
+**R7 — Acceptance ≠ discovery.** P1 proves a host *accepts* a device; it does not
+give the device the host's *key* to dial in. That rides on the passkey-sealed
+bundle, so **no-passkey devices have no specified way to learn new hosts**.
+**Resolution:** in pure device-chain mode, host keys must gossip the same way
+client keys do — carried in the mutual add-device exchange. Specify this (open Q).
+
+**R8 — No-root, single-device loss = total lockout.** With no root and one
+device, losing it strands every host (re-possess all). **Resolution:** strongly
+encourage (or require) either a root or a *second* device before this is the only
+recovery path; document it as the explicit cost of no-passkey mode.
+
+**R9 — Migration is a downgrade surface.** While per-host *and* account-scoped
+endorsements both validate during rollout, a server picks the weaker.
+**Resolution:** retire the per-host path deliberately and refuse it once a host
+supports account-scoped chains.
+
+**R10 — Un-revoke silently re-grants.** Endorsements have no expiry and `Rev` is
+add-only; removing a key from `Rev` re-admits it via its stale endorsement.
+**Resolution:** revocation is a **permanent tombstone** — re-admitting a device
+requires a *fresh* number-match and endorsement (new key or new ceremony), never
+un-revoking.
+
+**R11 — Endorsement graph is server-visible metadata.** The server relays/stores
+endorsements, so it learns device topology (who endorsed whom). Consistent with
+TRUST.md's metadata stance; noted so it is not mistaken for a leak of content.
+
+**Verdict.** The core claim — *the server can slam doors, never open them* —
+survives. With R1–R3 folded in, P1–P4 hold under §5. R2 is the one that reaches
+into shipped code and needs a product decision.
+
+## 10. Open questions
 
 - Root creation UX: when/how is `R` minted, and what is the no-passkey story for
   users who never create one (pure device-chain mode — supported, heals never)?
