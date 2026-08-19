@@ -1,13 +1,25 @@
 import type { Agent } from "@/lib/api";
 
-export type AgentKind = "codex" | "claude" | "opencode" | "aider" | "shell" | "custom";
+export type AgentKind =
+  | "codex"
+  | "claude"
+  | "opencode"
+  | "aider"
+  | "hermes"
+  | "grok"
+  | "shell"
+  | "custom";
 
 export function agentKind(agent: Agent): AgentKind {
   const binary = agent.argv[0]?.split(/[\\/]/).at(-1)?.toLowerCase() ?? "";
   if (binary.includes("codex")) return "codex";
   if (binary.includes("claude")) return "claude";
+  // Before `code`-ish matches: opencode contains "code", hermes and grok are
+  // their own binaries.
   if (binary.includes("opencode")) return "opencode";
   if (binary.includes("aider")) return "aider";
+  if (binary.includes("hermes")) return "hermes";
+  if (binary.includes("grok")) return "grok";
   if (binary === "bash" || binary === "sh" || binary === "zsh" || binary === "fish") {
     return "shell";
   }
@@ -24,6 +36,10 @@ export function agentKindLabel(kind: AgentKind): string {
       return "OpenCode";
     case "aider":
       return "Aider";
+    case "hermes":
+      return "Hermes Agent";
+    case "grok":
+      return "Grok Build";
     case "shell":
       return "Shell";
     default:
