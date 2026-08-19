@@ -383,7 +383,7 @@ export function WorkspaceTabs({
                 active &&
                   (look.connected && look.surface === "header"
                     ? look.dimmed
-                      ? "[--tab-surface:color-mix(in_oklab,var(--foreground)_3.5%,color-mix(in_oklab,var(--card)_75%,var(--background)))]"
+                      ? "[--tab-surface:color-mix(in_oklab,var(--foreground)_3.5%,color-mix(in_oklab,var(--card)_75%,var(--background)))] dark:[--tab-surface:color-mix(in_oklab,black_25%,color-mix(in_oklab,var(--card)_75%,var(--background)))]"
                       : "[--tab-surface:color-mix(in_oklab,var(--card)_75%,var(--background))]"
                     : "[--tab-surface:var(--background)]"),
                 // `tab-connected` flares the foot into the panel: see globals.

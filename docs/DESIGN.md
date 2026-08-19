@@ -50,7 +50,7 @@ add UI for that store until a current shell-session design is accepted.
 `--brand-well` / `--brand-hairline`. `--shell` is the app-shell ground — the
 sidebar, the frame the content panel floats in, and the workspace grid's
 gutter — set a step off the content panel in each theme (lighter in dark at
-`oklch(0.225 0 0)`, darker in light at `oklch(0.945 0 0)`) so chrome and
+`oklch(0.205 0 0)`, darker in light at `oklch(0.945 0 0)`) so chrome and
 content never read as one surface.
 
 The workspace tab strip (`workspace-tabs.tsx`) is the same move again: the
@@ -61,8 +61,10 @@ fresh tab reads as a surface awaiting panes rather than more chrome.
 
 Pane focus rides the same figure/ground idea rather than a fourth token: the
 focused pane is left as `--background`, the deepest surface in the stack, and
-every other pane takes a `bg-foreground/[0.035]` wash on top — lighter in dark,
-greyer in light, receding in both. Focus draws **no ring**; the background is
+every other pane takes a wash on top that always moves *away* from the light —
+`bg-black/25` in dark, `bg-foreground/[0.035]` in light — receding in both. In
+dark the ground is already near-black, so what visibly recedes is the pane's
+content rather than its surface. Focus draws **no ring**; the background is
 the whole signal. The only ring a pane draws is the cross-highlight from
 hovering its row in the sidebar, and a pane never draws it for its own hover. It has to be an overlay, not a background
 swap: xterm paints its own opaque canvas, so a pane's own `bg-*` never shows

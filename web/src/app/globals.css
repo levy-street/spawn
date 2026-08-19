@@ -246,7 +246,7 @@
   --brand-accent: oklch(0.67 0.22 31);
   --brand-accent-soft: oklch(0.67 0.22 31 / 0.14);
   --ring: var(--foreground);
-  --shell: oklch(0.225 0 0);
+  --shell: oklch(0.205 0 0);
   --terminal-bg: oklch(0.145 0 0);
 
   --brand-bg: oklch(0.115 0 0);

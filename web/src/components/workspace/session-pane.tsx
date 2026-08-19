@@ -254,16 +254,18 @@ export function SessionPane({
        * Which pane has focus, read at a glance. xterm paints its own opaque
        * canvas background, so the section's `bg-background` never shows through
        * the terminal itself — the only way to tint a pane is over the top. The
-       * focused pane is left exactly as it is (the deepest surface in the
-       * stack); every other one is washed toward the foreground, which reads as
-       * lighter in dark and greyer in light, i.e. receding in both. Sits under
-       * the exited-state scrim (z-20) and the shortcut bar (z-30), and takes no
-       * pointer events, so nothing about interacting with the pane changes.
+       * focused pane is left exactly as it is; every other one is washed
+       * *down*, away from the light: a black scrim in dark (the ground is
+       * already near-black, so what visibly recedes is the pane's content) and
+       * the same move in light, where washing toward the near-black foreground
+       * greys it. Sits under the exited-state scrim (z-20) and the shortcut bar
+       * (z-30), and takes no pointer events, so nothing about interacting with
+       * the pane changes.
        */}
       {!focused && paneCount > 1 && (
         <div
           aria-hidden
-          className="pointer-events-none absolute inset-0 z-10 bg-foreground/[0.035]"
+          className="pointer-events-none absolute inset-0 z-10 bg-foreground/[0.035] dark:bg-black/25"
         />
       )}
 
