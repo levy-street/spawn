@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { mockAuthenticatedApi, user } from "./app-mocks";
+import { mockApp, user } from "./app-mocks";
 
 // The admin dashboard: visible to admins, an empty shell to everyone else,
 // and the invite link shown exactly once at creation.
@@ -7,7 +7,7 @@ import { mockAuthenticatedApi, user } from "./app-mocks";
 const INVITE_URL = "https://spawn.example/signup?invite=test-invite-code-123";
 
 async function mockAdminApi(page: import("@playwright/test").Page, options: { isAdmin: boolean }) {
-  await mockAuthenticatedApi(page, { me: { ...user, is_admin: options.isAdmin } });
+  await mockApp(page, { me: { ...user, is_admin: options.isAdmin } });
   const invites: Array<Record<string, unknown>> = [];
   await page.route("**/api/admin/users", async (route) => {
     if (!options.isAdmin) {
@@ -24,7 +24,7 @@ async function mockAdminApi(page: import("@playwright/test").Page, options: { is
           email_verified_at: "2026-05-24T00:00:00Z",
           is_admin: true,
           host_count: 2,
-          agent_count: 7,
+          session_count: 7,
           browser_device_count: 3,
         },
         {
@@ -34,7 +34,7 @@ async function mockAdminApi(page: import("@playwright/test").Page, options: { is
           email_verified_at: null,
           is_admin: false,
           host_count: 0,
-          agent_count: 0,
+          session_count: 0,
           browser_device_count: 1,
         },
       ],
@@ -149,8 +149,11 @@ test("an invite link carries its code into signup", async ({ page }) => {
     submitted.push((await route.request().postDataJSON()) as Record<string, unknown>);
     await route.fulfill({ status: 403, json: { detail: "this invite is not valid" } });
   });
-  await page.route("**/api/auth/providers", async (route) => {
-    await route.fulfill({ status: 200, json: { providers: [] } });
+  await page.route("**/api/auth/config", async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: { providers: [], email_verification_required: false, invite_only: true },
+    });
   });
 
   await page.goto("/signup?invite=abc123xyz");

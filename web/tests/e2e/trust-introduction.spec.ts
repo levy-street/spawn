@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync, type KeyObject, sign as nodeSign } from "node:crypto";
 import { expect, test } from "@playwright/test";
-import { BROWSER_DEVICE_ID, HOST_ID, host, mockAuthenticatedApi, USER_ID } from "./app-mocks";
+import { BROWSER_DEVICE_ID, HOST_ID, host, mockApp, openSettings, USER_ID } from "./app-mocks";
 
 // Bidirectional approval, receiving half: this browser was endorsed, and the
 // endorsement carries the host's key. The panel verifies the signature
@@ -45,7 +45,7 @@ test("an endorsed browser verifies its hosts from the endorsement itself", async
 
   // The endorsed key is this browser's own, minted in-page: capture it from
   // the registration the app performs, then serve a matching endorsement.
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     hosts: [
       {
         ...host,
@@ -99,7 +99,7 @@ test("an endorsed browser verifies its hosts from the endorsement itself", async
     });
   });
 
-  await page.goto("/settings");
+  await openSettings(page, "devices");
   const panel = page.getByTestId("introduction-panel");
   await expect(panel).toBeVisible({ timeout: 20_000 });
   // The fingerprint shown is the ENDORSER's, derived locally from its key.
@@ -136,7 +136,7 @@ test("a server-substituted host key cannot be introduced", async ({ page }) => {
   const attackerRaw = rawPublicKey(attackerPair.publicKey);
   const endorserRaw = rawPublicKey(endorserPair.publicKey);
 
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     hosts: [
       {
         ...host,
@@ -196,7 +196,7 @@ test("a server-substituted host key cannot be introduced", async ({ page }) => {
     });
   });
 
-  await page.goto("/settings");
+  await openSettings(page, "devices");
   await expect(page.getByTestId("browser-fingerprint")).toBeVisible({ timeout: 20_000 });
   await page.waitForTimeout(2_000);
   // Nothing verifies, so the panel never offers the substituted key.

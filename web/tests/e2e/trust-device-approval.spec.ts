@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { expect, test } from "@playwright/test";
-import { BROWSER_DEVICE_ID, HOST_ID, host, mockAuthenticatedApi } from "./app-mocks";
+import { BROWSER_DEVICE_ID, HOST_ID, host, mockApp, openSettings } from "./app-mocks";
 
 // Device approval now lives in Settings → Browser devices: untrusted devices
 // are badged, a trusted browser approves them inline via the fingerprint
@@ -43,8 +43,8 @@ const secondDevice = {
 };
 
 test("an untrusted browser gets a guided callout, not a dead end", async ({ page }) => {
-  await mockAuthenticatedApi(page, { hosts: [KEYED_HOST], hostPins: {} });
-  await page.goto("/settings");
+  await mockApp(page, { hosts: [KEYED_HOST], hostPins: {} });
+  await openSettings(page, "devices");
 
   const callout = page.getByTestId("untrusted-callout");
   await expect(callout).toBeVisible();
@@ -58,12 +58,12 @@ test("an untrusted browser gets a guided callout, not a dead end", async ({ page
 test("a trusted browser approves a waiting device through the fingerprint ceremony", async ({
   page,
 }) => {
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     hosts: [KEYED_HOST],
     extraBrowserDevices: [secondDevice],
     hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] },
   });
-  await page.goto("/settings");
+  await openSettings(page, "devices");
 
   // This browser is trusted; the fixture device is waiting.
   await expect(page.getByText(/^trusted · 1 host$/).first()).toBeVisible();
@@ -88,12 +88,12 @@ test("a trusted browser approves a waiting device through the fingerprint ceremo
 test("a server-substituted key cannot be approved", async ({ page }) => {
   // The server lists the device with a fingerprint that does not match its
   // key. The ceremony re-derives locally and must refuse to sign.
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     hosts: [KEYED_HOST],
     extraBrowserDevices: [{ ...secondDevice, fingerprint: "SHA256:attackerchoice_A" }],
     hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] },
   });
-  await page.goto("/settings");
+  await openSettings(page, "devices");
 
   const pixelRow = page.locator("div.p-3", { hasText: "Pixel phone" }).first();
   await pixelRow.getByRole("button", { name: "Approve…" }).click();

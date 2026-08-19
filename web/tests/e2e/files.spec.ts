@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { agent, fileEntry, fileListing, HOST_ID, host, mockAuthenticatedApi } from "./app-mocks";
+import { fileEntry, fileListing, HOST_ID, host, mockApp, session } from "./app-mocks";
 
 const OTHER_HOST_ID = "00000000-0000-4000-8000-000000000009";
 const otherHost = {
@@ -41,7 +41,7 @@ function row(page: import("@playwright/test").Page, name: string) {
 }
 
 test("file tree lazily expands directories in place", async ({ page }) => {
-  await mockAuthenticatedApi(page, { files: treeFiles });
+  await mockApp(page, { files: treeFiles });
 
   await page.goto(`/hosts/${HOST_ID}/files`);
   const tree = page.getByRole("tree", { name: "Files" });
@@ -64,7 +64,7 @@ test("file tree lazily expands directories in place", async ({ page }) => {
 });
 
 test("?path deep link expands ancestors and selects the target", async ({ page }) => {
-  await mockAuthenticatedApi(page, { files: treeFiles });
+  await mockApp(page, { files: treeFiles });
 
   await page.goto(
     `/hosts/${HOST_ID}/files?path=${encodeURIComponent("/Users/tester/projects/spawn/main.rs")}`,
@@ -78,7 +78,7 @@ test("?path deep link expands ancestors and selects the target", async ({ page }
 
 test("header upload posts multipart into the tree root", async ({ page }) => {
   let uploadedDir: string | null = null;
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     files: treeFiles,
     fileUpload: async (_hostId, route) => {
       uploadedDir =
@@ -110,7 +110,7 @@ test("inline new folder, rename, and delete round-trip", async ({ page }) => {
   const mkdirs: unknown[] = [];
   const renames: unknown[] = [];
   const deletes: unknown[] = [];
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     files: treeFiles,
     fileMkdir: async (_h, body, route) => {
       mkdirs.push(body);
@@ -175,7 +175,7 @@ test("inline new folder, rename, and delete round-trip", async ({ page }) => {
 test("right-click opens a context menu with download and send to host", async ({ page }) => {
   const reads: Array<{ hostId: string; path: string }> = [];
   const uploads: Array<{ hostId: string; dir: string | null }> = [];
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     hosts: [host, otherHost],
     files: treeFiles,
     fileRead: (hostId, path) => {
@@ -217,7 +217,7 @@ test("right-click opens a context menu with download and send to host", async ({
 
 test("keyboard navigation: arrows move selection, F2 renames", async ({ page }) => {
   const renames: unknown[] = [];
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     files: treeFiles,
     fileRename: async (_h, body, route) => {
       renames.push(body);
@@ -251,23 +251,10 @@ test("keyboard navigation: arrows move selection, F2 renames", async ({ page }) 
     .toMatchObject({ path: "/Users/tester/projects/readme.md", name: "kb.txt" });
 });
 
-test("agent menu links to the host file explorer at the agent cwd", async ({ page }) => {
-  await mockAuthenticatedApi(page, { agents: [agent()] });
-
-  await page.goto(`/agents/${agent().id}`);
-  await page.locator("header").getByRole("button", { name: "palette actions" }).click();
-
-  const item = page.getByRole("menuitem", { name: "Browse files" });
-  await expect(item).toHaveAttribute(
-    "href",
-    `/hosts/${HOST_ID}/files?path=${encodeURIComponent("/Users/tester/projects/spawn")}`,
-  );
-});
-
-test("agent page toggles an inline files panel rooted at the cwd", async ({ page }) => {
+test("session page toggles an inline files panel rooted at the cwd", async ({ page }) => {
   let requestedPath: string | null = null;
-  await mockAuthenticatedApi(page, {
-    agents: [agent()],
+  await mockApp(page, {
+    sessions: [session()],
     files: (_hostId, path) => {
       requestedPath = path;
       return fileListing({
@@ -278,38 +265,48 @@ test("agent page toggles an inline files panel rooted at the cwd", async ({ page
     },
   });
 
-  await page.goto(`/agents/${agent().id}`);
-  await page.getByRole("button", { name: "Toggle files panel" }).click();
+  await page.goto(`/sessions/${session().id}`);
+  await page.getByRole("button", { name: "Toggle files", exact: true }).click();
 
   const panel = page.getByRole("complementary", { name: "Files panel" });
   await expect(panel).toBeVisible();
   await expect(panel.getByRole("treeitem").filter({ hasText: "main.rs" })).toBeVisible();
   await expect.poll(() => requestedPath).toBe("/Users/tester/projects/spawn");
 
-  await page.getByRole("button", { name: "Toggle files panel" }).click();
+  await page.getByRole("button", { name: "Toggle files", exact: true }).click();
   await expect(panel).toHaveCount(0);
 });
 
-test("screens page files panel follows the focused pane's agent", async ({ page }) => {
+test("workspace files panel follows the focused session pane", async ({ page }) => {
   const requested: Array<string | null> = [];
-  const { AGENT_B_ID, SCREEN_ID, screen } = await import("./app-mocks");
-  await mockAuthenticatedApi(page, {
-    agents: [agent(), agent({ id: AGENT_B_ID, name: "beta", cwd: "/Users/tester/beta" })],
-    screens: [screen()],
+  const { SESSION_B_ID, WORKSPACE_ID, workspace } = await import("./app-mocks");
+  await mockApp(page, {
+    sessions: [session(), session({ id: SESSION_B_ID, name: "beta", cwd: "/Users/tester/beta" })],
+    workspaces: [
+      workspace({
+        layout: {
+          version: 2,
+          tiles: [
+            { session_id: session().id, x: 0, y: 0, w: 6, h: 12 },
+            { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+          ],
+        },
+      }),
+    ],
     files: (_hostId, path) => {
       requested.push(path);
       return fileListing({ path: path ?? "/Users/tester", entries: [fileEntry()] });
     },
   });
 
-  await page.goto(`/screens/${SCREEN_ID}`);
+  await page.goto(`/w/${WORKSPACE_ID}`);
   await page.getByRole("button", { name: "Toggle files panel" }).click();
 
   const panel = page.getByRole("complementary", { name: "Files panel" });
   await expect(panel).toBeVisible();
   await expect.poll(() => requested.at(0)).toBe("/Users/tester/projects/spawn");
 
-  // Focusing the second pane re-roots the panel at that agent's cwd.
+  // Focusing the second pane re-roots the panel at that session's cwd.
   await page.locator("section[aria-label='beta']").click();
   await expect.poll(() => requested.at(-1)).toBe("/Users/tester/beta");
 });

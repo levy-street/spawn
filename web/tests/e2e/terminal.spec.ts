@@ -1,11 +1,11 @@
 import { devices, expect, type Page, test, type WebSocketRoute } from "@playwright/test";
+import { mockApp, SESSION_B_ID, SESSION_ID, session, workspace } from "./app-mocks";
 import {
-  handleAgentRtcSignal,
-  installAgentRtcMock,
+  handleSessionRtcSignal,
+  installSessionRtcMock,
   sendPty,
   setDisplayControl,
-} from "./agent-rtc-mock";
-import { AGENT_B_ID, AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
+} from "./session-rtc-mock";
 
 async function openTerminalWithMockSocket(
   page: Page,
@@ -19,7 +19,6 @@ async function openTerminalWithMockSocket(
     autoSnapshot?: boolean;
     uploadFinalAction?: "complete" | "disconnect" | "hold";
     stallUploadBackpressure?: boolean;
-    fromAgents?: boolean;
     historyEpoch?: string;
     historyOffset?: number;
   } = {},
@@ -31,7 +30,7 @@ async function openTerminalWithMockSocket(
     destination: "attachments" | "cwd";
     bytes: Buffer;
   }> = [];
-  await installAgentRtcMock(page, messages, {
+  await installSessionRtcMock(page, messages, {
     control: options.control,
     history: options.history,
     secondHistory: options.secondHistory,
@@ -46,7 +45,17 @@ async function openTerminalWithMockSocket(
       uploads.push(upload);
     },
   });
-  await mockAuthenticatedApi(page, { agents: [agent()] });
+  await mockApp(page, {
+    sessions: [session()],
+    workspaces: [
+      workspace({
+        layout: {
+          version: 2,
+          tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }],
+        },
+      }),
+    ],
+  });
   const sockets: WebSocketRoute[] = [];
 
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
@@ -54,7 +63,7 @@ async function openTerminalWithMockSocket(
     const index = sockets.length;
     ws.onMessage((message) => {
       messages.push(message);
-      handleAgentRtcSignal(ws, message);
+      handleSessionRtcSignal(ws, message);
     });
     ws.send(
       JSON.stringify({
@@ -64,7 +73,7 @@ async function openTerminalWithMockSocket(
         binding_nonce_required: true,
       }),
     );
-    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+    ws.send(JSON.stringify({ type: "session.status", status: "running" }));
     if (options.reconnect && index === 1) {
       setTimeout(() => {
         void ws.close({ code: 1001, reason: "test reconnect" });
@@ -72,9 +81,8 @@ async function openTerminalWithMockSocket(
     }
   });
 
-  if (options.fromAgents) await page.goto("/agents");
-  await page.goto(`/agents/${AGENT_ID}`);
-  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(page.getByLabel("Session terminal")).toBeVisible();
   return { messages, sockets, uploads };
 }
 
@@ -268,7 +276,7 @@ test("terminal renders ANSI color and sends keystrokes without refresh", async (
     });
   expect(redColor).not.toBe("rgb(229, 229, 229)");
 
-  await page.getByLabel("Agent terminal").click();
+  await page.getByLabel("Session terminal").click();
   await page.keyboard.type("hello");
 
   await expect.poll(() => binaryText(messages)).toContain("hello");
@@ -278,7 +286,7 @@ test("shift+enter sends ESC CR exactly once (no trailing plain CR)", async ({ pa
   // Claude-style TUIs bind ESC+CR to "insert newline"; a stray plain \r from
   // the same key press (keypress path) would submit the prompt instead.
   const { messages } = await openTerminalWithMockSocket(page, { history: "ready\n" });
-  await page.getByLabel("Agent terminal").click();
+  await page.getByLabel("Session terminal").click();
   await page.keyboard.press("Shift+Enter");
   await expect.poll(() => binaryText(messages)).toContain("\x1b\r");
   await page.keyboard.type("x");
@@ -290,7 +298,7 @@ test("shift+enter sends ESC CR exactly once (no trailing plain CR)", async ({ pa
 test("terminal sends control keys without waiting for a refresh", async ({ page }) => {
   const { messages } = await openTerminalWithMockSocket(page, { history: "ready\n" });
 
-  await page.getByLabel("Agent terminal").click();
+  await page.getByLabel("Session terminal").click();
   await page.keyboard.press("Control+C");
   await page.keyboard.press("Enter");
 
@@ -306,13 +314,25 @@ test("terminal attempts direct WebRTC transport when advertised", async ({ page 
     .toMatchObject({
       type: "rtc.offer",
       session_id: expect.any(String),
-      agent_id: AGENT_ID,
-      scope_type: "agent",
-      scope_id: AGENT_ID,
+      scope_type: "session",
+      scope_id: SESSION_ID,
       protocol: "spawn.pty",
       protocol_version: 2,
       sdp: expect.stringContaining("v=0"),
     });
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (
+          window as unknown as {
+            __spawnRtcTest: {
+              browserHandshakes: () => Array<{ path: string; protocols: string[] }>;
+            };
+          }
+        ).__spawnRtcTest.browserHandshakes(),
+      ),
+    )
+    .toContainEqual({ path: "/ws/browser", protocols: ["spawn.v3"] });
 });
 
 test("opening a terminal as viewer claims control automatically", async ({ page }) => {
@@ -439,9 +459,9 @@ test("reconciliation capacity refuses the ninth upload before any endpoint effec
   page,
 }) => {
   await page.addInitScript(
-    ({ agentId }) => {
+    ({ sessionId }) => {
       sessionStorage.setItem(
-        `spawn.upload-reconciliation.v1:${agentId}`,
+        `spawn.upload-reconciliation.v1:${sessionId}`,
         JSON.stringify(
           Array.from({ length: 8 }, (_, index) => ({
             uploadId: `retained-${index}`,
@@ -453,7 +473,7 @@ test("reconciliation capacity refuses the ninth upload before any endpoint effec
         ),
       );
     },
-    { agentId: AGENT_ID },
+    { sessionId: SESSION_ID },
   );
   const { messages, uploads } = await openTerminalWithMockSocket(page);
   await expect(page.getByTestId("upload-reconciliation").locator("strong")).toHaveCount(8);
@@ -490,7 +510,7 @@ test("reservation storage failure survives SPA remount and locks endpoint effect
   page,
 }) => {
   await failReconciliationStorageAfter(page, 0);
-  const { messages, uploads } = await openTerminalWithMockSocket(page, { fromAgents: true });
+  const { messages, uploads } = await openTerminalWithMockSocket(page);
 
   await page.locator('input[type="file"]').setInputFiles({
     name: "blocked-before.txt",
@@ -636,12 +656,12 @@ test("dual storage and history failure stays typed and updates overlapping consu
   await failReconciliationStorageAfter(page, 0);
   await failReconciliationHistoryFallback(page);
   const { messages, uploads } = await openTerminalWithMockSocket(page);
-  await page.evaluate((agentId) => {
+  await page.evaluate((sessionId) => {
     const probe = document.createElement("div");
     probe.dataset.testid = "upload-reconciliation-overlap-probe";
     document.body.append(probe);
     const sync = (event: Event) => {
-      if (!(event instanceof CustomEvent) || event.detail?.agentId !== agentId) return;
+      if (!(event instanceof CustomEvent) || event.detail?.sessionId !== sessionId) return;
       const runtime = (
         globalThis as typeof globalThis & {
           __spawnUploadReconciliationRuntime?: {
@@ -650,15 +670,15 @@ test("dual storage and history failure stays typed and updates overlapping consu
           };
         }
       ).__spawnUploadReconciliationRuntime;
-      probe.textContent = `${runtime?.faults.get(agentId) ?? ""}|${
+      probe.textContent = `${runtime?.faults.get(sessionId) ?? ""}|${
         runtime?.memory
-          .get(agentId)
+          .get(sessionId)
           ?.map((record) => record.fileName)
           .join(",") ?? ""
       }`;
     };
     window.addEventListener("spawn:upload-reconciliation", sync);
-  }, AGENT_ID);
+  }, SESSION_ID);
 
   await page
     .locator('input[type="file"]')
@@ -699,7 +719,6 @@ test("post-final storage failure preserves one ambiguity and blocks retry across
   await failReconciliationStorageAfter(page, 2);
   const { messages, uploads } = await openTerminalWithMockSocket(page, {
     uploadFinalAction: "hold",
-    fromAgents: true,
   });
   await page.locator('input[type="file"]').setInputFiles({
     name: "published-once.txt",
@@ -773,7 +792,7 @@ test("removing an uploading attachment aborts it and sends upload_cancel", async
   const { messages, uploads } = await openTerminalWithMockSocket(page, {
     stallUploadBackpressure: true,
   });
-  await page.getByLabel("Agent terminal").evaluate((terminal) => {
+  await page.getByLabel("Session terminal").evaluate((terminal) => {
     const transfer = new DataTransfer();
     transfer.items.add(
       new File([new Uint8Array(100_000).fill(0x31)], "cancel.png", { type: "image/png" }),
@@ -809,7 +828,7 @@ test("remove during the final Blob read ignores queued completion and sends no f
 }) => {
   await stallFinalUploadRead(page);
   const { messages, uploads } = await openTerminalWithMockSocket(page);
-  await page.getByLabel("Agent terminal").evaluate((terminal) => {
+  await page.getByLabel("Session terminal").evaluate((terminal) => {
     const transfer = new DataTransfer();
     transfer.items.add(new File(["gated final read"], "gated-remove.png", { type: "image/png" }));
     terminal.dispatchEvent(
@@ -860,9 +879,8 @@ test("remove during the final Blob read ignores queued completion and sends no f
 test("removing an attachment after publication preserves outcome_unknown", async ({ page }) => {
   const { messages, uploads } = await openTerminalWithMockSocket(page, {
     uploadFinalAction: "hold",
-    fromAgents: true,
   });
-  await page.getByLabel("Agent terminal").evaluate((terminal) => {
+  await page.getByLabel("Session terminal").evaluate((terminal) => {
     const transfer = new DataTransfer();
     transfer.items.add(new File(["published"], "maybe.png", { type: "image/png" }));
     terminal.dispatchEvent(
@@ -915,12 +933,11 @@ test("removing an attachment after publication preserves outcome_unknown", async
   await expect(page.getByRole("button", { name: "Remove maybe.png" })).toHaveCount(0);
   await expect(page.getByTestId("upload-reconciliation")).toBeVisible();
 
-  // Navigation fully unmounts this terminal; the agent-scoped session record
+  // Navigation fully unmounts this terminal; the session-scoped record
   // restores on the next component instance.
-  await page.getByRole("button", { name: "Back" }).click();
-  await expect(page).toHaveURL(/\/agents$/);
-  await page.goto(`/agents/${AGENT_ID}`);
-  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await page.goto("/download");
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(page.getByLabel("Session terminal")).toBeVisible();
   await expect(page.getByTestId("upload-reconciliation")).toContainText("maybe.png");
   await page.getByRole("button", { name: "Check in terminal" }).click();
   await expect(
@@ -929,7 +946,7 @@ test("removing an attachment after publication preserves outcome_unknown", async
   await page.getByRole("button", { name: "Dismiss maybe.png after checking" }).click();
   await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
   await page.reload();
-  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await expect(page.getByLabel("Session terminal")).toBeVisible();
   await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
 });
 
@@ -938,7 +955,6 @@ test("unmount after final dispatch persists reconciliation for the next terminal
 }) => {
   const { messages, uploads } = await openTerminalWithMockSocket(page, {
     uploadFinalAction: "hold",
-    fromAgents: true,
   });
   await page.locator('input[type="file"]').setInputFiles({
     name: "navigate.bin",
@@ -948,10 +964,9 @@ test("unmount after final dispatch persists reconciliation for the next terminal
   await expect.poll(() => uploads).toHaveLength(1);
   await expect(page.getByTestId("upload-reconciliation")).toContainText("navigate.bin");
 
-  await page.getByRole("button", { name: "Back" }).click();
-  await expect(page).toHaveURL(/\/agents$/);
-  await page.goto(`/agents/${AGENT_ID}`);
-  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await page.goto("/download");
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(page.getByLabel("Session terminal")).toBeVisible();
   await expect(page.getByTestId("upload-reconciliation")).toContainText("navigate.bin");
   expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
     1,
@@ -977,7 +992,7 @@ test("RTC generation replacement is definitive before final dispatch", async ({ 
       window as unknown as { __spawnRtcTest: { replaceRtcGeneration: () => void } }
     ).__spawnRtcTest.replaceRtcGeneration();
   });
-  await expect(page.getByText("Direct agent upload channel closed.")).toBeVisible();
+  await expect(page.getByText("Direct session upload channel closed.")).toBeVisible();
   expect(uploads).toHaveLength(0);
   expect(jsonMessages(messages).filter((message) => message?.type === "upload_start")).toHaveLength(
     1,
@@ -1015,7 +1030,7 @@ test("RTC generation replacement during the final Blob read cannot dispatch", as
       window as unknown as { __spawnFinalUploadReadGate: { release: () => void } }
     ).__spawnFinalUploadReadGate.release();
   });
-  await expect(page.getByText("Direct agent upload channel closed.")).toBeVisible();
+  await expect(page.getByText("Direct session upload channel closed.")).toBeVisible();
   await page.waitForTimeout(100);
   expect(uploads).toHaveLength(0);
   await expect(page.getByTestId("upload-reconciliation")).toHaveCount(0);
@@ -1047,12 +1062,12 @@ test("RTC generation replacement after final dispatch is outcome_unknown", async
   expect(uploads).toHaveLength(1);
 });
 
-test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", async ({
+test("spawn.v3 keeps keystrokes off the websocket until the DataChannel opens", async ({
   page,
 }) => {
   const { messages } = await openTerminalWithMockSocket(page, { noChannels: true });
 
-  // Viewport state belongs to spawn.ctl on v2 and must not be observable by
+  // Viewport state belongs to spawn.ctl and must not be observable by
   // the application server. This mock deliberately never opens DataChannels.
   await page.waitForTimeout(300);
   expect(jsonMessages(messages).some((message) => message?.type === "resize")).toBe(false);
@@ -1063,7 +1078,7 @@ test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", 
       binding_nonce: expect.stringMatching(/^[0-9a-f]{32}$/),
     });
 
-  await page.getByLabel("Agent terminal").click();
+  await page.getByLabel("Session terminal").click();
   await page.keyboard.type("secret input");
   await page.keyboard.press("Enter");
   await page.waitForTimeout(300);
@@ -1073,7 +1088,7 @@ test("spawn.v2 keeps keystrokes off the websocket until the DataChannel opens", 
   expect(binaryText(messages)).toBe("");
 });
 
-test("spawn.v2 holds endpoint effects until the daemon readiness event", async ({ page }) => {
+test("spawn.v3 holds endpoint effects until the daemon readiness event", async ({ page }) => {
   const { messages } = await openTerminalWithMockSocket(page, { noReady: true });
 
   await page.waitForFunction(() => {
@@ -1083,7 +1098,7 @@ test("spawn.v2 holds endpoint effects until the daemon readiness event", async (
       }
     ).__spawnRtcTest?.ptyReady();
   });
-  await page.getByLabel("Agent terminal").click();
+  await page.getByLabel("Session terminal").click();
   await page.keyboard.type("queued until ready");
   await page.keyboard.press("Enter");
   await page.waitForTimeout(300);
@@ -1100,22 +1115,33 @@ test("terminal reconnect restores a fresh terminal history snapshot", async ({ p
   await expect(liveTerminalRows(page)).toContainText("after reconnect");
 });
 
-test("previous-agent callbacks remain scoped to the previous terminal", async ({ page }) => {
+test("previous-session callbacks remain scoped to the previous terminal", async ({ page }) => {
   const messages: Array<string | Buffer> = [];
-  await installAgentRtcMock(page, messages, {
+  await installSessionRtcMock(page, messages, {
     history: "FIRST-AGENT\n",
     secondHistory: "SECOND-AGENT\n",
   });
-  await mockAuthenticatedApi(page, {
-    agents: [agent(), agent({ id: AGENT_B_ID, name: "second" })],
+  await mockApp(page, {
+    sessions: [session(), session({ id: SESSION_B_ID, name: "second" })],
+    workspaces: [
+      workspace({
+        layout: {
+          version: 2,
+          tiles: [
+            { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
+            { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+          ],
+        },
+      }),
+    ],
   });
   const sockets = new Map<string, WebSocketRoute>();
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
-    const agentId = new URL(ws.url()).searchParams.get("agent_id") ?? "unknown";
-    sockets.set(agentId, ws);
+    const sessionId = new URL(ws.url()).searchParams.get("session_id") ?? "unknown";
+    sockets.set(sessionId, ws);
     ws.onMessage((message) => {
       messages.push(message);
-      handleAgentRtcSignal(ws, message);
+      handleSessionRtcSignal(ws, message);
     });
     ws.send(
       JSON.stringify({
@@ -1125,23 +1151,23 @@ test("previous-agent callbacks remain scoped to the previous terminal", async ({
         binding_nonce_required: true,
       }),
     );
-    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+    ws.send(JSON.stringify({ type: "session.status", status: "running" }));
   });
 
-  await page.goto(`/agents/${AGENT_ID}`);
+  await page.goto(`/sessions/${SESSION_ID}`);
   await expect(liveTerminalRows(page)).toContainText("FIRST-AGENT");
-  expect(sockets.get(AGENT_ID)).toBeDefined();
+  expect(sockets.get(SESSION_ID)).toBeDefined();
 
   await page.getByRole("link", { name: /second/i }).click();
-  await expect(page).toHaveURL(new RegExp(`/agents/${AGENT_B_ID}$`));
-  const secondAgentRows = page
+  await expect(page).toHaveURL(new RegExp(`/sessions/${SESSION_B_ID}$`));
+  const secondSessionRows = page
     .locator('[data-testid="terminal-live-host"]:visible .xterm-rows')
     .last();
-  await expect(secondAgentRows).toContainText("SECOND-AGENT");
+  await expect(secondSessionRows).toContainText("SECOND-AGENT");
   await sendPty(page, "STALE-FIRST-CALLBACK\n", 0);
   await page.waitForTimeout(100);
 
-  await expect(secondAgentRows).not.toContainText("STALE-FIRST-CALLBACK");
+  await expect(secondSessionRows).not.toContainText("STALE-FIRST-CALLBACK");
   await expect(page.getByText("Another session has control · 222x88 · 9 viewers")).toBeHidden();
 });
 
@@ -1207,7 +1233,7 @@ test.describe("mobile terminal touch", () => {
     await openTerminalWithMockSocket(page, {
       history: longHistory(240),
     });
-    await expect(page.getByLabel("Agent terminal")).toBeVisible();
+    await expect(page.getByLabel("Session terminal")).toBeVisible();
     // A flick can only reveal scrollback that exists: wait for the replayed
     // history to land in the live terminal before gesturing.
     await expect(liveTerminalRows(page)).toContainText("history-");
@@ -1311,7 +1337,7 @@ test("OSC 8 hyperlinks render underlined without leaking the URL", async ({ page
 
 test("DECSCUSR switches the rendered cursor shape", async ({ page }) => {
   await openTerminalWithMockSocket(page, { history: "ready\r\n" });
-  await page.getByLabel("Agent terminal").click();
+  await page.getByLabel("Session terminal").click();
 
   await sendPty(page, "\x1b[6 q");
   await expect(page.getByTestId("terminal-live-host").locator(".xterm-cursor-bar")).toHaveCount(1);
@@ -1331,9 +1357,9 @@ test("DECSCUSR switches the rendered cursor shape", async ({ page }) => {
 test.describe("OSC 52 clipboard", () => {
   test.use({ permissions: ["clipboard-read", "clipboard-write"] });
 
-  test("agent writes to the system clipboard through OSC 52", async ({ page }) => {
+  test("session writes to the system clipboard through OSC 52", async ({ page }) => {
     await openTerminalWithMockSocket(page, { history: "ready\r\n" });
-    await page.getByLabel("Agent terminal").click();
+    await page.getByLabel("Session terminal").click();
 
     const payload = Buffer.from("hello clipboard", "utf8").toString("base64");
     await sendPty(page, `\x1b]52;c;${payload}\x07`);

@@ -1,11 +1,11 @@
 import { expect, test } from "@playwright/test";
-import { mockAuthenticatedApi, USER_ID } from "./app-mocks";
+import { mockApp, openSettings, USER_ID } from "./app-mocks";
 
 test("registers, displays, revokes, cleans locally, and replaces only after explicit action", async ({
   page,
 }) => {
-  await mockAuthenticatedApi(page);
-  await page.goto("/settings");
+  await mockApp(page);
+  await openSettings(page, "devices");
 
   const fingerprint = page.getByTestId("browser-fingerprint");
   await expect(fingerprint).toHaveText(/^SHA256:/);
@@ -69,7 +69,7 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
   await page.reload();
   // A reload closes the settings modal (it is an overlay, not a page); the
   // revoked state must survive it and greet the user on reopen.
-  await page.goto("/settings");
+  await openSettings(page, "devices");
   await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toBeVisible();
   const stillAbsent = await page.evaluate(async (userId) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -98,7 +98,7 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
 test("registration failure stays loud while settings and logout remain accessible", async ({
   page,
 }) => {
-  await mockAuthenticatedApi(page);
+  await mockApp(page);
   await page.route("**/api/browser-devices/register", async (route) => {
     await route.fulfill({
       status: 503,
@@ -106,7 +106,7 @@ test("registration failure stays loud while settings and logout remain accessibl
       json: { detail: "registration temporarily unavailable" },
     });
   });
-  await page.goto("/settings");
+  await openSettings(page, "devices");
 
   await expect(page.getByRole("alert").first()).toContainText("registration failed");
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
@@ -119,7 +119,7 @@ test("registration failure stays loud while settings and logout remain accessibl
 });
 
 test("rejects a substituted registration response", async ({ page }) => {
-  await mockAuthenticatedApi(page);
+  await mockApp(page);
   await page.route("**/api/browser-devices/register", async (route) => {
     await route.fulfill({
       status: 200,
@@ -134,7 +134,7 @@ test("rejects a substituted registration response", async ({ page }) => {
       },
     });
   });
-  await page.goto("/settings");
+  await openSettings(page, "devices");
 
   await expect(page.getByRole("alert").first()).toContainText("registration failed");
   await expect(page.getByTestId("browser-fingerprint")).not.toBeVisible();
@@ -143,7 +143,7 @@ test("rejects a substituted registration response", async ({ page }) => {
 test("rejects a server fingerprint that does not match the submitted browser key", async ({
   page,
 }) => {
-  await mockAuthenticatedApi(page);
+  await mockApp(page);
   await page.route("**/api/browser-devices/register", async (route) => {
     const body = route.request().postDataJSON() as { public_key: string };
     await route.fulfill({
@@ -159,7 +159,7 @@ test("rejects a server fingerprint that does not match the submitted browser key
       },
     });
   });
-  await page.goto("/settings");
+  await openSettings(page, "devices");
 
   await expect(page.getByRole("alert").first()).toContainText("registration failed");
   await expect(page.getByTestId("browser-fingerprint")).not.toBeVisible();
@@ -168,8 +168,8 @@ test("rejects a server fingerprint that does not match the submitted browser key
 test("rejects a substituted revocation response without deleting the local key", async ({
   page,
 }) => {
-  await mockAuthenticatedApi(page);
-  await page.goto("/settings");
+  await mockApp(page);
+  await openSettings(page, "devices");
   await expect(page.getByTestId("browser-fingerprint")).toHaveText(/^SHA256:/);
 
   await page.route("**/api/browser-devices/*/revoke", async (route) => {
@@ -211,8 +211,8 @@ test("rejects a substituted revocation response without deleting the local key",
 });
 
 test("devices can be renamed for recognition without touching the key", async ({ page }) => {
-  await mockAuthenticatedApi(page);
-  await page.goto("/settings");
+  await mockApp(page);
+  await openSettings(page, "devices");
 
   const fingerprint = page.getByTestId("browser-fingerprint");
   await expect(fingerprint).toHaveText(/^SHA256:/);
@@ -231,7 +231,7 @@ test("devices can be renamed for recognition without touching the key", async ({
 });
 
 test("clearing history prunes tombstones but never active devices", async ({ page }) => {
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     extraBrowserDevices: [
       {
         id: "00000000-0000-4000-8000-000000000041",
@@ -244,7 +244,7 @@ test("clearing history prunes tombstones but never active devices", async ({ pag
       },
     ],
   });
-  await page.goto("/settings");
+  await openSettings(page, "devices");
 
   await page.getByText("Revoked devices (1)").click();
   await expect(page.getByText("Old laptop")).toBeVisible();

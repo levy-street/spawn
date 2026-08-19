@@ -2,7 +2,7 @@ import type { Page, WebSocketRoute } from "@playwright/test";
 
 type Capture = string | Buffer;
 
-export async function installAgentRtcMock(
+export async function installSessionRtcMock(
   page: Page,
   captured: Capture[],
   options: {
@@ -71,6 +71,7 @@ export async function installAgentRtcMock(
         historyEpoch,
         historyOffset: historyOffset ?? 0,
         connections: 0,
+        websocketHandshakes: [] as Array<{ path: string; protocols: string[] }>,
         activePtyChannel: null as FakeDataChannel | null,
         channels: new Map<string, FakeDataChannel>(),
         ptyChannels: [] as FakeDataChannel[],
@@ -450,6 +451,27 @@ export async function installAgentRtcMock(
 
       (window as unknown as { RTCPeerConnection: typeof RTCPeerConnection }).RTCPeerConnection =
         FakePeerConnection as unknown as typeof RTCPeerConnection;
+      const NativeWebSocket = window.WebSocket;
+      const RecordingWebSocket = function (
+        this: WebSocket,
+        url: string | URL,
+        protocols?: string | string[],
+      ) {
+        state.websocketHandshakes.push({
+          path: new URL(String(url), location.href).pathname,
+          protocols:
+            typeof protocols === "string" ? [protocols] : Array.isArray(protocols) ? protocols : [],
+        });
+        return new NativeWebSocket(url, protocols);
+      } as unknown as typeof WebSocket;
+      Object.assign(RecordingWebSocket, {
+        CONNECTING: NativeWebSocket.CONNECTING,
+        OPEN: NativeWebSocket.OPEN,
+        CLOSING: NativeWebSocket.CLOSING,
+        CLOSED: NativeWebSocket.CLOSED,
+      });
+      RecordingWebSocket.prototype = NativeWebSocket.prototype;
+      window.WebSocket = RecordingWebSocket;
       (
         window as unknown as {
           __spawnRtcTest: {
@@ -469,6 +491,7 @@ export async function installAgentRtcMock(
             sendHistoryDelta: (epoch: string, offset: number, text: string) => void;
             sendHistoryWipe: (epoch: string) => void;
             sendHistoryGap: () => void;
+            browserHandshakes: () => Array<{ path: string; protocols: string[] }>;
           };
         }
       ).__spawnRtcTest = {
@@ -574,6 +597,9 @@ export async function installAgentRtcMock(
             .get("spawn.ctl")
             ?.receive(JSON.stringify({ version: 1, kind: "event", event: "history_gap" }));
         },
+        browserHandshakes() {
+          return state.websocketHandshakes.filter((entry) => entry.path === "/ws/browser");
+        },
       };
     },
     {
@@ -591,7 +617,7 @@ export async function installAgentRtcMock(
   );
 }
 
-export function handleAgentRtcSignal(ws: WebSocketRoute, message: string | Buffer) {
+export function handleSessionRtcSignal(ws: WebSocketRoute, message: string | Buffer) {
   if (typeof message !== "string") return;
   let frame: Record<string, unknown>;
   try {
@@ -600,11 +626,12 @@ export function handleAgentRtcSignal(ws: WebSocketRoute, message: string | Buffe
     return;
   }
   if (frame.type !== "rtc.offer") return;
-  const agentId = new URL(ws.url()).searchParams.get("agent_id");
+  const sessionId = new URL(ws.url()).searchParams.get("session_id");
   if (
-    frame.agent_id !== agentId ||
-    frame.scope_type !== "agent" ||
-    frame.scope_id !== agentId ||
+    !sessionId ||
+    typeof frame.session_id !== "string" ||
+    frame.scope_type !== "session" ||
+    frame.scope_id !== sessionId ||
     frame.protocol !== "spawn.pty" ||
     frame.protocol_version !== 2
   ) {
@@ -614,9 +641,8 @@ export function handleAgentRtcSignal(ws: WebSocketRoute, message: string | Buffe
     session_id: frame.session_id,
     binding_nonce: frame.binding_nonce,
     binding_generation: 1,
-    agent_id: agentId,
-    scope_type: "agent",
-    scope_id: agentId,
+    scope_type: "session",
+    scope_id: sessionId,
     protocol: "spawn.pty",
     protocol_version: 2,
   };

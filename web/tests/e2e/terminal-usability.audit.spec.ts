@@ -8,8 +8,8 @@ import {
   test,
   type WebSocketRoute,
 } from "@playwright/test";
-import { handleAgentRtcSignal, installAgentRtcMock, sendPty } from "./agent-rtc-mock";
-import { AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
+import { mockApp, SESSION_ID, session } from "./app-mocks";
+import { handleSessionRtcSignal, installSessionRtcMock, sendPty } from "./session-rtc-mock";
 
 type WireMessage = string | Buffer;
 
@@ -132,7 +132,7 @@ async function observeTerminal(page: Page, label: string): Promise<Observation> 
 
   return {
     label,
-    terminalBox: normalizeBox(await page.getByLabel("Agent terminal").boundingBox()),
+    terminalBox: normalizeBox(await page.getByLabel("Session terminal").boundingBox()),
     liveBox: normalizeBox(await liveTerminal(page).boundingBox()),
 
     scrolledUp,
@@ -292,7 +292,7 @@ async function openAuditedTerminal(
     }
   };
   let inputChain = Promise.resolve();
-  await installAgentRtcMock(page, messages, {
+  await installSessionRtcMock(page, messages, {
     history: options.history ?? "audit-ready\n$ ",
     secondHistory: options.reconnectHistory ?? "audit-reconnected\n$ ",
     control: options.control ?? { owner: true, cols: 120, rows: 36, viewers: 1 },
@@ -306,7 +306,7 @@ async function openAuditedTerminal(
       await write(`\r\nuploaded:${upload.name}\r\n$ `);
     },
   });
-  await mockAuthenticatedApi(page, { agents: [agent()] });
+  await mockApp(page, { sessions: [session()] });
 
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
     sockets.push(ws);
@@ -321,7 +321,7 @@ async function openAuditedTerminal(
         }
         socketEvents.push({ type: "json", message: parsed });
       }
-      handleAgentRtcSignal(ws, message);
+      handleSessionRtcSignal(ws, message);
     });
     ws.send(
       JSON.stringify({
@@ -331,11 +331,11 @@ async function openAuditedTerminal(
         binding_nonce_required: true,
       }),
     );
-    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+    ws.send(JSON.stringify({ type: "session.status", status: "running" }));
   });
 
-  await page.goto(`/agents/${AGENT_ID}`);
-  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(page.getByLabel("Session terminal")).toBeVisible();
   return { messages, directUploads, sockets, socketEvents };
 }
 
@@ -361,11 +361,11 @@ test.describe("terminal usability audit", () => {
     await expect(liveTerminalRows(page)).toBeVisible();
     observations.push(await observeTerminal(page, "loaded"));
 
-    const terminalBox = await page.getByLabel("Agent terminal").boundingBox();
+    const terminalBox = await page.getByLabel("Session terminal").boundingBox();
     expect(terminalBox?.width).toBeGreaterThan(800);
     expect(terminalBox?.height).toBeGreaterThan(400);
 
-    await page.getByLabel("Agent terminal").click();
+    await page.getByLabel("Session terminal").click();
     await page.keyboard.type("whoami");
     await page.keyboard.press("Enter");
     await expect(liveTerminalRows(page)).toContainText("audit:whoami");
@@ -385,7 +385,7 @@ test.describe("terminal usability audit", () => {
     await expect
       .poll(() => jsonMessages(messages).filter((message) => message?.type === "resize").length)
       .toBeGreaterThan(resizeFramesBefore);
-    const resizedBox = await page.getByLabel("Agent terminal").boundingBox();
+    const resizedBox = await page.getByLabel("Session terminal").boundingBox();
     expect(resizedBox?.width).toBeGreaterThan(600);
     expect(resizedBox?.height).toBeGreaterThan(300);
     observations.push(await observeTerminal(page, "resized"));
@@ -414,7 +414,7 @@ test.describe("terminal usability audit", () => {
 
     await page.mouse.wheel(0, 5000);
     await expect(liveTerminalRows(page)).toContainText("LIVE-AUDIT-WHILE-SCROLLED");
-    await page.getByLabel("Agent terminal").click();
+    await page.getByLabel("Session terminal").click();
     await page.keyboard.type("after scroll");
     await page.keyboard.press("Enter");
     await expect(liveTerminalRows(page)).toContainText("audit:after scroll");
@@ -423,7 +423,7 @@ test.describe("terminal usability audit", () => {
     sockets[0]?.close({ code: 1001, reason: "audit reconnect" });
     await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(2);
     await expect(liveTerminalRows(page)).toContainText("audit-reconnected");
-    await page.getByLabel("Agent terminal").click();
+    await page.getByLabel("Session terminal").click();
     await page.keyboard.type("after reconnect");
     await page.keyboard.press("Enter");
     await expect(liveTerminalRows(page)).toContainText("audit:after reconnect");
@@ -460,7 +460,7 @@ test.describe("terminal usability audit", () => {
       });
     observations.push(await observeTerminal(page, "viewer auto-took control"));
 
-    await page.getByLabel("Agent terminal").click();
+    await page.getByLabel("Session terminal").click();
     await page.keyboard.type("controlled input");
     await page.keyboard.press("Enter");
     await expect(liveTerminalRows(page)).toContainText("audit:controlled input");
@@ -498,7 +498,7 @@ test.describe("terminal usability audit", () => {
         history: `${longHistory(240)}mobile-ready\n$ `,
       });
 
-      await expect(page.getByLabel("Agent terminal")).toBeVisible();
+      await expect(page.getByLabel("Session terminal")).toBeVisible();
       await expect(page.getByRole("button", { name: "Ctrl-C" })).toBeVisible();
       observations.push(await observeTerminal(page, "mobile loaded"));
 

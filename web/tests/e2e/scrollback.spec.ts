@@ -1,6 +1,6 @@
 import { expect, type Page, test } from "@playwright/test";
-import { handleAgentRtcSignal, installAgentRtcMock, sendPty } from "./agent-rtc-mock";
-import { AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
+import { mockApp, SESSION_ID, session } from "./app-mocks";
+import { handleSessionRtcSignal, installSessionRtcMock, sendPty } from "./session-rtc-mock";
 
 // Unified scrollback: committed history is seeded into the live terminal's
 // own buffer and wheel/touch scroll it natively — one buffer, one coordinate
@@ -27,16 +27,16 @@ function v2Replay(lines: number) {
 
 async function openUnifiedTerminal(page: Page) {
   const messages: Array<string | Buffer> = [];
-  await installAgentRtcMock(page, messages, {
+  await installSessionRtcMock(page, messages, {
     history: v2Replay(150),
     control: { owner: true, cols: 80, rows: 12, viewers: 1 },
     autoSnapshot: true,
     historyEpoch: EPOCH,
     historyOffset: 0,
   });
-  await mockAuthenticatedApi(page, { agents: [agent()] });
+  await mockApp(page, { sessions: [session()] });
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
-    ws.onMessage((message) => handleAgentRtcSignal(ws, message));
+    ws.onMessage((message) => handleSessionRtcSignal(ws, message));
     ws.send(
       JSON.stringify({
         type: "rtc.config",
@@ -45,10 +45,10 @@ async function openUnifiedTerminal(page: Page) {
         binding_nonce_required: true,
       }),
     );
-    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+    ws.send(JSON.stringify({ type: "session.status", status: "running" }));
   });
-  await page.goto(`/agents/${AGENT_ID}`);
-  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(page.getByLabel("Session terminal")).toBeVisible();
   await expect(page.getByTestId("terminal-live-host").locator(".xterm-rows")).toContainText(
     "SCREEN-ROW-00",
   );
@@ -171,7 +171,7 @@ test("live output while scrolled back does not yank the reader to the bottom", a
   await page.waitForTimeout(300);
   await expect(live.locator(".xterm-rows")).toContainText("commit-");
 
-  // A busy agent keeps repainting while the reader is in history.
+  // A busy session keeps repainting while the reader is in history.
   for (let i = 0; i < 3; i += 1) {
     await sendPty(page, `\x1b[12;1Htick-${i}\r\n`);
     await page.waitForTimeout(200);
@@ -358,7 +358,8 @@ test("soft keyboard inset freezes the grid and pans instead of reflowing", async
 
   const setInset = (px: number) =>
     page.evaluate(
-      (p) => (window as unknown as { __setKeyboardInset: (px: number) => void }).__setKeyboardInset(p),
+      (p) =>
+        (window as unknown as { __setKeyboardInset: (px: number) => void }).__setKeyboardInset(p),
       px,
     );
 
@@ -443,16 +444,16 @@ test("wide-authored history does not column-garble at phone width", async ({ pag
   const SENTENCE =
     "capture for the duplicate content width histogram want me to pick up number forty two next or keep shaking out terminal issues first";
   const messages: Array<string | Buffer> = [];
-  await installAgentRtcMock(page, messages, {
+  await installSessionRtcMock(page, messages, {
     history: `${V2_MARKER}${V2_SENTINEL}${SENTENCE}\r\ncommit-000\r\n${V2_MARKER}\x1b[Hlive$ `,
     control: { owner: true, cols: 80, rows: 12, viewers: 1 },
     autoSnapshot: true,
     historyEpoch: EPOCH,
     historyOffset: 0,
   });
-  await mockAuthenticatedApi(page, { agents: [agent()] });
+  await mockApp(page, { sessions: [session()] });
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
-    ws.onMessage((message) => handleAgentRtcSignal(ws, message));
+    ws.onMessage((message) => handleSessionRtcSignal(ws, message));
     ws.send(
       JSON.stringify({
         type: "rtc.config",
@@ -461,7 +462,7 @@ test("wide-authored history does not column-garble at phone width", async ({ pag
         binding_nonce_required: true,
       }),
     );
-    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+    ws.send(JSON.stringify({ type: "session.status", status: "running" }));
   });
   const live = page.getByTestId("terminal-live-host");
   const revealHistory = async () => {
@@ -474,8 +475,8 @@ test("wide-authored history does not column-garble at phone width", async ({ pag
   // the real session took (≈165 → 126 → 48 cols) so xterm reflows the
   // wide-authored history repeatedly, as it did on the phone.
   await page.setViewportSize({ width: 1280, height: 800 });
-  await page.goto(`/agents/${AGENT_ID}`);
-  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(page.getByLabel("Session terminal")).toBeVisible();
   await expect(live.locator(".xterm-rows")).toContainText("live$");
   await revealHistory();
   expect(await columnGarbledRows(page)).toEqual([]);
@@ -505,16 +506,16 @@ test("wide-authored history does not column-garble at phone width", async ({ pag
 test("history reflows across width changes without loss or duplication", async ({ page }) => {
   const LONG = `LONGLINE-${"x".repeat(200)}-END`;
   const messages: Array<string | Buffer> = [];
-  await installAgentRtcMock(page, messages, {
+  await installSessionRtcMock(page, messages, {
     history: `${V2_MARKER}${V2_SENTINEL}${LONG}\r\ncommit-000\r\n${V2_MARKER}\x1b[Hlive$ `,
     control: { owner: true, cols: 80, rows: 12, viewers: 1 },
     autoSnapshot: true,
     historyEpoch: EPOCH,
     historyOffset: 0,
   });
-  await mockAuthenticatedApi(page, { agents: [agent()] });
+  await mockApp(page, { sessions: [session()] });
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
-    ws.onMessage((message) => handleAgentRtcSignal(ws, message));
+    ws.onMessage((message) => handleSessionRtcSignal(ws, message));
     ws.send(
       JSON.stringify({
         type: "rtc.config",
@@ -523,11 +524,11 @@ test("history reflows across width changes without loss or duplication", async (
         binding_nonce_required: true,
       }),
     );
-    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+    ws.send(JSON.stringify({ type: "session.status", status: "running" }));
   });
   await page.setViewportSize({ width: 1200, height: 800 });
-  await page.goto(`/agents/${AGENT_ID}`);
-  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(page.getByLabel("Session terminal")).toBeVisible();
   const live = page.getByTestId("terminal-live-host");
   await expect(live.locator(".xterm-rows")).toContainText("live$");
 

@@ -1,20 +1,25 @@
 import { createHash } from "node:crypto";
 import type { Page, Route } from "@playwright/test";
+import { autoPlace, type LayoutV2, type Rect, remove as removeTile } from "../../src/lib/grid";
 
 export const USER_ID = "00000000-0000-4000-8000-000000000001";
 export const HOST_ID = "00000000-0000-4000-8000-000000000002";
-export const PRESET_ID = "00000000-0000-4000-8000-000000000003";
-export const AGENT_ID = "00000000-0000-4000-8000-000000000004";
+export const AGENT_ID = "00000000-0000-4000-8000-000000000003";
+export const SESSION_ID = "00000000-0000-4000-8000-000000000004";
 export const SKILL_ID = "00000000-0000-4000-8000-000000000006";
-export const SCREEN_ID = "00000000-0000-4000-8000-000000000007";
-export const AGENT_B_ID = "00000000-0000-4000-8000-000000000008";
+export const WORKSPACE_ID = "00000000-0000-4000-8000-000000000007";
+export const SESSION_B_ID = "00000000-0000-4000-8000-000000000008";
 export const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
 export const CREATED_AT = "2026-05-24T00:00:00Z";
+const APPROVAL_NONCE = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+const HOST_PUBLIC_KEY = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
 
 export const user = {
   id: USER_ID,
   email: "tester@example.com",
   created_at: CREATED_AT,
+  email_verified_at: CREATED_AT,
+  is_admin: false,
 };
 
 export const host = {
@@ -25,30 +30,27 @@ export const host = {
   version: "0.1.0",
   status: "online",
   last_seen_at: CREATED_AT,
-  agent_count: 1,
+  session_count: 1,
   home_dir: "/Users/tester",
 };
 
-export const preset = {
-  id: PRESET_ID,
+export const agentDefinition = {
+  id: AGENT_ID,
   owner_user_id: null,
-  name: "codex",
-  agent_kind: "codex",
-  default_argv: ["codex"],
-  env_template: {},
+  name: "Codex",
+  kind: "codex",
+  command: "codex",
+  env: {},
   install: "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
 };
 
-export function agent(overrides: Record<string, unknown> = {}) {
+export function session(overrides: Record<string, unknown> = {}) {
   return {
-    id: AGENT_ID,
+    id: SESSION_ID,
     name: "palette",
     host_id: HOST_ID,
     host_name: "Mac",
-    preset_id: PRESET_ID,
     cwd: "/Users/tester/projects/spawn",
-    argv: ["codex"],
-    env: {},
     status: "running",
     started_at: CREATED_AT,
     exited_at: null,
@@ -58,10 +60,13 @@ export function agent(overrides: Record<string, unknown> = {}) {
     activity_state: "quiet",
     activity_label: "Quiet",
     exit_code: null,
-    pinned_at: null,
-    archived_at: null,
+    foreground_command: "zsh",
     ...overrides,
   };
+}
+
+export function agent(overrides: Record<string, unknown> = {}) {
+  return { ...agentDefinition, ...overrides };
 }
 
 export function skill(overrides: Record<string, unknown> = {}) {
@@ -77,19 +82,12 @@ export function skill(overrides: Record<string, unknown> = {}) {
   };
 }
 
-export function screen(overrides: Record<string, unknown> = {}) {
+export function workspace(overrides: Record<string, unknown> = {}) {
   return {
-    id: SCREEN_ID,
+    id: WORKSPACE_ID,
     name: "daily drive",
-    layout: {
-      root: {
-        type: "split",
-        direction: "row",
-        ratio: 0.5,
-        a: { type: "pane", agent_id: AGENT_ID },
-        b: { type: "pane", agent_id: AGENT_B_ID },
-      },
-    },
+    layout: { version: 2, tiles: [] } satisfies LayoutV2,
+    position: 0,
     created_at: CREATED_AT,
     updated_at: CREATED_AT,
     ...overrides,
@@ -121,41 +119,125 @@ export function fileListing(overrides: Record<string, unknown> = {}) {
   };
 }
 
-export async function mockAuthenticatedApi(
-  page: Page,
-  options: {
-    agents?: unknown[];
-    hosts?: unknown[];
-    screens?: unknown[];
-    updateScreen?: (id: string, body: unknown, route: Route) => Promise<void> | void;
-    createScreen?: (body: unknown, route: Route) => Promise<void> | void;
-    restartAgent?: (id: string, route: Route) => Promise<void> | void;
-    skills?: unknown[];
-    createAgent?: (body: unknown, route: Route) => Promise<void> | void;
-    updateAgent?: (id: string, body: unknown, route: Route) => Promise<void> | void;
-    createSkill?: (body: unknown, route: Route) => Promise<void> | void;
-    updateSkill?: (id: string, body: unknown, route: Route) => Promise<void> | void;
-    deleteSkill?: (id: string, route: Route) => Promise<void> | void;
-    files?: (hostId: string, path: string | null) => unknown;
-    fileRead?: (hostId: string, path: string) => string | Uint8Array;
-    fileUpload?: (hostId: string, route: Route) => Promise<void> | void;
-    fileMkdir?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
-    fileDelete?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
-    fileRename?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
-    /** Pre-registered devices beyond the one this browser registers itself. */
-    extraBrowserDevices?: Array<Record<string, unknown>>;
-    /** hostId → browser device ids the host trusts; endorsements append here. */
-    hostPins?: Record<string, string[]>;
-    /** endorsed device id → endorsement records served to that device. */
-    endorsementsFor?: Record<string, Array<Record<string, unknown>>>;
-    /** Override the signed-in account (e.g. to grant is_admin). */
-    me?: Record<string, unknown>;
-  } = {},
-) {
-  const agents = options.agents ?? [];
-  const hostList = options.hosts ?? [host];
-  const screenList = options.screens ?? [];
-  const skillList = options.skills ?? [];
+type JsonRecord = Record<string, unknown>;
+
+export interface AppMockStore {
+  user: JsonRecord | null;
+  config: {
+    providers: Array<{ id: "google" | "microsoft" | "github"; name: string }>;
+    email_verification_required: boolean;
+    invite_only: boolean;
+  };
+  hosts: JsonRecord[];
+  sessions: JsonRecord[];
+  workspaces: JsonRecord[];
+  agents: JsonRecord[];
+  skills: JsonRecord[];
+  recentDirs: Record<string, JsonRecord[]>;
+  hostAgents: Record<string, JsonRecord[]>;
+  sessionSkills: Record<string, string[]>;
+  requests: {
+    auth: JsonRecord[];
+    sessions: JsonRecord[];
+    workspaces: JsonRecord[];
+    workspacePatches: Array<{ id: string; body: JsonRecord }>;
+    agents: JsonRecord[];
+  };
+  setWorkspaceFull(value: boolean): void;
+  failNextWorkspacePatch(status?: number, detail?: string): void;
+}
+
+export interface AppMockOptions {
+  sessions?: unknown[];
+  hosts?: unknown[];
+  workspaces?: unknown[];
+  agents?: unknown[];
+  skills?: unknown[];
+  config?: Partial<AppMockStore["config"]>;
+  me?: Record<string, unknown> | null;
+  meSequence?: Array<Record<string, unknown> | null>;
+  recentDirs?: Record<string, Array<Record<string, unknown>>>;
+  hostAgents?: Record<string, Array<Record<string, unknown>>>;
+  sessionSkills?: Record<string, string[]>;
+  workspaceFull?: boolean;
+  updateWorkspace?: (
+    id: string,
+    body: unknown,
+    route: Route,
+    store: AppMockStore,
+  ) => Promise<void> | void;
+  createWorkspace?: (body: unknown, route: Route, store: AppMockStore) => Promise<void> | void;
+  createSession?: (body: unknown, route: Route, store: AppMockStore) => Promise<void> | void;
+  updateSession?: (
+    id: string,
+    body: unknown,
+    route: Route,
+    store: AppMockStore,
+  ) => Promise<void> | void;
+  restartSession?: (id: string, route: Route, store: AppMockStore) => Promise<void> | void;
+  createAgent?: (body: unknown, route: Route, store: AppMockStore) => Promise<void> | void;
+  updateAgent?: (
+    id: string,
+    body: unknown,
+    route: Route,
+    store: AppMockStore,
+  ) => Promise<void> | void;
+  deleteAgent?: (id: string, route: Route, store: AppMockStore) => Promise<void> | void;
+  createSkill?: (body: unknown, route: Route) => Promise<void> | void;
+  updateSkill?: (id: string, body: unknown, route: Route) => Promise<void> | void;
+  deleteSkill?: (id: string, route: Route) => Promise<void> | void;
+  files?: (hostId: string, path: string | null) => unknown;
+  fileRead?: (hostId: string, path: string) => string | Uint8Array;
+  fileUpload?: (hostId: string, route: Route) => Promise<void> | void;
+  fileMkdir?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
+  fileDelete?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
+  fileRename?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
+  extraBrowserDevices?: Array<Record<string, unknown>>;
+  hostPins?: Record<string, string[]>;
+  endorsementsFor?: Record<string, Array<Record<string, unknown>>>;
+}
+
+export async function mockApp(page: Page, options: AppMockOptions = {}): Promise<AppMockStore> {
+  let workspaceFull = options.workspaceFull ?? false;
+  let nextWorkspacePatchFailure: { status: number; detail: string } | null = null;
+  const store: AppMockStore = {
+    user: options.me === undefined ? { ...user } : options.me,
+    config: {
+      providers: [],
+      email_verification_required: false,
+      invite_only: false,
+      ...options.config,
+    },
+    hosts: (options.hosts ?? [host]).map((item) => ({ ...(item as JsonRecord) })),
+    sessions: (options.sessions ?? []).map((item) => ({ ...(item as JsonRecord) })),
+    workspaces: (options.workspaces ?? [workspace()]).map((item) => ({ ...(item as JsonRecord) })),
+    agents: (options.agents ?? [agent()]).map((item) => ({ ...(item as JsonRecord) })),
+    skills: (options.skills ?? []).map((item) => ({ ...(item as JsonRecord) })),
+    recentDirs: Object.fromEntries(
+      Object.entries(options.recentDirs ?? {}).map(([id, dirs]) => [
+        id,
+        dirs.map((dir) => ({ ...dir })),
+      ]),
+    ),
+    hostAgents: Object.fromEntries(
+      Object.entries(options.hostAgents ?? {}).map(([id, values]) => [
+        id,
+        values.map((value) => ({ ...value })),
+      ]),
+    ),
+    sessionSkills: Object.fromEntries(
+      Object.entries(options.sessionSkills ?? {}).map(([id, skillIds]) => [id, [...skillIds]]),
+    ),
+    requests: { auth: [], sessions: [], workspaces: [], workspacePatches: [], agents: [] },
+    setWorkspaceFull(value) {
+      workspaceFull = value;
+    },
+    failNextWorkspacePatch(status = 500, detail = "layout save failed") {
+      nextWorkspacePatchFailure = { status, detail };
+    },
+  };
+  const hostList = store.hosts;
+  const skillList = store.skills;
   const browserDeviceList: Array<Record<string, unknown>> = [
     ...(options.extraBrowserDevices ?? []),
   ];
@@ -531,18 +613,102 @@ export async function mockAuthenticatedApi(
         : new OriginalPeerConnection(configuration);
     } as unknown as typeof RTCPeerConnection;
   });
+  let meReads = 0;
+  let idCounter = 100;
+  const nextId = () => `00000000-0000-4000-8000-${String(idCounter++).padStart(12, "0")}`;
+  const findById = (values: JsonRecord[], id: string) => values.find((value) => value.id === id);
+  const json = (route: Route, value: unknown, status = 200) =>
+    route.fulfill({ status, contentType: "application/json", json: value });
+
   await page.route("**/api/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
     const method = request.method();
+    const readBody = async (): Promise<JsonRecord> =>
+      ((await request.postDataJSON()) ?? {}) as JsonRecord;
 
-    if (path === "/api/me") {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: { user: options.me ?? user },
+    if (path === "/api/auth/config" && method === "GET") {
+      await json(route, store.config);
+      return;
+    }
+    if (path === "/api/me" && method === "GET") {
+      const sequence = options.meSequence;
+      const selected = sequence?.length
+        ? sequence[Math.min(meReads++, sequence.length - 1)]
+        : store.user;
+      if (selected === null) {
+        await json(route, { detail: "not authenticated" }, 401);
+      } else {
+        store.user = { ...selected };
+        await json(route, { user: selected });
+      }
+      return;
+    }
+    if ((path === "/api/auth/signup" || path === "/api/auth/login") && method === "POST") {
+      const body = await readBody();
+      store.requests.auth.push({ path, ...body });
+      store.user = {
+        ...user,
+        email: typeof body.email === "string" ? body.email : user.email,
+        email_verified_at: path.endsWith("signup") ? null : CREATED_AT,
+      };
+      await json(route, { access_token: "mock-token", user: store.user });
+      return;
+    }
+    if (path === "/api/auth/logout" && method === "POST") {
+      store.user = null;
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
+    if (path === "/api/auth/verify-email/request" && method === "POST") {
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
+    if (path === "/api/auth/device/pending" && method === "POST") {
+      store.requests.auth.push({ path, ...(await readBody()) });
+      const digest = createHash("sha256")
+        .update(Buffer.from(HOST_PUBLIC_KEY, "base64url"))
+        .digest()
+        .subarray(0, 12)
+        .toString("base64url");
+      await json(route, {
+        host_name: String(store.hosts[0]?.name ?? "Mac"),
+        approval_nonce: APPROVAL_NONCE,
+        host_key_algorithm: "ed25519",
+        host_public_key: HOST_PUBLIC_KEY,
+        host_key_fingerprint: `SHA256:${digest}`,
       });
+      return;
+    }
+    if (path === "/api/auth/device/approve" && method === "POST") {
+      const body = await readBody();
+      store.requests.auth.push({ path, ...body });
+      await json(route, {
+        host_name: String(store.hosts[0]?.name ?? "Mac"),
+        host_id: store.hosts[0]?.id ?? null,
+        approval_nonce: body.approval_nonce,
+        host_key_algorithm: body.host_key_algorithm,
+        host_public_key: body.host_public_key,
+        host_key_fingerprint: body.host_key_fingerprint,
+        browser_device_id: body.browser_device_id,
+        browser_key_algorithm: body.browser_key_algorithm,
+        browser_public_key: body.browser_public_key,
+        browser_key_fingerprint: body.browser_key_fingerprint,
+      });
+      return;
+    }
+    if (path === "/api/auth/verify-email/confirm" && method === "POST") {
+      if (store.user) store.user.email_verified_at = CREATED_AT;
+      await json(route, { user: store.user });
+      return;
+    }
+    if (path === "/api/auth/password-reset/request" && method === "POST") {
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
+    if (path === "/api/auth/password-reset/confirm" && method === "POST") {
+      await json(route, { access_token: "mock-token", user: store.user ?? user });
       return;
     }
     if (path === "/api/browser-devices/register" && method === "POST") {
@@ -569,15 +735,11 @@ export async function mockAuthenticatedApi(
         };
         browserDeviceList.push(device);
       }
-      await route.fulfill({ status: 200, contentType: "application/json", json: device });
+      await json(route, device);
       return;
     }
     if (path === "/api/browser-devices" && method === "GET") {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: browserDeviceList,
-      });
+      await json(route, browserDeviceList);
       return;
     }
     const browserRevokeMatch = path.match(/^\/api\/browser-devices\/([^/]+)\/revoke$/);
@@ -593,33 +755,25 @@ export async function mockAuthenticatedApi(
         return;
       }
       device.revoked_at ??= CREATED_AT;
-      await route.fulfill({ status: 200, contentType: "application/json", json: device });
+      await json(route, device);
       return;
     }
     if (path === "/api/trust/bundle" && method === "GET") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: null });
+      await json(route, null);
       return;
     }
     if (path === "/api/trust/passkeys" && method === "GET") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: [] });
+      await json(route, []);
       return;
     }
     const hostPinsMatch = path.match(/^\/api\/trust\/hosts\/([^/]+)\/pins$/);
     if (hostPinsMatch && method === "GET") {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: hostPinMap[hostPinsMatch[1]] ?? [],
-      });
+      await json(route, hostPinMap[hostPinsMatch[1]] ?? []);
       return;
     }
     if (path === "/api/trust/endorsements" && method === "GET") {
       const endorsedId = url.searchParams.get("endorsed_device_id");
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: options.endorsementsFor?.[endorsedId ?? ""] ?? [],
-      });
+      await json(route, options.endorsementsFor?.[endorsedId ?? ""] ?? []);
       return;
     }
     if (path === "/api/trust/endorsements" && method === "POST") {
@@ -637,16 +791,12 @@ export async function mockAuthenticatedApi(
       hostPinMap[body.host_id] = [
         ...new Set([...(hostPinMap[body.host_id] ?? []), body.endorsed_device_id]),
       ];
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: {
-          host_id: body.host_id,
-          endorsed_device_id: body.endorsed_device_id,
-          endorsed_key_fingerprint: endorsed.fingerprint,
-          endorser_device_id: body.endorser_device_id,
-          created_at: CREATED_AT,
-        },
+      await json(route, {
+        host_id: body.host_id,
+        endorsed_device_id: body.endorsed_device_id,
+        endorsed_key_fingerprint: endorsed.fingerprint,
+        endorser_device_id: body.endorser_device_id,
+        created_at: CREATED_AT,
       });
       return;
     }
@@ -659,51 +809,101 @@ export async function mockAuthenticatedApi(
         return;
       }
       device.label = body.label ?? null;
-      await route.fulfill({ status: 200, contentType: "application/json", json: device });
+      await json(route, device);
       return;
     }
-    if (path === "/api/hosts") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: hostList });
+    if (path === "/api/hosts" && method === "GET") {
+      await json(route, hostList);
       return;
     }
-    if (path.match(/^\/api\/hosts\/[^/]+$/) && method === "GET") {
-      const id = path.split("/").at(-1) ?? "";
-      const match = (hostList as Array<{ id?: string }>).find((h) => h.id === id);
-      await route.fulfill({
-        status: match ? 200 : 404,
-        contentType: "application/json",
-        json: match ?? { detail: "host not found" },
+    const hostMatch = path.match(/^\/api\/hosts\/([^/]+)$/);
+    if (hostMatch) {
+      const selected = findById(store.hosts, hostMatch[1]);
+      if (!selected) {
+        await json(route, { detail: "host not found" }, 404);
+        return;
+      }
+      if (method === "GET") {
+        await json(route, selected);
+        return;
+      }
+      if (method === "PATCH") {
+        Object.assign(selected, await readBody());
+        await json(route, selected);
+        return;
+      }
+      if (method === "DELETE") {
+        store.hosts.splice(store.hosts.indexOf(selected), 1);
+        await route.fulfill({ status: 204, body: "" });
+        return;
+      }
+    }
+    const hostAgentsMatch = path.match(/^\/api\/hosts\/([^/]+)\/agents$/);
+    if (hostAgentsMatch && method === "GET") {
+      await json(route, { agents: store.hostAgents[hostAgentsMatch[1]] ?? [] });
+      return;
+    }
+    const installMatch = path.match(/^\/api\/hosts\/([^/]+)\/agents\/([^/]+)\/install$/);
+    if (installMatch && method === "POST") {
+      const [hostId, definitionId] = installMatch.slice(1);
+      const definition = findById(store.agents, definitionId);
+      store.hostAgents[hostId] ??= [];
+      const statuses = store.hostAgents[hostId];
+      let status = findById(statuses, definitionId);
+      if (!status) {
+        status = {
+          agent_id: definitionId,
+          agent_name: definition?.name ?? "Agent",
+          agent_kind: definition?.kind ?? "custom",
+          command: definition?.command ?? "agent",
+        };
+        statuses.push(status);
+      }
+      Object.assign(status, { installed: true, path: `/usr/local/bin/${status.command}` });
+      await json(route, {
+        ...status,
+        success: true,
+        exit_code: 0,
+        output: "installed",
+        error: null,
+        status,
       });
       return;
     }
-    if (path === `/api/hosts/${HOST_ID}/tools`) {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: { tools: [] },
+    const policyMatch = path.match(/^\/api\/hosts\/([^/]+)\/agents\/([^/]+)\/policy$/);
+    if (policyMatch && method === "PATCH") {
+      const body = await readBody();
+      store.hostAgents[policyMatch[1]] ??= [];
+      const statuses = store.hostAgents[policyMatch[1]];
+      let status = findById(statuses, policyMatch[2]);
+      if (!status) {
+        const definition = findById(store.agents, policyMatch[2]);
+        status = {
+          agent_id: policyMatch[2],
+          agent_name: definition?.name ?? "Agent",
+          agent_kind: definition?.kind ?? "custom",
+          command: definition?.command ?? "agent",
+          installed: false,
+        };
+        statuses.push(status);
+      }
+      Object.assign(status, body);
+      await json(route, {
+        agent_id: policyMatch[2],
+        auto_update: body.auto_update ?? false,
+        last_checked_at: null,
+        last_auto_update_at: null,
+        last_auto_update_error: null,
       });
       return;
     }
-    if (path === `/api/hosts/${HOST_ID}/dirs`) {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: {
-          path: url.searchParams.get("path") ?? host.home_dir,
-          home_dir: host.home_dir,
-          parent: "/Users",
-          entries: [{ name: "projects", path: "/Users/tester/projects" }],
-          error: null,
-        },
-      });
-      return;
-    }
-    if (path === "/api/presets") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: [preset] });
+    const recentMatch = path.match(/^\/api\/hosts\/([^/]+)\/recent-dirs$/);
+    if (recentMatch && method === "GET") {
+      await json(route, { dirs: (store.recentDirs[recentMatch[1]] ?? []).slice(0, 8) });
       return;
     }
     if (path === "/api/skills" && method === "GET") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: skillList });
+      await json(route, skillList);
       return;
     }
     if (path === "/api/skills" && method === "POST") {
@@ -712,11 +912,9 @@ export async function mockAuthenticatedApi(
         await options.createSkill(body, route);
         return;
       }
-      await route.fulfill({
-        status: 201,
-        contentType: "application/json",
-        json: skill({ ...(body as Record<string, unknown>) }),
-      });
+      const created = skill({ id: nextId(), ...(body as JsonRecord) });
+      store.skills.push(created);
+      await json(route, created, 201);
       return;
     }
     if (path.startsWith("/api/skills/") && method === "PATCH") {
@@ -726,11 +924,13 @@ export async function mockAuthenticatedApi(
         await options.updateSkill(id, body, route);
         return;
       }
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: skill({ id, ...(body as Record<string, unknown>) }),
-      });
+      const selected = findById(store.skills, id);
+      if (!selected) {
+        await json(route, { detail: "skill not found" }, 404);
+        return;
+      }
+      Object.assign(selected, body);
+      await json(route, selected);
       return;
     }
     if (path.startsWith("/api/skills/") && method === "DELETE") {
@@ -739,84 +939,259 @@ export async function mockAuthenticatedApi(
         await options.deleteSkill(id, route);
         return;
       }
-      await route.fulfill({ status: 204 });
+      const selected = findById(store.skills, id);
+      if (selected) store.skills.splice(store.skills.indexOf(selected), 1);
+      await route.fulfill({ status: 204, body: "" });
       return;
     }
-    if (path === "/api/screens" && method === "GET") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: screenList });
+    if (path === "/api/sessions" && method === "GET") {
+      const hostId = url.searchParams.get("host_id");
+      await json(
+        route,
+        hostId ? store.sessions.filter((item) => item.host_id === hostId) : store.sessions,
+      );
       return;
     }
-    if (path === "/api/screens" && method === "POST") {
-      const body = await request.postDataJSON();
-      if (options.createScreen) {
-        await options.createScreen(body, route);
+    if (path === "/api/sessions" && method === "POST") {
+      const body = await readBody();
+      store.requests.sessions.push(body);
+      if (options.createSession) {
+        await options.createSession(body, route, store);
         return;
       }
-      await route.fulfill({
-        status: 201,
-        contentType: "application/json",
-        json: screen({ ...(body as Record<string, unknown>) }),
+      const targetWorkspace =
+        typeof body.workspace_id === "string"
+          ? findById(store.workspaces, body.workspace_id)
+          : undefined;
+      let geometry = body.tile as Rect | undefined;
+      let baseTiles = ((targetWorkspace?.layout as LayoutV2 | undefined)?.tiles ?? []).map(
+        (tile) => ({ ...tile }),
+      );
+      if (targetWorkspace && !geometry) {
+        const placed = autoPlace(baseTiles);
+        if (workspaceFull || !placed.tile) {
+          await json(route, { detail: "workspace_full" }, 409);
+          return;
+        }
+        baseTiles = placed.tiles;
+        geometry = placed.tile;
+      }
+      const selectedHost =
+        typeof body.host_id === "string" ? findById(store.hosts, body.host_id) : undefined;
+      const created = session({
+        id: nextId(),
+        host_id: body.host_id,
+        host_name: selectedHost?.name ?? null,
+        cwd: body.cwd,
+        name: body.name ?? null,
+      });
+      store.sessions.push(created);
+      if (Array.isArray(body.skill_ids)) {
+        store.sessionSkills[String(created.id)] = body.skill_ids.map(String);
+      }
+      if (targetWorkspace && geometry) {
+        targetWorkspace.layout = {
+          version: 2,
+          tiles: [...baseTiles, { session_id: created.id as string, ...geometry }],
+        };
+        targetWorkspace.updated_at = new Date().toISOString();
+      }
+      await json(route, created, 201);
+      return;
+    }
+    const accessMatch = path.match(/^\/api\/sessions\/([^/]+)\/access$/);
+    if (accessMatch && (method === "GET" || method === "PATCH")) {
+      const body = method === "PATCH" ? await readBody() : {};
+      if (method === "PATCH" && Array.isArray(body.skill_ids)) {
+        store.sessionSkills[accessMatch[1]] = body.skill_ids.map(String);
+      }
+      const ids = store.sessionSkills[accessMatch[1]] ?? [];
+      await json(route, {
+        session_id: accessMatch[1],
+        skills: ids.length ? store.skills.filter((item) => ids.includes(String(item.id))) : [],
       });
       return;
     }
-    if (path.startsWith("/api/screens/") && method === "GET") {
-      const id = path.split("/").at(-1) ?? "";
-      const match = (screenList as Array<{ id?: string }>).find((v) => v.id === id);
-      await route.fulfill({
-        status: match ? 200 : 404,
-        contentType: "application/json",
-        json: match ?? { detail: "screen not found" },
-      });
-      return;
-    }
-    if (path.startsWith("/api/screens/") && method === "PATCH") {
-      const id = path.split("/").at(-1) ?? "";
-      const body = await request.postDataJSON();
-      if (options.updateScreen) {
-        await options.updateScreen(id, body, route);
+    const restartMatch = path.match(/^\/api\/sessions\/([^/]+)\/restart$/);
+    if (restartMatch && method === "POST") {
+      if (options.restartSession) {
+        await options.restartSession(restartMatch[1], route, store);
         return;
       }
-      const match = (screenList as Array<Record<string, unknown>>).find((v) => v.id === id);
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: { ...(match ?? screen()), ...(body as Record<string, unknown>) },
-      });
+      const selected = findById(store.sessions, restartMatch[1]);
+      if (!selected) {
+        await json(route, { detail: "session not found" }, 404);
+        return;
+      }
+      Object.assign(selected, { status: "running", exited_at: null, exit_code: null });
+      await json(route, selected);
       return;
     }
-    if (path.startsWith("/api/screens/") && method === "DELETE") {
-      await route.fulfill({ status: 204 });
+    const sessionMatch = path.match(/^\/api\/sessions\/([^/]+)$/);
+    if (sessionMatch) {
+      const selected = findById(store.sessions, sessionMatch[1]);
+      if (!selected) {
+        await json(route, { detail: "session not found" }, 404);
+        return;
+      }
+      if (method === "GET") {
+        await json(route, selected);
+        return;
+      }
+      if (method === "PATCH") {
+        const body = await readBody();
+        if (options.updateSession) {
+          await options.updateSession(sessionMatch[1], body, route, store);
+          return;
+        }
+        Object.assign(selected, body);
+        await json(route, selected);
+        return;
+      }
+      if (method === "DELETE") {
+        delete store.sessionSkills[sessionMatch[1]];
+        store.sessions.splice(store.sessions.indexOf(selected), 1);
+        for (const target of store.workspaces) {
+          const layout = target.layout as LayoutV2;
+          target.layout = { version: 2, tiles: removeTile(layout.tiles, sessionMatch[1]) };
+        }
+        await route.fulfill({ status: 204, body: "" });
+        return;
+      }
+    }
+    if (path === "/api/workspaces" && method === "GET") {
+      await json(
+        route,
+        [...store.workspaces].sort((a, b) => Number(a.position) - Number(b.position)),
+      );
       return;
+    }
+    if (path === "/api/workspaces" && method === "POST") {
+      const body = await readBody();
+      store.requests.workspaces.push(body);
+      if (options.createWorkspace) {
+        await options.createWorkspace(body, route, store);
+        return;
+      }
+      const createdWorkspace: JsonRecord = workspace({
+        id: nextId(),
+        name: body.name ?? `Workspace ${store.workspaces.length + 1}`,
+        position: store.workspaces.length,
+      });
+      let createdSession: JsonRecord | null = null;
+      if (body.first_session && typeof body.first_session === "object") {
+        const first = body.first_session as JsonRecord;
+        const selectedHost =
+          typeof first.host_id === "string" ? findById(store.hosts, first.host_id) : undefined;
+        createdSession = session({
+          id: nextId(),
+          host_id: first.host_id,
+          host_name: selectedHost?.name ?? null,
+          cwd: first.cwd,
+          name: null,
+        });
+        store.sessions.push(createdSession);
+        if (Array.isArray(first.skill_ids)) {
+          store.sessionSkills[String(createdSession.id)] = first.skill_ids.map(String);
+        }
+        createdWorkspace.layout = {
+          version: 2,
+          tiles: [{ session_id: createdSession.id as string, x: 0, y: 0, w: 12, h: 12 }],
+        };
+      }
+      store.workspaces.push(createdWorkspace);
+      await json(route, { workspace: createdWorkspace, session: createdSession }, 201);
+      return;
+    }
+    const workspaceMatch = path.match(/^\/api\/workspaces\/([^/]+)$/);
+    if (workspaceMatch) {
+      const selected = findById(store.workspaces, workspaceMatch[1]);
+      if (!selected) {
+        await json(route, { detail: "workspace not found" }, 404);
+        return;
+      }
+      if (method === "GET") {
+        await json(route, selected);
+        return;
+      }
+      if (method === "PATCH") {
+        const body = await readBody();
+        store.requests.workspacePatches.push({ id: workspaceMatch[1], body });
+        if (nextWorkspacePatchFailure) {
+          const failure = nextWorkspacePatchFailure;
+          nextWorkspacePatchFailure = null;
+          await json(route, { detail: failure.detail }, failure.status);
+          return;
+        }
+        if (options.updateWorkspace) {
+          await options.updateWorkspace(workspaceMatch[1], body, route, store);
+          return;
+        }
+        Object.assign(selected, body, { updated_at: new Date().toISOString() });
+        await json(route, selected);
+        return;
+      }
+      if (method === "DELETE") {
+        const ids = new Set(
+          ((selected.layout as LayoutV2 | undefined)?.tiles ?? []).map((tile) => tile.session_id),
+        );
+        for (const id of ids) delete store.sessionSkills[id];
+        store.sessions.splice(
+          0,
+          store.sessions.length,
+          ...store.sessions.filter((item) => !ids.has(String(item.id))),
+        );
+        store.workspaces.splice(store.workspaces.indexOf(selected), 1);
+        await route.fulfill({ status: 204, body: "" });
+        return;
+      }
     }
     if (path === "/api/agents" && method === "GET") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: agents });
+      await json(route, store.agents);
       return;
     }
     if (path === "/api/agents" && method === "POST") {
+      const body = await readBody();
+      store.requests.agents.push(body);
       if (options.createAgent) {
-        await options.createAgent(await request.postDataJSON(), route);
+        await options.createAgent(body, route, store);
         return;
       }
-      await route.fulfill({
-        status: 201,
-        contentType: "application/json",
-        json: agent(await request.postDataJSON()),
-      });
+      const created = agent({ id: nextId(), owner_user_id: USER_ID, ...body });
+      store.agents.push(created);
+      await json(route, created, 201);
       return;
     }
-    if (path.match(/^\/api\/agents\/[^/]+$/) && method === "PATCH") {
-      const id = path.split("/").at(-1) ?? "";
-      const body = await request.postDataJSON();
-      if (options.updateAgent) {
-        await options.updateAgent(id, body, route);
+    const agentMatch = path.match(/^\/api\/agents\/([^/]+)$/);
+    if (agentMatch) {
+      const selected = findById(store.agents, agentMatch[1]);
+      if (!selected || (method !== "GET" && selected.owner_user_id === null)) {
+        await json(route, { detail: "agent not found" }, 404);
         return;
       }
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: agent({ id, ...(body as Record<string, unknown>) }),
-      });
-      return;
+      if (method === "GET") {
+        await json(route, selected);
+        return;
+      }
+      if (method === "PATCH") {
+        const body = await readBody();
+        if (options.updateAgent) {
+          await options.updateAgent(agentMatch[1], body, route, store);
+          return;
+        }
+        Object.assign(selected, body);
+        await json(route, selected);
+        return;
+      }
+      if (method === "DELETE") {
+        if (options.deleteAgent) {
+          await options.deleteAgent(agentMatch[1], route, store);
+          return;
+        }
+        store.agents.splice(store.agents.indexOf(selected), 1);
+        await route.fulfill({ status: 204, body: "" });
+        return;
+      }
     }
     if (path === "/api/account/delete" && method === "POST") {
       const body = (await request.postDataJSON()) as {
@@ -842,45 +1217,7 @@ export async function mockAuthenticatedApi(
       for (let i = browserDeviceList.length - 1; i >= 0; i -= 1) {
         if (browserDeviceList[i].revoked_at != null) browserDeviceList.splice(i, 1);
       }
-      await route.fulfill({ status: 200, contentType: "application/json", json: { pruned } });
-      return;
-    }
-    const agentGetMatch = path.match(/^\/api\/agents\/([^/]+)$/);
-    if (agentGetMatch) {
-      const agentGetId = agentGetMatch[1];
-      const listedAgent = agents.find((item) => (item as { id?: string }).id === agentGetId);
-      if (method === "GET" && listedAgent) {
-        await route.fulfill({ status: 200, contentType: "application/json", json: listedAgent });
-        return;
-      }
-      if (agentGetId === AGENT_ID) {
-        await route.fulfill({ status: 200, contentType: "application/json", json: agent() });
-        return;
-      }
-      if (method === "GET") {
-        await route.fulfill({ status: 404, json: { detail: "agent not found" } });
-        return;
-      }
-    }
-    if (path === `/api/agents/${AGENT_ID}/access`) {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: { agent_id: AGENT_ID, skills: [] },
-      });
-      return;
-    }
-    const restartMatch = path.match(/^\/api\/agents\/([^/]+)\/restart$/);
-    if (restartMatch && method === "POST") {
-      if (options.restartAgent) {
-        await options.restartAgent(restartMatch[1], route);
-        return;
-      }
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        json: agent({ id: restartMatch[1] }),
-      });
+      await json(route, { pruned });
       return;
     }
 
@@ -890,4 +1227,27 @@ export async function mockAuthenticatedApi(
       json: { detail: `unmocked ${method} ${path}` },
     });
   });
+  return store;
 }
+
+export async function openSettings(
+  page: Page,
+  tab: "account" | "appearance" | "hosts" | "agents" | "skills" | "devices" | "trust" = "account",
+  workspaceId = WORKSPACE_ID,
+) {
+  await page.goto(`/w/${workspaceId}`);
+  await page.getByRole("button", { name: "Settings", exact: true }).first().click();
+  if (tab !== "account") {
+    await page.getByRole("button", { name: SETTINGS_TAB_LABELS[tab], exact: true }).click();
+  }
+}
+
+const SETTINGS_TAB_LABELS = {
+  account: "Account",
+  appearance: "Appearance",
+  hosts: "Hosts",
+  agents: "Agents",
+  skills: "Skills",
+  devices: "Browser devices",
+  trust: "Device trust",
+} as const;
