@@ -7,6 +7,7 @@
 
 pub mod acct_endorsement;
 pub mod browser_endorsement;
+pub mod endorsement_chain;
 pub mod host_pair_approval;
 pub mod sas;
 pub mod host_pair_possession;
