@@ -2,7 +2,6 @@
 
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import {
-  type CSSProperties,
   forwardRef,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
@@ -15,6 +14,13 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import {
+  type MenuAnchor,
+  type MenuPlacement,
+  measureMenu,
+  placeMenu,
+  pointAnchor,
+} from "@/components/ui/menu-position";
 import { BottomSheet } from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
@@ -40,6 +46,8 @@ export type CascadeItem = {
   detail?: string;
   /** Render as a non-interactive section label instead of a menu item. */
   heading?: boolean;
+  /** Draw the row in the danger ink, as DropdownMenuItem's `destructive` does. */
+  destructive?: boolean;
   disabled?: boolean;
   /** Leaf action: runs and closes the menu. Ignored when `panel` is set. */
   onSelect?: () => void;
@@ -121,7 +129,7 @@ export const CascadeMenu = forwardRef<
   const [open, setOpen] = useState(false);
   const [path, setPath] = useState<string[]>([]);
   const [direction, setDirection] = useState<"forward" | "back">("forward");
-  const [coords, setCoords] = useState<CSSProperties | null>(null);
+  const [coords, setCoords] = useState<MenuPlacement | null>(null);
   // Set when opened at a click: the menu hangs off that point instead of the
   // trigger, which matters when the trigger is a whole empty grid opening.
   const [point, setPoint] = useState<{ x: number; y: number } | null>(null);
@@ -206,41 +214,32 @@ export const CascadeMenu = forwardRef<
   );
 
   // Anchored positioning (menu mode): portal + fixed coords against the
-  // trigger rect, flipping above when there is no room below — the same
-  // approach as ui/dropdown-menu.
+  // trigger rect (or the click point), resolved by the shared `placeMenu` so
+  // the menu is always fully on screen — flipped above when there is no room
+  // below, slid in from either edge, height-capped when neither side fits.
   useLayoutEffect(() => {
     if (!open || asSheet) {
       setCoords(null);
       return;
     }
     const place = () => {
-      // Layout size, not the rendered rect: the open animation scales the
-      // menu, and a measurement taken mid-zoom places it a few px off.
-      const menu = menuRef.current;
-      const menuH = menu?.offsetHeight ?? 0;
-      const menuW = menu?.offsetWidth ?? 256;
-      const style: CSSProperties = { position: "fixed" };
-      // Click-anchored: drop from the cursor, flipping above it when the menu
-      // would run past the bottom, and never past either side.
-      if (point) {
-        if (point.y + menuH + 4 > window.innerHeight - 8 && point.y - menuH - 4 > 8) {
-          style.bottom = window.innerHeight - point.y + 4;
-        } else {
-          style.top = Math.max(8, Math.min(point.y + 4, window.innerHeight - menuH - 8));
-        }
-        style.left = Math.max(8, Math.min(point.x, window.innerWidth - menuW - 8));
-        setCoords(style);
-        return;
-      }
-      const anchor = rootRef.current?.getBoundingClientRect();
+      const { width, height } = measureMenu(menuRef.current, 240);
+      const anchor: MenuAnchor | null = point
+        ? pointAnchor(point.x, point.y)
+        : (rootRef.current?.getBoundingClientRect() ?? null);
       if (!anchor) return;
-      const opensUp =
-        anchor.bottom + menuH + 4 > window.innerHeight - 8 && anchor.top - menuH - 4 > 8;
-      if (opensUp) style.bottom = window.innerHeight - anchor.top + 4;
-      else style.top = anchor.bottom + 4;
-      if (align === "end") style.right = Math.max(8, window.innerWidth - anchor.right);
-      else style.left = Math.max(8, Math.min(anchor.left, window.innerWidth - menuW - 8));
-      setCoords(style);
+      setCoords(
+        placeMenu({
+          anchor,
+          menuWidth: width,
+          menuHeight: height,
+          // Click-anchored: the menu drops from the cursor, so there is no
+          // trigger box for `end` to hang off.
+          align: point ? "start" : align,
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+        }),
+      );
     };
     place();
     // Panels differ in height and async content lands late, so re-place on any
@@ -330,7 +329,7 @@ export const CascadeMenu = forwardRef<
         <button
           type="button"
           onClick={goBack}
-          className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-left text-[11px] font-medium text-muted-foreground transition-colors hover:bg-popover-accent hover:text-foreground"
         >
           <ChevronLeft className="size-3.5 shrink-0" aria-hidden />
           {panel.title ?? "Back"}
@@ -358,7 +357,7 @@ export const CascadeMenu = forwardRef<
               role="presentation"
               className={cn(
                 "select-none px-2 pb-1 pt-2 text-xs font-medium text-muted-foreground",
-                index > 0 && "mt-1 border-t border-border",
+                index > 0 && "mt-1 border-t border-popover-border",
               )}
             >
               {item.label}
@@ -373,10 +372,12 @@ export const CascadeMenu = forwardRef<
               aria-haspopup={item.panel ? "menu" : undefined}
               onClick={() => activate(item)}
               className={cn(
-                "flex w-full cursor-default select-none items-center gap-2 rounded-md px-2 text-left text-sm outline-none transition-colors",
-                "hover:bg-accent focus-visible:bg-accent disabled:pointer-events-none disabled:opacity-50",
+                "flex w-full select-none items-center gap-2 rounded-md px-2 text-left text-sm outline-none transition-colors",
+                "hover:bg-popover-accent focus-visible:bg-popover-accent disabled:pointer-events-none disabled:opacity-50",
                 // Taller touch targets in the sheet presentation.
-                asSheet ? "min-h-11 py-2" : "py-1.5",
+                asSheet ? "min-h-11 py-2.5" : "py-2",
+                item.destructive &&
+                  "text-destructive hover:bg-destructive/10 focus-visible:bg-destructive/10",
               )}
             >
               {item.icon != null && (
@@ -449,7 +450,9 @@ export const CascadeMenu = forwardRef<
               // pointer-events-auto: a modal Radix dialog sets `pointer-events:
               // none` on the body, and this menu is portaled to it — without
               // this, a menu opened from inside a dialog is dead to the mouse.
-              "pointer-events-auto z-[100] w-64 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40",
+              // Lighter than the shell it opens over, so it reads as a
+              // surface lifted off the chrome rather than a hole cut into it.
+              "pointer-events-auto z-[100] w-60 overflow-y-auto overflow-x-hidden overscroll-contain rounded-lg border border-popover-border bg-popover p-1 text-popover-foreground shadow-xl shadow-black/50",
               "animate-in fade-in-0 zoom-in-95 duration-100",
               menuClassName,
             )}

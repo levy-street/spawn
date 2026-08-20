@@ -1038,6 +1038,10 @@ export function WorkspaceTabs({
       <DropdownMenu
         align="end"
         className="mb-0.5 ml-auto shrink-0"
+        // Wider than the base min-width: two of these rows carry a host or
+        // folder name that truncates, and the default leaves them almost no
+        // room to say which one.
+        menuClassName="w-64"
         renderTrigger={(props) => (
           <Button
             {...props}
@@ -1066,13 +1070,15 @@ export function WorkspaceTabs({
         >
           <Server className="size-4" aria-hidden />
           <span className="min-w-0 flex-1 truncate">
-            {homeHost ? `Host: ${homeHost.name}` : "Set host…"}
+            {homeHost ? `Default host: ${homeHost.name}` : "Set default host…"}
           </span>
         </DropdownMenuItem>
         <DropdownMenuItem disabled={!homeHost} onSelect={() => setFolderPickerOpen(true)}>
           <FolderOpen className="size-4" aria-hidden />
           <span className="min-w-0 flex-1 truncate">
-            {workspace.cwd ? `Folder: ${basename(workspace.cwd) || workspace.cwd}` : "Set folder…"}
+            {workspace.cwd
+              ? `Default folder: ${basename(workspace.cwd) || workspace.cwd}`
+              : "Set default folder…"}
           </span>
         </DropdownMenuItem>
         <DropdownMenuItem
@@ -1082,13 +1088,13 @@ export function WorkspaceTabs({
           }}
         >
           <LayoutTemplate className="size-4" aria-hidden />
-          Save as template
+          Save workspace as template
         </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => void archiveWorkspace()}>
           <Archive className="size-4" aria-hidden />
           Archive workspace
         </DropdownMenuItem>
-        <DropdownMenuSeparator />
         <DropdownMenuItem destructive onSelect={() => void deleteWorkspace()}>
           <Trash2 className="size-4" aria-hidden />
           Delete workspace

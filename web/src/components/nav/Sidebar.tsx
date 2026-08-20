@@ -348,8 +348,11 @@ export function Sidebar({
 
   return (
     <div className="group/rail flex h-full min-h-0 flex-col bg-shell">
-      <div className="px-2.5 pb-1 pt-3">
-        <div className="flex h-(--row-h) items-center">
+      {/* h-9, not the --row-h nav rhythm: this row holds the 36px trident
+       * plate and nothing that has to line up with the tree below it, so the
+       * lockup sits tighter to the top edge than a nav row would. */}
+      <div className="px-2.5 pb-1.5 pt-2.5">
+        <div className="flex h-9 items-center">
           {/* The whole lockup goes home, not just the trident: the wordmark
            * carries a second link to the same place, hovering either lights
            * the trident's plate, and only the trident is in the tab order and
@@ -542,7 +545,6 @@ export function Sidebar({
           side="top"
           align="start"
           className="block w-full"
-          menuClassName="w-56"
           renderTrigger={(props) => (
             <RailTooltip label={user?.email ?? "Account"} disabled={!collapsed}>
               <Button

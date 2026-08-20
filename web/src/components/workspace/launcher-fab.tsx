@@ -576,16 +576,23 @@ export function LauncherFab({
           className={cn(
             // The one primary action on the canvas: a filled square button,
             // easing into its hover tint rather than snapping to it.
-            "grid size-12 shrink-0 place-items-center rounded-2xl",
+            "grid shrink-0 place-items-center rounded-2xl",
             "transition-all duration-200 ease-swift",
             bin
-              ? // Anything in flight, it is the bin: drop here to discard. The
-                // wobble is what carries that, the icon alone is too quiet.
-                "bin-jiggle bg-destructive/15 text-destructive group-data-[trash-hover]/fab:scale-110 group-data-[trash-hover]/fab:bg-destructive/30"
-              : "bg-primary text-primary-foreground hover:scale-105 hover:opacity-90 active:scale-95",
+              ? // Anything in flight, it is the bin: drop here to discard. It
+                // swells past the + it replaces so the drop target reads as
+                // the biggest thing on the canvas, and swells again once the
+                // drag is actually over it — the plate only, the glyph inside
+                // holds its size. Real width/height, not a scale: the jiggle
+                // owns `transform`, and an animation's transform beats the
+                // utility's, so a scale-* here would never render.
+                "size-14 bin-jiggle bg-destructive/15 text-destructive group-data-[trash-hover]/fab:size-16 group-data-[trash-hover]/fab:bg-destructive/30"
+              : "size-12 bg-primary text-primary-foreground hover:scale-105 hover:opacity-90 active:scale-95",
             showItems && "rotate-45",
           )}
         >
+          {/* The plate grows, the glyph does not: the icon holds the same
+              size the + had, so what reads as changing is the target. */}
           {bin ? (
             <Trash2 className="size-5" aria-hidden />
           ) : (

@@ -264,7 +264,7 @@ function ArchivedRow({
         align="end"
         sheetTitle={workspace.name}
         className="absolute right-1.5 top-1/2 -translate-y-1/2"
-        menuClassName="w-52"
+        menuClassName="w-44"
         renderTrigger={(props) => (
           <Button
             {...props}
@@ -286,6 +286,7 @@ function ArchivedRow({
               key: "delete",
               icon: <Trash2 />,
               label: "Delete forever",
+              destructive: true,
               onSelect: () => {
                 onDelete(workspace);
                 onActed?.();

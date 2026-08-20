@@ -187,7 +187,7 @@ export default function AppEntryPage() {
           className="min-h-[calc(var(--vv-height)-3rem)]"
           icon={<Trident className="size-8" />}
           title="Create your first workspace"
-          body="A workspace is a grid of terminal windows rooted in one folder on your host. Shells, agents, and file explorers all open there."
+          body="Pick a folder on your host, then summon a wall of terminals into it."
           action={
             <NewWorkspaceMenu
               trigger={

@@ -25,6 +25,12 @@
   --color-card-foreground: var(--card-foreground);
   --color-popover: var(--popover);
   --color-popover-foreground: var(--popover-foreground);
+  /* Menu chrome, kept off the shared --border/--accent pair: a popover is a
+     lighter surface than the ground it opens over, so its hairline and its
+     row hover both have to be read against that lighter ground rather than
+     against the panel. */
+  --color-popover-border: var(--popover-border);
+  --color-popover-accent: var(--popover-accent);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
   --color-secondary: var(--secondary);
@@ -132,8 +138,10 @@
   --muted-foreground: var(--color-ash);
   --card: var(--color-char);
   --card-foreground: var(--color-bone);
-  --popover: var(--color-char);
+  --popover: var(--color-panelg);
   --popover-foreground: var(--color-bone);
+  --popover-border: var(--color-line-strong);
+  --popover-accent: rgba(242, 237, 226, 0.1);
   /* The hero's CTA is bone on void, so every primary action is. Hellfire stays
      the accent — a rule, a mark, a hover — never the button ground. */
   --primary: var(--color-bone);
@@ -264,6 +272,8 @@
   --card-foreground: oklch(0.17 0 0);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0.17 0 0);
+  --popover-border: oklch(0.88 0 0);
+  --popover-accent: oklch(0.94 0 0);
   --primary: oklch(0.2 0 0);
   --primary-foreground: oklch(0.985 0 0);
   --secondary: oklch(0.95 0 0);
@@ -331,16 +341,20 @@
 [data-theme="dark"] {
   color-scheme: dark;
 
-  --background: oklch(0.13 0 0);
+  --background: oklch(0.10 0 0);
   --foreground: oklch(0.97 0 0);
   --muted: oklch(0.21 0 0);
   --muted-foreground: oklch(0.71 0 0);
   --card: oklch(0.16 0 0);
   --card-foreground: oklch(0.97 0 0);
-  /* Menus and popovers read as black cut into the surface, the same wherever
-     they open — over the lighter sidebar or over the panel ground. */
-  --popover: oklch(0.115 0 0);
+  /* Menus and popovers are the one surface that rises: lighter than --shell
+     (the sidebar) and well clear of --card (the content panel), so a menu
+     always reads as lifted off whatever it opens over rather than as a hole
+     cut into it. The hairline is lighter again — a lit top edge. */
+  --popover: oklch(0.235 0 0);
   --popover-foreground: oklch(0.97 0 0);
+  --popover-border: oklch(0.31 0 0);
+  --popover-accent: oklch(0.30 0 0);
   --primary: oklch(0.97 0 0);
   --primary-foreground: oklch(0.13 0 0);
   --secondary: oklch(0.24 0 0);
@@ -366,7 +380,7 @@
   --brand-accent: #ff453a;
   --brand-accent-soft: rgba(255, 69, 58, 0.14);
   --ring: var(--foreground);
-  --shell: oklch(0.205 0 0);
+  --shell: oklch(0.2 0 0);
   --terminal-bg: oklch(0.145 0 0);
 
   --brand-bg: oklch(0.115 0 0);

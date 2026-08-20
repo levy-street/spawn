@@ -3,7 +3,6 @@
 import { Check } from "lucide-react";
 import Link from "next/link";
 import {
-  type CSSProperties,
   forwardRef,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
@@ -16,6 +15,13 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import {
+  type MenuAnchor,
+  type MenuPlacement,
+  measureMenu,
+  placeMenu,
+  pointAnchor,
+} from "@/components/ui/menu-position";
 import { cn } from "@/lib/utils";
 
 /** Imperative handle: open the menu at a viewport point (e.g. a right-click),
@@ -51,7 +57,7 @@ export const DropdownMenu = forwardRef<
   ref,
 ) {
   const [open, setOpen] = useState(false);
-  const [coords, setCoords] = useState<CSSProperties | null>(null);
+  const [coords, setCoords] = useState<MenuPlacement | null>(null);
   // When opened via openAt (right-click), position at this viewport point
   // instead of anchoring to the trigger.
   const [point, setPoint] = useState<{ x: number; y: number } | null>(null);
@@ -77,49 +83,45 @@ export const DropdownMenu = forwardRef<
 
   // The menu renders in a portal (position: fixed) so it can never be clipped
   // by an ancestor's overflow — e.g. the horizontally-scrolling screen tab
-  // strip or the scrollable sidebar. Position it against the trigger's rect,
-  // flipping side/edge when it would leave the viewport. Recomputed on open
-  // and on scroll/resize so it tracks the trigger.
+  // strip or the scrollable sidebar. `placeMenu` anchors it to the trigger's
+  // rect (or the right-click point) and guarantees it lands fully on screen,
+  // flipping side and capping height when it would not otherwise fit.
+  // Recomputed on open, on scroll/resize, and whenever the menu's own size
+  // changes so it tracks the trigger.
   useLayoutEffect(() => {
     if (!open) {
       setCoords(null);
       return;
     }
     const place = () => {
-      // Layout size, not the rendered rect: the open animation scales the
-      // menu, and a measurement taken mid-zoom places it a few px off.
-      const menu = menuRef.current;
-      const menuH = menu?.offsetHeight ?? 0;
-      const menuW = menu?.offsetWidth ?? 176;
-      const style: CSSProperties = { position: "fixed" };
-      if (point) {
-        // Cursor-anchored (right-click): drop below-right, flipping near the
-        // viewport edges so it stays fully visible.
-        if (point.y + menuH + 4 > window.innerHeight - 8 && point.y - menuH - 4 > 8) {
-          style.bottom = window.innerHeight - point.y + 4;
-        } else {
-          style.top = point.y + 4;
-        }
-        style.left = Math.min(point.x, window.innerWidth - menuW - 8);
-        setCoords(style);
-        return;
-      }
-      const anchor = rootRef.current?.getBoundingClientRect();
+      const { width, height } = measureMenu(menuRef.current, 176);
+      const anchor: MenuAnchor | null = point
+        ? pointAnchor(point.x, point.y)
+        : (rootRef.current?.getBoundingClientRect() ?? null);
       if (!anchor) return;
-      const opensUp =
-        side === "top"
-          ? anchor.top - menuH - 4 > 8
-          : anchor.bottom + menuH + 4 > window.innerHeight - 8 && anchor.top - menuH - 4 > 8;
-      if (opensUp) style.bottom = window.innerHeight - anchor.top + 4;
-      else style.top = anchor.bottom + 4;
-      if (align === "end") style.right = Math.max(8, window.innerWidth - anchor.right);
-      else style.left = Math.min(anchor.left, window.innerWidth - menuW - 8);
-      setCoords(style);
+      setCoords(
+        placeMenu({
+          anchor,
+          menuWidth: width,
+          menuHeight: height,
+          // A cursor-anchored menu drops from the point; there is no trigger
+          // box for `end` to hang off.
+          align: point ? "start" : align,
+          side: point ? "bottom" : side,
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+        }),
+      );
     };
     place();
+    // Item counts change while open (a checkbox list, an async label), and a
+    // taller menu may no longer fit on the side it opened to.
+    const observer = new ResizeObserver(place);
+    if (menuRef.current) observer.observe(menuRef.current);
     window.addEventListener("scroll", place, true);
     window.addEventListener("resize", place);
     return () => {
+      observer.disconnect();
       window.removeEventListener("scroll", place, true);
       window.removeEventListener("resize", place);
     };
@@ -191,7 +193,10 @@ export const DropdownMenu = forwardRef<
             className={cn(
               // pointer-events-auto: a modal Radix dialog sets `pointer-events:
               // none` on <body>, which this portal would otherwise inherit.
-              "pointer-events-auto z-[100] min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40",
+              // A menu is a surface that rises off the shell, so it is drawn
+              // lighter than the ground it opens over (see --popover) and
+              // leans on the shadow rather than a hard edge for separation.
+              "pointer-events-auto z-[100] min-w-44 overflow-y-auto overscroll-contain rounded-lg border border-popover-border bg-popover p-1 text-popover-foreground shadow-xl shadow-black/50",
               "animate-in fade-in-0 zoom-in-95 duration-100",
               menuClassName,
             )}
@@ -205,7 +210,7 @@ export const DropdownMenu = forwardRef<
 });
 
 const ITEM_CLASS =
-  "flex w-full cursor-default select-none items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none transition-colors hover:bg-accent focus-visible:bg-accent disabled:pointer-events-none disabled:opacity-50";
+  "flex w-full select-none items-center gap-2 rounded-md px-2 py-2 text-left text-sm outline-none transition-colors hover:bg-popover-accent focus-visible:bg-popover-accent disabled:pointer-events-none disabled:opacity-50";
 
 export function DropdownMenuItem({
   onSelect,
@@ -274,7 +279,7 @@ export function DropdownMenuItem({
 }
 
 export function DropdownMenuSeparator() {
-  return <hr className="mx-1 my-1 h-px border-0 bg-border" />;
+  return <hr className="mx-1 my-1 h-px border-0 bg-popover-border" />;
 }
 
 export function DropdownMenuLabel({

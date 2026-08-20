@@ -27,6 +27,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -38,6 +39,12 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+import {
+  type MenuPlacement,
+  measureMenu,
+  placeMenu,
+  pointAnchor,
+} from "@/components/ui/menu-position";
 import { useHostControl } from "@/hooks/useHostControl";
 import { ApiError, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -607,6 +614,38 @@ export const FileExplorer = forwardRef<
     };
   }, [menu]);
 
+  // Placed by the shared menu geometry rather than by hand: the context menu
+  // opens at the cursor, which near a viewport edge is exactly where a
+  // naively-positioned menu runs off the screen.
+  const [menuCoords, setMenuCoords] = useState<MenuPlacement | null>(null);
+  useLayoutEffect(() => {
+    if (!menu) {
+      setMenuCoords(null);
+      return;
+    }
+    const place = () => {
+      const { width, height } = measureMenu(menuRef.current, 176);
+      setMenuCoords(
+        placeMenu({
+          anchor: pointAnchor(menu.x, menu.y),
+          menuWidth: width,
+          menuHeight: height,
+          align: "start",
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+        }),
+      );
+    };
+    place();
+    const observer = new ResizeObserver(place);
+    if (menuRef.current) observer.observe(menuRef.current);
+    window.addEventListener("resize", place);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", place);
+    };
+  }, [menu]);
+
   const onRowKeyDown = (event: ReactKeyboardEvent) => {
     if (renaming || creatingIn !== null) return;
     const index = entryRows.findIndex((r) => r.entry.path === selected);
@@ -1010,17 +1049,8 @@ export const FileExplorer = forwardRef<
         <div
           ref={menuRef}
           role="menu"
-          className="fixed z-50 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40"
-          style={{
-            left: Math.min(
-              menu.x,
-              typeof window !== "undefined" ? window.innerWidth - 200 : menu.x,
-            ),
-            top: Math.min(
-              menu.y,
-              typeof window !== "undefined" ? window.innerHeight - 240 : menu.y,
-            ),
-          }}
+          className="fixed z-50 min-w-44 overflow-y-auto overscroll-contain rounded-lg border border-popover-border bg-popover p-1 text-popover-foreground shadow-xl shadow-black/50"
+          style={menuCoords ?? { position: "fixed", visibility: "hidden" }}
           onClick={() => setMenu(null)}
         >
           {rowActions(menu.entry, menu.parentDir)}

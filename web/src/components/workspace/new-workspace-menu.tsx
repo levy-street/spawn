@@ -146,6 +146,10 @@ export function NewWorkspaceMenu({
       <CascadeMenu
         root={root}
         className="block w-full"
+        // Narrower than the cascade default: the items are short labels, and
+        // in the sidebar the menu should sit inside the button it drops from
+        // rather than out-measuring it.
+        menuClassName="w-52"
         sheetTitle="New workspace"
         renderTrigger={(triggerProps) =>
           isValidElement(trigger) ? (
