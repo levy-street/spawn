@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { type FormEvent, useEffect, useRef, useState } from "react";
+import { NumberCheck } from "@/components/access/number-check";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { Button } from "@/components/ui/button";
@@ -31,6 +32,8 @@ import {
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class ApprovalIdentityError extends Error {}
+
+const POSSESS_TRIES = 3;
 
 /**
  * Bind the just-approved local pin to its Host UUID so the signed-RTC
@@ -88,12 +91,19 @@ export default function DevicePage() {
   );
 }
 
+/**
+ * Possessing a host (docs/TRUST_UX.md): `spawnd possess` prints a code that
+ * opens this page; the host's terminal then shows a six-digit number and this
+ * device TYPES it. The entry is the check — a correct number approves; three
+ * misses abort. Older hosts with no number fall back to comparing the full
+ * fingerprint, never a weaker code.
+ */
 function DeviceInner() {
   const { user } = useAuth();
   const router = useRouter();
   const registration = useBrowserDeviceRegistration(user?.id);
   const [code, setCode] = useState("");
-  // Set on a successful approval; drives the "connected" screen and the
+  // Set on a successful approval; drives the "possessed" screen and the
   // hand-off to the host's page once its id is known.
   const [connected, setConnected] = useState<{
     hostPublicKey: string;
@@ -109,8 +119,9 @@ function DeviceInner() {
   // (nothing to type), "manual" when the page was opened bare.
   const [phase, setPhase] = useState<"init" | "auto" | "manual">("init");
   const [verifyCode, setVerifyCode] = useState<string | null>(null);
-  // Set if the SAS number never arrives (daemon gone/slow) — then we fall back
-  // to the always-sound fingerprint so the human is never stuck on "computing".
+  // Set if the SAS number never arrives (daemon gone/slow), or the operator
+  // says "I don't see a number" — then we fall back to the always-sound
+  // fingerprint so the human is never stuck.
   const [sasTimedOut, setSasTimedOut] = useState(false);
   const [hostName, setHostName] = useState<string | null>(null);
   const [pending, setPending] = useState<DevicePendingApproval | null>(null);
@@ -118,8 +129,12 @@ function DeviceInner() {
   const [localPinCommitted, setLocalPinCommitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // Entry-style check state: three tries, then the ceremony is over.
+  const [triesLeft, setTriesLeft] = useState(POSSESS_TRIES);
+  const [entryError, setEntryError] = useState<string | null>(null);
+  const [stopped, setStopped] = useState(false);
 
-  // Load the pending approval and land on the fingerprint screen. Takes either
+  // Load the pending approval and land on the number screen. Takes either
   // the opaque URL ref (auto-open path — nothing typed) or a typed user_code,
   // and remembers which so approve reuses the exact same identifier.
   const review = async (id: { user_code?: string; approval_ref?: string }) => {
@@ -134,7 +149,7 @@ function DeviceInner() {
       const expectedFingerprint = await ed25519PublicKeyFingerprint(r.host_public_key);
       if (r.host_key_fingerprint !== expectedFingerprint) {
         throw new ApprovalIdentityError(
-          "Daemon fingerprint did not match its public key; approval was blocked",
+          "The host's fingerprint did not match its key; nothing was trusted",
         );
       }
       if (!user) throw new ApprovalIdentityError("The authenticated account is unavailable");
@@ -146,10 +161,13 @@ function DeviceInner() {
       });
       // The committed-ephemeral SAS number is computed by a separate effect once
       // the browser identity is ready (it needs our key B). No grindable code:
-      // when the daemon offers no commitment we show the full fingerprint.
+      // when the daemon offers no commitment we compare the full fingerprint.
       setVerifyCode(null);
       setSasTimedOut(false);
       sasStartedRef.current = false;
+      setTriesLeft(POSSESS_TRIES);
+      setEntryError(null);
+      setStopped(false);
       setIdentifier(lookup);
       setPending(r);
       setLocalPinState(existing?.state ?? "new");
@@ -175,7 +193,8 @@ function DeviceInner() {
   // Committed-ephemeral SAS (docs/TRUST_DEVICE_MESH.md Appendix A). Once we hold
   // a pending ceremony that carries the daemon's commitment Cd and our browser
   // identity is ready, contribute our fresh nonce Nb + key B, wait for the daemon
-  // to reveal Nd, verify Cd opens, and compute the number both sides display.
+  // to reveal Nd, verify Cd opens, and compute the number the host's terminal is
+  // showing — this side never displays it, only checks the operator's entry.
   const sasStartedRef = useRef(false);
   const runSas = async (
     p: DevicePendingApproval,
@@ -205,13 +224,13 @@ function DeviceInner() {
       }
       if (!nd) {
         // The daemon never revealed its nonce — fall back to the fingerprint,
-        // which both sides show, instead of leaving the human on "computing".
+        // which both sides show, instead of leaving the human stuck.
         setSasTimedOut(true);
         return;
       }
       if (!(await verifyCommit(commit, hostKey, nd))) {
         throw new ApprovalIdentityError(
-          "The host's SAS commitment did not open — approval was blocked",
+          "The host's number commitment did not open — nothing was trusted",
         );
       }
       setVerifyCode(await computeSas(hostKey, browserKey, nd, nb));
@@ -219,7 +238,7 @@ function DeviceInner() {
       setError(
         err instanceof ApiError || err instanceof ApprovalIdentityError
           ? err.message
-          : "Could not compute the verification code",
+          : "Could not compute the check number",
       );
     }
   };
@@ -235,7 +254,7 @@ function DeviceInner() {
   // The daemon opens this page with an opaque handle baked into the URL
   // (`/device?ref=…`, or `?code=…` from a pre-0029 server), so an approval needs
   // nothing typed. Set the phase from the URL, then auto-load once the account
-  // is known, landing straight on the verification screen.
+  // is known, landing straight on the number screen.
   const autoTriedRef = useRef(false);
   // biome-ignore lint/correctness/useExhaustiveDependencies: one-shot guarded by a ref; review intentionally omitted
   useEffect(() => {
@@ -250,8 +269,8 @@ function DeviceInner() {
   }, [user]);
 
   // After a successful approval, hand the operator off to the new host's page.
-  // Wait a beat so they read "connected", and — on a first pairing, where the
-  // approve response has no host id yet — poll briefly for the Host row the
+  // Wait a beat so they read the done screen, and — on a first pairing, where
+  // the approve response has no host id yet — poll briefly for the Host row the
   // daemon's next poll creates. Falls back to the hosts list if it never lands.
   useEffect(() => {
     if (!connected) return;
@@ -285,14 +304,12 @@ function DeviceInner() {
         localIdentity.publicKeyWire !== registration.data.device.public_key
       ) {
         throw new ApprovalIdentityError(
-          "Local browser identity changed; refresh and review the daemon again",
+          "This browser's identity changed; refresh and start over on the host",
         );
       }
       const expectedFingerprint = await ed25519PublicKeyFingerprint(pending.host_public_key);
       if (pending.host_key_fingerprint !== expectedFingerprint) {
-        throw new ApprovalIdentityError(
-          "Daemon fingerprint changed after review; approval was blocked",
-        );
+        throw new ApprovalIdentityError("The host's key changed mid-check; nothing was trusted");
       }
       await approveBrowserHostPin({
         accountId: user.id,
@@ -333,7 +350,7 @@ function DeviceInner() {
         r.browser_key_fingerprint !== registration.data.device.fingerprint
       ) {
         throw new ApprovalIdentityError(
-          "Approval response changed the reviewed host or browser identity",
+          "The approval response changed the reviewed host or browser identity",
         );
       }
       setHostName(r.host_name);
@@ -358,12 +375,45 @@ function DeviceInner() {
             : "Approval failed";
       setError(
         localPinPersisted
-          ? `The exact host fingerprint is saved locally, but server approval did not complete: ${message}. Retry server approval or review the code again; the local pin will remain.`
+          ? `The host's exact key is saved in this browser, but the server step did not complete: ${message}. Retrying is safe.`
           : message,
       );
     } finally {
       setSubmitting(false);
     }
+  };
+
+  /** The typed digits ARE the check: match → approve; three misses → over. */
+  const onSubmitDigits = (digits: string) => {
+    if (!verifyCode || submitting) return;
+    if (digits.replace(/\D/gu, "") === verifyCode.replace(/\D/gu, "")) {
+      setEntryError(null);
+      void onApprove();
+      return;
+    }
+    const remaining = triesLeft - 1;
+    if (remaining <= 0) {
+      setTriesLeft(0);
+      setStopped(true);
+      return;
+    }
+    setTriesLeft(remaining);
+    setEntryError(`That's not it — ${remaining} ${remaining === 1 ? "try" : "tries"} left.`);
+  };
+
+  const resetCeremony = () => {
+    setPending(null);
+    setVerifyCode(null);
+    setSasTimedOut(false);
+    setLocalPinState(null);
+    setLocalPinCommitted(false);
+    setEntryError(null);
+    setTriesLeft(POSSESS_TRIES);
+    setStopped(false);
+    setError(null);
+    setCode("");
+    setIdentifier(null);
+    setPhase("manual");
   };
 
   const deviceLabel =
@@ -372,125 +422,108 @@ function DeviceInner() {
     registration.isError || (registration.data && registration.data.status !== "ready");
   const busy = phase === "init" || (phase === "auto" && !pending && !hostName && !error);
 
+  // The one human check, mapped onto the shared component's phases.
+  const checkPhase = stopped
+    ? ("stopped" as const)
+    : hostName
+      ? ("done" as const)
+      : submitting && pending
+        ? ("waiting" as const)
+        : pending && (verifyCode || sasTimedOut || !pending.sas_commit)
+          ? ("compare" as const)
+          : ("connecting" as const);
+  const useFingerprint = Boolean(pending && (!pending.sas_commit || sasTimedOut));
+  // A server approval that failed after the local pin landed needs a retry
+  // surface, not the entry field again — the human check already passed.
+  const retryable = Boolean(error && localPinCommitted && pending);
+
   return (
     <div className="mx-auto flex min-h-[60vh] max-w-md flex-col justify-center p-4">
       <Card>
         <CardContent className="space-y-5 p-6">
-          {hostName ? (
-            <div className="space-y-1 text-center" role="status">
-              <p className="text-lg font-medium text-foreground">
-                <code>{hostName}</code> is connected.
-              </p>
-              <p className="text-sm text-muted-foreground">Taking you to it…</p>
-            </div>
-          ) : pending ? (
-            <div className="space-y-5">
-              <div className="text-center">
-                <p className="text-sm text-muted-foreground">Approve this host</p>
-                <p className="text-xl font-semibold text-foreground">{pending.host_name}</p>
-              </div>
+          {hostName || pending || busy || stopped ? (
+            <div className="space-y-4">
+              {!hostName && !stopped && (
+                <div className="text-center">
+                  <p className="text-sm text-muted-foreground">Possess a host</p>
+                  {pending && (
+                    <p className="text-xl font-semibold text-foreground">{pending.host_name}</p>
+                  )}
+                </div>
+              )}
 
-              {pending.sas_commit && !sasTimedOut ? (
-                <div className="space-y-2 rounded-lg border p-4 text-center">
-                  <p className="text-sm text-muted-foreground">
-                    Confirm this matches the code in your terminal
+              {retryable ? (
+                <div className="space-y-3">
+                  <p className="text-sm text-destructive" role="alert">
+                    {error}
                   </p>
-                  <p
-                    className="font-mono text-4xl font-semibold tracking-[0.15em] text-foreground tabular-nums"
-                    data-testid="verification-code"
-                  >
-                    {verifyCode ?? "· · ·"}
-                  </p>
-                  {!verifyCode && <p className="text-xs text-muted-foreground">computing…</p>}
-                  <p
-                    className="break-all font-mono text-[11px] text-muted-foreground/70"
-                    data-testid="host-key-fingerprint"
-                  >
-                    {pending.host_key_fingerprint}
-                  </p>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      className="flex-1"
+                      disabled={submitting}
+                      onClick={() => void onApprove()}
+                    >
+                      {submitting ? "Retrying…" : "Retry"}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={submitting}
+                      onClick={resetCeremony}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
                 </div>
               ) : (
-                // No sound short code (pre-SAS daemon, or the SAS never arrived):
-                // match the full fingerprint against the one in the terminal.
-                <div className="space-y-2 rounded-lg border p-4 text-center">
-                  <p className="text-sm text-muted-foreground">
-                    {sasTimedOut
-                      ? "Couldn't get the short code — confirm this fingerprint matches your terminal"
-                      : "Confirm this fingerprint matches the one in your terminal"}
-                  </p>
-                  <p
-                    className="break-all font-mono text-sm font-semibold text-foreground"
-                    data-testid="host-key-fingerprint"
-                  >
-                    {pending.host_key_fingerprint}
-                  </p>
-                </div>
+                <NumberCheck
+                  phase={checkPhase}
+                  mode="enter"
+                  fingerprint={useFingerprint ? pending?.host_key_fingerprint : undefined}
+                  otherScreen="in the host's terminal"
+                  doneText={`${hostName} is possessed. All your devices can reach it.`}
+                  entryError={entryError ?? undefined}
+                  stoppedText="The number wasn't right, so nothing was trusted. Start over from the host's terminal."
+                  onSubmit={onSubmitDigits}
+                  onMatch={() => void onApprove()}
+                  onNoMatch={() => {
+                    if (useFingerprint || !pending?.sas_commit) {
+                      // Fingerprint mismatch is terminal.
+                      setStopped(true);
+                    } else {
+                      // "I don't see a number" — the always-sound fallback.
+                      setSasTimedOut(true);
+                    }
+                  }}
+                  onDone={() => router.push("/hosts")}
+                  onClose={resetCeremony}
+                />
               )}
 
-              {localPinState === "revoked" && (
+              {localPinState === "revoked" && !stopped && !hostName && (
                 <p className="text-xs text-destructive" data-testid="local-pin-state">
-                  You previously removed this key from this browser. Approving trusts it again.
+                  You previously removed this host from this browser. Continuing trusts it again.
                 </p>
               )}
-              {error && (
+              {error && !retryable && !stopped && (
                 <p className="text-sm text-destructive" role="alert">
                   {error}
                 </p>
               )}
-              {localPinCommitted && (
-                <p className="text-xs text-muted-foreground" role="status">
-                  Saved in this browser — retrying is safe.
-                </p>
-              )}
-
-              <div className="flex gap-2">
-                <Button
-                  type="button"
-                  className="flex-1"
-                  // In SAS mode, don't let the human approve before there's
-                  // something to compare — the number, or (if it never arrived)
-                  // the fingerprint fallback.
-                  disabled={
-                    submitting ||
-                    registration.data?.status !== "ready" ||
-                    (Boolean(pending.sas_commit) && !verifyCode && !sasTimedOut)
-                  }
-                  onClick={onApprove}
-                >
-                  {submitting
-                    ? "Approving…"
-                    : localPinCommitted
-                      ? "Retry server approval"
-                      : "Approve"}
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  disabled={submitting}
-                  onClick={() => {
-                    setPending(null);
-                    setVerifyCode(null);
-                    setLocalPinState(null);
-                    setLocalPinCommitted(false);
-                  }}
-                >
-                  Cancel
-                </Button>
-              </div>
             </div>
-          ) : busy ? (
-            <p className="py-6 text-center text-sm text-muted-foreground">Loading host…</p>
           ) : (
             <form className="space-y-4" onSubmit={onReview}>
               <div className="space-y-1 text-center">
-                <p className="text-lg font-medium text-foreground">Connect a host</p>
-                <p className="text-sm text-muted-foreground">
-                  Enter the code from <code>spawnd possess</code>.
-                </p>
+                <p className="text-lg font-medium text-foreground">Possess a host</p>
+                <p className="text-sm text-muted-foreground">Run this on the host:</p>
+              </div>
+              <div className="rounded-lg border border-border bg-muted px-4 py-3 font-mono text-sm text-foreground">
+                <span className="select-none text-muted-foreground">$ </span>spawnd possess
               </div>
               <div className="space-y-1">
                 <Label htmlFor="user_code" className="sr-only">
-                  Code from the terminal
+                  Code from the host's terminal
                 </Label>
                 <Input
                   id="user_code"
@@ -511,6 +544,9 @@ function DeviceInner() {
                   }}
                   required
                 />
+                <p className="text-center text-xs text-muted-foreground">
+                  Enter the code its terminal prints.
+                </p>
               </div>
               {error && (
                 <p className="text-sm text-destructive" role="alert">
@@ -518,7 +554,7 @@ function DeviceInner() {
                 </p>
               )}
               <Button type="submit" className="w-full" disabled={submitting}>
-                {submitting ? "Checking…" : "Look up host"}
+                {submitting ? "Checking…" : "Continue"}
               </Button>
             </form>
           )}
