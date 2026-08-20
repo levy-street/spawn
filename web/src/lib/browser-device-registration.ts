@@ -226,7 +226,14 @@ export function useBrowserDeviceRegistration(userId: string | undefined) {
     queryFn: () => registerBrowserDevice(userId!),
     enabled: userId !== undefined,
     retry: false,
-    staleTime: Number.POSITIVE_INFINITY,
+    // Registration is the reconcile: it stamps last-seen and is the moment a
+    // device discovers it was removed elsewhere (409-revoked → seamless key
+    // replacement). Long-lived pages must keep having that moment — a page
+    // that registers once and never again retries dead keys forever. Focus
+    // and a slow interval keep every open page honest within ~a minute.
+    staleTime: 30_000,
+    refetchInterval: 90_000,
+    refetchOnWindowFocus: "always",
   });
 
   useEffect(() => {
