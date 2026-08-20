@@ -130,6 +130,10 @@ export function useApproveDeviceCeremony({
   const noncesRef = useRef<Map<string, Uint8Array>>(new Map());
   // Guards so a poll that fires before the previous write lands does not double-submit.
   const actedRef = useRef<Set<string>>(new Set());
+  // Role/peer per pairing, remembered past the relay row's deletion.
+  const rolesRef = useRef<Map<string, { role: ApproveCeremonyRole; peerDeviceId: string }>>(
+    new Map(),
+  );
   const [records, setRecords] = useState<Map<string, CeremonyRecord>>(new Map());
   const [error, setError] = useState<string | null>(null);
 
@@ -432,6 +436,10 @@ export function useApproveDeviceCeremony({
       pairing.initiator_device_id === currentDevice.id ? "approver" : "new-device";
     const peerDeviceId =
       role === "approver" ? pairing.joiner_device_id : pairing.initiator_device_id;
+    // Remember who this ceremony was with: the completed pairing is deleted
+    // from the relay while the done screen is still up, and the screen must
+    // not forget its role or peer when that happens.
+    rolesRef.current.set(pairing.id, { role, peerDeviceId });
     views.push({
       pairingId: pairing.id,
       role,
@@ -452,14 +460,15 @@ export function useApproveDeviceCeremony({
     });
   }
   // Ceremonies whose pairing vanished after completion still deserve their
-  // done screen until dismissed.
+  // done screen until dismissed — with the role and peer they ran under.
   for (const [id, record] of records) {
     if (!record.done || views.some((v) => v.pairingId === id)) continue;
+    const remembered = rolesRef.current.get(id);
     views.push({
       pairingId: id,
-      role: "new-device",
-      peerDeviceId: "",
-      peerName: "the other device",
+      role: remembered?.role ?? "new-device",
+      peerDeviceId: remembered?.peerDeviceId ?? "",
+      peerName: remembered ? labelFor(remembered.peerDeviceId) : "the other device",
       phase: "done",
       number: record.sas,
       entryError: null,

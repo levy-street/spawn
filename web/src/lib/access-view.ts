@@ -230,8 +230,25 @@ export function deriveTrustEvents(input: AccessViewInput, now: Date): TrustEvent
   const named = (id: string) => nameOf.get(id) ?? "A removed device";
   const events: Array<TrustEventVM & { at: number }> = [];
 
+  // The approve ceremony records a MUTUAL endorsement: the approver's edge
+  // first, the new device's reciprocal seconds later. One human action, one
+  // history line — the reciprocal (the strictly later reverse edge) is the
+  // same event, not a second approval.
+  const earliestByPair = new Map<string, number>();
+  for (const e of input.edges) {
+    const key = `${e.endorser_device_id}→${e.endorsed_device_id}`;
+    const at = parse(e.created_at);
+    const prior = earliestByPair.get(key);
+    if (prior === undefined || at < prior) earliestByPair.set(key, at);
+  }
+  const isReciprocal = (e: AccessEdge): boolean => {
+    const reverse = earliestByPair.get(`${e.endorsed_device_id}→${e.endorser_device_id}`);
+    return reverse !== undefined && reverse < parse(e.created_at);
+  };
+
   for (const e of input.edges) {
     if (roots.has(e.endorsed_device_id)) continue;
+    if (isReciprocal(e)) continue;
     events.push(
       roots.has(e.endorser_device_id)
         ? {
