@@ -143,15 +143,17 @@ export async function retrofitAccountRoot(
   unlockWith: PasskeyWrapInput,
   serverRevision: number,
   root: AccountRootMaterial,
+  /** Root ROTATION: replace a sealed root whose key was revoked (never a live one). */
+  replace = false,
 ): Promise<{ readonly sealed: string; readonly revision: number } | null> {
   const opened = await openTrustEnvelope(scope.accountId, sealed, unlockWith);
-  if (opened.root !== null) return null;
+  if (opened.root !== null && !replace) return null;
   await enforceBundleFreshness(scope.accountId, opened.revision, revisionOptions(scope));
   const floor = await readHighestSeenRevision(scope.accountId, revisionOptions(scope));
   const revision =
     Math.max(floor, Number.isInteger(serverRevision) ? serverRevision : 0, opened.revision) + 1;
   return {
-    sealed: await setEnvelopeRoot(scope.accountId, sealed, unlockWith, root, revision),
+    sealed: await setEnvelopeRoot(scope.accountId, sealed, unlockWith, root, revision, replace),
     revision,
   };
 }

@@ -315,12 +315,13 @@ export async function setEnvelopeRoot(
   unlockWith: PasskeyWrapInput,
   root: AccountRootMaterial,
   revision: number,
+  replace = false,
 ): Promise<string> {
   requireAccountId(accountId);
   const envelope = parseEnvelope(accountId, wire);
   const dataKey = await recoverDataKey(envelope, accountId, unlockWith);
   const bundle = await openSealedBundle(dataKey, accountId, envelope.sealed);
-  if (bundle.root !== null) {
+  if (bundle.root !== null && !replace) {
     throw new TrustBundleError("invalid_bundle", "the trust bundle already holds an account root");
   }
   if (revision <= bundle.revision) {

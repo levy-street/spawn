@@ -246,7 +246,38 @@ export function TrustPanel() {
       // upgrade hosts to anchor on it, then let the key go out of scope.
       let report: AccountHealReport | null = null;
       if (imported.root !== null) {
-        report = await healBestEffort(id, await importAccountRoot(imported.root), imported.hosts);
+        // Root ROTATION (compromise response): if the sealed root's key was
+        // revoked, mint a successor over it and heal off that instead. The old
+        // key stays dead — revocation is a permanent tombstone (R10) — and the
+        // deny-list has already severed everything anchored on it.
+        const deviceRows = await browserDevices.list();
+        const sealedPk = imported.root.publicKeyWire;
+        const sealedRootRevoked = deviceRows.some(
+          (d) => d.public_key === sealedPk && d.revoked_at !== null,
+        );
+        const liveRoot = deviceRows.find((d) => d.is_root && d.revoked_at === null);
+        if (sealedRootRevoked && liveRoot === undefined) {
+          const successor = await generateAccountRoot();
+          const rotated = await retrofitAccountRoot(
+            { accountId: id },
+            stored.sealed,
+            { credentialId, prfSecret: secret },
+            stored.revision,
+            await exportAccountRootMaterial(successor),
+            true,
+          );
+          if (rotated !== null) {
+            try {
+              await trust.putBundle(rotated.sealed, stored.revision);
+            } catch {
+              return { imported, report };
+            }
+            await recordBundleRevision({ accountId: id }, rotated.revision);
+            report = await healBestEffort(id, successor, imported.hosts);
+          }
+        } else {
+          report = await healBestEffort(id, await importAccountRoot(imported.root), imported.hosts);
+        }
       } else {
         // Pre-root bundle: retrofit a freshly minted root under the same data
         // key (every enrolled passkey keeps working), store it durably, and
