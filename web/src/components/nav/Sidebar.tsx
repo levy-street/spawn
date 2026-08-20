@@ -232,9 +232,9 @@ export function Sidebar({
             <Settings className="size-4" aria-hidden />
             Settings
           </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => openSettings("trust")}>
+          <DropdownMenuItem onSelect={() => openSettings("access")}>
             <ShieldCheck className="size-4" aria-hidden />
-            Device trust
+            Access
           </DropdownMenuItem>
           <DropdownMenuItem
             destructive

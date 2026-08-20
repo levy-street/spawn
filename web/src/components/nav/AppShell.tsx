@@ -10,6 +10,7 @@ import {
   useLayoutEffect,
   useState,
 } from "react";
+import { AccessCeremonyHost } from "@/components/access/ceremony-host";
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
 import { BottomTabs } from "@/components/nav/BottomTabs";
 import { SIDEBAR_RAIL_WIDTH, Sidebar } from "@/components/nav/Sidebar";
@@ -172,6 +173,7 @@ export function AppShell({
       </div>
       {!hideMobileNav && <BottomTabs />}
       <SettingsDialog />
+      <AccessCeremonyHost />
     </div>
   );
 }

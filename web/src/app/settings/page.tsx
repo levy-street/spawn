@@ -4,9 +4,17 @@ import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
-import { openSettings, type SettingsTab } from "@/components/settings/settings-dialog-store";
+import { openSettings, type SettingsTabRequest } from "@/components/settings/settings-dialog-store";
 
-const TAB_KEYS: SettingsTab[] = ["account", "devices", "trust", "skills"];
+// "devices" and "trust" are the old tab names; both open Access now.
+const TAB_KEYS: SettingsTabRequest[] = [
+  "account",
+  "appearance",
+  "access",
+  "devices",
+  "trust",
+  "skills",
+];
 
 /**
  * Settings lives in the app-wide modal now. This route stays as the stable
@@ -20,8 +28,8 @@ const TAB_KEYS: SettingsTab[] = ["account", "devices", "trust", "skills"];
 function SettingsRedirect() {
   const params = useSearchParams();
   useEffect(() => {
-    const requested = params.get("tab") as SettingsTab | null;
-    openSettings(requested !== null && TAB_KEYS.includes(requested) ? requested : "devices");
+    const requested = params.get("tab") as SettingsTabRequest | null;
+    openSettings(requested !== null && TAB_KEYS.includes(requested) ? requested : "access");
   }, [params]);
   return null;
 }

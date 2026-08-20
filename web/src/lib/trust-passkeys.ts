@@ -1,9 +1,19 @@
 "use client";
 
+/**
+ * Passkey-backed trust, as one reusable hook (docs/TRUST_UX.md: the passkey is
+ * the whole safety story — "recovery" is not a concept the UI teaches).
+ *
+ * Every flow here was extracted verbatim from the retired TrustPanel; the
+ * mutation bodies are the security-reviewed originals (mesh stage 5): set up
+ * (mint root + seal), unlock (import + heal + rotate-if-revoked), backup
+ * enrollment, two-passkey revocation, and forget-this-browser. Surfaces mount
+ * whichever slices they need — the Access screen its "Use passkey" and "Add
+ * passkey" moments, account settings the passkey list.
+ */
+
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { openSettings } from "@/components/settings/settings-dialog-store";
-import { Button } from "@/components/ui/button";
 import {
   AccountHealError,
   type AccountHealReport,
@@ -38,11 +48,11 @@ import {
 } from "@/lib/trust-bootstrap";
 import type { TrustBundleHost } from "@/lib/trust-bundle";
 
-function describe(error: unknown): string {
+export function describePasskeyError(error: unknown): string {
   if (error instanceof PasskeyPrfError) {
     switch (error.code) {
       case "prf_unavailable":
-        return "This passkey cannot derive a trust secret. Its authenticator does not support the PRF extension, so this device needs the endorsement path instead.";
+        return "This passkey cannot protect your devices — its authenticator does not support the required extension.";
       case "cancelled":
         return "The passkey prompt was dismissed.";
       case "no_credential":
@@ -85,15 +95,13 @@ function describeHeal(report: AccountHealReport | null): string {
   if (report === null) return "";
   const healed = report.endorsedDeviceIds.length;
   const parts: string[] = [];
-  if (healed > 0) parts.push(`${healed} device${healed === 1 ? "" : "s"} re-rooted`);
+  if (healed > 0) parts.push(`${healed} device${healed === 1 ? "" : "s"} approved`);
   if (report.hostsUpgraded > 0)
-    parts.push(
-      `${report.hostsUpgraded} host${report.hostsUpgraded === 1 ? "" : "s"} anchored on your account root`,
-    );
-  return parts.length === 0 ? "" : ` Healed: ${parts.join(", ")}.`;
+    parts.push(`${report.hostsUpgraded} host${report.hostsUpgraded === 1 ? "" : "s"} protected`);
+  return parts.length === 0 ? "" : ` (${parts.join(", ")}.)`;
 }
 
-export function TrustPanel() {
+export function usePasskeyTrust() {
   const { user } = useAuth();
   const accountId = user?.id ?? null;
   const queryClient = useQueryClient();
@@ -121,7 +129,6 @@ export function TrustPanel() {
     enabled: accountId !== null,
     staleTime: Number.POSITIVE_INFINITY,
   });
-
   const localPins = useQuery({
     queryKey: ["trust", "local-pins", accountId],
     queryFn: () =>
@@ -149,14 +156,13 @@ export function TrustPanel() {
       // passkey cannot open it. Sealing this device's pins over an existing
       // bundle would lose the operator's other host keys AND lock every enrolled
       // passkey out of the old bundle at once. Enrolling another key or device
-      // uses the key-wrapping ceremony ("Add a backup passkey" / "Unlock"),
+      // uses the key-wrapping ceremony ("Add a backup passkey" / "Use passkey"),
       // never this path — so refuse outright when a bundle already exists.
       const existing = await trust.getBundle();
       if (existing !== null) {
         throw new Error(
-          "A trust bundle already exists for this account. Use “Unlock trust on this device” to " +
-            "import it, or “Add a backup passkey” to enroll another key. Setting up here would " +
-            "overwrite it and lock out your other devices.",
+          "This account already has a passkey-protected setup. Use “Use passkey” to bring it to " +
+            "this device, or add a backup passkey — setting up again here would overwrite it.",
         );
       }
 
@@ -168,8 +174,8 @@ export function TrustPanel() {
       );
       if (priorRoot !== undefined) {
         throw new Error(
-          "This account already has a root key from a previous setup. Revoke it under Devices " +
-            "before setting up a new passkey, so the new bundle can mint a fresh one.",
+          "This account still has keys from a previous passkey setup. Remove them under " +
+            "Access → Advanced before setting up a new passkey.",
         );
       }
 
@@ -177,7 +183,7 @@ export function TrustPanel() {
       if (!passkey.prfEnabled) {
         throw new PasskeyPrfError(
           "prf_unavailable",
-          "this authenticator reported no PRF support, so it cannot unlock a trust bundle",
+          "this authenticator reported no PRF support, so it cannot protect your devices",
         );
       }
       await trust.addPasskey(passkey.credentialId, "this device");
@@ -215,25 +221,29 @@ export function TrustPanel() {
       return { hostCount, report };
     },
     onMutate: begin,
-    onSuccess: ({ hostCount, report }) => {
+    onSuccess: ({ report }) => {
       setStatus(
-        `Passkey ready. ${hostCount} verified host${hostCount === 1 ? "" : "s"} sealed into your trust bundle.` +
-          describeHeal(report),
+        `Passkey added. If you lose every device, it brings everything back.${describeHeal(report)}`,
       );
       queryClient.invalidateQueries({ queryKey: ["trust"] });
+      queryClient.invalidateQueries({ queryKey: ["browser-devices"] });
+      queryClient.invalidateQueries({ queryKey: ["account-endorsements"] });
     },
-    onError: (err) => setError(describe(err)),
+    onError: (err) => setError(describePasskeyError(err)),
   });
 
-  /** Unlock on a device that has never been paired from a host terminal. */
+  /**
+   * The one passkey verb a device ever needs: prove the passkey, inherit the
+   * account's trusted hosts, and let the sealed root approve this device and
+   * re-protect hosts (mesh stage 5c heal; rotation if the sealed root was
+   * revoked).
+   */
   const unlock = useMutation({
     mutationFn: async () => {
       const id = accountId as string;
       const stored = await trust.getBundle();
       if (stored === null) {
-        throw new Error(
-          "No trust bundle has been sealed yet. Set one up on a paired device first.",
-        );
+        throw new Error("This account has no passkey yet. Add one on a device that works.");
       }
       const known = (await trust.listPasskeys()).map((row) => row.credential_id);
       const { credentialId, secret } = await evaluateTrustPrf(id, known);
@@ -307,22 +317,20 @@ export function TrustPanel() {
     onSuccess: ({ imported, report }) => {
       const base =
         imported.added.length === 0
-          ? `Already up to date — ${imported.alreadyTrusted.length} host${imported.alreadyTrusted.length === 1 ? "" : "s"} already trusted on this device.`
-          : `Imported ${imported.added.length} host${imported.added.length === 1 ? "" : "s"} onto this device.`;
-      const skipped =
-        imported.skippedRevoked.length === 0
-          ? ""
-          : ` ${imported.skippedRevoked.length} host${imported.skippedRevoked.length === 1 ? "" : "s"} you revoked here ${imported.skippedRevoked.length === 1 ? "was" : "were"} left revoked.`;
-      setStatus(base + skipped + describeHeal(report));
+          ? "This device already knows your hosts."
+          : `${imported.added.length} host${imported.added.length === 1 ? "" : "s"} now reachable from this device.`;
+      setStatus(base + describeHeal(report));
       queryClient.invalidateQueries({ queryKey: ["trust"] });
+      queryClient.invalidateQueries({ queryKey: ["browser-devices"] });
+      queryClient.invalidateQueries({ queryKey: ["account-endorsements"] });
     },
-    onError: (err) => setError(describe(err)),
+    onError: (err) => setError(describePasskeyError(err)),
   });
 
   /**
    * Recovery for a device holding pins the daemon will not accept: it signs
    * offers that are refused, which looks like a terminal that never connects.
-   * Unpinned it works again, unprotected, and can be re-endorsed after.
+   * Unpinned it works again, unprotected, and can be re-approved after.
    */
   const forget = useMutation({
     mutationFn: () => forgetTrustOnThisDevice({ accountId: accountId as string }),
@@ -335,7 +343,7 @@ export function TrustPanel() {
       );
       queryClient.invalidateQueries({ queryKey: ["trust"] });
     },
-    onError: (err) => setError(describe(err)),
+    onError: (err) => setError(describePasskeyError(err)),
   });
 
   /**
@@ -348,7 +356,7 @@ export function TrustPanel() {
       const id = accountId as string;
       const stored = await trust.getBundle();
       if (stored === null) {
-        throw new Error("Set up a passkey on this device first; there is nothing to back up yet.");
+        throw new Error("Add a passkey first; there is nothing to back up yet.");
       }
       const known = (await trust.listPasskeys()).map((row) => row.credential_id);
       const existing = await evaluateTrustPrf(id, known);
@@ -371,10 +379,10 @@ export function TrustPanel() {
     },
     onMutate: begin,
     onSuccess: () => {
-      setStatus("Backup passkey enrolled. Either passkey now opens your trust bundle.");
+      setStatus("Backup passkey added. Either passkey now works.");
       queryClient.invalidateQueries({ queryKey: ["trust"] });
     },
-    onError: (err) => setError(describe(err)),
+    onError: (err) => setError(describePasskeyError(err)),
   });
 
   /**
@@ -382,18 +390,18 @@ export function TrustPanel() {
    * Restricted to the two-passkey case: with more, a single device cannot gather
    * every survivor's secret to re-wrap, so revoking here would drop the others.
    */
-  const revoke = useMutation({
+  const revokePasskey = useMutation({
     mutationFn: async (target: PasskeyCredential) => {
       const id = accountId as string;
       const stored = await trust.getBundle();
       if (stored === null) {
-        throw new Error("There is no sealed bundle to revoke a passkey from.");
+        throw new Error("There is no passkey-protected setup to remove a passkey from.");
       }
       const survivors = (await trust.listPasskeys()).filter((row) => row.id !== target.id);
       if (survivors.length !== 1) {
         throw new Error(
-          "Revoking needs exactly one surviving passkey so this device can reseal for it. " +
-            "With more than two enrolled, revoke from each surviving device instead.",
+          "Removing needs exactly one surviving passkey so this device can reseal for it. " +
+            "With more than two enrolled, remove from each surviving device instead.",
         );
       }
       const survivor = survivors[0];
@@ -413,221 +421,34 @@ export function TrustPanel() {
     },
     onMutate: begin,
     onSuccess: () => {
-      setStatus("Passkey revoked. It can no longer open your trust bundle.");
+      setStatus("Passkey removed. It no longer opens anything.");
       queryClient.invalidateQueries({ queryKey: ["trust"] });
     },
-    onError: (err) => setError(describe(err)),
+    onError: (err) => setError(describePasskeyError(err)),
   });
 
-  const supported = isPasskeySupported();
   const busy =
     setUp.isPending ||
     unlock.isPending ||
     forget.isPending ||
     addBackup.isPending ||
-    revoke.isPending;
-  const hasBundle = bundle.data !== null && bundle.data !== undefined;
-  const pinCount = localPins.data?.length ?? null;
-  const passkeyCount = passkeys.data?.length ?? null;
+    revokePasskey.isPending;
 
-  const actionRow = (props: { title: string; description: string; button: React.ReactNode }) => (
-    <div className="flex items-start justify-between gap-3 border-t border-border py-3 first:border-t-0 first:pt-0 last:pb-0">
-      <div className="min-w-0">
-        <p className="text-sm font-medium">{props.title}</p>
-        <p className="text-xs text-muted-foreground">{props.description}</p>
-      </div>
-      <div className="shrink-0">{props.button}</div>
-    </div>
-  );
-
-  return (
-    <section className="flex flex-col gap-4">
-      <div>
-        <h2 className="text-lg font-semibold">Device trust</h2>
-        <p className="text-sm text-muted-foreground">
-          Carry the hosts this browser has verified to your other devices, protected by a passkey.
-        </p>
-      </div>
-      {!supported && (
-        <p className="text-sm text-muted-foreground">
-          This browser cannot use passkeys here. Passkeys need a secure context (HTTPS).
-        </p>
-      )}
-
-      <p className="text-sm">
-        This browser recognizes{" "}
-        <span className="font-semibold" data-testid="local-pin-count">
-          {pinCount ?? "…"}
-        </span>{" "}
-        host{pinCount === 1 ? "" : "s"}.{" "}
-        {bundle.isLoading ? (
-          <span data-testid="bundle-state">…</span>
-        ) : hasBundle ? (
-          <>
-            <span data-testid="bundle-state">Your saved trust</span> opens with any of{" "}
-            <span className="font-semibold" data-testid="passkey-count">
-              {passkeyCount ?? "…"}
-            </span>{" "}
-            passkey{passkeyCount === 1 ? "" : "s"}.
-          </>
-        ) : (
-          <>
-            <span data-testid="bundle-state">No saved trust yet</span> — set up a passkey below so
-            new devices can inherit your hosts (
-            <span data-testid="passkey-count">{passkeyCount ?? 0}</span> passkey
-            {passkeyCount === 1 ? "" : "s"} registered).
-          </>
-        )}
-      </p>
-
-      <div>
-        {!hasBundle &&
-          actionRow({
-            title: "Set up a passkey",
-            description: "Saves this browser's verified hosts under a new passkey.",
-            button: (
-              <Button
-                type="button"
-                disabled={!supported || busy || accountId === null}
-                onClick={() => setUp.mutate()}
-                data-testid="setup-passkey"
-              >
-                {setUp.isPending ? "Setting up…" : "Set up"}
-              </Button>
-            ),
-          })}
-        {actionRow({
-          title: "Unlock saved trust here",
-          description: "Recognize the hosts you verified elsewhere, using your passkey.",
-          button: (
-            <Button
-              type="button"
-              variant="secondary"
-              disabled={!supported || busy || accountId === null}
-              onClick={() => unlock.mutate()}
-              data-testid="unlock-trust"
-            >
-              {unlock.isPending ? "Unlocking…" : "Unlock"}
-            </Button>
-          ),
-        })}
-        {hasBundle &&
-          actionRow({
-            title: "Add a backup passkey",
-            description: "A second passkey that opens the same saved trust.",
-            button: (
-              <Button
-                type="button"
-                variant="secondary"
-                disabled={!supported || busy || accountId === null}
-                onClick={() => addBackup.mutate()}
-                data-testid="add-backup-passkey"
-              >
-                {addBackup.isPending ? "Enrolling…" : "Add backup"}
-              </Button>
-            ),
-          })}
-      </div>
-
-      {(passkeys.data?.length ?? 0) > 0 && (
-        <div className="rounded border p-3 text-sm" data-testid="passkey-list">
-          <p className="font-semibold">Your passkeys</p>
-          <ul className="mt-1 flex flex-col gap-2">
-            {passkeys.data?.map((passkey) => (
-              <li key={passkey.id} className="flex items-center justify-between gap-2">
-                <span className="truncate">{passkey.label ?? "passkey"}</span>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  className="shrink-0"
-                  disabled={busy || accountId === null || (passkeys.data?.length ?? 0) !== 2}
-                  onClick={() => revoke.mutate(passkey)}
-                  data-testid="revoke-passkey"
-                >
-                  {revoke.isPending ? "Revoking…" : "Revoke"}
-                </Button>
-              </li>
-            ))}
-          </ul>
-          {(passkeys.data?.length ?? 0) === 1 && (
-            <p className="mt-2 text-xs text-muted-foreground">
-              Add a backup passkey before revoking — revoking your only passkey would lock you out
-              of your saved trust.
-            </p>
-          )}
-          {(passkeys.data?.length ?? 0) > 2 && (
-            <p className="mt-2 text-xs text-muted-foreground">
-              Revoking needs exactly two passkeys enrolled. With more, this device cannot reseal for
-              every survivor — revoke from each surviving device instead.
-            </p>
-          )}
-        </div>
-      )}
-
-      {status !== null && (
-        <p className="text-sm font-medium" data-testid="trust-status">
-          {status}
-        </p>
-      )}
-      {error !== null && (
-        <p className="text-sm font-medium text-destructive" data-testid="trust-error">
-          {error}
-        </p>
-      )}
-
-      <details>
-        <summary className="cursor-pointer text-sm text-muted-foreground">
-          Recovery &amp; diagnostics
-        </summary>
-        <div className="mt-2 flex flex-col gap-3">
-          {actionRow({
-            title: "Forget trust on this browser",
-            description:
-              "Removes every host this browser recognizes; connections are unprotected until trusted again.",
-            button: (
-              <Button
-                type="button"
-                variant="secondary"
-                disabled={busy || accountId === null || (localPins.data?.length ?? 0) === 0}
-                onClick={() => forget.mutate()}
-                data-testid="forget-trust"
-              >
-                {forget.isPending ? "Forgetting…" : "Forget"}
-              </Button>
-            ),
-          })}
-          <div className="rounded border p-3 text-sm" data-testid="storage-report">
-            <p className="font-semibold">Browser storage</p>
-            {storage.isLoading || storage.data === undefined ? (
-              <p className="text-muted-foreground">checking…</p>
-            ) : (
-              <ul className="mt-1 font-mono text-xs">
-                <li>device identity persisted: {String(storage.data.identityPersisted)}</li>
-                <li>plain value persists: {String(storage.data.probe.plainValuePersists)}</li>
-                <li>Ed25519 key persists: {String(storage.data.probe.ed25519KeyPersists)}</li>
-                <li>ECDSA key persists: {String(storage.data.probe.ecdsaKeyPersists)}</li>
-                {storage.data.probe.failure !== null && (
-                  <li className="text-destructive">failure: {storage.data.probe.failure}</li>
-                )}
-              </ul>
-            )}
-            {storage.data !== undefined && !storage.data.identityPersisted && (
-              <p className="mt-2 text-destructive">
-                This browser did not keep its device identity. It will mint a new one on every load
-                and can never be trusted, so signed connections cannot work here.
-              </p>
-            )}
-          </div>
-        </div>
-      </details>
-
-      <p className="border-t border-border pt-3 text-xs text-muted-foreground">
-        Approving new devices happens in{" "}
-        <button type="button" className="underline" onClick={() => openSettings("devices")}>
-          Browser devices
-        </button>
-        : press Approve next to the waiting device and compare fingerprints.
-      </p>
-    </section>
-  );
+  return {
+    accountId,
+    passkeys,
+    bundle,
+    storage,
+    localPins,
+    setUp,
+    unlock,
+    forget,
+    addBackup,
+    revokePasskey,
+    busy,
+    status,
+    error,
+    supported: isPasskeySupported(),
+    hasBundle: bundle.data !== null && bundle.data !== undefined,
+  };
 }
