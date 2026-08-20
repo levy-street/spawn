@@ -147,7 +147,7 @@ function DeviceInner() {
       const expectedFingerprint = await ed25519PublicKeyFingerprint(r.host_public_key);
       if (r.host_key_fingerprint !== expectedFingerprint) {
         throw new ApprovalIdentityError(
-          "The host's fingerprint did not match its key; nothing was trusted",
+          "The host's identity did not check out; nothing was trusted",
         );
       }
       if (!user) throw new ApprovalIdentityError("The authenticated account is unavailable");
@@ -302,7 +302,9 @@ function DeviceInner() {
       }
       const expectedFingerprint = await ed25519PublicKeyFingerprint(pending.host_public_key);
       if (pending.host_key_fingerprint !== expectedFingerprint) {
-        throw new ApprovalIdentityError("The host's key changed mid-check; nothing was trusted");
+        throw new ApprovalIdentityError(
+          "The host's identity changed mid-check; nothing was trusted",
+        );
       }
       await approveBrowserHostPin({
         accountId: user.id,
@@ -367,7 +369,7 @@ function DeviceInner() {
             : "Approval failed";
       setError(
         localPinPersisted
-          ? `The host's exact key is saved in this browser, but the server step did not complete: ${message}. Retrying is safe.`
+          ? `The host's exact identity is saved in this browser, but the server step did not complete: ${message}. Retrying is safe.`
           : message,
       );
     } finally {

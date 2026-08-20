@@ -215,7 +215,9 @@ export function AccessPanel() {
         void qc.invalidateQueries({ queryKey: ["browser-device-local-identity", user.id] });
       } catch (cause) {
         const detail = cause instanceof Error ? cause.message : String(cause);
-        throw new Error(`The device was removed, but local key cleanup failed: ${detail}`);
+        throw new Error(
+          `The device was removed, but this browser could not finish cleaning up its old identity: ${detail}`,
+        );
       }
       return revoked;
     },
@@ -237,7 +239,7 @@ export function AccessPanel() {
       void qc.invalidateQueries({ queryKey: browserDeviceRegistrationQueryKey(user.id) });
       void qc.invalidateQueries({ queryKey: ["browser-device-local-identity", user.id] });
     } catch (cause) {
-      setError(`Local key cleanup still failed: ${cause instanceof Error ? cause.message : cause}`);
+      setError(`The cleanup still failed: ${cause instanceof Error ? cause.message : cause}`);
     }
   };
 
@@ -346,8 +348,8 @@ export function AccessPanel() {
       {registration.data?.status === "cleanup_pending" && (
         <div className="space-y-2 rounded-md border border-border p-3" role="alert">
           <p className="text-sm text-amber-700 dark:text-amber-300">
-            This device was removed, but deleting its local key failed. Nothing can use it anymore;
-            retry to finish cleaning up.
+            This device was removed, but cleaning up its old identity failed. Nothing can use it
+            anymore; retry to finish cleaning up.
           </p>
           <Button
             size="sm"
@@ -731,7 +733,7 @@ export function AccessPanel() {
                 <p className="text-sm font-medium">Reset passkey trust</p>
                 <p className="text-xs text-muted-foreground">
                   If you suspect your passkey was compromised: everything it approved loses that
-                  trust immediately, and your next passkey use starts a fresh anchor.
+                  trust immediately, and your next passkey use rebuilds it from scratch.
                 </p>
               </div>
               <Button
@@ -742,10 +744,10 @@ export function AccessPanel() {
                 onClick={() => {
                   if (
                     confirm(
-                      `Reset passkey trust?\n\nEvery device and host anchored on your passkey ` +
+                      `Reset passkey trust?\n\nEvery device and host your passkey approved ` +
                         `loses that trust immediately. Do this if you suspect the passkey was ` +
-                        `compromised. The next passkey use mints a fresh anchor and re-approves ` +
-                        `your devices.\n\nIts key fingerprint is ${rootFingerprint}.`,
+                        `compromised. The next passkey use starts fresh and re-approves ` +
+                        `your devices.\n\nIts fingerprint is ${rootFingerprint}.`,
                     )
                   ) {
                     revoke.mutate(liveRoot);
@@ -779,8 +781,8 @@ export function AccessPanel() {
                     confirm(
                       `Clear ${revokedRows.length} removed device${
                         revokedRows.length === 1 ? "" : "s"
-                      } from history?\n\nRemoval still stands — a cleared device can only ` +
-                        "come back through a fresh approval, like any new device.",
+                      } from history?\n\nRemoval is permanent — a cleared device stays locked ` +
+                        "out and can only come back through a fresh approval, like any new device.",
                     )
                   ) {
                     prune.mutate();
@@ -889,11 +891,17 @@ export function AccessPanel() {
           <Dialog.Content className="fixed left-1/2 top-1/2 z-[60] w-[min(100vw-2rem,420px)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-background p-5 shadow-2xl focus:outline-none">
             <Dialog.Title className="sr-only">Remove device</Dialog.Title>
             <Dialog.Description className="sr-only">
-              Removing a device revokes its access to every host, permanently.
+              Removing a device ends its access to every host, permanently.
             </Dialog.Description>
             {removeTarget && (
               <RemoveDeviceDialog
-                deviceName={removeTarget.label ?? "Unnamed device"}
+                // The roster's (suffix-disambiguated) name, so the dialog names
+                // the exact row the operator acted on, never a namesake.
+                deviceName={
+                  deviceRows.find((vm) => vm.id === removeTarget.id)?.name ??
+                  removeTarget.label ??
+                  "Unnamed device"
+                }
                 isThisDevice={removeTarget.public_key === currentPublicKey}
                 orphans={removeOrphans}
                 hasPasskey={hasPasskeyProtection}
