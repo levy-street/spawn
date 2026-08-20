@@ -14,6 +14,7 @@
  * replayed into another account or reinterpreted under a later format.
  */
 
+import type { AccountRootMaterial } from "./account-root";
 import { ed25519PublicKeyFingerprint, encodeBase64Url } from "./signed-signal";
 
 /** Domain separation: this secret must never collide with another PRF use. */
@@ -70,6 +71,28 @@ export interface TrustBundle {
    */
   readonly revision: number;
   readonly hosts: readonly TrustBundleHost[];
+  /**
+   * The account root (device mesh §3, stage 5): `pk_R` and the sealed seed of
+   * `sk_R`. Sealed alongside the host keys so any passkey-holder recovers the
+   * root and can heal/re-anchor. Null for accounts (and legacy bundles) with no
+   * root — pure device-chain mode, which fully works without one.
+   */
+  readonly root: AccountRootMaterial | null;
+}
+
+/** Validate root material without trusting the sealed bytes' shape. */
+function canonicalRoot(root: AccountRootMaterial | null | undefined): AccountRootMaterial | null {
+  if (root === null || root === undefined) {
+    return null;
+  }
+  const okKey =
+    typeof root.publicKeyWire === "string" && root.publicKeyWire.length === PUBLIC_KEY_WIRE_LENGTH;
+  const okSeed =
+    typeof root.seedWire === "string" && root.seedWire.length === PUBLIC_KEY_WIRE_LENGTH;
+  if (!okKey || !okSeed) {
+    throw new TrustBundleError("invalid_bundle", "trust bundle root material is malformed");
+  }
+  return { publicKeyWire: root.publicKeyWire, seedWire: root.seedWire };
 }
 
 export function requireRevision(revision: number): number {
@@ -235,6 +258,7 @@ export async function canonicalBundle(
   accountId: string,
   hosts: readonly TrustBundleHost[],
   revision: number,
+  root: AccountRootMaterial | null = null,
 ): Promise<TrustBundle> {
   if (hosts.length > MAX_HOSTS) {
     throw new TrustBundleError("too_many_hosts", `a trust bundle holds at most ${MAX_HOSTS} hosts`);
@@ -249,7 +273,13 @@ export async function canonicalBundle(
     seen.add(host.hostPublicKey);
   }
   canonical.sort((left, right) => (left.hostPublicKey < right.hostPublicKey ? -1 : 1));
-  return { version: TRUST_BUNDLE_VERSION, accountId, revision, hosts: canonical };
+  return {
+    version: TRUST_BUNDLE_VERSION,
+    accountId,
+    revision,
+    hosts: canonical,
+    root: canonicalRoot(root),
+  };
 }
 
 /** Seal a bundle for storage on the server, which only ever sees ciphertext. */
@@ -258,10 +288,11 @@ export async function sealTrustBundle(
   accountId: string,
   hosts: readonly TrustBundleHost[],
   revision: number,
+  root: AccountRootMaterial | null = null,
 ): Promise<string> {
   const subtle = requireSubtle();
   requireAccountId(accountId);
-  const bundle = await canonicalBundle(accountId, hosts, revision);
+  const bundle = await canonicalBundle(accountId, hosts, revision, root);
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
   const plaintext = new TextEncoder().encode(JSON.stringify(bundle));
   const ciphertext = new Uint8Array(
@@ -337,5 +368,6 @@ export async function openTrustBundle(
   // Legacy bundles predate the revision field; they open as revision 0, which is
   // the floor, so they establish rather than trip the rollback check.
   const revision = candidate.revision === undefined ? 0 : requireRevision(candidate.revision);
-  return canonicalBundle(accountId, candidate.hosts, revision);
+  // Legacy bundles (and no-root accounts) simply have no root field.
+  return canonicalBundle(accountId, candidate.hosts, revision, candidate.root ?? null);
 }
