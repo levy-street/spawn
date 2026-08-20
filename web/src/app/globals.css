@@ -104,12 +104,12 @@
   --color-ember: #ff453a;
 
   --font-grimoire:
-    "Palatino", "Palatino Linotype", "Book Antiqua", Georgia, "Times New Roman", serif;
+    var(--font-plex-sans, "IBM Plex Sans"), "Helvetica Neue", Arial, sans-serif;
   --font-sigil: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
 
 /*
- * Marketing skin. A `.grimoire` root commits to the void palette and serif body
+ * Marketing skin. A `.grimoire` root commits to the void palette and sans body
  * regardless of the app's light/dark toggle, so landing pages read as one dark,
  * dramatic surface while the product chrome stays theme-aware.
  */

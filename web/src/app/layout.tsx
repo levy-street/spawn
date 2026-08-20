@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
+import { grimoire } from "@/lib/fonts";
 import { AppProviders } from "@/lib/query";
 import { THEME_BOOTSTRAP_SCRIPT } from "@/lib/theme-bootstrap";
 import "./globals.css";
@@ -62,7 +63,10 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     // suppressHydrationWarning: the bootstrap script below stamps data-theme
     // and color-scheme onto <html> before React sees it, so the server markup
     // is expected to differ here.
-    <html lang="en" suppressHydrationWarning>
+    // The body face rides along as a CSS variable on <html>: the @theme token
+    // --font-grimoire substitutes var(--font-plex-sans) at :root, so the
+    // variable has to live on the root element itself to resolve.
+    <html lang="en" suppressHydrationWarning className={grimoire.variable}>
       <head>
         {/* Must run before first paint; see lib/theme-bootstrap.ts. */}
         {/* biome-ignore lint/security/noDangerouslySetInnerHtml: fixed, build-time string with no interpolation */}

@@ -98,7 +98,7 @@ export function AuthShell({
             <h1
               className={cn(
                 poster.className,
-                "mt-7 text-[clamp(28px,5vw,44px)] leading-[1.02] font-medium text-bone uppercase [text-wrap:balance]",
+                "mt-7 text-[clamp(30px,5.4vw,48px)] leading-[1.02] font-light text-bone uppercase [text-wrap:balance]",
               )}
             >
               {title}
@@ -122,7 +122,7 @@ export function AuthShell({
               <h1
                 className={cn(
                   poster.className,
-                  "text-[clamp(24px,5.5vw,30px)] leading-[1.06] font-medium text-bone uppercase [text-wrap:balance]",
+                  "text-[clamp(26px,5.9vw,32px)] leading-[1.06] font-light text-bone uppercase [text-wrap:balance]",
                 )}
               >
                 {title}

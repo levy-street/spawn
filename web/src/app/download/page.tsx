@@ -137,7 +137,7 @@ export default function DownloadPage() {
               <h1
                 className={cn(
                   poster.className,
-                  "text-[clamp(32px,5.2vw,58px)] leading-[1.02] font-medium text-bone uppercase [text-wrap:balance]",
+                  "text-[clamp(35px,5.6vw,63px)] leading-[1.02] font-light text-bone uppercase [text-wrap:balance]",
                 )}
               >
                 Install the daemon. <em className="text-hellfire not-italic">Possess the host.</em>
@@ -165,7 +165,7 @@ export default function DownloadPage() {
                   <h2
                     className={cn(
                       poster.className,
-                      "text-[26px] leading-none font-medium text-bone uppercase",
+                      "text-[28px] leading-none font-light text-bone uppercase",
                     )}
                   >
                     {detected.label}
@@ -241,7 +241,7 @@ export default function DownloadPage() {
                 <h3
                   className={cn(
                     poster.className,
-                    "mb-3 text-[24px] leading-[1.08] font-medium uppercase",
+                    "mb-3 text-[26px] leading-[1.08] font-light uppercase",
                   )}
                 >
                   {option.title}
@@ -261,7 +261,7 @@ export default function DownloadPage() {
             <h2
               className={cn(
                 poster.className,
-                "mb-4 max-w-[18ch] text-[clamp(24px,3.2vw,36px)] leading-[1.04] font-medium text-bone uppercase",
+                "mb-4 max-w-[18ch] text-[clamp(26px,3.5vw,39px)] leading-[1.04] font-light text-bone uppercase",
               )}
             >
               Prove the hosted binary path.

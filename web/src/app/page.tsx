@@ -249,7 +249,7 @@ export default function LandingPage() {
           <h1
             className={cn(
               poster.className,
-              "max-w-[13ch] text-[clamp(30px,4vw,58px)] leading-[1.08] font-medium text-bone uppercase [text-wrap:balance]",
+              "max-w-[13ch] text-[clamp(32px,4.3vw,63px)] leading-[1.08] font-light text-bone uppercase [text-wrap:balance]",
             )}
           >
             A daemon on every host <em className="text-hellfire not-italic">you&nbsp;own.</em>
@@ -297,7 +297,7 @@ export default function LandingPage() {
               <h2
                 className={cn(
                   poster.className,
-                  "max-w-[20ch] text-[clamp(30px,4.4vw,56px)] leading-[0.98] font-medium uppercase",
+                  "max-w-[20ch] text-[clamp(32px,4.8vw,60px)] leading-[0.98] font-light uppercase",
                 )}
               >
                 The same terminal, anywhere you stand.
@@ -373,7 +373,7 @@ export default function LandingPage() {
               <h2
                 className={cn(
                   poster.className,
-                  "max-w-[17ch] text-[clamp(26px,3.4vw,44px)] leading-[1.04] font-medium text-bone uppercase",
+                  "max-w-[17ch] text-[clamp(28px,3.7vw,48px)] leading-[1.04] font-light text-bone uppercase",
                 )}
               >
                 The server can't read your terminal.
@@ -428,7 +428,7 @@ export default function LandingPage() {
             <p
               className={cn(
                 poster.className,
-                "mx-auto mt-24 max-w-[34ch] text-center text-[clamp(22px,3.4vw,38px)] leading-[1.25] text-bone italic",
+                "mx-auto mt-24 max-w-[34ch] text-center text-[clamp(24px,3.7vw,41px)] leading-[1.25] text-bone italic",
               )}
             >
               A daemon that dials out and answers to one master sounds ominous, until you notice
@@ -469,12 +469,12 @@ export default function LandingPage() {
           <h2
             className={cn(
               poster.className,
-              "mb-5 text-[clamp(34px,5.2vw,64px)] leading-[0.98] font-medium text-bone uppercase",
+              "mb-5 text-[clamp(40px,7.5vw,92px)] leading-[0.98] font-light text-bone uppercase",
             )}
           >
             Bring a host online.
           </h2>
-          <p className="mx-auto mb-9 max-w-[48ch] text-[17px] leading-8 text-ash">
+          <p className="mx-auto mb-9 max-w-[48ch] text-[clamp(17px,2vw,21px)] leading-[1.6] text-ash">
             One line installs the daemon; you approve it against a fingerprint you can see. From
             then on, it answers only to you.
           </p>
@@ -506,7 +506,7 @@ export default function LandingPage() {
 function Rite({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div className="border-t-2 border-void pt-6">
-      <h3 className={cn(poster.className, "mb-3 text-[24px] leading-[1.08] font-medium uppercase")}>
+      <h3 className={cn(poster.className, "mb-3 text-[26px] leading-[1.08] font-light uppercase")}>
         {title}
       </h3>
       <p className="max-w-[44ch] text-[16px] leading-7">{children}</p>

@@ -42,7 +42,7 @@ export default function SecurityPage() {
           <h1
             className={cn(
               poster.className,
-              "mb-6 text-[clamp(34px,6.4vw,60px)] leading-[1.02] font-medium text-bone uppercase [text-wrap:balance]",
+              "mb-6 text-[clamp(36px,6.9vw,65px)] leading-[1.02] font-light text-bone uppercase [text-wrap:balance]",
             )}
           >
             We introduce. <em className="text-hellfire not-italic">We never listen.</em>
@@ -62,7 +62,7 @@ export default function SecurityPage() {
           <blockquote
             className={cn(
               poster.className,
-              "border-hellfire border-l-2 pl-6 text-[clamp(22px,3.4vw,32px)] leading-[1.3] text-bone italic",
+              "border-hellfire border-l-2 pl-6 text-[clamp(24px,3.7vw,35px)] leading-[1.3] text-bone italic",
             )}
           >
             “The only parties that handle your terminal are the daemon on your host and the browser
@@ -93,7 +93,7 @@ export default function SecurityPage() {
           <h2
             className={cn(
               poster.className,
-              "mb-14 max-w-[20ch] text-[clamp(28px,4.4vw,48px)] leading-[1.0] font-medium uppercase",
+              "mb-14 max-w-[20ch] text-[clamp(30px,4.8vw,52px)] leading-[1.0] font-light uppercase",
             )}
           >
             End-to-end encrypted, browser to daemon.
@@ -127,7 +127,7 @@ export default function SecurityPage() {
           <h2
             className={cn(
               poster.className,
-              "mb-5 max-w-[20ch] text-[clamp(28px,4.2vw,44px)] leading-[1.02] font-medium text-bone uppercase",
+              "mb-5 max-w-[20ch] text-[clamp(30px,4.5vw,48px)] leading-[1.02] font-light text-bone uppercase",
             )}
           >
             What it can’t see — and what it still does.
@@ -179,7 +179,7 @@ export default function SecurityPage() {
             <h2
               className={cn(
                 poster.className,
-                "mb-6 max-w-[17ch] text-[clamp(26px,3.4vw,44px)] leading-[1.04] font-medium text-bone uppercase",
+                "mb-6 max-w-[17ch] text-[clamp(28px,3.7vw,48px)] leading-[1.04] font-light text-bone uppercase",
               )}
             >
               Verify the fingerprint. Refuse the impostor.
@@ -247,7 +247,7 @@ export default function SecurityPage() {
           <h2
             className={cn(
               poster.className,
-              "mx-auto mb-6 max-w-[14ch] text-[clamp(30px,5.2vw,58px)] leading-[1.0] font-medium text-bone uppercase [text-wrap:balance]",
+              "mx-auto mb-6 max-w-[14ch] text-[clamp(32px,5.6vw,63px)] leading-[1.0] font-light text-bone uppercase [text-wrap:balance]",
             )}
           >
             The scarier it sounds, <em className="text-hellfire not-italic">the safer it is.</em>
@@ -299,7 +299,7 @@ function Mechanism({
         <span aria-hidden className="shrink-0">
           {icon}
         </span>
-        <h3 className={cn(poster.className, "text-[22px] leading-[1.08] font-medium uppercase")}>
+        <h3 className={cn(poster.className, "text-[24px] leading-[1.08] font-light uppercase")}>
           {title}
         </h3>
       </div>
