@@ -408,3 +408,169 @@ async def test_prune_deletes_only_this_accounts_tombstones(client):
     again = await client.post("/api/browser-devices/prune", headers=headers)
     assert again.status_code == 200
     assert again.json() == {"pruned": 0}
+
+
+async def test_prune_never_removes_a_revoked_key_from_the_host_deny_list(client):
+    """R10 regression: revocation is a PERMANENT tombstone that prune cannot undo.
+
+    A daemon replaces its deny-list wholesale on every push. Before the
+    ``revoked_browser_keys`` table, "Clear history" hard-deleted the roster
+    tombstone and the key silently dropped out of the next pushed deny-list —
+    so a stolen device still carrying a cached endorsement chain was re-admitted
+    with no fresh ceremony. Assert the actual frame content a daemon would
+    receive, before AND after prune, not merely that a push happened.
+    """
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, RevokedBrowserKey
+    from spawn_server.ws.daemon import _browser_pins_frame
+
+    user_id, token = await _signup(client, "prune-deny@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    async with get_sessionmaker()() as session:
+        host = Host(name="deny-box", owner_user_id=user_id)
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    proof = _proof(user_id, Ed25519PrivateKey.generate())
+    device = (
+        await client.post("/api/browser-devices/register", json=proof, headers=headers)
+    ).json()
+    revoked = await client.post(
+        f"/api/browser-devices/{device['id']}/revoke",
+        json={"expected_public_key": proof["public_key"]},
+        headers=headers,
+    )
+    assert revoked.status_code == 200
+
+    # Revoke mirrored the key into the permanent tombstone table...
+    async with get_sessionmaker()() as session:
+        tombstone = await session.get(RevokedBrowserKey, (user_id, proof["public_key"]))
+        assert tombstone is not None
+        assert tombstone.key_algorithm == "ed25519"
+        assert tombstone.revoked_at is not None
+    # ...and the key is in the frame a daemon would be pushed.
+    before = await _browser_pins_frame(host_id)
+    assert proof["public_key"] in before["revoked_browser_keys"]
+
+    pruned = await client.post("/api/browser-devices/prune", headers=headers)
+    assert pruned.status_code == 200
+    assert pruned.json() == {"pruned": 1}
+
+    # The roster row is gone (history cleared)...
+    listing = (await client.get("/api/browser-devices", headers=headers)).json()
+    assert listing == []
+    # ...but the key STILL appears in the deny-list pushed to hosts.
+    after = await _browser_pins_frame(host_id)
+    assert proof["public_key"] in after["revoked_browser_keys"]
+
+    # And the pruned key can never be quietly re-registered into the account:
+    # re-admission takes a fresh ceremony over a NEW key, never un-revoking.
+    resurrect = await client.post(
+        "/api/browser-devices/register", json=proof, headers=headers
+    )
+    assert resurrect.status_code == 409
+
+    # A different account revoking a key never bleeds into this account's
+    # deny-list, and vice versa: tombstones are account-scoped like the list.
+    other_id, other_token = await _signup(client, "prune-deny-other@example.com")
+    other_headers = {"Authorization": f"Bearer {other_token}"}
+    other_proof = _proof(other_id, Ed25519PrivateKey.generate())
+    other = (
+        await client.post(
+            "/api/browser-devices/register", json=other_proof, headers=other_headers
+        )
+    ).json()
+    await client.post(
+        f"/api/browser-devices/{other['id']}/revoke",
+        json={"expected_public_key": other_proof["public_key"]},
+        headers=other_headers,
+    )
+    final = await _browser_pins_frame(host_id)
+    assert other_proof["public_key"] not in final["revoked_browser_keys"]
+    assert proof["public_key"] in final["revoked_browser_keys"]
+
+
+async def test_live_root_uniqueness_is_a_database_invariant(client):
+    """One live root per account must hold under concurrency, not just under the
+    register route's app-level check: a double-mint racing past that check would
+    fork the account's trust anchor. The partial unique index (live roots only)
+    rejects the second insert while still allowing rotation — revoke the old
+    root, mint a successor."""
+
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import BrowserDevice
+
+    user_id, _ = await _signup(client, "root-db-unique@example.com")
+    async with get_sessionmaker()() as session:
+        session.add(
+            BrowserDevice(
+                owner_user_id=user_id,
+                key_algorithm="ed25519",
+                public_key="R" * 43,
+                is_root=True,
+            )
+        )
+        await session.commit()
+
+    # A second live root for the same owner is rejected by the DB itself,
+    # bypassing every app-level check.
+    async with get_sessionmaker()() as session:
+        session.add(
+            BrowserDevice(
+                owner_user_id=user_id,
+                key_algorithm="ed25519",
+                public_key="S" * 43,
+                is_root=True,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+    # Rotation still works: once the old root is tombstoned it leaves the
+    # partial index, and a successor root inserts cleanly.
+    async with get_sessionmaker()() as session:
+        old_root = (
+            await session.execute(
+                select(BrowserDevice).where(
+                    BrowserDevice.owner_user_id == user_id,
+                    BrowserDevice.is_root.is_(True),
+                )
+            )
+        ).scalar_one()
+        old_root.revoked_at = datetime.now(UTC)
+        await session.commit()
+    async with get_sessionmaker()() as session:
+        session.add(
+            BrowserDevice(
+                owner_user_id=user_id,
+                key_algorithm="ed25519",
+                public_key="T" * 43,
+                is_root=True,
+            )
+        )
+        await session.commit()
+
+    # A revoked root plus one live successor is the steady state after rotation.
+    async with get_sessionmaker()() as session:
+        roots = (
+            (
+                await session.execute(
+                    select(BrowserDevice.public_key, BrowserDevice.revoked_at).where(
+                        BrowserDevice.owner_user_id == user_id,
+                        BrowserDevice.is_root.is_(True),
+                    )
+                )
+            )
+            .all()
+        )
+    assert {(key, revoked is None) for key, revoked in roots} == {
+        ("R" * 43, False),
+        ("T" * 43, True),
+    }
