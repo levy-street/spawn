@@ -204,6 +204,32 @@ describe("trust history", () => {
     expect(events[0]?.when).toBe("Aug 19");
   });
 
+  test("a mutual endorsement is one approval line, not two", () => {
+    const events = deriveTrustEvents(
+      input({
+        devices: [
+          device({ id: "mac", label: "MacBook Pro", created_at: "2026-05-01T00:00:00Z" }),
+          device({ id: "phone", label: "iPhone" }),
+        ],
+        edges: [
+          {
+            endorser_device_id: "mac",
+            endorsed_device_id: "phone",
+            created_at: "2026-06-03T00:00:00Z",
+          },
+          // The new device's automatic reciprocal, seconds later.
+          {
+            endorser_device_id: "phone",
+            endorsed_device_id: "mac",
+            created_at: "2026-06-03T00:00:09Z",
+          },
+        ],
+      }),
+      NOW,
+    );
+    expect(events.map((e) => e.text)).toEqual(["MacBook Pro approved iPhone"]);
+  });
+
   test("a removal by an unknown device stays unattributed", () => {
     const events = deriveTrustEvents(
       input({
