@@ -91,8 +91,23 @@ export async function verifyAccountEndorsementSignature(input: {
   }
 }
 
+/**
+ * The exact peer key bytes (wire form) that went into the SAS number — pinned
+ * at SAS-compute time. The human's match authenticates THESE bytes and no
+ * others, so every later verify and sign must use only these, never the live
+ * relay row: a server that relayed honestly through the match could otherwise
+ * swap the key on a later poll and collect a valid endorsement of a key the
+ * human never checked.
+ */
+export interface PinnedCeremonyKeys {
+  initiatorPublicKey: string;
+  joinerPublicKey: string;
+}
+
 interface CeremonyRecord {
   sas: string | null;
+  /** Pinned alongside `sas`; null exactly while `sas` is null. */
+  pinnedKeys: PinnedCeremonyKeys | null;
   triesLeft: number;
   entryError: string | null;
   /** This side's endorsement has been recorded on the relay. */
@@ -104,6 +119,7 @@ interface CeremonyRecord {
 
 const FRESH: CeremonyRecord = {
   sas: null,
+  pinnedKeys: null,
   triesLeft: APPROVE_CEREMONY_TRIES,
   entryError: null,
   signedMine: false,
@@ -111,6 +127,101 @@ const FRESH: CeremonyRecord = {
   done: false,
   stopped: false,
 };
+
+const TAMPER_STOP_MESSAGE =
+  "The other device's key changed mid-ceremony, so nothing was trusted. Start over.";
+
+/** One account-endorsement edge as the server claims it (every field unverified). */
+interface AccountEndorsementEdge {
+  endorser_device_id: string;
+  endorser_public_key: string;
+  endorsed_device_id: string;
+  endorsed_public_key: string;
+  signature: string;
+}
+
+export type CeremonyStepPlan =
+  | { kind: "wait" }
+  | { kind: "abort"; reason: string }
+  | { kind: "sign"; endorsedDeviceId: string; endorsedPublicKey: string };
+
+/**
+ * APPROVER side, after a correct entry: decide what to sign. The typed number
+ * authenticated exactly the pinned bytes, so the endorsement target is the
+ * PINNED joiner key — and only while the live relay row still carries the same
+ * bytes. A key that differs from what the human matched is server tampering:
+ * abort the ceremony, sign nothing.
+ */
+export function planApproverEndorsement(input: {
+  pairing: Pick<PairingState, "initiator_public_key" | "joiner_public_key" | "joiner_device_id">;
+  pinned: PinnedCeremonyKeys;
+}): CeremonyStepPlan {
+  if (
+    input.pairing.initiator_public_key !== input.pinned.initiatorPublicKey ||
+    input.pairing.joiner_public_key !== input.pinned.joinerPublicKey
+  ) {
+    return { kind: "abort", reason: "pairing keys changed after the match" };
+  }
+  return {
+    kind: "sign",
+    endorsedDeviceId: input.pairing.joiner_device_id,
+    endorsedPublicKey: input.pinned.joinerPublicKey,
+  };
+}
+
+/**
+ * NEW-DEVICE side: decide whether the approver's endorsement is real and, if
+ * so, what to reciprocate. Verifies the edge's signature against the PINNED
+ * initiator key (the one whose commitment opened and whose bytes are in the
+ * number the approver typed) and signs only those pinned bytes. Aborts if the
+ * live relay row's keys no longer equal the pinned ones; waits (signing
+ * nothing) while no verifiable edge exists.
+ */
+export async function planReciprocalEndorsement(input: {
+  accountId: string;
+  pairing: Pick<PairingState, "initiator_device_id" | "initiator_public_key" | "joiner_public_key">;
+  pinned: PinnedCeremonyKeys;
+  currentDevice: { id: string; public_key: string };
+  edges: AccountEndorsementEdge[];
+}): Promise<CeremonyStepPlan> {
+  if (
+    input.pairing.initiator_public_key !== input.pinned.initiatorPublicKey ||
+    input.pairing.joiner_public_key !== input.pinned.joinerPublicKey
+  ) {
+    return { kind: "abort", reason: "pairing keys changed after the match" };
+  }
+  if (input.pinned.joinerPublicKey !== input.currentDevice.public_key) {
+    // The number authenticated bytes this device does not hold.
+    return { kind: "abort", reason: "the number did not cover this device's key" };
+  }
+  const edge = input.edges.find(
+    (e) =>
+      e.endorser_device_id === input.pairing.initiator_device_id &&
+      e.endorsed_device_id === input.currentDevice.id,
+  );
+  if (!edge) return { kind: "wait" };
+  if (
+    edge.endorser_public_key !== input.pinned.initiatorPublicKey ||
+    edge.endorsed_public_key !== input.currentDevice.public_key
+  ) {
+    // Server-claimed metadata names keys the ceremony never authenticated —
+    // not the edge this ceremony is waiting for.
+    return { kind: "wait" };
+  }
+  const valid = await verifyAccountEndorsementSignature({
+    accountId: input.accountId,
+    endorserPublicKey: input.pinned.initiatorPublicKey,
+    endorsedPublicKey: input.currentDevice.public_key,
+    endorsedDeviceId: input.currentDevice.id,
+    signature: edge.signature,
+  });
+  if (!valid) return { kind: "wait" }; // forged or damaged — never reciprocate
+  return {
+    kind: "sign",
+    endorsedDeviceId: input.pairing.initiator_device_id,
+    endorsedPublicKey: input.pinned.initiatorPublicKey,
+  };
+}
 
 export function useApproveDeviceCeremony({
   accountId,
@@ -232,28 +343,46 @@ export function useApproveDeviceCeremony({
         !actedRef.current.has(`sas:${pairing.id}`)
       ) {
         actedRef.current.add(`sas:${pairing.id}`);
+        // Snapshot the exact bytes that go into the number. These — and only
+        // these — are what the human's match authenticates, so they are pinned
+        // into the record and every later verify/sign uses the pinned copies.
+        const initiatorKey = pairing.initiator_public_key;
+        const joinerKey = pairing.joiner_public_key;
+        // This side's OWN key on the relay row must be its real key: a swapped
+        // own-key would put attacker bytes into the number and induce the peer
+        // to endorse a key this device does not hold.
+        const ownKeyHonest = amInitiator
+          ? initiatorKey === currentDevice.public_key
+          : joinerKey === currentDevice.public_key;
+        if (!ownKeyHonest) {
+          setError(TAMPER_STOP_MESSAGE);
+          await trust.cancelPairing(pairing.id).catch(() => {});
+          patch(pairing.id, { stopped: true });
+          return;
+        }
         if (amJoiner) {
           const opens = await verifyCommitWire(
             pairing.initiator_commit,
-            pairing.initiator_public_key,
+            initiatorKey,
             pairing.initiator_nonce,
           );
           if (!opens) {
-            setError(
-              "The other device's key changed mid-ceremony, so nothing was trusted. Start over.",
-            );
+            setError(TAMPER_STOP_MESSAGE);
             await trust.cancelPairing(pairing.id).catch(() => {});
             patch(pairing.id, { stopped: true });
             return;
           }
         }
         const number = await ceremonySas(
-          pairing.initiator_public_key,
-          pairing.joiner_public_key,
+          initiatorKey,
+          joinerKey,
           pairing.initiator_nonce,
           pairing.joiner_nonce,
         );
-        patch(pairing.id, { sas: number });
+        patch(pairing.id, {
+          sas: number,
+          pinnedKeys: { initiatorPublicKey: initiatorKey, joinerPublicKey: joinerKey },
+        });
       }
     } catch {
       // Transient relay races (e.g. set-once 409 from a duplicate poll) are safe
@@ -262,10 +391,12 @@ export function useApproveDeviceCeremony({
   }
 
   // NEW-DEVICE side: the approver's correct entry produced a signed endorsement
-  // naming us. Verify that signature against the CEREMONY's initiator key (the
-  // one whose commitment opened and whose bytes are in the number the approver
+  // naming us. Verify that signature against the PINNED initiator key (the one
+  // whose commitment opened and whose bytes are in the number the approver
   // typed) and sign the reciprocal edge — the one human entry covers both
-  // directions. A server-forged edge fails this verification and grants nothing.
+  // directions. A server-forged edge fails this verification and grants
+  // nothing; a relay row whose keys drifted from the pinned bytes aborts the
+  // ceremony outright.
   // biome-ignore lint/correctness/useExhaustiveDependencies: poll-driven effect keyed on poll data
   useEffect(() => {
     if (!currentDevice) return;
@@ -273,32 +404,30 @@ export function useApproveDeviceCeremony({
     for (const pairing of pairings.data ?? []) {
       if (pairing.joiner_device_id !== currentDevice.id) continue;
       const record = records.get(pairing.id);
-      if (!record?.sas || record.signedMine || record.stopped) continue;
+      if (!record?.sas || !record.pinnedKeys || record.signedMine || record.stopped) continue;
       if (actedRef.current.has(`reciprocate:${pairing.id}`)) continue;
-      const edge = edges.find(
-        (e) =>
-          e.endorser_device_id === pairing.initiator_device_id &&
-          e.endorsed_device_id === currentDevice.id,
-      );
-      if (!edge) continue;
-      if (
-        edge.endorser_public_key !== pairing.initiator_public_key ||
-        edge.endorsed_public_key !== currentDevice.public_key
-      ) {
-        continue;
-      }
       actedRef.current.add(`reciprocate:${pairing.id}`);
+      const pinned = record.pinnedKeys;
       void (async () => {
-        const valid = await verifyAccountEndorsementSignature({
+        const plan = await planReciprocalEndorsement({
           accountId,
-          endorserPublicKey: pairing.initiator_public_key,
-          endorsedPublicKey: currentDevice.public_key,
-          endorsedDeviceId: currentDevice.id,
-          signature: edge.signature,
+          pairing,
+          pinned,
+          currentDevice: { id: currentDevice.id, public_key: currentDevice.public_key },
+          edges,
         });
-        if (!valid) return; // forged or damaged — never reciprocate
+        if (plan.kind === "wait") {
+          actedRef.current.delete(`reciprocate:${pairing.id}`); // retry on next poll
+          return;
+        }
+        if (plan.kind === "abort") {
+          setError(TAMPER_STOP_MESSAGE);
+          await trust.cancelPairing(pairing.id).catch(() => {});
+          patch(pairing.id, { stopped: true });
+          return;
+        }
         try {
-          await signEndorsement(pairing.initiator_device_id, pairing.initiator_public_key);
+          await signEndorsement(plan.endorsedDeviceId, plan.endorsedPublicKey);
           patch(pairing.id, { signedMine: true, waitingSince: Date.now() });
         } catch {
           actedRef.current.delete(`reciprocate:${pairing.id}`); // retry on next poll
@@ -336,12 +465,22 @@ export function useApproveDeviceCeremony({
         .then(() => invalidatePairings());
     }
     // The peer may delete the pairing before our edge-poll notices completion:
-    // a ceremony we signed that vanished from the relay is also done.
+    // a ceremony we signed (this session, or a prior one — the edge proves it)
+    // that vanished from the relay is also done. One we had NOT signed (a
+    // number was up, then the row vanished — the peer's mismatch, exhausted
+    // tries, or cancel deleted it) is stopped: the terminal "nothing was
+    // trusted" screen must appear on this side too, not silently disappear.
     const liveIds = new Set((pairings.data ?? []).map((p) => p.id));
     for (const [id, record] of records) {
-      if (record.signedMine && !record.done && !record.stopped && !liveIds.has(id)) {
-        patch(id, { done: true });
-      }
+      if (record.done || record.stopped || record.sas === null || liveIds.has(id)) continue;
+      const peerId = rolesRef.current.get(id)?.peerDeviceId;
+      const mine =
+        record.signedMine ||
+        (peerId !== undefined &&
+          edges.some(
+            (e) => e.endorser_device_id === currentDevice.id && e.endorsed_device_id === peerId,
+          ));
+      patch(id, mine ? { done: true } : { stopped: true });
     }
   }, [pairings.data, endorsements.data, records]);
 
@@ -368,19 +507,29 @@ export function useApproveDeviceCeremony({
 
   /**
    * APPROVER side: the typed digits ARE the check. A match signs the account
-   * endorsement immediately; a mismatch burns one of three tries; the last
+   * endorsement immediately — against the PINNED joiner key, the exact bytes
+   * the typed number authenticated, and only while the live relay row still
+   * carries those bytes. A mismatch burns one of three tries; the last
    * mismatch aborts the ceremony — there is no "approve anyway".
    */
   const submitDigits = (pairing: PairingState, digits: string) => {
     const record = records.get(pairing.id);
-    if (!record?.sas || record.signedMine || record.stopped) return;
+    if (!record?.sas || !record.pinnedKeys || record.signedMine || record.stopped) return;
+    const pinned = record.pinnedKeys;
     const expected = record.sas.replace(/\D/gu, "");
     if (digits.replace(/\D/gu, "") === expected) {
       patch(pairing.id, { entryError: null });
       void (async () => {
         try {
-          if (!pairing.joiner_public_key) throw new Error("The ceremony is not ready yet");
-          await signEndorsement(pairing.joiner_device_id, pairing.joiner_public_key);
+          const plan = planApproverEndorsement({ pairing, pinned });
+          if (plan.kind !== "sign") {
+            setError(TAMPER_STOP_MESSAGE);
+            await trust.cancelPairing(pairing.id).catch(() => {});
+            patch(pairing.id, { stopped: true });
+            return;
+          }
+          await signEndorsement(plan.endorsedDeviceId, plan.endorsedPublicKey);
+          setError(null); // a retried approve that lands clears the stale failure line
           patch(pairing.id, { signedMine: true, waitingSince: Date.now(), entryError: null });
         } catch (e) {
           setError(e instanceof Error ? e.message : "Could not record the approval");
@@ -459,17 +608,19 @@ export function useApproveDeviceCeremony({
       waitingSince: record.waitingSince,
     });
   }
-  // Ceremonies whose pairing vanished after completion still deserve their
-  // done screen until dismissed — with the role and peer they ran under.
+  // Ceremonies whose pairing vanished after finishing still deserve their
+  // terminal screen — done OR stopped — until dismissed, with the role and
+  // peer they ran under. Stopped must survive the row's deletion exactly like
+  // done: the relay row is gone precisely because the ceremony was aborted.
   for (const [id, record] of records) {
-    if (!record.done || views.some((v) => v.pairingId === id)) continue;
+    if ((!record.done && !record.stopped) || views.some((v) => v.pairingId === id)) continue;
     const remembered = rolesRef.current.get(id);
     views.push({
       pairingId: id,
       role: remembered?.role ?? "new-device",
       peerDeviceId: remembered?.peerDeviceId ?? "",
       peerName: remembered ? labelFor(remembered.peerDeviceId) : "the other device",
-      phase: "done",
+      phase: record.stopped ? "stopped" : "done",
       number: record.sas,
       entryError: null,
       waitingSince: record.waitingSince,

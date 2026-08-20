@@ -82,6 +82,12 @@ async function healBestEffort(
     await ensureRootRegistered(root, accountId);
     const identity = await loadBrowserDeviceIdentity(accountId);
     if (identity === null) return null;
+    // Device SELECTION inside healAccount trusts nothing server-claimed (C1):
+    // it verifies every endorsement edge's signature and anchors only on the
+    // sealed root and this device's own key. Server pin-membership is
+    // deliberately not consulted — it is not firsthand-verifiable. The host
+    // ANCHOR-UPGRADE half still uses `hosts`, whose ids and keys are firsthand
+    // (the sealed bundle at unlock, local pins at mint).
     return await healAccount(root, accountId, identity, hosts);
   } catch (error) {
     // A conflicting root is a trust failure (a substituted is_root row), never
@@ -374,8 +380,14 @@ export function usePasskeyTrust() {
         { credentialId: existing.credentialId, prfSecret: existing.secret },
         { credentialId: backup.credentialId, prfSecret: backupSecret.secret },
       );
-      await trust.addPasskey(backup.credentialId, "backup passkey");
+      // The bundle CAS is the gate: the wrap must be durably stored before the
+      // credential is enrolled. The old order registered the passkey first, so
+      // a concurrent-reseal 409 here left an enrolled-but-unwrapped passkey —
+      // listed as protection while opening nothing. If enrollment fails after
+      // the write instead, the orphaned wrap is inert (only this authenticator
+      // can open it) and a retry simply reseals over it.
       await trust.putBundle(next, stored.revision);
+      await trust.addPasskey(backup.credentialId, "backup passkey");
     },
     onMutate: begin,
     onSuccess: () => {

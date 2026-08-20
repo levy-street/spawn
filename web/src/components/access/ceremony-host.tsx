@@ -114,25 +114,61 @@ export function AccessCeremonyHost() {
         <CeremonyDialog
           key={view.pairingId}
           view={view}
+          error={ceremony.error}
           onSubmit={(digits) => {
             const pairing = ceremony.pairings.find((p) => p.id === view.pairingId);
             if (pairing) ceremony.submitDigits(pairing, digits);
           }}
-          onCancel={() => ceremony.cancel(view.pairingId)}
-          onDismiss={() => ceremony.dismiss(view.pairingId)}
+          onCancel={() => {
+            ceremony.clearError();
+            ceremony.cancel(view.pairingId);
+          }}
+          onDismiss={() => {
+            ceremony.clearError();
+            ceremony.dismiss(view.pairingId);
+          }}
         />
       ))}
+      {ceremony.error !== null && ceremony.ceremonies.length === 0 && (
+        <CeremonyErrorToast message={ceremony.error} onDismiss={ceremony.clearError} />
+      )}
     </>
+  );
+}
+
+/**
+ * A ceremony error with no dialog to carry it (e.g. starting the approval
+ * failed before any pairing existed). Without this the failure is invisible
+ * and the operator waits on nothing.
+ */
+function CeremonyErrorToast({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+  return (
+    <div
+      data-testid="ceremony-error-toast"
+      className="fixed bottom-4 right-4 z-40 w-[320px] rounded-2xl border border-destructive/40 bg-card p-4 shadow-2xl shadow-black/30"
+    >
+      <p className="text-sm leading-relaxed text-foreground" role="alert">
+        {message}
+      </p>
+      <div className="mt-3">
+        <Button size="sm" variant="ghost" onClick={onDismiss}>
+          Dismiss
+        </Button>
+      </div>
+    </div>
   );
 }
 
 function CeremonyDialog({
   view,
+  error,
   onSubmit,
   onCancel,
   onDismiss,
 }: {
   view: ApproveCeremonyView;
+  /** The hook's ceremony-level error — a failed approve must say so, not blank the dialog. */
+  error: string | null;
   onSubmit: (digits: string) => void;
   onCancel: () => void;
   onDismiss: () => void;
@@ -180,6 +216,15 @@ function CeremonyDialog({
             onDone={onDismiss}
             onClose={finished ? onDismiss : onCancel}
           />
+          {error !== null && (
+            <p
+              className="mt-3 text-center text-sm text-destructive"
+              data-testid="ceremony-error"
+              role="alert"
+            >
+              {error}
+            </p>
+          )}
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
