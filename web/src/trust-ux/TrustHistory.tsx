@@ -12,7 +12,7 @@ export function TrustHistory({ events }: { events: TrustEventVM[] }) {
       <header className="mb-4">
         <h1 className="text-xl font-medium tracking-tight text-zinc-100">History</h1>
         <p className="mt-1 text-sm text-zinc-500">
-          Every change to who can reach your machines. If something here surprises you, remove the
+          Every change to who can reach your hosts. If something here surprises you, remove the
           device it names.
         </p>
       </header>

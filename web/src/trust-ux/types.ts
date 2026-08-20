@@ -12,7 +12,7 @@ export interface DeviceVM {
   lastSeen: string;
 }
 
-export interface MachineVM {
+export interface HostVM {
   id: string;
   name: string;
   /** "Possessed by MacBook Pro · May 28" */

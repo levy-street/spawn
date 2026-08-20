@@ -4,14 +4,14 @@ import { Button, DialogCard, IconAlert } from "./bits";
 
 export interface OrphanVM {
   name: string;
-  /** Protecting a machine first needs it reachable; offline ones can't be saved in time. */
+  /** Protecting a host first needs it reachable; offline ones can't be saved in time. */
   online: boolean;
 }
 
 export interface RemoveDeviceDialogProps {
   deviceName: string;
   isThisDevice?: boolean;
-  /** Machines only this device can unlock (R5). Removing it strands them. */
+  /** Hosts only this device can unlock (R5). Removing it strands them. */
   orphans?: OrphanVM[];
   recoveryOn: boolean;
   onRemove?: () => void;
@@ -21,9 +21,9 @@ export interface RemoveDeviceDialogProps {
 
 /**
  * Revocation, in one breath: instant, everywhere, permanent (P3 + R1 + R10).
- * If the device is some machine's only way in, the dialog says which (R5) and
+ * If the device is some host's only way in, the dialog says which (R5) and
  * steers to recovery first — but never blocks. The passkey-protects-it promise
- * is only made for machines that are online: an offline machine can't be
+ * is only made for hosts that are online: an offline host can't be
  * healed before the removal lands.
  */
 export function RemoveDeviceDialog({
@@ -68,8 +68,8 @@ export function RemoveDeviceDialog({
     <DialogCard>
       <h2 className="text-base font-medium tracking-tight text-zinc-100">Remove {deviceName}?</h2>
       <p className="mt-2 text-sm leading-relaxed text-zinc-400">
-        It loses access to every machine — instantly and permanently. To use it again, you'd link it
-        as a new device.
+        It loses access to every host — instantly and permanently. To use it again, you'd link it as
+        a new device.
       </p>
       {isThisDevice && (
         <p className="mt-2 text-sm leading-relaxed text-zinc-400">
