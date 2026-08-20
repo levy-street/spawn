@@ -6,10 +6,16 @@ const THREE_TABS: LayoutV3 = {
   version: 3,
   active_tab: "tab-1",
   tabs: [
-    { id: "tab-1", name: "Alpha", layout: { version: 2, tiles: [] } },
-    { id: "tab-2", name: "Beta", layout: { version: 2, tiles: [] } },
-    { id: "tab-3", name: "Gamma", layout: { version: 2, tiles: [] } },
+    { id: "tab-1", name: "Alpha", layout: { version: 3, tiles: [] } },
+    { id: "tab-2", name: "Beta", layout: { version: 3, tiles: [] } },
+    { id: "tab-3", name: "Gamma", layout: { version: 3, tiles: [] } },
   ],
+};
+
+const ONE_TAB: LayoutV3 = {
+  version: 3,
+  active_tab: "tab-1",
+  tabs: [{ id: "tab-1", name: "Solo", layout: { version: 3, tiles: [] } }],
 };
 
 async function setupTabs(page: Page) {
@@ -130,4 +136,139 @@ test("Alt+Shift+Arrow moves the focused tab without a pointer", async ({ page })
   await page.keyboard.press("Alt+Shift+ArrowRight");
   await page.keyboard.press("Alt+Shift+ArrowRight");
   await expect.poll(() => paintedOrder(strip)).toEqual(["Alpha", "Beta", "Gamma"]);
+});
+
+test("⌘ dragging a tab carries the copy under the hand, gap by gap", async ({ page }) => {
+  const store = await setupTabs(page);
+  const strip = page.getByRole("tablist");
+  const alpha = page.getByRole("tab", { name: "Alpha" });
+  const box = await alpha.boundingBox();
+  const beta = await page.getByRole("tab", { name: "Beta" }).boundingBox();
+  const gamma = await page.getByRole("tab", { name: "Gamma" }).boundingBox();
+  if (!box || !beta || !gamma) throw new Error("tab geometry unavailable");
+  const step = beta.x - box.x;
+  const y = box.y + box.height / 2;
+
+  await page.mouse.move(box.x + box.width / 2, y);
+  await page.mouse.down();
+  // Carried one tab's travel to the right, the copy's leading edge sits on
+  // Beta's resting edge — so that is the gap it claims.
+  await page.mouse.move(box.x + box.width / 2 + step, y, { steps: 8 });
+  await page.keyboard.down("Meta");
+
+  // The ghost says where the copy lands, and says it in place: it has left the
+  // end of the strip for the gap Beta opened by sliding aside.
+  const ghost = page.locator("[data-workspace-tab-ghost]");
+  await expect(ghost).toContainText("Alpha copy");
+  await expect
+    .poll(async () => Math.round((await ghost.boundingBox())?.x ?? 0))
+    .toBe(Math.round(beta.x));
+  // The strip's own order never changes, and Alpha has gone back to its own
+  // slot rather than riding the pointer.
+  expect(await paintedOrder(strip)).toEqual(["Alpha", "Beta", "Gamma"]);
+  expect((await alpha.boundingBox())?.x).toBeCloseTo(box.x, 0);
+
+  // Another tab's travel, another gap — the copy keeps pace with the pointer
+  // however far along the strip it has come.
+  await page.mouse.move(box.x + box.width / 2 + step * 2, y, { steps: 8 });
+  await expect
+    .poll(async () => Math.round((await ghost.boundingBox())?.x ?? 0))
+    .toBe(Math.round(gamma.x));
+
+  await page.mouse.up();
+  await page.keyboard.up("Meta");
+
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  expect(patchedOrder(store.requests.workspacePatches[0]?.body)).toEqual([
+    "Alpha",
+    "Beta",
+    "Alpha copy",
+    "Gamma",
+  ]);
+});
+
+test("the copy reaches either end of the strip", async ({ page }) => {
+  const store = await setupTabs(page);
+  const gamma = page.getByRole("tab", { name: "Gamma" });
+  const box = await gamma.boundingBox();
+  const alpha = await page.getByRole("tab", { name: "Alpha" }).boundingBox();
+  const beta = await page.getByRole("tab", { name: "Beta" }).boundingBox();
+  if (!box || !alpha || !beta) throw new Error("tab geometry unavailable");
+  const gap = beta.x - (alpha.x + alpha.width);
+  const y = box.y + box.height / 2;
+  const ghost = page.locator("[data-workspace-tab-ghost]");
+
+  await page.mouse.move(box.x + box.width / 2, y);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 - 8, y);
+  await page.keyboard.down("Meta");
+
+  // Carried to the head of the strip: the copy parts it before Alpha.
+  await page.mouse.move(alpha.x + 4, y, { steps: 8 });
+  await expect
+    .poll(async () => Math.round((await ghost.boundingBox())?.x ?? 0))
+    .toBe(Math.round(alpha.x));
+
+  // Carried back past the last tab, it rests where it started — the end of
+  // the strip is a gap like any other, and the one the drop uses.
+  await page.mouse.move(box.x + box.width * 1.5, y, { steps: 8 });
+  await expect
+    .poll(async () => Math.round((await ghost.boundingBox())?.x ?? 0))
+    .toBe(Math.round(box.x + box.width + gap));
+
+  await page.mouse.up();
+  await page.keyboard.up("Meta");
+
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  expect(patchedOrder(store.requests.workspacePatches[0]?.body)).toEqual([
+    "Alpha",
+    "Beta",
+    "Gamma",
+    "Gamma copy",
+  ]);
+});
+
+test("a lone tab copies too, the modifier pressed after the drag is under way", async ({
+  page,
+}) => {
+  const store = await mockApp(page, {
+    sessions: [],
+    workspaces: [workspace({ layout: ONE_TAB })],
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  const solo = page.getByRole("tab", { name: "Solo" });
+  await expect(solo).toBeVisible();
+  const box = await solo.boundingBox();
+  if (!box) throw new Error("tab geometry unavailable");
+  const y = box.y + box.height / 2;
+
+  // Nothing to reorder against, so the gesture has to arm on the press alone
+  // and wait to find out what it is.
+  await page.mouse.move(box.x + box.width / 2, y);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * 1.5, y, { steps: 8 });
+  await page.keyboard.down("Meta");
+  await expect(page.locator("[data-workspace-tab-ghost]")).toContainText("Solo copy");
+
+  await page.mouse.up();
+  await page.keyboard.up("Meta");
+
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  expect(patchedOrder(store.requests.workspacePatches[0]?.body)).toEqual(["Solo", "Solo copy"]);
+});
+
+test("a plain tab drag still reorders — the modifier is what copies", async ({ page }) => {
+  const store = await setupTabs(page);
+  const gamma = page.getByRole("tab", { name: "Gamma" });
+  const alphaBox = await page.getByRole("tab", { name: "Alpha" }).boundingBox();
+  if (!alphaBox) throw new Error("tab geometry unavailable");
+
+  await dragTab(page, gamma, alphaBox.x + 4);
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  expect(patchedOrder(store.requests.workspacePatches[0]?.body)).toEqual([
+    "Gamma",
+    "Alpha",
+    "Beta",
+  ]);
+  expect(store.requests.sessions).toEqual([]);
 });

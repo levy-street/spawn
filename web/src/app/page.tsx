@@ -326,9 +326,9 @@ export default function LandingPage() {
                 height={1086}
                 rotate="rotate-[0.6deg]"
                 label="№ 3 · The workspace"
-                alt="A wall of terminal panes in a tidy grid, one brighter than the rest, printed in red ink on black"
+                alt="A wall of terminal windows in a tidy grid, one brighter than the rest, printed in red ink on black"
               >
-                A workspace is a named grid of terminal panes rooted in one folder on a host, with
+                A workspace is a named grid of terminal windows rooted in one folder on a host, with
                 shells, agents, and file explorers side by side.
               </PaperPlate>
             </Drift>

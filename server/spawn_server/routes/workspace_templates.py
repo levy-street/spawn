@@ -25,7 +25,7 @@ def _validated_spec(spec: schemas.WorkspaceTemplateSpec) -> dict:
             {"session_id": f"t{index}", "x": tile.x, "y": tile.y, "w": tile.w, "h": tile.h}
             for index, tile in enumerate(tab.tiles)
         ]
-        if not grid.validate_layout({"version": 2, "tiles": synthetic})["ok"]:
+        if not grid.validate_layout({"version": grid.LAYOUT_VERSION, "tiles": synthetic})["ok"]:
             raise HTTPException(status_code=400, detail="invalid_template_geometry")
         for tile in tab.tiles:
             command = (tile.run.command or "").strip()

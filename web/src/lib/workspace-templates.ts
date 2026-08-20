@@ -1,4 +1,5 @@
 import type { Agent, Session, WorkspaceTemplateSpec } from "@/lib/api";
+import { runningAgent } from "@/lib/sessions";
 import type { LayoutV3 } from "@/lib/tabs";
 
 /**
@@ -16,7 +17,7 @@ export function templateSpecFromWorkspace(
   agents: Agent[],
 ): WorkspaceTemplateSpec {
   return {
-    version: 1,
+    version: 2,
     tabs: layout.tabs.map((tab) => ({
       name: tab.name,
       tiles: tab.layout.tiles.map((tile) => ({
@@ -36,11 +37,6 @@ function agentRun(
   session: Session | undefined,
   agents: Agent[],
 ): { kind: "agent"; command: string } | null {
-  const foreground = session?.foreground_command?.trim().toLowerCase();
-  if (!foreground) return null;
-  const agent = agents.find((item) => {
-    const first = item.command.trim().split(/\s+/u)[0] ?? "";
-    return (first.split("/").pop() ?? "").toLowerCase() === foreground;
-  });
+  const agent = runningAgent(session, agents);
   return agent ? { kind: "agent", command: agent.command } : null;
 }

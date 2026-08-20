@@ -11,7 +11,7 @@ const layout: LayoutV3 = {
       id: "t1",
       name: "Build",
       layout: {
-        version: 2,
+        version: 3,
         tiles: [
           { session_id: "s1", x: 0, y: 0, w: 6, h: 12 },
           { session_id: "s2", x: 6, y: 0, w: 6, h: 12 },
@@ -22,7 +22,7 @@ const layout: LayoutV3 = {
       id: "t2",
       name: "Files",
       layout: {
-        version: 2,
+        version: 3,
         tiles: [
           {
             session_id: "w1",
@@ -53,7 +53,7 @@ describe("templateSpecFromWorkspace", () => {
       [claude],
     );
     expect(spec).toEqual({
-      version: 1,
+      version: 2,
       tabs: [
         {
           name: "Build",

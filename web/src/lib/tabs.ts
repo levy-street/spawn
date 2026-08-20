@@ -1,9 +1,9 @@
-import { autoPlace, type LayoutV2, readingOrder, remove, type Tile } from "@/lib/grid";
+import { autoPlace, type GridLayout, readingOrder, remove, type Tile } from "@/lib/grid";
 
 /**
  * Layout schema v3 — the tab envelope (docs/OVERHAUL.md §4.4-tabs).
  *
- * A workspace holds an ordered list of named tabs, each wrapping one v2 tile
+ * A workspace holds an ordered list of named tabs, each wrapping one tile
  * grid; the v2 algebra in `lib/grid.ts` (and its conformance fixtures) is
  * untouched. Everything here is pure: no ambient state, inputs never mutated,
  * unknown tab ids answered with the input unchanged (or null where the caller
@@ -14,7 +14,22 @@ import { autoPlace, type LayoutV2, readingOrder, remove, type Tile } from "@/lib
 export interface WorkspaceTab {
   id: string;
   name: string;
-  layout: LayoutV2;
+  /**
+   * The tab's own home — the host and folder a window added to this tab opens
+   * in. Always a pair, and absent (or null) on both means "inherit the
+   * workspace's home", so a tab that has never been re-pointed follows the
+   * workspace as it moves. Optional here because that is how a tab is born:
+   * the server reads a missing key as inheriting.
+   */
+  host_id?: string | null;
+  cwd?: string | null;
+  layout: GridLayout;
+}
+
+/** A host/folder pair to open something in. */
+export interface Home {
+  host_id: string;
+  cwd: string;
 }
 
 export interface LayoutV3 {
@@ -65,7 +80,32 @@ export function withTabTiles(layout: LayoutV3, tabId: string, tiles: Tile[]): La
   return {
     ...layout,
     tabs: layout.tabs.map((tab) =>
-      tab.id === tabId ? { ...tab, layout: { version: 2, tiles } } : tab,
+      tab.id === tabId ? { ...tab, layout: { version: 3, tiles } } : tab,
+    ),
+  };
+}
+
+/**
+ * Where a window added to `tabId` opens: the tab's own home when it has one,
+ * else the workspace's, else nothing (and the caller has to ask).
+ */
+export function tabHome(
+  layout: LayoutV3,
+  tabId: string,
+  workspace: { host_id: string | null; cwd: string | null },
+): Home | null {
+  const tab = tabById(layout, tabId);
+  if (tab?.host_id && tab.cwd) return { host_id: tab.host_id, cwd: tab.cwd };
+  if (workspace.host_id && workspace.cwd) return { host_id: workspace.host_id, cwd: workspace.cwd };
+  return null;
+}
+
+/** The envelope with one tab re-pointed; null clears it back to inheriting. */
+export function withTabHome(layout: LayoutV3, tabId: string, home: Home | null): LayoutV3 {
+  return {
+    ...layout,
+    tabs: layout.tabs.map((tab) =>
+      tab.id === tabId ? { ...tab, host_id: home?.host_id ?? null, cwd: home?.cwd ?? null } : tab,
     ),
   };
 }
@@ -88,8 +128,63 @@ export function addTab(layout: LayoutV3, id: string, name: string): LayoutV3 | n
   return {
     version: 3,
     active_tab: id,
-    tabs: [...layout.tabs, { id, name, layout: { version: 2, tiles: [] } }],
+    tabs: [...layout.tabs, { id, name, layout: { version: 3, tiles: [] } }],
   };
+}
+
+/**
+ * A free name for a copy of `name`: "Build copy", then "Build copy 2" and on
+ * up, so duplicating the same tab twice never collides.
+ */
+export function copyTabName(layout: LayoutV3, name: string): string {
+  const taken = new Set(layout.tabs.map((tab) => tab.name));
+  const base = `${name} copy`;
+  if (!taken.has(base)) return base;
+  let n = 2;
+  while (taken.has(`${base} ${n}`)) n += 1;
+  return `${base} ${n}`;
+}
+
+/**
+ * Insert a copy of `tabId` into the strip and make it active. The copy keeps
+ * the original's geometry exactly; `sessionIds` maps each source tile's
+ * `session_id` to the id its copy should carry — a freshly created session for
+ * a pane, a fresh uuid for a widget. Tiles missing from the map are dropped,
+ * which is how a caller refuses to copy a pane whose session it could not
+ * recreate.
+ *
+ * `atIndex` is the slot the copy takes, counted in the strip as it stands and
+ * clamped to it; left out, the copy goes on the end. The source keeps its own
+ * slot either way — a copy never displaces the tab it came from.
+ *
+ * Null when the envelope is full or the tab is unknown.
+ */
+export function duplicateTab(
+  layout: LayoutV3,
+  tabId: string,
+  id: string,
+  name: string,
+  sessionIds: Map<string, string>,
+  atIndex?: number,
+): LayoutV3 | null {
+  if (layout.tabs.length >= MAX_TABS || tabById(layout, id)) return null;
+  const source = tabById(layout, tabId);
+  if (!source) return null;
+  const tiles = source.layout.tiles.flatMap((tile) => {
+    const copyId = sessionIds.get(tile.session_id);
+    return copyId ? [{ ...tile, session_id: copyId }] : [];
+  });
+  const tabs = [...layout.tabs];
+  const at = atIndex === undefined ? tabs.length : Math.min(Math.max(atIndex, 0), tabs.length);
+  tabs.splice(at, 0, {
+    id,
+    name,
+    // A copy opens its windows where the original did.
+    host_id: source.host_id ?? null,
+    cwd: source.cwd ?? null,
+    layout: { version: 3, tiles },
+  });
+  return { version: 3, active_tab: id, tabs };
 }
 
 /**

@@ -14,16 +14,38 @@ backfilled by name order per owner.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import sqlalchemy as sa
 
 from alembic import op
-from spawn_server.grid import from_split_tree
+from spawn_server import grid
 
 revision = "0031"
+# The canvas this migration was written against. `spawn_server.grid` follows
+# the live constants, which 0037 later doubled — but a migration has to keep
+# producing the geometry of its own era, or 0037 would rescale tiles that were
+# already born at the new size. Pin the algebra while it runs here.
+ERA_GRID_SIZE = 12
+ERA_MIN_TILE_SIZE = 2
+ERA_MAX_TILES = 8
 down_revision = "0030"
 branch_labels = None
 depends_on = None
+
+
+@contextmanager
+def _era_grid() -> Iterator[None]:
+    """Run the shared split-tree conversion on this migration's own canvas."""
+    saved = (grid.GRID_COLS, grid.GRID_ROWS, grid.MIN_TILE_SIZE, grid.MAX_TILES)
+    grid.GRID_COLS = grid.GRID_ROWS = ERA_GRID_SIZE
+    grid.MIN_TILE_SIZE = ERA_MIN_TILE_SIZE
+    grid.MAX_TILES = ERA_MAX_TILES
+    try:
+        yield
+    finally:
+        grid.GRID_COLS, grid.GRID_ROWS, grid.MIN_TILE_SIZE, grid.MAX_TILES = saved
 
 
 def _parse_layout(raw: object) -> dict:
@@ -100,7 +122,8 @@ def upgrade() -> None:
         root = _normalize_v1_node(
             _parse_layout(row.layout).get("root"), surviving_sessions, set()
         )
-        tiles = from_split_tree(root)
+        with _era_grid():
+            tiles = grid.from_split_tree(root)
         conn.execute(
             sa.text("UPDATE workspaces SET layout = :layout WHERE id = :id"),
             {"layout": json.dumps({"version": 2, "tiles": tiles}), "id": row.id},

@@ -4,6 +4,7 @@ import type { Session } from "@/lib/api";
 import {
   isShellCommand,
   relativeTime,
+  runningAgent,
   sessionActivityDetail,
   sessionActivityLabel,
   sessionActivityTone,
@@ -135,5 +136,28 @@ describe("sessionAtShell", () => {
     expect(sessionAtShell(makeSession({ foreground_command: null }))).toBe(true);
     expect(sessionAtShell(makeSession({ foreground_command: "-zsh" }))).toBe(true);
     expect(sessionAtShell(makeSession({ foreground_command: "claude" }))).toBe(false);
+  });
+});
+
+describe("runningAgent", () => {
+  const agents = [
+    { id: "a1", command: "claude" },
+    { id: "a2", command: "OPENAI_API_KEY=x /opt/bin/codex --yolo" },
+  ];
+
+  test("matches the foreground process against each agent's real command word", () => {
+    expect(runningAgent(makeSession({ foreground_command: "claude" }), agents)?.id).toBe("a1");
+    // Env assignments are skipped and the path stripped before comparing.
+    expect(runningAgent(makeSession({ foreground_command: "codex" }), agents)?.id).toBe("a2");
+    expect(runningAgent(makeSession({ foreground_command: "CLAUDE" }), agents)?.id).toBe("a1");
+  });
+
+  test("a shell prompt is not an agent", () => {
+    expect(runningAgent(makeSession({ foreground_command: null }), agents)).toBeNull();
+    expect(runningAgent(makeSession({ foreground_command: "-zsh" }), agents)).toBeNull();
+  });
+
+  test("an unclaimed foreground process is not an agent either", () => {
+    expect(runningAgent(makeSession({ foreground_command: "vim" }), agents)).toBeNull();
   });
 });

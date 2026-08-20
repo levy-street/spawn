@@ -31,6 +31,21 @@ function clampSidebarWidth(width: number): number {
   return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, width));
 }
 
+/**
+ * The sidebar's shape, remembered for the length of the tab.
+ *
+ * Every page mounts its own AppShell, and the router remounts one whenever a
+ * route segment changes — switching workspaces included. Starting from the
+ * component's own defaults each time means the rail flashes open (and writes
+ * "expanded" back over the stored value) on the way to reading localStorage,
+ * so the first read seeds this module and every later mount starts where the
+ * last one left off. localStorage is still what survives a reload.
+ */
+const remembered: { collapsed: boolean | null; width: number | null } = {
+  collapsed: null,
+  width: null,
+};
+
 export function AppShell({
   children,
   hideMobileNav = false,
@@ -42,15 +57,15 @@ export function AppShell({
 }) {
   const pathname = usePathname();
   const router = useRouter();
-  const [sidebarWidth, setSidebarWidth] = useState<number | null>(null);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState<number | null>(remembered.width);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(remembered.collapsed ?? false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [resizing, setResizing] = useState(false);
   const [transitionReady, setTransitionReady] = useState(false);
 
   const workspacesQ = useQuery({
     queryKey: ["workspaces"],
-    queryFn: workspaces.list,
+    queryFn: () => workspaces.list(),
     staleTime: 30_000,
   });
   const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
@@ -60,6 +75,10 @@ export function AppShell({
   );
 
   useIsoLayoutEffect(() => {
+    // Only the first mount reads storage; after that `remembered` is the
+    // fresher of the two — a mid-session toggle is in it before it is in
+    // localStorage's next write.
+    if (remembered.collapsed !== null) return;
     const savedWidth = Number(window.localStorage.getItem("spawn.sidebar.width"));
     if (Number.isFinite(savedWidth) && savedWidth > 0) {
       setSidebarWidth(clampSidebarWidth(savedWidth));
@@ -74,11 +93,13 @@ export function AppShell({
 
   useEffect(() => {
     if (sidebarWidth !== null) {
+      remembered.width = sidebarWidth;
       window.localStorage.setItem("spawn.sidebar.width", String(sidebarWidth));
     }
   }, [sidebarWidth]);
 
   useEffect(() => {
+    remembered.collapsed = sidebarCollapsed;
     window.localStorage.setItem("spawn.sidebar.collapsed", String(sidebarCollapsed));
   }, [sidebarCollapsed]);
 

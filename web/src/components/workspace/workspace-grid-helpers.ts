@@ -1,4 +1,13 @@
-import { GRID_SIZE, MIN_TILE_SIZE, type Rect, remove, type Tile, validate } from "@/lib/grid";
+import {
+  autoPlace,
+  GRID_SIZE,
+  MAX_TILES,
+  MIN_TILE_SIZE,
+  type Rect,
+  remove,
+  type Tile,
+  validate,
+} from "@/lib/grid";
 
 export interface PixelRect {
   left: number;
@@ -136,7 +145,7 @@ export function moveDivider(tiles: Tile[], divider: GridDivider, line: number): 
     }
     return { ...tile };
   });
-  if (!validate({ version: 2, tiles: next }).ok) return tiles;
+  if (!validate({ version: 3, tiles: next }).ok) return tiles;
   return next.sort((a, b) => a.y - b.y || a.x - b.x);
 }
 
@@ -236,7 +245,7 @@ function moveEdge(
     return grown;
   });
   const result = [moved, ...followed, ...kept.map((item) => ({ ...item }))];
-  if (!validate({ version: 2, tiles: result }).ok) return tiles;
+  if (!validate({ version: 3, tiles: result }).ok) return tiles;
   return result.sort((a, b) => a.y - b.y || a.x - b.x);
 }
 
@@ -312,13 +321,119 @@ export function dockSplitRect(target: Rect, zone: DockZone): { moved: Rect; kept
 }
 
 /**
- * iTerm-style dock: drop `movedId` against one side of `targetId`. The moved
- * pane's old spot is absorbed by its neighbours first (the same pass as
- * `grid.remove`, so the canvas stays packed), then the target's rect — which
- * may just have grown — splits in half along the zone's axis: the moved pane
- * takes the half on the zone's side, the target keeps the rest. Null when the
- * ids are invalid or the target is too small to split (under 6 cells on that
- * axis), so callers can leave the layout untouched.
+ * Held during a drag, either of these duplicates instead of moving — ⌘ is the
+ * Finder reflex, ⌥ the one people bring from tiling window managers and from
+ * dragging in design tools. Both, rather than picking a side.
+ */
+export function wantsDuplicate(event: { metaKey: boolean; altKey: boolean }): boolean {
+  return event.metaKey || event.altKey;
+}
+
+/**
+ * The id a caller hands `dockInsert` for the pane that does not exist yet —
+ * a ⌘-drag copy, or a pane being dragged out of the launcher. Never persisted:
+ * the caller lifts this tile's rect out of the result and drops the rest into
+ * the layout.
+ */
+export const PENDING_TILE_ID = "__pending__";
+
+type BandAxis = "x" | "y";
+
+function bandAxis(zone: DockZone): BandAxis {
+  return zone === "left" || zone === "right" ? "x" : "y";
+}
+
+/**
+ * The canvas read as a single band along `axis` — full-height columns side by
+ * side (axis "x"), or full-width rows stacked (axis "y") — in order, or null
+ * when the layout is anything less regular. A band is the one shape where
+ * "add a pane here" has an obviously right answer: keep every pane, share the
+ * canvas out evenly again.
+ */
+function canvasBand(tiles: Tile[], axis: BandAxis): Tile[] | null {
+  if (tiles.length === 0) return null;
+  const across = axis === "x" ? "y" : "x";
+  const thickness = axis === "x" ? "h" : "w";
+  if (tiles.some((tile) => tile[across] !== 0 || tile[thickness] !== GRID_SIZE)) return null;
+  const ordered = [...tiles].sort((a, b) => a[axis] - b[axis]);
+  let edge = 0;
+  for (const tile of ordered) {
+    if (tile[axis] !== edge) return null;
+    edge += axis === "x" ? tile.w : tile.h;
+  }
+  return edge === GRID_SIZE ? ordered : null;
+}
+
+/**
+ * GRID_SIZE shared between `count` slices as evenly as it divides, the
+ * remainder going to the leftmost/topmost slices (12 into 5 is 3,3,2,2,2).
+ * Null when the slices would fall under the minimum pane size.
+ */
+function evenSlices(count: number): number[] | null {
+  if (count < 1) return null;
+  const base = Math.floor(GRID_SIZE / count);
+  if (base < MIN_TILE_SIZE) return null;
+  const remainder = GRID_SIZE - base * count;
+  return Array.from({ length: count }, (_, index) => base + (index < remainder ? 1 : 0));
+}
+
+/** Lay an ordered band back across the whole canvas at even sizes. */
+function layOutBand(order: Tile[], axis: BandAxis): Tile[] | null {
+  const sizes = evenSlices(order.length);
+  if (!sizes) return null;
+  let edge = 0;
+  const result = order.map((tile, index) => {
+    const size = sizes[index] as number;
+    const placed =
+      axis === "x"
+        ? { ...tile, x: edge, y: 0, w: size, h: GRID_SIZE }
+        : { ...tile, x: 0, y: edge, w: GRID_SIZE, h: size };
+    edge += size;
+    return placed;
+  });
+  if (!validate({ version: 3, tiles: result }).ok) return null;
+  return result.sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
+/**
+ * Rebuild a band with `id` sitting on `zone`'s side of `targetId`. `incoming`
+ * is the tile taking that slot — the same object when a band member is being
+ * reordered, a fresh placeholder when a pane is being added. Null when the
+ * canvas is not a band on that axis, or cannot be shared out that many ways.
+ */
+function rebalanceBand(
+  tiles: Tile[],
+  incoming: Tile,
+  targetId: string,
+  zone: DockZone,
+): Tile[] | null {
+  const axis = bandAxis(zone);
+  const band = canvasBand(tiles, axis);
+  if (!band) return null;
+  // A band member being reordered leaves its slot first; a newcomer takes an
+  // extra one. Either way the target has to still be in the band.
+  const rest = band.filter((tile) => tile.session_id !== incoming.session_id);
+  const index = rest.findIndex((tile) => tile.session_id === targetId);
+  if (index === -1) return null;
+  const order = [...rest];
+  order.splice(zone === "left" || zone === "top" ? index : index + 1, 0, incoming);
+  return layOutBand(order, axis);
+}
+
+/**
+ * iTerm-style dock: drop `movedId` against one side of `targetId`.
+ *
+ * When the canvas is a plain band on the zone's axis — equal-ish columns side
+ * by side, or rows stacked — the pane simply changes places within it and the
+ * band is shared out evenly again. That is the whole layout, so halving one
+ * occupant would leave a canvas of mismatched widths nobody asked for.
+ *
+ * Otherwise: the moved pane's old spot is absorbed by its neighbours first
+ * (the same pass as `grid.remove`, so the canvas stays packed), then the
+ * target's rect — which may just have grown — splits in half along the zone's
+ * axis: the moved pane takes the half on the zone's side, the target keeps the
+ * rest. Null when the ids are invalid or the target is too small to split
+ * (under 6 cells on that axis), so callers can leave the layout untouched.
  */
 export function dockPane(
   tiles: Tile[],
@@ -328,6 +443,8 @@ export function dockPane(
 ): Tile[] | null {
   const moved = tiles.find((tile) => tile.session_id === movedId);
   if (!moved || movedId === targetId) return null;
+  const rebalanced = rebalanceBand(tiles, { ...moved }, targetId, zone);
+  if (rebalanced) return rebalanced;
   const without = remove(tiles, movedId);
   const target = without.find((tile) => tile.session_id === targetId);
   if (!target) return null;
@@ -340,7 +457,7 @@ export function dockPane(
       tile.session_id === targetId ? { ...tile, ...split.kept } : { ...tile },
     ),
   ];
-  if (!validate({ version: 2, tiles: result }).ok) return null;
+  if (!validate({ version: 3, tiles: result }).ok) return null;
   return result.sort((a, b) => a.y - b.y || a.x - b.x);
 }
 
@@ -401,11 +518,101 @@ export function movePane(tiles: Tile[], id: string, x: number, y: number): Tile[
       if (pushed) break;
     }
     if (!pushed) {
-      if (!validate({ version: 2, tiles: work }).ok) return tiles;
+      if (!validate({ version: 3, tiles: work }).ok) return tiles;
       return work.sort((a, b) => a.y - b.y || a.x - b.x);
     }
   }
   return tiles; // the cascade cycled: refuse rather than guess
+}
+
+/**
+ * `dockPane` for a tile that does not exist yet — a duplicate, or a pane being
+ * dragged out of the launcher. Same two outcomes: a band on the zone's axis
+ * takes the newcomer as one more equal slice (three columns become four, all
+ * the same width), and anything else halves the target, which keeps the rest.
+ * Null when the canvas is full, the target is unknown, or it is too small to
+ * split (under 6 cells on that axis).
+ */
+export function dockInsert(
+  tiles: Tile[],
+  id: string,
+  targetId: string,
+  zone: DockZone,
+): Tile[] | null {
+  if (tiles.length >= MAX_TILES) return null;
+  const target = tiles.find((tile) => tile.session_id === targetId);
+  if (!target) return null;
+  const rebalanced = rebalanceBand(
+    tiles,
+    { session_id: id, x: 0, y: 0, w: MIN_TILE_SIZE, h: MIN_TILE_SIZE },
+    targetId,
+    zone,
+  );
+  if (rebalanced) return rebalanced;
+  const split = dockSplitRect(target, zone);
+  if (!split) return null;
+  const result = [
+    { session_id: id, ...split.moved },
+    ...tiles.map((tile) =>
+      tile.session_id === targetId ? { ...tile, ...split.kept } : { ...tile },
+    ),
+  ];
+  if (!validate({ version: 3, tiles: result }).ok) return null;
+  return result.sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
+/**
+ * Where a pane goes when nobody aimed it — the "+" menu, a duplicate from the
+ * pane menu, a tap on the launcher. A canvas that is already a plain band of
+ * columns or rows takes one more equal slice (three columns become four, all
+ * the same width) rather than having its widest member halved; anything else
+ * falls back to `autoPlace`, which is the wire algebra the server would use.
+ *
+ * Returns the whole tile list including the newcomer — sibling geometry moves
+ * in the band case, so the caller has to persist all of it — or null when the
+ * canvas has no room.
+ */
+export function addPaneTiles(tiles: Tile[], id: string): Tile[] | null {
+  if (tiles.length >= MAX_TILES) return null;
+  if (tiles.length > 0) {
+    for (const zone of ["right", "bottom"] as const) {
+      const last = canvasBand(tiles, bandAxis(zone))?.at(-1);
+      const rebalanced = last
+        ? rebalanceBand(
+            tiles,
+            { session_id: id, x: 0, y: 0, w: MIN_TILE_SIZE, h: MIN_TILE_SIZE },
+            last.session_id,
+            zone,
+          )
+        : null;
+      if (rebalanced) return rebalanced;
+    }
+  }
+  const placed = autoPlace(tiles);
+  if (!placed.tile) return null;
+  return [...placed.tiles, { session_id: id, ...placed.tile }];
+}
+
+/**
+ * `movePane` for a tile that does not exist yet — a ⌘-drag copy landing on
+ * open canvas. The newcomer arrives at (x, y) carrying `size`, and neighbours
+ * are pushed by the same cascade a move would use. Null when the canvas is
+ * full or the push cannot resolve, so the caller can leave the layout alone.
+ */
+export function insertPane(
+  tiles: Tile[],
+  id: string,
+  size: { w: number; h: number },
+  x: number,
+  y: number,
+): Tile[] | null {
+  if (tiles.length >= MAX_TILES) return null;
+  if (tiles.some((tile) => tile.session_id === id)) return null;
+  // movePane relocates the tile before resolving anything, so the seed rect's
+  // position is irrelevant — only the size it carries in.
+  const seeded = [...tiles.map((tile) => ({ ...tile })), { session_id: id, x: 0, y: 0, ...size }];
+  const placed = movePane(seeded, id, x, y);
+  return placed === seeded ? null : placed;
 }
 
 /**

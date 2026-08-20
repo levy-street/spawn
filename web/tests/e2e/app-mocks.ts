@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Page, Route } from "@playwright/test";
-import { autoPlace, type LayoutV2, type Rect, remove as removeTile } from "../../src/lib/grid";
+import { autoPlace, type GridLayout, type Rect, remove as removeTile } from "../../src/lib/grid";
 import { activeTab, allTiles, type LayoutV3, tabOfSession, withTabTiles } from "../../src/lib/tabs";
 
 export const USER_ID = "00000000-0000-4000-8000-000000000001";
@@ -91,28 +91,44 @@ function workspaceNameFromCwd(cwd: string): string | null {
   return trimmed.split("/").at(-1) || null;
 }
 
-/** Wrap a spec's plain v2 layout into the wire's single-tab v3 envelope. */
-export function envelope(layout: LayoutV2): LayoutV3 {
+/**
+ * Wrap a spec's plain v2 layout into the wire's single-tab v3 envelope. The
+ * tab carries the folder keys the wire always does — null, meaning it inherits
+ * the workspace's home — so a spec can compare a PATCH body against this.
+ */
+export function envelope(layout: GridLayout, home?: { host_id: string; cwd: string }): LayoutV3 {
   return {
     version: 3,
     active_tab: "tab-1",
-    tabs: [{ id: "tab-1", name: "Tab 1", layout }],
+    tabs: [
+      {
+        id: "tab-1",
+        name: "Tab 1",
+        host_id: home?.host_id ?? null,
+        cwd: home?.cwd ?? null,
+        layout,
+      },
+    ],
   };
 }
 
 export function workspace(overrides: Record<string, unknown> = {}) {
   const { layout, ...rest } = overrides;
+  // Discriminated on shape, not on a version number: the grid's version moves
+  // when the canvas does, and a fixture that keys off it silently stops
+  // wrapping the moment it changes.
   const wrapped =
-    layout && (layout as { version?: number }).version === 2
-      ? envelope(layout as LayoutV2)
+    layout && !("tabs" in (layout as object))
+      ? envelope(layout as GridLayout)
       : (layout as LayoutV3 | undefined);
   return {
     id: WORKSPACE_ID,
     name: "daily drive",
     host_id: null,
     cwd: null,
-    layout: wrapped ?? envelope({ version: 2, tiles: [] }),
+    layout: wrapped ?? envelope({ version: 3, tiles: [] }),
     position: 0,
+    archived_at: null,
     created_at: CREATED_AT,
     updated_at: CREATED_AT,
     ...rest,
@@ -167,6 +183,7 @@ export interface AppMockStore {
     sessions: JsonRecord[];
     workspaces: JsonRecord[];
     workspacePatches: Array<{ id: string; body: JsonRecord }>;
+    workspaceArchives: Array<{ id: string; restoring: boolean }>;
     agents: JsonRecord[];
   };
   setWorkspaceFull(value: boolean): void;
@@ -258,7 +275,14 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     sessionSkills: Object.fromEntries(
       Object.entries(options.sessionSkills ?? {}).map(([id, skillIds]) => [id, [...skillIds]]),
     ),
-    requests: { auth: [], sessions: [], workspaces: [], workspacePatches: [], agents: [] },
+    requests: {
+      auth: [],
+      sessions: [],
+      workspaces: [],
+      workspacePatches: [],
+      workspaceArchives: [],
+      agents: [],
+    },
     setWorkspaceFull(value) {
       workspaceFull = value;
     },
@@ -997,9 +1021,15 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       const targetTab = targetLayout ? activeTab(targetLayout) : undefined;
       let geometry = body.tile as Rect | undefined;
       let baseTiles = (targetTab?.layout.tiles ?? []).map((tile) => ({ ...tile }));
+      // A forced-full workspace refuses whether or not the caller named a
+      // rect: the real server has no room for either.
+      if (targetWorkspace && workspaceFull) {
+        await json(route, { detail: "workspace_full" }, 409);
+        return;
+      }
       if (targetWorkspace && !geometry) {
         const placed = autoPlace(baseTiles);
-        if (workspaceFull || !placed.tile) {
+        if (!placed.tile) {
           await json(route, { detail: "workspace_full" }, 409);
           return;
         }
@@ -1097,9 +1127,20 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       }
     }
     if (path === "/api/workspaces" && method === "GET") {
+      if (url.searchParams.get("archived") === "true") {
+        await json(
+          route,
+          store.workspaces
+            .filter((item) => item.archived_at !== null)
+            .sort((a, b) => String(b.archived_at).localeCompare(String(a.archived_at))),
+        );
+        return;
+      }
       await json(
         route,
-        [...store.workspaces].sort((a, b) => Number(a.position) - Number(b.position)),
+        store.workspaces
+          .filter((item) => item.archived_at === null)
+          .sort((a, b) => Number(a.position) - Number(b.position)),
       );
       return;
     }
@@ -1114,15 +1155,19 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         body.first_session && typeof body.first_session === "object"
           ? (body.first_session as JsonRecord)
           : null;
+      // The home comes from `first_session` when one is asked for, else from
+      // the top-level pair — a blank workspace is created homed but empty.
+      const homeHostId = first?.host_id ?? body.host_id ?? null;
+      const homeCwd = first?.cwd ?? body.cwd ?? null;
       const createdWorkspace: JsonRecord = workspace({
         id: nextId(),
         name:
           body.name ??
-          workspaceNameFromCwd(typeof first?.cwd === "string" ? first.cwd : "") ??
+          workspaceNameFromCwd(typeof homeCwd === "string" ? homeCwd : "") ??
           `Workspace ${store.workspaces.length + 1}`,
         position: store.workspaces.length,
-        host_id: first?.host_id ?? null,
-        cwd: first?.cwd ?? null,
+        host_id: homeHostId,
+        cwd: homeCwd,
       });
       let createdSession: JsonRecord | null = null;
       if (first) {
@@ -1140,12 +1185,58 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
           store.sessionSkills[String(createdSession.id)] = first.skill_ids.map(String);
         }
         createdWorkspace.layout = envelope({
-          version: 2,
-          tiles: [{ session_id: createdSession.id as string, x: 0, y: 0, w: 12, h: 12 }],
+          version: 3,
+          tiles: [{ session_id: createdSession.id as string, x: 0, y: 0, w: 24, h: 24 }],
         });
       }
       store.workspaces.push(createdWorkspace);
       await json(route, { workspace: createdWorkspace, session: createdSession }, 201);
+      return;
+    }
+    const archiveMatch = path.match(/^\/api\/workspaces\/([^/]+)\/(un)?archive$/);
+    if (archiveMatch && method === "POST") {
+      const selected = findById(store.workspaces, archiveMatch[1]);
+      if (!selected) {
+        await json(route, { detail: "workspace not found" }, 404);
+        return;
+      }
+      const restoring = archiveMatch[2] === "un";
+      store.requests.workspaceArchives.push({ id: String(selected.id), restoring });
+      const ids = new Set(allTiles(selected.layout as LayoutV3).map((tile) => tile.session_id));
+      if (restoring) {
+        selected.archived_at = null;
+        // Reinsertion at the remembered slot: `position` never stopped
+        // holding this row's old place while it was away.
+        const rest = store.workspaces
+          .filter((item) => item.archived_at === null && item.id !== selected.id)
+          .sort((a, b) => Number(a.position) - Number(b.position));
+        rest.splice(Math.min(Number(selected.position), rest.length), 0, selected);
+        rest.forEach((item, index) => {
+          item.position = index;
+        });
+        // The same sessions start again, under the same ids.
+        for (const item of store.sessions) {
+          if (ids.has(String(item.id))) item.status = "starting";
+        }
+      } else {
+        // Suspend, not teardown: the windows stop, the layout is untouched.
+        for (const item of store.sessions) {
+          if (ids.has(String(item.id))) {
+            item.status = "killed";
+            item.foreground_command = null;
+          }
+        }
+        selected.archived_at = new Date().toISOString();
+        // Archiving closes the gap it made in the sidebar's ordering, and
+        // leaves the archived row's own position alone.
+        store.workspaces
+          .filter((item) => item.archived_at === null)
+          .sort((a, b) => Number(a.position) - Number(b.position))
+          .forEach((item, index) => {
+            item.position = index;
+          });
+      }
+      await json(route, selected);
       return;
     }
     const workspaceMatch = path.match(/^\/api\/workspaces\/([^/]+)$/);

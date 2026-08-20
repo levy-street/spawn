@@ -64,7 +64,12 @@ const DialogContent = React.forwardRef<
     VariantProps<typeof contentVariants> & { hideClose?: boolean }
 >(({ size, hideClose = false, className, children, ...props }, ref) => (
   <DialogPrimitive.Portal>
-    <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/60 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=open]:fade-in-0" />
+    {/* Tagged so a dialog holding portaled menus can tell a click on the
+        scrim (dismiss) from one on a menu it opened itself (do not). */}
+    <DialogPrimitive.Overlay
+      data-dialog-overlay=""
+      className="fixed inset-0 z-50 bg-black/60 backdrop-blur-[2px] data-[state=open]:animate-in data-[state=open]:fade-in-0"
+    />
     <DialogPrimitive.Content
       ref={ref}
       className={cn(contentVariants({ size }), className)}

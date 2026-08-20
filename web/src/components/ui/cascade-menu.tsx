@@ -446,7 +446,10 @@ export const CascadeMenu = forwardRef<
             onKeyDown={onListKeyDown}
             style={coords ?? { position: "fixed", visibility: "hidden" }}
             className={cn(
-              "z-[100] w-64 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40",
+              // pointer-events-auto: a modal Radix dialog sets `pointer-events:
+              // none` on the body, and this menu is portaled to it — without
+              // this, a menu opened from inside a dialog is dead to the mouse.
+              "pointer-events-auto z-[100] w-64 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40",
               "animate-in fade-in-0 zoom-in-95 duration-100",
               menuClassName,
             )}

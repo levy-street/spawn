@@ -4,8 +4,11 @@ import type { Session, Workspace } from "@/lib/api";
 import type { Tile } from "@/lib/grid";
 import {
   defaultWorkspaceName,
+  filterWorkspacesByName,
+  isArchived,
   tabAttentionCount,
   workspaceAttentionCount,
+  workspaceLiveSessionCount,
   workspaceRecency,
   workspaceSessionIds,
   workspaceTileCount,
@@ -24,9 +27,10 @@ function makeWorkspace(tiles: Tile[], overrides: Partial<Workspace> = {}): Works
     layout: {
       version: 3,
       active_tab: "tab-1",
-      tabs: [{ id: "tab-1", name: "Tab 1", layout: { version: 2, tiles } }],
+      tabs: [{ id: "tab-1", name: "Tab 1", layout: { version: 3, tiles } }],
     },
     position: 0,
+    archived_at: null,
     created_at: "2026-08-19T00:00:00Z",
     updated_at: "2026-08-19T00:00:00Z",
     ...overrides,
@@ -106,7 +110,7 @@ describe("tabAttentionCount", () => {
           id: "tab-1",
           name: "Tab 1",
           layout: {
-            version: 2 as const,
+            version: 3 as const,
             tiles: [
               { session_id: S1, x: 0, y: 0, w: 6, h: 12 },
               {
@@ -123,7 +127,7 @@ describe("tabAttentionCount", () => {
         {
           id: "tab-2",
           name: "Tab 2",
-          layout: { version: 2 as const, tiles: [{ session_id: S2, x: 0, y: 0, w: 12, h: 12 }] },
+          layout: { version: 3 as const, tiles: [{ session_id: S2, x: 0, y: 0, w: 12, h: 12 }] },
         },
       ],
     };
@@ -135,7 +139,7 @@ describe("tabAttentionCount", () => {
     expect(tabAttentionCount(layout.tabs[0]!, sessionsById)).toBe(1);
     expect(tabAttentionCount(layout.tabs[1]!, sessionsById)).toBe(1);
     expect(
-      tabAttentionCount({ ...layout.tabs[0]!, layout: { version: 2, tiles: [] } }, sessionsById),
+      tabAttentionCount({ ...layout.tabs[0]!, layout: { version: 3, tiles: [] } }, sessionsById),
     ).toBe(0);
   });
 });
@@ -157,5 +161,58 @@ describe("workspaceRecency", () => {
     expect(workspaceRecency(workspace, sessionsById)).toBe(Date.parse(newest));
     expect(workspaceRecency(workspace, new Map())).toBe(Date.parse("2026-08-19T10:00:00Z"));
     expect(workspaceRecency(makeWorkspace([], { updated_at: "garbage" }), new Map())).toBe(0);
+  });
+});
+
+describe("isArchived", () => {
+  test("reads the timestamp, not a flag", () => {
+    expect(isArchived(makeWorkspace([]))).toBe(false);
+    expect(isArchived(makeWorkspace([], { archived_at: "2026-08-19T00:00:00Z" }))).toBe(true);
+  });
+});
+
+describe("filterWorkspacesByName", () => {
+  const list = [
+    makeWorkspace([], { id: "a", name: "Build desk" }),
+    makeWorkspace([], { id: "b", name: "client work" }),
+    makeWorkspace([], { id: "c", name: "Buildkite" }),
+  ];
+
+  test("an empty or whitespace query keeps the list as it was", () => {
+    expect(filterWorkspacesByName(list, "")).toBe(list);
+    expect(filterWorkspacesByName(list, "   ")).toBe(list);
+  });
+
+  test("matches case-insensitively anywhere in the name, preserving order", () => {
+    expect(filterWorkspacesByName(list, "build").map((w) => w.id)).toEqual(["a", "c"]);
+    expect(filterWorkspacesByName(list, "DESK").map((w) => w.id)).toEqual(["a"]);
+    expect(filterWorkspacesByName(list, "  work ").map((w) => w.id)).toEqual(["b"]);
+    expect(filterWorkspacesByName(list, "nothing")).toEqual([]);
+  });
+});
+
+describe("workspaceLiveSessionCount", () => {
+  const workspace = makeWorkspace([
+    { session_id: S1, x: 0, y: 0, w: 8, h: 12 },
+    { session_id: S2, x: 8, y: 0, w: 8, h: 12 },
+    { session_id: S3, x: 16, y: 0, w: 8, h: 12 },
+  ]);
+
+  test("counts only sessions archiving would actually stop", () => {
+    const sessionsById = new Map<string, Session>([
+      [S1, makeSession(S1, { status: "running" })],
+      [S2, makeSession(S2, { status: "starting" })],
+      [S3, makeSession(S3, { status: "exited" })],
+    ]);
+    expect(workspaceLiveSessionCount(workspace, sessionsById)).toBe(2);
+  });
+
+  test("a workspace of dead or unknown panes costs nothing to archive", () => {
+    const sessionsById = new Map<string, Session>([
+      [S1, makeSession(S1, { status: "killed" })],
+      [S2, makeSession(S2, { status: "exited" })],
+    ]);
+    expect(workspaceLiveSessionCount(workspace, sessionsById)).toBe(0);
+    expect(workspaceLiveSessionCount(workspace, new Map())).toBe(0);
   });
 });

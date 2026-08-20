@@ -1,8 +1,8 @@
 /**
- * Pure 12×12 packed-grid algebra for workspace layout schema v2.
+ * Pure 24×24 packed-grid algebra for workspace grid schema v3.
  *
  * Contract: docs/OVERHAUL.md §4.4. The cross-language conformance suite in
- * proto/layout-v2-fixtures.json is the authority on every behavior here and is
+ * proto/layout-v3-fixtures.json is the authority on every behavior here and is
  * shared with the Python twin (server/spawn_server/grid.py); both
  * implementations must pass every fixture case. Behavior the §4.4 prose leaves
  * open is pinned by the fixture file's `_rules` list.
@@ -12,17 +12,25 @@
  * closes a gap, and only the one it just made).
  *
  * Except for `validate`, every function assumes a valid tile list (as defined
- * by `validate`): integer geometry, in bounds, at least 2×2, no overlaps, at
- * most 8 tiles, unique session ids. All functions are deterministic (no
+ * by `validate`): integer geometry, in bounds, at least 4×4, no overlaps, at
+ * most 16 tiles, unique session ids. All functions are deterministic (no
  * randomness, no ambient state), total on valid input, and never mutate their
  * arguments. Returned tile arrays are always sorted in reading order (y, then
  * x); on valid input that order is unambiguous because two tiles can never
  * share an origin cell.
  */
 
-export const GRID_SIZE = 12;
-export const MIN_TILE_SIZE = 2;
-export const MAX_TILES = 8;
+/**
+ * Grid schema version. Bumped from 2 to 3 when the canvas went from 12x12 to
+ * 24x24: coordinates ARE the wire format, so the number they are measured in
+ * has to travel with them. Anything still stamped 2 is in the old space and
+ * has not been through migration 0037 yet.
+ */
+export const LAYOUT_VERSION = 3;
+
+export const GRID_SIZE = 24;
+export const MIN_TILE_SIZE = 4;
+export const MAX_TILES = 16;
 
 /**
  * Non-session pane content. A widget tile's `session_id` is its own id — the
@@ -45,8 +53,8 @@ export interface Tile {
   widget?: TileWidget;
 }
 
-export interface LayoutV2 {
-  version: 2;
+export interface GridLayout {
+  version: typeof LAYOUT_VERSION;
   tiles: Tile[];
 }
 
@@ -70,7 +78,7 @@ export type SplitTreeNode = SplitTreePane | SplitTreeSplit;
 
 export type LayoutErrorCode =
   | "shape" // layout is not an object, or `tiles` is not an array
-  | "version" // `version` is not exactly 2
+  | "version" // `version` is not exactly LAYOUT_VERSION
   | "count" // more than MAX_TILES tiles
   | "session_id" // tile session_id is missing or not a non-empty string
   | "integer" // x/y/w/h are not all integers
@@ -133,7 +141,7 @@ export function validate(layout: unknown): ValidationResult {
   }
   const tiles: unknown[] = candidate.tiles;
   const errors: LayoutError[] = [];
-  if (candidate.version !== 2) errors.push({ code: "version" });
+  if (candidate.version !== LAYOUT_VERSION) errors.push({ code: "version" });
   if (tiles.length > MAX_TILES) errors.push({ code: "count" });
 
   const ids: (string | null)[] = [];
@@ -190,16 +198,16 @@ export function validate(layout: unknown): ValidationResult {
 }
 
 /**
- * Finds a spot for a new tile. Scans for the first free 2×2 position (y, then
+ * Finds a spot for a new tile. Scans for the first free 4×4 position (y, then
  * x), then greedily expands it rightward (at the minimum height) and downward. When no
- * 2×2 is free, splits the largest-area tile whose longer side is at least 4
+ * 4×4 is free, splits the largest-area tile whose longer side is at least 8
  * (ties on area broken by reading order) along its longer axis — a vertical
  * cut when w ≥ h — keeping ceil(side/2) for the existing tile and returning
  * the remaining half as the new tile's spot.
  *
  * Returns the new tile's geometry plus the (possibly shrunk) tile list; the
  * caller appends `{session_id, ...tile}` itself. `tile` is null when the grid
- * is already at MAX_TILES, or when no 2×2 is free and no tile is large enough
+ * is already at MAX_TILES, or when no 4×4 is free and no tile is large enough
  * to split (unreachable through this module's own operations, but valid
  * layouts exist that trigger it).
  */
@@ -322,7 +330,7 @@ export function move(tiles: Tile[], id: string, x: number, y: number): Tile[] {
 
 /**
  * Resizes a tile to (w, h) about its own origin, clamped to the invariants (at
- * least 2×2, within the canvas from the tile's position). Nothing else moves:
+ * least 4×4, within the canvas from the tile's position). Nothing else moves:
  * shrinking leaves empty canvas behind, and growing succeeds only into space
  * that is already empty — a growth that would overlap another tile returns the
  * input unchanged. Unknown ids return the input unchanged.

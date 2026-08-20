@@ -2,7 +2,9 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Archive,
   Check,
+  Copy,
   Ellipsis,
   FolderOpen,
   LayoutTemplate,
@@ -34,6 +36,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   DropdownMenu,
+  type DropdownMenuHandle,
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
@@ -44,6 +47,7 @@ import {
   agents,
   type Host,
   hosts,
+  sessionAccess,
   sessions,
   type Workspace,
   workspaces,
@@ -52,9 +56,12 @@ import {
 import type { Tile } from "@/lib/grid";
 import { GRID_SIZE } from "@/lib/grid";
 import { basename } from "@/lib/paths";
+import { runningAgent } from "@/lib/sessions";
 import {
   addTab,
   allTiles,
+  copyTabName,
+  duplicateTab,
   type LayoutV3,
   MAX_TABS,
   nextTabName,
@@ -66,8 +73,12 @@ import {
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { templateSpecFromWorkspace } from "@/lib/workspace-templates";
-import { tabAttentionCount } from "@/lib/workspaces";
+import { tabAttentionCount, workspaceLiveSessionCount } from "@/lib/workspaces";
+import { agentRunCommand } from "./agent-command";
 import { FolderPickerDialog } from "./folder-picker-dialog";
+import { pendingLaunch } from "./pending-launch";
+import { useTabHome } from "./tab-home";
+import { wantsDuplicate } from "./workspace-grid-helpers";
 
 /** Travel that tells a reorder drag apart from a click, as in the grid. */
 const DRAG_THRESHOLD_PX = 4;
@@ -87,12 +98,22 @@ type TabDrag = {
   /** The slot the tab would land in were the pointer lifted now. */
   to: number;
   startClientX: number;
+  /** The pointer's last x, so pressing ⌘/⌥ alone re-previews from where the
+   *  drag already is rather than waiting for the next move. */
+  lastClientX: number;
   /** Travel bounds that keep the dragged tab inside the strip's own tabs. */
   minDx: number;
   maxDx: number;
   /** What a passed-over tab gives up: the dragged tab's width plus the gap. */
   step: number;
+  /** True while ⌘/⌥ is held: the drop duplicates the tab instead of moving it,
+   *  and `insertAt` — not `to` — is the slot that matters. */
+  duplicating: boolean;
+  /** The slot the copy would take were the pointer lifted now, counted in the
+   *  strip as it stands (so `tabs.length` means the end). */
+  insertAt: number;
   move: (event: PointerEvent) => void;
+  key: (event: KeyboardEvent) => void;
   end: () => void;
   cancel: () => void;
 };
@@ -158,6 +179,16 @@ export function WorkspaceTabs({
   const [pendingHomeHost, setPendingHomeHost] = useState<Host | null>(null);
   const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
   const [templateNameDraft, setTemplateNameDraft] = useState("");
+  // One context menu serves the whole strip: right-click records which tab it
+  // was aimed at and opens the menu at the cursor.
+  const tabMenuRef = useRef<DropdownMenuHandle>(null);
+  // The tab under the cursor when its menu opened, so "Change tab folder"
+  // re-points that tab rather than whichever one is selected.
+  const [homeTabId, setHomeTabId] = useState<string | null>(null);
+  const tabHomeM = useTabHome(workspace, homeTabId ?? activeTabId, onError);
+  const tabGhostRef = useRef<HTMLDivElement>(null);
+  const tabGhostLabelRef = useRef<HTMLSpanElement>(null);
+  const [contextTabId, setContextTabId] = useState<string | null>(null);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
   const sessionsQ = useQuery({ queryKey: ["sessions"], queryFn: () => sessions.list() });
   const agentsQ = useQuery({ queryKey: ["agents"], queryFn: agents.list, staleTime: 60_000 });
@@ -264,6 +295,8 @@ export function WorkspaceTabs({
     document.removeEventListener("pointermove", drag.move);
     document.removeEventListener("pointerup", drag.end);
     document.removeEventListener("pointercancel", drag.cancel);
+    document.removeEventListener("keydown", drag.key);
+    document.removeEventListener("keyup", drag.key);
     for (const element of tabElementsRef.current.values()) {
       // Order: dropping the transition first means clearing the transform is
       // an instant jump, not an animation back from the drag's offset while
@@ -271,20 +304,35 @@ export function WorkspaceTabs({
       element.style.removeProperty("transition");
       element.style.transform = "";
       element.removeAttribute("data-dragging");
+      element.removeAttribute("data-duplicating");
+    }
+    const ghost = tabGhostRef.current;
+    if (ghost) {
+      ghost.hidden = true;
+      ghost.style.transform = "";
     }
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
+    if (commit && drag.duplicating) {
+      duplicateM.mutate({ tabId: drag.tabId, index: drag.insertAt });
+      return;
+    }
     const next = commit ? reorderTab(layoutRef.current, drag.tabId, drag.to) : null;
     if (!next) return;
     setDroppedOrder(next.tabs.map((tab) => tab.id));
     patchM.mutate(next);
   };
 
-  const beginDrag = (tabId: string, startClientX: number) => {
+  const beginDrag = (
+    tabId: string,
+    startClientX: number,
+    clientX: number,
+    duplicating: boolean,
+  ) => {
     const list = layoutRef.current.tabs;
     const from = list.findIndex((tab) => tab.id === tabId);
     const elements = list.map((tab) => tabElementsRef.current.get(tab.id));
-    if (from === -1 || elements.length < 2 || elements.some((element) => !element)) return;
+    if (from === -1 || elements.length === 0 || elements.some((element) => !element)) return;
     const slots: TabSlot[] = elements.map((element, index) => {
       const rect = (element as HTMLElement).getBoundingClientRect();
       return { id: list[index].id, left: rect.left, width: rect.width };
@@ -292,11 +340,58 @@ export function WorkspaceTabs({
     const first = slots[0];
     const last = slots[slots.length - 1];
     const grabbed = slots[from];
-    const move = (event: PointerEvent) => {
+    const secondSlot = slots[1];
+    // The strip's own gap, measured between two tabs where there are two — a
+    // lone tab can still be copied, and its ghost needs the same breathing
+    // room, so fall back to what the flex row is set to.
+    const gap = secondSlot
+      ? Math.max(0, secondSlot.left - (first.left + first.width))
+      : Number.parseFloat(stripRef.current ? getComputedStyle(stripRef.current).columnGap : "") ||
+        0;
+    /** Every place a copy can go: the resting left edge of each tab, and the
+     *  strip's end — which is where the ghost already sits in flow. */
+    const gaps = [...slots.map((slot) => slot.left), last.left + last.width + gap];
+    /** The ghost's resting geometry, read the first time it is shown. */
+    let ghostLeft = 0;
+    let ghostStep = 0;
+
+    /**
+     * Duplicating: open the gap the copy will drop into. The copy is carried
+     * at the offset the tab was grabbed by — exactly as the reorder carries
+     * the tab itself — so it stays under the hand however far the drag runs,
+     * and the gap it claims is whichever one its leading edge is nearest. The
+     * tabs from there on slide aside by a ghost's width, and the ghost travels
+     * back from the end of the strip to sit in the space. The source tab keeps
+     * its own slot throughout, the same bargain the pane drag strikes, where
+     * the original stays put and only the ghost moves.
+     */
+    const previewCopy = (pointerX: number) => {
       const drag = dragRef.current;
       if (!drag) return;
-      event.preventDefault();
-      const dx = Math.min(drag.maxDx, Math.max(drag.minDx, event.clientX - drag.startClientX));
+      const left = grabbed.left + (pointerX - drag.startClientX);
+      let insertAt = 0;
+      for (const [index, edge] of gaps.entries()) {
+        if (Math.abs(edge - left) < Math.abs(gaps[insertAt] - left)) insertAt = index;
+      }
+      if (insertAt === drag.insertAt) return;
+      drag.insertAt = insertAt;
+      for (const [index, slot] of slots.entries()) {
+        const element = tabElementsRef.current.get(slot.id);
+        if (!element) continue;
+        element.style.transform = index < insertAt ? "" : `translate3d(${ghostStep}px, 0, 0)`;
+      }
+      const ghost = tabGhostRef.current;
+      if (ghost) ghost.style.transform = `translate3d(${gaps[insertAt] - ghostLeft}px, 0, 0)`;
+    };
+
+    /**
+     * Reordering: the grabbed tab rides the pointer and the tabs it passes
+     * slide one slot the other way, into the space it left behind.
+     */
+    const previewMove = (pointerX: number) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      const dx = Math.min(drag.maxDx, Math.max(drag.minDx, pointerX - drag.startClientX));
       // The slot the tab has taken over: its leading edge against the resting
       // middles either side, so covering half a neighbour claims it. Middle
       // against middle would want a whole tab of travel, which the clamp at
@@ -317,15 +412,88 @@ export function WorkspaceTabs({
         element.style.transform = shift === 0 ? "" : `translate3d(${shift}px, 0, 0)`;
       }
     };
+
+    const apply = (pointerX: number) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      drag.lastClientX = pointerX;
+      if (drag.duplicating) previewCopy(pointerX);
+      else previewMove(pointerX);
+    };
+
+    /**
+     * ⌘/⌥ down or up, flipping a live drag between the two previews. Either
+     * way the strip parts around what the hand is carrying; what differs is
+     * what ends up in the gap — the tab itself, or the ghost of its copy.
+     */
+    const setDuplicating = (wanted: boolean) => {
+      const drag = dragRef.current;
+      if (!drag || drag.duplicating === wanted) return;
+      drag.duplicating = wanted;
+      document.body.style.cursor = wanted ? "copy" : "grabbing";
+      const element = tabElementsRef.current.get(drag.tabId);
+      if (element) {
+        if (wanted) element.setAttribute("data-duplicating", "true");
+        else element.removeAttribute("data-duplicating");
+        // Copying, the source eases back to its slot along with the rest of
+        // the strip; reordering, it is under the cursor again and must snap.
+        element.style.transition = wanted ? "transform 150ms ease-out" : "none";
+      }
+      const ghost = tabGhostRef.current;
+      if (ghost && wanted) {
+        drag.to = drag.from;
+        const source = layoutRef.current.tabs.find((tab) => tab.id === drag.tabId);
+        if (tabGhostLabelRef.current && source) {
+          tabGhostLabelRef.current.textContent = copyTabName(layoutRef.current, source.name);
+        }
+        // Shown, and shown untravelled, before it is measured: hidden it has
+        // no geometry at all, and a stale transform would skew what it has.
+        ghost.style.transform = "";
+        ghost.hidden = false;
+        const rect = ghost.getBoundingClientRect();
+        ghostLeft = rect.left;
+        ghostStep = rect.width + gap;
+      } else if (ghost) {
+        ghost.hidden = true;
+        ghost.style.transform = "";
+      }
+      // Re-preview in the new mode from wherever the pointer already is: the
+      // modifier can be pressed and released without the pointer moving.
+      drag.insertAt = -1;
+      apply(drag.lastClientX);
+    };
+
+    const move = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      event.preventDefault();
+      drag.lastClientX = event.clientX;
+      setDuplicating(wantsDuplicate(event));
+      apply(event.clientX);
+    };
+
     const drag: TabDrag = {
       tabId,
       from,
       to: from,
       startClientX,
+      lastClientX: clientX,
       minDx: first.left - grabbed.left,
       maxDx: last.left + last.width - (grabbed.left + grabbed.width),
-      step: grabbed.width + Math.max(0, slots[1].left - (first.left + first.width)),
+      step: grabbed.width + gap,
+      duplicating: false,
+      insertAt: -1,
       move,
+      key: (event) => {
+        // Escape abandons the drag; the strip closes back over the gap.
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          finishDrag(false);
+          return;
+        }
+        setDuplicating(wantsDuplicate(event));
+      },
       end: () => finishDrag(true),
       cancel: () => finishDrag(false),
     };
@@ -339,7 +507,11 @@ export function WorkspaceTabs({
     elements[from]?.setAttribute("data-dragging", "true");
     document.body.style.cursor = "grabbing";
     document.body.style.userSelect = "none";
+    setDuplicating(duplicating);
+    apply(clientX);
     document.addEventListener("pointermove", drag.move, { passive: false });
+    document.addEventListener("keydown", drag.key);
+    document.addEventListener("keyup", drag.key);
     document.addEventListener("pointerup", drag.end, { once: true });
     document.addEventListener("pointercancel", drag.cancel, { once: true });
   };
@@ -347,7 +519,12 @@ export function WorkspaceTabs({
   const armDrag = (tabId: string, event: ReactPointerEvent<HTMLElement>) => {
     draggedRef.current = false;
     if (event.button !== 0 || event.pointerType === "touch") return;
-    if (renamingId || layoutRef.current.tabs.length < 2) return;
+    if (renamingId) return;
+    // A lone tab has nowhere to be reordered to, but it can still be copied,
+    // and ⌘/⌥ is as often pressed after the drag is under way as before it —
+    // so the gesture arms whatever the strip holds, and a reorder with nowhere
+    // to go simply comes to nothing on the drop.
+    const duplicating = wantsDuplicate(event);
     disarmDrag();
     const startClientX = event.clientX;
     const startClientY = event.clientY;
@@ -359,7 +536,7 @@ export function WorkspaceTabs({
         return;
       }
       disarmDrag();
-      beginDrag(tabId, startClientX);
+      beginDrag(tabId, startClientX, moveEvent.clientX, duplicating || wantsDuplicate(moveEvent));
     };
     const armed: ArmedTabDrag = { move, end: disarmDrag };
     armedDragRef.current = armed;
@@ -424,6 +601,72 @@ export function WorkspaceTabs({
     patchM.mutate(next);
     onSwitch(next.active_tab as string);
   };
+
+  /**
+   * Duplicate a tab: same geometry, a second pane per pane, each on the same
+   * host and folder with the same agent relaunched in it. The sessions are
+   * real and new — this copies the workspace's shape and its intent, not the
+   * running processes. `index` is the slot the copy takes — where a ⌘/⌥ drag
+   * was dropped; left out, as the menu leaves it, the copy goes on the end.
+   */
+  const duplicateM = useMutation({
+    mutationFn: async ({ tabId, index }: { tabId: string; index?: number }) => {
+      const layout = layoutRef.current;
+      const tab = tabById(layout, tabId);
+      if (!tab) throw new Error("That tab is gone.");
+      if (layout.tabs.length >= MAX_TABS) {
+        throw new Error(`A workspace holds at most ${MAX_TABS} tabs.`);
+      }
+      const sessionsById = new Map((sessionsQ.data ?? []).map((item) => [item.id, item]));
+      const copiedIds = new Map<string, string>();
+      const created: string[] = [];
+      try {
+        for (const tile of tab.layout.tiles) {
+          // A widget is pure layout: its copy needs no round trip.
+          if (tile.widget) {
+            copiedIds.set(tile.session_id, crypto.randomUUID());
+            continue;
+          }
+          const source = sessionsById.get(tile.session_id);
+          if (!source) continue; // a tile whose session is already gone
+          const access = await sessionAccess.get(source.id).catch(() => null);
+          const skillIds = access?.skills.map((skill) => skill.id) ?? [];
+          const copy = await sessions.create({
+            host_id: source.host_id,
+            cwd: source.cwd,
+            ...(skillIds.length > 0 && { skill_ids: skillIds }),
+          });
+          created.push(copy.id);
+          copiedIds.set(tile.session_id, copy.id);
+          const agent = runningAgent(source, agentsQ.data ?? []);
+          if (agent) pendingLaunch.set(copy.id, agentRunCommand(agent));
+        }
+        const next = duplicateTab(
+          layout,
+          tabId,
+          crypto.randomUUID(),
+          copyTabName(layout, tab.name),
+          copiedIds,
+          index,
+        );
+        if (!next) throw new Error("This workspace has no room for another tab.");
+        const saved = await workspaces.update(workspace.id, { layout: next });
+        return { saved, tabId: next.active_tab as string };
+      } catch (error) {
+        // Never strand half a tab's worth of shells with nothing pointing at
+        // them: the layout write is the only thing that makes them visible.
+        await Promise.allSettled(created.map((id) => sessions.remove(id)));
+        throw error;
+      }
+    },
+    onSuccess: ({ saved, tabId }) => {
+      writeCaches(saved);
+      queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      onError?.(null);
+      onSwitch(tabId);
+    },
+    onError: (error) => onError?.(error instanceof Error ? error.message : String(error)),
+  });
 
   const close = async (tabId: string) => {
     const tab = workspace.layout.tabs.find((item) => item.id === tabId);
@@ -538,6 +781,32 @@ export function WorkspaceTabs({
     [sessionsQ.data],
   );
 
+  /**
+   * Put the workspace away: its shape is kept and its sessions stop. Only
+   * asks when there is something running to stop — the destructive copy
+   * belongs to Delete, which keeps nothing.
+   */
+  const archiveWorkspace = async () => {
+    const live = workspaceLiveSessionCount(workspace, sessionsById);
+    if (live > 0) {
+      const accepted = await confirm({
+        title: `Archive ${workspace.name}?`,
+        body: `${live} running ${live === 1 ? "session" : "sessions"} will be closed. The layout is kept — restore it any time from Archived in the sidebar.`,
+        confirmLabel: "Archive workspace",
+      });
+      if (!accepted) return;
+    }
+    try {
+      await workspaces.archive(workspace.id);
+    } catch (error) {
+      onError?.(error instanceof Error ? error.message : String(error));
+      return;
+    }
+    queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+    queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    router.replace("/app");
+  };
+
   return (
     /*
      * Shaped like real tabs: the strip is a band of the shell ground with a
@@ -599,6 +868,11 @@ export function WorkspaceTabs({
               aria-keyshortcuts="Alt+Shift+ArrowLeft Alt+Shift+ArrowRight"
               data-workspace-tab={tab.id}
               onPointerDown={(event) => armDrag(tab.id, event)}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                setContextTabId(tab.id);
+                tabMenuRef.current?.openAt(event.clientX, event.clientY);
+              }}
               onKeyDown={(event) => {
                 if (!event.altKey || !event.shiftKey || event.ctrlKey || event.metaKey) return;
                 const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : 0;
@@ -670,6 +944,21 @@ export function WorkspaceTabs({
           </div>
         );
       })}
+      {/* Where a ⌘/⌥ drag will drop the copy. It lives in flow past the last
+          tab — the strip makes room for it while the drag is live — and rides
+          a transform back to whichever gap the pointer has opened, which is
+          the slot `duplicateTab` is told to insert into. The source tab never
+          leaves its own slot. */}
+      <div
+        ref={tabGhostRef}
+        hidden
+        aria-hidden
+        data-workspace-tab-ghost
+        className="flex h-8 min-w-40 shrink-0 items-center gap-1.5 rounded-md border-2 border-dashed border-ring bg-ring/10 px-3 text-xs font-medium text-foreground transition-transform duration-150 ease-out"
+      >
+        <Copy className="size-3.5 shrink-0" aria-hidden />
+        <span ref={tabGhostLabelRef} className="max-w-48 truncate" />
+      </div>
       <Button
         type="button"
         variant="ghost"
@@ -681,6 +970,68 @@ export function WorkspaceTabs({
       >
         <Plus className="size-3.5" aria-hidden />
       </Button>
+
+      {/* Right-click on any tab. Rendered once for the whole strip and opened
+          at the cursor, so it is not eight menus deep in the DOM. */}
+      <DropdownMenu ref={tabMenuRef} align="start" className="hidden" renderTrigger={() => null}>
+        <DropdownMenuItem
+          disabled={
+            contextTabId === null ||
+            workspace.layout.tabs.length >= MAX_TABS ||
+            duplicateM.isPending
+          }
+          onSelect={() => {
+            if (contextTabId) duplicateM.mutate({ tabId: contextTabId });
+          }}
+        >
+          <Copy className="size-4" aria-hidden />
+          Duplicate tab
+          <span className="ml-auto shrink-0 pl-3 text-xs tracking-wide text-muted-foreground">
+            ⌘/⌥ drag
+          </span>
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          disabled={contextTabId === null}
+          onSelect={() => {
+            const tab = contextTabId ? tabById(workspace.layout, contextTabId) : null;
+            if (!tab) return;
+            if (tab.id !== activeTabId) onSwitch(tab.id);
+            setDraft(tab.name);
+            setRenamingId(tab.id);
+          }}
+        >
+          <Pencil className="size-4" aria-hidden />
+          Rename tab
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          // Always the tab under the cursor, so a tab with windows on it can
+          // still be re-pointed — the empty state's chip is only there while
+          // the canvas is bare.
+          disabled={contextTabId === null}
+          onSelect={() => {
+            if (!contextTabId) return;
+            setHomeTabId(contextTabId);
+            if (contextTabId !== activeTabId) onSwitch(contextTabId);
+            tabHomeM.open();
+          }}
+        >
+          <FolderOpen className="size-4" aria-hidden />
+          Change tab folder
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          destructive
+          disabled={contextTabId === null || workspace.layout.tabs.length <= 1}
+          onSelect={() => {
+            if (contextTabId) void close(contextTabId);
+          }}
+        >
+          <Trash2 className="size-4" aria-hidden />
+          Close tab
+        </DropdownMenuItem>
+      </DropdownMenu>
+
+      {tabHomeM.dialogs}
 
       {/* Core workspace settings live at the strip's far right; adding panes
           is the floating launcher's job (bottom-right of the viewport). */}
@@ -733,6 +1084,10 @@ export function WorkspaceTabs({
           <LayoutTemplate className="size-4" aria-hidden />
           Save as template
         </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => void archiveWorkspace()}>
+          <Archive className="size-4" aria-hidden />
+          Archive workspace
+        </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem destructive onSelect={() => void deleteWorkspace()}>
           <Trash2 className="size-4" aria-hidden />
@@ -784,7 +1139,7 @@ export function WorkspaceTabs({
                 onChange={(event) => setTemplateNameDraft(event.currentTarget.value)}
               />
               <p className="text-xs text-muted-foreground">
-                Saves this workspace's tabs, pane arrangement, and what runs in each pane. New
+                Saves this workspace's tabs, window arrangement, and what runs in each window. New
                 workspaces created from it pick their own folder.
               </p>
             </div>
@@ -807,7 +1162,7 @@ export function WorkspaceTabs({
           </DialogHeader>
           <div className="space-y-1 px-6 py-2">
             <p className="pb-1 text-xs text-muted-foreground">
-              New panes open on this host. Existing panes stay where they are.
+              New windows open on this host. Existing windows stay where they are.
             </p>
             {hostList.map((host) => {
               const current = host.id === workspace.host_id;

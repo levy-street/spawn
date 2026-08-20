@@ -22,15 +22,28 @@ import {
   type Workspace,
   workspaces,
 } from "@/lib/api";
-import { autoPlace, GRID_SIZE, type Rect } from "@/lib/grid";
-import { activeTab, tabById, tabTiles, withActiveTab, withTabTiles } from "@/lib/tabs";
+import { autoPlace, GRID_SIZE, type Rect, type Tile } from "@/lib/grid";
+import { activeTab, tabById, tabHome, tabTiles, withActiveTab, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { pendingLaunch } from "./pending-launch";
-import { type DockZone, dockSplitRect, dockZoneAt } from "./workspace-grid-helpers";
+import {
+  addPaneTiles,
+  type DockZone,
+  dockInsert,
+  dockZoneAt,
+  PENDING_TILE_ID,
+} from "./workspace-grid-helpers";
 
 /** What a launcher item adds: a shell, an agent in a shell, or a widget. */
 type Choice = { kind: "shell" } | { kind: "agent"; agent: Agent } | { kind: "files" };
+
+/** Where a dropped pane lands: a free opening, one half of a pane it was
+ *  aimed at, or an even share of the band. */
+type Drop =
+  | { kind: "opening"; rect: Rect }
+  | { kind: "dock"; targetId: string; zone: DockZone }
+  | { kind: "auto" };
 
 /** Pointer travel that separates a tap on an item from a drag off it. */
 const DRAG_THRESHOLD_PX = 4;
@@ -58,11 +71,19 @@ function choiceLabel(choice: Choice): string {
 export function LauncherFab({
   workspace,
   tabId,
+  paneDragging,
+  onPreviewTiles,
   onCreated,
 }: {
   workspace: Workspace;
   /** The tab on screen — panes land here, not in the server's idea of it. */
   tabId: string;
+  /** A pane is being carried on the canvas. This is the bin for that drag too,
+   *  so it wears the same face and keeps its drawer shut. */
+  paneDragging?: boolean;
+  /** The layout the canvas should show while a pane is dragged off here, null
+   *  once the drag ends. The grid renders it; the tab strip reads it too. */
+  onPreviewTiles?: (tiles: Tile[] | null) => void;
   onCreated?: (result: { sessionId: string | null }) => void;
 }) {
   const queryClient = useQueryClient();
@@ -77,18 +98,38 @@ export function LauncherFab({
     startY: number;
     started: boolean;
     target: Element | null;
-    /** Canvas geometry + where auto-place would land, captured at drag start. */
+    /**
+     * The canvas as it rests: its box, its openings, and where auto-place
+     * would land. All read once, at drag start, and never again — the panes
+     * on it are showing this drag's own preview, so measuring them mid-drag
+     * would have each frame answer the last one.
+     */
     canvas: DOMRect | null;
+    openings: Array<{ rect: Rect; button: Element | null }>;
     autoRect: Rect | null;
+    /** What the outline is promising, and the pointer target it came from —
+     *  the placement is only re-derived when that target changes. */
+    placement: string | null;
+    drop: Drop | null;
     move: (event: PointerEvent) => void;
-    up: (event: PointerEvent) => void;
+    up: () => void;
     cancel: () => void;
+    key: (event: KeyboardEvent) => void;
   } | null>(null);
+
+  // Anything in flight, from here or from the canvas: this is a bin for the
+  // length of it. Fanning out "add a pane" under the cursor at the same time
+  // would be offering the opposite of what the drop does.
+  const bin = dragging !== null || paneDragging === true;
+  const showItems = open && !bin;
 
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 15_000 });
   const agentsQ = useQuery({ queryKey: ["agents"], queryFn: agents.list, staleTime: 60_000 });
-  const homeHost = (hostsQ.data ?? []).find((host) => host.id === workspace.host_id) ?? null;
-  const home = homeHost && workspace.cwd ? { host: homeHost, cwd: workspace.cwd } : null;
+  // Where a window launched here opens: the tab's own home when it has one,
+  // else the workspace's — and only when that host is still around.
+  const target = tabHome(workspace.layout, tabId, workspace);
+  const homeHost = (hostsQ.data ?? []).find((host) => host.id === target?.host_id) ?? null;
+  const home = homeHost && target ? { host: homeHost, cwd: target.cwd } : null;
 
   const createM = useMutation({
     mutationFn: async ({
@@ -113,24 +154,23 @@ export function LauncherFab({
         layout = (await workspaces.update(workspace.id, { layout: withActiveTab(layout, tabId) }))
           .layout;
       }
-      // A dock resolves to a concrete placement by shrinking the occupant to
-      // its half. Sessions need that shrink persisted before the create (the
-      // server refuses a tile overlapping the occupant); the files write
-      // already carries the whole layout, so it folds the shrink in.
+      // A dock resolves to a concrete placement by reshaping the occupants
+      // around the newcomer — evenly across a band of columns or rows, else by
+      // halving the target. Sessions need that reshape persisted before the
+      // create (the server refuses a tile overlapping an occupant); the files
+      // write already carries the whole layout, so it folds the reshape in.
       let placed = placement;
       if (!placed && dock) {
         const tab = tabById(layout, tabId) ?? activeTab(layout);
-        const target = tab.layout.tiles.find((tile) => tile.session_id === dock.targetId);
-        const split = target ? dockSplitRect(target, dock.zone) : null;
-        if (target && split) {
+        const docked = dockInsert(tab.layout.tiles, PENDING_TILE_ID, dock.targetId, dock.zone);
+        const landed = docked?.find((tile) => tile.session_id === PENDING_TILE_ID);
+        if (docked && landed) {
           layout = withTabTiles(
             layout,
             tab.id,
-            tab.layout.tiles.map((tile) =>
-              tile.session_id === dock.targetId ? { ...tile, ...split.kept } : tile,
-            ),
+            docked.filter((tile) => tile.session_id !== PENDING_TILE_ID),
           );
-          placed = split.moved;
+          placed = { x: landed.x, y: landed.y, w: landed.w, h: landed.h };
           if (choice.kind !== "files") {
             layout = (
               await workspaces.update(workspace.id, { layout: withActiveTab(layout, tabId) })
@@ -140,24 +180,54 @@ export function LauncherFab({
       }
       if (choice.kind === "files") {
         const tab = tabById(layout, tabId) ?? activeTab(layout);
-        const placedTile = placed
-          ? { tile: placed, tiles: tab.layout.tiles }
-          : autoPlace(tab.layout.tiles);
-        if (!placedTile.tile) throw new ApiError(409, "workspace_full", "workspace_full");
+        const id = crypto.randomUUID();
+        const placedTiles = placed
+          ? [...tab.layout.tiles, { session_id: id, ...placed }]
+          : addPaneTiles(tab.layout.tiles, id);
+        if (!placedTiles) throw new ApiError(409, "workspace_full", "workspace_full");
         await workspaces.update(workspace.id, {
           layout: withActiveTab(
-            withTabTiles(layout, tab.id, [
-              ...placedTile.tiles,
-              {
-                session_id: crypto.randomUUID(),
-                ...placedTile.tile,
-                widget: { kind: "files" as const, host_id: home.host.id, path: home.cwd },
-              },
-            ]),
+            withTabTiles(
+              layout,
+              tab.id,
+              placedTiles.map((tile) =>
+                tile.session_id === id
+                  ? {
+                      ...tile,
+                      widget: { kind: "files" as const, host_id: home.host.id, path: home.cwd },
+                    }
+                  : tile,
+              ),
+            ),
             tab.id,
           ),
         });
         return { sessionId: null };
+      }
+      // A tap, or a drop on bare canvas: nothing was aimed at, so the pane
+      // joins an even band instead of halving the biggest occupant. The
+      // reshaped siblings have to land before the create — the server refuses
+      // a tile that overlaps what it still thinks is there.
+      if (!placed) {
+        const tab = tabById(layout, tabId) ?? activeTab(layout);
+        const added = addPaneTiles(tab.layout.tiles, PENDING_TILE_ID);
+        if (!added) throw new ApiError(409, "workspace_full", "workspace_full");
+        const landed = added.find((tile) => tile.session_id === PENDING_TILE_ID);
+        if (landed) {
+          placed = { x: landed.x, y: landed.y, w: landed.w, h: landed.h };
+          layout = (
+            await workspaces.update(workspace.id, {
+              layout: withActiveTab(
+                withTabTiles(
+                  layout,
+                  tab.id,
+                  added.filter((tile) => tile.session_id !== PENDING_TILE_ID),
+                ),
+                tabId,
+              ),
+            })
+          ).layout;
+        }
       }
       const session = await sessions.create({
         host_id: home.host.id,
@@ -176,7 +246,7 @@ export function LauncherFab({
     },
     onError: (error) => {
       if (isWorkspaceFullError(error)) {
-        toast.error("This tab is full. Remove a pane before adding another.");
+        toast.error("This tab is full. Remove a window before adding another.");
         queryClient.invalidateQueries({ queryKey: ["workspace", workspace.id] });
         return;
       }
@@ -191,10 +261,29 @@ export function LauncherFab({
       ? `${home.host.name} is offline`
       : undefined;
 
+  const layoutRef = useRef(workspace.layout);
+  layoutRef.current = workspace.layout;
+  // Read through a ref: an inline callback prop must not change the identities
+  // the live drag closed over.
+  const onPreviewTilesRef = useRef(onPreviewTiles);
+  onPreviewTilesRef.current = onPreviewTiles;
+
   const clearDropTarget = useCallback((drag: { target: Element | null }) => {
     drag.target?.removeAttribute("data-drop-target");
     drag.target = null;
   }, []);
+
+  /**
+   * Show the panes the shape they will take once this pane lands, so the
+   * outline never sits on top of a pane that has not moved out of its way.
+   * Handed to the grid rather than written onto its tiles: the grid renders
+   * every pane's geometry itself, and a second writer only holds until it
+   * re-renders.
+   */
+  const previewPanes = useCallback(
+    (tiles: Tile[] | null) => onPreviewTilesRef.current?.(tiles),
+    [],
+  );
 
   const endDrag = useCallback(() => {
     const drag = dragRef.current;
@@ -203,12 +292,14 @@ export function LauncherFab({
     document.removeEventListener("pointermove", drag.move);
     document.removeEventListener("pointerup", drag.up);
     document.removeEventListener("pointercancel", drag.cancel);
+    document.removeEventListener("keydown", drag.key);
     clearDropTarget(drag);
+    previewPanes(null);
     document.querySelector("[data-launcher-fab]")?.removeAttribute("data-trash-hover");
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
     setDragging(null);
-  }, [clearDropTarget]);
+  }, [clearDropTarget, previewPanes]);
 
   useEffect(() => endDrag, [endDrag]);
 
@@ -241,51 +332,90 @@ export function LauncherFab({
       document
         .querySelector("[data-launcher-fab]")
         ?.toggleAttribute("data-trash-hover", Boolean(under?.closest?.("[data-launcher-fab]")));
-      const openingElement = under?.closest?.("[data-grid-opening]") ?? null;
-      const opening = openingElement?.querySelector("button") ?? null;
-      if (opening !== drag.target) {
-        clearDropTarget(drag);
-        opening?.setAttribute("data-drop-target", "true");
-        drag.target = opening;
-      }
-      // Outline exactly where the pane will land: the hovered opening, the
-      // half of a hovered pane the cursor would dock against, or the
-      // auto-place slot anywhere else on the canvas.
       const preview = dropPreviewRef.current;
-      if (preview) {
-        let rect = openingElement
-          ? parseOpening(openingElement.getAttribute("data-grid-opening"))
-          : null;
-        if (!rect) {
-          const paneElement = under?.closest?.("[data-grid-tile]");
-          const targetId = paneElement?.getAttribute("data-grid-tile");
-          const target = targetId
-            ? tabTiles(workspace.layout, tabId).find((tile) => tile.session_id === targetId)
-            : undefined;
-          if (paneElement && target) {
-            const box = paneElement.getBoundingClientRect();
-            const zone = dockZoneAt(
-              (moveEvent.clientX - box.left) / box.width,
-              (moveEvent.clientY - box.top) / box.height,
-            );
-            rect = dockSplitRect(target, zone)?.moved ?? drag.autoRect;
-          } else {
-            rect = drag.autoRect;
-          }
+      const canvas = drag.canvas;
+      if (!preview || !canvas) return;
+
+      // What the pointer is aimed at, resolved in cell space against the
+      // resting layout rather than by hit-testing the panes: they are already
+      // showing this drag's preview, so a pane that slid aside would stop
+      // being the thing under the cursor and the placement would oscillate.
+      // Only the canvas and the launcher are read from the DOM — neither moves.
+      const cellWidth = canvas.width / GRID_SIZE;
+      const cellHeight = canvas.height / GRID_SIZE;
+      const pointerX = (moveEvent.clientX - canvas.left) / cellWidth;
+      const pointerY = (moveEvent.clientY - canvas.top) / cellHeight;
+      const covers = (rect: Rect) =>
+        pointerX >= rect.x &&
+        pointerX < rect.x + rect.w &&
+        pointerY >= rect.y &&
+        pointerY < rect.y + rect.h;
+
+      const resting = tabTiles(layoutRef.current, tabId);
+      const overCanvas = Boolean(under?.closest?.("[data-workspace-canvas]"));
+      const opening = overCanvas ? (drag.openings.find((slot) => covers(slot.rect)) ?? null) : null;
+      const hovered = overCanvas && !opening ? (resting.find(covers) ?? null) : null;
+      const zone = hovered
+        ? dockZoneAt((pointerX - hovered.x) / hovered.w, (pointerY - hovered.y) / hovered.h)
+        : null;
+      const placement = !overCanvas
+        ? "off"
+        : opening
+          ? `opening:${opening.rect.x},${opening.rect.y},${opening.rect.w},${opening.rect.h}`
+          : hovered
+            ? `dock:${hovered.session_id}:${zone}`
+            : "auto";
+      if (placement === drag.placement) return;
+      drag.placement = placement;
+
+      const button = opening?.button ?? null;
+      if (button !== drag.target) {
+        clearDropTarget(drag);
+        button?.setAttribute("data-drop-target", "true");
+        drag.target = button;
+      }
+      if (!overCanvas) {
+        drag.drop = null;
+        preview.hidden = true;
+        previewPanes(null);
+        return;
+      }
+      // Outline exactly where the pane will land, and remember it: the drop
+      // replays this rather than deriving its own.
+      //
+      // The whole previewed layout, not just the newcomer's rect: the panes
+      // have to move out of its way on screen, or the outline lands on top
+      // of one that never budged.
+      let placed: Tile[] | null = null;
+      if (opening) {
+        placed = [...resting, { session_id: PENDING_TILE_ID, ...opening.rect }];
+        drag.drop = { kind: "opening", rect: opening.rect };
+      } else {
+        if (hovered && zone) {
+          placed = dockInsert(resting, PENDING_TILE_ID, hovered.session_id, zone);
+          if (placed) drag.drop = { kind: "dock", targetId: hovered.session_id, zone };
         }
-        const overCanvas = Boolean(under?.closest?.("[data-workspace-canvas]"));
-        if (drag.canvas && rect && overCanvas) {
-          preview.hidden = false;
-          preview.style.left = `${drag.canvas.left + (rect.x / GRID_SIZE) * drag.canvas.width}px`;
-          preview.style.top = `${drag.canvas.top + (rect.y / GRID_SIZE) * drag.canvas.height}px`;
-          preview.style.width = `${(rect.w / GRID_SIZE) * drag.canvas.width}px`;
-          preview.style.height = `${(rect.h / GRID_SIZE) * drag.canvas.height}px`;
-        } else {
-          preview.hidden = true;
+        // Nothing aimed at, or an occupant too small to halve: the pane
+        // joins the band evenly, which is what the drop itself will do.
+        if (!placed) {
+          placed = addPaneTiles(resting, PENDING_TILE_ID);
+          drag.drop = { kind: "auto" };
         }
       }
+      const rect = placed?.find((tile) => tile.session_id === PENDING_TILE_ID) ?? drag.autoRect;
+      if (!rect) {
+        preview.hidden = true;
+        previewPanes(null);
+        return;
+      }
+      preview.hidden = false;
+      preview.style.left = `${canvas.left + (rect.x / GRID_SIZE) * canvas.width}px`;
+      preview.style.top = `${canvas.top + (rect.y / GRID_SIZE) * canvas.height}px`;
+      preview.style.width = `${(rect.w / GRID_SIZE) * canvas.width}px`;
+      preview.style.height = `${(rect.h / GRID_SIZE) * canvas.height}px`;
+      previewPanes(placed);
     };
-    const onUp = (upEvent: PointerEvent) => {
+    const onUp = () => {
       const drag = dragRef.current;
       endDrag();
       if (!drag) return;
@@ -294,32 +424,31 @@ export function LauncherFab({
         createM.mutate({ choice: drag.choice });
         return;
       }
-      const under = document.elementFromPoint(upEvent.clientX, upEvent.clientY);
-      const opening = parseOpening(
-        under?.closest?.("[data-grid-opening]")?.getAttribute("data-grid-opening"),
-      );
-      if (opening) {
-        createM.mutate({ choice: drag.choice, placement: opening });
-        return;
+      // Whatever the outline last promised — deriving it again from the
+      // pointer would read a canvas this drag has already reshaped, and land
+      // the pane somewhere it was never shown. Nothing promised means the
+      // pointer left the canvas: a change of mind.
+      const drop = drag.drop;
+      if (!drop) return;
+      if (drop.kind === "opening") {
+        createM.mutate({ choice: drag.choice, placement: drop.rect });
+      } else if (drop.kind === "dock") {
+        createM.mutate({
+          choice: drag.choice,
+          dock: { targetId: drop.targetId, zone: drop.zone },
+        });
+      } else {
+        createM.mutate({ choice: drag.choice });
       }
-      const paneElement = under?.closest?.("[data-grid-tile]");
-      const targetId = paneElement?.getAttribute("data-grid-tile");
-      if (paneElement && targetId) {
-        // Dropped on a pane: dock against the cursor's nearest edge, exactly
-        // as the preview outlined.
-        const box = paneElement.getBoundingClientRect();
-        const zone = dockZoneAt(
-          (upEvent.clientX - box.left) / box.width,
-          (upEvent.clientY - box.top) / box.height,
-        );
-        createM.mutate({ choice: drag.choice, dock: { targetId, zone } });
-        return;
-      }
-      // Anywhere else on the canvas still adds the pane; off it, the drag
-      // was a change of mind.
-      if (under?.closest?.("[data-workspace-canvas]")) createM.mutate({ choice: drag.choice });
     };
     const onCancel = () => endDrag();
+    /** Escape abandons the drag, the same as dropping it off the canvas. */
+    const onKey = (keyEvent: KeyboardEvent) => {
+      if (keyEvent.key !== "Escape") return;
+      keyEvent.preventDefault();
+      keyEvent.stopPropagation();
+      endDrag();
+    };
     dragRef.current = {
       choice,
       icon,
@@ -328,32 +457,40 @@ export function LauncherFab({
       started: false,
       target: null,
       canvas: document.querySelector("[data-workspace-canvas]")?.getBoundingClientRect() ?? null,
+      openings: [...document.querySelectorAll("[data-grid-opening]")].flatMap((element) => {
+        const rect = parseOpening(element.getAttribute("data-grid-opening"));
+        return rect ? [{ rect, button: element.querySelector("button") }] : [];
+      }),
       autoRect: autoPlace(tabTiles(workspace.layout, tabId)).tile,
+      placement: null,
+      drop: null,
       move: onMove,
       up: onUp,
       cancel: onCancel,
+      key: onKey,
     };
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onUp, { once: true });
     document.addEventListener("pointercancel", onCancel, { once: true });
+    document.addEventListener("keydown", onKey);
   };
 
   const items: Array<{ key: string; label: string; icon: ReactNode; choice: Choice }> = [
     {
       key: "shell",
-      label: "New shell pane",
+      label: "New shell window",
       icon: <SquareTerminal className="size-5.5" aria-hidden />,
       choice: { kind: "shell" },
     },
     ...(agentsQ.data ?? []).map((agent) => ({
       key: agent.id,
-      label: `New ${agent.name} pane`,
+      label: `New ${agent.name} window`,
       icon: <AgentIcon kind={agent.kind} size={22} className="rounded" aria-hidden />,
       choice: { kind: "agent" as const, agent },
     })),
     {
       key: "files",
-      label: "New file explorer pane",
+      label: "New file explorer window",
       icon: <FolderTree className="size-5.5" aria-hidden />,
       choice: { kind: "files" },
     },
@@ -363,7 +500,11 @@ export function LauncherFab({
     <>
       <div
         data-launcher-fab
-        onPointerEnter={() => setOpen(true)}
+        // Not while dragging: the drawer would fan out under the cursor at
+        // the exact moment the button means "drop here to discard".
+        onPointerEnter={() => {
+          if (!bin) setOpen(true);
+        }}
         onPointerLeave={() => setOpen(false)}
         onFocusCapture={() => setOpen(true)}
         onBlurCapture={(event) => {
@@ -380,15 +521,15 @@ export function LauncherFab({
       >
         <div
           role="toolbar"
-          aria-label="New pane launcher"
-          aria-hidden={!open}
+          aria-label="New window launcher"
+          aria-hidden={!showItems}
           className={cn(
             "flex items-center gap-0.5 overflow-hidden transition-[max-width,padding] duration-200 ease-swift",
             // Enough of an inset that the first icon's plate clears the
             // container's rounded corner.
             // The 44px item buttons carry ~11px of their own slack around the
             // icon, so the wrapper adds none and pulls the first plate in.
-            open ? "max-w-96 pl-0.5 pr-2" : "max-w-0 pl-0",
+            showItems ? "max-w-96 pl-0.5 pr-2" : "max-w-0 pl-0",
           )}
         >
           {[...items].reverse().map((item, index, list) => (
@@ -400,10 +541,12 @@ export function LauncherFab({
                 disabledReason ?? `${item.label} — click to add, drag onto the canvas to place`
               }
               disabled={disabled}
-              tabIndex={open ? 0 : -1}
+              tabIndex={showItems ? 0 : -1}
               // Fan out from the trigger: the icon nearest it leads, the rest
               // follow a frame behind each.
-              style={{ transitionDelay: `${(open ? list.length - 1 - index : index) * 35}ms` }}
+              style={{
+                transitionDelay: `${(showItems ? list.length - 1 - index : index) * 35}ms`,
+              }}
               onPointerDown={(event) => startDrag(item.choice, item.icon, event)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" || event.key === " ") {
@@ -414,7 +557,7 @@ export function LauncherFab({
               className={cn(
                 "grid size-11 shrink-0 cursor-grab touch-none place-items-center rounded-xl text-muted-foreground",
                 "transition-all duration-200 ease-swift",
-                open
+                showItems
                   ? "translate-x-0 scale-100 opacity-100"
                   : "pointer-events-none translate-x-4 scale-75 opacity-0",
                 "hover:bg-accent hover:text-foreground disabled:cursor-default disabled:opacity-50",
@@ -426,23 +569,24 @@ export function LauncherFab({
         </div>
         <button
           type="button"
-          aria-label="Add a pane"
-          aria-expanded={open}
-          title={disabledReason ?? "Add a pane"}
+          aria-label={bin ? "Discard what you are dragging" : "Add a window"}
+          aria-expanded={showItems}
+          title={bin ? "Drop here to discard" : (disabledReason ?? "Add a window")}
           onClick={() => setOpen((current) => !current)}
           className={cn(
             // The one primary action on the canvas: a filled square button,
             // easing into its hover tint rather than snapping to it.
             "grid size-12 shrink-0 place-items-center rounded-2xl",
             "transition-all duration-200 ease-swift",
-            dragging
-              ? // Mid-drag it is the bin: drop here to change your mind.
-                "bg-destructive/15 text-destructive group-data-[trash-hover]/fab:scale-110 group-data-[trash-hover]/fab:bg-destructive/30"
+            bin
+              ? // Anything in flight, it is the bin: drop here to discard. The
+                // wobble is what carries that, the icon alone is too quiet.
+                "bin-jiggle bg-destructive/15 text-destructive group-data-[trash-hover]/fab:scale-110 group-data-[trash-hover]/fab:bg-destructive/30"
               : "bg-primary text-primary-foreground hover:scale-105 hover:opacity-90 active:scale-95",
-            open && !dragging && "rotate-45",
+            showItems && "rotate-45",
           )}
         >
-          {dragging ? (
+          {bin ? (
             <Trash2 className="size-5" aria-hidden />
           ) : (
             <Plus className="size-5" aria-hidden />

@@ -30,7 +30,7 @@ async function openPaneFolderPicker(page: Page, foreground: string) {
     sessions: [session({ foreground_command: foreground })],
     workspaces: [
       workspace({
-        layout: { version: 2, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }] },
+        layout: { version: 3, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }] },
       }),
     ],
     files: () => listing,
@@ -81,4 +81,29 @@ test("an agent in the foreground is stopped first, and only with permission", as
   const running = store.sessions[0] as { foreground_command: string };
   running.foreground_command = "zsh";
   await expect.poll(() => ptyText(messages)).toContain("clear\ncd /Users/tester/projects\n");
+});
+
+test("a pane too narrow for the folder's name keeps just the icon", async ({ page }) => {
+  await mockApp(page, {
+    sessions: [session()],
+    workspaces: [
+      workspace({
+        layout: { version: 3, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }] },
+      }),
+    ],
+    files: () => listing,
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  const chip = page.getByRole("button", { name: "Change directory" });
+  const folderName = chip.locator("span");
+  await expect(folderName).toBeVisible();
+
+  // Squeezed to a header this thin, the name goes and the icon stays — the
+  // control is still there to click, and the title still spells the path out.
+  await page.setViewportSize({ width: 520, height: 800 });
+  await expect(folderName).toBeHidden();
+  await expect(chip).toBeVisible();
+
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await expect(folderName).toBeVisible();
 });

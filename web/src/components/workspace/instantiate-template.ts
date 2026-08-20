@@ -25,7 +25,7 @@ export async function instantiateTemplate(
     id: crypto.randomUUID(),
     name: tab.name,
     layout: {
-      version: 2 as const,
+      version: 3 as const,
       tiles: tab.tiles
         .filter((tile) => tile.run.kind === "files")
         .map((tile) => ({

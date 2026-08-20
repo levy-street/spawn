@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { LayoutV2, Tile, TileWidget } from "@/lib/grid";
+import type { GridLayout, Tile, TileWidget } from "@/lib/grid";
 import type { LayoutV3, WorkspaceTab } from "@/lib/tabs";
 
 /**
@@ -239,16 +239,20 @@ export const TileSchema: z.ZodType<Tile> = z.object({
   widget: TileWidgetSchema.optional(),
 });
 
-export const LayoutV2Schema: z.ZodType<LayoutV2> = z.object({
-  version: z.literal(2),
+export const GridLayoutSchema: z.ZodType<GridLayout> = z.object({
+  version: z.literal(3),
   tiles: z.array(TileSchema),
 });
 
-/** Layout v3 (§4.4-tabs): ordered named tabs, each wrapping one v2 grid. */
+/** Layout v3 (§4.4-tabs): ordered named tabs, each wrapping one tile grid. */
 export const WorkspaceTabSchema: z.ZodType<WorkspaceTab> = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
-  layout: LayoutV2Schema,
+  /** The tab's own home: where a window added to this tab opens. Null (the
+   *  pair moves together) inherits the workspace's. */
+  host_id: z.string().nullable().default(null),
+  cwd: z.string().nullable().default(null),
+  layout: GridLayoutSchema,
 });
 
 export const LayoutV3Schema: z.ZodType<LayoutV3> = z.object({
@@ -266,6 +270,10 @@ export const WorkspaceSchema = z.object({
   cwd: z.string().nullable().default(null),
   layout: LayoutV3Schema,
   position: z.number().int().default(0),
+  /** Set -> the workspace is put away: out of the sidebar's list, and every
+   *  session in it stopped. The layout is untouched — an archived workspace
+   *  still names the same windows, they are simply not running. */
+  archived_at: z.string().nullable().default(null),
   created_at: z.string(),
   updated_at: z.string(),
 });
@@ -735,7 +743,7 @@ export const TemplateTileSchema = z.object({
 export type TemplateTile = z.infer<typeof TemplateTileSchema>;
 
 export const WorkspaceTemplateSpecSchema = z.object({
-  version: z.literal(1),
+  version: z.literal(2),
   tabs: z
     .array(z.object({ name: z.string(), tiles: z.array(TemplateTileSchema).default([]) }))
     .min(1)
@@ -756,21 +764,30 @@ export const WorkspaceTemplateSchema = z.object({
 export type WorkspaceTemplate = z.infer<typeof WorkspaceTemplateSchema>;
 
 export const workspaces = {
-  /** Ordered by `position`. */
-  list: () =>
-    api("/api/workspaces", {
+  /** Active workspaces ordered by `position`; `{archived: true}` returns the
+   *  archived ones instead, most recently archived first. The two never mix. */
+  list: (params?: { archived?: boolean }) => {
+    const qs = params?.archived ? "?archived=true" : "";
+    return api(`/api/workspaces${qs}`, {
       method: "GET",
       schema: z.array(WorkspaceSchema),
-    }),
+    });
+  },
   get: (id: string) =>
     api(`/api/workspaces/${id}`, {
       method: "GET",
       schema: WorkspaceSchema,
     }),
-  /** `first_session` atomically creates the workspace plus one full-canvas shell. */
+  /**
+   * `first_session` atomically creates the workspace plus one full-canvas
+   * shell. Pass `host_id`/`cwd` instead to create it empty but homed — the
+   * tab opens on its empty state and panes added later start in that folder.
+   */
   create: (body?: {
     name?: string;
     first_session?: { host_id: string; cwd: string; skill_ids?: string[] };
+    host_id?: string;
+    cwd?: string;
   }) =>
     api("/api/workspaces", {
       method: "POST",
@@ -786,6 +803,20 @@ export const workspaces = {
       body: JSON.stringify(body),
       schema: WorkspaceSchema,
     }),
+  /**
+   * Put the workspace away: its shape (tabs, tile geometry, each pane's
+   * host/folder/skills) is captured, then its sessions are killed. Reversible
+   * via `unarchive` — unlike `remove`, which keeps nothing.
+   */
+  archive: (id: string) =>
+    api(`/api/workspaces/${id}/archive`, { method: "POST", schema: WorkspaceSchema }),
+  /**
+   * Bring it back: every window restarts where it stopped, under the same id,
+   * and the workspace returns to the sidebar slot it left from. A window whose
+   * host is offline stays stopped and can be started from its own window.
+   */
+  unarchive: (id: string) =>
+    api(`/api/workspaces/${id}/unarchive`, { method: "POST", schema: WorkspaceSchema }),
   /** Kills and deletes every session referenced by its tiles. Confirm first. */
   remove: (id: string) => api<void>(`/api/workspaces/${id}`, { method: "DELETE" }),
 };

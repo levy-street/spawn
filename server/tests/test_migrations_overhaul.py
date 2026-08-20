@@ -15,6 +15,8 @@ import sys
 import uuid
 from pathlib import Path
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 
 from spawn_server import grid
@@ -33,6 +35,16 @@ def _migration_env(db_url: str) -> dict[str, str]:
         }
     )
     return env
+
+
+def _head_revision() -> str:
+    """The chain's current head, read off the scripts rather than hard-coded —
+    the point here is that the chain arrives, not which number it arrives at."""
+    config = Config(str(SERVER_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(SERVER_ROOT / "alembic"))
+    head = ScriptDirectory.from_config(config).get_current_head()
+    assert head is not None
+    return head
 
 
 def _alembic(args: list[str], *, env: dict[str, str]) -> None:
@@ -328,8 +340,8 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
             even = first_tab_grid(workspaces["b even"])
             assert grid.validate(even)
             assert even["tiles"] == [
-                {"session_id": ids["a1"], "x": 0, "y": 0, "w": 6, "h": 12},
-                {"session_id": ids["a2"], "x": 6, "y": 0, "w": 6, "h": 12},
+                {"session_id": ids["a1"], "x": 0, "y": 0, "w": 12, "h": 24},
+                {"session_id": ids["a2"], "x": 12, "y": 0, "w": 12, "h": 24},
             ]
 
             ratio = first_tab_grid(workspaces["a ratio"])
@@ -343,10 +355,10 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
             dup = first_tab_grid(workspaces["d dup"])
             assert grid.validate(dup)
             assert dup["tiles"] == [
-                {"session_id": ids["a1"], "x": 0, "y": 0, "w": 12, "h": 12}
+                {"session_id": ids["a1"], "x": 0, "y": 0, "w": 24, "h": 24}
             ]
 
-            assert first_tab_grid(workspaces["e empty"]) == {"version": 2, "tiles": []}
+            assert first_tab_grid(workspaces["e empty"]) == {"version": 3, "tiles": []}
 
             # 0032: recent dirs backfilled newest-first, capped at 8 per host,
             # and never from the deleted archived session.
@@ -404,7 +416,7 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
         with engine.begin() as conn:
             assert conn.execute(
                 text("select version_num from alembic_version")
-            ).scalar_one() == "0036"
+            ).scalar_one() == _head_revision()
             envelope = json.loads(
                 conn.execute(
                     text("select layout from workspaces where id = :id"),

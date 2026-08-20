@@ -20,11 +20,12 @@ from .sessions import (
     create_session_row,
     dispatch_session_launch,
     kill_and_delete_session,
+    stop_session,
 )
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
 
-FIRST_SESSION_TILE = {"x": 0, "y": 0, "w": 12, "h": 12}
+FIRST_SESSION_TILE = {"x": 0, "y": 0, "w": grid.GRID_COLS, "h": grid.GRID_ROWS}
 _WORKSPACE_NAME_PATTERN = re.compile(r"\AWorkspace (\d+)\Z")
 
 # Layout schema v3 (docs/OVERHAUL.md §4.4-tabs): the stored/wire layout is an
@@ -45,7 +46,10 @@ def _single_tab_layout(tiles: list[dict]) -> dict:
             {
                 "id": DEFAULT_TAB_ID,
                 "name": DEFAULT_TAB_NAME,
-                "layout": {"version": 2, "tiles": tiles},
+                # No folder of its own: the tab inherits the workspace's home.
+                "host_id": None,
+                "cwd": None,
+                "layout": {"version": grid.LAYOUT_VERSION, "tiles": tiles},
             }
         ],
     }
@@ -56,21 +60,29 @@ def _utcnow() -> datetime:
 
 
 def parse_workspace_layout(raw: object) -> dict:
-    """The stored layout as a plain v3 envelope.
+    """The stored layout as a plain v3 envelope, in the current grid space.
 
-    v2 rows (pre-migration, or written by an old server) upgrade into a single
-    default tab; anything malformed reads as one empty tab so a workspace is
-    never tabless.
+    Envelope v2 rows (pre-tabs) upgrade into a single default tab; anything
+    malformed reads as one empty tab so a workspace is never tabless. A grid
+    still stamped with the old 12x12 schema is *lifted* — scaled, not merely
+    relabelled — so a database that has yet to run migration 0037 still serves
+    geometry the client can render.
     """
     if isinstance(raw, dict) and raw.get("version") == 3 and isinstance(raw.get("tabs"), list):
         tabs = [
             {
                 "id": tab["id"],
                 "name": tab["name"],
-                "layout": {
-                    "version": 2,
-                    "tiles": [dict(tile) for tile in tab["layout"]["tiles"]],
-                },
+                # The tab's own default host/folder; anything but a string
+                # reads as "inherit the workspace's home".
+                "host_id": tab["host_id"] if isinstance(tab.get("host_id"), str) else None,
+                "cwd": tab["cwd"] if isinstance(tab.get("cwd"), str) else None,
+                "layout": grid.lift_layout(
+                    {
+                        "version": tab["layout"].get("version"),
+                        "tiles": [dict(tile) for tile in tab["layout"]["tiles"]],
+                    }
+                ),
             }
             for tab in raw["tabs"]
             if isinstance(tab, dict)
@@ -84,10 +96,10 @@ def parse_workspace_layout(raw: object) -> dict:
             if not any(tab["id"] == active for tab in tabs):
                 active = tabs[0]["id"]
             return {"version": 3, "active_tab": active, "tabs": tabs}
-    if isinstance(raw, dict) and raw.get("version") == 2 and isinstance(
-        raw.get("tiles"), list
-    ):
-        return _single_tab_layout([dict(tile) for tile in raw["tiles"]])
+    # Envelope schema v2: a bare grid, from before tabs existed.
+    if isinstance(raw, dict) and raw.get("version") == 2 and isinstance(raw.get("tiles"), list):
+        lifted = grid.lift_layout({"version": 2, "tiles": [dict(t) for t in raw["tiles"]]})
+        return _single_tab_layout(lifted["tiles"])
     return _single_tab_layout([])
 
 
@@ -109,7 +121,10 @@ async def prune_workspace_tiles(db: AsyncSession, user: User, layout: dict) -> d
 
     A session lives in exactly one tab, so uniqueness is enforced across the
     whole envelope (first tab wins). Widget tiles carry no session, so only
-    their id uniqueness is checked.
+    their id uniqueness is checked. A tab whose own host/folder is incomplete —
+    half a pair, or a host that is no longer the owner's — goes back to
+    inheriting the workspace's home, the same way an unowned tile is dropped
+    rather than failing the write.
     """
     referenced = [
         tile.get("session_id")
@@ -129,6 +144,21 @@ async def prune_workspace_tiles(db: AsyncSession, user: User, layout: dict) -> d
             .scalars()
             .all()
         )
+    tab_hosts = {
+        tab["host_id"] for tab in layout["tabs"] if isinstance(tab.get("host_id"), str)
+    }
+    owned_hosts: set[str] = set()
+    if tab_hosts:
+        owned_hosts = set(
+            (
+                await db.execute(
+                    select(Host.id).where(Host.owner_user_id == user.id, Host.id.in_(tab_hosts))
+                )
+            )
+            .scalars()
+            .all()
+        )
+
     seen: set[str] = set()
     tabs: list[dict] = []
     for tab in layout["tabs"]:
@@ -141,7 +171,19 @@ async def prune_workspace_tiles(db: AsyncSession, user: User, layout: dict) -> d
                 continue
             seen.add(session_id)
             kept.append(dict(tile))
-        tabs.append({**tab, "layout": {"version": 2, "tiles": kept}})
+        # A tab's folder is a pair: half of one says nothing about where a
+        # window would open, so an unowned host takes its folder with it.
+        host_id = tab.get("host_id")
+        cwd = tab.get("cwd")
+        homed = host_id in owned_hosts and isinstance(cwd, str)
+        tabs.append(
+            {
+                **tab,
+                "host_id": host_id if homed else None,
+                "cwd": cwd if homed else None,
+                "layout": {"version": grid.LAYOUT_VERSION, "tiles": kept},
+            }
+        )
     return {"version": 3, "active_tab": layout.get("active_tab"), "tabs": tabs}
 
 
@@ -170,6 +212,7 @@ def _to_out(workspace: Workspace) -> schemas.WorkspaceOut:
         cwd=workspace.cwd,
         layout=schemas.WorkspaceLayoutV3.model_validate(parse_workspace_layout(workspace.layout)),
         position=workspace.position,
+        archived_at=workspace.archived_at,
         created_at=workspace.created_at,
         updated_at=workspace.updated_at,
     )
@@ -184,18 +227,39 @@ async def _get_owned_workspace(
     return workspace
 
 
-async def _owned_workspaces(db: AsyncSession, user: User) -> list[Workspace]:
-    return list(
-        (
-            await db.execute(
-                select(Workspace)
-                .where(Workspace.owner_user_id == user.id)
-                .order_by(Workspace.position, Workspace.created_at, Workspace.id)
-            )
+async def _owned_workspaces(
+    db: AsyncSession, user: User, *, archived: bool | None = False
+) -> list[Workspace]:
+    """Owned workspaces: active by default, archived on request, or every row.
+
+    Active rows order by `position` (the sidebar's own order). Archived rows
+    have left that space, so they order most-recently-archived first and their
+    stale `position` is ignored. `archived=None` returns both, and exists for
+    the one thing that must span the whole account: default-name uniqueness,
+    so a new workspace never takes the name of one waiting in the archive.
+    """
+    query = select(Workspace).where(Workspace.owner_user_id == user.id)
+    if archived is True:
+        query = query.where(Workspace.archived_at.is_not(None)).order_by(
+            Workspace.archived_at.desc(), Workspace.created_at.desc(), Workspace.id
         )
-        .scalars()
-        .all()
-    )
+    else:
+        if archived is False:
+            query = query.where(Workspace.archived_at.is_(None))
+        query = query.order_by(Workspace.position, Workspace.created_at, Workspace.id)
+    return list((await db.execute(query)).scalars().all())
+
+
+async def _reindex_active(db: AsyncSession, user: User) -> list[Workspace]:
+    """Renumber the active workspaces 0..n-1 and return them in order.
+
+    Positions are contiguous from 0 per owner, so anything that adds to or
+    removes from the sidebar has to close the gap it made.
+    """
+    rows = await _owned_workspaces(db, user, archived=False)
+    for index, row in enumerate(rows):
+        row.position = index
+    return rows
 
 
 def _next_free_name(existing_names: set[str]) -> str:
@@ -239,10 +303,14 @@ def _unique_name(base: str, existing_names: set[str]) -> str:
 
 @router.get("", response_model=list[schemas.WorkspaceOut])
 async def list_workspaces(
+    archived: bool = False,
     db: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> list[schemas.WorkspaceOut]:
-    return [_to_out(row) for row in await _owned_workspaces(db, user)]
+    """The sidebar's workspaces. Active by default — `?archived=true` returns
+    the put-away ones instead, newest first. The two lists never mix, so a
+    client that knows nothing about archiving simply stops seeing them."""
+    return [_to_out(row) for row in await _owned_workspaces(db, user, archived=archived)]
 
 
 @router.post(
@@ -253,28 +321,36 @@ async def create_workspace(
     db: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> schemas.WorkspaceCreateResponse:
-    existing = await _owned_workspaces(db, user)
-    existing_names = {row.name for row in existing}
+    active = await _owned_workspaces(db, user, archived=False)
+    # Names are checked against the archive too, so restoring one never
+    # collides with a workspace created while it was away. Positions are not:
+    # archived rows have left the sidebar's ordering entirely.
+    existing_names = {row.name for row in await _owned_workspaces(db, user, archived=None)}
+
+    # The home is either the first session's, or given directly for a
+    # workspace created empty; both name the workspace after its folder.
+    host: Host | None = None
+    home_host_id = body.first_session.host_id if body.first_session is not None else body.host_id
+    home_cwd = body.first_session.cwd if body.first_session is not None else body.cwd
+    if home_host_id is not None:
+        host = await db.get(Host, home_host_id)
+        if host is None or host.owner_user_id != user.id:
+            raise HTTPException(status_code=404, detail="host not found")
+
     name = body.name.strip() if body.name and body.name.strip() else None
-    if name is None and body.first_session is not None:
-        from_cwd = name_from_cwd(body.first_session.cwd)
+    if name is None and home_cwd is not None:
+        from_cwd = name_from_cwd(home_cwd)
         name = None if from_cwd is None else _unique_name(from_cwd, existing_names)
     if name is None:
         name = _next_free_name(existing_names)
-
-    host: Host | None = None
-    if body.first_session is not None:
-        host = await db.get(Host, body.first_session.host_id)
-        if host is None or host.owner_user_id != user.id:
-            raise HTTPException(status_code=404, detail="host not found")
 
     workspace = Workspace(
         owner_user_id=user.id,
         name=name,
         host_id=host.id if host is not None else None,
-        cwd=body.first_session.cwd if body.first_session is not None else None,
+        cwd=home_cwd,
         layout=_single_tab_layout([]),
-        position=len(existing),
+        position=len(active),
     )
     db.add(workspace)
     await db.flush()
@@ -350,7 +426,7 @@ async def update_workspace(
         workspace.cwd = cwd
     if body.position is not None:
         # Reorder by removal + reinsertion so positions stay contiguous.
-        rows = await _owned_workspaces(db, user)
+        rows = await _owned_workspaces(db, user, archived=False)
         rows = [row for row in rows if row.id != workspace.id]
         target = min(body.position, len(rows))
         rows.insert(target, workspace)
@@ -361,6 +437,112 @@ async def update_workspace(
     await db.refresh(workspace)
     return _to_out(workspace)
 
+
+@router.post("/{workspace_id}/archive", response_model=schemas.WorkspaceOut)
+async def archive_workspace(
+    workspace_id: str,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.WorkspaceOut:
+    """Put a workspace away: stop everything in it, change nothing else.
+
+    Archiving is suspend, not teardown. Every session is stopped — process
+    tree, PTY and the worker holding them go, so an archived workspace costs
+    the host nothing — but the rows survive, which means the layout keeps
+    pointing at the same windows in the same places and there is no snapshot
+    to take: the workspace *is* its own snapshot. `position` is left where it
+    was so a restore can slot the row back in; the active rows renumber
+    around it.
+    """
+    workspace = await _get_owned_workspace(db, workspace_id, user)
+    if workspace.archived_at is not None:
+        raise HTTPException(status_code=409, detail="workspace_archived")
+
+    layout = parse_workspace_layout(workspace.layout)
+    for tile in layout_tiles(layout):
+        if not isinstance(tile.get("session_id"), str) or tile.get("widget") is not None:
+            continue
+        session_row = await db.get(Session, tile["session_id"])
+        if session_row is not None and session_row.owner_user_id == user.id:
+            await stop_session(db, session_row)
+
+    workspace.archived_at = _utcnow()
+    workspace.updated_at = workspace.archived_at
+    await db.flush()
+    await _reindex_active(db, user)
+    await db.commit()
+    await db.refresh(workspace)
+    return _to_out(workspace)
+
+
+@router.post("/{workspace_id}/unarchive", response_model=schemas.WorkspaceOut)
+async def unarchive_workspace(
+    workspace_id: str,
+    db: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.WorkspaceOut:
+    """Bring it back: the same windows, restarted where they stopped.
+
+    Nothing is rebuilt, because nothing was taken apart — each session starts
+    again under its own id, in its own folder, on its own host. A session
+    whose host is offline stays stopped and can be started from its own window
+    later; a restore is never refused over one unreachable host. The workspace
+    returns to the sidebar slot it left from.
+    """
+    workspace = await _get_owned_workspace(db, workspace_id, user)
+    if workspace.archived_at is None:
+        raise HTTPException(status_code=409, detail="workspace_not_archived")
+
+    slot = workspace.position
+    workspace.archived_at = None
+    workspace.updated_at = _utcnow()
+
+    # Reinsertion, not an append: `position` has been holding this row's old
+    # place in the sidebar for as long as it was away.
+    rows = [
+        row for row in await _owned_workspaces(db, user, archived=False) if row.id != workspace.id
+    ]
+    rows.insert(min(max(slot, 0), len(rows)), workspace)
+    for index, row in enumerate(rows):
+        row.position = index
+
+    launches: list[tuple[Session, Host]] = []
+    for tile in layout_tiles(parse_workspace_layout(workspace.layout)):
+        if not isinstance(tile.get("session_id"), str) or tile.get("widget") is not None:
+            continue
+        session_row = await db.get(Session, tile["session_id"])
+        if session_row is None or session_row.owner_user_id != user.id:
+            continue
+        host = await db.get(Host, session_row.host_id)
+        if host is None or host.owner_user_id != user.id or host.status != "online":
+            continue
+        session_row.status = "starting"
+        session_row.started_at = _utcnow()
+        session_row.exited_at = None
+        session_row.exit_code = None
+        session_row.last_output_at = None
+        session_row.last_input_at = None
+        session_row.foreground_command = None
+        launches.append((session_row, host))
+
+    await db.commit()
+    await db.refresh(workspace)
+
+    # Dispatched after the commit, exactly as workspace creation does: the
+    # rows are in their restarting state before any daemon can call back.
+    for session_row, host in launches:
+        await db.refresh(session_row)
+        skills = await capabilities.get_session_launch_capabilities(
+            db, user=user, session_id=session_row.id
+        )
+        await dispatch_session_launch(
+            frame_type="session.restart",
+            session_row=session_row,
+            host=host,
+            create_cwd=True,
+            skills=skills,
+        )
+    return _to_out(workspace)
 
 @router.delete("/{workspace_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_workspace(

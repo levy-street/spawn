@@ -81,7 +81,7 @@ Renaming order matters in the DB because `agents` is both an old and a new table
 - A session is created by the **`+` cascade menu**: (host, if >1) → location (Home / Recent / Select folder…). No form, no separate page.
 - The daemon spawns the user's **login shell** — never an agent binary directly. The pane header's identity icon is also the **agent switcher**: hovering the header grows a plate and a chevron under the icon, and picking an agent from its menu types that agent's command into the PTY. Ctrl+C inside the agent returns to the shell naturally.
 - The daemon reports the **foreground process name** (basename only) so the UI knows what's running in each pane: sidebar icons, pane header icons, and whether the switcher can switch all derive from it.
-- The grid is a **12×12 free canvas** (no scroll — every pane always visible), with drag-to-move, edge/corner resize, drag-the-seam resize, and push-on-drop. Panes stay where they are put: gaps between them are a normal, persistable state, and a `--pane-divider` hairline is drawn only where two panes actually meet edge to edge.
+- The grid is a **24×24 free canvas** (no scroll — every pane always visible), with drag-to-move, edge/corner resize, drag-the-seam resize, and push-on-drop. Panes stay where they are put: gaps between them are a normal, persistable state, and a `--pane-divider` hairline is drawn only where two panes actually meet edge to edge.
 
 Terminal transport (WebRTC DataChannels, warm pool, keep-alive portals) is **unchanged in behavior** — only renamed. The pool/portal mechanism in `LiveTerminalProvider` + the `ScreenPane` slot-portal pattern is load-bearing (it keeps sockets alive across layout changes) and must be preserved in the new `WorkspaceGrid`.
 
@@ -218,10 +218,12 @@ Frame renames (all payload fields `agent_id → session_id`):
 
 **As-implemented notes (binding):** RTC signaling frames carry the scope tuple only — the redundant v2 `agent_id` field is **dropped**, not renamed (session routing = `scope_type:"session"` + `scope_id`). `host.agents.check_result`'s payload key is `agents` (was `tools`). The worker `Hello` frame keeps a serde alias for the pre-rename `agent_id` key so a v3 spawnd still adopts pre-rename workers. The per-agent DataChannel wire protocols (`spawn.pty`, `spawn.ctl` v1 incl. its `agent_generation` field and `stale_agent_generation`/`agent_unavailable` error codes, `spawn.host.ctl` v1) are **locked verbatim** — no vocabulary renames inside them. The `SPAWN_AGENT_CONFIG_DIR` env var keeps its name (it configures agent CLIs — valid new vocabulary); the on-disk skills root is `config_dir/sessions/<id>`.
 
-### 4.4 Workspace grid — layout schema v2 and algebra
+### 4.4 Workspace grid — grid schema v3 and algebra
 
 > **Layout v3 (tabs).** The stored/wire layout is now an envelope of named
-> tabs — `{version: 3, active_tab, tabs: [{id, name, layout: <v2>}]}` — with
+> tabs — `{version: 3, active_tab, tabs: [{id, name, host_id, cwd, layout:
+> <v2>}]}`, where a tab's `host_id`/`cwd` pair is its own home (null on both
+> inherits the workspace's; migration `0039`) — with
 > every invariant below applying **per tab** (see `proto/README.md` for the
 > envelope's own invariants). The v2 algebra and its fixtures are untouched;
 > the envelope logic is `web/src/lib/tabs.ts` / `routes/workspaces.py`, and
@@ -238,6 +240,20 @@ Frame renames (all payload fields `agent_id → session_id`):
 > sidebar nests Workspace → Tab → Session once a workspace has more than one
 > tab.
 
+> **Grid schema v3 (24×24).** The canvas was 12×12 with a 2×2 minimum through
+> schema v2; it is now **24×24 with a 4×4 minimum and a 16-tile cap**, so panes
+> keep the same relative floor while positioning gets twice the resolution.
+> Coordinates are the wire format, so the grid carries its own `version`
+> independently of the tab envelope's: migration `0037` lifts every stored
+> `version: 2` grid by doubling and stamps it `3`, and the API lifts a v2 grid
+> on write the same way (so a browser still holding the old bundle keeps
+> working through a deploy). The scaling is **keyed off that version, never off
+> the shape of the numbers** — doubling is not idempotent and a lifted layout
+> is indistinguishable from an unlifted one — which is what makes the migration
+> safe to re-run, to roll back, and to run after the new code is already live.
+> Workspace templates carry the same geometry and go from spec `version: 1` to
+> `2` under the same rules.
+
 **Schema (wire + DB):**
 
 ```jsonc
@@ -250,24 +266,24 @@ Frame renames (all payload fields `agent_id → session_id`):
 Invariants (validated server-side on every write, enforced client-side by construction):
 - Canvas is exactly **12 columns × 12 rows**; the grid always fills the pane area — no vertical scroll, every pane visible (tmux-like).
 - Integers only. `0 ≤ x`, `x+w ≤ 12`, `0 ≤ y`, `y+h ≤ 12`, `w ≥ 3`, `h ≥ 3`.
-- No two tiles overlap. Max **8 tiles** per workspace. Duplicate/unowned `session_id`s are pruned server-side (same policy as today's sanitizer).
+- No two tiles overlap. Max **16 tiles** per workspace. Duplicate/unowned `session_id`s are pruned server-side (same policy as today's sanitizer).
 
 **Pure algebra module** — implemented twice, from the same fixtures:
 - `web/src/lib/grid.ts` (TypeScript, exhaustively unit-tested)
 - `server/spawn_server/grid.py` (Python — used by layout validation, auto-place, and migration 0031)
 
-Both must pass the shared fixture suite **`proto/layout-v2-fixtures.json`** (owned by the grid workstream): a list of `{op, input, expected}` cases covering every function below. This is the collision-proof way to keep the two implementations identical.
+Both must pass the shared fixture suite **`proto/layout-v3-fixtures.json`** (owned by the grid workstream): a list of `{op, input, expected}` cases covering every function below. This is the collision-proof way to keep the two implementations identical.
 
 Functions (deterministic, no randomness):
 - `validate(layout)` — the invariants above.
-- `autoPlace(tiles) -> {tile, tiles} | {tile: null}` — first free 2×2 position scanning `y` then `x`; greedily expand `w` rightward while free, then `h` downward. If no 2×2 is free: take the largest-area tile that can be split (both halves ≥2 along its longer axis; ties → vertical split), shrink it to the first half, return the second half as the new tile — the split modifies an existing tile, hence the `{tile, tiles}` return. If no 2×2 is free **and** no tile is splittable, return `{tile: null}`: the workspace is full — the server responds **409 `workspace_full`** and the client disables `+` for that workspace with an explanatory tooltip.
+- `autoPlace(tiles) -> {tile, tiles} | {tile: null}` — first free 4×4 position scanning `y` then `x`; greedily expand `w` rightward while free, then `h` downward. If no 4×4 is free: take the largest-area tile that can be split (both halves ≥4 along its longer axis; ties → vertical split), shrink it to the first half, return the second half as the new tile — the split modifies an existing tile, hence the `{tile, tiles}` return. If no 4×4 is free **and** no tile is splittable, return `{tile: null}`: the workspace is full — the server responds **409 `workspace_full`** and the client disables `+` for that workspace with an explanatory tooltip.
 - `move(tiles, id, x, y) -> tiles` — clamp the target into the canvas and place the tile there. A free target is simply taken and the gap left behind stays a gap. An occupied target is a **swap**: let T = the tile with the greatest area overlap with the dragged tile's target rect (ties broken by reading order — lowest `(y, x)` wins); the dragged tile takes T's rect and T takes the dragged tile's original rect (both rects were valid, so the swap is valid). Consequence for consumers: `move` preserves the id set and the *multiset* of sizes, not per-tile sizes — a swap exchanges sizes between the two tiles.
 - `resize(tiles, id, w, h) -> tiles` — clamp to invariants about the tile's own origin. Nothing else moves: shrinking leaves empty canvas behind, and a growth that would overlap another tile is refused (no-op returning the input).
 - `remove(tiles, id) -> tiles` — drop the tile, then let survivors absorb **only** the rectangle it freed: one cell at a time in reading order, trying right, down, left, up, taking a step only when the strip of cells gained lies wholly inside the freed rect and is free. Nothing else on the canvas moves.
 - `compact(tiles) -> tiles` — sequential physical gravity in `(y, x)` order: each tile slides up then left only through space that is free at the moment it moves (no pass-through), so intermediate states are never overlapping. No operation calls this; it remains a pure utility in the contract.
 - Rounding rule everywhere (incl. `fromSplitTree`): edges (not widths) rounded with `floor(v + 0.5)` — identical in TS and Python (no banker's rounding).
 
-Where this prose and `proto/layout-v2-fixtures.json` disagree, **the fixtures win** — they are hand-verified and both implementations must pass them. UX note for B2: the canvas is free-form — gaps ARE a legal end state, and the empty space is itself a target (clicking it adds a pane there). The drag preview shows the post-move result, and a swap drop highlights the tile being exchanged.
+Where this prose and `proto/layout-v3-fixtures.json` disagree, **the fixtures win** — they are hand-verified and both implementations must pass them. UX note for B2: the canvas is free-form — gaps ARE a legal end state, and the empty space is itself a target (clicking it adds a pane there). The drag preview shows the post-move result, and a swap drop highlights the tile being exchanged.
 - `readingOrder(tiles) -> id[]` — sort by `(y, x)`. Used for the mobile stack and keyboard focus order.
 - `fromSplitTree(v1root) -> tiles` — migration converter: recursively assign float rects starting from `(0,0,12,12)`, `row` split gives `a` `ratio*w`; round edges to ints per the rounding rule; if any resulting tile violates the minimum tile size or overlaps after rounding, **fall back** to placing the panes in v1 DFS order (a-then-b) with repeated `autoPlace`. Trees with >8 panes keep the first 8 in DFS order. Deterministic either way.
 
@@ -407,7 +423,7 @@ All `+` entry points (sidebar add-session row, sidebar new-workspace with >1 hos
 
 ### 5.6 Grid interactions
 
-`web/src/components/workspace/WorkspaceGrid.tsx` renders `layout.tiles` as absolutely-positioned tiles (percentage geometry from the 12×12 units, `--pane-gap` gutters). **Terminal keep-alive is preserved**: the slot/portal pattern from the current screens page moves here — one `SessionPane` per session in a stable keyed layer, portaled into whichever tile slot the layout exposes; reshaping never remounts a terminal.
+`web/src/components/workspace/WorkspaceGrid.tsx` renders `layout.tiles` as absolutely-positioned tiles (percentage geometry from the 24×24 units, `--pane-gap` gutters). **Terminal keep-alive is preserved**: the slot/portal pattern from the current screens page moves here — one `SessionPane` per session in a stable keyed layer, portaled into whichever tile slot the layout exposes; reshaping never remounts a terminal.
 
 - **Drag to move:** press anywhere on the pane header that is not a control. During drag the pane follows the pointer as a `transform` (60fps, no React state per move); a ghost outline shows the snapped target cell (`movePane` in `workspace-grid-helpers.ts`, computed live per pointer position, throttled to grid-cell changes). Over empty canvas the ghost snaps to cells and the pane just goes there (`movePane`; a partial overlap pushes the blocking pane by the smallest in-bounds translation, or refuses). Hovering **another pane** switches to iTerm-style docking (`dockPane` + `dockZoneAt`): the pointer's nearest edge of the hovered pane picks a side, the dragged pane's vacated spot is absorbed by its neighbours (the same pass as `grid.remove`, so the canvas stays packed), and the target splits in half — the ghost claims the hovered side, so dropping a column onto the lower half of another stacks them vertically. Targets under 6 cells on the split axis refuse. Displaced panes animate (`transition: transform 150ms var(--ease-swift)`) in real time; release commits. `grid.move` (with its swap fallback) remains the fixture-pinned wire algebra; `movePane`/`dockPane` are view-layer only.
 - **Resize:** eight grab surfaces per pane — four edge strips and four corners (`TileResizeHandles`) — plus draggable seams where panes meet (`gridDividers`). An edge behaves like a splitter: flush neighbours in the pane's cross-range follow it (`resizeEdges` in `workspace-grid-helpers.ts` — shrinking to make room, growing to keep the seam where the swept cells are free), gapped neighbours clamp the drag, and the preview applies incrementally so one sweep closes a gap and then starts trading space. Live ghost + neighbor animation identical to move. `grid.resize` (about-the-origin, refuse-on-overlap) remains the fixture-pinned wire algebra; `resizeEdges` is view-layer only.
@@ -452,7 +468,7 @@ Ownership is **per-path**: a workstream may create/modify/delete only inside its
 | **A1** | **Server rewrite**: migrations 0029–0032 (+tests), `models.py`, `schemas.py`, `routes/sessions.py`, `routes/workspaces.py`, `routes/agents.py` (defs), `routes/hosts.py` (agents/recent-dirs), `routes/auth_config`, `grid.py` (validator/auto-place vs fixtures), `ws/daemon.py` + `ws/broker.py` v3 frames, seeder, all server tests | `server/**` | §4.1–4.4 contracts; fixtures file (A4) for grid tests — until it lands, mirror the §4.4 prose | `docs/ADMIN.md` if touched; review `proto/README.md` (A2's PR) |
 | **A2** | **Daemon v3**: frame renames, shell resolution in `session.create`, drop argv/env/install, `T_FOREGROUND` + foreground poller (worker), `session.foreground` emit, `host.agents.*`, scope_type rename + signed-signal bump + regenerate vectors, subprotocol v3 | `daemon/**`, `proto/README.md`, `proto/*vectors*` | §4.3 | `proto/README.md` (rewrite), `docs/SESSIOND.md`, `docs/TRUST.md` (foreground disclosure note) |
 | **A3** | **Design system**: token additions + literal purge in *surviving* files (`ui/*`, `ConnectionChip`, `FileExplorer`, `HostToolsPanel`→ kept pieces, admin, download, settings panels), new primitives (`dialog`, `confirm`, `cascade-menu`, `drawer`, `empty-state`, `spinner`), `icons/AgentIcon.tsx` + bundled logo SVGs | `web/src/app/globals.css`, `web/src/components/ui/**`, `web/src/components/icons/**`, literal-purge edits in surviving components | §4.6 | `docs/DESIGN.md` (becomes the UI standards doc: tokens, primitives, container-query rules, no-literal rule) |
-| **A4** | **Grid engine**: `web/src/lib/grid.ts` + exhaustive unit tests + `proto/layout-v2-fixtures.json` | those files only | §4.4 | fixture file is the doc |
+| **A4** | **Grid engine**: `web/src/lib/grid.ts` + exhaustive unit tests + `proto/layout-v3-fixtures.json` | those files only | §4.4 | fixture file is the doc |
 | **A5** | **Web data layer**: rewrite `lib/api.ts` (new types/endpoints per §4.2), `lib/ws.ts` (v3 frames, `session_id`), `lib/auth.ts` (+config), new `lib/sessions.ts` (title/activity/attention/shell-matcher helpers) + `lib/workspaces.ts` (naming, recency) + `lib/highlight-store.ts`; mechanical `agent→session` rename through `components/terminal/**` (props, hooks, `useAgentSocket→useSessionSocket`, `LiveTerminalProvider` pool keys — behavior untouched); delete `lib/agents.ts`, `lib/screens.ts`, `lib/layout.ts`, `lib/dnd.ts` | `web/src/lib/**` (except grid.ts/theme), `web/src/components/terminal/**` | §4.2, §4.3 | — |
 
 Phase A gate: server tests green against migrated fixture DB; daemon `cargo test` green incl. a real-PTY foreground test; web `bun test src` green; grid fixtures pass in both TS and Python; e2e is expected red until C2.
@@ -517,7 +533,7 @@ Plus: `bun run lint && bun run test:unit && bun run test:e2e` (web), `pytest` (s
 - Sessions stay standalone records; workspaces reference them via layout tiles; deleting a workspace closes its sessions (confirmed in UI).
 - `+ New workspace` immediately creates a shell session (host cascade when >1 host).
 - Full-stack rename (DB, API, protocol v3, web) with data-preserving migrations — pre-release with internal users.
-- Grid: free-form packed 12×12, no vertical scroll, dual TS/Python algebra kept identical via shared fixtures.
+- Grid: free-form packed 24×24, no vertical scroll, dual TS/Python algebra kept identical via shared fixtures.
 - Folder picking: in-app host browser over the existing E2E fs channel (native OS pickers can't browse remote hosts or return absolute paths).
 - "Root" location option became **Home** (`~`); literal `/` was rejected as permission-hostile and the fs channel is home-rooted anyway.
 - Onboarding gates account + email verification (when server-enforced); host connect is skippable; first workspace auto-created.

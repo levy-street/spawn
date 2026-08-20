@@ -276,7 +276,7 @@ be launched, so every skilled session gets the projection.
 
 ### Workspaces
 
-A workspace is a named 12×12 canvas of tiles. Tiles hold a session terminal, or a widget.
+A workspace is a named 24×24 canvas of tiles. Tiles hold a session terminal, or a widget.
 
 | Method | Path | Body |
 |--------|------|------|
@@ -285,19 +285,22 @@ A workspace is a named 12×12 canvas of tiles. Tiles hold a session terminal, or
 | GET | `/api/workspaces/{id}` | one workspace |
 | PATCH | `/api/workspaces/{id}` | `{name?, layout?, position?, host_id?, cwd?}` |
 | DELETE | `/api/workspaces/{id}` | kills and deletes every session referenced by its tiles, then the workspace (204) |
+| POST | `/api/workspaces/{id}/archive` | put it away: kills its sessions, keeps its shape server-side, empties its layout, sets `archived_at` |
+| POST | `/api/workspaces/{id}/unarchive` | rebuild it and spawn a fresh shell per pane; `{host_id?}` re-homes it, and 409 `host_required` asks for one when a pane's own host is gone or offline |
+| GET | `/api/workspaces/{id}/archived-shape` | the snapshot an archived workspace is holding, for viewing it without restoring: `{version: 1, active_tab, tabs: [{id, name, host_id, cwd, tiles: [{x, y, w, h, pane}]}]}` where `pane` is `{kind: "session", host_id, cwd, name, skill_ids, command}` or `{kind: "widget", widget}`; 409 `workspace_not_archived` otherwise |
 | GET | `/api/workspace-templates` | the caller's saved templates, ordered by name |
 | POST | `/api/workspace-templates` | `{name, host_id?, cwd?, spec}` — host/cwd: the folder the template remembers (instantiation skips the picker);  spec: `{version: 1, tabs: [{name, tiles: [{x, y, w, h, run}]}]}` where `run` is `{kind: "shell"\|"agent"\|"files", command?}` (command required for agents); geometry validated per tab with the grid invariants |
 | PATCH | `/api/workspace-templates/{id}` | `{name?, host_id?, cwd?, spec?}` |
 | DELETE | `/api/workspace-templates/{id}` | 204 |
 
 Layout schema v3 (wire + DB) — an envelope of named tabs, each wrapping one
-v2 tile grid:
+tile grid (grid schema v3):
 
 ```json
 {"version": 3,
  "active_tab": "tab-1",
  "tabs": [
-   {"id": "tab-1", "name": "Tab 1",
+   {"id": "tab-1", "name": "Tab 1", "host_id": null, "cwd": null,
     "layout": {"version": 2,
                "tiles": [{"session_id": "uuid", "x": 0, "y": 0, "w": 6, "h": 12},
                          {"session_id": "uuid", "x": 6, "y": 0, "w": 6, "h": 12,
@@ -319,13 +322,25 @@ from the first session tile for existing rows. New sessions and widgets
 default there, so adding a pane never asks where; PATCH validates that
 `host_id` names one of the caller's hosts and that `cwd` is non-empty.
 
-Per-tab grid invariants (unchanged from v2): integer geometry on a 12×12
-canvas, `w ≥ 2`, `h ≥ 2`, no overlap, max 8 tiles; unowned `session_id`s on
+Tab home (`0039`): each tab carries the same nullable `host_id` + `cwd` pair
+inside the envelope — where a window added to *that* tab opens. It is always a
+pair, and null on both means "inherit the workspace's home", so a tab that has
+never been re-pointed follows the workspace as it moves. A tab naming a host
+that is not the caller's — or carrying half a pair — is written back as
+inheriting rather than rejected, the same treatment an unowned tile gets.
+Migration `0039` backfills each tab from its first session tile (and each
+archived tab from its first stored session pane); tabs with nothing to inherit
+from are left untouched, since an absent pair already reads as inheriting.
+`ArchivedTab` carries the pair too, so a restore comes back pointing where the
+tab pointed.
+
+Per-tab grid invariants (unchanged from v2): integer geometry on a 24×24
+canvas, `w ≥ 4`, `h ≥ 4`, no overlap, max 16 tiles; unowned `session_id`s on
 tiles without a `widget` are pruned. Tiles need not cover the canvas — gaps
 are a normal, persistable state. A `widget` tile renders that widget instead
 of a terminal and its `session_id` is simply its own tile id (the algebra
 only requires a unique non-empty string). The shared fixture suite
-`layout-v2-fixtures.json` keeps the TypeScript and Python grid
+`layout-v3-fixtures.json` keeps the TypeScript and Python grid
 implementations identical; the envelope logic lives in `web/src/lib/tabs.ts`
 and `spawn_server/routes/workspaces.py` and is deliberately simple enough
 not to need one.

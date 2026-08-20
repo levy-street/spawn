@@ -57,8 +57,8 @@ async function openTerminalWithMockSocket(
     workspaces: [
       workspace({
         layout: {
-          version: 2,
-          tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }],
+          version: 3,
+          tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }],
         },
       }),
     ],
@@ -1138,10 +1138,10 @@ test("previous-session callbacks remain scoped to the previous terminal", async 
     workspaces: [
       workspace({
         layout: {
-          version: 2,
+          version: 3,
           tiles: [
-            { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
-            { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+            { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },
+            { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
           ],
         },
       }),
@@ -1301,10 +1301,10 @@ test.describe("mobile terminal touch", () => {
       workspaces: [
         workspace({
           layout: {
-            version: 2,
+            version: 3,
             tiles: [
-              { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 6 },
-              { session_id: SESSION_B_ID, x: 0, y: 6, w: 12, h: 6 },
+              { session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 12 },
+              { session_id: SESSION_B_ID, x: 0, y: 12, w: 24, h: 12 },
             ],
           },
         }),

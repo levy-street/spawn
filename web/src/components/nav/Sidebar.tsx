@@ -6,18 +6,30 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
+import { SidebarArchivedSection } from "@/components/nav/SidebarArchivedSection";
 import { SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
-import { SidebarIconSlot, SidebarRowLabel, sidebarRowClass } from "@/components/nav/sidebar-parts";
+import {
+  SidebarIconSlot,
+  SidebarNoMatches,
+  SidebarRowLabel,
+  SidebarSearch,
+  sidebarRowClass,
+} from "@/components/nav/sidebar-parts";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
 import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { toast } from "@/components/ui/toast";
 import { RailTooltip } from "@/components/ui/tooltip";
 import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
 import { hosts, sessions, type Workspace, workspaces } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
-import { workspaceAttentionCount } from "@/lib/workspaces";
+import {
+  filterWorkspacesByName,
+  workspaceAttentionCount,
+  workspaceLiveSessionCount,
+} from "@/lib/workspaces";
 
 export function Sidebar({
   pathname,
@@ -36,6 +48,7 @@ export function Sidebar({
   const queryClient = useQueryClient();
   const { user } = useAuth();
   const [actionError, setActionError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
 
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
@@ -44,8 +57,15 @@ export function Sidebar({
   });
   const workspacesQ = useQuery({
     queryKey: ["workspaces"],
-    queryFn: workspaces.list,
+    queryFn: () => workspaces.list(),
     refetchInterval: 30_000,
+  });
+  // Its own key: the archived list must never leak into ["workspaces"], which
+  // seven other surfaces read as "the workspaces I have".
+  const archivedQ = useQuery({
+    queryKey: ["workspaces", "archived"],
+    queryFn: () => workspaces.list({ archived: true }),
+    staleTime: 30_000,
   });
   const hostsQ = useQuery({
     queryKey: ["hosts"],
@@ -57,6 +77,14 @@ export function Sidebar({
     () => [...(workspacesQ.data ?? [])].sort((a, b) => a.position - b.position),
     [workspacesQ.data],
   );
+  // What the tree actually renders. Reordering is disabled while a search is
+  // narrowing the list: a drop index counted over visible rows would mean
+  // something different from the position the server writes.
+  const visibleWorkspaces = useMemo(
+    () => filterWorkspacesByName(orderedWorkspaces, query),
+    [orderedWorkspaces, query],
+  );
+  const searching = query.trim().length > 0;
   const sessionsById = useMemo(
     () => new Map((sessionsQ.data ?? []).map((session) => [session.id, session])),
     [sessionsQ.data],
@@ -66,7 +94,13 @@ export function Sidebar({
 
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    // Matches ["workspaces"] and ["workspaces", "archived"] both: archiving
+    // moves a row from one list to the other, so they always move together.
     queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+    // The singular key the workspace page reads is a different cache entry —
+    // and it is the one that decides whether that page draws a live canvas or
+    // an archived snapshot.
+    queryClient.invalidateQueries({ queryKey: ["workspace"] });
     queryClient.invalidateQueries({ queryKey: ["hosts"] });
   };
 
@@ -108,8 +142,42 @@ export function Sidebar({
     },
     onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
   });
+  const archiveWorkspaceM = useMutation({
+    mutationFn: ({ id }: { id: string; name: string; nextId: string | null }) =>
+      workspaces.archive(id),
+    onSuccess: (_result, { id, name, nextId }) => {
+      setActionError(null);
+      refresh();
+      // Said out loud, because the row leaves the list under your cursor and
+      // the only other evidence is a drawer that is probably closed.
+      toast(`Archived ${name}`);
+      // And carry on next door: the workspace you were looking at is stopped
+      // now, so the useful place to be is the one that took its slot.
+      if (currentWorkspaceId === id) {
+        router.push(nextId ? `/w/${nextId}` : "/app");
+        onNavigate?.();
+      }
+    },
+    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
+  });
+  const unarchiveWorkspaceM = useMutation({
+    mutationFn: (id: string) => workspaces.unarchive(id),
+    onSuccess: (workspace) => {
+      setActionError(null);
+      refresh();
+      router.push(`/w/${workspace.id}`);
+      onNavigate?.();
+    },
+    // Restoring is a deliberate act with its own outcome, and the sidebar's
+    // inline error sits above a list the restored row is not in yet.
+    onError: (error) => toast.error(error instanceof Error ? error.message : String(error)),
+  });
   const workspaceBusy =
-    renameWorkspaceM.isPending || reorderWorkspaceM.isPending || deleteWorkspaceM.isPending;
+    renameWorkspaceM.isPending ||
+    reorderWorkspaceM.isPending ||
+    deleteWorkspaceM.isPending ||
+    archiveWorkspaceM.isPending ||
+    unarchiveWorkspaceM.isPending;
 
   /**
    * Drag a workspace row up or down to reorder. Pointer-based with a small
@@ -207,6 +275,44 @@ export function Sidebar({
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onUp, { once: true });
     document.addEventListener("pointercancel", onCancel);
+  };
+
+  /**
+   * Archiving stops the work and keeps everything else, so it only stops to
+   * ask when there is work to stop: a workspace of stopped windows archives
+   * on the click. The destructive copy stays on Delete, which keeps nothing.
+   */
+  const requestWorkspaceArchive = async (workspace: Workspace) => {
+    const live = workspaceLiveSessionCount(workspace, sessionsById);
+    if (live > 0) {
+      const accepted = await confirm({
+        title: `Archive ${workspace.name}?`,
+        body: `${live} running ${live === 1 ? "session" : "sessions"} will be stopped. The layout is kept — restore it any time from Archived and every window starts again where it is.`,
+        confirmLabel: "Archive workspace",
+      });
+      if (!accepted) return;
+    }
+    archiveWorkspaceM.mutate({
+      id: workspace.id,
+      name: workspace.name,
+      // The row that will sit where this one did — or the one above it when
+      // this was the last, and nothing at all when it was the only one.
+      nextId: (() => {
+        const index = orderedWorkspaces.findIndex((row) => row.id === workspace.id);
+        if (index < 0) return null;
+        return (orderedWorkspaces[index + 1] ?? orderedWorkspaces[index - 1])?.id ?? null;
+      })(),
+    });
+  };
+
+  const requestArchivedDelete = async (workspace: Workspace) => {
+    const accepted = await confirm({
+      title: `Delete ${workspace.name} forever?`,
+      body: "Its layout is discarded. This cannot be undone.",
+      confirmLabel: "Delete forever",
+      destructive: true,
+    });
+    if (accepted) deleteWorkspaceM.mutate(workspace.id);
   };
 
   const requestWorkspaceDelete = async (workspace: Workspace) => {
@@ -364,13 +470,24 @@ export function Sidebar({
             {actionError}
           </p>
         )}
+        {!collapsed && orderedWorkspaces.length > 1 && (
+          // Full-bleed rule under the box, matching the section rules above
+          // and below the tree: the search is chrome, the list beneath it is
+          // the content it filters.
+          <div className="-mx-2.5 mb-2.5 border-b border-border px-2.5 pb-2.5">
+            <SidebarSearch value={query} onChange={setQuery} label="Search workspaces" />
+          </div>
+        )}
         {!collapsed && !workspacesQ.isLoading && orderedWorkspaces.length === 0 && (
           <p className="px-2 py-4 text-xs leading-5 text-muted-foreground">
             Your workspaces will appear here.
           </p>
         )}
+        {!collapsed && searching && visibleWorkspaces.length === 0 && (
+          <SidebarNoMatches query={query.trim()} />
+        )}
         <ul className="space-y-2">
-          {orderedWorkspaces.map((workspace) => {
+          {visibleWorkspaces.map((workspace) => {
             return (
               <SidebarWorkspaceRow
                 key={workspace.id}
@@ -381,13 +498,26 @@ export function Sidebar({
                 busy={workspaceBusy}
                 onNavigate={onNavigate}
                 onRename={(name) => renameWorkspaceM.mutate({ id: workspace.id, name })}
+                onArchive={() => void requestWorkspaceArchive(workspace)}
                 onDelete={() => void requestWorkspaceDelete(workspace)}
-                onRowPointerDown={(event) => startWorkspaceDrag(workspace.id, event)}
+                onRowPointerDown={
+                  searching ? undefined : (event) => startWorkspaceDrag(workspace.id, event)
+                }
               />
             );
           })}
         </ul>
       </nav>
+
+      <SidebarArchivedSection
+        workspaces={archivedQ.data ?? []}
+        collapsed={collapsed}
+        busy={workspaceBusy}
+        currentWorkspaceId={currentWorkspaceId}
+        onNavigate={onNavigate}
+        onRestore={(workspace) => unarchiveWorkspaceM.mutate(workspace.id)}
+        onDelete={(workspace) => void requestArchivedDelete(workspace)}
+      />
 
       <div className="border-y border-border px-2.5 py-2">
         <RailTooltip label="Settings" disabled={!collapsed}>

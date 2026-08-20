@@ -11,15 +11,15 @@ async def _signup(client, email: str) -> str:
 
 def _spec(tiles=None, *, name: str = "Tab 1") -> dict:
     return {
-        "version": 1,
+        "version": 2,
         "tabs": [
             {
                 "name": name,
                 "tiles": tiles
                 if tiles is not None
                 else [
-                    {"x": 0, "y": 0, "w": 6, "h": 12, "run": {"kind": "shell"}},
-                    {"x": 6, "y": 0, "w": 6, "h": 12, "run": {"kind": "agent", "command": "claude"}},
+                    {"x": 0, "y": 0, "w": 12, "h": 24, "run": {"kind": "shell"}},
+                    {"x": 12, "y": 0, "w": 12, "h": 24, "run": {"kind": "agent", "command": "claude"}},
                 ],
             }
         ],
@@ -60,8 +60,8 @@ async def test_template_spec_validation(client):
     # Overlapping geometry is refused with the layouts' own validator.
     overlap = _spec(
         [
-            {"x": 0, "y": 0, "w": 6, "h": 12, "run": {"kind": "shell"}},
-            {"x": 3, "y": 0, "w": 6, "h": 12, "run": {"kind": "shell"}},
+            {"x": 0, "y": 0, "w": 12, "h": 24, "run": {"kind": "shell"}},
+            {"x": 6, "y": 0, "w": 12, "h": 24, "run": {"kind": "shell"}},
         ]
     )
     r = await client.post(
@@ -75,7 +75,7 @@ async def test_template_spec_validation(client):
         "/api/workspace-templates",
         json={
             "name": "bad",
-            "spec": _spec([{"x": 0, "y": 0, "w": 12, "h": 12, "run": {"kind": "agent"}}]),
+            "spec": _spec([{"x": 0, "y": 0, "w": 24, "h": 24, "run": {"kind": "agent"}}]),
         },
         headers=auth,
     )
@@ -85,7 +85,7 @@ async def test_template_spec_validation(client):
         json={
             "name": "bad",
             "spec": _spec(
-                [{"x": 0, "y": 0, "w": 12, "h": 12, "run": {"kind": "shell", "command": "ls"}}]
+                [{"x": 0, "y": 0, "w": 24, "h": 24, "run": {"kind": "shell", "command": "ls"}}]
             ),
         },
         headers=auth,
@@ -95,7 +95,7 @@ async def test_template_spec_validation(client):
     # An empty tab list is a schema error.
     r = await client.post(
         "/api/workspace-templates",
-        json={"name": "bad", "spec": {"version": 1, "tabs": []}},
+        json={"name": "bad", "spec": {"version": 2, "tabs": []}},
         headers=auth,
     )
     assert r.status_code == 422
@@ -152,3 +152,36 @@ async def test_templates_are_owner_scoped(client):
     assert r.status_code == 404
     r = await client.delete(f"/api/workspace-templates/{template_id}", headers=auth_b)
     assert r.status_code == 404
+
+
+async def test_template_spec_v1_is_lifted_into_the_24x24_space(client):
+    """A client that still speaks the 12x12 spec keeps working through a
+    deploy: its geometry is scaled on the way in, not stored at half size."""
+    token = await _signup(client, "spec-v1@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    r = await client.post(
+        "/api/workspace-templates",
+        json={
+            "name": "legacy",
+            "spec": {
+                "version": 1,
+                "tabs": [
+                    {
+                        "name": "Tab 1",
+                        "tiles": [
+                            {"x": 0, "y": 0, "w": 6, "h": 12, "run": {"kind": "shell"}},
+                            {"x": 6, "y": 0, "w": 6, "h": 12, "run": {"kind": "shell"}},
+                        ],
+                    }
+                ],
+            },
+        },
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    spec = r.json()["spec"]
+    assert spec["version"] == 2
+    assert [(t["x"], t["y"], t["w"], t["h"]) for t in spec["tabs"][0]["tiles"]] == [
+        (0, 0, 12, 24),
+        (12, 0, 12, 24),
+    ]

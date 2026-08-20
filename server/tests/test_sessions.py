@@ -232,7 +232,7 @@ async def test_session_create_appends_workspace_tile(client):
     assert first.status_code == 201, first.text
     layout = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()["layout"]
     assert layout["tabs"][0]["layout"]["tiles"] == [
-        {"session_id": first.json()["id"], "x": 0, "y": 0, "w": 12, "h": 12}
+        {"session_id": first.json()["id"], "x": 0, "y": 0, "w": 24, "h": 24}
     ]
 
     # Second session splits the full-canvas tile.
@@ -245,10 +245,10 @@ async def test_session_create_appends_workspace_tile(client):
     layout = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()["layout"]
     by_id = {tile["session_id"]: tile for tile in layout["tabs"][0]["layout"]["tiles"]}
     assert by_id[first.json()["id"]] == {
-        "session_id": first.json()["id"], "x": 0, "y": 0, "w": 6, "h": 12
+        "session_id": first.json()["id"], "x": 0, "y": 0, "w": 12, "h": 24
     }
     assert by_id[second.json()["id"]] == {
-        "session_id": second.json()["id"], "x": 6, "y": 0, "w": 6, "h": 12
+        "session_id": second.json()["id"], "x": 12, "y": 0, "w": 12, "h": 24
     }
 
 
@@ -266,7 +266,7 @@ async def test_session_create_explicit_tile_validation(client):
             "host_id": host_id,
             "cwd": "/one",
             "workspace_id": workspace_id,
-            "tile": {"x": 0, "y": 0, "w": 6, "h": 12},
+            "tile": {"x": 0, "y": 0, "w": 12, "h": 24},
         },
         headers=auth,
     )
@@ -279,7 +279,7 @@ async def test_session_create_explicit_tile_validation(client):
             "host_id": host_id,
             "cwd": "/two",
             "workspace_id": workspace_id,
-            "tile": {"x": 3, "y": 0, "w": 6, "h": 12},
+            "tile": {"x": 6, "y": 0, "w": 12, "h": 24},
         },
         headers=auth,
     )
@@ -294,7 +294,7 @@ async def test_session_create_explicit_tile_validation(client):
             "host_id": host_id,
             "cwd": "/three",
             "workspace_id": workspace_id,
-            "tile": {"x": 10, "y": 0, "w": 6, "h": 12},
+            "tile": {"x": 20, "y": 0, "w": 12, "h": 24},
         },
         headers=auth,
     )
@@ -303,7 +303,7 @@ async def test_session_create_explicit_tile_validation(client):
     # A tile without a workspace is meaningless.
     bad = await client.post(
         "/api/sessions",
-        json={"host_id": host_id, "cwd": "/four", "tile": {"x": 0, "y": 0, "w": 3, "h": 3}},
+        json={"host_id": host_id, "cwd": "/four", "tile": {"x": 0, "y": 0, "w": 6, "h": 6}},
         headers=auth,
     )
     assert bad.status_code == 400

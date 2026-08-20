@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
 import { mockApp, WORKSPACE_ID } from "./app-mocks";
 
-const OUT = "/private/tmp/claude-501/-Users-charliesaxton-dev-spawn/6d00294e-752a-4198-ba96-a9f38a5d11ef/scratchpad";
+const OUT =
+  "/private/tmp/claude-501/-Users-charliesaxton-dev-spawn/6d00294e-752a-4198-ba96-a9f38a5d11ef/scratchpad";
 
 test("brand lockup shots", async ({ page }) => {
   await mockApp(page);

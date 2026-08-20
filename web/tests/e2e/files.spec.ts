@@ -287,10 +287,10 @@ test("a file explorer is added to the workspace as its own pane", async ({ page 
         host_id: HOST_ID,
         cwd: "/Users/tester/projects/spawn",
         layout: {
-          version: 2,
+          version: 3,
           tiles: [
-            { session_id: session().id, x: 0, y: 0, w: 6, h: 12 },
-            { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+            { session_id: session().id, x: 0, y: 0, w: 12, h: 24 },
+            { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
           ],
         },
       }),
@@ -304,8 +304,8 @@ test("a file explorer is added to the workspace as its own pane", async ({ page 
   await page.goto(`/w/${WORKSPACE_ID}`);
   // A file explorer is a pane like any other, added from the floating
   // launcher; the workspace's home answers where it points.
-  await page.getByRole("button", { name: "Add a pane" }).hover();
-  await page.getByRole("button", { name: "New file explorer pane" }).click();
+  await page.getByRole("button", { name: "Add a window" }).hover();
+  await page.getByRole("button", { name: "New file explorer window" }).click();
 
   const pane = page.getByRole("region", { name: /^Files — / });
   await expect(pane).toBeVisible();

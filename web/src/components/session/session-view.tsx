@@ -67,7 +67,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   });
   const workspacesQ = useQuery({
     queryKey: ["workspaces"],
-    queryFn: workspaces.list,
+    queryFn: () => workspaces.list(),
     staleTime: 15_000,
   });
   const memberWorkspace = useMemo(

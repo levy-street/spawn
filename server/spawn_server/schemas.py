@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -16,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from . import grid
 from .browser_registration import ED25519_SIGNATURE_B64URL_LENGTH
 from .host_identity import (
     decode_ed25519_public_key,
@@ -669,26 +670,49 @@ class WorkspaceTile(BaseModel):
 
 
 class WorkspaceLayout(BaseModel):
+    """One tab's tile grid, in the 24x24 space of grid schema v3.
+
+    A v2 grid is accepted and lifted on the way in. During a deploy there is a
+    window where a browser still holds the old bundle and keeps PATCHing 12x12
+    layouts; scaling them here means those writes land correctly instead of
+    being rejected, or — far worse — being stored as v3 and read back at half
+    scale. `grid.LAYOUT_VERSION` is the only thing that ever reaches the DB.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[2]
+    version: Literal[3]
     tiles: list[WorkspaceTile] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lift_v2_grid(cls, value: Any) -> Any:
+        return grid.lift_layout(value)
 
 
 class WorkspaceTab(BaseModel):
-    """One named 12x12 grid inside a workspace (layout schema v3)."""
+    """One named 24x24 grid inside a workspace (layout schema v3).
+
+    `host_id`/`cwd` are the tab's own default folder — where a window added to
+    this tab opens. Null means "inherit the workspace's home", so a tab that
+    has never been re-pointed follows the workspace as it moves; a host that
+    stops being the owner's is nulled back to inheriting on the next write.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=64)
     layout: WorkspaceLayout
+    host_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=1024)
 
 
 class WorkspaceLayoutV3(BaseModel):
     """The workspace layout envelope: an ordered list of tabs, each holding a
-    v2 tile grid. The v2 algebra (grid.py / grid.ts and the shared fixtures)
-    is untouched — tabs sit above it. A workspace always has at least one tab.
+    tile grid. The grid algebra (grid.py / grid.ts and the shared fixtures)
+    sits below this — tabs are an envelope over it, and the two are versioned
+    independently. A workspace always has at least one tab.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -712,8 +736,13 @@ class WorkspaceCreate(BaseModel):
     # Omitted -> the server names it "Workspace N" (next free N).
     name: str | None = Field(default=None, max_length=128)
     # Optional: create the workspace and its first shell session atomically;
-    # the session gets the full-canvas tile {0, 0, 12, 12}.
+    # the session gets the full-canvas tile.
     first_session: WorkspaceFirstSession | None = None
+    # The workspace's home host/folder, for a workspace created empty — the
+    # tab opens on its empty state and every pane added later starts here.
+    # Ignored when `first_session` is given, which sets the home itself.
+    host_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=1024)
 
 
 class WorkspacePatch(BaseModel):
@@ -733,6 +762,10 @@ class WorkspaceOut(BaseModel):
     cwd: str | None = None
     layout: WorkspaceLayoutV3
     position: int = 0
+    # Set -> the workspace is put away: out of the default list and stopped.
+    # Its layout is untouched, so what it holds is readable from `layout` and
+    # the session rows it names, exactly as an active workspace's is.
+    archived_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -767,17 +800,46 @@ class TemplateTab(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=64)
-    tiles: list[TemplateTile] = Field(default_factory=list, max_length=8)
+    tiles: list[TemplateTile] = Field(default_factory=list, max_length=grid.MAX_TILES)
 
 
 class WorkspaceTemplateSpec(BaseModel):
     """A workspace's shape, portable across folders: geometry + what runs.
-    Tile geometry is validated against the same grid invariants as layouts."""
+    Tile geometry is validated against the same grid invariants as layouts.
+
+    Version 2 carries 24x24 geometry; a v1 spec is 12x12 and is lifted on the
+    way in, for the same reason `WorkspaceLayout` lifts a v2 grid.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1]
+    version: Literal[2]
     tabs: list[TemplateTab] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lift_v1_spec(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or value.get("version") != 1:
+            return value
+        scale = grid.GRID_COLS // grid.V2_GRID_COLS
+        tabs = []
+        for tab in value.get("tabs") or []:
+            if not isinstance(tab, dict):
+                tabs.append(tab)
+                continue
+            tiles = []
+            for tile in tab.get("tiles") or []:
+                if not isinstance(tile, dict):
+                    tiles.append(tile)
+                    continue
+                scaled = dict(tile)
+                for key in ("x", "y", "w", "h"):
+                    size = scaled.get(key)
+                    if isinstance(size, int) and not isinstance(size, bool):
+                        scaled[key] = size * scale
+                tiles.append(scaled)
+            tabs.append({**tab, "tiles": tiles})
+        return {**value, "version": 2, "tabs": tabs}
 
 
 class WorkspaceTemplateCreate(BaseModel):

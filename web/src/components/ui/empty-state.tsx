@@ -8,12 +8,16 @@ import { cn } from "@/lib/utils";
  */
 export function EmptyState({
   icon,
+  iconPlate = true,
   title,
   body,
   action,
   className,
 }: {
   icon?: ReactNode;
+  /** False renders the icon bare — for a mark that is already a plate of its
+   *  own, like the brand trident. */
+  iconPlate?: boolean;
   title: string;
   body?: ReactNode;
   action?: ReactNode;
@@ -26,14 +30,17 @@ export function EmptyState({
         className,
       )}
     >
-      {icon != null && (
-        <div
-          className="flex size-12 items-center justify-center rounded-xl border border-border bg-muted text-muted-foreground [&>svg]:size-6"
-          aria-hidden
-        >
-          {icon}
-        </div>
-      )}
+      {icon != null &&
+        (iconPlate ? (
+          <div
+            className="flex size-12 items-center justify-center rounded-xl border border-border bg-muted text-muted-foreground [&>svg]:size-6"
+            aria-hidden
+          >
+            {icon}
+          </div>
+        ) : (
+          icon
+        ))}
       <div className="space-y-1">
         <h2 className="text-sm font-semibold">{title}</h2>
         {body != null && (

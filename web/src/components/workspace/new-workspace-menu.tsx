@@ -54,11 +54,11 @@ export function NewWorkspaceMenu({
       if (choice.kind === "template") {
         return instantiateTemplate(choice.template, host, cwd);
       }
-      const result = await workspaces.create({ first_session: { host_id: host.id, cwd } });
-      return {
-        workspaceId: result.workspace.id,
-        focusSessionId: result.session?.id ?? null,
-      };
+      // A blank workspace opens empty: one tab on its empty state, homed at
+      // the folder just chosen. Booting a terminal nobody asked for makes the
+      // first thing you do closing it.
+      const result = await workspaces.create({ host_id: host.id, cwd });
+      return { workspaceId: result.workspace.id, focusSessionId: null };
     },
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });

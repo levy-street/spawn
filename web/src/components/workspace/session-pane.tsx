@@ -6,6 +6,7 @@ import {
   ArrowUp,
   Check,
   ChevronDown,
+  Copy,
   Ellipsis,
   ExternalLink,
   Folder,
@@ -14,6 +15,7 @@ import {
   Trash2,
 } from "lucide-react";
 import {
+  type ReactNode,
   type PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
@@ -42,6 +44,16 @@ import { shellQuote } from "./agent-command";
 import { AgentSwitcher } from "./agent-switcher";
 import { FolderPickerDialog } from "./folder-picker-dialog";
 import { pendingLaunch } from "./pending-launch";
+
+/** Trailing shortcut hint in a menu row — the gesture that does the same thing. */
+function MenuHint({ children }: { children: ReactNode }) {
+  return (
+    <span className="ml-auto shrink-0 pl-3 text-xs tracking-wide text-muted-foreground">
+      {children}
+    </span>
+  );
+}
+
 import { runInShell, stillRunningMessage } from "./shell-handoff";
 
 export type PaneSlotTarget = { el: HTMLElement; stacked: boolean };
@@ -63,11 +75,13 @@ export function SessionPane({
   focused,
   paneCount,
   canDrag,
+  canDuplicate = false,
   canMoveUp,
   canMoveDown,
   onFocus,
   onToggleZoom,
   onMoveStart,
+  onDuplicate,
   onMoveUp,
   onMoveDown,
   onRemoveFromWorkspace,
@@ -82,11 +96,16 @@ export function SessionPane({
   focused: boolean;
   paneCount: number;
   canDrag: boolean;
+  /** False when the tab is full, or the session has not loaded yet. */
+  canDuplicate?: boolean;
   canMoveUp: boolean;
   canMoveDown: boolean;
   onFocus: (sessionId: string) => void;
   onToggleZoom: (sessionId: string) => void;
   onMoveStart: (sessionId: string, event: ReactPointerEvent<HTMLElement>) => void;
+  /** Open a second pane on the same host, folder, skills and agent (workspace
+   *  grid only — the grid owns placement). */
+  onDuplicate?: (sessionId: string) => void;
   onMoveUp: (sessionId: string) => void;
   onMoveDown: (sessionId: string) => void;
   onRemoveFromWorkspace: (sessionId: string) => void;
@@ -277,10 +296,10 @@ export function SessionPane({
 
       <header
         role="toolbar"
-        aria-label={`${title} pane controls`}
+        aria-label={`${title} window controls`}
         title={canDrag ? "Drag to move" : undefined}
         className={cn(
-          "group/pane-header flex h-9 shrink-0 items-center gap-2 border-b border-border bg-card/75 px-2 select-none",
+          "group/pane-header @container/pane-header flex h-9 shrink-0 items-center gap-2 border-b border-border bg-card/75 px-2 select-none",
           canDrag && "cursor-grab active:cursor-grabbing",
         )}
         onPointerDown={(event) => {
@@ -368,7 +387,9 @@ export function SessionPane({
         {session && (
           /* The pane's folder, as a control: pick a directory and the shell
              is sent a `cd` — the terminal changes where it points without
-             leaving the keyboard-first flow. */
+             leaving the keyboard-first flow. Squeezed narrow it keeps only its
+             icon: in a pane that thin the session's own name is worth more of
+             the bar than the folder's, and the title still carries the path. */
           <button
             type="button"
             aria-label="Change directory"
@@ -378,8 +399,10 @@ export function SessionPane({
             className="flex h-7 max-w-40 shrink-0 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <Folder className="size-3.5 shrink-0" aria-hidden />
-            <span className="truncate">{basename(session.cwd) || session.cwd}</span>
-            <ChevronDown className="size-3 shrink-0" aria-hidden />
+            <span className="truncate @max-[260px]/pane-header:hidden">
+              {basename(session.cwd) || session.cwd}
+            </span>
+            <ChevronDown className="size-3 shrink-0 @max-[260px]/pane-header:hidden" aria-hidden />
           </button>
         )}
         <DropdownMenu
@@ -417,6 +440,13 @@ export function SessionPane({
             <DropdownMenuItem disabled={restartM.isPending} onSelect={() => restartM.mutate()}>
               <RotateCcw className="size-4" aria-hidden />
               Restart
+            </DropdownMenuItem>
+          )}
+          {session && onDuplicate && (
+            <DropdownMenuItem disabled={!canDuplicate} onSelect={() => onDuplicate(sessionId)}>
+              <Copy className="size-4" aria-hidden />
+              Duplicate
+              <MenuHint>⌘/⌥ drag</MenuHint>
             </DropdownMenuItem>
           )}
           {stacked && (
@@ -492,7 +522,7 @@ export function SessionPane({
         onOpenChange={setCwdPickerOpen}
         onSelect={(path) => {
           if (!session) return;
-          const purpose = "Changing this pane's folder";
+          const purpose = "Changing this window's folder";
           void runInShell({
             session,
             handle: getHandle(),

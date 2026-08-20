@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus } from "lucide-react";
+import { Copy, Plus } from "lucide-react";
 import { useRouter } from "next/navigation";
 import {
   type CSSProperties,
@@ -14,14 +14,16 @@ import {
   useState,
 } from "react";
 import { flushSync } from "react-dom";
+import { Trident } from "@/components/icons/BrandMark";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import type { TerminalHandle } from "@/components/terminal/Terminal";
-import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import {
+  agents as agentsApi,
   type Host,
   type Session,
+  sessionAccess,
   sessions as sessionsApi,
   type Workspace,
   workspaces,
@@ -31,34 +33,58 @@ import {
   GRID_SIZE,
   MAX_TILES,
   MIN_TILE_SIZE,
+  type Rect,
   readingOrder,
   remove as removeTile,
   type Tile,
+  type TileWidget,
+  validate,
 } from "@/lib/grid";
-import { sessionTitle } from "@/lib/sessions";
-import { type LayoutV3, moveSessionToTab, tabTiles, withActiveTab, withTabTiles } from "@/lib/tabs";
+import { runningAgent, sessionTitle } from "@/lib/sessions";
+import {
+  type LayoutV3,
+  moveSessionToTab,
+  tabOfSession,
+  tabTiles,
+  withActiveTab,
+  withTabTiles,
+} from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { NewSessionMenu } from "./new-session-menu";
+import { agentRunCommand } from "./agent-command";
+import { NewSessionLozenges, NewSessionMenu } from "./new-session-menu";
+import { pendingLaunch } from "./pending-launch";
 import { type PaneSlotTarget, SessionPane } from "./session-pane";
+import { TabHomeButton } from "./tab-home";
 import { WidgetPane, widgetTitle } from "./widget-pane";
 import {
+  addPaneTiles,
   clampDividerLine,
+  dockInsert,
   dockPane,
   dockZoneAt,
   type EdgeTargets,
   freeRects,
   type GridDivider,
   gridDividers,
+  insertPane,
   moveDivider,
   moveIdInOrder,
   movePane,
+  PENDING_TILE_ID,
   type ResizeEdges,
   repackMobileTiles,
   resizeEdges,
   tilePixelRect,
+  wantsDuplicate,
 } from "./workspace-grid-helpers";
 
 const WIDE_CONTAINER_PX = 768;
+/**
+ * Where the first window of an empty tab lands: the left half, full height.
+ * Auto-placing would hand it the whole canvas, and a full canvas has nowhere
+ * left to invite a second window from — this leaves a standing opening.
+ */
+const FIRST_WINDOW: Rect = { x: 0, y: 0, w: GRID_SIZE / 2, h: GRID_SIZE };
 /** How long a dragged pane must hover a tab before the view switches to it. */
 const TAB_DWELL_MS = 250;
 /** Pointer travel that separates a click on the title bar from a drag. */
@@ -66,7 +92,6 @@ const DRAG_THRESHOLD_PX = 4;
 /** Grab width of a seam, and how far it stops short of a pane corner. */
 const DIVIDER_HIT_PX = 8;
 const DIVIDER_INSET_PX = 8;
-
 type SlotRegistry = Record<string, PaneSlotTarget>;
 type HandleGetter = () => TerminalHandle | null;
 
@@ -86,6 +111,15 @@ type MoveGesture = {
   sourceTab: { tabId: string; tiles: Tile[] } | null;
   /** `${targetId}:${zone}` while hovering another pane (dock mode). */
   lastDock: string | null;
+  /**
+   * Non-null while ⌘ is held: the drag is duplicating, not moving. The source
+   * pane stays put and this placeholder — same size, `PENDING_TILE_ID` — is what
+   * follows the cursor. The drop turns it into a real pane.
+   */
+  clone: { size: { w: number; h: number } } | null;
+  /** True while the pointer is over the launcher, which is a bin for the
+   *  length of a drag: the drop discards the pane instead of placing it. */
+  discarding: boolean;
   before: Tile[];
   preview: Tile[];
   areaRect: DOMRect;
@@ -127,6 +161,13 @@ type ArmedMove = {
   end: () => void;
 };
 
+/** The tile a gesture is actually dragging — the copy, when ⌘ is down. */
+function draggedTileId(gesture: GridGesture): string | null {
+  if (gesture.kind === "divider") return null;
+  if (gesture.kind === "move" && gesture.clone) return PENDING_TILE_ID;
+  return gesture.sessionId;
+}
+
 function tilesEqual(a: Tile[], b: Tile[]): boolean {
   return (
     a.length === b.length &&
@@ -143,6 +184,13 @@ function tilesEqual(a: Tile[], b: Tile[]): boolean {
   );
 }
 
+/**
+ * A tile's whole geometry, in cell fractions of the canvas. `--preview-*` is
+ * the one escape hatch: the pane being resized wants sub-cell pixel feedback
+ * under the pointer, which no grid rect can express, so `onGestureMove` writes
+ * those two on that pane alone and `clearGestureStyles` takes them back off.
+ * Every other pane's geometry comes from here and nowhere else.
+ */
 function tileStyle(tile: Tile, zoomed: boolean): CSSProperties {
   const values = zoomed
     ? { left: "0%", top: "0%", width: "100%", height: "100%" }
@@ -257,7 +305,9 @@ export function WorkspaceGrid({
   initialFocusId,
   onFocusChange,
   onSwitchTab,
+  previewTiles,
   onPreviewTiles,
+  onDraggingPane,
   onError,
 }: {
   workspace: Workspace;
@@ -269,9 +319,16 @@ export function WorkspaceGrid({
   onFocusChange?: (sessionId: string | null) => void;
   /** Fired when a dragged pane dwells over another tab in the strip. */
   onSwitchTab?: (tabId: string) => void;
+  /** A preview driven from outside the grid — a pane dragged off the launcher.
+   *  The panes take the shape they will have once it lands. Ignored while the
+   *  grid has a gesture of its own, which owns the preview. */
+  previewTiles?: Tile[] | null;
   /** Live gesture previews (move/resize/seam), null when no gesture is on.
    *  The tab strip uses this to restyle the selected tab mid-drag. */
   onPreviewTiles?: (tiles: Tile[] | null) => void;
+  /** A pane is being carried (moved or duplicated), so the launcher can put on
+   *  its bin face — dropping there discards instead of placing. */
+  onDraggingPane?: (dragging: boolean) => void;
   onError?: (message: string | null) => void;
 }) {
   const router = useRouter();
@@ -287,7 +344,8 @@ export function WorkspaceGrid({
     move: ((event: PointerEvent) => void) | null;
     up: ((event: PointerEvent) => void) | null;
     cancel: (() => void) | null;
-  }>({ move: null, up: null, cancel: null });
+    key: ((event: KeyboardEvent) => void) | null;
+  }>({ move: null, up: null, cancel: null, key: null });
   const [tiles, setTiles] = useState<Tile[]>(() => tabTiles(workspace.layout, tabId));
   const [slots, setSlots] = useState<SlotRegistry>({});
   const [wide, setWide] = useState(
@@ -315,6 +373,8 @@ export function WorkspaceGrid({
   onErrorRef.current = onError;
   const onPreviewTilesRef = useRef(onPreviewTiles);
   onPreviewTilesRef.current = onPreviewTiles;
+  const onDraggingPaneRef = useRef(onDraggingPane);
+  onDraggingPaneRef.current = onDraggingPane;
   /** The whole envelope with every local edit applied — what saves PATCH.
    *  Commits fold the active tab's tiles (and any cross-tab removal) in. */
   const latestLayoutRef = useRef<LayoutV3>(workspace.layout);
@@ -332,13 +392,57 @@ export function WorkspaceGrid({
   );
   const orderedIds = useMemo(() => readingOrder(tiles), [tiles]);
   const dividers = useMemo(() => gridDividers(tiles), [tiles]);
-  const openings = useMemo(() => (tiles.length >= MAX_TILES ? [] : freeRects(tiles)), [tiles]);
+  /**
+   * The layout a live gesture is showing, plus the tile riding the pointer —
+   * that one stays at its resting rect and is offset by a transform instead,
+   * so it tracks the cursor exactly rather than snapping to whole cells.
+   *
+   * Rendered rather than written onto the tiles by hand: a tile's geometry has
+   * exactly one owner, `tileStyle`. Driving the same properties imperatively
+   * as well only holds until something re-renders mid-gesture — and plenty
+   * does, since every preview reports up to the tab strip.
+   */
+  const [livePreview, setLivePreview] = useState<{
+    tiles: Tile[];
+    draggedId: string | null;
+  } | null>(null);
+  // Cleared for the length of a gesture: the openings are drop affordances for
+  // a canvas at rest, and mid-drag they light up under the ghost and offer to
+  // add a pane on top of the one being placed.
+  const openings = useMemo(
+    () => (livePreview !== null || tiles.length >= MAX_TILES ? [] : freeRects(tiles)),
+    [livePreview, tiles],
+  );
+  /**
+   * A tab holding one window has canvas left over, and nothing on screen says
+   * that canvas is clickable — so while there is exactly one window its
+   * openings stay lit rather than waiting for a hover. From the second window
+   * on they go quiet again: a working grid is not littered with dashed boxes.
+   */
+  const openingsLit = tiles.length === 1;
   const sessionTileIds = useMemo(() => readingOrder(tiles.filter((tile) => !tile.widget)), [tiles]);
   const allWorkspacesQ = useQuery({
     queryKey: ["workspaces"],
-    queryFn: workspaces.list,
+    queryFn: () => workspaces.list(),
     staleTime: 30_000,
   });
+  // Only read when a pane is duplicated, to relaunch whatever agent the
+  // source is running; a shell needs nothing typed into it.
+  const agentsQ = useQuery({
+    queryKey: ["agents"],
+    queryFn: agentsApi.list,
+    staleTime: 60_000,
+  });
+  const canDuplicate = useCallback(
+    (tileId: string) =>
+      tiles.length < MAX_TILES &&
+      (Boolean(tiles.find((tile) => tile.session_id === tileId)?.widget) ||
+        sessionsById.has(tileId)),
+    [sessionsById, tiles],
+  );
+  const canDuplicateRef = useRef(canDuplicate);
+  canDuplicateRef.current = canDuplicate;
+  const duplicateRef = useRef<(sourceId: string, placement: Rect | null) => void>(() => {});
 
   useEffect(() => {
     if (saving || workspace.updated_at === serverWorkspaceRef.current.updated_at) return;
@@ -442,6 +546,76 @@ export function WorkspaceGrid({
     [commitEnvelope],
   );
 
+  /**
+   * Duplicate a pane: same host, same folder, same skills, and the same agent
+   * relaunched in the copy's shell — a second pane pointed at the same work,
+   * not a second view of the same process. `placement` is where a ⌘-drag
+   * dropped it; the menu passes null and takes whatever spot auto-place finds.
+   *
+   * A widget tile is pure layout, so its copy needs no round trip at all.
+   */
+  const duplicatePane = useCallback(
+    async (sourceId: string, placement: Rect | null) => {
+      const source = latestTilesRef.current.find((tile) => tile.session_id === sourceId);
+      /** Commit the copy's tile, falling back to auto-place when the dropped
+       *  rect no longer fits (the layout moved on while the session started). */
+      const land = (tileId: string, widget?: TileWidget): boolean => {
+        const current = latestTilesRef.current;
+        const withWidget = (tiles: Tile[]): Tile[] =>
+          widget
+            ? tiles.map((tile) => (tile.session_id === tileId ? { ...tile, widget } : tile))
+            : tiles;
+        if (placement) {
+          const candidate = [...current, { session_id: tileId, ...placement }];
+          if (validate({ version: 3, tiles: candidate }).ok) {
+            commitLayout(withWidget(candidate));
+            return true;
+          }
+        }
+        // No drop rect (the menu, not a drag): share the canvas out evenly
+        // rather than halving whichever pane happens to be biggest.
+        const added = addPaneTiles(current, tileId);
+        if (!added) return false;
+        commitLayout(withWidget(added));
+        return true;
+      };
+
+      if (source?.widget) {
+        if (!land(crypto.randomUUID(), source.widget)) {
+          onErrorRef.current?.("This tab is full — close a window before duplicating another.");
+        }
+        return;
+      }
+      const session = sessionsById.get(sourceId);
+      if (!session) return;
+      try {
+        // Skills are read at launch, so they have to travel with the create
+        // call rather than being patched on afterwards.
+        const access = await sessionAccess.get(sourceId).catch(() => null);
+        const skillIds = access?.skills.map((skill) => skill.id) ?? [];
+        const created = await sessionsApi.create({
+          host_id: session.host_id,
+          cwd: session.cwd,
+          ...(skillIds.length > 0 && { skill_ids: skillIds }),
+        });
+        const agent = runningAgent(session, agentsQ.data ?? []);
+        if (agent) pendingLaunch.set(created.id, agentRunCommand(agent));
+        if (!land(created.id)) {
+          await sessionsApi.remove(created.id).catch(() => {});
+          throw new Error("This tab is full — close a window before duplicating another.");
+        }
+        queryClient.invalidateQueries({ queryKey: ["sessions"] });
+        setFocus(created.id, true);
+      } catch (error) {
+        onErrorRef.current?.(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [agentsQ.data, commitLayout, queryClient, sessionsById, setFocus],
+  );
+  duplicateRef.current = (sourceId, placement) => {
+    void duplicatePane(sourceId, placement);
+  };
+
   useEffect(() => {
     if (revision === 0) return;
     const submittedRevision = revision;
@@ -517,45 +691,58 @@ export function WorkspaceGrid({
   }, []);
 
   const clearGestureStyles = useCallback(() => {
-    for (const element of tileElementsRef.current.values()) {
+    const elements = [...tileElementsRef.current.values()];
+    for (const element of elements) {
+      // Transition off before the transform goes. By now the committed
+      // left/top already put the tile exactly where the transform was showing
+      // it, so animating that offset back to zero would fling the pane a full
+      // tile past its slot in the direction of travel and then walk it back.
+      element.style.transition = "none";
       element.style.transform = "";
       element.style.removeProperty("--preview-width");
       element.style.removeProperty("--preview-height");
-      element.style.removeProperty("transition");
       element.removeAttribute("data-gesture-active");
     }
+    // Flush the untransformed frame, then hand the transition back to the
+    // class so the next layout change animates normally.
+    if (elements.length > 0) void elements[0]?.offsetHeight;
+    for (const element of elements) element.style.removeProperty("transition");
     const ghost = ghostRef.current;
-    if (ghost) ghost.hidden = true;
+    if (ghost) {
+      ghost.hidden = true;
+      ghost.removeAttribute("data-clone");
+    }
     const divider = dividerElementRef.current;
     if (divider) {
       divider.style.transform = "";
       divider.removeAttribute("data-dragging");
       dividerElementRef.current = null;
     }
+    document.querySelector("[data-launcher-fab]")?.removeAttribute("data-trash-hover");
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
   }, []);
 
   const previewLayout = useCallback((gesture: GridGesture) => {
-    const { before, preview, areaRect } = gesture;
+    const { preview, areaRect } = gesture;
     onPreviewTilesRef.current?.(preview);
     // A seam drag has no dragged tile: every pane it touches previews in place.
-    const sessionId = gesture.kind === "divider" ? null : gesture.sessionId;
-    for (const next of preview) {
-      const element = tileElementsRef.current.get(next.session_id);
-      const previous = before.find((tile) => tile.session_id === next.session_id);
-      if (!element || !previous) continue;
-      if (next.session_id === sessionId) continue;
-      const from = tilePixelRect(previous, areaRect.width, areaRect.height);
-      const to = tilePixelRect(next, areaRect.width, areaRect.height);
-      element.style.transform = `translate3d(${to.left - from.left}px, ${to.top - from.top}px, 0)`;
-      element.style.setProperty("--preview-width", `${to.width}px`);
-      element.style.setProperty("--preview-height", `${to.height}px`);
-    }
-    const target = preview.find((tile) => tile.session_id === sessionId);
+    const sessionId = draggedTileId(gesture);
+    setLivePreview({ tiles: preview, draggedId: sessionId });
+    // Over the bin the drop discards rather than places, so there is nothing
+    // to outline — nor for a seam drag, which places nothing to begin with.
+    const target =
+      gesture.kind === "move" && gesture.discarding
+        ? undefined
+        : preview.find((tile) => tile.session_id === sessionId);
     const ghost = ghostRef.current;
-    if (!target || !ghost) return;
+    if (!ghost) return;
+    if (!target) {
+      ghost.hidden = true;
+      return;
+    }
     const rect = tilePixelRect(target, areaRect.width, areaRect.height);
+    ghost.toggleAttribute("data-clone", sessionId === PENDING_TILE_ID);
     ghost.hidden = false;
     ghost.style.left = `${rect.left}px`;
     ghost.style.top = `${rect.top}px`;
@@ -571,8 +758,23 @@ export function WorkspaceGrid({
       if (listeners.move) document.removeEventListener("pointermove", listeners.move);
       if (listeners.up) document.removeEventListener("pointerup", listeners.up);
       if (listeners.cancel) document.removeEventListener("pointercancel", listeners.cancel);
-      gestureListenersRef.current = { move: null, up: null, cancel: null };
-      if (gesture && commit && gesture.kind === "move" && gesture.sourceTab) {
+      if (listeners.key) {
+        document.removeEventListener("keydown", listeners.key);
+        document.removeEventListener("keyup", listeners.key);
+      }
+      gestureListenersRef.current = { move: null, up: null, cancel: null, key: null };
+      const cloning = gesture?.kind === "move" && gesture.clone !== null ? gesture : null;
+      const clonePlacement =
+        cloning?.preview.find((tile) => tile.session_id === PENDING_TILE_ID) ?? null;
+      if (cloning && commit && clonePlacement) {
+        // The copy is not a tile yet — it is a session that has to be created
+        // first. Settle everything the drag displaced now, so the canvas holds
+        // the shape the ghost promised, and let the copy land into the gap.
+        const settled = cloning.preview.filter((tile) => tile.session_id !== PENDING_TILE_ID);
+        if (!tilesEqual(cloning.before, settled)) flushSync(() => commitLayout(settled));
+        const { x, y, w, h } = clonePlacement;
+        duplicateRef.current(cloning.sessionId, { x, y, w, h });
+      } else if (gesture && commit && gesture.kind === "move" && gesture.sourceTab) {
         // The drag crossed tabs: one envelope write removes the tile from its
         // source tab and lands the previewed layout in the viewed tab.
         const source = gesture.sourceTab;
@@ -598,11 +800,165 @@ export function WorkspaceGrid({
         setTiles(latestTilesRef.current);
       }
       hoveredTabRef.current = null;
+      setLivePreview(null);
       onPreviewTilesRef.current?.(null);
+      onDraggingPaneRef.current?.(false);
       clearGestureStyles();
     },
     [clearGestureStyles, commitEnvelope, commitLayout],
   );
+
+  /**
+   * Dropped in the bin. A widget is pure layout, so it simply goes; a session
+   * is a live process, so it is closed on the same terms as the pane menu's
+   * "Close session" — asked for first, then killed.
+   *
+   * The tile leaves whichever tab holds it, not the one on screen: a drag that
+   * crossed tabs and was carried back to the bin left the pane where it began.
+   */
+  const discardPane = useCallback(
+    async (sessionId: string) => {
+      const drop = () => {
+        const tab = tabOfSession(latestLayoutRef.current, sessionId);
+        if (!tab) return;
+        commitEnvelope(
+          withTabTiles(latestLayoutRef.current, tab.id, removeTile(tab.layout.tiles, sessionId)),
+        );
+      };
+      const session = sessionsById.get(sessionId);
+      // A widget tile, or a pane whose session is already gone: nothing to kill.
+      if (!session) {
+        drop();
+        return;
+      }
+      const accepted = await confirm({
+        title: `Close ${sessionTitle(session)}?`,
+        body: "This kills the shell process and permanently removes the session.",
+        confirmLabel: "Close session",
+        destructive: true,
+      });
+      if (!accepted) return;
+      try {
+        await sessionsApi.remove(sessionId);
+      } catch (error) {
+        onErrorRef.current?.(error instanceof Error ? error.message : String(error));
+        return;
+      }
+      drop();
+      queryClient.removeQueries({ queryKey: ["session", sessionId] });
+      queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    },
+    [commitEnvelope, queryClient, sessionsById],
+  );
+
+  /**
+   * Everything a move gesture derives from a pointer position: the dragged
+   * thing's pixel transform, then either a dock preview (over a pane) or a
+   * cell-snapped placement (over open canvas). Split out of the pointermove
+   * handler because ⌘ going down or up has to re-derive all of it from the
+   * pointer's last known position, with no pointer event in hand.
+   */
+  const applyMovePointer = useCallback(
+    (gesture: MoveGesture, clientX: number, clientY: number) => {
+      const draggedId = gesture.clone ? PENDING_TILE_ID : gesture.sessionId;
+      const active = tileElementsRef.current.get(gesture.sessionId);
+      // A duplicating drag leaves the source pane where it is — only the ghost
+      // travels, which is what makes the copy read as a copy.
+      if (active) {
+        active.style.transform = gesture.clone
+          ? ""
+          : `translate3d(${clientX - gesture.startClientX}px, ${clientY - gesture.startClientY}px, 0)`;
+      }
+      // Aimed at the bin: the drop discards rather than places, so the pane in
+      // hand goes on following the pointer and nothing else on the canvas moves.
+      if (gesture.discarding) return;
+      const cellWidth = gesture.areaRect.width / GRID_SIZE;
+      const cellHeight = gesture.areaRect.height / GRID_SIZE;
+
+      // Hovering another pane docks against its nearest edge (iTerm-style):
+      // the target splits in half and the ghost claims the hovered side. While
+      // duplicating, the source pane is a legal target too — ⌘-dragging a pane
+      // onto its own edge is how you split it in two.
+      const pointerX = (clientX - gesture.areaRect.left) / cellWidth;
+      const pointerY = (clientY - gesture.areaRect.top) / cellHeight;
+      const hovered = gesture.before.find(
+        (tile) =>
+          tile.session_id !== draggedId &&
+          pointerX >= tile.x &&
+          pointerX < tile.x + tile.w &&
+          pointerY >= tile.y &&
+          pointerY < tile.y + tile.h,
+      );
+      if (hovered) {
+        const zone = dockZoneAt(
+          (pointerX - hovered.x) / hovered.w,
+          (pointerY - hovered.y) / hovered.h,
+        );
+        const dockKey = `${hovered.session_id}:${zone}`;
+        if (dockKey === gesture.lastDock) return;
+        const docked = gesture.clone
+          ? dockInsert(gesture.before, PENDING_TILE_ID, hovered.session_id, zone)
+          : dockPane(gesture.before, gesture.sessionId, hovered.session_id, zone);
+        if (docked) {
+          gesture.lastDock = dockKey;
+          // Leaving dock mode must recompute the cell path, whatever cell.
+          gesture.lastX = Number.NaN;
+          gesture.lastY = Number.NaN;
+          gesture.preview = docked;
+          previewLayout(gesture);
+          return;
+        }
+        // The occupant is too small to halve. Rather than preview nothing —
+        // which leaves the ghost sitting exactly on top of a pane that never
+        // moves — fall through and place by cell, which shoves the occupants
+        // aside to make the room.
+      }
+      gesture.lastDock = null;
+
+      const x = Math.round((clientX - gesture.areaRect.left - gesture.pointerOffsetX) / cellWidth);
+      const y = Math.round((clientY - gesture.areaRect.top - gesture.pointerOffsetY) / cellHeight);
+      if (x === gesture.lastX && y === gesture.lastY) return;
+      gesture.lastX = x;
+      gesture.lastY = y;
+      // A refused placement keeps the last previewed one. Falling back to
+      // `before` would drop the copy's placeholder entirely, and a ghost with
+      // nothing to point at is a ghost stranded wherever it last was.
+      gesture.preview = gesture.clone
+        ? (insertPane(gesture.before, PENDING_TILE_ID, gesture.clone.size, x, y) ?? gesture.preview)
+        : movePane(gesture.before, gesture.sessionId, x, y);
+      previewLayout(gesture);
+    },
+    [previewLayout],
+  );
+
+  /**
+   * Flip a live move gesture between moving and duplicating. Returns whether
+   * anything changed, so the caller only re-derives the preview when it did.
+   * Refused when the copy has nowhere to go — a full tab, or a pane whose
+   * session has not loaded — which leaves ⌘ as a plain modifier on a move.
+   */
+  const setCloneMode = useCallback((gesture: MoveGesture, wanted: boolean) => {
+    if (wanted === (gesture.clone !== null)) return false;
+    const source = gesture.before.find((tile) => tile.session_id === gesture.sessionId);
+    if (wanted && (!source || !canDuplicateRef.current(gesture.sessionId))) return false;
+    gesture.clone = wanted && source ? { size: { w: source.w, h: source.h } } : null;
+    gesture.lastDock = null;
+    // Force the next pointer application to recompute from scratch.
+    gesture.lastX = Number.NaN;
+    gesture.lastY = Number.NaN;
+    gesture.preview = gesture.before;
+    const element = tileElementsRef.current.get(gesture.sessionId);
+    if (element) {
+      element.style.removeProperty("--preview-width");
+      element.style.removeProperty("--preview-height");
+      // Entering: the source glides back to its own rect. Leaving: it is being
+      // dragged again, so it must snap under the cursor rather than chase it.
+      if (wanted) element.style.removeProperty("transition");
+      else element.style.transition = "none";
+    }
+    document.body.style.cursor = wanted ? "copy" : "grabbing";
+    return true;
+  }, []);
 
   const onGestureMove = useCallback(
     (event: PointerEvent) => {
@@ -640,13 +996,30 @@ export function WorkspaceGrid({
       if (gesture.kind === "move") {
         gesture.lastClientX = event.clientX;
         gesture.lastClientY = event.clientY;
+        const under = document.elementFromPoint(event.clientX, event.clientY);
+        // The launcher is the bin for the length of any drag. It floats over
+        // the canvas, so aiming at it has to take the placement off the table
+        // rather than dock the pane into whatever sits behind it.
+        const overBin = Boolean(under?.closest?.("[data-launcher-fab]"));
+        document.querySelector("[data-launcher-fab]")?.toggleAttribute("data-trash-hover", overBin);
+        if (overBin !== gesture.discarding) {
+          gesture.discarding = overBin;
+          // Either direction, the placement has to be derived again from here.
+          gesture.lastDock = null;
+          gesture.lastX = Number.NaN;
+          gesture.lastY = Number.NaN;
+          if (overBin) {
+            gesture.preview = gesture.before;
+            previewLayout(gesture);
+          }
+        }
         // Hovering another tab in the strip for a beat switches the view to
         // it mid-drag; the tabId-change effect below re-seeds the gesture so
-        // the pane is carried into the newly visible grid.
-        const overTab = document
-          .elementFromPoint(event.clientX, event.clientY)
-          ?.closest?.("[data-workspace-tab]")
-          ?.getAttribute("data-workspace-tab");
+        // the pane is carried into the newly visible grid. A duplicating drag
+        // stays home: the copy belongs beside the pane it came from.
+        const overTab = gesture.clone
+          ? null
+          : under?.closest?.("[data-workspace-tab]")?.getAttribute("data-workspace-tab");
         if (overTab && overTab !== tabIdRef.current) {
           const hovered = hoveredTabRef.current;
           if (!hovered || hovered.id !== overTab) {
@@ -658,51 +1031,8 @@ export function WorkspaceGrid({
         } else {
           hoveredTabRef.current = null;
         }
-        active.style.transform = `translate3d(${dx}px, ${dy}px, 0)`;
-        const cellWidth = gesture.areaRect.width / GRID_SIZE;
-        const cellHeight = gesture.areaRect.height / GRID_SIZE;
-
-        // Hovering another pane docks against its nearest edge (iTerm-style):
-        // the target splits in half and the ghost claims the hovered side.
-        const pointerX = (event.clientX - gesture.areaRect.left) / cellWidth;
-        const pointerY = (event.clientY - gesture.areaRect.top) / cellHeight;
-        const hovered = gesture.before.find(
-          (tile) =>
-            tile.session_id !== gesture.sessionId &&
-            pointerX >= tile.x &&
-            pointerX < tile.x + tile.w &&
-            pointerY >= tile.y &&
-            pointerY < tile.y + tile.h,
-        );
-        if (hovered) {
-          const zone = dockZoneAt(
-            (pointerX - hovered.x) / hovered.w,
-            (pointerY - hovered.y) / hovered.h,
-          );
-          const dockKey = `${hovered.session_id}:${zone}`;
-          if (dockKey === gesture.lastDock) return;
-          gesture.lastDock = dockKey;
-          // Leaving dock mode must recompute the cell path, whatever cell.
-          gesture.lastX = Number.NaN;
-          gesture.lastY = Number.NaN;
-          gesture.preview =
-            dockPane(gesture.before, gesture.sessionId, hovered.session_id, zone) ?? gesture.before;
-          previewLayout(gesture);
-          return;
-        }
-        gesture.lastDock = null;
-
-        const x = Math.round(
-          (event.clientX - gesture.areaRect.left - gesture.pointerOffsetX) / cellWidth,
-        );
-        const y = Math.round(
-          (event.clientY - gesture.areaRect.top - gesture.pointerOffsetY) / cellHeight,
-        );
-        if (x === gesture.lastX && y === gesture.lastY) return;
-        gesture.lastX = x;
-        gesture.lastY = y;
-        gesture.preview = movePane(gesture.before, gesture.sessionId, x, y);
-        previewLayout(gesture);
+        setCloneMode(gesture, wantsDuplicate(event));
+        applyMovePointer(gesture, event.clientX, event.clientY);
         return;
       }
 
@@ -750,17 +1080,26 @@ export function WorkspaceGrid({
       gesture.preview = resizeEdges(gesture.preview, gesture.sessionId, targets);
       previewLayout(gesture);
     },
-    [previewLayout],
+    [applyMovePointer, previewLayout, setCloneMode],
   );
 
   const onGestureUp = useCallback(
     (event: PointerEvent) => {
       const gesture = gestureRef.current;
+      if (gesture?.kind === "move" && gesture.discarding) {
+        // Into the bin. A copy exists only as a placeholder, so letting the
+        // gesture fall away is the whole of discarding it; a pane that is
+        // already on the canvas has to be closed.
+        const { sessionId, clone } = gesture;
+        finishGesture(false);
+        if (!clone) void discardPane(sessionId);
+        return;
+      }
       const overTab = document
         .elementFromPoint(event.clientX, event.clientY)
         ?.closest?.("[data-workspace-tab]")
         ?.getAttribute("data-workspace-tab");
-      if (gesture?.kind === "move" && overTab && overTab !== tabIdRef.current) {
+      if (gesture?.kind === "move" && !gesture.clone && overTab && overTab !== tabIdRef.current) {
         // Dropped on the strip before the dwell switch fired: move the pane
         // into that tab directly, auto-placed, and follow it.
         const moved = moveSessionToTab(latestLayoutRef.current, gesture.sessionId, overTab);
@@ -773,7 +1112,7 @@ export function WorkspaceGrid({
       }
       finishGesture(true);
     },
-    [commitEnvelope, finishGesture],
+    [commitEnvelope, discardPane, finishGesture],
   );
   const onGestureCancel = useCallback(() => finishGesture(false), [finishGesture]);
 
@@ -824,7 +1163,7 @@ export function WorkspaceGrid({
         if (placed.tile === null) {
           // No room here: the view switches but the drag ends without effect.
           finishGesture(false);
-          flushSync(() => setTiles(tabTiles(latestLayoutRef.current, tabId)));
+          setTiles(tabTiles(latestLayoutRef.current, tabId));
           return;
         }
         gesture.sourceTab ??= { tabId: originTabId, tiles: gesture.before };
@@ -834,7 +1173,10 @@ export function WorkspaceGrid({
         gesture.lastX = placed.tile.x;
         gesture.lastY = placed.tile.y;
         gesture.lastDock = null;
-        flushSync(() => setTiles(seeded));
+        setTiles(seeded);
+        // Reads the element before that render lands, which is fine: the only
+        // one touched is the pane being carried, and it keeps its key across
+        // the change, so React hands the same node back.
         const area = areaRef.current;
         const element = tileElementsRef.current.get(gesture.sessionId);
         if (area && element) {
@@ -862,7 +1204,7 @@ export function WorkspaceGrid({
         previewLayout(gesture);
         return;
       }
-      flushSync(() => setTiles(latestTilesRef.current));
+      setTiles(latestTilesRef.current);
       previewLayout(gesture);
       return;
     }
@@ -871,19 +1213,42 @@ export function WorkspaceGrid({
     setZoomedId(null);
   }, [finishGesture, previewLayout, tabId]);
 
+  /** Escape abandons any gesture. ⌘ down or up mid-drag, with the pointer
+   *  parked: re-derive from where it last was, so the ghost flips to a copy
+   *  without waiting for a wiggle. */
+  const onGestureKey = useCallback(
+    (event: KeyboardEvent) => {
+      const gesture = gestureRef.current;
+      if (!gesture) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        finishGesture(false);
+        return;
+      }
+      if (gesture.kind !== "move") return;
+      if (!setCloneMode(gesture, wantsDuplicate(event))) return;
+      applyMovePointer(gesture, gesture.lastClientX, gesture.lastClientY);
+    },
+    [applyMovePointer, finishGesture, setCloneMode],
+  );
+
   const installGestureListeners = useCallback(() => {
     gestureListenersRef.current = {
       move: onGestureMove,
       up: onGestureUp,
       cancel: onGestureCancel,
+      key: onGestureKey,
     };
     document.addEventListener("pointermove", onGestureMove, { passive: false });
     document.addEventListener("pointerup", onGestureUp, { once: true });
     document.addEventListener("pointercancel", onGestureCancel, { once: true });
-  }, [onGestureCancel, onGestureMove, onGestureUp]);
+    document.addEventListener("keydown", onGestureKey);
+    document.addEventListener("keyup", onGestureKey);
+  }, [onGestureCancel, onGestureKey, onGestureMove, onGestureUp]);
 
   const beginMove = useCallback(
-    (sessionId: string, startClientX: number, startClientY: number) => {
+    (sessionId: string, startClientX: number, startClientY: number, duplicating: boolean) => {
       const area = areaRef.current;
       const tileElement = tileElementsRef.current.get(sessionId);
       const tile = latestTilesRef.current.find((item) => item.session_id === sessionId);
@@ -904,20 +1269,25 @@ export function WorkspaceGrid({
         lastClientY: startClientY,
         sourceTab: null,
         lastDock: null,
+        clone: null,
+        discarding: false,
         before,
         preview: before,
         areaRect,
       };
       gestureRef.current = gesture;
+      onDraggingPaneRef.current?.(true);
       tileElement.dataset.gestureActive = "true";
       tileElement.style.transition = "none";
       document.body.style.cursor = "grabbing";
       document.body.style.userSelect = "none";
       setFocus(sessionId);
+      // Held before the drag crossed the threshold, it still means duplicate.
+      setCloneMode(gesture, duplicating);
       previewLayout(gesture);
       installGestureListeners();
     },
-    [installGestureListeners, previewLayout, setFocus],
+    [installGestureListeners, previewLayout, setCloneMode, setFocus],
   );
 
   const disarmMove = useCallback(() => {
@@ -949,7 +1319,7 @@ export function WorkspaceGrid({
           return;
         }
         disarmMove();
-        beginMove(sessionId, clientX, clientY);
+        beginMove(sessionId, clientX, clientY, wantsDuplicate(moveEvent));
       };
       const armed: ArmedMove = { sessionId, clientX, clientY, move: onMove, end: disarmMove };
       armedMoveRef.current = armed;
@@ -1011,7 +1381,7 @@ export function WorkspaceGrid({
       const before = latestTilesRef.current;
       dividerElementRef.current = element;
       element.dataset.dragging = "true";
-      gestureRef.current = {
+      const gesture: DividerGesture = {
         kind: "divider",
         divider,
         startClientX: event.clientX,
@@ -1021,15 +1391,17 @@ export function WorkspaceGrid({
         preview: before,
         areaRect: area.getBoundingClientRect(),
       };
+      gestureRef.current = gesture;
       for (const id of [...divider.before, ...divider.after]) {
         const tileElement = tileElementsRef.current.get(id);
         if (tileElement) tileElement.style.transition = "none";
       }
       document.body.style.cursor = divider.axis === "vertical" ? "col-resize" : "row-resize";
       document.body.style.userSelect = "none";
+      previewLayout(gesture);
       installGestureListeners();
     },
-    [finePointer, installGestureListeners, wide, zoomedId],
+    [finePointer, installGestureListeners, previewLayout, wide, zoomedId],
   );
 
   // Unmount-only: removes whatever listeners are actually installed. Keying
@@ -1041,9 +1413,17 @@ export function WorkspaceGrid({
       if (listeners.move) document.removeEventListener("pointermove", listeners.move);
       if (listeners.up) document.removeEventListener("pointerup", listeners.up);
       if (listeners.cancel) document.removeEventListener("pointercancel", listeners.cancel);
-      gestureListenersRef.current = { move: null, up: null, cancel: null };
+      if (listeners.key) {
+        document.removeEventListener("keydown", listeners.key);
+        document.removeEventListener("keyup", listeners.key);
+      }
+      gestureListenersRef.current = { move: null, up: null, cancel: null, key: null };
       disarmMove();
       clearGestureStyles();
+      // A preview left standing outlives this grid: it is held above us, and a
+      // grid mounted back into it would open on a layout nobody is dragging.
+      onPreviewTilesRef.current?.(null);
+      onDraggingPaneRef.current?.(false);
     },
     [clearGestureStyles, disarmMove],
   );
@@ -1095,8 +1475,8 @@ export function WorkspaceGrid({
       if (!session) return;
       const accepted = await confirm({
         title: `Replace ${sessionTitle(session)} with a file explorer?`,
-        body: "The session will be closed and its running process killed; a file explorer for its folder takes over the pane.",
-        confirmLabel: "Replace pane",
+        body: "The session will be closed and its running process killed; a file explorer for its folder takes over the window.",
+        confirmLabel: "Replace window",
         destructive: true,
       });
       if (!accepted) return;
@@ -1131,7 +1511,7 @@ export function WorkspaceGrid({
       const accepted = await confirm({
         title: `Move ${sessionTitle(session)} to ${host.name}?`,
         body: `This shell will be closed and its running process killed; a new shell starts in your home folder on ${host.name}.`,
-        confirmLabel: "Move pane",
+        confirmLabel: "Move window",
         destructive: true,
       });
       if (!accepted) return;
@@ -1178,12 +1558,24 @@ export function WorkspaceGrid({
 
   const canGesture = wide && finePointer && zoomedId === null;
 
+  // What the panes are showing right now: a gesture of this grid's own while
+  // one is running, else a pane being dragged out of the launcher, else the
+  // committed layout.
+  const shownTiles = livePreview?.tiles ?? previewTiles ?? tiles;
+
   const renderPaneSlots = () => {
     if (wide) {
       return (
         <div className="absolute inset-0 overflow-hidden">
           {tiles.map((tile) => {
             const zoomed = zoomedId === tile.session_id;
+            // The tile riding the pointer keeps its resting rect: it is offset
+            // by a transform, which tracks the cursor rather than the cell the
+            // preview has snapped it to.
+            const rect =
+              tile.session_id === livePreview?.draggedId
+                ? tile
+                : (shownTiles.find((other) => other.session_id === tile.session_id) ?? tile);
             return (
               <div
                 key={tile.session_id}
@@ -1192,27 +1584,31 @@ export function WorkspaceGrid({
                   else tileElementsRef.current.delete(tile.session_id);
                 }}
                 data-grid-tile={tile.session_id}
-                style={tileStyle(tile, zoomed)}
+                style={tileStyle(rect, zoomed)}
                 className={cn(
-                  "absolute z-10 min-h-0 min-w-0 border-pane-divider will-change-transform transition-transform duration-150 ease-swift",
+                  // Position and size ease together: a preview that moves a
+                  // pane but snaps its size reads as a glitch, not as the pane
+                  // making room. The pane under the pointer opts out with an
+                  // inline `transition: none` for the length of the gesture.
+                  "absolute z-10 min-h-0 min-w-0 border-pane-divider will-change-transform transition-[transform,left,top,width,height] duration-150 ease-swift",
                   // A divider only where two panes actually meet edge to edge;
                   // edges facing empty canvas (or the border) draw nothing.
                   !zoomed &&
-                    tiles.some(
+                    shownTiles.some(
                       (other) =>
-                        other.session_id !== tile.session_id &&
-                        other.x === tile.x + tile.w &&
-                        other.y < tile.y + tile.h &&
-                        tile.y < other.y + other.h,
+                        other.session_id !== rect.session_id &&
+                        other.x === rect.x + rect.w &&
+                        other.y < rect.y + rect.h &&
+                        rect.y < other.y + other.h,
                     ) &&
                     "border-r",
                   !zoomed &&
-                    tiles.some(
+                    shownTiles.some(
                       (other) =>
-                        other.session_id !== tile.session_id &&
-                        other.y === tile.y + tile.h &&
-                        other.x < tile.x + tile.w &&
-                        tile.x < other.x + other.w,
+                        other.session_id !== rect.session_id &&
+                        other.y === rect.y + rect.h &&
+                        other.x < rect.x + rect.w &&
+                        rect.x < other.x + other.w,
                     ) &&
                     "border-b",
                   zoomedId && !zoomed && "hidden",
@@ -1226,9 +1622,11 @@ export function WorkspaceGrid({
                     focused={focusedId === tile.session_id}
                     paneCount={tiles.length}
                     canDrag={canGesture}
+                    canDuplicate={canDuplicate(tile.session_id)}
                     onFocus={(id) => setFocus(id)}
                     onToggleZoom={(id) => setZoomedId((current) => (current === id ? null : id))}
                     onMoveStart={startMove}
+                    onDuplicate={(id) => duplicateRef.current(id, null)}
                     onRemove={removeFromWorkspace}
                   />
                 ) : (
@@ -1242,7 +1640,7 @@ export function WorkspaceGrid({
                         ? widgetTitle(tile.widget)
                         : (() => {
                             const session = sessionsById.get(tile.session_id);
-                            return session ? sessionTitle(session) : "pane";
+                            return session ? sessionTitle(session) : "window";
                           })()
                     }
                     onStart={startResize}
@@ -1267,22 +1665,29 @@ export function WorkspaceGrid({
                 <NewSessionMenu
                   mode="session"
                   workspaceId={workspace.id}
+                  tabId={tabId}
                   placement={rect}
                   // The trigger is the whole opening, so anchor to the click.
                   anchor="pointer"
                   trigger={
                     <button
                       type="button"
-                      aria-label="Add a pane here"
+                      aria-label="Add a window here"
                       className={cn(
-                        "group/opening grid size-full place-items-center rounded-md border border-dashed border-transparent text-muted-foreground transition-colors hover:border-border hover:bg-background/80",
+                        "group/opening grid size-full place-items-center rounded-md border border-dashed text-muted-foreground transition-colors hover:border-border hover:bg-background/80",
+                        openingsLit ? "border-border/60" : "border-transparent",
                         // Lit up while a pane dragged off the launcher hovers it.
                         "data-[drop-target]:border-ring/70 data-[drop-target]:bg-background/80",
                       )}
                     >
-                      <span className="flex items-center gap-1.5 text-xs opacity-0 transition-opacity group-hover/opening:opacity-100 group-data-[drop-target]/opening:opacity-100">
+                      <span
+                        className={cn(
+                          "flex items-center gap-1.5 text-xs transition-opacity group-hover/opening:opacity-100 group-data-[drop-target]/opening:opacity-100",
+                          !openingsLit && "opacity-0",
+                        )}
+                      >
                         <Plus className="size-4" aria-hidden />
-                        Add a pane
+                        Add a window
                       </span>
                     </button>
                   }
@@ -1304,8 +1709,8 @@ export function WorkspaceGrid({
                   type="button"
                   aria-label={
                     vertical
-                      ? "Resize the panes on either side"
-                      : "Resize the panes above and below"
+                      ? "Resize the windows on either side"
+                      : "Resize the windows above and below"
                   }
                   data-grid-divider={divider.id}
                   onPointerDown={(event) => startDividerDrag(divider, event)}
@@ -1346,8 +1751,16 @@ export function WorkspaceGrid({
             ref={ghostRef}
             hidden
             aria-hidden
-            className="pointer-events-none absolute z-50 border-2 border-dashed border-ring bg-ring/10"
-          />
+            data-grid-ghost
+            className="group/ghost pointer-events-none absolute z-50 grid place-items-center border-2 border-dashed border-ring bg-ring/10"
+          >
+            {/* Only a ⌘-drag shows a label: an ordinary move's ghost is
+                self-explanatory, a copy's is not. */}
+            <span className="hidden items-center gap-1.5 rounded-full bg-ring px-2.5 py-1 text-xs font-medium text-background shadow-sm group-data-[clone]/ghost:inline-flex">
+              <Copy className="size-3.5" aria-hidden />
+              Duplicate
+            </span>
+          </div>
         </div>
       );
     }
@@ -1398,27 +1811,45 @@ export function WorkspaceGrid({
         )}
       >
         {tiles.length === 0 ? (
-          <EmptyState
-            icon={<Plus />}
-            title="Start with a shell"
-            body="New sessions open in this workspace's folder — no picking required."
-            className="size-full"
-            action={
-              <NewSessionMenu
-                mode="session"
-                workspaceId={workspace.id}
-                trigger={
-                  <Button size="lg">
-                    <Plus className="size-4" aria-hidden />
-                    New session
-                  </Button>
-                }
-                onCreated={({ sessionId }) => {
-                  router.push(`/w/${workspace.id}?focus=${sessionId}`);
-                }}
-              />
-            }
-          />
+          <div className="relative size-full overflow-hidden">
+            {/* A wide, faint ember pool under the state, so an empty tab reads
+                as a lit stage rather than a void. */}
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-0 bg-[radial-gradient(55%_48%_at_50%_53%,color-mix(in_oklab,var(--color-brand-accent)_10%,transparent),transparent_72%)]"
+            />
+            <EmptyState
+              icon={<Trident className="mb-3 size-10" />}
+              iconPlate={false}
+              title="Open your first window"
+              body="The circle is empty. Spawn something into it."
+              className="relative size-full"
+              action={
+                <div className="flex flex-col items-center gap-4">
+                  {/* Where a window lands, above the rule; what lands there,
+                      below it. */}
+                  <TabHomeButton
+                    workspace={workspace}
+                    tabId={tabId}
+                    onError={(message) => onError?.(message ?? "")}
+                  />
+                  <hr className="h-px w-full max-w-xl border-0 bg-border" />
+                  {/* Every choice the ⋯ cascade offers, one click deep: an
+                      empty tab is the one place with room to spell them out. */}
+                  <NewSessionLozenges
+                    mode="session"
+                    workspaceId={workspace.id}
+                    tabId={tabId}
+                    placement={FIRST_WINDOW}
+                    className="max-w-xl"
+                    onCreated={({ sessionId }) => {
+                      router.push(`/w/${workspace.id}?focus=${sessionId}`);
+                    }}
+                  />
+                </div>
+              }
+            />
+          </div>
         ) : (
           renderPaneSlots()
         )}
@@ -1458,11 +1889,13 @@ export function WorkspaceGrid({
           focused={focusedId === sessionId}
           paneCount={tiles.length}
           canDrag={canGesture}
+          canDuplicate={canDuplicate(sessionId)}
           canMoveUp={!wide && index > 0}
           canMoveDown={!wide && index < orderedIds.length - 1}
           onFocus={(id) => setFocus(id)}
           onToggleZoom={(id) => setZoomedId((current) => (current === id ? null : id))}
           onMoveStart={startMove}
+          onDuplicate={(id) => duplicateRef.current(id, null)}
           onMoveUp={(id) => moveMobile(id, -1)}
           onMoveDown={(id) => moveMobile(id, 1)}
           onRemoveFromWorkspace={removeFromWorkspace}

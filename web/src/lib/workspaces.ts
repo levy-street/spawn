@@ -24,6 +24,38 @@ export function workspaceTileCount(workspace: Workspace): number {
   return allTiles(workspace.layout).length;
 }
 
+/**
+ * Workspaces whose name matches the sidebar search, in the order given.
+ * Case- and whitespace-insensitive substring, not fuzzy: the sidebar is a
+ * short list of names you chose, so a plain contains is both predictable and
+ * enough. An empty query matches everything.
+ */
+export function filterWorkspacesByName(list: Workspace[], query: string): Workspace[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return list;
+  return list.filter((workspace) => workspace.name.toLowerCase().includes(needle));
+}
+
+/** Put away rather than deleted: out of the sidebar's list, and stopped. */
+export function isArchived(workspace: Workspace): boolean {
+  return workspace.archived_at !== null;
+}
+
+/**
+ * Sessions on the workspace that archiving would stop — the count the confirm
+ * dialog warns about. Exited and killed panes are already over, so archiving a
+ * workspace made only of those costs nothing and asks nothing.
+ */
+export function workspaceLiveSessionCount(
+  workspace: Workspace,
+  sessionsById: Map<string, Session>,
+): number {
+  return workspaceSessionIds(workspace).filter((id) => {
+    const session = sessionsById.get(id);
+    return session !== undefined && session.status !== "exited" && session.status !== "killed";
+  }).length;
+}
+
 /** Sessions on the workspace that currently want the operator's attention. */
 export function workspaceAttentionCount(
   workspace: Workspace,

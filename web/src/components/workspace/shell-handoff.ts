@@ -47,7 +47,7 @@ export async function runInShell({
   const foreground = agentDisplayName(session.foreground_command);
   const proceed = await confirm({
     title: `Stop ${foreground} first?`,
-    body: `${purpose} types a command at the shell prompt, and ${foreground} is holding this pane's keyboard. Stopping it interrupts whatever it is doing.`,
+    body: `${purpose} types a command at the shell prompt, and ${foreground} is holding this window's keyboard. Stopping it interrupts whatever it is doing.`,
     confirmLabel: `Stop ${foreground}`,
     destructive: true,
   });
@@ -71,7 +71,7 @@ export async function runInShell({
 /** What the caller shows when the foreground never handed the shell back. */
 export function stillRunningMessage(session: Session, purpose: string): string {
   const foreground = agentDisplayName(session.foreground_command);
-  return `${foreground} is still running in this pane. Quit it in the terminal, then try ${purpose.toLocaleLowerCase()} again.`;
+  return `${foreground} is still running in this window. Quit it in the terminal, then try ${purpose.toLocaleLowerCase()} again.`;
 }
 
 function type(

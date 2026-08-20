@@ -1,6 +1,6 @@
 "use client";
 
-import { MoreHorizontal, Pencil, Trash2 } from "lucide-react";
+import { Archive, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 import Link from "next/link";
 import {
   type FormEvent,
@@ -9,7 +9,12 @@ import {
   useRef,
   useState,
 } from "react";
-import { SidebarIconSlot, SidebarRowLabel, sidebarRowClass } from "@/components/nav/sidebar-parts";
+import {
+  SidebarIconSlot,
+  SidebarRowLabel,
+  sidebarRowClass,
+  WorkspaceAvatar,
+} from "@/components/nav/sidebar-parts";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -23,16 +28,6 @@ import { RailTooltip } from "@/components/ui/tooltip";
 import type { Workspace } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-function workspaceInitials(name: string): string {
-  const words = name.trim().split(/\s+/).filter(Boolean);
-  return (
-    (words.length > 1
-      ? `${words[0]?.[0]}${words[1]?.[0]}`
-      : words[0]?.slice(0, 2)
-    )?.toUpperCase() || "W"
-  );
-}
-
 export function SidebarWorkspaceRow({
   workspace,
   active,
@@ -41,6 +36,7 @@ export function SidebarWorkspaceRow({
   busy,
   onNavigate,
   onRename,
+  onArchive,
   onDelete,
   onRowPointerDown,
 }: {
@@ -51,6 +47,7 @@ export function SidebarWorkspaceRow({
   busy: boolean;
   onNavigate?: () => void;
   onRename: (name: string) => void;
+  onArchive: () => void;
   onDelete: () => void;
   /** Arms the sidebar's drag-to-reorder; a plain click still navigates. */
   onRowPointerDown?: (event: ReactPointerEvent<HTMLLIElement>) => void;
@@ -80,14 +77,18 @@ export function SidebarWorkspaceRow({
             href={`/w/${workspace.id}`}
             onClick={onNavigate}
             aria-current={active ? "page" : undefined}
-            className={cn(
-              "relative grid size-9 place-items-center rounded-lg border text-[11px] font-semibold tracking-tight transition-colors",
-              active
-                ? "border-foreground/20 bg-accent text-accent-foreground"
-                : "border-border bg-muted/50 text-muted-foreground hover:bg-accent hover:text-foreground",
-            )}
+            className="relative"
           >
-            {workspaceInitials(workspace.name)}
+            <WorkspaceAvatar
+              name={workspace.name}
+              rail
+              className={cn(
+                "transition-colors",
+                active
+                  ? "border-foreground/20 bg-accent text-accent-foreground"
+                  : "border-border bg-muted/50 text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            />
             {attentionCount > 0 && (
               <span className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-card bg-warning" />
             )}
@@ -132,9 +133,7 @@ export function SidebarWorkspaceRow({
             className={cn(sidebarRowClass(active), "pr-10 [@media(pointer:coarse)]:pr-16")}
           >
             <SidebarIconSlot>
-              <span className="grid size-6 place-items-center rounded-md border border-border bg-muted/50 text-[10px] font-semibold text-muted-foreground">
-                {workspaceInitials(workspace.name)}
-              </span>
+              <WorkspaceAvatar name={workspace.name} />
             </SidebarIconSlot>
             <SidebarRowLabel collapsed={false} className="font-medium">
               {workspace.name}
@@ -180,6 +179,11 @@ export function SidebarWorkspaceRow({
               <DropdownMenuItem disabled={busy} onSelect={() => setEditing(true)}>
                 <Pencil className="size-4" aria-hidden />
                 Rename
+              </DropdownMenuItem>
+              {/* Above the separator: archiving is the reversible one. */}
+              <DropdownMenuItem disabled={busy} onSelect={onArchive}>
+                <Archive className="size-4" aria-hidden />
+                Archive
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem destructive disabled={busy} onSelect={onDelete}>

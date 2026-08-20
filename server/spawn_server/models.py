@@ -561,12 +561,21 @@ class Workspace(Base):
         String(36), ForeignKey("hosts.id", ondelete="SET NULL"), nullable=True
     )
     cwd: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    # Layout schema v3 (tabs over v2 grids), validated on every write by
+    # Layout schema v3 (tabs over grid-schema-v3 grids), validated on every write by
     # spawn_server.grid + routes/workspaces (docs/OVERHAUL.md §4.4).
     layout: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    # Sidebar ordering, contiguous from 0 per owner.
+    # Sidebar ordering, contiguous from 0 per owner. Archived rows leave that
+    # space entirely — they order by `archived_at` and their `position` is
+    # stale until a restore appends them back at the end.
     position: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
+    )
+    # Set -> the workspace is put away: out of the sidebar's list, and every
+    # session in it stopped. Nothing else moves — `layout` still names the same
+    # windows and `position` still holds the slot the row will come back to. A
+    # timestamp rather than a flag so the UI can say "archived 3 days ago".
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False

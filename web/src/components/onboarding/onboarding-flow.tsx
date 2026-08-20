@@ -110,7 +110,7 @@ export function OnboardingFlow() {
 
   const workspacesQuery = useQuery({
     queryKey: ["workspaces"],
-    queryFn: workspaces.list,
+    queryFn: () => workspaces.list(),
     enabled: step === "done",
     retry: 1,
   });

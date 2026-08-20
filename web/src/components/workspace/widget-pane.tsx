@@ -2,6 +2,7 @@
 
 import {
   ChevronsDownUp,
+  Copy,
   Ellipsis,
   FolderPlus,
   FolderTree,
@@ -35,9 +36,11 @@ export function WidgetPane({
   focused,
   paneCount,
   canDrag,
+  canDuplicate = false,
   onFocus,
   onToggleZoom,
   onMoveStart,
+  onDuplicate,
   onRemove,
 }: {
   tile: Tile;
@@ -45,9 +48,13 @@ export function WidgetPane({
   focused: boolean;
   paneCount: number;
   canDrag: boolean;
+  /** False when the tab is full. */
+  canDuplicate?: boolean;
   onFocus: (tileId: string) => void;
   onToggleZoom: (tileId: string) => void;
   onMoveStart: (tileId: string, event: ReactPointerEvent<HTMLElement>) => void;
+  /** Add a second explorer on the same host and path. */
+  onDuplicate?: (tileId: string) => void;
   onRemove: (tileId: string) => void;
 }) {
   const id = tile.session_id;
@@ -70,7 +77,7 @@ export function WidgetPane({
       )}
       <header
         role="toolbar"
-        aria-label={`${title} pane controls`}
+        aria-label={`${title} window controls`}
         title={canDrag ? "Drag to move" : undefined}
         className={cn(
           "flex h-9 shrink-0 items-center gap-2 border-b border-pane-divider bg-card/75 px-2 select-none",
@@ -117,6 +124,18 @@ export function WidgetPane({
             <ChevronsDownUp className="size-4" aria-hidden />
             Collapse all
           </DropdownMenuItem>
+          {onDuplicate && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem disabled={!canDuplicate} onSelect={() => onDuplicate(id)}>
+                <Copy className="size-4" aria-hidden />
+                Duplicate
+                <span className="ml-auto shrink-0 pl-3 text-xs tracking-wide text-muted-foreground">
+                  ⌘/⌥ drag
+                </span>
+              </DropdownMenuItem>
+            </>
+          )}
           <DropdownMenuSeparator />
           <DropdownMenuItem destructive onSelect={() => onRemove(id)}>
             <Trash2 className="size-4" aria-hidden />

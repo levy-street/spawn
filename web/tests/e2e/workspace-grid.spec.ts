@@ -1,8 +1,9 @@
 import { expect, type Page, test } from "@playwright/test";
-import { move, remove, resize, type Tile } from "../../src/lib/grid";
+import { GRID_SIZE, move, remove, resize, type Tile } from "../../src/lib/grid";
 import {
   type AppMockOptions,
   envelope,
+  HOST_ID,
   mockApp,
   SESSION_B_ID,
   SESSION_ID,
@@ -36,7 +37,7 @@ async function setupGrid(
   const store = await mockApp(page, {
     ...options,
     sessions: fixtures,
-    workspaces: [workspace({ layout: { version: 2, tiles } }), ...(options.extraWorkspaces ?? [])],
+    workspaces: [workspace({ layout: { version: 3, tiles } }), ...(options.extraWorkspaces ?? [])],
   });
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
     connections.push(new URL(ws.url()).searchParams.get("session_id") ?? "missing");
@@ -76,8 +77,8 @@ async function dragTile(
   await page.mouse.move(startX, startY);
   await page.mouse.down();
   await page.mouse.move(
-    areaBox.x + (targetX / 12) * areaBox.width + pointerOffsetX,
-    areaBox.y + (targetY / 12) * areaBox.height + pointerOffsetY,
+    areaBox.x + (targetX / GRID_SIZE) * areaBox.width + pointerOffsetX,
+    areaBox.y + (targetY / GRID_SIZE) * areaBox.height + pointerOffsetY,
     { steps: 4 },
   );
   await beforeDrop?.();
@@ -86,46 +87,46 @@ async function dragTile(
 
 test("renders layout v2 and persists drag output from grid.move", async ({ page }) => {
   const initial: Tile[] = [
-    { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 6 },
-    { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 6 },
+    { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 },
+    { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 12 },
   ];
   const { store } = await setupGrid(page, initial);
   const first = await page.locator(`[data-grid-tile="${SESSION_ID}"]`).boundingBox();
   const second = await page.locator(`[data-grid-tile="${SESSION_B_ID}"]`).boundingBox();
   expect(first && second && first.x < second.x).toBe(true);
 
-  await dragTile(page, SESSION_ID, 0, 6);
+  await dragTile(page, SESSION_ID, 0, 12);
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]).toEqual({
     id: WORKSPACE_ID,
-    body: { layout: envelope({ version: 2, tiles: move(initial, SESSION_ID, 0, 6) }) },
+    body: { layout: envelope({ version: 3, tiles: move(initial, SESSION_ID, 0, 12) }) },
   });
 });
 
 test("dropping a pane onto another docks it against the hovered edge", async ({ page }) => {
   const initial: Tile[] = [
-    { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
-    { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+    { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },
+    { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
   ];
   const { store } = await setupGrid(page, initial);
   // The drag ends with the pointer in the second pane's top zone: the first
   // pane's vacated column is absorbed, the target splits horizontally, and
   // the dragged pane takes the top half (iTerm-style dock).
-  await dragTile(page, SESSION_ID, 6, 0);
+  await dragTile(page, SESSION_ID, 12, 0);
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]?.body).toEqual({
     layout: envelope({
-      version: 2,
+      version: 3,
       tiles: [
-        { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 6 },
-        { session_id: SESSION_B_ID, x: 0, y: 6, w: 12, h: 6 },
+        { session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 12 },
+        { session_id: SESSION_B_ID, x: 0, y: 12, w: 24, h: 12 },
       ],
     }),
   });
 });
 
 test("the southeast resize handle persists grid.resize output", async ({ page }) => {
-  const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 6 }];
+  const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }];
   const { store } = await setupGrid(page, initial, { sessionFixtures: [session()] });
   const handle = page.getByRole("button", { name: "Resize palette (bottom-right corner)" });
   const tileBox = await page.locator(`[data-grid-tile="${SESSION_ID}"]`).boundingBox();
@@ -137,17 +138,17 @@ test("the southeast resize handle persists grid.resize output", async ({ page })
   await page.mouse.up();
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]?.body).toEqual({
-    layout: envelope({ version: 2, tiles: resize(initial, SESSION_ID, 9, 9) }),
+    layout: envelope({ version: 3, tiles: resize(initial, SESSION_ID, 18, 18) }),
   });
 });
 
 test("dragging the seam between two panes trades width between them", async ({ page }) => {
   const initial: Tile[] = [
-    { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
-    { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+    { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },
+    { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
   ];
   const { store } = await setupGrid(page, initial);
-  const seam = page.locator("[data-grid-divider='vertical-6-0']");
+  const seam = page.locator("[data-grid-divider='vertical-12-0']");
   const seamBox = await seam.boundingBox();
   const areaBox = await page
     .locator(`[data-grid-tile="${SESSION_ID}"]`)
@@ -157,18 +158,22 @@ test("dragging the seam between two panes trades width between them", async ({ p
 
   await page.mouse.move(seamBox.x + seamBox.width / 2, seamBox.y + seamBox.height / 2);
   await page.mouse.down();
-  await page.mouse.move(areaBox.x + (8 / 12) * areaBox.width, seamBox.y + seamBox.height / 2, {
-    steps: 4,
-  });
+  await page.mouse.move(
+    areaBox.x + (16 / GRID_SIZE) * areaBox.width,
+    seamBox.y + seamBox.height / 2,
+    {
+      steps: 4,
+    },
+  );
   await page.mouse.up();
 
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]?.body).toEqual({
     layout: envelope({
-      version: 2,
+      version: 3,
       tiles: [
-        { session_id: SESSION_ID, x: 0, y: 0, w: 8, h: 12 },
-        { session_id: SESSION_B_ID, x: 8, y: 0, w: 4, h: 12 },
+        { session_id: SESSION_ID, x: 0, y: 0, w: 16, h: 24 },
+        { session_id: SESSION_B_ID, x: 16, y: 0, w: 8, h: 24 },
       ],
     }),
   });
@@ -176,13 +181,13 @@ test("dragging the seam between two panes trades width between them", async ({ p
 
 test("clicking the title bar without moving is not a drag", async ({ page }) => {
   const initial: Tile[] = [
-    { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
-    { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+    { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },
+    { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
   ];
   const { store } = await setupGrid(page, initial);
   const tile = page.locator(`[data-grid-tile="${SESSION_ID}"]`);
   const before = await tile.boundingBox();
-  await page.getByRole("toolbar", { name: "palette pane controls" }).click();
+  await page.getByRole("toolbar", { name: "palette window controls" }).click();
   // Long enough for the debounced layout save to have fired, had one been queued.
   await page.waitForTimeout(700);
   expect((await tile.boundingBox())?.x).toBeCloseTo(before?.x ?? -1, 0);
@@ -190,7 +195,7 @@ test("clicking the title bar without moving is not a drag", async ({ page }) => 
 });
 
 test("shrinking a pane leaves empty canvas you can drop a pane into", async ({ page }) => {
-  const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }];
+  const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }];
   const { store } = await setupGrid(page, initial, { sessionFixtures: [session()] });
   const handle = page.getByRole("button", { name: "Resize palette (bottom-right corner)" });
   const areaBox = await page
@@ -207,16 +212,16 @@ test("shrinking a pane leaves empty canvas you can drop a pane into", async ({ p
 
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]?.body).toEqual({
-    layout: envelope({ version: 2, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 }] }),
+    layout: envelope({ version: 3, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 }] }),
   });
   // The freed half is offered as a drop target rather than being repacked.
-  await expect(page.locator("[data-grid-opening='6,0,6,12']")).toBeVisible();
+  await expect(page.locator("[data-grid-opening='12,0,12,24']")).toBeVisible();
 });
 
 test("removing a tile re-packs and expands the survivor", async ({ page }) => {
   const initial: Tile[] = [
-    { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
-    { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+    { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },
+    { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
   ];
   const { store } = await setupGrid(page, initial);
   await page.getByRole("button", { name: "palette options" }).click();
@@ -227,23 +232,23 @@ test("removing a tile re-packs and expands the survivor", async ({ page }) => {
     .click();
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]?.body).toEqual({
-    layout: envelope({ version: 2, tiles: remove(initial, SESSION_ID) }),
+    layout: envelope({ version: 3, tiles: remove(initial, SESSION_ID) }),
   });
 });
 
 test("zoom hides siblings without remounting or losing the terminal buffer", async ({ page }) => {
   const initial: Tile[] = [
-    { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
-    { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+    { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },
+    { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
   ];
   const { connections } = await setupGrid(page, initial);
   await expect.poll(() => connections.length).toBe(2);
   await sendPty(page, "KEEP-ALIVE", 0);
   const firstPane = page.getByRole("region", { name: "palette" });
   await expect(firstPane.locator(".xterm-rows")).toContainText("KEEP-ALIVE");
-  await firstPane.getByRole("toolbar", { name: "palette pane controls" }).dblclick();
+  await firstPane.getByRole("toolbar", { name: "palette window controls" }).dblclick();
   await expect(page.locator(`[data-grid-tile="${SESSION_B_ID}"]`)).toBeHidden();
-  await firstPane.getByRole("toolbar", { name: "palette pane controls" }).dblclick();
+  await firstPane.getByRole("toolbar", { name: "palette window controls" }).dblclick();
   await expect(page.locator(`[data-grid-tile="${SESSION_B_ID}"]`)).toBeVisible();
   await expect(firstPane.locator(".xterm-rows")).toContainText("KEEP-ALIVE");
   expect(connections).toHaveLength(2);
@@ -253,8 +258,8 @@ test("Alt+arrows follow reading order and Alt+digits switch workspace position",
   page,
 }) => {
   const initial: Tile[] = [
-    { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 12 },
-    { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 12 },
+    { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },
+    { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
   ];
   await setupGrid(page, initial, {
     extraWorkspaces: [workspace({ id: SECOND_WORKSPACE_ID, name: "second", position: 1 })],
@@ -272,12 +277,54 @@ test("Alt+arrows follow reading order and Alt+digits switch workspace position",
 
 test("empty workspaces offer session creation", async ({ page }) => {
   await setupGrid(page, [], { sessionFixtures: [] });
-  await expect(page.getByRole("heading", { name: "Start with a shell" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "New session" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Open your first window" })).toBeVisible();
+  // One lozenge per thing a window can run, straight from the cascade.
+  const row = page.getByRole("toolbar", { name: "Add a window" });
+  await expect(row.getByRole("button", { name: "Shell", exact: true })).toBeVisible();
+  await expect(row.getByRole("button", { name: "File explorer" })).toBeVisible();
+});
+
+test("the empty state's first window takes the left half, not the whole canvas", async ({
+  page,
+}) => {
+  // A workspace with a home of its own: picking a lozenge is the whole flow.
+  const store = await mockApp(page, {
+    workspaces: [workspace({ host_id: HOST_ID, cwd: "/Users/tester" })],
+    sessions: [],
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  await page
+    .getByRole("toolbar", { name: "Add a window" })
+    .getByRole("button", { name: "Shell", exact: true })
+    .click();
+  await expect.poll(() => store.requests.sessions.length).toBe(1);
+  expect(store.requests.sessions[0]).toMatchObject({ tile: { x: 0, y: 0, w: 12, h: 24 } });
+  // The half it did not take invites the next window without a hover.
+  const opening = page.locator("[data-grid-opening='12,0,12,24']");
+  await expect(opening.getByText("Add a window")).toHaveCSS("opacity", "1");
+});
+
+test("a lone window advertises the canvas beside it", async ({ page }) => {
+  // What the empty state leaves behind: one window on the left half, and an
+  // opening that says so without being hovered first.
+  await setupGrid(page, [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 }], {
+    sessionFixtures: [session()],
+  });
+  const opening = page.locator("[data-grid-opening='12,0,12,24']");
+  await expect(opening.getByText("Add a window")).toHaveCSS("opacity", "1");
+});
+
+test("openings go quiet once a second window is on the canvas", async ({ page }) => {
+  await setupGrid(page, [
+    { session_id: SESSION_ID, x: 0, y: 0, w: 8, h: 24 },
+    { session_id: SESSION_B_ID, x: 8, y: 0, w: 8, h: 24 },
+  ]);
+  const opening = page.locator("[data-grid-opening='16,0,8,24']");
+  await expect(opening.getByText("Add a window")).toHaveCSS("opacity", "0");
 });
 
 test("a session needing attention says so on its icon badge", async ({ page }) => {
-  await setupGrid(page, [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }], {
+  await setupGrid(page, [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }], {
     sessionFixtures: [session({ activity_state: "waiting", activity_label: "Needs input" })],
   });
   await expect(
@@ -287,14 +334,14 @@ test("a session needing attention says so on its icon badge", async ({ page }) =
 
 test("a failed layout PATCH rolls the optimistic drag back", async ({ page }) => {
   const initial: Tile[] = [
-    { session_id: SESSION_ID, x: 0, y: 0, w: 6, h: 6 },
-    { session_id: SESSION_B_ID, x: 6, y: 0, w: 6, h: 6 },
+    { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 },
+    { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 12 },
   ];
   const { store } = await setupGrid(page, initial);
   const tile = page.locator(`[data-grid-tile="${SESSION_ID}"]`);
   const area = tile.locator("..");
   store.failNextWorkspacePatch(503, "layout unavailable");
-  await dragTile(page, SESSION_ID, 0, 6);
+  await dragTile(page, SESSION_ID, 0, 12);
   await expect(page.locator("p[role='alert']")).toContainText("layout unavailable");
   // Measured against the grid area: the error banner shifts the whole page.
   await expect
@@ -308,4 +355,79 @@ test("a failed layout PATCH rolls the optimistic drag back", async ({ page }) =>
     (store.workspaces[0]?.layout as { tabs: Array<{ layout: { tiles: Tile[] } }> }).tabs[0]?.layout
       .tiles,
   ).toEqual(initial);
+});
+
+test("⌘ turns a drag into a duplicate: the source stays put and a copy is created", async ({
+  page,
+}) => {
+  const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 }];
+  const { store } = await setupGrid(page, initial, {
+    sessionFixtures: [session({ foreground_command: "codex" })],
+  });
+
+  await dragTile(page, SESSION_ID, 12, 0, async () => {
+    await page.keyboard.down("Meta");
+    // The ghost says what the drop will do; the source pane has gone home.
+    await expect(page.locator("[data-grid-ghost][data-clone]")).toBeVisible();
+  });
+  await page.keyboard.up("Meta");
+
+  // Same host, same folder — a second pane pointed at the same work.
+  await expect.poll(() => store.requests.sessions.length).toBe(1);
+  expect(store.requests.sessions[0]).toEqual({
+    host_id: session().host_id,
+    cwd: session().cwd,
+  });
+
+  // The source keeps its own tile; the copy takes the half it was dropped on.
+  await expect.poll(() => store.requests.workspacePatches.length).toBeGreaterThan(0);
+  const tiles = (
+    store.requests.workspacePatches.at(-1)?.body as {
+      layout: { tabs: Array<{ layout: { tiles: Tile[] } }> };
+    }
+  ).layout.tabs[0]?.layout.tiles;
+  expect(tiles?.length).toBe(2);
+  expect(tiles?.some((tile) => tile.session_id === SESSION_ID)).toBe(true);
+  expect(tiles?.some((tile) => tile.session_id !== SESSION_ID)).toBe(true);
+});
+
+test("⌥ duplicates too", async ({ page }) => {
+  const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 }];
+  const { store } = await setupGrid(page, initial, { sessionFixtures: [session()] });
+
+  await dragTile(page, SESSION_ID, 12, 0, async () => {
+    await page.keyboard.down("Alt");
+    await expect(page.locator("[data-grid-ghost][data-clone]")).toBeVisible();
+  });
+  await page.keyboard.up("Alt");
+
+  await expect.poll(() => store.requests.sessions.length).toBe(1);
+});
+
+test("a plain drag still moves — a modifier is what copies", async ({ page }) => {
+  const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }];
+  const { store } = await setupGrid(page, initial, { sessionFixtures: [session()] });
+
+  await dragTile(page, SESSION_ID, 12, 12);
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  expect(store.requests.sessions).toEqual([]);
+});
+
+test("the pane menu duplicates too, and names the ⌘ drag shortcut", async ({ page }) => {
+  const initial: Tile[] = [{ session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 12 }];
+  const { store } = await setupGrid(page, initial, { sessionFixtures: [session()] });
+
+  await page
+    .getByRole("button", { name: /options$/ })
+    .first()
+    .click();
+  const item = page.getByRole("menuitem", { name: /Duplicate/ });
+  await expect(item).toContainText("⌘/⌥ drag");
+  await item.click();
+
+  await expect.poll(() => store.requests.sessions.length).toBe(1);
+  expect(store.requests.sessions[0]).toEqual({
+    host_id: session().host_id,
+    cwd: session().cwd,
+  });
 });

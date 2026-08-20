@@ -19,22 +19,21 @@ async function openEmptyWorkspace(page: Page, options: Parameters<typeof mockApp
     ...options,
   });
   await page.goto(`/w/${WORKSPACE_ID}`);
-  await page.getByRole("button", { name: "New session" }).click();
+  // The empty state spells the choices out as lozenges; a shell on a workspace
+  // with no home of its own still has to answer "where".
+  await page
+    .getByRole("toolbar", { name: "Add a window" })
+    .getByRole("button", { name: "Shell", exact: true })
+    .click();
   return store;
 }
 
-test("one host skips host choice and Home creates in ~", async ({ page }) => {
-  const store = await openEmptyWorkspace(page);
-  const menu = page.getByRole("menu");
-  await expect(menu).toContainText("Choose a location");
-  await expect(menu.getByRole("menuitem", { name: /Mac/ })).toHaveCount(0);
-  await menu.getByRole("menuitem", { name: /Home/ }).click();
-  await expect.poll(() => store.requests.sessions.length).toBe(1);
-  expect(store.requests.sessions[0]).toEqual({
-    host_id: HOST_ID,
-    cwd: "~",
-    workspace_id: WORKSPACE_ID,
-  });
+test("one host skips the host list and browses folders straight away", async ({ page }) => {
+  await openEmptyWorkspace(page);
+  // A workspace with no home of its own still has to answer "where" — and the
+  // folder browser is the only thing that answers it now.
+  await expect(page.getByRole("menu")).toHaveCount(0);
+  await expect(page.getByRole("dialog", { name: "Select a folder on Mac" })).toBeVisible();
 });
 
 test("multiple hosts are shown and offline hosts are disabled", async ({ page }) => {
@@ -45,22 +44,7 @@ test("multiple hosts are shown and offline hosts are disabled", async ({ page })
   await expect(menu).toContainText("Choose a host");
   await expect(menu.getByRole("menuitem", { name: /Old Mac.*offline/ })).toBeDisabled();
   await menu.getByRole("menuitem", { name: /^Mac/ }).click();
-  await expect(menu.getByRole("menuitem", { name: /Home/ })).toBeVisible();
-});
-
-test("a recent directory creates the session in that exact path", async ({ page }) => {
-  const store = await openEmptyWorkspace(page, {
-    recentDirs: {
-      [HOST_ID]: [{ path: "/Users/tester/projects/spawn", last_used_at: "2026-08-19T01:00:00Z" }],
-    },
-  });
-  await page.getByRole("menuitem", { name: /spawn.*\/Users\/tester\/projects\/spawn/ }).click();
-  await expect.poll(() => store.requests.sessions.length).toBe(1);
-  expect(store.requests.sessions[0]).toMatchObject({
-    host_id: HOST_ID,
-    cwd: "/Users/tester/projects/spawn",
-    workspace_id: WORKSPACE_ID,
-  });
+  await expect(page.getByRole("dialog", { name: "Select a folder on Mac" })).toBeVisible();
 });
 
 test("folder picker browses the host control channel and selects the open folder", async ({
@@ -93,7 +77,6 @@ test("folder picker browses the host control channel and selects the open folder
             ],
           }),
   });
-  await page.getByRole("menuitem", { name: "Select folder…" }).click();
   const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
   await dialog.getByRole("option", { name: "projects" }).click();
   await expect(
@@ -101,11 +84,65 @@ test("folder picker browses the host control channel and selects the open folder
   ).toBeVisible();
   await dialog.getByRole("button", { name: "Select this folder" }).click();
   await expect.poll(() => store.requests.sessions.length).toBe(1);
-  expect(store.requests.sessions[0]).toMatchObject({
+  // The first window of an empty tab takes the left half, full height —
+  // leaving an opening the grid can offer for a second.
+  expect(store.requests.sessions[0]).toEqual({
     host_id: HOST_ID,
     cwd: "/Users/tester/projects",
     workspace_id: WORKSPACE_ID,
+    tile: { x: 0, y: 0, w: 12, h: 24 },
   });
+});
+
+test("the empty state re-points the tab's folder, and windows follow it", async ({ page }) => {
+  const store = await mockApp(page, {
+    // A workspace with a home of its own: the tab inherits it until it is
+    // given one, and the chip says so either way.
+    workspaces: [workspace({ host_id: HOST_ID, cwd: "/Users/tester" })],
+    sessions: [],
+    files: (_hostId, path) =>
+      fileListing({
+        path: path === "/Users/tester/projects" ? path : "/Users/tester",
+        parent: path === "/Users/tester/projects" ? "/Users/tester" : undefined,
+        entries:
+          path === "/Users/tester/projects"
+            ? []
+            : [
+                fileEntry({
+                  name: "projects",
+                  path: "/Users/tester/projects",
+                  is_dir: true,
+                  size: null,
+                }),
+              ],
+      }),
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  // Inherited from the workspace, shown as the folder windows would open in.
+  const chip = page.getByRole("button", { name: /tester/ });
+  await expect(chip).toBeVisible();
+
+  await chip.click();
+  const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
+  await dialog.getByRole("option", { name: "projects" }).click();
+  await dialog.getByRole("button", { name: "Select this folder" }).click();
+
+  // The tab now carries its own pair; the workspace's home is left alone.
+  await expect
+    .poll(() => store.requests.workspacePatches.at(-1)?.body)
+    .toMatchObject({
+      layout: {
+        tabs: [{ id: "tab-1", host_id: HOST_ID, cwd: "/Users/tester/projects" }],
+      },
+    });
+
+  // And that is where the next window opens.
+  await page
+    .getByRole("toolbar", { name: "Add a window" })
+    .getByRole("button", { name: "Shell", exact: true })
+    .click();
+  await expect.poll(() => store.requests.sessions.length).toBe(1);
+  expect(store.requests.sessions[0]).toMatchObject({ cwd: "/Users/tester/projects" });
 });
 
 test("a new workspace is named after the folder it opens in", async ({ page }) => {
@@ -131,15 +168,19 @@ test("a new workspace is named after the folder it opens in", async ({ page }) =
   await expect.poll(() => store.workspaces.at(-1)?.name).toBe("tester");
 });
 
-test("workspace_full disables the plus with an explanation", async ({ page }) => {
-  const store = await openEmptyWorkspace(page, { workspaceFull: true });
-  await page.getByRole("menuitem", { name: /Home/ }).click();
+test("workspace_full disables the lozenges with an explanation", async ({ page }) => {
+  // A workspace with a home: one click is the whole flow, so the refusal comes
+  // straight back from the create rather than after a folder is picked.
+  const store = await openEmptyWorkspace(page, {
+    workspaceFull: true,
+    workspaces: [workspace({ host_id: HOST_ID, cwd: "~" })],
+  });
   await expect.poll(() => store.requests.sessions.length).toBe(1);
-  const trigger = page.getByRole("button", { name: "New session" });
-  await expect(trigger).toHaveAttribute("aria-disabled", "true");
-  await expect(trigger.locator("..")).toHaveAttribute(
+  const row = page.getByRole("toolbar", { name: "Add a window" });
+  await expect(row.getByRole("button", { name: "Shell", exact: true })).toBeDisabled();
+  await expect(row).toHaveAttribute(
     "title",
-    "This workspace is full. Remove a pane before adding another session.",
+    "This workspace is full. Remove a window before adding another session.",
   );
   expect(store.sessions).toHaveLength(0);
 });

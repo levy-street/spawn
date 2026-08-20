@@ -1,14 +1,14 @@
 {
- "_doc": "Cross-language conformance suite for the 12x12 free-canvas grid algebra of workspace layout schema v2 (docs/OVERHAUL.md section 4.4). Each case names one operation (validate | autoPlace | move | resize | remove | compact | readingOrder | fromSplitTree), the exact input, and the exact expected result; web/src/lib/grid.ts and server/spawn_server/grid.py must both reproduce every expected value byte-for-byte after JSON normalization (deep equality on parsed values, array order included). Inputs to every op except validate are valid layouts per the section 4.4 invariants (integers, 12x12 bounds, min 2x2, no overlaps, max 8 tiles, unique session ids); validate cases probe arbitrary values. Where the section 4.4 prose is ambiguous, the `_rules` list below pins the behavior \u2014 together with the cases it is the authority both implementations follow.",
+ "_doc": "Cross-language conformance suite for the 24x24 free-canvas grid algebra of workspace grid schema v3 (docs/OVERHAUL.md section 4.4). Each case names one operation (validate | autoPlace | move | resize | remove | compact | readingOrder | fromSplitTree), the exact input, and the exact expected result; web/src/lib/grid.ts and server/spawn_server/grid.py must both reproduce every expected value byte-for-byte after JSON normalization (deep equality on parsed values, array order included). Inputs to every op except validate are valid layouts per the section 4.4 invariants (integers, 24x24 bounds, min 4x4, no overlaps, max 16 tiles, unique session ids); validate cases probe arbitrary values. Where the section 4.4 prose is ambiguous, the `_rules` list below pins the behavior — together with the cases it is the authority both implementations follow.",
  "_rules": [
-  "Every tile array returned by any operation is sorted in reading order \u2014 (y, x) ascending. Expected arrays compare exactly, order included.",
-  "validate returns {ok, errors}; error codes: shape (layout not an object or tiles not an array; reported alone), version (version !== 2), count (more than 8 tiles), session_id (missing or not a non-empty string; id FORMAT is deliberately not checked \u2014 pruning unknown/foreign ids is server policy upstream of the algebra), integer (x/y/w/h not all integers), bounds (outside the canvas), size (w or h < 3; at most one size error per tile), duplicate (same session_id as an earlier tile; index = later tile, other_index = first occurrence), overlap (index < other_index). Emission order: version, count, then per-tile errors in tile order (session_id, integer, bounds, size; an integer failure suppresses bounds/size for that tile), then duplicates in tile order, then overlaps for index pairs i<j in lexicographic order. Tiles failing integer or bounds checks are excluded from overlap checking.",
-  "autoPlace returns {tile, tiles}: tile is the new geometry (no session_id \u2014 the caller appends it), tiles the possibly-updated list. Scan: first free 3x3 by y then x; expand w rightward at height 3, then h downward at the expanded width. Fallback when no 3x3 is free: split candidates are tiles with max(w, h) >= 6; pick the largest area, ties broken by reading order; cut along the longer axis \u2014 vertical cut (side-by-side halves) when w >= h \u2014 the existing tile keeps ceil(side/2), the new tile gets floor(side/2). tile is null (tiles returned unchanged, sorted) when the input already has 8 tiles or no split candidate exists.",
-  "move(tiles, id, x, y): clamp the target into the canvas (x to [0, 12-w], y to [0, 12-h]). If the clamped target rect overlaps nothing, the tile simply takes it and the gap it leaves behind stays a gap \u2014 nothing repacks. If the target rect is occupied, the move is a SWAP: T = the tile with the greatest intersection area with the target rect, ties broken by reading order \u2014 lowest (y, x) first; the dragged tile adopts T's rect wholesale (x, y, w, AND h) and T adopts the dragged tile's original rect. A swap exchanges sizes between the two tiles \u2014 move preserves the multiset of sizes, not per-tile sizes. Unknown id: input returned unchanged (sorted).",
-  "resize(tiles, id, w, h): clamp w to [2, 12-x] and h to [2, 12-y] \u2014 the tile grows and shrinks about its own origin, which never moves. Nothing else moves either: shrinking leaves empty canvas behind, and growing is taken only when the resized rect overlaps no other tile; an overlapping growth returns the input unchanged (sorted). Unknown id: input returned unchanged (sorted).",
+  "Every tile array returned by any operation is sorted in reading order — (y, x) ascending. Expected arrays compare exactly, order included.",
+  "validate returns {ok, errors}; error codes: shape (layout not an object or tiles not an array; reported alone), version (version !== 3), count (more than 16 tiles), session_id (missing or not a non-empty string; id FORMAT is deliberately not checked — pruning unknown/foreign ids is server policy upstream of the algebra), integer (x/y/w/h not all integers), bounds (outside the canvas), size (w or h < 4; at most one size error per tile), duplicate (same session_id as an earlier tile; index = later tile, other_index = first occurrence), overlap (index < other_index). Emission order: version, count, then per-tile errors in tile order (session_id, integer, bounds, size; an integer failure suppresses bounds/size for that tile), then duplicates in tile order, then overlaps for index pairs i<j in lexicographic order. Tiles failing integer or bounds checks are excluded from overlap checking.",
+  "autoPlace returns {tile, tiles}: tile is the new geometry (no session_id — the caller appends it), tiles the possibly-updated list. Scan: first free 4x4 by y then x; expand w rightward at height 4, then h downward at the expanded width. Fallback when no 4x4 is free: split candidates are tiles with max(w, h) >= 8; pick the largest area, ties broken by reading order; cut along the longer axis — vertical cut (side-by-side halves) when w >= h — the existing tile keeps ceil(side/2), the new tile gets floor(side/2). tile is null (tiles returned unchanged, sorted) when the input already has 16 tiles or no split candidate exists.",
+  "move(tiles, id, x, y): clamp the target into the canvas (x to [0, 24-w], y to [0, 24-h]). If the clamped target rect overlaps nothing, the tile simply takes it and the gap it leaves behind stays a gap — nothing repacks. If the target rect is occupied, the move is a SWAP: T = the tile with the greatest intersection area with the target rect, ties broken by reading order — lowest (y, x) first; the dragged tile adopts T's rect wholesale (x, y, w, AND h) and T adopts the dragged tile's original rect. A swap exchanges sizes between the two tiles — move preserves the multiset of sizes, not per-tile sizes. Unknown id: input returned unchanged (sorted).",
+  "resize(tiles, id, w, h): clamp w to [4, 24-x] and h to [4, 24-y] — the tile grows and shrinks about its own origin, which never moves. Nothing else moves either: shrinking leaves empty canvas behind, and growing is taken only when the resized rect overlaps no other tile; an overlapping growth returns the input unchanged (sorted). Unknown id: input returned unchanged (sorted).",
   "compact: no operation calls this any more (the canvas is free-form); it stays in the contract as a pure utility. Process tiles in reading order of their input positions; each tile slides up as far as it can, then left, one continuous slide each, checked against ALL other tiles at their current positions (already-processed tiles at settled spots, later tiles at original spots). Tiles never pass through occupied cells, so validity is preserved at every step.",
-  "remove: drop the tile, then let the survivors absorb the rectangle it freed \u2014 nothing else on the canvas moves. Survivors grow one cell at a time in reading order of the post-drop list, trying right, down, left, then up; a step is taken only when the strip of cells it gains lies wholly inside the freed rectangle and overlaps no tile, and passes repeat until no tile can grow. Unknown id: input returned unchanged (sorted).",
-  "fromSplitTree: assign float rects from (0, 0, 12, 12); a row split puts a left and b right at s = x0 + ratio*(x1 - x0), a column split puts a top and b bottom (same formula on y); ratio is clamped to [0, 1]; each split position is computed once and shared by both children. Pane EDGES are rounded with floor(v + 0.5) \u2014 round half UP, not Python's banker's round(). If any rounded tile has w < 3 or h < 3, lies outside the canvas, or overlaps another, the whole layout falls back to repeated autoPlace from an empty canvas over the panes in v1 DFS order (a then b). Trees with more than 8 panes keep the first 8 in DFS order and drop the rest. Null root yields []. Pane agent_id becomes tile session_id verbatim.",
+  "remove: drop the tile, then let the survivors absorb the rectangle it freed — nothing else on the canvas moves. Survivors grow one cell at a time in reading order of the post-drop list, trying right, down, left, then up; a step is taken only when the strip of cells it gains lies wholly inside the freed rectangle and overlaps no tile, and passes repeat until no tile can grow. Unknown id: input returned unchanged (sorted).",
+  "fromSplitTree: assign float rects from (0, 0, 24, 24); a row split puts a left and b right at s = x0 + ratio*(x1 - x0), a column split puts a top and b bottom (same formula on y); ratio is clamped to [0, 1]; each split position is computed once and shared by both children. Pane EDGES are rounded with floor(v + 0.5) — round half UP, not Python's banker's round(). If any rounded tile has w < 4 or h < 4, lies outside the canvas, or overlaps another, the whole layout falls back to repeated autoPlace from an empty canvas over the panes in v1 DFS order (a then b). Trees with more than 16 panes keep the first 16 in DFS order and drop the rest. Null root yields []. Pane agent_id becomes tile session_id verbatim.",
   "All operations except validate assume valid input and are deterministic and free of randomness; both implementations must never mutate their inputs."
  ],
  "cases": [
@@ -17,14 +17,14 @@
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2,
+     "version": 3,
      "tiles": [
       {
        "session_id": "a",
        "x": 0,
        "y": 0,
-       "w": 12,
-       "h": 12
+       "w": 24,
+       "h": 24
       }
      ]
     }
@@ -39,7 +39,7 @@
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2,
+     "version": 3,
      "tiles": []
     }
    },
@@ -49,66 +49,122 @@
    }
   },
   {
-   "name": "validate-ok-eight-tiles",
+   "name": "validate-ok-at-max-tiles",
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2,
+     "version": 3,
      "tiles": [
       {
        "session_id": "a",
        "x": 0,
        "y": 0,
-       "w": 3,
+       "w": 6,
        "h": 6
       },
       {
        "session_id": "b",
-       "x": 3,
+       "x": 6,
        "y": 0,
-       "w": 3,
+       "w": 6,
        "h": 6
       },
       {
        "session_id": "c",
-       "x": 6,
+       "x": 12,
        "y": 0,
-       "w": 3,
+       "w": 6,
        "h": 6
       },
       {
        "session_id": "d",
-       "x": 9,
+       "x": 18,
        "y": 0,
-       "w": 3,
+       "w": 6,
        "h": 6
       },
       {
        "session_id": "e",
        "x": 0,
        "y": 6,
-       "w": 3,
+       "w": 6,
        "h": 6
       },
       {
        "session_id": "f",
-       "x": 3,
+       "x": 6,
        "y": 6,
-       "w": 3,
+       "w": 6,
        "h": 6
       },
       {
        "session_id": "g",
-       "x": 6,
+       "x": 12,
        "y": 6,
-       "w": 3,
+       "w": 6,
        "h": 6
       },
       {
        "session_id": "h",
-       "x": 9,
+       "x": 18,
        "y": 6,
-       "w": 3,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "i",
+       "x": 0,
+       "y": 12,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "j",
+       "x": 6,
+       "y": 12,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "k",
+       "x": 12,
+       "y": 12,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "l",
+       "x": 18,
+       "y": 12,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "m",
+       "x": 0,
+       "y": 18,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "n",
+       "x": 6,
+       "y": 18,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "o",
+       "x": 12,
+       "y": 18,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "p",
+       "x": 18,
+       "y": 18,
+       "w": 6,
        "h": 6
       }
      ]
@@ -130,8 +186,8 @@
        "session_id": "a",
        "x": 0,
        "y": 0,
-       "w": 12,
-       "h": 12
+       "w": 24,
+       "h": 24
       }
      ]
     }
@@ -150,21 +206,21 @@
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2,
+     "version": 3,
      "tiles": [
       {
        "session_id": "a",
        "x": 0,
        "y": 0,
-       "w": 6,
-       "h": 6
+       "w": 12,
+       "h": 12
       },
       {
        "session_id": "b",
-       "x": 3,
-       "y": 3,
-       "w": 6,
-       "h": 6
+       "x": 6,
+       "y": 6,
+       "w": 12,
+       "h": 12
       }
      ]
     }
@@ -185,14 +241,14 @@
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2,
+     "version": 3,
      "tiles": [
       {
        "session_id": "a",
        "x": 0,
        "y": 0,
-       "w": 1,
-       "h": 1
+       "w": 2,
+       "h": 2
       }
      ]
     }
@@ -212,14 +268,14 @@
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2,
+     "version": 3,
      "tiles": [
       {
        "session_id": "a",
-       "x": 10,
+       "x": 20,
        "y": 0,
-       "w": 6,
-       "h": 6
+       "w": 12,
+       "h": 12
       }
      ]
     }
@@ -239,14 +295,14 @@
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2,
+     "version": 3,
      "tiles": [
       {
        "session_id": "a",
-       "x": -1,
+       "x": -2,
        "y": 0,
-       "w": 6,
-       "h": 6
+       "w": 12,
+       "h": 12
       }
      ]
     }
@@ -266,14 +322,14 @@
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2,
+     "version": 3,
      "tiles": [
       {
        "session_id": "a",
        "x": 0.5,
        "y": 0,
-       "w": 6,
-       "h": 6
+       "w": 12,
+       "h": 12
       }
      ]
     }
@@ -293,21 +349,21 @@
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2,
+     "version": 3,
      "tiles": [
       {
        "session_id": "a",
        "x": 0,
        "y": 0,
-       "w": 6,
-       "h": 12
+       "w": 12,
+       "h": 24
       },
       {
        "session_id": "a",
-       "x": 6,
+       "x": 12,
        "y": 0,
-       "w": 6,
-       "h": 12
+       "w": 12,
+       "h": 24
       }
      ]
     }
@@ -328,70 +384,126 @@
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2,
+     "version": 3,
      "tiles": [
       {
        "session_id": "a",
        "x": 0,
        "y": 0,
-       "w": 3,
-       "h": 3
+       "w": 4,
+       "h": 4
       },
       {
        "session_id": "b",
-       "x": 3,
+       "x": 4,
        "y": 0,
-       "w": 3,
-       "h": 3
+       "w": 4,
+       "h": 4
       },
       {
        "session_id": "c",
-       "x": 6,
+       "x": 8,
        "y": 0,
-       "w": 3,
-       "h": 3
+       "w": 4,
+       "h": 4
       },
       {
        "session_id": "d",
-       "x": 9,
+       "x": 12,
        "y": 0,
-       "w": 3,
-       "h": 3
+       "w": 4,
+       "h": 4
       },
       {
        "session_id": "e",
-       "x": 0,
-       "y": 3,
-       "w": 3,
-       "h": 3
+       "x": 16,
+       "y": 0,
+       "w": 4,
+       "h": 4
       },
       {
        "session_id": "f",
-       "x": 3,
-       "y": 3,
-       "w": 3,
-       "h": 3
+       "x": 20,
+       "y": 0,
+       "w": 4,
+       "h": 4
       },
       {
        "session_id": "g",
-       "x": 6,
-       "y": 3,
-       "w": 3,
-       "h": 3
+       "x": 0,
+       "y": 4,
+       "w": 4,
+       "h": 4
       },
       {
        "session_id": "h",
-       "x": 9,
-       "y": 3,
-       "w": 3,
-       "h": 3
+       "x": 4,
+       "y": 4,
+       "w": 4,
+       "h": 4
       },
       {
        "session_id": "i",
+       "x": 8,
+       "y": 4,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "j",
+       "x": 12,
+       "y": 4,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "k",
+       "x": 16,
+       "y": 4,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "l",
+       "x": 20,
+       "y": 4,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "m",
        "x": 0,
-       "y": 6,
-       "w": 3,
-       "h": 3
+       "y": 8,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "n",
+       "x": 4,
+       "y": 8,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "o",
+       "x": 8,
+       "y": 8,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "p",
+       "x": 12,
+       "y": 8,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "q",
+       "x": 16,
+       "y": 8,
+       "w": 4,
+       "h": 4
       }
      ]
     }
@@ -410,7 +522,7 @@
    "op": "validate",
    "input": {
     "layout": {
-     "version": 2
+     "version": 3
     }
    },
    "expected": {
@@ -448,15 +560,15 @@
        "session_id": "a",
        "x": 0,
        "y": 0,
-       "w": 1,
-       "h": 3
+       "w": 2,
+       "h": 6
       },
       {
        "session_id": "b",
        "x": 0,
        "y": 0,
-       "w": 3,
-       "h": 3
+       "w": 6,
+       "h": 6
       }
      ]
     }
@@ -489,8 +601,8 @@
     "tile": {
      "x": 0,
      "y": 0,
-     "w": 12,
-     "h": 12
+     "w": 24,
+     "h": 24
     },
     "tiles": []
    }
@@ -504,25 +616,25 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ]
    },
    "expected": {
     "tile": {
-     "x": 6,
+     "x": 12,
      "y": 0,
-     "w": 6,
-     "h": 12
+     "w": 12,
+     "h": 24
     },
     "tiles": [
      {
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ]
    }
@@ -536,25 +648,25 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 6
+      "w": 24,
+      "h": 12
      }
     ]
    },
    "expected": {
     "tile": {
      "x": 0,
-     "y": 6,
-     "w": 12,
-     "h": 6
+     "y": 12,
+     "w": 24,
+     "h": 12
     },
     "tiles": [
      {
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 6
+      "w": 24,
+      "h": 12
      }
     ]
    }
@@ -568,53 +680,53 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    },
    "expected": {
     "tile": {
-     "x": 6,
-     "y": 6,
-     "w": 6,
-     "h": 6
+     "x": 12,
+     "y": 12,
+     "w": 12,
+     "h": 12
     },
     "tiles": [
      {
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    }
@@ -628,45 +740,45 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 3
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 3,
-      "w": 3,
-      "h": 9
+      "y": 6,
+      "w": 6,
+      "h": 18
      }
     ]
    },
    "expected": {
     "tile": {
-     "x": 3,
-     "y": 3,
-     "w": 9,
-     "h": 9
+     "x": 6,
+     "y": 6,
+     "w": 18,
+     "h": 18
     },
     "tiles": [
      {
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 3
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 3,
-      "w": 3,
-      "h": 9
+      "y": 6,
+      "w": 6,
+      "h": 18
      }
     ]
    }
   },
   {
-   "name": "autoplace-split-fallback-7-to-8",
+   "name": "autoplace-split-fallback-no-free-slot",
    "op": "autoPlace",
    "input": {
     "tiles": [
@@ -674,109 +786,109 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 3,
+      "x": 6,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "c",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "d",
-      "x": 9,
+      "x": 18,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "e",
       "x": 0,
-      "y": 6,
-      "w": 3,
-      "h": 6
+      "y": 12,
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "f",
-      "x": 3,
-      "y": 6,
-      "w": 3,
-      "h": 6
+      "x": 6,
+      "y": 12,
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "g",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    },
    "expected": {
     "tile": {
-     "x": 9,
-     "y": 6,
-     "w": 3,
-     "h": 6
+     "x": 18,
+     "y": 12,
+     "w": 6,
+     "h": 12
     },
     "tiles": [
      {
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 3,
+      "x": 6,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "c",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "d",
-      "x": 9,
+      "x": 18,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "e",
       "x": 0,
-      "y": 6,
-      "w": 3,
-      "h": 6
+      "y": 12,
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "f",
-      "x": 3,
-      "y": 6,
-      "w": 3,
-      "h": 6
+      "x": 6,
+      "y": 12,
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "g",
-      "x": 6,
-      "y": 6,
-      "w": 3,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 12
      }
     ]
    }
@@ -790,67 +902,67 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "d",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    },
    "expected": {
     "tile": {
-     "x": 3,
+     "x": 6,
      "y": 0,
-     "w": 3,
-     "h": 6
+     "w": 6,
+     "h": 12
     },
     "tiles": [
      {
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "d",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    }
@@ -864,53 +976,53 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 12
+      "w": 7,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 3,
+      "x": 7,
       "y": 0,
-      "w": 9,
-      "h": 6
+      "w": 17,
+      "h": 12
      },
      {
       "session_id": "c",
-      "x": 3,
-      "y": 6,
-      "w": 9,
-      "h": 6
+      "x": 7,
+      "y": 12,
+      "w": 17,
+      "h": 12
      }
     ]
    },
    "expected": {
     "tile": {
-     "x": 8,
+     "x": 16,
      "y": 0,
-     "w": 4,
-     "h": 6
+     "w": 8,
+     "h": 12
     },
     "tiles": [
      {
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 12
+      "w": 7,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 3,
+      "x": 7,
       "y": 0,
-      "w": 5,
-      "h": 6
+      "w": 9,
+      "h": 12
      },
      {
       "session_id": "c",
-      "x": 3,
-      "y": 6,
-      "w": 9,
-      "h": 6
+      "x": 7,
+      "y": 12,
+      "w": 17,
+      "h": 12
      }
     ]
    }
@@ -924,67 +1036,67 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 5,
-      "h": 5
+      "w": 10,
+      "h": 10
      },
      {
       "session_id": "b",
-      "x": 5,
+      "x": 10,
       "y": 0,
-      "w": 5,
-      "h": 5
+      "w": 10,
+      "h": 10
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 5,
-      "w": 5,
-      "h": 5
+      "y": 10,
+      "w": 10,
+      "h": 10
      },
      {
       "session_id": "d",
-      "x": 5,
-      "y": 5,
-      "w": 5,
-      "h": 5
+      "x": 10,
+      "y": 10,
+      "w": 10,
+      "h": 10
      }
     ]
    },
    "expected": {
     "tile": {
-     "x": 10,
+     "x": 20,
      "y": 0,
-     "w": 2,
-     "h": 12
+     "w": 4,
+     "h": 24
     },
     "tiles": [
      {
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 5,
-      "h": 5
+      "w": 10,
+      "h": 10
      },
      {
       "session_id": "b",
-      "x": 5,
+      "x": 10,
       "y": 0,
-      "w": 5,
-      "h": 5
+      "w": 10,
+      "h": 10
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 5,
-      "w": 5,
-      "h": 5
+      "y": 10,
+      "w": 10,
+      "h": 10
      },
      {
       "session_id": "d",
-      "x": 5,
-      "y": 5,
-      "w": 5,
-      "h": 5
+      "x": 10,
+      "y": 10,
+      "w": 10,
+      "h": 10
      }
     ]
    }
@@ -998,56 +1110,112 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "b",
-      "x": 3,
+      "x": 6,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "c",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "d",
-      "x": 9,
+      "x": 18,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "e",
       "x": 0,
       "y": 6,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "f",
-      "x": 3,
+      "x": 6,
       "y": 6,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "g",
-      "x": 6,
+      "x": 12,
       "y": 6,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "h",
-      "x": 9,
+      "x": 18,
       "y": 6,
-      "w": 3,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "i",
+      "x": 0,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "j",
+      "x": 6,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "k",
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "l",
+      "x": 18,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "m",
+      "x": 0,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "n",
+      "x": 6,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "o",
+      "x": 12,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p",
+      "x": 18,
+      "y": 18,
+      "w": 6,
       "h": 6
      }
     ]
@@ -1059,56 +1227,112 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "b",
-      "x": 3,
+      "x": 6,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "c",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "d",
-      "x": 9,
+      "x": 18,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "e",
       "x": 0,
       "y": 6,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "f",
-      "x": 3,
+      "x": 6,
       "y": 6,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "g",
-      "x": 6,
+      "x": 12,
       "y": 6,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "h",
-      "x": 9,
+      "x": 18,
       "y": 6,
-      "w": 3,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "i",
+      "x": 0,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "j",
+      "x": 6,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "k",
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "l",
+      "x": 18,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "m",
+      "x": 0,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "n",
+      "x": 6,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "o",
+      "x": 12,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p",
+      "x": 18,
+      "y": 18,
+      "w": 6,
       "h": 6
      }
     ]
@@ -1123,15 +1347,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ],
     "id": "b",
@@ -1144,15 +1368,15 @@
       "session_id": "b",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "a",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ]
    }
@@ -1166,20 +1390,20 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 6
+      "w": 24,
+      "h": 12
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 6,
-      "w": 12,
-      "h": 6
+      "y": 12,
+      "w": 24,
+      "h": 12
      }
     ],
     "id": "a",
     "x": 0,
-    "y": 6
+    "y": 12
    },
    "expected": {
     "tiles": [
@@ -1187,15 +1411,15 @@
       "session_id": "b",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 6
+      "w": 24,
+      "h": 12
      },
      {
       "session_id": "a",
       "x": 0,
-      "y": 6,
-      "w": 12,
-      "h": 6
+      "y": 12,
+      "w": 24,
+      "h": 12
      }
     ]
    }
@@ -1209,19 +1433,19 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 4,
-      "h": 12
+      "w": 8,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 4,
+      "x": 8,
       "y": 0,
-      "w": 8,
-      "h": 12
+      "w": 16,
+      "h": 24
      }
     ],
     "id": "a",
-    "x": 4,
+    "x": 8,
     "y": 0
    },
    "expected": {
@@ -1230,15 +1454,15 @@
       "session_id": "b",
       "x": 0,
       "y": 0,
-      "w": 4,
-      "h": 12
+      "w": 8,
+      "h": 24
      },
      {
       "session_id": "a",
-      "x": 4,
+      "x": 8,
       "y": 0,
-      "w": 8,
-      "h": 12
+      "w": 16,
+      "h": 24
      }
     ]
    }
@@ -1252,34 +1476,34 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "d",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ],
     "id": "d",
-    "x": 3,
-    "y": 3
+    "x": 6,
+    "y": 6
    },
    "expected": {
     "tiles": [
@@ -1287,29 +1511,29 @@
       "session_id": "d",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "a",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    }
@@ -1323,22 +1547,22 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      }
     ],
     "id": "a",
-    "x": 6,
-    "y": 6
+    "x": 12,
+    "y": 12
    },
    "expected": {
     "tiles": [
      {
       "session_id": "a",
-      "x": 6,
-      "y": 6,
-      "w": 3,
-      "h": 3
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 6
      }
     ]
    }
@@ -1352,27 +1576,27 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 3,
-      "w": 3,
-      "h": 3
+      "y": 6,
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 3,
-      "h": 6
+      "y": 12,
+      "w": 6,
+      "h": 12
      }
     ],
     "id": "a",
     "x": 0,
-    "y": 9
+    "y": 18
    },
    "expected": {
     "tiles": [
@@ -1380,22 +1604,22 @@
       "session_id": "c",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 3,
-      "w": 3,
-      "h": 3
+      "y": 6,
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "a",
       "x": 0,
-      "y": 6,
-      "w": 3,
-      "h": 6
+      "y": 12,
+      "w": 6,
+      "h": 12
      }
     ]
    }
@@ -1409,22 +1633,22 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 3
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 3,
-      "w": 12,
-      "h": 3
+      "y": 6,
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 12,
-      "h": 3
+      "y": 12,
+      "w": 24,
+      "h": 6
      }
     ],
     "id": "c",
@@ -1437,22 +1661,22 @@
       "session_id": "c",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 3
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 3,
-      "w": 12,
-      "h": 3
+      "y": 6,
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "a",
       "x": 0,
-      "y": 6,
-      "w": 12,
-      "h": 3
+      "y": 12,
+      "w": 24,
+      "h": 6
      }
     ]
    }
@@ -1466,36 +1690,36 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "b",
-      "x": 3,
+      "x": 6,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      }
     ],
     "id": "a",
-    "x": 9,
-    "y": 9
+    "x": 18,
+    "y": 18
    },
    "expected": {
     "tiles": [
      {
       "session_id": "b",
-      "x": 3,
+      "x": 6,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "a",
-      "x": 9,
-      "y": 9,
-      "w": 3,
-      "h": 3
+      "x": 18,
+      "y": 18,
+      "w": 6,
+      "h": 6
      }
     ]
    }
@@ -1509,27 +1733,27 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 9
+      "w": 24,
+      "h": 18
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 9,
-      "w": 3,
-      "h": 3
+      "y": 18,
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "c",
-      "x": 3,
-      "y": 9,
-      "w": 3,
-      "h": 3
+      "x": 6,
+      "y": 18,
+      "w": 6,
+      "h": 6
      }
     ],
     "id": "b",
-    "x": 99,
-    "y": 99
+    "x": 198,
+    "y": 198
    },
    "expected": {
     "tiles": [
@@ -1537,22 +1761,22 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 9
+      "w": 24,
+      "h": 18
      },
      {
       "session_id": "c",
-      "x": 3,
-      "y": 9,
-      "w": 3,
-      "h": 3
+      "x": 6,
+      "y": 18,
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "b",
-      "x": 9,
-      "y": 9,
-      "w": 3,
-      "h": 3
+      "x": 18,
+      "y": 18,
+      "w": 6,
+      "h": 6
      }
     ]
    }
@@ -1564,24 +1788,24 @@
     "tiles": [
      {
       "session_id": "a",
-      "x": 3,
-      "y": 3,
-      "w": 3,
-      "h": 3
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
      }
     ],
     "id": "a",
-    "x": 3,
-    "y": 3
+    "x": 6,
+    "y": 6
    },
    "expected": {
     "tiles": [
      {
       "session_id": "a",
-      "x": 3,
-      "y": 3,
-      "w": 3,
-      "h": 3
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
      }
     ]
    }
@@ -1595,8 +1819,8 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 12
+      "w": 24,
+      "h": 24
      }
     ],
     "id": "zz",
@@ -1609,8 +1833,8 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 12
+      "w": 24,
+      "h": 24
      }
     ]
    }
@@ -1624,27 +1848,27 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 3
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 3,
-      "w": 12,
-      "h": 3
+      "y": 6,
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 12,
-      "h": 3
+      "y": 12,
+      "w": 24,
+      "h": 6
      }
     ],
     "id": "a",
-    "w": 12,
-    "h": 6
+    "w": 24,
+    "h": 12
    },
    "expected": {
     "tiles": [
@@ -1652,22 +1876,22 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 3
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 3,
-      "w": 12,
-      "h": 3
+      "y": 6,
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 12,
-      "h": 3
+      "y": 12,
+      "w": 24,
+      "h": 6
      }
     ]
    }
@@ -1681,20 +1905,20 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ],
     "id": "a",
-    "w": 12,
-    "h": 12
+    "w": 24,
+    "h": 24
    },
    "expected": {
     "tiles": [
@@ -1702,15 +1926,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ]
    }
@@ -1724,13 +1948,13 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 12
+      "w": 24,
+      "h": 24
      }
     ],
     "id": "a",
-    "w": 1,
-    "h": 20
+    "w": 2,
+    "h": 40
    },
    "expected": {
     "tiles": [
@@ -1738,8 +1962,8 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 2,
-      "h": 12
+      "w": 4,
+      "h": 24
      }
     ]
    }
@@ -1753,20 +1977,20 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ],
     "id": "a",
-    "w": 3,
-    "h": 12
+    "w": 6,
+    "h": 24
    },
    "expected": {
     "tiles": [
@@ -1774,15 +1998,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 12
+      "w": 6,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ]
    }
@@ -1796,20 +2020,20 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 9,
-      "h": 12
+      "w": 18,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 9,
+      "x": 18,
       "y": 0,
-      "w": 3,
-      "h": 12
+      "w": 6,
+      "h": 24
      }
     ],
     "id": "b",
-    "w": 6,
-    "h": 12
+    "w": 12,
+    "h": 24
    },
    "expected": {
     "tiles": [
@@ -1817,15 +2041,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 9,
-      "h": 12
+      "w": 18,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 9,
+      "x": 18,
       "y": 0,
-      "w": 3,
-      "h": 12
+      "w": 6,
+      "h": 24
      }
     ]
    }
@@ -1839,13 +2063,13 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 12
+      "w": 24,
+      "h": 24
      }
     ],
     "id": "zz",
-    "w": 6,
-    "h": 6
+    "w": 12,
+    "h": 12
    },
    "expected": {
     "tiles": [
@@ -1853,8 +2077,8 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 12
+      "w": 24,
+      "h": 24
      }
     ]
    }
@@ -1868,15 +2092,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ],
     "id": "b"
@@ -1887,8 +2111,8 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 12
+      "w": 24,
+      "h": 24
      }
     ]
    }
@@ -1902,29 +2126,29 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "d",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ],
     "id": "d"
@@ -1935,22 +2159,22 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    }
@@ -1964,22 +2188,22 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 4
+      "w": 24,
+      "h": 8
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 4,
-      "w": 12,
-      "h": 4
+      "y": 8,
+      "w": 24,
+      "h": 8
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 8,
-      "w": 12,
-      "h": 4
+      "y": 16,
+      "w": 24,
+      "h": 8
      }
     ],
     "id": "b"
@@ -1990,15 +2214,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 6
+      "w": 24,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 12,
-      "h": 6
+      "y": 12,
+      "w": 24,
+      "h": 12
      }
     ]
    }
@@ -2012,8 +2236,8 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 12
+      "w": 24,
+      "h": 24
      }
     ],
     "id": "a"
@@ -2031,22 +2255,22 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ],
     "id": "c"
@@ -2057,15 +2281,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ]
    }
@@ -2077,10 +2301,10 @@
     "tiles": [
      {
       "session_id": "a",
-      "x": 3,
-      "y": 3,
-      "w": 3,
-      "h": 3
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
      }
     ],
     "id": "zz"
@@ -2089,10 +2313,10 @@
     "tiles": [
      {
       "session_id": "a",
-      "x": 3,
-      "y": 3,
-      "w": 3,
-      "h": 3
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
      }
     ]
    }
@@ -2104,10 +2328,10 @@
     "tiles": [
      {
       "session_id": "a",
-      "x": 3,
-      "y": 3,
-      "w": 3,
-      "h": 3
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
      }
     ]
    },
@@ -2117,8 +2341,8 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      }
     ]
    }
@@ -2130,17 +2354,17 @@
     "tiles": [
      {
       "session_id": "t1",
-      "x": 3,
+      "x": 6,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      },
      {
       "session_id": "t2",
       "x": 0,
-      "y": 3,
-      "w": 3,
-      "h": 3
+      "y": 6,
+      "w": 6,
+      "h": 6
      }
     ]
    },
@@ -2150,15 +2374,15 @@
       "session_id": "t2",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "t1",
-      "x": 3,
+      "x": 6,
       "y": 0,
-      "w": 3,
-      "h": 6
+      "w": 6,
+      "h": 12
      }
     ]
    }
@@ -2172,15 +2396,15 @@
       "session_id": "blocker",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "t",
-      "x": 6,
-      "y": 6,
-      "w": 3,
-      "h": 3
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 6
      }
     ]
    },
@@ -2190,15 +2414,15 @@
       "session_id": "blocker",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "t",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      }
     ]
    }
@@ -2212,29 +2436,29 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "d",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    },
@@ -2244,29 +2468,29 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "d",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    }
@@ -2278,17 +2502,17 @@
     "tiles": [
      {
       "session_id": "p",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "q",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      }
     ]
    },
@@ -2298,15 +2522,15 @@
       "session_id": "q",
       "x": 0,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      },
      {
       "session_id": "p",
-      "x": 3,
+      "x": 6,
       "y": 0,
-      "w": 3,
-      "h": 3
+      "w": 6,
+      "h": 6
      }
     ]
    }
@@ -2318,24 +2542,24 @@
     "tiles": [
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 12,
-      "h": 6
+      "y": 12,
+      "w": 24,
+      "h": 12
      },
      {
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      }
     ]
    },
@@ -2382,8 +2606,8 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 12
+      "w": 24,
+      "h": 24
      }
     ]
    }
@@ -2412,15 +2636,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ]
    }
@@ -2449,15 +2673,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 6
+      "w": 24,
+      "h": 12
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 6,
-      "w": 12,
-      "h": 6
+      "y": 12,
+      "w": 24,
+      "h": 12
      }
     ]
    }
@@ -2495,22 +2719,22 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    }
@@ -2539,15 +2763,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 4,
-      "h": 12
+      "w": 8,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 4,
+      "x": 8,
       "y": 0,
-      "w": 8,
-      "h": 12
+      "w": 16,
+      "h": 24
      }
     ]
    }
@@ -2585,22 +2809,22 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 7,
-      "h": 12
+      "w": 14,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 7,
+      "x": 14,
       "y": 0,
-      "w": 5,
-      "h": 6
+      "w": 10,
+      "h": 12
      },
      {
       "session_id": "c",
-      "x": 7,
-      "y": 6,
-      "w": 5,
-      "h": 6
+      "x": 14,
+      "y": 12,
+      "w": 10,
+      "h": 12
      }
     ]
    }
@@ -2629,15 +2853,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ]
    }
@@ -2666,15 +2890,15 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 12
+      "w": 12,
+      "h": 24
      }
     ]
    }
@@ -2721,35 +2945,35 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "d",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    }
   },
   {
-   "name": "fst-depth-12-caps-at-8",
+   "name": "fst-deep-chain-caps-at-max-tiles",
    "op": "fromSplitTree",
    "input": {
     "root": {
@@ -2849,8 +3073,80 @@
                  "agent_id": "p12"
                 },
                 "b": {
-                 "type": "pane",
-                 "agent_id": "p13"
+                 "type": "split",
+                 "direction": "row",
+                 "ratio": 0.5,
+                 "a": {
+                  "type": "pane",
+                  "agent_id": "p13"
+                 },
+                 "b": {
+                  "type": "split",
+                  "direction": "row",
+                  "ratio": 0.5,
+                  "a": {
+                   "type": "pane",
+                   "agent_id": "p14"
+                  },
+                  "b": {
+                   "type": "split",
+                   "direction": "row",
+                   "ratio": 0.5,
+                   "a": {
+                    "type": "pane",
+                    "agent_id": "p15"
+                   },
+                   "b": {
+                    "type": "split",
+                    "direction": "row",
+                    "ratio": 0.5,
+                    "a": {
+                     "type": "pane",
+                     "agent_id": "p16"
+                    },
+                    "b": {
+                     "type": "split",
+                     "direction": "row",
+                     "ratio": 0.5,
+                     "a": {
+                      "type": "pane",
+                      "agent_id": "p17"
+                     },
+                     "b": {
+                      "type": "split",
+                      "direction": "row",
+                      "ratio": 0.5,
+                      "a": {
+                       "type": "pane",
+                       "agent_id": "p18"
+                      },
+                      "b": {
+                       "type": "split",
+                       "direction": "row",
+                       "ratio": 0.5,
+                       "a": {
+                        "type": "pane",
+                        "agent_id": "p19"
+                       },
+                       "b": {
+                        "type": "split",
+                        "direction": "row",
+                        "ratio": 0.5,
+                        "a": {
+                         "type": "pane",
+                         "agent_id": "p20"
+                        },
+                        "b": {
+                         "type": "pane",
+                         "agent_id": "p21"
+                        }
+                       }
+                      }
+                     }
+                    }
+                   }
+                  }
+                 }
                 }
                }
               }
@@ -2871,56 +3167,112 @@
       "session_id": "p01",
       "x": 0,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "p05",
-      "x": 3,
+      "x": 6,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "p02",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 3,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "p06",
-      "x": 9,
+      "x": 18,
       "y": 0,
-      "w": 3,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p09",
+      "x": 0,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p10",
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p11",
+      "x": 12,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p12",
+      "x": 18,
+      "y": 6,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "p03",
       "x": 0,
-      "y": 6,
-      "w": 3,
+      "y": 12,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "p07",
-      "x": 3,
-      "y": 6,
-      "w": 3,
+      "x": 6,
+      "y": 12,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "p04",
-      "x": 6,
-      "y": 6,
-      "w": 3,
+      "x": 12,
+      "y": 12,
+      "w": 6,
       "h": 6
      },
      {
       "session_id": "p08",
-      "x": 9,
-      "y": 6,
-      "w": 3,
+      "x": 18,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p13",
+      "x": 0,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p14",
+      "x": 6,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p15",
+      "x": 12,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p16",
+      "x": 18,
+      "y": 18,
+      "w": 6,
       "h": 6
      }
     ]
@@ -2968,29 +3320,29 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 12,
-      "h": 3
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "b",
       "x": 0,
-      "y": 3,
-      "w": 12,
-      "h": 3
+      "y": 6,
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 12,
-      "h": 3
+      "y": 12,
+      "w": 24,
+      "h": 6
      },
      {
       "session_id": "d",
       "x": 0,
-      "y": 9,
-      "w": 12,
-      "h": 3
+      "y": 18,
+      "w": 24,
+      "h": 6
      }
     ]
    }
@@ -3037,29 +3389,29 @@
       "session_id": "a",
       "x": 0,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "b",
-      "x": 6,
+      "x": 12,
       "y": 0,
-      "w": 6,
-      "h": 6
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "c",
       "x": 0,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "y": 12,
+      "w": 12,
+      "h": 12
      },
      {
       "session_id": "d",
-      "x": 6,
-      "y": 6,
-      "w": 6,
-      "h": 6
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
      }
     ]
    }

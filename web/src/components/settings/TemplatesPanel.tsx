@@ -16,7 +16,7 @@ function templateSummary(template: WorkspaceTemplate): string {
     .filter((tile) => tile.run.kind === "agent").length;
   const parts = [
     `${tabs} ${tabs === 1 ? "tab" : "tabs"}`,
-    `${panes} ${panes === 1 ? "pane" : "panes"}`,
+    `${panes} ${panes === 1 ? "window" : "windows"}`,
   ];
   if (agents > 0) parts.push(`${agents} ${agents === 1 ? "agent" : "agents"}`);
   return parts.join(" · ");
@@ -74,8 +74,8 @@ export function TemplatesPanel() {
       <div>
         <h2 className="text-sm font-semibold">Workspace templates</h2>
         <p className="mt-1 text-xs text-muted-foreground">
-          A template is a workspace's shape — its tabs, pane arrangement, and what runs in each
-          pane. Save one from a workspace's ⋯ menu; create from one via the New workspace button.
+          A template is a workspace's shape — its tabs, window arrangement, and what runs in each
+          window. Save one from a workspace's ⋯ menu; create from one via the New workspace button.
         </p>
       </div>
 

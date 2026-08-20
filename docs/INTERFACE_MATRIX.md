@@ -22,12 +22,13 @@ and `daemon/`. `proto/README.md` remains the exhaustive wire reference.
 | Pair a host | onboarding, `/device`, Settings → Hosts | `/api/auth/device/{start,possession,poll,pending,approve}` | `auth.pendingDevice`, `auth.approveDevice` | device-code login and possession proof |
 | List/get/rename/delete hosts | Settings → Hosts, `/hosts/[id]` | `GET /api/hosts`, `GET/PATCH/DELETE /api/hosts/{id}` | `hosts.list/get/rename/remove` | registration and presence over daemon WS |
 | Check/install configured agents on a host | Settings → Hosts/Agents, session shortcut bar | `GET /api/hosts/{id}/agents`; `POST /api/hosts/{id}/agents/{agent_id}/install`; `PATCH /api/hosts/{id}/agents/{agent_id}/policy` | `hosts.agents/installAgent/updateAgentPolicy` | `host.agents.check` / `check_result`; `host.agents.install` / `install_result` |
-| Recent session directories | new-session cascade | `GET /api/hosts/{id}/recent-dirs` → `{dirs:[{path,last_used_at}]}` (newest first, max 8) | `hosts.recentDirs` | none |
+| Recent session directories | none — the folder browser answers "where" now; the route and its client helper remain | `GET /api/hosts/{id}/recent-dirs` → `{dirs:[{path,last_used_at}]}` (newest first, max 8) | `hosts.recentDirs` | none |
 | Host files | folder picker, file explorer | none; only signaling is server-mediated | `HostControlClient` | capability-rooted `spawn.host.ctl` `fs.*` requests and bounded streams |
 | List/create/get/rename/delete sessions | sidebar, workspace grid, `/sessions/[id]` | `GET/POST /api/sessions`, `GET/PATCH/DELETE /api/sessions/{id}`; list accepts only optional `host_id` | `sessions.*` | `session.create`, `session.kill`; terminal over direct channels |
 | Restart a session | sidebar, pane/full-session actions | `POST /api/sessions/{id}/restart` | `sessions.restart` | `session.restart` starts a login shell in the stored `cwd` |
 | Session skill access | Settings → Skills and session access consumers | `GET/PATCH /api/sessions/{id}/access` | `sessionAccess.get/update` | skills are included in `session.create` / `session.restart` and materialized per session |
 | List/create/get/update/delete workspaces | sidebar and `/w/[id]` | `GET/POST /api/workspaces`, `GET/PATCH/DELETE /api/workspaces/{id}` | `workspaces.*` | deleting a workspace best-effort kills every session referenced by its tiles |
+| Archive / restore a workspace | sidebar Archived drawer, `/w/[id]` | `POST /api/workspaces/{id}/{archive,unarchive}` | `workspaces.archive/unarchive` | archiving stops every session and keeps the rows, layout and sidebar slot; restoring restarts the same sessions in place |
 | Manage agent definitions | Settings → Agents, shortcut bar | `GET/POST /api/agents`, `PATCH/DELETE /api/agents/{id}` | `agents.*` | definitions are typed into the shell; built-ins are immutable through write routes |
 | Manage skills | Settings → Skills | `GET/POST /api/skills`, `PATCH/DELETE /api/skills/{id}` | `skills.*` | materialized into the session environment/config root |
 | Browser devices and trust | Settings → Browser devices / Device trust | `/api/browser-devices/*`, `/api/trust/{bundle,passkeys,endorsements,hosts/.../pins}` | `browserDevices.*`, `trust.*` | signed signaling and daemon-local browser pins |
@@ -103,7 +104,7 @@ the remaining geometry. Auto-placement returns HTTP 409 `workspace_full` when it
 legally add another tile.
 
 The canonical algebra is implemented in `server/spawn_server/grid.py` and
-`web/src/lib/grid.ts`; both consume `proto/layout-v2-fixtures.json`. Reading
+`web/src/lib/grid.ts`; both consume `proto/layout-v3-fixtures.json`. Reading
 order is `(y, x)` and drives the mobile stack and keyboard focus order.
 
 ## Web routes

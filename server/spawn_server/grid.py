@@ -1,8 +1,8 @@
-"""Workspace grid algebra — layout schema v2 (§4.4 of docs/OVERHAUL.md).
+"""Workspace grid algebra — grid schema v3 (§4.4 of docs/OVERHAUL.md).
 
 Pure and deterministic: the same functions exist in TypeScript as
 ``web/src/lib/grid.ts``, and both implementations must pass the shared
-fixture suite ``proto/layout-v2-fixtures.json`` — where prose and fixtures
+fixture suite ``proto/layout-v3-fixtures.json`` — where prose and fixtures
 disagree, the fixtures win. Used by layout validation, server-side
 auto-placement, and migration 0031.
 
@@ -16,10 +16,19 @@ from __future__ import annotations
 import math
 from typing import Any
 
-GRID_COLS = 12
-GRID_ROWS = 12
-MIN_TILE_SIZE = 2
-MAX_TILES = 8
+# Grid schema version — see the note in the TypeScript twin. Bumped with the
+# 12x12 -> 24x24 canvas so a stored layout says which space it is measured in.
+LAYOUT_VERSION = 3
+# The canvas grid schema v2 was measured in. Kept so the v2 -> v3 lift (the
+# API's compatibility path and migration 0037) can derive the scale rather
+# than hard-coding a factor that would rot the next time the canvas changes.
+V2_GRID_COLS = 12
+V2_GRID_ROWS = 12
+
+GRID_COLS = 24
+GRID_ROWS = 24
+MIN_TILE_SIZE = 4
+MAX_TILES = 16
 
 Tile = dict[str, Any]
 Rect = dict[str, int]
@@ -69,7 +78,7 @@ def validate_layout(layout: object) -> dict[str, Any]:
         return {"ok": False, "errors": [{"code": "shape"}]}
     tiles = layout["tiles"]
 
-    if layout.get("version") != 2:
+    if layout.get("version") != LAYOUT_VERSION:
         errors.append({"code": "version"})
     if len(tiles) > MAX_TILES:
         errors.append({"code": "count"})
@@ -123,7 +132,33 @@ def validate_tiles(tiles: object) -> bool:
     """Validate a bare tile list against the invariants."""
     if not isinstance(tiles, list):
         return False
-    return validate({"version": 2, "tiles": tiles})
+    return validate({"version": LAYOUT_VERSION, "tiles": tiles})
+
+
+def lift_layout(layout: object) -> Any:
+    """A grid in the current space, scaling a v2 (12x12) one on the way.
+
+    The single place the 12 -> 24 conversion happens outside migration 0037:
+    both the API's write path and its read path go through here, so a database
+    that has not been migrated yet still serves and accepts correct geometry,
+    and a stored grid is never relabelled without its coordinates moving with
+    it. Anything already at the current version is returned untouched.
+    """
+    if not isinstance(layout, dict) or layout.get("version") != 2:
+        return layout
+    scale = GRID_COLS // V2_GRID_COLS
+    tiles = []
+    for tile in layout.get("tiles") or []:
+        if not isinstance(tile, dict):
+            tiles.append(tile)
+            continue
+        scaled = dict(tile)
+        for key in ("x", "y", "w", "h"):
+            value = scaled.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                scaled[key] = value * scale
+        tiles.append(scaled)
+    return {**layout, "version": LAYOUT_VERSION, "tiles": tiles}
 
 
 def reading_order(tiles: list[Tile]) -> list[str]:
@@ -428,7 +463,7 @@ def _split_tree_panes(node: dict[str, Any] | None, out: list[str]) -> None:
 
 
 def from_split_tree(root: dict[str, Any] | None) -> list[Tile]:
-    """Convert a v1 split tree to v2 tiles (migration 0031).
+    """Convert a v1 split tree to grid tiles (migration 0031).
 
     Float edges are assigned recursively from ``(0, 0, 12, 12)`` and rounded
     with ``floor(v + 0.5)``. If any rounded tile ends below the 2×2 minimum,

@@ -1,5 +1,5 @@
-import { agentDisplayName } from "@/lib/agent-identity";
-import type { Session } from "@/lib/api";
+import { agentDisplayName, commandBasename } from "@/lib/agent-identity";
+import type { Agent, Session } from "@/lib/api";
 
 /**
  * Pure derivation helpers for sessions: display titles, activity labels and
@@ -109,4 +109,22 @@ export function isShellCommand(command: string | null | undefined): boolean {
  */
 export function sessionAtShell(session: Session): boolean {
   return session.foreground_command === null || isShellCommand(session.foreground_command);
+}
+
+/**
+ * Which installed agent a session is running, matched on the daemon-reported
+ * foreground process: its basename against the first real word of an agent's
+ * command (env assignments skipped, path stripped). Null for a shell prompt,
+ * or for a foreground process no agent claims — the caller then treats the
+ * session as a plain shell.
+ */
+export function runningAgent<T extends Pick<Agent, "command">>(
+  session: Pick<Session, "foreground_command"> | undefined,
+  agents: readonly T[],
+): T | null {
+  const reported = session?.foreground_command?.trim();
+  if (!reported || isShellCommand(reported)) return null;
+  // Login shells prefix argv[0] with "-"; the same can reach any basename.
+  const name = (reported.startsWith("-") ? reported.slice(1) : reported).toLowerCase();
+  return agents.find((agent) => commandBasename(agent.command).toLowerCase() === name) ?? null;
 }

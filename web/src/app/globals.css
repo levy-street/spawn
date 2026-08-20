@@ -520,6 +520,28 @@ body {
   }
 }
 
+/* The pane launcher becomes a bin for the length of any drag. The wobble is
+ * what says so at a glance — a button that only swapped its icon reads as the
+ * same button. Rests at neutral on the last frame, so the global
+ * reduced-motion rule below leaves it sitting straight. */
+@keyframes bin-jiggle {
+  0% {
+    transform: rotate(0deg);
+  }
+  25% {
+    transform: rotate(-7deg);
+  }
+  75% {
+    transform: rotate(7deg);
+  }
+  100% {
+    transform: rotate(0deg);
+  }
+}
+.bin-jiggle {
+  animation: bin-jiggle 0.45s ease-in-out infinite;
+}
+
 /* Honor reduced-motion globally: collapse all transitions/animations to
  * near-instant so the shell stays fully usable without motion. */
 @media (prefers-reduced-motion: reduce) {

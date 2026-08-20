@@ -7,6 +7,7 @@ import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
 import { Spinner } from "@/components/ui/spinner";
 import { toast } from "@/components/ui/toast";
+import { ArchivedBanner } from "@/components/workspace/archived-banner";
 import { LauncherFab } from "@/components/workspace/launcher-fab";
 import { WorkspaceGrid } from "@/components/workspace/workspace-grid";
 import { WorkspaceTabs } from "@/components/workspace/workspace-tabs";
@@ -41,9 +42,13 @@ function WorkspaceView({ workspaceId }: { workspaceId: string }) {
     if (message) toast.error(message);
   }, []);
   const [chosenTabId, setChosenTabId] = useState<string | null>(() => searchParams.get("tab"));
-  // The grid's live drag preview; the strip restyles the selected tab from it
-  // mid-gesture instead of waiting for the drop to commit.
+  // The layout a live drag is promising, from the grid's own gestures or from
+  // a pane dragged off the launcher. The strip restyles the selected tab from
+  // it, and the launcher's version is what the grid renders its panes at.
   const [previewTiles, setPreviewTiles] = useState<Tile[] | null>(null);
+  // A pane is being carried on the canvas, which turns the launcher into the
+  // bin for that drag.
+  const [draggingPane, setDraggingPane] = useState(false);
 
   const workspaceQ = useQuery({
     queryKey: ["workspace", workspaceId],
@@ -54,7 +59,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: string }) {
   });
   const workspacesQ = useQuery({
     queryKey: ["workspaces"],
-    queryFn: workspaces.list,
+    queryFn: () => workspaces.list(),
     staleTime: 10_000,
   });
   const sessionsQ = useQuery({
@@ -66,6 +71,14 @@ function WorkspaceView({ workspaceId }: { workspaceId: string }) {
   useEffect(() => {
     window.localStorage.setItem("spawn.workspaces.last", workspaceId);
   }, [workspaceId]);
+
+  // Archived from somewhere else (this device's sidebar, another tab): the
+  // lists it belongs to have changed even though this page can still show it,
+  // as the snapshot it has become.
+  useEffect(() => {
+    if (!workspaceQ.data?.archived_at) return;
+    queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+  }, [queryClient, workspaceQ.data?.archived_at]);
 
   useEffect(() => {
     if (!(workspaceQ.error instanceof ApiError) || workspaceQ.error.status !== 404) return;
@@ -150,6 +163,8 @@ function WorkspaceView({ workspaceId }: { workspaceId: string }) {
         onError={reportError}
       />
 
+      {workspace.archived_at && <ArchivedBanner workspace={workspace} />}
+
       <div className="flex min-h-0 flex-1">
         <WorkspaceGrid
           workspace={workspace}
@@ -158,18 +173,24 @@ function WorkspaceView({ workspaceId }: { workspaceId: string }) {
           initialFocusId={searchParams.get("focus")}
           onFocusChange={setFocusedId}
           onSwitchTab={switchTab}
+          previewTiles={previewTiles}
           onPreviewTiles={setPreviewTiles}
+          onDraggingPane={setDraggingPane}
           onError={reportError}
         />
       </div>
 
-      <LauncherFab
-        workspace={workspace}
-        tabId={activeTabId ?? activeTab(workspace.layout).id}
-        onCreated={({ sessionId }) => {
-          if (sessionId) router.push(`/w/${workspace.id}?focus=${sessionId}`);
-        }}
-      />
+      {!workspace.archived_at && (
+        <LauncherFab
+          workspace={workspace}
+          tabId={activeTabId ?? activeTab(workspace.layout).id}
+          paneDragging={draggingPane}
+          onPreviewTiles={setPreviewTiles}
+          onCreated={({ sessionId }) => {
+            if (sessionId) router.push(`/w/${workspace.id}?focus=${sessionId}`);
+          }}
+        />
+      )}
     </div>
   );
 }

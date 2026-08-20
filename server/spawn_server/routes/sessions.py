@@ -206,7 +206,7 @@ def _append_tile(
         placed.append({"session_id": session_id, **rect})
         placed_tiles = placed
     tabs = [
-        {**item, "layout": {"version": 2, "tiles": placed_tiles}}
+        {**item, "layout": {"version": grid.LAYOUT_VERSION, "tiles": placed_tiles}}
         if item["id"] == target["id"]
         else item
         for item in layout["tabs"]
@@ -284,6 +284,10 @@ async def create_session(
         workspace = await db.get(Workspace, body.workspace_id)
         if workspace is None or workspace.owner_user_id != user.id:
             raise HTTPException(status_code=404, detail="workspace not found")
+        # Nothing runs in an archived workspace — that is what archiving is
+        # for — so a new session would quietly undo it. Restore first.
+        if workspace.archived_at is not None:
+            raise HTTPException(status_code=409, detail="workspace_archived")
 
     session_row = await create_session_row(
         db,
@@ -362,6 +366,35 @@ async def restart_session(
         skills=skills,
     )
     return _to_out(session_row, host.name)
+
+
+async def stop_session(db: AsyncSession, session_row: Session) -> None:
+    """Send session.kill (best effort) and keep the row: the window stays.
+
+    The counterpart to `kill_and_delete_session`, and the difference is the
+    whole point of archiving: the process tree, the PTY and the worker holding
+    them go away — nothing of this session runs on the host any more — while
+    the row it is addressed by survives, so the tile still points somewhere and
+    `session.restart` can bring the same session back in the same folder.
+    """
+    broker = get_broker()
+    daemon = broker.get_daemon_for_session(session_row.id) or broker.get_daemon_for_host(
+        session_row.host_id
+    )
+    if daemon is not None:
+        try:
+            await daemon.send_text(
+                {"type": "session.kill", "session_id": session_row.id, "signal": "TERM"}
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("session.kill dispatch failed: %s", e)
+    await broker.detach_session(session_row.id)
+    # Written here rather than waited for: the daemon confirms the exit with a
+    # status frame, but an offline host never will, and a stopped workspace
+    # must not read as still running because its host was unreachable.
+    session_row.status = "killed"
+    session_row.exited_at = _utcnow()
+    session_row.foreground_command = None
 
 
 async def kill_and_delete_session(db: AsyncSession, session_row: Session) -> None:
