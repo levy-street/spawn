@@ -13,16 +13,16 @@ export interface RemoveDeviceDialogProps {
   isThisDevice?: boolean;
   /** Hosts only this device can unlock (R5). Removing it strands them. */
   orphans?: OrphanVM[];
-  recoveryOn: boolean;
+  hasPasskey: boolean;
   onRemove?: () => void;
   onCancel?: () => void;
-  onTurnOnRecovery?: () => void;
+  onAddPasskey?: () => void;
 }
 
 /**
  * Revocation, in one breath: instant, everywhere, permanent (P3 + R1 + R10).
  * If the device is some host's only way in, the dialog says which (R5) and
- * steers to recovery first — but never blocks. The passkey-protects-it promise
+ * steers to a passkey first — but never blocks. The passkey-protects-it promise
  * is only made for hosts that are online: an offline host can't be
  * healed before the removal lands.
  */
@@ -30,10 +30,10 @@ export function RemoveDeviceDialog({
   deviceName,
   isThisDevice = false,
   orphans = [],
-  recoveryOn,
+  hasPasskey,
   onRemove,
   onCancel,
-  onTurnOnRecovery,
+  onAddPasskey,
 }: RemoveDeviceDialogProps) {
   const online = orphans.filter((o) => o.online).map((o) => o.name);
   const offline = orphans.filter((o) => !o.online).map((o) => o.name);
@@ -43,13 +43,13 @@ export function RemoveDeviceDialog({
     const one = online.length === 1;
     parts.push(
       `${formatList(online)} ${one ? "trusts" : "trust"} only this device.${
-        recoveryOn
+        hasPasskey
           ? ` You'll confirm with your passkey so ${one ? "it stays" : "they stay"} reachable.`
           : ` Remove it and ${
               one
                 ? "it must be possessed again from its terminal"
                 : "they must be possessed again from their terminals"
-            } — or turn on recovery first.`
+            } — or add a passkey first.`
       }`,
     );
   }
@@ -83,10 +83,10 @@ export function RemoveDeviceDialog({
         </div>
       )}
       <div className="mt-4 flex flex-col gap-2">
-        {online.length > 0 && !recoveryOn ? (
+        {online.length > 0 && !hasPasskey ? (
           <>
-            <Button full onClick={onTurnOnRecovery}>
-              Turn on recovery first
+            <Button full onClick={onAddPasskey}>
+              Add a passkey first
             </Button>
             <Button full variant="danger" onClick={onRemove}>
               Remove anyway

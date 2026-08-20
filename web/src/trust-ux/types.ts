@@ -6,10 +6,13 @@ export interface DeviceVM {
   name: string;
   kind: DeviceKind;
   isThisDevice?: boolean;
-  /** "Linked by MacBook Pro · Jun 3" | "First device" | "Added by recovery · Jul 2" */
+  /** "Approved by MacBook Pro · Jun 3" | "First device" | "Signed in with passkey · Jul 2"
+      — or, while waiting, "Signed in 2m ago". */
   provenance: string;
   /** "Now" | "2h ago" | "Jun 12" */
   lastSeen: string;
+  /** Signed in but not yet approved: visible immediately (R4), amber, with Approve. */
+  waiting?: boolean;
 }
 
 export interface HostVM {
@@ -20,7 +23,7 @@ export interface HostVM {
   online: boolean;
 }
 
-export type TrustEventKind = "added" | "removed" | "recovery";
+export type TrustEventKind = "approved" | "removed" | "passkey";
 
 /** One line of the trust log (R4): plain sentence + when. */
 export interface TrustEventVM {
@@ -30,10 +33,8 @@ export interface TrustEventVM {
   kind: TrustEventKind;
 }
 
-export type RecoveryVM = { on: true; detail: string } | { on: false };
-
 /**
  * The number check (committed SAS, A5). One component serves both ceremonies:
- * linking a device and connecting a computer.
+ * approving a device and possessing a host.
  */
 export type CeremonyPhase = "connecting" | "compare" | "waiting" | "done" | "stopped";

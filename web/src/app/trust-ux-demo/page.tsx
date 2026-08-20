@@ -3,10 +3,9 @@
 import type { ReactNode } from "react";
 import { AccessBlocked } from "@/trust-ux/AccessBlocked";
 import { AccessScreen } from "@/trust-ux/AccessScreen";
-import { LinkNewDevice, LinkRequest, LinkRequestToast } from "@/trust-ux/LinkDevice";
+import { ApproveRequest, ApproveRequestToast, WaitingForApproval } from "@/trust-ux/ApproveDevice";
 import { NumberCheck } from "@/trust-ux/NumberCheck";
 import { PossessHost } from "@/trust-ux/PossessHost";
-import { ResetRecoveryDialog, TurnOnRecoveryDialog } from "@/trust-ux/Recovery";
 import { RemoveDeviceDialog } from "@/trust-ux/RemoveDevice";
 import { TrustHistory } from "@/trust-ux/TrustHistory";
 import type { DeviceVM, HostVM, TrustEventVM } from "@/trust-ux/types";
@@ -26,17 +25,26 @@ const devices: DeviceVM[] = [
     id: "d2",
     name: "iPhone",
     kind: "phone",
-    provenance: "Linked by MacBook Pro · Jun 3",
+    provenance: "Approved by MacBook Pro · Jun 3",
     lastSeen: "2h ago",
   },
   {
     id: "d3",
     name: "Pixel 9",
     kind: "phone",
-    provenance: "Added by recovery · Jul 2",
+    provenance: "Signed in with passkey · Jul 2",
     lastSeen: "Aug 12",
   },
 ];
+
+const waitingDevice: DeviceVM = {
+  id: "d4",
+  name: "Firefox on Mac",
+  kind: "laptop",
+  provenance: "Signed in 2 minutes ago",
+  lastSeen: "Now",
+  waiting: true,
+};
 
 const hosts: HostVM[] = [
   { id: "c1", name: "mac-studio", provenance: "Possessed by MacBook Pro · May 28", online: true },
@@ -44,12 +52,12 @@ const hosts: HostVM[] = [
 ];
 
 const history: TrustEventVM[] = [
-  { id: "e1", text: "Recovery restored Pixel 9", when: "Jul 2", kind: "recovery" },
-  { id: "e2", text: "iPhone possessed dev-box", when: "Jun 20", kind: "added" },
-  { id: "e3", text: "MacBook Pro linked iPhone", when: "Jun 3", kind: "added" },
-  { id: "e4", text: "MacBook Pro possessed mac-studio", when: "May 28", kind: "added" },
+  { id: "e1", text: "Pixel 9 signed in with passkey", when: "Jul 2", kind: "passkey" },
+  { id: "e2", text: "iPhone possessed dev-box", when: "Jun 20", kind: "approved" },
+  { id: "e3", text: "MacBook Pro approved iPhone", when: "Jun 3", kind: "approved" },
+  { id: "e4", text: "MacBook Pro possessed mac-studio", when: "May 28", kind: "approved" },
   { id: "e5", text: "Old iPad removed by MacBook Pro", when: "Apr 19", kind: "removed" },
-  { id: "e6", text: "Recovery turned on", when: "Apr 2", kind: "recovery" },
+  { id: "e6", text: "Passkey added", when: "Apr 2", kind: "passkey" },
 ];
 
 export default function TrustUxDemoPage() {
@@ -61,42 +69,56 @@ export default function TrustUxDemoPage() {
             spawn trust — every screen, every state
           </h1>
           <p className="mt-2 text-sm leading-relaxed text-zinc-500">
-            Three nouns (device, host, recovery), three verbs (link, possess, remove), one artifact
-            (the number). Nothing else reaches a screen.
+            Two nouns (device, host), three verbs (approve, possess, remove), one artifact (the
+            number) — plus the passkey, borrowed from the platform, never taught. Nothing else
+            reaches a screen.
           </p>
         </header>
 
         <DemoSection
           id="roster"
           title="Access — the one destination"
-          blurb="Everything about trust lives on one screen. Row provenance and history lines are the audit trail, in plain words."
+          blurb="A device appears here the moment it signs in; approval is the transition, not the insertion. Row provenance and history lines are the audit trail, in plain words."
         >
-          <Variant label="Recovery on">
+          <Variant label="Default">
             <PagePanel>
               <AccessScreen
                 devices={devices}
                 hosts={hosts}
-                recovery={{ on: true, detail: "Your passkey can bring everything back." }}
                 history={history}
-                onLinkDevice={noop}
+                onNewDevice={noop}
                 onPossessHost={noop}
                 onDeviceOptions={noop}
-                onResetRecovery={noop}
                 onShowHistory={noop}
               />
             </PagePanel>
           </Variant>
-          <Variant label="Recovery off (no-passkey mode)">
+          <Variant label="A device waiting for approval">
+            <PagePanel>
+              <AccessScreen
+                devices={[...devices.slice(0, 2), waitingDevice]}
+                hosts={hosts}
+                history={history}
+                onNewDevice={noop}
+                onPossessHost={noop}
+                onApproveDevice={noop}
+                onDeviceOptions={noop}
+                onShowHistory={noop}
+              />
+            </PagePanel>
+          </Variant>
+          <Variant label="No passkey — the one nudge">
             <PagePanel>
               <AccessScreen
                 devices={devices.slice(0, 2)}
                 hosts={hosts}
-                recovery={{ on: false }}
-                history={history.filter((e) => e.kind !== "recovery")}
-                onLinkDevice={noop}
+                history={history.filter((e) => e.kind !== "passkey")}
+                passkeyNudge
+                onNewDevice={noop}
                 onPossessHost={noop}
                 onDeviceOptions={noop}
-                onTurnOnRecovery={noop}
+                onAddPasskey={noop}
+                onDismissNudge={noop}
                 onShowHistory={noop}
               />
             </PagePanel>
@@ -106,7 +128,7 @@ export default function TrustUxDemoPage() {
         <DemoSection
           id="desktop"
           title="Desktop"
-          blurb="The same system in an app window: the roster as a settings pane, the row menu, confirms over the page, and a link request arriving as a corner toast."
+          blurb="The same system in an app window: the roster as a settings pane, the row menu, confirms over the page, and an approval request arriving as a corner toast."
         >
           <Variant label="Settings — row menu open">
             <DesktopFrame>
@@ -114,15 +136,13 @@ export default function TrustUxDemoPage() {
                 wide
                 devices={devices}
                 hosts={hosts}
-                recovery={{ on: true, detail: "Your passkey can bring everything back." }}
                 history={history}
                 openMenuDeviceId="d2"
-                onLinkDevice={noop}
+                onNewDevice={noop}
                 onPossessHost={noop}
                 onDeviceOptions={noop}
                 onRenameDevice={noop}
                 onRemoveDevice={noop}
-                onResetRecovery={noop}
                 onShowHistory={noop}
               />
             </DesktopFrame>
@@ -132,7 +152,7 @@ export default function TrustUxDemoPage() {
               overlay={
                 <RemoveDeviceDialog
                   deviceName="iPhone"
-                  recoveryOn
+                  hasPasskey
                   onRemove={noop}
                   onCancel={noop}
                 />
@@ -142,22 +162,20 @@ export default function TrustUxDemoPage() {
                 wide
                 devices={devices}
                 hosts={hosts}
-                recovery={{ on: true, detail: "Your passkey can bring everything back." }}
                 history={history}
-                onLinkDevice={noop}
+                onNewDevice={noop}
                 onPossessHost={noop}
                 onDeviceOptions={noop}
-                onResetRecovery={noop}
                 onShowHistory={noop}
               />
             </DesktopFrame>
           </Variant>
-          <Variant label="A new device asks to link — corner toast">
+          <Variant label="A new device asks — waiting row + corner toast">
             <DesktopFrame
               toast={
-                <LinkRequestToast
-                  deviceName="Pixel 9"
-                  deviceKind="phone"
+                <ApproveRequestToast
+                  deviceName="Firefox on Mac"
+                  deviceKind="laptop"
                   onEnterNumber={noop}
                   onIgnore={noop}
                 />
@@ -165,14 +183,13 @@ export default function TrustUxDemoPage() {
             >
               <AccessScreen
                 wide
-                devices={devices.slice(0, 2)}
+                devices={[...devices.slice(0, 2), waitingDevice]}
                 hosts={hosts}
-                recovery={{ on: true, detail: "Your passkey can bring everything back." }}
                 history={history}
-                onLinkDevice={noop}
+                onNewDevice={noop}
                 onPossessHost={noop}
+                onApproveDevice={noop}
                 onDeviceOptions={noop}
-                onResetRecovery={noop}
                 onShowHistory={noop}
               />
             </DesktopFrame>
@@ -181,14 +198,14 @@ export default function TrustUxDemoPage() {
 
         <DemoSection
           id="link-device"
-          title="Link a new device"
-          blurb="Both sides of the link. The new device shows the number; the trusted device types it — entering is the check, so it can't be waved through. With a passkey none of these screens exist: signing in is the whole flow."
+          title="Approve a device"
+          blurb="Both sides of the approval. The new device shows the number; the trusted device types it — entering is the check, so it can't be waved through. With a passkey none of these screens exist: signing in is the approval."
         >
           <Variant label="New device — waiting">
-            <LinkNewDevice onCancel={noop} />
+            <WaitingForApproval onCancel={noop} />
           </Variant>
           <Variant label="Existing device — request">
-            <LinkRequest
+            <ApproveRequest
               deviceName="iPhone"
               deviceKind="phone"
               account="jeremy@levystreet.com"
@@ -201,7 +218,7 @@ export default function TrustUxDemoPage() {
               phase="compare"
               mode="show"
               number="923 579"
-              title="Link this device"
+              title="Approve this device"
               otherScreen="on the device you already use"
               doneText=""
               onClose={noop}
@@ -211,7 +228,7 @@ export default function TrustUxDemoPage() {
             <NumberCheck
               phase="compare"
               mode="enter"
-              title="Link iPhone"
+              title="Approve iPhone"
               otherScreen="on the new device"
               doneText=""
               onSubmit={noop}
@@ -222,7 +239,7 @@ export default function TrustUxDemoPage() {
             <NumberCheck
               phase="compare"
               mode="enter"
-              title="Link iPhone"
+              title="Approve iPhone"
               otherScreen="on the new device"
               doneText=""
               entryError="That's not it — 2 tries left."
@@ -234,9 +251,9 @@ export default function TrustUxDemoPage() {
             <NumberCheck
               phase="done"
               mode="enter"
-              title="Link iPhone"
+              title="Approve iPhone"
               otherScreen="on the new device"
-              doneText="iPhone is linked. Every host is ready."
+              doneText="iPhone is approved. Every host is ready."
               onDone={noop}
             />
           </Variant>
@@ -297,7 +314,7 @@ export default function TrustUxDemoPage() {
             <NumberCheck
               phase="connecting"
               mode="enter"
-              title="Link iPhone"
+              title="Approve iPhone"
               otherScreen="on the new device"
               doneText=""
             />
@@ -307,7 +324,7 @@ export default function TrustUxDemoPage() {
               phase="waiting"
               mode="show"
               number="923 579"
-              title="Link this device"
+              title="Approve this device"
               otherScreen="on the other device"
               doneText=""
             />
@@ -317,7 +334,7 @@ export default function TrustUxDemoPage() {
               phase="waiting"
               mode="show"
               number="923 579"
-              title="Link this device"
+              title="Approve this device"
               otherScreen="on the other device"
               doneText=""
               slowHint
@@ -327,7 +344,7 @@ export default function TrustUxDemoPage() {
             <NumberCheck
               phase="stopped"
               mode="enter"
-              title="Link iPhone"
+              title="Approve iPhone"
               otherScreen="on the new device"
               doneText=""
               onClose={noop}
@@ -341,23 +358,23 @@ export default function TrustUxDemoPage() {
           blurb="Instant, everywhere, permanent — one breath. If a host would be stranded, the dialog names it — and only promises the passkey fix when the host is online to receive it."
         >
           <Variant label="Standard">
-            <RemoveDeviceDialog deviceName="iPhone" recoveryOn onRemove={noop} onCancel={noop} />
+            <RemoveDeviceDialog deviceName="iPhone" hasPasskey onRemove={noop} onCancel={noop} />
           </Variant>
-          <Variant label="Would strand a host — recovery off">
+          <Variant label="Would strand a host — no passkey">
             <RemoveDeviceDialog
               deviceName="MacBook Pro"
               orphans={[{ name: "mac-studio", online: true }]}
-              recoveryOn={false}
+              hasPasskey={false}
               onRemove={noop}
               onCancel={noop}
-              onTurnOnRecovery={noop}
+              onAddPasskey={noop}
             />
           </Variant>
-          <Variant label="Would strand a host — recovery on">
+          <Variant label="Would strand a host — with passkey">
             <RemoveDeviceDialog
               deviceName="MacBook Pro"
               orphans={[{ name: "mac-studio", online: true }]}
-              recoveryOn
+              hasPasskey
               onRemove={noop}
               onCancel={noop}
             />
@@ -366,7 +383,7 @@ export default function TrustUxDemoPage() {
             <RemoveDeviceDialog
               deviceName="iPhone"
               orphans={[{ name: "dev-box", online: false }]}
-              recoveryOn
+              hasPasskey
               onRemove={noop}
               onCancel={noop}
             />
@@ -375,23 +392,10 @@ export default function TrustUxDemoPage() {
             <RemoveDeviceDialog
               deviceName="MacBook Pro"
               isThisDevice
-              recoveryOn
+              hasPasskey
               onRemove={noop}
               onCancel={noop}
             />
-          </Variant>
-        </DemoSection>
-
-        <DemoSection
-          id="recovery"
-          title="Recovery"
-          blurb="One passkey, sold as what it does. Turning it on is the only decision; everything after is automatic."
-        >
-          <Variant label="Turn on">
-            <TurnOnRecoveryDialog onCreate={noop} onNotNow={noop} />
-          </Variant>
-          <Variant label="Reset">
-            <ResetRecoveryDialog onReset={noop} onCancel={noop} />
           </Variant>
         </DemoSection>
 
@@ -404,19 +408,19 @@ export default function TrustUxDemoPage() {
             <AccessBlocked
               variant="removed"
               detail="Removed Aug 12 by MacBook Pro."
-              onLink={noop}
+              onStartOver={noop}
               onSignOut={noop}
             />
           </Variant>
-          <Variant label="Not linked yet">
-            <AccessBlocked variant="not-linked" onLink={noop} onSignOut={noop} />
+          <Variant label="Not approved yet">
+            <AccessBlocked variant="not-approved" onUsePasskey={noop} onSignOut={noop} />
           </Variant>
         </DemoSection>
 
         <DemoSection
           id="history"
           title="History — the full log"
-          blurb="Every trust change is one sentence. A rogue link is meant to be noticed here, then removed."
+          blurb="Every trust change is one sentence. A rogue approval is meant to be noticed here, then removed."
         >
           <Variant label="All events">
             <PagePanel>
