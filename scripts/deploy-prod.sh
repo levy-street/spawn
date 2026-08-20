@@ -198,6 +198,10 @@ PREBUILT_TARGETS=(
   "linux-aarch64:aarch64-unknown-linux-gnu"
 )
 publish_prebuilts() {
+  if [[ "${SPAWN_DEPLOY_PREBUILTS:-1}" != "1" ]]; then
+    printf 'deploy-prod: prebuilt publish disabled (SPAWN_DEPLOY_PREBUILTS=0)\n'
+    return 0
+  fi
   command -v gh >/dev/null 2>&1 || {
     printf 'deploy-prod: gh not found locally; skipping prebuilt publish\n'
     return 0

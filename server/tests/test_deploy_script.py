@@ -87,11 +87,28 @@ def _fake_ssh(tmp_path: Path, remote_home: Path) -> Path:
         fakebin / "ssh",
         f"""#!/usr/bin/env bash
 set -euo pipefail
-printf '%s\\n' "$1" > "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-host.log"
-printf '%s\\n' "$2" > "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-command.log"
+printf '%s\\n' "$1" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-host.log"
+printf '%s\\n' "$2" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/ssh-command.log"
 script="$SPAWN_DEPLOY_TEST_LOG_DIR/remote-script.sh"
 cat > "$script"
 HOME={str(remote_home)!r} bash -lc "$2" < "$script"
+""",
+    )
+    # Tripwires: the deploy script must never reach the real network or a real
+    # host from a test. A leaked scp/gh call fails the deploy loudly and locally
+    # instead of contacting GitHub or production (spawnd-prod is a REAL alias).
+    _write_executable(
+        fakebin / "scp",
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/scp.log"
+exit 1
+""",
+    )
+    _write_executable(
+        fakebin / "gh",
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/gh.log"
+exit 1
 """,
     )
     return fakebin
@@ -105,6 +122,9 @@ def _deploy_env(tmp_path: Path, fakebin: Path, remote: Path, **overrides: str) -
             "SPAWN_DEPLOY_TEST_LOG_DIR": str(tmp_path / "logs"),
             "SPAWN_DEPLOY_PATH": str(remote),
             "SPAWN_DEPLOY_SUDO": "",
+            # Prebuilt publishing pulls a real GitHub release and scp's to the
+            # target host; tests exercise it only via the explicit opt-in below.
+            "SPAWN_DEPLOY_PREBUILTS": "0",
         }
     )
     env.update(overrides)
@@ -216,6 +236,25 @@ def test_deploy_handles_remote_path_with_spaces(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     assert f"to prod:{remote_with_spaces}" in result.stdout
     assert "restart spawn-server" in _log(tmp_path, "systemctl.log")
+    assert "remote deploy: complete" in result.stdout
+
+
+def test_deploy_prebuilt_publish_skips_cleanly_without_a_release(tmp_path: Path):
+    """With publishing enabled but no prebuilt-latest release (fake gh exits 1),
+    the deploy still succeeds and never invokes scp — the publish step is
+    best-effort by contract, the from-source fallback stays intact."""
+
+    _origin, local, remote = _init_repo(tmp_path)
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    env = _deploy_env(tmp_path, fakebin, remote, SPAWN_DEPLOY_PREBUILTS="1")
+
+    result = _deploy(local, env)
+
+    assert result.returncode == 0, result.stderr
+    assert "no prebuilt-latest release; skipping prebuilt publish" in result.stdout
+    assert "release download prebuilt-latest" in _log(tmp_path, "gh.log")
+    assert _log(tmp_path, "scp.log") == ""
     assert "remote deploy: complete" in result.stdout
 
 
