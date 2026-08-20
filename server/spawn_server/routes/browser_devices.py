@@ -28,7 +28,9 @@ def _to_out(device: BrowserDevice) -> schemas.BrowserDeviceOut:
         fingerprint=ed25519_key_fingerprint(device.public_key),
         label=device.label,
         created_at=device.created_at,
+        last_seen_at=device.last_seen_at,
         revoked_at=device.revoked_at,
+        revoked_by_device_id=device.revoked_by_device_id,
         is_root=device.is_root,
     )
 
@@ -68,6 +70,12 @@ async def register_browser_device(
         )
     ).scalar_one_or_none()
     if existing is not None:
+        # Registration reconciles on every app load; that touchpoint is the
+        # honest "last seen" for the device. Stamp before answering (revoked
+        # tombstones stay untouched — they are history, not presence).
+        if existing.owner_user_id == user_id and existing.revoked_at is None:
+            existing.last_seen_at = datetime.now(UTC)
+            await session.commit()
         return _registration_result(existing, user_id)
 
     if body.is_root:
@@ -94,6 +102,7 @@ async def register_browser_device(
         # so a name the operator chose is never overwritten by a later default.
         label=body.label,
         is_root=body.is_root,
+        last_seen_at=None if body.is_root else datetime.now(UTC),
     )
     session.add(device)
     try:
@@ -170,6 +179,14 @@ async def revoke_browser_device(
     session: AsyncSession = Depends(get_session),
 ) -> schemas.BrowserDeviceOut:
     now = datetime.now(UTC)
+    # Attribution only (the removed screen names its remover, R4). Accept the
+    # claimed device only if it is a live device of this same account; anything
+    # else is silently dropped rather than failing the revoke.
+    revoked_by: str | None = None
+    if body.revoked_by_device_id is not None:
+        claimed = await session.get(BrowserDevice, body.revoked_by_device_id)
+        if claimed is not None and claimed.owner_user_id == user.id and claimed.revoked_at is None:
+            revoked_by = claimed.id
     result = await session.execute(
         update(BrowserDevice)
         .where(
@@ -178,7 +195,7 @@ async def revoke_browser_device(
             BrowserDevice.public_key == body.expected_public_key,
             BrowserDevice.revoked_at.is_(None),
         )
-        .values(revoked_at=now)
+        .values(revoked_at=now, revoked_by_device_id=revoked_by)
     )
     await session.commit()
 
@@ -245,7 +262,9 @@ async def rename_browser_device(
     label = body.label
     public_key = device.public_key
     created_at = device.created_at
+    last_seen_at = device.last_seen_at
     revoked_at = device.revoked_at
+    revoked_by_device_id = device.revoked_by_device_id
     is_root = device.is_root
     await session.commit()
     return schemas.BrowserDeviceOut(
@@ -255,6 +274,8 @@ async def rename_browser_device(
         fingerprint=ed25519_key_fingerprint(public_key),
         label=label,
         created_at=created_at,
+        last_seen_at=last_seen_at,
         revoked_at=revoked_at,
+        revoked_by_device_id=revoked_by_device_id,
         is_root=is_root,
     )

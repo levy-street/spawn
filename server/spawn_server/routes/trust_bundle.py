@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -579,6 +580,47 @@ async def list_account_endorsements(
             endorsed_device_id=row.endorsed_device_id,
             endorsed_public_key=row.endorsed_public_key,
             signature=row.signature,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+class HostPinDetail(BaseModel):
+    device_id: str
+    # True when the pin came from the possess ceremony itself (no endorser) —
+    # the "Possessed by" provenance on the Access screen.
+    direct: bool
+    created_at: datetime
+
+
+@router.get("/hosts/{host_id}/pin-details", response_model=list[HostPinDetail])
+async def list_host_browser_pin_details(
+    host_id: str,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[HostPinDetail]:
+    """Pin records with provenance, for the Access screen's host rows
+    (docs/TRUST_UX.md). Display data only — admission stays daemon-side."""
+
+    host = await session.get(Host, host_id)
+    if host is None or host.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="host not found")
+    rows = (
+        await session.execute(
+            select(
+                HostBrowserPin.browser_device_id,
+                HostBrowserPin.endorser_device_id,
+                HostBrowserPin.created_at,
+            )
+            .where(HostBrowserPin.host_id == host_id)
+            .order_by(HostBrowserPin.created_at)
+        )
+    ).all()
+    return [
+        HostPinDetail(
+            device_id=row.browser_device_id,
+            direct=row.endorser_device_id is None,
             created_at=row.created_at,
         )
         for row in rows
