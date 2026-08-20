@@ -13,16 +13,16 @@ import {
   Menu,
   MenuItem,
 } from "./bits";
-import type { DeviceVM, MachineVM, RecoveryVM, TrustEventVM } from "./types";
+import type { DeviceVM, HostVM, RecoveryVM, TrustEventVM } from "./types";
 
-export interface DevicesScreenProps {
+export interface AccessScreenProps {
   devices: DeviceVM[];
-  machines: MachineVM[];
+  hosts: HostVM[];
   recovery: RecoveryVM;
   /** Newest first; the screen shows the first three. */
   history: TrustEventVM[];
   onLinkDevice?: () => void;
-  onPossessMachine?: () => void;
+  onPossessHost?: () => void;
   onDeviceOptions?: (id: string) => void;
   onTurnOnRecovery?: () => void;
   onResetRecovery?: () => void;
@@ -39,13 +39,13 @@ export interface DevicesScreenProps {
  * The single trust destination. Row provenance ("Linked by …") and the history
  * lines are the visible audit surface (R4): every endorsement is a sentence here.
  */
-export function DevicesScreen({
+export function AccessScreen({
   devices,
-  machines,
+  hosts,
   recovery,
   history,
   onLinkDevice,
-  onPossessMachine,
+  onPossessHost,
   onDeviceOptions,
   onTurnOnRecovery,
   onResetRecovery,
@@ -54,15 +54,15 @@ export function DevicesScreen({
   openMenuDeviceId,
   onRenameDevice,
   onRemoveDevice,
-}: DevicesScreenProps) {
+}: AccessScreenProps) {
   return (
     <div className={`${wide ? "w-full max-w-2xl" : "w-[420px]"} max-w-full space-y-7`}>
       <header>
-        <h1 className="text-xl font-medium tracking-tight text-zinc-100">Devices</h1>
+        <h1 className="text-xl font-medium tracking-tight text-zinc-100">Access</h1>
         <p className="mt-1 text-sm text-zinc-500">
           {recovery.on
-            ? "Every device here can reach every machine. Only you can add to this list."
-            : "Linked devices reach the machines you've possessed. Only you can add to this list."}
+            ? "Every device here can reach every host. Only you can add to this list."
+            : "Linked devices reach the hosts you've possessed. Only you can add to this list."}
         </p>
       </header>
 
@@ -91,7 +91,7 @@ export function DevicesScreen({
           <div className="min-w-44 flex-1">
             <p className="text-sm font-medium text-zinc-100">Recovery is off</p>
             <p className="text-xs leading-relaxed text-zinc-400">
-              Lose your last device and you start over — every machine possessed again from its
+              Lose your last device and you start over — every host possessed again from its
               terminal.
             </p>
           </div>
@@ -147,13 +147,9 @@ export function DevicesScreen({
       </section>
 
       <section>
-        <SectionHeader
-          label="Your machines"
-          action="Possess a machine"
-          onAction={onPossessMachine}
-        />
+        <SectionHeader label="Your hosts" action="Possess a host" onAction={onPossessHost} />
         <div className="divide-y divide-zinc-800/80 rounded-xl border border-zinc-800 bg-zinc-900/40">
-          {machines.map((c) => (
+          {hosts.map((c) => (
             <div key={c.id} className="flex items-center gap-3 px-4 py-3">
               <span
                 className={`flex size-9 shrink-0 items-center justify-center rounded-lg bg-zinc-800/80 text-zinc-300 ${c.online ? "" : "opacity-60"}`}

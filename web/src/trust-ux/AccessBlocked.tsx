@@ -43,7 +43,7 @@ export function AccessBlocked({
             </span>
             <h2 className="text-lg font-medium tracking-tight text-zinc-100">One step left</h2>
             <p className="max-w-[26ch] text-balance text-sm leading-relaxed text-zinc-400">
-              This device isn't linked yet, so your machines stay out of reach.
+              This device isn't linked yet, so your hosts stay out of reach.
             </p>
           </>
         )}

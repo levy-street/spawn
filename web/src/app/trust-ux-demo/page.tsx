@@ -2,14 +2,14 @@
 
 import type { ReactNode } from "react";
 import { AccessBlocked } from "@/trust-ux/AccessBlocked";
-import { DevicesScreen } from "@/trust-ux/DevicesScreen";
+import { AccessScreen } from "@/trust-ux/AccessScreen";
 import { LinkNewDevice, LinkRequest, LinkRequestToast } from "@/trust-ux/LinkDevice";
 import { NumberCheck } from "@/trust-ux/NumberCheck";
-import { PossessMachine } from "@/trust-ux/PossessMachine";
+import { PossessHost } from "@/trust-ux/PossessHost";
 import { ResetRecoveryDialog, TurnOnRecoveryDialog } from "@/trust-ux/Recovery";
 import { RemoveDeviceDialog } from "@/trust-ux/RemoveDevice";
 import { TrustHistory } from "@/trust-ux/TrustHistory";
-import type { DeviceVM, MachineVM, TrustEventVM } from "@/trust-ux/types";
+import type { DeviceVM, HostVM, TrustEventVM } from "@/trust-ux/types";
 
 const noop = () => undefined;
 
@@ -38,7 +38,7 @@ const devices: DeviceVM[] = [
   },
 ];
 
-const machines: MachineVM[] = [
+const hosts: HostVM[] = [
   { id: "c1", name: "mac-studio", provenance: "Possessed by MacBook Pro · May 28", online: true },
   { id: "c2", name: "dev-box", provenance: "Possessed by iPhone · Jun 20", online: false },
 ];
@@ -61,25 +61,25 @@ export default function TrustUxDemoPage() {
             spawn trust — every screen, every state
           </h1>
           <p className="mt-2 text-sm leading-relaxed text-zinc-500">
-            Three nouns (device, machine, recovery), three verbs (link, possess, remove), one
-            artifact (the number). Nothing else reaches a screen.
+            Three nouns (device, host, recovery), three verbs (link, possess, remove), one artifact
+            (the number). Nothing else reaches a screen.
           </p>
         </header>
 
         <DemoSection
           id="roster"
-          title="Devices — the one destination"
+          title="Access — the one destination"
           blurb="Everything about trust lives on one screen. Row provenance and history lines are the audit trail, in plain words."
         >
           <Variant label="Recovery on">
             <PagePanel>
-              <DevicesScreen
+              <AccessScreen
                 devices={devices}
-                machines={machines}
+                hosts={hosts}
                 recovery={{ on: true, detail: "Your passkey can bring everything back." }}
                 history={history}
                 onLinkDevice={noop}
-                onPossessMachine={noop}
+                onPossessHost={noop}
                 onDeviceOptions={noop}
                 onResetRecovery={noop}
                 onShowHistory={noop}
@@ -88,13 +88,13 @@ export default function TrustUxDemoPage() {
           </Variant>
           <Variant label="Recovery off (no-passkey mode)">
             <PagePanel>
-              <DevicesScreen
+              <AccessScreen
                 devices={devices.slice(0, 2)}
-                machines={machines}
+                hosts={hosts}
                 recovery={{ on: false }}
                 history={history.filter((e) => e.kind !== "recovery")}
                 onLinkDevice={noop}
-                onPossessMachine={noop}
+                onPossessHost={noop}
                 onDeviceOptions={noop}
                 onTurnOnRecovery={noop}
                 onShowHistory={noop}
@@ -110,15 +110,15 @@ export default function TrustUxDemoPage() {
         >
           <Variant label="Settings — row menu open">
             <DesktopFrame>
-              <DevicesScreen
+              <AccessScreen
                 wide
                 devices={devices}
-                machines={machines}
+                hosts={hosts}
                 recovery={{ on: true, detail: "Your passkey can bring everything back." }}
                 history={history}
                 openMenuDeviceId="d2"
                 onLinkDevice={noop}
-                onPossessMachine={noop}
+                onPossessHost={noop}
                 onDeviceOptions={noop}
                 onRenameDevice={noop}
                 onRemoveDevice={noop}
@@ -138,14 +138,14 @@ export default function TrustUxDemoPage() {
                 />
               }
             >
-              <DevicesScreen
+              <AccessScreen
                 wide
                 devices={devices}
-                machines={machines}
+                hosts={hosts}
                 recovery={{ on: true, detail: "Your passkey can bring everything back." }}
                 history={history}
                 onLinkDevice={noop}
-                onPossessMachine={noop}
+                onPossessHost={noop}
                 onDeviceOptions={noop}
                 onResetRecovery={noop}
                 onShowHistory={noop}
@@ -163,14 +163,14 @@ export default function TrustUxDemoPage() {
                 />
               }
             >
-              <DevicesScreen
+              <AccessScreen
                 wide
                 devices={devices.slice(0, 2)}
-                machines={machines}
+                hosts={hosts}
                 recovery={{ on: true, detail: "Your passkey can bring everything back." }}
                 history={history}
                 onLinkDevice={noop}
-                onPossessMachine={noop}
+                onPossessHost={noop}
                 onDeviceOptions={noop}
                 onResetRecovery={noop}
                 onShowHistory={noop}
@@ -236,7 +236,7 @@ export default function TrustUxDemoPage() {
               mode="enter"
               title="Link iPhone"
               otherScreen="on the new device"
-              doneText="iPhone is linked. Every machine is ready."
+              doneText="iPhone is linked. Every host is ready."
               onDone={noop}
             />
           </Variant>
@@ -244,13 +244,13 @@ export default function TrustUxDemoPage() {
 
         <DemoSection
           id="connect-computer"
-          title="Possess a machine"
-          blurb="The product's own verb — the same one the terminal prints. One command on the machine; its terminal shows the number and this device types it."
+          title="Possess a host"
+          blurb="The product's own verb — the same one the terminal prints. One command on the host; its terminal shows the number and this device types it."
         >
           <Variant label="Step 1 — the command">
-            <PossessMachine command="spawnd possess" onCancel={noop} />
+            <PossessHost command="spawnd possess" onCancel={noop} />
           </Variant>
-          <Variant label="The machine's terminal">
+          <Variant label="The host's terminal">
             <TerminalMock />
           </Variant>
           <Variant label="This device — types it">
@@ -258,19 +258,19 @@ export default function TrustUxDemoPage() {
               phase="compare"
               mode="enter"
               title="Possess mac-studio"
-              otherScreen="in the machine's terminal"
+              otherScreen="in the host's terminal"
               doneText=""
               onSubmit={noop}
               onNoMatch={noop}
             />
           </Variant>
-          <Variant label="Older machine — fingerprint">
+          <Variant label="Older host — fingerprint">
             <NumberCheck
               phase="compare"
               mode="enter"
               fingerprint="pv4_JydeAk0APeP4mQ2c"
               title="Possess dev-box"
-              otherScreen="in the machine's terminal"
+              otherScreen="in the host's terminal"
               doneText=""
               onMatch={noop}
               onNoMatch={noop}
@@ -281,7 +281,7 @@ export default function TrustUxDemoPage() {
               phase="done"
               mode="enter"
               title="Possess mac-studio"
-              otherScreen="in the machine's terminal"
+              otherScreen="in the host's terminal"
               doneText="mac-studio is possessed. All your devices can reach it."
               onDone={noop}
             />
@@ -338,12 +338,12 @@ export default function TrustUxDemoPage() {
         <DemoSection
           id="remove"
           title="Remove a device"
-          blurb="Instant, everywhere, permanent — one breath. If a machine would be stranded, the dialog names it — and only promises the passkey fix when the machine is online to receive it."
+          blurb="Instant, everywhere, permanent — one breath. If a host would be stranded, the dialog names it — and only promises the passkey fix when the host is online to receive it."
         >
           <Variant label="Standard">
             <RemoveDeviceDialog deviceName="iPhone" recoveryOn onRemove={noop} onCancel={noop} />
           </Variant>
-          <Variant label="Would strand a machine — recovery off">
+          <Variant label="Would strand a host — recovery off">
             <RemoveDeviceDialog
               deviceName="MacBook Pro"
               orphans={[{ name: "mac-studio", online: true }]}
@@ -353,7 +353,7 @@ export default function TrustUxDemoPage() {
               onTurnOnRecovery={noop}
             />
           </Variant>
-          <Variant label="Would strand a machine — recovery on">
+          <Variant label="Would strand a host — recovery on">
             <RemoveDeviceDialog
               deviceName="MacBook Pro"
               orphans={[{ name: "mac-studio", online: true }]}
@@ -362,7 +362,7 @@ export default function TrustUxDemoPage() {
               onCancel={noop}
             />
           </Variant>
-          <Variant label="Stranded machine is offline">
+          <Variant label="Stranded host is offline">
             <RemoveDeviceDialog
               deviceName="iPhone"
               orphans={[{ name: "dev-box", online: false }]}
@@ -481,7 +481,7 @@ function DesktopFrame({
   overlay?: ReactNode;
   toast?: ReactNode;
 }) {
-  const nav = ["Dash", "Agents", "Machines", "Screens", "Devices"];
+  const nav = ["Dash", "Agents", "Hosts", "Screens", "Access"];
   return (
     <div className="relative w-[1080px] max-w-full overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-xl shadow-black/30">
       <div className="flex">
@@ -492,7 +492,7 @@ function DesktopFrame({
               <p
                 key={item}
                 className={`rounded-lg px-2 py-1.5 text-sm ${
-                  item === "Devices" ? "bg-zinc-800/80 text-zinc-100" : "text-zinc-500"
+                  item === "Access" ? "bg-zinc-800/80 text-zinc-100" : "text-zinc-500"
                 }`}
               >
                 {item}
@@ -520,7 +520,7 @@ function TerminalMock() {
       <p className="text-zinc-500">
         <span className="select-none">$ </span>spawnd possess
       </p>
-      <p className="mt-1 text-zinc-400">Possessing this machine for your account…</p>
+      <p className="mt-1 text-zinc-400">Possessing this host for your account…</p>
       <p className="mt-4 text-zinc-500">Your number:</p>
       <p className="mt-1 text-2xl font-semibold tabular-nums tracking-[0.14em] text-zinc-50">
         923 579
