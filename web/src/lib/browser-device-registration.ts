@@ -2,7 +2,7 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
-import { type BrowserDevice, browserDevices } from "./api";
+import { ApiError, type BrowserDevice, browserDevices } from "./api";
 import {
   createBrowserDeviceRegistrationProof,
   deleteBrowserDeviceIdentity,
@@ -143,12 +143,31 @@ async function registerBrowserDevice(userId: string): Promise<BrowserDeviceRegis
 
   const identity = await loadOrCreateBrowserDeviceIdentity(userId);
   const signature = await createBrowserDeviceRegistrationProof(identity, userId);
-  const device = await browserDevices.register({
-    key_algorithm: "ed25519",
-    public_key: identity.publicKeyWire,
-    signature,
-    label: defaultDeviceLabel(),
-  });
+  let device: BrowserDevice;
+  try {
+    device = await browserDevices.register({
+      key_algorithm: "ed25519",
+      public_key: identity.publicKeyWire,
+      signature,
+      label: defaultDeviceLabel(),
+    });
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409 && /revoked/iu.test(error.message)) {
+      // The server refused this key as revoked: this device was removed FROM
+      // ANOTHER device (R1), and this is the moment it finds out. Land on the
+      // same honest removed state a self-removal reaches — clean up the dead
+      // key now so "Start over" can mint a fresh one — instead of looping on
+      // an opaque registration failure (seen live: a remotely-removed phone
+      // retried its 409 indefinitely behind a generic error banner).
+      const status = await beginBrowserDeviceLocalCleanup(userId, identity.publicKeyWire);
+      if (status === "cleanup_pending") {
+        await finishBrowserDeviceLocalCleanup(userId, identity.publicKeyWire);
+        return { status: "revoked", publicKey: identity.publicKeyWire };
+      }
+      return { status, publicKey: identity.publicKeyWire };
+    }
+    throw error;
+  }
   const expectedFingerprint = await ed25519PublicKeyFingerprint(identity.publicKeyWire);
   if (
     device.key_algorithm !== "ed25519" ||
