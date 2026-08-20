@@ -134,6 +134,80 @@ async def test_the_root_cannot_be_endorsed(client):
     assert resp.status_code == 422
 
 
+async def test_anchor_upgrade_pins_the_root_on_a_host(client):
+    """The 5c anchor upgrade end-to-end over HTTP: an already-pinned device
+    endorses the ROOT onto a host through the ordinary per-host endorsement
+    route; the pin set delivered to the daemon then contains pk_R, and it stays
+    live after the endorsing device is revoked (the ratchet)."""
+
+    from spawn_server.browser_endorsement import encode_browser_endorsement_transcript
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, HostBrowserPin
+    from spawn_server.ws.daemon import _live_browser_pins
+
+    user_id, auth = await _signup(client, "root-anchor@example.com")
+    device_key = Ed25519PrivateKey.generate()
+    device_id = (await _register(client, auth, user_id, device_key)).json()["id"]
+    root_key = Ed25519PrivateKey.generate()
+    root_id = (await _register(client, auth, user_id, root_key, is_root=True)).json()["id"]
+
+    host_key = Ed25519PrivateKey.generate()
+    host_pub = _wire(host_key.public_key().public_bytes_raw())
+    async with get_sessionmaker()() as session:
+        host = Host(
+            name="anchor-box",
+            owner_user_id=user_id,
+            host_key_algorithm="ed25519",
+            host_public_key=host_pub,
+        )
+        session.add(host)
+        await session.flush()
+        # The endorsing device is directly pinned, as after a possess ceremony.
+        session.add(
+            HostBrowserPin(
+                host_id=host.id,
+                browser_device_id=device_id,
+                browser_key_algorithm="ed25519",
+                browser_public_key=_wire(device_key.public_key().public_bytes_raw()),
+                browser_key_fingerprint="SHA256:" + "e" * 16,
+            )
+        )
+        await session.commit()
+        host_id = host.id
+
+    transcript = encode_browser_endorsement_transcript(
+        user_id,
+        host_key.public_key().public_bytes_raw(),
+        device_key.public_key().public_bytes_raw(),
+        root_key.public_key().public_bytes_raw(),
+        root_id,
+    )
+    resp = await client.post(
+        "/api/trust/endorsements",
+        json={
+            "host_id": host_id,
+            "endorser_device_id": device_id,
+            "endorsed_device_id": root_id,
+            "signature": _wire(device_key.sign(transcript)),
+        },
+        headers=auth,
+    )
+    assert resp.status_code == 200, resp.text
+
+    pins = await _live_browser_pins(host_id)
+    assert {row["browser_device_id"] for row in pins} == {device_id, root_id}
+
+    # Revoke the endorsing device: the root's anchor pin must survive it.
+    revoke = await client.post(
+        f"/api/browser-devices/{device_id}/revoke",
+        json={"expected_public_key": _wire(device_key.public_key().public_bytes_raw())},
+        headers=auth,
+    )
+    assert revoke.status_code == 200, revoke.text
+    pins = await _live_browser_pins(host_id)
+    assert {row["browser_device_id"] for row in pins} == {root_id}
+
+
 async def test_rename_preserves_is_root(client):
     user_id, auth = await _signup(client, "root-rename@example.com")
     root_id = (
