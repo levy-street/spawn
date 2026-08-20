@@ -41,7 +41,7 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
   await page.locator('[aria-label^="Options for"]').first().click();
   await page.getByRole("menuitem", { name: "Remove…" }).click();
   await page.getByTestId("remove-confirm").click();
-  await expect(page.getByText("This device was removed.", { exact: false })).toBeVisible();
+  await expect(page.getByText("This device was removed", { exact: false })).toBeVisible();
   await expect(page.getByRole("button", { name: "Start over" })).toBeVisible();
 
   const afterRevoke = await page.evaluate(async (userId) => {
@@ -192,7 +192,10 @@ test("rejects a substituted revocation response without deleting the local key",
   await page.getByRole("menuitem", { name: "Remove…" }).click();
   await page.getByTestId("remove-confirm").click();
   await expect(
-    page.locator("p[role=alert]").filter({ hasText: "did not confirm the expected device key" }).first(),
+    page
+      .locator("p[role=alert]")
+      .filter({ hasText: "did not confirm the expected device key" })
+      .first(),
   ).toBeVisible();
 
   const localKeyStillExists = await page.evaluate(async (userId) => {
@@ -264,4 +267,23 @@ test("clearing history prunes tombstones but never active devices", async ({ pag
   await expect(page.getByText(/Removed devices/)).toHaveCount(0);
   await expect(page.getByText("Old laptop")).toHaveCount(0);
   await expect(page.getByTestId("device-row").getByText("This device")).toBeVisible();
+});
+
+test("a remotely-removed device lands on Start over, not an opaque failure", async ({ page }) => {
+  await mockAuthenticatedApi(page);
+  // The server refuses the key as revoked: this device was removed from
+  // ANOTHER device, and this reload is the moment it finds out.
+  await page.route("**/api/browser-devices/register", async (route) => {
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      json: { detail: "revoked browser public keys cannot be registered again" },
+    });
+  });
+  await page.goto("/settings");
+
+  await expect(page.getByText("This device was removed", { exact: false })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start over" })).toBeVisible();
+  // The generic registration-failure alert must NOT be the story told here.
+  await expect(page.getByText("could not register")).toHaveCount(0);
 });

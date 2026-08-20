@@ -381,8 +381,8 @@ export function AccessPanel() {
       {registration.data?.status === "revoked" && (
         <div className="space-y-2 rounded-md border border-border p-3" role="status">
           <p className="text-sm">
-            This device was removed. Start over to sign in fresh — it will appear in the list,
-            waiting for approval like any new device.
+            This device was removed{describeRemoval(allDevices, registration.data.publicKey)}. It
+            can start over as a new device — it will appear in the list, waiting for approval.
           </p>
           <Button size="sm" onClick={() => void startFresh(registration.data!.publicKey)}>
             Start over
@@ -946,6 +946,19 @@ export function AccessPanel() {
     row can't be confused ("Approved … Jun 3" vs "Seen Aug 12"). */
 function seen(lastSeen: string): string {
   return lastSeen === "Now" ? "Now" : `Seen ${lastSeen}`;
+}
+
+/** " — Aug 20, by Chrome on Mac" when the tombstone is still known (R4: the
+    sharp end of a removal names its remover). Empty when history was cleared. */
+function describeRemoval(devices: BrowserDevice[], publicKey: string): string {
+  const tombstone = devices.find((d) => d.public_key === publicKey && d.revoked_at !== null);
+  if (!tombstone?.revoked_at) return "";
+  const when = new Date(tombstone.revoked_at).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+  const remover = devices.find((d) => d.id === tombstone.revoked_by_device_id);
+  return remover?.label ? ` — ${when}, by ${remover.label}` : ` — ${when}`;
 }
 
 /**
