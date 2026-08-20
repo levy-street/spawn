@@ -18,7 +18,7 @@ from sqlalchemy.orm import aliased
 from .. import auth as auth_mod
 from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
-from ..models import Agent, BrowserDevice, Host, HostBrowserPin
+from ..models import Agent, BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey
 from ..redis import agent_event_channel, get_backend
 from .broker import DaemonConn, RtcSessionBinding, get_broker
 from .host_signal import (
@@ -825,14 +825,26 @@ async def _revoked_browser_keys(account_id: str) -> list[str]:
     """Public keys of the account's revoked browser devices — the deny-list a
     host subtracts from acceptance (device mesh §3). Account-scoped, not
     host-scoped: a revoked device must be denied even where it would connect via
-    a chain to another host's anchor. Add-only in effect (a device is tombstoned,
-    never un-revoked), and the daemon can only reject with it, never admit."""
+    a chain to another host's anchor. Add-only in FACT, not just in effect
+    (R10): the union of currently-revoked roster rows and the permanent
+    ``revoked_browser_keys`` tombstones, which "Clear history" never deletes —
+    a daemon replaces its deny-list wholesale on every push, so computing from
+    prunable rows alone would silently un-revoke a pruned key and re-admit a
+    stolen device via its cached endorsement chain. The roster arm is kept as
+    belt-and-braces for any stamp that has not (yet) been mirrored. The daemon
+    can only reject with this list, never admit."""
 
     async with _bounded_host_ownership_session() as session:
         rows = await session.execute(
-            select(BrowserDevice.public_key).where(
+            select(BrowserDevice.public_key)
+            .where(
                 BrowserDevice.owner_user_id == account_id,
                 BrowserDevice.revoked_at.is_not(None),
+            )
+            .union(
+                select(RevokedBrowserKey.public_key).where(
+                    RevokedBrowserKey.owner_user_id == account_id
+                )
             )
         )
         return sorted(row[0] for row in rows)

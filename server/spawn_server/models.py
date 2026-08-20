@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -107,6 +108,49 @@ class BrowserDevice(Base):
             "key_algorithm",
             "public_key",
             name="uq_browser_devices_public_key",
+        ),
+        # DB-level guard behind the "at most one root" app check in the
+        # register route: a concurrent double-mint must not fork the account's
+        # trust anchor. Partial (live roots only) so rotation — revoke the old
+        # root, mint a successor — still works.
+        Index(
+            "uq_browser_devices_live_root",
+            "owner_user_id",
+            unique=True,
+            sqlite_where=text("is_root AND revoked_at IS NULL"),
+            postgresql_where=text("is_root AND revoked_at IS NULL"),
+        ),
+    )
+
+
+class RevokedBrowserKey(Base):
+    """Permanent, account-scoped tombstone for a revoked browser key (R10).
+
+    The account deny-list pushed to daemons must never shrink: revocation is a
+    permanent tombstone, and re-admitting a device requires a fresh ceremony
+    over a NEW key, never un-revoking. The ``browser_devices`` tombstone row is
+    roster history the operator may prune ("Clear history"); this row is the
+    key-level fact that survives that prune, so a pruned key can never drop out
+    of the deny-list and be re-admitted via a cached endorsement chain. Nothing
+    deletes rows here (account deletion cascades aside): the deny-list is
+    computed as the union of currently-revoked roster rows and this table.
+    """
+
+    __tablename__ = "revoked_browser_keys"
+
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    public_key: Mapped[str] = mapped_column(String(43), primary_key=True)
+    key_algorithm: Mapped[str] = mapped_column(String(16), nullable=False)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Advisory attribution carried over from the roster row; never authorization.
+    revoked_by_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "key_algorithm = 'ed25519' AND length(public_key) = 43",
+            name="ck_revoked_browser_keys_ed25519_key",
         ),
     )
 

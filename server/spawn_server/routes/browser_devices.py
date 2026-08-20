@@ -14,7 +14,7 @@ from .. import auth, schemas
 from ..browser_registration import verify_browser_registration_proof
 from ..db import get_session
 from ..host_identity import ed25519_key_fingerprint
-from ..models import BrowserDevice, Host, User
+from ..models import BrowserDevice, Host, RevokedBrowserKey, User
 from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/browser-devices", tags=["browser-devices"])
@@ -78,6 +78,25 @@ async def register_browser_device(
             await session.commit()
         return _registration_result(existing, user_id)
 
+    # A key this account revoked stays revoked forever (R10), even after the
+    # roster tombstone was pruned away: re-admission takes a fresh ceremony
+    # over a NEW key, never re-registration of the old one. Without this check
+    # the pruned key would register "successfully" and then be silently refused
+    # by every host's deny-list.
+    permanently_revoked = (
+        await session.execute(
+            select(RevokedBrowserKey.public_key).where(
+                RevokedBrowserKey.owner_user_id == user_id,
+                RevokedBrowserKey.public_key == body.public_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if permanently_revoked is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="revoked browser public keys cannot be registered again",
+        )
+
     if body.is_root:
         # At most one account root. A live root already present means this is a
         # stale/duplicate mint; refuse rather than fork the account's anchor.
@@ -120,6 +139,23 @@ async def register_browser_device(
             )
         ).scalar_one_or_none()
         if winner is None:
+            if body.is_root:
+                # No row with this key means the collision was the live-root
+                # partial unique index: a concurrent mint won the race past the
+                # app-level check above. Name the real conflict.
+                concurrent_root = (
+                    await session.execute(
+                        select(BrowserDevice.id).where(
+                            BrowserDevice.owner_user_id == user_id,
+                            BrowserDevice.is_root.is_(True),
+                            BrowserDevice.revoked_at.is_(None),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if concurrent_root is not None:
+                    raise HTTPException(
+                        status_code=409, detail="account already has a root"
+                    ) from None
             raise HTTPException(
                 status_code=409, detail="browser public key is unavailable"
             ) from None
@@ -152,7 +188,7 @@ async def prune_revoked_browser_devices(
     user: User = Depends(auth.current_user),
     session: AsyncSession = Depends(get_session),
 ) -> schemas.BrowserDevicePruneResponse:
-    """Hard-delete this account's revoked device tombstones.
+    """Hard-delete this account's revoked device ROSTER rows — history only.
 
     Deletion is fail-closed for pins by the same contract reconciliation relies
     on: a revoked device's own pins are already non-live and cascade away with
@@ -160,11 +196,14 @@ async def prune_revoked_browser_devices(
     because a dangling endorser id is never admitted (see
     ``_live_browser_device_id_set``).
 
-    It DOES change the account's deny-list: a pruned key is no longer listed
-    as revoked, and a daemon's deny-list replaces wholesale on push. Push now
-    so daemons converge — otherwise a key that is later legitimately
-    re-registered and re-approved (a fresh ceremony) stays refused until the
-    daemon's next reconnect (seen live). Best effort as always.
+    It never changes the account's deny-list: every revoked key was mirrored
+    into ``revoked_browser_keys`` at revoke time (and by the 0036 backfill),
+    prune deliberately does NOT touch that table, and the deny-list is the
+    union of both. Revocation is a permanent tombstone (R10) — "Clear history"
+    must never re-admit a stolen device that still carries a cached endorsement
+    chain. Still push after deleting: a daemon's state replaces wholesale on
+    push, so pushing reconverges any drift at a natural change point. Best
+    effort as always.
     """
     result = await session.execute(
         delete(BrowserDevice).where(
@@ -214,7 +253,6 @@ async def revoke_browser_device(
         )
         .values(revoked_at=now, revoked_by_device_id=revoked_by)
     )
-    await session.commit()
 
     device = (
         await session.execute(
@@ -224,8 +262,10 @@ async def revoke_browser_device(
         )
     ).scalar_one_or_none()
     if device is None:
+        await session.rollback()
         raise HTTPException(status_code=404, detail="browser device not found")
     if device.public_key != body.expected_public_key:
+        await session.rollback()
         raise HTTPException(
             status_code=409,
             detail="browser device changed; refresh before revoking",
@@ -233,7 +273,47 @@ async def revoke_browser_device(
     if result.rowcount == 0 and device.revoked_at is None:
         # No matching update and no tombstone means the row changed outside
         # this immutable-key contract. Fail closed rather than claiming revoke.
+        await session.rollback()
         raise HTTPException(status_code=409, detail="browser device revocation did not commit")
+
+    # Revocation is a PERMANENT tombstone (R10): mirror the key into the
+    # key-level tombstone table in the SAME transaction as the roster stamp, so
+    # a later "Clear history" prune of the roster row can never drop this key
+    # out of the account deny-list. Idempotent: a repeat revoke (or a heal after
+    # an interrupted one) finds the tombstone already present and adds nothing.
+    if device.revoked_at is not None:
+        tombstone = await session.get(
+            RevokedBrowserKey, (device.owner_user_id, device.public_key)
+        )
+        if tombstone is None:
+            session.add(
+                RevokedBrowserKey(
+                    owner_user_id=device.owner_user_id,
+                    public_key=device.public_key,
+                    key_algorithm=device.key_algorithm,
+                    revoked_at=device.revoked_at,
+                    revoked_by_device_id=device.revoked_by_device_id,
+                )
+            )
+    try:
+        await session.commit()
+    except IntegrityError:
+        # A concurrent revoke of the same key committed its tombstone between
+        # our get and our commit. The permanent deny is in place either way;
+        # re-read the (already stamped) row and answer from it, failing closed
+        # if the stamp is somehow absent.
+        await session.rollback()
+        device = (
+            await session.execute(
+                select(BrowserDevice).where(
+                    BrowserDevice.id == device_id, BrowserDevice.owner_user_id == user.id
+                )
+            )
+        ).scalar_one_or_none()
+        if device is None or device.revoked_at is None:
+            raise HTTPException(
+                status_code=409, detail="browser device revocation did not commit"
+            ) from None
 
     # Revocation only stamps a DB tombstone; a live daemon keeps trusting this
     # device -- directly, and via every pin it endorsed -- until it next
