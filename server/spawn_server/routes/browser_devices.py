@@ -246,6 +246,7 @@ async def rename_browser_device(
     public_key = device.public_key
     created_at = device.created_at
     revoked_at = device.revoked_at
+    is_root = device.is_root
     await session.commit()
     return schemas.BrowserDeviceOut(
         id=device_id,
@@ -255,4 +256,5 @@ async def rename_browser_device(
         label=label,
         created_at=created_at,
         revoked_at=revoked_at,
+        is_root=is_root,
     )
