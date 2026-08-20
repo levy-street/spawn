@@ -17,6 +17,7 @@
  * unlock — it cannot read the data key or forge a bundle.
  */
 
+import type { AccountRootMaterial } from "./account-root";
 import { encodeBase64Url } from "./signed-signal";
 import {
   canonicalBundle,
@@ -179,12 +180,13 @@ export async function sealTrustEnvelope(
   hosts: readonly TrustBundleHost[],
   passkeys: readonly PasskeyWrapInput[],
   revision: number,
+  root: AccountRootMaterial | null = null,
 ): Promise<string> {
   requireAccountId(accountId);
   if (passkeys.length === 0) {
     throw new TrustBundleError("invalid_bundle", "an envelope needs at least one passkey wrap");
   }
-  const bundle = await canonicalBundle(accountId, hosts, revision);
+  const bundle = await canonicalBundle(accountId, hosts, revision, root);
   const dataKey = crypto.getRandomValues(new Uint8Array(DATA_KEY_BYTES));
   const sealed = await sealBytes(
     await importDataKey(dataKey),
@@ -283,7 +285,7 @@ async function openSealedBundle(
   // authenticated with the rest of the plaintext; legacy bundles without one
   // open as 0. The caller enforces monotonicity against a local floor.
   const revision = candidate.revision === undefined ? 0 : requireRevision(candidate.revision);
-  return canonicalBundle(accountId, candidate.hosts, revision);
+  return canonicalBundle(accountId, candidate.hosts, revision, candidate.root ?? null);
 }
 
 /** Open the envelope with one enrolled passkey and return the trust bundle. */
@@ -389,5 +391,7 @@ export async function revokePasskeyFromEnvelope(
   if (revision <= bundle.revision) {
     throw new TrustBundleError("invalid_bundle", "revocation must advance the bundle revision");
   }
-  return sealTrustEnvelope(accountId, bundle.hosts, keep, revision);
+  // Reseal with the root the bundle already carried — dropping it here would
+  // silently destroy the account's only copy of sk_R.
+  return sealTrustEnvelope(accountId, bundle.hosts, keep, revision, bundle.root);
 }

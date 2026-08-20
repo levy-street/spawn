@@ -17,6 +17,7 @@
  */
 
 import { encodeAcctEndorsementTranscript } from "./acct-endorsement-transcript";
+import { encodeBrowserDeviceRegistrationTranscript } from "./browser-device-registration-transcript";
 import { ED25519_SIGNATURE_BYTES, encodeBase64Url } from "./signed-signal";
 
 /** A usable account root: its wire public key plus a sign-capable private key. */
@@ -71,6 +72,28 @@ export async function importAccountRoot(material: AccountRootMaterial): Promise<
     ["sign"],
   );
   return { publicKeyWire: material.publicKeyWire, privateKey };
+}
+
+/**
+ * Sign the root's own browser-device registration proof. The root registers as
+ * a `browser_device` marked `is_root` (mesh 5b) so it reuses the endorsement
+ * store and pin delivery; like any device registration, ownership of the key is
+ * proven by signing the registration transcript with it.
+ */
+export async function createRootRegistrationProof(
+  root: AccountRoot,
+  accountId: string,
+): Promise<string> {
+  const transcript = encodeBrowserDeviceRegistrationTranscript(accountId, root.publicKeyWire);
+  const owned = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(owned).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, root.privateKey, owned),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new Error("root registration signer returned an invalid signature length");
+  }
+  return encodeBase64Url(signature);
 }
 
 /**

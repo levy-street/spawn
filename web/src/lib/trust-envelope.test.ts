@@ -224,3 +224,71 @@ describe("trust envelope", () => {
     await expect(sealEnvelope(ACCOUNT, [await host()], [])).rejects.toThrow(TrustBundleError);
   });
 });
+
+describe("account root in the envelope (mesh stage 5)", () => {
+  async function rootMaterial() {
+    const { exportAccountRootMaterial, generateAccountRoot } = await import("./account-root");
+    return exportAccountRootMaterial(await generateAccountRoot());
+  }
+
+  test("the root seals in and comes back on open; absent means null", async () => {
+    const root = await rootMaterial();
+    const withRoot = await sealTrustEnvelope(
+      ACCOUNT,
+      [await host()],
+      [passkey("laptop", 1)],
+      1,
+      root,
+    );
+    const opened = await openTrustEnvelope(ACCOUNT, withRoot, passkey("laptop", 1));
+    expect(opened.root).toEqual(root);
+
+    const withoutRoot = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    expect((await openTrustEnvelope(ACCOUNT, withoutRoot, passkey("laptop", 1))).root).toBeNull();
+  });
+
+  test("revoking a passkey reseals WITH the root — sk_R must survive the rotation", async () => {
+    const root = await rootMaterial();
+    const sealed = await sealTrustEnvelope(
+      ACCOUNT,
+      [await host()],
+      [passkey("laptop", 1)],
+      1,
+      root,
+    );
+    const withBackup = await enrollPasskeyInEnvelope(
+      ACCOUNT,
+      sealed,
+      passkey("laptop", 1),
+      passkey("yubikey", 2),
+    );
+    const rotated = await revokePasskeyFromEnvelope(
+      ACCOUNT,
+      withBackup,
+      [passkey("laptop", 1)],
+      "yubikey",
+      2,
+    );
+    expect((await openTrustEnvelope(ACCOUNT, rotated, passkey("laptop", 1))).root).toEqual(root);
+  });
+
+  test("enrolling a backup passkey leaves the sealed root intact", async () => {
+    const root = await rootMaterial();
+    const sealed = await sealTrustEnvelope(
+      ACCOUNT,
+      [await host()],
+      [passkey("laptop", 1)],
+      1,
+      root,
+    );
+    const withBackup = await enrollPasskeyInEnvelope(
+      ACCOUNT,
+      sealed,
+      passkey("laptop", 1),
+      passkey("yubikey", 2),
+    );
+    expect((await openTrustEnvelope(ACCOUNT, withBackup, passkey("yubikey", 2))).root).toEqual(
+      root,
+    );
+  });
+});

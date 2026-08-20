@@ -9,6 +9,7 @@
  * See docs/TRUST.md "how a new device bootstraps trust".
  */
 
+import type { AccountRootMaterial } from "./account-root";
 import {
   approveBrowserHostPin,
   type BrowserHostPin,
@@ -47,6 +48,14 @@ export interface ImportedTrust {
   readonly alreadyTrusted: readonly string[];
   /** Hosts the bundle named that this device has locally revoked, left untouched. */
   readonly skippedRevoked: readonly string[];
+  /**
+   * The account root's sealed material, when the bundle carries one. This is the
+   * healing key: the caller re-endorses the account's devices off it and then
+   * drops it — it must never be persisted outside the sealed bundle.
+   */
+  readonly root: AccountRootMaterial | null;
+  /** Every host the bundle names, for the heal's per-host anchor upgrades. */
+  readonly hosts: readonly TrustBundleHost[];
 }
 
 /** The bundle rollback floor lives in the same origin-partitioned storage as pins. */
@@ -77,6 +86,7 @@ export async function sealCurrentTrust(
   passkey: PasskeyWrapInput,
   scope: TrustBootstrapScope,
   serverRevision: number,
+  root: AccountRootMaterial | null = null,
 ): Promise<{ readonly sealed: string; readonly hostCount: number; readonly revision: number }> {
   const origin = scope.origin ?? browserHostPinServerOrigin();
   const pins = await listActiveBrowserHostPins(
@@ -87,7 +97,7 @@ export async function sealCurrentTrust(
   const floor = await readHighestSeenRevision(scope.accountId, revisionOptions(scope));
   const revision = Math.max(floor, Number.isInteger(serverRevision) ? serverRevision : 0) + 1;
   return {
-    sealed: await sealTrustEnvelope(scope.accountId, hosts, [passkey], revision),
+    sealed: await sealTrustEnvelope(scope.accountId, hosts, [passkey], revision, root),
     hostCount: hosts.length,
     revision,
   };
@@ -224,7 +234,7 @@ export async function importTrustBundle(
     );
     added.push(host.hostPublicKey);
   }
-  return { added, alreadyTrusted, skippedRevoked };
+  return { added, alreadyTrusted, skippedRevoked, root: bundle.root, hosts: bundle.hosts };
 }
 
 /**
