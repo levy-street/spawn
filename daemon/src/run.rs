@@ -33,6 +33,7 @@ use crate::ws::{self, WsInbound};
 use spawnd::acct_endorsement::{signature_from_wire, AcctEndorsementTranscript};
 use spawnd::endorsement_chain::{
     find_valid_chain, ChainEdge, RevocationSet, DEFAULT_MAX_CHAIN_EDGES,
+    MAX_CARRIED_ENDORSEMENTS,
 };
 use spawnd::host_pair_approval::account_id_bytes;
 use spawnd::signed_signal::{
@@ -471,6 +472,16 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
 
     let registry = AgentRegistry::new();
     let rtc_sessions = RtcSessions::new();
+    // Process-lifetime monotonic floor for the account deny-list (device mesh
+    // §3). Owned here — above the per-connection loop — so a reconnect cannot
+    // reset it: a key revoked on one control connection stays revoked on every
+    // later one, whatever the server's next frames say. Deliberately in-memory
+    // only: the server's permanent tombstone (R10) is the durable store across
+    // restarts, and a server malicious enough to withhold a revocation after a
+    // daemon restart could equally have withheld it before the daemon ever
+    // learned it — a local disk cache would close no attack class while adding
+    // a write path into credential storage from the hostile-input WS handler.
+    let mut daemon_revoked = RevocationSet::new();
     if !rtc_sessions
         .bind_registered_host_id(live_credentials.host_id)
         .await
@@ -511,6 +522,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 &registry,
                 &rtc_sessions,
                 &mut credential_loader,
+                &mut daemon_revoked,
             );
             tokio::pin!(session_fut);
 
@@ -587,6 +599,7 @@ async fn serve_one_connection(
     registry: &AgentRegistry,
     rtc_sessions: &RtcSessions,
     loader: &mut CredentialLoader,
+    daemon_revoked: &mut RevocationSet,
 ) -> Result<ServeOutcome> {
     serve_one_connection_with_loader(
         live_credentials,
@@ -595,10 +608,12 @@ async fn serve_one_connection(
         rtc_sessions,
         CREDENTIAL_RELOAD_INTERVAL,
         loader,
+        daemon_revoked,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_one_connection_with_loader(
     live_credentials: &LiveCredentialSnapshot,
     ws_url: &url::Url,
@@ -606,6 +621,7 @@ async fn serve_one_connection_with_loader(
     rtc_sessions: &RtcSessions,
     poll_interval: Duration,
     loader: &mut CredentialLoader,
+    daemon_revoked: &mut RevocationSet,
 ) -> Result<ServeOutcome> {
     // Keep this boundary self-contained as well as guarding it in `run`: a
     // caller cannot open a websocket from a snapshot that was already stale
@@ -754,6 +770,7 @@ async fn serve_one_connection_with_loader(
             rtc_sessions,
             &out_tx,
             live_credentials,
+            daemon_revoked,
         );
         tokio::pin!(dispatch_fut);
         tokio::select! {
@@ -1092,6 +1109,20 @@ fn verify_signed_rtc_offer_admitted(
         tracing::warn!(reason = "no-carried-endorsements", "signed RTC offer refused");
         return None;
     }
+    // Independent daemon-side cap, before any parse or signature work. The
+    // honest relay bounds carried sets to the same 64, so an over-cap list only
+    // ever comes from a party driving this socket directly; the wire
+    // deserializer already refuses such frames, and this re-check keeps the
+    // bound local to the admission path (defense in depth, named refusal).
+    if carried.len() > MAX_CARRIED_ENDORSEMENTS {
+        tracing::warn!(
+            reason = "carried-endorsements-over-cap",
+            carried = carried.len(),
+            max = MAX_CARRIED_ENDORSEMENTS,
+            "signed RTC offer refused"
+        );
+        return None;
+    }
     let Some(host_identity) = creds::host_identity(record).ok().flatten() else {
         tracing::warn!(reason = "no-host-identity", "signed RTC offer refused");
         return None;
@@ -1203,16 +1234,22 @@ async fn dispatch_loop(
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
     live_credentials: &LiveCredentialSnapshot,
+    daemon_revoked: &mut RevocationSet,
 ) -> Result<()> {
     // This host's account, as canonical UUID bytes, learned from registration.
     // Used to scope carried endorsement chains at connect (device mesh §3). A
     // wrong/absent value only denies the chain path — it never grants — so a
     // lying server can at most withhold chained admission, not forge it.
     let mut daemon_account: Option<[u8; 16]> = None;
-    // Account deny-list (device mesh §3): keys the server reports as revoked,
-    // subtracted from acceptance. Fail-closed and subtract-only — it can only
-    // reject a connection, never admit one, so server authority over it is safe.
-    let mut daemon_revoked = RevocationSet::new();
+    // `daemon_revoked` is the account deny-list (device mesh §3): keys the
+    // server reports as revoked, subtracted from acceptance. Fail-closed and
+    // subtract-only — it can only reject a connection, never admit one, so
+    // server authority over it is safe. It is owned by the supervisor, not this
+    // connection, and every delivered list is UNIONED in (`absorb`), never
+    // assigned: once a key is revoked it stays revoked for the life of the
+    // process even if a later frame — or a later connection — omits it. The
+    // durable backstop across restarts is the server's permanent tombstone
+    // (R10); this floor removes the in-process half of the P3′ residual.
     while let Some(msg) = in_rx.recv().await {
         match msg {
             WsInbound::Closed => return Ok(()),
@@ -1232,13 +1269,26 @@ async fn dispatch_loop(
                     }
                     tracing::info!(%host_id, "registered with server");
                     daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
-                    daemon_revoked = revocation_set_from_wire(revoked_browser_keys.as_deref());
+                    let newly_revoked = daemon_revoked
+                        .absorb(revocation_set_from_wire(revoked_browser_keys.as_deref()));
                     reconcile_browser_pins(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
                         browser_device_ids.as_deref(),
                     )
                     .await;
+                    if newly_revoked {
+                        // RTC channels are peer-to-peer and can outlive a
+                        // control-WS reconnect, so a device revoked while this
+                        // daemon was disconnected must lose its live channel at
+                        // re-registration, not keep it (R1). On the first
+                        // registration of a fresh process no sessions exist and
+                        // this is a no-op.
+                        tracing::info!(
+                            "revocations learned at registration: closing live RTC sessions for re-admission"
+                        );
+                        rtc_sessions.invalidate_trust_and_close_all().await;
+                    }
                 }
                 Inbound::HostBrowserPins {
                     account_id,
@@ -1250,9 +1300,11 @@ async fn dispatch_loop(
                     // device takes effect immediately instead of waiting for the
                     // daemon to happen to reconnect -- which could be hours.
                     daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
-                    let updated_revoked = revocation_set_from_wire(revoked_browser_keys.as_deref());
-                    let newly_revoked = updated_revoked.revokes_beyond(&daemon_revoked);
-                    daemon_revoked = updated_revoked;
+                    // Union, never replace: a shorter or absent pushed list must
+                    // not un-revoke (the deny-list is add-only end to end, R10;
+                    // a shrinking frame can only mean a withholding server).
+                    let newly_revoked = daemon_revoked
+                        .absorb(revocation_set_from_wire(revoked_browser_keys.as_deref()));
                     reconcile_browser_pins(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
@@ -1330,7 +1382,7 @@ async fn dispatch_loop(
                                 envelope,
                                 &live_credentials.record,
                                 daemon_account.as_ref(),
-                                &daemon_revoked,
+                                daemon_revoked,
                                 &carried_endorsements,
                             ) {
                                 Some(verified)
@@ -3622,6 +3674,7 @@ mod tests {
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
         let epoch_before = rtc_sessions.trust_epoch_for_test();
+        let mut daemon_revoked = RevocationSet::new();
 
         {
             let connection = serve_one_connection_with_loader(
@@ -3631,6 +3684,7 @@ mod tests {
                 &rtc_sessions,
                 Duration::from_millis(5),
                 &mut loader,
+                &mut daemon_revoked,
             );
             tokio::pin!(connection);
             tokio::time::timeout(Duration::from_secs(1), async {
@@ -4011,6 +4065,7 @@ mod tests {
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
 
+        let mut daemon_revoked = RevocationSet::new();
         let first_outcome = {
             let first = serve_one_connection_with_loader(
                 &active,
@@ -4019,6 +4074,7 @@ mod tests {
                 &rtc_sessions,
                 Duration::from_millis(10),
                 &mut loader,
+                &mut daemon_revoked,
             );
             tokio::pin!(first);
             let first_auth = tokio::select! {
@@ -4048,6 +4104,7 @@ mod tests {
                 &rtc_sessions,
                 Duration::from_millis(10),
                 &mut loader,
+                &mut daemon_revoked,
             ),
         )
         .await
@@ -4210,6 +4267,7 @@ mod tests {
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
 
+        let mut daemon_revoked = RevocationSet::new();
         let connection = serve_one_connection_with_loader(
             &active,
             &ws_url,
@@ -4217,6 +4275,7 @@ mod tests {
             &rtc_sessions,
             Duration::from_secs(5),
             &mut loader,
+            &mut daemon_revoked,
         );
         tokio::pin!(connection);
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -4236,6 +4295,301 @@ mod tests {
             .expect("daemon connection close timeout")
             .expect("daemon connection result");
         assert!(matches!(outcome, ServeOutcome::SessionEnded(_)));
+        assert_eq!(rtc_sessions.resident_session_count().await, 0);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("local websocket server timeout")
+            .expect("local websocket server task");
+    }
+
+    #[test]
+    fn carried_edge_cap_admits_at_cap_and_refuses_over_cap() {
+        use ed25519_dalek::SigningKey;
+        use spawnd::acct_endorsement::{sign_transcript, signature_to_wire};
+        use spawnd::signed_signal::public_key_to_wire;
+        use spawnd::signed_signal_wire::{sign_rtc_signal_wire, RtcProtocol};
+
+        let user = "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+        let account = account_id_bytes(user).expect("account bytes");
+
+        // Host identity, an anchor device X (the only pinned key), and a
+        // browser B admitted only through the carried chain X→B.
+        let host_seed = [9u8; 32];
+        let host_key = SigningKey::from_bytes(&host_seed);
+        let host_peer =
+            public_key_from_wire(&public_key_to_wire(&host_key.verifying_key())).unwrap();
+        let anchor_key = SigningKey::from_bytes(&[1u8; 32]);
+        let anchor_wire = public_key_to_wire(&anchor_key.verifying_key());
+        let browser_key = SigningKey::from_bytes(&[7u8; 32]);
+        let browser_wire = public_key_to_wire(&browser_key.verifying_key());
+
+        let mut record = StoredCreds::default();
+        record.host_private_key_seed = Some(URL_SAFE_NO_PAD.encode(host_seed));
+        let fingerprint = creds::browser_key_fingerprint(&anchor_wire).unwrap();
+        let pin = creds::browser_pin_from_approval(
+            &Uuid::from_u128(1).to_string(),
+            "ed25519",
+            &anchor_wire,
+            &fingerprint,
+        )
+        .unwrap();
+        creds::merge_browser_pin(&mut record, pin).unwrap();
+
+        // The signed offer proves possession of B.
+        let offer = SignedSignalTranscript::new(
+            SignalKind::Offer,
+            2,
+            Uuid::from_u128(2).to_string(),
+            ScopeType::Agent,
+            Uuid::from_u128(3).to_string(),
+            SenderRole::Browser,
+            host_peer.to_bytes(),
+            "v=0\r\no=browser\r\n",
+        )
+        .unwrap();
+        let envelope = sign_rtc_signal_wire(&browser_key, RtcProtocol::Agent, &offer).unwrap();
+
+        // One genuine X→B edge, presented as duplicate copies up to the cap —
+        // the honest relay's own maximum. Duplicates collapse before the
+        // search, so this admits, and cheaply.
+        let device_id = Uuid::from_u128(4).to_string();
+        let transcript =
+            AcctEndorsementTranscript::from_wire(user, &anchor_wire, &browser_wire, &device_id)
+                .unwrap();
+        let signature = signature_to_wire(&sign_transcript(&anchor_key, &transcript));
+        let edge = CarriedEndorsement {
+            account_id: user.to_string(),
+            endorser_public_key: anchor_wire.clone(),
+            endorsed_public_key: browser_wire.clone(),
+            endorsed_device_id: device_id,
+            signature,
+        };
+        let at_cap = vec![edge.clone(); MAX_CARRIED_ENDORSEMENTS];
+        let verified = verify_signed_rtc_offer_admitted(
+            &envelope,
+            &record,
+            Some(&account),
+            &RevocationSet::new(),
+            &at_cap,
+        )
+        .expect("an at-cap carried set with a genuine chain admits");
+        assert_eq!(verified.sender_public_key(), &browser_key.verifying_key());
+
+        // One over the daemon's independent cap: refused outright, even though
+        // the same genuine chain is inside. Only a server driving the socket
+        // directly can present this — the honest relay bounds at the same 64.
+        let over_cap = vec![edge; MAX_CARRIED_ENDORSEMENTS + 1];
+        assert!(
+            verify_signed_rtc_offer_admitted(
+                &envelope,
+                &record,
+                Some(&account),
+                &RevocationSet::new(),
+                &over_cap,
+            )
+            .is_none(),
+            "an over-cap carried set must be refused"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn a_revoked_key_stays_denied_when_a_later_frame_omits_it() {
+        use ed25519_dalek::SigningKey;
+        use spawnd::signed_signal::public_key_to_wire;
+        use spawnd::signed_signal_wire::{sign_rtc_signal_wire, RtcProtocol};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local websocket");
+        let address = listener.local_addr().unwrap();
+        let server_url = url::Url::parse(&format!("http://{address}")).unwrap();
+        let ws_url = config::ws_url(&server_url).unwrap();
+
+        let host_id = Uuid::from_u128(10);
+        let host_seed = [9u8; 32];
+        let host_key = SigningKey::from_bytes(&host_seed);
+        let host_peer =
+            public_key_from_wire(&public_key_to_wire(&host_key.verifying_key())).unwrap();
+        let browser_key = SigningKey::from_bytes(&[7u8; 32]);
+        let browser_wire = public_key_to_wire(&browser_key.verifying_key());
+        let browser_pk_bytes = browser_key.verifying_key().to_bytes();
+
+        // A fully well-formed signed host-scope offer from the browser: absent
+        // the revocation it would verify against the pin and reach RTC.
+        let session_id = Uuid::from_u128(2).to_string();
+        let offer = SignedSignalTranscript::new(
+            SignalKind::Offer,
+            1,
+            session_id.clone(),
+            ScopeType::Host,
+            host_id.to_string(),
+            SenderRole::Browser,
+            host_peer.to_bytes(),
+            "v=0\r\no=browser\r\n",
+        )
+        .unwrap();
+        let envelope = sign_rtc_signal_wire(&browser_key, RtcProtocol::Host, &offer).unwrap();
+
+        let account_id = "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let (close_tx, close_rx) = oneshot::channel();
+        let server_session_id = session_id.clone();
+        let server_browser_wire = browser_wire.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept daemon socket");
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static("spawn.control.v2"),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .expect("daemon websocket handshake");
+            let register = socket
+                .next()
+                .await
+                .expect("daemon register frame")
+                .expect("valid daemon register frame")
+                .into_text()
+                .expect("text daemon register frame");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&register).unwrap()["type"],
+                "register"
+            );
+
+            let frames = [
+                // The revocation lands in the registration frame...
+                serde_json::json!({
+                    "type": "registered",
+                    "host_id": host_id,
+                    "account_id": account_id,
+                    "revoked_browser_keys": [server_browser_wire],
+                })
+                .to_string(),
+                // ...then a later push replaces the list with an EMPTY one —
+                // the whole-replace un-revoke attack (P3′ residual). Pin
+                // fields stay absent so pin reconciliation never runs.
+                serde_json::json!({
+                    "type": "host.browser_pins",
+                    "account_id": account_id,
+                    "revoked_browser_keys": [],
+                })
+                .to_string(),
+                // The revoked (but still locally pinned) key now offers. The
+                // monotonic floor must refuse it before any RTC work; with a
+                // whole-replace deny-list this would verify, reach the RTC
+                // path, and emit an answer or failure-status frame.
+                serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": server_session_id,
+                    "binding_nonce": "a".repeat(32),
+                    "scope_type": "host",
+                    "scope_id": host_id,
+                    "protocol": "spawn.host.ctl",
+                    "protocol_version": 1,
+                    "signed_envelope": envelope,
+                    "ice_servers": [],
+                })
+                .to_string(),
+            ];
+            for frame in frames {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(frame))
+                    .await
+                    .expect("send revocation-ratchet frame");
+            }
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    r#"{"type":"host.ping","request_id":"after-revoked-offer"}"#.into(),
+                ))
+                .await
+                .expect("send post-offer ping");
+
+            // Dispatch is serial, so by pong time the offer was fully handled.
+            // Any frame besides the pong (an rtc.answer, a host status) proves
+            // the revoked key reached the RTC path.
+            let mut unexpected = Vec::new();
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                    .await
+                    .expect("post-offer pong timeout")
+                    .expect("post-offer websocket close")
+                    .expect("post-offer websocket read")
+                    .into_text()
+                    .expect("post-offer text frame");
+                let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+                if value["type"] == "host.pong" && value["request_id"] == "after-revoked-offer" {
+                    break;
+                }
+                unexpected.push(value);
+            }
+            assert_eq!(unexpected, Vec::<serde_json::Value>::new());
+            observed_tx.send(()).expect("refusal observation");
+            close_rx.await.expect("close request");
+            socket.close(None).await.expect("close daemon socket");
+        });
+
+        // The browser key IS pinned: only the deny-list stands between the
+        // revoked device and admission.
+        let record = credential_record(
+            1,
+            1,
+            "revocation-ratchet-test-token",
+            host_id,
+            server_url.as_str(),
+            9,
+            &[(Uuid::from_u128(1), browser_wire.as_str())],
+        );
+        let active = LiveCredentialSnapshot::initial(record.clone(), &server_url).unwrap();
+        let stable_record = record.clone();
+        let mut loader =
+            CredentialLoader::start(Duration::from_secs(1), move || Ok(stable_record.clone()))
+                .expect("credential loader");
+        let registry = AgentRegistry::new();
+        assert!(registry.claim_discovery());
+        let rtc_sessions = RtcSessions::new();
+        assert!(rtc_sessions.bind_registered_host_id(host_id).await);
+
+        let mut daemon_revoked = RevocationSet::new();
+        {
+            let connection = serve_one_connection_with_loader(
+                &active,
+                &ws_url,
+                &registry,
+                &rtc_sessions,
+                Duration::from_secs(5),
+                &mut loader,
+                &mut daemon_revoked,
+            );
+            tokio::pin!(connection);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    observed = observed_rx => observed.expect("server refusal observation"),
+                    result = &mut connection => {
+                        panic!("daemon connection ended before refusal proof: {}", result.is_ok());
+                    }
+                }
+            })
+            .await
+            .expect("live revocation-ratchet refusal timeout");
+            assert_eq!(rtc_sessions.resident_session_count().await, 0);
+            close_tx.send(()).expect("close test websocket");
+            let outcome = tokio::time::timeout(Duration::from_secs(1), &mut connection)
+                .await
+                .expect("daemon connection close timeout")
+                .expect("daemon connection result");
+            assert!(matches!(outcome, ServeOutcome::SessionEnded(_)));
+        }
+        // The floor outlives the connection: a reconnect (a fresh dispatch
+        // loop) starts from this state, so the omitted key stays denied for
+        // the life of the process, not just the socket.
+        assert!(daemon_revoked.contains(&browser_pk_bytes));
         assert_eq!(rtc_sessions.resident_session_count().await, 0);
         tokio::time::timeout(Duration::from_secs(1), server)
             .await
@@ -4331,6 +4685,7 @@ mod tests {
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
         let epoch_before = rtc_sessions.trust_epoch_for_test();
+        let mut daemon_revoked = RevocationSet::new();
 
         {
             let connection = serve_one_connection_with_loader(
@@ -4340,6 +4695,7 @@ mod tests {
                 &rtc_sessions,
                 Duration::from_millis(5),
                 &mut loader,
+                &mut daemon_revoked,
             );
             tokio::pin!(connection);
             tokio::time::timeout(Duration::from_secs(1), async {
@@ -4495,6 +4851,7 @@ mod tests {
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
         let cleanup_gate = rtc_sessions.stall_next_close_all_for_test().await;
+        let mut daemon_revoked = RevocationSet::new();
 
         let outcome = {
             let connection = serve_one_connection_with_loader(
@@ -4504,6 +4861,7 @@ mod tests {
                 &rtc_sessions,
                 Duration::from_millis(5),
                 &mut loader,
+                &mut daemon_revoked,
             );
             tokio::pin!(connection);
             tokio::time::timeout(Duration::from_secs(1), async {
