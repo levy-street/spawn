@@ -714,6 +714,15 @@ async def _live_browser_device_id_set(session: AsyncSession, host_id: str) -> se
     identical on SQLite and Postgres. A missing endorser row (no FK on
     endorser_device_id, so a hard-deleted endorser leaves a dangling id) fails
     closed: endorser_id is NULL, so the pin is never admitted.
+
+    The account ROOT's pin is a deliberate ratchet exception (mesh stage 5c):
+    once endorsed onto a host it stays live as long as the root itself is not
+    revoked, even after its endorser dies. The endorser was live when the route
+    verified and stored the row, and the whole point of anchoring on `R` is
+    surviving the loss/revocation of every ordinary device — a root pin that
+    died with its endorser would re-couple recovery to a single device's fate
+    (breaking P3′). Root compromise is handled by revoking the root itself,
+    which drops the pin here AND lands pk_R on the account deny-list.
     """
 
     endorser = aliased(BrowserDevice)
@@ -723,6 +732,7 @@ async def _live_browser_device_id_set(session: AsyncSession, host_id: str) -> se
                 HostBrowserPin.browser_device_id,
                 HostBrowserPin.endorser_device_id,
                 BrowserDevice.revoked_at.label("endorsed_revoked_at"),
+                BrowserDevice.is_root.label("endorsed_is_root"),
                 endorser.id.label("endorser_id"),
                 endorser.revoked_at.label("endorser_revoked_at"),
             )
@@ -741,7 +751,7 @@ async def _live_browser_device_id_set(session: AsyncSession, host_id: str) -> se
         for row in eligible:
             if row.browser_device_id in live:
                 continue
-            rooted = row.endorser_device_id is None
+            rooted = row.endorser_device_id is None or row.endorsed_is_root
             endorsed_by_live = (
                 row.endorser_id is not None
                 and row.endorser_revoked_at is None
