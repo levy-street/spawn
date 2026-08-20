@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  Button,
   Chip,
   IconButton,
   IconChevronRight,
@@ -13,19 +14,25 @@ import {
   Menu,
   MenuItem,
 } from "./bits";
-import type { DeviceVM, HostVM, RecoveryVM, TrustEventVM } from "./types";
+import type { DeviceVM, HostVM, TrustEventVM } from "./types";
 
 export interface AccessScreenProps {
   devices: DeviceVM[];
   hosts: HostVM[];
-  recovery: RecoveryVM;
   /** Newest first; the screen shows the first three. */
   history: TrustEventVM[];
-  onLinkDevice?: () => void;
+  /**
+   * One-time tip shown when the account has no passkey: the R8 cost, stated
+   * once and dismissible. There is no recovery object to manage — a passkey
+   * (added in account settings) IS the safety net.
+   */
+  passkeyNudge?: boolean;
+  onNewDevice?: () => void;
   onPossessHost?: () => void;
+  onApproveDevice?: (id: string) => void;
   onDeviceOptions?: (id: string) => void;
-  onTurnOnRecovery?: () => void;
-  onResetRecovery?: () => void;
+  onAddPasskey?: () => void;
+  onDismissNudge?: () => void;
   onShowHistory?: () => void;
   /** Desktop settings pane: full-width rows instead of the 420px column. */
   wide?: boolean;
@@ -36,19 +43,22 @@ export interface AccessScreenProps {
 }
 
 /**
- * The single trust destination. Row provenance ("Linked by …") and the history
- * lines are the visible audit surface (R4): every endorsement is a sentence here.
+ * The single trust destination, named for what it governs. A device appears
+ * here the moment it signs in (R4: every sign-in is visible immediately);
+ * approval is the transition, not the insertion. Row provenance and the
+ * history lines are the audit surface.
  */
 export function AccessScreen({
   devices,
   hosts,
-  recovery,
   history,
-  onLinkDevice,
+  passkeyNudge = false,
+  onNewDevice,
   onPossessHost,
+  onApproveDevice,
   onDeviceOptions,
-  onTurnOnRecovery,
-  onResetRecovery,
+  onAddPasskey,
+  onDismissNudge,
   onShowHistory,
   wide = false,
   openMenuDeviceId,
@@ -60,53 +70,12 @@ export function AccessScreen({
       <header>
         <h1 className="text-xl font-medium tracking-tight text-zinc-100">Access</h1>
         <p className="mt-1 text-sm text-zinc-500">
-          {recovery.on
-            ? "Every device here can reach every host. Only you can add to this list."
-            : "Linked devices reach the hosts you've possessed. Only you can add to this list."}
+          Every approved device reaches every host — and only you can approve one.
         </p>
       </header>
 
-      {recovery.on ? (
-        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
-          <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-emerald-400/10 text-emerald-400">
-            <IconKey />
-          </span>
-          <div className="min-w-36 flex-1">
-            <p className="text-sm font-medium text-zinc-100">Recovery is on</p>
-            <p className="text-xs text-zinc-500">{recovery.detail}</p>
-          </div>
-          <button
-            type="button"
-            onClick={onResetRecovery}
-            className="text-xs font-medium text-zinc-500 transition-colors hover:text-zinc-200"
-          >
-            Reset
-          </button>
-        </div>
-      ) : (
-        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-amber-400/20 bg-amber-400/5 px-4 py-3">
-          <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-amber-400/10 text-amber-400">
-            <IconKey />
-          </span>
-          <div className="min-w-44 flex-1">
-            <p className="text-sm font-medium text-zinc-100">Recovery is off</p>
-            <p className="text-xs leading-relaxed text-zinc-400">
-              Lose your last device and you start over — every host possessed again from its
-              terminal.
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={onTurnOnRecovery}
-            className="shrink-0 rounded-lg bg-amber-400/15 px-3 py-1.5 text-xs font-medium text-amber-300 transition-colors hover:bg-amber-400/25 max-sm:ml-12"
-          >
-            Turn on
-          </button>
-        </div>
-      )}
-
       <section>
-        <SectionHeader label="Your devices" action="Link a device" onAction={onLinkDevice} />
+        <SectionHeader label="Your devices" action="New device" onAction={onNewDevice} />
         <div className="divide-y divide-zinc-800/80 rounded-xl border border-zinc-800 bg-zinc-900/40">
           {devices.map((d) => (
             <div key={d.id} className="relative flex items-center gap-3 px-4 py-3">
@@ -117,20 +86,34 @@ export function AccessScreen({
                 <div className="flex items-center gap-2">
                   <span className="truncate text-sm font-medium text-zinc-100">{d.name}</span>
                   {d.isThisDevice && <Chip>This device</Chip>}
+                  {d.waiting && (
+                    <span className="shrink-0 whitespace-nowrap rounded-full bg-amber-400/10 px-2 py-0.5 text-[11px] font-medium text-amber-300">
+                      Waiting for approval
+                    </span>
+                  )}
                 </div>
                 {/* The provenance is the audit surface — it wraps rather than
                     truncates on narrow screens, where the who/when matters most. */}
                 <p className="text-xs leading-relaxed text-zinc-500 sm:truncate">
                   {d.provenance}
-                  <span className="sm:hidden"> · {seenLabel(d.lastSeen)}</span>
+                  {!d.waiting && <span className="sm:hidden"> · {seenLabel(d.lastSeen)}</span>}
                 </p>
               </div>
-              <span className="hidden shrink-0 text-xs text-zinc-600 sm:block">
-                {seenLabel(d.lastSeen)}
-              </span>
-              <IconButton label={`Options for ${d.name}`} onClick={() => onDeviceOptions?.(d.id)}>
-                <IconEllipsis />
-              </IconButton>
+              {d.waiting ? (
+                <Button onClick={() => onApproveDevice?.(d.id)}>Approve…</Button>
+              ) : (
+                <>
+                  <span className="hidden shrink-0 text-xs text-zinc-600 sm:block">
+                    {seenLabel(d.lastSeen)}
+                  </span>
+                  <IconButton
+                    label={`Options for ${d.name}`}
+                    onClick={() => onDeviceOptions?.(d.id)}
+                  >
+                    <IconEllipsis />
+                  </IconButton>
+                </>
+              )}
               {openMenuDeviceId === d.id && (
                 <div className="absolute right-3 top-11 z-10">
                   <Menu>
@@ -175,6 +158,33 @@ export function AccessScreen({
         </div>
       </section>
 
+      {passkeyNudge && (
+        <div className="flex items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
+          <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-zinc-800/80 text-zinc-400">
+            <IconKey />
+          </span>
+          <p className="min-w-0 flex-1 text-xs leading-relaxed text-zinc-400">
+            If you lose every device, a passkey brings everything back. You can add one in account
+            settings.
+          </p>
+          <button
+            type="button"
+            onClick={onAddPasskey}
+            className="shrink-0 text-xs font-medium text-zinc-300 transition-colors hover:text-zinc-100"
+          >
+            Add passkey
+          </button>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={onDismissNudge}
+            className="shrink-0 text-zinc-600 transition-colors hover:text-zinc-300"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
       <section>
         <SectionHeader label="History" action="Everything" onAction={onShowHistory} plain />
         <ul className="space-y-2.5">
@@ -196,7 +206,7 @@ export function AccessScreen({
 }
 
 /** "Now" stays bare; any other last-seen value gets its label so two dates on a
-    row can't be confused ("Linked … Jun 3" vs "Seen Aug 12"). */
+    row can't be confused ("Approved … Jun 3" vs "Seen Aug 12"). */
 function seenLabel(lastSeen: string): string {
   return lastSeen === "Now" ? "Now" : `Seen ${lastSeen}`;
 }

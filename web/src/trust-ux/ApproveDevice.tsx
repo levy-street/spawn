@@ -4,20 +4,19 @@ import { Button, Eyebrow, IconLaptop, IconPhone, Screen, Spinner } from "./bits"
 import type { DeviceKind } from "./types";
 
 /**
- * The new device, freshly signed in, before any ceremony.
- * With a passkey this screen is never seen — recovery admits the device silently.
+ * The new device, freshly signed in. It is already visible in every roster —
+ * approval is what it's waiting for. With a passkey this screen is never seen:
+ * signing in with it is the approval.
  */
-export function LinkNewDevice({ onCancel }: { onCancel?: () => void }) {
+export function WaitingForApproval({ onCancel }: { onCancel?: () => void }) {
   return (
     <Screen>
-      <Eyebrow>Link this device</Eyebrow>
+      <Eyebrow>Approve this device</Eyebrow>
       <div className="flex flex-1 flex-col items-center justify-center gap-4 text-center">
         <Spinner />
-        <h2 className="text-lg font-medium tracking-tight text-zinc-100">
-          Confirm from another device
-        </h2>
+        <h2 className="text-lg font-medium tracking-tight text-zinc-100">Waiting for approval</h2>
         <p className="max-w-[26ch] text-balance text-sm leading-relaxed text-zinc-400">
-          Open spawn on a device you already use — or sign in here with your recovery passkey.
+          Approve from a device you already use — or sign in here with your passkey.
         </p>
       </div>
       <Button full variant="ghost" onClick={onCancel}>
@@ -29,9 +28,9 @@ export function LinkNewDevice({ onCancel }: { onCancel?: () => void }) {
 
 /**
  * The prompt an existing device receives. Approving opens the number check;
- * nothing is trusted until the numbers match there.
+ * nothing is trusted until the number is entered there.
  */
-export function LinkRequest({
+export function ApproveRequest({
   deviceName,
   deviceKind,
   account,
@@ -55,7 +54,7 @@ export function LinkRequest({
             <IconLaptop className="size-6" />
           )}
         </span>
-        <h2 className="text-lg font-medium tracking-tight text-zinc-100">Link {deviceName}?</h2>
+        <h2 className="text-lg font-medium tracking-tight text-zinc-100">Approve {deviceName}?</h2>
         <p className="max-w-[26ch] text-balance text-sm leading-relaxed text-zinc-400">
           It just signed in as {account}. If that wasn't you, ignore this.
         </p>
@@ -73,11 +72,11 @@ export function LinkRequest({
 }
 
 /**
- * The same link request as it arrives on a desktop: a corner toast over
- * whatever the user is doing. Approving opens the number check; Ignore
- * dismisses — nothing is trusted from this card alone.
+ * The same request as it arrives on a desktop: a corner toast over whatever
+ * the user is doing. Approving opens the number check; Ignore dismisses —
+ * nothing is trusted from this card alone.
  */
-export function LinkRequestToast({
+export function ApproveRequestToast({
   deviceName,
   deviceKind,
   onEnterNumber,
@@ -95,7 +94,7 @@ export function LinkRequestToast({
           {deviceKind === "phone" ? <IconPhone /> : <IconLaptop />}
         </span>
         <div className="min-w-0 flex-1">
-          <p className="text-sm font-medium text-zinc-100">Link {deviceName}?</p>
+          <p className="text-sm font-medium text-zinc-100">Approve {deviceName}?</p>
           <p className="mt-0.5 text-xs leading-relaxed text-zinc-400">
             It just signed in as you. If that wasn't you, ignore this.
           </p>

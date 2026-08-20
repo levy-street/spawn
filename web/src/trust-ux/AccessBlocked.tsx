@@ -2,7 +2,7 @@
 
 import { Button, IconBlocked, Screen } from "./bits";
 
-export type AccessBlockedVariant = "removed" | "not-linked";
+export type AccessBlockedVariant = "removed" | "not-approved";
 
 /**
  * What a refused device sees. Removal is permanent (R10): the only way back is
@@ -12,13 +12,15 @@ export type AccessBlockedVariant = "removed" | "not-linked";
 export function AccessBlocked({
   variant,
   detail,
-  onLink,
+  onUsePasskey,
+  onStartOver,
   onSignOut,
 }: {
   variant: AccessBlockedVariant;
-  /** e.g. "Removed Aug 12 by MacBook Pro." — the actor, matching "Linked by". */
+  /** e.g. "Removed Aug 12 by MacBook Pro." — the actor, matching "Approved by". */
   detail?: string;
-  onLink?: () => void;
+  onUsePasskey?: () => void;
+  onStartOver?: () => void;
   onSignOut?: () => void;
 }) {
   return (
@@ -43,15 +45,22 @@ export function AccessBlocked({
             </span>
             <h2 className="text-lg font-medium tracking-tight text-zinc-100">One step left</h2>
             <p className="max-w-[26ch] text-balance text-sm leading-relaxed text-zinc-400">
-              This device isn't linked yet, so your hosts stay out of reach.
+              This device isn't approved yet, so your hosts stay out of reach. Approve it from a
+              device you already use — or sign in with your passkey.
             </p>
           </>
         )}
       </div>
       <div className="flex flex-col gap-2">
-        <Button full onClick={onLink}>
-          {variant === "removed" ? "Link as a new device" : "Link this device"}
-        </Button>
+        {variant === "removed" ? (
+          <Button full onClick={onStartOver}>
+            Start over
+          </Button>
+        ) : (
+          <Button full onClick={onUsePasskey}>
+            Use passkey
+          </Button>
+        )}
         <Button full variant="ghost" onClick={onSignOut}>
           Sign out
         </Button>

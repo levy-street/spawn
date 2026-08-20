@@ -3,8 +3,8 @@
 import type { TrustEventVM } from "./types";
 
 /**
- * The full trust log (R4): every link, connection, removal, and recovery event
- * as one plain sentence, newest first. No filters — reading it is the feature.
+ * The full trust log (R4): every approval, possession, removal, and passkey
+ * event as one plain sentence, newest first. No filters — reading it is the feature.
  */
 export function TrustHistory({ events }: { events: TrustEventVM[] }) {
   return (
@@ -23,7 +23,7 @@ export function TrustHistory({ events }: { events: TrustEventVM[] }) {
               className={`size-1.5 shrink-0 translate-y-[-1px] rounded-full ${
                 e.kind === "removed"
                   ? "bg-red-400/80"
-                  : e.kind === "recovery"
+                  : e.kind === "passkey"
                     ? "bg-emerald-400/80"
                     : "bg-zinc-600"
               }`}
