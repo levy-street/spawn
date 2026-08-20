@@ -77,6 +77,11 @@ class BrowserDevice(Base):
     # a hostile server could label its own device convincingly. The fingerprint
     # remains the value an operator compares.
     label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The account ROOT (device mesh §3, stage 5), not a real browser: pk_R held
+    # here so it reuses the endorsement store, pin/anchor delivery, and chain
+    # validation. A root never connects (it has no browser and no RTC), only
+    # endorses (R→d) and anchors. At most one per account.
+    is_root: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
