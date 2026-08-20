@@ -138,3 +138,71 @@ async def test_pin_details_distinguish_direct_from_endorsed(client):
     assert by_device[direct["id"]]["direct"] is True
     assert by_device[endorsed["id"]]["direct"] is False
     assert all("created_at" in d for d in details)
+
+
+async def test_endorsement_and_prune_push_state_to_account_hosts(client, monkeypatch):
+    """Approvals and prunes must reconcile daemons NOW: a daemon's deny-list
+    replaces wholesale on push, so a route that changes revocation-relevant
+    state without pushing leaves hosts refusing (or trusting) stale keys."""
+
+    from spawn_server.models import Host
+    from spawn_server.routes import browser_devices as bd_routes
+    from spawn_server.routes import trust_bundle as tb_routes
+
+    pushed: list[str] = []
+
+    async def record_push(host_id: str) -> None:
+        pushed.append(host_id)
+
+    monkeypatch.setattr(tb_routes, "push_browser_pins", record_push)
+    monkeypatch.setattr(bd_routes, "push_browser_pins", record_push)
+
+    user_id, auth = await _signup(client, "push-on-change@example.com")
+    async with get_sessionmaker()() as session:
+        host = Host(name="push-box", owner_user_id=user_id)
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    a_key = Ed25519PrivateKey.generate()
+    a = (await _register(client, auth, user_id, a_key)).json()
+    b_key = Ed25519PrivateKey.generate()
+    b = (await _register(client, auth, user_id, b_key)).json()
+
+    from spawn_server.acct_endorsement import encode_acct_endorsement_transcript
+
+    signature = _wire(
+        a_key.sign(
+            encode_acct_endorsement_transcript(
+                user_id,
+                a_key.public_key().public_bytes_raw(),
+                b_key.public_key().public_bytes_raw(),
+                b["id"],
+            )
+        )
+    )
+    r = await client.post(
+        "/api/trust/account-endorsements",
+        json={
+            "endorser_device_id": a["id"],
+            "endorsed_device_id": b["id"],
+            "signature": signature,
+        },
+        headers=auth,
+    )
+    assert r.status_code == 200, r.text
+    assert host_id in pushed, "recording an approval must push host state"
+
+    pushed.clear()
+    revoke = await client.post(
+        f"/api/browser-devices/{b['id']}/revoke",
+        json={"expected_public_key": b["public_key"]},
+        headers=auth,
+    )
+    assert revoke.status_code == 200
+    pushed.clear()
+
+    prune = await client.post("/api/browser-devices/prune", headers=auth)
+    assert prune.status_code == 200
+    assert prune.json()["pruned"] == 1
+    assert host_id in pushed, "pruning must push so stale deny-lists converge"
