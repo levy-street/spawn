@@ -513,7 +513,7 @@ export function WorkspaceTabs({
     }
     queryClient.invalidateQueries({ queryKey: ["workspaces"] });
     queryClient.invalidateQueries({ queryKey: ["sessions"] });
-    router.replace("/");
+    router.replace("/app");
   };
 
   const submitWorkspaceRename = (event?: FormEvent) => {

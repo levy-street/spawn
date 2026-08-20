@@ -1,23 +1,20 @@
 "use client";
 
-import {
-  AlertTriangle,
-  Apple,
-  ArrowLeft,
-  CheckCircle2,
-  Copy,
-  Download,
-  Laptop,
-  MonitorCog,
-  Server,
-  Terminal,
-} from "lucide-react";
+import { AlertTriangle, ArrowRight, Check, CheckCircle2, Copy, Laptop } from "lucide-react";
+import Image from "next/image";
 import Link from "next/link";
-import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
-import { Trident, Wordmark } from "@/components/icons/BrandMark";
-import { Button } from "@/components/ui/button";
+import {
+  Colophon,
+  CTA_QUIET,
+  CTA_SLAB,
+  Eyebrow,
+  Masthead,
+  RegistrationMarks,
+} from "@/components/brand/press";
+import { poster } from "@/lib/fonts";
 import { detectPlatform, type PlatformOS, UNDETECTED_PLATFORM } from "@/lib/platform";
+import { cn } from "@/lib/utils";
 
 const PLATFORM_COPY: Record<
   PlatformOS,
@@ -65,17 +62,14 @@ const PLATFORM_COPY: Record<
 
 const OPTIONS = [
   {
-    icon: <Apple className="size-5" />,
     title: "macOS",
     body: "Downloads a Darwin build for Apple Silicon or Intel, then starts a LaunchAgent.",
   },
   {
-    icon: <Server className="size-5" />,
     title: "Linux",
     body: "Downloads an x86_64 or arm64 Linux build, then starts user systemd when available.",
   },
   {
-    icon: <MonitorCog className="size-5" />,
     title: "Remote hosts",
     body: "SSH into the machine that should run agents, then run the same command there.",
   },
@@ -102,143 +96,191 @@ export default function DownloadPage() {
     window.setTimeout(() => setCopied(false), 1600);
   };
 
+  // The one dot of colour on the detected plate: the brand ink says "good",
+  // hellfire says "not here", ash says "we couldn't tell".
   const statusIcon = useMemo(() => {
-    if (supported) return <CheckCircle2 className="size-5 text-success" />;
-    if (detected.status === "unsupported") return <AlertTriangle className="size-5 text-warning" />;
-    return <Laptop className="size-5 text-info" />;
+    if (supported) return <CheckCircle2 className="size-4 text-ember" aria-hidden />;
+    if (detected.status === "unsupported")
+      return <AlertTriangle className="size-4 text-hellfire" aria-hidden />;
+    return <Laptop className="size-4 text-ash" aria-hidden />;
   }, [detected.status, supported]);
 
   return (
-    <main className="min-h-vv bg-brand-bg text-foreground">
-      <nav className="mx-auto flex w-full max-w-7xl items-center justify-between px-4 py-5 sm:px-6 lg:px-8">
-        <Link href="/" className="flex items-center gap-2.5 text-brand-accent">
-          <Trident className="size-7 shrink-0" />
-          <Wordmark className="h-6" />
-        </Link>
-        <Button asChild variant="ghost" size="sm">
-          <Link href="/">
-            <ArrowLeft className="size-4" />
-            Back
-          </Link>
-        </Button>
-      </nav>
+    <main className="grimoire min-h-vv overflow-x-clip">
+      <Masthead current="download" />
 
-      <section className="border-border border-y bg-brand-panel px-4 py-12 sm:px-6 lg:px-8">
-        <div className="mx-auto grid w-full max-w-7xl gap-8 lg:grid-cols-[0.9fr_1.1fr] lg:items-center">
-          <div>
-            <p className="mb-4 inline-flex items-center gap-2 rounded-md border border-brand-hairline bg-brand-panel/70 px-3 py-1 text-sm text-foreground/85">
-              <Download className="size-4 text-info" />
-              Possess a host
-            </p>
-            <h1 className="text-4xl font-semibold leading-tight sm:text-5xl">
-              Install the daemon. Possess the host.
-            </h1>
-            <p className="mt-5 max-w-xl text-lg leading-8 text-foreground/85">
-              The installer detects macOS or Linux on the machine where it runs, downloads the
-              matching prebuilt daemon, then starts it as a user service. One line, then the pairing
-              ceremony — consensual, auditable, revocable.
-            </p>
+      {/* ── The hero: the dial-out plate, type ranged left ─────── */}
+      <section className="relative isolate overflow-hidden border-line-g border-b">
+        <Image
+          src="/brand/ink/hosts-ink.png"
+          alt=""
+          aria-hidden
+          fill
+          priority
+          sizes="100vw"
+          className="pointer-events-none object-cover object-[50%_45%]"
+        />
+        <div
+          aria-hidden
+          className="absolute inset-0"
+          style={{
+            background:
+              "linear-gradient(180deg, rgba(0,0,0,.94) 0%, rgba(0,0,0,.86) 40%, rgba(0,0,0,.9) 100%)",
+          }}
+        />
+        <RegistrationMarks />
+
+        <div className="relative z-10 mx-auto w-full max-w-6xl min-w-0 px-5 py-24 sm:px-8">
+          <div className="grid min-w-0 gap-14 lg:grid-cols-[1.05fr_0.95fr] lg:items-center">
+            <div>
+              <Eyebrow className="mb-5">Possess a host</Eyebrow>
+              <h1
+                className={cn(
+                  poster.className,
+                  "text-[clamp(32px,5.2vw,58px)] leading-[1.02] font-medium text-bone uppercase [text-wrap:balance]",
+                )}
+              >
+                Install the daemon. <em className="text-hellfire not-italic">Possess the host.</em>
+              </h1>
+              <p className="mt-6 max-w-[54ch] text-[17px] leading-8 text-ash">
+                The installer detects macOS or Linux on the machine where it runs, downloads the
+                matching prebuilt daemon, then starts it as a user service. One line, then the
+                pairing ceremony — consensual, auditable, revocable.
+              </p>
+            </div>
+
+            {/* The detected plate, set like the lander's "server's entire view". */}
+            <figure className="min-w-0 border border-line-strong bg-char">
+              <figcaption className="flex items-center justify-between gap-4 border-line-g border-b px-5 py-3.5 font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
+                <span>Detected browser OS</span>
+                <span aria-hidden className="flex items-center gap-1.5">
+                  <span className="size-2 rounded-full bg-hellfire" />
+                  <span className="size-2 rounded-full bg-blood" />
+                  <span className="size-2 rounded-full bg-line-strong" />
+                </span>
+              </figcaption>
+              <div className="min-w-0 px-5 py-6 sm:px-6">
+                <div className="flex items-center gap-3">
+                  {statusIcon}
+                  <h2
+                    className={cn(
+                      poster.className,
+                      "text-[26px] leading-none font-medium text-bone uppercase",
+                    )}
+                  >
+                    {detected.label}
+                  </h2>
+                </div>
+                <p className="mt-4 text-[15px] leading-7 text-ash">{detected.recommendation}</p>
+                <p className="mt-5 border-line-g border-t pt-4 font-sigil text-[12px] leading-6 text-ash">
+                  {detected.service}
+                </p>
+              </div>
+            </figure>
           </div>
 
-          <div className="rounded-md border border-brand-hairline bg-brand-panel/60 p-4 sm:p-5">
-            <div className="flex items-start gap-3">
-              <div className="mt-1">{statusIcon}</div>
-              <div>
-                <p className="text-sm text-muted-foreground">Detected browser OS</p>
-                <h2 className="mt-1 text-2xl font-semibold">{detected.label}</h2>
-                <p className="mt-3 text-sm leading-6 text-foreground/85">
-                  {detected.recommendation}
-                </p>
-                <p className="mt-3 text-sm text-muted-foreground">{detected.service}</p>
-              </div>
+          {/* The line itself, and the two doors out of the hero — the lander
+           * hangs its install chip and CTA off the foot of the hero the same
+           * way, so the fold always ends on something you can act on. */}
+          <div className="mt-16 min-w-0 border-line-g border-t pt-10">
+            <p className="mb-5 font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
+              {detected.title}
+            </p>
+            <div className="flex max-w-full min-w-0 items-center gap-3 rounded-sm border border-bone bg-void py-4 pr-3 pl-4 font-sigil text-[13px] text-bone">
+              <span className="text-ember">$</span>
+              <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{command}</code>
             </div>
+
+            <div className="mt-8 flex flex-col items-stretch gap-5 sm:flex-row sm:items-center sm:gap-7">
+              <button type="button" onClick={copyCommand} disabled={!canCopy} className={CTA_SLAB}>
+                {copied ? (
+                  <Check className="size-4" aria-hidden />
+                ) : (
+                  <Copy className="size-4" aria-hidden />
+                )}
+                {copied ? "Copied" : "Copy command"}
+              </button>
+              <Link href="/signup" className={CTA_QUIET}>
+                Create account
+                <ArrowRight className="size-4" aria-hidden />
+              </Link>
+            </div>
+
+            {!supported && (
+              <p className="mt-8 flex items-start gap-3 border-hellfire border-l-2 bg-char py-4 pr-5 pl-5 text-[15px] leading-7 text-bone">
+                <AlertTriangle className="mt-1 size-4 shrink-0 text-hellfire" aria-hidden />
+                <span>
+                  Use this command from a supported macOS or Linux terminal, not from this browser
+                  OS.
+                </span>
+              </p>
+            )}
           </div>
         </div>
       </section>
 
-      <section className="px-4 py-10 sm:px-6 lg:px-8">
-        <div className="mx-auto grid w-full max-w-7xl gap-6 lg:grid-cols-[1.25fr_0.75fr]">
-          <div className="rounded-md border border-brand-hairline bg-brand-panel p-4 sm:p-6">
-            <div className="flex items-center gap-3">
-              <div className="flex size-10 items-center justify-center rounded-md bg-white text-black">
-                <Terminal className="size-5" />
-              </div>
-              <div>
-                <h2 className="text-xl font-semibold">{detected.title}</h2>
-                <p className="text-sm text-muted-foreground">Run this in the host terminal.</p>
-              </div>
-            </div>
-
-            <div className="mt-5 rounded-md border border-brand-hairline bg-brand-well p-3 font-mono text-sm text-foreground">
-              <span className="mr-2 text-success">$</span>
-              <code className="break-all">{command}</code>
-            </div>
-
-            <div className="mt-4 flex flex-col gap-3 sm:flex-row">
-              <Button type="button" onClick={copyCommand} disabled={!canCopy}>
-                <Copy className="size-4" />
-                {copied ? "Copied" : "Copy command"}
-              </Button>
-              <Button asChild variant="outline">
-                <Link href="/signup">
-                  Create account
-                  <CheckCircle2 className="size-4" />
-                </Link>
-              </Button>
-            </div>
-
-            {!supported && (
-              <p className="mt-4 rounded-md border border-warning/25 bg-warning-soft px-3 py-2 text-sm text-warning">
-                Use this command from a supported macOS or Linux terminal, not from this browser OS.
-              </p>
-            )}
-          </div>
-
-          <div className="grid gap-3">
+      {/* ── Plate II: where it can run, black ink on red ───────── */}
+      <section className="relative overflow-hidden bg-plate text-void">
+        {/* Small, faint, and clear of the columns: at 20% the stamp darkened the
+         * ground beneath it, and black body copy over dimmed red stopped
+         * reading — the third column took the worst of it. */}
+        <div
+          aria-hidden
+          className="pointer-events-none absolute -top-20 -right-20 size-[16rem] rotate-[4deg] opacity-[0.10] sm:size-[22rem]"
+        >
+          {/* biome-ignore lint/performance/noImgElement: decorative stamp, no optimization needed */}
+          <img src="/brand/spawnd-icon-black.svg" alt="" className="size-full" />
+        </div>
+        <div className="relative mx-auto w-full max-w-6xl px-5 py-24 sm:px-8">
+          <p className="mb-14 font-sigil text-[12px] font-medium tracking-[0.3em] uppercase">
+            Where it can run
+          </p>
+          <div className="grid min-w-0 gap-y-14 md:grid-cols-3 md:gap-x-12 md:gap-y-0">
             {OPTIONS.map((option) => (
-              <InstallOption key={option.title} icon={option.icon} title={option.title}>
-                {option.body}
-              </InstallOption>
+              <div key={option.title} className="border-t-2 border-void pt-6">
+                <h3
+                  className={cn(
+                    poster.className,
+                    "mb-3 text-[24px] leading-[1.08] font-medium uppercase",
+                  )}
+                >
+                  {option.title}
+                </h3>
+                <p className="max-w-[44ch] text-[16px] leading-7">{option.body}</p>
+              </div>
             ))}
           </div>
         </div>
       </section>
 
-      <section className="border-border border-t bg-brand-panel px-4 py-10 sm:px-6 lg:px-8">
-        <div className="mx-auto grid w-full max-w-7xl gap-6 md:grid-cols-2">
+      {/* ── The smoke test ─────────────────────────────────────── */}
+      <section className="px-5 py-24 sm:px-8">
+        <div className="mx-auto grid w-full max-w-6xl min-w-0 gap-10 md:grid-cols-2 md:items-center">
           <div>
-            <h2 className="text-2xl font-semibold">Prebuilt-only smoke test</h2>
-            <p className="mt-3 text-sm leading-6 text-muted-foreground">
+            <Eyebrow className="mb-5">Prebuilt-only smoke test</Eyebrow>
+            <h2
+              className={cn(
+                poster.className,
+                "mb-4 max-w-[18ch] text-[clamp(24px,3.2vw,36px)] leading-[1.04] font-medium text-bone uppercase",
+              )}
+            >
+              Prove the hosted binary path.
+            </h2>
+            <p className="max-w-[50ch] text-[16px] leading-7 text-ash">
               Use this when you want to prove the hosted binary path works and fail instead of
               building from source.
             </p>
           </div>
-          <div className="rounded-md border border-brand-hairline bg-brand-well p-3 font-mono text-sm text-foreground">
-            <span className="mr-2 text-success">$</span>
-            <code className="break-all">{prebuiltCommand}</code>
+          <div className="flex max-w-full min-w-0 items-center gap-3 rounded-sm border border-line-strong bg-char py-4 pr-3 pl-4 font-sigil text-[13px] text-bone">
+            <span className="text-ember">$</span>
+            <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">
+              {prebuiltCommand}
+            </code>
           </div>
         </div>
       </section>
-    </main>
-  );
-}
 
-function InstallOption({
-  icon,
-  title,
-  children,
-}: {
-  icon: ReactNode;
-  title: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="rounded-md border border-brand-hairline bg-brand-panel/50 p-4">
-      <div className="mb-3 flex size-9 items-center justify-center rounded-md bg-white text-black">
-        {icon}
-      </div>
-      <h3 className="font-semibold">{title}</h3>
-      <p className="mt-2 text-sm leading-6 text-muted-foreground">{children}</p>
-    </div>
+      <Colophon />
+    </main>
   );
 }

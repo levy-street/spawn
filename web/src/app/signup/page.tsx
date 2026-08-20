@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 import { AuthShell } from "@/components/onboarding/auth-shell";
@@ -38,7 +39,7 @@ function SignupPageContent() {
       <div className="space-y-5">
         {invite !== null ? (
           <p
-            className="rounded-md border border-success/40 bg-success-soft px-3 py-2 text-sm"
+            className="rounded-sm border border-ember/40 bg-ember/10 px-3 py-2 text-sm text-bone"
             role="status"
           >
             You have an invite — finish creating your account below.
@@ -50,6 +51,15 @@ function SignupPageContent() {
           oauthReturnTo="/onboarding"
           onSuccess={() => router.replace("/onboarding")}
         />
+        <p className="text-center text-sm text-ash">
+          Already have an account?{" "}
+          <Link
+            href="/login"
+            className="-my-2 inline-flex items-center py-2 font-medium text-ember underline decoration-ember/50 underline-offset-4 transition-colors hover:text-hellfire hover:decoration-ember"
+          >
+            Log in
+          </Link>
+        </p>
       </div>
     </AuthShell>
   );

@@ -1,0 +1,223 @@
+"use client";
+
+import { useQuery } from "@tanstack/react-query";
+import { Plus, Server } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
+import { Trident } from "@/components/icons/BrandMark";
+import { AppShell } from "@/components/nav/AppShell";
+import { openSettings } from "@/components/settings/settings-dialog-store";
+import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/ui/empty-state";
+import { Spinner } from "@/components/ui/spinner";
+import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
+import { hosts, workspaces } from "@/lib/api";
+import { useAuth, useAuthConfig } from "@/lib/auth";
+
+/**
+ * The door into the product: every route that means "take me to my work" —
+ * signing in, finishing onboarding, deleting the workspace you were in, the
+ * lander's Enter — lands here, and this decides where "my work" actually is
+ * (verify email, connect a host, pick a workspace, or the last one you used).
+ *
+ * It is deliberately not `/`: the lander owns that, so the brand mark in the
+ * app chrome can go back to the marketing site instead of bouncing straight
+ * back in here. Signed out, there is nothing to resolve — go and sign in.
+ */
+export default function AppEntryPage() {
+  const router = useRouter();
+  const { user, loading: authLoading, error: authError } = useAuth();
+  const { config, loading: configLoading, error: configError } = useAuthConfig();
+  const [skippedHost, setSkippedHost] = useState<boolean | null>(null);
+  const hostsQ = useQuery({
+    queryKey: ["hosts"],
+    queryFn: hosts.list,
+    enabled: Boolean(user),
+  });
+  const workspacesQ = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: workspaces.list,
+    enabled: Boolean(user),
+  });
+
+  useEffect(() => {
+    if (!user) {
+      setSkippedHost(null);
+      return;
+    }
+    setSkippedHost(window.localStorage.getItem("spawn.onboarding.skippedHost") === "true");
+  }, [user]);
+
+  const listedHosts = useMemo(() => hostsQ.data ?? [], [hostsQ.data]);
+  const orderedWorkspaces = useMemo(
+    () => [...(workspacesQ.data ?? [])].sort((a, b) => a.position - b.position),
+    [workspacesQ.data],
+  );
+  const firstOnlineHost = listedHosts.find((host) => host.status === "online");
+  const verificationIncomplete = Boolean(
+    user && config?.email_verification_required && !user.email_verified_at,
+  );
+
+  useEffect(() => {
+    if (!authLoading && !authError && !user) {
+      router.replace("/login");
+    }
+  }, [authError, authLoading, router, user]);
+
+  useEffect(() => {
+    if (
+      !user ||
+      !config ||
+      skippedHost === null ||
+      hostsQ.isLoading ||
+      workspacesQ.isLoading ||
+      hostsQ.error ||
+      workspacesQ.error
+    ) {
+      return;
+    }
+    if (config.email_verification_required && !user.email_verified_at) {
+      router.replace("/onboarding");
+      return;
+    }
+    if (listedHosts.length === 0) {
+      if (!skippedHost) router.replace("/onboarding?step=host");
+      return;
+    }
+    if (orderedWorkspaces.length > 0) {
+      const savedId = window.localStorage.getItem("spawn.workspaces.last");
+      const target =
+        orderedWorkspaces.find((workspace) => workspace.id === savedId) ?? orderedWorkspaces[0];
+      if (target) {
+        window.localStorage.setItem("spawn.workspaces.last", target.id);
+        router.replace(`/w/${target.id}`);
+      }
+      return;
+    }
+  }, [
+    config,
+    hostsQ.error,
+    hostsQ.isLoading,
+    listedHosts,
+    orderedWorkspaces,
+    router,
+    skippedHost,
+    user,
+    workspacesQ.error,
+    workspacesQ.isLoading,
+  ]);
+
+  if (authLoading) return <AppEntrySpinner />;
+  if (authError) {
+    return (
+      <EmptyState
+        title="Could not check your account"
+        body={authError instanceof Error ? authError.message : String(authError)}
+      />
+    );
+  }
+
+  if (!user) return <AppEntrySpinner />;
+
+  if (
+    configLoading ||
+    skippedHost === null ||
+    hostsQ.isLoading ||
+    workspacesQ.isLoading ||
+    verificationIncomplete
+  ) {
+    return <AppEntrySpinner />;
+  }
+
+  if (configError || hostsQ.error || workspacesQ.error) {
+    const error = configError ?? hostsQ.error ?? workspacesQ.error;
+    return (
+      <EmptyState
+        title="Could not load your workspace"
+        body={error instanceof Error ? error.message : String(error)}
+        action={
+          <Button
+            onClick={() => {
+              void hostsQ.refetch();
+              void workspacesQ.refetch();
+            }}
+          >
+            Try again
+          </Button>
+        }
+      />
+    );
+  }
+
+  if (listedHosts.length === 0 && skippedHost) {
+    return (
+      <AppShell>
+        <EmptyState
+          className="min-h-[calc(var(--vv-height)-3rem)]"
+          icon={<Server />}
+          title="Connect a host to start a session"
+          body="Install the daemon on a machine you control, then approve its pairing code."
+          action={<Button onClick={() => openSettings("hosts")}>Connect a host</Button>}
+        />
+      </AppShell>
+    );
+  }
+
+  if (listedHosts.length > 0 && orderedWorkspaces.length === 0 && !firstOnlineHost) {
+    return (
+      <AppShell>
+        <EmptyState
+          className="min-h-[calc(var(--vv-height)-3rem)]"
+          icon={<Server />}
+          title="Your host is offline"
+          body="Bring a daemon online before creating the first workspace."
+          action={<Button onClick={() => openSettings("hosts")}>View hosts</Button>}
+        />
+      </AppShell>
+    );
+  }
+
+  if (orderedWorkspaces.length === 0) {
+    // No silent auto-create: the first workspace is a deliberate act — pick
+    // its folder (or replay a saved template) from the same menu the sidebar
+    // button opens.
+    return (
+      <AppShell>
+        <EmptyState
+          className="min-h-[calc(var(--vv-height)-3rem)]"
+          icon={<Trident className="size-8" />}
+          title="Create your first workspace"
+          body="A workspace is a grid of terminal panes rooted in one folder on your host. Shells, agents, and file explorers all open there."
+          action={
+            <NewWorkspaceMenu
+              trigger={
+                <Button size="lg">
+                  <Plus className="size-4" aria-hidden />
+                  New workspace
+                </Button>
+              }
+              onCreated={({ workspaceId, focusSessionId }) => {
+                window.localStorage.setItem("spawn.workspaces.last", workspaceId);
+                router.replace(
+                  focusSessionId
+                    ? `/w/${workspaceId}?focus=${focusSessionId}`
+                    : `/w/${workspaceId}`,
+                );
+              }}
+            />
+          }
+        />
+      </AppShell>
+    );
+  }
+
+  return <AppEntrySpinner />;
+}
+
+function AppEntrySpinner() {
+  return (
+    <div className="flex min-h-vv items-center justify-center">
+      <Spinner size={20} label="Opening your workspace" />
+    </div>
+  );
+}

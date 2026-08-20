@@ -260,15 +260,18 @@ export function SessionPane({
        * moves every pixel between it and the pane's ground — the terminal's
        * background, the header, the gutters — while leaving anything with more
        * contrast than the chrome, the output itself, exactly as it was. The
-       * pane rises to chrome; its content stays legible. `isolate` on the
-       * section keeps the blend inside the pane. Sits under the exited-state
-       * scrim (z-20) and the shortcut bar (z-30), and takes no pointer events,
-       * so nothing about interacting with the pane changes.
+       * pane rises to chrome; its content stays legible. Half strength, so the
+       * ground lands midway between the pane's own and the chrome's rather than
+       * flush against chrome — enough to read the focus at a glance without
+       * washing the unfocused panes out. `isolate` on the section keeps the
+       * blend inside the pane. Sits under the exited-state scrim (z-20) and the
+       * shortcut bar (z-30), and takes no pointer events, so nothing about
+       * interacting with the pane changes.
        */}
       {!focused && paneCount > 1 && (
         <div
           aria-hidden
-          className="pointer-events-none absolute inset-0 z-10 bg-shell mix-blend-darken dark:mix-blend-lighten"
+          className="pointer-events-none absolute inset-0 z-10 bg-shell/50 mix-blend-darken dark:mix-blend-lighten"
         />
       )}
 

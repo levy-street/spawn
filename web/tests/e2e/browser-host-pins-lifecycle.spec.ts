@@ -384,7 +384,7 @@ test("host-detail resolution binds before a legitimate tombstone-first DELETE", 
 
   await requestHostDeletion(page);
 
-  await expect(page).toHaveURL(/\/$/u);
+  await expect(page).toHaveURL(/\/app$/u);
   expect(state.deleteCalls).toBe(1);
   expect(pinStateAtDelete).toMatchObject([
     { hostIds: [HOST_ID], hostPublicKey: HOST_PUBLIC_KEY, state: "revoked" },

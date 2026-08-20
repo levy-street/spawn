@@ -34,7 +34,7 @@ function ResetPasswordForm() {
       const result = await auth.confirmPasswordReset({ token, new_password: password });
       queryClient.setQueryData(["me"], { user: result.user });
       void queryClient.invalidateQueries({ queryKey: ["me"] });
-      router.replace("/");
+      router.replace("/app");
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : "Could not reset your password");
     } finally {

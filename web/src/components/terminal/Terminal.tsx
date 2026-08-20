@@ -1550,10 +1550,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       const inset = terminalInset();
       const useCanvas = canvasRect && canvasRect.width > 0 && canvasRect.height > 0;
       return {
-        width: Math.max(
-          1,
-          Math.ceil(useCanvas ? canvasRect.width + inset.x : elementRect.width),
-        ),
+        width: Math.max(1, Math.ceil(useCanvas ? canvasRect.width + inset.x : elementRect.width)),
         height: Math.max(
           1,
           Math.ceil(useCanvas ? canvasRect.height + inset.y : elementRect.height),

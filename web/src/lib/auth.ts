@@ -60,5 +60,8 @@ export async function logout() {
     // session may already be dead server-side (expired, or the account was
     // just deleted, which clears the cookie itself). Leaving is the point.
   }
-  if (typeof window !== "undefined") window.location.assign("/login");
+  // Out to the lander, not the login form: signing out is leaving, and being
+  // dropped straight back onto a password field reads as a failed session
+  // rather than a finished one. Signing in again is one nav click away.
+  if (typeof window !== "undefined") window.location.assign("/");
 }

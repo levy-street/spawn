@@ -60,12 +60,12 @@ export function WidgetPane({
       className="relative isolate flex size-full min-h-0 min-w-0 flex-col overflow-hidden bg-background"
     >
       {/* Same focus language as session panes: the focused pane is untouched,
-          every other one has its ground blended up to `--shell` while its
-          content keeps its contrast — see session-pane.tsx. */}
+          every other one has its ground blended halfway toward `--shell` while
+          its content keeps its contrast — see session-pane.tsx. */}
       {!focused && paneCount > 1 && (
         <div
           aria-hidden
-          className="pointer-events-none absolute inset-0 z-10 bg-shell mix-blend-darken dark:mix-blend-lighten"
+          className="pointer-events-none absolute inset-0 z-10 bg-shell/50 mix-blend-darken dark:mix-blend-lighten"
         />
       )}
       <header

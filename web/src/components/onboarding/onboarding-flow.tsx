@@ -12,7 +12,7 @@ import { ApiError, auth, type Host, hosts, type User, workspaces } from "@/lib/a
 import { useAuth, useAuthConfig } from "@/lib/auth";
 import { AuthShell } from "./auth-shell";
 import { SignupForm } from "./signup-form";
-import { type OnboardingStep, resolveStep } from "./step-machine";
+import { ONBOARDING_STEPS, type OnboardingStep, resolveStep } from "./step-machine";
 
 const SKIPPED_HOST_KEY = "spawn.onboarding.skippedHost";
 const SUCCESS_BEAT_MS = 900;
@@ -211,7 +211,7 @@ export function OnboardingFlow() {
 
         setCompletion({ status: "success", message: "Setup complete." });
         await new Promise((resolve) => window.setTimeout(resolve, SUCCESS_BEAT_MS));
-        if (mountedRef.current) router.replace("/");
+        if (mountedRef.current) router.replace("/app");
       } catch (cause) {
         if (!mountedRef.current) return;
         completionStartedRef.current = false;
@@ -268,6 +268,12 @@ export function OnboardingFlow() {
   }
 
   const visibleStep: OnboardingStep = transitionBeat ?? step;
+  // A gate the server would never enforce has no business on the rail: with no
+  // mailer configured, /api/auth/config reports verification as not required,
+  // and showing "Verify" only makes the jump to Host read as a skipped step.
+  const visibleSteps = config.email_verification_required
+    ? ONBOARDING_STEPS
+    : ONBOARDING_STEPS.filter((candidate) => candidate !== "verify");
   const copy =
     visibleStep === "done" && onlineHost === null
       ? {
@@ -277,7 +283,13 @@ export function OnboardingFlow() {
       : STEP_COPY[visibleStep];
 
   return (
-    <AuthShell title={copy.title} description={copy.description} step={visibleStep}>
+    <AuthShell
+      title={copy.title}
+      description={copy.description}
+      step={visibleStep}
+      steps={visibleSteps}
+      layout="split"
+    >
       {transitionBeat === "verify" ? (
         <SuccessBeat message="Email verified. Moving on…" />
       ) : transitionBeat === "host" ? (
@@ -293,9 +305,14 @@ export function OnboardingFlow() {
       ) : step === "host" ? (
         <div className="space-y-5">
           <div className="min-w-0 [&_button]:min-h-11 [&_button]:min-w-11 [&_input]:min-h-11">
-            <ConnectHostSection onHostOnline={onHostOnline} />
+            <ConnectHostSection onHostOnline={onHostOnline} frameless />
           </div>
-          <Button type="button" variant="link" className="h-11 w-full" onClick={skipHost}>
+          <Button
+            type="button"
+            variant="link"
+            className="h-11 w-full text-ash hover:text-bone"
+            onClick={skipHost}
+          >
             Skip for now
           </Button>
         </div>
@@ -334,7 +351,7 @@ function AccountStep({
     <div className="space-y-4">
       {invite !== null ? (
         <p
-          className="rounded-md border border-success/40 bg-success-soft px-3 py-2 text-sm"
+          className="rounded-sm border border-ember/40 bg-ember/10 px-3 py-2 text-sm text-bone"
           role="status"
         >
           Your invite is ready. Create the account it belongs to.
@@ -347,11 +364,11 @@ function AccountStep({
         onSuccess={onSuccess}
         submitLabel="Create account and continue"
       />
-      <p className="text-center text-sm text-muted-foreground">
+      <p className="text-center text-sm text-ash">
         Already have an account?{" "}
         <Link
           href="/login"
-          className="inline-flex min-h-11 items-center font-medium text-foreground underline underline-offset-4"
+          className="inline-flex min-h-11 items-center font-medium text-ember underline decoration-ember/50 underline-offset-4 transition-colors hover:text-hellfire hover:decoration-ember"
         >
           Log in instead
         </Link>
@@ -387,8 +404,8 @@ function VerifyStep({ email }: { email: string }) {
 
   return (
     <div className="space-y-5">
-      <div className="flex items-start gap-3 rounded-md bg-muted p-4">
-        <Mail className="mt-0.5 size-5 shrink-0 text-info" aria-hidden />
+      <div className="flex items-start gap-3 rounded-sm border border-line-g bg-panelg p-4">
+        <Mail className="mt-0.5 size-5 shrink-0 text-ember" aria-hidden />
         <p className="min-w-0 text-sm leading-6">
           We sent a link to <span className="break-all font-medium">{email}</span>.
         </p>
@@ -426,7 +443,7 @@ function SuccessBeat({ message }: { message: string }) {
       className="flex min-h-32 flex-col items-center justify-center gap-3 text-center"
       role="status"
     >
-      <span className="flex size-9 items-center justify-center rounded-full bg-success-soft text-success">
+      <span className="flex size-9 items-center justify-center rounded-full border border-ember/40 bg-ember/12 text-ember">
         <Check className="size-5" aria-hidden />
       </span>
       <p className="text-sm font-medium">{message}</p>
@@ -460,7 +477,7 @@ function CompletionBeat({ state, onRetry }: { state: CompletionState; onRetry: (
 
 function LoadingShell() {
   return (
-    <AuthShell title="Preparing setup">
+    <AuthShell title="Preparing setup" layout="split">
       <div className="flex min-h-28 items-center justify-center">
         <Spinner size={20} label="Preparing onboarding" />
       </div>
@@ -478,7 +495,7 @@ function LoadFailure({
   onRetry: () => void;
 }) {
   return (
-    <AuthShell title={title} description={message}>
+    <AuthShell title={title} description={message} layout="split">
       <Button type="button" className="h-11 w-full" onClick={onRetry}>
         Try again
       </Button>

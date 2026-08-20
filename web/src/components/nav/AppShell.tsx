@@ -189,7 +189,12 @@ export function AppShell({
                   {currentWorkspaceName ? (
                     <span className="block truncate">{currentWorkspaceName}</span>
                   ) : (
-                    <Wordmark className="h-3.5 text-brand-accent" />
+                    // Centred by its own flex line, not the text baseline it
+                    // would otherwise sit on, and in the same brand ink as
+                    // the trident in the sidebar.
+                    <span className="flex items-center justify-center text-hellfire">
+                      <Wordmark className="h-3.5" />
+                    </span>
                   )}
                 </div>
                 <NewSessionMenu

@@ -7,7 +7,7 @@ export default function OnboardingPage() {
   return (
     <Suspense
       fallback={
-        <AuthShell title="Preparing setup">
+        <AuthShell title="Preparing setup" layout="split">
           <div className="flex min-h-28 items-center justify-center">
             <Spinner size={20} label="Preparing onboarding" />
           </div>

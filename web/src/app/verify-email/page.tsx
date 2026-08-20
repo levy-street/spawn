@@ -92,7 +92,7 @@ function VerifyEmail() {
         hosts: hostsQuery.data,
         skippedHost: storage.skippedHost,
       }) === "done"
-        ? "/"
+        ? "/app"
         : "/onboarding";
 
     return (

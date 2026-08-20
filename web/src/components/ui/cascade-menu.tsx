@@ -62,6 +62,11 @@ export type CascadeMenuHandle = {
   open: () => void;
   /** Open anchored to a viewport point (a click) rather than the trigger. */
   openAt: (x: number, y: number) => void;
+  /**
+   * Point-anchored toggle for triggers that open at the cursor: a second click
+   * closes the menu instead of dragging it to the new cursor position.
+   */
+  toggleAt: (x: number, y: number) => void;
   close: () => void;
 };
 
@@ -151,9 +156,17 @@ export const CascadeMenu = forwardRef<
         setPoint({ x, y });
         setOpenState(true);
       },
+      toggleAt: (x: number, y: number) => {
+        if (open) {
+          close();
+          return;
+        }
+        setPoint({ x, y });
+        setOpenState(true);
+      },
       close,
     }),
-    [setOpenState, close],
+    [open, setOpenState, close],
   );
 
   useEffect(() => {

@@ -74,7 +74,7 @@ function WorkspaceView({ workspaceId }: { workspaceId: string }) {
     const remaining = [...(workspacesQ.data ?? [])]
       .filter((workspace) => workspace.id !== workspaceId)
       .sort((a, b) => a.position - b.position);
-    router.replace(remaining[0] ? `/w/${remaining[0].id}` : "/");
+    router.replace(remaining[0] ? `/w/${remaining[0].id}` : "/app");
   }, [queryClient, router, workspaceId, workspaceQ.error, workspacesQ.data, workspacesQ.isLoading]);
 
   const workspace = workspaceQ.data;

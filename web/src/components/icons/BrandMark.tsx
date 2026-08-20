@@ -38,10 +38,12 @@ const WORDMARK_MASK: React.CSSProperties = {
 
 /**
  * The drawn `spawnd` wordmark from the brand kit — blocky letterforms built
- * from the same merged ink droplets as the trident. Rendered as a CSS mask
- * filled with `currentColor`, so call sites colour it exactly like text:
- * app chrome uses `text-brand-accent` (theme-swapped), `.grimoire` surfaces
- * use `text-hellfire`, and hover transitions on a parent tint it live.
+ * from the same merged ink droplets as the trident. Same art as the brand
+ * kit's `spawnd-text-red`, left unpainted so it renders as a CSS mask filled
+ * with `currentColor` — call sites colour it exactly like text. Pair it with
+ * the trident under `text-hellfire`: that is the brand ink (#E11E15) the
+ * trident art is drawn in, so the lockup reads as one mark. The chrome's
+ * `--brand-accent` is not it — dark swaps that to ember and splits the pair.
  *
  * Size it by height (`h-3.5`, `h-[19px]`…); the width follows from the
  * lockup's fixed 1753:370 aspect ratio.

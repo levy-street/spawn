@@ -66,9 +66,9 @@ export default function ForgotPasswordPage() {
           <Button type="submit" className="h-11 w-full" disabled={submitting || email === ""}>
             {submitting ? "Sending…" : "Send reset link"}
           </Button>
-          <p className="text-center text-sm text-muted-foreground">
+          <p className="text-center text-sm text-ash">
             <Link
-              className="inline-flex min-h-11 items-center underline underline-offset-4"
+              className="inline-flex min-h-11 items-center text-ember underline decoration-ember/50 underline-offset-4 transition-colors hover:text-hellfire hover:decoration-ember"
               href="/login"
             >
               Back to sign in

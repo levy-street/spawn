@@ -135,7 +135,7 @@ function HostDetail() {
       queryClient.invalidateQueries({ queryKey: ["hosts"] });
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
       openSettings("hosts");
-      router.push("/");
+      router.push("/app");
     },
     onError: (caught) => {
       if (caught instanceof HostDeletionFlowError && caught.localTombstoneWritten) {

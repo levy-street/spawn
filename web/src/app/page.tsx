@@ -1,223 +1,21 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, Check, Copy, Plus, Server } from "lucide-react";
-import { Bodoni_Moda } from "next/font/google";
+import { ArrowRight } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import type { ReactNode, RefObject } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Trident, Wordmark } from "@/components/icons/BrandMark";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Colophon,
+  CTA_QUIET,
+  CTA_SLAB,
+  InstallCommand,
+  Masthead,
+  RegistrationMarks,
+} from "@/components/brand/press";
+import { Wordmark } from "@/components/icons/BrandMark";
+import { poster } from "@/lib/fonts";
 import { cn } from "@/lib/utils";
-
-/*
- * The landing's poster face: a high-contrast didone for display type only.
- * next/font inlines it at build time — no runtime font request — and the app
- * chrome never sees it; body copy stays on the grimoire serif.
- */
-const poster = Bodoni_Moda({ subsets: ["latin"], style: ["normal", "italic"], display: "swap" });
-
-import { AppShell } from "@/components/nav/AppShell";
-import { openSettings } from "@/components/settings/settings-dialog-store";
-import { Button } from "@/components/ui/button";
-import { EmptyState } from "@/components/ui/empty-state";
-import { Spinner } from "@/components/ui/spinner";
-import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
-import { hosts, workspaces } from "@/lib/api";
-import { useAuth, useAuthConfig } from "@/lib/auth";
-
-export default function HomePage() {
-  const router = useRouter();
-  const { user, loading: authLoading, error: authError } = useAuth();
-  const { config, loading: configLoading, error: configError } = useAuthConfig();
-  const [skippedHost, setSkippedHost] = useState<boolean | null>(null);
-  const hostsQ = useQuery({
-    queryKey: ["hosts"],
-    queryFn: hosts.list,
-    enabled: Boolean(user),
-  });
-  const workspacesQ = useQuery({
-    queryKey: ["workspaces"],
-    queryFn: workspaces.list,
-    enabled: Boolean(user),
-  });
-
-  useEffect(() => {
-    if (!user) {
-      setSkippedHost(null);
-      return;
-    }
-    setSkippedHost(window.localStorage.getItem("spawn.onboarding.skippedHost") === "true");
-  }, [user]);
-
-  const listedHosts = useMemo(() => hostsQ.data ?? [], [hostsQ.data]);
-  const orderedWorkspaces = useMemo(
-    () => [...(workspacesQ.data ?? [])].sort((a, b) => a.position - b.position),
-    [workspacesQ.data],
-  );
-  const firstOnlineHost = listedHosts.find((host) => host.status === "online");
-  const verificationIncomplete = Boolean(
-    user && config?.email_verification_required && !user.email_verified_at,
-  );
-
-  useEffect(() => {
-    if (
-      !user ||
-      !config ||
-      skippedHost === null ||
-      hostsQ.isLoading ||
-      workspacesQ.isLoading ||
-      hostsQ.error ||
-      workspacesQ.error
-    ) {
-      return;
-    }
-    if (config.email_verification_required && !user.email_verified_at) {
-      router.replace("/onboarding");
-      return;
-    }
-    if (listedHosts.length === 0) {
-      if (!skippedHost) router.replace("/onboarding?step=host");
-      return;
-    }
-    if (orderedWorkspaces.length > 0) {
-      const savedId = window.localStorage.getItem("spawn.workspaces.last");
-      const target =
-        orderedWorkspaces.find((workspace) => workspace.id === savedId) ?? orderedWorkspaces[0];
-      if (target) {
-        window.localStorage.setItem("spawn.workspaces.last", target.id);
-        router.replace(`/w/${target.id}`);
-      }
-      return;
-    }
-  }, [
-    config,
-    hostsQ.error,
-    hostsQ.isLoading,
-    listedHosts,
-    orderedWorkspaces,
-    router,
-    skippedHost,
-    user,
-    workspacesQ.error,
-    workspacesQ.isLoading,
-  ]);
-
-  if (authLoading) return <HomeSpinner />;
-  if (authError) {
-    return (
-      <EmptyState
-        title="Could not check your account"
-        body={authError instanceof Error ? authError.message : String(authError)}
-      />
-    );
-  }
-
-  if (!user) return <LandingPage />;
-
-  if (
-    configLoading ||
-    skippedHost === null ||
-    hostsQ.isLoading ||
-    workspacesQ.isLoading ||
-    verificationIncomplete
-  ) {
-    return <HomeSpinner />;
-  }
-
-  if (configError || hostsQ.error || workspacesQ.error) {
-    const error = configError ?? hostsQ.error ?? workspacesQ.error;
-    return (
-      <EmptyState
-        title="Could not load your workspace"
-        body={error instanceof Error ? error.message : String(error)}
-        action={
-          <Button
-            onClick={() => {
-              void hostsQ.refetch();
-              void workspacesQ.refetch();
-            }}
-          >
-            Try again
-          </Button>
-        }
-      />
-    );
-  }
-
-  if (listedHosts.length === 0 && skippedHost) {
-    return (
-      <AppShell>
-        <EmptyState
-          className="min-h-[calc(var(--vv-height)-3rem)]"
-          icon={<Server />}
-          title="Connect a host to start a session"
-          body="Install the daemon on a machine you control, then approve its pairing code."
-          action={<Button onClick={() => openSettings("hosts")}>Connect a host</Button>}
-        />
-      </AppShell>
-    );
-  }
-
-  if (listedHosts.length > 0 && orderedWorkspaces.length === 0 && !firstOnlineHost) {
-    return (
-      <AppShell>
-        <EmptyState
-          className="min-h-[calc(var(--vv-height)-3rem)]"
-          icon={<Server />}
-          title="Your host is offline"
-          body="Bring a daemon online before creating the first workspace."
-          action={<Button onClick={() => openSettings("hosts")}>View hosts</Button>}
-        />
-      </AppShell>
-    );
-  }
-
-  if (orderedWorkspaces.length === 0) {
-    // No silent auto-create: the first workspace is a deliberate act — pick
-    // its folder (or replay a saved template) from the same menu the sidebar
-    // button opens.
-    return (
-      <AppShell>
-        <EmptyState
-          className="min-h-[calc(var(--vv-height)-3rem)]"
-          icon={<Trident className="size-8" />}
-          title="Create your first workspace"
-          body="A workspace is a grid of terminal panes rooted in one folder on your host. Shells, agents, and file explorers all open there."
-          action={
-            <NewWorkspaceMenu
-              trigger={
-                <Button size="lg">
-                  <Plus className="size-4" aria-hidden />
-                  New workspace
-                </Button>
-              }
-              onCreated={({ workspaceId, focusSessionId }) => {
-                window.localStorage.setItem("spawn.workspaces.last", workspaceId);
-                router.replace(
-                  focusSessionId
-                    ? `/w/${workspaceId}?focus=${focusSessionId}`
-                    : `/w/${workspaceId}`,
-                );
-              }}
-            />
-          }
-        />
-      </AppShell>
-    );
-  }
-
-  return <HomeSpinner />;
-}
-
-function HomeSpinner() {
-  return (
-    <div className="flex min-h-vv items-center justify-center">
-      <Spinner size={20} label="Opening your workspace" />
-    </div>
-  );
-}
 
 /*
  * ── Scroll system ────────────────────────────────────────────────
@@ -299,7 +97,7 @@ function ScrollStamp() {
     <div
       ref={ref}
       aria-hidden
-      className="pointer-events-none absolute -top-16 -right-16 size-[22rem] rotate-[4deg] opacity-20 will-change-transform sm:size-[30rem]"
+      className="pointer-events-none absolute -top-20 -right-20 size-[16rem] rotate-[4deg] opacity-[0.10] will-change-transform sm:size-[22rem]"
     >
       {/* biome-ignore lint/performance/noImgElement: decorative stamp, no optimization needed */}
       <img src="/brand/spawnd-icon-black.svg" alt="" className="size-full" />
@@ -394,94 +192,14 @@ function ScrubVideo({ src, poster, alt }: { src: string; poster: string; alt: st
   );
 }
 
-/** The install one-liner on a paper chip, with a copy button. */
-function InstallCommand({ command, className }: { command: string; className?: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <div
-      className={cn(
-        "flex w-full max-w-full items-center gap-3 rounded-sm border border-bone bg-void py-3.5 pr-3 pl-4 font-sigil text-[13px] text-bone sm:w-auto",
-        className,
-      )}
-    >
-      <span className="text-ember">$</span>
-      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{command}</code>
-      <button
-        type="button"
-        aria-label="Copy install command"
-        onClick={() => {
-          void navigator.clipboard?.writeText(command).then(() => {
-            setCopied(true);
-            window.setTimeout(() => setCopied(false), 2000);
-          });
-        }}
-        className="ml-1 shrink-0 rounded-sm p-1 text-bone/50 transition-colors hover:text-bone"
-      >
-        {copied ? (
-          <Check className="size-4 text-ember" aria-hidden />
-        ) : (
-          <Copy className="size-4" aria-hidden />
-        )}
-      </button>
-    </div>
-  );
-}
-
-const GITHUB_URL = "https://github.com/levy-street/spawn";
-
-/** Collapses the masthead continuously with the scroll: every value is a
- * pure function of scrollY, written straight to the DOM, so there is no
- * threshold to flip back and forth across and no re-render per frame. */
-function useMastheadScrub(): {
-  navRef: RefObject<HTMLElement | null>;
-  brandRef: RefObject<HTMLAnchorElement | null>;
-  markRef: RefObject<HTMLSpanElement | null>;
-  wordRef: RefObject<HTMLSpanElement | null>;
-} {
-  const navRef = useRef<HTMLElement>(null);
-  const brandRef = useRef<HTMLAnchorElement>(null);
-  const markRef = useRef<HTMLSpanElement>(null);
-  const wordRef = useRef<HTMLSpanElement>(null);
-
-  useEffect(() => {
-    const mix = (a: number, b: number, t: number) => a + (b - a) * t;
-    let raf = 0;
-    const update = () => {
-      // 0 at the very top, 1 once 90px of scroll has passed.
-      const p = Math.min(1, Math.max(0, window.scrollY / 90));
-      if (navRef.current) navRef.current.style.paddingBlock = `${mix(24, 14, p)}px`;
-      if (brandRef.current) brandRef.current.style.gap = `${mix(8, 0, p)}px`;
-      if (markRef.current) {
-        const size = mix(32, 28, p);
-        markRef.current.style.width = `${size}px`;
-        markRef.current.style.height = `${size}px`;
-      }
-      if (wordRef.current) {
-        wordRef.current.style.height = `${mix(16, 0, p)}px`;
-        wordRef.current.style.opacity = `${1 - p}`;
-        wordRef.current.style.transform = `translateY(${mix(0, -4, p)}px)`;
-      }
-    };
-    const schedule = () => {
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(update);
-    };
-    window.addEventListener("scroll", schedule, { passive: true });
-    window.addEventListener("resize", schedule);
-    update();
-    return () => {
-      window.removeEventListener("scroll", schedule);
-      window.removeEventListener("resize", schedule);
-      cancelAnimationFrame(raf);
-    };
-  }, []);
-
-  return { navRef, brandRef, markRef, wordRef };
-}
-
-function LandingPage() {
+/**
+ * The lander is `/` for everyone, signed in or not — the brand mark in the
+ * app chrome comes back here, and so does signing out. The masthead, the
+ * install chip, and the colophon are the shared press chrome
+ * (`components/brand/press`), so /security and /download wear them too.
+ */
+export default function LandingPage() {
   const [origin, setOrigin] = useState("https://spawnd.dev");
-  const { navRef, brandRef, markRef, wordRef } = useMastheadScrub();
 
   useEffect(() => {
     setOrigin(window.location.origin);
@@ -491,54 +209,7 @@ function LandingPage() {
 
   return (
     <main className="grimoire min-h-vv overflow-x-clip">
-      {/* ── Nav: three zones, the brand at the centre, pinned ──── */}
-      <header className="sticky top-0 z-40 border-line-g border-b bg-void/85 backdrop-blur-md">
-        <nav
-          ref={navRef}
-          className="mx-auto flex w-full max-w-[1440px] items-center justify-between gap-4 px-5 py-6 font-sigil text-[11px] tracking-[0.22em] uppercase sm:grid sm:grid-cols-[1fr_auto_1fr] sm:px-8 sm:text-[12px]"
-        >
-          <div className="hidden items-center gap-7 sm:flex sm:gap-10">
-            <Link
-              href="/security"
-              className="hidden text-ash transition-colors hover:text-bone sm:inline"
-            >
-              Security
-            </Link>
-            <a
-              href={GITHUB_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="hidden text-ash transition-colors hover:text-bone sm:inline"
-            >
-              Open&nbsp;source
-            </a>
-          </div>
-          <Link
-            href="/"
-            aria-label="spawnd home"
-            ref={brandRef}
-            className="flex flex-col items-center gap-2 text-hellfire"
-          >
-            <span ref={markRef} className="block size-8">
-              <Trident className="size-full" />
-            </span>
-            <span ref={wordRef} aria-hidden className="block h-4 overflow-hidden">
-              <Wordmark aria-hidden className="h-4" />
-            </span>
-          </Link>
-          <div className="flex items-center justify-end gap-7 sm:gap-10">
-            <Link
-              href="/login"
-              className="hidden text-ash transition-colors hover:text-bone sm:inline"
-            >
-              Log&nbsp;in
-            </Link>
-            <Link href="/signup" className="text-ember transition-colors hover:text-hellfire">
-              Sign&nbsp;up&nbsp;→
-            </Link>
-          </div>
-        </nav>
-      </header>
+      <Masthead />
 
       {/* ── The living hero: full-bleed ink video, type top-left ── */}
       <section className="relative isolate overflow-hidden border-line-g border-b">
@@ -572,30 +243,7 @@ function LandingPage() {
           />
         </div>
         {/* Registration marks: the corners of the press bed. */}
-        <span
-          aria-hidden
-          className="pointer-events-none absolute top-3 left-4 z-10 font-sigil text-[15px] text-hellfire/50 select-none"
-        >
-          +
-        </span>
-        <span
-          aria-hidden
-          className="pointer-events-none absolute top-3 right-4 z-10 font-sigil text-[15px] text-hellfire/50 select-none"
-        >
-          +
-        </span>
-        <span
-          aria-hidden
-          className="pointer-events-none absolute bottom-3 left-4 z-10 font-sigil text-[15px] text-hellfire/50 select-none"
-        >
-          +
-        </span>
-        <span
-          aria-hidden
-          className="pointer-events-none absolute right-4 bottom-3 z-10 font-sigil text-[15px] text-hellfire/50 select-none"
-        >
-          +
-        </span>
+        <RegistrationMarks />
 
         <div className="relative z-10 mx-auto flex min-h-[90svh] w-full max-w-[1440px] flex-col items-start justify-start px-5 pt-4 pb-20 sm:px-8 sm:pt-6 sm:pb-24">
           <h1
@@ -609,10 +257,7 @@ function LandingPage() {
 
           <div className="mt-auto flex w-full flex-col items-stretch gap-4 pt-16 sm:w-auto sm:flex-row sm:items-center">
             <InstallCommand command={installCommand} />
-            <Link
-              href="/download"
-              className="group inline-flex items-center justify-center gap-2 rounded-sm bg-bone px-7 py-[15px] font-sigil text-[13px] font-medium tracking-[0.14em] text-void uppercase transition-colors hover:bg-white"
-            >
+            <Link href="/download" className={CTA_SLAB}>
               Install the daemon
               <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
@@ -621,7 +266,7 @@ function LandingPage() {
       </section>
 
       {/* ── Plate II: the rite, black ink on red ───────────────── */}
-      <section className="relative overflow-hidden bg-hellfire text-void">
+      <section className="relative overflow-hidden bg-plate text-void">
         <ScrollStamp />
         <div className="relative mx-auto w-full max-w-6xl px-5 py-24 sm:px-8">
           <p className="mb-14 font-sigil text-[12px] font-medium tracking-[0.3em] uppercase">
@@ -835,17 +480,11 @@ function LandingPage() {
           </p>
           <InstallCommand command={installCommand} className="mb-9" />
           <div className="flex flex-col items-center justify-center gap-5 sm:flex-row sm:gap-7">
-            <Link
-              href="/signup"
-              className="group inline-flex items-center justify-center gap-2 rounded-sm bg-hellfire px-7 py-4 font-sigil text-[13px] tracking-[0.14em] text-void uppercase transition-colors hover:bg-ember"
-            >
+            <Link href="/signup" className={CTA_SLAB}>
               Sign up
               <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
-            <Link
-              href="/download"
-              className="font-sigil text-[12px] tracking-[0.18em] text-bone uppercase underline decoration-ember/70 underline-offset-8 transition-colors hover:text-ember hover:decoration-ember"
-            >
+            <Link href="/download" className={CTA_QUIET}>
               Install the daemon
             </Link>
           </div>
@@ -859,23 +498,7 @@ function LandingPage() {
       </section>
 
       {/* ── Colophon ───────────────────────────────────────────── */}
-      <footer className="border-line-g border-t px-5 py-10 sm:px-8">
-        <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-4 font-sigil text-[11px] tracking-[0.14em] text-ash uppercase sm:flex-row">
-          <span>consensual · auditable · revocable</span>
-          <div className="flex items-center gap-5">
-            <Link href="/security" className="transition-colors hover:text-bone">
-              Security
-            </Link>
-            <Link href="/download" className="transition-colors hover:text-bone">
-              Install
-            </Link>
-            <Link href="/login" className="transition-colors hover:text-bone">
-              Log in
-            </Link>
-          </div>
-          <span>Open source · MIT / Apache-2.0</span>
-        </div>
-      </footer>
+      <Colophon />
     </main>
   );
 }
@@ -886,7 +509,7 @@ function Rite({ title, children }: { title: string; children: ReactNode }) {
       <h3 className={cn(poster.className, "mb-3 text-[24px] leading-[1.08] font-medium uppercase")}>
         {title}
       </h3>
-      <p className="max-w-[44ch] text-[15px] leading-7">{children}</p>
+      <p className="max-w-[44ch] text-[16px] leading-7">{children}</p>
     </div>
   );
 }

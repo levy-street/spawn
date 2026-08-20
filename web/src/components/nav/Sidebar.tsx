@@ -104,7 +104,7 @@ export function Sidebar({
     onSuccess: (_result, id) => {
       setActionError(null);
       refresh();
-      if (currentWorkspaceId === id) router.push("/");
+      if (currentWorkspaceId === id) router.push("/app");
     },
     onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
   });
@@ -241,39 +241,67 @@ export function Sidebar({
   );
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-shell">
+    <div className="group/rail flex h-full min-h-0 flex-col bg-shell">
       <div className="px-2.5 pb-1 pt-3">
         <div className="flex h-(--row-h) items-center">
-          {collapsed ? (
-            <RailTooltip label="Expand sidebar">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                aria-label="Expand sidebar"
-                onClick={onToggle}
-                className="group/brand size-9 shrink-0"
+          {/* The whole lockup goes home, not just the trident: the wordmark
+           * carries a second link to the same place, hovering either lights
+           * the trident's plate, and only the trident is in the tab order and
+           * the accessibility tree — two stops reading "spawnd home" back to
+           * back is noise, and the wordmark is the redundant one. */}
+          <div className="group/home flex min-w-0 flex-1 items-center">
+            {collapsed ? (
+              <RailTooltip label="Expand sidebar">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Expand sidebar"
+                  onClick={onToggle}
+                  className="size-9 shrink-0"
+                >
+                  {/* Anywhere on the rail, not just this button: reaching for
+                   * the sidebar at all is the intent, and the swap tells you
+                   * the mark is a door back before you get to it. */}
+                  <Trident className="size-5.5 group-hover/rail:hidden" />
+                  <PanelLeftOpen
+                    className="hidden size-4.5 text-muted-foreground group-hover/rail:block"
+                    aria-hidden
+                  />
+                </Button>
+              </RailTooltip>
+            ) : (
+              <Link
+                href="/"
+                onClick={onNavigate}
+                className="grid size-9 shrink-0 place-items-center rounded-lg text-foreground transition-colors group-hover/home:bg-accent/50"
+                aria-label="spawnd home"
               >
-                <Trident className="size-6 group-hover/brand:hidden" />
-                <PanelLeftOpen
-                  className="hidden size-4.5 text-muted-foreground group-hover/brand:block"
-                  aria-hidden
-                />
-              </Button>
-            </RailTooltip>
-          ) : (
-            <Link
-              href="/"
-              onClick={onNavigate}
-              className="grid size-9 shrink-0 place-items-center rounded-lg text-foreground transition-colors hover:bg-accent/50"
-              aria-label="Home"
-            >
-              <Trident className="size-6" />
-            </Link>
-          )}
-          <SidebarRowLabel collapsed={collapsed} className="text-brand-accent">
-            <Wordmark className="h-5" />
-          </SidebarRowLabel>
+                <Trident className="size-5.5" />
+              </Link>
+            )}
+            {/* The lockup, not two marks: `flex items-center` centres the
+             * wordmark on the trident's axis (left to itself the mask is an
+             * inline-block and sits on the row's text baseline, 3px high), and
+             * hellfire is the brand ink the trident is drawn in — the chrome
+             * accent would swap it to the dark-theme ember and split the pair. */}
+            <SidebarRowLabel collapsed={collapsed} className="ml-1.5 flex items-center">
+              <Link
+                href="/"
+                onClick={onNavigate}
+                aria-hidden
+                tabIndex={-1}
+                className={cn(
+                  "flex items-center text-hellfire",
+                  // Faded out on the rail, so it must not still be a target
+                  // sitting in the empty space beside the trident.
+                  collapsed && "pointer-events-none",
+                )}
+              >
+                <Wordmark className="h-[17px]" />
+              </Link>
+            </SidebarRowLabel>
+          </div>
           {showCollapseControl ? (
             <Button
               type="button"

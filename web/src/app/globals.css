@@ -95,6 +95,11 @@
   --color-bone: #f2ede2;
   --color-ash: #a39a8c;
   --color-hellfire: #e11e15;
+  /* The flood coat. Black body copy on hellfire measures 4.39:1 — a hair under
+     the 4.5:1 bar — so a full-bleed red plate carrying black text is pulled in
+     this fractionally lighter mix of the same ink (4.85:1) instead. Line work
+     and small marks stay on hellfire proper; only plate grounds use this. */
+  --color-plate: #ea2a1b;
   --color-blood: #7c100b;
   --color-ember: #ff453a;
 
@@ -109,10 +114,109 @@
  * dramatic surface while the product chrome stays theme-aware.
  */
 .grimoire {
+  color-scheme: dark;
   background: var(--color-void);
   color: var(--color-bone);
   font-family: var(--font-grimoire);
   -webkit-font-smoothing: antialiased;
+
+  /*
+   * The app's semantic tokens, re-cut in press ink. Product primitives — Card,
+   * Button, Input, the host-pairing panel — turn up inside the signup funnel,
+   * and re-pointing the tokens is what makes them read as the poster does
+   * without a parallel component set to maintain.
+   */
+  --background: var(--color-void);
+  --foreground: var(--color-bone);
+  --muted: var(--color-panelg);
+  --muted-foreground: var(--color-ash);
+  --card: var(--color-char);
+  --card-foreground: var(--color-bone);
+  --popover: var(--color-char);
+  --popover-foreground: var(--color-bone);
+  /* The hero's CTA is bone on void, so every primary action is. Hellfire stays
+     the accent — a rule, a mark, a hover — never the button ground. */
+  --primary: var(--color-bone);
+  --primary-foreground: var(--color-void);
+  --secondary: rgba(242, 237, 226, 0.05);
+  --secondary-foreground: var(--color-bone);
+  --accent: rgba(242, 237, 226, 0.12);
+  --accent-foreground: var(--color-bone);
+  --destructive: var(--color-ember);
+  --destructive-foreground: var(--color-void);
+  --destructive-soft: rgba(255, 69, 58, 0.14);
+  /* One ink means one affirmative: status collapses onto the brand red and the
+     bone/ash pair rather than importing a green and a blue the press never
+     mixed. */
+  --success: var(--color-ember);
+  --success-soft: rgba(255, 69, 58, 0.12);
+  --warning: var(--color-ember);
+  --warning-soft: rgba(255, 69, 58, 0.12);
+  --info: var(--color-ash);
+  --info-soft: rgba(163, 154, 140, 0.14);
+  --tone-active: var(--color-ember);
+  --tone-waiting: var(--color-ash);
+  --tone-idle: var(--color-ash);
+  --tone-offline: var(--color-line-strong);
+  --border: var(--color-line-g);
+  --pane-divider: var(--color-line-strong);
+  --input: var(--color-line-strong);
+  --ring: var(--color-ember);
+  --brand-accent: var(--color-ember);
+  --brand-accent-soft: rgba(255, 69, 58, 0.14);
+}
+
+/*
+ * The account surfaces (signup, login, recovery, the onboarding gates) print
+ * their controls the way the poster does: sigil monospace, letterspaced, set
+ * in caps. Scoped to the class AuthShell sets rather than to `.grimoire`, so
+ * the same shared primitives keep their app voice everywhere else — and so a
+ * component the auth flow borrows, like the host-pairing panel, is dressed
+ * without knowing it was borrowed.
+ *
+ * Corners drop to the radius the landing page's chips use; every `rounded-*`
+ * utility reads its radius through `var()`, so one override re-cuts the whole
+ * surface.
+ */
+.pressroom {
+  --radius-lg: 0.375rem;
+  --radius-md: 0.375rem;
+}
+.pressroom :is(button, [role="button"], .ui-button) {
+  font-family: var(--font-sigil);
+  font-size: 0.75rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.pressroom label {
+  font-family: var(--font-sigil);
+  font-size: 0.6875rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-ash);
+}
+.pressroom :is(input, textarea, select) {
+  font-family: var(--font-sigil);
+}
+/* A quiet control on the press is a hairline plate — the poster fills nothing
+   in grey. Keyed off the variant the button reports, so every borrowed
+   secondary/outline control obeys without a class at the call site. */
+.pressroom .ui-button:is([data-variant="secondary"], [data-variant="outline"]) {
+  border: 1px solid var(--color-line-strong);
+  background-color: transparent;
+  color: var(--color-bone);
+}
+.pressroom .ui-button:is([data-variant="secondary"], [data-variant="outline"]):hover {
+  border-color: var(--color-bone);
+  background-color: rgba(242, 237, 226, 0.08);
+}
+/* A disabled control is an unstruck plate — a hairline and ash type, rather
+   than the bone slab dimmed to a muddy grey. */
+.pressroom .ui-button:disabled:not([data-variant="link"]) {
+  border: 1px solid var(--color-line-g);
+  background-color: transparent;
+  color: var(--color-ash);
+  opacity: 1;
 }
 .grimoire ::selection {
   background: var(--color-hellfire);

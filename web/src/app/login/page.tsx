@@ -29,7 +29,7 @@ export default function LoginPage() {
       const result = await auth.login({ email, password });
       queryClient.setQueryData(["me"], { user: result.user });
       void queryClient.invalidateQueries({ queryKey: ["me"] });
-      router.replace("/");
+      router.replace("/app");
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : "Login failed");
     } finally {
@@ -43,7 +43,7 @@ export default function LoginPage() {
       description="Sign in to reach the shells running across your machines."
     >
       <div className="space-y-5">
-        <OAuthButtons providers={config?.providers ?? []} returnTo="/" loading={configLoading} />
+        <OAuthButtons providers={config?.providers ?? []} returnTo="/app" loading={configLoading} />
         {configError ? (
           <p className="text-sm text-muted-foreground" role="status">
             Social sign-in is temporarily unavailable. Email sign-in still works.
@@ -69,7 +69,7 @@ export default function LoginPage() {
               <Label htmlFor="login-password">Password</Label>
               <Link
                 href="/forgot-password"
-                className="inline-flex min-h-11 items-center text-xs text-muted-foreground underline underline-offset-4"
+                className="-my-2 inline-flex items-center py-2 font-sigil text-[10px] uppercase tracking-[0.16em] text-ash underline decoration-line-strong underline-offset-4 transition-colors hover:text-ember hover:decoration-ember"
               >
                 Forgot password?
               </Link>
@@ -94,11 +94,11 @@ export default function LoginPage() {
             {submitting ? "Signing in…" : "Sign in"}
           </Button>
         </form>
-        <p className="text-center text-sm text-muted-foreground">
+        <p className="text-center text-sm text-ash">
           No account?{" "}
           <Link
             href="/signup"
-            className="inline-flex min-h-11 items-center font-medium text-foreground underline underline-offset-4"
+            className="inline-flex min-h-11 items-center font-medium text-ember underline decoration-ember/50 underline-offset-4 transition-colors hover:text-hellfire hover:decoration-ember"
           >
             Create one
           </Link>

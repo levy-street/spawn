@@ -332,7 +332,7 @@ export function NewSessionMenu(props: {
                       // detail === 0 is keyboard activation: keep that anchored
                       // to the trigger, where focus already is.
                       if (anchor === "pointer" && event.detail > 0) {
-                        menuRef.current?.openAt(event.clientX, event.clientY);
+                        menuRef.current?.toggleAt(event.clientX, event.clientY);
                         return;
                       }
                       triggerProps.onClick();

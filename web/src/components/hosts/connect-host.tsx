@@ -23,6 +23,7 @@ import {
 } from "@/lib/browser-host-pins";
 import { detectPlatform, UNDETECTED_PLATFORM } from "@/lib/platform";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
+import { cn } from "@/lib/utils";
 
 class ApprovalIdentityError extends Error {}
 
@@ -59,8 +60,13 @@ async function seedApprovedHostBinding(input: {
   }
 }
 
-export function ConnectHostSection(props: { onHostOnline?: (host: Host) => void }): JSX.Element {
-  const { onHostOnline } = props;
+export function ConnectHostSection(props: {
+  onHostOnline?: (host: Host) => void;
+  /** Drop the card chrome and its heading: the host is already inside a framed,
+   * titled surface (the onboarding sheet) and a second frame just doubles it. */
+  frameless?: boolean;
+}): JSX.Element {
+  const { onHostOnline, frameless = false } = props;
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
   const [copied, setCopied] = useState(false);
   const notifiedRef = useRef(false);
@@ -91,15 +97,17 @@ export function ConnectHostSection(props: { onHostOnline?: (host: Host) => void 
           : "your machine";
 
   return (
-    <Card className="overflow-hidden shadow-none">
-      <CardHeader>
-        <CardTitle>Connect a host</CardTitle>
-        <CardDescription>
-          Install the daemon on the machine where your sessions should run, then approve its
-          one-time pairing code.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
+    <Card className={cn("overflow-hidden shadow-none", frameless && "border-0 bg-transparent")}>
+      {frameless ? null : (
+        <CardHeader>
+          <CardTitle>Connect a host</CardTitle>
+          <CardDescription>
+            Install the daemon on the machine where your sessions should run, then approve its
+            one-time pairing code.
+          </CardDescription>
+        </CardHeader>
+      )}
+      <CardContent className={cn("space-y-5", frameless && "p-0")}>
         <section aria-labelledby="install-daemon-title" className="space-y-2">
           <div className="flex items-center gap-2">
             <Terminal className="size-4 text-muted-foreground" aria-hidden />

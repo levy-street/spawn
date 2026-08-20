@@ -19,7 +19,7 @@ export function OAuthButtons({
           <Button
             key={provider.id}
             asChild
-            variant="secondary"
+            variant="outline"
             className="h-11 w-full justify-center"
           >
             <a
@@ -32,10 +32,10 @@ export function OAuthButtons({
           </Button>
         ))}
       </div>
-      <div className="flex items-center gap-3 text-xs uppercase tracking-wider text-muted-foreground">
-        <div className="h-px flex-1 bg-border" aria-hidden />
+      <div className="flex items-center gap-3 font-sigil text-[10px] uppercase tracking-[0.22em] text-ash">
+        <div className="h-px flex-1 bg-line-g" aria-hidden />
         <span>or use email</span>
-        <div className="h-px flex-1 bg-border" aria-hidden />
+        <div className="h-px flex-1 bg-line-g" aria-hidden />
       </div>
     </div>
   );
