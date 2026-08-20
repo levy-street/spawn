@@ -8,7 +8,13 @@ import { useSyncExternalStore } from "react";
  * doing, and closing it returns them exactly there. /settings and /trust stay
  * deep-linkable via redirect pages that call `openSettings` on mount.
  */
-export type SettingsTab = "account" | "appearance" | "devices" | "trust" | "skills";
+export type SettingsTab = "account" | "appearance" | "access" | "skills";
+
+/**
+ * Old bookmarks and copy said "Browser devices" / "Device trust"; both now
+ * live on the one Access tab (docs/TRUST_UX.md).
+ */
+export type SettingsTabRequest = SettingsTab | "devices" | "trust";
 
 let openTab: SettingsTab | null = null;
 const listeners = new Set<() => void>();
@@ -17,8 +23,8 @@ function emit() {
   for (const listener of listeners) listener();
 }
 
-export function openSettings(tab: SettingsTab = "account") {
-  openTab = tab;
+export function openSettings(tab: SettingsTabRequest = "account") {
+  openTab = tab === "devices" || tab === "trust" ? "access" : tab;
   emit();
 }
 

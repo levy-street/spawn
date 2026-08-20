@@ -1,12 +1,12 @@
 "use client";
 
 import * as Dialog from "@radix-ui/react-dialog";
-import { MonitorSmartphone, Palette, ShieldCheck, User, Wrench, X } from "lucide-react";
+import { Palette, ShieldCheck, User, Wrench, X } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
 import type { ComponentType } from "react";
+import { AccessPanel } from "@/components/settings/AccessPanel";
 import { AccountPanel } from "@/components/settings/AccountPanel";
 import { AppearancePanel } from "@/components/settings/AppearancePanel";
-import { DevicesPanel } from "@/components/settings/DevicesPanel";
 import { SkillsPanel } from "@/components/settings/SkillsPanel";
 import {
   closeSettings,
@@ -14,7 +14,6 @@ import {
   type SettingsTab,
   useSettingsDialog,
 } from "@/components/settings/settings-dialog-store";
-import { TrustPanel } from "@/components/settings/TrustPanel";
 import { cn } from "@/lib/utils";
 
 const TABS: Array<{
@@ -24,8 +23,7 @@ const TABS: Array<{
 }> = [
   { key: "account", label: "Account", icon: User },
   { key: "appearance", label: "Appearance", icon: Palette },
-  { key: "devices", label: "Browser devices", icon: MonitorSmartphone },
-  { key: "trust", label: "Device trust", icon: ShieldCheck },
+  { key: "access", label: "Access", icon: ShieldCheck },
   { key: "skills", label: "Skills", icon: Wrench },
 ];
 
@@ -63,7 +61,7 @@ export function SettingsDialog() {
           )}
         >
           <Dialog.Description className="sr-only">
-            Account, appearance, browser devices, device trust, and skills.
+            Account, appearance, access, and skills.
           </Dialog.Description>
 
           {/* Tab rail: left column on desktop, horizontal strip on mobile. */}
@@ -105,8 +103,7 @@ export function SettingsDialog() {
             <div className="mx-auto flex w-full max-w-xl flex-col gap-6 p-4 pt-5 md:p-6">
               {tab === "account" && <AccountPanel />}
               {tab === "appearance" && <AppearancePanel />}
-              {tab === "devices" && <DevicesPanel />}
-              {tab === "trust" && <TrustPanel />}
+              {tab === "access" && <AccessPanel />}
               {tab === "skills" && <SkillsPanel />}
             </div>
           </div>
