@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { mockAuthenticatedApi, USER_ID } from "./app-mocks";
 
-test("registers, displays, revokes, cleans locally, and replaces only after explicit action", async ({
+test("removing this device is seamless: the key dies, a fresh one takes its place", async ({
   page,
 }) => {
   await mockAuthenticatedApi(page);
@@ -28,6 +28,7 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
     database.close();
     return {
       publicKey: record.publicKeyWire,
+      fingerprint: document.querySelector('[data-testid="browser-fingerprint"]')?.textContent ?? "",
       localStorage: Object.fromEntries(
         Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index)!)
           .filter(Boolean)
@@ -41,59 +42,50 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
   await page.locator('[aria-label^="Options for"]').first().click();
   await page.getByRole("menuitem", { name: "Remove…" }).click();
   await page.getByTestId("remove-confirm").click();
-  await expect(page.getByText("This device was removed", { exact: false })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start over" })).toBeVisible();
 
-  const afterRevoke = await page.evaluate(async (userId) => {
+  // No button, no dead end: registration re-runs, mints a fresh identity, and
+  // this browser reappears as an ordinary device — with a DIFFERENT key.
+  await expect(fingerprint).not.toHaveText(before.fingerprint, { timeout: 15_000 });
+  await expect(fingerprint).toHaveText(/^SHA256:/);
+  await expect(page.getByTestId("device-row").getByText("This device")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start over" })).toHaveCount(0);
+
+  const afterReplace = await page.evaluate(async (userId) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open("spawn-browser-device-identity");
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
-    const localRecord = await new Promise<unknown>((resolve, reject) => {
-      const request = database
-        .transaction("device-identities", "readonly")
-        .objectStore("device-identities")
-        .get(userId);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+    const localRecord = await new Promise<Record<string, unknown> | undefined>(
+      (resolve, reject) => {
+        const request = database
+          .transaction("device-identities", "readonly")
+          .objectStore("device-identities")
+          .get(userId);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      },
+    );
     database.close();
     return {
-      localRecord,
+      publicKey: localRecord?.publicKeyWire ?? null,
       marker: localStorage.getItem(`spawn.browser-device.revocation.v1.${userId}`),
     };
   }, USER_ID);
-  expect(afterRevoke.localRecord).toBeUndefined();
-  expect(afterRevoke.marker).toBe(`revoked:${before.publicKey}`);
+  // The revoked key never returns; the replacement is a new key; no marker
+  // lingers to gate anything.
+  expect(afterReplace.publicKey).not.toBeNull();
+  expect(afterReplace.publicKey).not.toBe(before.publicKey);
+  expect(afterReplace.marker).toBeNull();
 
+  // The replacement survives a reload unchanged (no second mint).
   await page.reload();
-  // A reload closes the settings modal (it is an overlay, not a page); the
-  // revoked state must survive it and greet the user on reopen.
   await page.goto("/settings");
-  await expect(page.getByRole("button", { name: "Start over" })).toBeVisible();
-  const stillAbsent = await page.evaluate(async (userId) => {
-    const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open("spawn-browser-device-identity");
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    const request = database
-      .transaction("device-identities", "readonly")
-      .objectStore("device-identities")
-      .get(userId);
-    const result = await new Promise<unknown>((resolve, reject) => {
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    database.close();
-    return result;
-  }, USER_ID);
-  expect(stillAbsent).toBeUndefined();
-
-  await page.getByRole("button", { name: "Start over" }).click();
   await expect(fingerprint).toHaveText(/^SHA256:/);
+  await expect(page.getByRole("button", { name: "Start over" })).toHaveCount(0);
+
   // The removed key stays in history (under Advanced), never resurrected.
+  await page.getByTestId("access-advanced").locator("summary").click();
   await expect(page.getByText(/Removed devices \(1\)/)).toHaveCount(1);
 });
 
@@ -269,21 +261,32 @@ test("clearing history prunes tombstones but never active devices", async ({ pag
   await expect(page.getByTestId("device-row").getByText("This device")).toBeVisible();
 });
 
-test("a remotely-removed device lands on Start over, not an opaque failure", async ({ page }) => {
+test("a remotely-removed device replaces its key seamlessly on the next load", async ({ page }) => {
   await mockAuthenticatedApi(page);
-  // The server refuses the key as revoked: this device was removed from
-  // ANOTHER device, and this reload is the moment it finds out.
+  // The server refuses the FIRST key as revoked: this device was removed from
+  // ANOTHER device, and this load is the moment it finds out. The replacement
+  // key (second register call) is accepted by the underlying stateful mock.
+  let refusals = 0;
   await page.route("**/api/browser-devices/register", async (route) => {
-    await route.fulfill({
-      status: 409,
-      contentType: "application/json",
-      json: { detail: "revoked browser public keys cannot be registered again" },
-    });
+    if (refusals === 0) {
+      refusals += 1;
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        json: { detail: "revoked browser public keys cannot be registered again" },
+      });
+      return;
+    }
+    await route.fallback();
   });
   await page.goto("/settings");
 
-  await expect(page.getByText("This device was removed", { exact: false })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start over" })).toBeVisible();
-  // The generic registration-failure alert must NOT be the story told here.
+  // Straight to an ordinary registered device — no dead end, no button.
+  await expect(page.getByTestId("browser-fingerprint")).toHaveText(/^SHA256:/, {
+    timeout: 15_000,
+  });
+  await expect(page.getByTestId("device-row").getByText("This device")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start over" })).toHaveCount(0);
   await expect(page.getByText("could not register")).toHaveCount(0);
+  expect(refusals).toBe(1);
 });

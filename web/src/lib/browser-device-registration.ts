@@ -137,9 +137,30 @@ export function defaultDeviceLabel(): string | null {
     .slice(0, 64);
 }
 
-async function registerBrowserDevice(userId: string): Promise<BrowserDeviceRegistrationState> {
-  const marker = readBrowserDeviceRevocationMarker(userId);
-  if (marker !== null) return { status: marker.status, publicKey: marker.publicKey };
+async function registerBrowserDevice(
+  userId: string,
+  replacedRevokedKey = false,
+): Promise<BrowserDeviceRegistrationState> {
+  // A removal is not a dead end for the browser it happened to: the removed
+  // KEY stays dead for good (R10), and this signed-in browser simply becomes
+  // a new, unapproved device — visible in every roster, waiting for approval
+  // (R4). No button, no ceremony to get *here*; the ceremony guards approval,
+  // never presence. Finish any interrupted cleanup, drop the marker, and fall
+  // through to minting a fresh identity.
+  let marker = readBrowserDeviceRevocationMarker(userId);
+  if (marker?.status === "cleanup_pending") {
+    try {
+      await finishBrowserDeviceLocalCleanup(userId, marker.publicKey);
+    } catch {
+      // The dead key could not be deleted locally; surface that explicitly
+      // rather than minting a second identity next to it.
+      return { status: "cleanup_pending", publicKey: marker.publicKey };
+    }
+    marker = readBrowserDeviceRevocationMarker(userId);
+  }
+  if (marker?.status === "revoked") {
+    allowExplicitBrowserIdentityReplacement(userId, marker.publicKey);
+  }
 
   const identity = await loadOrCreateBrowserDeviceIdentity(userId);
   const signature = await createBrowserDeviceRegistrationProof(identity, userId);
@@ -152,19 +173,26 @@ async function registerBrowserDevice(userId: string): Promise<BrowserDeviceRegis
       label: defaultDeviceLabel(),
     });
   } catch (error) {
-    if (error instanceof ApiError && error.status === 409 && /revoked/iu.test(error.message)) {
+    if (
+      error instanceof ApiError &&
+      error.status === 409 &&
+      /revoked/iu.test(error.message) &&
+      !replacedRevokedKey
+    ) {
       // The server refused this key as revoked: this device was removed FROM
-      // ANOTHER device (R1), and this is the moment it finds out. Land on the
-      // same honest removed state a self-removal reaches — clean up the dead
-      // key now so "Start over" can mint a fresh one — instead of looping on
-      // an opaque registration failure (seen live: a remotely-removed phone
-      // retried its 409 indefinitely behind a generic error banner).
+      // ANOTHER device (R1), and this is the moment it finds out. Clean up the
+      // dead key and register a fresh one in the same pass — seamlessly, the
+      // way any unapproved sign-in appears. Guarded to a single replacement:
+      // a server refusing the brand-new key too is an error worth seeing.
       const status = await beginBrowserDeviceLocalCleanup(userId, identity.publicKeyWire);
       if (status === "cleanup_pending") {
         await finishBrowserDeviceLocalCleanup(userId, identity.publicKeyWire);
-        return { status: "revoked", publicKey: identity.publicKeyWire };
       }
-      return { status, publicKey: identity.publicKeyWire };
+      const cleared = readBrowserDeviceRevocationMarker(userId);
+      if (cleared?.status === "revoked") {
+        allowExplicitBrowserIdentityReplacement(userId, cleared.publicKey);
+      }
+      return registerBrowserDevice(userId, true);
     }
     throw error;
   }

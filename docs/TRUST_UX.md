@@ -167,9 +167,14 @@ password manager too; remove compromised devices). Root rotation happens automat
 the next passkey sign-in. No dialogs in the trust UX.
 
 ### 7. Connection refused — `AccessBlocked`
-- **removed** — "This device was removed — Aug 12, by MacBook Pro. It can start over
-  as a new device." → *Start over*. (Names the remover: R4 visibility at the sharp end.
-  Rejoining is a fresh approval, never an un-remove: R10.)
+- **removed** — *(refined 2026-08-21, owner review during field test)* there is no removed
+  screen and no "Start over" button: a removed device that is still signed in seamlessly
+  becomes a new, unapproved device on its next load — the dead key is cleaned up and a
+  fresh one registers automatically, landing it in the ordinary *waiting* state. The
+  button gated nothing (anyone can clear site data); the real invariants hold without it:
+  the removed KEY stays dead forever (R10), every sign-in is visible (R4, with the removal
+  and its remover in History), and approval — the only gate that matters — still takes the
+  ceremony. The disaster flow is the ordinary flow.
 - **not approved yet** — "One step left — approve from a device you already use, or sign
   in with your passkey." → *Use passkey*.
 
