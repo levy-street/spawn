@@ -298,7 +298,11 @@ export const BrowserDeviceSchema = z.object({
   /** Recognition only; never a trust input. See the server model. */
   label: z.string().nullable().default(null),
   created_at: z.string(),
+  /** Stamped each time this device's registration reconciles (every app load). */
+  last_seen_at: z.string().nullable().default(null),
   revoked_at: z.string().nullable(),
+  /** Which of the account's devices asked for the removal (attribution, R4). */
+  revoked_by_device_id: z.string().nullable().default(null),
   /** The account root (pk_R): endorses + anchors, never connects. Filtered out
    * of connect/ceremony lists. */
   is_root: z.boolean().default(false),
@@ -465,10 +469,13 @@ export const browserDevices = {
       body: JSON.stringify({ label }),
       schema: BrowserDeviceSchema,
     }),
-  revoke: (deviceId: string, expectedPublicKey: string) =>
+  revoke: (deviceId: string, expectedPublicKey: string, revokedByDeviceId?: string | null) =>
     api(`/api/browser-devices/${deviceId}/revoke`, {
       method: "POST",
-      body: JSON.stringify({ expected_public_key: expectedPublicKey }),
+      body: JSON.stringify({
+        expected_public_key: expectedPublicKey,
+        revoked_by_device_id: revokedByDeviceId ?? null,
+      }),
       schema: BrowserDeviceSchema,
     }),
   /** Hard-deletes this account's revoked device tombstones. */
@@ -601,6 +608,22 @@ export const trust = {
   /** Browser device IDs a host already trusts. */
   hostPins: (hostId: string) =>
     api(`/api/trust/hosts/${hostId}/pins`, { method: "GET", schema: z.array(z.string()) }),
+  /**
+   * Pin records with provenance for the Access screen's host rows: `direct`
+   * means the pin came from the possess ceremony itself. Display only —
+   * admission stays daemon-side.
+   */
+  hostPinDetails: (hostId: string) =>
+    api(`/api/trust/hosts/${hostId}/pin-details`, {
+      method: "GET",
+      schema: z.array(
+        z.object({
+          device_id: z.string(),
+          direct: z.boolean(),
+          created_at: z.string(),
+        }),
+      ),
+    }),
   /**
    * Endorsements naming this device, so it can verify them locally and learn
    * its hosts' true keys. Every field is server-claimed; the caller verifies.
