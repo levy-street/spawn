@@ -275,7 +275,7 @@ test("blocks first contact when the server fingerprint disagrees with the host k
   await page.goto("/device?code=QZ4K-7HMT");
 
   await expect(page.locator("p[role=alert]")).toContainText(
-    "fingerprint did not match its key",
+    "identity did not check out",
   );
   await expect(page.getByTestId("host-key-fingerprint")).not.toBeVisible();
   expect(approveCalled).toBe(false);

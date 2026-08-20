@@ -134,9 +134,40 @@ function firstDeviceId(devices: AccessDevice[]): string | null {
   return first?.id ?? null;
 }
 
+/**
+ * id → display name, with the naming-layer defense (docs/TRUST_UX.md, small
+ * rules): when two or more live devices share a name, every one after the
+ * first — by first sign-in, so a device already in the roster always keeps
+ * its bare name — gets a numbered suffix ("MacBook Pro (2)"), and no two
+ * roster or history rows can read identically. Display-only, deliberately:
+ * a rogue sign-in that copies an existing device's name is what this defends
+ * against (R4), and creation order decides who wears the suffix, so the
+ * newcomer can never push the suffix onto the device it imitates.
+ */
+export function deviceDisplayNames(devices: AccessDevice[]): Map<string, string> {
+  const names = new Map(devices.map((d) => [d.id, deviceDisplayName(d)]));
+  const groups = new Map<string, AccessDevice[]>();
+  for (const d of liveNonRoot(devices)) {
+    const base = deviceDisplayName(d);
+    const group = groups.get(base);
+    if (group === undefined) groups.set(base, [d]);
+    else group.push(d);
+  }
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const byCreation = [...group].sort(
+      (a, b) => parse(a.created_at) - parse(b.created_at) || (a.id < b.id ? -1 : 1),
+    );
+    for (const [i, d] of byCreation.entries()) {
+      if (i > 0) names.set(d.id, `${deviceDisplayName(d)} (${i + 1})`);
+    }
+  }
+  return names;
+}
+
 export function deriveDeviceVMs(input: AccessViewInput, now: Date): DeviceVM[] {
   const roots = rootIds(input.devices);
-  const nameOf = new Map(input.devices.map((d) => [d.id, deviceDisplayName(d)]));
+  const nameOf = deviceDisplayNames(input.devices);
   const firstId = firstDeviceId(input.devices);
 
   // Earliest inbound edge per device — the original provenance. Later edges
@@ -163,7 +194,7 @@ export function deriveDeviceVMs(input: AccessViewInput, now: Date): DeviceVM[] {
   }
 
   const vms = liveNonRoot(input.devices).map((d): DeviceVM => {
-    const name = deviceDisplayName(d);
+    const name = nameOf.get(d.id) ?? deviceDisplayName(d);
     const edge = inbound.get(d.id);
     let provenance: string;
     let waiting = false;
@@ -205,7 +236,7 @@ export function deriveDeviceVMs(input: AccessViewInput, now: Date): DeviceVM[] {
 }
 
 export function deriveHostVMs(input: AccessViewInput, now: Date): HostVM[] {
-  const nameOf = new Map(input.devices.map((d) => [d.id, deviceDisplayName(d)]));
+  const nameOf = deviceDisplayNames(input.devices);
   return input.hosts.map((host): HostVM => {
     let possess: AccessPinDetail | null = null;
     for (const pin of input.pinDetails.get(host.id) ?? []) {
@@ -226,7 +257,7 @@ export function deriveHostVMs(input: AccessViewInput, now: Date): HostVM[] {
 
 export function deriveTrustEvents(input: AccessViewInput, now: Date): TrustEventVM[] {
   const roots = rootIds(input.devices);
-  const nameOf = new Map(input.devices.map((d) => [d.id, deviceDisplayName(d)]));
+  const nameOf = deviceDisplayNames(input.devices);
   const named = (id: string) => nameOf.get(id) ?? "A removed device";
   const events: Array<TrustEventVM & { at: number }> = [];
 
@@ -286,7 +317,7 @@ export function deriveTrustEvents(input: AccessViewInput, now: Date): TrustEvent
     const by = d.revoked_by_device_id === null ? "" : ` by ${named(d.revoked_by_device_id)}`;
     events.push({
       id: `removed:${d.id}`,
-      text: `${deviceDisplayName(d)} removed${by}`,
+      text: `${named(d.id)} removed${by}`,
       when: shortDate(d.revoked_at, now),
       kind: "removed",
       at: parse(d.revoked_at),

@@ -121,6 +121,67 @@ describe("device rows", () => {
     expect(vms[0]?.id).toBe("phone");
     expect(vms[0]?.isThisDevice).toBe(true);
   });
+
+  test("duplicate names get a creation-order suffix; the earliest keeps its bare name", () => {
+    // R4 naming defense (docs/TRUST_UX.md, small rules): a rogue sign-in that
+    // copies an existing device's name must not read identically to it — and
+    // must not be able to push the suffix onto the device it imitates.
+    const original = device({
+      id: "b-original",
+      label: "Chrome on Mac",
+      created_at: "2026-05-01T00:00:00Z",
+    });
+    const rogue = device({
+      id: "a-rogue", // sorts before the original by id — creation order must win
+      label: "Chrome on Mac",
+      created_at: "2026-08-20T11:00:00Z",
+    });
+    const third = device({
+      id: "c-third",
+      label: "Chrome on Mac",
+      created_at: "2026-08-20T11:30:00Z",
+    });
+    const vms = deriveDeviceVMs(
+      input({ devices: [rogue, original, third, phone], currentDeviceId: "b-original" }),
+      NOW,
+    );
+    const nameOf = (id: string) => vms.find((v) => v.id === id)?.name;
+    expect(nameOf("b-original")).toBe("Chrome on Mac");
+    expect(nameOf("a-rogue")).toBe("Chrome on Mac (2)");
+    expect(nameOf("c-third")).toBe("Chrome on Mac (3)");
+    // A non-colliding name stays verbatim, and "This device" stays identified
+    // even when its name is the duplicated one.
+    expect(nameOf("phone")).toBe("iPhone");
+    expect(vms.find((v) => v.id === "b-original")?.isThisDevice).toBe(true);
+  });
+
+  test("a removed namesake does not suffix the one live holder of a name", () => {
+    const gone = device({
+      id: "gone",
+      label: "Chrome on Mac",
+      created_at: "2026-04-01T00:00:00Z",
+      revoked_at: "2026-05-02T00:00:00Z",
+    });
+    const live = device({ id: "live", label: "Chrome on Mac", created_at: "2026-06-01T00:00:00Z" });
+    const vms = deriveDeviceVMs(input({ devices: [gone, live] }), NOW);
+    expect(vms.find((v) => v.id === "live")?.name).toBe("Chrome on Mac");
+  });
+
+  test("provenance and history speak the suffixed names too", () => {
+    const first = device({ id: "m1", label: "MacBook Pro", created_at: "2026-05-01T00:00:00Z" });
+    const second = device({ id: "m2", label: "MacBook Pro", created_at: "2026-06-01T00:00:00Z" });
+    const target = device({ id: "px", label: "Pixel 9", created_at: "2026-07-02T00:00:00Z" });
+    const shared = input({
+      devices: [first, second, target],
+      edges: [
+        { endorser_device_id: "m2", endorsed_device_id: "px", created_at: "2026-07-02T08:00:00Z" },
+      ],
+    });
+    const vms = deriveDeviceVMs(shared, NOW);
+    expect(vms.find((v) => v.id === "px")?.provenance).toBe("Approved by MacBook Pro (2) · Jul 2");
+    const events = deriveTrustEvents(shared, NOW);
+    expect(events.map((e) => e.text)).toEqual(["MacBook Pro (2) approved Pixel 9"]);
+  });
 });
 
 describe("host rows", () => {
