@@ -392,7 +392,10 @@ export function AccessPanel() {
         </div>
       )}
 
-      {(error || devices.error) && (
+      {/* A background-poll blip (deploy, brief network drop) must not flash an
+          error over a roster that is still showing good data seconds old; only
+          a load that never succeeded deserves the banner. */}
+      {(error || (devices.error && devices.data === undefined)) && (
         <p className="text-sm text-destructive" role="alert">
           {error ?? `Failed to load devices: ${String(devices.error)}`}
         </p>
