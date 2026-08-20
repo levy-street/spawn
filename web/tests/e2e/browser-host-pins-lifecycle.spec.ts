@@ -127,9 +127,7 @@ async function corruptExistingPin(page: Page): Promise<void> {
 }
 
 async function approveExactHost(page: Page): Promise<void> {
-  await page.goto("/device");
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
+  await page.goto("/device?code=QZ4K-7HMT");
   await page.getByRole("button", { name: /^(?:They match|Retry)$/u }).click();
   await expect(page.getByTestId("ceremony-done")).toContainText("is possessed");
 }
@@ -407,9 +405,7 @@ test("server delete failure retains tombstone across disappearance, reload, retr
   expect(state.deleteCalls).toBe(2);
   expect(await readHostPins(page)).toMatchObject([{ state: "revoked" }]);
 
-  await page.goto("/device");
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
+  await page.goto("/device?code=QZ4K-7HMT");
   await expect(page.getByTestId("local-pin-state")).toContainText("previously removed this host");
   await page.getByRole("button", { name: "They match" }).click();
   await expect(page.getByTestId("ceremony-done")).toContainText("is possessed");

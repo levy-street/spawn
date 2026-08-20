@@ -1,14 +1,13 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { type FormEvent, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { NumberCheck } from "@/components/access/number-check";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { AppShell } from "@/components/nav/AppShell";
+import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { ApiError, auth, type DevicePendingApproval, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
@@ -102,7 +101,6 @@ function DeviceInner() {
   const { user } = useAuth();
   const router = useRouter();
   const registration = useBrowserDeviceRegistration(user?.id);
-  const [code, setCode] = useState("");
   // Set on a successful approval; drives the "possessed" screen and the
   // hand-off to the host's page once its id is known.
   const [connected, setConnected] = useState<{
@@ -134,8 +132,8 @@ function DeviceInner() {
   const [entryError, setEntryError] = useState<string | null>(null);
   const [stopped, setStopped] = useState(false);
 
-  // Load the pending approval and land on the number screen. Takes either
-  // the opaque URL ref (auto-open path — nothing typed) or a typed user_code,
+  // Load the pending approval and land on the number screen. Takes the opaque
+  // URL ref the terminal opened/printed (or the pre-0029 user_code URL param),
   // and remembers which so approve reuses the exact same identifier.
   const review = async (id: { user_code?: string; approval_ref?: string }) => {
     const lookup = id.approval_ref
@@ -183,11 +181,6 @@ function DeviceInner() {
     } finally {
       setSubmitting(false);
     }
-  };
-
-  const onReview = (e: FormEvent) => {
-    e.preventDefault();
-    void review({ user_code: code });
   };
 
   // Committed-ephemeral SAS (docs/TRUST_DEVICE_MESH.md Appendix A). Once we hold
@@ -327,7 +320,7 @@ function DeviceInner() {
         pending.host_public_key,
       );
       const r = await auth.approveDevice({
-        ...(identifier ?? { user_code: code.trim().toUpperCase() }),
+        ...(identifier ?? {}),
         approval_nonce: pending.approval_nonce,
         host_key_algorithm: pending.host_key_algorithm,
         host_public_key: pending.host_public_key,
@@ -364,7 +357,6 @@ function DeviceInner() {
       setPending(null);
       setLocalPinState(null);
       setLocalPinCommitted(false);
-      setCode("");
       setIdentifier(null);
     } catch (err) {
       const message =
@@ -411,9 +403,13 @@ function DeviceInner() {
     setTriesLeft(POSSESS_TRIES);
     setStopped(false);
     setError(null);
-    setCode("");
     setIdentifier(null);
     setPhase("manual");
+  };
+
+  const backToAccess = () => {
+    router.push("/");
+    openSettings("access");
   };
 
   const deviceLabel =
@@ -513,7 +509,7 @@ function DeviceInner() {
               )}
             </div>
           ) : (
-            <form className="space-y-4" onSubmit={onReview}>
+            <div className="space-y-4" data-testid="possess-instructions">
               <div className="space-y-1 text-center">
                 <p className="text-lg font-medium text-foreground">Possess a host</p>
                 <p className="text-sm text-muted-foreground">Run this on the host:</p>
@@ -521,42 +517,22 @@ function DeviceInner() {
               <div className="rounded-lg border border-border bg-muted px-4 py-3 font-mono text-sm text-foreground">
                 <span className="select-none text-muted-foreground">$ </span>spawnd possess
               </div>
-              <div className="space-y-1">
-                <Label htmlFor="user_code" className="sr-only">
-                  Code from the host's terminal
-                </Label>
-                <Input
-                  id="user_code"
-                  placeholder="QZ4K-7HMT"
-                  inputMode="text"
-                  autoCapitalize="characters"
-                  autoComplete="one-time-code"
-                  className="text-center font-mono text-lg tracking-[0.2em]"
-                  value={code}
-                  onChange={(e) => {
-                    setCode(e.target.value);
-                    setIdentifier(null);
-                    setPending(null);
-                    setVerifyCode(null);
-                    setLocalPinState(null);
-                    setLocalPinCommitted(false);
-                    setHostName(null);
-                  }}
-                  required
-                />
-                <p className="text-center text-xs text-muted-foreground">
-                  Enter the code its terminal prints.
-                </p>
-              </div>
+              <p className="text-center text-sm leading-relaxed text-muted-foreground">
+                Its terminal opens this approval in your browser and shows a six-digit number.
+                You'll type the number to finish.
+              </p>
+              <p className="text-center text-xs text-muted-foreground/80">
+                On a remote host, open the link the terminal prints.
+              </p>
               {error && (
-                <p className="text-sm text-destructive" role="alert">
+                <p className="text-center text-sm text-destructive" role="alert">
                   {error}
                 </p>
               )}
-              <Button type="submit" className="w-full" disabled={submitting}>
-                {submitting ? "Checking…" : "Continue"}
+              <Button type="button" variant="ghost" className="w-full" onClick={backToAccess}>
+                Cancel
               </Button>
-            </form>
+            </div>
           )}
 
           {registrationBlocked && (
