@@ -297,6 +297,9 @@ export const BrowserDeviceSchema = z.object({
   label: z.string().nullable().default(null),
   created_at: z.string(),
   revoked_at: z.string().nullable(),
+  /** The account root (pk_R): endorses + anchors, never connects. Filtered out
+   * of connect/ceremony lists. */
+  is_root: z.boolean().default(false),
 });
 export type BrowserDevice = z.infer<typeof BrowserDeviceSchema>;
 
