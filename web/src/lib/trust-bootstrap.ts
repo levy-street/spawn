@@ -26,6 +26,7 @@ import {
   type PasskeyWrapInput,
   revokePasskeyFromEnvelope,
   sealTrustEnvelope,
+  setEnvelopeRoot,
 } from "./trust-envelope";
 import {
   enforceBundleFreshness,
@@ -126,6 +127,33 @@ export async function enrollBackupPasskey(
   const opened = await openTrustEnvelope(scope.accountId, sealed, unlockWith);
   await enforceBundleFreshness(scope.accountId, opened.revision, revisionOptions(scope));
   return enrollPasskeyInEnvelope(scope.accountId, sealed, unlockWith, newPasskey);
+}
+
+/**
+ * Retrofit a freshly minted root into a pre-root bundle at unlock time, so
+ * accounts sealed before stage 5 gain recovery without re-running setup.
+ * Returns null when the bundle already carries a root (nothing to do). The
+ * caller stores the returned envelope, records the revision, and only then
+ * registers/heals off the root — a root whose seed is not durably sealed must
+ * never become an endorser or anchor.
+ */
+export async function retrofitAccountRoot(
+  scope: TrustBootstrapScope,
+  sealed: string,
+  unlockWith: PasskeyWrapInput,
+  serverRevision: number,
+  root: AccountRootMaterial,
+): Promise<{ readonly sealed: string; readonly revision: number } | null> {
+  const opened = await openTrustEnvelope(scope.accountId, sealed, unlockWith);
+  if (opened.root !== null) return null;
+  await enforceBundleFreshness(scope.accountId, opened.revision, revisionOptions(scope));
+  const floor = await readHighestSeenRevision(scope.accountId, revisionOptions(scope));
+  const revision =
+    Math.max(floor, Number.isInteger(serverRevision) ? serverRevision : 0, opened.revision) + 1;
+  return {
+    sealed: await setEnvelopeRoot(scope.accountId, sealed, unlockWith, root, revision),
+    revision,
+  };
 }
 
 /**

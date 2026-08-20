@@ -301,6 +301,45 @@ export async function openTrustEnvelope(
 }
 
 /**
+ * Retrofit an account root into a pre-root bundle (mesh stage 5c).
+ *
+ * Reseals the bundle's content — same hosts, plus the root, at an advanced
+ * revision — under the SAME data key, so every enrolled passkey's wrap keeps
+ * working without gathering the other passkeys' PRF secrets. Refuses to touch a
+ * bundle that already holds a root: an existing `sk_R` is the account's anchor
+ * and is never silently replaced.
+ */
+export async function setEnvelopeRoot(
+  accountId: string,
+  wire: string,
+  unlockWith: PasskeyWrapInput,
+  root: AccountRootMaterial,
+  revision: number,
+): Promise<string> {
+  requireAccountId(accountId);
+  const envelope = parseEnvelope(accountId, wire);
+  const dataKey = await recoverDataKey(envelope, accountId, unlockWith);
+  const bundle = await openSealedBundle(dataKey, accountId, envelope.sealed);
+  if (bundle.root !== null) {
+    throw new TrustBundleError("invalid_bundle", "the trust bundle already holds an account root");
+  }
+  if (revision <= bundle.revision) {
+    throw new TrustBundleError(
+      "invalid_bundle",
+      "a root retrofit must advance the bundle revision",
+    );
+  }
+  const amended = await canonicalBundle(accountId, bundle.hosts, revision, root);
+  const sealed = await sealBytes(
+    await importDataKey(dataKey),
+    aad(BUNDLE_AAD_MAGIC, accountId),
+    new TextEncoder().encode(JSON.stringify(amended)),
+  );
+  const next: EnvelopeWire = { ...envelope, sealed };
+  return encodeBase64Url(new TextEncoder().encode(JSON.stringify(next)));
+}
+
+/**
  * Enroll another passkey by adding a wrap of the same data key.
  *
  * Requires a passkey that can already unlock, and the new passkey's PRF secret,

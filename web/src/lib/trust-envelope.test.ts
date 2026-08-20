@@ -292,3 +292,55 @@ describe("account root in the envelope (mesh stage 5)", () => {
     );
   });
 });
+
+describe("root retrofit into a pre-root bundle (mesh stage 5c)", () => {
+  async function rootMaterial() {
+    const { exportAccountRootMaterial, generateAccountRoot } = await import("./account-root");
+    return exportAccountRootMaterial(await generateAccountRoot());
+  }
+
+  test("retrofit adds the root and every enrolled passkey still opens", async () => {
+    const { setEnvelopeRoot } = await import("./trust-envelope");
+    const hosts = [await host()];
+    const legacy = await sealEnvelope(ACCOUNT, hosts, [passkey("laptop", 1)]);
+    const withBackup = await enrollPasskeyInEnvelope(
+      ACCOUNT,
+      legacy,
+      passkey("laptop", 1),
+      passkey("yubikey", 2),
+    );
+    const root = await rootMaterial();
+    const amended = await setEnvelopeRoot(ACCOUNT, withBackup, passkey("laptop", 1), root, 2);
+    // Both passkeys open the amended bundle — the data key was reused, so the
+    // backup's wrap survived a reseal it never participated in.
+    for (const key of [passkey("laptop", 1), passkey("yubikey", 2)]) {
+      const opened = await openTrustEnvelope(ACCOUNT, amended, key);
+      expect(opened.root).toEqual(root);
+      expect(opened.revision).toBe(2);
+      expect(opened.hosts.map((h) => h.hostPublicKey)).toEqual(hosts.map((h) => h.hostPublicKey));
+    }
+  });
+
+  test("retrofit refuses a bundle that already holds a root", async () => {
+    const { setEnvelopeRoot } = await import("./trust-envelope");
+    const root = await rootMaterial();
+    const sealed = await sealTrustEnvelope(
+      ACCOUNT,
+      [await host()],
+      [passkey("laptop", 1)],
+      1,
+      root,
+    );
+    await expect(
+      setEnvelopeRoot(ACCOUNT, sealed, passkey("laptop", 1), await rootMaterial(), 2),
+    ).rejects.toThrow(TrustBundleError);
+  });
+
+  test("retrofit must advance the revision", async () => {
+    const { setEnvelopeRoot } = await import("./trust-envelope");
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    await expect(
+      setEnvelopeRoot(ACCOUNT, sealed, passkey("laptop", 1), await rootMaterial(), 1),
+    ).rejects.toThrow(TrustBundleError);
+  });
+});
