@@ -49,6 +49,7 @@ export function AddDeviceCeremonyPanel({
   const actedRef = useRef<Set<string>>(new Set());
   const [sasByPairing, setSasByPairing] = useState<Map<string, string>>(new Map());
   const [endorsed, setEndorsed] = useState<Set<string>>(new Set());
+  const [completedPeers, setCompletedPeers] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const pairings = useQuery({
@@ -56,9 +57,12 @@ export function AddDeviceCeremonyPanel({
     queryFn: () => trust.listPairings(currentDevice.id),
     refetchInterval: 1500,
   });
+  // Polled while the panel is open so the ceremony notices the PEER's
+  // endorsement landing and can flip to its completed state.
   const endorsements = useQuery({
     queryKey: ["account-endorsements"],
     queryFn: trust.accountEndorsements,
+    refetchInterval: 4000,
   });
 
   const alreadyEndorsed = new Set(
@@ -76,6 +80,53 @@ export function AddDeviceCeremonyPanel({
   useEffect(() => {
     for (const pairing of pairings.data ?? []) void advance(pairing);
   }, [pairings.data]);
+
+  // Completion: once BOTH directions of the mutual endorsement exist, the
+  // ceremony is done — say so and delete the pairing so neither screen lingers
+  // on "waiting for the other side" until the relay TTL. Either side may win
+  // the delete; the loser's 404 is fine.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: poll-driven effect
+  useEffect(() => {
+    const edges = endorsements.data ?? [];
+    for (const pairing of pairings.data ?? []) {
+      if (!sasByPairing.has(pairing.id) || actedRef.current.has(`done:${pairing.id}`)) continue;
+      const amInitiator = pairing.initiator_device_id === currentDevice.id;
+      const peerId = amInitiator ? pairing.joiner_device_id : pairing.initiator_device_id;
+      const mine =
+        endorsed.has(pairing.id) ||
+        edges.some(
+          (e) => e.endorser_device_id === currentDevice.id && e.endorsed_device_id === peerId,
+        );
+      const theirs = edges.some(
+        (e) => e.endorser_device_id === peerId && e.endorsed_device_id === currentDevice.id,
+      );
+      if (!mine || !theirs) continue;
+      actedRef.current.add(`done:${pairing.id}`);
+      setCompletedPeers((prev) => [...prev, labelFor(peerId)]);
+      setSasByPairing((prev) => {
+        const next = new Map(prev);
+        next.delete(pairing.id);
+        return next;
+      });
+      void trust
+        .cancelPairing(pairing.id)
+        .catch(() => {})
+        .then(() => invalidatePairings());
+    }
+    // The peer may delete the pairing before our edge-poll notices completion:
+    // a ceremony we confirmed that vanished from the relay is also done.
+    const liveIds = new Set((pairings.data ?? []).map((p) => p.id));
+    for (const id of endorsed) {
+      if (liveIds.has(id) || actedRef.current.has(`done:${id}`) || !sasByPairing.has(id)) continue;
+      actedRef.current.add(`done:${id}`);
+      setCompletedPeers((prev) => [...prev, "the other device"]);
+      setSasByPairing((prev) => {
+        const next = new Map(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  }, [pairings.data, endorsements.data]);
 
   async function advance(pairing: PairingState): Promise<void> {
     const amInitiator = pairing.initiator_device_id === currentDevice.id;
@@ -221,6 +272,18 @@ export function AddDeviceCeremonyPanel({
           {error}
         </p>
       )}
+
+      {completedPeers.map((peer, index) => (
+        <p
+          // biome-ignore lint/suspicious/noArrayIndexKey: append-only session list
+          key={`${peer}-${index}`}
+          role="status"
+          data-testid="ceremony-done"
+          className="rounded-md border border-primary/40 bg-primary/5 p-3 text-sm text-primary"
+        >
+          <span className="font-medium">{peer}</span> is now trusted on every host you own.
+        </p>
+      ))}
 
       {active.map((pairing) => {
         const number = sasByPairing.get(pairing.id) ?? "";
