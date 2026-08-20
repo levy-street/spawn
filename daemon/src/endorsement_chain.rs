@@ -45,6 +45,21 @@ use crate::acct_endorsement::{
 /// small enough to bound per-connect verification work.
 pub const DEFAULT_MAX_CHAIN_EDGES: usize = 8;
 
+/// Independent daemon-side cap on how many carried endorsement edges one
+/// presentation may contain. **Aligned to the honest relay's own bound**
+/// (`MAX_RELAYED_ENDORSEMENTS = 64` in the server's `signed_signal_relay`), so
+/// no honest offer can ever exceed it — the relay refuses to forward a larger
+/// set. A count above this therefore only ever arrives from a party driving
+/// the daemon's control socket directly (a malicious or compromised server),
+/// and the right response is refusal, not truncation: truncating would let
+/// that party choose which edges survive. The cap bounds the per-presentation
+/// Ed25519 verifies (the expensive step) and — together with the adjacency
+/// de-duplication in [`find_valid_chain`] — the chain search itself, so an
+/// edge flood cannot stall the dispatch task that also services revocation
+/// teardown (R1). If the relay's bound is ever raised, raise this in the same
+/// change; the daemon must never depend on the relay for its own bounds.
+pub const MAX_CARRIED_ENDORSEMENTS: usize = 64;
+
 /// One endorsement edge in a presented chain: the signed statement plus its
 /// signature. `transcript.endorser_public_key` endorses `transcript.endorsed_public_key`.
 #[derive(Debug, Clone)]
@@ -90,6 +105,22 @@ impl RevocationSet {
         self.keys.iter().any(|key| !previous.contains(key))
     }
 
+    /// Fold a freshly delivered deny-list into this one: **union, never
+    /// shrink**. The in-memory set is a monotonic floor — once a key has been
+    /// revoked it stays revoked for the life of this process even if a later
+    /// frame omits it. The account deny-list is add-only by design (docs §3,
+    /// R10: revocation is a permanent tombstone), so a shorter pushed list can
+    /// only mean a withholding server (the P3′ residual) and must not silently
+    /// un-revoke; this is the same ratchet discipline the server applies to
+    /// `supports_account_chains` (R9). Returns true iff `incoming` held at
+    /// least one key not already present — genuine growth, the R1 signal to
+    /// tear down live sessions.
+    pub fn absorb(&mut self, incoming: RevocationSet) -> bool {
+        let grew = incoming.revokes_beyond(self);
+        self.keys.extend(incoming.keys);
+        grew
+    }
+
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -103,6 +134,8 @@ impl RevocationSet {
 pub enum ChainError {
     #[error("chain has {got} edges, exceeding the maximum of {max}")]
     TooLong { max: usize, got: usize },
+    #[error("{got} carried endorsement edges exceed the {max}-edge cap")]
+    TooManyEdges { max: usize, got: usize },
     #[error("a zero-length chain requires the connecting key to be an anchor")]
     NotAnchored,
     #[error("the first endorser is not one of the host's anchors")]
@@ -247,6 +280,15 @@ pub fn find_valid_chain(
     edges: &[ChainEdge],
     max_edges: usize,
 ) -> Result<(), ChainError> {
+    // Independent size cap on the presented set (see the constant's rationale):
+    // refuse outright before any signature work, so a hostile relay cannot buy
+    // unbounded inline verification with an inflated edge list.
+    if edges.len() > MAX_CARRIED_ENDORSEMENTS {
+        return Err(ChainError::TooManyEdges {
+            max: MAX_CARRIED_ENDORSEMENTS,
+            got: edges.len(),
+        });
+    }
     let target = connecting_key.to_bytes();
     if revoked.contains(&target) {
         return Err(ChainError::Revoked);
@@ -259,7 +301,13 @@ pub fn find_valid_chain(
     // Directed adjacency (endorser → endorsed) over edges that individually pass
     // every non-structural rule. Verifying here means a graph edge is always a
     // genuine, in-account, unrevoked endorsement; the search only has to find a
-    // path to an anchor and keep it simple and bounded.
+    // path to an anchor and keep it simple and bounded. Parallel duplicates of
+    // one (endorser, endorsed) pair collapse to a single adjacency entry: the
+    // memoization-free simple-path DFS below multiplies across duplicates
+    // (m copies per hop along a d-hop path is m^d work — ~8^8 ≈ 17M recursions
+    // at the 64-edge cap), so de-duplicating before the search is what keeps it
+    // bounded. Dropping a duplicate never loses a path: post-verification both
+    // copies assert the same genuine edge.
     let mut adjacency: HashMap<[u8; PUBLIC_KEY_BYTES], Vec<[u8; PUBLIC_KEY_BYTES]>> =
         HashMap::new();
     for edge in edges {
@@ -283,12 +331,18 @@ pub fn find_valid_chain(
         {
             continue;
         }
-        adjacency.entry(endorser).or_default().push(endorsed);
+        let neighbors = adjacency.entry(endorser).or_default();
+        if !neighbors.contains(&endorsed) {
+            neighbors.push(endorsed);
+        }
     }
 
-    // Depth-first from each unrevoked anchor toward the connecting key. The graph
-    // is tiny (account devices) and depth is capped at `max_edges`, so this is
-    // cheap; `visited` keeps the path simple (no laundering through a cycle).
+    // Depth-first from each unrevoked anchor toward the connecting key. With at
+    // most MAX_CARRIED_ENDORSEMENTS de-duplicated edges and depth capped at
+    // `max_edges`, the simple-path search is polynomially bounded (worst case —
+    // an adversarially dense graph — is on the order of 10^5 visits per anchor,
+    // microseconds); `visited` keeps the path simple (no laundering through a
+    // cycle).
     for anchor in anchors {
         let start = anchor.to_bytes();
         if revoked.contains(&start) {
@@ -785,5 +839,111 @@ mod tests {
             edge(USER, &c, &b, DEVICES[3]),
         ];
         find(&[a], &RevocationSet::new(), &b, &edges).expect("A→B admits B despite cycles");
+    }
+
+    #[test]
+    fn an_over_cap_carried_edge_set_is_refused_outright() {
+        // Exactly at the cap: a real path among noise still admits. One over:
+        // refused before any signature work. The honest relay bounds carried
+        // sets to the same 64, so only a server driving the daemon socket
+        // directly can ever present more — and it gets a refusal, not work.
+        let (anchor, device) = (key(1), key(2));
+        let mut edges = vec![edge(USER, &anchor, &device, DEVICES[0])];
+        let noise_endorser = key(3);
+        for seed in 0..(MAX_CARRIED_ENDORSEMENTS as u8 - 1) {
+            let target = key(100 + seed);
+            edges.push(edge(USER, &noise_endorser, &target, DEVICES[1]));
+        }
+        assert_eq!(edges.len(), MAX_CARRIED_ENDORSEMENTS);
+        find(
+            std::slice::from_ref(&anchor),
+            &RevocationSet::new(),
+            &device,
+            &edges,
+        )
+        .expect("an at-cap edge set with a real path is admitted");
+
+        edges.push(edge(USER, &noise_endorser, &key(99), DEVICES[2]));
+        assert_eq!(
+            find(&[anchor], &RevocationSet::new(), &device, &edges),
+            Err(ChainError::TooManyEdges {
+                max: MAX_CARRIED_ENDORSEMENTS,
+                got: MAX_CARRIED_ENDORSEMENTS + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_edges_collapse_so_the_search_stays_bounded() {
+        // Worst-case duplicate flood at the cap: an 8-hop path with every edge
+        // presented 8 times (64 edges) and an unreachable target. Without
+        // adjacency de-duplication the memoization-free simple-path DFS
+        // multiplies across the copies (8^8 ≈ 17M recursions — many seconds in
+        // a debug build, inline on the dispatch task that also runs R1
+        // teardown); with it the search is a handful of steps. The generous
+        // wall-clock bound is a regression tripwire, not a benchmark.
+        let keys: Vec<SigningKey> = (30..39).map(key).collect();
+        let mut edges = Vec::with_capacity(MAX_CARRIED_ENDORSEMENTS);
+        for _ in 0..8 {
+            for hop in 0..8 {
+                edges.push(edge(
+                    USER,
+                    &keys[hop],
+                    &keys[hop + 1],
+                    DEVICES[hop % DEVICES.len()],
+                ));
+            }
+        }
+        assert_eq!(edges.len(), MAX_CARRIED_ENDORSEMENTS);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            find(
+                std::slice::from_ref(&keys[0]),
+                &RevocationSet::new(),
+                &key(99),
+                &edges
+            ),
+            Err(ChainError::NoValidChain)
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "duplicate-edge search must stay bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn duplicate_edges_still_admit_the_real_path() {
+        // De-duplication must only collapse copies, never lose the edge: a path
+        // presented redundantly still admits.
+        let (a, b, c) = (key(1), key(2), key(3));
+        let edges = [
+            edge(USER, &a, &b, DEVICES[0]),
+            edge(USER, &a, &b, DEVICES[0]),
+            edge(USER, &a, &b, DEVICES[0]),
+            edge(USER, &b, &c, DEVICES[1]),
+            edge(USER, &b, &c, DEVICES[1]),
+        ];
+        find(&[a], &RevocationSet::new(), &c, &edges)
+            .expect("a redundantly presented path still admits");
+    }
+
+    #[test]
+    fn absorb_is_a_monotonic_floor_union_never_shrink() {
+        let a = key(2).verifying_key().to_bytes();
+        let b = key(3).verifying_key().to_bytes();
+        let mut floor = RevocationSet::from_keys([a]);
+
+        // An empty (or shorter) delivered list must not un-revoke.
+        assert!(!floor.absorb(RevocationSet::new()));
+        assert!(floor.contains(&a));
+
+        // Genuine growth is reported (the R1 teardown signal) and unions in.
+        assert!(floor.absorb(RevocationSet::from_keys([b])));
+        assert!(floor.contains(&a) && floor.contains(&b));
+
+        // Redelivery of known keys is not growth.
+        assert!(!floor.absorb(RevocationSet::from_keys([a, b])));
+        assert_eq!(floor.len(), 2);
     }
 }

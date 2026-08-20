@@ -30,6 +30,53 @@ where
     Ok(Some(value))
 }
 
+/// Bound the carried endorsement edge-set at the wire, independently of the
+/// relay's own `MAX_RELAYED_ENDORSEMENTS` (the same 64 — see the constant's
+/// rationale). The honest relay never forwards more, so an over-cap list can
+/// only come from a party driving this socket directly; refusing the frame at
+/// deserialization stops it before the vector is even fully allocated, and the
+/// admission path re-checks the same cap for defense in depth. `#[serde(default)]`
+/// still handles an absent field; a present field must be a sequence, so
+/// `carried_endorsements: null` cannot collapse to "none carried".
+fn deserialize_bounded_carried_endorsements<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CarriedEndorsement>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use spawnd::endorsement_chain::MAX_CARRIED_ENDORSEMENTS;
+
+    struct BoundedEdges;
+    impl<'de> serde::de::Visitor<'de> for BoundedEdges {
+        type Value = Vec<CarriedEndorsement>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_CARRIED_ENDORSEMENTS} carried endorsement edges"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut edges = Vec::new();
+            while let Some(edge) = seq.next_element::<CarriedEndorsement>()? {
+                if edges.len() == MAX_CARRIED_ENDORSEMENTS {
+                    return Err(serde::de::Error::custom(
+                        "carried endorsement edges exceed the daemon cap",
+                    ));
+                }
+                edges.push(edge);
+            }
+            Ok(edges)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedEdges)
+}
+
 fn serialize_bounded_signed_envelope<S>(
     value: &Option<String>,
     serializer: S,
@@ -286,7 +333,12 @@ pub enum Inbound {
         /// Account endorsement edges the browser carries so a daemon that does
         /// not directly pin the offering key can admit it via a chain to an
         /// anchor (device mesh §3). Empty for a directly-pinned browser.
-        #[serde(default)]
+        /// Bounded at the wire: a set larger than the daemon's independent cap
+        /// rejects the whole frame (see the deserializer).
+        #[serde(
+            default,
+            deserialize_with = "deserialize_bounded_carried_endorsements"
+        )]
         carried_endorsements: Vec<CarriedEndorsement>,
         #[serde(default)]
         ice_servers: Vec<RtcIceServerConfig>,
@@ -735,6 +787,68 @@ mod signed_rtc_relay_tests {
                 }))
                 .is_err(),
                 "present answer field must require a non-null string"
+            );
+        }
+    }
+
+    #[test]
+    fn carried_endorsements_are_bounded_at_the_wire() {
+        use spawnd::endorsement_chain::MAX_CARRIED_ENDORSEMENTS;
+
+        let session_id = "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1";
+        let edge = serde_json::json!({
+            "account_id": "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
+            "endorser_public_key": "endorser",
+            "endorsed_public_key": "endorsed",
+            "endorsed_device_id": "11111111-2222-4333-8444-555555555551",
+            "signature": "sig",
+        });
+        let offer = |count: usize| {
+            serde_json::json!({
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "signed_envelope": "{\"opaque\":true}",
+                "carried_endorsements": vec![edge.clone(); count],
+            })
+        };
+
+        // The honest relay never forwards more than 64 edges, so exactly the
+        // cap must parse and one over must reject the whole frame — an
+        // over-cap set only ever comes from a party driving the daemon socket
+        // directly, and it must not buy any admission work.
+        let at_cap: Inbound = serde_json::from_value(offer(MAX_CARRIED_ENDORSEMENTS))
+            .expect("an at-cap carried edge set parses");
+        assert!(matches!(
+            at_cap,
+            Inbound::RtcOffer { ref carried_endorsements, .. }
+                if carried_endorsements.len() == MAX_CARRIED_ENDORSEMENTS
+        ));
+        assert!(
+            serde_json::from_value::<Inbound>(offer(MAX_CARRIED_ENDORSEMENTS + 1)).is_err(),
+            "an over-cap carried edge set must reject the frame"
+        );
+
+        // Absent stays the empty default; present-but-not-a-sequence rejects.
+        let absent: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "rtc.offer",
+            "session_id": session_id,
+            "signed_envelope": "{\"opaque\":true}",
+        }))
+        .expect("absent carried edges remain valid");
+        assert!(matches!(
+            absent,
+            Inbound::RtcOffer { ref carried_endorsements, .. } if carried_endorsements.is_empty()
+        ));
+        for bad in [serde_json::Value::Null, serde_json::json!("edges")] {
+            assert!(
+                serde_json::from_value::<Inbound>(serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": session_id,
+                    "signed_envelope": "{\"opaque\":true}",
+                    "carried_endorsements": bad,
+                }))
+                .is_err(),
+                "a present non-sequence carried_endorsements must reject"
             );
         }
     }
