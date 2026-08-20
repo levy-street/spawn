@@ -1076,21 +1076,43 @@ fn verify_signed_rtc_offer_admitted(
         // Fail-closed: a revoked key never connects, even if a pin still lingers
         // (the deny-list is delivered independently of pin reconciliation).
         if revoked.contains(&verified.sender_public_key().to_bytes()) {
+            tracing::warn!(reason = "revoked-pinned-key", "signed RTC offer refused");
             return None;
         }
         return Some(verified);
     }
     // Chain path only when the offer carries edges and we know our own account.
-    let account_id = account_id?;
+    // Each refusal names its reason: an uninformative reject line made a real
+    // admission failure undiagnosable in the field.
+    let Some(account_id) = account_id else {
+        tracing::warn!(reason = "no-account-anchor", "signed RTC offer refused");
+        return None;
+    };
     if carried.is_empty() {
+        tracing::warn!(reason = "no-carried-endorsements", "signed RTC offer refused");
         return None;
     }
-    let host_identity = creds::host_identity(record).ok().flatten()?;
-    let host_key = public_key_from_wire(&host_identity.public_key).ok()?;
+    let Some(host_identity) = creds::host_identity(record).ok().flatten() else {
+        tracing::warn!(reason = "no-host-identity", "signed RTC offer refused");
+        return None;
+    };
+    let Ok(host_key) = public_key_from_wire(&host_identity.public_key) else {
+        tracing::warn!(reason = "bad-host-key", "signed RTC offer refused");
+        return None;
+    };
     // Verify against the sender the envelope CLAIMS: this proves possession of
     // that private key. Only a proven-possessed key is a candidate for a chain.
-    let claimed_sender = envelope_sender(envelope).ok()?;
-    let verified = verify_rtc_signal_wire(envelope, &claimed_sender, &host_key).ok()?;
+    let Ok(claimed_sender) = envelope_sender(envelope) else {
+        tracing::warn!(reason = "unreadable-envelope-sender", "signed RTC offer refused");
+        return None;
+    };
+    let Ok(verified) = verify_rtc_signal_wire(envelope, &claimed_sender, &host_key) else {
+        tracing::warn!(
+            reason = "envelope-verification-failed",
+            "signed RTC offer refused"
+        );
+        return None;
+    };
     let anchors: Vec<_> = record
         .browser_pins()
         .iter()
@@ -1108,8 +1130,24 @@ fn verify_signed_rtc_offer_admitted(
         DEFAULT_MAX_CHAIN_EDGES,
     ) {
         Ok(()) => Some(verified),
-        Err(_) => None,
+        Err(error) => {
+            tracing::warn!(
+                reason = "no-valid-chain",
+                ?error,
+                sender = %short_key(verified.sender_public_key()),
+                carried = carried.len(),
+                parsed_edges = edges.len(),
+                anchors = anchors.len(),
+                "signed RTC offer refused"
+            );
+            None
+        }
     }
+}
+
+/// First bytes of a key, hex, for log correlation (never a trust input).
+fn short_key(key: &ed25519_dalek::VerifyingKey) -> String {
+    key.to_bytes()[..6].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Build the deny-list from the wire keys the server delivers. Malformed keys
@@ -1303,6 +1341,7 @@ async fn dispatch_loop(
                                         scope_type = ?verified.transcript().scope_type(),
                                         scope_id = %verified.transcript().scope_id(),
                                         chained = !carried_endorsements.is_empty(),
+                                        sender = %short_key(verified.sender_public_key()),
                                         "verified signed RTC offer against a local browser pin or chain"
                                     );
                                     Some(verified)
