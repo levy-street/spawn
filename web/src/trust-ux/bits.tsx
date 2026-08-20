@@ -91,6 +91,41 @@ export function Screen({ children }: { children: ReactNode }) {
   );
 }
 
+/** An opened row menu (the host app positions it). */
+export function Menu({ children }: { children: ReactNode }) {
+  return (
+    <div
+      role="menu"
+      className="w-40 rounded-xl border border-zinc-700/80 bg-zinc-900 py-1 shadow-2xl shadow-black/50"
+    >
+      {children}
+    </div>
+  );
+}
+
+export function MenuItem({
+  danger = false,
+  onClick,
+  children,
+}: {
+  danger?: boolean;
+  onClick?: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      className={`block w-full px-3.5 py-2 text-left text-sm transition-colors ${
+        danger ? "text-red-400 hover:bg-red-500/10" : "text-zinc-200 hover:bg-zinc-800"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
 /** A modal card (rendered inline; the host app supplies the backdrop). */
 export function DialogCard({ children }: { children: ReactNode }) {
   return (

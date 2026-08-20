@@ -10,21 +10,29 @@ import {
   IconLaptop,
   IconPhone,
   IconPlus,
+  Menu,
+  MenuItem,
 } from "./bits";
-import type { ComputerVM, DeviceVM, RecoveryVM, TrustEventVM } from "./types";
+import type { DeviceVM, MachineVM, RecoveryVM, TrustEventVM } from "./types";
 
 export interface DevicesScreenProps {
   devices: DeviceVM[];
-  computers: ComputerVM[];
+  machines: MachineVM[];
   recovery: RecoveryVM;
   /** Newest first; the screen shows the first three. */
   history: TrustEventVM[];
   onLinkDevice?: () => void;
-  onConnectComputer?: () => void;
+  onPossessMachine?: () => void;
   onDeviceOptions?: (id: string) => void;
   onTurnOnRecovery?: () => void;
   onResetRecovery?: () => void;
   onShowHistory?: () => void;
+  /** Desktop settings pane: full-width rows instead of the 420px column. */
+  wide?: boolean;
+  /** Row whose options menu is open (Rename / Remove — everything a row can do). */
+  openMenuDeviceId?: string;
+  onRenameDevice?: (id: string) => void;
+  onRemoveDevice?: (id: string) => void;
 }
 
 /**
@@ -33,24 +41,28 @@ export interface DevicesScreenProps {
  */
 export function DevicesScreen({
   devices,
-  computers,
+  machines,
   recovery,
   history,
   onLinkDevice,
-  onConnectComputer,
+  onPossessMachine,
   onDeviceOptions,
   onTurnOnRecovery,
   onResetRecovery,
   onShowHistory,
+  wide = false,
+  openMenuDeviceId,
+  onRenameDevice,
+  onRemoveDevice,
 }: DevicesScreenProps) {
   return (
-    <div className="w-[420px] max-w-full space-y-7">
+    <div className={`${wide ? "w-full max-w-2xl" : "w-[420px]"} max-w-full space-y-7`}>
       <header>
         <h1 className="text-xl font-medium tracking-tight text-zinc-100">Devices</h1>
         <p className="mt-1 text-sm text-zinc-500">
           {recovery.on
-            ? "Every device here can reach every computer. Only you can add to this list."
-            : "Linked devices reach the computers you've connected. Only you can add to this list."}
+            ? "Every device here can reach every machine. Only you can add to this list."
+            : "Linked devices reach the machines you've possessed. Only you can add to this list."}
         </p>
       </header>
 
@@ -79,7 +91,7 @@ export function DevicesScreen({
           <div className="min-w-44 flex-1">
             <p className="text-sm font-medium text-zinc-100">Recovery is off</p>
             <p className="text-xs leading-relaxed text-zinc-400">
-              Lose your last device and you start over — every computer set up again from its
+              Lose your last device and you start over — every machine possessed again from its
               terminal.
             </p>
           </div>
@@ -97,7 +109,7 @@ export function DevicesScreen({
         <SectionHeader label="Your devices" action="Link a device" onAction={onLinkDevice} />
         <div className="divide-y divide-zinc-800/80 rounded-xl border border-zinc-800 bg-zinc-900/40">
           {devices.map((d) => (
-            <div key={d.id} className="flex items-center gap-3 px-4 py-3">
+            <div key={d.id} className="relative flex items-center gap-3 px-4 py-3">
               <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-zinc-800/80 text-zinc-300">
                 {d.kind === "phone" ? <IconPhone /> : <IconLaptop />}
               </span>
@@ -119,6 +131,16 @@ export function DevicesScreen({
               <IconButton label={`Options for ${d.name}`} onClick={() => onDeviceOptions?.(d.id)}>
                 <IconEllipsis />
               </IconButton>
+              {openMenuDeviceId === d.id && (
+                <div className="absolute right-3 top-11 z-10">
+                  <Menu>
+                    <MenuItem onClick={() => onRenameDevice?.(d.id)}>Rename</MenuItem>
+                    <MenuItem danger onClick={() => onRemoveDevice?.(d.id)}>
+                      Remove…
+                    </MenuItem>
+                  </Menu>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -126,12 +148,12 @@ export function DevicesScreen({
 
       <section>
         <SectionHeader
-          label="Your computers"
-          action="Connect a computer"
-          onAction={onConnectComputer}
+          label="Your machines"
+          action="Possess a machine"
+          onAction={onPossessMachine}
         />
         <div className="divide-y divide-zinc-800/80 rounded-xl border border-zinc-800 bg-zinc-900/40">
-          {computers.map((c) => (
+          {machines.map((c) => (
             <div key={c.id} className="flex items-center gap-3 px-4 py-3">
               <span
                 className={`flex size-9 shrink-0 items-center justify-center rounded-lg bg-zinc-800/80 text-zinc-300 ${c.online ? "" : "opacity-60"}`}

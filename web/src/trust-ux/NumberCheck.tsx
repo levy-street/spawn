@@ -15,15 +15,15 @@ export interface NumberCheckProps {
   /** "923 579" — displayed in `show` mode. */
   number?: string;
   /**
-   * Legacy computers (older software) have no number; the check falls back to
+   * Legacy machines (older software) have no number; the check falls back to
    * comparing this full fingerprint — never a weaker code. Compare-style.
    */
   fingerprint?: string;
-  /** What this ceremony is for: "Link iPhone" / "Connect mac-studio". */
+  /** What this ceremony is for: "Link iPhone" / "Possess mac-studio". */
   title: string;
-  /** Where the other half is: "on the new device" / "in the computer's terminal". */
+  /** Where the other half is: "on the new device" / "in the machine's terminal". */
   otherScreen: string;
-  /** One line shown on success: "Linked. Every computer is ready." */
+  /** One line shown on success: "Linked. Every machine is ready." */
   doneText: string;
   /** `enter` mode: wrong-entry feedback, e.g. "That's not it — 2 tries left." */
   entryError?: string;
@@ -92,7 +92,7 @@ export function NumberCheck({
               {fingerprint}
             </p>
             <p className="mt-6 max-w-[26ch] text-balance text-center text-sm leading-relaxed text-zinc-400">
-              This computer runs older software, so compare its full fingerprint — shown{" "}
+              This machine runs older software, so compare its full fingerprint — shown{" "}
               {otherScreen}.
             </p>
           </div>
