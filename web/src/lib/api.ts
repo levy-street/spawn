@@ -592,6 +592,9 @@ export const trust = {
       body: JSON.stringify({ sealed, expected_revision: expectedRevision ?? null }),
       schema: TrustBundleSchema,
     }),
+  /** Abandon the sealed bundle (removing the last passkey). Forgets recovery
+   * material only — never grants or restores anything. */
+  deleteBundle: () => api<void>("/api/trust/bundle", { method: "DELETE" }),
   listPasskeys: () =>
     api("/api/trust/passkeys", {
       method: "GET",

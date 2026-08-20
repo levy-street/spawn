@@ -118,6 +118,23 @@ async def put_trust_bundle(
     return schemas.TrustBundleOut(sealed=body.sealed, revision=next_revision, updated_at=now)
 
 
+@router.delete("/bundle", status_code=204)
+async def delete_trust_bundle(
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    """Delete the account's sealed bundle (removing the last passkey abandons it).
+
+    Deleting only forgets recovery material the account owner sealed — it never
+    grants or restores anything, so no pin push is needed. Idempotent: an
+    account with no bundle is the normal pre-bootstrap state.
+    """
+    row = await session.get(TrustBundle, user.id)
+    if row is not None:
+        await session.delete(row)
+        await session.commit()
+
+
 @router.get("/passkeys", response_model=list[schemas.PasskeyCredentialOut])
 async def list_passkeys(
     user: User = Depends(auth.current_user),
