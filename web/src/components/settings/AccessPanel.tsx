@@ -807,8 +807,8 @@ export function AccessPanel() {
                     confirm(
                       `Clear ${revokedRows.length} removed device${
                         revokedRows.length === 1 ? "" : "s"
-                      } from history?\n\nRemoval itself is permanent — these devices stay ` +
-                        "locked out — this only clears the list.",
+                      } from history?\n\nRemoval still stands — a cleared device can only ` +
+                        "come back through a fresh approval, like any new device.",
                     )
                   ) {
                     prune.mutate();

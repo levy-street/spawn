@@ -549,6 +549,23 @@ async def create_account_endorsement(
             created_at=winner.created_at,
         )
 
+    # Nudge every host of the account so their pin/deny state reconciles NOW,
+    # not at the next daemon reconnect. Admission itself needs no push (the
+    # device carries its chain), but a daemon's deny-list REPLACES on push and
+    # can otherwise sit stale — seen live: a key revoked, pruned, re-registered,
+    # and re-approved stayed refused indefinitely because nothing pushed after
+    # the revoke. Best effort: a failed push must never fail the approval.
+    host_ids = (
+        (await session.execute(select(Host.id).where(Host.owner_user_id == user_id)))
+        .scalars()
+        .all()
+    )
+    for host_id in host_ids:
+        try:
+            await push_browser_pins(host_id)
+        except Exception:
+            pass
+
     return schemas.AccountEndorsementOut(
         id=record_id,
         endorser_device_id=body.endorser_device_id,

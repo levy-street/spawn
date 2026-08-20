@@ -154,12 +154,17 @@ async def prune_revoked_browser_devices(
 ) -> schemas.BrowserDevicePruneResponse:
     """Hard-delete this account's revoked device tombstones.
 
-    Deletion is fail-closed by the same contract reconciliation relies on: a
-    revoked device's own pins are already non-live and cascade away with the
-    row, and pins whose endorsement chain ran through it stay severed because
-    a dangling endorser id is never admitted (see
-    ``_live_browser_device_id_set``). No host's live pin set changes, so no
-    push is needed — this only forgets history, never grants or restores.
+    Deletion is fail-closed for pins by the same contract reconciliation relies
+    on: a revoked device's own pins are already non-live and cascade away with
+    the row, and pins whose endorsement chain ran through it stay severed
+    because a dangling endorser id is never admitted (see
+    ``_live_browser_device_id_set``).
+
+    It DOES change the account's deny-list: a pruned key is no longer listed
+    as revoked, and a daemon's deny-list replaces wholesale on push. Push now
+    so daemons converge — otherwise a key that is later legitimately
+    re-registered and re-approved (a fresh ceremony) stays refused until the
+    daemon's next reconnect (seen live). Best effort as always.
     """
     result = await session.execute(
         delete(BrowserDevice).where(
@@ -168,7 +173,19 @@ async def prune_revoked_browser_devices(
         )
     )
     await session.commit()
-    return schemas.BrowserDevicePruneResponse(pruned=result.rowcount or 0)
+    pruned = result.rowcount or 0
+    if pruned > 0:
+        host_ids = (
+            (await session.execute(select(Host.id).where(Host.owner_user_id == user.id)))
+            .scalars()
+            .all()
+        )
+        for host_id in host_ids:
+            try:
+                await push_browser_pins(host_id)
+            except Exception:
+                pass
+    return schemas.BrowserDevicePruneResponse(pruned=pruned)
 
 
 @router.post("/{device_id}/revoke", response_model=schemas.BrowserDeviceOut)
