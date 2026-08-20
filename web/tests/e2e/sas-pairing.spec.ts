@@ -128,9 +128,7 @@ test("possess types the six digits; a wrong entry burns a try, the right one app
   page,
 }) => {
   const routes = await installRoutes(page, { revealedNd: ND });
-  await page.goto("/device");
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
+  await page.goto("/device?code=QZ4K-7HMT");
 
   // The entry field appears once the commitment opened and the SAS is derivable.
   const entry = page.getByTestId("number-entry");
@@ -158,9 +156,7 @@ test("possess types the six digits; a wrong entry burns a try, the right one app
 
 test("three wrong entries end the ceremony with nothing trusted", async ({ page }) => {
   const routes = await installRoutes(page, { revealedNd: ND });
-  await page.goto("/device");
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
+  await page.goto("/device?code=QZ4K-7HMT");
 
   const entry = page.getByTestId("number-entry");
   await expect(entry).toBeVisible({ timeout: 15_000 });
@@ -186,9 +182,7 @@ test("a relay that reveals a mismatched Nd is caught by the commit check", async
   // The "daemon" reveals a nonce that does not open the commitment — exactly
   // what a substituting relay would have to do. The browser must refuse.
   await installRoutes(page, { revealedNd: Buffer.alloc(32, 8) });
-  await page.goto("/device");
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
+  await page.goto("/device?code=QZ4K-7HMT");
 
   await expect(page.locator("p[role=alert]")).toContainText("commitment did not open", {
     timeout: 15_000,

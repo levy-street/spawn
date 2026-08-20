@@ -136,9 +136,7 @@ test("device approval shows the locally derived fingerprint before confirmation"
     await route.fulfill({ status: 404, json: { detail: "not mocked" } });
   });
 
-  await page.goto("/device");
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
+  await page.goto("/device?code=QZ4K-7HMT");
 
   await expect(page.getByTestId("host-key-fingerprint")).toHaveText(hostFingerprint);
   await expect(page.getByText("build-host", { exact: false })).toBeVisible();
@@ -176,6 +174,45 @@ test("device approval shows the locally derived fingerprint before confirmation"
   expect(JSON.stringify(webStorage)).not.toContain(
     (approvalBody as { signature: string }).signature,
   );
+});
+
+test("the bare page instructs — one command, no code to type", async ({ page }) => {
+  await page.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/me") {
+      await route.fulfill({
+        status: 200,
+        json: {
+          user: { id: USER_ID, email: "owner@example.com", created_at: "2026-07-17T00:00:00Z" },
+        },
+      });
+      return;
+    }
+    if (path === "/api/browser-devices/register") {
+      const body = route.request().postDataJSON() as { public_key: string };
+      await route.fulfill({
+        status: 200,
+        json: {
+          id: BROWSER_DEVICE_ID,
+          key_algorithm: "ed25519",
+          public_key: body.public_key,
+          fingerprint: fingerprint(body.public_key),
+          created_at: "2026-07-17T00:00:00Z",
+          revoked_at: null,
+        },
+      });
+      return;
+    }
+    await route.fulfill({ status: 404, json: { detail: "not mocked" } });
+  });
+  await page.goto("/device");
+
+  const instructions = page.getByTestId("possess-instructions");
+  await expect(instructions).toBeVisible();
+  await expect(instructions).toContainText("spawnd possess");
+  await expect(instructions).toContainText("six-digit number");
+  // The terminal's link is the entry — there is nothing to type here.
+  await expect(page.locator("input")).toHaveCount(0);
 });
 
 test("blocks first contact when the server fingerprint disagrees with the host key", async ({
@@ -235,9 +272,7 @@ test("blocks first contact when the server fingerprint disagrees with the host k
     await route.fulfill({ status: 404, json: { detail: "not mocked" } });
   });
 
-  await page.goto("/device");
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
+  await page.goto("/device?code=QZ4K-7HMT");
 
   await expect(page.locator("p[role=alert]")).toContainText(
     "fingerprint did not match its key",
@@ -308,9 +343,7 @@ test("server approval failure retains a reload-safe local pin and offers explici
     await route.fulfill({ status: 404, json: { detail: "not mocked" } });
   });
 
-  await page.goto("/device");
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
+  await page.goto("/device?code=QZ4K-7HMT");
   await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
   await page.getByRole("button", { name: "They match" }).click();
 
@@ -322,8 +355,6 @@ test("server approval failure retains a reload-safe local pin and offers explici
   ]);
 
   await page.reload();
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByRole("button", { name: "They match" })).toBeVisible();
 });
 
@@ -402,9 +433,7 @@ test("substituted approval response fails loudly while preserving retryable loca
     await route.fulfill({ status: 404, json: { detail: "not mocked" } });
   });
 
-  await page.goto("/device");
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
+  await page.goto("/device?code=QZ4K-7HMT");
   await page.getByRole("button", { name: "They match" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText(
@@ -461,9 +490,7 @@ test("local pin write corruption blocks approval before any server call", async 
     await route.fulfill({ status: 500, json: { detail: "must not be called" } });
   });
 
-  await page.goto("/device");
-  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Continue" }).click();
+  await page.goto("/device?code=QZ4K-7HMT");
   await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
   await corruptHostPinStore(page);
   await page.getByRole("button", { name: "They match" }).click();
@@ -541,14 +568,9 @@ test("two native Chromium tabs converge on one exact local pin", async ({ contex
   };
   await installRoutes(page);
   await installRoutes(secondPage);
-  await Promise.all([page.goto("/device"), secondPage.goto("/device")]);
   await Promise.all([
-    page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT"),
-    secondPage.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT"),
-  ]);
-  await Promise.all([
-    page.getByRole("button", { name: "Continue" }).click(),
-    secondPage.getByRole("button", { name: "Continue" }).click(),
+    page.goto("/device?code=QZ4K-7HMT"),
+    secondPage.goto("/device?code=QZ4K-7HMT"),
   ]);
   await Promise.all([
     page.getByRole("button", { name: "They match" }).click(),
