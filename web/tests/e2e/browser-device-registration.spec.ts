@@ -9,7 +9,7 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
 
   const fingerprint = page.getByTestId("browser-fingerprint");
   await expect(fingerprint).toHaveText(/^SHA256:/);
-  await expect(page.getByText("this browser", { exact: true })).toBeVisible();
+  await expect(page.getByText("This device", { exact: true })).toBeVisible();
 
   const before = await page.evaluate(async (userId) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -38,10 +38,11 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
   expect(JSON.stringify(before.localStorage)).not.toContain("signature");
   expect(JSON.stringify(before.localStorage)).not.toContain("private");
 
-  page.once("dialog", (dialog) => void dialog.accept());
-  await page.getByRole("button", { name: "Revoke" }).click();
-  await expect(page.getByText("revoked", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toBeVisible();
+  await page.locator('[aria-label^="Options for"]').first().click();
+  await page.getByRole("menuitem", { name: "Remove…" }).click();
+  await page.getByTestId("remove-confirm").click();
+  await expect(page.getByText("This device was removed.", { exact: false })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start over" })).toBeVisible();
 
   const afterRevoke = await page.evaluate(async (userId) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -70,7 +71,7 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
   // A reload closes the settings modal (it is an overlay, not a page); the
   // revoked state must survive it and greet the user on reopen.
   await page.goto("/settings");
-  await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start over" })).toBeVisible();
   const stillAbsent = await page.evaluate(async (userId) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open("spawn-browser-device-identity");
@@ -90,9 +91,10 @@ test("registers, displays, revokes, cleans locally, and replaces only after expl
   }, USER_ID);
   expect(stillAbsent).toBeUndefined();
 
-  await page.getByRole("button", { name: "Start fresh on this browser" }).click();
+  await page.getByRole("button", { name: "Start over" }).click();
   await expect(fingerprint).toHaveText(/^SHA256:/);
-  await expect(page.getByText("revoked", { exact: true })).toHaveCount(1);
+  // The removed key stays in history (under Advanced), never resurrected.
+  await expect(page.getByText(/Removed devices \(1\)/)).toHaveCount(1);
 });
 
 test("registration failure stays loud while settings and logout remain accessible", async ({
@@ -108,10 +110,10 @@ test("registration failure stays loud while settings and logout remain accessibl
   });
   await page.goto("/settings");
 
-  await expect(page.getByRole("alert").first()).toContainText("registration failed");
+  await expect(page.getByRole("alert").first()).toContainText("could not register");
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Browser devices" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Retry registration" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Access" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
   // Logout stays reachable through the Account tab even when registration
   // is broken.
   await page.getByRole("button", { name: "Account" }).click();
@@ -136,7 +138,7 @@ test("rejects a substituted registration response", async ({ page }) => {
   });
   await page.goto("/settings");
 
-  await expect(page.getByRole("alert").first()).toContainText("registration failed");
+  await expect(page.getByRole("alert").first()).toContainText("could not register");
   await expect(page.getByTestId("browser-fingerprint")).not.toBeVisible();
 });
 
@@ -161,7 +163,7 @@ test("rejects a server fingerprint that does not match the submitted browser key
   });
   await page.goto("/settings");
 
-  await expect(page.getByRole("alert").first()).toContainText("registration failed");
+  await expect(page.getByRole("alert").first()).toContainText("could not register");
   await expect(page.getByTestId("browser-fingerprint")).not.toBeVisible();
 });
 
@@ -186,9 +188,12 @@ test("rejects a substituted revocation response without deleting the local key",
       },
     });
   });
-  page.once("dialog", (dialog) => void dialog.accept());
-  await page.getByRole("button", { name: "Revoke" }).click();
-  await expect(page.locator("p[role=alert]")).toContainText("Revocation response did not confirm");
+  await page.locator('[aria-label^="Options for"]').first().click();
+  await page.getByRole("menuitem", { name: "Remove…" }).click();
+  await page.getByTestId("remove-confirm").click();
+  await expect(
+    page.locator("p[role=alert]").filter({ hasText: "did not confirm the expected device key" }).first(),
+  ).toBeVisible();
 
   const localKeyStillExists = await page.evaluate(async (userId) => {
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -218,16 +223,17 @@ test("devices can be renamed for recognition without touching the key", async ({
   await expect(fingerprint).toHaveText(/^SHA256:/);
   const before = await fingerprint.textContent();
 
-  await page.getByRole("button", { name: /^Rename/ }).click();
+  await page.locator('[aria-label^="Options for"]').first().click();
+  await page.getByRole("menuitem", { name: "Rename" }).click();
   const nameInput = page.getByPlaceholder("e.g. Work laptop, Pixel phone");
   await nameInput.fill("Test rig");
-  await page.getByRole("button", { name: "Save name" }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
 
   await expect(page.getByText("Test rig", { exact: true })).toBeVisible();
   // Renaming is recognition metadata only: same key, same locally derived
-  // fingerprint, same "this browser" binding.
+  // fingerprint, same "this device" binding.
   await expect(fingerprint).toHaveText(before ?? /^SHA256:/);
-  await expect(page.getByText("this browser", { exact: true })).toBeVisible();
+  await expect(page.getByText("This device", { exact: true })).toBeVisible();
 });
 
 test("clearing history prunes tombstones but never active devices", async ({ page }) => {
@@ -246,14 +252,16 @@ test("clearing history prunes tombstones but never active devices", async ({ pag
   });
   await page.goto("/settings");
 
-  await page.getByText("Revoked devices (1)").click();
-  await expect(page.getByText("Old laptop")).toBeVisible();
+  await page.getByTestId("access-advanced").locator("summary").click();
+  await expect(page.getByText(/Removed devices \(1\)/)).toBeVisible();
+  // Matches both the roster tombstone and the history line — both are correct.
+  await expect(page.getByText("Old laptop").first()).toBeVisible();
 
   page.once("dialog", (dialog) => void dialog.accept());
   await page.getByRole("button", { name: "Clear history" }).click();
 
-  // The tombstone section disappears entirely; this browser's active row stays.
-  await expect(page.getByText(/Revoked devices/)).toHaveCount(0);
+  // The tombstone section disappears entirely; this device's active row stays.
+  await expect(page.getByText(/Removed devices/)).toHaveCount(0);
   await expect(page.getByText("Old laptop")).toHaveCount(0);
-  await expect(page.getByText("this browser")).toBeVisible();
+  await expect(page.getByTestId("device-row").getByText("This device")).toBeVisible();
 });

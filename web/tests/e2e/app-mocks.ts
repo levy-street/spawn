@@ -613,6 +613,27 @@ export async function mockAuthenticatedApi(
       });
       return;
     }
+    const hostPinDetailsMatch = path.match(/^\/api\/trust\/hosts\/([^/]+)\/pin-details$/);
+    if (hostPinDetailsMatch && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: (hostPinMap[hostPinDetailsMatch[1]] ?? []).map((deviceId) => ({
+          device_id: deviceId,
+          direct: true,
+          created_at: CREATED_AT,
+        })),
+      });
+      return;
+    }
+    if (path === "/api/trust/account-endorsements" && method === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", json: [] });
+      return;
+    }
+    if (path === "/api/trust/pairing" && method === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", json: [] });
+      return;
+    }
     if (path === "/api/trust/endorsements" && method === "GET") {
       const endorsedId = url.searchParams.get("endorsed_device_id");
       await route.fulfill({
