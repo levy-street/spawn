@@ -134,6 +134,18 @@ async def test_the_root_cannot_be_endorsed(client):
     assert resp.status_code == 422
 
 
+async def test_rename_preserves_is_root(client):
+    user_id, auth = await _signup(client, "root-rename@example.com")
+    root_id = (
+        await _register(client, auth, user_id, Ed25519PrivateKey.generate(), is_root=True)
+    ).json()["id"]
+    resp = await client.patch(
+        f"/api/browser-devices/{root_id}", json={"label": "Account root"}, headers=auth
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_root"] is True
+
+
 async def test_the_root_cannot_pair(client):
     user_id, auth = await _signup(client, "root-nopair@example.com")
     root = Ed25519PrivateKey.generate()
