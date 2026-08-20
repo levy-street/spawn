@@ -32,6 +32,7 @@ import {
   forgetTrustOnThisDevice,
   importTrustBundle,
   recordBundleRevision,
+  retrofitAccountRoot,
   revokeBackupPasskey,
   sealCurrentTrust,
 } from "@/lib/trust-bootstrap";
@@ -246,6 +247,28 @@ export function TrustPanel() {
       let report: AccountHealReport | null = null;
       if (imported.root !== null) {
         report = await healBestEffort(id, await importAccountRoot(imported.root), imported.hosts);
+      } else {
+        // Pre-root bundle: retrofit a freshly minted root under the same data
+        // key (every enrolled passkey keeps working), store it durably, and
+        // only then let the root endorse and anchor. A concurrent unlock loses
+        // the server's revision CAS and simply skips — the winner's root heals.
+        const root = await generateAccountRoot();
+        const retro = await retrofitAccountRoot(
+          { accountId: id },
+          stored.sealed,
+          { credentialId, prfSecret: secret },
+          stored.revision,
+          await exportAccountRootMaterial(root),
+        );
+        if (retro !== null) {
+          try {
+            await trust.putBundle(retro.sealed, stored.revision);
+          } catch {
+            return { imported, report };
+          }
+          await recordBundleRevision({ accountId: id }, retro.revision);
+          report = await healBestEffort(id, root, imported.hosts);
+        }
       }
       return { imported, report };
     },
