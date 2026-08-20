@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { breadcrumbParts, joinDirectory, visibleDirectories } from "./folder-picker-helpers";
+import {
+  breadcrumbParts,
+  isWithinHome,
+  joinDirectory,
+  parentWithinHome,
+  visibleDirectories,
+} from "./folder-picker-helpers";
 
 const entries = [
   { name: "src", is_dir: true },
@@ -13,13 +19,52 @@ describe("folder picker path helpers", () => {
     expect(joinDirectory("/Users/alice/project/", "../archive")).toBe("/Users/alice/archive");
   });
 
-  test("builds clickable breadcrumb paths", () => {
-    expect(breadcrumbParts("/Users/alice/project")).toEqual([
-      { label: "/", path: "/" },
-      { label: "Users", path: "/Users" },
-      { label: "alice", path: "/Users/alice" },
+  test("builds clickable breadcrumb paths rooted at home", () => {
+    expect(breadcrumbParts("/Users/alice/project/web", "/Users/alice")).toEqual([
+      { label: "Home", path: "/Users/alice" },
       { label: "project", path: "/Users/alice/project" },
+      { label: "web", path: "/Users/alice/project/web" },
     ]);
+  });
+
+  test("home itself is the only crumb at home", () => {
+    expect(breadcrumbParts("/Users/alice", "/Users/alice")).toEqual([
+      { label: "Home", path: "/Users/alice" },
+    ]);
+  });
+
+  test("a path above home collapses to the home crumb — its ancestors are not browsable", () => {
+    expect(breadcrumbParts("/Users", "/Users/alice")).toEqual([
+      { label: "Home", path: "/Users/alice" },
+    ]);
+  });
+
+  test("a home of / still walks from the filesystem root", () => {
+    expect(breadcrumbParts("/srv/data", "/")).toEqual([
+      { label: "/", path: "/" },
+      { label: "srv", path: "/srv" },
+      { label: "data", path: "/srv/data" },
+    ]);
+  });
+});
+
+describe("folder picker home boundary", () => {
+  test("home and its descendants are inside, ancestors and siblings are not", () => {
+    expect(isWithinHome("/Users/alice", "/Users/alice")).toBe(true);
+    expect(isWithinHome("/Users/alice/project", "/Users/alice/")).toBe(true);
+    expect(isWithinHome("/Users", "/Users/alice")).toBe(false);
+    expect(isWithinHome("/", "/Users/alice")).toBe(false);
+    // A prefix match on the string is not a match on the tree.
+    expect(isWithinHome("/Users/alicia", "/Users/alice")).toBe(false);
+  });
+
+  test("stepping up stops at home", () => {
+    expect(parentWithinHome("/Users/alice/project/web", "/Users/alice")).toBe(
+      "/Users/alice/project",
+    );
+    expect(parentWithinHome("/Users/alice/project", "/Users/alice")).toBe("/Users/alice");
+    expect(parentWithinHome("/Users/alice", "/Users/alice")).toBeNull();
+    expect(parentWithinHome("/Users", "/Users/alice")).toBeNull();
   });
 });
 

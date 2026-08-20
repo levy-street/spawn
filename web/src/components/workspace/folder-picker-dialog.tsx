@@ -26,10 +26,16 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { useHostControl } from "@/hooks/useHostControl";
 import type { Host } from "@/lib/api";
-import type { HostControlClient } from "@/lib/hostControl";
-import { normalizeCwdForHost, parentDir } from "@/lib/paths";
+import { type HostControlClient, HostControlError } from "@/lib/hostControl";
+import { normalizeCwdForHost } from "@/lib/paths";
 import { cn } from "@/lib/utils";
-import { breadcrumbParts, joinDirectory, visibleDirectories } from "./folder-picker-helpers";
+import {
+  breadcrumbParts,
+  isWithinHome,
+  joinDirectory,
+  parentWithinHome,
+  visibleDirectories,
+} from "./folder-picker-helpers";
 
 const SHOW_HIDDEN_KEY = "spawn.folderPicker.showHidden";
 
@@ -107,9 +113,14 @@ export function FolderPickerDialog({
     [dirsQ.data?.entries, showHidden],
   );
 
+  // Every jump — crumb, row, "..", drill menu — lands inside home or not at
+  // all. The host refuses anything above it, so clamping here keeps a stale
+  // path (a saved cwd from another machine, say) from stranding the picker on
+  // an error screen with no way down.
   const navigate = (value: string) => {
     if (!homeDir) return;
-    setPath(normalizeCwdForHost(value, homeDir));
+    const next = normalizeCwdForHost(value, homeDir);
+    setPath(isWithinHome(next, homeDir) ? next : normalizeCwdForHost("~", homeDir));
     setFilter("");
     setSelectedIndex(0);
   };
@@ -139,7 +150,11 @@ export function FolderPickerDialog({
   };
 
   const loading = state !== "ready" || homeQ.isLoading || dirsQ.isLoading;
-  const breadcrumbs = breadcrumbParts(resolvedPath.startsWith("/") ? resolvedPath : "/");
+  const listedPath = resolvedPath.startsWith("/") ? resolvedPath : "/";
+  const breadcrumbs = breadcrumbParts(listedPath, homeDir ?? "/");
+  // Null at the home root: there is no rung above it, so no ".." row.
+  const parentPath = homeDir === null ? null : parentWithinHome(listedPath, homeDir);
+  const selectable = homeDir !== null && isWithinHome(listedPath, homeDir);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -244,7 +259,7 @@ export function FolderPickerDialog({
                 if (selected) navigate(selected.path);
               } else if (event.key === "Backspace" && filter === "") {
                 event.preventDefault();
-                navigate(dirsQ.data?.parent ?? parentDir(resolvedPath));
+                if (parentPath !== null) navigate(parentPath);
               }
             }}
             className="min-h-0 flex-1 overflow-y-auto rounded-lg border border-border bg-card/35 p-1 outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -256,15 +271,21 @@ export function FolderPickerDialog({
                 ))}
               </div>
             ) : dirsQ.isError ? (
-              <div className="grid min-h-36 place-items-center p-6 text-center text-sm text-destructive">
-                {dirsQ.error instanceof Error ? dirsQ.error.message : "Could not list this folder."}
+              <div className="flex min-h-36 flex-col items-center justify-center gap-3 p-6 text-center">
+                <p className="text-sm text-destructive" role="alert">
+                  {listErrorMessage(dirsQ.error)}
+                </p>
+                {parentPath !== null || !selectable ? (
+                  <Button type="button" variant="outline" size="sm" onClick={() => navigate("~")}>
+                    <Home className="size-4" aria-hidden />
+                    Back to home folder
+                  </Button>
+                ) : null}
               </div>
             ) : directories.length === 0 ? (
               <>
-                {resolvedPath !== "/" && filter === "" && (
-                  <ParentFolderRow
-                    onNavigate={() => navigate(dirsQ.data?.parent ?? parentDir(resolvedPath))}
-                  />
+                {parentPath !== null && filter === "" && (
+                  <ParentFolderRow onNavigate={() => navigate(parentPath)} />
                 )}
                 <div className="grid min-h-36 place-items-center p-6 text-center text-sm text-muted-foreground">
                   {filter
@@ -276,10 +297,8 @@ export function FolderPickerDialog({
               </>
             ) : (
               <>
-                {resolvedPath !== "/" && filter === "" && (
-                  <ParentFolderRow
-                    onNavigate={() => navigate(dirsQ.data?.parent ?? parentDir(resolvedPath))}
-                  />
+                {parentPath !== null && filter === "" && (
+                  <ParentFolderRow onNavigate={() => navigate(parentPath)} />
                 )}
                 {directories.map((entry, index) => (
                   <button
@@ -361,7 +380,7 @@ export function FolderPickerDialog({
           </Button>
           <Button
             type="button"
-            disabled={!homeDir || !resolvedPath.startsWith("/")}
+            disabled={!selectable}
             onClick={() => {
               onSelect(resolvedPath);
               onOpenChange(false);
@@ -373,6 +392,30 @@ export function FolderPickerDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+/**
+ * Host filesystem errors, said the way someone picking a folder would hear
+ * them. The raw codes leak the daemon's jail vocabulary ("outside the home
+ * root") into a dialog whose user never asked about roots.
+ */
+function listErrorMessage(error: unknown): string {
+  if (error instanceof HostControlError) {
+    switch (error.code) {
+      case "outside_root":
+      case "traversal_rejected":
+        return "That folder sits above your home folder, which is as far up as Spawn can browse.";
+      case "permission_denied":
+        return "You do not have permission to open this folder.";
+      case "not_found":
+        return "This folder no longer exists.";
+      case "not_directory":
+        return "That is a file, not a folder.";
+      case "symlink_rejected":
+        return "This is a symbolic link, which Spawn does not follow.";
+    }
+  }
+  return error instanceof Error ? error.message : "Could not list this folder.";
 }
 
 type DrillProps = {

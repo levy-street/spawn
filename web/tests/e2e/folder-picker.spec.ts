@@ -20,6 +20,13 @@ const listings: Record<string, ReturnType<typeof fileListing>> = {
     ],
   }),
   "/Users/shared": fileListing({ path: "/Users/shared", parent: "/Users", entries: [] }),
+  "/Users/tester/projects": fileListing({
+    path: "/Users/tester/projects",
+    parent: "/Users/tester",
+    entries: [
+      fileEntry({ name: "spawn", path: "/Users/tester/projects/spawn", is_dir: true, size: null }),
+    ],
+  }),
 };
 
 async function openPicker(page: Page) {
@@ -59,9 +66,32 @@ test("clicking a folder opens it", async ({ page }) => {
 
 test("a breadcrumb chevron drills into that folder's subfolders", async ({ page }) => {
   const dialog = await openPicker(page);
-  await dialog.getByRole("button", { name: "Browse /Users", exact: true }).click();
+  await dialog.getByRole("button", { name: "Browse /Users/tester", exact: true }).click();
   const menu = page.getByRole("menu");
-  await expect(menu.getByRole("menuitem", { name: "tester" })).toBeVisible();
-  await menu.getByRole("menuitem", { name: "shared" }).click();
-  await expect(dialog.getByRole("listbox", { name: "Folders in /Users/shared" })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: "projects" })).toBeVisible();
+  await menu.getByRole("menuitem", { name: "projects" }).click();
+  await expect(
+    dialog.getByRole("listbox", { name: "Folders in /Users/tester/projects" }),
+  ).toBeVisible();
+});
+
+test("home is the ceiling: no way up and no crumbs above it", async ({ page }) => {
+  const dialog = await openPicker(page);
+  // The host is rooted at the home directory, so /Users is not reachable —
+  // offering a ".." row or a "Users" crumb here only walks into an error.
+  await expect(dialog.getByRole("button", { name: "Parent folder" })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Home", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Users", exact: true })).toHaveCount(0);
+});
+
+test("the .. row appears below home and steps back up to it", async ({ page }) => {
+  const dialog = await openPicker(page);
+  await dialog.getByRole("option", { name: "projects" }).click();
+  await expect(
+    dialog.getByRole("listbox", { name: "Folders in /Users/tester/projects" }),
+  ).toBeVisible();
+
+  await dialog.getByRole("button", { name: "Parent folder" }).click();
+  await expect(dialog.getByRole("listbox", { name: "Folders in /Users/tester" })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Parent folder" })).toHaveCount(0);
 });
