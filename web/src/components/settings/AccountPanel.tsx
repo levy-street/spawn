@@ -7,6 +7,107 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ApiError, account, auth } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
+import { usePasskeyTrust } from "@/lib/trust-passkeys";
+
+/**
+ * Passkeys live in account settings, next to email and password — sign-in
+ * furniture, not trust machinery (docs/TRUST_UX.md). The one taught promise:
+ * if you lose every device, a passkey brings everything back.
+ */
+function PasskeysSection() {
+  const passkey = usePasskeyTrust();
+  const count = passkey.passkeys.data?.length ?? null;
+
+  return (
+    <div className="space-y-3 rounded-md border border-border p-3" data-testid="passkey-list">
+      <div>
+        <p className="text-sm font-medium">Passkeys</p>
+        <p className="text-sm text-muted-foreground">
+          A passkey signs in and approves a device in one step — and if you lose every device, it
+          brings everything back.
+        </p>
+      </div>
+      {!passkey.supported && (
+        <p className="text-sm text-muted-foreground">
+          This browser cannot use passkeys here. Passkeys need a secure context (HTTPS).
+        </p>
+      )}
+      {count !== null && count > 0 && (
+        <ul className="flex flex-col gap-2">
+          {passkey.passkeys.data?.map((row) => (
+            <li key={row.id} className="flex items-center justify-between gap-2 text-sm">
+              <span className="min-w-0 truncate">
+                {row.label ?? "passkey"}
+                <span className="ml-2 text-xs text-muted-foreground">
+                  added {new Date(row.created_at).toLocaleDateString()}
+                </span>
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                className="shrink-0"
+                disabled={passkey.busy || (count !== 1 && count !== 2)}
+                data-testid="revoke-passkey"
+                onClick={() => {
+                  if (count === 1) {
+                    if (
+                      confirm(
+                        "Remove your only passkey?\n\nYour devices keep working, but the " +
+                          "protection it provides ends: if you ever lose every device, nothing " +
+                          "will bring this account's hosts back.",
+                      )
+                    ) {
+                      passkey.removeLastPasskey.mutate(row);
+                    }
+                  } else {
+                    passkey.revokePasskey.mutate(row);
+                  }
+                }}
+              >
+                {passkey.revokePasskey.isPending || passkey.removeLastPasskey.isPending
+                  ? "Removing…"
+                  : "Remove"}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {count !== null && count > 2 && (
+        <p className="text-xs text-muted-foreground">
+          Removing needs at most two passkeys enrolled. With more, this device cannot reseal for
+          every survivor — remove from each surviving device instead.
+        </p>
+      )}
+      <div className="flex items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          disabled={!passkey.supported || passkey.busy}
+          data-testid={passkey.hasBundle ? "add-backup-passkey" : "setup-passkey"}
+          onClick={() => (passkey.hasBundle ? passkey.addBackup.mutate() : passkey.setUp.mutate())}
+        >
+          {passkey.setUp.isPending || passkey.addBackup.isPending ? "Adding…" : "Add passkey"}
+        </Button>
+        {count === 1 && (
+          <p className="text-xs text-muted-foreground">
+            A second passkey (another phone, a security key) survives losing this one.
+          </p>
+        )}
+      </div>
+      {passkey.status !== null && (
+        <p className="text-sm font-medium" role="status" data-testid="trust-status">
+          {passkey.status}
+        </p>
+      )}
+      {passkey.error !== null && (
+        <p className="text-sm text-destructive" role="alert" data-testid="trust-error">
+          {passkey.error}
+        </p>
+      )}
+    </div>
+  );
+}
 
 export function AccountPanel() {
   const { user } = useAuth();
@@ -72,6 +173,8 @@ export function AccountPanel() {
           </Button>
         </div>
       )}
+      <PasskeysSection />
+
       <Button
         variant="secondary"
         onClick={() => {

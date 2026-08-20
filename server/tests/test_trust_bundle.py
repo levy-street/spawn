@@ -490,3 +490,36 @@ async def test_revoked_endorser_introductions_are_not_offered(client):
     )
     assert listed.status_code == 200
     assert listed.json() == []
+
+
+async def test_bundle_delete_abandons_it_idempotently(client):
+    """Removing the last passkey abandons the bundle; deleting twice is fine."""
+
+    _, auth = await _signup(client, "bundle-delete@example.com")
+    sealed = "c2VhbGVkLWJ5dGVz"
+    put = await client.put("/api/trust/bundle", json={"sealed": sealed}, headers=auth)
+    assert put.status_code == 200
+
+    deleted = await client.delete("/api/trust/bundle", headers=auth)
+    assert deleted.status_code == 204
+    assert (await client.get("/api/trust/bundle", headers=auth)).json() is None
+    # Idempotent: no bundle is the normal pre-bootstrap state.
+    assert (await client.delete("/api/trust/bundle", headers=auth)).status_code == 204
+
+    # A fresh bundle can be sealed again afterward (revision restarts server-side).
+    fresh = await client.put("/api/trust/bundle", json={"sealed": sealed}, headers=auth)
+    assert fresh.status_code == 200
+    assert fresh.json()["revision"] == 1
+
+
+async def test_bundle_delete_is_account_scoped(client):
+    _, auth_a = await _signup(client, "bundle-del-a@example.com")
+    _, auth_b = await _signup(client, "bundle-del-b@example.com")
+    sealed = "c2VhbGVkLWJ5dGVz"
+    assert (
+        await client.put("/api/trust/bundle", json={"sealed": sealed}, headers=auth_a)
+    ).status_code == 200
+
+    assert (await client.delete("/api/trust/bundle", headers=auth_b)).status_code == 204
+    kept = await client.get("/api/trust/bundle", headers=auth_a)
+    assert kept.json() is not None

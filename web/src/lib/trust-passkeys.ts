@@ -427,12 +427,47 @@ export function usePasskeyTrust() {
     onError: (err) => setError(describePasskeyError(err)),
   });
 
+  /**
+   * Remove the ONLY passkey — abandoning the protection it provided. The
+   * sealed anchor is revoked first (fail-closed: everything it approved loses
+   * that trust immediately), then the bundle and the credential row go. The
+   * caller shows the honest cost before calling; nothing here re-asks.
+   */
+  const removeLastPasskey = useMutation({
+    mutationFn: async (target: PasskeyCredential) => {
+      const remaining = await trust.listPasskeys();
+      if (remaining.length !== 1 || remaining[0].id !== target.id) {
+        throw new Error("This path removes only the final passkey.");
+      }
+      // The root this passkey sealed must not outlive it as a live endorser.
+      const liveRoot = (await browserDevices.list()).find(
+        (d) => d.is_root && d.revoked_at === null,
+      );
+      if (liveRoot !== undefined) {
+        await browserDevices.revoke(liveRoot.id, liveRoot.public_key);
+      }
+      await trust.deleteBundle();
+      await trust.removePasskey(target.id);
+    },
+    onMutate: begin,
+    onSuccess: () => {
+      setStatus(
+        "Passkey removed. Your devices keep working, but if you lose them all, nothing brings this account's hosts back.",
+      );
+      queryClient.invalidateQueries({ queryKey: ["trust"] });
+      queryClient.invalidateQueries({ queryKey: ["browser-devices"] });
+      queryClient.invalidateQueries({ queryKey: ["account-endorsements"] });
+    },
+    onError: (err) => setError(describePasskeyError(err)),
+  });
+
   const busy =
     setUp.isPending ||
     unlock.isPending ||
     forget.isPending ||
     addBackup.isPending ||
-    revokePasskey.isPending;
+    revokePasskey.isPending ||
+    removeLastPasskey.isPending;
 
   return {
     accountId,
@@ -445,6 +480,7 @@ export function usePasskeyTrust() {
     forget,
     addBackup,
     revokePasskey,
+    removeLastPasskey,
     busy,
     status,
     error,
