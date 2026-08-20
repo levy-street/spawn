@@ -1,197 +1,212 @@
 "use client";
 
-/**
- * Shared presentational primitives for the trust UX.
- * Basic Tailwind only: spacing, hierarchy, borders. No visual-design investment.
- */
+import type { ReactNode, SVGProps } from "react";
 
-import { type FormEvent, type ReactNode, useState } from "react";
+/* ---------- buttons ---------- */
 
-export type Tone = "ok" | "warn" | "danger" | "neutral";
+type ButtonVariant = "primary" | "subtle" | "danger" | "ghost";
 
-const pillTone: Record<Tone, string> = {
-  ok: "border-green-600 text-green-700",
-  warn: "border-amber-600 text-amber-700",
-  danger: "border-red-600 text-red-700",
-  neutral: "border-neutral-400 text-neutral-600",
+const buttonStyles: Record<ButtonVariant, string> = {
+  primary: "bg-zinc-100 text-zinc-900 hover:bg-white",
+  subtle: "bg-zinc-800/80 text-zinc-200 hover:bg-zinc-700/80",
+  danger: "border border-red-500/20 bg-red-500/10 text-red-400 hover:bg-red-500/20",
+  ghost: "text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/60",
 };
 
-export function Pill({ tone, children }: { tone: Tone; children: ReactNode }) {
-  return (
-    <span
-      className={`inline-block rounded-full border px-2 py-0.5 text-xs whitespace-nowrap ${pillTone[tone]}`}
-    >
-      {children}
-    </span>
-  );
-}
-
-const dotTone: Record<Tone, string> = {
-  ok: "bg-green-500",
-  warn: "bg-amber-500",
-  danger: "bg-red-500",
-  neutral: "bg-neutral-400",
-};
-
-export function Dot({ tone }: { tone: Tone }) {
-  return <span className={`inline-block h-2 w-2 rounded-full ${dotTone[tone]}`} />;
-}
-
-type BtnKind = "primary" | "quiet" | "danger" | "danger-quiet";
-
-const btnKind: Record<BtnKind, string> = {
-  primary: "bg-neutral-900 text-white border-neutral-900 hover:bg-neutral-700",
-  quiet: "bg-white text-neutral-800 border-neutral-300 hover:bg-neutral-100",
-  danger: "bg-red-700 text-white border-red-700 hover:bg-red-600",
-  "danger-quiet": "bg-white text-red-700 border-red-300 hover:bg-red-50",
-};
-
-export function Btn({
-  kind = "quiet",
+export function Button({
+  variant = "primary",
+  full = false,
   onClick,
-  disabled,
   children,
-  submit,
 }: {
-  kind?: BtnKind;
+  variant?: ButtonVariant;
+  full?: boolean;
   onClick?: () => void;
-  disabled?: boolean;
   children: ReactNode;
-  submit?: boolean;
 }) {
   return (
     <button
-      type={submit ? "submit" : "button"}
+      type="button"
       onClick={onClick}
-      disabled={disabled}
-      className={`rounded-md border px-3 py-1.5 text-sm disabled:opacity-40 ${btnKind[kind]}`}
+      className={`inline-flex h-9 items-center justify-center gap-2 rounded-lg px-4 text-sm font-medium transition-colors ${buttonStyles[variant]} ${full ? "w-full" : ""}`}
     >
       {children}
     </button>
   );
 }
 
-export function Card({ children, tone }: { children: ReactNode; tone?: Tone }) {
-  const border =
-    tone === "danger"
-      ? "border-red-300"
-      : tone === "warn"
-        ? "border-amber-300"
-        : "border-neutral-200";
-  return <div className={`rounded-lg border bg-white p-4 ${border}`}>{children}</div>;
-}
-
-export function SectionTitle({ children }: { children: ReactNode }) {
-  return <h2 className="text-base font-semibold text-neutral-900">{children}</h2>;
-}
-
-export function Muted({ children }: { children: ReactNode }) {
-  return <p className="text-sm text-neutral-500">{children}</p>;
-}
-
-export function Spinner() {
+export function IconButton({
+  label,
+  onClick,
+  children,
+}: {
+  label: string;
+  onClick?: () => void;
+  children: ReactNode;
+}) {
   return (
-    <span
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={onClick}
+      className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-zinc-500 transition-colors hover:bg-zinc-800/70 hover:text-zinc-200"
+    >
+      {children}
+    </button>
+  );
+}
+
+/* ---------- small pieces ---------- */
+
+export function Spinner({ className = "" }: { className?: string }) {
+  return (
+    <div
+      className={`size-5 animate-spin rounded-full border-2 border-zinc-700 border-t-zinc-300 ${className}`}
       role="status"
       aria-label="Working"
-      className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-800 align-middle"
     />
   );
 }
 
-/** The 6-digit match code, displayed "NNN NNN", large. */
-export function MatchCode({ code }: { code: string }) {
-  const digits = code.replace(/\D/g, "");
-  const shown = digits.length === 6 ? `${digits.slice(0, 3)} ${digits.slice(3)}` : code;
+export function Chip({ children }: { children: ReactNode }) {
   return (
-    <div className="rounded-lg border border-neutral-300 bg-neutral-50 px-6 py-4 text-center font-mono text-4xl tracking-[0.3em] text-neutral-900">
-      {shown}
+    <span className="shrink-0 whitespace-nowrap rounded-full bg-emerald-400/10 px-2 py-0.5 text-[11px] font-medium text-emerald-400">
+      {children}
+    </span>
+  );
+}
+
+/** The small label naming what a flow screen is for. Sentence case — names live here. */
+export function Eyebrow({ children }: { children: ReactNode }) {
+  return <p className="text-xs font-medium tracking-wide text-zinc-500">{children}</p>;
+}
+
+/** The screen card every flow lives in. */
+export function Screen({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex min-h-[420px] w-[340px] max-w-full flex-col rounded-2xl border border-zinc-800 bg-zinc-900/40 p-6 shadow-xl shadow-black/20">
+      {children}
     </div>
   );
 }
 
-/**
- * Entry side of the number match (A5: entry-style, never tap-to-approve).
- * Local input state only; the ceremony state machine lives in props of the parent.
- */
-export function CodeEntry({
-  otherSideLabel,
-  attemptsRemaining,
-  wrongEntry,
-  disabled,
-  onSubmitCode,
-  onReportMismatch,
-}: {
-  /** Names the screen the code is shown on, e.g. `the terminal on "atlas"`. */
-  otherSideLabel: string;
-  attemptsRemaining: number;
-  wrongEntry: boolean;
-  disabled?: boolean;
-  onSubmitCode: (code: string) => void;
-  onReportMismatch: () => void;
-}) {
-  const [value, setValue] = useState("");
-  const digits = value.replace(/\D/g, "").slice(0, 6);
-
-  function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    if (digits.length === 6) onSubmitCode(digits);
-  }
-
+/** A modal card (rendered inline; the host app supplies the backdrop). */
+export function DialogCard({ children }: { children: ReactNode }) {
   return (
-    <form onSubmit={handleSubmit} className="space-y-3">
-      <label className="block text-sm text-neutral-700">
-        Enter the code shown on {otherSideLabel}.
-        <input
-          value={digits.length > 3 ? `${digits.slice(0, 3)} ${digits.slice(3)}` : digits}
-          onChange={(e) => setValue(e.target.value)}
-          inputMode="numeric"
-          autoComplete="one-time-code"
-          placeholder="000 000"
-          disabled={disabled}
-          className="mt-2 block w-full rounded-md border border-neutral-300 px-3 py-2 text-center font-mono text-2xl tracking-widest disabled:opacity-40"
-        />
-      </label>
-      {wrongEntry ? (
-        <p className="text-sm text-amber-700">
-          That doesn&apos;t match. Check the two screens carefully — if they show different codes,
-          stop. {attemptsRemaining} {attemptsRemaining === 1 ? "attempt" : "attempts"} left.
-        </p>
-      ) : null}
-      <div className="flex items-center justify-between gap-3">
-        <Btn submit kind="primary" disabled={disabled || digits.length !== 6}>
-          Verify
-        </Btn>
-        <Btn kind="danger-quiet" onClick={onReportMismatch} disabled={disabled}>
-          The codes don&apos;t match
-        </Btn>
-      </div>
-    </form>
+    <div className="w-[340px] max-w-full rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-2xl shadow-black/40">
+      {children}
+    </div>
   );
 }
 
-/** Shared terminal outcome cards for ceremonies. */
-export function CeremonyOutcome({
-  tone,
-  title,
-  body,
-  actions,
-}: {
-  tone: Tone;
-  title: string;
-  body: ReactNode;
-  actions?: ReactNode;
-}) {
+/* ---------- icons (inline, stroke = currentColor) ---------- */
+
+function Svg({ children, ...props }: SVGProps<SVGSVGElement> & { children: ReactNode }) {
   return (
-    <Card tone={tone}>
-      <div className="space-y-2">
-        <div className="flex items-center gap-2">
-          <Dot tone={tone} />
-          <h3 className="font-semibold text-neutral-900">{title}</h3>
-        </div>
-        <div className="text-sm text-neutral-700">{body}</div>
-        {actions ? <div className="flex gap-2 pt-1">{actions}</div> : null}
-      </div>
-    </Card>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.75"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className="size-[18px]"
+      {...props}
+    >
+      {children}
+    </svg>
+  );
+}
+
+export function IconPhone(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Svg {...props}>
+      <rect x="7" y="2" width="10" height="20" rx="2" />
+      <path d="M12 18h.01" />
+    </Svg>
+  );
+}
+
+export function IconLaptop(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Svg {...props}>
+      <rect x="4" y="5" width="16" height="11" rx="2" />
+      <path d="M2 19h20" />
+    </Svg>
+  );
+}
+
+export function IconComputer(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Svg {...props}>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="m7 9 3 3-3 3" />
+      <path d="M13 15h4" />
+    </Svg>
+  );
+}
+
+export function IconKey(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Svg {...props}>
+      <path d="M2.6 17.4A2 2 0 0 0 2 18.8V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.2a2 2 0 0 0 1.4-.6l.8-.8a6.5 6.5 0 1 0-4-4Z" />
+      <circle cx="16.5" cy="7.5" r="0.5" />
+    </Svg>
+  );
+}
+
+export function IconCheck(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Svg {...props}>
+      <path d="m4 12.5 5 5L20 6.5" />
+    </Svg>
+  );
+}
+
+export function IconAlert(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Svg {...props}>
+      <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+      <path d="M12 9v4" />
+      <path d="M12 17h.01" />
+    </Svg>
+  );
+}
+
+export function IconBlocked(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Svg {...props}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="m5.7 5.7 12.6 12.6" />
+    </Svg>
+  );
+}
+
+export function IconEllipsis(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Svg {...props}>
+      <circle cx="5" cy="12" r="0.6" />
+      <circle cx="12" cy="12" r="0.6" />
+      <circle cx="19" cy="12" r="0.6" />
+    </Svg>
+  );
+}
+
+export function IconPlus(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Svg {...props}>
+      <path d="M12 5v14" />
+      <path d="M5 12h14" />
+    </Svg>
+  );
+}
+
+export function IconChevronRight(props: SVGProps<SVGSVGElement>) {
+  return (
+    <Svg {...props}>
+      <path d="m9 6 6 6-6 6" />
+    </Svg>
   );
 }
