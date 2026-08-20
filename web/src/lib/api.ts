@@ -86,6 +86,8 @@ export const HostSchema = z.object({
   status: z.enum(["online", "offline"]),
   last_seen_at: z.string().nullable(),
   agent_count: z.number().int(),
+  /** Mesh R9: chain-capable hosts refuse the legacy per-host endorsement path. */
+  supports_account_chains: z.boolean().default(false),
 });
 export type Host = z.infer<typeof HostSchema>;
 

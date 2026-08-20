@@ -208,6 +208,73 @@ async def test_anchor_upgrade_pins_the_root_on_a_host(client):
     assert {row["browser_device_id"] for row in pins} == {root_id}
 
 
+async def test_chain_capable_host_refuses_per_host_device_endorsement(client):
+    """Mesh R9: a host that validates account chains refuses the legacy
+    per-host DEVICE endorsement (the ceremony covers it account-wide), while
+    the root anchor upgrade — the one remaining per-host statement — passes."""
+
+    from spawn_server.browser_endorsement import encode_browser_endorsement_transcript
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, HostBrowserPin
+
+    user_id, auth = await _signup(client, "r9-refusal@example.com")
+    endorser_key = Ed25519PrivateKey.generate()
+    endorser_id = (await _register(client, auth, user_id, endorser_key)).json()["id"]
+    newcomer_id, newcomer_key = await _add_device(user_id)
+    root_key = Ed25519PrivateKey.generate()
+    root_id = (await _register(client, auth, user_id, root_key, is_root=True)).json()["id"]
+
+    host_key = Ed25519PrivateKey.generate()
+    async with get_sessionmaker()() as session:
+        host = Host(
+            name="chain-box",
+            owner_user_id=user_id,
+            host_key_algorithm="ed25519",
+            host_public_key=_wire(host_key.public_key().public_bytes_raw()),
+            supports_account_chains=True,
+        )
+        session.add(host)
+        await session.flush()
+        session.add(
+            HostBrowserPin(
+                host_id=host.id,
+                browser_device_id=endorser_id,
+                browser_key_algorithm="ed25519",
+                browser_public_key=_wire(endorser_key.public_key().public_bytes_raw()),
+                browser_key_fingerprint="SHA256:" + "e" * 16,
+            )
+        )
+        await session.commit()
+        host_id = host.id
+
+    def endorsement(endorsed_key: Ed25519PrivateKey, endorsed_id: str) -> dict:
+        transcript = encode_browser_endorsement_transcript(
+            user_id,
+            host_key.public_key().public_bytes_raw(),
+            endorser_key.public_key().public_bytes_raw(),
+            endorsed_key.public_key().public_bytes_raw(),
+            endorsed_id,
+        )
+        return {
+            "host_id": host_id,
+            "endorser_device_id": endorser_id,
+            "endorsed_device_id": endorsed_id,
+            "signature": _wire(endorser_key.sign(transcript)),
+        }
+
+    refused = await client.post(
+        "/api/trust/endorsements", json=endorsement(newcomer_key, newcomer_id), headers=auth
+    )
+    assert refused.status_code == 422
+    assert "add-device ceremony" in refused.json()["detail"]
+
+    # The root anchor upgrade is the surviving per-host statement.
+    allowed = await client.post(
+        "/api/trust/endorsements", json=endorsement(root_key, root_id), headers=auth
+    )
+    assert allowed.status_code == 200, allowed.text
+
+
 async def test_rename_preserves_is_root(client):
     user_id, auth = await _signup(client, "root-rename@example.com")
     root_id = (

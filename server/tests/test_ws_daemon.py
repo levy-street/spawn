@@ -243,6 +243,46 @@ async def test_daemon_ws_register_accepts_old_shape_and_heartbeat_query_token(cl
         assert host.last_seen_at is not None
 
 
+async def test_register_ratchets_account_chain_support(client):
+    """Mesh R9: chain capability is set by an advertising daemon and never
+    lowered by an older build reconnecting — the per-host endorsement path
+    stays retired once retired."""
+
+    user_id, _ = await _signup(client, "ws-chain-ratchet@example.com")
+    host_id = await _create_host(user_id)
+
+    async def register(payload: dict) -> None:
+        ws = FakeDaemonWebSocket()
+        ws.queue_text(payload)
+        ws.queue_disconnect()
+        await daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+
+    sm = get_sessionmaker()
+
+    await register({"type": "register", "host_name": "new-spawnd", "version": "0.2.0"})
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None and host.supports_account_chains is False
+
+    await register(
+        {
+            "type": "register",
+            "host_name": "new-spawnd",
+            "version": "0.2.0",
+            "supports_account_chains": True,
+        }
+    )
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None and host.supports_account_chains is True
+
+    # An old build (no flag) reconnects: the ratchet holds.
+    await register({"type": "register", "host_name": "old-spawnd", "version": "0.1.0"})
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None and host.supports_account_chains is True
+
+
 async def test_daemon_ws_register_resyncs_only_owned_existing_agents_while_connected(client):
     user_id, _ = await _signup(client, "ws-daemon-resync@example.com")
     host_id = await _create_host(user_id, name="primary")

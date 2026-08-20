@@ -191,6 +191,11 @@ async def _prepare_host_activation(
         value = registration.get(field)
         if isinstance(value, str) and value:
             values[field] = value
+    # Ratchet, never lower: once a chain-capable daemon has registered, the
+    # legacy per-host endorsement path stays retired for this host (mesh R9)
+    # even if an older build reconnects later.
+    if registration.get("supports_account_chains") is True:
+        values["supports_account_chains"] = True
     result = await session.execute(
         update(Host)
         .where(

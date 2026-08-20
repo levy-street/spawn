@@ -87,7 +87,12 @@ export function EndorseDevicePanel({
       if (mine === undefined) {
         throw new Error("This browser is not registered with the server.");
       }
-      const keyed = (await hosts.list()).filter((host) => (host.host_public_key ?? null) !== null);
+      // Mesh R9: chain-capable hosts refuse per-host device endorsements (the
+      // add-device ceremony covers them account-wide), so this legacy path only
+      // targets hosts that have not advertised chain support.
+      const keyed = (await hosts.list()).filter(
+        (host) => (host.host_public_key ?? null) !== null && !host.supports_account_chains,
+      );
       const myHostIds = new Set<string>();
       for (const host of keyed) {
         if ((await trust.hostPins(host.id)).includes(mine.id)) myHostIds.add(host.id);
@@ -95,7 +100,7 @@ export function EndorseDevicePanel({
       const targets = keyed.filter((host) => myHostIds.has(host.id));
       if (targets.length === 0) {
         throw new Error(
-          "This browser is not trusted by any host yet, so it cannot vouch for another. Approve from a browser that can already open terminals.",
+          "Every host you can vouch toward accepts account-wide trust — use “Add a device to your account” above instead of per-host approval.",
         );
       }
       // The fingerprint the operator compared is only meaningful if it is the

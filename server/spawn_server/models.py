@@ -243,6 +243,11 @@ class Host(Base):
     os: Mapped[str | None] = mapped_column(String(64), nullable=True)
     arch: Mapped[str | None] = mapped_column(String(64), nullable=True)
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The daemon advertises chain admission at register (mesh R9): once true,
+    # the legacy per-host device-endorsement path is refused for this host so a
+    # hostile server cannot steer admission onto the weaker rail. Ratchets up
+    # only — an old build reconnecting must not reopen the retired path.
+    supports_account_chains: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     # Nullable only for hosts created before the 0017 pairing migration. Every
     # new device-code approval stores an immutable Ed25519 pin here.
     host_key_algorithm: Mapped[str | None] = mapped_column(String(16), nullable=True)
