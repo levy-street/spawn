@@ -1,695 +1,413 @@
 "use client";
 
-/**
- * Trust UX demo — renders every component of web/src/trust-ux in every state
- * it defines (see web/src/trust-ux/DESIGN.md), with hardcoded mock data and
- * console.log callbacks. Scroll one page, see the whole designed system.
- */
-
 import type { ReactNode } from "react";
-import { ConnectionGate, VerifiedChip } from "@/trust-ux/ConnectionGate";
-import { DeviceRoster } from "@/trust-ux/DeviceRoster";
-import { HostTrustList } from "@/trust-ux/HostTrustList";
-import { LinkDeviceApprove } from "@/trust-ux/LinkDeviceApprove";
-import { LinkDeviceNew } from "@/trust-ux/LinkDeviceNew";
-import { PairHost } from "@/trust-ux/PairHost";
-import { PasskeyOnboarding } from "@/trust-ux/PasskeyOnboarding";
-import { RecoveryFlow } from "@/trust-ux/RecoveryFlow";
-import { RemoveDeviceDialog } from "@/trust-ux/RemoveDeviceDialog";
-import { ResetPasskeyTrustDialog } from "@/trust-ux/ResetPasskeyTrustDialog";
-import { SecurityOverview } from "@/trust-ux/SecurityOverview";
+import { AccessBlocked } from "@/trust-ux/AccessBlocked";
+import { ConnectComputer } from "@/trust-ux/ConnectComputer";
+import { DevicesScreen } from "@/trust-ux/DevicesScreen";
+import { LinkNewDevice, LinkRequest } from "@/trust-ux/LinkDevice";
+import { NumberCheck } from "@/trust-ux/NumberCheck";
+import { ResetRecoveryDialog, TurnOnRecoveryDialog } from "@/trust-ux/Recovery";
+import { RemoveDeviceDialog } from "@/trust-ux/RemoveDevice";
 import { TrustHistory } from "@/trust-ux/TrustHistory";
-import type {
-  LinkDeviceApproveState,
-  LinkDeviceNewState,
-  PairHostState,
-  PasskeyOnboardingState,
-  RecoveryState,
-  RequesterClaims,
-  TrustDevice,
-  TrustEvent,
-  TrustHost,
-} from "@/trust-ux/types";
+import type { ComputerVM, DeviceVM, TrustEventVM } from "@/trust-ux/types";
 
-function log(name: string) {
-  return (...args: unknown[]) => console.log(`[trust-ux] ${name}`, ...args);
-}
+const noop = () => undefined;
 
-function Section({ title, note, children }: { title: string; note?: string; children: ReactNode }) {
-  return (
-    <section className="space-y-4">
-      <div>
-        <h2 className="text-xl font-semibold text-neutral-900">{title}</h2>
-        {note ? <p className="mt-1 text-sm text-neutral-500">{note}</p> : null}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function Example({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div>
-      <p className="mb-1 font-mono text-xs text-neutral-400">{label}</p>
-      <div className="max-w-2xl">{children}</div>
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* Mock data                                                           */
-/* ------------------------------------------------------------------ */
-
-const devicesPasskeyMode: TrustDevice[] = [
+const devices: DeviceVM[] = [
   {
     id: "d1",
-    name: "Jeremy's MacBook Pro",
-    platform: "macOS · Safari",
+    name: "MacBook Pro",
+    kind: "laptop",
     isThisDevice: true,
-    addedAt: "Mar 2",
-    lastSeenAt: "now",
-    provenance: { kind: "first-device" },
-    backedByPasskey: true,
-    soleKeyForHosts: [],
+    provenance: "First device",
+    lastSeen: "Now",
   },
   {
     id: "d2",
     name: "iPhone",
-    platform: "iOS · Safari",
-    isThisDevice: false,
-    addedAt: "Mar 5",
-    lastSeenAt: "2 hours ago",
-    provenance: { kind: "linked", byDeviceName: "Jeremy's MacBook Pro", at: "Mar 5" },
-    backedByPasskey: true,
-    soleKeyForHosts: [],
+    kind: "phone",
+    provenance: "Linked by MacBook Pro · Jun 3",
+    lastSeen: "2h ago",
   },
   {
     id: "d3",
-    name: "Work ThinkPad",
-    platform: "Linux · Firefox",
-    isThisDevice: false,
-    addedAt: "Aug 18",
-    lastSeenAt: "yesterday",
-    provenance: { kind: "linked", byDeviceName: "iPhone", at: "Aug 18" },
-    backedByPasskey: false,
-    vouchedForBy: { deviceId: "d2", deviceName: "iPhone" },
-    soleKeyForHosts: ["atlas"],
-  },
-];
-
-const devicesNoPasskeyMode: TrustDevice[] = [
-  {
-    id: "d1",
-    name: "Framework laptop",
-    platform: "Linux · Chromium",
-    isThisDevice: true,
-    addedAt: "Jan 12",
-    lastSeenAt: "now",
-    provenance: { kind: "first-device" },
-    backedByPasskey: false,
-    soleKeyForHosts: ["dream", "minivac"],
-  },
-  {
-    id: "d2",
     name: "Pixel 9",
-    platform: "Android · Chrome",
-    isThisDevice: false,
-    addedAt: "Feb 1",
-    lastSeenAt: "3 days ago",
-    provenance: { kind: "linked", byDeviceName: "Framework laptop", at: "Feb 1" },
-    backedByPasskey: false,
-    vouchedForBy: { deviceId: "d1", deviceName: "Framework laptop" },
-    soleKeyForHosts: [],
+    kind: "phone",
+    provenance: "Added by recovery · Jul 2",
+    lastSeen: "Aug 12",
   },
 ];
 
-const hosts: TrustHost[] = [
-  {
-    id: "h1",
-    name: "dream",
-    online: true,
-    status: { kind: "backed-by-passkey", alsoPairedWith: ["Jeremy's MacBook Pro"] },
-  },
-  {
-    id: "h2",
-    name: "atlas",
-    online: false,
-    status: { kind: "paired-only", deviceNames: ["Work ThinkPad"] },
-    pendingRemovalApplies: true,
-  },
-  {
-    id: "h3",
-    name: "minivac",
-    online: true,
-    status: { kind: "orphaned", formerDeviceName: "old iPad" },
-  },
+const computers: ComputerVM[] = [
+  { id: "c1", name: "mac-studio", provenance: "Set up by MacBook Pro · May 28", online: true },
+  { id: "c2", name: "dev-box", provenance: "Set up by iPhone · Jun 20", online: false },
 ];
 
-const history: TrustEvent[] = [
-  {
-    id: "e1",
-    at: "Aug 19, 14:02",
-    kind: "device-removed",
-    deviceName: "old iPad",
-    byDeviceName: "Jeremy's MacBook Pro",
-  },
-  { id: "e2", at: "Aug 19, 13:58", kind: "link-mismatch-stopped" },
-  {
-    id: "e3",
-    at: "Aug 18, 09:31",
-    kind: "device-linked",
-    deviceName: "Work ThinkPad",
-    approvedBy: "iPhone",
-  },
-  { id: "e4", at: "Aug 12, 20:15", kind: "passkey-backed-host", hostName: "dream" },
-  { id: "e5", at: "Aug 12, 20:15", kind: "passkey-backed-device", deviceName: "iPhone" },
-  { id: "e6", at: "Aug 10, 11:47", kind: "account-restored", deviceName: "Jeremy's MacBook Pro" },
-  { id: "e7", at: "Jul 30, 16:20", kind: "link-expired" },
-  {
-    id: "e8",
-    at: "Jun 3, 10:05",
-    kind: "host-paired",
-    hostName: "atlas",
-    byDeviceName: "Work ThinkPad",
-  },
-  { id: "e9", at: "Mar 2, 09:00", kind: "passkey-created" },
-  { id: "e10", at: "Feb 28, 08:12", kind: "passkey-trust-reset", orphanedHostNames: ["minivac"] },
+const history: TrustEventVM[] = [
+  { id: "e1", text: "Recovery restored Pixel 9", when: "Jul 2", kind: "recovery" },
+  { id: "e2", text: "iPhone connected dev-box", when: "Jun 20", kind: "added" },
+  { id: "e3", text: "MacBook Pro linked iPhone", when: "Jun 3", kind: "added" },
+  { id: "e4", text: "MacBook Pro connected mac-studio", when: "May 28", kind: "added" },
+  { id: "e5", text: "Old iPad removed by MacBook Pro", when: "Apr 19", kind: "removed" },
+  { id: "e6", text: "Recovery turned on", when: "Apr 2", kind: "recovery" },
 ];
-
-const requester: RequesterClaims = {
-  claimedName: "iPad Air",
-  claimedPlatform: "iPadOS · Safari",
-  requestedAt: "14:02",
-};
-
-const linkNewStates: [string, LinkDeviceNewState][] = [
-  [
-    "choose — passkey available (passkey-first fork)",
-    { step: "choose", passkeyAvailable: true, hostCount: 3 },
-  ],
-  [
-    "choose — no passkey (ceremony is the only path)",
-    { step: "choose", passkeyAvailable: false, hostCount: 3 },
-  ],
-  ["waiting-for-approver", { step: "waiting-for-approver" }],
-  [
-    "showing-code",
-    {
-      step: "showing-code",
-      code: "483291",
-      approverName: "Jeremy's MacBook Pro",
-      expiresInSeconds: 120,
-    },
-  ],
-  [
-    "linked — backed by passkey",
-    { step: "linked", approverName: "Jeremy's MacBook Pro", backedByPasskey: true, hostCount: 3 },
-  ],
-  [
-    "linked — vouched only (pre-heal)",
-    { step: "linked", approverName: "Pixel 9", backedByPasskey: false, hostCount: 2 },
-  ],
-  ["declined (mismatch or refusal on the other side)", { step: "declined" }],
-  ["expired", { step: "expired" }],
-  ["integrity-failure (commitment check failed — loud abort)", { step: "integrity-failure" }],
-  ["error", { step: "error", message: "The connection dropped while waiting." }],
-];
-
-const approveStates: [string, LinkDeviceApproveState][] = [
-  ["incoming (claims labeled unverified)", { step: "incoming", requester }],
-  [
-    "enter-code — first attempt",
-    { step: "enter-code", requester, attemptsRemaining: 3, wrongEntry: false },
-  ],
-  [
-    "enter-code — after a wrong entry",
-    { step: "enter-code", requester, attemptsRemaining: 2, wrongEntry: true },
-  ],
-  ["verifying", { step: "verifying" }],
-  [
-    "approved — backed by passkey",
-    { step: "approved", deviceName: "iPad Air", backedByPasskey: true, hostCount: 3 },
-  ],
-  [
-    "approved — vouched only",
-    { step: "approved", deviceName: "iPad Air", backedByPasskey: false, hostCount: 2 },
-  ],
-  ["mismatch-reported (user pressed 'codes don't match')", { step: "mismatch-reported" }],
-  ["attempts-exhausted", { step: "attempts-exhausted" }],
-  ["expired", { step: "expired" }],
-  ["error", { step: "error", message: "The connection dropped while verifying." }],
-];
-
-const pairHostStates: [string, PairHostState][] = [
-  [
-    "instructions",
-    {
-      step: "instructions",
-      command: "curl -fsSL https://spawnd.dev/install.sh | sh && spawnd pair",
-    },
-  ],
-  ["waiting-for-host", { step: "waiting-for-host" }],
-  [
-    "enter-code — first attempt",
-    { step: "enter-code", hostName: "atlas", attemptsRemaining: 3, wrongEntry: false },
-  ],
-  [
-    "enter-code — after a wrong entry",
-    { step: "enter-code", hostName: "atlas", attemptsRemaining: 1, wrongEntry: true },
-  ],
-  [
-    "fingerprint-fallback (legacy host — full-entropy compare, the one tap-to-confirm)",
-    {
-      step: "fingerprint-fallback",
-      hostName: "old-nas",
-      fingerprintGroups: ["7f2a", "91cc", "0be3", "44d1", "a8f0", "3e97"],
-    },
-  ],
-  ["verifying", { step: "verifying" }],
-  ["paired — backed by passkey", { step: "paired", hostName: "atlas", backedByPasskey: true }],
-  [
-    "paired — no passkey (R5 warning inline)",
-    { step: "paired", hostName: "atlas", backedByPasskey: false },
-  ],
-  ["mismatch-reported", { step: "mismatch-reported" }],
-  ["attempts-exhausted", { step: "attempts-exhausted" }],
-  ["expired", { step: "expired" }],
-  ["error", { step: "error", message: "The connection dropped while waiting for the host." }],
-];
-
-const passkeyStates: [string, PasskeyOnboardingState][] = [
-  ["offer (first screen after first sign-in)", { step: "offer" }],
-  ["creating", { step: "creating" }],
-  ["done", { step: "done" }],
-  ["cost-sheet (the no-passkey contract, R8)", { step: "cost-sheet" }],
-  ["error", { step: "error", message: "Your browser cancelled the passkey prompt." }],
-];
-
-const recoveryStates: [string, RecoveryState][] = [
-  ["intro", { step: "intro", hostCount: 3 }],
-  ["unlocking", { step: "unlocking" }],
-  ["restoring", { step: "restoring" }],
-  ["restored", { step: "restored", hostCount: 3 }],
-  [
-    "lockout (no passkey, R8 — the honest dead end)",
-    { step: "lockout", hostNames: ["dream", "minivac"] },
-  ],
-  ["error", { step: "error", message: "The passkey prompt didn't complete." }],
-];
-
-/* ------------------------------------------------------------------ */
-/* Page                                                                */
-/* ------------------------------------------------------------------ */
 
 export default function TrustUxDemoPage() {
   return (
-    <main className="min-h-screen bg-neutral-100 px-6 py-10 text-neutral-900">
-      <div className="mx-auto max-w-5xl space-y-12">
-        <header>
-          <h1 className="text-2xl font-bold">spawn trust UX — every component, every state</h1>
-          <p className="mt-1 text-sm text-neutral-500">
-            Clean-room design from docs/TRUST.md + docs/TRUST_DEVICE_MESH.md. Spec:
-            web/src/trust-ux/DESIGN.md. All data is mocked; every action logs to the console.
+    <main className="min-h-screen bg-zinc-950 px-4 py-14 text-zinc-300 antialiased sm:px-6">
+      <div className="mx-auto max-w-7xl">
+        <header className="max-w-2xl">
+          <h1 className="text-2xl font-medium tracking-tight text-zinc-100">
+            spawn trust — every screen, every state
+          </h1>
+          <p className="mt-2 text-sm leading-relaxed text-zinc-500">
+            Three nouns (device, computer, recovery), three verbs (link, connect, remove), one
+            artifact (the number). Nothing else reaches a screen.
           </p>
         </header>
 
-        <Section
-          title="1 · Security overview strip"
-          note="DESIGN.md §4.1 — passkey state, counts, every warning with its remedy."
+        <DemoSection
+          id="roster"
+          title="Devices — the one destination"
+          blurb="Everything about trust lives on one screen. Row provenance and history lines are the audit trail, in plain words."
         >
-          <Example label="passkey active, no warnings (steady state)">
-            <SecurityOverview
-              passkey={{ state: "active", createdAt: "Mar 2" }}
-              deviceCount={3}
-              hostCount={3}
-              warnings={[]}
-              onCreatePasskey={log("overview.onCreatePasskey")}
-              onResetPasskeyTrust={log("overview.onResetPasskeyTrust")}
-              onWarningAction={log("overview.onWarningAction")}
-            />
-          </Example>
-          <Example label="passkey active, with warnings (sole-key host · awaiting backup · new-device nudge)">
-            <SecurityOverview
-              passkey={{ state: "active", createdAt: "Mar 2" }}
-              deviceCount={3}
-              hostCount={3}
-              warnings={[
-                { kind: "sole-key-host", hostName: "atlas", deviceName: "Work ThinkPad" },
-                { kind: "awaiting-passkey-backup", deviceCount: 1 },
-                { kind: "new-device-nudge", deviceName: "Work ThinkPad", addedAt: "Aug 18" },
-              ]}
-              onCreatePasskey={log("overview.onCreatePasskey")}
-              onResetPasskeyTrust={log("overview.onResetPasskeyTrust")}
-              onWarningAction={log("overview.onWarningAction")}
-            />
-          </Example>
-          <Example label="no passkey (permanent signage, R8)">
-            <SecurityOverview
-              passkey={{ state: "none" }}
-              deviceCount={1}
-              hostCount={2}
-              warnings={[{ kind: "single-device-no-passkey" }]}
-              onCreatePasskey={log("overview.onCreatePasskey")}
-              onResetPasskeyTrust={log("overview.onResetPasskeyTrust")}
-              onWarningAction={log("overview.onWarningAction")}
-            />
-          </Example>
-        </Section>
-
-        <Section
-          title="2 · Device roster"
-          note="DESIGN.md §4.2 — the R4 detection surface: provenance sentences, status pills, sole-key warnings, always-visible Remove."
-        >
-          <Example label="passkey mode — backed, vouched (pre-heal), sole-key warning">
-            <DeviceRoster
-              devices={devicesPasskeyMode}
-              passkeyActive={true}
-              onLinkDevice={log("roster.onLinkDevice")}
-              onRemoveDevice={log("roster.onRemoveDevice")}
-            />
-          </Example>
-          <Example label="no-passkey mode — vouch provenance is the only structure">
-            <DeviceRoster
-              devices={devicesNoPasskeyMode}
-              passkeyActive={false}
-              onLinkDevice={log("roster.onLinkDevice")}
-              onRemoveDevice={log("roster.onRemoveDevice")}
-            />
-          </Example>
-        </Section>
-
-        <Section
-          title="3 · Host trust list"
-          note="DESIGN.md §4.3 — backed / paired-only (R5 pre-warning) / orphaned, plus offline pending-removal wording (P3)."
-        >
-          <Example label="all host states in one list">
-            <HostTrustList
-              hosts={hosts}
-              onPairHost={log("hosts.onPairHost")}
-              onShowPairingInstructions={log("hosts.onShowPairingInstructions")}
-            />
-          </Example>
-        </Section>
-
-        <Section
-          title="4 · Trust history"
-          note="DESIGN.md §4.4 — every event kind, including failed ceremonies (danger tone)."
-        >
-          <Example label="all ten event kinds">
-            <TrustHistory events={history} />
-          </Example>
-        </Section>
-
-        <Section
-          title="5 · Link this device (joining side)"
-          note="DESIGN.md §5.3 — passkey-first fork; the new device displays the code, the trusted device types it."
-        >
-          {linkNewStates.map(([label, state]) => (
-            <Example key={label} label={label}>
-              <LinkDeviceNew
-                state={state}
-                onUsePasskey={log("linkNew.onUsePasskey")}
-                onStartApproval={log("linkNew.onStartApproval")}
-                onCancel={log("linkNew.onCancel")}
-                onStartOver={log("linkNew.onStartOver")}
-                onDone={log("linkNew.onDone")}
+          <Variant label="Recovery on">
+            <PagePanel>
+              <DevicesScreen
+                devices={devices}
+                computers={computers}
+                recovery={{ on: true, detail: "Your passkey can bring everything back." }}
+                history={history}
+                onLinkDevice={noop}
+                onConnectComputer={noop}
+                onDeviceOptions={noop}
+                onResetRecovery={noop}
+                onShowHistory={noop}
               />
-            </Example>
-          ))}
-        </Section>
-
-        <Section
-          title="6 · Approve a device (trusted side)"
-          note="DESIGN.md §5.3 — claims labeled unverified; entry-style code check with three attempts and the always-visible mismatch escape."
-        >
-          {approveStates.map(([label, state]) => (
-            <Example key={label} label={label}>
-              <LinkDeviceApprove
-                state={state}
-                onContinue={log("approve.onContinue")}
-                onDismiss={log("approve.onDismiss")}
-                onSubmitCode={log("approve.onSubmitCode")}
-                onReportMismatch={log("approve.onReportMismatch")}
-                onDone={log("approve.onDone")}
+            </PagePanel>
+          </Variant>
+          <Variant label="Recovery off (no-passkey mode)">
+            <PagePanel>
+              <DevicesScreen
+                devices={devices.slice(0, 2)}
+                computers={computers}
+                recovery={{ on: false }}
+                history={history.filter((e) => e.kind !== "recovery")}
+                onLinkDevice={noop}
+                onConnectComputer={noop}
+                onDeviceOptions={noop}
+                onTurnOnRecovery={noop}
+                onShowHistory={noop}
               />
-            </Example>
-          ))}
-        </Section>
+            </PagePanel>
+          </Variant>
+        </DemoSection>
 
-        <Section
-          title="7 · Pair a host"
-          note="DESIGN.md §5.2 — terminal shows the code, browser types it; legacy hosts fall back to the full-fingerprint compare, never a weak short code."
+        <DemoSection
+          id="link-device"
+          title="Link a new device"
+          blurb="Both sides of the link. The new device shows the number; the trusted device types it — entering is the check, so it can't be waved through. With a passkey none of these screens exist: signing in is the whole flow."
         >
-          {pairHostStates.map(([label, state]) => (
-            <Example key={label} label={label}>
-              <PairHost
-                state={state}
-                onCopyCommand={log("pairHost.onCopyCommand")}
-                onCancel={log("pairHost.onCancel")}
-                onStartOver={log("pairHost.onStartOver")}
-                onSubmitCode={log("pairHost.onSubmitCode")}
-                onReportMismatch={log("pairHost.onReportMismatch")}
-                onFingerprintsMatch={log("pairHost.onFingerprintsMatch")}
-                onFingerprintsDiffer={log("pairHost.onFingerprintsDiffer")}
-                onDone={log("pairHost.onDone")}
-              />
-            </Example>
-          ))}
-        </Section>
+          <Variant label="New device — waiting">
+            <LinkNewDevice onCancel={noop} />
+          </Variant>
+          <Variant label="Existing device — request">
+            <LinkRequest
+              deviceName="iPhone"
+              deviceKind="phone"
+              account="jeremy@levystreet.com"
+              onEnterNumber={noop}
+              onIgnore={noop}
+            />
+          </Variant>
+          <Variant label="New device — shows its number">
+            <NumberCheck
+              phase="compare"
+              mode="show"
+              number="923 579"
+              title="Link this device"
+              otherScreen="on the device you already use"
+              doneText=""
+              onClose={noop}
+            />
+          </Variant>
+          <Variant label="Trusted device — types it">
+            <NumberCheck
+              phase="compare"
+              mode="enter"
+              title="Link iPhone"
+              otherScreen="on the new device"
+              doneText=""
+              onSubmit={noop}
+              onNoMatch={noop}
+            />
+          </Variant>
+          <Variant label="Wrong entry">
+            <NumberCheck
+              phase="compare"
+              mode="enter"
+              title="Link iPhone"
+              otherScreen="on the new device"
+              doneText=""
+              entryError="That's not it — 2 tries left."
+              onSubmit={noop}
+              onNoMatch={noop}
+            />
+          </Variant>
+          <Variant label="Done">
+            <NumberCheck
+              phase="done"
+              mode="enter"
+              title="Link iPhone"
+              otherScreen="on the new device"
+              doneText="iPhone is linked. Every computer is ready."
+              onDone={noop}
+            />
+          </Variant>
+        </DemoSection>
 
-        <Section
-          title="8 · Passkey setup"
-          note="DESIGN.md §5.1 + §5.6 — offered before anything else; skipping goes through the cost sheet, never past it."
+        <DemoSection
+          id="connect-computer"
+          title="Connect a computer"
+          blurb="One command on the computer; its terminal shows the number and this device types it."
         >
-          {passkeyStates.map(([label, state]) => (
-            <Example key={label} label={label}>
-              <PasskeyOnboarding
-                state={state}
-                onCreatePasskey={log("passkey.onCreatePasskey")}
-                onSkip={log("passkey.onSkip")}
-                onAcceptLockoutRisk={log("passkey.onAcceptLockoutRisk")}
-                onBackToCreate={log("passkey.onBackToCreate")}
-                onContinue={log("passkey.onContinue")}
-              />
-            </Example>
-          ))}
-        </Section>
+          <Variant label="Step 1 — the command">
+            <ConnectComputer command="spawnd possess" onCancel={noop} />
+          </Variant>
+          <Variant label="The computer's terminal">
+            <TerminalMock />
+          </Variant>
+          <Variant label="This device — types it">
+            <NumberCheck
+              phase="compare"
+              mode="enter"
+              title="Connect mac-studio"
+              otherScreen="in the computer's terminal"
+              doneText=""
+              onSubmit={noop}
+              onNoMatch={noop}
+            />
+          </Variant>
+          <Variant label="Older computer — fingerprint">
+            <NumberCheck
+              phase="compare"
+              mode="enter"
+              fingerprint="pv4_JydeAk0APeP4mQ2c"
+              title="Connect dev-box"
+              otherScreen="in the computer's terminal"
+              doneText=""
+              onMatch={noop}
+              onNoMatch={noop}
+            />
+          </Variant>
+          <Variant label="Done">
+            <NumberCheck
+              phase="done"
+              mode="enter"
+              title="Connect mac-studio"
+              otherScreen="in the computer's terminal"
+              doneText="mac-studio is connected. All your devices can reach it."
+              onDone={noop}
+            />
+          </Variant>
+        </DemoSection>
 
-        <Section
-          title="9 · Recovery after total loss"
-          note="DESIGN.md §5.4 — one passkey unlock restores everything; without one, the honest lockout."
+        <DemoSection
+          id="ceremony-states"
+          title="The number check — remaining states"
+          blurb="Mismatch is terminal: there is no approve-anyway. The machinery before the number is one spinner."
         >
-          {recoveryStates.map(([label, state]) => (
-            <Example key={label} label={label}>
-              <RecoveryFlow
-                state={state}
-                onUnlockWithPasskey={log("recovery.onUnlockWithPasskey")}
-                onShowPairingInstructions={log("recovery.onShowPairingInstructions")}
-                onDone={log("recovery.onDone")}
-                onRetry={log("recovery.onRetry")}
-              />
-            </Example>
-          ))}
-        </Section>
+          <Variant label="Securing">
+            <NumberCheck
+              phase="connecting"
+              mode="enter"
+              title="Link iPhone"
+              otherScreen="on the new device"
+              doneText=""
+            />
+          </Variant>
+          <Variant label="You confirmed — other side pending">
+            <NumberCheck
+              phase="waiting"
+              mode="show"
+              number="923 579"
+              title="Link this device"
+              otherScreen="on the other device"
+              doneText=""
+            />
+          </Variant>
+          <Variant label="Waiting, slowly">
+            <NumberCheck
+              phase="waiting"
+              mode="show"
+              number="923 579"
+              title="Link this device"
+              otherScreen="on the other device"
+              doneText=""
+              slowHint
+            />
+          </Variant>
+          <Variant label="Numbers don't match — stop">
+            <NumberCheck
+              phase="stopped"
+              mode="enter"
+              title="Link iPhone"
+              otherScreen="on the new device"
+              doneText=""
+              onClose={noop}
+            />
+          </Variant>
+        </DemoSection>
 
-        <Section
-          title="10 · Remove a device"
-          note="DESIGN.md §5.5 — the three consequence tiers, computed and named; steady state says 'nothing else is affected'."
+        <DemoSection
+          id="remove"
+          title="Remove a device"
+          blurb="Instant, everywhere, permanent — one breath. If a computer would be stranded, the dialog names it — and only promises the passkey fix when the computer is online to receive it."
         >
-          <Example label="steady state — zero blast radius (P3'')">
+          <Variant label="Standard">
+            <RemoveDeviceDialog deviceName="iPhone" recoveryOn onRemove={noop} onCancel={noop} />
+          </Variant>
+          <Variant label="Would strand a computer — recovery off">
             <RemoveDeviceDialog
-              device={devicesPasskeyMode[1]}
-              consequences={{
-                onlineHostCount: 3,
-                offlineHostCount: 0,
-                hasLiveSessions: false,
-                orphanedHostNames: [],
-                collateralDevices: [],
-              }}
-              passkeyActive={true}
-              onConfirmRemove={log("remove.onConfirmRemove")}
-              onBackHostsFirst={log("remove.onBackHostsFirst")}
-              onCancel={log("remove.onCancel")}
+              deviceName="MacBook Pro"
+              orphans={[{ name: "mac-studio", online: true }]}
+              recoveryOn={false}
+              onRemove={noop}
+              onCancel={noop}
+              onTurnOnRecovery={noop}
             />
-          </Example>
-          <Example label="live sessions + offline hosts (P3 precise wording, R1)">
+          </Variant>
+          <Variant label="Would strand a computer — recovery on">
             <RemoveDeviceDialog
-              device={devicesPasskeyMode[1]}
-              consequences={{
-                onlineHostCount: 2,
-                offlineHostCount: 1,
-                hasLiveSessions: true,
-                orphanedHostNames: [],
-                collateralDevices: [],
-              }}
-              passkeyActive={true}
-              onConfirmRemove={log("remove.onConfirmRemove")}
-              onBackHostsFirst={log("remove.onBackHostsFirst")}
-              onCancel={log("remove.onCancel")}
+              deviceName="MacBook Pro"
+              orphans={[{ name: "mac-studio", online: true }]}
+              recoveryOn
+              onRemove={noop}
+              onCancel={noop}
             />
-          </Example>
-          <Example label="orphans a host, passkey available — heal-first primary action (R5)">
+          </Variant>
+          <Variant label="Stranded computer is offline">
             <RemoveDeviceDialog
-              device={devicesPasskeyMode[2]}
-              consequences={{
-                onlineHostCount: 2,
-                offlineHostCount: 1,
-                hasLiveSessions: false,
-                orphanedHostNames: ["atlas"],
-                collateralDevices: [],
-              }}
-              passkeyActive={true}
-              onConfirmRemove={log("remove.onConfirmRemove")}
-              onBackHostsFirst={log("remove.onBackHostsFirst")}
-              onCancel={log("remove.onCancel")}
+              deviceName="iPhone"
+              orphans={[{ name: "dev-box", online: false }]}
+              recoveryOn
+              onRemove={noop}
+              onCancel={noop}
             />
-          </Example>
-          <Example label="orphans hosts + collateral devices, no passkey — acknowledge required">
+          </Variant>
+          <Variant label="This device">
             <RemoveDeviceDialog
-              device={devicesNoPasskeyMode[0]}
-              consequences={{
-                onlineHostCount: 1,
-                offlineHostCount: 1,
-                hasLiveSessions: true,
-                orphanedHostNames: ["dream", "minivac"],
-                collateralDevices: [{ deviceName: "Pixel 9", restoredByNextPasskeyUse: false }],
-              }}
-              passkeyActive={false}
-              onConfirmRemove={log("remove.onConfirmRemove")}
-              onBackHostsFirst={log("remove.onBackHostsFirst")}
-              onCancel={log("remove.onCancel")}
+              deviceName="MacBook Pro"
+              isThisDevice
+              recoveryOn
+              onRemove={noop}
+              onCancel={noop}
             />
-          </Example>
-          <Example label="collateral device restored by next passkey use (P3'' transient window)">
-            <RemoveDeviceDialog
-              device={devicesPasskeyMode[1]}
-              consequences={{
-                onlineHostCount: 3,
-                offlineHostCount: 0,
-                hasLiveSessions: false,
-                orphanedHostNames: [],
-                collateralDevices: [
-                  { deviceName: "Work ThinkPad", restoredByNextPasskeyUse: true },
-                ],
-              }}
-              passkeyActive={true}
-              onConfirmRemove={log("remove.onConfirmRemove")}
-              onBackHostsFirst={log("remove.onBackHostsFirst")}
-              onCancel={log("remove.onCancel")}
-            />
-          </Example>
-        </Section>
+          </Variant>
+        </DemoSection>
 
-        <Section
-          title="11 · Reset passkey trust (the root)"
-          note="DESIGN.md §5.5 — suspected passkey compromise only; typed confirmation; §4.1 rotation consequences named."
+        <DemoSection
+          id="recovery"
+          title="Recovery"
+          blurb="One passkey, sold as what it does. Turning it on is the only decision; everything after is automatic."
         >
-          <Example label="with hosts that would be orphaned">
-            <ResetPasskeyTrustDialog
-              orphanedHostNames={["dream"]}
-              deviceCount={3}
-              onConfirmReset={log("reset.onConfirmReset")}
-              onCancel={log("reset.onCancel")}
-            />
-          </Example>
-          <Example label="no hosts rely only on the passkey">
-            <ResetPasskeyTrustDialog
-              orphanedHostNames={[]}
-              deviceCount={2}
-              onConfirmReset={log("reset.onConfirmReset")}
-              onCancel={log("reset.onCancel")}
-            />
-          </Example>
-        </Section>
+          <Variant label="Turn on">
+            <TurnOnRecoveryDialog onCreate={noop} onNotNow={noop} />
+          </Variant>
+          <Variant label="Reset">
+            <ResetRecoveryDialog onReset={noop} onCancel={noop} />
+          </Variant>
+        </DemoSection>
 
-        <Section
-          title="12 · Connection-refused moments"
-          note="DESIGN.md §5.7 — terminal states with a named remedy; never spinners, never 'connection failed'."
+        <DemoSection
+          id="blocked"
+          title="Connection refused"
+          blurb="A refused device gets its exact next step, never a raw error. Removal names who removed it."
         >
-          <Example label="device-removed (at connect)">
-            <ConnectionGate
-              refusal={{
-                kind: "device-removed",
-                removedAt: "Aug 19",
-                removedByDeviceName: "Jeremy's MacBook Pro",
-              }}
-              onUsePasskey={log("gate.onUsePasskey")}
-              onLinkThisDevice={log("gate.onLinkThisDevice")}
-              onShowPairingInstructions={log("gate.onShowPairingInstructions")}
-              onOpenSecurity={log("gate.onOpenSecurity")}
+          <Variant label="Removed device">
+            <AccessBlocked
+              variant="removed"
+              detail="Removed Aug 12 by MacBook Pro."
+              onLink={noop}
+              onSignOut={noop}
             />
-          </Example>
-          <Example label="session-ended-removed (R1 live teardown — never rendered as 'reconnecting')">
-            <ConnectionGate
-              refusal={{ kind: "session-ended-removed" }}
-              onUsePasskey={log("gate.onUsePasskey")}
-              onLinkThisDevice={log("gate.onLinkThisDevice")}
-              onShowPairingInstructions={log("gate.onShowPairingInstructions")}
-              onOpenSecurity={log("gate.onOpenSecurity")}
-            />
-          </Example>
-          <Example label="trust-path-broken — passkey available">
-            <ConnectionGate
-              refusal={{
-                kind: "trust-path-broken",
-                throughDeviceName: "iPhone",
-                passkeyAvailable: true,
-              }}
-              onUsePasskey={log("gate.onUsePasskey")}
-              onLinkThisDevice={log("gate.onLinkThisDevice")}
-              onShowPairingInstructions={log("gate.onShowPairingInstructions")}
-              onOpenSecurity={log("gate.onOpenSecurity")}
-            />
-          </Example>
-          <Example label="trust-path-broken — no passkey">
-            <ConnectionGate
-              refusal={{
-                kind: "trust-path-broken",
-                throughDeviceName: "Framework laptop",
-                passkeyAvailable: false,
-              }}
-              onUsePasskey={log("gate.onUsePasskey")}
-              onLinkThisDevice={log("gate.onLinkThisDevice")}
-              onShowPairingInstructions={log("gate.onShowPairingInstructions")}
-              onOpenSecurity={log("gate.onOpenSecurity")}
-            />
-          </Example>
-          <Example label="host-orphaned (R5 happened — no remote fix, by design)">
-            <ConnectionGate
-              refusal={{ kind: "host-orphaned", hostName: "minivac" }}
-              onUsePasskey={log("gate.onUsePasskey")}
-              onLinkThisDevice={log("gate.onLinkThisDevice")}
-              onShowPairingInstructions={log("gate.onShowPairingInstructions")}
-              onOpenSecurity={log("gate.onOpenSecurity")}
-            />
-          </Example>
-          <Example label="host-added-elsewhere (R7 gap, no-passkey mode)">
-            <ConnectionGate
-              refusal={{
-                kind: "host-added-elsewhere",
-                hostName: "dream",
-                pairingDeviceName: "Framework laptop",
-              }}
-              onUsePasskey={log("gate.onUsePasskey")}
-              onLinkThisDevice={log("gate.onLinkThisDevice")}
-              onShowPairingInstructions={log("gate.onShowPairingInstructions")}
-              onOpenSecurity={log("gate.onOpenSecurity")}
-            />
-          </Example>
-        </Section>
+          </Variant>
+          <Variant label="Not linked yet">
+            <AccessBlocked variant="not-linked" onLink={noop} onSignOut={noop} />
+          </Variant>
+        </DemoSection>
 
-        <Section
-          title="13 · Session verified chip"
-          note="DESIGN.md §5.7 — always present when connected, so its absence is meaningful."
+        <DemoSection
+          id="history"
+          title="History — the full log"
+          blurb="Every trust change is one sentence. A rogue link is meant to be noticed here, then removed."
         >
-          <Example label="basis: passkey">
-            <VerifiedChip basis={{ kind: "passkey" }} />
-          </Example>
-          <Example label="basis: vouched by a device">
-            <VerifiedChip basis={{ kind: "device", deviceName: "Jeremy's MacBook Pro" }} />
-          </Example>
-        </Section>
+          <Variant label="All events">
+            <PagePanel>
+              <TrustHistory events={history} />
+            </PagePanel>
+          </Variant>
+        </DemoSection>
       </div>
     </main>
+  );
+}
+
+/* ---------- demo chrome (not part of the design system) ---------- */
+
+function DemoSection({
+  id,
+  title,
+  blurb,
+  children,
+}: {
+  id: string;
+  title: string;
+  blurb: string;
+  children: ReactNode;
+}) {
+  return (
+    <section id={id} className="mt-14 border-t border-zinc-800/60 pt-12">
+      <h2 className="text-lg font-medium tracking-tight text-zinc-100">{title}</h2>
+      <p className="mt-1 max-w-xl text-sm leading-relaxed text-zinc-500">{blurb}</p>
+      <div id={`${id}-grid`} className="mt-8 flex flex-wrap items-start gap-x-8 gap-y-10">
+        {children}
+      </div>
+    </section>
+  );
+}
+
+function Variant({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="min-w-0 max-w-full">
+      <p className="mb-3 text-[11px] font-medium uppercase tracking-wider text-zinc-600">{label}</p>
+      {children}
+    </div>
+  );
+}
+
+/** Frames full-page surfaces (roster, history) the way `Screen` frames flows. */
+function PagePanel({ children }: { children: ReactNode }) {
+  return (
+    <div className="max-w-full rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 shadow-xl shadow-black/20 sm:p-6">
+      {children}
+    </div>
+  );
+}
+
+/** What the daemon prints during `spawnd possess` — shown for flow context. */
+function TerminalMock() {
+  return (
+    <div className="w-[340px] rounded-2xl border border-zinc-800 bg-zinc-950 p-5 font-mono text-[13px] leading-relaxed shadow-xl shadow-black/20">
+      <p className="text-zinc-500">
+        <span className="select-none">$ </span>spawnd possess
+      </p>
+      <p className="mt-1 text-zinc-400">Connecting this computer to your account…</p>
+      <p className="mt-4 text-zinc-500">Your number:</p>
+      <p className="mt-1 text-2xl font-semibold tabular-nums tracking-[0.14em] text-zinc-50">
+        923 579
+      </p>
+      <p className="mt-4 text-zinc-400">On your device, enter this number.</p>
+    </div>
   );
 }
