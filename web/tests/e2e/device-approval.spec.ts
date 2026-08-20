@@ -137,15 +137,15 @@ test("device approval shows the locally derived fingerprint before confirmation"
   });
 
   await page.goto("/device");
-  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Look up host" }).click();
+  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Continue" }).click();
 
   await expect(page.getByTestId("host-key-fingerprint")).toHaveText(hostFingerprint);
   await expect(page.getByText("build-host", { exact: false })).toBeVisible();
   expect(approved).toBe(false);
 
-  await page.getByRole("button", { name: "Approve", exact: true }).click();
-  await expect(page.getByRole("status")).toContainText("build-host is connected");
+  await page.getByRole("button", { name: "They match" }).click();
+  await expect(page.getByTestId("ceremony-done")).toContainText("build-host is possessed");
   expect(approved).toBe(true);
   expect(localPinAtServerApproval).toMatchObject([
     {
@@ -236,11 +236,11 @@ test("blocks first contact when the server fingerprint disagrees with the host k
   });
 
   await page.goto("/device");
-  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Look up host" }).click();
+  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Continue" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText(
-    "fingerprint did not match its public key",
+    "fingerprint did not match its key",
   );
   await expect(page.getByTestId("host-key-fingerprint")).not.toBeVisible();
   expect(approveCalled).toBe(false);
@@ -309,23 +309,22 @@ test("server approval failure retains a reload-safe local pin and offers explici
   });
 
   await page.goto("/device");
-  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Look up host" }).click();
+  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
-  await page.getByRole("button", { name: "Approve", exact: true }).click();
+  await page.getByRole("button", { name: "They match" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText("review the device code again");
-  await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Retry server approval" })).toBeVisible();
-  await expect(page.getByRole("status")).toContainText("Saved in this browser");
+  await expect(page.locator("p[role=alert]")).toContainText("saved in this browser");
+  await expect(page.getByRole("button", { name: "Retry", exact: true })).toBeVisible();
   expect(await readHostPins(page)).toMatchObject([
     { state: "active", hostPublicKey: HOST_PUBLIC_KEY },
   ]);
 
   await page.reload();
-  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Look up host" }).click();
-  await expect(page.getByRole("button", { name: "Retry server approval" })).toBeVisible();
+  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByRole("button", { name: "They match" })).toBeVisible();
 });
 
 test("substituted approval response fails loudly while preserving retryable local trust", async ({
@@ -404,15 +403,14 @@ test("substituted approval response fails loudly while preserving retryable loca
   });
 
   await page.goto("/device");
-  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Look up host" }).click();
-  await page.getByRole("button", { name: "Approve", exact: true }).click();
+  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page.getByRole("button", { name: "They match" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText(
-    "Approval response changed the reviewed host or browser identity",
+    "approval response changed the reviewed host or browser identity",
   );
-  await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Retry server approval" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry", exact: true })).toBeVisible();
   expect(await readHostPins(page)).toMatchObject([
     { state: "active", hostPublicKey: HOST_PUBLIC_KEY },
   ]);
@@ -464,11 +462,11 @@ test("local pin write corruption blocks approval before any server call", async 
   });
 
   await page.goto("/device");
-  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Look up host" }).click();
+  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Continue" }).click();
   await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
   await corruptHostPinStore(page);
-  await page.getByRole("button", { name: "Approve", exact: true }).click();
+  await page.getByRole("button", { name: "They match" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText("stored host pin");
   expect(approveCalls).toBe(0);
@@ -545,19 +543,19 @@ test("two native Chromium tabs converge on one exact local pin", async ({ contex
   await installRoutes(secondPage);
   await Promise.all([page.goto("/device"), secondPage.goto("/device")]);
   await Promise.all([
-    page.getByLabel("Code from the terminal").fill("QZ4K-7HMT"),
-    secondPage.getByLabel("Code from the terminal").fill("QZ4K-7HMT"),
+    page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT"),
+    secondPage.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT"),
   ]);
   await Promise.all([
-    page.getByRole("button", { name: "Look up host" }).click(),
-    secondPage.getByRole("button", { name: "Look up host" }).click(),
+    page.getByRole("button", { name: "Continue" }).click(),
+    secondPage.getByRole("button", { name: "Continue" }).click(),
   ]);
   await Promise.all([
-    page.getByRole("button", { name: "Approve", exact: true }).click(),
-    secondPage.getByRole("button", { name: "Approve", exact: true }).click(),
+    page.getByRole("button", { name: "They match" }).click(),
+    secondPage.getByRole("button", { name: "They match" }).click(),
   ]);
-  await expect(page.getByRole("status")).toContainText("is connected");
-  await expect(secondPage.getByRole("status")).toContainText("is connected");
+  await expect(page.getByTestId("ceremony-done")).toContainText("is possessed");
+  await expect(secondPage.getByTestId("ceremony-done")).toContainText("is possessed");
   expect(await readHostPins(page)).toMatchObject([
     { hostPublicKey: HOST_PUBLIC_KEY, state: "active" },
   ]);

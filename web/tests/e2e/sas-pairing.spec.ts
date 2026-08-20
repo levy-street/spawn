@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import { expect, type Page, test } from "@playwright/test";
 
-// The committed-ephemeral SAS on /device (docs/TRUST_DEVICE_MESH.md Appendix A):
-// the browser contributes Nb, the daemon reveals Nd, the browser verifies the
-// commitment opens and shows the 6-digit number. A relay that reveals a
-// mismatched Nd (a substitution) must be caught by the commit check.
+// The committed-ephemeral SAS on /device (docs/TRUST_DEVICE_MESH.md Appendix A),
+// entry-style per docs/TRUST_UX.md: the browser contributes Nb, the daemon
+// reveals Nd, the browser verifies the commitment opens and then asks the
+// operator to TYPE the six digits the host's terminal shows. A correct entry is
+// the approval; a relay that reveals a mismatched Nd (a substitution) must be
+// caught by the commit check before any number is accepted.
 
 const USER_ID = "00000000-0000-4000-8000-000000000001";
 const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
@@ -26,12 +28,31 @@ function sasCommit(hostKeyB64url: string, nd: Buffer): string {
     .toString("base64url");
 }
 
+/** The six digits both endpoints derive — byte-identical to src/lib/sas.ts. */
+function sasDigits(hostKey: Buffer, browserKey: Buffer, nd: Buffer, nb: Buffer): string {
+  const digest = createHash("sha256")
+    .update(Buffer.concat([Buffer.from("SPAWN-SAS-V1"), hostKey, browserKey, nd, nb]))
+    .digest();
+  const n = ((digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]) >>> 0;
+  return (n % 1_000_000).toString().padStart(6, "0");
+}
+
+interface Contribution {
+  nb: Buffer;
+  browserKey: Buffer;
+}
+
 /** Install the common auth + browser-registration mocks, plus a SAS-aware
  * device flow. `revealedNd` is what the "daemon" reveals — pass a tampered value
- * to simulate a substituting relay. */
-async function installRoutes(page: Page, opts: { revealedNd: Buffer }): Promise<void> {
+ * to simulate a substituting relay. Returns a handle that captures the
+ * browser's contribution, from which the test derives the number the host's
+ * terminal would be showing. */
+async function installRoutes(
+  page: Page,
+  opts: { revealedNd: Buffer },
+): Promise<{ contribution: () => Contribution | null }> {
   const commit = sasCommit(HOST_PUBLIC_KEY, ND);
-  let contributed = false;
+  let contribution: Contribution | null = null;
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/me") {
@@ -55,7 +76,14 @@ async function installRoutes(page: Page, opts: { revealedNd: Buffer }): Promise<
       return;
     }
     if (path === "/api/auth/device/sas") {
-      contributed = true;
+      const body = route.request().postDataJSON() as {
+        sas_browser_nonce: string;
+        browser_public_key: string;
+      };
+      contribution = {
+        nb: Buffer.from(body.sas_browser_nonce, "base64url"),
+        browserKey: Buffer.from(body.browser_public_key, "base64url"),
+      };
       await route.fulfill({ json: { ok: true } });
       return;
     }
@@ -69,7 +97,7 @@ async function installRoutes(page: Page, opts: { revealedNd: Buffer }): Promise<
           host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
           sas_commit: commit,
           // Nd is revealed only after the browser has contributed Nb.
-          sas_host_nonce: contributed ? opts.revealedNd.toString("base64url") : null,
+          sas_host_nonce: contribution !== null ? opts.revealedNd.toString("base64url") : null,
         },
       });
       return;
@@ -93,22 +121,65 @@ async function installRoutes(page: Page, opts: { revealedNd: Buffer }): Promise<
     }
     await route.fulfill({ status: 404, json: { detail: "not mocked" } });
   });
+  return { contribution: () => contribution };
 }
 
-test("SAS pairing shows a 6-digit number and approves", async ({ page }) => {
-  await installRoutes(page, { revealedNd: ND });
+test("possess types the six digits; a wrong entry burns a try, the right one approves", async ({
+  page,
+}) => {
+  const routes = await installRoutes(page, { revealedNd: ND });
   await page.goto("/device");
-  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Look up host" }).click();
+  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Continue" }).click();
 
-  // The committed-ephemeral number appears (not the "· · ·" placeholder).
-  await expect(page.getByTestId("verification-code")).toHaveText(/^\d{3} \d{3}$/, {
+  // The entry field appears once the commitment opened and the SAS is derivable.
+  const entry = page.getByTestId("number-entry");
+  await expect(entry).toBeVisible({ timeout: 15_000 });
+  const contribution = routes.contribution();
+  if (contribution === null) throw new Error("browser never contributed Nb");
+  const digits = sasDigits(
+    Buffer.from(HOST_PUBLIC_KEY, "base64url"),
+    contribution.browserKey,
+    ND,
+    contribution.nb,
+  );
+
+  // A wrong number is feedback, not approval.
+  const wrong = digits.replace(/\d/g, (d) => String((Number(d) + 1) % 10));
+  await entry.fill(wrong);
+  await expect(page.getByTestId("entry-error")).toContainText("2 tries left");
+
+  // The right number IS the approval.
+  await entry.fill(digits);
+  await expect(page.getByTestId("ceremony-done")).toContainText("sas-host is possessed", {
     timeout: 15_000,
   });
-  const approve = page.getByRole("button", { name: "Approve", exact: true });
-  await expect(approve).toBeEnabled();
-  await approve.click();
-  await expect(page.getByRole("status")).toContainText("is connected");
+});
+
+test("three wrong entries end the ceremony with nothing trusted", async ({ page }) => {
+  const routes = await installRoutes(page, { revealedNd: ND });
+  await page.goto("/device");
+  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Continue" }).click();
+
+  const entry = page.getByTestId("number-entry");
+  await expect(entry).toBeVisible({ timeout: 15_000 });
+  const contribution = routes.contribution();
+  if (contribution === null) throw new Error("browser never contributed Nb");
+  const digits = sasDigits(
+    Buffer.from(HOST_PUBLIC_KEY, "base64url"),
+    contribution.browserKey,
+    ND,
+    contribution.nb,
+  );
+  const wrong = digits.replace(/\d/g, (d) => String((Number(d) + 1) % 10));
+  await entry.fill(wrong);
+  await expect(page.getByTestId("entry-error")).toContainText("2 tries left");
+  await entry.fill(wrong);
+  await expect(page.getByTestId("entry-error")).toContainText("1 try left");
+  await entry.fill(wrong);
+  await expect(page.getByTestId("number-check")).toHaveAttribute("data-phase", "stopped");
+  await expect(page.getByText("The numbers don't match")).toBeVisible();
 });
 
 test("a relay that reveals a mismatched Nd is caught by the commit check", async ({ page }) => {
@@ -116,13 +187,12 @@ test("a relay that reveals a mismatched Nd is caught by the commit check", async
   // what a substituting relay would have to do. The browser must refuse.
   await installRoutes(page, { revealedNd: Buffer.alloc(32, 8) });
   await page.goto("/device");
-  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Look up host" }).click();
+  await page.getByLabel("Code from the host's terminal").fill("QZ4K-7HMT");
+  await page.getByRole("button", { name: "Continue" }).click();
 
   await expect(page.locator("p[role=alert]")).toContainText("commitment did not open", {
     timeout: 15_000,
   });
-  // No number was shown, and approval is blocked.
-  await expect(page.getByTestId("verification-code")).toHaveText("· · ·");
-  await expect(page.getByRole("button", { name: "Approve", exact: true })).toBeDisabled();
+  // No entry field is offered: there is no sound number to check against.
+  await expect(page.getByTestId("number-entry")).toHaveCount(0);
 });

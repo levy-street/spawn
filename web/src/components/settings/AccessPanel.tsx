@@ -670,7 +670,7 @@ export function AccessPanel() {
 
           {/* Legacy per-host approval (mesh R9): only toward hosts that have
               not advertised account-chain support. */}
-          {canApproveLegacy && waitingDevices.length > 0 && user && (
+          {canApproveLegacy && (waitingDevices.length > 0 || legacyNote !== null) && user && (
             <div className="space-y-2 rounded-md border border-border p-3">
               <p className="text-sm font-medium">Approve for older hosts</p>
               <p className="text-xs text-muted-foreground">
