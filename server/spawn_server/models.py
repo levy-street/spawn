@@ -85,7 +85,13 @@ class BrowserDevice(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
+    # Stamped whenever the device's identity registration reconciles (each app
+    # load) — an honest "last seen" without per-request tracking.
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Which of the account's devices asked for the revocation (R4: the removed
+    # screen names its remover). Advisory display data, never authorization.
+    revoked_by_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     owner: Mapped[User] = relationship(back_populates="browser_devices")
     host_pins: Mapped[list[HostBrowserPin]] = relationship(

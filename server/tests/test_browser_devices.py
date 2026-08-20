@@ -112,7 +112,11 @@ async def test_registration_is_authenticated_idempotent_and_account_scoped(clien
     assert first.status_code == 200, first.text
     repeated = await client.post("/api/browser-devices/register", json=proof, headers=headers)
     assert repeated.status_code == 200, repeated.text
-    assert repeated.json() == first.json()
+    # Identical except last_seen_at, which each reconcile legitimately advances
+    # (it is the Access screen's "Seen …" value).
+    repeated_body, first_body = repeated.json(), first.json()
+    assert repeated_body.pop("last_seen_at") >= first_body.pop("last_seen_at")
+    assert repeated_body == first_body
     assert first.json()["public_key"] == proof["public_key"]
     assert first.json()["fingerprint"].startswith("SHA256:")
     assert first.json()["revoked_at"] is None
@@ -127,7 +131,11 @@ async def test_registration_is_authenticated_idempotent_and_account_scoped(clien
 
     listing = await client.get("/api/browser-devices", headers=headers)
     assert listing.status_code == 200
-    assert listing.json() == [first.json()]
+    listed = listing.json()
+    assert len(listed) == 1
+    listed_body, first_again = listed[0], first.json()
+    assert listed_body.pop("last_seen_at") >= first_again.pop("last_seen_at")
+    assert listed_body == first_again
     other_listing = await client.get(
         "/api/browser-devices", headers={"Authorization": f"Bearer {second_token}"}
     )

@@ -82,6 +82,10 @@ class BrowserDeviceRevokeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_public_key: str = Field(min_length=43, max_length=43)
+    # Which of the caller's devices is asking — display attribution only (the
+    # removed screen names its remover, R4); ignored if it isn't a live device
+    # of this account. Never an authorization input.
+    revoked_by_device_id: str | None = Field(default=None, min_length=36, max_length=36)
 
     @field_validator("expected_public_key")
     @classmethod
@@ -97,7 +101,9 @@ class BrowserDeviceOut(BaseModel):
     fingerprint: str
     label: str | None = None
     created_at: datetime
+    last_seen_at: datetime | None = None
     revoked_at: datetime | None = None
+    revoked_by_device_id: str | None = None
     # True for the account root (pk_R): clients filter it out of connect/ceremony
     # lists since it never connects — it only endorses and anchors.
     is_root: bool = False
