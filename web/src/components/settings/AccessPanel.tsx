@@ -17,7 +17,6 @@ import { type BrowserDevice, browserDevices, hosts as hostsApi, trust } from "@/
 import { useAuth } from "@/lib/auth";
 import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
 import {
-  allowExplicitBrowserIdentityReplacement,
   type BrowserDeviceRegistrationState,
   beginBrowserDeviceLocalCleanup,
   browserDeviceRegistrationQueryKey,
@@ -199,17 +198,21 @@ export function AccessPanel() {
       }
       if (device.public_key !== currentPublicKey) return revoked;
 
-      // Disable identity-dependent actions immediately after the server
-      // confirms revocation, even if durable local cleanup fails below.
+      // Removing THIS device: disable identity-dependent actions immediately,
+      // clean up the dead key, then let registration re-run — it mints a fresh
+      // identity and this browser reappears as an ordinary waiting device.
+      // Seamless by design: removal kills the KEY forever (R10); presence is
+      // just a sign-in, and approval is the only gate that matters.
       setRegistrationState({ status: "cleanup_pending", publicKey: device.public_key });
       try {
         const localStatus = await beginBrowserDeviceLocalCleanup(user.id, device.public_key);
         setRegistrationState({ status: localStatus, publicKey: device.public_key });
         if (localStatus === "cleanup_pending") {
           await finishBrowserDeviceLocalCleanup(user.id, device.public_key);
-          setRegistrationState({ status: "revoked", publicKey: device.public_key });
-          qc.setQueryData(["browser-device-local-identity", user.id], null);
         }
+        qc.setQueryData(["browser-device-local-identity", user.id], null);
+        void qc.invalidateQueries({ queryKey: browserDeviceRegistrationQueryKey(user.id) });
+        void qc.invalidateQueries({ queryKey: ["browser-device-local-identity", user.id] });
       } catch (cause) {
         const detail = cause instanceof Error ? cause.message : String(cause);
         throw new Error(`The device was removed, but local key cleanup failed: ${detail}`);
@@ -229,35 +232,12 @@ export function AccessPanel() {
     setError(null);
     try {
       await finishBrowserDeviceLocalCleanup(user.id, expectedPublicKey);
-      setRegistrationState({ status: "revoked", publicKey: expectedPublicKey });
       qc.setQueryData(["browser-device-local-identity", user.id], null);
-    } catch (cause) {
-      setError(`Local key cleanup still failed: ${cause instanceof Error ? cause.message : cause}`);
-    }
-  };
-
-  /**
-   * One explicit action for "this browser was removed, get me going again":
-   * clean up the dead local key (idempotent) and authorize minting a fresh
-   * identity. Still a single deliberate user click — a removed browser never
-   * silently re-mints itself.
-   */
-  const startFresh = async (publicKey: string) => {
-    if (!user) return;
-    setError(null);
-    try {
-      const status = await beginBrowserDeviceLocalCleanup(user.id, publicKey);
-      setRegistrationState({ status, publicKey });
-      if (status === "cleanup_pending") {
-        await finishBrowserDeviceLocalCleanup(user.id, publicKey);
-      }
-      setRegistrationState({ status: "revoked", publicKey });
-      qc.setQueryData(["browser-device-local-identity", user.id], null);
-      allowExplicitBrowserIdentityReplacement(user.id, publicKey);
+      // Registration re-runs and replaces the cleaned-up key seamlessly.
       void qc.invalidateQueries({ queryKey: browserDeviceRegistrationQueryKey(user.id) });
       void qc.invalidateQueries({ queryKey: ["browser-device-local-identity", user.id] });
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(`Local key cleanup still failed: ${cause instanceof Error ? cause.message : cause}`);
     }
   };
 
@@ -375,17 +355,6 @@ export function AccessPanel() {
             onClick={() => void retryCleanup(registration.data!.publicKey)}
           >
             Retry
-          </Button>
-        </div>
-      )}
-      {registration.data?.status === "revoked" && (
-        <div className="space-y-2 rounded-md border border-border p-3" role="status">
-          <p className="text-sm">
-            This device was removed{describeRemoval(allDevices, registration.data.publicKey)}. It
-            can start over as a new device — it will appear in the list, waiting for approval.
-          </p>
-          <Button size="sm" onClick={() => void startFresh(registration.data!.publicKey)}>
-            Start over
           </Button>
         </div>
       )}
@@ -946,19 +915,6 @@ export function AccessPanel() {
     row can't be confused ("Approved … Jun 3" vs "Seen Aug 12"). */
 function seen(lastSeen: string): string {
   return lastSeen === "Now" ? "Now" : `Seen ${lastSeen}`;
-}
-
-/** " — Aug 20, by Chrome on Mac" when the tombstone is still known (R4: the
-    sharp end of a removal names its remover). Empty when history was cleared. */
-function describeRemoval(devices: BrowserDevice[], publicKey: string): string {
-  const tombstone = devices.find((d) => d.public_key === publicKey && d.revoked_at !== null);
-  if (!tombstone?.revoked_at) return "";
-  const when = new Date(tombstone.revoked_at).toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-  });
-  const remover = devices.find((d) => d.id === tombstone.revoked_by_device_id);
-  return remover?.label ? ` — ${when}, by ${remover.label}` : ` — ${when}`;
 }
 
 /**
