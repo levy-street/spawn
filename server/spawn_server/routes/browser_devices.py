@@ -29,6 +29,7 @@ def _to_out(device: BrowserDevice) -> schemas.BrowserDeviceOut:
         label=device.label,
         created_at=device.created_at,
         revoked_at=device.revoked_at,
+        is_root=device.is_root,
     )
 
 
@@ -69,6 +70,21 @@ async def register_browser_device(
     if existing is not None:
         return _registration_result(existing, user_id)
 
+    if body.is_root:
+        # At most one account root. A live root already present means this is a
+        # stale/duplicate mint; refuse rather than fork the account's anchor.
+        already_root = (
+            await session.execute(
+                select(BrowserDevice.id).where(
+                    BrowserDevice.owner_user_id == user_id,
+                    BrowserDevice.is_root.is_(True),
+                    BrowserDevice.revoked_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if already_root is not None:
+            raise HTTPException(status_code=409, detail="account already has a root")
+
     device = BrowserDevice(
         id=str(uuid.uuid4()),
         owner_user_id=user_id,
@@ -77,6 +93,7 @@ async def register_browser_device(
         # Only on first registration. Re-registration returns the existing row,
         # so a name the operator chose is never overwritten by a later default.
         label=body.label,
+        is_root=body.is_root,
     )
     session.add(device)
     try:

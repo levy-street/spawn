@@ -65,6 +65,11 @@ class BrowserDeviceRegisterRequest(BaseModel):
         min_length=ED25519_SIGNATURE_B64URL_LENGTH,
         max_length=ED25519_SIGNATURE_B64URL_LENGTH,
     )
+    # Register this key as the account ROOT (pk_R), not a browser (device mesh
+    # §3). Not bound in the registration proof: is_root grants no trust on its
+    # own (a root anchors only via possess/re-anchor, never automatically), so a
+    # server flipping it is at most a denial of service, which it can do anyway.
+    is_root: bool = False
 
     @field_validator("public_key")
     @classmethod
@@ -93,6 +98,9 @@ class BrowserDeviceOut(BaseModel):
     label: str | None = None
     created_at: datetime
     revoked_at: datetime | None = None
+    # True for the account root (pk_R): clients filter it out of connect/ceremony
+    # lists since it never connects — it only endorses and anchors.
+    is_root: bool = False
 
 
 class BrowserDeviceRenameRequest(BaseModel):

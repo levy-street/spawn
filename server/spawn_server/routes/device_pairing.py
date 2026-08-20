@@ -94,6 +94,10 @@ async def start_pairing(
     for device in (initiator, joiner):
         if device.revoked_at is not None:
             raise HTTPException(status_code=409, detail="revoked devices cannot pair")
+        if device.is_root:
+            # The root never runs a browser↔browser SAS: it has no browser and
+            # never connects. It endorses (R→d) via the passkey, not by pairing.
+            raise HTTPException(status_code=422, detail="the account root cannot pair")
 
     now = datetime.now(UTC)
     active = (

@@ -442,6 +442,11 @@ async def create_account_endorsement(
             raise HTTPException(
                 status_code=409, detail="revoked browser devices cannot endorse or be endorsed"
             )
+    if endorsed.is_root:
+        # The root anchors trust; nothing endorses it. R only ever appears as the
+        # ENDORSER (R→d). Endorsing the root would be meaningless and confuse the
+        # graph, so refuse it.
+        raise HTTPException(status_code=422, detail="the account root cannot be endorsed")
 
     verify_acct_endorsement_proof(
         account_id=user_id,
