@@ -11,7 +11,6 @@ import { closeSettings } from "@/components/settings/settings-dialog-store";
 import { EndorseDevicePanel, useDeviceTrustMap } from "@/components/trust/device-endorsement";
 import { IntroductionPanel } from "@/components/trust/introduction-panel";
 import { Button } from "@/components/ui/button";
-import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { type AccessPinDetail, deriveAccessView } from "@/lib/access-view";
 import { type BrowserDevice, browserDevices, hosts as hostsApi, trust } from "@/lib/api";
@@ -285,6 +284,7 @@ export function AccessPanel() {
   });
 
   // Dialog state.
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<BrowserDevice | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [removeTarget, setRemoveTarget] = useState<BrowserDevice | null>(null);
@@ -469,7 +469,7 @@ export function AccessPanel() {
             return (
               <div
                 key={vm.id}
-                className="flex items-center gap-3 px-4 py-3"
+                className="relative flex items-center gap-3 px-4 py-3"
                 data-testid="device-row"
               >
                 <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
@@ -518,30 +518,20 @@ export function AccessPanel() {
                   </span>
                 )}
                 {device && (
-                  <DropdownMenu
-                    renderTrigger={(props) => (
-                      <button
-                        type="button"
-                        {...props}
-                        aria-label={`Options for ${vm.name}`}
-                        className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                      >
-                        <MoreHorizontal className="size-4" />
-                      </button>
-                    )}
-                  >
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        setRenameTarget(device);
-                        setRenameValue(device.label ?? "");
-                      }}
-                    >
-                      Rename
-                    </DropdownMenuItem>
-                    <DropdownMenuItem destructive onSelect={() => setRemoveTarget(device)}>
-                      Remove…
-                    </DropdownMenuItem>
-                  </DropdownMenu>
+                  <RowMenu
+                    label={`Options for ${vm.name}`}
+                    open={openMenuId === vm.id}
+                    onToggle={() => setOpenMenuId(openMenuId === vm.id ? null : vm.id)}
+                    onRename={() => {
+                      setOpenMenuId(null);
+                      setRenameTarget(device);
+                      setRenameValue(device.label ?? "");
+                    }}
+                    onRemove={() => {
+                      setOpenMenuId(null);
+                      setRemoveTarget(device);
+                    }}
+                  />
                 )}
               </div>
             );
@@ -956,4 +946,61 @@ export function AccessPanel() {
     row can't be confused ("Approved … Jun 3" vs "Seen Aug 12"). */
 function seen(lastSeen: string): string {
   return lastSeen === "Now" ? "Now" : `Seen ${lastSeen}`;
+}
+
+/**
+ * Row options as an inline menu, not a portal: the settings dialog is a modal
+ * Radix layer, and it swallows pointer events aimed at anything portaled
+ * outside its subtree.
+ */
+function RowMenu({
+  label,
+  open,
+  onToggle,
+  onRename,
+  onRemove,
+}: {
+  label: string;
+  open: boolean;
+  onToggle: () => void;
+  onRename: () => void;
+  onRemove: () => void;
+}) {
+  return (
+    <>
+      <button
+        type="button"
+        aria-label={label}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        onClick={onToggle}
+        className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+      >
+        <MoreHorizontal className="size-4" />
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-3 top-11 z-10 min-w-36 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={onRename}
+            className="flex w-full items-center rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent"
+          >
+            Rename
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={onRemove}
+            className="flex w-full items-center rounded-md px-2 py-1.5 text-left text-sm text-destructive transition-colors hover:bg-accent"
+          >
+            Remove…
+          </button>
+        </div>
+      )}
+    </>
+  );
 }
