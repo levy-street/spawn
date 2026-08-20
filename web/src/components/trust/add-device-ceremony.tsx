@@ -198,7 +198,11 @@ export function AddDeviceCeremonyPanel({
   };
 
   const active = (pairings.data ?? []).filter((p) => sasByPairing.has(p.id));
-  const others = devices.filter((d) => d.id !== currentDevice.id && d.revoked_at == null);
+  // The account root never pairs (no browser, never connects), so it is never a
+  // target here.
+  const others = devices.filter(
+    (d) => d.id !== currentDevice.id && d.revoked_at == null && !d.is_root,
+  );
 
   const labelFor = (deviceId: string): string =>
     devices.find((d) => d.id === deviceId)?.label ?? "the other device";
