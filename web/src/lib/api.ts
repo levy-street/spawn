@@ -444,6 +444,8 @@ export const browserDevices = {
     public_key: string;
     signature: string;
     label?: string | null;
+    /** Registers the account ROOT (mesh stage 5): at most one per account. */
+    is_root?: boolean;
   }) =>
     api("/api/browser-devices/register", {
       method: "POST",

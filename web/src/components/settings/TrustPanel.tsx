@@ -4,7 +4,19 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
-import { type PasskeyCredential, trust } from "@/lib/api";
+import {
+  AccountHealError,
+  type AccountHealReport,
+  ensureRootRegistered,
+  healAccount,
+} from "@/lib/account-heal";
+import {
+  type AccountRoot,
+  exportAccountRootMaterial,
+  generateAccountRoot,
+  importAccountRoot,
+} from "@/lib/account-root";
+import { browserDevices, type PasskeyCredential, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
 import { browserHostPinServerOrigin, listActiveBrowserHostPins } from "@/lib/browser-host-pins";
@@ -23,6 +35,7 @@ import {
   revokeBackupPasskey,
   sealCurrentTrust,
 } from "@/lib/trust-bootstrap";
+import type { TrustBundleHost } from "@/lib/trust-bundle";
 
 function describe(error: unknown): string {
   if (error instanceof PasskeyPrfError) {
@@ -40,6 +53,43 @@ function describe(error: unknown): string {
     }
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Heal the account off the root while `sk_R` is legitimately in memory — the
+ * mint and unlock moments only. Best-effort by design: the passkey action it
+ * rides on must succeed even when healing cannot (e.g. this device's identity
+ * is not registered yet); trust already granted is never at stake, and the next
+ * passkey moment simply heals again.
+ */
+async function healBestEffort(
+  accountId: string,
+  root: AccountRoot,
+  hosts: readonly TrustBundleHost[],
+): Promise<AccountHealReport | null> {
+  try {
+    await ensureRootRegistered(root, accountId);
+    const identity = await loadBrowserDeviceIdentity(accountId);
+    if (identity === null) return null;
+    return await healAccount(root, accountId, identity, hosts);
+  } catch (error) {
+    // A conflicting root is a trust failure (a substituted is_root row), never
+    // something to paper over silently.
+    if (error instanceof AccountHealError && error.code === "root_conflict") throw error;
+    return null;
+  }
+}
+
+function describeHeal(report: AccountHealReport | null): string {
+  if (report === null) return "";
+  const healed = report.endorsedDeviceIds.length;
+  const parts: string[] = [];
+  if (healed > 0) parts.push(`${healed} device${healed === 1 ? "" : "s"} re-rooted`);
+  if (report.hostsUpgraded > 0)
+    parts.push(
+      `${report.hostsUpgraded} host${report.hostsUpgraded === 1 ? "" : "s"} anchored on your account root`,
+    );
+  return parts.length === 0 ? "" : ` Healed: ${parts.join(", ")}.`;
 }
 
 export function TrustPanel() {
@@ -109,6 +159,19 @@ export function TrustPanel() {
         );
       }
 
+      // Preflight the account root BEFORE the passkey gesture: a live root from
+      // an earlier setup (whose seed this bundle would not hold) must stop us
+      // here, not after the operator has enrolled an authenticator.
+      const priorRoot = (await browserDevices.list()).find(
+        (d) => d.is_root && d.revoked_at === null,
+      );
+      if (priorRoot !== undefined) {
+        throw new Error(
+          "This account already has a root key from a previous setup. Revoke it under Devices " +
+            "before setting up a new passkey, so the new bundle can mint a fresh one.",
+        );
+      }
+
       const passkey = await createTrustPasskey(id, user?.email ?? "spawn operator");
       if (!passkey.prfEnabled) {
         throw new PasskeyPrfError(
@@ -118,21 +181,43 @@ export function TrustPanel() {
       }
       await trust.addPasskey(passkey.credentialId, "this device");
 
+      // Mint the account root with the passkey (mesh stage 5c): its seed is
+      // sealed into this bundle, so any passkey unlock can heal the account.
+      const root = await generateAccountRoot();
+
       const { secret } = await evaluateTrustPrf(id, [passkey.credentialId]);
       const { sealed, hostCount, revision } = await sealCurrentTrust(
         { credentialId: passkey.credentialId, prfSecret: secret },
         { accountId: id },
         0,
+        await exportAccountRootMaterial(root),
       );
       await trust.putBundle(sealed, undefined);
       // Advance the rollback floor only after the bundle is durably stored.
       await recordBundleRevision({ accountId: id }, revision);
-      return hostCount;
+
+      // Register + heal only after the sealed seed is durably stored: a root
+      // the bundle cannot recover must never become an endorser or anchor.
+      const pins = await listActiveBrowserHostPins(
+        { accountId: id, origin: browserHostPinServerOrigin() },
+        {},
+      );
+      const report = await healBestEffort(
+        id,
+        root,
+        pins.map((pin) => ({
+          hostPublicKey: pin.hostPublicKey,
+          hostFingerprint: pin.hostFingerprint,
+          hostIds: pin.hostIds,
+        })),
+      );
+      return { hostCount, report };
     },
     onMutate: begin,
-    onSuccess: (hostCount) => {
+    onSuccess: ({ hostCount, report }) => {
       setStatus(
-        `Passkey ready. ${hostCount} verified host${hostCount === 1 ? "" : "s"} sealed into your trust bundle.`,
+        `Passkey ready. ${hostCount} verified host${hostCount === 1 ? "" : "s"} sealed into your trust bundle.` +
+          describeHeal(report),
       );
       queryClient.invalidateQueries({ queryKey: ["trust"] });
     },
@@ -151,21 +236,30 @@ export function TrustPanel() {
       }
       const known = (await trust.listPasskeys()).map((row) => row.credential_id);
       const { credentialId, secret } = await evaluateTrustPrf(id, known);
-      return importTrustBundle({ credentialId, prfSecret: secret }, stored.sealed, {
+      const imported = await importTrustBundle({ credentialId, prfSecret: secret }, stored.sealed, {
         accountId: id,
       });
+
+      // The heal moment (mesh stage 5c): the unlock proved the passkey, so the
+      // sealed root is legitimately in memory. Re-root every device off R and
+      // upgrade hosts to anchor on it, then let the key go out of scope.
+      let report: AccountHealReport | null = null;
+      if (imported.root !== null) {
+        report = await healBestEffort(id, await importAccountRoot(imported.root), imported.hosts);
+      }
+      return { imported, report };
     },
     onMutate: begin,
-    onSuccess: (result) => {
+    onSuccess: ({ imported, report }) => {
       const base =
-        result.added.length === 0
-          ? `Already up to date — ${result.alreadyTrusted.length} host${result.alreadyTrusted.length === 1 ? "" : "s"} already trusted on this device.`
-          : `Imported ${result.added.length} host${result.added.length === 1 ? "" : "s"} onto this device.`;
+        imported.added.length === 0
+          ? `Already up to date — ${imported.alreadyTrusted.length} host${imported.alreadyTrusted.length === 1 ? "" : "s"} already trusted on this device.`
+          : `Imported ${imported.added.length} host${imported.added.length === 1 ? "" : "s"} onto this device.`;
       const skipped =
-        result.skippedRevoked.length === 0
+        imported.skippedRevoked.length === 0
           ? ""
-          : ` ${result.skippedRevoked.length} host${result.skippedRevoked.length === 1 ? "" : "s"} you revoked here ${result.skippedRevoked.length === 1 ? "was" : "were"} left revoked.`;
-      setStatus(base + skipped);
+          : ` ${imported.skippedRevoked.length} host${imported.skippedRevoked.length === 1 ? "" : "s"} you revoked here ${imported.skippedRevoked.length === 1 ? "was" : "were"} left revoked.`;
+      setStatus(base + skipped + describeHeal(report));
       queryClient.invalidateQueries({ queryKey: ["trust"] });
     },
     onError: (err) => setError(describe(err)),

@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
   createRootEndorsementProof,
+  createRootRegistrationProof,
   exportAccountRootMaterial,
   generateAccountRoot,
   importAccountRoot,
 } from "./account-root";
 import { encodeAcctEndorsementTranscript } from "./acct-endorsement-transcript";
+import { encodeBrowserDeviceRegistrationTranscript } from "./browser-device-registration-transcript";
 import { decodeEd25519PublicKeyWire } from "./signed-signal";
 
 const ACCOUNT = "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
@@ -29,13 +31,9 @@ async function verifyRootEndorsement(
   const rawKey = decodeEd25519PublicKeyWire(rootPublicKeyWire);
   const keyBuf = new ArrayBuffer(rawKey.byteLength);
   new Uint8Array(keyBuf).set(rawKey);
-  const publicKey = await crypto.subtle.importKey(
-    "raw",
-    keyBuf,
-    { name: "Ed25519" },
-    false,
-    ["verify"],
-  );
+  const publicKey = await crypto.subtle.importKey("raw", keyBuf, { name: "Ed25519" }, false, [
+    "verify",
+  ]);
   const sigBytes = Uint8Array.from(atob(signatureWire.replace(/-/g, "+").replace(/_/g, "/")), (c) =>
     c.charCodeAt(0),
   );
@@ -75,5 +73,26 @@ describe("account root", () => {
     await expect(
       createRootEndorsementProof(root, ACCOUNT, root.publicKeyWire, DEVICE),
     ).rejects.toThrow();
+  });
+
+  test("the root signs its own registration proof, verifiable under pk_R", async () => {
+    const root = await generateAccountRoot();
+    const sig = await createRootRegistrationProof(root, ACCOUNT);
+
+    const transcript = encodeBrowserDeviceRegistrationTranscript(ACCOUNT, root.publicKeyWire);
+    const owned = new ArrayBuffer(transcript.byteLength);
+    new Uint8Array(owned).set(transcript);
+    const rawKey = decodeEd25519PublicKeyWire(root.publicKeyWire);
+    const keyBuf = new ArrayBuffer(rawKey.byteLength);
+    new Uint8Array(keyBuf).set(rawKey);
+    const publicKey = await crypto.subtle.importKey("raw", keyBuf, { name: "Ed25519" }, false, [
+      "verify",
+    ]);
+    const sigBytes = Uint8Array.from(atob(sig.replace(/-/g, "+").replace(/_/g, "/")), (c) =>
+      c.charCodeAt(0),
+    );
+    const sigBuf = new ArrayBuffer(sigBytes.byteLength);
+    new Uint8Array(sigBuf).set(sigBytes);
+    expect(await crypto.subtle.verify({ name: "Ed25519" }, publicKey, sigBuf, owned)).toBe(true);
   });
 });
