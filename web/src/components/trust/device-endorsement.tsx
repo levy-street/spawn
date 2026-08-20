@@ -37,7 +37,7 @@ export function useDeviceTrustMap(enabled: boolean) {
           byDevice.set(deviceId, [...(byDevice.get(deviceId) ?? []), hostId]);
         }
       }
-      return byDevice;
+      return { byDevice, byHost: new Map(entries) };
     },
     enabled: enabled && keyedHosts.length > 0,
     refetchInterval: 15_000,
@@ -45,7 +45,11 @@ export function useDeviceTrustMap(enabled: boolean) {
   return {
     keyedHosts,
     hostsById: new Map(keyedHosts.map((host) => [host.id, host])),
-    trustedHostIdsFor: (deviceId: string): string[] => pins.data?.get(deviceId) ?? [],
+    trustedHostIdsFor: (deviceId: string): string[] => pins.data?.byDevice.get(deviceId) ?? [],
+    /** Live pin device-ids per host, for R5 sole-trust warnings and the roster. */
+    pinsByHost: pins.data?.byHost ?? new Map<string, string[]>(),
+    /** Devices holding at least one per-host pin: the roster's advisory anchors. */
+    pinnedDeviceIds: new Set(pins.data ? pins.data.byDevice.keys() : []),
     ready: pins.data !== undefined || keyedHosts.length === 0,
   };
 }

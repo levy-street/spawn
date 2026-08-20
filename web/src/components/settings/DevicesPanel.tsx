@@ -22,6 +22,7 @@ import {
   useBrowserDeviceRegistration,
 } from "@/lib/browser-device-registration";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
+import { computeTrustRoster, hostsSolelyTrustedBy } from "@/lib/trust-roster";
 
 export function DevicesPanel() {
   const { user } = useAuth();
@@ -178,6 +179,27 @@ export function DevicesPanel() {
     enabled: user !== null,
   });
 
+  // The R4 roster: the endorsement graph, visible and audited, so a rogue
+  // endorsement (a compromised device silently vouching for an attacker key)
+  // is detectable and revocable. Advisory only — admission stays daemon-side.
+  const accountEdges = useQuery({
+    queryKey: ["account-endorsements"],
+    queryFn: trust.accountEndorsements,
+    enabled: user !== null,
+    refetchInterval: 15_000,
+  });
+  const roster = computeTrustRoster(
+    devices.data ?? [],
+    accountEdges.data ?? [],
+    trustMap.pinnedDeviceIds,
+  );
+  const nameFor = (deviceId: string): string => {
+    const device = (devices.data ?? []).find((d) => d.id === deviceId);
+    if (device === undefined) return "an unknown device";
+    if (device.is_root) return "Account root";
+    return device.label?.trim() || "an unnamed browser";
+  };
+
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const rename = useMutation({
@@ -236,7 +258,9 @@ export function DevicesPanel() {
     const name = deviceName(device);
     const isRenaming = renamingId === device.id;
     const trustedCount = trustMap.trustedHostIdsFor(device.id).length;
-    const showTrustBadge = !device.revoked_at && trustMap.ready;
+    const showTrustBadge = !device.revoked_at && !device.is_root && trustMap.ready;
+    const summary = roster.get(device.id);
+    const vouchers = (summary?.vouchedForBy ?? []).map(nameFor);
     return (
       <div key={device.id} className="p-3">
         <div className="flex items-start justify-between gap-3">
@@ -300,10 +324,22 @@ export function DevicesPanel() {
                     revoked
                   </span>
                 )}
+                {device.is_root && (
+                  <span
+                    className="rounded border border-primary/50 px-1.5 py-0.5 text-[11px] text-primary"
+                    data-testid="root-badge"
+                  >
+                    account root
+                  </span>
+                )}
                 {showTrustBadge &&
                   (trustedCount > 0 ? (
                     <span className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground">
                       trusted · {trustedCount} host{trustedCount === 1 ? "" : "s"}
+                    </span>
+                  ) : summary?.chainTrusted ? (
+                    <span className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                      {summary.rootChild ? "trusted · account root" : "trusted · account chain"}
                     </span>
                   ) : (
                     <span className="rounded border border-amber-600/50 px-1.5 py-0.5 text-[11px] text-amber-700 dark:text-amber-300">
@@ -335,6 +371,19 @@ export function DevicesPanel() {
                 {derivedFingerprint ?? "…"}
               </p>
             )}
+            {/* Provenance (R4): who vouched for this device. A voucher the
+                operator does not recognize is the rogue-CA tell — revoke it. */}
+            {!device.revoked_at && vouchers.length > 0 && (
+              <p className="text-xs text-muted-foreground" data-testid="vouched-for-by">
+                Vouched for by {vouchers.join(", ")}
+              </p>
+            )}
+            {device.is_root && !device.revoked_at && (
+              <p className="text-xs text-muted-foreground">
+                Recovery anchor sealed under your passkey. It endorses your devices and never
+                connects itself.
+              </p>
+            )}
             <p className="text-xs text-muted-foreground">
               Added {new Date(device.created_at).toLocaleDateString()}
               {device.revoked_at &&
@@ -343,30 +392,54 @@ export function DevicesPanel() {
           </div>
           {!device.revoked_at ? (
             <div className="flex shrink-0 gap-2">
-              {!isCurrent && trustMap.ready && trustedCount === 0 && canApproveOthers && (
-                <Button
-                  size="sm"
-                  disabled={derivedFingerprint === null}
-                  onClick={() => {
-                    setApprovalNote(null);
-                    setApprovingId(approvingId === device.id ? null : device.id);
-                  }}
-                >
-                  Approve…
-                </Button>
-              )}
+              {!isCurrent &&
+                !device.is_root &&
+                trustMap.ready &&
+                trustedCount === 0 &&
+                !summary?.chainTrusted &&
+                canApproveOthers && (
+                  <Button
+                    size="sm"
+                    disabled={derivedFingerprint === null}
+                    onClick={() => {
+                      setApprovalNote(null);
+                      setApprovingId(approvingId === device.id ? null : device.id);
+                    }}
+                  >
+                    Approve…
+                  </Button>
+                )}
               <Button
                 size="sm"
                 variant="secondary"
                 disabled={revoke.isPending || derivedFingerprint === null}
                 onClick={() => {
                   const who = name ?? "this unnamed browser";
-                  if (
-                    confirm(
+                  let prompt: string;
+                  if (device.is_root) {
+                    prompt =
+                      `Revoke your ACCOUNT ROOT?\n\nEvery device and host anchored on it loses ` +
+                      `that trust immediately. Do this if you suspect the root (your passkey) ` +
+                      `was compromised. The next passkey unlock mints a fresh root and re-roots ` +
+                      `your devices.\n\nIts key fingerprint is ${derivedFingerprint}.`;
+                  } else {
+                    // R5: revoking a host's only trusted device orphans that
+                    // host — every chain must pass the revoked anchor.
+                    const orphaned = hostsSolelyTrustedBy(device.id, trustMap.pinsByHost).map(
+                      (hostId) => trustMap.hostsById.get(hostId)?.name ?? hostId,
+                    );
+                    const warning =
+                      orphaned.length === 0
+                        ? ""
+                        : `\n\nWARNING: ${orphaned.join(", ")} trust${
+                            orphaned.length === 1 ? "s" : ""
+                          } ONLY this device. Revoking it cuts them off until you re-pair, or ` +
+                          `heal them onto your account root first (unlock with your passkey).`;
+                    prompt =
                       `Revoke ${who}?\n\nIt immediately loses terminal access on every host. ` +
-                        `Its key fingerprint is ${derivedFingerprint}.`,
-                    )
-                  ) {
+                      `Its key fingerprint is ${derivedFingerprint}.${warning}`;
+                  }
+                  if (confirm(prompt)) {
                     revoke.mutate(device);
                   }
                 }}
@@ -547,6 +620,36 @@ export function DevicesPanel() {
               {prune.isPending ? "Clearing…" : "Clear history"}
             </Button>
           </div>
+        </details>
+      )}
+
+      {(accountEdges.data?.length ?? 0) > 0 && (
+        <details data-testid="trust-log">
+          <summary className="cursor-pointer text-sm text-muted-foreground">
+            Trust log ({accountEdges.data?.length})
+          </summary>
+          {/* The audit trail (R4): every live endorsement, newest first. An
+              entry the operator does not remember making means a device is
+              vouching behind their back — revoke it above. */}
+          <ul className="mt-2 space-y-1 rounded-md border border-border p-3">
+            {[...(accountEdges.data ?? [])]
+              .sort((a, b) => (a.created_at < b.created_at ? 1 : -1))
+              .map((edge) => (
+                <li
+                  key={`${edge.endorser_device_id}:${edge.endorsed_device_id}`}
+                  className="text-xs text-muted-foreground"
+                >
+                  <span className="font-medium text-foreground">
+                    {nameFor(edge.endorser_device_id)}
+                  </span>{" "}
+                  vouched for{" "}
+                  <span className="font-medium text-foreground">
+                    {nameFor(edge.endorsed_device_id)}
+                  </span>{" "}
+                  · {new Date(edge.created_at).toLocaleDateString()}
+                </li>
+              ))}
+          </ul>
         </details>
       )}
 

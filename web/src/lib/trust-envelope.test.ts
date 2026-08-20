@@ -344,3 +344,42 @@ describe("root retrofit into a pre-root bundle (mesh stage 5c)", () => {
     ).rejects.toThrow(TrustBundleError);
   });
 });
+
+describe("root rotation (replace a revoked root)", () => {
+  test("replace=true swaps the sealed root; wraps stay intact; default still refuses", async () => {
+    const { exportAccountRootMaterial, generateAccountRoot } = await import("./account-root");
+    const { setEnvelopeRoot } = await import("./trust-envelope");
+    const dead = await exportAccountRootMaterial(await generateAccountRoot());
+    const successor = await exportAccountRootMaterial(await generateAccountRoot());
+    const sealed = await sealTrustEnvelope(
+      ACCOUNT,
+      [await host()],
+      [passkey("laptop", 1)],
+      1,
+      dead,
+    );
+    const withBackup = await enrollPasskeyInEnvelope(
+      ACCOUNT,
+      sealed,
+      passkey("laptop", 1),
+      passkey("yubikey", 2),
+    );
+
+    await expect(
+      setEnvelopeRoot(ACCOUNT, withBackup, passkey("laptop", 1), successor, 2),
+    ).rejects.toThrow(TrustBundleError);
+
+    const rotated = await setEnvelopeRoot(
+      ACCOUNT,
+      withBackup,
+      passkey("laptop", 1),
+      successor,
+      2,
+      true,
+    );
+    for (const key of [passkey("laptop", 1), passkey("yubikey", 2)]) {
+      const opened = await openTrustEnvelope(ACCOUNT, rotated, key);
+      expect(opened.root).toEqual(successor);
+    }
+  });
+});
