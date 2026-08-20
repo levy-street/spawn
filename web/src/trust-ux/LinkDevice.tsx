@@ -71,3 +71,42 @@ export function LinkRequest({
     </Screen>
   );
 }
+
+/**
+ * The same link request as it arrives on a desktop: a corner toast over
+ * whatever the user is doing. Approving opens the number check; Ignore
+ * dismisses — nothing is trusted from this card alone.
+ */
+export function LinkRequestToast({
+  deviceName,
+  deviceKind,
+  onEnterNumber,
+  onIgnore,
+}: {
+  deviceName: string;
+  deviceKind: DeviceKind;
+  onEnterNumber?: () => void;
+  onIgnore?: () => void;
+}) {
+  return (
+    <div className="w-[320px] rounded-2xl border border-zinc-700/80 bg-zinc-900 p-4 shadow-2xl shadow-black/50">
+      <div className="flex items-start gap-3">
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-zinc-800/80 text-zinc-300">
+          {deviceKind === "phone" ? <IconPhone /> : <IconLaptop />}
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-medium text-zinc-100">Link {deviceName}?</p>
+          <p className="mt-0.5 text-xs leading-relaxed text-zinc-400">
+            It just signed in as you. If that wasn't you, ignore this.
+          </p>
+        </div>
+      </div>
+      <div className="mt-3 flex gap-2">
+        <Button onClick={onEnterNumber}>Enter its number</Button>
+        <Button variant="ghost" onClick={onIgnore}>
+          Ignore
+        </Button>
+      </div>
+    </div>
+  );
+}

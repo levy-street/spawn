@@ -3,16 +3,16 @@
 import { Button, Eyebrow, Screen } from "./bits";
 
 /**
- * First step of connecting a computer. The computer's terminal prints the same
- * six digits this screen will show next — the number check then runs unchanged.
+ * First step of possessing a machine — the product's own verb, the same one the
+ * terminal prints. Its terminal shows six digits; the number check runs unchanged.
  */
-export function ConnectComputer({ command, onCancel }: { command: string; onCancel?: () => void }) {
+export function PossessMachine({ command, onCancel }: { command: string; onCancel?: () => void }) {
   return (
     <Screen>
-      <Eyebrow>Connect a computer</Eyebrow>
+      <Eyebrow>Possess a machine</Eyebrow>
       <div className="flex flex-1 flex-col justify-center gap-5">
         <h2 className="text-lg font-medium tracking-tight text-zinc-100">
-          Run this on the computer
+          Run this on the machine
         </h2>
         <div className="rounded-xl border border-zinc-800 bg-zinc-950 px-4 py-3 font-mono text-sm text-zinc-200">
           <span className="select-none text-zinc-600">$ </span>

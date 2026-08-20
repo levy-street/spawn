@@ -12,10 +12,10 @@ export interface DeviceVM {
   lastSeen: string;
 }
 
-export interface ComputerVM {
+export interface MachineVM {
   id: string;
   name: string;
-  /** "Connected by MacBook Pro · May 28" */
+  /** "Possessed by MacBook Pro · May 28" */
   provenance: string;
   online: boolean;
 }
