@@ -62,6 +62,12 @@ pub enum Outbound {
         arch: String,
         version: String,
         existing_agents: Vec<Uuid>,
+        /// This build admits browsers via account-scoped endorsement chains
+        /// (`endorsement_chain::find_valid_chain`), so the server may refuse the
+        /// legacy per-host device-endorsement path toward this host (mesh R9:
+        /// while both paths validate, a hostile server picks the weaker one).
+        /// Old servers ignore the unknown field.
+        supports_account_chains: bool,
     },
     #[serde(rename = "host.heartbeat")]
     HostHeartbeat,

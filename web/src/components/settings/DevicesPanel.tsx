@@ -167,7 +167,11 @@ export function DevicesPanel() {
   const [approvingId, setApprovingId] = useState<string | null>(null);
   const [approvalNote, setApprovalNote] = useState<string | null>(null);
   const currentTrustedHosts = currentDevice ? trustMap.trustedHostIdsFor(currentDevice.id) : [];
-  const canApproveOthers = currentTrustedHosts.length > 0;
+  // Per-host approval survives only toward LEGACY hosts (mesh R9): chain-capable
+  // hosts refuse it, and the account ceremony covers them instead.
+  const canApproveOthers = currentTrustedHosts.some(
+    (hostId) => trustMap.hostsById.get(hostId)?.supports_account_chains !== true,
+  );
   const bundle = useQuery({
     queryKey: ["trust", "bundle"],
     queryFn: () => trust.getBundle(),

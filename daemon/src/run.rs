@@ -715,6 +715,7 @@ async fn serve_one_connection_with_loader(
         arch: std::env::consts::ARCH.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         existing_agents: registry.ids(),
+        supports_account_chains: true,
     };
     let register_json = serde_json::to_string(&register)?;
     out_tx

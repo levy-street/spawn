@@ -322,6 +322,20 @@ async def create_browser_endorsement(
                 status_code=409, detail="revoked browser devices cannot endorse or be endorsed"
             )
 
+    # Mesh R9: once this host's daemon validates account-scoped chains, the
+    # legacy per-host path is retired for DEVICE admission — otherwise both
+    # rails stay live and a hostile server steers admission onto the weaker
+    # one. The single remaining per-host use is anchoring the account ROOT
+    # (the 5c anchor upgrade), which is precisely a statement about this host.
+    if host.supports_account_chains and not endorsed.is_root:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "this host accepts account-wide trust; approve the device once with the "
+                "add-device ceremony instead of per-host endorsement"
+            ),
+        )
+
     # The endorser must already be pinned to this host. An endorsement from a
     # device the host does not trust carries no authority, and accepting it here
     # would invite the daemon to reject rows this table had blessed.

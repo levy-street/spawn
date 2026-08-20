@@ -557,6 +557,9 @@ class HostOut(BaseModel):
     status: str
     last_seen_at: datetime | None = None
     agent_count: int = 0
+    # Mesh R9: true once this host's daemon validates account-scoped chains;
+    # the legacy per-host device-endorsement path is refused for such hosts.
+    supports_account_chains: bool = False
 
 
 class HostPatch(BaseModel):

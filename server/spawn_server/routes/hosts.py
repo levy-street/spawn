@@ -64,6 +64,7 @@ def _to_out(host: Host, agent_count: int) -> schemas.HostOut:
         status=host.status,
         last_seen_at=host.last_seen_at,
         agent_count=agent_count,
+        supports_account_chains=host.supports_account_chains,
     )
 
 
