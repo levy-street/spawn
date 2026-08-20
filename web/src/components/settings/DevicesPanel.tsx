@@ -543,6 +543,9 @@ export function DevicesPanel() {
         trustMap.ready &&
         trustMap.keyedHosts.length > 0 &&
         currentTrustedHosts.length === 0 &&
+        // A chain-admitted device CAN open terminals (the daemon walks its
+        // carried endorsements to an anchor) — don't tell it otherwise.
+        !roster.get(currentDevice.id)?.chainTrusted &&
         registration.data?.status === "ready" && (
           <div
             className="space-y-2 rounded-md border border-amber-600/50 p-3"
