@@ -1,5 +1,6 @@
 "use client";
 
+import { AlertTriangle } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { NumberCheck } from "@/components/access/number-check";
@@ -21,18 +22,40 @@ import {
   browserHostPinServerOrigin,
   loadBrowserHostPin,
 } from "@/lib/browser-host-pins";
-import {
-  b64urlDecode,
-  b64urlEncode,
-  sas as computeSas,
-  FIELD_BYTES,
-  verifyCommit,
-} from "@/lib/sas";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class ApprovalIdentityError extends Error {}
 
-const POSSESS_TRIES = 3;
+/**
+ * The `#k=` URL fragment is the possession ceremony's out-of-band channel:
+ * the daemon appends its OWN public key to the approval URL locally, after
+ * receiving `verification_uri`, and the fragment travels terminal→browser
+ * without ever appearing in an HTTP request — the server cannot see, strip,
+ * or rewrite it in flight. Its value is what the server-claimed host key
+ * must equal EXACTLY; on any difference nothing is pinned or approved.
+ *
+ * Returns the wire-encoded key, `null` when the URL carries no `k` fragment
+ * (an older daemon, a retyped URL — the fingerprint-compare fallback), or
+ * `"malformed"` when a `k` value is present but is not a canonical ed25519
+ * wire key — a damaged or truncated link is refused, never downgraded.
+ */
+function readFragmentHostKey(hash: string): string | null | "malformed" {
+  const raw = hash.startsWith("#") ? hash.slice(1) : hash;
+  if (!raw) return null;
+  const value = new URLSearchParams(raw).get("k");
+  if (value === null) return null;
+  return /^[A-Za-z0-9_-]{43}$/u.test(value) ? value : "malformed";
+}
+
+const REFUSAL_MISMATCH =
+  "This host's identity could not be verified: the server presented a different identity " +
+  "key than the one in your host's link. Nothing was trusted and no access was granted. " +
+  "This can mean the connection is being tampered with — start over from the host's " +
+  "terminal, on a network you trust.";
+const REFUSAL_MALFORMED =
+  "The identity check in this link (the part after '#') is damaged or cut off, so this " +
+  "host could not be verified. Nothing was trusted. Copy the entire link from the host's " +
+  "terminal and open it again.";
 
 /**
  * Bind the just-approved local pin to its Host UUID so the signed-RTC
@@ -91,11 +114,13 @@ export default function DevicePage() {
 }
 
 /**
- * Possessing a host (docs/TRUST_UX.md): `spawnd possess` prints a code that
- * opens this page; the host's terminal then shows a six-digit number and this
- * device TYPES it. The entry is the check — a correct number approves; three
- * misses abort. Older hosts with no number fall back to comparing the full
- * fingerprint, never a weaker code.
+ * Possessing a host (docs/TRUST_UX.md §4): `spawnd possess` opens/prints a
+ * link that carries the host's identity key in its URL fragment. This page
+ * checks the server's claimed key against that out-of-band value invisibly;
+ * on an exact match the human's one step is a single Approve click. A
+ * mismatch is refused outright. Links with no fragment (older hosts, retyped
+ * URLs) fall back to comparing the full fingerprint against the terminal —
+ * never a weaker check, and never a silent pin.
  */
 function DeviceInner() {
   const { user } = useAuth();
@@ -116,25 +141,26 @@ function DeviceInner() {
   // "init" until the effect reads the URL: "auto" when a handle was baked in
   // (nothing to type), "manual" when the page was opened bare.
   const [phase, setPhase] = useState<"init" | "auto" | "manual">("init");
-  const [verifyCode, setVerifyCode] = useState<string | null>(null);
-  // Set if the SAS number never arrives (daemon gone/slow), or the operator
-  // says "I don't see a number" — then we fall back to the always-sound
-  // fingerprint so the human is never stuck.
-  const [sasTimedOut, setSasTimedOut] = useState(false);
+  // The out-of-band host key from the URL fragment; null → fingerprint fallback.
+  const fragmentKeyRef = useRef<string | null>(null);
+  // Terminal refusal (fragment mismatch / damaged link). Nothing was trusted.
+  const [refusal, setRefusal] = useState<string | null>(null);
+  // True once the pending host key equaled the fragment key exactly — the
+  // invisible check passed, so the screen is a plain Approve confirmation.
+  const [fragmentVerified, setFragmentVerified] = useState(false);
   const [hostName, setHostName] = useState<string | null>(null);
   const [pending, setPending] = useState<DevicePendingApproval | null>(null);
   const [localPinState, setLocalPinState] = useState<BrowserHostPinState | "new" | null>(null);
   const [localPinCommitted, setLocalPinCommitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  // Entry-style check state: three tries, then the ceremony is over.
-  const [triesLeft, setTriesLeft] = useState(POSSESS_TRIES);
-  const [entryError, setEntryError] = useState<string | null>(null);
   const [stopped, setStopped] = useState(false);
 
-  // Load the pending approval and land on the number screen. Takes the opaque
-  // URL ref the terminal opened/printed (or the pre-0029 user_code URL param),
-  // and remembers which so approve reuses the exact same identifier.
+  // Load the pending approval. Takes the opaque URL ref the terminal
+  // opened/printed (or the pre-0029 user_code URL param) and remembers which,
+  // so approve reuses the exact same identifier. The fragment check happens
+  // here, before anything is shown or stored: the server-claimed key either
+  // exactly equals the out-of-band key or the ceremony is refused.
   const review = async (id: { user_code?: string; approval_ref?: string }) => {
     const lookup = id.approval_ref
       ? { approval_ref: id.approval_ref }
@@ -150,6 +176,14 @@ function DeviceInner() {
           "The host's identity did not check out; nothing was trusted",
         );
       }
+      // THE substitution check (docs/TRUST_DEVICE_MESH.md): the server's
+      // claimed key against the key the host's own link carried out-of-band.
+      // A hostile relay cannot pass this without controlling the terminal.
+      const fragmentKey = fragmentKeyRef.current;
+      if (fragmentKey !== null && r.host_public_key !== fragmentKey) {
+        setRefusal(REFUSAL_MISMATCH);
+        return;
+      }
       if (!user) throw new ApprovalIdentityError("The authenticated account is unavailable");
       const existing = await loadBrowserHostPin({
         accountId: user.id,
@@ -157,14 +191,7 @@ function DeviceInner() {
         hostPublicKey: r.host_public_key,
         hostFingerprint: expectedFingerprint,
       });
-      // The committed-ephemeral SAS number is computed by a separate effect once
-      // the browser identity is ready (it needs our key B). No grindable code:
-      // when the daemon offers no commitment we compare the full fingerprint.
-      setVerifyCode(null);
-      setSasTimedOut(false);
-      sasStartedRef.current = false;
-      setTriesLeft(POSSESS_TRIES);
-      setEntryError(null);
+      setFragmentVerified(fragmentKey !== null);
       setStopped(false);
       setIdentifier(lookup);
       setPending(r);
@@ -183,71 +210,10 @@ function DeviceInner() {
     }
   };
 
-  // Committed-ephemeral SAS (docs/TRUST_DEVICE_MESH.md Appendix A). Once we hold
-  // a pending ceremony that carries the daemon's commitment Cd and our browser
-  // identity is ready, contribute our fresh nonce Nb + key B, wait for the daemon
-  // to reveal Nd, verify Cd opens, and compute the number the host's terminal is
-  // showing — this side never displays it, only checks the operator's entry.
-  const sasStartedRef = useRef(false);
-  const runSas = async (
-    p: DevicePendingApproval,
-    id: { user_code?: string; approval_ref?: string },
-    browserPublicKey: string,
-  ) => {
-    if (!p.sas_commit) return; // pre-SAS daemon → fingerprint fallback in the UI
-    try {
-      const hostKey = b64urlDecode(p.host_public_key);
-      const browserKey = b64urlDecode(browserPublicKey);
-      const commit = b64urlDecode(p.sas_commit);
-      const nb = crypto.getRandomValues(new Uint8Array(FIELD_BYTES));
-      await auth.contributeSas({
-        ...id,
-        sas_browser_nonce: b64urlEncode(nb),
-        browser_public_key: browserPublicKey,
-      });
-      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-      let nd: Uint8Array | null = null;
-      for (let attempt = 0; attempt < 40 && !nd; attempt += 1) {
-        const fresh = await auth.pendingDevice(id).catch(() => null);
-        if (fresh?.sas_host_nonce) {
-          nd = b64urlDecode(fresh.sas_host_nonce);
-          break;
-        }
-        await sleep(1000);
-      }
-      if (!nd) {
-        // The daemon never revealed its nonce — fall back to the fingerprint,
-        // which both sides show, instead of leaving the human stuck.
-        setSasTimedOut(true);
-        return;
-      }
-      if (!(await verifyCommit(commit, hostKey, nd))) {
-        throw new ApprovalIdentityError(
-          "The host's number commitment did not open — nothing was trusted",
-        );
-      }
-      setVerifyCode(await computeSas(hostKey, browserKey, nd, nb));
-    } catch (err) {
-      setError(
-        err instanceof ApiError || err instanceof ApprovalIdentityError
-          ? err.message
-          : "Could not compute the check number",
-      );
-    }
-  };
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: one-shot guarded by a ref; runSas intentionally omitted
-  useEffect(() => {
-    if (!pending?.sas_commit || verifyCode || sasStartedRef.current) return;
-    if (registration.data?.status !== "ready") return;
-    sasStartedRef.current = true;
-    void runSas(pending, identifier ?? {}, registration.data.device.public_key);
-  }, [pending, registration.data, verifyCode, identifier]);
-
   // The daemon opens this page with an opaque handle baked into the URL
-  // (`/device?ref=…`, or `?code=…` from a pre-0029 server), so an approval needs
-  // nothing typed. Set the phase from the URL, then auto-load once the account
-  // is known, landing straight on the number screen.
+  // (`/device?ref=…`, or `?code=…` from a pre-0029 server) and its own host
+  // key in the `#k=` fragment. Read both, then auto-load once the account is
+  // known, landing straight on the approve (or fallback-compare) screen.
   const autoTriedRef = useRef(false);
   // biome-ignore lint/correctness/useExhaustiveDependencies: one-shot guarded by a ref; review intentionally omitted
   useEffect(() => {
@@ -258,6 +224,14 @@ function DeviceInner() {
     setPhase(hasHandle ? "auto" : "manual");
     if (!hasHandle || !user || autoTriedRef.current) return;
     autoTriedRef.current = true;
+    const fragment = readFragmentHostKey(window.location.hash);
+    if (fragment === "malformed") {
+      // A present-but-broken identity check is refused, never downgraded to
+      // the fingerprint fallback: the link was damaged, not merely old.
+      setRefusal(REFUSAL_MALFORMED);
+      return;
+    }
+    fragmentKeyRef.current = fragment;
     void review(ref ? { approval_ref: ref } : { user_code: urlCode ?? undefined });
   }, [user]);
 
@@ -298,6 +272,14 @@ function DeviceInner() {
       ) {
         throw new ApprovalIdentityError(
           "This browser's identity changed; refresh and start over on the host",
+        );
+      }
+      // Defense in depth: re-assert the out-of-band binding at the moment of
+      // signing, so no state shuffle can approve a key the fragment never
+      // vouched for.
+      if (fragmentKeyRef.current !== null && pending.host_public_key !== fragmentKeyRef.current) {
+        throw new ApprovalIdentityError(
+          "The host's identity no longer matches its link; nothing was trusted",
         );
       }
       const expectedFingerprint = await ed25519PublicKeyFingerprint(pending.host_public_key);
@@ -377,32 +359,12 @@ function DeviceInner() {
     }
   };
 
-  /** The typed digits ARE the check: match → approve; three misses → over. */
-  const onSubmitDigits = (digits: string) => {
-    if (!verifyCode || submitting) return;
-    if (digits.replace(/\D/gu, "") === verifyCode.replace(/\D/gu, "")) {
-      setEntryError(null);
-      void onApprove();
-      return;
-    }
-    const remaining = triesLeft - 1;
-    if (remaining <= 0) {
-      setTriesLeft(0);
-      setStopped(true);
-      return;
-    }
-    setTriesLeft(remaining);
-    setEntryError(`That's not it — ${remaining} ${remaining === 1 ? "try" : "tries"} left.`);
-  };
-
   const resetCeremony = () => {
     setPending(null);
-    setVerifyCode(null);
-    setSasTimedOut(false);
+    setFragmentVerified(false);
+    setRefusal(null);
     setLocalPinState(null);
     setLocalPinCommitted(false);
-    setEntryError(null);
-    setTriesLeft(POSSESS_TRIES);
     setStopped(false);
     setError(null);
     setIdentifier(null);
@@ -418,28 +380,48 @@ function DeviceInner() {
     registration.data?.status === "ready" ? (registration.data.device.label ?? null) : null;
   const registrationBlocked =
     registration.isError || (registration.data && registration.data.status !== "ready");
-  const busy = phase === "init" || (phase === "auto" && !pending && !hostName && !error);
+  const busy =
+    phase === "init" || (phase === "auto" && !pending && !hostName && !error && !refusal);
 
-  // The one human check, mapped onto the shared component's phases.
+  // The fallback human check (no fragment), mapped onto the shared component.
   const checkPhase = stopped
     ? ("stopped" as const)
     : hostName
       ? ("done" as const)
       : submitting && pending
         ? ("waiting" as const)
-        : pending && (verifyCode || sasTimedOut || !pending.sas_commit)
+        : pending
           ? ("compare" as const)
           : ("connecting" as const);
-  const useFingerprint = Boolean(pending && (!pending.sas_commit || sasTimedOut));
   // A server approval that failed after the local pin landed needs a retry
-  // surface, not the entry field again — the human check already passed.
+  // surface, not the check again — the identity check already passed.
   const retryable = Boolean(error && localPinCommitted && pending);
 
   return (
     <div className="mx-auto flex min-h-[60vh] max-w-md flex-col justify-center p-4">
       <Card>
         <CardContent className="space-y-5 p-6">
-          {hostName || pending || busy || stopped ? (
+          {refusal ? (
+            <div className="flex min-h-[320px] flex-col" data-testid="possess-refusal">
+              <div className="flex flex-1 flex-col items-center justify-center gap-4">
+                <div className="flex size-12 items-center justify-center rounded-full bg-destructive/10 text-destructive">
+                  <AlertTriangle className="size-6" />
+                </div>
+                <h2 className="text-lg font-medium tracking-tight text-foreground">
+                  This host could not be verified
+                </h2>
+                <p
+                  className="max-w-[30ch] text-balance text-center text-sm leading-relaxed text-muted-foreground"
+                  role="alert"
+                >
+                  {refusal}
+                </p>
+              </div>
+              <Button className="w-full" variant="secondary" onClick={resetCeremony}>
+                Close
+              </Button>
+            </div>
+          ) : hostName || pending || busy || stopped ? (
             <div className="space-y-4">
               {!hostName && !stopped && (
                 <div className="text-center">
@@ -474,25 +456,47 @@ function DeviceInner() {
                     </Button>
                   </div>
                 </div>
+              ) : pending && fragmentVerified && !hostName ? (
+                <div className="flex min-h-[320px] flex-col" data-testid="possess-approve-screen">
+                  <div className="flex flex-1 flex-col items-center justify-center">
+                    <p className="max-w-[30ch] text-balance text-center text-sm leading-relaxed text-muted-foreground">
+                      This browser verified the host&apos;s identity against the link from its
+                      terminal. Approving grants all your devices access to it.
+                    </p>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <Button
+                      type="button"
+                      className="w-full"
+                      data-testid="possess-approve"
+                      disabled={submitting}
+                      onClick={() => void onApprove()}
+                    >
+                      {submitting ? "Approving…" : `Approve ${pending.host_name}`}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      className="w-full"
+                      disabled={submitting}
+                      onClick={resetCeremony}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
               ) : (
                 <NumberCheck
                   phase={checkPhase}
                   mode="enter"
-                  fingerprint={useFingerprint ? pending?.host_key_fingerprint : undefined}
+                  fingerprint={pending?.host_key_fingerprint}
                   otherScreen="in the host's terminal"
                   doneText={`${hostName} is possessed. All your devices can reach it.`}
-                  entryError={entryError ?? undefined}
-                  stoppedText="The number wasn't right, so nothing was trusted. Start over from the host's terminal."
-                  onSubmit={onSubmitDigits}
+                  stoppedText="The fingerprints don't match, so nothing was trusted. Start over from the host's terminal."
                   onMatch={() => void onApprove()}
                   onNoMatch={() => {
-                    if (useFingerprint || !pending?.sas_commit) {
-                      // Fingerprint mismatch is terminal.
-                      setStopped(true);
-                    } else {
-                      // "I don't see a number" — the always-sound fallback.
-                      setSasTimedOut(true);
-                    }
+                    // Fingerprint mismatch is terminal.
+                    setStopped(true);
                   }}
                   onDone={() => router.push("/hosts")}
                   onClose={resetCeremony}
@@ -520,11 +524,12 @@ function DeviceInner() {
                 <span className="select-none text-muted-foreground">$ </span>spawnd possess
               </div>
               <p className="text-center text-sm leading-relaxed text-muted-foreground">
-                Its terminal opens this approval in your browser and shows a six-digit number.
-                You'll type the number to finish.
+                Its terminal opens this approval in your browser. The link carries the host&apos;s
+                identity, so finishing is a single click.
               </p>
               <p className="text-center text-xs text-muted-foreground/80">
-                On a remote host, open the link the terminal prints.
+                On a remote host, copy the whole link the terminal prints — including the part after
+                &apos;#&apos; — into any browser.
               </p>
               {error && (
                 <p className="text-center text-sm text-destructive" role="alert">

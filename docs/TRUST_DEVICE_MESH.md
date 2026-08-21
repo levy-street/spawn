@@ -74,8 +74,10 @@ device or the root. Endorsements are **account-scoped**, not per-host (this is
 the deliberate change from today's per-host endorsement).
 
 **Anchors.** Each host `h` pins a set of trusted keys `A(h)` — its **anchors**.
-An anchor enters `A(h)` only by a human check: the possessing device's key at
-`possess` time (the 6-digit host-pairing check), and/or the root `R`.
+An anchor enters `A(h)` only by an out-of-band check: the possessing device's
+key at `possess` time (since 2026-08-21 the URL-fragment host-key check — see
+the Appendix A note; previously the 6-digit host-pairing SAS), and/or the root
+`R`.
 **Ratchet (as built):** once `R` enters `A(h)`, it stays there even if the
 device whose endorsement installed it is later revoked — the installer was
 trusted at installation time, and an `R`-anchor that died with a device would
@@ -117,9 +119,12 @@ Commit-then-reveal is mandatory — see §6, Proof of P2.
 
 ## 4. Operations
 
-- **possess(h) by device d.** The human verifies the host↔device pairing — this
-  is an **anchor ceremony and must meet A5** (committed ephemeral SAS, or a
-  full-entropy fingerprint compare). `h` sets `A(h) ⊇ {pk_d}`. If a root exists,
+- **possess(h) by device d.** The host↔device pairing is verified out of band —
+  this is an **anchor ceremony and must meet A5**. As built (2026-08-21) the
+  check is the URL-fragment host-key equality (full key, exact, machine-checked
+  over a channel the server never carries — Appendix A note), with the
+  full-entropy fingerprint compare as the no-fragment fallback; the committed
+  ephemeral SAS was the previous mechanism. `h` sets `A(h) ⊇ {pk_d}`. If a root exists,
   `d` also presents `R`'s endorsement of `d` and `h` adds `R` to `A(h)` (so the
   host anchors on the account, surviving loss of `d`). *The mesh's entire
   soundness (P2) inherits from this check — see **R2**.*
@@ -581,8 +586,25 @@ unbuilt); possess-time anchor-on-`R` (§8); merge + prod rollout.
 
 This is the construction A5 requires: a 6-digit number a substituting server
 **cannot grind**. It is Bluetooth Secure Simple Pairing "Numeric Comparison" /
-MANA-III, adapted to our relay-mediated flow. Used at `possess` (host↔browser)
-and at `add-device` (browser↔browser); below is the host↔browser instance.
+MANA-III, adapted to our relay-mediated flow. Used at `add-device`
+(browser↔browser). Below is the original host↔browser instance, kept as the
+normative description of the construction.
+
+> **Possession no longer uses the SAS (2026-08-21).** `spawnd possess` now
+> verifies the host key through an **out-of-band URL fragment** instead: after
+> receiving `verification_uri`, the daemon appends its own host public key
+> *locally* as `#k=<host_public_key_wire>` (overwriting any server-supplied
+> fragment) and refuses a `verification_uri` that is not same-origin with the
+> server the operator pointed it at. URL fragments are never sent in HTTP
+> requests, so the key rides terminal→browser without transiting the server;
+> `/device` asserts the server-claimed `host_public_key` **exactly equals** the
+> fragment and refuses to pin or approve on any difference (or on a damaged
+> fragment). This is A5 by different means — full-key, exact, machine-checked
+> equality over a channel the server never touches, replacing a 6-digit human
+> compare — and it removes the human comparison step entirely (the remaining
+> click is pure intent). A link with **no** fragment (older daemon, retyped
+> URL) falls back to the full-fingerprint compare below, never a weaker code.
+> The committed SAS remains the device↔device (`add-device`) check, unchanged.
 
 ### Values
 

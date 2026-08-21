@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 import { expect, type Page, test } from "@playwright/test";
 
+// The /device approval page on its no-fragment paths: every test here opens
+// the page WITHOUT a `#k=` host-key fragment, which is the fallback lane
+// (older daemons, retyped URLs) — the human compares the full fingerprint
+// against the host's terminal. The fragment lane, and the refusal of a
+// server-substituted host key, live in possess-key-check.spec.ts.
+
 const USER_ID = "00000000-0000-4000-8000-000000000001";
 const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
 const APPROVAL_NONCE = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
@@ -210,7 +216,7 @@ test("the bare page instructs — one command, no code to type", async ({ page }
   const instructions = page.getByTestId("possess-instructions");
   await expect(instructions).toBeVisible();
   await expect(instructions).toContainText("spawnd possess");
-  await expect(instructions).toContainText("six-digit number");
+  await expect(instructions).toContainText("single click");
   // The terminal's link is the entry — there is nothing to type here.
   await expect(page.locator("input")).toHaveCount(0);
 });
@@ -274,9 +280,7 @@ test("blocks first contact when the server fingerprint disagrees with the host k
 
   await page.goto("/device?code=QZ4K-7HMT");
 
-  await expect(page.locator("p[role=alert]")).toContainText(
-    "identity did not check out",
-  );
+  await expect(page.locator("p[role=alert]")).toContainText("identity did not check out");
   await expect(page.getByTestId("host-key-fingerprint")).not.toBeVisible();
   expect(approveCalled).toBe(false);
 });

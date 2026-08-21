@@ -1186,6 +1186,54 @@ async def test_approval_rejects_identity_changed_after_review_without_token_or_p
     assert fresh_review["host_key_fingerprint"] != review["host_key_fingerprint"]
 
 
+async def test_substituted_pending_host_key_cannot_absorb_an_out_of_band_approval(client):
+    """The /device fragment contract, server side (regression for the
+    URL-fragment possession flow): the browser only ever approves the host key
+    it was handed out-of-band — the `#k=` fragment the daemon appended to the
+    approval URL locally. If the server substitutes a different key into the
+    ceremony it relays (`/pending` returns a key ≠ the fragment), the browser
+    refuses outright; and even an approval forced through bound to the REAL
+    key must not attach to the substituted ceremony. Nothing may reach an
+    approved state, no Host row may exist, and the substituted ceremony must
+    stay pending for its own (wrong) key only."""
+
+    user_id, auth = await _signup(client, "fragment-substitution@example.com")
+    browser = await _register_browser(client, user_id, auth)
+    fragment_key = _public_key(11)  # what the daemon's link carries, out of band
+    substituted_key = _public_key(12)  # what a hostile server put in the ceremony
+
+    start = await _start(client, substituted_key)
+    review = await _review(client, start, auth)
+    # What the browser compares against its fragment — and refuses on. The rest
+    # of the test forces the approval anyway, as a defense-in-depth check.
+    assert review["host_public_key"] == substituted_key
+    forced_review = {
+        **review,
+        "host_public_key": fragment_key,
+        "host_key_fingerprint": host_key_fingerprint("ed25519", fragment_key),
+    }
+
+    approval = await _approve(client, start, user_id, auth, forced_review, browser)
+    assert approval.status_code == 409
+    assert "review" in approval.json()["detail"]
+
+    async with get_sessionmaker()() as session:
+        dc = await session.get(DeviceCode, start["device_code"])
+        assert dc is not None
+        assert dc.status == "pending"
+        assert dc.user_id is None
+        assert dc.browser_device_id is None
+        assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 0
+
+    # The real daemon (polling with the fragment key) can never complete this
+    # ceremony, and the substituted ceremony itself is still unapproved.
+    assert (await _poll(client, start, fragment_key)).json() == {"error": "invalid_device_binding"}
+    assert (await _poll(client, start, substituted_key)).json() == {
+        "error": "authorization_pending"
+    }
+    assert (await client.get("/api/hosts", headers=auth)).json() == []
+
+
 async def test_concurrent_approval_and_poll_issue_exactly_one_token_and_pin(client):
     user_id, auth = await _signup(client, "approval-poll-race@example.com")
     browser = await _register_browser(client, user_id, auth)

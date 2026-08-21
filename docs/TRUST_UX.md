@@ -29,7 +29,7 @@ Everything on screen is one of these sentences happening. Nothing on screen is a
 | **approve** | verb | add-device SAS ceremony + mutual endorsement |
 | **possess** | verb | the host anchor ceremony — the product's own verb |
 | **remove** | verb | revoke: Rev tombstone + live-session teardown |
-| **the number** | artifact | committed-ephemeral SAS (A5, Appendix A) |
+| **the number** | artifact | committed-ephemeral SAS (device↔device only; possession's check rides the link itself, §4) |
 
 Six taught concepts — plus **the passkey**, which is *borrowed, not taught*: users already
 know it from every other product, and here it silently carries the entire root lifecycle
@@ -108,11 +108,14 @@ object.
 - Device rows are not stateful beyond the "This device" tint and the waiting pill; host
   rows dim when offline (presence, not trust).
 
-### 2. The number check — `NumberCheck` (one component, both flows)
+### 2. The number check — `NumberCheck` (the device↔device ceremony)
 
 The check is **entry-style, never tap-to-approve** (the protocol's own words, §3):
 the side being approved *shows* the number; the side that already has trust *types*
 it. Typing is the proof of comparison — a habituated tap can't wave it through.
+*(Since 2026-08-21 this is the device↔device check only; host possession verifies the
+key via the link itself — §4 — and borrows just this component's fingerprint frame
+for its legacy fallback.)*
 
 - **connecting** — "Securing the connection…" spinner. (Covers commit/reveal/nonces.)
 - **compare · show** — the six digits, huge; "Enter this number on the other device";
@@ -140,10 +143,26 @@ it. Typing is the proof of comparison — a habituated tap can't wave it through
 - With a passkey there is **no flow at all**: signing in with it is the approval.
   Recovery-after-total-loss is deliberately the *same non-flow*.
 
-### 4. Possess a host — `PossessHost`
+### 4. Possess a host — `PossessHost` *(revised 2026-08-21: link-carried key check)*
 - **instruction** — "Run this on the host: `spawnd possess`" (one command, one line).
-- → NumberCheck (terminal shows, this device types) → **done** ("mac-studio is possessed.
-  All your devices can reach it.")
+- The terminal opens (or prints) an approval link that carries the host's identity key
+  after its `#` — a URL fragment, which never appears in any HTTP request, so it rides
+  terminal→browser out of band and **the server never sees it**. This device checks the
+  server's claimed key against it invisibly: nothing to type, nothing to compare.
+- **approve** — on an exact match, the one human step is a single **Approve
+  mac-studio** button (the intent step: you're granting your devices access) → **done**
+  ("mac-studio is possessed. All your devices can reach it."). This matches a CLI-tool
+  login: click the link, sign in if needed, approve — the terminal picks it up on its
+  own, on the same or any other device.
+- **refused** — if the server claims a *different* key than the link carries (the
+  substitution a hostile relay would need), or the link's `#k` part is damaged, the
+  screen is a terminal refusal ("This host could not be verified") — no approve path is
+  offered, nothing is trusted. There is no override.
+- **fallback** — a link with *no* `#k` part (an older host, a hand-retyped URL) falls
+  back to the full-fingerprint compare (the check-frame's fingerprint state, against the
+  fingerprint the terminal still prints) — never a weaker check, never a silent pin.
+- The 6-digit possession number is gone: the link check replaces the committed SAS for
+  this ceremony (the SAS remains the device↔device check, §2/§3).
 
 ### 5. Remove a device — `RemoveDeviceDialog`
 - **confirm** — "Remove iPhone? It loses access to every host — instantly and
@@ -188,7 +207,8 @@ the next passkey sign-in. No dialogs in the trust UX.
 
 - **First device + first host.** Sign up on the device (no ceremony — there is nothing
   to approve *from*; the roster shows "First device"). Possess the first host: run one
-  command, type one number. Total human cost: one number. The passkey nudge appears.
+  command, click Approve (the link itself carries the identity check, §4). Total human
+  cost: one click. The passkey nudge appears.
 - **Additional device, passkey.** Sign in with the passkey → done. Zero screens. (The
   heal endorses it off the root; the sealed vault delivers the hosts.)
 - **Additional device, no passkey.** Sign in → it appears everywhere as *Waiting for
@@ -259,9 +279,13 @@ What a naive design would show, what we show instead, and why the protocol survi
 
 ## Invariant map (nothing weakened)
 
-- **A5 number match** — kept in both ceremonies as ENTRY, not tap-to-approve (the
-  protocol's own requirement): one side shows, the other types; mismatch and exhausted
-  tries are terminal, no override. Legacy hosts get the full-fingerprint compare.
+- **A5 key authentication** — device↔device keeps the committed SAS as ENTRY, not
+  tap-to-approve: one side shows, the other types; mismatch and exhausted tries are
+  terminal, no override. Host possession's check moved (2026-08-21) from the SAS to
+  the out-of-band URL-fragment key equality (§4) — stronger than a 6-digit compare
+  (full key, exact match, machine-checked) and equally beyond a substituting server's
+  reach, since the fragment never transits the server. Its mismatch is terminal, no
+  override; legacy hosts get the full-fingerprint compare, never a weaker code.
 - **P3/R1/R10 revocation** — instant ("instantly"), account-wide ("every host"),
   permanent ("permanently"; rejoin = fresh approval), live teardown (removed device
   drops to `AccessBlocked` mid-session).

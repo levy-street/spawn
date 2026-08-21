@@ -496,31 +496,6 @@ pub struct DeviceStartRequest<'a> {
     pub version: &'a str,
     pub host_key_algorithm: &'a str,
     pub host_public_key: &'a str,
-    /// Committed-ephemeral SAS commitment `Cd`. Skipped when absent so a retry
-    /// against a pre-SAS server (which forbids unknown fields) is clean.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sas_commit: Option<&'a str>,
-}
-
-/// Daemon's side of the SAS handshake — fetch the browser's `Nb`/`B` and, once
-/// present, reveal our own `Nd`. See docs/TRUST_DEVICE_MESH.md Appendix A.
-#[derive(Debug, Serialize)]
-pub struct DeviceSasHostRequest<'a> {
-    pub device_code: &'a str,
-    pub host_key_algorithm: &'a str,
-    pub host_public_key: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sas_host_nonce: Option<&'a str>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DeviceSasHostResponse {
-    #[serde(default)]
-    pub sas_browser_nonce: Option<String>,
-    #[serde(default)]
-    pub sas_browser_key: Option<String>,
-    // The server also echoes sas_host_nonce; the daemon has no use for it back,
-    // and serde drops the unrecognized field.
 }
 
 #[derive(Debug, Deserialize)]
