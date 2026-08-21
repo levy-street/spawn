@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Literal
@@ -631,6 +632,49 @@ class SessionOut(BaseModel):
 
 # ---------- workspaces ----------
 
+# A workspace icon is a small square thumbnail the browser renders itself, from
+# an image found in the workspace's folder or picked by the owner. 32 KiB of
+# base64 is roughly a 128x128 WebP with room to spare; anything larger is not an
+# icon, it is a picture, and it would be paid for on every sidebar render.
+WORKSPACE_ICON_MAX_CHARS = 32 * 1024
+# Deliberately narrow: `data:` only, so a stored icon can never make a client
+# fetch from a third party, and raster only — SVG is markup, and markup in an
+# `<img>` is a surface we have no reason to take on for a 24px tile.
+_WORKSPACE_ICON_PATTERN = re.compile(r"^data:image/(?:png|webp);base64,[A-Za-z0-9+/]+={0,2}$")
+
+WorkspaceIconSource = Literal["auto", "custom", "none"]
+
+
+def validate_workspace_icon(value: str | None) -> str | None:
+    """The icon as stored, or a `ValueError` naming what was wrong with it.
+
+    Null is always allowed: it is how a workspace says "draw my initials".
+    """
+    if value is None:
+        return None
+    if len(value) > WORKSPACE_ICON_MAX_CHARS:
+        raise ValueError("icon is too large")
+    if _WORKSPACE_ICON_PATTERN.fullmatch(value) is None:
+        raise ValueError("icon must be a base64 data URL of a PNG or WebP image")
+    return value
+
+
+class WorkspaceIconFields(BaseModel):
+    """The icon pair, shared by workspaces and the templates saved from them.
+
+    `icon` absent and `icon` explicitly null are different requests on a PATCH
+    — "leave it" versus "clear it" — so routes read `model_fields_set` rather
+    than testing for None.
+    """
+
+    icon: str | None = None
+    icon_source: WorkspaceIconSource | None = None
+
+    @field_validator("icon")
+    @classmethod
+    def _validate_icon(cls, value: str | None) -> str | None:
+        return validate_workspace_icon(value)
+
 
 class TileWidget(BaseModel):
     """Non-session pane content. A widget tile's `session_id` is its own id."""
@@ -732,7 +776,7 @@ class WorkspaceFirstSession(BaseModel):
     skill_ids: list[str] | None = None
 
 
-class WorkspaceCreate(BaseModel):
+class WorkspaceCreate(WorkspaceIconFields):
     # Omitted -> the server names it "Workspace N" (next free N).
     name: str | None = Field(default=None, max_length=128)
     # Optional: create the workspace and its first shell session atomically;
@@ -745,7 +789,7 @@ class WorkspaceCreate(BaseModel):
     cwd: str | None = Field(default=None, max_length=1024)
 
 
-class WorkspacePatch(BaseModel):
+class WorkspacePatch(WorkspaceIconFields):
     name: str | None = Field(default=None, max_length=128)
     layout: WorkspaceLayoutV3 | None = None
     position: int | None = Field(default=None, ge=0)
@@ -755,7 +799,7 @@ class WorkspacePatch(BaseModel):
     cwd: str | None = Field(default=None, max_length=1024)
 
 
-class WorkspaceOut(BaseModel):
+class WorkspaceOut(WorkspaceIconFields):
     id: str
     name: str
     host_id: str | None = None
@@ -842,7 +886,7 @@ class WorkspaceTemplateSpec(BaseModel):
         return {**value, "version": 2, "tabs": tabs}
 
 
-class WorkspaceTemplateCreate(BaseModel):
+class WorkspaceTemplateCreate(WorkspaceIconFields):
     name: str = Field(min_length=1, max_length=128)
     # The folder the template remembers: instantiation goes straight there.
     host_id: str | None = None
@@ -850,14 +894,14 @@ class WorkspaceTemplateCreate(BaseModel):
     spec: WorkspaceTemplateSpec
 
 
-class WorkspaceTemplatePatch(BaseModel):
+class WorkspaceTemplatePatch(WorkspaceIconFields):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     host_id: str | None = None
     cwd: str | None = Field(default=None, max_length=1024)
     spec: WorkspaceTemplateSpec | None = None
 
 
-class WorkspaceTemplateOut(BaseModel):
+class WorkspaceTemplateOut(WorkspaceIconFields):
     model_config = ConfigDict(from_attributes=True)
 
     id: str

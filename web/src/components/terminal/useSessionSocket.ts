@@ -96,6 +96,10 @@ export interface DirectSessionUploadOptions {
   /** Called synchronously after the final frame is accepted by the channel.
    *  The caller must persist ambiguity before this component can unmount. */
   onFinalDispatched?: () => void;
+  /** Bytes handed to the channel so far, out of the upload's total. Fires
+   *  once per chunk (plus once at 0 when the endpoint is ready), so a caller
+   *  can drive a progress indicator. */
+  onProgress?: (sentBytes: number, totalBytes: number) => void;
 }
 
 export type SocketState = "idle" | "connecting" | "open" | "closed" | "error";
@@ -700,6 +704,12 @@ export function useSessionSocket({
           if (!message || message.kind !== "ready") {
             throw new Error("Direct session upload did not start after bounded retries.");
           }
+          // A resumed upload starts part-way in; report that floor before the
+          // first chunk so progress never jumps backwards.
+          options.onProgress?.(
+            Math.min(blob.size, message.nextSequence * SESSION_CTL_UPLOAD_CHUNK_BYTES),
+            blob.size,
+          );
           for (let sequence = message.nextSequence; sequence < expected.chunks; sequence += 1) {
             assertUploadContext(uploadSignal);
             await waitForUploadBackpressure(uploadSignal).catch((error) => {
@@ -736,6 +746,7 @@ export function useSessionSocket({
               finalDispatched = true;
               options.onFinalDispatched?.();
             }
+            options.onProgress?.(end, blob.size);
           }
           try {
             message = await waitUploadMessage(uploadId, 30_000, uploadSignal, invalidUploadReason);

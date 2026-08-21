@@ -244,7 +244,7 @@ function ArchivedRow({
         className={cn(sidebarRowClass(active), "pr-10 [@media(pointer:coarse)]:pr-16")}
       >
         <SidebarIconSlot>
-          <WorkspaceAvatar name={workspace.name} className="opacity-70" />
+          <WorkspaceAvatar name={workspace.name} icon={workspace.icon} className="opacity-70" />
         </SidebarIconSlot>
         <SidebarRowLabel collapsed={false}>{workspace.name}</SidebarRowLabel>
       </Link>

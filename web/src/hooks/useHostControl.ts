@@ -8,6 +8,8 @@ import { useAuth } from "@/lib/auth";
 import { HostControlClient, type HostControlState } from "@/lib/hostControl";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 
+const EMPTY_CAPABILITIES: ReadonlySet<string> = new Set();
+
 export function useHostControl(hostId: string | null, enabled = true) {
   const { user } = useAuth();
   const hostQuery = useQuery({
@@ -57,7 +59,14 @@ export function useHostControl(hostId: string | null, enabled = true) {
     [hostId],
   );
 
-  const [state, setState] = useState<HostControlState>("idle");
+  // Capabilities travel with the state, and land before `ready`: a subscriber
+  // that saw a ready client with an empty capability set would conclude the
+  // host supports nothing and cache that conclusion.
+  const [snapshot, setSnapshot] = useState<{
+    state: HostControlState;
+    capabilities: ReadonlySet<string>;
+  }>({ state: "idle", capabilities: EMPTY_CAPABILITIES });
+  const { state } = snapshot;
 
   // Only connect once the account and the host record are known, so a pinned
   // host is never reached (or falsely, terminally refused) before its identity
@@ -66,10 +75,12 @@ export function useHostControl(hostId: string | null, enabled = true) {
 
   useEffect(() => {
     if (!client || !enabled || !signalingReady) {
-      setState("idle");
+      setSnapshot({ state: "idle", capabilities: EMPTY_CAPABILITIES });
       return;
     }
-    const unsubscribe = client.subscribe(setState);
+    const unsubscribe = client.subscribe((next) =>
+      setSnapshot({ state: next, capabilities: client.getCapabilities() }),
+    );
     client.connect();
     return () => {
       unsubscribe();
@@ -78,5 +89,12 @@ export function useHostControl(hostId: string | null, enabled = true) {
   }, [client, enabled, signalingReady]);
 
   const signedRtcRefusal = state === "error" ? (client?.getSignedRtcRefusal() ?? null) : null;
-  return { client, state, signedRtcRefusal };
+  return {
+    client,
+    state,
+    capabilities: snapshot.capabilities,
+    /** Host platform, for wording only — never for gating a capability. */
+    os: hostQuery.data?.os ?? null,
+    signedRtcRefusal,
+  };
 }

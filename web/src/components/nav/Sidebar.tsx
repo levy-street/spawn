@@ -109,6 +109,14 @@ export function Sidebar({
     onSuccess: refresh,
     onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
   });
+  const iconWorkspaceM = useMutation({
+    // "custom" whichever way it went: a mark chosen here, and initials chosen
+    // here, are both the owner's answer — the folder scan must not undo it.
+    mutationFn: ({ id, icon }: { id: string; icon: string | null }) =>
+      workspaces.update(id, { icon, icon_source: "custom" }),
+    onSuccess: refresh,
+    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
+  });
   const reorderWorkspaceM = useMutation({
     // The server reorders by removal + reinsertion, so a single position
     // write is a proper insert-at-index for the drag drop.
@@ -174,6 +182,7 @@ export function Sidebar({
   });
   const workspaceBusy =
     renameWorkspaceM.isPending ||
+    iconWorkspaceM.isPending ||
     reorderWorkspaceM.isPending ||
     deleteWorkspaceM.isPending ||
     archiveWorkspaceM.isPending ||
@@ -447,7 +456,7 @@ export function Sidebar({
       </div>
 
       <div className="border-y border-border px-2.5 py-2">
-        <RailTooltip label="New workspace" disabled={!collapsed} className="[&>span]:w-full">
+        <RailTooltip label="New workspace" disabled={!collapsed}>
           {onlineHosts.length > 0 ? (
             <NewWorkspaceMenu
               trigger={newWorkspaceButton}
@@ -501,6 +510,7 @@ export function Sidebar({
                 busy={workspaceBusy}
                 onNavigate={onNavigate}
                 onRename={(name) => renameWorkspaceM.mutate({ id: workspace.id, name })}
+                onIcon={(icon) => iconWorkspaceM.mutate({ id: workspace.id, icon })}
                 onArchive={() => void requestWorkspaceArchive(workspace)}
                 onDelete={() => void requestWorkspaceDelete(workspace)}
                 onRowPointerDown={

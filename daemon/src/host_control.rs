@@ -15,6 +15,7 @@ use uuid::Uuid;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 
+use crate::host_desktop::DesktopAction;
 use crate::host_direct::{decode_write_chunk, HostDirectChannel};
 use crate::host_files::{
     HostFileOperations, HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES,
@@ -247,6 +248,9 @@ impl Drop for PublicationPermit {
 struct Context {
     direct: HostDirectChannel,
     files: Arc<HostFileService>,
+    /// None when this build or host cannot render previews at all.
+    preview: Option<Arc<crate::host_preview::PreviewService>>,
+    desktop: Arc<crate::host_desktop::DesktopService>,
     state: Arc<Mutex<State>>,
     long_tasks: Arc<Semaphore>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
@@ -521,8 +525,31 @@ impl Context {
                     .stat_in_session(path, Arc::clone(&self.file_operations))
                     .await
                 {
-                    Ok(stat) => match serde_json::to_value(stat) {
-                        Ok(result) => self.response(request_id, result).await,
+                    Ok(stat) => match serde_json::to_value(&stat) {
+                        Ok(mut result) => {
+                            // Name-only classification: `fs.stat` never opens
+                            // the file, so there are no bytes to sniff and no
+                            // evidence on which to grant `open_allowed`. The
+                            // type is a hint for choosing an icon, nothing more.
+                            if let Some(object) = result.as_object_mut() {
+                                let guess = crate::host_mime::classify_by_extension(
+                                    std::ffi::OsStr::new(&stat.name),
+                                );
+                                object.insert(
+                                    "content_type".into(),
+                                    Value::from(guess.content_type),
+                                );
+                                object.insert(
+                                    "content_type_source".into(),
+                                    Value::from(guess.source),
+                                );
+                                object.insert(
+                                    "preview_kind".into(),
+                                    Value::from(guess.preview.as_wire()),
+                                );
+                            }
+                            self.response(request_id, result).await
+                        }
                         Err(_) => false,
                     },
                     Err(error) => self.error(request_id, error.code, &error.detail).await,
@@ -579,6 +606,16 @@ impl Context {
                 }
             }
             "fs.read" => self.begin_read(request_id, payload).await,
+            "fs.read.range" => self.begin_range_read(request_id, payload).await,
+            "fs.preview" => self.begin_preview(request_id, payload).await,
+            "desktop.reveal" => {
+                self.desktop_action(request_id, payload, DesktopAction::Reveal)
+                    .await
+            }
+            "desktop.open" => {
+                self.desktop_action(request_id, payload, DesktopAction::Open)
+                    .await
+            }
             "fs.write.begin" => self.begin_write(request_id, payload).await,
             _ => {
                 self.error(
@@ -640,6 +677,317 @@ impl Context {
                 .read_requests
                 .remove(&cleanup_request_id);
             false
+        }
+    }
+
+    async fn begin_range_read(
+        &self,
+        request_id: &str,
+        payload: Option<&Map<String, Value>>,
+    ) -> bool {
+        let Some(path) = payload_string(payload, "path") else {
+            return self
+                .error(request_id, "invalid_request", "path is required")
+                .await;
+        };
+        let Some(length) = payload_u64(payload, "length") else {
+            return self
+                .error(request_id, "invalid_request", "length is required")
+                .await;
+        };
+        let offset = payload_u64(payload, "offset").unwrap_or(0);
+        if length == 0 || length > crate::host_files::MAX_RANGE_BYTES {
+            return self
+                .error(
+                    request_id,
+                    "range_too_large",
+                    "range length must be between 1 byte and 16 MiB",
+                )
+                .await;
+        }
+        let if_version = payload_string(payload, "if_version").map(str::to_string);
+        let Ok(permit) = Arc::clone(&self.long_tasks).try_acquire_owned() else {
+            return self
+                .error(
+                    request_id,
+                    "too_many_tasks",
+                    "too many long-running host operations",
+                )
+                .await;
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = self.state.lock().await;
+            if state.cancelled_request_ids.remove(request_id) {
+                drop(state);
+                return self
+                    .error(request_id, "cancelled", "file read was cancelled")
+                    .await;
+            }
+            state
+                .read_requests
+                .insert(request_id.to_string(), Arc::clone(&cancelled));
+        }
+        let context = self.clone();
+        let request_id = request_id.to_string();
+        let cleanup_request_id = request_id.clone();
+        let path = path.to_string();
+        let task = async move {
+            let _permit = permit;
+            let sent = context
+                .send_range_read(&request_id, &path, offset, length, if_version, cancelled)
+                .await;
+            context.state.lock().await.read_requests.remove(&request_id);
+            if !sent && !context.closed.load(Ordering::Acquire) {
+                close_with_deadline_later(context.direct.transport());
+            }
+        };
+        if self.spawn_session_task(task).await {
+            true
+        } else {
+            self.state
+                .lock()
+                .await
+                .read_requests
+                .remove(&cleanup_request_id);
+            false
+        }
+    }
+
+    async fn send_range_read(
+        &self,
+        request_id: &str,
+        path: &str,
+        offset: u64,
+        length: u64,
+        if_version: Option<String>,
+        cancelled: Arc<AtomicBool>,
+    ) -> bool {
+        use tokio::io::AsyncReadExt;
+
+        let stream = match self
+            .files
+            .open_range_read_in_session(
+                path,
+                offset,
+                length,
+                if_version,
+                Arc::clone(&cancelled),
+                Arc::clone(&self.file_operations),
+            )
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => return self.error(request_id, error.code, &error.detail).await,
+        };
+        if cancelled.load(Ordering::Acquire) {
+            return self
+                .error(request_id, "cancelled", "file read was cancelled")
+                .await;
+        }
+        let stream_id = Uuid::new_v4().to_string();
+        let (signal_tx, mut signal_rx) = mpsc::channel(MAX_READ_SIGNALS);
+        self.state
+            .lock()
+            .await
+            .reads
+            .insert(stream_id.clone(), signal_tx);
+        if !self
+            .response(
+                request_id,
+                json!({
+                    "stream_id": stream_id,
+                    "path": stream.stat.path,
+                    "name": stream.stat.name,
+                    "offset": stream.offset,
+                    "length": stream.length,
+                    "file_size": stream.stat.size,
+                    "modified_at": stream.stat.modified_at,
+                    "version": stream.version,
+                    "sha256": stream.sha256,
+                    "content_type": stream.content_type,
+                    "content_type_source": stream.content_type_source,
+                    "preview_kind": stream.preview_kind,
+                    "open_allowed": stream.open_allowed,
+                    "eof": stream.eof,
+                }),
+            )
+            .await
+        {
+            let _ = self.finish_read(&stream_id).await;
+            return false;
+        }
+        // Bounded at the reader, so the pump cannot run past the slice the
+        // digest was computed over even if the file grew underneath us.
+        let mut reader = stream.file.take(stream.length);
+        let expected = stream.sha256.clone();
+        self.pump_stream(
+            &stream_id,
+            &mut reader,
+            &mut signal_rx,
+            stream.length,
+            &expected,
+            &cancelled,
+        )
+        .await
+    }
+
+    async fn begin_preview(&self, request_id: &str, payload: Option<&Map<String, Value>>) -> bool {
+        let Some(path) = payload_string(payload, "path") else {
+            return self
+                .error(request_id, "invalid_request", "path is required")
+                .await;
+        };
+        let Some(max_pixels) = payload_u64(payload, "max_pixels") else {
+            return self
+                .error(request_id, "invalid_request", "max_pixels is required")
+                .await;
+        };
+        let max_pixels = u32::try_from(max_pixels).unwrap_or(u32::MAX);
+        if !crate::host_preview::is_supported_size(max_pixels) {
+            return self
+                .error(request_id, "invalid_request", "unsupported preview size")
+                .await;
+        }
+        let Some(preview) = self.preview.clone() else {
+            return self
+                .error(
+                    request_id,
+                    "preview_unsupported",
+                    "this host cannot render previews",
+                )
+                .await;
+        };
+        let if_version = payload_string(payload, "if_version").map(str::to_string);
+        let context = self.clone();
+        let request_id = request_id.to_string();
+        let path = path.to_string();
+        let task = async move {
+            // No long-task permit is taken here. The render holds its own much
+            // narrower semaphore, and streaming an in-memory PNG is not a
+            // filesystem operation — taking a long-task permit around the slow
+            // part is exactly the inversion that would let queued previews
+            // starve reads and writes.
+            let sent = context
+                .send_preview(&request_id, &preview, &path, max_pixels, if_version)
+                .await;
+            if !sent && !context.closed.load(Ordering::Acquire) {
+                close_with_deadline_later(context.direct.transport());
+            }
+        };
+        self.spawn_session_task(task).await
+    }
+
+    async fn send_preview(
+        &self,
+        request_id: &str,
+        preview: &crate::host_preview::PreviewService,
+        path: &str,
+        max_pixels: u32,
+        if_version: Option<String>,
+    ) -> bool {
+        let image = match preview
+            .render(
+                &self.files,
+                path,
+                max_pixels,
+                if_version,
+                Arc::clone(&self.file_operations),
+            )
+            .await
+        {
+            Ok(image) => image,
+            Err(error) => return self.error(request_id, error.code, &error.detail).await,
+        };
+        let digest = format!("{:x}", Sha256::digest(&image.bytes));
+        let stream_id = Uuid::new_v4().to_string();
+        let (signal_tx, mut signal_rx) = mpsc::channel(MAX_READ_SIGNALS);
+        self.state
+            .lock()
+            .await
+            .reads
+            .insert(stream_id.clone(), signal_tx);
+        if !self
+            .response(
+                request_id,
+                json!({
+                    "stream_id": stream_id,
+                    "path": image.path,
+                    "name": image.name,
+                    "length": image.bytes.len(),
+                    "sha256": digest,
+                    "content_type": image.content_type,
+                    "source_content_type": image.source_content_type,
+                    "width": image.width,
+                    "height": image.height,
+                    "version": image.version,
+                }),
+            )
+            .await
+        {
+            let _ = self.finish_read(&stream_id).await;
+            return false;
+        }
+        let length = image.bytes.len() as u64;
+        let mut reader = std::io::Cursor::new(image.bytes);
+        let cancelled = AtomicBool::new(false);
+        self.pump_stream(
+            &stream_id,
+            &mut reader,
+            &mut signal_rx,
+            length,
+            &digest,
+            &cancelled,
+        )
+        .await
+    }
+
+    async fn desktop_action(
+        &self,
+        request_id: &str,
+        payload: Option<&Map<String, Value>>,
+        action: DesktopAction,
+    ) -> bool {
+        if !crate::host_desktop::DESKTOP_SUPPORTED {
+            return self
+                .error(
+                    request_id,
+                    "desktop_unavailable",
+                    "this host cannot open files on a desktop",
+                )
+                .await;
+        }
+        // The payload is a path and nothing else. There is no application,
+        // argument or flag field to read, so nothing a client sends can name a
+        // program to run.
+        let Some(path) = payload_string(payload, "path") else {
+            return self
+                .error(request_id, "invalid_request", "path is required")
+                .await;
+        };
+        let result = match action {
+            DesktopAction::Reveal => {
+                self.desktop
+                    .reveal(&self.files, path, Arc::clone(&self.file_operations))
+                    .await
+            }
+            DesktopAction::Open => {
+                self.desktop
+                    .open(&self.files, path, Arc::clone(&self.file_operations))
+                    .await
+            }
+        };
+        match result {
+            Ok(resolved) => {
+                // "dispatched", not "the application opened" — the honest
+                // contract for handing something to LaunchServices.
+                self.response(
+                    request_id,
+                    json!({ "path": resolved, "action": action.as_wire() }),
+                )
+                .await
+            }
+            Err(error) => self.error(request_id, error.code, &error.detail).await,
         }
     }
 
@@ -863,6 +1211,124 @@ impl Context {
         }
     }
 
+    /// Stream a source out under the ack window, verifying as it goes.
+    ///
+    /// Every stream-producing operation funnels through here. The window, the
+    /// running digest, the cancel handling and the `file_changed` check are the
+    /// most integrity-sensitive code in this file, so they exist exactly once
+    /// rather than once per operation.
+    async fn pump_stream<R>(
+        &self,
+        stream_id: &str,
+        reader: &mut R,
+        signal_rx: &mut mpsc::Receiver<ReadSignal>,
+        expected_length: u64,
+        expected_sha256: &str,
+        cancelled: &AtomicBool,
+    ) -> bool
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let mut sequence = 0_u64;
+        let mut acknowledged = 0_u64;
+        let mut length = 0_u64;
+        let mut actual = Sha256::new();
+        let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return self.finish_read(stream_id).await;
+            }
+            while let Ok(signal) = signal_rx.try_recv() {
+                match signal {
+                    ReadSignal::Ack(value) if value >= acknowledged && value <= sequence => {
+                        acknowledged = value;
+                    }
+                    ReadSignal::Cancel => {
+                        return self.finish_read(stream_id).await;
+                    }
+                    ReadSignal::Ack(_) => {
+                        let _ = self.finish_read(stream_id).await;
+                        return false;
+                    }
+                }
+            }
+            let read = match reader.read(&mut buffer).await {
+                Ok(read) => read,
+                Err(error) => {
+                    if !self.finish_read(stream_id).await {
+                        return false;
+                    }
+                    return self
+                        .stream_error(stream_id, "io_error", &error.to_string())
+                        .await;
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            length = length.saturating_add(read as u64);
+            actual.update(&buffer[..read]);
+            if !self
+                .send_read_chunk(stream_id, sequence, &buffer[..read])
+                .await
+            {
+                return false;
+            }
+            sequence = sequence.saturating_add(1);
+            while sequence.saturating_sub(acknowledged) >= STREAM_WINDOW_CHUNKS {
+                let signal = tokio::time::timeout(stream_ack_timeout(), signal_rx.recv()).await;
+                match signal {
+                    Ok(Some(ReadSignal::Ack(value)))
+                        if value >= acknowledged && value <= sequence =>
+                    {
+                        acknowledged = value;
+                    }
+                    Ok(Some(ReadSignal::Cancel)) => {
+                        return self.finish_read(stream_id).await;
+                    }
+                    Ok(Some(ReadSignal::Ack(_))) | Ok(None) => {
+                        let _ = self.finish_read(stream_id).await;
+                        return false;
+                    }
+                    Err(_) => {
+                        if !self.finish_read(stream_id).await {
+                            return false;
+                        }
+                        return self
+                            .stream_error(
+                                stream_id,
+                                "stream_timeout",
+                                "stream acknowledgement timed out",
+                            )
+                            .await;
+                    }
+                }
+                if cancelled.load(Ordering::Acquire) {
+                    return self.finish_read(stream_id).await;
+                }
+            }
+        }
+        let digest = format!("{:x}", actual.finalize());
+        if length != expected_length || digest != expected_sha256 {
+            if !self.finish_read(stream_id).await {
+                return false;
+            }
+            return self
+                .stream_error(stream_id, "file_changed", "file changed during transfer")
+                .await;
+        }
+        let sent = self
+            .send(json!({
+                "version": VERSION,
+                "type": "stream.end",
+                "stream_id": stream_id,
+                "length": length,
+                "sha256": digest,
+            }))
+            .await;
+        self.finish_read(stream_id).await && sent
+    }
+
     async fn send_read(&self, request_id: &str, path: &str, cancelled: Arc<AtomicBool>) -> bool {
         let mut stream = match self
             .files
@@ -906,104 +1372,15 @@ impl Context {
             return false;
         }
 
-        let mut sequence = 0_u64;
-        let mut acknowledged = 0_u64;
-        let mut length = 0_u64;
-        let mut actual = Sha256::new();
-        let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
-        loop {
-            if cancelled.load(Ordering::Acquire) {
-                return self.finish_read(&stream_id).await;
-            }
-            while let Ok(signal) = signal_rx.try_recv() {
-                match signal {
-                    ReadSignal::Ack(value) if value >= acknowledged && value <= sequence => {
-                        acknowledged = value;
-                    }
-                    ReadSignal::Cancel => {
-                        return self.finish_read(&stream_id).await;
-                    }
-                    ReadSignal::Ack(_) => {
-                        let _ = self.finish_read(&stream_id).await;
-                        return false;
-                    }
-                }
-            }
-            let read = match stream.file.read(&mut buffer).await {
-                Ok(read) => read,
-                Err(error) => {
-                    if !self.finish_read(&stream_id).await {
-                        return false;
-                    }
-                    return self
-                        .stream_error(&stream_id, "io_error", &error.to_string())
-                        .await;
-                }
-            };
-            if read == 0 {
-                break;
-            }
-            length = length.saturating_add(read as u64);
-            actual.update(&buffer[..read]);
-            if !self
-                .send_read_chunk(&stream_id, sequence, &buffer[..read])
-                .await
-            {
-                return false;
-            }
-            sequence = sequence.saturating_add(1);
-            while sequence.saturating_sub(acknowledged) >= STREAM_WINDOW_CHUNKS {
-                let signal = tokio::time::timeout(stream_ack_timeout(), signal_rx.recv()).await;
-                match signal {
-                    Ok(Some(ReadSignal::Ack(value)))
-                        if value >= acknowledged && value <= sequence =>
-                    {
-                        acknowledged = value;
-                    }
-                    Ok(Some(ReadSignal::Cancel)) => {
-                        return self.finish_read(&stream_id).await;
-                    }
-                    Ok(Some(ReadSignal::Ack(_))) | Ok(None) => {
-                        let _ = self.finish_read(&stream_id).await;
-                        return false;
-                    }
-                    Err(_) => {
-                        if !self.finish_read(&stream_id).await {
-                            return false;
-                        }
-                        return self
-                            .stream_error(
-                                &stream_id,
-                                "stream_timeout",
-                                "stream acknowledgement timed out",
-                            )
-                            .await;
-                    }
-                }
-                if cancelled.load(Ordering::Acquire) {
-                    return self.finish_read(&stream_id).await;
-                }
-            }
-        }
-        let digest = format!("{:x}", actual.finalize());
-        if length != stream.stat.size || digest != stream.sha256 {
-            if !self.finish_read(&stream_id).await {
-                return false;
-            }
-            return self
-                .stream_error(&stream_id, "file_changed", "file changed during transfer")
-                .await;
-        }
-        let sent = self
-            .send(json!({
-                "version": VERSION,
-                "type": "stream.end",
-                "stream_id": stream_id,
-                "length": length,
-                "sha256": digest,
-            }))
-            .await;
-        self.finish_read(&stream_id).await && sent
+        self.pump_stream(
+            &stream_id,
+            &mut stream.file,
+            &mut signal_rx,
+            stream.stat.size,
+            &stream.sha256,
+            &cancelled,
+        )
+        .await
     }
 
     async fn handle_late_write_chunk(
@@ -1590,9 +1967,21 @@ pub(crate) fn install(
             let file_operations = HostFileOperations::new(Arc::clone(&closed));
             #[cfg(test)]
             file_operations.set_effect_test_hooks(files.write_lifecycle_test_hooks());
+            #[cfg(target_os = "macos")]
+            let preview = crate::host_preview::PreviewService::new(Arc::new(
+                crate::host_preview::QlmanageRenderer,
+            ))
+            .ok()
+            .map(Arc::new);
+            // A host with no renderer simply never advertises `fs.preview`, so
+            // the UI shows metadata cards and asks for nothing it cannot get.
+            #[cfg(not(target_os = "macos"))]
+            let preview: Option<Arc<crate::host_preview::PreviewService>> = None;
             let context = Context {
                 direct: HostDirectChannel::new(Arc::clone(&dc)),
                 files,
+                preview,
+                desktop: Arc::new(crate::host_desktop::DesktopService::new()),
                 state: Arc::new(Mutex::new(State::default())),
                 long_tasks: Arc::new(Semaphore::new(MAX_LONG_TASKS)),
                 background_tasks: Arc::new(Mutex::new(JoinSet::new())),
@@ -1681,19 +2070,43 @@ pub(crate) fn install(
             {
                 return;
             }
+            // Built rather than literal: what this daemon can do depends on the
+            // platform and on whether a renderer could be started. The client
+            // gates every new action on this list and never on the reported OS,
+            // so an old daemon on a Mac correctly offers nothing extra and a
+            // future Linux daemon lights up with no client change.
+            let mut capabilities = vec![
+                "ping",
+                "fs.home",
+                "fs.list",
+                "fs.stat",
+                "fs.read",
+                "fs.read.range",
+                "fs.write.begin",
+                "fs.mkdir",
+                "fs.rename",
+                "fs.remove",
+            ];
+            if publication_context.preview.is_some() {
+                capabilities.push("fs.preview");
+            }
+            if crate::host_desktop::DESKTOP_SUPPORTED {
+                capabilities.push("desktop.reveal");
+                capabilities.push("desktop.open");
+            }
             let hello = json!({
                 "version": VERSION,
                 "type": "hello",
                 "protocol": PROTOCOL,
-                "capabilities": [
-                    "ping", "fs.home", "fs.list", "fs.stat", "fs.read",
-                    "fs.write.begin", "fs.mkdir", "fs.rename", "fs.remove"
-                ],
+                "capabilities": capabilities,
                 "limits": {
                     "frame_bytes": MAX_FRAME_BYTES,
                     "chunk_bytes": STREAM_CHUNK_BYTES,
                     "file_bytes": MAX_FILE_BYTES,
                     "directory_entries": crate::host_files::MAX_DIRECTORY_ENTRIES,
+                    "range_bytes": crate::host_files::MAX_RANGE_BYTES,
+                    "preview_bytes": crate::host_preview::MAX_PREVIEW_BYTES,
+                    "preview_pixels": crate::host_preview::PREVIEW_PIXEL_SIZES,
                     "normal_queue": MAX_NORMAL_QUEUE,
                     "fast_queue": MAX_FAST_QUEUE,
                     "long_tasks": MAX_LONG_TASKS,

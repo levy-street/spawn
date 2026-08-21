@@ -43,6 +43,10 @@ scripts/check-signed-rtc-live.sh
 printf '%s\n' "== host-control pin-gate guard =="
 scripts/check-host-control-gated.sh
 
+printf '%s\n' "== host desktop launch guard =="
+scripts/check-host-desktop-launch.sh --self-test
+scripts/check-host-desktop-launch.sh
+
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
 

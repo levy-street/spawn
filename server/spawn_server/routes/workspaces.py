@@ -212,6 +212,8 @@ def _to_out(workspace: Workspace) -> schemas.WorkspaceOut:
         cwd=workspace.cwd,
         layout=schemas.WorkspaceLayoutV3.model_validate(parse_workspace_layout(workspace.layout)),
         position=workspace.position,
+        icon=workspace.icon,
+        icon_source=workspace.icon_source,
         archived_at=workspace.archived_at,
         created_at=workspace.created_at,
         updated_at=workspace.updated_at,
@@ -351,6 +353,11 @@ async def create_workspace(
         cwd=home_cwd,
         layout=_single_tab_layout([]),
         position=len(active),
+        # Given only by the template flow, which hands down the mark the
+        # template was saved with. Left unset, the pair stays null and the
+        # browser scans the folder the first time the workspace opens.
+        icon=body.icon,
+        icon_source=body.icon_source,
     )
     db.add(workspace)
     await db.flush()
@@ -424,6 +431,13 @@ async def update_workspace(
         if not cwd:
             raise HTTPException(status_code=400, detail="cwd is required")
         workspace.cwd = cwd
+    # `icon: null` clears the mark; an absent `icon` leaves it. Only
+    # `model_fields_set` tells those apart, and the two fields move
+    # independently: a scan that finds nothing writes the source alone.
+    if "icon" in body.model_fields_set:
+        workspace.icon = body.icon
+    if "icon_source" in body.model_fields_set:
+        workspace.icon_source = body.icon_source
     if body.position is not None:
         # Reorder by removal + reinsertion so positions stay contiguous.
         rows = await _owned_workspaces(db, user, archived=False)

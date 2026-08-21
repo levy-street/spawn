@@ -160,6 +160,42 @@ export function fileListing(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** Everything a current macOS daemon advertises. */
+const DEFAULT_HOST_CAPABILITIES = [
+  "ping",
+  "fs.home",
+  "fs.list",
+  "fs.stat",
+  "fs.read",
+  "fs.read.range",
+  "fs.write.begin",
+  "fs.mkdir",
+  "fs.rename",
+  "fs.remove",
+  "fs.preview",
+  "desktop.reveal",
+  "desktop.open",
+];
+
+/** What a daemon shipped before this feature advertises. */
+export const LEGACY_HOST_CAPABILITIES = [
+  "ping",
+  "fs.home",
+  "fs.list",
+  "fs.stat",
+  "fs.read",
+  "fs.write.begin",
+  "fs.mkdir",
+  "fs.rename",
+  "fs.remove",
+];
+
+/** A real 1x1 PNG, so an <img> actually decodes what the host "rendered". */
+const PREVIEW_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  "base64",
+);
+
 type JsonRecord = Record<string, unknown>;
 
 export interface AppMockStore {
@@ -232,6 +268,17 @@ export interface AppMockOptions {
   deleteSkill?: (id: string, route: Route) => Promise<void> | void;
   files?: (hostId: string, path: string | null) => unknown;
   fileRead?: (hostId: string, path: string) => string | Uint8Array;
+  /** Bytes of the PNG the host would render for a file it cannot stream. */
+  filePreview?: (hostId: string, path: string, maxPixels: number) => string | Uint8Array;
+  fileStat?: (hostId: string, path: string) => Record<string, unknown>;
+  /** Records desktop actions so a spec can assert the exact path requested. */
+  fileReveal?: (hostId: string, path: string) => void;
+  fileOpen?: (hostId: string, path: string) => void;
+  /**
+   * What the daemon advertises. Defaults to a fully capable macOS host; a spec
+   * overrides it with a legacy list to exercise the gating.
+   */
+  capabilities?: string[];
   fileUpload?: (hostId: string, route: Route) => Promise<void> | void;
   fileMkdir?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
   fileDelete?: (hostId: string, body: unknown, route: Route) => Promise<void> | void;
@@ -368,6 +415,74 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
           bytes_b64: bytes.toString("base64"),
         };
       }
+      if (operation === "fs.read.range") {
+        const all = Buffer.from(options.fileRead?.(hostId, String(payload.path)) ?? "hi");
+        const offset = Number(payload.offset ?? 0);
+        const requested = Number(payload.length ?? all.length);
+        const slice = all.subarray(offset, offset + requested);
+        return {
+          path: payload.path,
+          name:
+            String(payload.path ?? "file")
+              .split("/")
+              .at(-1) ?? "file",
+          offset,
+          length: slice.length,
+          file_size: all.length,
+          version: `v${all.length}`,
+          // The digest covers the slice, exactly as the daemon's does.
+          sha256: createHash("sha256").update(slice).digest("hex"),
+          content_type: "text/plain",
+          content_type_source: "extension",
+          preview_kind: "native",
+          open_allowed: true,
+          eof: offset + slice.length >= all.length,
+          bytes_b64: slice.toString("base64"),
+        };
+      }
+      if (operation === "fs.preview") {
+        const bytes = Buffer.from(
+          options.filePreview?.(hostId, String(payload.path), Number(payload.max_pixels)) ??
+            PREVIEW_PNG,
+        );
+        return {
+          path: payload.path,
+          name:
+            String(payload.path ?? "file")
+              .split("/")
+              .at(-1) ?? "file",
+          length: bytes.length,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          content_type: "image/png",
+          source_content_type: "application/octet-stream",
+          width: Number(payload.max_pixels ?? 256),
+          height: Number(payload.max_pixels ?? 256),
+          version: "v1",
+          bytes_b64: bytes.toString("base64"),
+        };
+      }
+      if (operation === "desktop.reveal") {
+        options.fileReveal?.(hostId, String(payload.path));
+        return { path: payload.path, action: "reveal" };
+      }
+      if (operation === "desktop.open") {
+        options.fileOpen?.(hostId, String(payload.path));
+        return { path: payload.path, action: "open" };
+      }
+      if (operation === "fs.stat") {
+        return (
+          options.fileStat?.(hostId, String(payload.path)) ?? {
+            path: payload.path,
+            name:
+              String(payload.path ?? "file")
+                .split("/")
+                .at(-1) ?? "file",
+            kind: "file",
+            size: 2,
+            modified_at: 1_700_000_000,
+          }
+        );
+      }
       if (operation === "fs.write.commit") {
         if (options.fileUpload) {
           let result: Record<string, unknown> | undefined;
@@ -388,7 +503,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     },
   );
 
-  await page.addInitScript(() => {
+  await page.addInitScript((capabilities: string[]) => {
     Object.defineProperty(globalThis, "showSaveFilePicker", {
       configurable: true,
       value: undefined,
@@ -428,17 +543,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
           version: 1,
           type: "hello",
           protocol: "spawn.host.ctl",
-          capabilities: [
-            "ping",
-            "fs.home",
-            "fs.list",
-            "fs.stat",
-            "fs.read",
-            "fs.write.begin",
-            "fs.mkdir",
-            "fs.rename",
-            "fs.remove",
-          ],
+          capabilities,
         });
       }
 
@@ -490,7 +595,11 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
           }
           try {
             const result = await invoke()(this.hostId, operation, payload);
-            if (operation === "fs.read") {
+            if (
+              operation === "fs.read" ||
+              operation === "fs.read.range" ||
+              operation === "fs.preview"
+            ) {
               const streamId = crypto.randomUUID();
               const bytes = String(result.bytes_b64 ?? "");
               const { bytes_b64: _, ...declaration } = result;
@@ -501,14 +610,24 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
                 ok: true,
                 result: { ...declaration, stream_id: streamId },
               });
-              if (bytes)
+              // The client rejects any chunk over 8 KiB by tearing down the
+              // channel, and it requires strictly increasing sequence numbers.
+              // Emitting a whole file as one frame silently capped every
+              // fixture at 8 KiB, so anything larger has to be split here the
+              // way the daemon splits it.
+              const CHUNK_BYTES = 8 * 1024;
+              const binary = bytes ? atob(bytes) : "";
+              let sequence = 0;
+              for (let offset = 0; offset < binary.length; offset += CHUNK_BYTES) {
                 this.emit({
                   version: 1,
                   type: "stream.chunk",
                   stream_id: streamId,
-                  sequence: 0,
-                  bytes_b64: bytes,
+                  sequence,
+                  bytes_b64: btoa(binary.slice(offset, offset + CHUNK_BYTES)),
                 });
+                sequence += 1;
+              }
               this.emit({
                 version: 1,
                 type: "stream.end",
@@ -666,7 +785,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
         ? new MockHostPeerConnection(hostId)
         : new OriginalPeerConnection(configuration);
     } as unknown as typeof RTCPeerConnection;
-  });
+  }, options.capabilities ?? DEFAULT_HOST_CAPABILITIES);
   let meReads = 0;
   let idCounter = 100;
   const nextId = () => `00000000-0000-4000-8000-${String(idCounter++).padStart(12, "0")}`;

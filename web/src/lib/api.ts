@@ -261,6 +261,12 @@ export const LayoutV3Schema: z.ZodType<LayoutV3> = z.object({
   tabs: z.array(WorkspaceTabSchema).min(1),
 });
 
+export const WorkspaceIconSourceSchema = z
+  .enum(["auto", "custom", "none"])
+  .nullable()
+  .default(null);
+export type WorkspaceIconSource = z.infer<typeof WorkspaceIconSourceSchema>;
+
 export const WorkspaceSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
@@ -270,6 +276,12 @@ export const WorkspaceSchema = z.object({
   cwd: z.string().nullable().default(null),
   layout: LayoutV3Schema,
   position: z.number().int().default(0),
+  /** The workspace's mark: a small square raster as a self-contained data URL,
+   *  found in its folder or chosen by its owner. Null draws the initials. */
+  icon: z.string().nullable().default(null),
+  /** Whether the mark is settled. Null means nobody has looked yet, which is
+   *  what makes the browser scan the folder when the workspace opens. */
+  icon_source: WorkspaceIconSourceSchema,
   /** Set -> the workspace is put away: out of the sidebar's list, and every
    *  session in it stopped. The layout is untouched — an archived workspace
    *  still names the same windows, they are simply not running. */
@@ -758,6 +770,12 @@ export const WorkspaceTemplateSchema = z.object({
   host_id: z.string().uuid().nullable().default(null),
   cwd: z.string().nullable().default(null),
   spec: WorkspaceTemplateSpecSchema,
+  /** The mark the saved workspace was wearing: a small square raster as a self-contained data URL,
+   *  found in its folder or chosen by its owner. Null draws the initials. */
+  icon: z.string().nullable().default(null),
+  /** Whether the mark is settled. Null means nobody has looked yet, which is
+   *  what makes the browser scan the folder when the workspace opens. */
+  icon_source: WorkspaceIconSourceSchema,
   created_at: z.string(),
   updated_at: z.string(),
 });
@@ -788,6 +806,8 @@ export const workspaces = {
     first_session?: { host_id: string; cwd: string; skill_ids?: string[] };
     host_id?: string;
     cwd?: string;
+    icon?: string | null;
+    icon_source?: WorkspaceIconSource;
   }) =>
     api("/api/workspaces", {
       method: "POST",
@@ -796,7 +816,16 @@ export const workspaces = {
     }),
   update: (
     id: string,
-    body: { name?: string; layout?: LayoutV3; position?: number; host_id?: string; cwd?: string },
+    body: {
+      name?: string;
+      layout?: LayoutV3;
+      position?: number;
+      host_id?: string;
+      cwd?: string;
+      /** Present clears or sets the mark; absent leaves it. */
+      icon?: string | null;
+      icon_source?: WorkspaceIconSource;
+    },
   ) =>
     api(`/api/workspaces/${id}`, {
       method: "PATCH",
@@ -828,7 +857,14 @@ export const workspaceTemplates = {
       method: "GET",
       schema: z.array(WorkspaceTemplateSchema),
     }),
-  create: (body: { name: string; host_id?: string; cwd?: string; spec: WorkspaceTemplateSpec }) =>
+  create: (body: {
+    name: string;
+    host_id?: string;
+    cwd?: string;
+    spec: WorkspaceTemplateSpec;
+    icon?: string | null;
+    icon_source?: WorkspaceIconSource;
+  }) =>
     api("/api/workspace-templates", {
       method: "POST",
       body: JSON.stringify(body),
@@ -836,7 +872,14 @@ export const workspaceTemplates = {
     }),
   update: (
     id: string,
-    body: { name?: string; host_id?: string; cwd?: string; spec?: WorkspaceTemplateSpec },
+    body: {
+      name?: string;
+      host_id?: string;
+      cwd?: string;
+      spec?: WorkspaceTemplateSpec;
+      icon?: string | null;
+      icon_source?: WorkspaceIconSource;
+    },
   ) =>
     api(`/api/workspace-templates/${id}`, {
       method: "PATCH",

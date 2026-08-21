@@ -1,6 +1,6 @@
 "use client";
 
-import { Archive, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
+import { Archive, ImagePlus, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 import Link from "next/link";
 import {
   type FormEvent,
@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { RailTooltip } from "@/components/ui/tooltip";
+import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
 import type { Workspace } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -36,6 +37,7 @@ export function SidebarWorkspaceRow({
   busy,
   onNavigate,
   onRename,
+  onIcon,
   onArchive,
   onDelete,
   onRowPointerDown,
@@ -47,6 +49,8 @@ export function SidebarWorkspaceRow({
   busy: boolean;
   onNavigate?: () => void;
   onRename: (name: string) => void;
+  /** Null sets it back to the initials. */
+  onIcon: (icon: string | null) => void;
   onArchive: () => void;
   onDelete: () => void;
   /** Arms the sidebar's drag-to-reorder; a plain click still navigates. */
@@ -54,6 +58,7 @@ export function SidebarWorkspaceRow({
 }) {
   const menuRef = useRef<DropdownMenuHandle>(null);
   const [editing, setEditing] = useState(false);
+  const [iconOpen, setIconOpen] = useState(false);
   const [draft, setDraft] = useState(workspace.name);
 
   useEffect(() => {
@@ -81,11 +86,16 @@ export function SidebarWorkspaceRow({
           >
             <WorkspaceAvatar
               name={workspace.name}
+              icon={workspace.icon}
               rail
               className={cn(
                 "transition-colors",
+                // Selection has to be a ring, not a border: a workspace with a
+                // custom icon renders no border of its own (WorkspaceAvatar
+                // leaves that to us), and a ring also sits outside the tile
+                // instead of eating 2px of the artwork.
                 active
-                  ? "border-foreground/20 bg-accent text-accent-foreground"
+                  ? "border-foreground/20 bg-accent text-accent-foreground ring-1 ring-foreground"
                   : "border-border bg-muted/50 text-muted-foreground hover:bg-accent hover:text-foreground",
               )}
             />
@@ -133,7 +143,7 @@ export function SidebarWorkspaceRow({
             className={cn(sidebarRowClass(active), "pr-10 [@media(pointer:coarse)]:pr-16")}
           >
             <SidebarIconSlot>
-              <WorkspaceAvatar name={workspace.name} />
+              <WorkspaceAvatar name={workspace.name} icon={workspace.icon} />
             </SidebarIconSlot>
             <SidebarRowLabel collapsed={false} className="font-medium">
               {workspace.name}
@@ -180,6 +190,12 @@ export function SidebarWorkspaceRow({
                 <Pencil className="size-4" aria-hidden />
                 Rename
               </DropdownMenuItem>
+              {/* Directly under Rename: both answer "what is this workspace
+                  called", one in letters and one in a picture. */}
+              <DropdownMenuItem disabled={busy} onSelect={() => setIconOpen(true)}>
+                <ImagePlus className="size-4" aria-hidden />
+                Change icon…
+              </DropdownMenuItem>
               {/* Above the separator: archiving is the reversible one. */}
               <DropdownMenuItem disabled={busy} onSelect={onArchive}>
                 <Archive className="size-4" aria-hidden />
@@ -194,6 +210,23 @@ export function SidebarWorkspaceRow({
           </>
         )}
       </div>
+
+      {/* Mounted only while open: the dialog holds a host connection of its
+          own, and a sidebar of thirty workspaces must not carry thirty of
+          them idling. The panel has no exit animation, so unmounting on close
+          looks exactly like closing. */}
+      {iconOpen && (
+        <WorkspaceIconDialog
+          open
+          onOpenChange={setIconOpen}
+          name={workspace.name}
+          icon={workspace.icon}
+          hostId={workspace.host_id}
+          cwd={workspace.cwd}
+          busy={busy}
+          onSelect={onIcon}
+        />
+      )}
     </li>
   );
 }

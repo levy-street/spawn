@@ -1,11 +1,13 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Pencil, Trash2, X } from "lucide-react";
+import { Check, ImagePlus, Pencil, Trash2, X } from "lucide-react";
 import { type FormEvent, useState } from "react";
+import { WorkspaceAvatar } from "@/components/nav/sidebar-parts";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
 import { Input } from "@/components/ui/input";
+import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
 import { type WorkspaceTemplate, workspaceTemplates } from "@/lib/api";
 
 function templateSummary(template: WorkspaceTemplate): string {
@@ -28,6 +30,7 @@ export function TemplatesPanel() {
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["workspace-templates"], queryFn: workspaceTemplates.list });
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [iconFor, setIconFor] = useState<WorkspaceTemplate | null>(null);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -36,6 +39,15 @@ export function TemplatesPanel() {
       workspaceTemplates.update(id, { name }),
     onSuccess: () => {
       setEditingId(null);
+      setError(null);
+      qc.invalidateQueries({ queryKey: ["workspace-templates"] });
+    },
+    onError: (err) => setError(err instanceof Error ? err.message : String(err)),
+  });
+  const iconM = useMutation({
+    mutationFn: ({ id, icon }: { id: string; icon: string | null }) =>
+      workspaceTemplates.update(id, { icon, icon_source: "custom" }),
+    onSuccess: () => {
       setError(null);
       qc.invalidateQueries({ queryKey: ["workspace-templates"] });
     },
@@ -133,10 +145,26 @@ export function TemplatesPanel() {
                 </form>
               ) : (
                 <>
+                  <WorkspaceAvatar
+                    name={template.name}
+                    icon={template.icon}
+                    rail
+                    className="border border-border bg-muted/40"
+                  />
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium">{template.name}</p>
                     <p className="text-xs text-muted-foreground">{templateSummary(template)}</p>
                   </div>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    aria-label={`Change the icon for ${template.name}`}
+                    onClick={() => setIconFor(template)}
+                    className="size-8 shrink-0 text-muted-foreground hover:text-foreground"
+                  >
+                    <ImagePlus className="size-4" aria-hidden />
+                  </Button>
                   <Button
                     type="button"
                     size="icon"
@@ -167,6 +195,23 @@ export function TemplatesPanel() {
           ))}
         </ul>
       )}
+
+      {/* One dialog for the list: the row that asked for it is the row it
+          edits, and dismissing forgets which that was. */}
+      <WorkspaceIconDialog
+        open={iconFor !== null}
+        onOpenChange={(open) => {
+          if (!open) setIconFor(null);
+        }}
+        name={iconFor?.name ?? ""}
+        icon={iconFor?.icon ?? null}
+        hostId={iconFor?.host_id ?? null}
+        cwd={iconFor?.cwd ?? null}
+        busy={iconM.isPending}
+        onSelect={(icon) => {
+          if (iconFor) iconM.mutate({ id: iconFor.id, icon });
+        }}
+      />
     </div>
   );
 }

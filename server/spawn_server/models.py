@@ -570,6 +570,17 @@ class Workspace(Base):
     position: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )
+    # The workspace's mark: a small square thumbnail as a self-contained
+    # `data:image/(png|webp);base64,...` URL, checked on every write by
+    # `schemas.validate_workspace_icon`. Null -> the sidebar draws the name's
+    # initials, as it always has.
+    icon: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Whether the icon question is settled, which `icon` alone cannot say: a
+    # null icon is both "nobody has looked" and "looked, found nothing". NULL
+    # -> the browser scans this workspace's folder next time it opens; "auto"
+    # (that scan found one), "custom" (the owner chose it, or deliberately
+    # cleared it) and "none" (scanned, nothing worth using) all mean: leave it.
+    icon_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Set -> the workspace is put away: out of the sidebar's list, and every
     # session in it stopped. Nothing else moves — `layout` still names the same
     # windows and `position` still holds the slot the row will come back to. A
@@ -606,6 +617,11 @@ class WorkspaceTemplate(Base):
     # {"version": 1, "tabs": [{"name", "tiles": [{x, y, w, h, "run"}]}]},
     # validated by routes/workspace_templates on every write.
     spec: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # The mark the saved workspace was wearing, in the same form and under the
+    # same validation as `Workspace.icon`; a workspace created from this
+    # template inherits it instead of scanning its folder.
+    icon: Mapped[str | None] = mapped_column(Text, nullable=True)
+    icon_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

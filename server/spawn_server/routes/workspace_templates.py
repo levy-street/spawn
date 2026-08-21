@@ -96,6 +96,10 @@ async def create_template(
         host_id=host_id,
         cwd=cwd,
         spec=_validated_spec(body.spec),
+        # The mark the saved workspace was wearing, so a workspace created
+        # from this template arrives already wearing it.
+        icon=body.icon,
+        icon_source=body.icon_source,
     )
     session.add(template)
     await session.commit()
@@ -125,6 +129,12 @@ async def update_template(
         )
     if body.spec is not None:
         template.spec = _validated_spec(body.spec)
+    # `icon: null` clears it, an absent `icon` leaves it — same rule as a
+    # workspace PATCH, and for the same reason.
+    if "icon" in body.model_fields_set:
+        template.icon = body.icon
+    if "icon_source" in body.model_fields_set:
+        template.icon_source = body.icon_source
     await session.commit()
     await session.refresh(template)
     return schemas.WorkspaceTemplateOut.model_validate(template)

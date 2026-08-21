@@ -26,6 +26,8 @@ import {
 } from "react";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
+import { type UploadTrack, uploadRatio } from "@/components/terminal/upload-progress";
+import { UploadProgressBar } from "@/components/terminal/upload-progress-bar";
 import { useSessionSocket } from "@/components/terminal/useSessionSocket";
 // Terminal configuration shared with the conformance harness
 // (tools/term-conformance/); see xterm-config.mjs before changing options.
@@ -44,6 +46,7 @@ import { useAuth } from "@/lib/auth";
 import { DirectSessionUploadError } from "@/lib/session-ctl";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
+import { viewportInset } from "@/lib/viewport";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
@@ -461,6 +464,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const [uploadReconciliationFault, setUploadReconciliationFault] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
+  // Byte progress of every upload in flight, keyed by upload id. Drives the
+  // hairline across the top of the terminal; see UploadProgressBar.
+  const [uploadTracks, setUploadTracks] = useState<Record<string, UploadTrack>>({});
   const [dropActive, setDropActive] = useState(false);
   // Live-edge tracking drives the "jump to latest" button. `atLiveEdge` is the
   // rendered state; the ref mirrors it for synchronous reads inside output
@@ -728,6 +734,25 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     },
     [sessionId],
   );
+
+  const beginUploadTrack = useCallback((id: string, total: number) => {
+    setUploadTracks((current) => ({ ...current, [id]: { sent: 0, total } }));
+  }, []);
+
+  const advanceUploadTrack = useCallback((id: string, sent: number, total: number) => {
+    // Only track uploads that are still open: a late chunk callback from an
+    // aborted upload must not resurrect the bar.
+    setUploadTracks((current) => (current[id] ? { ...current, [id]: { sent, total } } : current));
+  }, []);
+
+  const endUploadTrack = useCallback((id: string) => {
+    setUploadTracks((current) => {
+      if (!(id in current)) return current;
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+  }, []);
 
   const updatePendingAttachments = useCallback(
     (updater: (attachments: PendingAttachment[]) => PendingAttachment[]) => {
@@ -1504,11 +1529,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     // How much of the layout the on-screen keyboard is covering right now.
     // visualViewport shrinks (and can offset) under the keyboard while the
-    // layout viewport may not, so this is the authoritative signal.
+    // layout viewport may not, so this is the authoritative signal — read
+    // through viewportInset(), which discounts the same shrink when it comes
+    // from pinch zoom rather than a keyboard.
     const readKeyboardInset = () => {
       const vv = window.visualViewport;
       if (!vv) return 0;
-      return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+      return viewportInset({
+        visualHeight: vv.height,
+        offsetTop: vv.offsetTop,
+        scale: vv.scale,
+        layoutHeight: window.innerHeight,
+      }).keyboard;
     };
 
     // The soft keyboard is up. In this state we must NOT refit: shrinking the
@@ -2431,9 +2463,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           },
         ]);
         try {
+          beginUploadTrack(clientId, file.size);
           reserveUploadReconciliation(clientId, file.name || "Image");
           const result = await socket.uploadFile(file, {
             uploadId: clientId,
+            onProgress: (uploaded, total) => advanceUploadTrack(clientId, uploaded, total),
             name: file.name || defaultImageName(file),
             mimeType: mimeTypeForFile(file),
             destination: "attachments",
@@ -2483,6 +2517,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
               attachment.id === clientId ? { ...attachment, status: "error" } : attachment,
             ),
           );
+        } finally {
+          endUploadTrack(clientId);
         }
       }
       if (sent > 0) {
@@ -2490,6 +2526,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
     },
     [
+      advanceUploadTrack,
+      beginUploadTrack,
+      endUploadTrack,
       handleUploadSaved,
       assertUploadReconciliation,
       dismissUploadReconciliation,
@@ -2515,9 +2554,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
         const uploadId = makeClientId();
         try {
+          beginUploadTrack(uploadId, file.size);
           reserveUploadReconciliation(uploadId, file.name || "File");
           const result = await socket.uploadFile(file, {
             uploadId,
+            onProgress: (uploaded, total) => advanceUploadTrack(uploadId, uploaded, total),
             destination: "cwd",
             name: file.name || "file",
             mimeType: mimeTypeForUpload(file),
@@ -2549,6 +2590,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             dismissUploadReconciliation(uploadId);
             showUploadStatus(message);
           }
+        } finally {
+          endUploadTrack(uploadId);
         }
       }
       if (sent > 0) {
@@ -2556,7 +2599,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
     },
     [
+      advanceUploadTrack,
+      beginUploadTrack,
       dismissUploadReconciliation,
+      endUploadTrack,
       assertUploadReconciliation,
       promoteUploadReconciliation,
       reserveUploadReconciliation,
@@ -2927,9 +2973,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         const uploadId = options?.uploadId ?? makeClientId();
         const fileName = file.name || "file";
         try {
+          beginUploadTrack(uploadId, file.size);
           reserveUploadReconciliation(uploadId, fileName);
           const result = await socket.uploadFile(file, {
             name: fileName,
+            onProgress: (uploaded, total) => advanceUploadTrack(uploadId, uploaded, total),
             mimeType: mimeTypeForUpload(file),
             destination: options?.destination ?? "attachments",
             uploadId,
@@ -2954,6 +3002,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             dismissUploadReconciliation(uploadId);
           }
           throw error;
+        } finally {
+          endUploadTrack(uploadId);
         }
       },
       focus: () => termRef.current?.focus(),
@@ -2971,9 +3021,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       snapToLiveEdge,
     }),
     [
+      advanceUploadTrack,
       appendAttachmentsForSubmit,
       assertUploadReconciliation,
+      beginUploadTrack,
       dismissUploadReconciliation,
+      endUploadTrack,
       snapToLiveEdge,
       pasteDataTransfer,
       pasteFromClipboard,
@@ -2983,6 +3036,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       socket,
       sessionId,
     ],
+  );
+
+  const settledAttachments = pendingAttachments.filter(
+    (attachment) => attachment.status !== "uploading",
   );
 
   const onDragEnter = (event: DragEvent<HTMLDivElement>) => {
@@ -3130,9 +3187,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           ))}
         </div>
       )}
-      {pendingAttachments.length > 0 && (
+      {/* Upload progress reads as a hairline under the pane header. Uploads in
+          flight are only ever this bar: a thumbnail for something that is
+          about to disappear on its own just flashes. */}
+      <UploadProgressBar ratio={uploadRatio(Object.values(uploadTracks))} />
+      {/* What survives the upload does get a chip — a queued attachment (the
+          deferred paste mode) needs somewhere to be seen and removed, and a
+          failed one needs to say so. */}
+      {settledAttachments.length > 0 && (
         <div className="pointer-events-auto absolute bottom-2 left-2 z-20 flex max-w-[calc(100%-1rem)] gap-2 overflow-x-auto rounded-md border border-border bg-background/90 p-1 shadow-lg backdrop-blur">
-          {pendingAttachments.map((attachment) => (
+          {settledAttachments.map((attachment) => (
             <div
               key={attachment.id}
               className="relative h-14 w-14 shrink-0 overflow-hidden rounded border border-border bg-card"

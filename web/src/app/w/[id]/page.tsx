@@ -11,6 +11,7 @@ import { ArchivedBanner } from "@/components/workspace/archived-banner";
 import { LauncherFab } from "@/components/workspace/launcher-fab";
 import { WorkspaceGrid } from "@/components/workspace/workspace-grid";
 import { WorkspaceTabs } from "@/components/workspace/workspace-tabs";
+import { useWorkspaceIconAutoFill } from "@/hooks/useWorkspaceIconAutoFill";
 import { ApiError, sessions, workspaces } from "@/lib/api";
 import { readingOrder, type Tile } from "@/lib/grid";
 import { activeTab, tabById, tabOfSession, tabTiles } from "@/lib/tabs";
@@ -91,6 +92,9 @@ function WorkspaceView({ workspaceId }: { workspaceId: string }) {
   }, [queryClient, router, workspaceId, workspaceQ.error, workspacesQ.data, workspacesQ.isLoading]);
 
   const workspace = workspaceQ.data;
+  // A workspace nobody has looked at yet gets its folder scanned for a mark
+  // the first time it is opened with its host online.
+  useWorkspaceIconAutoFill(workspace);
 
   /*
    * Which tab is open. Explicit choices (clicks, ?tab=, a ?focus= session's

@@ -128,7 +128,11 @@ export const CascadeMenu = forwardRef<
 ) {
   const [open, setOpen] = useState(false);
   const [path, setPath] = useState<string[]>([]);
-  const [direction, setDirection] = useState<"forward" | "back">("forward");
+  // null until a step is taken: the first panel of an open should not slide,
+  // only the container's own zoom-from-the-trigger carries that motion. A
+  // slide there read as the menu arriving from off to the right no matter
+  // which corner it was actually hung from.
+  const [direction, setDirection] = useState<"forward" | "back" | null>(null);
   const [coords, setCoords] = useState<MenuPlacement | null>(null);
   // Set when opened at a click: the menu hangs off that point instead of the
   // trigger, which matters when the trigger is a whole empty grid opening.
@@ -143,7 +147,7 @@ export const CascadeMenu = forwardRef<
       setOpen(next);
       if (next) {
         setPath([]);
-        setDirection("forward");
+        setDirection(null);
       } else {
         setPoint(null);
       }
@@ -322,7 +326,8 @@ export const CascadeMenu = forwardRef<
       key={pathKey}
       className={cn(
         "animate-in fade-in-0 duration-150",
-        direction === "forward" ? "slide-in-from-right-4" : "slide-in-from-left-4",
+        direction === "forward" && "slide-in-from-right-4",
+        direction === "back" && "slide-in-from-left-4",
       )}
     >
       {depth > 0 ? (

@@ -3,8 +3,12 @@
 import { Slot } from "@radix-ui/react-slot";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FolderOpen } from "lucide-react";
-import { isValidElement, type JSX, useState } from "react";
-import { CascadeMenu, type CascadePanel } from "@/components/ui/cascade-menu";
+import { isValidElement, type JSX, useRef, useState } from "react";
+import {
+  CascadeMenu,
+  type CascadeMenuHandle,
+  type CascadePanel,
+} from "@/components/ui/cascade-menu";
 import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import {
@@ -14,7 +18,7 @@ import {
   workspaces,
   workspaceTemplates,
 } from "@/lib/api";
-import { FolderPickerDialog } from "./folder-picker-dialog";
+import { FolderPicker } from "./folder-picker";
 import { instantiateTemplate } from "./instantiate-template";
 
 /** What the menu creates once a folder is chosen: a blank workspace with one
@@ -38,6 +42,10 @@ export function NewWorkspaceMenu({
   onCreated?: (result: { workspaceId: string; focusSessionId: string | null }) => void;
 }): JSX.Element {
   const queryClient = useQueryClient();
+  // The cascade has closed by the time the picker opens, so the picker cannot
+  // hang off it — it hangs off the trigger the cascade came from instead.
+  const triggerRef = useRef<HTMLElement>(null);
+  const menuRef = useRef<CascadeMenuHandle>(null);
   const [pickerHost, setPickerHost] = useState<Host | null>(null);
   const [pickerChoice, setPickerChoice] = useState<Choice>({ kind: "blank" });
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -144,6 +152,7 @@ export function NewWorkspaceMenu({
   return (
     <>
       <CascadeMenu
+        ref={menuRef}
         root={root}
         className="block w-full"
         // Narrower than the cascade default: the items are short labels, and
@@ -155,22 +164,43 @@ export function NewWorkspaceMenu({
           isValidElement(trigger) ? (
             <Slot
               {...triggerProps}
+              ref={triggerRef}
               aria-disabled={createM.isPending || undefined}
               onClick={createM.isPending ? undefined : triggerProps.onClick}
             >
               {trigger}
             </Slot>
           ) : (
-            <button {...triggerProps} type="button">
+            <button
+              {...triggerProps}
+              ref={(node) => {
+                triggerRef.current = node;
+              }}
+              type="button"
+            >
               {trigger as React.ReactNode}
             </button>
           )
         }
       />
-      <FolderPickerDialog
+      <FolderPicker
         key={`${pickerHost?.id ?? "none"}:${pickerOpen ? "open" : "closed"}`}
         open={pickerOpen}
         host={pickerHost}
+        anchorRef={triggerRef}
+        onBack={() => {
+          setPickerOpen(false);
+          menuRef.current?.open();
+        }}
+        // A template's remembered folder, when it is on the host being picked:
+        // the picker opens where the template last ran rather than at home.
+        initialPath={
+          pickerChoice.kind === "template" &&
+          pickerChoice.template.host_id === pickerHost?.id &&
+          pickerChoice.template.cwd
+            ? pickerChoice.template.cwd
+            : null
+        }
         onOpenChange={setPickerOpen}
         onSelect={(path) => {
           if (pickerHost) createAt(pickerHost, path, pickerChoice);

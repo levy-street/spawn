@@ -784,3 +784,120 @@ async def test_archive_is_scoped_to_its_owner(client):
     intruder = {"Authorization": f"Bearer {other}"}
     assert (await client.post(f"/api/workspaces/{workspace_id}/archive", headers=intruder)).status_code == 404
     assert (await client.post(f"/api/workspaces/{workspace_id}/unarchive", headers=intruder)).status_code == 404
+
+
+# ---------- icon ----------
+
+# 1x1 transparent PNG; small enough to inline, real enough to be an icon.
+ICON_PNG = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+
+async def test_a_new_workspace_has_no_icon_and_has_not_been_looked_at(client):
+    """Null on both fields is the state that asks the browser to go looking."""
+    token = await _signup(client, "icon-fresh@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    workspace = (await client.post("/api/workspaces", json={}, headers=auth)).json()["workspace"]
+    assert (workspace["icon"], workspace["icon_source"]) == (None, None)
+
+
+async def test_icon_round_trips_through_patch_and_list(client):
+    token = await _signup(client, "icon-patch@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    workspace = (await client.post("/api/workspaces", json={}, headers=auth)).json()["workspace"]
+
+    r = await client.patch(
+        f"/api/workspaces/{workspace['id']}",
+        json={"icon": ICON_PNG, "icon_source": "auto"},
+        headers=auth,
+    )
+    assert r.status_code == 200, r.text
+    assert (r.json()["icon"], r.json()["icon_source"]) == (ICON_PNG, "auto")
+
+    listed = (await client.get("/api/workspaces", headers=auth)).json()
+    assert listed[0]["icon"] == ICON_PNG
+
+
+async def test_a_patch_that_omits_the_icon_leaves_it_alone(client):
+    """Renaming a workspace must not quietly strip its mark."""
+    token = await _signup(client, "icon-keep@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    workspace = (await client.post("/api/workspaces", json={}, headers=auth)).json()["workspace"]
+    await client.patch(
+        f"/api/workspaces/{workspace['id']}",
+        json={"icon": ICON_PNG, "icon_source": "custom"},
+        headers=auth,
+    )
+
+    r = await client.patch(
+        f"/api/workspaces/{workspace['id']}", json={"name": "renamed"}, headers=auth
+    )
+    assert (r.json()["name"], r.json()["icon"]) == ("renamed", ICON_PNG)
+
+
+async def test_an_explicit_null_icon_clears_it(client):
+    """"Use initials" is a null icon with the source still settled, so the
+    folder scan does not immediately put the old mark back."""
+    token = await _signup(client, "icon-clear@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    workspace = (await client.post("/api/workspaces", json={}, headers=auth)).json()["workspace"]
+    await client.patch(
+        f"/api/workspaces/{workspace['id']}",
+        json={"icon": ICON_PNG, "icon_source": "auto"},
+        headers=auth,
+    )
+
+    r = await client.patch(
+        f"/api/workspaces/{workspace['id']}",
+        json={"icon": None, "icon_source": "custom"},
+        headers=auth,
+    )
+    assert (r.json()["icon"], r.json()["icon_source"]) == (None, "custom")
+
+
+async def test_a_scan_that_found_nothing_records_only_the_source(client):
+    token = await _signup(client, "icon-none@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    workspace = (await client.post("/api/workspaces", json={}, headers=auth)).json()["workspace"]
+
+    r = await client.patch(
+        f"/api/workspaces/{workspace['id']}", json={"icon_source": "none"}, headers=auth
+    )
+    assert (r.json()["icon"], r.json()["icon_source"]) == (None, "none")
+
+
+async def test_only_small_raster_data_urls_are_accepted(client):
+    """A stored icon must never make a client fetch from a third party, and
+    must never be markup."""
+    token = await _signup(client, "icon-reject@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    workspace = (await client.post("/api/workspaces", json={}, headers=auth)).json()["workspace"]
+
+    from spawn_server.schemas import WORKSPACE_ICON_MAX_CHARS
+
+    rejected = [
+        "https://example.com/logo.png",
+        "data:image/svg+xml;base64,PHN2Zy8+",
+        "data:text/html;base64,PGI+aGk8L2I+",
+        "data:image/png,notbase64",
+        "data:image/png;base64," + "A" * WORKSPACE_ICON_MAX_CHARS,
+    ]
+    for value in rejected:
+        r = await client.patch(
+            f"/api/workspaces/{workspace['id']}", json={"icon": value}, headers=auth
+        )
+        assert r.status_code == 422, f"accepted {value[:40]}"
+    assert (await client.get(f"/api/workspaces/{workspace['id']}", headers=auth)).json()["icon"] is None
+
+
+async def test_icon_source_is_a_closed_set(client):
+    token = await _signup(client, "icon-source@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    workspace = (await client.post("/api/workspaces", json={}, headers=auth)).json()["workspace"]
+    r = await client.patch(
+        f"/api/workspaces/{workspace['id']}", json={"icon_source": "guessed"}, headers=auth
+    )
+    assert r.status_code == 422

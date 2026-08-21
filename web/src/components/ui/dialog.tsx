@@ -50,6 +50,16 @@ const contentVariants = cva(
           "md:rounded-xl md:border md:border-border md:shadow-2xl md:shadow-black/20 md:dark:shadow-black/50",
           "md:data-[state=open]:zoom-in-95",
         ),
+        // The file viewer: `full-mobile` given as much room as the viewport
+        // will spare, because the content is the point — a page of a PDF, a
+        // video frame, a wide table of code — and cropping it to a settings
+        // panel would defeat opening it at all.
+        viewer: cn(
+          "inset-0 pad-safe-top pad-safe-bottom max-h-(--vv-height)",
+          "md:inset-auto md:left-1/2 md:top-1/2 md:h-[min(100vh-3rem,860px)] md:w-[min(100vw-3rem,960px)] md:-translate-x-1/2 md:-translate-y-1/2",
+          "md:rounded-xl md:border md:border-border md:shadow-2xl md:shadow-black/20 md:dark:shadow-black/50",
+          "md:data-[state=open]:zoom-in-95",
+        ),
       },
     },
     defaultVariants: { size: "md" },

@@ -185,3 +185,61 @@ async def test_template_spec_v1_is_lifted_into_the_24x24_space(client):
         (0, 0, 12, 24),
         (12, 0, 12, 24),
     ]
+
+
+ICON_PNG = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+
+async def test_a_template_carries_the_mark_it_was_saved_with(client):
+    """Saving a workspace as a template keeps its icon, so every workspace
+    created from it opens wearing the same mark."""
+    token = await _signup(client, "template-icon@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    created = await client.post(
+        "/api/workspace-templates",
+        json={"name": "marked", "spec": _spec(), "icon": ICON_PNG, "icon_source": "custom"},
+        headers=auth,
+    )
+    assert created.status_code == 201, created.text
+    assert (created.json()["icon"], created.json()["icon_source"]) == (ICON_PNG, "custom")
+
+    template_id = created.json()["id"]
+    renamed = await client.patch(
+        f"/api/workspace-templates/{template_id}", json={"name": "still marked"}, headers=auth
+    )
+    assert renamed.json()["icon"] == ICON_PNG
+
+    cleared = await client.patch(
+        f"/api/workspace-templates/{template_id}", json={"icon": None}, headers=auth
+    )
+    assert cleared.json()["icon"] is None
+
+
+async def test_a_template_icon_is_held_to_the_same_rule_as_a_workspace(client):
+    token = await _signup(client, "template-icon-bad@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    r = await client.post(
+        "/api/workspace-templates",
+        json={"name": "bad", "spec": _spec(), "icon": "https://example.com/logo.png"},
+        headers=auth,
+    )
+    assert r.status_code == 422
+
+
+async def test_a_workspace_can_be_created_already_wearing_a_mark(client):
+    """The template flow hands the icon down at creation rather than in a
+    follow-up PATCH, so the new row never renders as initials first."""
+    token = await _signup(client, "template-instantiate-icon@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    created = await client.post(
+        "/api/workspaces",
+        json={"name": "from template", "icon": ICON_PNG, "icon_source": "custom"},
+        headers=auth,
+    )
+    assert created.status_code == 201, created.text
+    workspace = created.json()["workspace"]
+    assert (workspace["icon"], workspace["icon_source"]) == (ICON_PNG, "custom")

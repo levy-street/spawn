@@ -281,17 +281,36 @@ A workspace is a named 24×24 canvas of tiles. Tiles hold a session terminal, or
 | Method | Path | Body |
 |--------|------|------|
 | GET | `/api/workspaces` | list, ordered by `position` |
-| POST | `/api/workspaces` | `{name?, first_session?: {host_id, cwd, skill_ids?}}` → `{workspace, session\|null}` |
+| POST | `/api/workspaces` | `{name?, first_session?: {host_id, cwd, skill_ids?}, icon?, icon_source?}` → `{workspace, session\|null}` |
 | GET | `/api/workspaces/{id}` | one workspace |
-| PATCH | `/api/workspaces/{id}` | `{name?, layout?, position?, host_id?, cwd?}` |
+| PATCH | `/api/workspaces/{id}` | `{name?, layout?, position?, host_id?, cwd?, icon?, icon_source?}` — `icon` present-and-null clears the mark, absent leaves it |
 | DELETE | `/api/workspaces/{id}` | kills and deletes every session referenced by its tiles, then the workspace (204) |
 | POST | `/api/workspaces/{id}/archive` | put it away: kills its sessions, keeps its shape server-side, empties its layout, sets `archived_at` |
 | POST | `/api/workspaces/{id}/unarchive` | rebuild it and spawn a fresh shell per pane; `{host_id?}` re-homes it, and 409 `host_required` asks for one when a pane's own host is gone or offline |
 | GET | `/api/workspaces/{id}/archived-shape` | the snapshot an archived workspace is holding, for viewing it without restoring: `{version: 1, active_tab, tabs: [{id, name, host_id, cwd, tiles: [{x, y, w, h, pane}]}]}` where `pane` is `{kind: "session", host_id, cwd, name, skill_ids, command}` or `{kind: "widget", widget}`; 409 `workspace_not_archived` otherwise |
 | GET | `/api/workspace-templates` | the caller's saved templates, ordered by name |
-| POST | `/api/workspace-templates` | `{name, host_id?, cwd?, spec}` — host/cwd: the folder the template remembers (instantiation skips the picker);  spec: `{version: 1, tabs: [{name, tiles: [{x, y, w, h, run}]}]}` where `run` is `{kind: "shell"\|"agent"\|"files", command?}` (command required for agents); geometry validated per tab with the grid invariants |
-| PATCH | `/api/workspace-templates/{id}` | `{name?, host_id?, cwd?, spec?}` |
+| POST | `/api/workspace-templates` | `{name, host_id?, cwd?, spec, icon?, icon_source?}` — host/cwd: the folder the template remembers (instantiation skips the picker);  spec: `{version: 1, tabs: [{name, tiles: [{x, y, w, h, run}]}]}` where `run` is `{kind: "shell"\|"agent"\|"files", command?}` (command required for agents); geometry validated per tab with the grid invariants |
+| PATCH | `/api/workspace-templates/{id}` | `{name?, host_id?, cwd?, spec?, icon?, icon_source?}` |
 | DELETE | `/api/workspace-templates/{id}` | 204 |
+
+The icon pair (workspaces and templates alike):
+
+- `icon` — the row's mark, as a self-contained `data:image/png;base64,…` or
+  `data:image/webp;base64,…` URL of at most 32 KiB. Never a remote URL (a
+  stored icon must not make a client fetch from a third party) and never SVG
+  (markup in an `<img>` buys nothing for a 24px tile). Null draws the name's
+  initials. The server validates the form and the ceiling and 422s otherwise;
+  it does not decode the image.
+- `icon_source` — `"auto" | "custom" | "none" | null`. Null is the only value
+  that means *unlooked*: it is what makes the browser walk the workspace's
+  folder over `spawn.host.ctl` the next time the workspace is opened, rank
+  what it finds (favicon, app icon, logo, then any image in the usual asset
+  directories), rasterize the winner to a small square, and PATCH it back as
+  `"auto"` — or record `"none"` when the folder had nothing worth wearing.
+  `"custom"` is the owner's own answer, including the answer "initials"
+  (`{"icon": null, "icon_source": "custom"}`), and is never overwritten by a
+  scan. The scan is entirely client-side: the server never reads the host's
+  filesystem and receives only the finished thumbnail.
 
 Layout schema v3 (wire + DB) — an envelope of named tabs, each wrapping one
 tile grid (grid schema v3):
@@ -894,7 +913,7 @@ that label only on a host-scoped peer connection for its server-registered host
 identity. The server never receives these messages. Version 1 starts with:
 
 ```json
-{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.write.begin","fs.mkdir","fs.rename","fs.remove"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.read.range","fs.write.begin","fs.mkdir","fs.rename","fs.remove","fs.preview","desktop.reveal","desktop.open"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"range_bytes":16777216,"preview_bytes":2097152,"preview_pixels":[128,256,512,1024],"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
 {"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
 {"version":1,"type":"cancel","request_id":"unguessable-id"}
@@ -932,7 +951,63 @@ more than the fixed 1024-entry directory ceiling, and the final page sets
 pages/3072 entries for an active directory and evicts collapsed directory
 pages. Entries contain `name`, `path`, `kind`, `is_dir`, optional `size`, and
 optional `modified_at`. The daemon's filesystem capability is rooted at the
-host home directory; the workspace folder picker browses this tree.
+host home directory; the workspace folder picker browses this tree. `fs.stat`
+additionally reports a name-derived `content_type`, `content_type_source`, and
+`preview_kind`; it never opens the file, so it has no evidence on which to
+report `open_allowed` and never does.
+
+`capabilities` is built per platform and per daemon, not fixed: `fs.preview`,
+`desktop.reveal`, and `desktop.open` are advertised only where the host can
+actually perform them (macOS, with a preview staging area that started
+successfully). The browser gates every one of these on the advertised list and
+never on the host's reported OS, so an older daemon on macOS correctly offers
+nothing new and a future Linux daemon lights them up with no client change.
+Unadvertised operations answer `unsupported_operation` as an ordinary error
+response rather than closing the channel.
+
+`fs.read.range` accepts `{path, offset?, length, if_version?}` and streams a
+bounded slice: `length` is capped at 16 MiB and clamped down to what remains,
+and the declared `sha256` covers **exactly the returned slice**, not the whole
+file. This is deliberately a separate operation from `fs.read` rather than an
+option on it. An older daemon ignores unknown payload keys, so a ranged
+`fs.read` would silently stream — and whole-file hash — a 512 MiB file to answer
+a 4 KiB question; and `fs.read`'s `sha256` is defined as the whole-file digest,
+which a range would fork inside a frozen v1 vocabulary. `fs.read` is unchanged
+and keeps its end-to-end whole-file guarantee for downloads and transfers. The
+response also carries `file_size`, `eof`, a sniffed `content_type` with its
+`content_type_source`, a `preview_kind`, and `open_allowed`.
+
+`version` is an opaque validator over the file's identity, size, and
+nanosecond mtime. Second-granularity `modified_at` cannot distinguish an edit
+made in the same second as the read, and inode identity catches a
+replace-by-rename that leaves the timestamp looking plausible. Passing it back
+as `if_version` fails the request with `version_changed` rather than serving
+bytes that no longer match a cached preview.
+
+`fs.preview` accepts `{path, max_pixels, if_version?}` and streams a rendered
+PNG for formats no browser can draw. `max_pixels` is an allowlist —
+`128`, `256`, `512`, `1024` — and anything else is refused rather than clamped,
+because a free integer lets a caller ask a third-party generator for a
+16384-pixel render. Failure is always an error response
+(`preview_unsupported`, `preview_unavailable`, `preview_timeout`,
+`preview_too_large`, `preview_session_unavailable`, `version_changed`), never a
+success with an empty body. Previews are always streamed, never returned inline:
+a 16 KiB frame leaves roughly 11.5 KiB after base64, while a rendered page is
+50 KiB to 1 MiB, and an inline path would be a second delivery mechanism with
+no `stream.end` digest, window, cancel, or tombstone beside a mature one.
+
+`desktop.reveal` and `desktop.open` take a path and nothing else. There is no
+field for an application, arguments, or flags — not optional, not ignored,
+absent from the schema — so argv is built entirely from daemon constants plus a
+path the daemon resolved itself. `ok:true` means the launch was dispatched, not
+that an application opened. Reveal only selects the target and is permitted for
+any path inside the root; open is confined to regular files that pass a
+magic-sniffed allowlist, carry no execute bit, are not executable formats, are
+not URL-indirection files, and clear a per-channel rate limit. Because the same
+channel offers `fs.write.begin`, those gates are what stop write-then-open from
+being a code-execution primitive, and the daemon re-checks all of them on every
+call: `open_allowed` reported by other operations is a hint for drawing a menu,
+never a grant.
 
 The daemon acquires the canonical home directory once as a filesystem
 capability. Every component is then opened relative to held directory handles

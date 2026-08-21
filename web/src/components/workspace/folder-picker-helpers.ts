@@ -1,3 +1,4 @@
+import type { HostDirEntry, HostDirList } from "@/lib/hostControl";
 import { normalizeAbsolutePath, parentDir, trimTrailingSlash } from "@/lib/paths";
 
 export function joinDirectory(parent: string, child: string): string {
@@ -73,4 +74,63 @@ export function breadcrumbParts(
     breadcrumbs.push({ label: part, path: current });
   }
   return breadcrumbs;
+}
+
+/** One column of the picker's Finder-style trail. */
+export type FolderColumn = {
+  /** The folder this column lists. */
+  path: string;
+  /** The child of `path` the trail continues through, highlighted here. */
+  selectedChild: string | null;
+};
+
+/**
+ * The column trail for `path`: one column per ancestor from the home root
+ * down, each highlighting the child the trail continues through, then a final
+ * column listing `path`'s own subfolders with nothing selected yet.
+ *
+ * The trail is derived from the path rather than accumulated as you click, so
+ * every way of moving — a crumb, the drill menu, an arrow key, a stale saved
+ * cwd — rebuilds the same columns. There is no history to fall out of sync.
+ */
+export function folderColumns(path: string, homeDir: string): FolderColumn[] {
+  const trail = breadcrumbParts(path, homeDir);
+  return trail.map((crumb, index) => ({
+    path: crumb.path,
+    selectedChild: trail[index + 1]?.path ?? null,
+  }));
+}
+
+/**
+ * Pages to ask for before giving up on a directory. The daemon serves 96
+ * entries a page and refuses to inventory more than 1024 of them, so twelve
+ * rounds reaches the end of anything it will ever return.
+ */
+export const FOLDER_PAGE_BUDGET = 12;
+
+/**
+ * Every entry in a directory, not just the first page.
+ *
+ * The daemon returns entries in raw readdir order, unsorted — so a single page
+ * is an arbitrary 96 of them, not the first 96 alphabetically. In a home
+ * directory (where dotfiles and loose files easily fill a page on their own)
+ * that left the picker showing a scattered handful of real folders and hiding
+ * the rest. Anything that lists folders has to drain the cursor.
+ */
+export async function listAllEntries(
+  fetchPage: (cursor: number) => Promise<HostDirList>,
+  budget = FOLDER_PAGE_BUDGET,
+): Promise<{ entries: HostDirEntry[]; truncated: boolean }> {
+  const entries: HostDirEntry[] = [];
+  let cursor = 0;
+  for (let page = 0; page < budget; page += 1) {
+    const result = await fetchPage(cursor);
+    entries.push(...result.entries);
+    // The daemon's own ceiling: it stopped reading the directory, so there is
+    // nothing further to ask for even though more exists on disk.
+    if (result.truncated === true) return { entries, truncated: true };
+    if (typeof result.next_cursor !== "number") return { entries, truncated: false };
+    cursor = result.next_cursor;
+  }
+  return { entries, truncated: true };
 }

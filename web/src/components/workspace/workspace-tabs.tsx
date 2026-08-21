@@ -7,6 +7,7 @@ import {
   Copy,
   Ellipsis,
   FolderOpen,
+  ImagePlus,
   LayoutTemplate,
   Pencil,
   Plus,
@@ -43,6 +44,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
+import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
 import {
   agents,
   type Host,
@@ -75,7 +77,7 @@ import { cn } from "@/lib/utils";
 import { templateSpecFromWorkspace } from "@/lib/workspace-templates";
 import { tabAttentionCount, workspaceLiveSessionCount } from "@/lib/workspaces";
 import { agentRunCommand } from "./agent-command";
-import { FolderPickerDialog } from "./folder-picker-dialog";
+import { FolderPicker } from "./folder-picker";
 import { pendingLaunch } from "./pending-launch";
 import { useTabHome } from "./tab-home";
 import { wantsDuplicate } from "./workspace-grid-helpers";
@@ -173,10 +175,12 @@ export function WorkspaceTabs({
   const [renameWorkspaceOpen, setRenameWorkspaceOpen] = useState(false);
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
+  const settingsButtonRef = useRef<HTMLButtonElement>(null);
   const [hostPickerOpen, setHostPickerOpen] = useState(false);
   /** A home-host change in flight: picked in the host dialog, committed only
    *  once its folder is chosen — cancelling the folder picker drops it. */
   const [pendingHomeHost, setPendingHomeHost] = useState<Host | null>(null);
+  const [iconOpen, setIconOpen] = useState(false);
   const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
   const [templateNameDraft, setTemplateNameDraft] = useState("");
   // One context menu serves the whole strip: right-click records which tab it
@@ -185,7 +189,7 @@ export function WorkspaceTabs({
   // The tab under the cursor when its menu opened, so "Change tab folder"
   // re-points that tab rather than whichever one is selected.
   const [homeTabId, setHomeTabId] = useState<string | null>(null);
-  const tabHomeM = useTabHome(workspace, homeTabId ?? activeTabId, onError);
+  const tabHomeM = useTabHome(workspace, homeTabId ?? activeTabId, onError, settingsButtonRef);
   const tabGhostRef = useRef<HTMLDivElement>(null);
   const tabGhostLabelRef = useRef<HTMLSpanElement>(null);
   const [contextTabId, setContextTabId] = useState<string | null>(null);
@@ -698,8 +702,13 @@ export function WorkspaceTabs({
   };
 
   const settingsM = useMutation({
-    mutationFn: (body: { name?: string; cwd?: string; host_id?: string }) =>
-      workspaces.update(workspace.id, body),
+    mutationFn: (body: {
+      name?: string;
+      cwd?: string;
+      host_id?: string;
+      icon?: string | null;
+      icon_source?: "auto" | "custom" | "none";
+    }) => workspaces.update(workspace.id, body),
     onSuccess: (saved) => {
       writeCaches(saved);
       onError?.(null);
@@ -716,6 +725,9 @@ export function WorkspaceTabs({
         ...(workspace.host_id && workspace.cwd
           ? { host_id: workspace.host_id, cwd: workspace.cwd }
           : {}),
+        // So does the mark: every workspace made from this template opens
+        // wearing it, rather than scanning its way back to the same image.
+        ...(workspace.icon ? { icon: workspace.icon, icon_source: workspace.icon_source } : {}),
         spec: templateSpecFromWorkspace(
           workspace.layout,
           new Map((sessionsQ.data ?? []).map((session) => [session.id, session])),
@@ -1045,9 +1057,14 @@ export function WorkspaceTabs({
         renderTrigger={(props) => (
           <Button
             {...props}
+            ref={settingsButtonRef}
             type="button"
             variant="ghost"
             size="icon"
+            onClick={() => {
+              setFolderPickerOpen(false);
+              props.onClick();
+            }}
             aria-label={`${workspace.name} settings`}
             className="size-7 text-muted-foreground hover:text-foreground"
           >
@@ -1063,6 +1080,10 @@ export function WorkspaceTabs({
         >
           <Pencil className="size-4" aria-hidden />
           Rename workspace
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setIconOpen(true)}>
+          <ImagePlus className="size-4" aria-hidden />
+          Change workspace icon…
         </DropdownMenuItem>
         <DropdownMenuItem
           disabled={hostList.length === 0 || (hostList.length === 1 && Boolean(homeHost))}
@@ -1100,6 +1121,17 @@ export function WorkspaceTabs({
           Delete workspace
         </DropdownMenuItem>
       </DropdownMenu>
+
+      <WorkspaceIconDialog
+        open={iconOpen}
+        onOpenChange={setIconOpen}
+        name={workspace.name}
+        icon={workspace.icon}
+        hostId={workspace.host_id}
+        cwd={workspace.cwd}
+        busy={settingsM.isPending}
+        onSelect={(icon) => settingsM.mutate({ icon, icon_source: "custom" })}
+      />
 
       <Dialog open={renameWorkspaceOpen} onOpenChange={setRenameWorkspaceOpen}>
         <DialogContent size="sm">
@@ -1208,10 +1240,14 @@ export function WorkspaceTabs({
         </DialogContent>
       </Dialog>
 
-      <FolderPickerDialog
+      <FolderPicker
         key={`${(pendingHomeHost ?? homeHost)?.id ?? "none"}:${folderPickerOpen ? "open" : "closed"}`}
         open={folderPickerOpen}
         host={pendingHomeHost ?? homeHost}
+        // Only when the host is unchanged: a folder from the old host means
+        // nothing on the new one, so switching hosts starts at its home.
+        initialPath={pendingHomeHost ? null : workspace.cwd}
+        anchorRef={settingsButtonRef}
         onOpenChange={(open) => {
           setFolderPickerOpen(open);
           if (!open) setPendingHomeHost(null);

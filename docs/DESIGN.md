@@ -104,6 +104,21 @@ The `*-soft` tints are translucent so they sit correctly on any surface
 
 "Attention" states (a session waiting for input) use the `warning` family.
 
+### Code (theme-swapped)
+
+| Token | Light | Dark | Use |
+| --- | --- | --- | --- |
+| `--code-comment` | `oklch(0.55 0.02 260)` | `oklch(0.62 0.02 260)` | comments |
+| `--code-string` | `oklch(0.48 0.12 150)` | `oklch(0.78 0.13 150)` | string literals |
+| `--code-keyword` | `oklch(0.50 0.16 305)` | `oklch(0.76 0.14 305)` | keywords, markup tags |
+| `--code-number` | `oklch(0.52 0.13 60)` | `oklch(0.80 0.12 70)` | numbers, markup attributes |
+| `--code-punct` | `oklch(0.55 0.02 260)` | `oklch(0.66 0.02 260)` | punctuation |
+
+Its own family rather than a reuse of the status hues, which carry meaning:
+painting a string literal "success green" is precisely the semantic overload the
+token system exists to prevent. Light values sit at the same `L ≤ 0.55` the
+status hues use, so each clears 4.5:1 on `--background`.
+
 ### Status-dot tones (theme-swapped)
 
 | Token | Light | Dark | Meaning |
@@ -181,7 +196,7 @@ tokens only.
 | `skeleton.tsx` | `Skeleton` | loading placeholders for known layouts |
 | `spinner.tsx` | `Spinner` (`size`, `label`) | indeterminate loading; replaces "Loading..." text |
 | `empty-state.tsx` | `EmptyState` (`icon`, `title`, `body`, `action`) | empty workspace, no hosts, empty lists |
-| `dialog.tsx` | `Dialog`, `DialogContent` (`size`: `sm`/`md`/`lg`/`full-mobile`), `DialogHeader/Title/Description/Footer/Trigger/Close` | every modal. `full-mobile` = full screen under `md:`, large panel above |
+| `dialog.tsx` | `Dialog`, `DialogContent` (`size`: `sm`/`md`/`lg`/`full-mobile`/`viewer`), `DialogHeader/Title/Description/Footer/Trigger/Close` | every modal. `full-mobile` = full screen under `md:`, large panel above; `viewer` is the same shape sized for file content |
 | `confirm.tsx` | `confirm(opts): Promise<boolean>`, `useConfirm`, `ConfirmHost` | destructive/irreversible actions. `ConfirmHost` is mounted once in the app shell; never build ad-hoc confirm dialogs |
 | `toast.tsx` | `toast(msg)`, `toast.error(msg)`, `ToastHost` | transient outcome/error notices (replaces inline error banners). `ToastHost` is mounted once in the app shell; duplicates coalesce; errors linger longer. The stack sits above the pane launcher, bottom-right |
 | `dropdown-menu.tsx` | `DropdownMenu` (render-prop trigger, `openAt` handle), `DropdownMenuItem/Separator/Label` | single-level menus, kebabs, right-click menus |
@@ -189,6 +204,8 @@ tokens only.
 | `sheet.tsx` | `BottomSheet` | mobile bottom-sheet container (drag handle, scrim, `--vv-height` cap) |
 | `drawer.tsx` | `Drawer` | left slide-in panel (the mobile sidebar): scrim, drag-to-dismiss, focus trap |
 | `tooltip.tsx` | `RailTooltip` | collapsed-sidebar hover/focus hints |
+| `popover.tsx` | `Popover` (`anchor`, `side`, `align`, `interactive`) | a floating surface anchored to a rect the *caller* supplies, when that rect is not simply the trigger — the file preview card tracks a row vertically while staying pinned to the panel's edge. Non-interactive by default (`role="tooltip"`, pointer events off) so it cannot capture the hover that opened it |
+| `hover-intent.ts` | `useHoverIntent`, `createHoverIntent` | opening something because the pointer *stopped*, not because it passed through. The pure factory takes its clock, so the behaviour is unit-tested with no DOM |
 
 Usage rules:
 

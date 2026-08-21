@@ -1,25 +1,29 @@
 "use client";
 
+import { useQuery } from "@tanstack/react-query";
 import {
+  ChevronDown,
   ChevronsDownUp,
   Copy,
   Ellipsis,
+  Folder,
   FolderPlus,
-  FolderTree,
   RefreshCw,
   Trash2,
   Upload,
 } from "lucide-react";
-import { type PointerEvent as ReactPointerEvent, useRef } from "react";
+import { type PointerEvent as ReactPointerEvent, useRef, useState } from "react";
 import { FileExplorer, type FileExplorerHandle } from "@/components/files/FileExplorer";
 import {
   DropdownMenu,
   DropdownMenuItem,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+import { hosts } from "@/lib/api";
 import type { Tile, TileWidget } from "@/lib/grid";
 import { basename } from "@/lib/paths";
 import { cn } from "@/lib/utils";
+import { FolderPicker } from "./folder-picker";
 
 export function widgetTitle(widget: TileWidget): string {
   return `Files — ${basename(widget.path) || widget.path}`;
@@ -41,6 +45,7 @@ export function WidgetPane({
   onToggleZoom,
   onMoveStart,
   onDuplicate,
+  onChangePath,
   onRemove,
 }: {
   tile: Tile;
@@ -55,11 +60,17 @@ export function WidgetPane({
   onMoveStart: (tileId: string, event: ReactPointerEvent<HTMLElement>) => void;
   /** Add a second explorer on the same host and path. */
   onDuplicate?: (tileId: string) => void;
+  /** Re-root this explorer at another folder on the same host. */
+  onChangePath?: (tileId: string, path: string) => void;
   onRemove: (tileId: string) => void;
 }) {
   const id = tile.session_id;
   const title = widgetTitle(widget);
   const explorerRef = useRef<FileExplorerHandle>(null);
+  const folderChipRef = useRef<HTMLButtonElement>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
+  const paneHost = (hostsQ.data ?? []).find((host) => host.id === widget.host_id) ?? null;
   return (
     <section
       aria-label={title}
@@ -89,11 +100,26 @@ export function WidgetPane({
         }}
         onDoubleClick={() => onToggleZoom(id)}
       >
-        <FolderTree className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-        <span className="min-w-0 flex-1 truncate text-xs font-medium">{title}</span>
-        <span className="min-w-0 truncate font-mono text-[10px] text-muted-foreground">
-          {widget.path}
-        </span>
+        {/* The pane's folder, as a control — the same chip a shell pane wears,
+            so "where am I, and how do I go somewhere else" is answered the same
+            way whatever the pane holds. The full path stays in the title. */}
+        <button
+          ref={folderChipRef}
+          type="button"
+          aria-label="Change folder"
+          aria-expanded={pickerOpen}
+          title={widget.path}
+          disabled={!onChangePath}
+          onClick={() => setPickerOpen((value) => !value)}
+          onDoubleClick={(event) => event.stopPropagation()}
+          className="mr-auto flex h-7 min-w-0 items-center gap-1.5 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none"
+        >
+          <Folder className="size-3.5 shrink-0" aria-hidden />
+          <span className="truncate font-medium text-foreground">
+            {basename(widget.path) || widget.path}
+          </span>
+          {onChangePath && <ChevronDown className="size-3 shrink-0" aria-hidden />}
+        </button>
         <DropdownMenu
           align="end"
           renderTrigger={(props) => (
@@ -143,6 +169,21 @@ export function WidgetPane({
           </DropdownMenuItem>
         </DropdownMenu>
       </header>
+
+      {onChangePath && (
+        <FolderPicker
+          key={`${widget.host_id}:${pickerOpen ? "open" : "closed"}`}
+          open={pickerOpen}
+          host={paneHost}
+          initialPath={widget.path}
+          anchorRef={folderChipRef}
+          onOpenChange={setPickerOpen}
+          onSelect={(path) => {
+            setPickerOpen(false);
+            if (path !== widget.path) onChangePath(id, path);
+          }}
+        />
+      )}
 
       <FileExplorer
         ref={explorerRef}

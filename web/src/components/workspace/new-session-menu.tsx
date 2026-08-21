@@ -9,6 +9,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
+  type RefObject,
   useEffect,
   useRef,
   useState,
@@ -25,7 +26,7 @@ import { type Agent, ApiError, agents, type Host, hosts, sessions, workspaces } 
 import { autoPlace, type Rect } from "@/lib/grid";
 import { activeTab, tabHome, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { FolderPickerDialog } from "./folder-picker-dialog";
+import { FolderPicker } from "./folder-picker";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { pendingLaunch } from "./pending-launch";
 import { addPaneTiles, PENDING_TILE_ID } from "./workspace-grid-helpers";
@@ -57,13 +58,13 @@ export type NewSessionProps = {
  * wears, and the overlays every presentation has to mount (the folder picker
  * a "Select folder…" opens, and the error a refused create reports).
  */
-function useNewSessionChoices({
-  mode,
-  workspaceId,
-  tabId,
-  placement,
-  onCreated,
-}: NewSessionProps): {
+function useNewSessionChoices(
+  { mode, workspaceId, tabId, placement, onCreated }: NewSessionProps,
+  /** What the folder picker hangs off — the cascade has closed by then. */
+  anchorRef?: RefObject<HTMLElement | null>,
+  /** Reopens the cascade behind the picker; omitted where there is not one. */
+  onBack?: () => void,
+): {
   root: CascadePanel;
   disabled: boolean;
   tooltip: string | undefined;
@@ -304,10 +305,19 @@ function useNewSessionChoices({
           {errorMessage}
         </span>
       )}
-      <FolderPickerDialog
+      <FolderPicker
         key={`${pickerHost?.id ?? "none"}:${pickerOpen ? "open" : "closed"}`}
         open={pickerOpen}
         host={pickerHost}
+        initialPath={pickerHost && home?.host.id === pickerHost.id ? home.cwd : null}
+        anchorRef={anchorRef}
+        onBack={
+          onBack &&
+          (() => {
+            setPickerOpen(false);
+            onBack();
+          })
+        }
         onOpenChange={setPickerOpen}
         onSelect={(path) => {
           if (pickerHost) createAt(pickerHost, path, pickerChoice);
@@ -331,11 +341,16 @@ export function NewSessionMenu(
   },
 ): JSX.Element {
   const { trigger, mode, anchor = "trigger" } = props;
-  const { root, disabled, tooltip, overlays } = useNewSessionChoices(props);
+  const anchorRef = useRef<HTMLSpanElement>(null);
   const menuRef = useRef<CascadeMenuHandle>(null);
+  // The lozenge row has no single cascade to return to, so only this
+  // presentation offers a way back.
+  const { root, disabled, tooltip, overlays } = useNewSessionChoices(props, anchorRef, () =>
+    menuRef.current?.open(),
+  );
 
   return (
-    <span className="relative inline-flex" title={tooltip}>
+    <span ref={anchorRef} className="relative inline-flex" title={tooltip}>
       <CascadeMenu
         ref={menuRef}
         root={root}
@@ -439,13 +454,15 @@ function Lozenge({
  * their own lozenge, so the row never has to answer that itself.
  */
 export function NewSessionLozenges(props: NewSessionProps & { className?: string }): JSX.Element {
-  const { root, disabled, tooltip, overlays } = useNewSessionChoices(props);
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const { root, disabled, tooltip, overlays } = useNewSessionChoices(props, anchorRef);
   // "Somewhere else" is the cascade's escape hatch for a surface with nothing
   // else to say where a window lands. The row has the tab's own folder sitting
   // right above it, which is the better answer, so it drops the item.
   const picks = root.items.filter((item) => item.key !== "shell-elsewhere");
   return (
     <div
+      ref={anchorRef}
       role="toolbar"
       aria-label={root.title}
       title={tooltip}

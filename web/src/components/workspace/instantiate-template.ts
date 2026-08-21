@@ -3,6 +3,18 @@ import { basename } from "@/lib/paths";
 import { activeTab, type LayoutV3, withActiveTab } from "@/lib/tabs";
 import { pendingLaunch } from "./pending-launch";
 
+/** See the call in `instantiateTemplate`. */
+function iconForInstance(
+  template: WorkspaceTemplate,
+  host: Host,
+  cwd: string,
+): { icon?: string; icon_source?: "auto" | "custom" } {
+  if (!template.icon) return {};
+  if (template.icon_source === "custom") return { icon: template.icon, icon_source: "custom" };
+  const sameFolder = template.host_id === host.id && template.cwd === cwd;
+  return sameFolder ? { icon: template.icon, icon_source: "auto" } : {};
+}
+
 /**
  * Replay a template against a freshly chosen folder: create the workspace
  * with the template's tab set (widget tiles inline), then walk the tabs
@@ -18,6 +30,12 @@ export async function instantiateTemplate(
 ): Promise<{ workspaceId: string; focusSessionId: string | null }> {
   const { workspace } = await workspaces.create({
     name: basename(cwd) || template.name,
+    // The template's mark, when it is still the right mark for this folder.
+    // One the owner chose travels with the template wherever it is replayed;
+    // one that was merely found in the folder the template was saved from is
+    // only kept when this is that same folder — otherwise the new workspace
+    // is left unlooked, and finds its own.
+    ...iconForInstance(template, host, cwd),
   });
   await workspaces.update(workspace.id, { host_id: host.id, cwd });
 

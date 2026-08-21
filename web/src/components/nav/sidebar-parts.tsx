@@ -58,23 +58,42 @@ export function workspaceInitials(name: string): string {
  * collapsed sidebar navigates by; the default is the small mark that sits in
  * a row's icon slot. Archived rows wear the same one — a workspace put away
  * is still the same workspace.
+ *
+ * `icon` is the workspace's own image, found in its folder or chosen by its
+ * owner: same square, same corners, drawn in place of the initials. It is
+ * contained rather than cropped, and the small variant sheds the plate and
+ * border the monogram needs — a mark with its own shape should not sit in a
+ * box — while the rail keeps its edge, which is what makes the collapsed
+ * sidebar read as a column of tiles.
  */
 export function WorkspaceAvatar({
   name,
+  icon,
   rail = false,
   className,
 }: {
   name: string;
+  icon?: string | null;
   rail?: boolean;
   className?: string;
 }) {
+  const shape = rail ? "size-9 rounded-lg" : "size-6 rounded-md";
+  if (icon) {
+    return (
+      // Any border here is the caller's, which is how the rail shows selection.
+      <span className={cn("grid shrink-0 place-items-center overflow-hidden", shape, className)}>
+        {/* biome-ignore lint/performance/noImgElement: a stored data URL, already sized to the tile — there is nothing for next/image to fetch or optimize */}
+        <img src={icon} alt="" aria-hidden draggable={false} className="size-full object-contain" />
+      </span>
+    );
+  }
   return (
     <span
       className={cn(
-        "grid place-items-center font-semibold",
+        "grid shrink-0 place-items-center font-semibold",
         rail
-          ? "size-9 rounded-lg border text-[11px] tracking-tight"
-          : "size-6 rounded-md border border-border bg-muted/50 text-[10px] text-muted-foreground",
+          ? cn(shape, "border text-[11px] tracking-tight")
+          : cn(shape, "border border-border bg-muted/50 text-[10px] text-muted-foreground"),
         className,
       )}
     >

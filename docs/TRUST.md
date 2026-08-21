@@ -162,9 +162,49 @@ above.
 | Skill bodies | current: persisted in `skills`; carried in `session.create` / `session.restart` | endpoint-local replacement is not implemented |
 | ~~MCP server registry (headers incl. bearer tokens), `/mcp` endpoint~~ | — | **removed entirely, 2026-07-09** — see below |
 | Host paths, directory entry names/sizes/mtimes, reads, writes, and detailed operation errors | former REST host-file routes plus `host.fs.*` frames | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source uses `spawn.host.ctl` only |
+| Host file previews (rendered thumbnails, decoded head slices) | current: `spawn.host.ctl` `fs.preview` / `fs.read.range` only | never server-visible; held in memory for the session, never written to disk, never logged |
+| Host desktop launches (`desktop.reveal`, `desktop.open`) | current: `spawn.host.ctl` only; the daemon records the operation name locally in `activity.rs` and never the path | never server-visible |
 | Cross-host file transfer | former server source-read/forward path | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source is browser-mediated across two host channels |
 | Agent check/install commands, paths, installed/latest versions, output, and detailed errors | current: REST plus `host.agents.*`; policy errors can persist in Postgres | server-readable path remains; endpoint-only replacement is not implemented |
 | Free-form daemon errors | current master: `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | P2-ERROR-01 target: stable content-free server code plus E2E detail; not implemented |
+
+### Host previews and desktop launches
+
+The preview and desktop operations added alongside the file viewer do not
+change what the control plane can see: rendered pixels and file slices travel
+the same encrypted DataChannel that already carried `fs.read`, and signaling
+stays signaling. Three things about the *host's* exposure do change, and are
+recorded here rather than left to be discovered.
+
+**The daemon now spawns GUI-session processes on behalf of a remote request.**
+This is not a new privilege for an authenticated browser — it can already open a
+PTY session and type `open ~/anything`, and the daemon already spawns login
+shells and install commands. But it is a new *surface*, in three ways. It is
+reachable without creating a session, so it leaves no `sessions` row and no
+visible pane; the daemon therefore records each launch locally by operation name
+only, never by path. It shortens the exploit chain from "drive an interactive
+shell" to "send one frame", which matters because the same channel offers
+`fs.write.begin`: write-then-open would be a code-execution primitive if the
+gates on `desktop.open` (regular files only, magic-sniffed allowlist, no execute
+bit, no executable magic, explicit refusal of URL-indirection types, and a rate
+limit) were ever relaxed. And it runs third-party native code — QuickLook
+generators are arbitrary binaries parsing untrusted documents — which is why
+they are executed out of process via `qlmanage` rather than in-process through
+the framework, so a crash costs one failed preview rather than the daemon that
+holds the host's identity key. `scripts/check-host-desktop-launch.sh` pins these
+properties in the source.
+
+**Ambient authority is now consumed at exactly two roots, not one.** The
+previous invariant — consumed once, for the home directory — is restated rather
+than quietly broken: it is consumed at startup for the user's home directory
+(client-reachable and client-named) and for a daemon-private preview staging
+directory (never client-reachable, never client-named, and never containing a
+client-supplied path component). Request-time operations continue to resolve
+only through held handles. A renderer needs a real path, and the only safe way
+to give it one is to hard-link the already-validated inode under a name the
+daemon chose and then verify the link points at that same inode; reconstructing
+a path from components would hand another process a string the kernel never
+resolved through our handles.
 
 Workspace, session, agent-definition, and skill names remain server-visible;
 users must not place secrets in labels. A default session name includes the

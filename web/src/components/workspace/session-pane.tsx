@@ -13,6 +13,7 @@ import {
   Pencil,
   RotateCcw,
   Trash2,
+  X,
 } from "lucide-react";
 import {
   type ReactNode,
@@ -42,7 +43,7 @@ import { sessionTitle, sessionTitleDetail } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
 import { shellQuote } from "./agent-command";
 import { AgentSwitcher } from "./agent-switcher";
-import { FolderPickerDialog } from "./folder-picker-dialog";
+import { FolderPicker } from "./folder-picker";
 import { pendingLaunch } from "./pending-launch";
 
 /** Trailing shortcut hint in a menu row — the gesture that does the same thing. */
@@ -122,6 +123,7 @@ export function SessionPane({
   const [editingName, setEditingName] = useState(false);
   const [selfHovered, setSelfHovered] = useState(false);
   const [cwdPickerOpen, setCwdPickerOpen] = useState(false);
+  const cwdChipRef = useRef<HTMLButtonElement>(null);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
   const hostList = hostsQ.data ?? [];
   const paneHost = hostList.find((host) => host.id === session?.host_id) ?? null;
@@ -299,7 +301,9 @@ export function SessionPane({
         aria-label={`${title} window controls`}
         title={canDrag ? "Drag to move" : undefined}
         className={cn(
-          "group/pane-header @container/pane-header flex h-9 shrink-0 items-center gap-2 border-b border-border bg-card/75 px-2 select-none",
+          // Tighter on the right than the left: the bar ends in icon buttons, whose
+          // own padding already holds the glyph clear of the edge.
+          "group/pane-header @container/pane-header flex h-9 shrink-0 items-center gap-2 border-b border-border bg-card/75 pl-2 pr-1.5 select-none",
           canDrag && "cursor-grab active:cursor-grabbing",
         )}
         onPointerDown={(event) => {
@@ -391,10 +395,11 @@ export function SessionPane({
              icon: in a pane that thin the session's own name is worth more of
              the bar than the folder's, and the title still carries the path. */
           <button
+            ref={cwdChipRef}
             type="button"
             aria-label="Change directory"
             title={session.cwd}
-            onClick={() => setCwdPickerOpen(true)}
+            onClick={() => setCwdPickerOpen((value) => !value)}
             onDoubleClick={(event) => event.stopPropagation()}
             className="flex h-7 max-w-40 shrink-0 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
@@ -462,14 +467,37 @@ export function SessionPane({
               </DropdownMenuItem>
             </>
           )}
-          <DropdownMenuSeparator />
-          {session && (
+        </DropdownMenu>
+        {session && (
+          /* Closing has its own control, at the far right where a window's
+             close has always been. It opens a menu rather than closing on the
+             spot: an X inside a grid of panes is a small target next to the
+             one that reveals the pane's options, and the menu is what makes
+             hitting it by mistake cost nothing. */
+          <DropdownMenu
+            align="end"
+            renderTrigger={(props) => (
+              <button
+                {...props}
+                type="button"
+                aria-label={`Close ${title}`}
+                onDoubleClick={(event) => event.stopPropagation()}
+                // Pulled back off the bar's rhythm: the two menu buttons are
+                // one cluster at the end of the header, not two more items in
+                // the row of controls. Same 28px target as its neighbour, on a
+                // lighter glyph — closing should be reachable, not loud.
+                className="-ml-1 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
+              >
+                <X className="size-3.5" aria-hidden />
+              </button>
+            )}
+          >
             <DropdownMenuItem destructive disabled={closeM.isPending} onSelect={closeSession}>
               <Trash2 className="size-4" aria-hidden />
               Close session
             </DropdownMenuItem>
-          )}
-        </DropdownMenu>
+          </DropdownMenu>
+        )}
       </header>
 
       {session ? (
@@ -515,10 +543,12 @@ export function SessionPane({
         </div>
       )}
 
-      <FolderPickerDialog
+      <FolderPicker
         key={`${paneHost?.id ?? "none"}:${cwdPickerOpen ? "open" : "closed"}`}
         open={cwdPickerOpen}
         host={paneHost}
+        initialPath={session?.cwd}
+        anchorRef={cwdChipRef}
         onOpenChange={setCwdPickerOpen}
         onSelect={(path) => {
           if (!session) return;

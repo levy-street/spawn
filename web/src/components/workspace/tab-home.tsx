@@ -2,14 +2,14 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, Folder } from "lucide-react";
-import { type JSX, type ReactNode, useState } from "react";
+import { type JSX, type ReactNode, type RefObject, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { hostStatusTone, StatusDot } from "@/components/ui/status";
 import { type Host, hosts as hostsApi, type Workspace, workspaces } from "@/lib/api";
 import { basename } from "@/lib/paths";
 import { type LayoutV3, tabById, tabHome, withTabHome } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
-import { FolderPickerDialog } from "./folder-picker-dialog";
+import { FolderPicker } from "./folder-picker";
 
 /**
  * A tab's home — the host and folder its windows open in — as a thing you can
@@ -24,6 +24,8 @@ export function useTabHome(
   workspace: Workspace,
   tabId: string,
   onError?: (message: string | null) => void,
+  /** What the folder picker hangs off; each surface supplies its own. */
+  anchorRef?: RefObject<HTMLElement | null>,
 ): {
   /** Where windows added to this tab open, resolved through the fallback. */
   home: { host: Host | null; cwd: string } | null;
@@ -102,10 +104,22 @@ export function useTabHome(
           </div>
         </DialogContent>
       </Dialog>
-      <FolderPickerDialog
+      <FolderPicker
         key={`${pickerHost?.id ?? "none"}:${pickerHost ? "open" : "closed"}`}
         open={pickerHost !== null}
         host={pickerHost}
+        // Only when the tab already lives on the host being picked — a folder
+        // from a different machine is not a place this one can open.
+        initialPath={pickerHost && pickerHost.id === resolved?.host_id ? resolved.cwd : null}
+        anchorRef={anchorRef}
+        onBack={
+          hostList.length > 1
+            ? () => {
+                setPickerHost(null);
+                setHostPickerOpen(true);
+              }
+            : undefined
+        }
         onOpenChange={(next) => {
           if (!next) setPickerHost(null);
         }}
@@ -142,11 +156,13 @@ export function TabHomeButton({
   className?: string;
   onError?: (message: string | null) => void;
 }): JSX.Element {
-  const { home, open, dialogs } = useTabHome(workspace, tabId, onError);
+  const anchorRef = useRef<HTMLButtonElement>(null);
+  const { home, open, dialogs } = useTabHome(workspace, tabId, onError, anchorRef);
   const hostName = home?.host?.name;
   return (
     <>
       <button
+        ref={anchorRef}
         type="button"
         onClick={open}
         title={home ? `${home.cwd}${hostName ? ` on ${hostName}` : ""}` : undefined}

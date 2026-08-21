@@ -30,6 +30,8 @@ function makeWorkspace(tiles: Tile[], overrides: Partial<Workspace> = {}): Works
       tabs: [{ id: "tab-1", name: "Tab 1", layout: { version: 3, tiles } }],
     },
     position: 0,
+    icon: null,
+    icon_source: null,
     archived_at: null,
     created_at: "2026-08-19T00:00:00Z",
     updated_at: "2026-08-19T00:00:00Z",

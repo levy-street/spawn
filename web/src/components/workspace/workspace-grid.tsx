@@ -1462,6 +1462,19 @@ export function WorkspaceGrid({
     return () => document.removeEventListener("keydown", onKeyDown, true);
   }, [allWorkspacesQ.data, focusedId, orderedIds, router, setFocus, workspace.id]);
 
+  /** Re-root a file widget, keeping its rect and its place in the tab. */
+  const changeWidgetPath = useCallback(
+    (tileId: string, path: string) =>
+      commitLayout(
+        latestTilesRef.current.map((tile) =>
+          tile.session_id === tileId && tile.widget
+            ? { ...tile, widget: { ...tile.widget, path } }
+            : tile,
+        ),
+      ),
+    [commitLayout],
+  );
+
   const removeFromWorkspace = useCallback(
     (sessionId: string) => commitLayout(removeTile(latestTilesRef.current, sessionId)),
     [commitLayout],
@@ -1627,6 +1640,7 @@ export function WorkspaceGrid({
                     onToggleZoom={(id) => setZoomedId((current) => (current === id ? null : id))}
                     onMoveStart={startMove}
                     onDuplicate={(id) => duplicateRef.current(id, null)}
+                    onChangePath={changeWidgetPath}
                     onRemove={removeFromWorkspace}
                   />
                 ) : (
@@ -1786,6 +1800,7 @@ export function WorkspaceGrid({
                   onFocus={(id) => setFocus(id)}
                   onToggleZoom={() => {}}
                   onMoveStart={() => {}}
+                  onChangePath={changeWidgetPath}
                   onRemove={removeFromWorkspace}
                 />
               ) : (
