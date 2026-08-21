@@ -5,6 +5,11 @@ types `command` into a session's shell. spawn does not manage agent
 credentials; each CLI handles its own auth interactively on the host (e.g.
 `claude /login`). `install` is offered visibly as "install & run" when the
 command's binary is missing — never executed silently.
+
+`yolo_args`/`yolo_env` spell out how each CLI is told to stop asking for
+permission. They are inert until a user turns the toggle on in Settings →
+Agents (`agent_preferences`), and they are server-owned for built-ins: a tool
+that renames its flag is fixed here and re-synced on the next startup.
 """
 
 from __future__ import annotations
@@ -16,6 +21,11 @@ from .models import Agent
 
 CODEX_INSTALL_COMMAND = "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
 
+# opencode resolves every action to allow/ask/deny; allowing all of them is the
+# closest it gets to the other CLIs' bypass flags. Compact JSON — this is typed
+# into a shell as a quoted word, so every byte shows up on screen.
+OPENCODE_ALLOW_ALL = '{"edit":"allow","bash":"allow","webfetch":"allow"}'
+
 BUILTIN_AGENTS: list[dict] = [
     {
         "name": "claude-code",
@@ -23,6 +33,8 @@ BUILTIN_AGENTS: list[dict] = [
         "command": "claude",
         "env": {},
         "install": "npm install -g @anthropic-ai/claude-code",
+        "yolo_args": "--dangerously-skip-permissions",
+        "yolo_env": {},
     },
     {
         "name": "codex",
@@ -30,6 +42,10 @@ BUILTIN_AGENTS: list[dict] = [
         "command": "codex",
         "env": {},
         "install": CODEX_INSTALL_COMMAND,
+        # The long form rather than the older `--yolo` alias: it says what it
+        # does, and it is the spelling that survived the rename.
+        "yolo_args": "--dangerously-bypass-approvals-and-sandbox",
+        "yolo_env": {},
     },
     {
         "name": "opencode",
@@ -37,6 +53,10 @@ BUILTIN_AGENTS: list[dict] = [
         "command": "opencode",
         "env": {},
         "install": "npm install -g opencode-ai",
+        # opencode has no bypass flag; permissions are configuration, and
+        # OPENCODE_PERMISSION is the env-shaped override of that config.
+        "yolo_args": None,
+        "yolo_env": {"OPENCODE_PERMISSION": OPENCODE_ALLOW_ALL},
     },
     {
         "name": "aider-sonnet",
@@ -45,6 +65,8 @@ BUILTIN_AGENTS: list[dict] = [
         "env": {},
         # pipx is the cleanest install path; fall back to a user pip if not.
         "install": "pipx install aider-chat || pip install --user aider-chat",
+        "yolo_args": "--yes-always",
+        "yolo_env": {},
     },
 ]
 
@@ -69,13 +91,19 @@ async def seed_builtin_agents(session: AsyncSession) -> None:
                     command=spec["command"],
                     env=dict(spec["env"]),
                     install=spec.get("install"),
+                    yolo_args=spec.get("yolo_args"),
+                    yolo_env=dict(spec.get("yolo_env") or {}),
                 )
             )
             changed = True
         else:
-            for field in ("kind", "command", "install"):
+            for field in ("kind", "command", "install", "yolo_args"):
                 if getattr(row, field) != spec.get(field):
                     setattr(row, field, spec.get(field))
                     changed = True
+            wanted_env = dict(spec.get("yolo_env") or {})
+            if dict(row.yolo_env or {}) != wanted_env:
+                row.yolo_env = wanted_env
+                changed = True
     if changed:
         await session.commit()

@@ -39,6 +39,14 @@ export function buildHostWsUrl(hostId: string): string {
   return url.toString();
 }
 
+/**
+ * Owner-scoped attention stream. One per tab, not one per session: the whole
+ * point is to hear about a session that has no pane open.
+ */
+export function buildAlertsWsUrl(): string {
+  return new URL(`${originForWs()}/ws/alerts`).toString();
+}
+
 // ---------- Inbound JSON frame types ----------
 
 export interface DisplayControlState {

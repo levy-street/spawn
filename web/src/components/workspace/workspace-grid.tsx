@@ -191,15 +191,13 @@ function tilesEqual(a: Tile[], b: Tile[]): boolean {
  * those two on that pane alone and `clearGestureStyles` takes them back off.
  * Every other pane's geometry comes from here and nowhere else.
  */
-function tileStyle(tile: Tile, zoomed: boolean): CSSProperties {
-  const values = zoomed
-    ? { left: "0%", top: "0%", width: "100%", height: "100%" }
-    : {
-        left: `${(tile.x / GRID_SIZE) * 100}%`,
-        top: `${(tile.y / GRID_SIZE) * 100}%`,
-        width: `${(tile.w / GRID_SIZE) * 100}%`,
-        height: `${(tile.h / GRID_SIZE) * 100}%`,
-      };
+function tileStyle(tile: Tile): CSSProperties {
+  const values = {
+    left: `${(tile.x / GRID_SIZE) * 100}%`,
+    top: `${(tile.y / GRID_SIZE) * 100}%`,
+    width: `${(tile.w / GRID_SIZE) * 100}%`,
+    height: `${(tile.h / GRID_SIZE) * 100}%`,
+  };
   return {
     "--tile-left": values.left,
     "--tile-top": values.top,
@@ -360,7 +358,6 @@ export function WorkspaceGrid({
       ? initialFocusId
       : (readingOrder(initialTiles)[0] ?? null);
   });
-  const [zoomedId, setZoomedId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [revision, setRevision] = useState(0);
 
@@ -470,11 +467,6 @@ export function WorkspaceGrid({
     return () => query.removeEventListener("change", update);
   }, []);
 
-  useEffect(() => {
-    if (wide) return;
-    setZoomedId(null);
-  }, [wide]);
-
   const setFocus = useCallback(
     (sessionId: string | null, focusTerminal = false) => {
       setFocusedId(sessionId);
@@ -505,10 +497,6 @@ export function WorkspaceGrid({
     }
     if (!focusedId || !orderedIds.includes(focusedId)) setFocus(orderedIds[0] ?? null);
   }, [focusedId, orderedIds, setFocus]);
-
-  useEffect(() => {
-    if (zoomedId && !orderedIds.includes(zoomedId)) setZoomedId(null);
-  }, [orderedIds, zoomedId]);
 
   const writeWorkspaceCaches = useCallback(
     (next: Workspace) => {
@@ -1210,7 +1198,6 @@ export function WorkspaceGrid({
     }
     if (gesture) finishGesture(false);
     setTiles(latestTilesRef.current);
-    setZoomedId(null);
   }, [finishGesture, previewLayout, tabId]);
 
   /** Escape abandons any gesture. ⌘ down or up mid-drag, with the pointer
@@ -1301,12 +1288,11 @@ export function WorkspaceGrid({
 
   /**
    * The whole title bar is the drag surface, so the gesture only commits once
-   * the pointer has travelled far enough to rule out a click or a double-click
-   * (which zooms the pane).
+   * the pointer has travelled far enough to rule out a click.
    */
   const startMove = useCallback(
     (sessionId: string, event: ReactPointerEvent<HTMLElement>) => {
-      if (!wide || !finePointer || zoomedId || event.pointerType === "touch") return;
+      if (!wide || !finePointer || event.pointerType === "touch") return;
       if (!tileElementsRef.current.has(sessionId)) return;
       disarmMove();
       const clientX = event.clientX;
@@ -1327,12 +1313,12 @@ export function WorkspaceGrid({
       document.addEventListener("pointerup", disarmMove, { once: true });
       document.addEventListener("pointercancel", disarmMove, { once: true });
     },
-    [beginMove, disarmMove, finePointer, wide, zoomedId],
+    [beginMove, disarmMove, finePointer, wide],
   );
 
   const startResize = useCallback(
     (sessionId: string, edges: ResizeEdges, event: ReactPointerEvent<HTMLElement>) => {
-      if (!wide || !finePointer || zoomedId || event.pointerType === "touch") return;
+      if (!wide || !finePointer || event.pointerType === "touch") return;
       const area = areaRef.current;
       const tileElement = tileElementsRef.current.get(sessionId);
       const tile = latestTilesRef.current.find((item) => item.session_id === sessionId);
@@ -1367,12 +1353,12 @@ export function WorkspaceGrid({
       previewLayout(gesture);
       installGestureListeners();
     },
-    [finePointer, installGestureListeners, previewLayout, setFocus, wide, zoomedId],
+    [finePointer, installGestureListeners, previewLayout, setFocus, wide],
   );
 
   const startDividerDrag = useCallback(
     (divider: GridDivider, event: ReactPointerEvent<HTMLElement>) => {
-      if (!wide || !finePointer || zoomedId || event.pointerType === "touch") return;
+      if (!wide || !finePointer || event.pointerType === "touch") return;
       const area = areaRef.current;
       if (!area) return;
       event.preventDefault();
@@ -1401,7 +1387,7 @@ export function WorkspaceGrid({
       previewLayout(gesture);
       installGestureListeners();
     },
-    [finePointer, installGestureListeners, previewLayout, wide, zoomedId],
+    [finePointer, installGestureListeners, previewLayout, wide],
   );
 
   // Unmount-only: removes whatever listeners are actually installed. Keying
@@ -1440,12 +1426,6 @@ export function WorkspaceGrid({
           event.stopPropagation();
           router.push(`/w/${target.id}`);
         }
-        return;
-      }
-      if (event.code === "KeyZ" && focusedId) {
-        event.preventDefault();
-        event.stopPropagation();
-        setZoomedId((current) => (current === focusedId ? null : focusedId));
         return;
       }
       const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
@@ -1569,7 +1549,7 @@ export function WorkspaceGrid({
     [commitLayout, setFocus],
   );
 
-  const canGesture = wide && finePointer && zoomedId === null;
+  const canGesture = wide && finePointer;
 
   // What the panes are showing right now: a gesture of this grid's own while
   // one is running, else a pane being dragged out of the launcher, else the
@@ -1581,7 +1561,6 @@ export function WorkspaceGrid({
       return (
         <div className="absolute inset-0 overflow-hidden">
           {tiles.map((tile) => {
-            const zoomed = zoomedId === tile.session_id;
             // The tile riding the pointer keeps its resting rect: it is offset
             // by a transform, which tracks the cursor rather than the cell the
             // preview has snapped it to.
@@ -1597,7 +1576,7 @@ export function WorkspaceGrid({
                   else tileElementsRef.current.delete(tile.session_id);
                 }}
                 data-grid-tile={tile.session_id}
-                style={tileStyle(rect, zoomed)}
+                style={tileStyle(rect)}
                 className={cn(
                   // Position and size ease together: a preview that moves a
                   // pane but snaps its size reads as a glitch, not as the pane
@@ -1606,26 +1585,20 @@ export function WorkspaceGrid({
                   "absolute z-10 min-h-0 min-w-0 border-pane-divider will-change-transform transition-[transform,left,top,width,height] duration-150 ease-swift",
                   // A divider only where two panes actually meet edge to edge;
                   // edges facing empty canvas (or the border) draw nothing.
-                  !zoomed &&
-                    shownTiles.some(
-                      (other) =>
-                        other.session_id !== rect.session_id &&
-                        other.x === rect.x + rect.w &&
-                        other.y < rect.y + rect.h &&
-                        rect.y < other.y + other.h,
-                    ) &&
-                    "border-r",
-                  !zoomed &&
-                    shownTiles.some(
-                      (other) =>
-                        other.session_id !== rect.session_id &&
-                        other.y === rect.y + rect.h &&
-                        other.x < rect.x + rect.w &&
-                        rect.x < other.x + other.w,
-                    ) &&
-                    "border-b",
-                  zoomedId && !zoomed && "hidden",
-                  zoomed && "z-30",
+                  shownTiles.some(
+                    (other) =>
+                      other.session_id !== rect.session_id &&
+                      other.x === rect.x + rect.w &&
+                      other.y < rect.y + rect.h &&
+                      rect.y < other.y + other.h,
+                  ) && "border-r",
+                  shownTiles.some(
+                    (other) =>
+                      other.session_id !== rect.session_id &&
+                      other.y === rect.y + rect.h &&
+                      other.x < rect.x + rect.w &&
+                      rect.x < other.x + other.w,
+                  ) && "border-b",
                 )}
               >
                 {tile.widget ? (
@@ -1637,7 +1610,6 @@ export function WorkspaceGrid({
                     canDrag={canGesture}
                     canDuplicate={canDuplicate(tile.session_id)}
                     onFocus={(id) => setFocus(id)}
-                    onToggleZoom={(id) => setZoomedId((current) => (current === id ? null : id))}
                     onMoveStart={startMove}
                     onDuplicate={(id) => duplicateRef.current(id, null)}
                     onChangePath={changeWidgetPath}
@@ -1646,7 +1618,7 @@ export function WorkspaceGrid({
                 ) : (
                   <PaneSlot sessionId={tile.session_id} stacked={false} register={registerSlot} />
                 )}
-                {canGesture && !zoomed && (
+                {canGesture && (
                   <TileResizeHandles
                     sessionId={tile.session_id}
                     title={
@@ -1663,54 +1635,53 @@ export function WorkspaceGrid({
               </div>
             );
           })}
-          {!zoomedId &&
-            openings.map((rect) => (
-              <div
-                key={`opening-${rect.x}-${rect.y}-${rect.w}-${rect.h}`}
-                data-grid-opening={`${rect.x},${rect.y},${rect.w},${rect.h}`}
-                style={{
-                  left: `${(rect.x / GRID_SIZE) * 100}%`,
-                  top: `${(rect.y / GRID_SIZE) * 100}%`,
-                  width: `${(rect.w / GRID_SIZE) * 100}%`,
-                  height: `${(rect.h / GRID_SIZE) * 100}%`,
-                }}
-                className="absolute z-0 p-1 [&>span]:size-full [&>span>div]:size-full"
-              >
-                <NewSessionMenu
-                  mode="session"
-                  workspaceId={workspace.id}
-                  tabId={tabId}
-                  placement={rect}
-                  // The trigger is the whole opening, so anchor to the click.
-                  anchor="pointer"
-                  trigger={
-                    <button
-                      type="button"
-                      aria-label="Add a window here"
+          {openings.map((rect) => (
+            <div
+              key={`opening-${rect.x}-${rect.y}-${rect.w}-${rect.h}`}
+              data-grid-opening={`${rect.x},${rect.y},${rect.w},${rect.h}`}
+              style={{
+                left: `${(rect.x / GRID_SIZE) * 100}%`,
+                top: `${(rect.y / GRID_SIZE) * 100}%`,
+                width: `${(rect.w / GRID_SIZE) * 100}%`,
+                height: `${(rect.h / GRID_SIZE) * 100}%`,
+              }}
+              className="absolute z-0 p-1 [&>span]:size-full [&>span>div]:size-full"
+            >
+              <NewSessionMenu
+                mode="session"
+                workspaceId={workspace.id}
+                tabId={tabId}
+                placement={rect}
+                // The trigger is the whole opening, so anchor to the click.
+                anchor="pointer"
+                trigger={
+                  <button
+                    type="button"
+                    aria-label="Add a window here"
+                    className={cn(
+                      "group/opening grid size-full place-items-center rounded-md border border-dashed text-muted-foreground transition-colors hover:border-border hover:bg-background/80",
+                      openingsLit ? "border-border/60" : "border-transparent",
+                      // Lit up while a pane dragged off the launcher hovers it.
+                      "data-[drop-target]:border-ring/70 data-[drop-target]:bg-background/80",
+                    )}
+                  >
+                    <span
                       className={cn(
-                        "group/opening grid size-full place-items-center rounded-md border border-dashed text-muted-foreground transition-colors hover:border-border hover:bg-background/80",
-                        openingsLit ? "border-border/60" : "border-transparent",
-                        // Lit up while a pane dragged off the launcher hovers it.
-                        "data-[drop-target]:border-ring/70 data-[drop-target]:bg-background/80",
+                        "flex items-center gap-1.5 text-xs transition-opacity group-hover/opening:opacity-100 group-data-[drop-target]/opening:opacity-100",
+                        !openingsLit && "opacity-0",
                       )}
                     >
-                      <span
-                        className={cn(
-                          "flex items-center gap-1.5 text-xs transition-opacity group-hover/opening:opacity-100 group-data-[drop-target]/opening:opacity-100",
-                          !openingsLit && "opacity-0",
-                        )}
-                      >
-                        <Plus className="size-4" aria-hidden />
-                        Add a window
-                      </span>
-                    </button>
-                  }
-                  onCreated={({ sessionId }) => {
-                    if (sessionId) setFocus(sessionId, true);
-                  }}
-                />
-              </div>
-            ))}
+                      <Plus className="size-4" aria-hidden />
+                      Add a window
+                    </span>
+                  </button>
+                }
+                onCreated={({ sessionId }) => {
+                  if (sessionId) setFocus(sessionId, true);
+                }}
+              />
+            </div>
+          ))}
           {canGesture &&
             dividers.map((divider) => {
               const vertical = divider.axis === "vertical";
@@ -1798,7 +1769,6 @@ export function WorkspaceGrid({
                   paneCount={tiles.length}
                   canDrag={false}
                   onFocus={(id) => setFocus(id)}
-                  onToggleZoom={() => {}}
                   onMoveStart={() => {}}
                   onChangePath={changeWidgetPath}
                   onRemove={removeFromWorkspace}
@@ -1908,7 +1878,6 @@ export function WorkspaceGrid({
           canMoveUp={!wide && index > 0}
           canMoveDown={!wide && index < orderedIds.length - 1}
           onFocus={(id) => setFocus(id)}
-          onToggleZoom={(id) => setZoomedId((current) => (current === id ? null : id))}
           onMoveStart={startMove}
           onDuplicate={(id) => duplicateRef.current(id, null)}
           onMoveUp={(id) => moveMobile(id, -1)}

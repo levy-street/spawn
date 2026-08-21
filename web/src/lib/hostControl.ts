@@ -51,6 +51,31 @@ export class HostControlError extends Error {
   }
 }
 
+/** One exact capacity reading, only ever carried by `spawn.host.ctl`. */
+export interface HostCapacitySample {
+  /** Whole-machine CPU use, 0-100, across every logical core. */
+  cpu_percent: number;
+  memory_used_bytes: number;
+  memory_total_bytes: number;
+  /** 1-minute load average where the platform keeps one. */
+  load_one?: number | null;
+  uptime_seconds: number;
+}
+
+/** What the machine is. Repeated on every sample so one request is enough. */
+export interface HostCapacitySpec {
+  cpu_cores: number;
+  cpu_physical_cores?: number | null;
+  cpu_model?: string | null;
+  memory_bytes: number;
+  gpu?: string | null;
+}
+
+export interface HostMetrics {
+  sample: HostCapacitySample;
+  spec?: HostCapacitySpec | null;
+}
+
 export interface HostDirEntry {
   name: string;
   path: string;
@@ -717,6 +742,34 @@ export class HostControlClient {
    */
   openDefault(path: string, options?: HostControlRequestOptions): Promise<HostFileOp> {
     return this.request<HostFileOp>("desktop.open", { path }, options);
+  }
+
+  /**
+   * Exact capacity for this host, straight from its daemon.
+   *
+   * The whole point of asking here rather than reading the host list: the
+   * server is given a five-level bucket every thirty seconds, and these
+   * numbers have no server code path at all (see `daemon/src/host_metrics.rs`
+   * and docs/TRUST.md). A host with telemetry switched off never advertises
+   * `host.metrics`, so callers must gate on `hasCapability` and draw nothing
+   * rather than showing an empty gauge.
+   */
+  async metrics(options?: HostControlRequestOptions): Promise<HostMetrics> {
+    const result = await this.request<HostMetrics>("host.metrics", {}, options);
+    const sample = result?.sample;
+    if (
+      !sample ||
+      typeof sample.cpu_percent !== "number" ||
+      !Number.isFinite(sample.cpu_percent) ||
+      !Number.isSafeInteger(sample.memory_total_bytes) ||
+      !Number.isSafeInteger(sample.memory_used_bytes)
+    ) {
+      // Same posture as `stat`: a malformed answer on this channel means the
+      // peer is not the daemon this client thinks it is talking to.
+      this.failRtc();
+      throw new HostControlError("invalid_response", "Host returned an invalid capacity sample");
+    }
+    return result;
   }
 
   /** Operations this generation's daemon advertised in its `hello`. */

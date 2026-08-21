@@ -228,6 +228,33 @@ function PooledTerminal({
   );
 }
 
+/**
+ * Which sessions currently have a pane on screen.
+ *
+ * A session is "claimed" while a placeholder holds its terminal, and the grid
+ * only renders the active tab's tiles — so this is the honest answer to "can
+ * the user already see this happening?", which is what an alert needs before
+ * deciding it has anything to tell them.
+ */
+export function useClaimedSessions(): Record<string, boolean> {
+  return useContext(StateCtx).claimed;
+}
+
+/**
+ * Reach any live terminal by id, from outside its pane.
+ *
+ * The pool already keys handles by session, so a surface that is not a pane —
+ * an alert asking to be taken to the session it is about — can focus the right
+ * terminal without the workspace grid having to route the request. Returns
+ * null for a session with no live terminal yet, so callers retry rather than
+ * assume.
+ */
+export function useTerminalHandles(): (sessionId: string) => TerminalHandle | null {
+  const actions = useContext(ActionsCtx);
+  if (!actions) throw new Error("useTerminalHandles must be used within LiveTerminalProvider");
+  return actions.getHandle;
+}
+
 /** Claim the shared warm terminal for `sessionId` into a placeholder. Attach the
  *  returned `attach` ref to the div where the terminal body should render. */
 export function useLiveTerminal(sessionId: string | null) {

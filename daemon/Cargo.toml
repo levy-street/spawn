@@ -55,6 +55,10 @@ cap-std = "4"
 cap-fs-ext = "4"
 rustix = { version = "1", features = ["fs", "process"] }
 
+# host capacity telemetry (host_metrics.rs). `system` only: spawnd never reads
+# disks, networks, components, or the process table through this crate.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
 # session worker: encrypted scrollback at rest + memory hygiene
 chacha20poly1305 = "0.10"
 zeroize = "1"

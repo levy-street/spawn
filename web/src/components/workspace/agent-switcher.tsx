@@ -136,10 +136,6 @@ export function AgentSwitcher({
           title={label}
           aria-label={label}
           data-open={triggerProps["aria-expanded"] || undefined}
-          // The header is also the drag handle and the zoom target; neither
-          // should fire from the switcher. (Its pointerdown handler already
-          // ignores buttons, so only the double-click needs stopping.)
-          onDoubleClick={(event) => event.stopPropagation()}
           className={cn(
             "group/agent-switcher flex shrink-0 items-center rounded-lg p-px transition-colors",
             "group-hover/pane-header:bg-accent/70",

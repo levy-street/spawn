@@ -5,7 +5,7 @@ import { ExternalLink, MoreHorizontal, Pencil, Server, Trash2 } from "lucide-rea
 import Link from "next/link";
 import { type FormEvent, useEffect, useState } from "react";
 import { ConnectHostSection } from "@/components/hosts/connect-host";
-import { closeSettings } from "@/components/settings/settings-dialog-store";
+import { leaveSettingsFor } from "@/components/settings/settings-dialog-store";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -184,7 +184,7 @@ function HostCard({
           </p>
         </div>
         <Button asChild variant="outline" size="sm" className="shrink-0">
-          <Link href={`/hosts/${host.id}`} onClick={closeSettings}>
+          <Link href={`/hosts/${host.id}`} onClick={() => leaveSettingsFor("hosts")}>
             <ExternalLink className="size-3.5" aria-hidden />
             <span className="hidden @sm/settings:inline">Details</span>
           </Link>

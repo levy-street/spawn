@@ -4,6 +4,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowDown,
   ArrowUp,
+  Bell,
+  BellOff,
   Check,
   ChevronDown,
   Copy,
@@ -38,6 +40,7 @@ import { Input } from "@/components/ui/input";
 import { hostStatusTone, SessionStatusDot, StatusDot } from "@/components/ui/status";
 import { type Host, hosts, type Session, sessions } from "@/lib/api";
 import { highlightStore, useHighlightedSession } from "@/lib/highlight-store";
+import { toggleSessionMuted, useSessionMuted } from "@/lib/notify-prefs";
 import { basename } from "@/lib/paths";
 import { sessionTitle, sessionTitleDetail } from "@/lib/sessions";
 import { cn } from "@/lib/utils";
@@ -80,7 +83,6 @@ export function SessionPane({
   canMoveUp,
   canMoveDown,
   onFocus,
-  onToggleZoom,
   onMoveStart,
   onDuplicate,
   onMoveUp,
@@ -102,7 +104,6 @@ export function SessionPane({
   canMoveUp: boolean;
   canMoveDown: boolean;
   onFocus: (sessionId: string) => void;
-  onToggleZoom: (sessionId: string) => void;
   onMoveStart: (sessionId: string, event: ReactPointerEvent<HTMLElement>) => void;
   /** Open a second pane on the same host, folder, skills and agent (workspace
    *  grid only — the grid owns placement). */
@@ -250,6 +251,10 @@ export function SessionPane({
     [onFocus, sessionId],
   );
 
+  // Before the portal-host early return below: hooks must run in the same
+  // order on every render, and this component can bail out before painting.
+  const muted = useSessionMuted(sessionId);
+
   if (!hostRef.current && typeof document !== "undefined") {
     const host = document.createElement("div");
     host.style.display = "contents";
@@ -311,7 +316,6 @@ export function SessionPane({
           if ((event.target as Element).closest?.("button, input, a")) return;
           onMoveStart(sessionId, event);
         }}
-        onDoubleClick={() => !stacked && onToggleZoom(sessionId)}
       >
         <span className="relative shrink-0">
           {session ? (
@@ -346,10 +350,23 @@ export function SessionPane({
           />
         ) : (
           <span
-            className="min-w-0 flex-1 truncate text-xs font-medium"
-            title={session ? sessionTitleDetail(session) : undefined}
+            className={cn(
+              "flex min-w-0 flex-1 items-center gap-1.5 truncate text-xs font-medium",
+              // Dimmed rather than badged: a muted pane should read as turned
+              // down, and the whole label carrying the state says that with
+              // less furniture than a chip would.
+              muted && "text-muted-foreground",
+            )}
+            title={
+              session
+                ? `${sessionTitleDetail(session)}${muted ? " · alerts muted" : ""}`
+                : undefined
+            }
           >
-            {title}
+            {muted && (
+              <BellOff role="img" aria-label="Alerts muted" className="size-3.5 shrink-0" />
+            )}
+            <span className="min-w-0 truncate">{title}</span>
           </span>
         )}
         {session && paneHost && hostList.length > 1 && onMoveToHost && (
@@ -364,7 +381,6 @@ export function SessionPane({
                 type="button"
                 aria-label="Change host"
                 title={`Running on ${paneHost.name}`}
-                onDoubleClick={(event) => event.stopPropagation()}
                 className="flex h-7 max-w-36 shrink-0 items-center gap-1.5 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
               >
                 <StatusDot tone={hostStatusTone(paneHost.status)} label={paneHost.status} />
@@ -400,7 +416,6 @@ export function SessionPane({
             aria-label="Change directory"
             title={session.cwd}
             onClick={() => setCwdPickerOpen((value) => !value)}
-            onDoubleClick={(event) => event.stopPropagation()}
             className="flex h-7 max-w-40 shrink-0 items-center gap-1 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             <Folder className="size-3.5 shrink-0" aria-hidden />
@@ -417,7 +432,6 @@ export function SessionPane({
               {...props}
               type="button"
               aria-label={`${title} options`}
-              onDoubleClick={(event) => event.stopPropagation()}
               className="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
             >
               <Ellipsis className="size-4" aria-hidden />
@@ -454,6 +468,16 @@ export function SessionPane({
               <MenuHint>⌘/⌥ drag</MenuHint>
             </DropdownMenuItem>
           )}
+          {session && (
+            <DropdownMenuItem onSelect={() => toggleSessionMuted(sessionId)}>
+              {muted ? (
+                <Bell className="size-4" aria-hidden />
+              ) : (
+                <BellOff className="size-4" aria-hidden />
+              )}
+              {muted ? "Unmute alerts" : "Mute alerts"}
+            </DropdownMenuItem>
+          )}
           {stacked && (
             <>
               <DropdownMenuSeparator />
@@ -481,7 +505,6 @@ export function SessionPane({
                 {...props}
                 type="button"
                 aria-label={`Close ${title}`}
-                onDoubleClick={(event) => event.stopPropagation()}
                 // Pulled back off the bar's rhythm: the two menu buttons are
                 // one cluster at the end of the header, not two more items in
                 // the row of controls. Same 28px target as its neighbour, on a

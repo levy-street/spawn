@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, grid, schemas
+from .. import auth, grid, legion, schemas
 from ..db import get_session
 from ..models import Host, RecentDir, Session, User, Workspace
 from ..ws.broker import get_broker
@@ -310,6 +310,14 @@ async def create_session(
 
     await db.commit()
     await db.refresh(session_row)
+
+    # The durable record of the summoning. Booked after the commit and before
+    # the dispatch: the session row exists by now, and a rollup that cannot be
+    # written must not be able to stop a session from starting (see legion).
+    await legion.record_session_started(user.id)
+    live_sessions, hosts_online = await legion.live_counts(db, user.id)
+    await legion.record_peaks(user.id, sessions=live_sessions, hosts_online=hosts_online)
+
     skills = await capabilities.get_session_launch_capabilities(
         db, user=user, session_id=session_row.id
     )

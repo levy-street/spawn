@@ -75,6 +75,17 @@ def _to_out(host: Host, session_count: int) -> schemas.HostOut:
         status=host.status,
         last_seen_at=host.last_seen_at,
         session_count=session_count,
+        cpu_cores=host.cpu_cores,
+        cpu_physical_cores=host.cpu_physical_cores,
+        cpu_model=host.cpu_model,
+        memory_bytes=host.memory_bytes,
+        gpu=host.gpu,
+        # An offline host's last reading is a stale reading. Reporting it would
+        # draw a live-looking meter for a machine that is gone, so the buckets
+        # go with the daemon and only the spec (which is still true) stays.
+        cpu_bucket=host.cpu_bucket if host.status == "online" else None,
+        mem_bucket=host.mem_bucket if host.status == "online" else None,
+        capacity_at=host.capacity_at,
     )
 
 

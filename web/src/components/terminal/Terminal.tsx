@@ -24,6 +24,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { ConnectingOverlay } from "@/components/terminal/ConnectingOverlay";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
 import { type UploadTrack, uploadRatio } from "@/components/terminal/upload-progress";
@@ -460,6 +461,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   });
   const [exitBanner, setExitBanner] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  // Whether this terminal has ever had bytes rendered into it. It is what the
+  // connecting overlay watches: an empty pane is worth explaining, a pane with
+  // output in it is not worth covering. Latched once and never cleared — a
+  // later reconnect belongs to the status chip, not to a full-pane card.
+  const [painted, setPainted] = useState(false);
+  const paintedRef = useRef(false);
+  const markPainted = useCallback(() => {
+    if (paintedRef.current) return;
+    paintedRef.current = true;
+    setPainted(true);
+  }, []);
   const [uploadReconciliations, setUploadReconciliations] = useState<UploadReconciliation[]>([]);
   const [uploadReconciliationFault, setUploadReconciliationFault] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
@@ -1111,6 +1123,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }, 250);
       }
       const closeHudSample = latencyHudRef.current?.noteEcho(performance.now()) ?? null;
+      markPainted();
       if (liveSeedWriteInFlightRef.current) {
         pendingLiveSeedWritesRef.current.enqueue(bytes, dcOffsetAfter, lastSizeRef.current);
       } else {
@@ -1129,6 +1142,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onHistory: (bytes, dcOffset, historyAnchor) => {
       const term = termRef.current;
       if (!term) return;
+      markPainted();
       clearPrediction();
       if (typeof dcOffset === "number") {
         scrollbackSnapshotOffsetsRef.current.set(bytes, dcOffset);
@@ -1288,6 +1302,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         sig ? ` signal=${sig}` : ""
       }]\x1b[0m\r\n`;
       termRef.current?.write(banner);
+      markPainted();
       setExitBanner(`Session exited (code=${code ?? "?"}${sig ? `, signal=${sig}` : ""})`);
       onExit?.(code, sig);
     },
@@ -3042,6 +3057,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     (attachment) => attachment.status !== "uploading",
   );
 
+  // While the connecting overlay is up it is the pane's transport story, told
+  // in full sentences — the corner chip would be the same news at 10px. The
+  // chip's node stays mounted either way: it is the live region, so it keeps
+  // announcing the transitions a screen reader would otherwise miss.
+  const connectingOverlayOwnsStatus =
+    !painted && (socket.state !== "open" || (socket.v3 && !socket.dcOpen));
+
   const onDragEnter = (event: DragEvent<HTMLDivElement>) => {
     if (!hasFileTransfer(event.dataTransfer)) return;
     event.preventDefault();
@@ -3138,6 +3160,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           />
         </div>
       </div>
+      {/* Before the first byte lands there is nothing under here but the
+          terminal's own black: the overlay explains the wait, and gets out of
+          the way the moment output arrives. */}
+      <ConnectingOverlay
+        socketState={socket.state}
+        v3={socket.v3}
+        dcOpen={socket.dcOpen}
+        refusal={socket.signedRtcRefusal}
+        painted={painted}
+        hostName={hostIdentityQuery.data?.name ?? null}
+        hostOffline={hostIdentityQuery.data?.status === "offline"}
+      />
       {(uploadReconciliations.length > 0 || uploadReconciliationFault) && (
         <div
           data-testid="upload-reconciliation"
@@ -3295,7 +3329,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           a healthy "open" connection is the norm, not news. */}
       <div
         className={
-          socket.state !== "open" || channelPending || exitBanner || uploadStatus
+          (socket.state !== "open" || channelPending || exitBanner || uploadStatus) &&
+          !connectingOverlayOwnsStatus
             ? "pointer-events-none absolute right-2 top-2 rounded bg-popover/90 px-2 py-0.5 text-[10px] text-muted-foreground ring-1 ring-border"
             : "sr-only"
         }

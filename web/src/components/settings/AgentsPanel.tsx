@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Lock, MoreHorizontal, Pencil, Plus, Trash2, X } from "lucide-react";
+import { Lock, MoreHorizontal, Pencil, Plus, Trash2, X, Zap } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import { AgentIcon } from "@/components/icons/AgentIcon";
 import {
@@ -26,7 +26,10 @@ import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
+import { agentYoloAvailable } from "@/components/workspace/agent-command";
 import { type Agent, type AgentCreateInput, agents } from "@/lib/api";
+import { cn } from "@/lib/utils";
 
 export function AgentsPanel() {
   const queryClient = useQueryClient();
@@ -56,6 +59,22 @@ export function AgentsPanel() {
       refresh();
     },
     onError: (caught) => setError(caught instanceof Error ? caught.message : String(caught)),
+  });
+  const yoloM = useMutation({
+    mutationFn: ({ id, yolo }: { id: string; yolo: boolean }) =>
+      agents.setPreferences(id, { yolo }),
+    // Optimistic: the switch is a direct manipulation and must move under the
+    // finger, not a round trip later. A failure re-reads the truth.
+    onMutate: ({ id, yolo }) => {
+      queryClient.setQueryData<Agent[]>(["agents"], (current) =>
+        current?.map((item) => (item.id === id ? { ...item, yolo } : item)),
+      );
+    },
+    onSuccess: () => setError(null),
+    onError: (caught) => {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      refresh();
+    },
   });
   const removeM = useMutation({
     mutationFn: agents.remove,
@@ -118,7 +137,11 @@ export function AgentsPanel() {
               Built in
             </div>
             {builtIns.map((agent) => (
-              <AgentDefinitionRow key={agent.id} agent={agent} />
+              <AgentDefinitionRow
+                key={agent.id}
+                agent={agent}
+                onYoloChange={(yolo) => yoloM.mutate({ id: agent.id, yolo })}
+              />
             ))}
           </div>
         )}
@@ -140,6 +163,7 @@ export function AgentsPanel() {
             busy={updateM.isPending || removeM.isPending}
             onEdit={() => setEditor({ agent })}
             onRemove={() => void requestRemove(agent)}
+            onYoloChange={(yolo) => yoloM.mutate({ id: agent.id, yolo })}
           />
         ))}
       </section>
@@ -167,12 +191,21 @@ function AgentDefinitionRow({
   busy = false,
   onEdit,
   onRemove,
+  onYoloChange,
 }: {
   agent: Agent;
   busy?: boolean;
   onEdit?: () => void;
   onRemove?: () => void;
+  onYoloChange?: (yolo: boolean) => void;
 }) {
+  /*
+   * "Read only" and the yolo switch sit on the same row and are not in
+   * tension: the definition is the server's, the choice to run it without
+   * permission prompts is this account's, and it is stored separately (§ the
+   * `agent_preferences` table). So built-ins get a live toggle too.
+   */
+  const yoloable = agentYoloAvailable(agent);
   return (
     <Card className="shadow-none">
       <CardContent className="flex items-center gap-3 p-3">
@@ -184,8 +217,41 @@ function AgentDefinitionRow({
           </div>
           <code className="mt-1 block truncate font-mono text-xs text-muted-foreground">
             {agent.command}
+            {agent.yolo && yoloable && (
+              <span className="text-amber-600 dark:text-amber-500">{yoloSuffix(agent)}</span>
+            )}
           </code>
         </div>
+        {onYoloChange && (
+          /* The bolt alone was a mystery control. The word is the label —
+             short enough to sit on every row without crowding the command. */
+          <div className="flex shrink-0 items-center gap-4">
+            <span
+              className={cn(
+                "inline-flex items-center gap-1.5 text-sm font-medium transition-colors",
+                !yoloable
+                  ? "text-muted-foreground/50"
+                  : agent.yolo
+                    ? "text-amber-500"
+                    : "text-muted-foreground",
+              )}
+            >
+              <Zap className={cn("size-4", agent.yolo && yoloable && "fill-current")} aria-hidden />
+              yolo
+            </span>
+            <Switch
+              checked={agent.yolo && yoloable}
+              disabled={!yoloable}
+              onCheckedChange={onYoloChange}
+              aria-label={`Yolo mode for ${agent.name}`}
+              title={
+                yoloable
+                  ? `Run ${agent.name} without permission prompts`
+                  : `${agent.name} has no way to skip its permission prompts`
+              }
+            />
+          </div>
+        )}
         {onEdit && onRemove && (
           <DropdownMenu
             renderTrigger={(props) => (
@@ -214,6 +280,13 @@ function AgentDefinitionRow({
       </CardContent>
     </Card>
   );
+}
+
+/** What yolo mode visibly adds to the typed command, for the row's preview. */
+function yoloSuffix(agent: Agent): string {
+  const env = Object.keys(agent.yolo_env ?? {});
+  const args = agent.yolo_args?.trim();
+  return `${env.length > 0 ? ` +${env.join(" +")}` : ""}${args ? ` ${args}` : ""}`;
 }
 
 function AgentEditorDialog({
@@ -321,6 +394,21 @@ function AgentEditorDialog({
                 }
                 placeholder="npm install -g my-agent"
               />
+            </div>
+            <div className="space-y-1.5 @sm/agent-form:col-span-2">
+              <Label htmlFor="agent-yolo">Yolo arguments (optional)</Label>
+              <Input
+                id="agent-yolo"
+                value={draft.yoloArgs}
+                onChange={(event) =>
+                  setDraft((current) => ({ ...current, yoloArgs: event.currentTarget.value }))
+                }
+                placeholder="--dangerously-skip-permissions"
+              />
+              <p className="text-xs text-muted-foreground">
+                Appended to the command when this agent&rsquo;s yolo toggle is on. Leave blank and
+                no toggle is offered.
+              </p>
             </div>
             <div className="space-y-2 @sm/agent-form:col-span-2">
               <div className="flex items-center justify-between gap-2">

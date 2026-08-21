@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   agentInstallAndRunCommand,
   agentRunCommand,
+  agentYoloAvailable,
   envPrefix,
   shellQuote,
 } from "@/components/workspace/agent-command";
@@ -56,6 +57,45 @@ describe("agentRunCommand", () => {
       agentRunCommand({ command: "aider --model sonnet", env: { AIDER_DARK_MODE: "true" } }),
     ).toBe("AIDER_DARK_MODE=true aider --model sonnet");
   });
+
+  test("appends yolo arguments only when the preference is on", () => {
+    const claude = { command: "claude", env: {}, yolo_args: "--dangerously-skip-permissions" };
+    expect(agentRunCommand({ ...claude, yolo: false })).toBe("claude");
+    expect(agentRunCommand({ ...claude, yolo: true })).toBe(
+      "claude --dangerously-skip-permissions",
+    );
+  });
+
+  test("merges yolo env over the agent's own, quoting as usual", () => {
+    // opencode has no flag: yolo is a configuration override in the env.
+    expect(
+      agentRunCommand({
+        command: "opencode",
+        env: { OPENCODE_THEME: "dark" },
+        yolo: true,
+        yolo_args: null,
+        yolo_env: { OPENCODE_PERMISSION: '{"edit":"allow"}' },
+      }),
+    ).toBe(`OPENCODE_THEME=dark OPENCODE_PERMISSION='{"edit":"allow"}' opencode`);
+  });
+
+  test("a preference with nothing to spell it changes nothing", () => {
+    expect(agentRunCommand({ command: "mine", env: {}, yolo: true, yolo_args: "  " })).toBe("mine");
+    expect(agentRunCommand({ command: "mine", env: {}, yolo: true })).toBe("mine");
+  });
+});
+
+describe("agentYoloAvailable", () => {
+  test("true when there is an argument or an environment variable to set", () => {
+    expect(agentYoloAvailable({ yolo_args: "--yes-always" })).toBe(true);
+    expect(agentYoloAvailable({ yolo_env: { OPENCODE_PERMISSION: "{}" } })).toBe(true);
+  });
+
+  test("false when the agent has no way to skip its prompts", () => {
+    expect(agentYoloAvailable({})).toBe(false);
+    expect(agentYoloAvailable({ yolo_args: "   ", yolo_env: {} })).toBe(false);
+    expect(agentYoloAvailable({ yolo_args: null, yolo_env: null })).toBe(false);
+  });
 });
 
 describe("agentInstallAndRunCommand", () => {
@@ -67,6 +107,18 @@ describe("agentInstallAndRunCommand", () => {
         install: "npm i -g @openai/codex",
       }),
     ).toBe("npm i -g @openai/codex && FOO='b r' codex");
+  });
+
+  test("carries yolo into the run half of the chain", () => {
+    expect(
+      agentInstallAndRunCommand({
+        command: "claude",
+        env: {},
+        install: "npm i -g @anthropic-ai/claude-code",
+        yolo: true,
+        yolo_args: "--dangerously-skip-permissions",
+      }),
+    ).toBe("npm i -g @anthropic-ai/claude-code && claude --dangerously-skip-permissions");
   });
 
   test("null when there is no install command", () => {

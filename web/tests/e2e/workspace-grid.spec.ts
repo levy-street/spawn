@@ -11,7 +11,7 @@ import {
   WORKSPACE_ID,
   workspace,
 } from "./app-mocks";
-import { handleSessionRtcSignal, installSessionRtcMock, sendPty } from "./session-rtc-mock";
+import { handleSessionRtcSignal, installSessionRtcMock } from "./session-rtc-mock";
 
 const THIRD_SESSION_ID = "00000000-0000-4000-8000-00000000000a";
 const SECOND_WORKSPACE_ID = "00000000-0000-4000-8000-00000000000b";
@@ -234,24 +234,6 @@ test("removing a tile re-packs and expands the survivor", async ({ page }) => {
   expect(store.requests.workspacePatches[0]?.body).toEqual({
     layout: envelope({ version: 3, tiles: remove(initial, SESSION_ID) }),
   });
-});
-
-test("zoom hides siblings without remounting or losing the terminal buffer", async ({ page }) => {
-  const initial: Tile[] = [
-    { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },
-    { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
-  ];
-  const { connections } = await setupGrid(page, initial);
-  await expect.poll(() => connections.length).toBe(2);
-  await sendPty(page, "KEEP-ALIVE", 0);
-  const firstPane = page.getByRole("region", { name: "palette" });
-  await expect(firstPane.locator(".xterm-rows")).toContainText("KEEP-ALIVE");
-  await firstPane.getByRole("toolbar", { name: "palette window controls" }).dblclick();
-  await expect(page.locator(`[data-grid-tile="${SESSION_B_ID}"]`)).toBeHidden();
-  await firstPane.getByRole("toolbar", { name: "palette window controls" }).dblclick();
-  await expect(page.locator(`[data-grid-tile="${SESSION_B_ID}"]`)).toBeVisible();
-  await expect(firstPane.locator(".xterm-rows")).toContainText("KEEP-ALIVE");
-  expect(connections).toHaveLength(2);
 });
 
 test("Alt+arrows follow reading order and Alt+digits switch workspace position", async ({

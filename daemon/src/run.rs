@@ -703,12 +703,19 @@ async fn serve_one_connection_with_loader(
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown-host".into());
 
+    // The GPU name is the one part of the spec that needs a subprocess, so it
+    // is probed off to the side and folded in whenever it lands. Registering
+    // without it costs a host its GPU label until the next reconnect, which is
+    // strictly better than making the connection wait on `nvidia-smi`.
+    crate::host_metrics::sampler().probe_gpu();
+
     let register = Outbound::Register {
         host_name,
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         existing_sessions: registry.ids(),
+        spec: crate::host_metrics::sampler().spec(),
     };
     let register_json = serde_json::to_string(&register)?;
     out_tx
@@ -724,7 +731,11 @@ async fn serve_one_connection_with_loader(
         tick.tick().await; // consume the immediate first tick
         loop {
             tick.tick().await;
-            let frame = match serde_json::to_string(&Outbound::HostHeartbeat) {
+            let (cpu_bucket, mem_bucket) = crate::host_metrics::sampler().heartbeat_buckets();
+            let frame = match serde_json::to_string(&Outbound::HostHeartbeat {
+                cpu_bucket,
+                mem_bucket,
+            }) {
                 Ok(s) => s,
                 Err(_) => continue,
             };

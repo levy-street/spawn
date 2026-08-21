@@ -282,6 +282,22 @@ class Host(Base):
         nullable=True,
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # What the machine is. Written once from `register` and stable after that,
+    # so nothing here is refreshed per heartbeat. All nullable: a daemon older
+    # than the field, or one running with SPAWND_NO_TELEMETRY, reports none of
+    # it and must keep working exactly as before.
+    cpu_cores: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cpu_physical_cores: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cpu_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    memory_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    gpu: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # How hard it is working — as a meter segment count in 0..=5, never a
+    # percentage. See migration 0042 and daemon/src/host_metrics.rs: the exact
+    # figures exist, and deliberately never travel through this server.
+    cpu_bucket: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    mem_bucket: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Distinguishes "idle" from "never reported": both leave the buckets NULL.
+    capacity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -360,8 +376,39 @@ class Agent(Base):
     # Optional shell command offered when the command's binary is missing on a
     # host ("install & run"); typed visibly into the PTY, never run silently.
     install: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # How this CLI is told to stop asking for permission ("yolo mode"). Every
+    # tool spells it differently, so the definition carries the spelling and
+    # the per-user AgentPreference below carries the on/off. Both empty means
+    # the tool has no such mode and the toggle is not offered.
+    yolo_args: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    yolo_env: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
 
     __table_args__ = (UniqueConstraint("owner_user_id", "name", name="uq_agents_owner_name"),)
+
+
+class AgentPreference(Base):
+    """One user's settings for one agent definition — including built-ins.
+
+    Built-ins are shared rows nobody may edit, so a preference on one cannot
+    live on ``agents``. Rows are created lazily on first write; a missing row
+    reads as every default.
+    """
+
+    __tablename__ = "agent_preferences"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Launch this agent with its permission prompts turned off.
+    yolo: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "agent_id", name="uq_agent_preferences_owner_agent"),
+    )
 
 
 class HostAgentPolicy(Base):
@@ -700,6 +747,48 @@ class Invite(Base):
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class LegionDay(Base):
+    """One owner's fleet activity for one UTC day. Counters only.
+
+    Why this exists at all: session rows are hard-deleted when a workspace is
+    deleted, so a profile computed from ``sessions`` would show a person's
+    history *shrinking* as they tidy up. This table is the durable record —
+    append-only, one row per owner per day, and nothing in it can be traced
+    back to a particular session once written.
+
+    ``agents`` is a small JSON object of foreground executable basenames to
+    counts (``{"claude": 12, "codex": 3}``). It is drawn from the same
+    ``session.foreground`` vocabulary the pane labels already use — a bare
+    basename, never arguments or paths — and is bounded on write so a host
+    cycling through hundreds of binaries cannot grow the row without limit.
+    """
+
+    __tablename__ = "legion_days"
+
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    # ISO ``YYYY-MM-DD``, always the server's UTC day. A string rather than a
+    # DATE so SQLite and Postgres read back the identical value.
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    sessions_started: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    session_seconds: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0", nullable=False
+    )
+    peak_sessions: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    peak_hosts_online: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    agents: Mapped[str] = mapped_column(Text, default="{}", server_default="{}", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
 

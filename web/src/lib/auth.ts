@@ -1,6 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import { closeAlertSocket } from "@/lib/alert-socket";
 import { ApiError, type AuthConfig, auth, type User } from "@/lib/api";
 
 /**
@@ -53,6 +54,10 @@ export function useAuthConfig() {
 }
 
 export async function logout() {
+  // Drop the alert stream first: a socket whose cookie has just been revoked
+  // would otherwise sit in a reconnect loop against a 1008 until the redirect
+  // tears the page down.
+  closeAlertSocket();
   try {
     await auth.logout();
   } catch {

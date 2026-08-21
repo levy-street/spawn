@@ -25,10 +25,12 @@ from .routes import capabilities as capabilities_routes
 from .routes import device as device_routes
 from .routes import hosts as hosts_routes
 from .routes import install as install_routes
+from .routes import profile as profile_routes
 from .routes import sessions as sessions_routes
 from .routes import trust_bundle as trust_bundle_routes
 from .routes import workspace_templates as workspace_templates_routes
 from .routes import workspaces as workspaces_routes
+from .ws import alerts as alerts_ws
 from .ws import browser as browser_ws
 from .ws import daemon as daemon_ws
 from .ws import host as host_ws
@@ -84,6 +86,7 @@ def create_app() -> FastAPI:
     app.include_router(capabilities_routes.router)
     app.include_router(device_routes.router)
     app.include_router(hosts_routes.router)
+    app.include_router(profile_routes.router)
     app.include_router(sessions_routes.router)
     app.include_router(workspace_templates_routes.router)
     app.include_router(workspaces_routes.router)
@@ -94,6 +97,7 @@ def create_app() -> FastAPI:
     app.include_router(daemon_ws.router)
     app.include_router(browser_ws.router)
     app.include_router(host_ws.router)
+    app.include_router(alerts_ws.router)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

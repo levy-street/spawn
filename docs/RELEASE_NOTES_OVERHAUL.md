@@ -18,7 +18,7 @@ workspace product.
   shortcut types its visible command into the PTY. Exiting or interrupting the
   CLI returns to the shell.
 - Workspaces use a packed 12×12 grid with up to eight session tiles. Desktop
-  supports drag, resize, and zoom; mobile uses the same sessions in reading
+  supports drag and resize; mobile uses the same sessions in reading
   order as a vertical stack.
 
 ## Required upgrade order

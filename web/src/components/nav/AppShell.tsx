@@ -14,12 +14,14 @@ import {
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
 import { Wordmark } from "@/components/icons/BrandMark";
 import { Sidebar } from "@/components/nav/Sidebar";
+import { ProfileDialog } from "@/components/profile/ProfileDialog";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { Button } from "@/components/ui/button";
 import { ConfirmHost } from "@/components/ui/confirm";
 import { Drawer } from "@/components/ui/drawer";
 import { ToastHost } from "@/components/ui/toast";
 import { NewSessionMenu } from "@/components/workspace/new-session-menu";
+import { useSessionAlerts } from "@/hooks/useSessionAlerts";
 import { workspaces } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -68,6 +70,15 @@ export function AppShell({
     queryFn: () => workspaces.list(),
     staleTime: 30_000,
   });
+  /*
+   * Alerts are mounted here because this is the one component every signed-in
+   * route renders. The hook holds no state of its own — the socket, the
+   * preferences and the cross-tab claim are all module singletons — precisely
+   * because this shell remounts on every route change (see `remembered`
+   * above), and an attention stream that redialed on every workspace click
+   * would drop the events it exists to deliver.
+   */
+  useSessionAlerts();
   const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
   const currentWorkspaceName = useMemo(
     () => workspacesQ.data?.find((workspace) => workspace.id === currentWorkspaceId)?.name,
@@ -168,7 +179,11 @@ export function AppShell({
                 : `${sidebarWidth}px`,
           }}
           className={cn(
-            "pad-safe-top pad-safe-bottom sticky top-0 relative hidden h-vv shrink-0 flex-col bg-shell @md/shell:flex",
+            // `sticky`, not `relative`: both were set, and which one won came down
+            // to utility order in the generated stylesheet rather than intent.
+            // Sticky already establishes the positioning context the resize
+            // grip needs, so the pair collapses to the one that was meant.
+            "pad-safe-top pad-safe-bottom sticky top-0 hidden h-vv shrink-0 flex-col bg-shell @md/shell:flex",
             transitionReady && !resizing && "transition-[width] duration-200 ease-swift",
           )}
           aria-label="Primary"
@@ -270,6 +285,7 @@ export function AppShell({
       <ConfirmHost />
       <ToastHost />
       <SettingsDialog />
+      <ProfileDialog />
     </div>
   );
 }

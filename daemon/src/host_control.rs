@@ -608,6 +608,30 @@ impl Context {
             "fs.read" => self.begin_read(request_id, payload).await,
             "fs.read.range" => self.begin_range_read(request_id, payload).await,
             "fs.preview" => self.begin_preview(request_id, payload).await,
+            // Exact capacity, straight down the DataChannel. This is the
+            // whole point of putting it here rather than on the heartbeat:
+            // the browser gets real numbers and the control plane gets a
+            // five-level bucket every thirty seconds (see `host_metrics`).
+            // Cheap and synchronous — one sysinfo refresh, rate-limited
+            // internally — so it answers on the normal queue like `ping`.
+            "host.metrics" => match crate::host_metrics::sampler().sample() {
+                Some(sample) => {
+                    let spec = crate::host_metrics::sampler().spec();
+                    self.response(
+                        request_id,
+                        json!({"sample": sample, "spec": spec}),
+                    )
+                    .await
+                }
+                None => {
+                    self.error(
+                        request_id,
+                        "telemetry_disabled",
+                        "this host does not report capacity",
+                    )
+                    .await
+                }
+            },
             "desktop.reveal" => {
                 self.desktop_action(request_id, payload, DesktopAction::Reveal)
                     .await
@@ -2089,6 +2113,12 @@ pub(crate) fn install(
             ];
             if publication_context.preview.is_some() {
                 capabilities.push("fs.preview");
+            }
+            // Advertised, not assumed: a host with `SPAWND_NO_TELEMETRY` set
+            // looks to the browser exactly like a daemon too old to have the
+            // operation, and the UI draws no meters for either.
+            if crate::host_metrics::enabled() {
+                capabilities.push("host.metrics");
             }
             if crate::host_desktop::DESKTOP_SUPPORTED {
                 capabilities.push("desktop.reveal");

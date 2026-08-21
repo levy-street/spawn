@@ -1,12 +1,13 @@
 import { expect, test } from "@playwright/test";
 import { agent, host, mockApp, openSettings, USER_ID, user } from "./app-mocks";
 
-test("all seven settings tabs open", async ({ page }) => {
+test("all eight settings tabs open", async ({ page }) => {
   await mockApp(page);
   await openSettings(page);
   const cases = [
     ["Account", "Account"],
     ["Appearance", "Appearance"],
+    ["Notifications", "Notifications"],
     ["Hosts", "Hosts"],
     ["Agents", "Agents"],
     ["Skills", "Skills"],
@@ -96,6 +97,40 @@ test("Agents keeps built-ins read-only and round-trips a custom definition", asy
     .getByRole("button", { name: "Delete agent" })
     .click();
   await expect.poll(() => store.agents.some((item) => item.name === "Deploy bot")).toBe(false);
+});
+
+test("Agents offers a yolo toggle on a built-in and withholds it without a flag", async ({
+  page,
+}) => {
+  const store = await mockApp(page, {
+    agents: [
+      agent(),
+      agent({
+        id: "00000000-0000-4000-8000-00000000000f",
+        owner_user_id: USER_ID,
+        name: "Review bot",
+        kind: "custom",
+        command: "review",
+        env: {},
+        install: null,
+        yolo_args: null,
+        yolo_env: {},
+      }),
+    ],
+  });
+  await openSettings(page, "agents");
+
+  // Built-ins are read-only definitions, but the yolo choice is the account's
+  // own — so the switch is live on one anyway.
+  const codex = page.getByRole("switch", { name: "Yolo mode for Codex" });
+  await expect(codex).toHaveAttribute("aria-checked", "false");
+  await codex.click();
+  await expect.poll(() => store.agents.find((item) => item.name === "Codex")?.yolo).toBe(true);
+  await expect(codex).toHaveAttribute("aria-checked", "true");
+  await expect(page.getByText("--dangerously-bypass-approvals-and-sandbox")).toBeVisible();
+
+  // Nothing to spell it with, so nothing to poke at.
+  await expect(page.getByRole("switch", { name: "Yolo mode for Review bot" })).toBeDisabled();
 });
 
 test("Admin row is hidden for ordinary users", async ({ page }) => {

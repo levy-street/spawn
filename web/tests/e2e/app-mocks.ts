@@ -43,6 +43,9 @@ export const agentDefinition = {
   command: "codex",
   env: {},
   install: "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
+  yolo_args: "--dangerously-bypass-approvals-and-sandbox",
+  yolo_env: {},
+  yolo: false,
 };
 
 export function session(overrides: Record<string, unknown> = {}) {
@@ -1449,6 +1452,19 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       await json(route, created, 201);
       return;
     }
+    const agentPreferencesMatch = path.match(/^\/api\/agents\/([^/]+)\/preferences$/);
+    if (agentPreferencesMatch && method === "PATCH") {
+      const selected = findById(store.agents, agentPreferencesMatch[1]);
+      if (!selected) {
+        await json(route, { detail: "agent not found" }, 404);
+        return;
+      }
+      // Built-ins accept this where PATCH on the definition would 404: the row
+      // written server-side is the caller's preference, not the definition.
+      Object.assign(selected, await readBody());
+      await json(route, selected);
+      return;
+    }
     const agentMatch = path.match(/^\/api\/agents\/([^/]+)$/);
     if (agentMatch) {
       const selected = findById(store.agents, agentMatch[1]);
@@ -1519,7 +1535,15 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
 
 export async function openSettings(
   page: Page,
-  tab: "account" | "appearance" | "hosts" | "agents" | "skills" | "devices" | "trust" = "account",
+  tab:
+    | "account"
+    | "appearance"
+    | "notifications"
+    | "hosts"
+    | "agents"
+    | "skills"
+    | "devices"
+    | "trust" = "account",
   workspaceId = WORKSPACE_ID,
 ) {
   await page.goto(`/w/${workspaceId}`);
@@ -1532,6 +1556,7 @@ export async function openSettings(
 const SETTINGS_TAB_LABELS = {
   account: "Account",
   appearance: "Appearance",
+  notifications: "Notifications",
   hosts: "Hosts",
   agents: "Agents",
   skills: "Skills",

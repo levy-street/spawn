@@ -26,6 +26,7 @@ import { type Agent, ApiError, agents, type Host, hosts, sessions, workspaces } 
 import { autoPlace, type Rect } from "@/lib/grid";
 import { activeTab, tabHome, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
+import { agentRunCommand } from "./agent-command";
 import { FolderPicker } from "./folder-picker";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { pendingLaunch } from "./pending-launch";
@@ -166,12 +167,13 @@ function useNewSessionChoices(
           workspace_id: workspaceId,
           tile,
         });
-        if (choice.kind === "agent") pendingLaunch.set(session.id, choice.agent.command);
+        if (choice.kind === "agent") pendingLaunch.set(session.id, agentRunCommand(choice.agent));
         return { workspaceId, sessionId: session.id };
       }
       const result = await workspaces.create({ first_session: { host_id: host.id, cwd } });
       if (!result.session) throw new Error("The workspace was created without its first session.");
-      if (choice.kind === "agent") pendingLaunch.set(result.session.id, choice.agent.command);
+      if (choice.kind === "agent")
+        pendingLaunch.set(result.session.id, agentRunCommand(choice.agent));
       return { workspaceId: result.workspace.id, sessionId: result.session.id };
     },
     onSuccess: (result) => {

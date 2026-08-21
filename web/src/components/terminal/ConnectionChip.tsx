@@ -49,7 +49,7 @@ const TRUST_VIEW: Record<
   },
 };
 
-const REFUSAL_DETAIL: Record<SignedRtcRefusalReason, string> = {
+export const REFUSAL_DETAIL: Record<SignedRtcRefusalReason, string> = {
   host_key_substituted:
     "This host presented a different identity key than the one you approved. Connection blocked to prevent interception — re-verify and re-approve the host to reconnect.",
   host_key_revoked: "You revoked this host's approved key. Re-approve it to reconnect.",

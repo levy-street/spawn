@@ -173,9 +173,64 @@ Host shape:
   "host_key_fingerprint": "SHA256:short-base64url|null",
   "status": "online" | "offline",
   "last_seen_at": "2026-05-04T...",
-  "session_count": 2
+  "session_count": 2,
+  "cpu_cores": 64,
+  "cpu_physical_cores": 32,
+  "cpu_model": "AMD Ryzen Threadripper",
+  "memory_bytes": 274877906944,
+  "gpu": "2\u00d7 NVIDIA GeForce RTX 4090",
+  "cpu_bucket": 3,
+  "mem_bucket": 1,
+  "capacity_at": "2026-05-04T..."
 }
 ```
+
+Every capacity field is nullable. The spec fields are null until a daemon that
+reports them registers; the two buckets are additionally null for any host that
+is `offline`, because a departed daemon's last reading is a stale reading and a
+live-looking meter on a dead machine is worse than no meter. `capacity_at` is
+what separates "idle" from "never reported", which are otherwise both null.
+
+### Profile
+
+| Method | Path            | Notes |
+|--------|-----------------|-------|
+| GET    | `/api/profile`  | identity, the fleet now, and the daily record behind it |
+
+```json
+{
+  "id": "uuid", "email": "...", "created_at": "...", "is_admin": false,
+  "totals": {"hosts": 3, "hosts_online": 2, "cores": 96,
+             "memory_bytes": 412316860416, "sessions_live": 4,
+             "sessions_started": 812, "session_seconds": 149322,
+             "active_days": 61, "current_streak": 9, "longest_streak": 23,
+             "peak_hosts_online": 4, "peak_sessions": 11,
+             "first_day": "2026-06-21"},
+  "agents": [{"command": "claude", "count": 402}],
+  "days":   [{"day": "2026-08-21", "sessions_started": 6,
+              "session_seconds": 5400, "peak_sessions": 3,
+              "peak_hosts_online": 2}],
+  "hosts":  [{"id": "uuid", "name": "nightmare", "os": "linux",
+              "status": "online", "cpu_cores": 64,
+              "memory_bytes": 274877906944, "gpu": "2\u00d7 RTX 4090",
+              "session_count": 4, "created_at": "...", "last_seen_at": "..."}],
+  "history_days": 120,
+  "today": "2026-08-21"
+}
+```
+
+`days` is **sparse** — only days something happened — and covers the last
+`history_days`. `totals` are lifetime figures over every recorded day, not just
+the window. `today` is the server's UTC day, returned so a client densifying
+`days` into a calendar colours the same squares the streak counter counted
+rather than disagreeing with it across a timezone.
+
+Behind it is `legion_days`, an append-only per-owner-per-UTC-day counter table
+(migration 0042). It exists because sessions are hard-deleted with their
+workspace: a profile computed from the `sessions` table would show a person's
+history shrinking as they tidy up. `agents` counts the same disclosed
+`session.foreground` basenames the pane labels use — never arguments or paths —
+and is bounded per day.
 
 ### Sessions
 
@@ -232,18 +287,32 @@ session's shell. Not a process.
 | Method | Path             | Body                                                          |
 |--------|------------------|---------------------------------------------------------------|
 | GET    | `/api/agents`    | list (built-ins + user-defined)                               |
-| POST   | `/api/agents`    | `{name, kind, command, env?, install?}`                       |
+| POST   | `/api/agents`    | `{name, kind, command, env?, install?, yolo_args?, yolo_env?}` |
 | PATCH  | `/api/agents/{id}` | update a custom agent (built-ins immutable; write → 404)    |
 | DELETE | `/api/agents/{id}` |                                                             |
+| PATCH  | `/api/agents/{id}/preferences` | `{yolo?}` — the caller's own settings; **accepts built-ins** |
 
 `AgentOut`: `id, owner_user_id (null = built-in), name, kind, command
-(string), env (dict), install (string|null)`.
+(string), env (dict), install (string|null), yolo_args (string|null), yolo_env
+(dict), yolo (bool)`.
+
+**Yolo mode.** `yolo_args`/`yolo_env` are how one CLI is told to stop asking
+for permission; every tool spells it differently and one has no flag at all, so
+the spelling lives on the definition and is server-owned for built-ins. Both
+empty means the tool has no such mode and the client offers no toggle. `yolo`
+is not part of the definition: built-ins are single rows shared by every
+account, so the choice is per user, stored in `agent_preferences` and returned
+for the *reading* user. `PATCH /{id}/preferences` is the only write that
+accepts a built-in for that reason; turning `yolo` on for an agent with neither
+`yolo_args` nor `yolo_env` is a 400. The browser folds the choice into the
+command it types — `yolo_env` merged over `env`, `yolo_args` appended — so it
+is as visible in the terminal as anything else the shortcut bar types.
 
 Built-in agents (server-seeded, idempotent, `owner_user_id = null`):
-- **claude-code** — command `claude`, install `npm install -g @anthropic-ai/claude-code`
-- **codex** — command `codex`, install `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`
-- **opencode** — command `opencode`, install `npm install -g opencode-ai`
-- **aider-sonnet** — command `aider --model claude-sonnet-4-6`, install `pipx install aider-chat || pip install --user aider-chat`
+- **claude-code** — command `claude`, install `npm install -g @anthropic-ai/claude-code`, yolo `--dangerously-skip-permissions`
+- **codex** — command `codex`, install `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`, yolo `--dangerously-bypass-approvals-and-sandbox`
+- **opencode** — command `opencode`, install `npm install -g opencode-ai`, yolo `OPENCODE_PERMISSION` (it has no flag; permissions are configuration)
+- **aider-sonnet** — command `aider --model claude-sonnet-4-6`, install `pipx install aider-chat || pip install --user aider-chat`, yolo `--yes-always`
 
 There is no `shell` built-in: sessions *are* shells.
 
@@ -382,9 +451,14 @@ not to need one.
  "os": "linux",
  "arch": "x86_64",
  "version": "0.1.0",
- "existing_sessions": ["uuid", ...]}
+ "existing_sessions": ["uuid", ...],
+ "spec": {"cpu_cores": 64,
+          "cpu_physical_cores": 32,
+          "cpu_model": "AMD Ryzen Threadripper",
+          "memory_bytes": 274877906944,
+          "gpu": "2\u00d7 NVIDIA GeForce RTX 4090"}}
 
-{"type": "host.heartbeat"}
+{"type": "host.heartbeat", "cpu_bucket": 3, "mem_bucket": 1}
 
 {"type": "host.pong", "request_id": "uuid"}
 
@@ -629,6 +703,20 @@ affect a replacement session. The legacy `generation` spelling and the v2
 `agent_id` field are rejected vocabulary — a daemon routes session frames by
 `scope_id` only.
 
+`spec` is optional on `register`, and `cpu_bucket`/`mem_bucket` are optional on
+`host.heartbeat`. All are absent from a daemon that predates them and from one
+started with `SPAWND_NO_TELEMETRY=1`; a telemetry-free daemon emits exactly the
+pre-existing `{"type": "host.heartbeat"}`. Every field is re-validated
+server-side (`spawn_server/host_capacity.py`) and stored per field, so one bad
+value does not discard the rest.
+
+A bucket is a **meter segment count in `0..=5`**, never a percentage. This is
+the deliberate resolution limit described in docs/TRUST.md: a five-level
+reading every thirty seconds is enough to draw a capacity meter and useless as
+a behavioural trace. Exact CPU/memory/load figures exist, and reach the browser
+only over the `spawn.host.ctl` `host.metrics` operation — there is no server
+code path that carries them.
+
 The server sends `host.heartbeat` acknowledgements for daemon heartbeats so
 the daemon can distinguish healthy idle connections from dead sockets.
 
@@ -667,6 +755,65 @@ signaling/status plane. A `spawn.v3` websocket never becomes a terminal relay.
 {"type": "rtc.candidate", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "scope_type":"session", "scope_id":"session-uuid", "protocol":"spawn.pty", "protocol_version":2, "candidate": {"candidate": "..."}}
 {"type": "rtc.status", "session_id": "browser-generated-id", "binding_nonce": "browser-generated-hex", "binding_generation": 7, "scope_type":"session", "scope_id":"session-uuid", "protocol":"spawn.pty", "protocol_version":2, "status": "connected|failed"}
 ```
+
+## Alert WebSocket — `/ws/alerts`
+
+- Auth: session cookie (or `?token=` for testing).
+- Required subprotocol: `spawn.alerts.v1`. An old/missing subprotocol receives
+  only `{"type":"protocol.required","protocol":"spawn.alerts.v1","version":1}`
+  and closes with `4003`.
+- Scoped to the **owner**, not to a session: one socket per browser tab,
+  carrying events for every session that owner has. This is the difference
+  that matters — `/ws/browser` only exists for a session with a pane open,
+  and the session you need telling about is the one you are not watching.
+- Read-only. The browser sends nothing; inbound frames are ignored.
+- Content discipline: the only session-derived string here is `command`, the
+  foreground process basename that `GET /api/sessions` already returns. It is
+  the same documented exception, not a new one. No terminal bytes, no argv,
+  no cwd, no output. See `docs/TRUST.md`.
+
+Transitions are detected server-side and published on
+`spawn:user:{user_id}:alerts`. `agent.finished` and `session.died` are detected
+at the write site in `ws/daemon.py`, where the previous `foreground_command` is
+still in hand. `agent.awaiting_input` has no write to hang off — the server
+derives "waiting" lazily from timestamps whenever a session is read, so nothing
+happens at the moment one goes quiet — and is instead a per-session timer
+(`QuietWatch`) owned by the daemon connection, which is the one place a
+session maps to exactly one server worker. Only `session.activity` arms it:
+`session.input_activity` *cancels* it (the user spoke last, so the agent owes
+them a reply), and a `session.foreground` report does not arm it at all —
+workers re-report their foreground on every reconnect, and arming there raised
+alerts for sessions that had done nothing. Before publishing, the row is
+re-read: the last output must exist, be newer than the last input, and be at
+least the window old. Three writes null `foreground_command` — the
+`session.exit` handler, `POST /api/sessions/{id}/restart`, and workspace
+archive — and only the first of them is an alert; the other two are things
+the owner just asked for. `agent.finished` therefore requires the session to
+still be `running`.
+
+### Server → browser
+
+```json
+{"type": "alerts.ping"}
+{"type": "alert", "event": "agent.finished", "session_id": "session-uuid", "command": "claude", "at": "2026-08-21T10:00:00+00:00"}
+{"type": "alert", "event": "agent.awaiting_input", "session_id": "session-uuid", "command": "claude", "at": "2026-08-21T10:00:00+00:00"}
+{"type": "alert", "event": "session.died", "session_id": "session-uuid", "command": "claude", "exit_code": 137, "signal": null, "at": "2026-08-21T10:00:00+00:00"}
+```
+
+- `agent.finished` — a non-shell foreground process gave way to the shell (or
+  to nothing) while the session stayed `running`. `command` is what ended. An
+  agent replaced by another program is not a finish.
+- `agent.awaiting_input` — a non-shell foreground process produced no
+  output for `ALERT_QUIET_SECONDS` (8 s, the same window the `waiting` status
+  dot uses) while the session stayed `running`:
+  it finished a turn, or it is asking something. For an agent CLI this is the
+  common case, because those idle at their own prompt instead of exiting.
+  Emitted at most once per quiet period — only fresh activity rearms it.
+- `session.died` — the session exited or was killed. `command` names whatever
+  was in the foreground when it went, or is null for an idle shell. Exactly
+  one event is published for this transition, never a finish as well.
+- `alerts.ping` — idle keepalive, roughly every 25 s. Carries no meaning
+  beyond "the link is alive"; a client that stops seeing them should redial.
 
 ## Direct per-session DataChannels
 
@@ -913,7 +1060,7 @@ that label only on a host-scoped peer connection for its server-registered host
 identity. The server never receives these messages. Version 1 starts with:
 
 ```json
-{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.read.range","fs.write.begin","fs.mkdir","fs.rename","fs.remove","fs.preview","desktop.reveal","desktop.open"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"range_bytes":16777216,"preview_bytes":2097152,"preview_pixels":[128,256,512,1024],"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
+{"version":1,"type":"hello","protocol":"spawn.host.ctl","capabilities":["ping","fs.home","fs.list","fs.stat","fs.read","fs.read.range","fs.write.begin","fs.mkdir","fs.rename","fs.remove","fs.preview","host.metrics","desktop.reveal","desktop.open"],"limits":{"frame_bytes":16384,"chunk_bytes":8192,"file_bytes":536870912,"directory_entries":1024,"range_bytes":16777216,"preview_bytes":2097152,"preview_pixels":[128,256,512,1024],"normal_queue":64,"fast_queue":64,"long_tasks":8,"write_reapers":1}}
 {"version":1,"type":"request","request_id":"unguessable-id","operation":"ping"}
 {"version":1,"type":"response","request_id":"unguessable-id","ok":true,"result":{"pong":true}}
 {"version":1,"type":"cancel","request_id":"unguessable-id"}
@@ -959,7 +1106,10 @@ report `open_allowed` and never does.
 `capabilities` is built per platform and per daemon, not fixed: `fs.preview`,
 `desktop.reveal`, and `desktop.open` are advertised only where the host can
 actually perform them (macOS, with a preview staging area that started
-successfully). The browser gates every one of these on the advertised list and
+successfully). `host.metrics` is advertised on every platform unless the daemon
+was started with `SPAWND_NO_TELEMETRY=1`, which makes an opted-out host
+indistinguishable from a daemon too old to have the operation — both draw no
+meters, which is the intended outcome for both. The browser gates every one of these on the advertised list and
 never on the host's reported OS, so an older daemon on macOS correctly offers
 nothing new and a future Linux daemon lights them up with no client change.
 Unadvertised operations answer `unsupported_operation` as an ordinary error
@@ -995,6 +1145,31 @@ success with an empty body. Previews are always streamed, never returned inline:
 a 16 KiB frame leaves roughly 11.5 KiB after base64, while a rendered page is
 50 KiB to 1 MiB, and an inline path would be a second delivery mechanism with
 no `stream.end` digest, window, cancel, or tombstone beside a mature one.
+
+`host.metrics` takes no payload and answers with one exact reading plus the
+host's static spec:
+
+```json
+{"type":"response","request_id":"...","result":{
+  "sample":{"cpu_percent":41.2,"memory_used_bytes":38654705664,
+            "memory_total_bytes":274877906944,"load_one":6.31,
+            "uptime_seconds":918233},
+  "spec":{"cpu_cores":64,"cpu_physical_cores":32,
+          "cpu_model":"AMD Ryzen Threadripper",
+          "memory_bytes":274877906944,"gpu":"2\u00d7 RTX 4090"}}}
+```
+
+This is the only place exact capacity figures exist on the wire, and the reason
+they live here rather than on `host.heartbeat`: a per-second utilization trace
+of somebody's machines is a behavioural fingerprint, and the control plane is
+built not to be able to read one (docs/TRUST.md). It is a plain
+request/response on the normal queue rather than a subscription — the browser
+polls at whatever rate it is drawing at, the daemon rate-limits internally to
+sysinfo's minimum sampling interval and returns the previous reading to a
+caller that asks sooner, and a host with telemetry off answers
+`telemetry_disabled` as an ordinary error. Opening this channel costs a real
+WebRTC connection per host, so clients are expected to open it only for a
+surface someone is looking at and close it when they leave.
 
 `desktop.reveal` and `desktop.open` take a path and nothing else. There is no
 field for an application, arguments, or flags — not optional, not ignored,

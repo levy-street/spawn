@@ -88,8 +88,89 @@ export const HostSchema = z.object({
   status: z.enum(["online", "offline"]),
   last_seen_at: z.string().nullable(),
   session_count: z.number().int(),
+  /* Capacity. Every field is nullable and stays null for a daemon that
+   * predates telemetry or runs with SPAWND_NO_TELEMETRY — the strip draws no
+   * meter at all rather than an empty one, which says something different.
+   * `cpu_bucket`/`mem_bucket` are meter segment counts in 0..5, never
+   * percentages: the exact figures come from the host over `spawn.host.ctl`
+   * and deliberately have no server code path (docs/TRUST.md). */
+  cpu_cores: z.number().int().nullable().default(null),
+  cpu_physical_cores: z.number().int().nullable().default(null),
+  cpu_model: z.string().nullable().default(null),
+  memory_bytes: z.number().int().nullable().default(null),
+  gpu: z.string().nullable().default(null),
+  cpu_bucket: z.number().int().min(0).max(5).nullable().default(null),
+  mem_bucket: z.number().int().min(0).max(5).nullable().default(null),
+  capacity_at: z.string().nullable().default(null),
 });
 export type Host = z.infer<typeof HostSchema>;
+
+/** One UTC day of fleet activity. Sparse — quiet days are simply absent. */
+export const LegionDaySchema = z.object({
+  day: z.string(),
+  sessions_started: z.number().int().default(0),
+  session_seconds: z.number().int().default(0),
+  peak_sessions: z.number().int().default(0),
+  peak_hosts_online: z.number().int().default(0),
+});
+export type LegionDay = z.infer<typeof LegionDaySchema>;
+
+export const LegionTotalsSchema = z.object({
+  hosts: z.number().int().default(0),
+  hosts_online: z.number().int().default(0),
+  cores: z.number().int().default(0),
+  memory_bytes: z.number().int().default(0),
+  sessions_live: z.number().int().default(0),
+  sessions_started: z.number().int().default(0),
+  session_seconds: z.number().int().default(0),
+  active_days: z.number().int().default(0),
+  current_streak: z.number().int().default(0),
+  longest_streak: z.number().int().default(0),
+  peak_hosts_online: z.number().int().default(0),
+  peak_sessions: z.number().int().default(0),
+  first_day: z.string().nullable().default(null),
+});
+export type LegionTotals = z.infer<typeof LegionTotalsSchema>;
+
+/** A foreground executable basename and how often it has been seen. */
+export const LegionAgentSchema = z.object({
+  command: z.string(),
+  count: z.number().int(),
+});
+export type LegionAgent = z.infer<typeof LegionAgentSchema>;
+
+export const LegionHostSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  os: z.string().nullable().default(null),
+  status: z.string(),
+  cpu_cores: z.number().int().nullable().default(null),
+  memory_bytes: z.number().int().nullable().default(null),
+  gpu: z.string().nullable().default(null),
+  session_count: z.number().int().default(0),
+  created_at: z.string().nullable().default(null),
+  last_seen_at: z.string().nullable().default(null),
+});
+export type LegionHost = z.infer<typeof LegionHostSchema>;
+
+/** Everything the profile dialog draws (`GET /api/profile`). */
+export const ProfileSchema = z.object({
+  id: z.string(),
+  email: z.string(),
+  created_at: z.string(),
+  email_verified_at: z.string().nullable().default(null),
+  is_admin: z.boolean().default(false),
+  totals: LegionTotalsSchema,
+  agents: z.array(LegionAgentSchema).default([]),
+  days: z.array(LegionDaySchema).default([]),
+  hosts: z.array(LegionHostSchema).default([]),
+  history_days: z.number().int(),
+  /* The server's UTC day. The calendar is densified against this rather than
+   * the browser's clock, so a viewer in UTC+13 colours the squares the streak
+   * counter actually counted. */
+  today: z.string(),
+});
+export type Profile = z.infer<typeof ProfileSchema>;
 
 /** Availability of one agent definition on one host (`GET /api/hosts/{id}/agents`). */
 export const HostAgentStatusSchema = z.object({
@@ -184,6 +265,15 @@ export const AgentSchema = z.object({
   command: z.string(),
   env: z.record(z.string(), z.string()).default({}),
   install: z.string().nullable().optional(),
+  /* How this CLI is told to stop asking permission ("yolo mode"): arguments
+   * appended to `command`, environment merged over `env`, or both. Every tool
+   * spells it differently and one (opencode) has no flag at all, so the
+   * definition carries the spelling. Both empty = no such mode. */
+  yolo_args: z.string().nullable().default(null),
+  yolo_env: z.record(z.string(), z.string()).default({}),
+  /** The signed-in user's own choice, not a property of the definition —
+   *  built-ins are shared rows, and one account's yolo is not another's. */
+  yolo: z.boolean().default(false),
 });
 export type Agent = z.infer<typeof AgentSchema>;
 
@@ -193,6 +283,8 @@ export interface AgentCreateInput {
   command: string;
   env?: Record<string, string>;
   install?: string | null;
+  yolo_args?: string | null;
+  yolo_env?: Record<string, string>;
 }
 
 export type AgentUpdateInput = Partial<AgentCreateInput>;
@@ -594,6 +686,10 @@ export const admin = {
     api(`/api/admin/invites/${id}/revoke`, { method: "POST", schema: AdminInviteSchema }),
 };
 
+export const profile = {
+  get: () => api("/api/profile", { method: "GET", schema: ProfileSchema }),
+};
+
 export const account = {
   /** Permanently deletes the signed-in account and everything it owns. */
   remove: (body: { confirm_email: string; password?: string }) =>
@@ -908,6 +1004,14 @@ export const agents = {
       schema: AgentSchema,
     }),
   remove: (id: string) => api<void>(`/api/agents/${id}`, { method: "DELETE" }),
+  /** The caller's own settings for an agent. Accepts built-ins, which the
+   *  definition PATCH above refuses: the row written is this user's. */
+  setPreferences: (id: string, body: { yolo?: boolean }) =>
+    api(`/api/agents/${id}/preferences`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      schema: AgentSchema,
+    }),
 };
 
 export const skills = {

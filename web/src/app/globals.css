@@ -597,6 +597,35 @@ body {
   animation: upload-sheen 1.2s linear infinite;
 }
 
+/* The connecting terminal's channel line: dashes drifting toward the padlock
+ * between the two endpoints, so a pane that is still negotiating reads as
+ * working rather than hung. One dash period of travel per cycle, which makes
+ * the last frame identical to the first — the global reduced-motion rule below
+ * freezes it on a clean dashed hairline rather than mid-slide. Painted in
+ * currentColor so call sites tint the line with a text utility, exactly like
+ * the padlock it runs into. */
+@keyframes channel-drift {
+  to {
+    background-position-x: var(--channel-drift-to);
+  }
+}
+.channel-line {
+  --channel-drift-to: 8px;
+  background-image: repeating-linear-gradient(90deg, currentColor 0 2px, transparent 2px 8px);
+  background-size: 8px 1px;
+  background-repeat: repeat-x;
+  background-position: 0 center;
+}
+/* Only the half of the channel that is actually carrying anything drifts; the
+ * far half stays a still dashed gap until it comes up. */
+.channel-line-flow {
+  animation: channel-drift 0.75s linear infinite;
+}
+/* The far side of the channel drifts the other way; both flow inward. */
+.channel-line-rev {
+  --channel-drift-to: -8px;
+}
+
 /* Honor reduced-motion globally: collapse all transitions/animations to
  * near-instant so the shell stays fully usable without motion. */
 @media (prefers-reduced-motion: reduce) {

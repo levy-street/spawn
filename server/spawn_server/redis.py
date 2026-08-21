@@ -25,6 +25,16 @@ def session_event_channel(session_id: str) -> str:
     return f"spawn:session:{session_id}:events"
 
 
+def user_alert_channel(user_id: str) -> str:
+    """Cross-worker attention events for every browser this owner has open.
+
+    Distinct from ``session_event_channel`` on purpose: that one reaches the
+    browsers attached to one session, and an alert has to reach an owner who
+    has no pane open on the session at all.
+    """
+    return f"spawn:user:{user_id}:alerts"
+
+
 def _lease_generation(value: bytes) -> int | None:
     try:
         generation_raw, owner_raw = value.split(b":", 1)

@@ -8,6 +8,9 @@ export type AgentDraft = {
   command: string;
   install: string;
   env: AgentEnvRow[];
+  /** Arguments appended when this agent is launched in yolo mode. Blank means
+   *  the agent has no such mode and its toggle is not offered. */
+  yoloArgs: string;
 };
 
 export function agentDraft(agent?: Agent): AgentDraft {
@@ -16,6 +19,7 @@ export function agentDraft(agent?: Agent): AgentDraft {
     kind: agent?.kind ?? "custom",
     command: agent?.command ?? "",
     install: agent?.install ?? "",
+    yoloArgs: agent?.yolo_args ?? "",
     env: Object.entries(agent?.env ?? {}).map(([key, value], index) => ({
       id: `${agent?.id ?? "new"}-${index}`,
       key,
@@ -36,5 +40,6 @@ export function agentDraftToInput(draft: AgentDraft): AgentCreateInput {
     command: draft.command.trim(),
     env,
     install: draft.install.trim() || null,
+    yolo_args: draft.yoloArgs.trim() || null,
   };
 }

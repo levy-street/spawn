@@ -25,6 +25,7 @@ import {
 import { autoPlace, GRID_SIZE, type Rect, type Tile } from "@/lib/grid";
 import { activeTab, tabById, tabHome, tabTiles, withActiveTab, withTabTiles } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
+import { agentRunCommand } from "./agent-command";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
 import { pendingLaunch } from "./pending-launch";
 import {
@@ -235,7 +236,7 @@ export function LauncherFab({
         workspace_id: workspace.id,
         tile: placed,
       });
-      if (choice.kind === "agent") pendingLaunch.set(session.id, choice.agent.command);
+      if (choice.kind === "agent") pendingLaunch.set(session.id, agentRunCommand(choice.agent));
       return { sessionId: session.id };
     },
     onSuccess: (result) => {

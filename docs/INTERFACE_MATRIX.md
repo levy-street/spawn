@@ -10,7 +10,7 @@ and `daemon/`. `proto/README.md` remains the exhaustive wire reference.
 | Session | one login-shell PTY on a host | `sessions` / `/api/sessions` / `/sessions/[id]` or a workspace tile |
 | Agent | launchable CLI definition used as a shortcut inside a session; not a process | `agents` / `/api/agents` / Settings → Agents |
 | Workspace | named packed grid of session tiles | `workspaces` / `/api/workspaces` / `/w/[id]` |
-| Host | paired machine running `spawnd` | `hosts` / `/api/hosts` / Settings → Hosts and `/hosts/[id]` |
+| Host | paired machine running `spawnd` | `hosts` / `/api/hosts` / Settings → Hosts, `/hosts/[id]`, and `/legion` |
 | Skill | managed content materialized for an allowed session | `skills` / `/api/skills` / Settings → Skills |
 
 ## HTTP and direct-channel capabilities
@@ -32,9 +32,13 @@ and `daemon/`. `proto/README.md` remains the exhaustive wire reference.
 | List/create/get/update/delete workspaces | sidebar and `/w/[id]` | `GET/POST /api/workspaces`, `GET/PATCH/DELETE /api/workspaces/{id}` | `workspaces.*` | deleting a workspace best-effort kills every session referenced by its tiles |
 | Archive / restore a workspace | sidebar Archived drawer, `/w/[id]` | `POST /api/workspaces/{id}/{archive,unarchive}` | `workspaces.archive/unarchive` | archiving stops every session and keeps the rows, layout and sidebar slot; restoring restarts the same sessions in place |
 | Manage agent definitions | Settings → Agents, shortcut bar | `GET/POST /api/agents`, `PATCH/DELETE /api/agents/{id}` | `agents.*` | definitions are typed into the shell; built-ins are immutable through write routes |
+| Yolo mode (skip an agent's permission prompts) | Settings → Agents, one switch per agent | `PATCH /api/agents/{id}/preferences` → `{yolo}`; the spelling rides on `AgentOut` as `yolo_args`/`yolo_env` | `agents.setPreferences`, `agentRunCommand` | per user, not per definition (`agent_preferences`), so the switch is live on read-only built-ins; folded into the command the browser types, never a hidden launch flag |
 | Manage skills | Settings → Skills | `GET/POST /api/skills`, `PATCH/DELETE /api/skills/{id}` | `skills.*` | materialized into the session environment/config root |
 | Browser devices and trust | Settings → Browser devices / Device trust | `/api/browser-devices/*`, `/api/trust/{bundle,passkeys,endorsements,hosts/.../pins}` | `browserDevices.*`, `trust.*` | signed signaling and daemon-local browser pins |
+| Host capacity | sidebar Legion strip, `/legion`, profile dialog | on `GET /api/hosts`: static spec (`cpu_cores`, `cpu_physical_cores`, `cpu_model`, `memory_bytes`, `gpu`) plus `cpu_bucket`/`mem_bucket` in `0..=5` and `capacity_at`; buckets are withheld for an offline host | `summarizeLegion`, `useHostCapacity` | spec on `register`; buckets on `host.heartbeat`; **exact** figures only over `spawn.host.ctl` `host.metrics`, never server-visible. `SPAWND_NO_TELEMETRY=1` disables all three |
+| Profile and legion history | account menu → Profile | `GET /api/profile` → identity, `totals`, `agents`, sparse `days`, `hosts`, `history_days`, `today` | `profile.get`, `calendar` | none — read from `legion_days`, an append-only per-owner-per-day counter table written beside the existing lifecycle writes |
 | Terminal input/output | workspace/session terminal | none | `useSessionSocket`, `LiveTerminalProvider` | ordered reliable `spawn.pty` DataChannel direct to the endpoint |
+| Alerts on agent completion | Settings → Notifications, pane menu → Mute alerts | none; delivered over `/ws/alerts` (owner-scoped, subprotocol `spawn.alerts.v1`) | `subscribeToAlerts`, `useSessionAlerts`, `notify-prefs` | transitions are detected beside the lifecycle writes in `ws/daemon.py`; the daemon gains no new frame |
 | Replay, resize, display ownership, upload | workspace/session terminal | none | `spawn.ctl` client | ordered reliable locked `spawn.ctl` v1 DataChannel direct to the endpoint |
 
 `POST /api/sessions` accepts `host_id`, `cwd`, optional `name`, optional
@@ -63,7 +67,7 @@ The daemon control frames implemented in `daemon/src/proto.rs` are:
 
 | Direction | Frames |
 | --- | --- |
-| daemon → server | `register` (`existing_sessions`), `host.heartbeat`, `host.pong`, `session.started`, `session.exit`, `session.activity`, `session.input_activity`, `session.foreground`, `host.agents.check_result`, `host.agents.install_result`, `rtc.answer`, `rtc.candidate`, `rtc.status`, `error` |
+| daemon → server | `register` (`existing_sessions`, optional `spec`), `host.heartbeat` (optional `cpu_bucket`/`mem_bucket`), `host.pong`, `session.started`, `session.exit`, `session.activity`, `session.input_activity`, `session.foreground`, `host.agents.check_result`, `host.agents.install_result`, `rtc.answer`, `rtc.candidate`, `rtc.status`, `error` |
 | server → daemon | `registered`, `host.browser_pins`, `host.heartbeat`, `host.ping`, `host.agents.check`, `host.agents.install`, `session.create`, `session.restart`, `session.kill`, `rtc.offer`, `rtc.candidate`, `rtc.close` |
 
 As implemented:
@@ -120,12 +124,22 @@ order is `(y, x)` and drives the mobile stack and keyboard focus order.
 | `/login`, `/signup`, `/forgot-password`, `/reset-password`, `/verify-email` | account flows |
 | `/device` | daemon device-code approval |
 | `/hosts/[id]`, `/hosts/[id]/files` | host detail and full host file explorer |
+| `/legion` | every host, its capacity, and what is running on it; optional live per-second figures over the host control channel |
 | `/download`, `/security` | public product/support pages |
 | `/admin` | administrator-only accounts, invites, and email operations |
 
 Account, appearance, hosts, agents, skills, browser devices, and device trust
 are tabs in the settings dialog opened from the app shell; they are not
-standalone app routes.
+standalone app routes. The profile is likewise a dialog rather than a route,
+opened from the account menu in the sidebar footer, so it overlays a workspace
+of live panes without detaching any of them.
+
+Capacity resolution is deliberate and is documented in docs/TRUST.md: the
+server holds a five-level bucket refreshed per heartbeat, the browser gets
+exact figures directly from the daemon, and a host can decline both with
+`SPAWND_NO_TELEMETRY=1` — which also removes `host.metrics` from the channel's
+advertised capabilities, so an opted-out host is indistinguishable from an old
+one.
 
 The proposed endpoint-local protected-data design remains review-pending and
 unimplemented; its pre-overhaul object model is retained in

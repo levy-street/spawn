@@ -4,12 +4,16 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, FolderOpen, MoreHorizontal, Pencil, Server, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { HostAgentsPanel } from "@/components/hosts/HostAgentsPanel";
 import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { AppShell } from "@/components/nav/AppShell";
-import { openSettings } from "@/components/settings/settings-dialog-store";
+import {
+  openSettings,
+  type SettingsTab,
+  takeSettingsReturn,
+} from "@/components/settings/settings-dialog-store";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
@@ -58,6 +62,11 @@ function HostDetail() {
   const id = params?.id;
   const router = useRouter();
   const queryClient = useQueryClient();
+  // Read once, on mount, and cleared by the read: the flag describes the
+  // navigation that landed here, not a persistent property of the page.
+  const settingsReturnRef = useRef<SettingsTab | null | undefined>(undefined);
+  if (settingsReturnRef.current === undefined) settingsReturnRef.current = takeSettingsReturn();
+  const settingsReturn = settingsReturnRef.current;
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -216,186 +225,211 @@ function HostDetail() {
     if (accepted) removeM.mutate();
   };
 
+  /**
+   * Back means back — always the route you came from. Arriving here from the
+   * settings dialog additionally reopens it on the way, because the dialog is
+   * not URL state and so is the one part of "where I was" that history cannot
+   * restore by itself. Opening it before the navigation is what carries it
+   * across: the store is a module singleton, so the shell that mounts on the
+   * far side finds it already open.
+   *
+   * A page opened cold in a fresh tab has nothing to pop, so it goes to the
+   * legion rather than leaving the arrow dead.
+   */
+  const goBack = () => {
+    if (settingsReturn) openSettings(settingsReturn);
+    if (window.history.length > 1) router.back();
+    else router.push("/legion");
+  };
+
   if (!id) return null;
 
   return (
-    <main className="mx-auto w-full max-w-4xl p-4 @md/shell:p-6">
-      <header className="mb-6 flex items-center gap-2">
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="size-8 shrink-0"
-          aria-label="Back to hosts settings"
-          onClick={() => openSettings("hosts")}
-        >
-          <ArrowLeft className="size-4" aria-hidden />
-        </Button>
-        <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border bg-muted text-muted-foreground">
-          <Server className="size-4" aria-hidden />
-        </span>
-        <div className="flex min-w-0 flex-1 items-center gap-2">
-          {editingName ? (
-            <Input
-              aria-label="Host name"
-              autoFocus
-              value={draftName}
-              onChange={(event) => setDraftName(event.currentTarget.value)}
-              onBlur={submitRename}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") submitRename();
-                if (event.key === "Escape") setEditingName(false);
-              }}
-              className="h-8 max-w-56"
-              disabled={renameM.isPending}
-            />
-          ) : (
-            <button
-              type="button"
-              className="truncate rounded-md px-1 text-base font-semibold tracking-tight hover:bg-accent/50"
-              title="Rename host"
-              onClick={() => {
+    // The shell's <main> is `overflow-hidden` on desktop, so a page taller
+    // than the viewport has to carry its own scroller or it is simply clipped
+    // — and scrolling here rather than the document is also what keeps the
+    // sidebar still instead of riding up with the content.
+    <div className="h-full overflow-y-auto">
+      <main className="mx-auto w-full max-w-4xl p-4 @md/shell:p-6">
+        <header className="mb-6 flex items-center gap-2">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 shrink-0"
+            aria-label="Back"
+            onClick={goBack}
+          >
+            <ArrowLeft className="size-4" aria-hidden />
+          </Button>
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border bg-muted text-muted-foreground">
+            <Server className="size-4" aria-hidden />
+          </span>
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            {editingName ? (
+              <Input
+                aria-label="Host name"
+                autoFocus
+                value={draftName}
+                onChange={(event) => setDraftName(event.currentTarget.value)}
+                onBlur={submitRename}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") submitRename();
+                  if (event.key === "Escape") setEditingName(false);
+                }}
+                className="h-8 max-w-56"
+                disabled={renameM.isPending}
+              />
+            ) : (
+              <button
+                type="button"
+                className="truncate rounded-md px-1 text-base font-semibold tracking-tight hover:bg-accent/50"
+                title="Rename host"
+                onClick={() => {
+                  if (!host) return;
+                  setDraftName(host.name);
+                  setEditingName(true);
+                }}
+              >
+                {host?.name ?? "…"}
+              </button>
+            )}
+            {host && (
+              <Badge variant={host.status === "online" ? "success" : "outline"}>
+                {host.status}
+              </Badge>
+            )}
+          </div>
+          <Button asChild variant="outline" size="sm" className="shrink-0">
+            <Link href={`/hosts/${id}/files`}>
+              <FolderOpen className="size-4" aria-hidden />
+              <span className="hidden sm:inline">Files</span>
+            </Link>
+          </Button>
+          <DropdownMenu
+            renderTrigger={(props) => (
+              <Button
+                {...props}
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="size-8 shrink-0"
+                aria-label="Host actions"
+              >
+                <MoreHorizontal className="size-4" aria-hidden />
+              </Button>
+            )}
+          >
+            <DropdownMenuItem
+              onSelect={() => {
                 if (!host) return;
                 setDraftName(host.name);
                 setEditingName(true);
               }}
             >
-              {host?.name ?? "…"}
-            </button>
-          )}
-          {host && (
-            <Badge variant={host.status === "online" ? "success" : "outline"}>{host.status}</Badge>
-          )}
-        </div>
-        <Button asChild variant="outline" size="sm" className="shrink-0">
-          <Link href={`/hosts/${id}/files`}>
-            <FolderOpen className="size-4" aria-hidden />
-            <span className="hidden sm:inline">Files</span>
-          </Link>
-        </Button>
-        <DropdownMenu
-          renderTrigger={(props) => (
-            <Button
-              {...props}
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-8 shrink-0"
-              aria-label="Host actions"
+              <Pencil className="size-4" aria-hidden />
+              Rename
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem destructive onSelect={() => void requestRemove()}>
+              <Trash2 className="size-4" aria-hidden />
+              {localDeletionPending ? "Retry server deletion" : "Remove host"}
+            </DropdownMenuItem>
+          </DropdownMenu>
+        </header>
+
+        {error && (
+          <p className="mb-3 text-sm text-destructive" role="alert">
+            {error}
+          </p>
+        )}
+        {hostQ.error && (
+          <p className="text-sm text-destructive" role="alert">
+            Failed to load host: {String(hostQ.error)}
+          </p>
+        )}
+        {hostQ.isLoading && (
+          <div className="space-y-4">
+            <Skeleton className="h-28 w-full rounded-xl" />
+            <Skeleton className="h-40 w-full rounded-xl" />
+          </div>
+        )}
+
+        {host && (
+          <div className="space-y-4">
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-xl border border-border p-4 text-sm @lg/shell:grid-cols-4">
+              <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
+              <Fact label="Daemon" value={host.version ?? "unknown"} />
+              <Fact label="Sessions" value={String(host.session_count)} />
+              <Fact
+                label="Connection"
+                value={
+                  host.status === "online"
+                    ? `online · heartbeat ${relativeTime(host.last_seen_at) ?? "now"}`
+                    : `offline · last seen ${relativeTime(host.last_seen_at) ?? "never"}`
+                }
+              />
+              <Fact label="Host identity" value={host.host_key_algorithm ?? "legacy unpaired"} />
+              <Fact label="Fingerprint" value={host.host_key_fingerprint ?? "not pinned"} mono />
+            </dl>
+
+            <HostAgentsPanel host={host} />
+
+            <section
+              className="overflow-hidden rounded-xl border border-border"
+              aria-labelledby="host-sessions-title"
             >
-              <MoreHorizontal className="size-4" aria-hidden />
-            </Button>
-          )}
-        >
-          <DropdownMenuItem
-            onSelect={() => {
-              if (!host) return;
-              setDraftName(host.name);
-              setEditingName(true);
-            }}
-          >
-            <Pencil className="size-4" aria-hidden />
-            Rename
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem destructive onSelect={() => void requestRemove()}>
-            <Trash2 className="size-4" aria-hidden />
-            {localDeletionPending ? "Retry server deletion" : "Remove host"}
-          </DropdownMenuItem>
-        </DropdownMenu>
-      </header>
-
-      {error && (
-        <p className="mb-3 text-sm text-destructive" role="alert">
-          {error}
-        </p>
-      )}
-      {hostQ.error && (
-        <p className="text-sm text-destructive" role="alert">
-          Failed to load host: {String(hostQ.error)}
-        </p>
-      )}
-      {hostQ.isLoading && (
-        <div className="space-y-4">
-          <Skeleton className="h-28 w-full rounded-xl" />
-          <Skeleton className="h-40 w-full rounded-xl" />
-        </div>
-      )}
-
-      {host && (
-        <div className="space-y-4">
-          <dl className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-xl border border-border p-4 text-sm @lg/shell:grid-cols-4">
-            <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
-            <Fact label="Daemon" value={host.version ?? "unknown"} />
-            <Fact label="Sessions" value={String(host.session_count)} />
-            <Fact
-              label="Connection"
-              value={
-                host.status === "online"
-                  ? `online · heartbeat ${relativeTime(host.last_seen_at) ?? "now"}`
-                  : `offline · last seen ${relativeTime(host.last_seen_at) ?? "never"}`
-              }
-            />
-            <Fact label="Host identity" value={host.host_key_algorithm ?? "legacy unpaired"} />
-            <Fact label="Fingerprint" value={host.host_key_fingerprint ?? "not pinned"} mono />
-          </dl>
-
-          <HostAgentsPanel host={host} />
-
-          <section
-            className="overflow-hidden rounded-xl border border-border"
-            aria-labelledby="host-sessions-title"
-          >
-            <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-              <h2 id="host-sessions-title" className="text-sm font-medium">
-                Sessions
-                <span className="ml-2 text-xs font-normal text-muted-foreground">
-                  {sessionsQ.data?.length ?? 0}
-                </span>
-              </h2>
-            </div>
-            {sessionsQ.isLoading && <Skeleton className="m-4 h-12 w-[calc(100%-2rem)]" />}
-            {sessionsQ.error && (
-              <p className="px-4 py-3 text-sm text-destructive">{String(sessionsQ.error)}</p>
-            )}
-            {!sessionsQ.isLoading && !sessionsQ.error && sessionsQ.data?.length === 0 && (
-              <p className="px-4 py-4 text-sm text-muted-foreground">
-                No sessions are running on this host.
-              </p>
-            )}
-            <ul className="divide-y divide-border">
-              {(sessionsQ.data ?? []).map((session) => (
-                <li key={session.id}>
-                  <Link
-                    href={`/sessions/${session.id}`}
-                    className="flex items-center gap-3 px-4 py-3 transition-colors hover:bg-accent/40"
-                  >
-                    <span className="relative shrink-0">
-                      <AgentIcon command={session.foreground_command} size={28} />
-                      <SessionStatusDot
-                        session={session}
-                        className="absolute -bottom-0.5 -right-0.5"
-                      />
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium">
-                        {sessionTitle(session)}
+              <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+                <h2 id="host-sessions-title" className="text-sm font-medium">
+                  Sessions
+                  <span className="ml-2 text-xs font-normal text-muted-foreground">
+                    {sessionsQ.data?.length ?? 0}
+                  </span>
+                </h2>
+              </div>
+              {sessionsQ.isLoading && <Skeleton className="m-4 h-12 w-[calc(100%-2rem)]" />}
+              {sessionsQ.error && (
+                <p className="px-4 py-3 text-sm text-destructive">{String(sessionsQ.error)}</p>
+              )}
+              {!sessionsQ.isLoading && !sessionsQ.error && sessionsQ.data?.length === 0 && (
+                <p className="px-4 py-4 text-sm text-muted-foreground">
+                  No sessions are running on this host.
+                </p>
+              )}
+              <ul className="divide-y divide-border">
+                {(sessionsQ.data ?? []).map((session) => (
+                  <li key={session.id}>
+                    <Link
+                      href={`/sessions/${session.id}`}
+                      className="flex items-center gap-3 px-4 py-3 transition-colors hover:bg-accent/40"
+                    >
+                      <span className="relative shrink-0">
+                        <AgentIcon command={session.foreground_command} size={28} />
+                        <SessionStatusDot
+                          session={session}
+                          className="absolute -bottom-0.5 -right-0.5"
+                        />
                       </span>
-                      <span className="block truncate font-mono text-[11px] text-muted-foreground">
-                        {agentDisplayName(session.foreground_command)} · {session.cwd}
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium">
+                          {sessionTitle(session)}
+                        </span>
+                        <span className="block truncate font-mono text-[11px] text-muted-foreground">
+                          {agentDisplayName(session.foreground_command)} · {session.cwd}
+                        </span>
                       </span>
-                    </span>
-                    <span className="hidden shrink-0 text-[11px] text-muted-foreground sm:block">
-                      {sessionActivityDetail(session)}
-                    </span>
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          </section>
-        </div>
-      )}
-    </main>
+                      <span className="hidden shrink-0 text-[11px] text-muted-foreground sm:block">
+                        {sessionActivityDetail(session)}
+                      </span>
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          </div>
+        )}
+      </main>
+    </div>
   );
 }
 

@@ -433,6 +433,88 @@ class HostOut(BaseModel):
     status: str
     last_seen_at: datetime | None = None
     session_count: int = 0
+    # Capacity. Every field is optional and stays None for a daemon that
+    # predates telemetry or runs with SPAWND_NO_TELEMETRY — the UI draws no
+    # meter rather than an empty one, which is a different statement.
+    cpu_cores: int | None = None
+    cpu_physical_cores: int | None = None
+    cpu_model: str | None = None
+    memory_bytes: int | None = None
+    gpu: str | None = None
+    # Meter segment counts in 0..=5, never percentages. Exact figures exist and
+    # travel browser-to-daemon over `spawn.host.ctl`; see daemon host_metrics.
+    cpu_bucket: int | None = None
+    mem_bucket: int | None = None
+    capacity_at: datetime | None = None
+
+
+class LegionDayOut(BaseModel):
+    """One UTC day of fleet activity. Sparse: unrecorded days are simply absent."""
+
+    model_config = ConfigDict(from_attributes=True)
+    day: str
+    sessions_started: int = 0
+    session_seconds: int = 0
+    peak_sessions: int = 0
+    peak_hosts_online: int = 0
+
+
+class LegionAgentOut(BaseModel):
+    """A foreground basename and how often it has been seen. Never a path."""
+
+    command: str
+    count: int
+
+
+class LegionTotalsOut(BaseModel):
+    hosts: int = 0
+    hosts_online: int = 0
+    # Summed across hosts that report them; a fleet with one silent daemon
+    # under-reports rather than guessing.
+    cores: int = 0
+    memory_bytes: int = 0
+    sessions_live: int = 0
+    sessions_started: int = 0
+    session_seconds: int = 0
+    active_days: int = 0
+    current_streak: int = 0
+    longest_streak: int = 0
+    peak_hosts_online: int = 0
+    peak_sessions: int = 0
+    first_day: str | None = None
+
+
+class LegionHostOut(BaseModel):
+    """A host as the profile lists it — identity and spec, no live buckets."""
+
+    id: str
+    name: str
+    os: str | None = None
+    status: str
+    cpu_cores: int | None = None
+    memory_bytes: int | None = None
+    gpu: str | None = None
+    session_count: int = 0
+    created_at: datetime | None = None
+    last_seen_at: datetime | None = None
+
+
+class ProfileOut(BaseModel):
+    """Everything the profile dialog draws, in one request."""
+
+    id: str
+    email: str
+    created_at: datetime
+    email_verified_at: datetime | None = None
+    is_admin: bool = False
+    totals: LegionTotalsOut
+    agents: list[LegionAgentOut] = Field(default_factory=list)
+    days: list[LegionDayOut] = Field(default_factory=list)
+    hosts: list[LegionHostOut] = Field(default_factory=list)
+    # The window `days` covers, so the client can densify it into a calendar
+    # without having to agree with the server about "today" independently.
+    history_days: int
+    today: str
 
 
 class HostPatch(BaseModel):
@@ -515,6 +597,8 @@ class AgentCreate(BaseModel):
     command: str = Field(max_length=1024)
     env: dict[str, str] = Field(default_factory=dict)
     install: str | None = Field(default=None, max_length=2048)
+    yolo_args: str | None = Field(default=None, max_length=256)
+    yolo_env: dict[str, str] = Field(default_factory=dict)
 
 
 class AgentPatch(BaseModel):
@@ -523,6 +607,14 @@ class AgentPatch(BaseModel):
     command: str | None = Field(default=None, max_length=1024)
     env: dict[str, str] | None = None
     install: str | None = Field(default=None, max_length=2048)
+    yolo_args: str | None = Field(default=None, max_length=256)
+    yolo_env: dict[str, str] | None = None
+
+
+class AgentPreferencePatch(BaseModel):
+    """Settings a user holds over an agent — built-ins included."""
+
+    yolo: bool | None = None
 
 
 class AgentOut(BaseModel):
@@ -535,6 +627,12 @@ class AgentOut(BaseModel):
     command: str
     env: dict[str, str]
     install: str | None = None
+    # How this CLI is told to skip its permission prompts. Both empty means it
+    # has no such mode, and the client does not offer the toggle.
+    yolo_args: str | None = None
+    yolo_env: dict[str, str] = Field(default_factory=dict)
+    # The reading user's own choice, not a property of the definition.
+    yolo: bool = False
 
 
 # ---------- managed skills ----------

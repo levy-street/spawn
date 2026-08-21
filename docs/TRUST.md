@@ -126,7 +126,10 @@ install commands; skill names, descriptions, bodies, defaults, and session
 grants; public trust material; connection/signaling timing; and IP addresses.
 Host-agent availability/install flows also expose the definition target,
 installed path/version data, result output/errors, policy, and update
-timestamps. Activity frames contain no terminal bytes and are throttled, but
+timestamps. Since 2026-08-21 the server additionally holds a host's static
+hardware spec, a five-level CPU/memory reading refreshed per heartbeat, and a
+per-owner daily activity rollup — see "Host capacity" below for why those are
+bucketed and coarse rather than exact, and for the switch that turns them off. Activity frames contain no terminal bytes and are throttled, but
 their timing is behavioral metadata. Self-host when any of this metadata or
 remaining server-readable configuration is itself sensitive.
 
@@ -145,6 +148,18 @@ learns *which program* is running in a session (e.g. `claude`, `vim`,
 sensitive should self-host, exactly as with the activity-timing metadata
 above.
 
+The same basename is the only session-derived string on the owner alert
+stream (`/ws/alerts`). Detecting "an agent finished" means comparing the
+previous foreground basename against the new one at the moment the server
+writes it, so the alert reuses a fact the server already holds and already
+returns from `GET /api/sessions` rather than disclosing a new one. Alert
+payloads carry a session id, an event class, the basename, and an exit
+code or signal — never terminal text, and never anything the pane header was
+not already showing. Alerts are published on an owner-scoped channel
+(`spawn:user:{user_id}:alerts`) under the same host-owner fencing as every
+other publish from `/ws/daemon`, so a superseded daemon cannot raise alerts
+on a host it no longer owns.
+
 **Protected-content migration inventory:**
 
 | Content class | Current or historical path | Migration state |
@@ -156,7 +171,8 @@ above.
 | Terminal snapshots / card previews | retired process-snapshot frames | removed from server; rendered from endpoint replay/output |
 | REST terminal input and snapshots | retired `/api/agents/{id}/input`, `/snapshot` | removed; browser uses `spawn.pty` / `spawn.ctl` directly |
 | Terminal geometry and viewport actions | retired REST/WS resize/scroll/redraw/display-control paths | removed from server; per-session `spawn.ctl` only |
-| Agent-definition command/env/install | current: persisted in `agents`; read through `/api/agents`; shortcut command constructed in the browser | endpoint-local replacement is not implemented |
+| Agent-definition command/env/install/yolo | current: persisted in `agents`; read through `/api/agents`; shortcut command constructed in the browser | endpoint-local replacement is not implemented |
+| Which agents an account runs without permission prompts | current: one boolean per (owner, agent) in `agent_preferences`, written through `PATCH /api/agents/{id}/preferences` | the flag is applied browser-side when the command is typed; the server learns the preference but never the launch |
 | Session working directory | current: persisted in `sessions.cwd`; carried by `session.create` / `session.restart` | endpoint-local replacement is not implemented |
 | Default session names derived from `cwd` | current: `_default_session_name` includes the directory basename | neutral-name/scrub proposal is not implemented |
 | Skill bodies | current: persisted in `skills`; carried in `session.create` / `session.restart` | endpoint-local replacement is not implemented |
@@ -167,6 +183,54 @@ above.
 | Cross-host file transfer | former server source-read/forward path | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source is browser-mediated across two host channels |
 | Agent check/install commands, paths, installed/latest versions, output, and detailed errors | current: REST plus `host.agents.*`; policy errors can persist in Postgres | server-readable path remains; endpoint-only replacement is not implemented |
 | Free-form daemon errors | current master: `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | P2-ERROR-01 target: stable content-free server code plus E2E detail; not implemented |
+
+### Host capacity (2026-08-21)
+
+Showing a fleet means showing how hard each machine is working, and utilization
+is a far more sensitive signal than it first looks. A per-second CPU/memory
+trace of somebody's machines is a behavioural fingerprint: when they work, when
+they sleep, when a build runs, when the GPU rig is training, when they went on
+holiday. Putting that on the control plane would be a real regression against
+the principle this document opens with, and it would be one bought for a
+progress bar.
+
+So capacity is split by resolution, and the split is enforced by which
+transport carries it.
+
+**The server is given a bucket.** `host.heartbeat` may carry `cpu_bucket` and
+`mem_bucket`: a meter segment count in `0..=5`, once every thirty seconds. That
+is enough to draw the sidebar's capacity meter and to sort a fleet by which
+machine is pinned, and it is close to useless as a trace — five levels at
+2 samples/minute cannot distinguish a compile from a video call. `register`
+additionally carries a static spec (cores, memory, CPU model, GPU name), which
+is inert: it describes hardware, it does not change while the daemon runs, and
+it is the figure the product actually wants to show off.
+
+**The browser is given the truth.** Exact CPU percentage, memory bytes, load
+average and uptime are served by `host.metrics` on the `spawn.host.ctl`
+DataChannel — browser to daemon, at whatever rate the browser is drawing at,
+with no server code path in between. This is the same posture as `fs.read`:
+precision lives on the connection the control plane cannot read.
+
+**And a host can decline both.** `SPAWND_NO_TELEMETRY=1` stops the daemon
+reporting capacity anywhere: no spec on `register`, no buckets on the
+heartbeat, and `host.metrics` never advertised in the channel's `hello`. That
+last part matters — an opted-out host is indistinguishable from a daemon too
+old to have the operation, so opting out is not itself a signal. It follows the
+shape of the existing `SPAWND_NO_CPU_SCOPES` switch: one variable, checked
+once, no partial modes.
+
+Two consequences worth stating plainly rather than leaving to be found. The
+buckets are *new metadata the server did not previously hold* — small, coarse,
+and rate-limited, but new, and the inventory above is updated accordingly. And
+the daily activity rollup (`legion_days`) that backs the profile is likewise
+new server-side retention: per-owner, per-UTC-day counters — sessions started,
+seconds run, peak concurrent sessions and online hosts, and a bounded tally of
+the already-disclosed `session.foreground` basenames. It holds no per-session
+rows, nothing that outlives its day bucket in identifiable form, and no paths,
+arguments, or terminal bytes. It exists because sessions are hard-deleted with
+their workspace, so anything computed from the `sessions` table would show a
+person's history shrinking as they tidy up.
 
 ### Host previews and desktop launches
 

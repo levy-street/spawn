@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  Bell,
   Bot,
   ExternalLink,
   LayoutTemplate,
@@ -18,6 +19,7 @@ import { AgentsPanel } from "@/components/settings/AgentsPanel";
 import { AppearancePanel } from "@/components/settings/AppearancePanel";
 import { DevicesPanel } from "@/components/settings/DevicesPanel";
 import { HostsPanel } from "@/components/settings/HostsPanel";
+import { NotificationsPanel } from "@/components/settings/NotificationsPanel";
 import { SkillsPanel } from "@/components/settings/SkillsPanel";
 import {
   closeSettings,
@@ -39,6 +41,7 @@ const TABS: Array<{
 }> = [
   { key: "account", label: "Account", icon: User },
   { key: "appearance", label: "Appearance", icon: Palette },
+  { key: "notifications", label: "Notifications", icon: Bell },
   { key: "hosts", label: "Hosts", icon: Server },
   { key: "agents", label: "Agents", icon: Bot },
   { key: "skills", label: "Skills", icon: Wrench },
@@ -55,7 +58,8 @@ export function SettingsDialog() {
     <Dialog open={tab !== null} onOpenChange={(open) => (open ? undefined : closeSettings())}>
       <DialogContent size="full-mobile" data-testid="settings-dialog" className="md:flex-row">
         <DialogDescription className="sr-only">
-          Manage your account, appearance, hosts, agents, skills, browser devices, and device trust.
+          Manage your account, appearance, notifications, hosts, agents, skills, browser devices,
+          and device trust.
         </DialogDescription>
 
         <nav
@@ -103,6 +107,7 @@ export function SettingsDialog() {
           <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 p-4 pt-5 md:p-6">
             {tab === "account" && <AccountPanel />}
             {tab === "appearance" && <AppearancePanel />}
+            {tab === "notifications" && <NotificationsPanel />}
             {tab === "hosts" && <HostsPanel />}
             {tab === "agents" && <AgentsPanel />}
             {tab === "skills" && <SkillsPanel />}

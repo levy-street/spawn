@@ -1,11 +1,12 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { LogOut, PanelLeftClose, PanelLeftOpen, Plus, Settings, X } from "lucide-react";
+import { LogOut, PanelLeftClose, PanelLeftOpen, Plus, Settings, UserRound, X } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
+import { LegionStrip } from "@/components/legion/LegionStrip";
 import { SidebarArchivedSection } from "@/components/nav/SidebarArchivedSection";
 import { SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
 import {
@@ -15,10 +16,15 @@ import {
   SidebarSearch,
   sidebarRowClass,
 } from "@/components/nav/sidebar-parts";
+import { openProfile } from "@/components/profile/profile-dialog-store";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
-import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import {
+  DropdownMenu,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { toast } from "@/components/ui/toast";
 import { RailTooltip } from "@/components/ui/tooltip";
 import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
@@ -532,6 +538,18 @@ export function Sidebar({
         onDelete={(workspace) => void requestArchivedDelete(workspace)}
       />
 
+      {/* Below Archived and above Settings: the machines you own are footer
+       * furniture like the drawer over them, not a live ticker competing with
+       * the workspace tree. Fed from the queries above rather than its own —
+       * the section must not cost a request, and its counts must never
+       * disagree with the rows it sits under. */}
+      <LegionStrip
+        hosts={hostsQ.data ?? []}
+        sessions={sessionsQ.data ?? []}
+        collapsed={collapsed}
+        onNavigate={onNavigate}
+      />
+
       <div className="border-y border-border px-2.5 py-2">
         <RailTooltip label="Settings" disabled={!collapsed}>
           <Button
@@ -577,6 +595,16 @@ export function Sidebar({
             </RailTooltip>
           )}
         >
+          <DropdownMenuItem
+            onSelect={() => {
+              onNavigate?.();
+              openProfile();
+            }}
+          >
+            <UserRound className="size-4" aria-hidden />
+            Profile
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
           <DropdownMenuItem
             destructive
             onSelect={() => {

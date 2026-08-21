@@ -19,6 +19,7 @@ mod host_control;
 mod host_desktop;
 mod host_direct;
 mod host_files;
+mod host_metrics;
 mod host_mime;
 mod host_preview;
 mod host_signal;

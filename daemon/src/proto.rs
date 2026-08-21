@@ -62,9 +62,25 @@ pub enum Outbound {
         arch: String,
         version: String,
         existing_sessions: Vec<Uuid>,
+        /// What this machine is — cores, memory, CPU model, GPU. Sent once, on
+        /// registration, because none of it changes while the daemon runs.
+        /// Absent when `SPAWND_NO_TELEMETRY` is set, and absent from every
+        /// daemon older than this field, so the server must treat "no spec" as
+        /// normal rather than as a fault.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spec: Option<crate::host_metrics::HostSpec>,
     },
+    /// The keepalive, optionally carrying two meter readings. Buckets, never
+    /// percentages: see `host_metrics` for why the server is given a coarse
+    /// reading and the browser an exact one. With telemetry off, both fields
+    /// are skipped and the frame is byte-for-byte the one older daemons send.
     #[serde(rename = "host.heartbeat")]
-    HostHeartbeat,
+    HostHeartbeat {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_bucket: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mem_bucket: Option<u8>,
+    },
     #[serde(rename = "host.pong")]
     HostPong { request_id: String },
     #[serde(rename = "session.exit")]

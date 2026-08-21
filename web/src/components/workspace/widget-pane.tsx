@@ -42,7 +42,6 @@ export function WidgetPane({
   canDrag,
   canDuplicate = false,
   onFocus,
-  onToggleZoom,
   onMoveStart,
   onDuplicate,
   onChangePath,
@@ -56,7 +55,6 @@ export function WidgetPane({
   /** False when the tab is full. */
   canDuplicate?: boolean;
   onFocus: (tileId: string) => void;
-  onToggleZoom: (tileId: string) => void;
   onMoveStart: (tileId: string, event: ReactPointerEvent<HTMLElement>) => void;
   /** Add a second explorer on the same host and path. */
   onDuplicate?: (tileId: string) => void;
@@ -98,7 +96,6 @@ export function WidgetPane({
           if ((event.target as Element).closest?.("button, input, a")) return;
           onMoveStart(id, event);
         }}
-        onDoubleClick={() => onToggleZoom(id)}
       >
         {/* The pane's folder, as a control — the same chip a shell pane wears,
             so "where am I, and how do I go somewhere else" is answered the same
@@ -111,7 +108,6 @@ export function WidgetPane({
           title={widget.path}
           disabled={!onChangePath}
           onClick={() => setPickerOpen((value) => !value)}
-          onDoubleClick={(event) => event.stopPropagation()}
           className="mr-auto flex h-7 min-w-0 items-center gap-1.5 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:pointer-events-none"
         >
           <Folder className="size-3.5 shrink-0" aria-hidden />
@@ -127,7 +123,6 @@ export function WidgetPane({
               {...props}
               type="button"
               aria-label={`${title} options`}
-              onDoubleClick={(event) => event.stopPropagation()}
               className="grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
             >
               <Ellipsis className="size-4" aria-hidden />

@@ -1,6 +1,15 @@
-import { type Host, sessions, type WorkspaceTemplate, workspaces } from "@/lib/api";
+import { commandBasename } from "@/lib/agent-identity";
+import {
+  type Agent,
+  agents,
+  type Host,
+  sessions,
+  type WorkspaceTemplate,
+  workspaces,
+} from "@/lib/api";
 import { basename } from "@/lib/paths";
 import { activeTab, type LayoutV3, withActiveTab } from "@/lib/tabs";
+import { agentRunCommand } from "./agent-command";
 import { pendingLaunch } from "./pending-launch";
 
 /** See the call in `instantiateTemplate`. */
@@ -22,12 +31,17 @@ function iconForInstance(
  * pointed at each tab first, since session creation appends there. Agent
  * tiles queue their launch command for the pane to claim when it connects
  * (panes in background tabs claim theirs when the tab is first opened).
+ *
+ * A template stores the bare command it captured, so each agent tile is
+ * matched back to a live definition before launching — otherwise a replay
+ * would be the one way of starting an agent that ignored its yolo toggle.
  */
 export async function instantiateTemplate(
   template: WorkspaceTemplate,
   host: Host,
   cwd: string,
 ): Promise<{ workspaceId: string; focusSessionId: string | null }> {
+  const definitions = await agents.list().catch((): Agent[] => []);
   const { workspace } = await workspaces.create({
     name: basename(cwd) || template.name,
     // The template's mark, when it is still the right mark for this folder.
@@ -76,7 +90,9 @@ export async function instantiateTemplate(
         workspace_id: workspace.id,
         tile: { x: tile.x, y: tile.y, w: tile.w, h: tile.h },
       });
-      if (tile.run.kind === "agent") pendingLaunch.set(session.id, tile.run.command);
+      if (tile.run.kind === "agent") {
+        pendingLaunch.set(session.id, launchCommand(tile.run.command, definitions));
+      }
       focusSessionId ??= session.id;
     }
     layout = (await workspaces.get(workspace.id)).layout;
@@ -86,4 +102,15 @@ export async function instantiateTemplate(
     await workspaces.update(workspace.id, { layout: withActiveTab(layout, firstTabId) });
   }
   return { workspaceId: workspace.id, focusSessionId };
+}
+
+/**
+ * The template's stored command, re-resolved through the matching definition
+ * so today's environment and yolo choice apply. Falls back to the stored
+ * string when nothing matches — the definition may since have been deleted.
+ */
+function launchCommand(stored: string, definitions: readonly Agent[]): string {
+  const name = commandBasename(stored).toLowerCase();
+  const agent = definitions.find((item) => commandBasename(item.command).toLowerCase() === name);
+  return agent ? agentRunCommand(agent) : stored;
 }

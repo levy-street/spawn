@@ -10,6 +10,7 @@ import { useSyncExternalStore } from "react";
 export type SettingsTab =
   | "account"
   | "appearance"
+  | "notifications"
   | "hosts"
   | "agents"
   | "skills"
@@ -32,6 +33,31 @@ export function openSettings(tab: SettingsTab = "account") {
 export function closeSettings() {
   openTab = null;
   emit();
+}
+
+/**
+ * The settings tab a full-page navigation came *from*, so that page's back
+ * control can return to it instead of guessing.
+ *
+ * A module value rather than a query parameter, for the same reason the open
+ * tab is one: the dialog is not URL state, so "I got here from the Hosts tab"
+ * is a fact about this session's navigation and not about the address. It is
+ * read once and cleared — arriving any other way, or reloading, leaves it null,
+ * and back then means back.
+ */
+let returnTab: SettingsTab | null = null;
+
+/** Close the dialog on the way to a page that can return to this tab. */
+export function leaveSettingsFor(tab: SettingsTab) {
+  returnTab = tab;
+  closeSettings();
+}
+
+/** The tab to return to, consumed. Null unless the last navigation set one. */
+export function takeSettingsReturn(): SettingsTab | null {
+  const tab = returnTab;
+  returnTab = null;
+  return tab;
 }
 
 export function useSettingsDialog(): SettingsTab | null {

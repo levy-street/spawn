@@ -19,8 +19,10 @@ import {
   sidebarRowClass,
   WorkspaceAvatar,
 } from "@/components/nav/sidebar-parts";
+import { useArmedMotion } from "@/components/ui/armed-motion";
 import { Button } from "@/components/ui/button";
 import { CascadeMenu } from "@/components/ui/cascade-menu";
+import { Collapse } from "@/components/ui/collapse";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { RailTooltip } from "@/components/ui/tooltip";
 import type { Workspace } from "@/lib/api";
@@ -33,6 +35,15 @@ const LAST_OPENED_KEY = "spawn.sidebar.archivedLastOpened";
 /** How many put-away workspaces the drawer shows before deferring to the
  *  dialog: enough to reach the recent ones, short enough to stay a drawer. */
 const DRAWER_LIMIT = 5;
+
+/**
+ * Whether the drawer is open, for the length of the tab. `AppShell` keeps one
+ * of these for the rail and for the same reason: this shell remounts on every
+ * route change, and a component that starts closed and learns better from an
+ * effect renders shut for a frame each time — which the disclosure then
+ * animates, replaying itself on every workspace switch.
+ */
+const remembered: { open: boolean | null } = { open: null };
 
 /** "Archived 3d ago · 2 windows" — read off the workspace's own layout, which
  *  archiving leaves exactly as it was. */
@@ -81,14 +92,20 @@ export function SidebarArchivedSection({
   onRestore: (workspace: Workspace) => void;
   onDelete: (workspace: Workspace) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(remembered.open ?? false);
+  const armed = useArmedMotion();
   const [showAll, setShowAll] = useState(false);
   const [lastOpenedId, setLastOpenedId] = useState<string | null>(null);
 
-  // Read once on mount: the mobile drawer mounts a second Sidebar, and both
-  // should agree about whether the drawer is open.
+  // Only the first mount reads the open flag from storage; after that
+  // `remembered` is the fresher of the two. The mobile drawer mounts a second
+  // Sidebar, and both read the same value.
   useEffect(() => {
-    setOpen(window.localStorage.getItem(OPEN_KEY) === "true");
+    if (remembered.open === null) {
+      const stored = window.localStorage.getItem(OPEN_KEY) === "true";
+      remembered.open = stored;
+      setOpen(stored);
+    }
     setLastOpenedId(window.localStorage.getItem(LAST_OPENED_KEY));
   }, []);
 
@@ -118,6 +135,7 @@ export function SidebarArchivedSection({
 
   const toggle = () => {
     setOpen((current) => {
+      remembered.open = !current;
       window.localStorage.setItem(OPEN_KEY, String(!current));
       return !current;
     });
@@ -150,15 +168,24 @@ export function SidebarArchivedSection({
               {/* Points up while closed — the list unfolds downward from here. */}
               <ChevronUp
                 aria-hidden
-                className={cn("size-3.5 transition-transform duration-150", open && "rotate-180")}
+                className={cn(
+                  "size-3.5",
+                  // Armed after the first paint: a chevron that mounts already
+                  // turned must not re-spin on every workspace switch.
+                  armed && "transition-transform duration-150",
+                  open && "rotate-180",
+                )}
               />
             </span>
           )}
         </button>
       </RailTooltip>
 
-      {open && !collapsed && (
-        <div className="mt-1 space-y-1">
+      {/* Glides open rather than appearing. The rows stay mounted so the
+       * drawer has a height to animate to, and Collapse makes the clipped
+       * content inert so a shut drawer holds nothing focusable. */}
+      <Collapse open={open && !collapsed}>
+        <div className="space-y-1 pt-1">
           <ul className="space-y-1">
             {drawerRows.map((workspace) => (
               <ArchivedRow
@@ -188,7 +215,7 @@ export function SidebarArchivedSection({
             </button>
           )}
         </div>
-      )}
+      </Collapse>
 
       <ArchivedDialog
         open={showAll}
