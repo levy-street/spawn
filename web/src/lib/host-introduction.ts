@@ -93,6 +93,96 @@ export function encodeHostIntroductionTranscript(
   return output;
 }
 
+// ---------------------------------------------------------------------------
+// Continuous gossip (docs/TRUST_DEVICE_MESH.md R7, continuous leg)
+// ---------------------------------------------------------------------------
+
+export const HOST_INTRO_BCAST_MAGIC = textEncoder.encode("SPAWN-HOST-INTRO-BCAST-V1");
+export const HOST_INTRO_BCAST_VERSION = 1;
+export const HOST_INTRO_BCAST_TRANSCRIPT_BYTES =
+  HOST_INTRO_BCAST_MAGIC.byteLength + 1 + UUID_BYTES + ED25519_PUBLIC_KEY_BYTES * 2;
+
+export const DEVICE_INTRO_MAGIC = textEncoder.encode("SPAWN-DEVICE-INTRO-V1");
+export const DEVICE_INTRO_VERSION = 1;
+export const DEVICE_INTRO_TRANSCRIPT_BYTES =
+  DEVICE_INTRO_MAGIC.byteLength +
+  1 +
+  UUID_BYTES +
+  ED25519_PUBLIC_KEY_BYTES * 2 +
+  UUID_BYTES +
+  ED25519_PUBLIC_KEY_BYTES;
+
+/** Ceremonies hand over a handful of peers; the relay caps the list server-side. */
+export const MAX_DEVICE_INTRODUCTIONS = 32;
+
+/**
+ * `magic ‖ version ‖ account ‖ publisher_pk ‖ host_pk` — the DURABLE broadcast
+ * form: unscoped to any recipient, published to the account store whenever a
+ * device verifies a host out of band. Deliberately a different domain than the
+ * ceremony-scoped SPAWN-HOST-INTRO-V1 (which binds a joiner): replaying a true
+ * broadcast to another device of the same account is harmless by construction,
+ * and cross-account replay dies on the account binding.
+ */
+export function encodeHostIntroductionBroadcastTranscript(
+  accountId: string,
+  publisherPublicKeyWire: string,
+  hostPublicKeyWire: string,
+): Uint8Array {
+  const publisherPublicKey = decodeEd25519PublicKeyWire(publisherPublicKeyWire);
+  const hostPublicKey = decodeEd25519PublicKeyWire(hostPublicKeyWire);
+  const output = new Uint8Array(HOST_INTRO_BCAST_TRANSCRIPT_BYTES);
+  let offset = 0;
+  for (const field of [
+    HOST_INTRO_BCAST_MAGIC,
+    Uint8Array.of(HOST_INTRO_BCAST_VERSION),
+    uuidBytes(accountId, "account id"),
+    publisherPublicKey,
+    hostPublicKey,
+  ]) {
+    output.set(field, offset);
+    offset += field.byteLength;
+  }
+  return output;
+}
+
+/**
+ * `magic ‖ version ‖ account ‖ introducer_pk ‖ peer_pk ‖ peer_device_id ‖ joiner_pk`
+ * — a device-key introduction carried on the add-device ceremony: the approver
+ * hands the joiner the device keys IT learned firsthand, so the joiner can later
+ * verify those devices' broadcast host introductions without ever having met
+ * them. Scoped to the joiner exactly like the ceremony host introductions.
+ */
+export function encodeDeviceIntroductionTranscript(
+  accountId: string,
+  introducerPublicKeyWire: string,
+  peerPublicKeyWire: string,
+  peerDeviceId: string,
+  joinerPublicKeyWire: string,
+): Uint8Array {
+  const introducerPublicKey = decodeEd25519PublicKeyWire(introducerPublicKeyWire);
+  const peerPublicKey = decodeEd25519PublicKeyWire(peerPublicKeyWire);
+  const joinerPublicKey = decodeEd25519PublicKeyWire(joinerPublicKeyWire);
+  if (encodeBase64Url(peerPublicKey) === encodeBase64Url(joinerPublicKey)) {
+    // Introducing the joiner to itself says nothing.
+    throw new Error("a device may not be introduced to itself");
+  }
+  const output = new Uint8Array(DEVICE_INTRO_TRANSCRIPT_BYTES);
+  let offset = 0;
+  for (const field of [
+    DEVICE_INTRO_MAGIC,
+    Uint8Array.of(DEVICE_INTRO_VERSION),
+    uuidBytes(accountId, "account id"),
+    introducerPublicKey,
+    peerPublicKey,
+    uuidBytes(peerDeviceId, "peer device id"),
+    joinerPublicKey,
+  ]) {
+    output.set(field, offset);
+    offset += field.byteLength;
+  }
+  return output;
+}
+
 /** One introduction as relayed. Every field is untrusted until verified. */
 export interface ClaimedHostIntroduction {
   readonly host_id: string;
@@ -165,6 +255,166 @@ export async function planHostIntroductionAcceptance(input: {
       });
     } catch (cause) {
       rejected.push(`${name}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  }
+  return { accepted, rejected };
+}
+
+async function verifyTranscriptSignature(
+  transcript: Uint8Array,
+  signatureWire: string,
+  signerPublicKeyWire: string,
+): Promise<boolean> {
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = decodeBase64Url(signatureWire, ED25519_SIGNATURE_BYTES);
+  const ownedSignature = new ArrayBuffer(signature.byteLength);
+  new Uint8Array(ownedSignature).set(signature);
+  const key = await importEd25519PublicKeyWire(signerPublicKeyWire);
+  return crypto.subtle.verify({ name: "Ed25519" }, key, ownedSignature, ownedTranscript);
+}
+
+/** One broadcast row as the store serves it. Untrusted until verified. */
+export interface ClaimedBroadcastIntroduction {
+  readonly publisher_device_id: string;
+  readonly publisher_public_key: string;
+  readonly host_id: string;
+  readonly host_name: string;
+  readonly host_public_key: string;
+  readonly signature: string;
+}
+
+export interface BroadcastAcceptancePlan {
+  readonly accepted: readonly AcceptedHostIntroduction[];
+  /**
+   * Rows from publishers this device holds no firsthand key for. EXPECTED for
+   * a device approved before its peers learned to introduce themselves — not
+   * an error, just not yet trustable. Counted so the caller can stay quiet.
+   */
+  readonly unknownPublisher: number;
+  /** Signature/shape failures: possible tampering, worth a quiet trace. */
+  readonly rejected: readonly string[];
+}
+
+/**
+ * RECIPIENT side of the continuous gossip: decide which broadcast rows to
+ * trust. The entire security is the peer-key rule — a row counts ONLY if its
+ * claimed publisher key is one this device learned FIRSTHAND (ceremony-pinned,
+ * or handed over inside a ceremony by a key that was). The server's claim of
+ * who published is display data; the signature must verify under the firsthand
+ * key itself. Rows published by this device, or by keys it does not hold, are
+ * skipped without trust changing either way.
+ */
+export async function planBroadcastIntroductionAcceptance(input: {
+  accountId: string;
+  ownPublicKey: string;
+  /** Firsthand peer device keys (wire form) — the ONLY acceptable signers. */
+  trustedPeerKeys: ReadonlySet<string>;
+  claimed: readonly ClaimedBroadcastIntroduction[];
+}): Promise<BroadcastAcceptancePlan> {
+  const accepted: AcceptedHostIntroduction[] = [];
+  const rejected: string[] = [];
+  let unknownPublisher = 0;
+  for (const item of input.claimed) {
+    const name = typeof item.host_name === "string" && item.host_name ? item.host_name : "a host";
+    if (item.publisher_public_key === input.ownPublicKey) continue; // our own rows
+    if (!input.trustedPeerKeys.has(item.publisher_public_key)) {
+      unknownPublisher += 1;
+      continue;
+    }
+    try {
+      const transcript = encodeHostIntroductionBroadcastTranscript(
+        input.accountId,
+        item.publisher_public_key,
+        item.host_public_key,
+      );
+      const valid = await verifyTranscriptSignature(
+        transcript,
+        item.signature,
+        item.publisher_public_key,
+      );
+      if (!valid) {
+        rejected.push(`${name}: the introduction did not verify`);
+        continue;
+      }
+      accepted.push({
+        hostId: item.host_id,
+        hostName: name,
+        hostPublicKey: item.host_public_key,
+        hostFingerprint: await ed25519PublicKeyFingerprint(item.host_public_key),
+      });
+    } catch (cause) {
+      rejected.push(`${name}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  }
+  return { accepted, unknownPublisher, rejected };
+}
+
+/** One relayed device introduction. Untrusted until verified. */
+export interface ClaimedDeviceIntroduction {
+  readonly device_id: string;
+  readonly device_label: string;
+  readonly device_public_key: string;
+  readonly signature: string;
+}
+
+export interface AcceptedDeviceIntroduction {
+  readonly deviceId: string;
+  readonly deviceLabel: string;
+  readonly devicePublicKey: string;
+}
+
+export interface DeviceIntroductionAcceptancePlan {
+  readonly accepted: readonly AcceptedDeviceIntroduction[];
+  readonly rejected: readonly string[];
+}
+
+/**
+ * JOINER side: which relayed device introductions are real. Verified against
+ * the CEREMONY-PINNED approver key and this device's own key — never anything
+ * the relay currently claims. The approver's own key is NOT accepted through
+ * this path (the ceremony itself is its provenance), and a peer equal to this
+ * device is vacuous.
+ */
+export async function planDeviceIntroductionAcceptance(input: {
+  accountId: string;
+  /** The approver key pinned at SAS-compute time. */
+  pinnedIntroducerPublicKey: string;
+  /** This device's own identity key (also pinned by the ceremony). */
+  ownPublicKey: string;
+  claimed: readonly ClaimedDeviceIntroduction[];
+}): Promise<DeviceIntroductionAcceptancePlan> {
+  const accepted: AcceptedDeviceIntroduction[] = [];
+  const rejected: string[] = [];
+  for (const item of input.claimed.slice(0, MAX_DEVICE_INTRODUCTIONS)) {
+    const label =
+      typeof item.device_label === "string" && item.device_label ? item.device_label : "a device";
+    if (item.device_public_key === input.ownPublicKey) continue;
+    if (item.device_public_key === input.pinnedIntroducerPublicKey) continue;
+    try {
+      const transcript = encodeDeviceIntroductionTranscript(
+        input.accountId,
+        input.pinnedIntroducerPublicKey,
+        item.device_public_key,
+        item.device_id,
+        input.ownPublicKey,
+      );
+      const valid = await verifyTranscriptSignature(
+        transcript,
+        item.signature,
+        input.pinnedIntroducerPublicKey,
+      );
+      if (!valid) {
+        rejected.push(`${label}: the introduction did not verify`);
+        continue;
+      }
+      accepted.push({
+        deviceId: item.device_id,
+        deviceLabel: label,
+        devicePublicKey: item.device_public_key,
+      });
+    } catch (cause) {
+      rejected.push(`${label}: ${cause instanceof Error ? cause.message : String(cause)}`);
     }
   }
   return { accepted, rejected };

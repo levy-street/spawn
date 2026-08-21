@@ -53,6 +53,20 @@ def _introductions(pairing: DevicePairing) -> list[schemas.DevicePairingIntroduc
         return None
 
 
+def _device_introductions(
+    pairing: DevicePairing,
+) -> list[schemas.DevicePairingDeviceIntroductionItem] | None:
+    if pairing.device_introductions is None:
+        return None
+    try:
+        return [
+            schemas.DevicePairingDeviceIntroductionItem.model_validate(item)
+            for item in json.loads(pairing.device_introductions)
+        ]
+    except Exception:
+        return None
+
+
 def _state(pairing: DevicePairing) -> schemas.DevicePairingState:
     return schemas.DevicePairingState(
         id=pairing.id,
@@ -64,6 +78,7 @@ def _state(pairing: DevicePairing) -> schemas.DevicePairingState:
         joiner_nonce=pairing.joiner_nonce,
         initiator_nonce=pairing.initiator_nonce,
         introductions=_introductions(pairing),
+        device_introductions=_device_introductions(pairing),
         created_at=pairing.created_at,
         expires_at=pairing.expires_at,
     )
@@ -257,10 +272,15 @@ async def post_introductions(
     if pairing.introductions is not None:
         raise HTTPException(status_code=409, detail="introductions already recorded")
     payload = json.dumps([item.model_dump() for item in body.introductions])
+    device_payload = (
+        json.dumps([item.model_dump() for item in body.device_introductions])
+        if body.device_introductions
+        else None
+    )
     result = await session.execute(
         update(DevicePairing)
         .where(DevicePairing.id == pairing.id, DevicePairing.introductions.is_(None))
-        .values(introductions=payload)
+        .values(introductions=payload, device_introductions=device_payload)
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:

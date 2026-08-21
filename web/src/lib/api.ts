@@ -569,6 +569,16 @@ export const PairingIntroductionSchema = z.object({
 });
 export type PairingIntroduction = z.infer<typeof PairingIntroductionSchema>;
 
+/** One relayed device-key introduction (continuous gossip bootstrap); untrusted
+ * until the joiner verifies it against the ceremony-pinned initiator key. */
+export const PairingDeviceIntroductionSchema = z.object({
+  device_id: z.string(),
+  device_label: z.string(),
+  device_public_key: z.string().length(43),
+  signature: z.string().length(86),
+});
+export type PairingDeviceIntroduction = z.infer<typeof PairingDeviceIntroductionSchema>;
+
 const PairingStateSchema = z.object({
   id: z.string(),
   initiator_device_id: z.string(),
@@ -579,10 +589,25 @@ const PairingStateSchema = z.object({
   joiner_nonce: z.string().nullable().optional(),
   initiator_nonce: z.string().nullable().optional(),
   introductions: z.array(PairingIntroductionSchema).nullable().optional(),
+  device_introductions: z.array(PairingDeviceIntroductionSchema).nullable().optional(),
   created_at: z.string(),
   expires_at: z.string(),
 });
 export type PairingState = z.infer<typeof PairingStateSchema>;
+
+/** One durable broadcast introduction as served; untrusted until verified
+ * against a FIRSTHAND copy of the publisher's key. */
+export const HostIntroductionRowSchema = z.object({
+  id: z.string(),
+  publisher_device_id: z.string(),
+  publisher_public_key: z.string().length(43),
+  host_id: z.string(),
+  host_name: z.string(),
+  host_public_key: z.string().length(43),
+  signature: z.string().length(86),
+  created_at: z.string(),
+});
+export type HostIntroductionRow = z.infer<typeof HostIntroductionRowSchema>;
 
 export const trust = {
   /** null when this account has never sealed a bundle. */
@@ -744,11 +769,38 @@ export const trust = {
     api(`/api/trust/pairing/${id}`, { method: "DELETE", schema: z.unknown() }),
   /** Initiator only in practice: the signatures bind ITS key; a joiner-posted
    * list would verify for no one. Set-once on the relay. */
-  postPairingIntroductions: (id: string, introductions: PairingIntroduction[]) =>
+  postPairingIntroductions: (
+    id: string,
+    introductions: PairingIntroduction[],
+    deviceIntroductions: PairingDeviceIntroduction[] = [],
+  ) =>
     api(`/api/trust/pairing/${id}/introductions`, {
       method: "POST",
-      body: JSON.stringify({ introductions }),
+      body: JSON.stringify({
+        introductions,
+        device_introductions: deviceIntroductions,
+      }),
       schema: PairingStateSchema,
+    }),
+  /** The durable broadcast store (continuous gossip): every live introduction
+   * for this account, minus rows from revoked publishers. */
+  listHostIntroductions: () =>
+    api("/api/trust/host-introductions", {
+      method: "GET",
+      schema: z.array(HostIntroductionRowSchema),
+    }),
+  /** Publish (or idempotently re-publish) one broadcast introduction. */
+  publishHostIntroduction: (body: {
+    publisher_device_id: string;
+    host_id: string;
+    host_name: string;
+    host_public_key: string;
+    signature: string;
+  }) =>
+    api("/api/trust/host-introductions", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: HostIntroductionRowSchema,
     }),
 };
 

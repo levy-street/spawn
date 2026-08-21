@@ -22,6 +22,7 @@ import {
   browserHostPinServerOrigin,
   loadBrowserHostPin,
 } from "@/lib/browser-host-pins";
+import { publishHostIntroductionBroadcast } from "@/lib/host-gossip";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class ApprovalIdentityError extends Error {}
@@ -338,6 +339,31 @@ function DeviceInner() {
         hostFingerprint: expectedFingerprint,
         knownHostId: r.host_id,
       });
+      // Continuous gossip (mesh R7): the moment this device verifies a host,
+      // it vouches the key to the account so its firsthand-known peers pin it
+      // too. Best-effort — the background reconcile sweep republishes anything
+      // this misses (e.g. a first pairing whose Host row is not created yet).
+      if (r.host_id) {
+        const publishTarget = {
+          hostId: r.host_id,
+          hostName: r.host_name,
+          hostPublicKey: pending.host_public_key,
+        };
+        void (async () => {
+          try {
+            const signer = await loadBrowserDeviceIdentity(user.id);
+            if (signer === null || registration.data?.status !== "ready") return;
+            await publishHostIntroductionBroadcast({
+              accountId: user.id,
+              deviceId: registration.data.device.id,
+              identity: signer,
+              target: publishTarget,
+            });
+          } catch {
+            // The sweep is the durable path.
+          }
+        })();
+      }
       setPending(null);
       setLocalPinState(null);
       setLocalPinCommitted(false);

@@ -567,12 +567,45 @@ class DevicePairingIntroductionItem(BaseModel):
         return value
 
 
-class DevicePairingIntroductions(BaseModel):
-    """Initiator's move, after the reveal: the hosts it vouches to the joiner."""
+class DevicePairingDeviceIntroductionItem(BaseModel):
+    """One device-key introduction (continuous gossip bootstrap), relayed
+    verbatim. The signature is over the SPAWN-DEVICE-INTRO-V1 transcript and
+    only the joiner can judge it — against the initiator key its ceremony
+    pinned. Shape checks only here."""
 
     model_config = ConfigDict(extra="forbid")
 
-    introductions: list[DevicePairingIntroductionItem] = Field(min_length=1, max_length=64)
+    device_id: str = Field(min_length=36, max_length=36)
+    device_label: str = Field(min_length=1, max_length=128)
+    device_public_key: str = Field(min_length=43, max_length=43)
+    signature: str = Field(min_length=86, max_length=86)
+
+    @field_validator("device_public_key")
+    @classmethod
+    def _validate_device_key(cls, value: str) -> str:
+        decode_ed25519_public_key(value)
+        return value
+
+
+class DevicePairingIntroductions(BaseModel):
+    """Initiator's move, after the reveal: the hosts it vouches to the joiner,
+    plus (optionally) the peer device keys it learned firsthand so the joiner
+    can honor those peers' broadcast introductions later."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    introductions: list[DevicePairingIntroductionItem] = Field(
+        default_factory=list, max_length=64
+    )
+    device_introductions: list[DevicePairingDeviceIntroductionItem] = Field(
+        default_factory=list, max_length=32
+    )
+
+    @model_validator(mode="after")
+    def _require_some_payload(self) -> "DevicePairingIntroductions":
+        if not self.introductions and not self.device_introductions:
+            raise ValueError("introductions must carry at least one host or device entry")
+        return self
 
 
 class DevicePairingState(BaseModel):
@@ -589,8 +622,43 @@ class DevicePairingState(BaseModel):
     joiner_nonce: str | None = None
     initiator_nonce: str | None = None
     introductions: list[DevicePairingIntroductionItem] | None = None
+    device_introductions: list[DevicePairingDeviceIntroductionItem] | None = None
     created_at: datetime
     expires_at: datetime
+
+
+class HostIntroductionPublish(BaseModel):
+    """One durable broadcast introduction (continuous gossip). The signature is
+    over the SPAWN-HOST-INTRO-BCAST-V1 transcript; the server verifies it
+    against the publisher's registered key as hygiene, recipients re-verify it
+    against the key they learned firsthand."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    publisher_device_id: str = Field(min_length=36, max_length=36)
+    host_id: str = Field(min_length=1, max_length=36)
+    host_name: str = Field(min_length=1, max_length=128)
+    host_public_key: str = Field(min_length=43, max_length=43)
+    signature: str = Field(min_length=86, max_length=86)
+
+    @field_validator("host_public_key")
+    @classmethod
+    def _validate_host_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class HostIntroductionOut(BaseModel):
+    id: str
+    publisher_device_id: str
+    # The publisher's registered key, echoed for the recipient's convenience;
+    # display-adjacent — acceptance requires the FIRSTHAND copy to match.
+    publisher_public_key: str
+    host_id: str
+    host_name: str
+    host_public_key: str
+    signature: str
+    created_at: datetime
 
 
 # ---------- hosts ----------

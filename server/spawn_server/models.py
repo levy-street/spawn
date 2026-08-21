@@ -502,6 +502,12 @@ class DevicePairing(Base):
     # joiner verifies each signature against the ceremony-pinned initiator key,
     # so a substituted or forged entry verifies for no one. Set-once.
     introductions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Continuous gossip's bootstrap: the initiator's signed DEVICE-key
+    # introductions (JSON list) — the peer keys it learned firsthand, handed to
+    # the joiner so it can later verify those peers' broadcast host
+    # introductions. Posted and set-once together with `introductions`; relayed
+    # verbatim and judged only by the joiner against the ceremony-pinned key.
+    device_introductions: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -511,6 +517,57 @@ class DevicePairing(Base):
         CheckConstraint(
             "initiator_device_id <> joiner_device_id",
             name="ck_device_pairings_distinct",
+        ),
+    )
+
+
+class HostIntroduction(Base):
+    """One device's DURABLE, signed vouch of a host key to its whole account —
+    the continuous leg of mesh R7 host-key gossip.
+
+    Published when a device verifies a host out of band (possess, or its own
+    reconcile sweep). The server stores, caps, and serves these rows but is NOT
+    their authority: a recipient honors a row only when it holds the publisher's
+    device key FIRSTHAND (ceremony-learned) and the SPAWN-HOST-INTRO-BCAST-V1
+    signature verifies against that firsthand key. The hygiene verification at
+    insert (against the publisher's registered key) merely keeps rows that could
+    never verify for anyone out of the store. GET filters out rows from revoked
+    publishers — the fail-closed direction the server is trusted for.
+    """
+
+    __tablename__ = "host_introductions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    publisher_device_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("browser_devices.id", ondelete="CASCADE"), nullable=False
+    )
+    # Display/binding claims for the recipient's pin bookkeeping; the verified
+    # payload is host_public_key.
+    host_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    host_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    host_public_key: Mapped[str] = mapped_column(String(43), nullable=False)
+    # base64url Ed25519 signature over the SPAWN-HOST-INTRO-BCAST-V1 transcript.
+    signature: Mapped[str] = mapped_column(String(86), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "publisher_device_id",
+            "host_public_key",
+            name="uq_host_introductions_publisher_host",
+        ),
+        CheckConstraint(
+            "length(host_public_key) = 43",
+            name="ck_host_introductions_host_key",
+        ),
+        CheckConstraint(
+            "length(signature) = 86",
+            name="ck_host_introductions_signature",
         ),
     )
 

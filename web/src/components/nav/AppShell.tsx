@@ -11,6 +11,7 @@ import {
   useState,
 } from "react";
 import { AccessCeremonyHost } from "@/components/access/ceremony-host";
+import { HostGossipSync } from "@/components/access/host-gossip-sync";
 import { SessionApprovalGate } from "@/components/access/session-approval-gate";
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
 import { BottomTabs } from "@/components/nav/BottomTabs";
@@ -176,6 +177,7 @@ export function AppShell({
       <SettingsDialog />
       <AccessCeremonyHost />
       <SessionApprovalGate />
+      <HostGossipSync />
     </div>
   );
 }

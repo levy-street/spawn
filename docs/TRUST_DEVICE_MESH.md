@@ -459,14 +459,18 @@ peer (which blocks cross-session/cross-host splicing), not on a nonce `h` picks.
 | 5 | Root lifecycle of §4.1: mint at passkey creation, sealed-in-bundle (survives passkey enroll/revoke resealing), full heal on unlock, retrofit for pre-root bundles, rotation after root revocation, anchor ratchet | live recovery drill: all devices revoked → passkey unlock on a fresh device → `chained=true` to the host |
 | 6 | R4 roster (per-device provenance, audit log, R5 revoke warnings) + R9 retirement (daemon advertises `supports_account_chains` at register; server **ratchets** the flag and refuses per-host device endorsement toward such hosts — the root anchor upgrade is the one surviving per-host statement) | live: mixed fleet — new daemon refused legacy path with ceremony pointer, old daemons unaffected; roster verified on-screen |
 | R7 | Host-key gossip over the add-device exchange: the approver signs `SPAWN-HOST-INTRO-V1` (`account ‖ approver_pk ‖ host_pk ‖ joiner_pk`) per host it holds an ACTIVE local pin for, posts the set on the pairing relay (set-once, post-reveal, before its endorsement edge so the joiner's completion cue implies the list is present); the joiner verifies each against the **ceremony-pinned** approver key + its own key and approves the host key locally like a hand-run possession. Web-only; the daemon never sees the statement (deliberately not `SPAWN-BROWSER-ENDORSE-V1` — no cross-protocol signature reuse) | unit (tamper: swapped host key / signer / joiner / account); live: two-context SAS, joiner's first terminal connect reads fully verified |
+| R7-cont | CONTINUOUS gossip: (a) a device that verifies a host publishes a durable `SPAWN-HOST-INTRO-BCAST-V1` vouch (`account ‖ publisher_pk ‖ host_pk`) to the account store (`host_introductions`, migration 0040) — at possess time and via a reconcile sweep that retroactively publishes pre-existing pins; (b) every device keeps a durable FIRSTHAND peer-device-key store, seeded ONLY at ceremony completion (both roles persist the SAS-pinned peer key) and by `SPAWN-DEVICE-INTRO-V1` device introductions the approver signs into the same ceremony payload — NEVER from server-claimed metadata (a self-signed edge naming an attacker key verifies under its own claim: honoring it would be a full MITM; unit-tested as the trap case); (c) recipients honor a broadcast row only when its publisher key is in that firsthand store and the signature re-verifies against the firsthand copy, then pin locally (a conflicting binding never overwrites — the held pin is the substitution signal). Server hygiene-verifies at insert against the registered key, caps per account, and withholds rows from revoked publishers on GET; recipients also drop revoked peers from their firsthand memory | unit (trap: unknown-publisher self-signed row moves no trust; tamper; replay-to-wrong-joiner); server (idempotent republish, revoked-publisher filter, cap); live: second host possessed AFTER the ceremony arrives verified on the peer with no new ceremony |
 
 Not yet done: merge to master + prod rollout; folding possess-time anchor-on-`R`
 (§4 possess) into the possess flow — as built, a new host gains `R` at the next
 heal moment rather than at possess itself (sound, one heal later than the doc's
-ideal). R7 residuals: devices approved before the gossip leg shipped hold no
-introduced pins retroactively, and a host possessed AFTER a device joined
-reaches that device as first-contact until the next passkey heal — the sealed
-bundle remains the catch-up channel for both.
+ideal). R7 residuals after the continuous leg: a device approved BEFORE the
+continuous build holds no firsthand peer keys, so it needs ONE more ceremony
+(re-approval) — or a passkey heal — to seed its store; from then on coverage is
+continuous. And an introduction is only as honest as the publishing device:
+A3's rogue-CA blast radius applies to host vouches exactly as to endorsements,
+with R4 detection (the roster and log) as the defense. The sealed bundle
+remains the catch-up channel of last resort.
 
 ---
 
@@ -529,8 +533,14 @@ client keys do — carried in the mutual add-device exchange. The approver signs
 domain-separated `SPAWN-HOST-INTRO-V1` statement per host it has itself verified
 (its active local pins), scoped to the exact joiner key the SAS authenticated;
 the relay carries it set-once; the joiner verifies against the ceremony-pinned
-approver key and pins locally. See §8 (R7 row) for the shipped shape and its
-residuals (no retroactive delivery; hosts possessed later ride the next heal).
+approver key and pins locally. **Extended to CONTINUOUS delivery** (§8 R7-cont
+row): verified hosts are also published as durable `SPAWN-HOST-INTRO-BCAST-V1`
+vouches that every device holding the publisher's key FIRSTHAND (a durable
+peer-key store seeded only inside ceremonies, bootstrapped across hops by
+`SPAWN-DEVICE-INTRO-V1` handovers) verifies and pins on its own — so a host
+possessed AFTER a device joined arrives already verified, no passkey and no
+re-ceremony. Residual: devices approved before the continuous build need one
+more ceremony to seed their firsthand memory.
 
 **R8 — No-root, single-device loss = total lockout.** With no root and one
 device, losing it strands every host (re-possess all). **Resolution:** strongly
@@ -586,8 +596,9 @@ what ships.
   no periodic timer.
 
 - ~~R7 host discovery~~ → host-key gossip carried in the add-device exchange
-  (`SPAWN-HOST-INTRO-V1`, §8 R7 row); the bundle remains the catch-up channel
-  for hosts possessed after a device joined.
+  (`SPAWN-HOST-INTRO-V1`, §8 R7 row) AND continuously thereafter
+  (`SPAWN-HOST-INTRO-BCAST-V1` + firsthand peer-key stores, §8 R7-cont row);
+  the bundle is now the catch-up channel of last resort only.
 
 **Still open:** possess-time anchor-on-`R` (§8); merge + prod rollout.
 
