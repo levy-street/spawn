@@ -29,6 +29,7 @@ import {
 import {
   type BrowserDevice,
   hosts as hostsApi,
+  type PairingDeviceIntroduction,
   type PairingIntroduction,
   type PairingState,
   trust,
@@ -36,6 +37,7 @@ import {
 import {
   type BrowserDeviceIdentity,
   createAccountEndorsementProof,
+  createDeviceIntroductionProof,
   createHostIntroductionProof,
   loadBrowserDeviceIdentity,
 } from "@/lib/browser-device-identity";
@@ -45,7 +47,13 @@ import {
   listActiveBrowserHostPins,
   resolveActiveBrowserHostPin,
 } from "@/lib/browser-host-pins";
-import { MAX_HOST_INTRODUCTIONS, planHostIntroductionAcceptance } from "@/lib/host-introduction";
+import {
+  MAX_DEVICE_INTRODUCTIONS,
+  MAX_HOST_INTRODUCTIONS,
+  planDeviceIntroductionAcceptance,
+  planHostIntroductionAcceptance,
+} from "@/lib/host-introduction";
+import { listPeerDeviceKeys, rememberPeerDeviceKey } from "@/lib/peer-device-keys";
 import { b64urlEncode } from "@/lib/sas";
 import {
   decodeBase64Url,
@@ -130,6 +138,9 @@ interface CeremonyRecord {
    * pairing snapshot so the row's post-completion deletion cannot lose them.
    * Untrusted until verified against the pinned initiator key. */
   introductions: PairingIntroduction[] | null;
+  /** JOINER side: relayed device-key introductions (continuous gossip
+   * bootstrap), stashed under the same rule and judged the same way. */
+  deviceIntroductions: PairingDeviceIntroduction[] | null;
   waitingSince: number | null;
   done: boolean;
   stopped: boolean;
@@ -142,6 +153,7 @@ const FRESH: CeremonyRecord = {
   entryError: null,
   signedMine: false,
   introductions: null,
+  deviceIntroductions: null,
   waitingSince: null,
   done: false,
   stopped: false,
@@ -316,7 +328,6 @@ export function useApproveDeviceCeremony({
       if (!signer || !currentDevice) return;
       const origin = browserHostPinServerOrigin();
       const pins = await listActiveBrowserHostPins({ accountId, origin });
-      if (pins.length === 0) return;
       const hostList = await hostsApi.list().catch(() => []);
       const items: PairingIntroduction[] = [];
       for (const pin of pins) {
@@ -343,8 +354,37 @@ export function useApproveDeviceCeremony({
           });
         }
       }
-      if (items.length === 0) return;
-      await trust.postPairingIntroductions(pairing.id, items);
+      // Continuous-gossip bootstrap: also hand over the peer device keys THIS
+      // device learned firsthand, so the joiner can honor those peers' future
+      // broadcast introductions without ever having met them. The joiner and
+      // this device itself are excluded (the ceremony is their provenance).
+      const deviceItems: PairingDeviceIntroduction[] = [];
+      try {
+        const peers = await listPeerDeviceKeys({ accountId, origin });
+        for (const peer of peers) {
+          if (deviceItems.length >= MAX_DEVICE_INTRODUCTIONS) break;
+          if (peer.publicKey === pinned.joinerPublicKey) continue;
+          if (peer.publicKey === currentDevice.public_key) continue;
+          const signature = await createDeviceIntroductionProof(
+            signer,
+            accountId,
+            peer.publicKey,
+            peer.deviceId,
+            pinned.joinerPublicKey,
+          );
+          deviceItems.push({
+            device_id: peer.deviceId,
+            device_label:
+              devices.find((device) => device.id === peer.deviceId)?.label ?? "a device",
+            device_public_key: peer.publicKey,
+            signature,
+          });
+        }
+      } catch {
+        // Peer handover is a bonus on top of a bonus; hosts still ride alone.
+      }
+      if (items.length === 0 && deviceItems.length === 0) return;
+      await trust.postPairingIntroductions(pairing.id, items, deviceItems);
     } catch {
       setError(
         "Approved, but this device couldn't hand over its hosts — the new device will verify each host when it first connects.",
@@ -385,13 +425,24 @@ export function useApproveDeviceCeremony({
     const amInitiator = pairing.initiator_device_id === currentDevice.id;
     const amJoiner = pairing.joiner_device_id === currentDevice.id;
     if (!amInitiator && !amJoiner) return;
-    // Stash relayed host introductions (R7) the moment any snapshot carries
-    // them: the pairing row is deleted at completion, and acceptance must run
-    // from data this side already holds, never a post-completion re-fetch.
-    if (amJoiner && (pairing.introductions?.length ?? 0) > 0) {
+    // Stash relayed introductions (R7 hosts + continuous-gossip device keys)
+    // the moment any snapshot carries them: the pairing row is deleted at
+    // completion, and acceptance must run from data this side already holds,
+    // never a post-completion re-fetch.
+    if (amJoiner) {
       const record = records.get(pairing.id);
-      if (record !== undefined && record.introductions === null) {
-        patch(pairing.id, { introductions: pairing.introductions ?? null });
+      const change: Partial<CeremonyRecord> = {};
+      if (record !== undefined) {
+        if (record.introductions === null && (pairing.introductions?.length ?? 0) > 0) {
+          change.introductions = pairing.introductions ?? null;
+        }
+        if (
+          record.deviceIntroductions === null &&
+          (pairing.device_introductions?.length ?? 0) > 0
+        ) {
+          change.deviceIntroductions = pairing.device_introductions ?? null;
+        }
+        if (Object.keys(change).length > 0) patch(pairing.id, change);
       }
     }
     try {
@@ -522,11 +573,14 @@ export function useApproveDeviceCeremony({
           // simply has nothing to accept and this device verifies each host on
           // first use instead).
           let introductions = pairing.introductions ?? null;
+          let deviceIntroductions = pairing.device_introductions ?? null;
           if (introductions === null || introductions.length === 0) {
-            introductions = await trust
+            const row = await trust
               .listPairings(currentDevice.id)
-              .then((rows) => rows.find((row) => row.id === pairing.id)?.introductions ?? null)
+              .then((rows) => rows.find((candidate) => candidate.id === pairing.id) ?? null)
               .catch(() => null);
+            introductions = row?.introductions ?? null;
+            deviceIntroductions = row?.device_introductions ?? deviceIntroductions;
           }
           await signEndorsement(plan.endorsedDeviceId, plan.endorsedPublicKey);
           patch(pairing.id, {
@@ -534,6 +588,9 @@ export function useApproveDeviceCeremony({
             waitingSince: Date.now(),
             // Never clobber an earlier stash with a failed re-read.
             ...(introductions !== null && introductions.length > 0 ? { introductions } : {}),
+            ...(deviceIntroductions !== null && deviceIntroductions.length > 0
+              ? { deviceIntroductions }
+              : {}),
           });
         } catch {
           actedRef.current.delete(`reciprocate:${pairing.id}`); // retry on next poll
@@ -554,15 +611,49 @@ export function useApproveDeviceCeremony({
     if (!currentDevice) return;
     for (const [id, record] of records) {
       if (!record.signedMine || record.stopped) continue;
-      if (record.introductions === null || record.introductions.length === 0) continue;
+      const hasHosts = record.introductions !== null && record.introductions.length > 0;
+      const hasDevices =
+        record.deviceIntroductions !== null && record.deviceIntroductions.length > 0;
+      if (!hasHosts && !hasDevices) continue;
       if (!record.pinnedKeys) continue;
       if (rolesRef.current.get(id)?.role !== "new-device") continue;
       if (actedRef.current.has(`introductions:${id}`)) continue;
       actedRef.current.add(`introductions:${id}`);
       const pinned = record.pinnedKeys;
-      const claimed = record.introductions;
+      const claimed = record.introductions ?? [];
+      const claimedDevices = record.deviceIntroductions ?? [];
       void (async () => {
+        // Device-key handover (continuous gossip bootstrap): judged against
+        // the same ceremony-pinned key, remembered as firsthand-by-proxy.
+        // Quiet best-effort — the host leg below is the user-visible one.
         try {
+          if (claimedDevices.length > 0) {
+            const devicePlan = await planDeviceIntroductionAcceptance({
+              accountId,
+              pinnedIntroducerPublicKey: pinned.initiatorPublicKey,
+              ownPublicKey: currentDevice.public_key,
+              claimed: claimedDevices,
+            });
+            const origin = browserHostPinServerOrigin();
+            for (const peer of devicePlan.accepted) {
+              await rememberPeerDeviceKey({
+                accountId,
+                origin,
+                publicKey: peer.devicePublicKey,
+                deviceId: peer.deviceId,
+                source: "ceremony-introduction",
+              }).catch(() => {});
+            }
+            for (const reason of devicePlan.rejected) {
+              console.warn(`spawn: device introduction rejected: ${reason}`);
+            }
+            void qc.invalidateQueries({ queryKey: ["peer-device-keys"] });
+          }
+        } catch {
+          // Nothing was trusted; broadcast rows from unmet peers stay unhonored.
+        }
+        try {
+          if (claimed.length === 0) return;
           const plan = await planHostIntroductionAcceptance({
             accountId,
             pinnedIntroducerPublicKey: pinned.initiatorPublicKey,
@@ -609,6 +700,42 @@ export function useApproveDeviceCeremony({
     }
   }, [records]);
 
+  /**
+   * A COMPLETED ceremony is the one moment a peer device key is learned
+   * firsthand: persist it into the durable peer-key store (continuous gossip's
+   * provenance root) — the exact bytes the SAS pinned, never the relay's live
+   * claim. Both roles remember their opposite. Best-effort: a storage failure
+   * costs future broadcast acceptance, never the approval itself.
+   */
+  const persistCeremonyPeerKey = (
+    pairingId: string,
+    record: CeremonyRecord,
+    role: ApproveCeremonyRole,
+    peerDeviceId: string,
+  ): void => {
+    if (!record.pinnedKeys || peerDeviceId === "") return;
+    if (actedRef.current.has(`peerkey:${pairingId}`)) return;
+    actedRef.current.add(`peerkey:${pairingId}`);
+    const peerKey =
+      role === "approver"
+        ? record.pinnedKeys.joinerPublicKey
+        : record.pinnedKeys.initiatorPublicKey;
+    void (async () => {
+      try {
+        await rememberPeerDeviceKey({
+          accountId,
+          origin: browserHostPinServerOrigin(),
+          publicKey: peerKey,
+          deviceId: peerDeviceId,
+          source: "ceremony",
+        });
+        void qc.invalidateQueries({ queryKey: ["peer-device-keys"] });
+      } catch {
+        actedRef.current.delete(`peerkey:${pairingId}`); // retry on a later pass
+      }
+    })();
+  };
+
   // Completion: once BOTH directions of the mutual endorsement exist, the
   // ceremony is done — flip the phase and delete the pairing so neither screen
   // lingers until the relay TTL. Either side may win the delete; the loser's
@@ -631,6 +758,7 @@ export function useApproveDeviceCeremony({
         (e) => e.endorser_device_id === peerId && e.endorsed_device_id === currentDevice.id,
       );
       if (!mine || !theirs) continue;
+      persistCeremonyPeerKey(pairing.id, record, amInitiator ? "approver" : "new-device", peerId);
       patch(pairing.id, { done: true });
       void trust
         .cancelPairing(pairing.id)
@@ -646,13 +774,17 @@ export function useApproveDeviceCeremony({
     const liveIds = new Set((pairings.data ?? []).map((p) => p.id));
     for (const [id, record] of records) {
       if (record.done || record.stopped || record.sas === null || liveIds.has(id)) continue;
-      const peerId = rolesRef.current.get(id)?.peerDeviceId;
+      const remembered = rolesRef.current.get(id);
+      const peerId = remembered?.peerDeviceId;
       const mine =
         record.signedMine ||
         (peerId !== undefined &&
           edges.some(
             (e) => e.endorser_device_id === currentDevice.id && e.endorsed_device_id === peerId,
           ));
+      if (mine && remembered !== undefined && peerId !== undefined) {
+        persistCeremonyPeerKey(id, record, remembered.role, peerId);
+      }
       patch(id, mine ? { done: true } : { stopped: true });
     }
   }, [pairings.data, endorsements.data, records]);

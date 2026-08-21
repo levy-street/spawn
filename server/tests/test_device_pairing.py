@@ -359,3 +359,89 @@ async def test_introductions_ride_the_relay_post_reveal_set_once_and_shape_check
         headers=foreign_auth,
     )
     assert foreign.status_code == 404
+
+
+def _device_intro_item() -> dict[str, str]:
+    return {
+        "device_id": "0b6e6c64-0000-4000-8000-00000000000b",
+        "device_label": "MacBook Chrome",
+        "device_public_key": _wire(Ed25519PrivateKey.generate()),
+        # Opaque to the relay; only the joiner can judge it.
+        "signature": _b64u(os.urandom(64)),
+    }
+
+
+async def test_device_introductions_ride_alongside_and_alone(client):
+    user_id, auth = await _signup(client, "pairing-device-intros@example.com")
+    initiator_id, initiator_key = await _add_device(user_id)
+    joiner_id, joiner_key = await _add_device(user_id)
+    pairing_id, n_i = await _ceremony_to_reveal(
+        client, auth, initiator_id, joiner_id, initiator_key, joiner_key
+    )
+    revealed = await client.post(
+        f"{PAIRING}/{pairing_id}/reveal", json={"initiator_nonce": _b64u(n_i)}, headers=auth
+    )
+    assert revealed.status_code == 200, revealed.text
+
+    # Hosts + devices in one set-once move; both relay verbatim.
+    host_item, device_item = _intro_item(), _device_intro_item()
+    posted = await client.post(
+        f"{PAIRING}/{pairing_id}/introductions",
+        json={"introductions": [host_item], "device_introductions": [device_item]},
+        headers=auth,
+    )
+    assert posted.status_code == 200, posted.text
+    assert posted.json()["introductions"] == [host_item]
+    assert posted.json()["device_introductions"] == [device_item]
+
+    # Set-once covers the pair of lists together.
+    again = await client.post(
+        f"{PAIRING}/{pairing_id}/introductions",
+        json={"introductions": [_intro_item()]},
+        headers=auth,
+    )
+    assert again.status_code == 409
+
+    # A second ceremony may carry ONLY device introductions (an approver with
+    # peers but no pins still bootstraps the joiner's firsthand memory)…
+    joiner2_id, joiner2_key = await _add_device(user_id)
+    pairing2, n_i2 = await _ceremony_to_reveal(
+        client, auth, initiator_id, joiner2_id, initiator_key, joiner2_key
+    )
+    revealed2 = await client.post(
+        f"{PAIRING}/{pairing2}/reveal", json={"initiator_nonce": _b64u(n_i2)}, headers=auth
+    )
+    assert revealed2.status_code == 200
+    devices_only = await client.post(
+        f"{PAIRING}/{pairing2}/introductions",
+        json={"introductions": [], "device_introductions": [_device_intro_item()]},
+        headers=auth,
+    )
+    assert devices_only.status_code == 200, devices_only.text
+    assert devices_only.json()["introductions"] == []
+    assert len(devices_only.json()["device_introductions"]) == 1
+
+    # …but a payload with NOTHING in it is refused, as are shape violations.
+    joiner3_id, joiner3_key = await _add_device(user_id)
+    pairing3, n_i3 = await _ceremony_to_reveal(
+        client, auth, initiator_id, joiner3_id, initiator_key, joiner3_key
+    )
+    await client.post(
+        f"{PAIRING}/{pairing3}/reveal", json={"initiator_nonce": _b64u(n_i3)}, headers=auth
+    )
+    for bad in (
+        {"introductions": [], "device_introductions": []},
+        {"introductions": []},
+        {
+            "introductions": [],
+            "device_introductions": [{**_device_intro_item(), "device_public_key": "!" * 43}],
+        },
+        {
+            "introductions": [],
+            "device_introductions": [_device_intro_item() for _ in range(33)],
+        },
+    ):
+        refused = await client.post(
+            f"{PAIRING}/{pairing3}/introductions", json=bad, headers=auth
+        )
+        assert refused.status_code == 422, bad

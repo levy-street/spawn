@@ -151,6 +151,8 @@ export async function mockAuthenticatedApi(
     /** Seeded add-device pairing relay rows (served by GET, mutated by the
      * introductions endpoint). Shape: DevicePairingState JSON. */
     pairings?: Array<Record<string, unknown>>;
+    /** Seeded durable host-introduction rows (continuous gossip store). */
+    hostIntroductions?: Array<Record<string, unknown>>;
     /** Override the signed-in account (e.g. to grant is_admin). */
     me?: Record<string, unknown>;
   } = {},
@@ -164,6 +166,9 @@ export async function mockAuthenticatedApi(
   ];
   const hostPinMap: Record<string, string[]> = { ...(options.hostPins ?? {}) };
   const pairingRows: Array<Record<string, unknown>> = [...(options.pairings ?? [])];
+  const hostIntroductionRows: Array<Record<string, string>> = [
+    ...((options.hostIntroductions ?? []) as Array<Record<string, string>>),
+  ];
 
   const invokeFileHandler = async (
     handler: ((hostId: string, body: unknown, route: Route) => Promise<void> | void) | undefined,
@@ -673,13 +678,57 @@ export async function mockAuthenticatedApi(
         await route.fulfill({ status: 409, json: { detail: "introductions already recorded" } });
         return;
       }
-      const body = (await request.postDataJSON()) as { introductions?: unknown[] };
-      if (!Array.isArray(body.introductions) || body.introductions.length === 0) {
+      const body = (await request.postDataJSON()) as {
+        introductions?: unknown[];
+        device_introductions?: unknown[];
+      };
+      const hostItems = Array.isArray(body.introductions) ? body.introductions : [];
+      const deviceItems = Array.isArray(body.device_introductions) ? body.device_introductions : [];
+      if (hostItems.length === 0 && deviceItems.length === 0) {
         await route.fulfill({ status: 422, json: { detail: "invalid introductions" } });
         return;
       }
-      row.introductions = body.introductions;
+      row.introductions = hostItems;
+      row.device_introductions = deviceItems.length > 0 ? deviceItems : null;
       await route.fulfill({ status: 200, contentType: "application/json", json: row });
+      return;
+    }
+    if (path === "/api/trust/host-introductions" && method === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: hostIntroductionRows,
+      });
+      return;
+    }
+    if (path === "/api/trust/host-introductions" && method === "POST") {
+      const body = (await request.postDataJSON()) as Record<string, string>;
+      const publisher = browserDeviceList.find((item) => item.id === body.publisher_device_id);
+      if (!publisher) {
+        await route.fulfill({ status: 404, json: { detail: "publisher device not found" } });
+        return;
+      }
+      const existing = hostIntroductionRows.find(
+        (item) =>
+          item.publisher_device_id === body.publisher_device_id &&
+          item.host_public_key === body.host_public_key,
+      );
+      if (existing) {
+        await route.fulfill({ status: 200, contentType: "application/json", json: existing });
+        return;
+      }
+      const record = {
+        id: `intro-${hostIntroductionRows.length + 1}`,
+        publisher_device_id: body.publisher_device_id,
+        publisher_public_key: String(publisher.public_key),
+        host_id: body.host_id,
+        host_name: body.host_name,
+        host_public_key: body.host_public_key,
+        signature: body.signature,
+        created_at: CREATED_AT,
+      };
+      hostIntroductionRows.push(record);
+      await route.fulfill({ status: 200, contentType: "application/json", json: record });
       return;
     }
     if (path === "/api/trust/endorsements" && method === "GET") {

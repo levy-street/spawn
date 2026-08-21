@@ -179,7 +179,11 @@ terminal state precisely so the residual is a chosen, contained trade.
   mac-studio** button (the intent step: you're granting your devices access) → **done**
   ("mac-studio is possessed. All your devices can reach it."). This matches a CLI-tool
   login: click the link, sign in if needed, approve — the terminal picks it up on its
-  own, on the same or any other device.
+  own, on the same or any other device. Approving also, invisibly, tells your other
+  devices about the new host *(2026-08-22)* — each one it has met through an approval
+  checks the message for itself and the host simply arrives already verified there.
+  Nothing to see; the done line's "all your devices can reach it" is now the whole
+  truth, verification included.
 - **refused** — if the server claims a *different* key than the link carries (the
   substitution a hostile relay would need), or the link's `#k` part is damaged, the
   screen is a terminal refusal ("This host could not be verified") — no approve path is
