@@ -40,8 +40,13 @@ export async function verifyCommitWire(
   );
 }
 
-/** The 6-digit number both devices display, `"NNN NNN"`. Initiator in the host
- * position, joiner in the browser position. */
+/** The device↔device ceremony number both devices display, `"NN NN"`. Four
+ * digits (not the host flow's six): each wrong guess is an online, one-shot,
+ * committed attempt, so 1-in-10⁴ bounds a substituting server's success while
+ * keeping the entry light. Initiator in the host position, joiner in the
+ * browser position. */
+export const CEREMONY_SAS_DIGITS = 4;
+
 export async function ceremonySas(
   initiatorKeyWire: string,
   joinerKeyWire: string,
@@ -53,5 +58,6 @@ export async function ceremonySas(
     b64urlDecode(joinerKeyWire),
     b64urlDecode(initiatorNonceWire),
     b64urlDecode(joinerNonceWire),
+    CEREMONY_SAS_DIGITS,
   );
 }

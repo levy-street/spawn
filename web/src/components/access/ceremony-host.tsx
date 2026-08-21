@@ -9,6 +9,7 @@ import { NumberCheck } from "@/components/access/number-check";
 import { useSettingsDialog } from "@/components/settings/settings-dialog-store";
 import { useDeviceTrustMap } from "@/components/trust/device-endorsement";
 import { Button } from "@/components/ui/button";
+import { CEREMONY_SAS_DIGITS } from "@/lib/add-device-ceremony";
 import { type BrowserDevice, browserDevices, trust } from "@/lib/api";
 import { type ApproveCeremonyView, useApproveDeviceCeremony } from "@/lib/approve-ceremony";
 import { useAuth } from "@/lib/auth";
@@ -201,6 +202,7 @@ function CeremonyDialog({
           <NumberCheck
             phase={view.phase}
             mode={isApprover ? "enter" : "show"}
+            digits={CEREMONY_SAS_DIGITS}
             number={view.number ?? undefined}
             otherScreen={isApprover ? "on the new device" : "on the device you already use"}
             doneText={
