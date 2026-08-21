@@ -89,6 +89,12 @@ class BrowserDevice(Base):
     # Stamped whenever the device's identity registration reconciles (each app
     # load) — an honest "last seen" without per-request tracking.
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Stamped when this (unapproved) device actively asks to be approved — it
+    # tried to open an agent session. Lets other devices surface, and
+    # re-surface, the approval toast. Advisory display data, never authorization.
+    approval_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Which of the account's devices asked for the revocation (R4: the removed
     # screen names its remover). Advisory display data, never authorization.

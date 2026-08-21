@@ -580,6 +580,23 @@ export async function mockAuthenticatedApi(
       });
       return;
     }
+    const requestApprovalMatch = path.match(/^\/api\/browser-devices\/([^/]+)\/request-approval$/);
+    if (requestApprovalMatch && method === "POST") {
+      const body = (await request.postDataJSON()) as { public_key?: string };
+      const device = browserDeviceList.find((item) => item.id === requestApprovalMatch[1]);
+      if (!device) {
+        await route.fulfill({ status: 404, json: { detail: "browser device not found" } });
+        return;
+      }
+      if (device.public_key !== body.public_key) {
+        await route.fulfill({ status: 409, json: { detail: "browser device changed" } });
+        return;
+      }
+      device.approval_requested_at = new Date().toISOString();
+      device.last_seen_at = device.approval_requested_at;
+      await route.fulfill({ status: 200, contentType: "application/json", json: device });
+      return;
+    }
     const browserRevokeMatch = path.match(/^\/api\/browser-devices\/([^/]+)\/revoke$/);
     if (browserRevokeMatch && method === "POST") {
       const body = (await request.postDataJSON()) as { expected_public_key?: string };

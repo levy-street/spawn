@@ -1,7 +1,7 @@
 "use client";
 
 import * as Dialog from "@radix-ui/react-dialog";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Laptop, Smartphone } from "lucide-react";
 import { useEffect, useState } from "react";
 import { consumeApprovalRequest, useApprovalRequest } from "@/components/access/ceremony-store";
@@ -15,6 +15,7 @@ import { type ApproveCeremonyView, useApproveDeviceCeremony } from "@/lib/approv
 import { useAuth } from "@/lib/auth";
 import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
 import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
+import { approvalToastEligible, pickApprovalToastDevice } from "@/lib/session-approval";
 import { computeTrustRoster } from "@/lib/trust-roster";
 
 /**
@@ -32,6 +33,7 @@ import { computeTrustRoster } from "@/lib/trust-roster";
  */
 export function AccessCeremonyHost() {
   const { user } = useAuth();
+  const qc = useQueryClient();
   const settingsTab = useSettingsDialog();
   const registration = useBrowserDeviceRegistration(user?.id);
   const devices = useQuery({
@@ -55,6 +57,16 @@ export function AccessCeremonyHost() {
     refetchInterval: 15_000,
   });
   const trustMap = useDeviceTrustMap(user !== null);
+
+  // The roster fetched before this browser's own registration landed cannot
+  // contain this device, and until it does `canApprove` reads false — the
+  // toast would wait a full poll cycle for no reason. Refetch the moment the
+  // identity is ready (same pattern as the Access panel).
+  useEffect(() => {
+    if (registration.data?.status === "ready") {
+      void qc.invalidateQueries({ queryKey: ["browser-devices"] });
+    }
+  }, [qc, registration.data?.status]);
 
   const currentPublicKey =
     registration.data?.publicKey ?? localIdentity.data?.publicKeyWire ?? null;
@@ -86,7 +98,9 @@ export function AccessCeremonyHost() {
   const roster = computeTrustRoster(devices.data ?? [], edges.data ?? [], trustMap.pinnedDeviceIds);
   const canApprove =
     currentDevice !== null && (roster.get(currentDevice.id)?.chainTrusted ?? false);
-  const [ignoredIds, setIgnoredIds] = useState<Set<string>>(new Set());
+  // Ignore is per sitting AND per ask: a device that actively asks again after
+  // being ignored (it tried to open an agent session) re-raises the toast.
+  const [ignoredAt, setIgnoredAt] = useState<Map<string, number>>(new Map());
   const waiting =
     !canApprove || !trustMap.ready || !edges.data
       ? []
@@ -97,10 +111,14 @@ export function AccessCeremonyHost() {
             d.id !== currentDevice?.id &&
             !(roster.get(d.id)?.chainTrusted ?? false) &&
             trustMap.trustedHostIdsFor(d.id).length === 0 &&
-            !ignoredIds.has(d.id),
+            approvalToastEligible(d, ignoredAt.get(d.id)),
         );
-  // One toast at a time; the settings dialog already shows waiting rows.
-  const toastDevice = settingsTab === null && ceremony.ceremonies.length === 0 ? waiting[0] : null;
+  // One toast at a time (the most urgent ask first); the settings dialog
+  // already shows waiting rows.
+  const toastDevice =
+    settingsTab === null && ceremony.ceremonies.length === 0
+      ? pickApprovalToastDevice(waiting)
+      : null;
 
   return (
     <>
@@ -108,7 +126,7 @@ export function AccessCeremonyHost() {
         <ApproveRequestToast
           device={toastDevice}
           onEnterNumber={() => ceremony.start(toastDevice)}
-          onIgnore={() => setIgnoredIds((prev) => new Set(prev).add(toastDevice.id))}
+          onIgnore={() => setIgnoredAt((prev) => new Map(prev).set(toastDevice.id, Date.now()))}
         />
       )}
       {ceremony.ceremonies.map((view) => (
@@ -249,6 +267,9 @@ function ApproveRequestToast({
 }) {
   const name = device.label ?? "Unnamed device";
   const isPhone = /iphone|ipad|android|pixel|phone|tablet/iu.test(name);
+  // An active ask (it tried to open an agent session) reads differently from a
+  // quiet sign-in: someone is standing at that device waiting on this one.
+  const asking = device.approval_requested_at !== null;
   return (
     <div
       data-testid="approve-toast"
@@ -261,7 +282,9 @@ function ApproveRequestToast({
         <div className="min-w-0 flex-1">
           <p className="text-sm font-medium text-foreground">Approve {name}?</p>
           <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-            It just signed in as you. If that wasn't you, ignore this.
+            {asking
+              ? "It's asking for approval to reach your hosts. If that wasn't you, ignore this."
+              : "It just signed in as you. If that wasn't you, ignore this."}
           </p>
         </div>
       </div>

@@ -149,9 +149,21 @@ terminal state precisely so the residual is a chosen, contained trade.
 - new device: signs in → already listed everywhere → **waiting** ("Approve from a device
   you already use — or sign in here with your passkey") → NumberCheck (show side) →
   approved.
+- **the session gate** *(added 2026-08-21)*: opening an agent session on an unapproved
+  device puts the waiting card OVER the dead terminal (`SessionApprovalGate`) — the
+  daemon was always going to refuse the connection; the card turns that refusal into
+  the flow. Opening it also **asks out loud**: the device's roster row is stamped
+  "asking for approval", which raises the toast on every device that can approve — and
+  re-raises one that was ignored, since a fresh ask outranks an old Ignore. The card
+  yields the screen to the NumberCheck the moment an approver starts, and offers the
+  two escapes that need no other device (the passkey, possessing a host from its
+  terminal). The stamp is advisory in both directions: it grants nothing, and a device
+  that never stamps is still a visible waiting row (R4).
 - existing device: the request arrives as a prompt (`ApproveRequest`) or, on desktop, a
   corner toast — *Enter its number* / *Ignore* → NumberCheck (enter side). The roster's
-  waiting row is the pull path to the same place.
+  waiting row is the pull path to the same place. An actively-asking device's toast
+  says so ("It's asking for approval to reach your hosts") and outranks quiet
+  sign-ins.
 - With a passkey there is **no flow at all**: signing in with it is the approval.
   Recovery-after-total-loss is deliberately the *same non-flow*.
 
@@ -207,7 +219,9 @@ the next passkey sign-in. No dialogs in the trust UX.
   and its remover in History), and approval — the only gate that matters — still takes the
   ceremony. The disaster flow is the ordinary flow.
 - **not approved yet** — "One step left — approve from a device you already use, or sign
-  in with your passkey." → *Use passkey*.
+  in with your passkey." → *Use passkey*. As built, this state materializes where the
+  refusal actually bites: the `SessionApprovalGate` card over an agent session (§3),
+  which carries the same sentence and both escapes.
 
 ### 8. History — `TrustHistory`
 - Plain sentences, newest first: "MacBook Pro approved iPhone", "Pixel 9 signed in with
@@ -317,6 +331,7 @@ What a naive design would show, what we show instead, and why the protocol survi
 | Access roster (default / waiting / nudge / wide / row menu) | `AccessScreen` |
 | Number check (show / enter / fingerprint / waiting / done / stopped) | `NumberCheck` |
 | New device waiting | `WaitingForApproval` |
+| Blocked agent session on an unapproved device | `SessionApprovalGate` |
 | Approval request (prompt / desktop toast) | `ApproveRequest`, `ApproveRequestToast` |
 | Possess instruction | `PossessHost` |
 | Remove confirm (standard / orphan on-off-line / this device) | `RemoveDeviceDialog` |

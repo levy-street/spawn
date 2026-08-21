@@ -574,3 +574,73 @@ async def test_live_root_uniqueness_is_a_database_invariant(client):
         ("R" * 43, False),
         ("T" * 43, True),
     }
+
+
+async def test_request_approval_stamps_own_live_row_only(client):
+    user_id, token = await _signup(client, "browser-ask@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    key = Ed25519PrivateKey.generate()
+    registered = await client.post(
+        "/api/browser-devices/register", json=_proof(user_id, key), headers=headers
+    )
+    assert registered.status_code == 200, registered.text
+    device = registered.json()
+    assert device["approval_requested_at"] is None
+
+    asked = await client.post(
+        f"/api/browser-devices/{device['id']}/request-approval",
+        json={"public_key": device["public_key"]},
+        headers=headers,
+    )
+    assert asked.status_code == 200, asked.text
+    stamped = asked.json()
+    assert stamped["approval_requested_at"] is not None
+    # Asking is also presence.
+    assert stamped["last_seen_at"] is not None
+
+    listed = await client.get("/api/browser-devices", headers=headers)
+    assert listed.status_code == 200
+    row = next(item for item in listed.json() if item["id"] == device["id"])
+
+    # SQLite round-trips naive UTC while the fresh response is tz-aware; the
+    # instant is what must match.
+    def _instant(value: str):
+        from datetime import UTC as _utc
+        from datetime import datetime as _datetime
+
+        parsed = _datetime.fromisoformat(value)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=_utc)
+
+    assert _instant(row["approval_requested_at"]) == _instant(stamped["approval_requested_at"])
+
+    # A key mismatch is a stale view of the roster, never a stamp.
+    other_key = _proof(user_id, Ed25519PrivateKey.generate())["public_key"]
+    mismatch = await client.post(
+        f"/api/browser-devices/{device['id']}/request-approval",
+        json={"public_key": other_key},
+        headers=headers,
+    )
+    assert mismatch.status_code == 409
+
+    # Another account can neither stamp nor observe this row.
+    _, foreign_token = await _signup(client, "browser-ask-foreign@example.com")
+    foreign = await client.post(
+        f"/api/browser-devices/{device['id']}/request-approval",
+        json={"public_key": device["public_key"]},
+        headers={"Authorization": f"Bearer {foreign_token}"},
+    )
+    assert foreign.status_code == 404
+
+    # A tombstone never asks for approval (R10: re-admission is a fresh key).
+    revoked = await client.post(
+        f"/api/browser-devices/{device['id']}/revoke",
+        json={"expected_public_key": device["public_key"]},
+        headers=headers,
+    )
+    assert revoked.status_code == 200, revoked.text
+    after = await client.post(
+        f"/api/browser-devices/{device['id']}/request-approval",
+        json={"public_key": device["public_key"]},
+        headers=headers,
+    )
+    assert after.status_code == 409
