@@ -148,6 +148,9 @@ export async function mockAuthenticatedApi(
     hostPins?: Record<string, string[]>;
     /** endorsed device id → endorsement records served to that device. */
     endorsementsFor?: Record<string, Array<Record<string, unknown>>>;
+    /** Seeded add-device pairing relay rows (served by GET, mutated by the
+     * introductions endpoint). Shape: DevicePairingState JSON. */
+    pairings?: Array<Record<string, unknown>>;
     /** Override the signed-in account (e.g. to grant is_admin). */
     me?: Record<string, unknown>;
   } = {},
@@ -160,6 +163,7 @@ export async function mockAuthenticatedApi(
     ...(options.extraBrowserDevices ?? []),
   ];
   const hostPinMap: Record<string, string[]> = { ...(options.hostPins ?? {}) };
+  const pairingRows: Array<Record<string, unknown>> = [...(options.pairings ?? [])];
 
   const invokeFileHandler = async (
     handler: ((hostId: string, body: unknown, route: Route) => Promise<void> | void) | undefined,
@@ -648,7 +652,34 @@ export async function mockAuthenticatedApi(
       return;
     }
     if (path === "/api/trust/pairing" && method === "GET") {
-      await route.fulfill({ status: 200, contentType: "application/json", json: [] });
+      const forDevice = url.searchParams.get("device_id");
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        json: pairingRows.filter(
+          (row) => row.initiator_device_id === forDevice || row.joiner_device_id === forDevice,
+        ),
+      });
+      return;
+    }
+    const pairingIntroductionsMatch = path.match(/^\/api\/trust\/pairing\/([^/]+)\/introductions$/);
+    if (pairingIntroductionsMatch && method === "POST") {
+      const row = pairingRows.find((item) => item.id === pairingIntroductionsMatch[1]);
+      if (!row) {
+        await route.fulfill({ status: 404, json: { detail: "pairing not found" } });
+        return;
+      }
+      if (row.introductions != null) {
+        await route.fulfill({ status: 409, json: { detail: "introductions already recorded" } });
+        return;
+      }
+      const body = (await request.postDataJSON()) as { introductions?: unknown[] };
+      if (!Array.isArray(body.introductions) || body.introductions.length === 0) {
+        await route.fulfill({ status: 422, json: { detail: "invalid introductions" } });
+        return;
+      }
+      row.introductions = body.introductions;
+      await route.fulfill({ status: 200, contentType: "application/json", json: row });
       return;
     }
     if (path === "/api/trust/endorsements" && method === "GET") {

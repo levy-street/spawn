@@ -548,6 +548,33 @@ class DevicePairingOut(BaseModel):
     expires_at: datetime
 
 
+class DevicePairingIntroductionItem(BaseModel):
+    """One host-key introduction (mesh R7), relayed verbatim. The signature is
+    over the SPAWN-HOST-INTRO-V1 transcript and only the joiner can judge it —
+    against the initiator key its ceremony pinned. Shape checks only here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    host_id: str = Field(min_length=1, max_length=36)
+    host_name: str = Field(min_length=1, max_length=128)
+    host_public_key: str = Field(min_length=43, max_length=43)
+    signature: str = Field(min_length=86, max_length=86)
+
+    @field_validator("host_public_key")
+    @classmethod
+    def _validate_host_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class DevicePairingIntroductions(BaseModel):
+    """Initiator's move, after the reveal: the hosts it vouches to the joiner."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    introductions: list[DevicePairingIntroductionItem] = Field(min_length=1, max_length=64)
+
+
 class DevicePairingState(BaseModel):
     """The relayed ceremony state, polled by both devices. Every value is
     server-relayed and untrusted on its own — the SAS number each side derives
@@ -561,6 +588,7 @@ class DevicePairingState(BaseModel):
     joiner_public_key: str | None = None
     joiner_nonce: str | None = None
     initiator_nonce: str | None = None
+    introductions: list[DevicePairingIntroductionItem] | None = None
     created_at: datetime
     expires_at: datetime
 

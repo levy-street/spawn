@@ -1,6 +1,7 @@
 import { encodeAcctEndorsementTranscript } from "./acct-endorsement-transcript";
 import { encodeBrowserDeviceRegistrationTranscript } from "./browser-device-registration-transcript";
 import { encodeBrowserEndorsementTranscript } from "./browser-endorsement-transcript";
+import { encodeHostIntroductionTranscript } from "./host-introduction";
 import { encodeHostPairApprovalTranscript } from "./host-pair-approval-transcript";
 import {
   ED25519_PUBLIC_KEY_WIRE_CHARS,
@@ -541,6 +542,48 @@ export async function createAccountEndorsementProof(
     throw new BrowserDeviceIdentityError(
       "corrupt_record",
       "account endorsement signer returned an invalid signature length",
+    );
+  }
+  return encodeBase64Url(signature);
+}
+
+/**
+ * Sign a host-key introduction toward one specific joiner (device mesh R7).
+ *
+ * The statement is scoped: THIS device (which verified `hostPublicKey` out of
+ * band, or it must not sign) vouches that key to exactly `joinerPublicKey` —
+ * the key the SAS ceremony authenticated. Domain-separated from every
+ * endorsement transcript; the daemon never sees or accepts it.
+ */
+export async function createHostIntroductionProof(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+  hostPublicKey: string,
+  joinerPublicKey: string,
+): Promise<string> {
+  assertAccountId(accountId);
+  const record = privateIdentityRecords.get(identity);
+  if (record === undefined || record.accountId !== accountId) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not belong to the authenticated account",
+    );
+  }
+  const transcript = encodeHostIntroductionTranscript(
+    accountId,
+    record.publicKeyWire,
+    hostPublicKey,
+    joinerPublicKey,
+  );
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new BrowserDeviceIdentityError(
+      "corrupt_record",
+      "host introduction signer returned an invalid signature length",
     );
   }
   return encodeBase64Url(signature);

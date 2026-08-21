@@ -559,6 +559,16 @@ export const account = {
     api<void>("/api/account/delete", { method: "POST", body: JSON.stringify(body) }),
 };
 
+/** One relayed host-key introduction (mesh R7); untrusted until the joiner
+ * verifies its signature against the ceremony-pinned initiator key. */
+export const PairingIntroductionSchema = z.object({
+  host_id: z.string(),
+  host_name: z.string(),
+  host_public_key: z.string().length(43),
+  signature: z.string().length(86),
+});
+export type PairingIntroduction = z.infer<typeof PairingIntroductionSchema>;
+
 const PairingStateSchema = z.object({
   id: z.string(),
   initiator_device_id: z.string(),
@@ -568,6 +578,7 @@ const PairingStateSchema = z.object({
   joiner_public_key: z.string().nullable().optional(),
   joiner_nonce: z.string().nullable().optional(),
   initiator_nonce: z.string().nullable().optional(),
+  introductions: z.array(PairingIntroductionSchema).nullable().optional(),
   created_at: z.string(),
   expires_at: z.string(),
 });
@@ -731,6 +742,14 @@ export const trust = {
     }),
   cancelPairing: (id: string) =>
     api(`/api/trust/pairing/${id}`, { method: "DELETE", schema: z.unknown() }),
+  /** Initiator only in practice: the signatures bind ITS key; a joiner-posted
+   * list would verify for no one. Set-once on the relay. */
+  postPairingIntroductions: (id: string, introductions: PairingIntroduction[]) =>
+    api(`/api/trust/pairing/${id}/introductions`, {
+      method: "POST",
+      body: JSON.stringify({ introductions }),
+      schema: PairingStateSchema,
+    }),
 };
 
 export const agents = {
