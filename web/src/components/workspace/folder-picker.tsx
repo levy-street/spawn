@@ -467,7 +467,14 @@ export function FolderPicker({
               steps back to that, not up the folder trail, which is what the
               crumbs and the leftmost column are already for. */}
           {onBack && (
-            <div className="flex h-9 shrink-0 items-center rounded-md border border-border bg-card/35 px-1">
+            <div
+              aria-hidden={searchOpen}
+              className={cn(
+                "flex h-9 shrink-0 items-center rounded-md border border-border bg-card/35 px-1",
+                "transition-opacity duration-150 ease-swift",
+                searchOpen && "opacity-0",
+              )}
+            >
               <Button
                 type="button"
                 variant="ghost"
