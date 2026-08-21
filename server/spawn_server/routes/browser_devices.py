@@ -29,6 +29,7 @@ def _to_out(device: BrowserDevice) -> schemas.BrowserDeviceOut:
         label=device.label,
         created_at=device.created_at,
         last_seen_at=device.last_seen_at,
+        approval_requested_at=device.approval_requested_at,
         revoked_at=device.revoked_at,
         revoked_by_device_id=device.revoked_by_device_id,
         is_root=device.is_root,
@@ -227,6 +228,38 @@ async def prune_revoked_browser_devices(
     return schemas.BrowserDevicePruneResponse(pruned=pruned)
 
 
+@router.post("/{device_id}/request-approval", response_model=schemas.BrowserDeviceOut)
+async def request_browser_device_approval(
+    device_id: str,
+    body: schemas.BrowserDeviceApprovalRequest,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.BrowserDeviceOut:
+    """An unapproved device asks, out loud, to be approved.
+
+    Stamped when the device tries to open an agent session: the other devices'
+    roster poll picks it up and surfaces (or re-surfaces) the approval toast.
+    Advisory display data in both directions — stamping it grants nothing, and
+    a device that never stamps it is still visible as a waiting row (R4).
+    """
+
+    device = await session.get(BrowserDevice, device_id)
+    if device is None or device.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="browser device not found")
+    if device.public_key != body.public_key:
+        raise HTTPException(
+            status_code=409, detail="browser device changed; refresh before asking again"
+        )
+    if device.revoked_at is not None:
+        raise HTTPException(status_code=409, detail="revoked devices cannot ask for approval")
+    now = datetime.now(UTC)
+    device.approval_requested_at = now
+    # Asking is also presence: the device is right here, waiting on a human.
+    device.last_seen_at = now
+    await session.commit()
+    return _to_out(device)
+
+
 @router.post("/{device_id}/revoke", response_model=schemas.BrowserDeviceOut)
 async def revoke_browser_device(
     device_id: str,
@@ -360,6 +393,7 @@ async def rename_browser_device(
     public_key = device.public_key
     created_at = device.created_at
     last_seen_at = device.last_seen_at
+    approval_requested_at = device.approval_requested_at
     revoked_at = device.revoked_at
     revoked_by_device_id = device.revoked_by_device_id
     is_root = device.is_root
@@ -372,6 +406,7 @@ async def rename_browser_device(
         label=label,
         created_at=created_at,
         last_seen_at=last_seen_at,
+        approval_requested_at=approval_requested_at,
         revoked_at=revoked_at,
         revoked_by_device_id=revoked_by_device_id,
         is_root=is_root,

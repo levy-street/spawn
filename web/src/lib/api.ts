@@ -300,6 +300,9 @@ export const BrowserDeviceSchema = z.object({
   created_at: z.string(),
   /** Stamped each time this device's registration reconciles (every app load). */
   last_seen_at: z.string().nullable().default(null),
+  /** When this device last actively asked to be approved (it tried to open an
+   * agent session). Surfaces — and re-surfaces — the approval toast elsewhere. */
+  approval_requested_at: z.string().nullable().default(null),
   revoked_at: z.string().nullable(),
   /** Which of the account's devices asked for the removal (attribution, R4). */
   revoked_by_device_id: z.string().nullable().default(null),
@@ -471,6 +474,14 @@ export const browserDevices = {
     api("/api/browser-devices/prune", {
       method: "POST",
       schema: z.object({ pruned: z.number().int() }),
+    }),
+  /** This (unapproved) device asks out loud to be approved — other devices'
+   * roster poll surfaces, or re-surfaces, the approval toast. Advisory only. */
+  requestApproval: (deviceId: string, publicKey: string) =>
+    api(`/api/browser-devices/${deviceId}/request-approval`, {
+      method: "POST",
+      body: JSON.stringify({ public_key: publicKey }),
+      schema: BrowserDeviceSchema,
     }),
 };
 

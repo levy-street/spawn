@@ -11,6 +11,7 @@ import {
   useState,
 } from "react";
 import { AccessCeremonyHost } from "@/components/access/ceremony-host";
+import { SessionApprovalGate } from "@/components/access/session-approval-gate";
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
 import { BottomTabs } from "@/components/nav/BottomTabs";
 import { SIDEBAR_RAIL_WIDTH, Sidebar } from "@/components/nav/Sidebar";
@@ -174,6 +175,7 @@ export function AppShell({
       {!hideMobileNav && <BottomTabs />}
       <SettingsDialog />
       <AccessCeremonyHost />
+      <SessionApprovalGate />
     </div>
   );
 }

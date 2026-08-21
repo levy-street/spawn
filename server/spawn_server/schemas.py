@@ -102,6 +102,9 @@ class BrowserDeviceOut(BaseModel):
     label: str | None = None
     created_at: datetime
     last_seen_at: datetime | None = None
+    # When this device last actively asked to be approved (it tried to open an
+    # agent session). Surfaces — and re-surfaces — the approval toast elsewhere.
+    approval_requested_at: datetime | None = None
     revoked_at: datetime | None = None
     revoked_by_device_id: str | None = None
     # True for the account root (pk_R): clients filter it out of connect/ceremony
@@ -113,6 +116,21 @@ class BrowserDeviceRenameRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     label: str | None = Field(default=None, max_length=64)
+
+
+class BrowserDeviceApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # The caller proves it is talking about the key it actually holds, exactly
+    # like revoke's expected_public_key: a consistency check, not authorization
+    # (the stamp is advisory display data either way).
+    public_key: str = Field(min_length=43, max_length=43)
+
+    @field_validator("public_key")
+    @classmethod
+    def validate_public_key(cls, value: str) -> str:
+        decode_ed25519_public_key(value)
+        return value
 
 
 class BrowserDevicePruneResponse(BaseModel):
