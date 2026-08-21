@@ -6,6 +6,11 @@ the reference implementation of every screen and state lives at `web/src/trust-u
 (props-driven components + `/trust-ux-demo`), and the visual presentation is the
 "Clean-Room Trust UX" artifact.
 
+> **Note:** the `web/src/trust-ux/` prototype and its presentation are a 2026-08-20
+> snapshot and predate the 2026-08-21 revisions (host possession's link-carried key check,
+> §4; the four-digit device↔device number, §2); this document is authoritative where they
+> differ.
+
 The protocol ([TRUST_DEVICE_MESH.md](../../../docs/TRUST_DEVICE_MESH.md), governed by
 [TRUST.md](../../../docs/TRUST.md)) is an endorsement mesh: device keys, host anchors,
 account-scoped signed chains, a passkey-sealed root, committed-SAS ceremonies, an add-only
