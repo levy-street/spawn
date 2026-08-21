@@ -95,23 +95,6 @@ function PasskeysSection() {
           </p>
         )}
       </div>
-      {passkey.hasBundle && (
-        <div className="flex items-center gap-2">
-          <Button
-            type="button"
-            size="sm"
-            variant="secondary"
-            disabled={!passkey.supported || passkey.busy}
-            data-testid="use-passkey"
-            onClick={() => passkey.unlock.mutate()}
-          >
-            {passkey.unlock.isPending ? "Checking…" : "Use passkey"}
-          </Button>
-          <p className="text-xs text-muted-foreground">
-            Approves this device and makes every host reachable from it.
-          </p>
-        </div>
-      )}
       {passkey.status !== null && (
         <p className="text-sm font-medium" role="status" data-testid="trust-status">
           {passkey.status}
