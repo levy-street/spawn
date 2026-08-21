@@ -9,9 +9,12 @@ import { useAuth } from "@/lib/auth";
  * redirect to /login. While loading, render a tiny placeholder so we don't
  * flash the page contents to anonymous users.
  *
- * The current path (with its query) is carried as `?next=` so login can return
- * here afterwards — critical for `/device?ref=…`, whose approval handle would
- * otherwise be lost when a not-yet-signed-in browser is bounced to login.
+ * The current path (with its query AND fragment) is carried as `?next=` so
+ * login can return here afterwards — critical for `/device?ref=…#k=…`: the
+ * approval handle and the host-key fragment (the possession ceremony's
+ * out-of-band identity check) would otherwise be lost when a not-yet-signed-in
+ * browser is bounced to login, silently downgrading the ceremony to the
+ * fingerprint fallback.
  */
 export function AuthGate({ children }: { children: ReactNode }) {
   const { user, loading } = useAuth();
@@ -19,7 +22,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!loading && !user) {
-      const here = window.location.pathname + window.location.search;
+      const here = window.location.pathname + window.location.search + window.location.hash;
       const next = here && here !== "/" ? `?next=${encodeURIComponent(here)}` : "";
       router.replace(`/login${next}`);
     }

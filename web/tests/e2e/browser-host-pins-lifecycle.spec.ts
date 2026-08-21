@@ -127,8 +127,10 @@ async function corruptExistingPin(page: Page): Promise<void> {
 }
 
 async function approveExactHost(page: Page): Promise<void> {
-  await page.goto("/device?code=QZ4K-7HMT");
-  await page.getByRole("button", { name: /^(?:They match|Retry)$/u }).click();
+  // The primary lane: the daemon's link carries the host key as a `#k=`
+  // fragment; the page verifies it invisibly and offers a single Approve.
+  await page.goto(`/device?code=QZ4K-7HMT#k=${HOST_PUBLIC_KEY}`);
+  await page.getByRole("button", { name: /^(?:Approve deletion-host|Retry)$/u }).click();
   await expect(page.getByTestId("ceremony-done")).toContainText("is possessed");
 }
 
@@ -405,9 +407,9 @@ test("server delete failure retains tombstone across disappearance, reload, retr
   expect(state.deleteCalls).toBe(2);
   expect(await readHostPins(page)).toMatchObject([{ state: "revoked" }]);
 
-  await page.goto("/device?code=QZ4K-7HMT");
+  await page.goto(`/device?code=QZ4K-7HMT#k=${HOST_PUBLIC_KEY}`);
   await expect(page.getByTestId("local-pin-state")).toContainText("previously removed this host");
-  await page.getByRole("button", { name: "They match" }).click();
+  await page.getByRole("button", { name: "Approve deletion-host" }).click();
   await expect(page.getByTestId("ceremony-done")).toContainText("is possessed");
   expect(await readHostPins(page)).toMatchObject([
     { hostIds: [HOST_ID], hostPublicKey: HOST_PUBLIC_KEY, state: "active" },

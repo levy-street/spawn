@@ -699,10 +699,16 @@ async def device_sas(
     session: AsyncSession = Depends(get_session),
     _user: User = Depends(auth.current_user),
 ) -> schemas.DeviceSasResponse:
-    """Browser's committed-ephemeral SAS contribution: its nonce Nb and key B.
-    The server only stores/forwards them (it is a dumb relay); the daemon reads
-    them on its next poll and reveals its own Nd. Set-once, and only while the
-    ceremony is still pending with a daemon commitment present."""
+    """LEGACY (pre-fragment daemons only). Browser's committed-ephemeral SAS
+    contribution: its nonce Nb and key B. The server only stores/forwards them
+    (it is a dumb relay); the daemon reads them on its next poll and reveals its
+    own Nd. Set-once, and only while the ceremony is still pending with a daemon
+    commitment present.
+
+    Since 2026-08-21 possession verifies the host key via the out-of-band URL
+    fragment instead (docs/TRUST_DEVICE_MESH.md Appendix A note): new daemons
+    send no sas_commit and new web builds never call this. It remains so that
+    an old daemon paired against an old cached web build keeps working."""
 
     dc = await _pending_device_code(
         session, user_code=body.user_code, approval_ref=body.approval_ref
