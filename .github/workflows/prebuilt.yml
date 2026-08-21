@@ -173,6 +173,11 @@ jobs:
   # and the installer pins the same hashes — so the bytes CI built, prod serves.
   publish:
     needs: [macos, linux-x86_64, linux-aarch64]
+    # The rolling release is the PROD install channel (deploy-prod.sh and the
+    # installer both pull it), so only master may move it. A workflow_dispatch
+    # on any other ref still builds and uploads run artifacts — the way to get
+    # branch binaries for a dev host — but must never touch prebuilt-latest.
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
