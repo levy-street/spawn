@@ -458,11 +458,15 @@ peer (which blocks cross-session/cross-host splicing), not on a nonce `h` picks.
 | 4 | Fail-closed `Rev`: `revoked_browser_keys` delivered to every account host on connect and on change; deny-list growth triggers live-session teardown (R1) | live: revoked device denied new connects; open terminal dropped mid-session |
 | 5 | Root lifecycle of §4.1: mint at passkey creation, sealed-in-bundle (survives passkey enroll/revoke resealing), full heal on unlock, retrofit for pre-root bundles, rotation after root revocation, anchor ratchet | live recovery drill: all devices revoked → passkey unlock on a fresh device → `chained=true` to the host |
 | 6 | R4 roster (per-device provenance, audit log, R5 revoke warnings) + R9 retirement (daemon advertises `supports_account_chains` at register; server **ratchets** the flag and refuses per-host device endorsement toward such hosts — the root anchor upgrade is the one surviving per-host statement) | live: mixed fleet — new daemon refused legacy path with ceremony pointer, old daemons unaffected; roster verified on-screen |
+| R7 | Host-key gossip over the add-device exchange: the approver signs `SPAWN-HOST-INTRO-V1` (`account ‖ approver_pk ‖ host_pk ‖ joiner_pk`) per host it holds an ACTIVE local pin for, posts the set on the pairing relay (set-once, post-reveal, before its endorsement edge so the joiner's completion cue implies the list is present); the joiner verifies each against the **ceremony-pinned** approver key + its own key and approves the host key locally like a hand-run possession. Web-only; the daemon never sees the statement (deliberately not `SPAWN-BROWSER-ENDORSE-V1` — no cross-protocol signature reuse) | unit (tamper: swapped host key / signer / joiner / account); live: two-context SAS, joiner's first terminal connect reads fully verified |
 
 Not yet done: merge to master + prod rollout; folding possess-time anchor-on-`R`
 (§4 possess) into the possess flow — as built, a new host gains `R` at the next
 heal moment rather than at possess itself (sound, one heal later than the doc's
-ideal); R7's no-passkey host discovery (below).
+ideal). R7 residuals: devices approved before the gossip leg shipped hold no
+introduced pins retroactively, and a host possessed AFTER a device joined
+reaches that device as first-contact until the next passkey heal — the sealed
+bundle remains the catch-up channel for both.
 
 ---
 
@@ -520,8 +524,13 @@ into A5's "ephemeral from both endpoints."
 **R7 — Acceptance ≠ discovery.** P1 proves a host *accepts* a device; it does not
 give the device the host's *key* to dial in. That rides on the passkey-sealed
 bundle, so **no-passkey devices have no specified way to learn new hosts**.
-**Resolution:** in pure device-chain mode, host keys must gossip the same way
-client keys do — carried in the mutual add-device exchange. Specify this (open Q).
+**Resolution (built):** in pure device-chain mode, host keys gossip the same way
+client keys do — carried in the mutual add-device exchange. The approver signs a
+domain-separated `SPAWN-HOST-INTRO-V1` statement per host it has itself verified
+(its active local pins), scoped to the exact joiner key the SAS authenticated;
+the relay carries it set-once; the joiner verifies against the ceremony-pinned
+approver key and pins locally. See §8 (R7 row) for the shipped shape and its
+residuals (no retroactive delivery; hosts possessed later ride the next heal).
 
 **R8 — No-root, single-device loss = total lockout.** With no root and one
 device, losing it strands every host (re-possess all). **Resolution:** strongly
@@ -576,9 +585,11 @@ what ships.
 - ~~Re-anchoring triggers~~ → every passkey moment (mint and each unlock);
   no periodic timer.
 
-**Still open:** R7 — no-passkey devices have no specified way to learn *new*
-hosts' keys (host-key gossip in the add-device exchange is designed but
-unbuilt); possess-time anchor-on-`R` (§8); merge + prod rollout.
+- ~~R7 host discovery~~ → host-key gossip carried in the add-device exchange
+  (`SPAWN-HOST-INTRO-V1`, §8 R7 row); the bundle remains the catch-up channel
+  for hosts possessed after a device joined.
+
+**Still open:** possess-time anchor-on-`R` (§8); merge + prod rollout.
 
 ---
 

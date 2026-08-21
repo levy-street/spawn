@@ -38,7 +38,7 @@ const TRUST_VIEW: Record<
     tint: "text-amber-500",
     label: "first contact",
     detail:
-      "Signed, but this browser has not verified this host before — the host key came from the server on first contact. Approve the host or unlock your saved trust for full verification.",
+      "Signed, but this device is meeting this host for the first time — it took the server's word for the host's identity. Signing in with your passkey verifies it fully; approving this device again from one that already reaches the host also hands it over.",
   },
   raw: {
     icon: ShieldOff,

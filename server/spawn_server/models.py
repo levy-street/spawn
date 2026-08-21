@@ -497,6 +497,11 @@ class DevicePairing(Base):
     # Move 3 (initiator opens): its nonce N_I, accepted only after the joiner
     # contributed and only if it opens the commitment.
     initiator_nonce: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    # R7 host-key gossip: the initiator's signed host introductions (JSON list),
+    # posted after the reveal and relayed verbatim. Opaque to the server — the
+    # joiner verifies each signature against the ceremony-pinned initiator key,
+    # so a substituted or forged entry verifies for no one. Set-once.
+    introductions: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

@@ -16,6 +16,7 @@ On a match both devices sign a MUTUAL account endorsement via
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -38,6 +39,20 @@ def _aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
+def _introductions(pairing: DevicePairing) -> list[schemas.DevicePairingIntroductionItem] | None:
+    if pairing.introductions is None:
+        return None
+    try:
+        return [
+            schemas.DevicePairingIntroductionItem.model_validate(item)
+            for item in json.loads(pairing.introductions)
+        ]
+    except Exception:
+        # A row this endpoint validated on write cannot normally fail to parse;
+        # if it somehow does, relay nothing rather than half a list.
+        return None
+
+
 def _state(pairing: DevicePairing) -> schemas.DevicePairingState:
     return schemas.DevicePairingState(
         id=pairing.id,
@@ -48,6 +63,7 @@ def _state(pairing: DevicePairing) -> schemas.DevicePairingState:
         joiner_public_key=pairing.joiner_public_key,
         joiner_nonce=pairing.joiner_nonce,
         initiator_nonce=pairing.initiator_nonce,
+        introductions=_introductions(pairing),
         created_at=pairing.created_at,
         expires_at=pairing.expires_at,
     )
@@ -215,6 +231,46 @@ async def reveal(
         raise HTTPException(status_code=409, detail="initiator nonce already revealed")
     await session.commit()
     return _state(await _live_pairing(session, pairing_id, user.id))
+
+
+@router.post("/{pairing_id}/introductions", response_model=schemas.DevicePairingState)
+async def post_introductions(
+    pairing_id: str,
+    body: schemas.DevicePairingIntroductions,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.DevicePairingState:
+    """Initiator's host-key introductions (mesh R7), relayed to the joiner.
+
+    Accepted only after the reveal — introductions ride a ceremony that has
+    fully exchanged — and set-once, so a relay cannot swap the list after the
+    joiner read it. The server checks shape only: each signature binds the
+    account, the initiator key, the host key, and the JOINER key, and the joiner
+    verifies it against the initiator key its own ceremony pinned — a forged or
+    substituted entry verifies for no one, and a joiner-posted list fails that
+    same check (only the initiator's key signs).
+    """
+
+    pairing = await _live_pairing(session, pairing_id, user.id)
+    if pairing.initiator_nonce is None:
+        raise HTTPException(status_code=409, detail="ceremony has not completed its reveal")
+    if pairing.introductions is not None:
+        raise HTTPException(status_code=409, detail="introductions already recorded")
+    payload = json.dumps([item.model_dump() for item in body.introductions])
+    result = await session.execute(
+        update(DevicePairing)
+        .where(DevicePairing.id == pairing.id, DevicePairing.introductions.is_(None))
+        .values(introductions=payload)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        raise HTTPException(status_code=409, detail="introductions already recorded")
+    await session.commit()
+    pairing = await _live_pairing(session, pairing_id, user.id)
+    # The raw UPDATE bypassed the identity map; re-read so the response carries
+    # what the row now holds.
+    await session.refresh(pairing)
+    return _state(pairing)
 
 
 @router.delete("/{pairing_id}")

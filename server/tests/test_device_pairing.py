@@ -259,3 +259,103 @@ async def test_pairing_list_is_account_scoped(client):
     # Another account querying the same device id sees nothing.
     scoped = await client.get(PAIRING, params={"device_id": joiner_id}, headers=other_auth)
     assert scoped.json() == []
+
+
+async def _ceremony_to_reveal(client, auth, initiator_id, joiner_id, initiator_key, joiner_key):
+    k_i = initiator_key.public_key().public_bytes_raw()
+    k_j = joiner_key.public_key().public_bytes_raw()
+    n_i, n_j = os.urandom(32), os.urandom(32)
+    started = await client.post(
+        PAIRING,
+        json={
+            "initiator_device_id": initiator_id,
+            "joiner_device_id": joiner_id,
+            "initiator_public_key": _b64u(k_i),
+            "initiator_commit": _b64u(_commit(k_i, n_i)),
+        },
+        headers=auth,
+    )
+    assert started.status_code == 200, started.text
+    pairing_id = started.json()["id"]
+    contributed = await client.post(
+        f"{PAIRING}/{pairing_id}/contribute",
+        json={"joiner_public_key": _b64u(k_j), "joiner_nonce": _b64u(n_j)},
+        headers=auth,
+    )
+    assert contributed.status_code == 200, contributed.text
+    return pairing_id, n_i
+
+
+def _intro_item(host_key: Ed25519PrivateKey | None = None) -> dict[str, str]:
+    key = host_key or Ed25519PrivateKey.generate()
+    return {
+        "host_id": "0b6e6c64-0000-4000-8000-00000000000a",
+        "host_name": "dream",
+        "host_public_key": _wire(key),
+        # Opaque to the relay; only the joiner can judge it (86-char b64url).
+        "signature": _b64u(os.urandom(64)),
+    }
+
+
+async def test_introductions_ride_the_relay_post_reveal_set_once_and_shape_checked(client):
+    user_id, auth = await _signup(client, "pair-intro@example.com")
+    initiator_id, initiator_key = await _add_device(user_id)
+    joiner_id, joiner_key = await _add_device(user_id)
+    pairing_id, n_i = await _ceremony_to_reveal(
+        client, auth, initiator_id, joiner_id, initiator_key, joiner_key
+    )
+
+    # Before the reveal the ceremony has not fully exchanged: refused.
+    early = await client.post(
+        f"{PAIRING}/{pairing_id}/introductions",
+        json={"introductions": [_intro_item()]},
+        headers=auth,
+    )
+    assert early.status_code == 409
+
+    revealed = await client.post(
+        f"{PAIRING}/{pairing_id}/reveal", json={"initiator_nonce": _b64u(n_i)}, headers=auth
+    )
+    assert revealed.status_code == 200, revealed.text
+
+    # Shape guards: empty, over-cap, malformed key, malformed signature.
+    for bad in (
+        {"introductions": []},
+        {"introductions": [_intro_item() for _ in range(65)]},
+        {"introductions": [{**_intro_item(), "host_public_key": "!" * 43}]},
+        {"introductions": [{**_intro_item(), "signature": "short"}]},
+    ):
+        refused = await client.post(f"{PAIRING}/{pairing_id}/introductions", json=bad, headers=auth)
+        assert refused.status_code == 422, refused.text
+
+    item = _intro_item()
+    posted = await client.post(
+        f"{PAIRING}/{pairing_id}/introductions",
+        json={"introductions": [item]},
+        headers=auth,
+    )
+    assert posted.status_code == 200, posted.text
+    assert posted.json()["introductions"] == [item]
+
+    # Set-once: a relay must not be able to swap the list after the joiner read it.
+    again = await client.post(
+        f"{PAIRING}/{pairing_id}/introductions",
+        json={"introductions": [_intro_item()]},
+        headers=auth,
+    )
+    assert again.status_code == 409
+
+    # The joiner's poll carries them verbatim.
+    joiner_view = (await client.get(PAIRING, params={"device_id": joiner_id}, headers=auth)).json()[
+        0
+    ]
+    assert joiner_view["introductions"] == [item]
+
+    # Another account cannot touch the pairing at all.
+    _, foreign_auth = await _signup(client, "pair-intro-foreign@example.com")
+    foreign = await client.post(
+        f"{PAIRING}/{pairing_id}/introductions",
+        json={"introductions": [_intro_item()]},
+        headers=foreign_auth,
+    )
+    assert foreign.status_code == 404

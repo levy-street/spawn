@@ -148,7 +148,9 @@ terminal state precisely so the residual is a chosen, contained trade.
 ### 3. Approve a device — `WaitingForApproval` (the new device) / `ApproveRequest` + `ApproveRequestToast` (an existing one)
 - new device: signs in → already listed everywhere → **waiting** ("Approve from a device
   you already use — or sign in here with your passkey") → NumberCheck (show side) →
-  approved.
+  approved. Approval also hands the new device every host the approving device
+  has itself verified *(2026-08-21)* — nothing extra on screen; the new device's
+  first connection simply starts out fully verified instead of first-contact.
 - **the session gate** *(added 2026-08-21)*: opening an agent session on an unapproved
   device puts the waiting card OVER the dead terminal (`SessionApprovalGate`) — the
   daemon was always going to refuse the connection; the card turns that refusal into

@@ -26,12 +26,26 @@ import {
   freshSasNonce,
   verifyCommitWire,
 } from "@/lib/add-device-ceremony";
-import { type BrowserDevice, type PairingState, trust } from "@/lib/api";
+import {
+  type BrowserDevice,
+  hosts as hostsApi,
+  type PairingIntroduction,
+  type PairingState,
+  trust,
+} from "@/lib/api";
 import {
   type BrowserDeviceIdentity,
   createAccountEndorsementProof,
+  createHostIntroductionProof,
   loadBrowserDeviceIdentity,
 } from "@/lib/browser-device-identity";
+import {
+  approveBrowserHostPin,
+  browserHostPinServerOrigin,
+  listActiveBrowserHostPins,
+  resolveActiveBrowserHostPin,
+} from "@/lib/browser-host-pins";
+import { MAX_HOST_INTRODUCTIONS, planHostIntroductionAcceptance } from "@/lib/host-introduction";
 import { b64urlEncode } from "@/lib/sas";
 import {
   decodeBase64Url,
@@ -112,6 +126,10 @@ interface CeremonyRecord {
   entryError: string | null;
   /** This side's endorsement has been recorded on the relay. */
   signedMine: boolean;
+  /** JOINER side: relayed host introductions (R7), stashed from the live
+   * pairing snapshot so the row's post-completion deletion cannot lose them.
+   * Untrusted until verified against the pinned initiator key. */
+  introductions: PairingIntroduction[] | null;
   waitingSince: number | null;
   done: boolean;
   stopped: boolean;
@@ -123,6 +141,7 @@ const FRESH: CeremonyRecord = {
   triesLeft: APPROVE_CEREMONY_TRIES,
   entryError: null,
   signedMine: false,
+  introductions: null,
   waitingSince: null,
   done: false,
   stopped: false,
@@ -277,6 +296,62 @@ export function useApproveDeviceCeremony({
   const invalidatePairings = () =>
     qc.invalidateQueries({ queryKey: ["device-pairings", deviceId] });
 
+  /**
+   * APPROVER side, after a correct entry: sign one host introduction per host
+   * this device has itself verified (its ACTIVE local pins — it may only vouch
+   * keys it checked out of band) toward the PINNED joiner key, and post them on
+   * the relay BEFORE the endorsement edge. The ordering closes the completion
+   * race: the joiner cannot see the edge (its cue to reciprocate and finish)
+   * until the introductions are already on the row its poll snapshots.
+   * Best-effort by design — a failure here must never block the approval, but
+   * it is surfaced, not swallowed: the joiner then verifies each host on first
+   * use exactly as before this leg existed.
+   */
+  const postIntroductions = async (
+    pairing: PairingState,
+    pinned: PinnedCeremonyKeys,
+  ): Promise<void> => {
+    try {
+      const signer = (await loadBrowserDeviceIdentity(accountId)) ?? identity;
+      if (!signer || !currentDevice) return;
+      const origin = browserHostPinServerOrigin();
+      const pins = await listActiveBrowserHostPins({ accountId, origin });
+      if (pins.length === 0) return;
+      const hostList = await hostsApi.list().catch(() => []);
+      const items: PairingIntroduction[] = [];
+      for (const pin of pins) {
+        const boundIds =
+          pin.hostIds.length > 0
+            ? pin.hostIds
+            : hostList
+                .filter((host) => host.host_public_key === pin.hostPublicKey)
+                .map((host) => host.id);
+        if (boundIds.length === 0) continue;
+        const signature = await createHostIntroductionProof(
+          signer,
+          accountId,
+          pin.hostPublicKey,
+          pinned.joinerPublicKey,
+        );
+        for (const hostId of boundIds) {
+          if (items.length >= MAX_HOST_INTRODUCTIONS) break;
+          items.push({
+            host_id: hostId,
+            host_name: hostList.find((host) => host.id === hostId)?.name ?? "host",
+            host_public_key: pin.hostPublicKey,
+            signature,
+          });
+        }
+      }
+      if (items.length === 0) return;
+      await trust.postPairingIntroductions(pairing.id, items);
+    } catch {
+      setError(
+        "Approved, but this device couldn't hand over its hosts — the new device will verify each host when it first connects.",
+      );
+    }
+  };
+
   const signEndorsement = async (endorsedDeviceId: string, endorsedPublicKey: string) => {
     // Load the identity fresh at sign time rather than trusting a long-lived
     // prop: the signing key handle lives in a WeakMap keyed by the identity
@@ -310,6 +385,15 @@ export function useApproveDeviceCeremony({
     const amInitiator = pairing.initiator_device_id === currentDevice.id;
     const amJoiner = pairing.joiner_device_id === currentDevice.id;
     if (!amInitiator && !amJoiner) return;
+    // Stash relayed host introductions (R7) the moment any snapshot carries
+    // them: the pairing row is deleted at completion, and acceptance must run
+    // from data this side already holds, never a post-completion re-fetch.
+    if (amJoiner && (pairing.introductions?.length ?? 0) > 0) {
+      const record = records.get(pairing.id);
+      if (record !== undefined && record.introductions === null) {
+        patch(pairing.id, { introductions: pairing.introductions ?? null });
+      }
+    }
     try {
       if (amJoiner && !pairing.joiner_nonce && !actedRef.current.has(`contribute:${pairing.id}`)) {
         actedRef.current.add(`contribute:${pairing.id}`);
@@ -427,14 +511,103 @@ export function useApproveDeviceCeremony({
           return;
         }
         try {
+          // Collect the approver's host introductions (R7) BEFORE signing the
+          // reciprocal. The polled `pairing` snapshot can predate them (this
+          // effect is triggered by the ENDORSEMENTS poll), but the approver
+          // posts introductions before its edge — so the edge we just verified
+          // proves they are already on the row, and the row provably still
+          // lives because completion needs the reciprocal we have not signed
+          // yet. One fresh read closes the deletion race for good; best-effort
+          // (a failed read must not block the approval — the acceptance step
+          // simply has nothing to accept and this device verifies each host on
+          // first use instead).
+          let introductions = pairing.introductions ?? null;
+          if (introductions === null || introductions.length === 0) {
+            introductions = await trust
+              .listPairings(currentDevice.id)
+              .then((rows) => rows.find((row) => row.id === pairing.id)?.introductions ?? null)
+              .catch(() => null);
+          }
           await signEndorsement(plan.endorsedDeviceId, plan.endorsedPublicKey);
-          patch(pairing.id, { signedMine: true, waitingSince: Date.now() });
+          patch(pairing.id, {
+            signedMine: true,
+            waitingSince: Date.now(),
+            // Never clobber an earlier stash with a failed re-read.
+            ...(introductions !== null && introductions.length > 0 ? { introductions } : {}),
+          });
         } catch {
           actedRef.current.delete(`reciprocate:${pairing.id}`); // retry on next poll
         }
       })();
     }
   }, [pairings.data, endorsements.data, records]);
+
+  // NEW-DEVICE side, after its reciprocal is signed: accept the approver's host
+  // introductions (R7). Each signature is verified against the CEREMONY-PINNED
+  // initiator key and this device's own key — the exact bytes the human's
+  // number covered — then the host key is approved locally like a hand-run
+  // possession, so this device's first connection is already fully verified
+  // instead of first-contact. Failures reject only that host and are surfaced;
+  // the approval itself (admission) is unaffected either way.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: poll-driven effect keyed on poll data
+  useEffect(() => {
+    if (!currentDevice) return;
+    for (const [id, record] of records) {
+      if (!record.signedMine || record.stopped) continue;
+      if (record.introductions === null || record.introductions.length === 0) continue;
+      if (!record.pinnedKeys) continue;
+      if (rolesRef.current.get(id)?.role !== "new-device") continue;
+      if (actedRef.current.has(`introductions:${id}`)) continue;
+      actedRef.current.add(`introductions:${id}`);
+      const pinned = record.pinnedKeys;
+      const claimed = record.introductions;
+      void (async () => {
+        try {
+          const plan = await planHostIntroductionAcceptance({
+            accountId,
+            pinnedIntroducerPublicKey: pinned.initiatorPublicKey,
+            ownPublicKey: currentDevice.public_key,
+            claimed,
+          });
+          const origin = browserHostPinServerOrigin();
+          const failures = [...plan.rejected];
+          for (const intro of plan.accepted) {
+            try {
+              await approveBrowserHostPin({
+                accountId,
+                origin,
+                hostPublicKey: intro.hostPublicKey,
+                hostFingerprint: intro.hostFingerprint,
+              });
+              // Bind the host id so the downgrade gate sees this host as
+              // pinned from the very first connection (never a silent no-op:
+              // resolve only binds when the claimed key equals the pinned one).
+              await resolveActiveBrowserHostPin({
+                accountId,
+                origin,
+                hostId: intro.hostId,
+                claimedHostPublicKey: intro.hostPublicKey,
+                claimedHostFingerprint: intro.hostFingerprint,
+              });
+            } catch (cause) {
+              failures.push(
+                `${intro.hostName}: ${cause instanceof Error ? cause.message : String(cause)}`,
+              );
+            }
+          }
+          if (failures.length > 0) {
+            setError(
+              `This device is approved, but some hosts couldn't be verified here yet (${failures.join("; ")}). Each will be checked when it first connects.`,
+            );
+          }
+        } catch (cause) {
+          setError(
+            `This device is approved, but the hosts it was handed could not be verified (${cause instanceof Error ? cause.message : String(cause)}). Each will be checked when it first connects.`,
+          );
+        }
+      })();
+    }
+  }, [records]);
 
   // Completion: once BOTH directions of the mutual endorsement exist, the
   // ceremony is done — flip the phase and delete the pairing so neither screen
@@ -528,6 +701,9 @@ export function useApproveDeviceCeremony({
             patch(pairing.id, { stopped: true });
             return;
           }
+          // Host introductions FIRST (R7): they must be on the relay row
+          // before the edge whose appearance lets the joiner finish.
+          await postIntroductions(pairing, pinned);
           await signEndorsement(plan.endorsedDeviceId, plan.endorsedPublicKey);
           setError(null); // a retried approve that lands clears the stale failure line
           patch(pairing.id, { signedMine: true, waitingSince: Date.now(), entryError: null });
