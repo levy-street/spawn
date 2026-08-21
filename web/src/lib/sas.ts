@@ -1,5 +1,5 @@
 /**
- * Committed-ephemeral Short Authentication String (SAS) — the 6-digit number a
+ * Committed-ephemeral Short Authentication String (SAS) — the short number a
  * human compares across two screens during pairing.
  *
  * This is the construction docs/TRUST_DEVICE_MESH.md Appendix A requires: a code
@@ -7,7 +7,8 @@
  * MANA-III). Each side contributes a fresh 32-byte nonce; the committer hashes
  * its nonce before the peer reveals theirs, so a relaying MITM cannot adapt its
  * contribution after seeing the target — the two displayed SAS collide only with
- * probability ~1e-6 per one-shot ceremony.
+ * probability 10^-d per one-shot ceremony, where d is the digit count (host
+ * possession uses 6 → ~1e-6; the device↔device ceremony uses 4 → 1e-4).
  *
  * Contrast `verification-code.ts` (a function of the long-lived host key alone):
  * a server grinds a matching key in ~1e6 work. That is convenience; THIS is the
@@ -60,19 +61,23 @@ export async function verifyCommit(
   return diff === 0;
 }
 
-/** The 6-digit SAS both endpoints display, from the keys/nonces each side sees.
- * Formatted `"NNN NNN"`. */
+/** The short authentication string both endpoints display, from the keys/nonces
+ * each side sees. `digits` defaults to 6 ("NNN NNN") — the daemon-matched host
+ * value, byte-frozen by the shared test vectors — and the device↔device ceremony
+ * asks for 4 ("NN NN"). Split into two even-ish groups for readability. */
 export async function sas(
   hostKey: Uint8Array,
   browserKey: Uint8Array,
   hostNonce: Uint8Array,
   browserNonce: Uint8Array,
+  digits = 6,
 ): Promise<string> {
   const digest = await sha256(concat([SAS_DOMAIN, hostKey, browserKey, hostNonce, browserNonce]));
   const n = ((digest[0] << 24) | (digest[1] << 16) | (digest[2] << 8) | digest[3]) >>> 0;
-  const code = n % 1_000_000;
-  const s = code.toString().padStart(6, "0");
-  return `${s.slice(0, 3)} ${s.slice(3)}`;
+  const code = n % 10 ** digits;
+  const s = code.toString().padStart(digits, "0");
+  const half = Math.ceil(digits / 2);
+  return `${s.slice(0, half)} ${s.slice(half)}`;
 }
 
 /** base64url (no padding) helpers for the 32-byte SAS wire values. */

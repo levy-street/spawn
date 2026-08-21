@@ -14,7 +14,7 @@ export interface NumberCheckProps {
    * "enter" types the number the other screen is showing.
    */
   mode: "show" | "enter";
-  /** "923 579" — displayed in `show` mode (and grayed while `waiting`). */
+  /** e.g. "97 28" (device, 4 digits) or "923 579" (host, 6) — shown in `show` mode. */
   number?: string;
   /**
    * Legacy hosts (older software) have no number; the check falls back to
@@ -27,11 +27,13 @@ export interface NumberCheckProps {
   doneText: string;
   /** `enter` mode: wrong-entry feedback, e.g. "That's not it — 2 tries left." */
   entryError?: string;
+  /** How many digits to expect/type: 6 for host possession, 4 for device↔device. */
+  digits?: number;
   /** `waiting`: show a quiet nudge once the caller considers it slow. */
   slowHint?: boolean;
   /** Optional line under the stopped headline (defaults to the safe-abort copy). */
   stoppedText?: string;
-  /** `enter` mode: called with the six digits once all are typed. */
+  /** `enter` mode: called with the digits once `digits` of them are typed. */
   onSubmit?: (digits: string) => void;
   /** Fingerprint fallback only. */
   onMatch?: () => void;
@@ -58,6 +60,7 @@ export function NumberCheck({
   otherScreen,
   doneText,
   entryError,
+  digits: expected = 6,
   slowHint = false,
   stoppedText,
   onSubmit,
@@ -69,9 +72,9 @@ export function NumberCheck({
   const [entered, setEntered] = useState("");
 
   const submitIfComplete = (raw: string) => {
-    const digits = raw.replace(/\D/gu, "").slice(0, 6);
+    const digits = raw.replace(/\D/gu, "").slice(0, expected);
     setEntered(digits);
-    if (digits.length === 6) {
+    if (digits.length === expected) {
       onSubmit?.(digits);
       setEntered("");
     }
@@ -151,9 +154,10 @@ export function NumberCheck({
               value={entered}
               onChange={(event) => submitIfComplete(event.target.value)}
               inputMode="numeric"
+              maxLength={expected}
               autoComplete="one-time-code"
-              placeholder="000 000"
-              aria-label="The six-digit number shown on the other screen"
+              placeholder={"0".repeat(expected)}
+              aria-label={`The ${expected}-digit number shown on the other screen`}
               data-testid="number-entry"
               // biome-ignore lint/a11y/noAutofocus: the entry field is this screen's entire purpose
               autoFocus
