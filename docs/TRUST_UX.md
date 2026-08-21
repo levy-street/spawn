@@ -117,10 +117,17 @@ it. Typing is the proof of comparison — a habituated tap can't wave it through
 key via the link itself — §4 — and borrows just this component's fingerprint frame
 for its legacy fallback.)*
 
+The number is **four digits** (since 2026-08-21; was six). Each wrong entry is an
+online, committed, one-shot attempt — the commitment pins the substituting server to a
+single guess per ceremony — so four digits bound its success at 1-in-10⁴ while keeping
+the entry light. (Host possession, which now needs no number at all, kept six on the
+legacy fingerprint-less path it no longer reaches.) The mismatch screen stays a hard
+terminal state precisely so the residual is a chosen, contained trade.
+
 - **connecting** — "Securing the connection…" spinner. (Covers commit/reveal/nonces.)
-- **compare · show** — the six digits, huge; "Enter this number on the other device";
+- **compare · show** — the four digits, huge; "Enter this number on the other device";
   quiet waiting line beneath. No confirm button on this side at all.
-- **compare · enter** — a six-digit field; wrong entry says "That's not it — N tries
+- **compare · enter** — a four-digit field; wrong entry says "That's not it — N tries
   left" and the third miss lands on **stopped**; the standing escape is *"I don't
   see a number"*.
 - **compare · fingerprint** — older hosts have no number; the same frame shows
