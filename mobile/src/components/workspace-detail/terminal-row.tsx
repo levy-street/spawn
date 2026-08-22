@@ -8,11 +8,11 @@ import { ListRow } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import { AgentIcon } from "@/components/workspace-detail/agent-icon";
+import { paneRowStyles } from "@/components/workspace-detail/pane-row-styles";
 import { identifyAgent } from "@/data/selectors/agent";
 import { attentionRank, displayStatus, sessionTitle } from "@/data/selectors/session";
 import type { AgentDef, Host, Session, TransportState } from "@/data/types/domain";
 import { haptics } from "@/lib/haptics";
-import { useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
 export interface TerminalRowProps {
@@ -38,15 +38,12 @@ export const TerminalRow = memo(function TerminalRow({
   onMove,
   onClose,
 }: TerminalRowProps) {
-  const theme = useTheme();
   const identity = identifyAgent(session.foreground_command, agents);
   const status = displayStatus(session, host, transport);
   const rank = attentionRank(session);
   const title = sessionTitle(session, agents);
   const hostName = host?.name ?? session.host_name;
-  const detail = hostName
-    ? `${identity.displayName} · ${hostName} · ${session.cwd}`
-    : `${identity.displayName} · ${session.cwd}`;
+  const detail = hostName ? `${identity.displayName} · ${hostName}` : identity.displayName;
   const statusColor = rank === 2 ? "destructive" : rank === 1 ? "warning" : "mutedForeground";
 
   const leadingActions = useMemo<SwipeAction[]>(
@@ -81,14 +78,13 @@ export const TerminalRow = memo(function TerminalRow({
 
   return (
     <SwipeableRow
-      contentStyle={{ backgroundColor: theme.colors.background }}
+      contentStyle={paneRowStyles.swipeContent}
       leadingActions={leadingActions}
       testID={`terminal-swipe-${session.id}`}
       trailingActions={trailingActions}
     >
-      <View style={styles.frame} testID={`terminal-row-${session.id}`}>
+      <View style={paneRowStyles.frame} testID={`terminal-row-${session.id}`}>
         <ListRow
-          height="tall"
           leading={
             <View style={styles.iconFrame}>
               <AgentIcon identity={identity} size={sizing.listRow.leading.pane} />
@@ -113,7 +109,7 @@ export const TerminalRow = memo(function TerminalRow({
           subtitle={detail}
           title={title}
           trailing={
-            <View style={styles.status}>
+            <View style={paneRowStyles.status}>
               <StatusDot pulse={status.pulse} tone={status.tone} />
               <Text color={statusColor} numberOfLines={1} variant="caption">
                 {status.label}
@@ -125,7 +121,7 @@ export const TerminalRow = memo(function TerminalRow({
           accessibilityLabel={`Actions for ${title}`}
           icon="Ellipsis"
           onPress={onActions}
-          style={styles.action}
+          style={paneRowStyles.action}
         />
       </View>
     </SwipeableRow>
@@ -133,16 +129,6 @@ export const TerminalRow = memo(function TerminalRow({
 });
 
 const styles = StyleSheet.create({
-  action: {
-    height: sizing.listRow.trailingTarget,
-    position: "absolute",
-    right: 0,
-    top: (sizing.listRow.tall - sizing.listRow.trailingTarget) / 2,
-    width: sizing.listRow.trailingTarget,
-  },
-  frame: {
-    position: "relative",
-  },
   iconFrame: {
     flexShrink: 0,
     position: "relative",
@@ -151,11 +137,5 @@ const styles = StyleSheet.create({
     bottom: 0,
     position: "absolute",
     right: 0,
-  },
-  status: {
-    alignItems: "center",
-    flexDirection: "row",
-    gap: sizing.space.peer,
-    paddingRight: sizing.listRow.trailingTarget,
   },
 });

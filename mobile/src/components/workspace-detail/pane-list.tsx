@@ -106,12 +106,14 @@ export const PaneList = memo(function PaneList({
       ItemSeparatorComponent={ListSeparator}
       keyExtractor={(tile) => tile.session_id}
       ListEmptyComponent={
-        <EmptyState
-          action={<AddPaneControl canAddPane={canAddPane} onAddPane={onAddPane} />}
-          description="The circle is empty. Spawn something into it."
-          icon="SquareTerminal"
-          title="Open your first window"
-        />
+        <View style={styles.emptyState}>
+          <EmptyState
+            action={<AddPaneControl canAddPane={canAddPane} onAddPane={onAddPane} />}
+            description="The circle is empty. Spawn something into it."
+            icon="SquareTerminal"
+            title="Open your first window"
+          />
+        </View>
       }
       ListFooterComponent={
         tiles.length > 0 ? (
@@ -155,7 +157,6 @@ function MissingPaneRow({ paneId, onActions }: { paneId: string; onActions: () =
   return (
     <View testID={`missing-row-${paneId}`}>
       <ListRow
-        height="tall"
         leading={<StatusDot tone="offline" />}
         onLongPress={() => {
           haptics.impact("medium");
@@ -181,6 +182,7 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   footer: {
+    paddingHorizontal: sizing.screen.gutter,
     paddingTop: sizing.space.block,
   },
   fullWidth: {
@@ -188,7 +190,9 @@ const styles = StyleSheet.create({
   },
   listContent: {
     paddingBottom: sizing.space.block,
-    paddingHorizontal: sizing.screen.gutter,
     paddingTop: sizing.space.cluster,
+  },
+  emptyState: {
+    paddingHorizontal: sizing.screen.gutter,
   },
 });

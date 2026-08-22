@@ -13,6 +13,7 @@ import Animated, {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { scheduleOnRN } from "react-native-worklets";
 
+import { registerNavigationOverlayDismiss } from "@/components/nav/overlay-dismiss";
 import { haptics } from "@/lib/haptics";
 import { alpha, chrome, pressroomColors, useTheme } from "@/theme";
 
@@ -132,6 +133,13 @@ export function SwipeDismissOverlay({
     });
   }, [entrance, height, onDismiss, reducedMotion, theme.motion, translateY]);
 
+  useEffect(() => {
+    if (!visible) return;
+    // Primary navigation is already replacing the active scene, so waiting for the exit
+    // animation would leave a modal window intercepting the destination tab.
+    return registerNavigationOverlayDismiss(onDismiss);
+  }, [onDismiss, visible]);
+
   const pan = useMemo(
     () =>
       Gesture.Pan()
@@ -245,7 +253,15 @@ export function SwipeDismissOverlay({
         <Animated.View pointerEvents="none" style={[styles.backdrop, backdropStyle]} />
         <GestureDetector gesture={pan}>
           <Animated.View
-            style={[styles.panel, { backgroundColor: theme.colors.background }, panelStyle]}
+            style={[
+              styles.panel,
+              {
+                backgroundColor: theme.colors.background,
+                borderRadius: theme.radii.xxl,
+              },
+              panelStyle,
+            ]}
+            testID="swipe-dismiss-overlay-panel"
           >
             {children}
           </Animated.View>
@@ -262,6 +278,7 @@ const styles = StyleSheet.create({
   },
   panel: {
     flex: 1,
+    overflow: "hidden",
   },
   root: {
     flex: 1,

@@ -4,7 +4,6 @@ import type { ComponentType, PropsWithChildren } from "react";
 import { StyleSheet } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
-import { ListSeparator } from "@/components/ui/list-row";
 import { WorkspaceListScreen } from "@/components/workspaces/workspace-list-screen";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import { borderWidth, ThemeProvider } from "@/theme";
@@ -59,7 +58,14 @@ const mockWorkspaces = [
   mockWorkspace,
   { ...mockWorkspace, id: "workspace-2", name: "Web", position: 1 },
 ];
-const mockArchived: WorkspaceOut[] = [];
+const mockArchived: WorkspaceOut[] = [
+  {
+    ...mockWorkspace,
+    id: "workspace-archived",
+    name: "Archived native",
+    archived_at: "2026-08-22T00:00:00Z",
+  },
+];
 const mockSessions: never[] = [];
 const mockTemplates: never[] = [];
 const mockAgents: never[] = [];
@@ -209,28 +215,36 @@ describe("workspace list refresh stability", () => {
     await screen.unmount();
   });
 
-  it("renders one global header with create and destination actions", async () => {
+  it("renders one global header carrying only the create action", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
     expect(screen.getAllByText("Workspaces")).toHaveLength(1);
     expect(screen.getByLabelText("New workspace")).toBeTruthy();
-    expect(screen.getByLabelText("Open hosts")).toBeTruthy();
-    expect(screen.getByLabelText("Open settings")).toBeTruthy();
+
+    // Hosts and Settings moved to the bottom nav; offering them here too was the
+    // duplication round 6 removed. Creating a workspace is not navigation, so it stays.
+    expect(screen.queryByLabelText("Open hosts")).toBeNull();
+    expect(screen.queryByLabelText("Open settings")).toBeNull();
 
     await fireEvent.press(screen.getByTestId("new-workspace-button"));
     expect(mockCreateVisible).toBe(true);
-    await fireEvent.press(screen.getByLabelText("Open hosts"));
-    await fireEvent.press(screen.getByLabelText("Open settings"));
-    expect(mockPush).toHaveBeenNthCalledWith(1, "/hosts");
-    expect(mockPush).toHaveBeenNthCalledWith(2, "/settings");
 
     await screen.unmount();
   });
 
-  it("renders search directly below the header with one divider on each boundary", async () => {
+  it("renders archived navigation directly above search with its count and chevron", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
+    const root = screen.getByTestId("workspace-list-screen");
+    const archivedSection = screen.getByTestId("archived-workspaces-section");
     const searchSection = screen.getByTestId("workspace-search-section");
     const sectionStyle = StyleSheet.flatten(searchSection.props["style"]);
+    const archivedRow = screen.getByLabelText("Archived workspaces, 1 workspace");
 
+    expect(root.children.indexOf(archivedSection)).toBeLessThan(
+      root.children.indexOf(searchSection),
+    );
+    expect(archivedRow).toHaveStyle({ borderRadius: borderWidth.none });
+    expect(within(archivedSection).getByText("Archived workspaces")).toBeTruthy();
+    expect(within(archivedSection).getByText("1 workspace")).toBeTruthy();
     expect(within(searchSection).getByTestId("workspace-search")).toBeTruthy();
     expect(searchSection.parent).toBe(screen.getByTestId("workspace-list-screen"));
     expect(screen.queryByTestId("keyboard-sticky-view")).toBeNull();
@@ -244,13 +258,18 @@ describe("workspace list refresh stability", () => {
       marginLeft: sizing.listRow.separatorFullBleed,
     });
     expect(screen.getByTestId("workspace-list")).toBeTruthy();
+
+    await fireEvent.press(archivedRow);
+    expect(mockPush).toHaveBeenCalledWith("/workspaces/archived");
     await screen.unmount();
   });
 
-  it("joins full-width list items with the global separator", async () => {
+  it("joins workspace rows with a global separator at zero left inset", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
-    expect(latestList().ItemSeparatorComponent).toBe(ListSeparator);
-    expect(within(screen.getByTestId("workspace-list")).getByTestId("list-separator")).toBeTruthy();
+    expect(latestList().ItemSeparatorComponent).toBeDefined();
+    expect(within(screen.getByTestId("workspace-list")).getByTestId("list-separator")).toHaveStyle({
+      marginLeft: 0,
+    });
     await screen.unmount();
   });
 

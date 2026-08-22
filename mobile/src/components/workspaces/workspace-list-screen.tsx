@@ -4,27 +4,29 @@ import { type Href, useRouter } from "expo-router";
 import { useCallback, useMemo, useState } from "react";
 import { View } from "react-native";
 
-import { AppHeader, type AppHeaderAction } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
-import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
 import { ListSeparator } from "@/components/ui/list-row";
-import { SearchField } from "@/components/ui/search-field";
-import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
-import { ArchivedWorkspacesLink } from "@/components/workspaces/archived-workspaces-link";
 import { ChangeWorkspaceIconDialog } from "@/components/workspaces/change-workspace-icon-dialog";
 import { CreateWorkspaceDialog } from "@/components/workspaces/create-workspace-dialog";
 import { RenameWorkspaceDialog } from "@/components/workspaces/rename-workspace-dialog";
+import {
+  WorkspaceListControls,
+  WorkspaceListStatusError,
+} from "@/components/workspaces/workspace-list-chrome";
 import { WorkspaceListEmpty } from "@/components/workspaces/workspace-list-empty";
-import { WorkspaceListError } from "@/components/workspaces/workspace-list-error";
+import { WorkspaceListHeader } from "@/components/workspaces/workspace-list-header";
 import {
   type WorkspaceOperationInput,
   type WorkspaceRowModel,
   workspaceErrorMessage,
   workspaceForSelectors,
 } from "@/components/workspaces/workspace-list-model";
-import { WorkspaceListSkeletons } from "@/components/workspaces/workspace-list-skeletons";
+import {
+  WorkspaceListFailure,
+  WorkspaceListLoading,
+} from "@/components/workspaces/workspace-list-states";
 import { workspaceListStyles as styles } from "@/components/workspaces/workspace-list-styles";
 import {
   duplicateWorkspaceDeep,
@@ -56,6 +58,11 @@ import type { DomainSnapshot, Workspace } from "@/data/types/domain";
 import { haptics } from "@/lib/haptics";
 import { useTheme } from "@/theme";
 
+function WorkspaceListSeparator(): React.JSX.Element {
+  // FlashList accepts a component, so bind the required edge-to-edge configuration once.
+  return <ListSeparator inset={false} />;
+}
+
 export function WorkspaceListScreen() {
   const theme = useTheme();
   const router = useRouter();
@@ -79,31 +86,7 @@ export function WorkspaceListScreen() {
   const [manualRefreshing, setManualRefreshing] = useState(false);
   const openCreate = useCallback(() => setCreateVisible(true), []);
   const canCreate = !workspacesQuery.isLoading && workspacesQuery.error === null;
-  const headerActions = useMemo<readonly AppHeaderAction[]>(
-    () => [
-      {
-        accessibilityLabel: "New workspace",
-        disabled: !canCreate,
-        icon: "Plus",
-        onPress: openCreate,
-        testID: "new-workspace-button",
-      },
-      {
-        accessibilityLabel: "Open hosts",
-        icon: "Server",
-        onPress: () => router.push("/hosts"),
-      },
-      {
-        accessibilityLabel: "Open settings",
-        icon: "Settings",
-        onPress: () => router.push("/settings"),
-      },
-    ],
-    [canCreate, openCreate, router],
-  );
-  const header = (
-    <AppHeader actions={headerActions} testID="workspace-list-header" title="Workspaces" />
-  );
+  const header = <WorkspaceListHeader canCreate={canCreate} onCreate={openCreate} />;
 
   const operationMutation = useMutation({
     mutationFn: async (input: WorkspaceOperationInput): Promise<WorkspaceOperationResult> => {
@@ -274,31 +257,16 @@ export function WorkspaceListScreen() {
   }, [manualRefreshing, refreshArchived, refreshSessions, refreshTemplates, refreshWorkspaces]);
 
   if (workspacesQuery.isLoading) {
-    return (
-      <Screen header={header} padded={false}>
-        <View
-          style={[styles.screen, { backgroundColor: theme.colors.background }]}
-          testID="workspace-list-screen"
-        >
-          <WorkspaceListSkeletons />
-        </View>
-      </Screen>
-    );
+    return <WorkspaceListLoading header={header} />;
   }
 
   if (workspacesQuery.error) {
     return (
-      <Screen header={header} padded={false}>
-        <View
-          style={[styles.screen, { backgroundColor: theme.colors.background }]}
-          testID="workspace-list-screen"
-        >
-          <WorkspaceListError
-            message={workspaceErrorMessage(workspacesQuery.error)}
-            onRetry={() => void refresh()}
-          />
-        </View>
-      </Screen>
+      <WorkspaceListFailure
+        header={header}
+        message={workspaceErrorMessage(workspacesQuery.error)}
+        onRetry={() => void refresh()}
+      />
     );
   }
 
@@ -308,41 +276,23 @@ export function WorkspaceListScreen() {
         style={[styles.screen, { backgroundColor: theme.colors.background }]}
         testID="workspace-list-screen"
       >
-        <View testID="workspace-search-section">
-          <View style={styles.searchControls}>
-            <SearchField
-              onChangeText={setQuery}
-              placeholder="Search workspaces"
-              testID="workspace-search"
-              value={query}
-            />
-          </View>
-          <ListSeparator inset={false} />
-        </View>
+        <WorkspaceListControls
+          archivedCount={archivedQuery.data?.length ?? 0}
+          onOpenArchived={() => {
+            haptics.selection();
+            router.push("/workspaces/archived" as Href);
+          }}
+          onQueryChange={setQuery}
+          query={query}
+        />
         {sessionsQuery.error ? (
-          <View
-            accessibilityRole="alert"
-            style={[styles.statusError, { borderColor: theme.colors.border }]}
-          >
-            <Text color="mutedForeground" variant="caption">
-              Session status is unavailable.
-            </Text>
-            <Button onPress={() => void sessionsQuery.refetch()} size="sm" variant="ghost">
-              Retry
-            </Button>
-          </View>
+          <WorkspaceListStatusError onRetry={() => void sessionsQuery.refetch()} />
         ) : null}
         <FlashList
           data={rows}
-          ItemSeparatorComponent={ListSeparator}
+          ItemSeparatorComponent={WorkspaceListSeparator}
           keyExtractor={(item) => item.workspace.id}
           ListEmptyComponent={<WorkspaceListEmpty onCreate={openCreate} query={query} />}
-          ListFooterComponent={
-            <ArchivedWorkspacesLink
-              count={archivedQuery.data?.length ?? 0}
-              onPress={() => router.push("/workspaces/archived" as Href)}
-            />
-          }
           onRefresh={() => void refresh()}
           refreshing={manualRefreshing}
           renderItem={renderItem}

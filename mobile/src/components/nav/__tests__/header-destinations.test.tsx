@@ -11,18 +11,18 @@ describe("headerDestinationActions", () => {
     mockPush.mockClear();
   });
 
-  it("builds actions that navigate directly to each destination", () => {
-    const actions = headerDestinationActions(["hosts", "settings"]);
+  it("keeps secondary destinations while dropping the primary tab routes", () => {
+    const actions = headerDestinationActions(["hosts", "legion", "settings", "admin"]);
 
     expect(actions.map(({ accessibilityLabel, icon }) => ({ accessibilityLabel, icon }))).toEqual([
-      { accessibilityLabel: "Open hosts", icon: "Server" },
-      { accessibilityLabel: "Open settings", icon: "Settings" },
+      { accessibilityLabel: "Open Legion", icon: "RadioTower" },
+      { accessibilityLabel: "Open admin", icon: "ShieldCheck" },
     ]);
 
     actions[0]?.onPress();
     actions[1]?.onPress();
 
-    expect(mockPush).toHaveBeenNthCalledWith(1, "/hosts");
-    expect(mockPush).toHaveBeenNthCalledWith(2, "/settings");
+    expect(mockPush).toHaveBeenNthCalledWith(1, "/legion");
+    expect(mockPush).toHaveBeenNthCalledWith(2, "/admin");
   });
 });

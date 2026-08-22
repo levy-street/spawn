@@ -1,5 +1,5 @@
 import { fireEvent, render } from "@testing-library/react-native";
-import type { StyleProp, ViewStyle } from "react-native";
+import { type StyleProp, StyleSheet, type ViewStyle } from "react-native";
 
 import { PaneList } from "@/components/workspace-detail/pane-list";
 import { TabStrip } from "@/components/workspace-detail/tab-strip";
@@ -87,20 +87,57 @@ describe("workspace tab pane lists", () => {
     );
 
     expect(screen.getByText("Files — dev")).toBeTruthy();
-    expect(screen.getByText("office-mac · /Users/spawn/dev")).toBeTruthy();
+    expect(screen.getByText("office-mac")).toBeTruthy();
+    expect(screen.queryByText("office-mac · /Users/spawn/dev")).toBeNull();
     expect(screen.getByText("Online")).toBeTruthy();
     expect(screen.getByTestId("pane-list-main")).toHaveStyle({
-      paddingHorizontal: sizing.screen.gutter,
       paddingTop: sizing.space.cluster,
     });
-    const row = screen.getByLabelText("Files — dev, office-mac · /Users/spawn/dev");
+    expect(
+      StyleSheet.flatten(screen.getByTestId("pane-list-main").props["style"]).paddingHorizontal,
+    ).toBeUndefined();
+    expect(screen.getByTestId("files-swipe-files-1-content")).toHaveStyle({
+      backgroundColor: "transparent",
+    });
+    const row = screen.getByLabelText("Files — dev, office-mac");
     expect(row).toHaveStyle({
-      minHeight: sizing.listRow.tall,
+      minHeight: sizing.listRow.regular,
       paddingHorizontal: sizing.listRow.horizontalPadding,
       paddingVertical: sizing.listRow.verticalPadding,
     });
     fireEvent.press(row);
     expect(onOpenFiles).toHaveBeenCalledWith("host-1", "/Users/spawn/dev");
+  });
+
+  it("uses the shared separator between full-bleed pane rows", async () => {
+    const tiles: Tile[] = ["first", "second"].map((id, index) => ({
+      session_id: id,
+      x: index,
+      y: 0,
+      w: 12,
+      h: 24,
+      widget: { kind: "files", host_id: "host-1", path: `/tmp/${id}` },
+    }));
+    const screen = await render(
+      <PaneList
+        agents={[]}
+        canAddPane
+        hostsById={new Map([["host-1", makeHost()]])}
+        onAddPane={jest.fn()}
+        onMovePane={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={jest.fn()}
+        onPaneActions={jest.fn()}
+        onRemovePane={jest.fn()}
+        onRenameSession={jest.fn()}
+        sessionsById={new Map()}
+        tab={makeTab("main", tiles)}
+        transports={{}}
+      />,
+      { wrapper: ThemeProvider },
+    );
+
+    expect(screen.getAllByTestId("list-separator")).toHaveLength(1);
   });
 
   it("disables add-tab at the eight-tab ceiling", async () => {
@@ -157,7 +194,7 @@ describe("workspace tab pane lists", () => {
     expect(screen.getByText("This tab is full. A tab can contain up to 16 panes.")).toBeTruthy();
   });
 
-  it("renders an unavailable pane through the tall row primitive", async () => {
+  it("renders an unavailable pane through the regular full-bleed row primitive", async () => {
     const screen = await render(
       <PaneList
         agents={[]}
@@ -178,7 +215,7 @@ describe("workspace tab pane lists", () => {
     );
 
     expect(screen.getByLabelText("Session unavailable, Refresh or remove this pane.")).toHaveStyle({
-      minHeight: sizing.listRow.tall,
+      minHeight: sizing.listRow.regular,
     });
   });
 });

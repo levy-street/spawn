@@ -17,6 +17,11 @@ export interface ListRowProps {
   shape?: "inset" | "fullBleed";
 }
 
+export interface ListSeparatorProps {
+  /** Clear the row's leading slot. Set false for an edge-to-edge divider. Default true. */
+  inset?: boolean;
+}
+
 export function ListRow({
   height = "regular",
   leading,
@@ -66,7 +71,7 @@ export function ListRow({
   );
 }
 
-export function ListSeparator({ inset = true }: { inset?: boolean }): React.JSX.Element {
+export function ListSeparator({ inset = true }: ListSeparatorProps): React.JSX.Element {
   const theme = useTheme();
 
   return (

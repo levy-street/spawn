@@ -1,6 +1,9 @@
 import { render, screen } from "@testing-library/react-native";
+import { StyleSheet } from "react-native";
 
 import TerminalScreen, { TERMINAL_ROUTE_GESTURE_OPTIONS } from "@/app/terminal/[sessionId]";
+import { darkTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 interface MockTerminalData {
   error: Error | null;
@@ -101,7 +104,7 @@ describe("TerminalScreen dismissal", () => {
   });
 
   test.each(["loading", "error", "connected"] as const)(
-    "enables an unrestricted native full-screen horizontal back gesture while %s",
+    "uses one rounded full-screen card gesture while %s",
     async (state) => {
       mockTerminalData = dataFor(state);
       await render(<TerminalScreen />);
@@ -109,12 +112,23 @@ describe("TerminalScreen dismissal", () => {
       expect(screen.getByTestId("mock-terminal-route-options")).toBeTruthy();
       expect(mockStackScreenOptions).toMatchObject(TERMINAL_ROUTE_GESTURE_OPTIONS);
       expect(mockStackScreenOptions).toMatchObject({
+        animation: "simple_push",
+        animationMatchesGesture: true,
         fullScreenGestureEnabled: true,
+        fullScreenGestureShadowEnabled: true,
         gestureDirection: "horizontal",
         gestureEnabled: true,
         headerShown: false,
         presentation: "card",
       });
+      expect(mockStackScreenOptions["contentStyle"]).toMatchObject({
+        borderRadius: darkTheme.radii.xxl,
+        overflow: "hidden",
+      });
+      expect(
+        StyleSheet.flatten(screen.getByTestId("terminal-nav-clearance").props["style"])
+          .paddingBottom,
+      ).toBe(sizing.bottomNav.contentHeight + sizing.bottomNav.verticalPadding);
       // An omitted response distance is what lets the native recognizer begin at screen centre.
       expect(mockStackScreenOptions).not.toHaveProperty("gestureResponseDistance");
       if (state === "connected") {

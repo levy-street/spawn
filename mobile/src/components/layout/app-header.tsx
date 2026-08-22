@@ -1,7 +1,7 @@
 import { createContext, type ReactNode, useContext } from "react";
 import { StyleSheet, View } from "react-native";
 import { SafeAreaInsetsContext } from "react-native-safe-area-context";
-
+import { isPrimaryHeaderDestinationAction } from "@/components/nav/primary-destinations";
 import type { IconName } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
 import { Text } from "@/components/ui/text";
@@ -35,19 +35,28 @@ export interface AppHeaderProps {
 }
 
 const MAX_ACTIONS = 3;
-const AppHeaderDefaultLeadingContext = createContext<ReactNode>(null);
+interface AppHeaderNavigationDefaults {
+  backOverride?: () => void;
+  leading: ReactNode;
+}
+
+const AppHeaderNavigationContext = createContext<AppHeaderNavigationDefaults>({ leading: null });
 
 export function AppHeaderLeadingProvider({
+  backOverride,
   children,
   leading,
 }: {
+  backOverride?: () => void;
   children: ReactNode;
   leading: ReactNode;
 }): React.JSX.Element {
   return (
-    <AppHeaderDefaultLeadingContext.Provider value={leading}>
+    <AppHeaderNavigationContext.Provider
+      value={{ ...(backOverride === undefined ? {} : { backOverride }), leading }}
+    >
       {children}
-    </AppHeaderDefaultLeadingContext.Provider>
+    </AppHeaderNavigationContext.Provider>
   );
 }
 
@@ -61,7 +70,7 @@ export function AppHeader({
   divider = true,
   testID,
 }: AppHeaderProps): React.JSX.Element {
-  const defaultLeading = useContext(AppHeaderDefaultLeadingContext);
+  const navigationDefaults = useContext(AppHeaderNavigationContext);
   const insets = useContext(SafeAreaInsetsContext) ?? {
     bottom: spacing[0],
     left: spacing[0],
@@ -69,8 +78,14 @@ export function AppHeader({
     top: spacing[0],
   };
   const theme = useTheme();
-  const visibleActions = actions?.slice(0, MAX_ACTIONS);
-  const resolvedLeading = leading ?? defaultLeading;
+  // Older route screens still declare Hosts/Settings actions. The global header is the
+  // enforcement boundary: primary destinations belong exclusively to persistent tabs,
+  // while contextual actions such as create, connect, Legion, and Admin remain intact.
+  const visibleActions = actions
+    ?.filter((action) => !isPrimaryHeaderDestinationAction(action))
+    .slice(0, MAX_ACTIONS);
+  const resolvedLeading = leading ?? navigationDefaults.leading;
+  const resolvedBack = navigationDefaults.backOverride ?? onBack;
 
   return (
     <View
@@ -96,11 +111,11 @@ export function AppHeader({
       >
         <View style={styles.leadingSlot} testID="app-header-leading-slot">
           {resolvedLeading ??
-            (onBack === undefined ? null : (
+            (resolvedBack === undefined ? null : (
               <IconButton
                 accessibilityLabel="Go back"
                 icon="ChevronLeft"
-                onPress={onBack}
+                onPress={resolvedBack}
                 size="lg"
                 style={styles.action}
                 variant="ghost"
@@ -120,25 +135,26 @@ export function AppHeader({
         </View>
 
         <View style={styles.trailingSlot} testID="app-header-trailing-slot">
-          {accessory ??
-            (visibleActions === undefined || visibleActions.length === 0 ? null : (
-              <View style={styles.actions}>
-                {visibleActions.map((action) => (
-                  <IconButton
-                    accessibilityLabel={action.accessibilityLabel}
-                    icon={action.icon}
-                    key={action.testID ?? action.accessibilityLabel}
-                    onPress={action.onPress}
-                    size="lg"
-                    style={styles.action}
-                    variant="ghost"
-                    {...(action.busy === undefined ? {} : { loading: action.busy })}
-                    {...(action.disabled === undefined ? {} : { disabled: action.disabled })}
-                    {...(action.testID === undefined ? {} : { testID: action.testID })}
-                  />
-                ))}
-              </View>
-            ))}
+          {accessory === undefined &&
+          (visibleActions === undefined || visibleActions.length === 0) ? null : (
+            <View style={styles.actions}>
+              {accessory}
+              {visibleActions?.map((action) => (
+                <IconButton
+                  accessibilityLabel={action.accessibilityLabel}
+                  icon={action.icon}
+                  key={action.testID ?? action.accessibilityLabel}
+                  onPress={action.onPress}
+                  size="lg"
+                  style={styles.action}
+                  variant="ghost"
+                  {...(action.busy === undefined ? {} : { loading: action.busy })}
+                  {...(action.disabled === undefined ? {} : { disabled: action.disabled })}
+                  {...(action.testID === undefined ? {} : { testID: action.testID })}
+                />
+              ))}
+            </View>
+          )}
         </View>
       </View>
     </View>

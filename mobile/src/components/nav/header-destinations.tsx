@@ -18,12 +18,14 @@ const DESTINATIONS: Record<
 export function headerDestinationActions(
   destinations: readonly HeaderDestination[],
 ): readonly AppHeaderAction[] {
-  return destinations.map((destination) => {
-    const item = DESTINATIONS[destination];
-    return {
-      accessibilityLabel: item.accessibilityLabel,
-      icon: item.icon,
-      onPress: () => router.push(item.href),
-    };
-  });
+  return destinations
+    .filter((destination) => destination !== "hosts" && destination !== "settings")
+    .map((destination) => {
+      const item = DESTINATIONS[destination];
+      return {
+        accessibilityLabel: item.accessibilityLabel,
+        icon: item.icon,
+        onPress: () => router.push(item.href),
+      };
+    });
 }

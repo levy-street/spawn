@@ -121,10 +121,12 @@ describe("TerminalRow", () => {
 
     expect(displayStatus).toHaveBeenCalledWith(session, host, "idle");
     expect(screen.getByText("Composed status")).toBeTruthy();
-    expect(
-      screen.getByLabelText("Implement mobile, Codex · office-mac · /Users/spawn/dev/spawn"),
-    ).toHaveStyle({
-      minHeight: sizing.listRow.tall,
+    expect(screen.queryByText(/Users\/spawn\/dev\/spawn/)).toBeNull();
+    expect(screen.getByTestId("terminal-swipe-session-1-content")).toHaveStyle({
+      backgroundColor: "transparent",
+    });
+    expect(screen.getByLabelText("Implement mobile, Codex · office-mac")).toHaveStyle({
+      minHeight: sizing.listRow.regular,
       paddingHorizontal: sizing.listRow.horizontalPadding,
       paddingVertical: sizing.listRow.verticalPadding,
     });

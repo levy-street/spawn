@@ -1,10 +1,13 @@
-import { Stack, usePathname, useRouter } from "expo-router";
+import { Tabs, usePathname, useRouter } from "expo-router";
 import type { ReactNode } from "react";
-import { StyleSheet, View } from "react-native";
 
 import { AdminAccessBoundary, resolveAdminAccess } from "@/components/admin/admin-access";
 import { AppHeaderLeadingProvider } from "@/components/layout/app-header";
-import { BottomNav, isBottomNavRoute } from "@/components/nav/bottom-nav";
+import {
+  companionTabBackDestination,
+  isBottomNavRoute,
+  PersistentBottomNav,
+} from "@/components/nav/bottom-nav";
 import { ProfileMenu } from "@/components/nav/profile-menu";
 import { useMeQuery } from "@/data/queries/auth";
 import { useAuthenticatedAccount } from "@/lib/auth-gate";
@@ -70,32 +73,55 @@ export default function AppStackLayout(): React.JSX.Element | null {
   const theme = useTheme();
   const account = useAuthenticatedAccount();
   const pathname = usePathname();
+  const router = useRouter();
 
   if (!account.ready) return null;
 
   const showRootNavigation = isBottomNavRoute(pathname);
+  const companionBackDestination = companionTabBackDestination(pathname);
 
   return (
     <AdminRouteBoundary>
-      <View style={styles.shell}>
-        <AppHeaderLeadingProvider leading={showRootNavigation ? <ProfileMenu /> : null}>
-          <Stack
-            initialRouteName="workspaces/index"
-            screenOptions={{
-              ...FULL_SCREEN_BACK_OPTIONS,
-              contentStyle: { backgroundColor: theme.colors.background },
-              headerShown: false,
-            }}
-          />
-        </AppHeaderLeadingProvider>
-        {showRootNavigation ? <BottomNav /> : null}
-      </View>
+      <AppHeaderLeadingProvider
+        {...(companionBackDestination === null
+          ? {}
+          : { backOverride: () => router.navigate(companionBackDestination) })}
+        leading={showRootNavigation ? <ProfileMenu /> : null}
+      >
+        <Tabs
+          backBehavior="none"
+          initialRouteName="workspaces"
+          screenOptions={{
+            animation: "none",
+            headerShown: false,
+            popToTopOnBlur: false,
+            sceneStyle: { backgroundColor: theme.colors.background },
+          }}
+          tabBar={({ navigation, state }) => (
+            <PersistentBottomNav
+              navigation={{
+                navigate: (name, params) => navigation.navigate(name, params),
+              }}
+              state={{
+                index: state.index,
+                routes: state.routes.map((route) => ({
+                  key: route.key,
+                  name: route.name,
+                  ...(route.params === undefined ? {} : { params: route.params }),
+                })),
+              }}
+            />
+          )}
+        >
+          <Tabs.Screen name="workspaces" />
+          <Tabs.Screen name="workspace" />
+          <Tabs.Screen name="hosts" />
+          <Tabs.Screen name="host" />
+          <Tabs.Screen name="legion" />
+          <Tabs.Screen name="settings" />
+          <Tabs.Screen name="admin" />
+        </Tabs>
+      </AppHeaderLeadingProvider>
     </AdminRouteBoundary>
   );
 }
-
-const styles = StyleSheet.create({
-  shell: {
-    flex: 1,
-  },
-});

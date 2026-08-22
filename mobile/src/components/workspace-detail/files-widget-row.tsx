@@ -7,6 +7,7 @@ import { IconButton } from "@/components/ui/icon-button";
 import { ListRow } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
+import { paneRowStyles } from "@/components/workspace-detail/pane-row-styles";
 import { haptics } from "@/lib/haptics";
 import { borderWidth, useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
@@ -40,7 +41,6 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
   const theme = useTheme();
   const title = `Files — ${pathLeaf(path)}`;
   const status = hostOnline ? "Online" : "Offline";
-  const detail = hostName ? `${hostName} · ${path}` : path;
   const leadingActions = useMemo<SwipeAction[]>(
     () => [
       {
@@ -67,14 +67,13 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
 
   return (
     <SwipeableRow
-      contentStyle={{ backgroundColor: theme.colors.background }}
+      contentStyle={paneRowStyles.swipeContent}
       leadingActions={leadingActions}
       testID={`files-swipe-${paneId}`}
       trailingActions={trailingActions}
     >
-      <View style={styles.frame} testID={`files-row-${paneId}`}>
+      <View style={paneRowStyles.frame} testID={`files-row-${paneId}`}>
         <ListRow
-          height="tall"
           leading={
             <View
               style={[
@@ -98,10 +97,10 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
             onOpen();
           }}
           shape="fullBleed"
-          subtitle={detail}
+          {...(hostName ? { subtitle: hostName } : {})}
           title={title}
           trailing={
-            <View style={styles.status}>
+            <View style={paneRowStyles.status}>
               <StatusDot pulse={false} tone={hostOnline ? "active" : "offline"} />
               <Text color="mutedForeground" variant="caption">
                 {status}
@@ -113,7 +112,7 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
           accessibilityLabel={`Actions for ${title}`}
           icon="Ellipsis"
           onPress={onActions}
-          style={styles.action}
+          style={paneRowStyles.action}
         />
       </View>
     </SwipeableRow>
@@ -121,27 +120,11 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
 });
 
 const styles = StyleSheet.create({
-  action: {
-    height: sizing.listRow.trailingTarget,
-    position: "absolute",
-    right: 0,
-    top: (sizing.listRow.tall - sizing.listRow.trailingTarget) / 2,
-    width: sizing.listRow.trailingTarget,
-  },
-  frame: {
-    position: "relative",
-  },
   iconPlate: {
     alignItems: "center",
     borderWidth: borderWidth.hairline,
     height: sizing.listRow.leading.rich,
     justifyContent: "center",
     width: sizing.listRow.leading.rich,
-  },
-  status: {
-    alignItems: "center",
-    flexDirection: "row",
-    gap: sizing.space.peer,
-    paddingRight: sizing.listRow.trailingTarget,
   },
 });

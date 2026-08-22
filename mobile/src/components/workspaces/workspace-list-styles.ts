@@ -4,10 +4,6 @@ import { borderWidth, radii } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
 export const workspaceListStyles = StyleSheet.create({
-  archivedButton: {
-    alignSelf: "center",
-    marginVertical: sizing.space.block,
-  },
   screen: {
     flex: 1,
   },

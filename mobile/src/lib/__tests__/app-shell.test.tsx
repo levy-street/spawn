@@ -20,8 +20,16 @@ jest.mock("expo-router", () => {
       accessibilityLabel: options?.title,
       testID: `app-screen-${name}`,
     });
+  const Tabs = ({ children }: MockStackProps) =>
+    createElement(View, { testID: "root-tabs" }, children);
+  Tabs.Screen = ({ name, options }: MockStackScreenProps) =>
+    createElement(View, {
+      accessibilityLabel: options?.title,
+      testID: `app-screen-${name}`,
+    });
   return {
     Stack,
+    Tabs,
     usePathname: () => "/workspaces",
     useRouter: () => ({ navigate: jest.fn(), replace: jest.fn(), push: jest.fn() }),
   };
@@ -39,8 +47,10 @@ import AppStackLayout, { APP_ROUTE_MAP, FULL_SCREEN_BACK_OPTIONS } from "@/app/(
 import { ThemeProvider } from "@/theme";
 
 describe("app navigation shell", () => {
-  // The owner asked for no menu at all: no burger drawer, no bottom tab bar.
-  it("renders a menu-less stack", async () => {
+  // Round 6 reinstated a persistent bottom nav, reversing round 3's "no menu at
+  // all". The shell is a tab navigator whose destinations each retain their own
+  // stack; the burger drawer stays gone.
+  it("renders a tab shell with a persistent nav, and no drawer", async () => {
     const screen = await render(
       <ThemeProvider>
         <AppStackLayout />
@@ -48,8 +58,10 @@ describe("app navigation shell", () => {
     );
 
     expect(screen.queryByTestId("root-drawer")).toBeNull();
-    expect(screen.queryByTestId("root-tabs")).toBeNull();
-    expect(screen.getByTestId("root-stack")).toBeTruthy();
+    expect(screen.getByTestId("root-tabs")).toBeTruthy();
+    for (const destination of ["workspaces", "hosts", "settings"]) {
+      expect(screen.getByTestId(`app-screen-${destination}`)).toBeTruthy();
+    }
   });
 
   it("exposes no root Files destination", () => {

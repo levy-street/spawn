@@ -123,7 +123,9 @@ describe("settings panel behavior", () => {
   test("settings root renders exactly the nine documented panel entries", async () => {
     const screen = await render(<SettingsRoot />, { wrapper });
     expect(screen.getAllByTestId(/^settings-panel-/)).toHaveLength(9);
-    expect(screen.getByRole("button", { name: "Open hosts" })).toBeOnTheScreen();
+    // Hosts is a bottom-nav destination now and must not be duplicated in the
+    // header; Admin is not in the nav, so it keeps its header entry.
+    expect(screen.queryByRole("button", { name: "Open hosts" })).toBeNull();
     expect(screen.getByRole("button", { name: "Open admin" })).toBeOnTheScreen();
     expect(screen.queryByText("Terminal")).toBeNull();
     expect(screen.queryByText("Sessions")).toBeNull();

@@ -4,6 +4,7 @@ import { StyleSheet, View } from "react-native";
 
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
+import { ROUNDED_CARD_GESTURE_OPTIONS } from "@/components/nav/navigation-options";
 import { TerminalOverlay } from "@/components/terminal-ui/terminal-overlay";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -15,19 +16,15 @@ import {
   useTerminalData,
 } from "@/data/queries/terminal";
 import { useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 function routeSessionId(value: string | string[] | undefined): string {
   return Array.isArray(value) ? (value[0] ?? "") : (value ?? "");
 }
 
 export const TERMINAL_ROUTE_GESTURE_OPTIONS = {
-  animation: "slide_from_right",
-  animationMatchesGesture: true,
-  fullScreenGestureEnabled: true,
-  gestureDirection: "horizontal",
-  gestureEnabled: true,
+  ...ROUNDED_CARD_GESTURE_OPTIONS,
   headerShown: false,
-  presentation: "card",
 } as const;
 
 export default function TerminalScreen(): React.JSX.Element {
@@ -45,7 +42,11 @@ export default function TerminalScreen(): React.JSX.Element {
     <Stack.Screen
       options={{
         ...TERMINAL_ROUTE_GESTURE_OPTIONS,
-        contentStyle: { backgroundColor: theme.colors.background },
+        contentStyle: {
+          backgroundColor: theme.colors.background,
+          borderRadius: theme.radii.xxl,
+          overflow: "hidden",
+        },
       }}
     />
   );
@@ -54,32 +55,37 @@ export default function TerminalScreen(): React.JSX.Element {
     return (
       <>
         {screenOptions}
-        <Screen header={<AppHeader onBack={() => router.back()} title="Terminal" />} padded={false}>
-          <View
-            style={[
-              styles.center,
-              {
-                backgroundColor: theme.colors.background,
-                gap: theme.space(3),
-                paddingHorizontal: theme.space(6),
-              },
-            ]}
+        <View style={styles.navClearance} testID="terminal-nav-clearance">
+          <Screen
+            header={<AppHeader onBack={() => router.back()} title="Terminal" />}
+            padded={false}
           >
-            <Text accessibilityRole="header" variant="title">
-              Terminal unavailable
-            </Text>
-            <Text color="mutedForeground" style={styles.centered} variant="body">
-              {sessionId.length === 0
-                ? "This terminal link does not include a session."
-                : (data.error?.message ?? "The session could not be loaded.")}
-            </Text>
-            {sessionId.length > 0 ? (
-              <Button onPress={() => void data.refetch()} variant="outline">
-                Retry
-              </Button>
-            ) : null}
-          </View>
-        </Screen>
+            <View
+              style={[
+                styles.center,
+                {
+                  backgroundColor: theme.colors.background,
+                  gap: theme.space(3),
+                  paddingHorizontal: theme.space(6),
+                },
+              ]}
+            >
+              <Text accessibilityRole="header" variant="title">
+                Terminal unavailable
+              </Text>
+              <Text color="mutedForeground" style={styles.centered} variant="body">
+                {sessionId.length === 0
+                  ? "This terminal link does not include a session."
+                  : (data.error?.message ?? "The session could not be loaded.")}
+              </Text>
+              {sessionId.length > 0 ? (
+                <Button onPress={() => void data.refetch()} variant="outline">
+                  Retry
+                </Button>
+              ) : null}
+            </View>
+          </Screen>
+        </View>
       </>
     );
   }
@@ -88,15 +94,20 @@ export default function TerminalScreen(): React.JSX.Element {
     return (
       <>
         {screenOptions}
-        <Screen header={<AppHeader onBack={() => router.back()} title="Terminal" />} padded={false}>
-          <View
-            accessibilityLabel="Loading terminal"
-            accessibilityRole="progressbar"
-            style={[styles.center, { backgroundColor: theme.colors.background }]}
+        <View style={styles.navClearance} testID="terminal-nav-clearance">
+          <Screen
+            header={<AppHeader onBack={() => router.back()} title="Terminal" />}
+            padded={false}
           >
-            <Spinner />
-          </View>
-        </Screen>
+            <View
+              accessibilityLabel="Loading terminal"
+              accessibilityRole="progressbar"
+              style={[styles.center, { backgroundColor: theme.colors.background }]}
+            >
+              <Spinner />
+            </View>
+          </Screen>
+        </View>
       </>
     );
   }
@@ -104,15 +115,17 @@ export default function TerminalScreen(): React.JSX.Element {
   return (
     <>
       {screenOptions}
-      <TerminalOverlay
-        focused={focused}
-        host={data.host}
-        onDismiss={() => router.back()}
-        onKill={() => kill.mutateAsync()}
-        onRename={(name) => rename.mutateAsync(name).then(() => undefined)}
-        onRestart={() => restart.mutateAsync().then(() => undefined)}
-        session={data.session}
-      />
+      <View style={styles.navClearance} testID="terminal-nav-clearance">
+        <TerminalOverlay
+          focused={focused}
+          host={data.host}
+          onDismiss={() => router.back()}
+          onKill={() => kill.mutateAsync()}
+          onRename={(name) => rename.mutateAsync(name).then(() => undefined)}
+          onRestart={() => restart.mutateAsync().then(() => undefined)}
+          session={data.session}
+        />
+      </View>
     </>
   );
 }
@@ -125,5 +138,9 @@ const styles = StyleSheet.create({
   },
   centered: {
     textAlign: "center",
+  },
+  navClearance: {
+    flex: 1,
+    paddingBottom: sizing.bottomNav.contentHeight + sizing.bottomNav.verticalPadding,
   },
 });

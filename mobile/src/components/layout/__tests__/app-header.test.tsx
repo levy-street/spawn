@@ -1,7 +1,7 @@
 import { fireEvent, render } from "@testing-library/react-native";
 import { StyleSheet, View } from "react-native";
 
-import { AppHeader } from "@/components/layout/app-header";
+import { AppHeader, AppHeaderLeadingProvider } from "@/components/layout/app-header";
 import { ThemeProvider } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
@@ -33,6 +33,21 @@ describe("AppHeader", () => {
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 
+  it("uses a shell back override for the root of a retained companion tab", async () => {
+    const onBack = jest.fn();
+    const onBackOverride = jest.fn();
+    const screen = await renderHeader(
+      <AppHeaderLeadingProvider backOverride={onBackOverride} leading={null}>
+        <AppHeader onBack={onBack} title="Host" />
+      </AppHeaderLeadingProvider>,
+    );
+
+    await fireEvent.press(screen.getByLabelText("Go back"));
+
+    expect(onBackOverride).toHaveBeenCalledTimes(1);
+    expect(onBack).not.toHaveBeenCalled();
+  });
+
   it("renders a leading control instead of the back chevron", async () => {
     const onBack = jest.fn();
     const screen = await renderHeader(
@@ -61,6 +76,40 @@ describe("AppHeader", () => {
 
     expect(onRefresh).toHaveBeenCalledTimes(1);
     expect(onSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps screen actions visible beside a declared accessory", async () => {
+    const onPress = jest.fn();
+    const screen = await renderHeader(
+      <AppHeader
+        accessory={<View testID="connection-accessory" />}
+        actions={[{ accessibilityLabel: "Terminal actions", icon: "Ellipsis", onPress }]}
+        title="Terminal"
+      />,
+    );
+
+    expect(screen.getByTestId("connection-accessory")).toBeTruthy();
+    await fireEvent.press(screen.getByLabelText("Terminal actions"));
+    expect(onPress).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops primary destinations while retaining contextual screen actions", async () => {
+    const onCreate = jest.fn();
+    const screen = await renderHeader(
+      <AppHeader
+        actions={[
+          { accessibilityLabel: "New workspace", icon: "Plus", onPress: onCreate },
+          { accessibilityLabel: "Open hosts", icon: "Server", onPress: jest.fn() },
+          { accessibilityLabel: "Open settings", icon: "Settings", onPress: jest.fn() },
+        ]}
+        title="Workspaces"
+      />,
+    );
+
+    expect(screen.queryByLabelText("Open hosts")).toBeNull();
+    expect(screen.queryByLabelText("Open settings")).toBeNull();
+    await fireEvent.press(screen.getByLabelText("New workspace"));
+    expect(onCreate).toHaveBeenCalledTimes(1);
   });
 
   it("does not fire a disabled action", async () => {

@@ -107,20 +107,22 @@ describe("host screen headers", () => {
 
   afterEach(() => jest.restoreAllMocks());
 
-  test("Hosts renders one title and wires all global header actions", async () => {
+  test("Hosts renders one title and keeps only its own screen actions", async () => {
     await render(<HostListScreen />, { wrapper: Providers });
 
     expect(screen.getAllByText("Hosts")).toHaveLength(1);
     expect(screen.getByRole("header", { name: "Hosts" })).toBeOnTheScreen();
 
+    // The bottom nav owns Settings now, so the header must not offer it a second
+    // time. Legion and Connect stay: neither is a nav destination.
+    expect(screen.queryByTestId("hosts-settings-action")).toBeNull();
+
     await fireEvent.press(screen.getByTestId("hosts-legion-action"));
-    await fireEvent.press(screen.getByTestId("hosts-settings-action"));
     await fireEvent.press(screen.getByTestId("hosts-connect-action"));
     await fireEvent.press(screen.getByRole("button", { name: "Go back" }));
 
     expect(mockPush).toHaveBeenNthCalledWith(1, "/legion");
-    expect(mockPush).toHaveBeenNthCalledWith(2, "/settings");
-    expect(mockPush).toHaveBeenNthCalledWith(3, "/onboarding/host");
+    expect(mockPush).toHaveBeenNthCalledWith(2, "/onboarding/host");
     expect(mockBack).toHaveBeenCalledTimes(1);
   });
 
