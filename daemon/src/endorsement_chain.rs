@@ -24,10 +24,10 @@
 //! proven and asks only "does *this* key chain to an anchor, unrevoked?". The two
 //! together are the full admission rule.
 //!
-//! Not yet wired into the connect path: today a host admits a browser only if its
-//! key is *directly* pinned (single hop). This validator is what will let a host
-//! admit a key reachable through a carried chain instead; that wiring is the next
-//! step, held for review.
+//! Wired into the connect path (`run.rs`): a signed-RTC offer from a key that is
+//! not directly pinned is admitted iff [`find_valid_chain`] proves a carried
+//! endorsement chain from one of this host's pinned anchors to that key, with
+//! every key on the path off the deny-list (the doc's §3 admission rule).
 
 use std::collections::{HashMap, HashSet};
 

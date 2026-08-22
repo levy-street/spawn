@@ -27,8 +27,9 @@
 //!
 //! [`verify_endorsement`] checks a **single edge** against a candidate set of
 //! trusted endorser keys. Multi-hop chain validation to a host's anchors (the
-//! full admission rule, doc §3) is a later stage that calls this per edge; it is
-//! deliberately not wired into the connect path yet.
+//! full admission rule, doc §3) is [`crate::endorsement_chain`], which the
+//! connect path (`run.rs`) invokes per signed-RTC offer; it verifies each edge
+//! through this module.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
