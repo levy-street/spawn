@@ -224,12 +224,10 @@ test("removing a tile re-packs and expands the survivor", async ({ page }) => {
     { session_id: SESSION_B_ID, x: 12, y: 0, w: 12, h: 24 },
   ];
   const { store } = await setupGrid(page, initial);
-  await page.getByRole("button", { name: "palette options" }).click();
-  await page.getByRole("menuitem", { name: "Close session" }).click();
-  await page
-    .getByRole("dialog", { name: /^Close / })
-    .getByRole("button", { name: "Close session" })
-    .click();
+  await page.getByRole("button", { name: "Close palette" }).click();
+  const confirm = page.getByRole("dialog", { name: /^Close / });
+  await expect(confirm).toBeVisible();
+  await confirm.getByRole("button", { name: "Close session" }).click();
   await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
   expect(store.requests.workspacePatches[0]?.body).toEqual({
     layout: envelope({ version: 3, tiles: remove(initial, SESSION_ID) }),

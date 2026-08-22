@@ -14,7 +14,6 @@ import {
   Folder,
   Pencil,
   RotateCcw,
-  Trash2,
   X,
 } from "lucide-react";
 import {
@@ -494,32 +493,19 @@ export function SessionPane({
         </DropdownMenu>
         {session && (
           /* Closing has its own control, at the far right where a window's
-             close has always been. It opens a menu rather than closing on the
-             spot: an X inside a grid of panes is a small target next to the
-             one that reveals the pane's options, and the menu is what makes
-             hitting it by mistake cost nothing. */
-          <DropdownMenu
-            align="end"
-            renderTrigger={(props) => (
-              <button
-                {...props}
-                type="button"
-                aria-label={`Close ${title}`}
-                // Pulled back off the bar's rhythm: the two menu buttons are
-                // one cluster at the end of the header, not two more items in
-                // the row of controls. Same 28px target as its neighbour, on a
-                // lighter glyph — closing should be reachable, not loud.
-                className="-ml-1 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
-              >
-                <X className="size-3.5" aria-hidden />
-              </button>
-            )}
+             close has always been. The confirmation dialog protects against
+             accidental clicks, so the X can express its intent directly. */
+          <button
+            type="button"
+            aria-label={`Close ${title}`}
+            disabled={closeM.isPending}
+            onClick={closeSession}
+            // Pulled back off the bar's rhythm: the two controls are one
+            // cluster at the end of the header, not two more items in the row.
+            className="-ml-1 grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-destructive disabled:opacity-50"
           >
-            <DropdownMenuItem destructive disabled={closeM.isPending} onSelect={closeSession}>
-              <Trash2 className="size-4" aria-hidden />
-              Close session
-            </DropdownMenuItem>
-          </DropdownMenu>
+            <X className="size-3.5" aria-hidden />
+          </button>
         )}
       </header>
 
