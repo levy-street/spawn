@@ -16,6 +16,7 @@ import {
   borderWidth,
   clampDisplay,
   displayLineHeightRatio,
+  FixedThemeProvider,
   fontFamily,
   fontSize,
   fontWeight,
@@ -63,7 +64,18 @@ function BrandLockup() {
   );
 }
 
-export function AuthShell({ children, description, title }: AuthShellProps) {
+export function AuthShell(props: AuthShellProps) {
+  // The Pressroom ground is a fixed dark plate, so the controls on it must not
+  // follow the device into light mode — that paints near-black labels on a
+  // near-black card and makes the whole screen unreadable.
+  return (
+    <FixedThemeProvider mode="dark">
+      <AuthShellSurface {...props} />
+    </FixedThemeProvider>
+  );
+}
+
+function AuthShellSurface({ children, description, title }: AuthShellProps) {
   const { width } = useWindowDimensions();
   const titleSize = clampDisplay(width, spacing[6] + spacing[0.5], 5.9, spacing[8]);
 

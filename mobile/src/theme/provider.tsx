@@ -27,6 +27,28 @@ interface ThemeProviderValue {
 
 const ThemeContext = createContext<ThemeProviderValue | null>(null);
 
+/**
+ * Pins a subtree to one palette regardless of the device appearance. The auth
+ * surface paints a fixed dark brand ground, so its controls must not follow the
+ * OS into light mode — that renders near-black labels on a near-black card.
+ */
+export function FixedThemeProvider({
+  mode,
+  children,
+}: PropsWithChildren<{ mode: "light" | "dark" }>) {
+  const outer = useContext(ThemeContext);
+  const value = useMemo<ThemeProviderValue>(
+    () => ({
+      theme: themeForMode(mode),
+      mode: outer?.mode ?? "system",
+      setMode: outer?.setMode ?? (() => undefined),
+    }),
+    [mode, outer],
+  );
+
+  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
+}
+
 export function ThemeProvider({ children }: PropsWithChildren) {
   const osScheme = useColorScheme();
   const [mode, setModeState] = useState<ThemeMode>("system");

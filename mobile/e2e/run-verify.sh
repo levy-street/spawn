@@ -20,6 +20,8 @@ echo "== relaunching app =="
 xcrun simctl terminate booted host.exp.Exponent >/dev/null 2>&1
 xcrun simctl openurl booted "exp://$HOST" >/dev/null 2>&1
 sleep 35
+maestro test e2e/flows/dismiss-devmenu.yaml >/dev/null 2>&1 || true
+sleep 2
 shot "00-launch"
 
 echo "== capturing routes =="

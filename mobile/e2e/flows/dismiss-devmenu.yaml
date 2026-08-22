@@ -1,0 +1,9 @@
+# Expo Go's dev-menu chrome renders in its own window, invisible to Maestro's
+# hierarchy dump, so drive it positionally: accept the onboarding, then close
+# the menu sheet it reveals.
+appId: host.exp.Exponent
+---
+- tapOn:
+    point: "50%,92%"
+- tapOn:
+    point: "93%,33%"
