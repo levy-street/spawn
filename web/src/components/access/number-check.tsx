@@ -4,7 +4,13 @@ import { AlertTriangle, Check, Loader2 } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 
-export type NumberCheckPhase = "connecting" | "compare" | "waiting" | "done" | "stopped";
+export type NumberCheckPhase =
+  | "connecting"
+  | "compare"
+  | "waiting"
+  | "done"
+  | "half-done"
+  | "stopped";
 
 export interface NumberCheckProps {
   phase: NumberCheckPhase;
@@ -33,6 +39,9 @@ export interface NumberCheckProps {
   slowHint?: boolean;
   /** Optional line under the stopped headline (defaults to the safe-abort copy). */
   stoppedText?: string;
+  /** `half-done`: the honest in-between — this side finished, the other never
+   * did. States what worked and the one step that finishes the link. */
+  halfDoneText?: string;
   /** `enter` mode: called with the digits once `digits` of them are typed. */
   onSubmit?: (digits: string) => void;
   /** Fingerprint fallback only. */
@@ -63,6 +72,7 @@ export function NumberCheck({
   digits: expected = 6,
   slowHint = false,
   stoppedText,
+  halfDoneText,
   onSubmit,
   onMatch,
   onNoMatch,
@@ -222,6 +232,28 @@ export function NumberCheck({
           </div>
           <Button className="w-full" onClick={onDone}>
             Done
+          </Button>
+        </>
+      )}
+
+      {phase === "half-done" && (
+        <>
+          <div className="flex flex-1 flex-col items-center justify-center gap-4">
+            <div className="flex size-12 items-center justify-center rounded-full bg-amber-500/10 text-amber-500">
+              <AlertTriangle className="size-6" />
+            </div>
+            <h2 className="text-lg font-medium tracking-tight text-foreground">Not finished</h2>
+            <p
+              className="max-w-[28ch] text-balance text-center text-sm leading-relaxed text-muted-foreground"
+              data-testid="ceremony-half-done"
+              role="status"
+            >
+              {halfDoneText ??
+                "Approved on this side, but the other device didn't finish. Approve it again from the device list to finish the link."}
+            </p>
+          </div>
+          <Button className="w-full" variant="secondary" onClick={onClose}>
+            Close
           </Button>
         </>
       )}

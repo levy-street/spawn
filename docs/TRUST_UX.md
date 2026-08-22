@@ -142,6 +142,15 @@ terminal state precisely so the residual is a chosen, contained trade.
 - **waiting** — you finished; other side hasn't. Number stays visible, dimmed; after
   a while a quiet hint ("Make sure the other side is still open").
 - **done** — check mark, one line of what you gained.
+- **not finished** *(added 2026-08-22, review C1)* — the honest in-between when the
+  ceremony's relay row dies (10-minute timeout, or the other side closing) after this
+  side finished but before the other did. Amber, terminal, *Close* only: it names what
+  worked and the one step that completes the link ("Approve it again from the device
+  list"), and quietly upgrades itself to **done** if the other half lands late. No
+  screen infers success or failure from the row's disappearance alone — each side reads
+  its terminal state off the verified record itself, so a new device whose approval
+  landed reads **done** (never "nothing was trusted"), and an approver missing the
+  link-back never reads success while the mutual link (mesh §4, P1) is half-complete.
 - **stopped** — mismatch or exhausted tries. Red, terminal: nothing was trusted.
   *Close* only. There is no "approve anyway" (A4/A5 are not softenable).
 
