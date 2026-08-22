@@ -69,9 +69,6 @@
     ],
     "experiments": {
       "typedRoutes": true
-    },
-    "extra": {
-      "apiUrl": "https://spawn.example.com"
     }
   }
 }
