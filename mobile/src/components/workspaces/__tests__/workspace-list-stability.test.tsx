@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render } from "@testing-library/react-native";
+import { act, fireEvent, render } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
+import { StyleSheet } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { WorkspaceListScreen } from "@/components/workspaces/workspace-list-screen";
@@ -18,7 +19,9 @@ interface CapturedFlashListProps {
 const mockFlashListRenders: CapturedFlashListProps[] = [];
 let mockFlashListMounts = 0;
 let mockSessionsRefetching = false;
+let mockCreateVisible = false;
 const mockPush = jest.fn();
+const mockSetOptions = jest.fn();
 const mockRefetchWorkspaces = jest.fn(() => Promise.resolve({}));
 const mockRefetchArchived = jest.fn(() => Promise.resolve({}));
 const mockRefetchSessions = jest.fn(() => Promise.resolve({}));
@@ -76,12 +79,22 @@ jest.mock("expo-router", () => ({
   useRouter: () => ({ push: mockPush }),
 }));
 
+jest.mock("@react-navigation/native", () => {
+  const actual = jest.requireActual<typeof import("@react-navigation/native")>(
+    "@react-navigation/native",
+  );
+  return { ...actual, useNavigation: () => ({ setOptions: mockSetOptions }) };
+});
+
 jest.mock("@/components/ui/toast", () => ({ useToast: () => mockToast }));
 jest.mock("@/components/workspaces/change-workspace-icon-dialog", () => ({
   ChangeWorkspaceIconDialog: () => null,
 }));
 jest.mock("@/components/workspaces/create-workspace-dialog", () => ({
-  CreateWorkspaceDialog: () => null,
+  CreateWorkspaceDialog: ({ visible }: { visible: boolean }) => {
+    mockCreateVisible = visible;
+    return null;
+  },
 }));
 jest.mock("@/components/workspaces/rename-workspace-dialog", () => ({
   RenameWorkspaceDialog: () => null,
@@ -158,6 +171,7 @@ describe("workspace list refresh stability", () => {
     mockFlashListRenders.length = 0;
     mockFlashListMounts = 0;
     mockSessionsRefetching = false;
+    mockCreateVisible = false;
   });
 
   it("shows refreshing only for an explicit user pull", async () => {
@@ -179,6 +193,36 @@ describe("workspace list refresh stability", () => {
       await Promise.resolve();
     });
     expect(latestList().refreshing).toBe(false);
+    await screen.unmount();
+  });
+
+  it("leaves the top safe-area inset to the route Screen", async () => {
+    const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
+    const rootStyle = StyleSheet.flatten(
+      screen.getByTestId("workspace-list-screen").props["style"],
+    );
+
+    expect(rootStyle.paddingTop).toBeUndefined();
+    await screen.unmount();
+  });
+
+  it("configures create and destination actions in the native header", async () => {
+    const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
+    const options = mockSetOptions.mock.calls.at(-1)?.[0] as
+      | { headerRight?: () => React.JSX.Element }
+      | undefined;
+    const headerRight = options?.headerRight;
+    if (!headerRight) throw new Error("Workspace header actions were not configured.");
+
+    const header = await render(headerRight(), { wrapper: Providers });
+    expect(header.getByLabelText("New workspace")).toBeTruthy();
+    expect(header.getByLabelText("Open hosts")).toBeTruthy();
+    expect(header.getByLabelText("Open settings")).toBeTruthy();
+    await fireEvent.press(header.getByTestId("new-workspace-button"));
+    expect(mockCreateVisible).toBe(true);
+    expect(screen.queryByText("Workspaces")).toBeNull();
+
+    await header.unmount();
     await screen.unmount();
   });
 

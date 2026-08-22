@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { useSharedValue } from "react-native-reanimated";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { TabPager } from "@/components/gestures/tab-pager";
 import { LauncherSheet } from "@/components/launcher/launcher-sheet";
 import { Confirm } from "@/components/ui/confirm";
@@ -51,18 +50,18 @@ interface ConfirmationState {
   onConfirm: () => void;
 }
 
+const TAB_FULL_MESSAGE = "This tab is full. A tab can contain up to 16 panes.";
+
 function errorMessage(error: unknown): string {
   return error instanceof Error && error.message.trim() ? error.message : "Something went wrong.";
 }
 
 export function WorkspaceDetail({
   workspaceId,
-  onBack,
   onOpenTerminal,
   onOpenFiles,
 }: WorkspaceDetailProps) {
   const theme = useTheme();
-  const insets = useSafeAreaInsets();
   const detail = useWorkspaceDetail(workspaceId);
   const workspace = detail.workspace.data ?? null;
   const sessions = detail.sessions.data ?? [];
@@ -134,6 +133,16 @@ export function WorkspaceDetail({
   }, []);
 
   const presentLauncher = useCallback((tabId: string) => setLauncherTabId(tabId), []);
+  const presentWorkspaceActions = useCallback(() => setWorkspaceActionsVisible(true), []);
+
+  const presentActiveLauncher = useCallback(() => {
+    if (!activeTab || !canAddTile(activeTab.layout)) {
+      setOperationError(TAB_FULL_MESSAGE);
+      haptics.warning();
+      return;
+    }
+    presentLauncher(activeTab.id);
+  }, [activeTab, presentLauncher]);
 
   const confirmRemove = useCallback(
     (currentWorkspace: Workspace, tile: Tile) => {
@@ -154,6 +163,32 @@ export function WorkspaceDetail({
       });
     },
     [actions, run, sessionsById],
+  );
+
+  const closeTab = useCallback(
+    (tab: WorkspaceTab) => {
+      if (!workspace) return;
+      const close = () => {
+        void run(
+          () => actions.deleteTab(workspace, tab.id),
+          () => setTabTarget(null),
+        );
+      };
+      if (!tab.layout.tiles.some((tile) => !tile.widget)) {
+        close();
+        return;
+      }
+      setConfirmation({
+        title: `Close ${tab.name}?`,
+        description: "Every session in this tab will be killed and deleted.",
+        confirmLabel: "Close tab",
+        onConfirm: () => {
+          setConfirmation(null);
+          close();
+        },
+      });
+    },
+    [actions, run, workspace],
   );
 
   const renderPage = useCallback(
@@ -209,18 +244,14 @@ export function WorkspaceDetail({
     <View style={[styles.screen, { backgroundColor: theme.colors.background }]}>
       <WorkspaceHeader
         canAddPane={activeTab ? canAddTile(activeTab.layout) : false}
-        onActions={() => setWorkspaceActionsVisible(true)}
-        onAddPane={() => {
-          if (activeTab) presentLauncher(activeTab.id);
-        }}
-        onBack={onBack}
-        topInset={insets.top}
+        onActions={presentWorkspaceActions}
+        onAddPane={presentActiveLauncher}
         workspace={workspace}
       />
       <TabStrip
         activeIndex={activeIndex}
+        addBusy={busy}
         canAdd={canAddTab(workspace.layout)}
-        dragProgress={dragProgress}
         onActions={setTabTarget}
         onAdd={() => {
           void run(async () => {
@@ -228,6 +259,8 @@ export function WorkspaceDetail({
             if (saved.layout.active_tab) setSelectedTabId(saved.layout.active_tab);
           });
         }}
+        onClose={closeTab}
+        onReorder={(tabId, toIndex) => actions.reorderTab(workspace, tabId, toIndex)}
         onSelect={(index) => {
           const tab = workspace.layout.tabs[index];
           if (tab) setSelectedTabId(tab.id);
@@ -295,24 +328,12 @@ export function WorkspaceDetail({
         workspace={workspace}
       />
       <TabActionsSheet
-        onDelete={(tab) => {
-          setConfirmation({
-            title: `Delete ${tab.name}?`,
-            description: "Every session in this tab will be killed and deleted.",
-            confirmLabel: "Delete tab",
-            onConfirm: () => {
-              setConfirmation(null);
-              void run(
-                () => actions.deleteTab(workspace, tab.id),
-                () => setTabTarget(null),
-              );
-            },
-          });
-        }}
+        onDelete={closeTab}
         onDismiss={() => setTabTarget(null)}
         onRename={(tab) => setRenameTarget({ kind: "tab", id: tab.id, value: tab.name })}
         onReorder={(tab, offset) => {
-          actions.reorderTab(workspace, tab.id, offset);
+          const index = workspace.layout.tabs.findIndex((candidate) => candidate.id === tab.id);
+          actions.reorderTab(workspace, tab.id, index + offset);
           setTabTarget(null);
         }}
         tab={tabTarget}

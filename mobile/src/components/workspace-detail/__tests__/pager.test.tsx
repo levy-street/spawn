@@ -27,9 +27,10 @@ describe("workspace tab pager", () => {
         <TabStrip
           activeIndex={0}
           canAdd
-          dragProgress={progress}
           onActions={jest.fn()}
           onAdd={jest.fn()}
+          onClose={jest.fn()}
+          onReorder={jest.fn()}
           onSelect={jest.fn()}
           tabs={tabs}
         />

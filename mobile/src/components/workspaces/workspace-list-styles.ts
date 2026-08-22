@@ -1,62 +1,56 @@
 import { StyleSheet } from "react-native";
 
-import { borderWidth, chrome, radii, spacing, typeStyles } from "@/theme";
+import { borderWidth, radii } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export const workspaceListStyles = StyleSheet.create({
   archivedButton: {
     alignSelf: "center",
-    marginVertical: spacing[4],
-  },
-  header: {
-    alignItems: "center",
-    flexDirection: "row",
-    justifyContent: "space-between",
-    minHeight: spacing[12],
-    paddingHorizontal: spacing[2.5],
-  },
-  heading: {
-    ...typeStyles.uiSmMedium,
+    marginVertical: sizing.space.block,
   },
   listContent: {
-    paddingHorizontal: spacing[2.5],
+    paddingHorizontal: sizing.screen.gutter,
   },
   rowSeparator: {
-    height: spacing[1],
+    height: sizing.listRow.betweenRows,
   },
   screen: {
     flex: 1,
   },
   search: {
-    paddingBottom: spacing[2.5],
-    paddingHorizontal: spacing[2.5],
+    paddingBottom: sizing.space.peer,
+    paddingHorizontal: sizing.screen.gutter,
+    paddingTop: sizing.space.peer,
   },
   skeletonCopy: {
     flex: 1,
-    gap: spacing[2],
+    gap: sizing.space.peer,
   },
   skeletonDetail: {
-    height: spacing[3],
+    height: sizing.space.cluster,
     width: "48%",
   },
   skeletonIcon: {
-    height: spacing[6],
-    width: spacing[6],
+    height: sizing.listRow.leading.workspace,
+    width: sizing.listRow.leading.workspace,
   },
   skeletonRow: {
     alignItems: "center",
     borderRadius: radii.lg,
     flexDirection: "row",
-    gap: spacing[2],
-    height: chrome.touchTarget,
-    paddingHorizontal: spacing[1.5],
+    gap: sizing.listRow.contentGap,
+    minHeight: sizing.listRow.tall,
+    paddingHorizontal: sizing.listRow.workspaceHorizontalPadding,
+    paddingVertical: sizing.listRow.workspaceVerticalPadding,
   },
   skeletonTitle: {
-    height: spacing[4],
+    height: sizing.space.block,
     width: "72%",
   },
   skeletons: {
-    gap: spacing[1],
-    paddingHorizontal: spacing[2.5],
+    gap: sizing.listRow.betweenRows,
+    paddingHorizontal: sizing.screen.gutter,
+    paddingTop: sizing.space.peer,
   },
   statusError: {
     alignItems: "center",
@@ -64,6 +58,6 @@ export const workspaceListStyles = StyleSheet.create({
     borderTopWidth: borderWidth.hairline,
     flexDirection: "row",
     justifyContent: "space-between",
-    paddingHorizontal: spacing[2.5],
+    paddingHorizontal: sizing.screen.gutter,
   },
 });

@@ -60,6 +60,19 @@ export function reorderPaneLayout(
   return replaceTabLayout(workspace, tabId, applyMobileOrder(tab, ids));
 }
 
+export async function deleteSessionsForTab(
+  sessionIds: readonly string[],
+  removeSession: (sessionId: string) => Promise<unknown> = deleteSession,
+): Promise<void> {
+  const deletions = await Promise.allSettled(
+    sessionIds.map((sessionId) => removeSession(sessionId)),
+  );
+  const failure = deletions.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failure) throw failure.reason;
+}
+
 export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
   const client = useQueryClient();
   const commit = useWorkspaceLayoutCommit();
@@ -83,10 +96,9 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
     },
     renameTab: (workspace: Workspace, tabId: TabId, name: string) =>
       commit(workspace, renameTab(workspace.layout, tabId, name)),
-    reorderTab: (workspace: Workspace, tabId: TabId, offset: -1 | 1) => {
-      const current = workspace.layout.tabs.findIndex((tab) => tab.id === tabId);
-      const layout = reorderTab(workspace.layout, tabId, current + offset);
-      reorder.schedule(workspace, layout);
+    reorderTab: (workspace: Workspace, tabId: TabId, toIndex: number) => {
+      const layout = reorderTab(workspace.layout, tabId, toIndex);
+      if (layout !== workspace.layout) reorder.schedule(workspace, layout);
     },
     deleteTab: async (workspace: Workspace, tabId: TabId) => {
       const tab = workspace.layout.tabs.find((candidate) => candidate.id === tabId);
@@ -95,8 +107,11 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       const sessionIds = tab.layout.tiles
         .filter((tile) => !tile.widget)
         .map((tile) => tile.session_id);
-      await Promise.all(sessionIds.map(deleteSession));
-      await invalidateSessions();
+      try {
+        await deleteSessionsForTab(sessionIds);
+      } finally {
+        await invalidateSessions();
+      }
       return commit(workspace, layout);
     },
     renameSession: async (session: Session, name: string) => {

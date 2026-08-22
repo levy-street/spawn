@@ -83,6 +83,7 @@ describe("TerminalSurface", () => {
     const ref = createRef<TerminalSurfaceHandle>();
     const screen = await render(<TerminalSurface ref={ref} {...props()} />);
     expect(screen.getByTestId("terminal-webview")).toBeTruthy();
+    expect(mockWebViewProps["allowsBackForwardNavigationGestures"]).toBe(false);
 
     await act(() => {
       ref.current?.focus();

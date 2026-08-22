@@ -3,11 +3,9 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type Href, useRouter } from "expo-router";
 import { useCallback, useMemo, useState } from "react";
 import { View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
-import { Icon } from "@/components/ui/icon";
 import { SearchField } from "@/components/ui/search-field";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
@@ -17,6 +15,7 @@ import { CreateWorkspaceDialog } from "@/components/workspaces/create-workspace-
 import { RenameWorkspaceDialog } from "@/components/workspaces/rename-workspace-dialog";
 import { WorkspaceListEmpty } from "@/components/workspaces/workspace-list-empty";
 import { WorkspaceListError } from "@/components/workspaces/workspace-list-error";
+import { WorkspaceListHeader } from "@/components/workspaces/workspace-list-header";
 import {
   type WorkspaceOperationInput,
   type WorkspaceRowModel,
@@ -53,7 +52,7 @@ import {
 } from "@/data/selectors/workspace";
 import type { DomainSnapshot, Workspace } from "@/data/types/domain";
 import { haptics } from "@/lib/haptics";
-import { spacing, useTheme } from "@/theme";
+import { useTheme } from "@/theme";
 
 export function WorkspaceListScreen() {
   const theme = useTheme();
@@ -76,6 +75,7 @@ export function WorkspaceListScreen() {
   const [renameTarget, setRenameTarget] = useState<WorkspaceOut | null>(null);
   const [iconTarget, setIconTarget] = useState<WorkspaceOut | null>(null);
   const [manualRefreshing, setManualRefreshing] = useState(false);
+  const openCreate = useCallback(() => setCreateVisible(true), []);
 
   const operationMutation = useMutation({
     mutationFn: async (input: WorkspaceOperationInput): Promise<WorkspaceOperationResult> => {
@@ -247,39 +247,37 @@ export function WorkspaceListScreen() {
 
   if (workspacesQuery.isLoading) {
     return (
-      <SafeAreaView style={[styles.screen, { backgroundColor: theme.colors.background }]}>
-        <View style={styles.header}>
-          <Text accessibilityRole="header" style={styles.heading} weight="semibold">
-            Workspaces
-          </Text>
-        </View>
+      <View
+        style={[styles.screen, { backgroundColor: theme.colors.background }]}
+        testID="workspace-list-screen"
+      >
+        <WorkspaceListHeader canCreate={false} onCreate={openCreate} />
         <WorkspaceListSkeletons />
-      </SafeAreaView>
+      </View>
     );
   }
 
   if (workspacesQuery.error) {
     return (
-      <SafeAreaView style={[styles.screen, { backgroundColor: theme.colors.background }]}>
+      <View
+        style={[styles.screen, { backgroundColor: theme.colors.background }]}
+        testID="workspace-list-screen"
+      >
+        <WorkspaceListHeader canCreate={false} onCreate={openCreate} />
         <WorkspaceListError
           message={workspaceErrorMessage(workspacesQuery.error)}
           onRetry={() => void refresh()}
         />
-      </SafeAreaView>
+      </View>
     );
   }
 
   return (
-    <SafeAreaView style={[styles.screen, { backgroundColor: theme.colors.background }]}>
-      <View style={styles.header}>
-        <Text accessibilityRole="header" style={styles.heading} weight="semibold">
-          Workspaces
-        </Text>
-        <Button onPress={() => setCreateVisible(true)} size="sm">
-          <Icon color="primaryForeground" name="Plus" size={spacing[4]} />
-          New
-        </Button>
-      </View>
+    <View
+      style={[styles.screen, { backgroundColor: theme.colors.background }]}
+      testID="workspace-list-screen"
+    >
+      <WorkspaceListHeader canCreate onCreate={openCreate} />
       <View style={styles.search}>
         <SearchField onChangeText={setQuery} placeholder="Search workspaces" value={query} />
       </View>
@@ -301,9 +299,7 @@ export function WorkspaceListScreen() {
         data={rows}
         ItemSeparatorComponent={WorkspaceRowSeparator}
         keyExtractor={(item) => item.workspace.id}
-        ListEmptyComponent={
-          <WorkspaceListEmpty onCreate={() => setCreateVisible(true)} query={query} />
-        }
+        ListEmptyComponent={<WorkspaceListEmpty onCreate={openCreate} query={query} />}
         ListFooterComponent={
           <ArchivedWorkspacesLink
             count={archivedQuery.data?.length ?? 0}
@@ -399,7 +395,7 @@ export function WorkspaceListScreen() {
         }}
         workspace={iconTarget}
       />
-    </SafeAreaView>
+    </View>
   );
 }
 

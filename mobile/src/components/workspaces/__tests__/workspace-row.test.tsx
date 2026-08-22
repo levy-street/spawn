@@ -12,7 +12,8 @@ import {
 } from "@/components/workspaces/workspace-row";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import type { WorkspaceStats } from "@/data/types/domain";
-import { chrome, ThemeProvider } from "@/theme";
+import { ThemeProvider } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 jest.mock("react-native-gesture-handler", () => {
   const actual = jest.requireActual<typeof import("react-native-gesture-handler")>(
@@ -99,7 +100,7 @@ describe("workspace list presentation", () => {
     );
     expect(screen.getByText("2 tabs · 3 running · 1 need attention")).toBeTruthy();
     expect(screen.getByLabelText("1 need attention")).toBeTruthy();
-    await fireEvent.press(screen.getByLabelText(/spawn mobile\. 2 tabs/));
+    await fireEvent.press(screen.getByLabelText(/spawn mobile, 2 tabs/));
     expect(callbacks.onOpen).toHaveBeenCalledTimes(1);
     await screen.unmount();
   });
@@ -171,16 +172,15 @@ describe("workspace list presentation", () => {
     );
   });
 
-  test("uses a 40pt visual row inside a 44pt touch target", async () => {
+  test("uses the shared tall ListRow height", async () => {
     const screen = await render(
       <WorkspaceRow {...callbacks} stats={stats} workspace={workspace()} />,
       { wrapper: Providers },
     );
-    expect(screen.getByTestId("workspace-row-touch-workspace-1")).toHaveStyle({
-      height: chrome.touchTarget,
-    });
-    expect(screen.getByTestId("workspace-row-visual-workspace-1")).toHaveStyle({
-      height: chrome.rowHeight,
+    expect(screen.getByLabelText(/spawn mobile, 2 tabs/)).toHaveStyle({
+      minHeight: sizing.listRow.tall,
+      paddingHorizontal: sizing.listRow.horizontalPadding,
+      paddingVertical: sizing.listRow.verticalPadding,
     });
     await screen.unmount();
   });

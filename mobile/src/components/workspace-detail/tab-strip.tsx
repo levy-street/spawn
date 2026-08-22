@@ -1,173 +1,346 @@
-import { useEffect, useRef } from "react";
-import { Pressable, ScrollView, StyleSheet, View } from "react-native";
-import Animated, { type SharedValue, useAnimatedStyle } from "react-native-reanimated";
-
-import { IconButton } from "@/components/ui/icon-button";
-import { Text } from "@/components/ui/text";
+import { type ComponentRef, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AccessibilityInfo,
+  type LayoutChangeEvent,
+  Pressable,
+  StyleSheet,
+  View,
+} from "react-native";
+import Animated, {
+  scrollTo,
+  useAnimatedRef,
+  useAnimatedScrollHandler,
+  useAnimatedStyle,
+  useFrameCallback,
+  useSharedValue,
+} from "react-native-reanimated";
+import { scheduleOnRN } from "react-native-worklets";
+import { Icon } from "@/components/ui/icon";
+import { Spinner } from "@/components/ui/spinner";
+import {
+  DraggableTab,
+  TAB_ACTION_TARGET,
+  TAB_CONNECTED_HEIGHT,
+  TAB_GAP,
+  TAB_GEOMETRY,
+  TAB_STEP,
+  TAB_STRIP_HEIGHT,
+  type TabDragValues,
+} from "@/components/workspace-detail/draggable-tab";
+import { tabDestinationIndex, tabInsertionX } from "@/components/workspace-detail/tab-reorder";
 import type { WorkspaceTab } from "@/data/types/layout";
 import { haptics } from "@/lib/haptics";
 import { useReducedMotion } from "@/lib/motion/reduced-motion";
-import { borderWidth, chrome, opacity, spacing, tabSurfaces, useTheme } from "@/theme";
+import { borderWidth, duration, layer, opacity, spacing, tabSurfaces, useTheme } from "@/theme";
 
-const TAB_WIDTH = spacing[24];
-const TAB_GAP = spacing[1.5];
-const TAB_STEP = TAB_WIDTH + TAB_GAP;
+const TAB_EDGE_SCROLL_BAND = spacing[12];
+const TAB_DROP_INDICATOR_HEIGHT = spacing[7];
+const TAB_SCROLL_BREATHING_ROOM = spacing[3];
+const AUTO_SCROLL_MAX_POINTS_PER_SECOND = 720;
+const MILLISECONDS_PER_SECOND = 1_000;
 
 export interface TabStripProps {
   tabs: readonly WorkspaceTab[];
   activeIndex: number;
-  dragProgress: SharedValue<number>;
   canAdd: boolean;
+  addBusy?: boolean;
   onSelect: (index: number) => void;
   onActions: (tab: WorkspaceTab) => void;
+  onClose: (tab: WorkspaceTab) => void;
+  onReorder: (tabId: string, toIndex: number) => void;
   onAdd: () => void;
+}
+
+function announce(message: string): void {
+  AccessibilityInfo.announceForAccessibility(message);
+}
+
+function beginDragFeedback(name: string, index: number, count: number): void {
+  haptics.impact("medium");
+  announce(`Moving ${name}, position ${index + 1} of ${count}`);
+}
+
+function indexDragFeedback(index: number, count: number): void {
+  haptics.selection();
+  announce(`Position ${index + 1} of ${count}`);
+}
+
+function endDragFeedback(name: string, index: number, count: number): void {
+  haptics.impact("light");
+  announce(`Moved ${name} to position ${index + 1} of ${count}`);
 }
 
 export function TabStrip({
   tabs,
   activeIndex,
-  dragProgress,
   canAdd,
+  addBusy = false,
   onSelect,
   onActions,
+  onClose,
+  onReorder,
   onAdd,
 }: TabStripProps) {
   const theme = useTheme();
   const reducedMotion = useReducedMotion();
-  const scrollRef = useRef<ScrollView>(null);
+  const scrollRef = useAnimatedRef<ComponentRef<typeof Animated.ScrollView>>();
+  const stripRef = useRef<View>(null);
+  const suppressPressRef = useRef(false);
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [scrollEnabled, setScrollEnabled] = useState(true);
   const surfaces = theme.isDark ? tabSurfaces.dark : tabSurfaces.light;
-  const indicatorStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: dragProgress.value * TAB_STEP }],
-  }));
+  const activeFrom = useSharedValue(-1);
+  const activeTo = useSharedValue(-1);
+  const contentWidth = useSharedValue(0);
+  const dragMoved = useSharedValue(false);
+  const pointerAbsoluteX = useSharedValue(0);
+  const pointerOffset = useSharedValue(0);
+  const scrollX = useSharedValue(0);
+  const stripWindowLeft = useSharedValue(0);
+  const translationX = useSharedValue(0);
+  const viewportWidth = useSharedValue(0);
+  const dragValues = useMemo<TabDragValues>(
+    () => ({
+      activeFrom,
+      activeTo,
+      contentWidth,
+      dragMoved,
+      pointerAbsoluteX,
+      pointerOffset,
+      scrollX,
+      stripWindowLeft,
+      translationX,
+      viewportWidth,
+    }),
+    [
+      activeFrom,
+      activeTo,
+      contentWidth,
+      dragMoved,
+      pointerAbsoluteX,
+      pointerOffset,
+      scrollX,
+      stripWindowLeft,
+      translationX,
+      viewportWidth,
+    ],
+  );
+
+  const scrollHandler = useAnimatedScrollHandler((event) => {
+    scrollX.value = event.contentOffset.x;
+  });
+
+  const measureStrip = useCallback(
+    (event: LayoutChangeEvent) => {
+      viewportWidth.value = event.nativeEvent.layout.width;
+      stripRef.current?.measureInWindow((x: number) => {
+        stripWindowLeft.value = x;
+      });
+    },
+    [stripWindowLeft, viewportWidth],
+  );
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
       animated: !reducedMotion,
-      x: Math.max(0, activeIndex * TAB_STEP - TAB_STEP),
+      x: Math.max(0, activeIndex * TAB_STEP - TAB_SCROLL_BREATHING_ROOM),
     });
-  }, [activeIndex, reducedMotion]);
+  }, [activeIndex, reducedMotion, scrollRef]);
+
+  const beginDrag = useCallback((tabId: string, name: string, index: number, count: number) => {
+    suppressPressRef.current = true;
+    setDraggingId(tabId);
+    setScrollEnabled(false);
+    beginDragFeedback(name, index, count);
+  }, []);
+
+  const finishDrag = useCallback(
+    (tabId: string, name: string, fromIndex: number, toIndex: number, moved: boolean) => {
+      setDraggingId(null);
+      setScrollEnabled(true);
+      if (fromIndex !== toIndex) {
+        endDragFeedback(name, toIndex, tabs.length);
+        onReorder(tabId, toIndex);
+      } else if (!moved) {
+        const tab = tabs.find((candidate) => candidate.id === tabId);
+        if (tab) onActions(tab);
+      }
+      setTimeout(() => {
+        suppressPressRef.current = false;
+      }, duration.instant);
+    },
+    [onActions, onReorder, tabs],
+  );
+
+  const cancelDrag = useCallback((name: string) => {
+    setDraggingId(null);
+    setScrollEnabled(true);
+    announce(`Cancelled moving ${name}`);
+    setTimeout(() => {
+      suppressPressRef.current = false;
+    }, duration.instant);
+  }, []);
+
+  useFrameCallback((frame) => {
+    if (activeFrom.value < 0 || viewportWidth.value <= 0) return;
+    const localPointerX = pointerAbsoluteX.value - stripWindowLeft.value;
+    let speed = 0;
+    if (localPointerX < TAB_EDGE_SCROLL_BAND) {
+      speed =
+        -AUTO_SCROLL_MAX_POINTS_PER_SECOND *
+        (1 - Math.max(0, localPointerX) / TAB_EDGE_SCROLL_BAND);
+    } else if (localPointerX > viewportWidth.value - TAB_EDGE_SCROLL_BAND) {
+      speed =
+        AUTO_SCROLL_MAX_POINTS_PER_SECOND *
+        (1 - Math.max(0, viewportWidth.value - localPointerX) / TAB_EDGE_SCROLL_BAND);
+    }
+    if (speed === 0) return;
+
+    const elapsed = frame.timeSincePreviousFrame ?? duration.base;
+    const maxScroll = Math.max(0, contentWidth.value - viewportWidth.value);
+    const nextScroll = Math.min(
+      Math.max(0, scrollX.value + (speed * elapsed) / MILLISECONDS_PER_SECOND),
+      maxScroll,
+    );
+    if (nextScroll === scrollX.value) return;
+
+    scrollX.value = nextScroll;
+    scrollTo(scrollRef, nextScroll, 0, false);
+    const contentPointer = pointerAbsoluteX.value - stripWindowLeft.value + nextScroll;
+    const sourceLeft = activeFrom.value * TAB_STEP;
+    const translation = contentPointer - pointerOffset.value - sourceLeft;
+    translationX.value = translation;
+    const destination = tabDestinationIndex(
+      activeFrom.value,
+      translation,
+      tabs.length,
+      TAB_GEOMETRY,
+    );
+    if (destination !== activeTo.value) {
+      activeTo.value = destination;
+      scheduleOnRN(indexDragFeedback, destination, tabs.length);
+    }
+  });
+
+  const indicatorStyle = useAnimatedStyle(() => ({
+    opacity:
+      activeFrom.value >= 0 && activeFrom.value !== activeTo.value
+        ? opacity.opaque
+        : opacity.hidden,
+    transform: [
+      {
+        translateX: tabInsertionX(activeFrom.value, activeTo.value, TAB_GEOMETRY),
+      },
+    ],
+  }));
+
+  const handleSelect = (index: number) => {
+    if (suppressPressRef.current) return;
+    haptics.selection();
+    onSelect(index);
+  };
 
   return (
-    <View
-      style={[
-        styles.frame,
-        {
-          borderBottomColor: theme.colors.border,
-          borderBottomWidth: borderWidth.hairline,
-          minHeight: chrome.touchTarget,
-        },
-      ]}
-    >
-      <ScrollView
+    <View ref={stripRef} style={[styles.frame, { backgroundColor: theme.colors.shell }]}>
+      <Animated.ScrollView
         contentContainerStyle={styles.content}
         horizontal
+        onContentSizeChange={(width) => {
+          contentWidth.value = width;
+        }}
+        onLayout={measureStrip}
+        onScroll={scrollHandler}
         ref={scrollRef}
+        scrollEnabled={scrollEnabled}
+        scrollEventThrottle={spacing[4]}
         showsHorizontalScrollIndicator={false}
         testID="workspace-tab-strip"
       >
         <View style={styles.tabs}>
+          {tabs.map((tab, index) => (
+            <DraggableTab
+              active={index === activeIndex}
+              canClose={tabs.length > 1}
+              dragValues={dragValues}
+              dragging={draggingId === tab.id}
+              index={index}
+              key={tab.id}
+              onAccessibleReorder={(toIndex) => onReorder(tab.id, toIndex)}
+              onActions={() => onActions(tab)}
+              onBeginDrag={beginDrag}
+              onCancelDrag={cancelDrag}
+              onClose={() => {
+                haptics.impact("light");
+                onClose(tab);
+              }}
+              onFinishDrag={finishDrag}
+              onIndexChange={indexDragFeedback}
+              onSelect={() => handleSelect(index)}
+              reducedMotion={reducedMotion}
+              surfaces={surfaces}
+              tab={tab}
+              tabCount={tabs.length}
+            />
+          ))}
           <Animated.View
             pointerEvents="none"
-            style={[
-              styles.focusedSurface,
-              {
-                backgroundColor: surfaces.focused,
-                borderRadius: theme.radii.md,
-              },
-              indicatorStyle,
-            ]}
-            testID="workspace-tab-indicator"
+            style={[styles.dropIndicator, { backgroundColor: theme.colors.ring }, indicatorStyle]}
+            testID="tab-drop-indicator"
           />
-          {tabs.map((tab, index) => {
-            const selected = index === activeIndex;
-            return (
-              <Pressable
-                accessibilityLabel={`${tab.name} tab`}
-                accessibilityRole="tab"
-                accessibilityState={{ selected }}
-                key={tab.id}
-                onLongPress={() => {
-                  haptics.impact("medium");
-                  onActions(tab);
-                }}
-                onPress={() => onSelect(index)}
-                style={({ pressed }) => [
-                  styles.tab,
-                  {
-                    opacity: pressed ? opacity.hoverButton : opacity.opaque,
-                  },
-                ]}
-                testID={`workspace-tab-${tab.id}`}
-              >
-                {({ pressed }) => (
-                  <View
-                    style={[
-                      styles.tabSurface,
-                      {
-                        backgroundColor: pressed
-                          ? theme.colors.accent
-                          : selected
-                            ? "transparent"
-                            : surfaces.dimmed,
-                        borderRadius: theme.radii.md,
-                        paddingHorizontal: spacing[2],
-                      },
-                    ]}
-                    testID={`workspace-tab-surface-${tab.id}`}
-                  >
-                    <Text
-                      color={selected ? "foreground" : "mutedForeground"}
-                      numberOfLines={1}
-                      variant="label"
-                      weight={selected ? "semibold" : "normal"}
-                    >
-                      {tab.name}
-                    </Text>
-                  </View>
-                )}
-              </Pressable>
-            );
-          })}
         </View>
-        <IconButton
-          accessibilityLabel="Add tab"
-          disabled={!canAdd}
-          icon="Plus"
-          onPress={onAdd}
-          size="sm"
+        <Pressable
+          accessibilityHint={canAdd ? undefined : "A workspace can have up to 8 tabs"}
+          accessibilityLabel="New tab"
+          accessibilityRole="button"
+          accessibilityState={{ busy: addBusy, disabled: !canAdd || addBusy }}
+          disabled={!canAdd || addBusy}
+          onPress={() => {
+            haptics.impact("light");
+            onAdd();
+          }}
+          style={({ pressed }) => [
+            styles.addButton,
+            {
+              backgroundColor: pressed ? theme.colors.accent : "transparent",
+              borderRadius: theme.radii.md,
+              opacity: !canAdd || addBusy ? opacity.disabled : opacity.opaque,
+            },
+          ]}
           testID="add-tab-button"
-        />
-      </ScrollView>
+        >
+          {addBusy ? <Spinner size={spacing[4]} /> : <Icon name="Plus" size={spacing[4]} />}
+        </Pressable>
+      </Animated.ScrollView>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  content: {
+  addButton: {
     alignItems: "center",
+    height: TAB_ACTION_TARGET,
+    justifyContent: "center",
+    width: TAB_ACTION_TARGET,
+  },
+  content: {
+    alignItems: "flex-end",
     gap: TAB_GAP,
+    minHeight: TAB_STRIP_HEIGHT,
+    paddingBottom: TAB_GAP,
+    paddingRight: TAB_GAP,
+  },
+  dropIndicator: {
+    borderRadius: borderWidth.hairline,
+    height: TAB_DROP_INDICATOR_HEIGHT,
+    left: 0,
+    position: "absolute",
+    top: (TAB_CONNECTED_HEIGHT - TAB_DROP_INDICATOR_HEIGHT) / 2,
+    width: borderWidth.emphasis,
+    zIndex: layer.launcherDropPreview,
   },
   frame: {
     flexShrink: 0,
-  },
-  focusedSurface: {
-    height: spacing[8],
-    left: 0,
-    position: "absolute",
-    top: spacing[1.5],
-    width: TAB_WIDTH,
-  },
-  tab: {
-    alignItems: "center",
-    height: chrome.touchTarget,
-    justifyContent: "center",
-    width: TAB_WIDTH,
-  },
-  tabSurface: {
-    alignItems: "center",
-    height: spacing[8],
-    justifyContent: "center",
-    width: TAB_WIDTH,
+    minHeight: TAB_STRIP_HEIGHT,
   },
   tabs: {
     flexDirection: "row",

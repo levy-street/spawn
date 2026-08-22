@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { ScrollView, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 
+import { Screen } from "@/components/layout/screen";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Field } from "@/components/ui/field";
@@ -10,6 +11,7 @@ import type { WorkspaceIconChoice } from "@/components/workspaces/workspace-icon
 import { WorkspaceIconPicker } from "@/components/workspaces/workspace-icon-picker";
 import type { WorkspaceTemplateOut } from "@/data/api/schemas/templates";
 import { spacing } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 const BLANK_TEMPLATE = "__blank__";
 
@@ -83,65 +85,67 @@ export function CreateWorkspaceDialog({
     });
   };
 
-  const footer = (
-    <>
-      <Button disabled={busy} onPress={onDismiss} size="sm" variant="outline">
-        Cancel
-      </Button>
-      <Button loading={busy} onPress={submit} size="sm">
-        Create workspace
-      </Button>
-    </>
-  );
+  const footer = [
+    <Button
+      disabled={busy}
+      key="cancel"
+      onPress={onDismiss}
+      testID="create-workspace-cancel"
+      variant="outline"
+    >
+      Cancel
+    </Button>,
+    <Button key="create" loading={busy} onPress={submit} testID="create-workspace-submit">
+      Create workspace
+    </Button>,
+  ];
 
   return (
     <Dialog
-      footer={footer}
+      contentStyle={styles.dialogContent}
       onDismiss={onDismiss}
       showCloseButton={false}
       size="full-mobile"
       title="New workspace"
       visible={visible}
     >
-      <ScrollView
-        contentContainerStyle={styles.content}
-        keyboardShouldPersistTaps="handled"
-        testID="create-workspace-dialog"
-      >
-        <Field error={error} label="Name" required>
-          <Input
-            autoFocus
-            editable={!busy}
-            onChangeText={setName}
-            onSubmitEditing={submit}
-            placeholder="Workspace name"
-            purpose="name"
-            returnKeyType="done"
-            value={name}
-          />
-        </Field>
-        <Field label="Template">
-          <Select
-            disabled={busy}
-            onChange={setTemplateId}
-            options={options}
-            placeholder="Choose a template"
-            value={templateId}
-          />
-        </Field>
-        <WorkspaceIconPicker name={name} onChange={setIconChoice} value={iconChoice} />
-        <View style={styles.bottomSpacer} />
-      </ScrollView>
+      <Screen footer={footer} scroll>
+        <View style={styles.content} testID="create-workspace-dialog">
+          <Field error={error} label="Name" required>
+            <Input
+              autoFocus
+              editable={!busy}
+              onChangeText={setName}
+              onSubmitEditing={submit}
+              placeholder="Workspace name"
+              purpose="name"
+              returnKeyType="done"
+              value={name}
+            />
+          </Field>
+          <Field label="Template">
+            <Select
+              disabled={busy}
+              onChange={setTemplateId}
+              options={options}
+              placeholder="Choose a template"
+              value={templateId}
+            />
+          </Field>
+          <WorkspaceIconPicker name={name} onChange={setIconChoice} value={iconChoice} />
+        </View>
+      </Screen>
     </Dialog>
   );
 }
 
 const styles = StyleSheet.create({
-  bottomSpacer: {
-    height: spacing[8],
-  },
   content: {
-    gap: spacing[5],
-    padding: spacing[4],
+    gap: sizing.space.section,
+    paddingBottom: sizing.space.section,
+    paddingTop: sizing.space.block,
+  },
+  dialogContent: {
+    paddingBottom: spacing[0],
   },
 });

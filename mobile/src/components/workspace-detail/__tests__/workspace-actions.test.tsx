@@ -1,13 +1,13 @@
-import { fireEvent, render } from "@testing-library/react-native";
+import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren, ReactNode } from "react";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { WorkspaceDetail } from "@/components/workspace-detail/workspace-detail";
 import type { Session } from "@/data/types/domain";
-import type { WorkspaceTab } from "@/data/types/layout";
+import type { Tile, WorkspaceTab } from "@/data/types/layout";
 import { ThemeProvider } from "@/theme";
 
-import { makeWorkspace } from "./fixtures";
+import { makeSession, makeTab, makeWorkspace } from "./fixtures";
 
 type CapturedProps = Record<string, unknown>;
 
@@ -26,7 +26,8 @@ interface CapturedGroups {
 
 const mockCaptured: CapturedGroups = {};
 const mockOpenTerminal = jest.fn();
-const mockWorkspace = makeWorkspace();
+let mockWorkspace = makeWorkspace();
+let mockSessions: Session[] = [];
 const mockLaunchedSession: Session = {
   id: "launched-session",
   name: "Native session",
@@ -98,20 +99,46 @@ jest.mock("@/components/launcher/launcher-sheet", () => ({
 jest.mock("@/components/workspace-detail/workspace-header", () => ({
   WorkspaceHeader: (props: CapturedProps) => {
     const React = jest.requireActual<typeof import("react")>("react");
-    const { Pressable, Text } = jest.requireActual<typeof import("react-native")>("react-native");
+    const { Pressable, Text, View } =
+      jest.requireActual<typeof import("react-native")>("react-native");
     mockCaptured.header = props;
     return React.createElement(
-      Pressable,
-      { accessibilityLabel: "Header add", onPress: props["onAddPane"] as () => void },
-      React.createElement(Text, null, "Header add"),
+      View,
+      null,
+      React.createElement(
+        Pressable,
+        { accessibilityLabel: "Header add", onPress: props["onAddPane"] as () => void },
+        React.createElement(Text, null, "Header add"),
+      ),
+      React.createElement(
+        Pressable,
+        { accessibilityLabel: "Header actions", onPress: props["onActions"] as () => void },
+        React.createElement(Text, null, "Header actions"),
+      ),
     );
   },
 }));
 
 jest.mock("@/components/workspace-detail/tab-strip", () => ({
   TabStrip: (props: CapturedProps) => {
+    const React = jest.requireActual<typeof import("react")>("react");
+    const { Pressable, Text } = jest.requireActual<typeof import("react-native")>("react-native");
     mockCaptured.tabStrip = props;
-    return null;
+    const tabs = props["tabs"] as WorkspaceTab[];
+    const first = tabs[0];
+    const onClose = props["onClose"];
+    return first && tabs.length > 1
+      ? React.createElement(
+          Pressable,
+          {
+            accessibilityLabel: `Close ${first.name}`,
+            onPress: () => {
+              if (typeof onClose === "function") onClose(first);
+            },
+          },
+          React.createElement(Text, null, `Close ${first.name}`),
+        )
+      : null;
   },
 }));
 
@@ -164,7 +191,7 @@ jest.mock("@/components/ui/confirm", () => ({
 jest.mock("@/data/queries/workspace-detail", () => ({
   useWorkspaceDetail: () => ({
     workspace: { data: mockWorkspace, refetch: jest.fn() },
-    sessions: { data: [] },
+    sessions: { data: mockSessions },
     hosts: { data: [] },
     agents: { data: [] },
     loading: false,
@@ -203,6 +230,8 @@ function expectHandlers(group: keyof CapturedGroups, names: readonly string[]): 
 describe("workspace action wiring", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockWorkspace = makeWorkspace();
+    mockSessions = [];
     for (const key of Object.keys(mockCaptured) as Array<keyof CapturedGroups>) {
       delete mockCaptured[key];
     }
@@ -233,6 +262,119 @@ describe("workspace action wiring", () => {
     await screen.unmount();
   });
 
+  it("opens workspace actions from the header ellipsis", async () => {
+    const screen = await render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+
+    expect(mockCaptured.workspaceActions?.["visible"]).toBe(false);
+    await fireEvent.press(screen.getByLabelText("Header actions"));
+    expect(mockCaptured.workspaceActions?.["visible"]).toBe(true);
+  });
+
+  it("surfaces the 16-pane reason when the header add control is blocked", async () => {
+    const tiles: Tile[] = Array.from({ length: 16 }, (_, index) => ({
+      session_id: `session-${index}`,
+      x: index,
+      y: 0,
+      w: 4,
+      h: 4,
+    }));
+    mockWorkspace = makeWorkspace([makeTab("main", tiles)]);
+    const screen = await render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+
+    await fireEvent.press(screen.getByLabelText("Header add"));
+    expect(screen.getByText("This tab is full. A tab can contain up to 16 panes.")).toBeTruthy();
+    expect(mockCaptured.launcher?.["visible"]).toBe(false);
+  });
+
+  it("confirms a close with live sessions and removes only after confirmation", async () => {
+    const session = makeSession();
+    mockSessions = [session];
+    mockWorkspace = makeWorkspace([
+      makeTab("main", [{ session_id: session.id, x: 0, y: 0, w: 24, h: 24 }]),
+      makeTab("tests"),
+    ]);
+    const screen = await render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+
+    await fireEvent.press(screen.getByLabelText("Close main"));
+    expect(mockCaptured.confirm?.["visible"]).toBe(true);
+    expect(mockCaptured.confirm?.["title"]).toBe("Close main?");
+    expect(mockWorkspaceActions.deleteTab).not.toHaveBeenCalled();
+
+    await act(async () => {
+      (mockCaptured.confirm?.["onConfirm"] as (() => void) | undefined)?.();
+    });
+    await waitFor(() =>
+      expect(mockWorkspaceActions.deleteTab).toHaveBeenCalledWith(mockWorkspace, "main"),
+    );
+  });
+
+  it("closes an empty tab immediately without destructive confirmation", async () => {
+    mockWorkspace = makeWorkspace([makeTab("main"), makeTab("tests")]);
+    const screen = await render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+
+    await fireEvent.press(screen.getByLabelText("Close main"));
+    await waitFor(() =>
+      expect(mockWorkspaceActions.deleteTab).toHaveBeenCalledWith(mockWorkspace, "main"),
+    );
+    expect(mockCaptured.confirm?.["visible"]).toBe(false);
+  });
+
+  it("persists only the final absolute tab destination from a drag drop", async () => {
+    mockWorkspace = makeWorkspace([makeTab("main"), makeTab("tests"), makeTab("server")]);
+    const screen = await render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+
+    await act(async () => {
+      (
+        mockCaptured.tabStrip?.["onReorder"] as
+          | ((tabId: string, toIndex: number) => void)
+          | undefined
+      )?.("main", 2);
+    });
+    expect(mockWorkspaceActions.reorderTab).toHaveBeenCalledTimes(1);
+    expect(mockWorkspaceActions.reorderTab).toHaveBeenCalledWith(mockWorkspace, "main", 2);
+    await screen.unmount();
+  });
+
   it("supplies a function for every action exposed by the workspace screen", async () => {
     const screen = await render(
       <WorkspaceDetail
@@ -244,8 +386,8 @@ describe("workspace action wiring", () => {
       { wrapper: Providers },
     );
 
-    expectHandlers("header", ["onBack", "onAddPane", "onActions"]);
-    expectHandlers("tabStrip", ["onSelect", "onActions", "onAdd"]);
+    expectHandlers("header", ["onAddPane", "onActions"]);
+    expectHandlers("tabStrip", ["onSelect", "onActions", "onAdd", "onClose", "onReorder"]);
     expectHandlers("paneList", [
       "onAddPane",
       "onOpenTerminal",

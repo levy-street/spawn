@@ -1,0 +1,11 @@
+# Boots the app in Expo Go and proves the shell renders without a red box.
+appId: host.exp.Exponent
+---
+- launchApp:
+    clearState: false
+- extendedWaitUntil:
+    notVisible: "Continue"
+    timeout: 8000
+- takeScreenshot: /tmp/spawn-shots/00-launch
+- assertNotVisible: "Uncaught Error"
+- assertNotVisible: "Requiring unknown module"

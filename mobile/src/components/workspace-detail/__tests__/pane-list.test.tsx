@@ -1,13 +1,13 @@
 import { fireEvent, render } from "@testing-library/react-native";
 import type { StyleProp, ViewStyle } from "react-native";
-import { makeMutable } from "react-native-reanimated";
 
 import { PaneList } from "@/components/workspace-detail/pane-list";
 import { TabStrip } from "@/components/workspace-detail/tab-strip";
 import { canAddTab } from "@/data/layout/tabs";
 import { canAddTile } from "@/data/layout/tiles";
 import type { Tile } from "@/data/types/layout";
-import { chrome, radii, spacing, specialSpace, ThemeProvider } from "@/theme";
+import { ThemeProvider } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 import { makeHost, makeTab } from "./fixtures";
 
@@ -90,15 +90,16 @@ describe("workspace tab pane lists", () => {
     expect(screen.getByText("office-mac · /Users/spawn/dev")).toBeTruthy();
     expect(screen.getByText("Online")).toBeTruthy();
     expect(screen.getByTestId("pane-list-main")).toHaveStyle({
-      padding: specialSpace.paneHalfGap,
+      paddingHorizontal: sizing.screen.gutter,
+      paddingTop: sizing.space.cluster,
     });
-    expect(screen.getByTestId("files-row-files-1")).toHaveStyle({
-      borderRadius: radii.md,
-      minHeight: spacing[14],
-      paddingHorizontal: spacing[3],
-      paddingVertical: spacing[2],
+    const row = screen.getByLabelText("Files — dev, office-mac · /Users/spawn/dev");
+    expect(row).toHaveStyle({
+      minHeight: sizing.listRow.tall,
+      paddingHorizontal: sizing.listRow.horizontalPadding,
+      paddingVertical: sizing.listRow.verticalPadding,
     });
-    fireEvent.press(screen.getByTestId("files-row-files-1"));
+    fireEvent.press(row);
     expect(onOpenFiles).toHaveBeenCalledWith("host-1", "/Users/spawn/dev");
   });
 
@@ -109,9 +110,10 @@ describe("workspace tab pane lists", () => {
       <TabStrip
         activeIndex={0}
         canAdd={canAddTab(layout)}
-        dragProgress={makeMutable(0)}
         onActions={jest.fn()}
         onAdd={jest.fn()}
+        onClose={jest.fn()}
+        onReorder={jest.fn()}
         onSelect={jest.fn()}
         tabs={tabs}
       />,
@@ -119,12 +121,6 @@ describe("workspace tab pane lists", () => {
     );
 
     expect(screen.getByTestId("add-tab-button")).toBeDisabled();
-    expect(screen.getByTestId("workspace-tab-tab-1")).toHaveStyle({
-      height: chrome.touchTarget,
-    });
-    expect(screen.getByTestId("workspace-tab-surface-tab-1")).toHaveStyle({
-      height: spacing[8],
-    });
   });
 
   it("disables add-pane at the sixteen-tile ceiling", async () => {
@@ -156,6 +152,32 @@ describe("workspace tab pane lists", () => {
       { wrapper: ThemeProvider },
     );
 
-    expect(screen.getByLabelText("Add")).toBeDisabled();
+    expect(screen.getByLabelText("Add terminal or files")).toBeDisabled();
+    expect(screen.getByText("This tab is full. A tab can contain up to 16 panes.")).toBeTruthy();
+  });
+
+  it("renders an unavailable pane through the tall row primitive", async () => {
+    const screen = await render(
+      <PaneList
+        agents={[]}
+        canAddPane
+        hostsById={new Map()}
+        onAddPane={jest.fn()}
+        onMovePane={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={jest.fn()}
+        onPaneActions={jest.fn()}
+        onRemovePane={jest.fn()}
+        onRenameSession={jest.fn()}
+        sessionsById={new Map()}
+        tab={makeTab("main", [{ session_id: "missing", x: 0, y: 0, w: 24, h: 24 }])}
+        transports={{}}
+      />,
+      { wrapper: ThemeProvider },
+    );
+
+    expect(screen.getByLabelText("Session unavailable, Refresh or remove this pane.")).toHaveStyle({
+      minHeight: sizing.listRow.tall,
+    });
   });
 });

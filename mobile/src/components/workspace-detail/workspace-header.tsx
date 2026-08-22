@@ -1,89 +1,78 @@
+import { useNavigation } from "@react-navigation/native";
+import { useLayoutEffect } from "react";
 import { StyleSheet, View } from "react-native";
 
 import { IconButton } from "@/components/ui/icon-button";
-import { Text } from "@/components/ui/text";
 import type { Workspace } from "@/data/types/domain";
-import { borderWidth, chrome, spacing, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export interface WorkspaceHeaderProps {
   workspace: Workspace;
   canAddPane: boolean;
-  topInset: number;
-  onBack: () => void;
   onAddPane: () => void;
   onActions: () => void;
 }
 
+/** Configures the owning native-stack header so this screen never charges the top inset twice. */
 export function WorkspaceHeader({
   workspace,
   canAddPane,
-  topInset,
-  onBack,
   onAddPane,
   onActions,
 }: WorkspaceHeaderProps) {
-  const theme = useTheme();
+  const navigation = useNavigation();
 
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      title: workspace.name,
+      headerRight: () => (
+        <WorkspaceHeaderActions
+          canAddPane={canAddPane}
+          onActions={onActions}
+          onAddPane={onAddPane}
+        />
+      ),
+    });
+  }, [canAddPane, navigation, onActions, onAddPane, workspace.name]);
+
+  return null;
+}
+
+function WorkspaceHeaderActions({
+  canAddPane,
+  onAddPane,
+  onActions,
+}: Pick<WorkspaceHeaderProps, "canAddPane" | "onAddPane" | "onActions">) {
   return (
-    <View
-      style={[
-        styles.header,
-        {
-          borderBottomColor: theme.colors.border,
-          borderBottomWidth: borderWidth.hairline,
-          minHeight: spacing[12] + topInset,
-          paddingHorizontal: spacing[1.5],
-          paddingTop: topInset,
-        },
-      ]}
-      testID="workspace-header"
-    >
-      <View style={[styles.side, styles.sideStart]}>
-        <IconButton accessibilityLabel="Back to workspaces" icon="ChevronLeft" onPress={onBack} />
-      </View>
-      <View style={styles.title}>
-        <Text accessibilityRole="header" numberOfLines={1} variant="label" weight="medium">
-          {workspace.name}
-        </Text>
-      </View>
-      <View style={[styles.side, styles.sideEnd]}>
-        <IconButton
-          accessibilityLabel="Add terminal or files"
-          disabled={!canAddPane}
-          icon="Plus"
-          onPress={onAddPane}
-          testID="header-add-pane"
-        />
-        <IconButton
-          accessibilityLabel="Workspace actions"
-          icon="Ellipsis"
-          onPress={onActions}
-          testID="workspace-actions-button"
-        />
-      </View>
+    <View style={styles.actions}>
+      <IconButton
+        accessibilityHint={
+          canAddPane ? undefined : "This tab is full. A tab can contain up to 16 panes."
+        }
+        accessibilityLabel="Add terminal or files"
+        icon="Plus"
+        onPress={onAddPane}
+        style={styles.action}
+        testID="header-add-pane"
+      />
+      <IconButton
+        accessibilityLabel="Workspace actions"
+        icon="Ellipsis"
+        onPress={onActions}
+        style={styles.action}
+        testID="workspace-actions-button"
+      />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  header: {
+  action: {
+    height: sizing.control.iconButton.default,
+    width: sizing.control.iconButton.default,
+  },
+  actions: {
     alignItems: "center",
     flexDirection: "row",
-  },
-  side: {
-    alignItems: "center",
-    flexDirection: "row",
-    width: chrome.touchTarget * 2,
-  },
-  sideEnd: {
-    justifyContent: "flex-end",
-  },
-  sideStart: {
-    justifyContent: "flex-start",
-  },
-  title: {
-    flex: 1,
-    minWidth: 0,
-    alignItems: "center",
   },
 });

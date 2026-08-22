@@ -19,6 +19,16 @@ function routeSessionId(value: string | string[] | undefined): string {
   return Array.isArray(value) ? (value[0] ?? "") : (value ?? "");
 }
 
+export const TERMINAL_ROUTE_GESTURE_OPTIONS = {
+  animation: "slide_from_right",
+  animationMatchesGesture: true,
+  fullScreenGestureEnabled: true,
+  gestureDirection: "horizontal",
+  gestureEnabled: true,
+  headerShown: true,
+  presentation: "card",
+} as const;
+
 export default function TerminalScreen(): React.JSX.Element {
   const theme = useTheme();
   const focused = useIsFocused();
@@ -33,8 +43,12 @@ export default function TerminalScreen(): React.JSX.Element {
   const screenOptions = (
     <Stack.Screen
       options={{
-        headerShown: false,
-        presentation: "card",
+        ...TERMINAL_ROUTE_GESTURE_OPTIONS,
+        contentStyle: { backgroundColor: theme.colors.background },
+        headerShadowVisible: false,
+        headerStyle: { backgroundColor: theme.colors.background },
+        headerTintColor: theme.colors.foreground,
+        title: "Terminal",
       }}
     />
   );
@@ -67,7 +81,6 @@ export default function TerminalScreen(): React.JSX.Element {
                 Retry
               </Button>
             ) : null}
-            <Button onPress={() => router.back()}>Close</Button>
           </View>
         </Screen>
       </>

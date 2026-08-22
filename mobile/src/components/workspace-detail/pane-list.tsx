@@ -1,9 +1,10 @@
 import { FlashList } from "@shopify/flash-list";
 import { memo, useCallback, useMemo } from "react";
-import { Pressable, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
+import { ListRow } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import { FilesWidgetRow } from "@/components/workspace-detail/files-widget-row";
@@ -12,7 +13,7 @@ import { readingOrder } from "@/data/layout/mobile-order";
 import type { AgentDef, Host, Session, TransportState } from "@/data/types/domain";
 import { isFilesWidget, type Tile, type WorkspaceTab } from "@/data/types/layout";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, spacing, specialSpace, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export interface PaneListProps {
   tab: WorkspaceTab;
@@ -100,17 +101,13 @@ export const PaneList = memo(function PaneList({
 
   return (
     <FlashList
-      contentContainerStyle={{ padding: specialSpace.paneHalfGap }}
+      contentContainerStyle={styles.listContent}
       data={tiles}
       ItemSeparatorComponent={PaneSeparator}
       keyExtractor={(tile) => tile.session_id}
       ListEmptyComponent={
         <EmptyState
-          action={
-            <Button disabled={!canAddPane} onPress={onAddPane} size="sm">
-              Add terminal or files
-            </Button>
-          }
+          action={<AddPaneControl canAddPane={canAddPane} onAddPane={onAddPane} />}
           description="The circle is empty. Spawn something into it."
           icon="SquareTerminal"
           title="Open your first window"
@@ -119,10 +116,7 @@ export const PaneList = memo(function PaneList({
       ListFooterComponent={
         tiles.length > 0 ? (
           <View style={styles.footer}>
-            <Button disabled={!canAddPane} onPress={onAddPane} size="sm" variant="outline">
-              <Icon name="Plus" />
-              Add
-            </Button>
+            <AddPaneControl canAddPane={canAddPane} onAddPane={onAddPane} />
           </View>
         ) : null
       }
@@ -137,59 +131,70 @@ function PaneSeparator() {
   return <View style={styles.separator} />;
 }
 
-function MissingPaneRow({ paneId, onActions }: { paneId: string; onActions: () => void }) {
-  const theme = useTheme();
+function AddPaneControl({ canAddPane, onAddPane }: { canAddPane: boolean; onAddPane: () => void }) {
   return (
-    <Pressable
-      accessibilityLabel="Session unavailable"
-      accessibilityRole="button"
-      onLongPress={() => {
-        haptics.impact("medium");
-        onActions();
-      }}
-      onPress={onActions}
-      style={[
-        styles.missing,
-        {
-          backgroundColor: theme.colors.card,
-          borderColor: theme.colors.paneDivider,
-          borderRadius: theme.radii.md,
-          borderWidth: borderWidth.hairline,
-          gap: spacing[3],
-          minHeight: spacing[14],
-          paddingHorizontal: spacing[3],
-          paddingVertical: spacing[2],
-        },
-      ]}
-      testID={`missing-row-${paneId}`}
-    >
-      <StatusDot tone="offline" />
-      <View style={styles.missingCopy}>
-        <Text variant="label">Session unavailable</Text>
-        <Text color="mutedForeground" variant="caption">
-          Refresh or remove this pane.
+    <View style={styles.addControl}>
+      <Button
+        accessibilityHint={
+          canAddPane ? undefined : "This tab is full. A tab can contain up to 16 panes."
+        }
+        disabled={!canAddPane}
+        onPress={onAddPane}
+        style={styles.fullWidth}
+        variant="outline"
+      >
+        <Icon name="Plus" size={sizing.control.spinner} />
+        Add terminal or files
+      </Button>
+      {!canAddPane ? (
+        <Text color="warning" style={styles.blockedReason} variant="caption">
+          This tab is full. A tab can contain up to 16 panes.
         </Text>
-      </View>
-      <Icon color="mutedForeground" name="Ellipsis" />
-    </Pressable>
+      ) : null}
+    </View>
+  );
+}
+
+function MissingPaneRow({ paneId, onActions }: { paneId: string; onActions: () => void }) {
+  return (
+    <View testID={`missing-row-${paneId}`}>
+      <ListRow
+        height="tall"
+        leading={<StatusDot tone="offline" />}
+        onLongPress={() => {
+          haptics.impact("medium");
+          onActions();
+        }}
+        onPress={onActions}
+        subtitle="Refresh or remove this pane."
+        title="Session unavailable"
+        trailing={<Icon color="mutedForeground" name="Ellipsis" />}
+      />
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
+  addControl: {
+    alignItems: "stretch",
+    gap: sizing.space.peer,
+    width: "100%",
+  },
+  blockedReason: {
+    textAlign: "center",
+  },
   footer: {
-    alignItems: "center",
-    paddingTop: chrome.paneGap,
+    paddingTop: sizing.space.block,
   },
-  missing: {
-    alignItems: "center",
-    flexDirection: "row",
-    minHeight: chrome.touchTarget,
+  fullWidth: {
+    width: "100%",
   },
-  missingCopy: {
-    flex: 1,
-    minWidth: 0,
+  listContent: {
+    paddingBottom: sizing.space.block,
+    paddingHorizontal: sizing.screen.gutter,
+    paddingTop: sizing.space.cluster,
   },
   separator: {
-    height: chrome.paneGap,
+    height: sizing.listRow.betweenRows,
   },
 });

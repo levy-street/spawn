@@ -1,8 +1,10 @@
 import { QueryClient } from "@tanstack/react-query";
+import { tabDestinationIndex } from "@/components/workspace-detail/tab-reorder";
 import { reorderPaneLayout } from "@/components/workspace-detail/use-workspace-actions";
 import { patchWorkspace } from "@/data/api/endpoints/workspaces";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import * as mobileOrder from "@/data/layout/mobile-order";
+import { reorderTab } from "@/data/layout/tabs";
 import {
   commitWorkspaceLayout,
   createWorkspaceReorderDebouncer,
@@ -63,6 +65,36 @@ describe("workspace mobile reorder", () => {
       layout.tabs[0]?.layout.tiles.find((tile) => tile.session_id === "files")?.widget,
     ).toEqual({ kind: "files", host_id: "host-1", path: "/work", view: "tree" });
     applyMobileOrder.mockRestore();
+  });
+
+  it("resolves every fixed-width tab drop and produces the expected order", () => {
+    const geometry = { tabWidth: 160, tabGap: 6 };
+    const step = geometry.tabWidth + geometry.tabGap;
+    const tabs = Array.from({ length: 8 }, (_, index) => makeTab(`tab-${index}`));
+    const workspace = makeWorkspace(tabs);
+
+    for (let from = 0; from < tabs.length; from += 1) {
+      for (let to = 0; to < tabs.length; to += 1) {
+        const destination = tabDestinationIndex(from, (to - from) * step, tabs.length, geometry);
+        const reordered = reorderTab(workspace.layout, tabs[from]?.id ?? "", destination);
+        const expected = tabs.map((tab) => tab.id);
+        const [moved] = expected.splice(from, 1);
+        if (moved) expected.splice(to, 0, moved);
+
+        expect(destination).toBe(to);
+        expect(reordered.tabs.map((tab) => tab.id)).toEqual(expected);
+        expect(reordered.active_tab).toBe(workspace.layout.active_tab);
+      }
+    }
+  });
+
+  it("changes destination only after the dragged edge crosses a neighbor midpoint", () => {
+    const geometry = { tabWidth: 160, tabGap: 6 };
+
+    expect(tabDestinationIndex(1, 85, 3, geometry)).toBe(1);
+    expect(tabDestinationIndex(1, 87, 3, geometry)).toBe(2);
+    expect(tabDestinationIndex(1, -85, 3, geometry)).toBe(1);
+    expect(tabDestinationIndex(1, -87, 3, geometry)).toBe(0);
   });
 
   it("coalesces rapid reorders into one PATCH after 500ms", async () => {

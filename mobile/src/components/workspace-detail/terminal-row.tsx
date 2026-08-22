@@ -1,7 +1,10 @@
 import { memo, useMemo } from "react";
-import { Pressable, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
+
 import { type SwipeAction, SwipeableRow } from "@/components/gestures/swipeable-row";
 import { Icon } from "@/components/ui/icon";
+import { IconButton } from "@/components/ui/icon-button";
+import { ListRow } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import { AgentIcon } from "@/components/workspace-detail/agent-icon";
@@ -9,7 +12,8 @@ import { identifyAgent } from "@/data/selectors/agent";
 import { attentionRank, displayStatus, sessionTitle } from "@/data/selectors/session";
 import type { AgentDef, Host, Session, TransportState } from "@/data/types/domain";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
+import { useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export interface TerminalRowProps {
   session: Session;
@@ -77,100 +81,81 @@ export const TerminalRow = memo(function TerminalRow({
 
   return (
     <SwipeableRow
-      contentStyle={{ backgroundColor: theme.colors.card }}
+      contentStyle={{ backgroundColor: theme.colors.background }}
       leadingActions={leadingActions}
-      style={{ borderRadius: theme.radii.md }}
+      style={{ borderRadius: theme.radii.lg }}
       testID={`terminal-swipe-${session.id}`}
       trailingActions={trailingActions}
     >
-      <Pressable
-        accessibilityActions={[{ name: "activate" }, { name: "longpress", label: "Show actions" }]}
-        accessibilityLabel={`${title}, ${identity.displayName}, ${status.label}`}
-        accessibilityRole="button"
-        onAccessibilityAction={(event) => {
-          if (event.nativeEvent.actionName === "longpress") onActions();
-          else if (event.nativeEvent.actionName === "activate") onOpen();
-        }}
-        onLongPress={() => {
-          haptics.impact("medium");
-          onActions();
-        }}
-        onPress={onOpen}
-        style={({ pressed }) => [
-          styles.row,
-          {
-            backgroundColor: pressed ? theme.colors.accent : theme.colors.card,
-            borderColor: theme.colors.paneDivider,
-            borderRadius: theme.radii.md,
-            borderWidth: borderWidth.hairline,
-            gap: spacing[3],
-            minHeight: spacing[14],
-            opacity: pressed ? opacity.hoverButton : opacity.opaque,
-            paddingHorizontal: spacing[3],
-            paddingVertical: spacing[2],
-          },
-        ]}
-        testID={`terminal-row-${session.id}`}
-      >
-        <View style={styles.iconFrame}>
-          <AgentIcon identity={identity} />
-          <StatusDot
-            bordered
-            pulse={status.pulse}
-            style={styles.iconStatus}
-            testID={`terminal-status-dot-${session.id}`}
-            tone={status.tone}
-          />
-        </View>
-        <View style={styles.copy}>
-          <Text numberOfLines={1} variant="label" weight="semibold">
-            {title}
-          </Text>
-          <Text color="mutedForeground" numberOfLines={1} variant="caption">
-            {detail}
-          </Text>
-        </View>
-        <View style={styles.trailing}>
-          <View style={[styles.status, { gap: theme.space(1.5) }]}>
-            <StatusDot pulse={status.pulse} tone={status.tone} />
-            <Text color={statusColor} numberOfLines={1} variant="caption">
-              {status.label}
-            </Text>
-          </View>
-          <Icon color="mutedForeground" name="Ellipsis" size={theme.space(4)} />
-        </View>
-      </Pressable>
+      <View style={styles.frame} testID={`terminal-row-${session.id}`}>
+        <ListRow
+          height="tall"
+          leading={
+            <View style={styles.iconFrame}>
+              <AgentIcon identity={identity} size={sizing.listRow.leading.pane} />
+              <StatusDot
+                bordered
+                pulse={status.pulse}
+                style={styles.iconStatus}
+                testID={`terminal-status-dot-${session.id}`}
+                tone={status.tone}
+              />
+            </View>
+          }
+          onLongPress={() => {
+            haptics.impact("medium");
+            onActions();
+          }}
+          onPress={() => {
+            haptics.selection();
+            onOpen();
+          }}
+          subtitle={detail}
+          title={title}
+          trailing={
+            <View style={styles.status}>
+              <StatusDot pulse={status.pulse} tone={status.tone} />
+              <Text color={statusColor} numberOfLines={1} variant="caption">
+                {status.label}
+              </Text>
+            </View>
+          }
+        />
+        <IconButton
+          accessibilityLabel={`Actions for ${title}`}
+          icon="Ellipsis"
+          onPress={onActions}
+          style={styles.action}
+        />
+      </View>
     </SwipeableRow>
   );
 });
 
 const styles = StyleSheet.create({
-  copy: {
-    flex: 1,
-    minWidth: 0,
+  action: {
+    height: sizing.listRow.trailingTarget,
+    position: "absolute",
+    right: 0,
+    top: (sizing.listRow.tall - sizing.listRow.trailingTarget) / 2,
+    width: sizing.listRow.trailingTarget,
+  },
+  frame: {
+    position: "relative",
   },
   iconFrame: {
     flexShrink: 0,
     position: "relative",
   },
   iconStatus: {
-    bottom: -borderWidth.emphasis,
+    bottom: 0,
     position: "absolute",
-    right: -borderWidth.emphasis,
-  },
-  row: {
-    alignItems: "center",
-    flexDirection: "row",
-    minHeight: chrome.touchTarget,
+    right: 0,
   },
   status: {
     alignItems: "center",
     flexDirection: "row",
-  },
-  trailing: {
-    alignItems: "flex-end",
-    alignSelf: "stretch",
-    justifyContent: "space-between",
-    maxWidth: "34%",
+    gap: sizing.space.peer,
+    paddingRight: sizing.listRow.trailingTarget,
   },
 });

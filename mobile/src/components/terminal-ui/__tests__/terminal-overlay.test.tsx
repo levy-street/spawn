@@ -15,31 +15,6 @@ jest.mock("expo-linking", () => ({
   openURL: jest.fn(async () => undefined),
 }));
 
-jest.mock("@/components/ui/swipe-dismiss-overlay", () => {
-  const React = require("react") as typeof import("react");
-  const { View } = require("react-native") as typeof import("react-native");
-  return {
-    SwipeDismissOverlay: ({
-      children,
-      dragHandleRegion,
-    }: React.PropsWithChildren<{ dragHandleRegion?: string }>) =>
-      React.createElement(
-        View,
-        { testID: "mock-swipe-overlay", accessibilityLabel: dragHandleRegion },
-        children,
-      ),
-  };
-});
-
-jest.mock("@/components/terminal-ui/full-surface-dismiss", () => {
-  const React = require("react") as typeof import("react");
-  const { View } = require("react-native") as typeof import("react-native");
-  return {
-    FullSurfaceDismiss: ({ children }: React.PropsWithChildren) =>
-      React.createElement(View, { testID: "mock-full-surface-dismiss" }, children),
-  };
-});
-
 jest.mock("@/components/terminal-ui/terminal-header", () => ({ TerminalHeader: () => null }));
 jest.mock("@/components/terminal-ui/modifier-bar", () => ({ ModifierBar: () => null }));
 jest.mock("@/components/terminal-ui/search-bar", () => ({ TerminalSearchBar: () => null }));
@@ -126,7 +101,7 @@ describe("terminal overlay dismissal", () => {
     mockTerminalSurfaceProps = {};
   });
 
-  test("keeps header drag and adds a full-surface horizontal recognizer", async () => {
+  test("renders connected content without a competing nested page-dismiss recognizer", async () => {
     await render(
       <ThemeProvider>
         <TerminalOverlay
@@ -140,8 +115,9 @@ describe("terminal overlay dismissal", () => {
         />
       </ThemeProvider>,
     );
-    expect(screen.getByTestId("mock-swipe-overlay")).toHaveProp("accessibilityLabel", "header");
-    expect(screen.getByTestId("mock-full-surface-dismiss")).toBeTruthy();
+    expect(screen.getByTestId("terminal")).toBeTruthy();
+    expect(screen.queryByTestId("terminal-full-surface-dismiss")).toBeNull();
+    expect(screen.queryByTestId("swipe-dismiss-overlay")).toBeNull();
   });
 
   test("opens safe terminal links deliberately and rejects unsupported schemes", async () => {

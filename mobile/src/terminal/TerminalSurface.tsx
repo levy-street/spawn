@@ -360,6 +360,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
         originWhitelist={["*"]}
         scrollEnabled={false}
         bounces={false}
+        allowsBackForwardNavigationGestures={false}
         overScrollMode="never"
         hideKeyboardAccessoryView
         keyboardDisplayRequiresUserAction={false}

@@ -1,12 +1,15 @@
 import { memo, useMemo } from "react";
-import { Pressable, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 
 import { type SwipeAction, SwipeableRow } from "@/components/gestures/swipeable-row";
 import { Icon } from "@/components/ui/icon";
+import { IconButton } from "@/components/ui/icon-button";
+import { ListRow } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
+import { borderWidth, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export interface FilesWidgetRowProps {
   paneId: string;
@@ -64,104 +67,81 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
 
   return (
     <SwipeableRow
-      contentStyle={{ backgroundColor: theme.colors.card }}
+      contentStyle={{ backgroundColor: theme.colors.background }}
       leadingActions={leadingActions}
-      style={{ borderRadius: theme.radii.md }}
+      style={{ borderRadius: theme.radii.lg }}
       testID={`files-swipe-${paneId}`}
       trailingActions={trailingActions}
     >
-      <Pressable
-        accessibilityActions={[{ name: "activate" }, { name: "longpress", label: "Show actions" }]}
-        accessibilityLabel={`${title}, ${status}`}
-        accessibilityRole="button"
-        onAccessibilityAction={(event) => {
-          if (event.nativeEvent.actionName === "longpress") onActions();
-          else if (event.nativeEvent.actionName === "activate") onOpen();
-        }}
-        onLongPress={() => {
-          haptics.impact("medium");
-          onActions();
-        }}
-        onPress={() => {
-          haptics.selection();
-          onOpen();
-        }}
-        style={({ pressed }) => [
-          styles.row,
-          {
-            backgroundColor: pressed ? theme.colors.accent : theme.colors.card,
-            borderColor: theme.colors.paneDivider,
-            borderRadius: theme.radii.md,
-            borderWidth: borderWidth.hairline,
-            gap: spacing[3],
-            minHeight: spacing[14],
-            opacity: pressed ? opacity.hoverButton : opacity.opaque,
-            paddingHorizontal: spacing[3],
-            paddingVertical: spacing[2],
-          },
-        ]}
-        testID={`files-row-${paneId}`}
-      >
-        <View
-          style={[
-            styles.iconPlate,
-            {
-              backgroundColor: theme.colors.muted,
-              borderColor: theme.colors.border,
-              borderRadius: theme.radii.lg,
-              borderWidth: borderWidth.hairline,
-              height: theme.space(8),
-              width: theme.space(8),
-            },
-          ]}
-        >
-          <Icon color="mutedForeground" name="FolderTree" size={theme.space(4.5)} />
-        </View>
-        <View style={styles.copy}>
-          <Text numberOfLines={1} variant="label" weight="semibold">
-            {title}
-          </Text>
-          <Text color="mutedForeground" numberOfLines={1} variant="caption">
-            {detail}
-          </Text>
-        </View>
-        <View style={styles.trailing}>
-          <View style={[styles.status, { gap: theme.space(1.5) }]}>
-            <StatusDot pulse={false} tone={hostOnline ? "active" : "offline"} />
-            <Text color="mutedForeground" variant="caption">
-              {status}
-            </Text>
-          </View>
-          <Icon color="mutedForeground" name="Ellipsis" size={theme.space(4)} />
-        </View>
-      </Pressable>
+      <View style={styles.frame} testID={`files-row-${paneId}`}>
+        <ListRow
+          height="tall"
+          leading={
+            <View
+              style={[
+                styles.iconPlate,
+                {
+                  backgroundColor: theme.colors.muted,
+                  borderColor: theme.colors.border,
+                  borderRadius: theme.radii.lg,
+                },
+              ]}
+            >
+              <Icon color="mutedForeground" name="FolderTree" size={sizing.control.icon} />
+            </View>
+          }
+          onLongPress={() => {
+            haptics.impact("medium");
+            onActions();
+          }}
+          onPress={() => {
+            haptics.selection();
+            onOpen();
+          }}
+          subtitle={detail}
+          title={title}
+          trailing={
+            <View style={styles.status}>
+              <StatusDot pulse={false} tone={hostOnline ? "active" : "offline"} />
+              <Text color="mutedForeground" variant="caption">
+                {status}
+              </Text>
+            </View>
+          }
+        />
+        <IconButton
+          accessibilityLabel={`Actions for ${title}`}
+          icon="Ellipsis"
+          onPress={onActions}
+          style={styles.action}
+        />
+      </View>
     </SwipeableRow>
   );
 });
 
 const styles = StyleSheet.create({
-  copy: {
-    flex: 1,
-    minWidth: 0,
+  action: {
+    height: sizing.listRow.trailingTarget,
+    position: "absolute",
+    right: 0,
+    top: (sizing.listRow.tall - sizing.listRow.trailingTarget) / 2,
+    width: sizing.listRow.trailingTarget,
+  },
+  frame: {
+    position: "relative",
   },
   iconPlate: {
     alignItems: "center",
-    flexShrink: 0,
+    borderWidth: borderWidth.hairline,
+    height: sizing.listRow.leading.rich,
     justifyContent: "center",
-  },
-  row: {
-    alignItems: "center",
-    flexDirection: "row",
-    minHeight: chrome.touchTarget,
+    width: sizing.listRow.leading.rich,
   },
   status: {
     alignItems: "center",
     flexDirection: "row",
-  },
-  trailing: {
-    alignItems: "flex-end",
-    alignSelf: "stretch",
-    justifyContent: "space-between",
-    maxWidth: "34%",
+    gap: sizing.space.peer,
+    paddingRight: sizing.listRow.trailingTarget,
   },
 });

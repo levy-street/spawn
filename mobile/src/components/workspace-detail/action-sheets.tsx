@@ -69,6 +69,7 @@ export function PaneActionsSheet({
         label: "Move to another tab",
         icon: <Icon name="ArrowRightLeft" />,
         disabled: !canMove,
+        ...(canMove ? {} : { detail: "No other tab has room" }),
         onPress: () => onMove(tile),
       },
       {
@@ -76,6 +77,7 @@ export function PaneActionsSheet({
         label: "Duplicate",
         icon: <Icon name="Copy" />,
         disabled: tab ? !canAddTile(tab.layout) : true,
+        ...(tab && !canAddTile(tab.layout) ? { detail: "This tab is full" } : {}),
         onPress: () => onDuplicate(tile, session),
       },
       {
@@ -83,6 +85,7 @@ export function PaneActionsSheet({
         label: "Move up",
         icon: <Icon name="ArrowUp" />,
         disabled: !target || index <= 0,
+        ...(!target || index <= 0 ? { detail: "Already first" } : {}),
         onPress: () => {
           if (target) onReorder(target, -1);
         },
@@ -92,6 +95,9 @@ export function PaneActionsSheet({
         label: "Move down",
         icon: <Icon name="ArrowDown" />,
         disabled: !target || !tab || index < 0 || index >= tab.layout.tiles.length - 1,
+        ...(!target || !tab || index < 0 || index >= tab.layout.tiles.length - 1
+          ? { detail: "Already last" }
+          : {}),
         onPress: () => {
           if (target) onReorder(target, 1);
         },
@@ -141,15 +147,24 @@ export interface MovePaneSheetProps {
 }
 
 export function MovePaneSheet({ visible, tile, workspace, onDismiss, onMove }: MovePaneSheetProps) {
+  const sourceTabId = tile
+    ? (workspace.layout.tabs.find((tab) =>
+        tab.layout.tiles.some((candidate) => candidate.session_id === tile.session_id),
+      )?.id ?? null)
+    : null;
   const actions = tile
-    ? workspace.layout.tabs.map(
-        (tab): ActionSheetAction => ({
+    ? workspace.layout.tabs.map((tab): ActionSheetAction => {
+        const canMove = canMovePaneToTab(workspace.layout, tile.session_id, tab.id);
+        return {
           id: tab.id,
           label: tab.name,
-          disabled: !canMovePaneToTab(workspace.layout, tile.session_id, tab.id),
+          disabled: !canMove,
+          ...(canMove
+            ? {}
+            : { detail: tab.id === sourceTabId ? "Current tab" : "This tab is full" }),
           onPress: () => onMove(tab.id),
-        }),
-      )
+        };
+      })
     : [];
   return (
     <ActionSheet
@@ -195,6 +210,7 @@ export function TabActionsSheet({
           label: "Move left",
           icon: <Icon name="ArrowLeft" />,
           disabled: index <= 0,
+          ...(index <= 0 ? { detail: "Already first" } : {}),
           onPress: () => onReorder(tab, -1),
         },
         {
@@ -202,12 +218,18 @@ export function TabActionsSheet({
           label: "Move right",
           icon: <Icon name="ArrowRight" />,
           disabled: index < 0 || index >= workspace.layout.tabs.length - 1,
+          ...(index < 0 || index >= workspace.layout.tabs.length - 1
+            ? { detail: "Already last" }
+            : {}),
           onPress: () => onReorder(tab, 1),
         },
         {
           id: "delete",
-          label: "Delete tab",
-          detail: "Closes every session in this tab",
+          label: "Close tab",
+          detail:
+            workspace.layout.tabs.length === 1
+              ? "A workspace must keep one tab"
+              : "Closes every session in this tab",
           icon: <Icon color="destructive" name="Trash2" />,
           destructive: true,
           disabled: !canRemoveTab(workspace.layout, tab.id),
@@ -257,6 +279,7 @@ export function WorkspaceActionsSheet({
           label: "Add tab",
           icon: <Icon name="Plus" />,
           disabled: !canAddTab,
+          ...(canAddTab ? {} : { detail: "A workspace can have up to 8 tabs" }),
           onPress: onAddTab,
         },
       ]}

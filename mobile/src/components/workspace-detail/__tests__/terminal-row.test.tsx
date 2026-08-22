@@ -3,7 +3,8 @@ import type { ReactNode } from "react";
 
 import { TerminalRow } from "@/components/workspace-detail/terminal-row";
 import * as sessionSelectors from "@/data/selectors/session";
-import { radii, spacing, ThemeProvider } from "@/theme";
+import { ThemeProvider } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 import { makeAgent, makeHost, makeSession } from "./fixtures";
 
@@ -51,7 +52,7 @@ describe("TerminalRow", () => {
       { wrapper: ThemeProvider },
     );
 
-    expect(screen.getByTestId(`agent-icon-${icon}`)).toBeTruthy();
+    expect(screen.getByTestId(`agent-icon-${icon}`, { includeHiddenElements: true })).toBeTruthy();
     expect(screen.getByText(new RegExp(label))).toBeTruthy();
     expect(screen.getByText("Implement mobile")).toBeTruthy();
     expect(screen.getByText("Quiet")).toBeTruthy();
@@ -69,7 +70,7 @@ describe("TerminalRow", () => {
       { wrapper: ThemeProvider },
     );
 
-    expect(screen.getByTestId("agent-icon-monogram")).toBeTruthy();
+    expect(screen.getByTestId("agent-icon-monogram", { includeHiddenElements: true })).toBeTruthy();
     expect(screen.getByText(/Nebula/)).toBeTruthy();
   });
 
@@ -88,7 +89,7 @@ describe("TerminalRow", () => {
       { wrapper: ThemeProvider },
     );
 
-    expect(screen.getByTestId(icon)).toBeTruthy();
+    expect(screen.getByTestId(icon, { includeHiddenElements: true })).toBeTruthy();
     expect(screen.getByText(new RegExp(label))).toBeTruthy();
   });
 
@@ -120,11 +121,12 @@ describe("TerminalRow", () => {
 
     expect(displayStatus).toHaveBeenCalledWith(session, host, "idle");
     expect(screen.getByText("Composed status")).toBeTruthy();
-    expect(screen.getByTestId(`terminal-row-${session.id}`)).toHaveStyle({
-      borderRadius: radii.md,
-      minHeight: spacing[14],
-      paddingHorizontal: spacing[3],
-      paddingVertical: spacing[2],
+    expect(
+      screen.getByLabelText("Implement mobile, Codex · office-mac · /Users/spawn/dev/spawn"),
+    ).toHaveStyle({
+      minHeight: sizing.listRow.tall,
+      paddingHorizontal: sizing.listRow.horizontalPadding,
+      paddingVertical: sizing.listRow.verticalPadding,
     });
     displayStatus.mockRestore();
   });
