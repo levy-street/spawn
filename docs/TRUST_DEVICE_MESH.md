@@ -574,6 +574,37 @@ that. **Resolution:** A7 is a stated premise of P5; treat any future path that
 weakens enforcement as A6 treats a signaling bypass. *(Code-verified 2026-08-19;
 also fixed a stale "off by default" comment in daemon/src/run.rs.)*
 
+**Security-review hardenings B1–B5 (2026-08-22, PR #25 review).** Four
+server-trust findings, fixed on-branch; one invariant recorded. **B1:** the
+registration proof is now `SPAWN-BROWSER-REGISTER-V2` with the root claim
+bound as a signed flags byte — `is_root` had been a server-mutable request
+field feeding real authority (the sole R9 per-host-endorsement exemption and
+the root pin-liveness ratchet); the server now verifies the claim against the
+proof, so a flipped flag is refused, with shared vectors pinning both flag
+values and both flip directions (green-field cutover, no v1 window). **B2:**
+root rotation no longer destroys `sk_R` on a bare server claim — rotation
+retires the outgoing seed into a bounded, sealed `retiredRoots` archive
+(refusing at the cap rather than evicting), and the trigger requires the
+roster's revoked row to carry the sealed `pk_R` AND the key to appear in the
+permanent add-only tombstone table (new authenticated GET), so a fabricated
+"revoked + no live root" roster is uncorroborated: nothing rotates, the
+operator is told, and even a corroborated lie now destroys nothing. **B3:**
+`removeLastPasskey` revokes only the roster row whose key equals the
+bundle-unsealed `pk_R` (loud skip otherwise), and the root-registration
+response is verified field-for-field before healing proceeds — the server's
+`is_root` labeling alone never selects what gets revoked or anchored.
+**B4:** the carried-endorsement relay now has a module-load fit proof (exact
+worst-case serialized-JSON arithmetic, token-alphabet field values so bytes ==
+characters) that a maximal sanitizer-accepted edge set fits the 64 KiB routing
+bound, and the Redis→daemon hop documents why sanitize is not re-run there
+(the daemon independently caps at 64 and re-verifies every signature).
+**B5 (stated invariant, no code change):** a fingerprint served by the
+control plane must never be DISPLAYED as a comparison value without local
+recomputation from the accompanying key — every current surface re-derives
+(`canonicalHost`, roster fingerprints), and any future surface must too, or
+the human check of A4/A5 silently degrades into trusting the adversary's
+label.
+
 **Verdict.** The core claim — *the server can slam doors, never open them* —
 survives, and now with code-level backing: A2 (private keys never leave) and P5
 (connection requires proof-of-possession of a pinned key) were audited in the
