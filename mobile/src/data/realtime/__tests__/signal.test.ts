@@ -1,4 +1,8 @@
 import { openHostSignal } from "@/data/realtime/host-signal";
+import {
+  reopenRegisteredGenerations,
+  retireRegisteredGenerations,
+} from "@/data/realtime/lifecycle";
 import { openSessionSignal } from "@/data/realtime/session-signal";
 import { useConnectionStore } from "@/data/stores/connection";
 import { useSessionUiStore } from "@/data/stores/session-ui";
@@ -106,6 +110,35 @@ describe("signalling relays", () => {
       protocol: "spawn.host.v1",
     });
     channel.close();
+  });
+
+  it("registers session and host generations until their channels close", async () => {
+    const sessionChannel = openSessionSignal("session-lifecycle");
+    const hostChannel = openHostSignal("host-lifecycle");
+    await flushPromises();
+    const initialSockets = FakeWebSocket.instances.slice();
+    for (const socket of initialSockets) socket.open();
+
+    retireRegisteredGenerations("background");
+    expect(initialSockets.map((socket) => socket.readyState)).toEqual([3, 3]);
+    expect(sessionChannel.state).toBe("closed");
+    expect(hostChannel.state).toBe("closed");
+
+    await reopenRegisteredGenerations();
+    await flushPromises();
+    const reopenedSockets = FakeWebSocket.instances.slice(2);
+    expect(reopenedSockets).toHaveLength(2);
+    for (const socket of reopenedSockets) socket.open();
+
+    retireRegisteredGenerations("interface-change");
+    expect(reopenedSockets.map((socket) => socket.readyState)).toEqual([3, 3]);
+
+    sessionChannel.close();
+    hostChannel.close();
+    const socketCountAfterClose = FakeWebSocket.instances.length;
+    await reopenRegisteredGenerations();
+    await flushPromises();
+    expect(FakeWebSocket.instances).toHaveLength(socketCountAfterClose);
   });
 
   it("treats binary signalling as a protocol failure", async () => {

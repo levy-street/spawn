@@ -1,4 +1,5 @@
 import { buildBrowserSocketUrl } from "@/data/api/socket-urls";
+import { registerRealtimeGenerationTarget } from "@/data/realtime/lifecycle";
 import { ReconnectingSocket, type SocketState } from "@/data/realtime/socket";
 import { useConnectionStore } from "@/data/stores/connection";
 import { useSessionUiStore } from "@/data/stores/session-ui";
@@ -54,6 +55,7 @@ class SessionSignalChannel implements SignalChannel {
   private readonly socket: ReconnectingSocket<unknown>;
   private readonly listeners = new Set<(frame: unknown) => void>();
   private readonly unsubscribers: Array<() => void>;
+  private readonly unregisterGenerationTarget: () => void;
 
   constructor(private readonly sessionId: string) {
     this.socket = new ReconnectingSocket({
@@ -63,6 +65,10 @@ class SessionSignalChannel implements SignalChannel {
       reconnectDelayMs: (attempt) =>
         Math.min(SIGNAL_RECONNECT_CAP_MS, SIGNAL_RECONNECT_STEP_MS * (attempt + 1)),
       maxReconnectAttempt: SIGNAL_RECONNECT_CAP_MS / SIGNAL_RECONNECT_STEP_MS,
+    });
+    this.unregisterGenerationTarget = registerRealtimeGenerationTarget({
+      retire: () => this.socket.retire(),
+      reopen: () => this.socket.connect(),
     });
     this.unsubscribers = [
       this.socket.subscribe((state) => {
@@ -118,6 +124,7 @@ class SessionSignalChannel implements SignalChannel {
   }
 
   close(): void {
+    this.unregisterGenerationTarget();
     for (const unsubscribe of this.unsubscribers) {
       unsubscribe();
     }

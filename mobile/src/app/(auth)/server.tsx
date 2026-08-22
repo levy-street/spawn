@@ -1,3 +1,4 @@
+import { Screen } from "@/components/layout/screen";
 import { ServerPanel } from "@/components/settings/server-panel";
 
 /**
@@ -6,5 +7,9 @@ import { ServerPanel } from "@/components/settings/server-panel";
  * in order to sign in.
  */
 export default function SignedOutServerRoute(): React.JSX.Element {
-  return <ServerPanel />;
+  return (
+    <Screen padded={false}>
+      <ServerPanel />
+    </Screen>
+  );
 }

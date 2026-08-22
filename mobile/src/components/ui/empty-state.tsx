@@ -2,7 +2,8 @@ import type { ReactElement, ReactNode } from "react";
 import { type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
-import { borderWidth, spacing, useTheme } from "@/theme";
+import { borderWidth, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export interface EmptyStateProps {
   action?: ReactNode;
@@ -16,7 +17,7 @@ export interface EmptyStateProps {
 
 function EmptyStateIcon({ icon }: { icon: IconName | ReactElement }) {
   if (typeof icon === "string") {
-    return <Icon color="mutedForeground" name={icon} size={spacing[6]} />;
+    return <Icon color="mutedForeground" name={icon} size={sizing.emptyState.icon} />;
   }
   return icon;
 }
@@ -53,7 +54,7 @@ export function EmptyState({
           <EmptyStateIcon icon={icon} />
         ))}
       <View style={styles.copy}>
-        <Text style={styles.centeredText} variant="label" weight="semibold">
+        <Text style={[styles.centeredText, styles.title]} variant="label" weight="semibold">
           {title}
         </Text>
         {description !== undefined && (
@@ -79,32 +80,39 @@ export function EmptyState({
 
 const styles = StyleSheet.create({
   action: {
-    marginTop: spacing[2],
+    alignSelf: "stretch",
+    marginTop: sizing.emptyState.actionTopGap,
   },
   centeredText: {
     textAlign: "center",
   },
   container: {
     alignItems: "center",
-    gap: spacing[3],
+    alignSelf: "stretch",
+    gap: sizing.emptyState.contentGap,
     justifyContent: "center",
-    paddingHorizontal: spacing[6],
-    paddingVertical: spacing[12],
+    paddingHorizontal: sizing.emptyState.horizontalPadding,
+    paddingVertical: sizing.emptyState.verticalPadding,
   },
   copy: {
-    gap: spacing[1],
+    gap: sizing.emptyState.copyGap,
   },
   description: {
-    maxWidth: spacing[24] * 4,
+    maxWidth: sizing.emptyState.bodyMaxWidth,
   },
   descriptionText: {
-    lineHeight: spacing[6],
+    fontSize: sizing.type.emptyStateBody.fontSize,
+    lineHeight: sizing.type.emptyStateBody.lineHeight,
   },
   iconPlate: {
     alignItems: "center",
     borderWidth: borderWidth.hairline,
-    height: spacing[12],
+    height: sizing.emptyState.iconPlate,
     justifyContent: "center",
-    width: spacing[12],
+    width: sizing.emptyState.iconPlate,
+  },
+  title: {
+    fontSize: sizing.type.emptyStateTitle.fontSize,
+    lineHeight: sizing.type.emptyStateTitle.lineHeight,
   },
 });

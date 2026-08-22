@@ -1,8 +1,8 @@
 import { useIsFocused } from "@react-navigation/native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { StyleSheet, View } from "react-native";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { Screen } from "@/components/layout/screen";
 import { TerminalOverlay } from "@/components/terminal-ui/terminal-overlay";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -21,7 +21,6 @@ function routeSessionId(value: string | string[] | undefined): string {
 
 export default function TerminalScreen(): React.JSX.Element {
   const theme = useTheme();
-  const insets = useSafeAreaInsets();
   const focused = useIsFocused();
   const router = useRouter();
   const params = useLocalSearchParams<{ sessionId?: string | string[] }>();
@@ -34,8 +33,6 @@ export default function TerminalScreen(): React.JSX.Element {
   const screenOptions = (
     <Stack.Screen
       options={{
-        animation: "none",
-        gestureEnabled: false,
         headerShown: false,
         presentation: "card",
       }}
@@ -46,33 +43,33 @@ export default function TerminalScreen(): React.JSX.Element {
     return (
       <>
         {screenOptions}
-        <View
-          style={[
-            styles.center,
-            {
-              backgroundColor: theme.colors.background,
-              gap: theme.space(3),
-              paddingBottom: insets.bottom + theme.space(4),
-              paddingHorizontal: theme.space(6),
-              paddingTop: insets.top + theme.space(4),
-            },
-          ]}
-        >
-          <Text accessibilityRole="header" variant="title">
-            Terminal unavailable
-          </Text>
-          <Text color="mutedForeground" style={styles.centered} variant="body">
-            {sessionId.length === 0
-              ? "This terminal link does not include a session."
-              : (data.error?.message ?? "The session could not be loaded.")}
-          </Text>
-          {sessionId.length > 0 ? (
-            <Button onPress={() => void data.refetch()} variant="outline">
-              Retry
-            </Button>
-          ) : null}
-          <Button onPress={() => router.back()}>Close</Button>
-        </View>
+        <Screen padded={false}>
+          <View
+            style={[
+              styles.center,
+              {
+                backgroundColor: theme.colors.background,
+                gap: theme.space(3),
+                paddingHorizontal: theme.space(6),
+              },
+            ]}
+          >
+            <Text accessibilityRole="header" variant="title">
+              Terminal unavailable
+            </Text>
+            <Text color="mutedForeground" style={styles.centered} variant="body">
+              {sessionId.length === 0
+                ? "This terminal link does not include a session."
+                : (data.error?.message ?? "The session could not be loaded.")}
+            </Text>
+            {sessionId.length > 0 ? (
+              <Button onPress={() => void data.refetch()} variant="outline">
+                Retry
+              </Button>
+            ) : null}
+            <Button onPress={() => router.back()}>Close</Button>
+          </View>
+        </Screen>
       </>
     );
   }
@@ -81,13 +78,15 @@ export default function TerminalScreen(): React.JSX.Element {
     return (
       <>
         {screenOptions}
-        <View
-          accessibilityLabel="Loading terminal"
-          accessibilityRole="progressbar"
-          style={[styles.center, { backgroundColor: theme.colors.background }]}
-        >
-          <Spinner />
-        </View>
+        <Screen padded={false}>
+          <View
+            accessibilityLabel="Loading terminal"
+            accessibilityRole="progressbar"
+            style={[styles.center, { backgroundColor: theme.colors.background }]}
+          >
+            <Spinner />
+          </View>
+        </Screen>
       </>
     );
   }

@@ -1,6 +1,9 @@
+import { Link } from "expo-router";
 import type { ReactNode, RefObject } from "react";
+import { useEffect, useRef } from "react";
 import { Pressable, ScrollView, StyleSheet, View } from "react-native";
 
+import { GlassSurface } from "@/components/ui/glass";
 import {
   Popover,
   type PopoverAlign,
@@ -36,6 +39,14 @@ export interface MenuLabel {
 
 export type MenuEntry = MenuItem | MenuSeparator | MenuLabel;
 
+/** Native iOS context menu primitives for navigational Links and their long-press previews. */
+function UnavailableNativeLinkMenu(): null {
+  return null;
+}
+
+export const NativeLinkMenu = Link?.Menu ?? UnavailableNativeLinkMenu;
+export const NativeLinkMenuAction = Link?.MenuAction ?? UnavailableNativeLinkMenu;
+
 export interface MenuProps {
   visible: boolean;
   onDismiss: () => void;
@@ -68,103 +79,130 @@ export function Menu({
   accessibilityLabel = "Actions",
 }: MenuProps): React.JSX.Element {
   const theme = useTheme();
+  const wasVisible = useRef(false);
+  const minimumWidth = theme.space(65);
+  const resolvedWidth = Math.max(width ?? theme.space(70), minimumWidth);
+
+  useEffect(() => {
+    if (visible && !wasVisible.current) haptics.overlayOpen();
+    wasVisible.current = visible;
+  }, [visible]);
+
+  const dismiss = () => {
+    haptics.overlayDismiss();
+    onDismiss();
+  };
 
   return (
     <Popover
       accessibilityLabel={accessibilityLabel}
       align={align}
-      contentStyle={{ padding: theme.space(1) }}
+      contentStyle={{
+        backgroundColor: "transparent",
+        borderColor: "transparent",
+        borderWidth: borderWidth.none,
+      }}
       interactive
-      onDismiss={onDismiss}
+      onDismiss={dismiss}
       overlayLayer={layer.menu}
       side={side}
       visible={visible}
-      width={width ?? theme.space(44)}
+      width={resolvedWidth}
       {...(anchorRect === undefined ? {} : { anchorRect })}
       {...(anchorRef === undefined ? {} : { anchorRef })}
     >
-      <ScrollView
-        bounces={false}
-        contentContainerStyle={styles.scrollContent}
-        keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator
+      <GlassSurface
+        style={{
+          borderColor: theme.colors.popoverBorder,
+          borderRadius: theme.radii.xxl,
+          borderWidth: borderWidth.hairline,
+          minWidth: minimumWidth,
+          padding: theme.space(1.5),
+        }}
       >
-        {entries.map((entry) => {
-          if (isSeparator(entry)) {
-            return (
-              <View
-                key={entry.id}
-                style={{
-                  backgroundColor: theme.colors.popoverBorder,
-                  height: borderWidth.hairline,
-                  marginHorizontal: theme.space(1),
-                  marginVertical: theme.space(1),
-                }}
-              />
-            );
-          }
-          if (isLabel(entry)) {
-            return (
-              <Text
-                color="mutedForeground"
-                key={entry.id}
-                style={{ paddingHorizontal: theme.space(2), paddingVertical: theme.space(1.5) }}
-                variant="micro"
-              >
-                {entry.label}
-              </Text>
-            );
-          }
-
-          const textColor = entry.destructive ? "destructive" : "popoverForeground";
-          return (
-            <Pressable
-              accessibilityLabel={entry.accessibilityLabel ?? entry.label}
-              accessibilityRole="menuitem"
-              accessibilityState={{ disabled: entry.disabled }}
-              disabled={entry.disabled}
-              key={entry.id}
-              onPress={() => {
-                haptics.selection();
-                entry.onPress();
-                onDismiss();
-              }}
-              style={({ pressed }) => [
-                styles.item,
-                {
-                  backgroundColor: pressed
-                    ? entry.destructive
-                      ? theme.colors.destructiveSoft
-                      : theme.colors.popoverAccent
-                    : "transparent",
-                  borderRadius: theme.radii.md,
-                  gap: theme.space(2),
-                  minHeight: chrome.touchTarget,
-                  opacity: entry.disabled ? opacity.disabled : opacity.opaque,
-                  paddingHorizontal: theme.space(2),
-                  paddingVertical: theme.space(2),
-                },
-              ]}
-            >
-              {entry.icon ? (
-                <View style={[styles.icon, { height: theme.space(4), width: theme.space(4) }]}>
-                  {entry.icon}
-                </View>
-              ) : null}
-              <View style={styles.copy}>
-                <Text color={textColor} variant="body">
+        <ScrollView
+          bounces={false}
+          contentContainerStyle={styles.scrollContent}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator
+        >
+          {entries.map((entry) => {
+            if (isSeparator(entry)) {
+              return (
+                <View
+                  key={entry.id}
+                  style={{
+                    backgroundColor: theme.colors.popoverBorder,
+                    height: borderWidth.hairline,
+                    marginHorizontal: theme.space(1),
+                    marginVertical: theme.space(1),
+                  }}
+                />
+              );
+            }
+            if (isLabel(entry)) {
+              return (
+                <Text
+                  color="mutedForeground"
+                  key={entry.id}
+                  style={{ paddingHorizontal: theme.space(2), paddingVertical: theme.space(1.5) }}
+                  variant="micro"
+                >
                   {entry.label}
                 </Text>
-                {entry.detail ? (
-                  <Text color="mutedForeground" variant="caption">
-                    {entry.detail}
-                  </Text>
+              );
+            }
+
+            const textColor = entry.destructive ? "destructive" : "popoverForeground";
+            return (
+              <Pressable
+                accessibilityLabel={entry.accessibilityLabel ?? entry.label}
+                accessibilityRole="menuitem"
+                accessibilityState={{ disabled: entry.disabled }}
+                disabled={entry.disabled}
+                key={entry.id}
+                onPress={() => {
+                  haptics.selection();
+                  entry.onPress();
+                  dismiss();
+                }}
+                style={({ pressed }) => [
+                  styles.item,
+                  {
+                    backgroundColor: pressed
+                      ? entry.destructive
+                        ? theme.colors.destructiveSoft
+                        : theme.colors.popoverAccent
+                      : "transparent",
+                    borderRadius: theme.radii.md,
+                    gap: theme.space(2),
+                    minHeight: chrome.touchTarget,
+                    opacity: entry.disabled ? opacity.disabled : opacity.opaque,
+                    paddingHorizontal: theme.space(2),
+                    paddingVertical: theme.space(2),
+                  },
+                ]}
+              >
+                {entry.icon ? (
+                  <View style={[styles.icon, { height: theme.space(4), width: theme.space(4) }]}>
+                    {entry.icon}
+                  </View>
                 ) : null}
-              </View>
-            </Pressable>
-          );
-        })}
-      </ScrollView>
+                <View style={styles.copy}>
+                  <Text color={textColor} variant="uiBase">
+                    {entry.label}
+                  </Text>
+                  {entry.detail ? (
+                    <Text color="mutedForeground" variant="caption">
+                      {entry.detail}
+                    </Text>
+                  ) : null}
+                </View>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      </GlassSurface>
     </Popover>
   );
 }

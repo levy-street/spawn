@@ -1,3 +1,5 @@
+import { sizing } from "./sizing";
+
 export const spacing = {
   0: 0,
   px: 1,
@@ -26,7 +28,7 @@ export const spacing = {
 } as const;
 
 export function space(units: number): number {
-  return units * 4;
+  return units * sizing.space.unit;
 }
 
 export const radii = {
@@ -65,11 +67,11 @@ export const borderWidth = {
 export const chrome = {
   sidebarWidth: 264,
   sidebarRailWidth: 56,
-  rowHeight: 40,
-  paneGap: 6,
-  contentInsetMobile: 0,
-  contentInsetDesktop: 8,
-  touchTarget: 44,
+  rowHeight: sizing.listRow.regular,
+  paneGap: sizing.space.peer,
+  contentInsetMobile: sizing.screen.gutter,
+  contentInsetDesktop: sizing.screen.regularWidthGutter,
+  touchTarget: sizing.control.minimumTouchTarget,
   terminalPaddingHorizontal: 6,
   terminalPaddingVertical: 4,
   menuViewportMargin: 8,

@@ -1,107 +1,77 @@
-import { fireEvent, render } from "@testing-library/react-native";
+import { render } from "@testing-library/react-native";
 import type { ReactNode } from "react";
 
-interface MockDrawerProps {
+interface MockStackProps {
   children: ReactNode;
-  screenOptions: (props: { navigation: { dispatch: (action: unknown) => void } }) => {
-    drawerType?: string;
-    headerLeft?: () => ReactNode;
-    swipeEdgeWidth?: number;
-    swipeEnabled?: boolean;
-  };
+  screenOptions?: unknown;
 }
-
-interface MockDrawerScreenProps {
+interface MockStackScreenProps {
   name: string;
-  options: {
-    headerShown?: boolean;
-    title?: string;
-  };
+  options?: { title?: string };
 }
 
-let capturedDrawerProps: MockDrawerProps | null = null;
-
-jest.mock("expo-router/drawer", () => {
+jest.mock("expo-router", () => {
   const { createElement } = require("react");
   const { View } = require("react-native");
-  const Drawer = (props: MockDrawerProps) => {
-    capturedDrawerProps = props;
-    return createElement(View, { testID: "root-drawer" }, props.children);
-  };
-  Drawer.Screen = ({ name, options }: MockDrawerScreenProps) =>
+  const Stack = ({ children }: MockStackProps) =>
+    createElement(View, { testID: "root-stack" }, children);
+  Stack.Screen = ({ name, options }: MockStackScreenProps) =>
     createElement(View, {
-      accessibilityLabel: options.title,
-      testID: `drawer-screen-${name}`,
+      accessibilityLabel: options?.title,
+      testID: `app-screen-${name}`,
     });
-  return { Drawer };
+  return {
+    Stack,
+    usePathname: () => "/workspaces",
+    useRouter: () => ({ navigate: jest.fn(), replace: jest.fn(), push: jest.fn() }),
+  };
 });
 
-jest.mock("expo-router", () => ({
-  usePathname: () => "/workspaces",
-  useRouter: () => ({ navigate: jest.fn(), replace: jest.fn() }),
+jest.mock("@/data/queries/auth", () => ({
+  useMeQuery: () => ({ data: { user: { id: "u1", is_admin: false } }, isLoading: false }),
 }));
 
-jest.mock("expo-splash-screen", () => ({
-  preventAutoHideAsync: jest.fn(async () => undefined),
+jest.mock("@/lib/auth-gate", () => ({
+  useAuthenticatedAccount: () => ({ accountId: "u1", ready: true }),
 }));
 
-jest.mock("expo-font", () => ({
-  useFonts: () => [true, null],
-}));
-
-jest.mock("expo-notifications", () => ({}));
-
-jest.mock("react-native-keyboard-controller", () => ({
-  KeyboardProvider: ({ children }: { children: ReactNode }) => children,
-}));
-
-import { TERMINAL_ROUTE_OPTIONS } from "@/app/_layout";
-import DrawerLayout, { DRAWER_SWIPE_EDGE_WIDTH, ROOT_DRAWER_ROUTES } from "@/app/(drawer)/_layout";
+import AppStackLayout, { APP_ROUTE_MAP, FULL_SCREEN_BACK_OPTIONS } from "@/app/(drawer)/_layout";
 import { ThemeProvider } from "@/theme";
 
 describe("app navigation shell", () => {
-  it("renders the drawer destinations without a root Files screen", async () => {
+  // The owner asked for no menu at all: no burger drawer, no bottom tab bar.
+  it("renders a menu-less stack", async () => {
     const screen = await render(
       <ThemeProvider>
-        <DrawerLayout />
+        <AppStackLayout />
       </ThemeProvider>,
     );
 
-    expect(ROOT_DRAWER_ROUTES).toEqual(["workspaces", "hosts", "legion", "settings"]);
-    for (const route of ROOT_DRAWER_ROUTES) {
-      expect(screen.getByTestId(`drawer-screen-${route}`)).toBeTruthy();
+    expect(screen.queryByTestId("root-drawer")).toBeNull();
+    expect(screen.queryByTestId("root-tabs")).toBeNull();
+    expect(screen.getByTestId("root-stack")).toBeTruthy();
+  });
+
+  it("exposes no root Files destination", () => {
+    const paths = Object.keys(APP_ROUTE_MAP);
+    expect(paths).not.toContain("/files");
+    expect(paths.some((p) => p.startsWith("/files"))).toBe(false);
+    // Files stay contextual under a host.
+    expect(paths).toContain("/host/[id]/files");
+  });
+
+  it("keeps every public destination reachable", () => {
+    const paths = Object.keys(APP_ROUTE_MAP);
+    for (const required of ["/workspaces", "/hosts", "/legion", "/settings", "/admin"]) {
+      expect(paths).toContain(required);
     }
-    expect(screen.queryByTestId("drawer-screen-files")).toBeNull();
   });
 
-  it("uses a back drawer with a narrow edge swipe", async () => {
-    await render(
-      <ThemeProvider>
-        <DrawerLayout />
-      </ThemeProvider>,
-    );
-
-    expect(capturedDrawerProps).not.toBeNull();
-    const dispatch = jest.fn();
-    const options = capturedDrawerProps?.screenOptions({ navigation: { dispatch } });
-    expect(options).toMatchObject({
-      drawerType: "back",
-      swipeEdgeWidth: DRAWER_SWIPE_EDGE_WIDTH,
-      swipeEnabled: true,
-    });
-    expect(DRAWER_SWIPE_EDGE_WIDTH).toBe(20);
-
-    const header = await render(<ThemeProvider>{options?.headerLeft?.()}</ThemeProvider>);
-    await fireEvent.press(header.getByLabelText("Open navigation menu"));
-    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "OPEN_DRAWER" }));
-  });
-
-  it("configures terminal as a vertically dismissable card", () => {
-    expect(TERMINAL_ROUTE_OPTIONS).toMatchObject({
-      presentation: "card",
+  // Edge-only back gestures were the owner's complaint; this must stay full-screen.
+  it("enables full-screen back gestures", () => {
+    expect(FULL_SCREEN_BACK_OPTIONS).toMatchObject({
       gestureEnabled: true,
-      gestureDirection: "vertical",
-      animationMatchesGesture: true,
+      gestureDirection: "horizontal",
       fullScreenGestureEnabled: true,
     });
   });

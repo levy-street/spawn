@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Pressable, StyleSheet, View } from "react-native";
+import { ActionSheetIOS, Platform, Pressable, StyleSheet, View } from "react-native";
 
 import { Sheet, SheetHeader } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
@@ -24,6 +24,56 @@ export interface ActionSheetProps {
   title?: string;
   message?: string;
   cancelLabel?: string;
+}
+
+export type NativeActionSheetOptions = Omit<ActionSheetProps, "visible">;
+
+/**
+ * Opens UIKit's bottom action sheet when that presentation is intentional.
+ * Icons and detail copy are omitted because ActionSheetIOS only accepts button labels.
+ */
+export function showNativeActionSheet({
+  actions,
+  onDismiss,
+  title,
+  message,
+  cancelLabel = "Cancel",
+}: NativeActionSheetOptions): boolean {
+  if (Platform.OS !== "ios") return false;
+
+  const cancelButtonIndex = actions.length;
+  const destructiveButtonIndex = actions.flatMap((action, index) =>
+    action.destructive ? [index] : [],
+  );
+  const disabledButtonIndices = actions.flatMap((action, index) =>
+    action.disabled ? [index] : [],
+  );
+
+  ActionSheetIOS.showActionSheetWithOptions(
+    {
+      cancelButtonIndex,
+      disabledButtonIndices,
+      destructiveButtonIndex,
+      options: [...actions.map((action) => action.label), cancelLabel],
+      ...(message === undefined ? {} : { message }),
+      ...(title === undefined ? {} : { title }),
+    },
+    (buttonIndex) => {
+      if (buttonIndex === cancelButtonIndex) {
+        onDismiss();
+        return;
+      }
+
+      const action = actions[buttonIndex];
+      if (!action || action.disabled) return;
+      if (action.destructive) haptics.warning();
+      else haptics.selection();
+      action.onPress();
+      onDismiss();
+    },
+  );
+
+  return true;
 }
 
 export function ActionSheet({

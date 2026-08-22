@@ -2,7 +2,8 @@ import type { ReactNode } from "react";
 import { Pressable, type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
 
 import { Text, type TextColor } from "@/components/ui/text";
-import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
+import { borderWidth, opacity, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export type ChipVariant =
   | "default"
@@ -94,7 +95,7 @@ export function Chip({
     <>
       {leading}
       {typeof children === "string" || typeof children === "number" ? (
-        <Text color={palette.textColor} variant="micro">
+        <Text color={palette.textColor} style={styles.label} variant="label">
           {children}
         </Text>
       ) : (
@@ -125,9 +126,8 @@ export function Chip({
         accessibilityRole="button"
         accessibilityState={{ disabled }}
         disabled={disabled}
-        hitSlop={(chrome.touchTarget - spacing[6]) / 2}
         onPress={onPress}
-        style={({ pressed }) => [chipStyle, pressed && styles.pressed]}
+        style={({ pressed }) => [chipStyle, pressed && { backgroundColor: theme.colors.accent }]}
         testID={testID}
       >
         {content}
@@ -148,14 +148,15 @@ const styles = StyleSheet.create({
     alignSelf: "flex-start",
     borderWidth: borderWidth.hairline,
     flexDirection: "row",
-    gap: spacing["1.5"],
-    height: spacing[6],
-    paddingHorizontal: spacing[2],
+    gap: sizing.chip.contentGap,
+    minHeight: sizing.chip.minHeight,
+    paddingHorizontal: sizing.chip.horizontalPadding,
   },
   disabled: {
     opacity: opacity.disabled,
   },
-  pressed: {
-    opacity: opacity.hoverButton,
+  label: {
+    fontSize: sizing.type.componentLabel.fontSize,
+    lineHeight: sizing.type.componentLabel.lineHeight,
   },
 });

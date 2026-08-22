@@ -1,7 +1,8 @@
 import type { ReactNode } from "react";
 import { type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
 import { Text } from "@/components/ui/text";
-import { alpha, borderWidth, spacing, useTheme } from "@/theme";
+import { alpha, borderWidth, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export type BadgeVariant =
   | "default"
@@ -123,8 +124,8 @@ const styles = StyleSheet.create({
     alignSelf: "flex-start",
     borderWidth: borderWidth.hairline,
     flexDirection: "row",
-    gap: spacing[1],
-    paddingHorizontal: spacing[2],
-    paddingVertical: spacing["0.5"],
+    gap: sizing.badge.contentGap,
+    paddingHorizontal: sizing.badge.horizontalPadding,
+    paddingVertical: sizing.badge.verticalPadding,
   },
 });

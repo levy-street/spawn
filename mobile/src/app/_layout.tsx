@@ -31,6 +31,13 @@ export const TERMINAL_ROUTE_OPTIONS = {
   fullScreenGestureEnabled: true,
 } as const;
 
+export const ROOT_CARD_OPTIONS = {
+  presentation: "card",
+  gestureEnabled: true,
+  gestureDirection: "horizontal",
+  fullScreenGestureEnabled: true,
+} as const;
+
 function IncomingLinkCoordinator(): null {
   const pathname = usePathname();
   const router = useRouter();
@@ -85,6 +92,7 @@ function RootNavigator(): React.JSX.Element {
         <AlertPresenter />
         <Stack
           screenOptions={{
+            ...ROOT_CARD_OPTIONS,
             contentStyle: { backgroundColor: theme.colors.background },
             headerShown: false,
           }}

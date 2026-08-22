@@ -37,6 +37,17 @@ export interface SheetHeaderProps {
   action?: ReactNode;
 }
 
+/**
+ * Route-backed sheet defaults for Expo Router Stack.Screen options. The system owns the
+ * grabber and corner radius; callers can replace the detents for their content shape.
+ */
+export const NATIVE_FORM_SHEET_OPTIONS = {
+  presentation: "formSheet" as const,
+  sheetAllowedDetents: [0.48, 0.9],
+  sheetGrabberVisible: true,
+  sheetInitialDetentIndex: 0,
+};
+
 export function SheetHeader({ title, action }: SheetHeaderProps): React.JSX.Element {
   const theme = useTheme();
 

@@ -20,7 +20,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { useReducedMotionPreference } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, type Colors, chrome, opacity, spacing, useTheme } from "@/theme";
+import { borderWidth, type Colors, opacity, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export type ButtonVariant = "default" | "secondary" | "outline" | "ghost" | "destructive" | "link";
 export type ButtonSize = "default" | "sm" | "lg" | "icon";
@@ -47,13 +48,6 @@ interface ButtonPalette {
 }
 
 const AnimatedPressable = Animated.createAnimatedComponent(Pressable);
-
-const BUTTON_HEIGHT = {
-  default: spacing[10],
-  sm: spacing[9],
-  lg: spacing[11],
-  icon: spacing[10],
-} as const;
 
 export function buttonContentColor(variant: ButtonVariant): keyof Colors {
   switch (variant) {
@@ -223,7 +217,7 @@ export function Button({
   };
 
   const resolvedAccessibilityLabel = accessibilityLabel ?? extractAccessibilityLabel(children);
-  const hitSlop = (chrome.touchTarget - BUTTON_HEIGHT[size]) / 2;
+  const hitSlop = (sizing.control.comfortableTouchTarget - sizing.control.button[size]) / 2;
 
   return (
     <AnimatedPressable
@@ -261,6 +255,7 @@ export function Button({
           <View pointerEvents="none" style={styles.loadingOverlay}>
             <Spinner
               color={palette.contentColor}
+              size={sizing.control.spinner}
               {...(testID === undefined ? {} : { testID: `${testID}-spinner` })}
             />
           </View>
@@ -274,13 +269,13 @@ const styles = StyleSheet.create({
   base: {
     alignItems: "center",
     flexDirection: "row",
-    gap: spacing[2],
+    gap: sizing.space.peer,
     justifyContent: "center",
   },
   content: {
     alignItems: "center",
     flexDirection: "row",
-    gap: spacing[2],
+    gap: sizing.space.peer,
     justifyContent: "center",
   },
   contentFrame: {
@@ -289,18 +284,17 @@ const styles = StyleSheet.create({
     position: "relative",
   },
   default: {
-    height: BUTTON_HEIGHT.default,
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[2],
+    minHeight: sizing.control.button.default,
+    paddingHorizontal: sizing.space.block,
   },
   icon: {
-    height: BUTTON_HEIGHT.icon,
-    paddingHorizontal: spacing[0],
-    width: BUTTON_HEIGHT.icon,
+    height: sizing.control.button.icon,
+    paddingHorizontal: 0,
+    width: sizing.control.button.icon,
   },
   lg: {
-    height: BUTTON_HEIGHT.lg,
-    paddingHorizontal: spacing[6],
+    minHeight: sizing.control.button.lg,
+    paddingHorizontal: sizing.space.section,
   },
   linkPressed: {
     textDecorationLine: "underline",
@@ -314,7 +308,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   sm: {
-    height: BUTTON_HEIGHT.sm,
-    paddingHorizontal: spacing[3],
+    minHeight: sizing.control.button.sm,
+    paddingHorizontal: sizing.space.cluster,
   },
 });

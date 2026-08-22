@@ -1,4 +1,5 @@
 import { getBaseUrl } from "@/data/api/config";
+import { clearPendingAuthenticatedLink } from "@/lib/linking";
 import { secureStorage } from "@/lib/secure-storage";
 
 type StoredToken = {
@@ -67,8 +68,7 @@ async function get(): Promise<string | null> {
   }
   if (stored === null) return null;
   if (isExpired(stored)) {
-    tokenCache.set(key, null);
-    await secureStorage.delete(key);
+    await clearStoredToken(key);
     return null;
   }
   return stored.jwt;
@@ -89,6 +89,13 @@ function notifyTokenChanged(): void {
   }
 }
 
+async function clearStoredToken(key: string): Promise<void> {
+  tokenCache.set(key, null);
+  clearPendingAuthenticatedLink();
+  await secureStorage.delete(key);
+  notifyTokenChanged();
+}
+
 /** Subscribe to credential changes. Returns an unsubscribe function. */
 function subscribe(listener: () => void): () => void {
   changeListeners.add(listener);
@@ -106,10 +113,7 @@ async function set(jwt: string): Promise<void> {
 }
 
 async function clear(): Promise<void> {
-  const key = await currentStorageKey();
-  tokenCache.set(key, null);
-  await secureStorage.delete(key);
-  notifyTokenChanged();
+  await clearStoredToken(await currentStorageKey());
 }
 
 function sessionCookie(header: string): string | null {

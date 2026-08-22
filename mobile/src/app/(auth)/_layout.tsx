@@ -8,6 +8,10 @@ export default function AuthLayout() {
   return (
     <Stack
       screenOptions={{
+        presentation: "card",
+        gestureEnabled: true,
+        gestureDirection: "horizontal",
+        fullScreenGestureEnabled: true,
         animation: reducedMotion ? "none" : "fade",
         animationDuration: theme.motion.duration.base,
         contentStyle: { backgroundColor: theme.colors.background },

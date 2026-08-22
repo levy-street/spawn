@@ -1,7 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { usePathname, useRouter } from "expo-router";
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { readHostSkipped } from "@/components/onboarding/onboarding-state";
 import { Button } from "@/components/ui/button";
@@ -10,6 +10,7 @@ import { Text } from "@/components/ui/text";
 import { authToken } from "@/data/api/auth-token";
 import { ApiError, subscribeUnauthenticated } from "@/data/api/client";
 import { useAuthConfigQuery, useAuthHostsQuery, useMeQuery } from "@/data/queries/auth";
+import { clearDeviceIdentityAccount, setDeviceIdentityAccount } from "@/lib/crypto/identity";
 import { spacing, useTheme } from "@/theme";
 
 export const AUTH_GATE_DESTINATIONS = {
@@ -76,7 +77,64 @@ type HostSkipState =
 type BootstrapState =
   | { status: "loading"; hasToken: boolean }
   | { status: "error"; kind: "account" | "config"; error: unknown; retry(): void }
-  | { status: "ready"; destination: AuthGateDestination; hasToken: boolean };
+  | {
+      status: "ready";
+      destination: AuthGateDestination;
+      hasToken: false;
+      accountId: null;
+    }
+  | {
+      status: "ready";
+      destination: AuthGateDestination;
+      hasToken: true;
+      accountId: string;
+    };
+
+export interface DeviceIdentityAccountBinding {
+  reconcile(accountId: string | null): boolean;
+  clear(): void;
+}
+
+export function createDeviceIdentityAccountBinding(
+  dependencies: { setAccount(accountId: string): void; clearAccount(): void } = {
+    setAccount: setDeviceIdentityAccount,
+    clearAccount: clearDeviceIdentityAccount,
+  },
+): DeviceIdentityAccountBinding {
+  let selectedAccountId: string | null = null;
+
+  const clear = () => {
+    if (selectedAccountId === null) return;
+    dependencies.clearAccount();
+    selectedAccountId = null;
+  };
+
+  return {
+    reconcile(accountId) {
+      if (accountId === selectedAccountId) return accountId !== null;
+      clear();
+      if (accountId === null) return false;
+      dependencies.setAccount(accountId);
+      selectedAccountId = accountId;
+      return true;
+    },
+    clear,
+  };
+}
+
+interface AuthenticatedAccountState {
+  accountId: string | null;
+  ready: boolean;
+}
+
+const AuthenticatedAccountContext = createContext<AuthenticatedAccountState>({
+  accountId: null,
+  ready: false,
+});
+
+export function useAuthenticatedAccount(): AuthenticatedAccountState {
+  return useContext(AuthenticatedAccountContext);
+}
 
 export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
   const [tokenAttempt, setTokenAttempt] = useState(0);
@@ -111,7 +169,8 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
     };
   }, [requestId]);
 
-  const hasToken = tokenState.status === "ready" && tokenState.token !== null;
+  const tokenStateCurrent = tokenState.requestId === requestId;
+  const hasToken = tokenStateCurrent && tokenState.status === "ready" && tokenState.token !== null;
 
   useEffect(() => {
     if (!hasToken) return;
@@ -144,7 +203,9 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
     }
   }, [configQuery, hasToken, hostsQuery, meQuery]);
 
-  if (tokenState.status === "loading") return { status: "loading", hasToken: false };
+  if (!tokenStateCurrent || tokenState.status === "loading") {
+    return { status: "loading", hasToken: false };
+  }
   if (tokenState.status === "error") {
     return { status: "error", kind: "account", error: tokenState.error, retry };
   }
@@ -152,6 +213,7 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
     return {
       status: "ready",
       hasToken: false,
+      accountId: null,
       destination: AUTH_GATE_DESTINATIONS.login,
     };
   }
@@ -161,6 +223,7 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
     return {
       status: "ready",
       hasToken: false,
+      accountId: null,
       destination: AUTH_GATE_DESTINATIONS.login,
     };
   }
@@ -183,6 +246,7 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
   return {
     status: "ready",
     hasToken: true,
+    accountId: meQuery.data.user.id,
     destination: resolveAuthGateDestination({
       hasToken: true,
       emailVerified: meQuery.data.user.email_verified_at !== null,
@@ -260,6 +324,13 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
   const theme = useTheme();
   const bootstrap = useAuthBootstrap();
+  const accountBindingRef = useRef<DeviceIdentityAccountBinding | null>(null);
+  if (accountBindingRef.current === null) {
+    accountBindingRef.current = createDeviceIdentityAccountBinding();
+  }
+  const accountBinding = accountBindingRef.current;
+  const accountId = bootstrap.status === "ready" && bootstrap.hasToken ? bootstrap.accountId : null;
+  const accountReady = accountBinding.reconcile(accountId);
   const redirectRef = useRef<OnceRedirect | null>(null);
   if (redirectRef.current === null) {
     redirectRef.current = createUnauthenticatedRedirect((destination) => {
@@ -268,7 +339,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
     });
   }
 
-  useEffect(() => subscribeUnauthenticated(() => redirectRef.current?.redirect()), []);
+  useEffect(() => authToken.subscribe(accountBinding.clear), [accountBinding]);
+  useEffect(
+    () =>
+      subscribeUnauthenticated(() => {
+        accountBinding.clear();
+        redirectRef.current?.redirect();
+      }),
+    [accountBinding],
+  );
+  useEffect(() => () => accountBinding.clear(), [accountBinding]);
   useEffect(() => {
     if (bootstrap.status === "ready" && bootstrap.hasToken) {
       redirectRef.current?.reset();
@@ -289,18 +369,20 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // view unmounts the Stack, which resets Expo Router to "/" and re-triggers
   // the redirect that produced the loading state — an infinite boot loop.
   return (
-    <View style={styles.root}>
-      {children}
-      {bootstrap.status === "error" ? (
-        <View style={[styles.overlay, { backgroundColor: theme.colors.background }]}>
-          <GateError kind={bootstrap.kind} retry={bootstrap.retry} />
-        </View>
-      ) : shouldRender ? null : (
-        <View style={[styles.overlay, { backgroundColor: theme.colors.background }]}>
-          <GateLoading />
-        </View>
-      )}
-    </View>
+    <AuthenticatedAccountContext.Provider value={{ accountId, ready: accountReady }}>
+      <View style={styles.root}>
+        {children}
+        {bootstrap.status === "error" ? (
+          <View style={[styles.overlay, { backgroundColor: theme.colors.background }]}>
+            <GateError kind={bootstrap.kind} retry={bootstrap.retry} />
+          </View>
+        ) : shouldRender ? null : (
+          <View style={[styles.overlay, { backgroundColor: theme.colors.background }]}>
+            <GateLoading />
+          </View>
+        )}
+      </View>
+    </AuthenticatedAccountContext.Provider>
   );
 }
 

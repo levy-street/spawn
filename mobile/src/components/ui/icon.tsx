@@ -1,3 +1,4 @@
+import { type SFSymbol, SymbolView } from "expo-symbols";
 import {
   AlertCircle,
   AlertTriangle,
@@ -226,18 +227,73 @@ export const iconSet = {
 
 export type IconName = keyof typeof iconSet;
 
+export type IconVariant = "brand" | "chrome";
+
+const chromeSymbolSet: Partial<Record<IconName, SFSymbol>> = {
+  Archive: "archivebox",
+  ArrowDown: "arrow.down",
+  ArrowLeft: "arrow.left",
+  ArrowRight: "arrow.right",
+  ArrowUp: "arrow.up",
+  Check: "checkmark",
+  ChevronDown: "chevron.down",
+  ChevronLeft: "chevron.left",
+  ChevronRight: "chevron.right",
+  ChevronUp: "chevron.up",
+  Clipboard: "doc.on.clipboard",
+  Copy: "doc.on.doc",
+  Download: "arrow.down.to.line",
+  Ellipsis: "ellipsis",
+  ExternalLink: "arrow.up.right.square",
+  Folder: "folder",
+  Home: "house",
+  MoreHorizontal: "ellipsis",
+  Pencil: "pencil",
+  Plus: "plus",
+  RefreshCw: "arrow.clockwise",
+  RotateCcw: "arrow.counterclockwise",
+  RotateCw: "arrow.clockwise",
+  Search: "magnifyingglass",
+  Settings: "gearshape",
+  Settings2: "gearshape.2",
+  Trash2: "trash",
+  Upload: "square.and.arrow.up",
+  X: "xmark",
+};
+
 export interface IconProps {
   accessibilityLabel?: string;
   color?: keyof Colors;
   name: IconName;
   size?: number;
+  /** Apple chrome opts into SF Symbols; Spawn brand/domain imagery remains Lucide by default. */
+  variant?: IconVariant;
+  /** Allows a chrome caller with a more specific platform symbol to override the shared mapping. */
+  symbol?: SFSymbol;
   testID?: string;
 }
 
-export function Icon({ accessibilityLabel, color = "foreground", name, size, testID }: IconProps) {
+export function Icon({
+  accessibilityLabel,
+  color = "foreground",
+  name,
+  size,
+  symbol,
+  testID,
+  variant = "brand",
+}: IconProps) {
   const theme = useTheme();
   const IconGlyph = iconSet[name];
   const resolvedSize = size ?? theme.space(4);
+  const fallback = (
+    <IconGlyph
+      accessibilityElementsHidden
+      accessible={false}
+      color={theme.colors[color]}
+      size={resolvedSize}
+    />
+  );
+  const symbolName = symbol ?? chromeSymbolSet[name];
 
   return (
     <View
@@ -248,12 +304,20 @@ export function Icon({ accessibilityLabel, color = "foreground", name, size, tes
       {...(accessibilityLabel === undefined ? {} : { accessibilityLabel })}
       {...(testID === undefined ? {} : { testID })}
     >
-      <IconGlyph
-        accessibilityElementsHidden
-        accessible={false}
-        color={theme.colors[color]}
-        size={resolvedSize}
-      />
+      {variant === "chrome" && symbolName ? (
+        <SymbolView
+          accessibilityElementsHidden
+          accessible={false}
+          fallback={fallback}
+          name={symbolName}
+          size={resolvedSize}
+          tintColor={theme.colors[color]}
+          type="monochrome"
+          weight="regular"
+        />
+      ) : (
+        fallback
+      )}
     </View>
   );
 }

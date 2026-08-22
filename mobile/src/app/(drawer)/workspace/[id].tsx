@@ -1,5 +1,6 @@
 import { type Href, useLocalSearchParams, useRouter } from "expo-router";
 
+import { Screen } from "@/components/layout/screen";
 import { WorkspaceDetail } from "@/components/workspace-detail/workspace-detail";
 
 function firstParam(value: string | string[] | undefined): string {
@@ -12,15 +13,17 @@ export default function WorkspaceDetailRoute() {
   const workspaceId = firstParam(params.id);
 
   return (
-    <WorkspaceDetail
-      onBack={() => router.back()}
-      onOpenFiles={(hostId, path) => {
-        router.push(`/host/${hostId}/files?path=${encodeURIComponent(path)}` as Href);
-      }}
-      onOpenTerminal={(sessionId) => {
-        router.push(`/terminal/${sessionId}` as Href);
-      }}
-      workspaceId={workspaceId}
-    />
+    <Screen padded={false}>
+      <WorkspaceDetail
+        onBack={() => router.back()}
+        onOpenFiles={(hostId, path) => {
+          router.push(`/host/${hostId}/files?path=${encodeURIComponent(path)}` as Href);
+        }}
+        onOpenTerminal={(sessionId) => {
+          router.push(`/terminal/${sessionId}` as Href);
+        }}
+        workspaceId={workspaceId}
+      />
+    </Screen>
   );
 }

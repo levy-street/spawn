@@ -1,32 +1,10 @@
-import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
-
+import { Screen } from "@/components/layout/screen";
 import { OnboardingFlow } from "@/components/onboarding/onboarding-flow";
 
-export default function OnboardingScreen() {
+export default function OnboardingScreen(): React.JSX.Element {
   return (
-    <SafeAreaView edges={["top", "bottom"]} style={styles.safeArea}>
-      <KeyboardAvoidingView
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-        style={styles.safeArea}
-      >
-        <ScrollView
-          automaticallyAdjustKeyboardInsets
-          contentContainerStyle={styles.scrollContent}
-          keyboardShouldPersistTaps="handled"
-        >
-          <OnboardingFlow />
-        </ScrollView>
-      </KeyboardAvoidingView>
-    </SafeAreaView>
+    <Screen padded={false} scroll>
+      <OnboardingFlow />
+    </Screen>
   );
 }
-
-const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-  },
-  scrollContent: {
-    flexGrow: 1,
-  },
-});
