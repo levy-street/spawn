@@ -64,7 +64,20 @@ import {
 export const APPROVE_CEREMONY_TRIES = 3;
 
 export type ApproveCeremonyRole = "approver" | "new-device";
-export type ApproveCeremonyPhase = "connecting" | "compare" | "waiting" | "done" | "stopped";
+/**
+ * `half-done` is the honest intermediate terminal (C1): this side's approval
+ * provably landed but the reciprocal edge never did before the relay row
+ * vanished, so the mutual endorsement (mesh §4, required for P1) is
+ * half-complete. It never claims full success and upgrades itself to `done`
+ * if the reciprocal lands later.
+ */
+export type ApproveCeremonyPhase =
+  | "connecting"
+  | "compare"
+  | "waiting"
+  | "done"
+  | "half-done"
+  | "stopped";
 
 export interface ApproveCeremonyView {
   pairingId: string;
@@ -143,6 +156,8 @@ interface CeremonyRecord {
   deviceIntroductions: PairingDeviceIntroduction[] | null;
   waitingSince: number | null;
   done: boolean;
+  /** Honest intermediate terminal: mine landed, the reciprocal never did. */
+  halfDone: boolean;
   stopped: boolean;
 }
 
@@ -156,6 +171,7 @@ const FRESH: CeremonyRecord = {
   deviceIntroductions: null,
   waitingSince: null,
   done: false,
+  halfDone: false,
   stopped: false,
 };
 
@@ -254,6 +270,109 @@ export async function planReciprocalEndorsement(input: {
   };
 }
 
+/**
+ * Whether one direction of the mutual endorsement provably exists: an edge
+ * between exactly these device ids, claiming exactly the expected (ceremony-
+ * pinned or own) keys, whose signature verifies under the expected endorser
+ * key. Server-claimed metadata alone is never evidence — a fabricated row with
+ * a bad signature reads as "does not exist".
+ */
+export async function accountEndorsementEdgeVerified(input: {
+  accountId: string;
+  edges: AccountEndorsementEdge[];
+  endorserDeviceId: string;
+  endorserPublicKey: string;
+  endorsedDeviceId: string;
+  endorsedPublicKey: string;
+}): Promise<boolean> {
+  const edge = input.edges.find(
+    (e) =>
+      e.endorser_device_id === input.endorserDeviceId &&
+      e.endorsed_device_id === input.endorsedDeviceId,
+  );
+  if (!edge) return false;
+  if (
+    edge.endorser_public_key !== input.endorserPublicKey ||
+    edge.endorsed_public_key !== input.endorsedPublicKey
+  ) {
+    return false;
+  }
+  return verifyAccountEndorsementSignature({
+    accountId: input.accountId,
+    endorserPublicKey: input.endorserPublicKey,
+    endorsedPublicKey: input.endorsedPublicKey,
+    endorsedDeviceId: input.endorsedDeviceId,
+    signature: edge.signature,
+  });
+}
+
+export type VanishedCeremonyPlan =
+  /** Both directions provably exist (or, for the joiner, the approver's edge
+   * does and `signReciprocal` asks the caller to complete the mutual pair). */
+  | { kind: "done"; signReciprocal: boolean }
+  /** This side's edge landed; the reciprocal never did. Honest intermediate —
+   * the caller shows "not finished" and re-plans on later polls to upgrade. */
+  | { kind: "half-done" }
+  /** Nothing this side can prove was trusted. */
+  | { kind: "stopped" };
+
+/**
+ * The truthful terminal state for a ceremony whose relay row vanished (10-min
+ * TTL, peer cancel, or the peer's completing delete) — C1. The row's absence
+ * proves nothing by itself; only signature-verified endorsement edges do:
+ *
+ * - APPROVER: its own edge (x→c) alone is NOT success — the mutual
+ *   endorsement (mesh §4, P1) needs the reciprocal c→x, verified against the
+ *   ceremony-pinned joiner key. Without it: `half-done`, never "every host is
+ *   ready". With neither edge: `stopped`.
+ * - JOINER: a verified x→c edge means this device IS admitted (the approver's
+ *   edge is what grants admission), even if this side never signed — `done`,
+ *   with `signReciprocal` so the caller completes the pair. No verified edge:
+ *   `stopped` ("nothing was trusted" stays true).
+ */
+export async function planVanishedCeremonyCompletion(input: {
+  accountId: string;
+  role: ApproveCeremonyRole;
+  /** This side already posted its endorsement in this session (local truth). */
+  signedMine: boolean;
+  pinned: PinnedCeremonyKeys | null;
+  currentDevice: { id: string; public_key: string };
+  peerDeviceId: string;
+  edges: AccountEndorsementEdge[];
+}): Promise<VanishedCeremonyPlan> {
+  const { pinned } = input;
+  if (pinned === null) {
+    // No pinned bytes means no number was ever up; nothing verifiable either
+    // way. Claim only what this side provably did.
+    return input.signedMine ? { kind: "half-done" } : { kind: "stopped" };
+  }
+  const peerKey = input.role === "approver" ? pinned.joinerPublicKey : pinned.initiatorPublicKey;
+  const mine =
+    input.signedMine ||
+    (await accountEndorsementEdgeVerified({
+      accountId: input.accountId,
+      edges: input.edges,
+      endorserDeviceId: input.currentDevice.id,
+      endorserPublicKey: input.currentDevice.public_key,
+      endorsedDeviceId: input.peerDeviceId,
+      endorsedPublicKey: peerKey,
+    }));
+  const theirs = await accountEndorsementEdgeVerified({
+    accountId: input.accountId,
+    edges: input.edges,
+    endorserDeviceId: input.peerDeviceId,
+    endorserPublicKey: peerKey,
+    endorsedDeviceId: input.currentDevice.id,
+    endorsedPublicKey: input.currentDevice.public_key,
+  });
+  if (input.role === "approver") {
+    if (!mine) return { kind: "stopped" };
+    return theirs ? { kind: "done", signReciprocal: false } : { kind: "half-done" };
+  }
+  if (mine) return { kind: "done", signReciprocal: false };
+  return theirs ? { kind: "done", signReciprocal: true } : { kind: "stopped" };
+}
+
 export function useApproveDeviceCeremony({
   accountId,
   currentDevice,
@@ -318,14 +437,19 @@ export function useApproveDeviceCeremony({
    * Best-effort by design — a failure here must never block the approval, but
    * it is surfaced, not swallowed: the joiner then verifies each host on first
    * use exactly as before this leg existed.
+   *
+   * Returns the warning to show (or null): the caller signs the endorsement
+   * AFTER this and clears any stale error line on success, so a warning set
+   * here directly would be wiped by its own approval landing.
    */
   const postIntroductions = async (
     pairing: PairingState,
     pinned: PinnedCeremonyKeys,
-  ): Promise<void> => {
+  ): Promise<string | null> => {
+    let peerHandoverWarning: string | null = null;
     try {
       const signer = (await loadBrowserDeviceIdentity(accountId)) ?? identity;
-      if (!signer || !currentDevice) return;
+      if (!signer || !currentDevice) return null;
       const origin = browserHostPinServerOrigin();
       const pins = await listActiveBrowserHostPins({ accountId, origin });
       const hostList = await hostsApi.list().catch(() => []);
@@ -381,14 +505,17 @@ export function useApproveDeviceCeremony({
           });
         }
       } catch {
-        // Peer handover is a bonus on top of a bonus; hosts still ride alone.
+        // Non-blocking (hosts still ride alone), but surfaced (R-c): losing
+        // this leg quietly costs the joiner the ability to honor those peers'
+        // future broadcast host introductions, and nobody would know why.
+        peerHandoverWarning =
+          "Approved, but this device couldn't hand over your other devices — hosts they share later will be verified on the new device when it first connects to them.";
       }
-      if (items.length === 0 && deviceItems.length === 0) return;
+      if (items.length === 0 && deviceItems.length === 0) return peerHandoverWarning;
       await trust.postPairingIntroductions(pairing.id, items, deviceItems);
+      return peerHandoverWarning;
     } catch {
-      setError(
-        "Approved, but this device couldn't hand over its hosts — the new device will verify each host when it first connects.",
-      );
+      return "Approved, but this device couldn't hand over its hosts — the new device will verify each host when it first connects.";
     }
   };
 
@@ -625,7 +752,9 @@ export function useApproveDeviceCeremony({
       void (async () => {
         // Device-key handover (continuous gossip bootstrap): judged against
         // the same ceremony-pinned key, remembered as firsthand-by-proxy.
-        // Quiet best-effort — the host leg below is the user-visible one.
+        // Non-blocking best-effort, but surfaced (R-c) like the host leg: a
+        // swallowed failure here silently costs this device the ability to
+        // honor those peers' future broadcast host introductions.
         try {
           if (claimedDevices.length > 0) {
             const devicePlan = await planDeviceIntroductionAcceptance({
@@ -635,22 +764,38 @@ export function useApproveDeviceCeremony({
               claimed: claimedDevices,
             });
             const origin = browserHostPinServerOrigin();
+            let storedFailures = 0;
             for (const peer of devicePlan.accepted) {
-              await rememberPeerDeviceKey({
-                accountId,
-                origin,
-                publicKey: peer.devicePublicKey,
-                deviceId: peer.deviceId,
-                source: "ceremony-introduction",
-              }).catch(() => {});
+              try {
+                await rememberPeerDeviceKey({
+                  accountId,
+                  origin,
+                  publicKey: peer.devicePublicKey,
+                  deviceId: peer.deviceId,
+                  source: "ceremony-introduction",
+                });
+              } catch {
+                storedFailures += 1;
+              }
             }
             for (const reason of devicePlan.rejected) {
+              // Individually judged-and-refused rows (a forged or damaged row
+              // must be refused quietly — refusal IS the correct handling).
               console.warn(`spawn: device introduction rejected: ${reason}`);
+            }
+            if (storedFailures > 0) {
+              setError(
+                "This device is approved, but it couldn't remember your other devices — hosts they share later will be checked here when they first connect.",
+              );
             }
             void qc.invalidateQueries({ queryKey: ["peer-device-keys"] });
           }
-        } catch {
-          // Nothing was trusted; broadcast rows from unmet peers stay unhonored.
+        } catch (cause) {
+          // Nothing was trusted; broadcast rows from unmet peers stay
+          // unhonored — say so instead of leaving a silent capability gap.
+          setError(
+            `This device is approved, but your other devices couldn't be handed over (${cause instanceof Error ? cause.message : String(cause)}) — hosts they share later will be checked here when they first connect.`,
+          );
         }
         try {
           if (claimed.length === 0) return;
@@ -669,6 +814,10 @@ export function useApproveDeviceCeremony({
                 origin,
                 hostPublicKey: intro.hostPublicKey,
                 hostFingerprint: intro.hostFingerprint,
+                // Handover is an introduction, not a hand-run possession: it
+                // must never resurrect a key the operator removed on THIS
+                // device (tombstones yield only to a fresh explicit ceremony).
+                reactivateRevoked: false,
               });
               // Bind the host id so the downgrade gate sees this host as
               // pinned from the very first connection (never a silent no-op:
@@ -735,56 +884,140 @@ export function useApproveDeviceCeremony({
     })();
   };
 
-  // Completion: once BOTH directions of the mutual endorsement exist, the
-  // ceremony is done — flip the phase and delete the pairing so neither screen
-  // lingers until the relay TTL. Either side may win the delete; the loser's
-  // 404 is fine.
+  // Completion: once BOTH directions of the mutual endorsement PROVABLY exist
+  // — each edge signature-verified against the ceremony-pinned peer key / this
+  // device's own key, never the server's say-so — the ceremony is done: flip
+  // the phase and delete the pairing so neither screen lingers until the relay
+  // TTL. Either side may win the delete; the loser's 404 is fine.
   // biome-ignore lint/correctness/useExhaustiveDependencies: poll-driven effect keyed on poll data
   useEffect(() => {
     if (!currentDevice) return;
     const edges = endorsements.data ?? [];
     for (const pairing of pairings.data ?? []) {
       const record = records.get(pairing.id);
-      if (!record?.sas || record.done || record.stopped) continue;
+      if (!record?.sas || !record.pinnedKeys || record.done || record.stopped) continue;
       const amInitiator = pairing.initiator_device_id === currentDevice.id;
+      const amJoiner = pairing.joiner_device_id === currentDevice.id;
+      if (!amInitiator && !amJoiner) continue;
+      const guard = `complete:${pairing.id}`;
+      if (actedRef.current.has(guard)) continue;
+      actedRef.current.add(guard);
+      const role: ApproveCeremonyRole = amInitiator ? "approver" : "new-device";
       const peerId = amInitiator ? pairing.joiner_device_id : pairing.initiator_device_id;
-      const mine =
-        record.signedMine ||
-        edges.some(
-          (e) => e.endorser_device_id === currentDevice.id && e.endorsed_device_id === peerId,
-        );
-      const theirs = edges.some(
-        (e) => e.endorser_device_id === peerId && e.endorsed_device_id === currentDevice.id,
-      );
-      if (!mine || !theirs) continue;
-      persistCeremonyPeerKey(pairing.id, record, amInitiator ? "approver" : "new-device", peerId);
-      patch(pairing.id, { done: true });
-      void trust
-        .cancelPairing(pairing.id)
-        .catch(() => {})
-        .then(() => invalidatePairings());
+      const pinned = record.pinnedKeys;
+      void (async () => {
+        try {
+          const peerKey = role === "approver" ? pinned.joinerPublicKey : pinned.initiatorPublicKey;
+          const mine =
+            record.signedMine ||
+            (await accountEndorsementEdgeVerified({
+              accountId,
+              edges,
+              endorserDeviceId: currentDevice.id,
+              endorserPublicKey: currentDevice.public_key,
+              endorsedDeviceId: peerId,
+              endorsedPublicKey: peerKey,
+            }));
+          const theirs = await accountEndorsementEdgeVerified({
+            accountId,
+            edges,
+            endorserDeviceId: peerId,
+            endorserPublicKey: peerKey,
+            endorsedDeviceId: currentDevice.id,
+            endorsedPublicKey: currentDevice.public_key,
+          });
+          if (!mine || !theirs) return; // not complete yet; next poll re-plans
+          persistCeremonyPeerKey(pairing.id, record, role, peerId);
+          patch(pairing.id, { done: true, halfDone: false });
+          await trust.cancelPairing(pairing.id).catch(() => {});
+          await invalidatePairings();
+        } finally {
+          actedRef.current.delete(guard);
+        }
+      })();
     }
-    // The peer may delete the pairing before our edge-poll notices completion:
-    // a ceremony we signed (this session, or a prior one — the edge proves it)
-    // that vanished from the relay is also done. One we had NOT signed (a
-    // number was up, then the row vanished — the peer's mismatch, exhausted
-    // tries, or cancel deleted it) is stopped: the terminal "nothing was
-    // trusted" screen must appear on this side too, not silently disappear.
+    // The peer may delete the pairing before our edge-poll notices completion,
+    // the 10-minute TTL may reap it, or the peer may cancel. The row's absence
+    // proves nothing on its own (C1) — plan the truthful terminal from the
+    // verified edges: done only with evidence of BOTH directions; an approver
+    // whose own edge landed but whose reciprocal never arrived reads
+    // half-done ("not finished"), never success; a joiner the approver's
+    // verified edge admits reads done (and signs the reciprocal it never got
+    // to post) instead of "nothing was trusted". half-done re-plans on every
+    // poll and upgrades itself when the missing edge lands late.
     const liveIds = new Set((pairings.data ?? []).map((p) => p.id));
     for (const [id, record] of records) {
       if (record.done || record.stopped || record.sas === null || liveIds.has(id)) continue;
+      const guard = `vanished:${id}`;
+      if (actedRef.current.has(guard)) continue;
+      actedRef.current.add(guard);
       const remembered = rolesRef.current.get(id);
-      const peerId = remembered?.peerDeviceId;
-      const mine =
-        record.signedMine ||
-        (peerId !== undefined &&
-          edges.some(
-            (e) => e.endorser_device_id === currentDevice.id && e.endorsed_device_id === peerId,
-          ));
-      if (mine && remembered !== undefined && peerId !== undefined) {
-        persistCeremonyPeerKey(id, record, remembered.role, peerId);
-      }
-      patch(id, mine ? { done: true } : { stopped: true });
+      void (async () => {
+        try {
+          if (remembered === undefined) {
+            // Role and peer were never rendered (degenerate). Nothing can be
+            // verified; claim only what this side provably did.
+            if (record.signedMine) {
+              if (!record.halfDone) patch(id, { halfDone: true });
+            } else {
+              patch(id, { stopped: true });
+            }
+            return;
+          }
+          const planWith = (edgeSet: AccountEndorsementEdge[]) =>
+            planVanishedCeremonyCompletion({
+              accountId,
+              role: remembered.role,
+              signedMine: record.signedMine,
+              pinned: record.pinnedKeys,
+              currentDevice: { id: currentDevice.id, public_key: currentDevice.public_key },
+              peerDeviceId: remembered.peerDeviceId,
+              edges: edgeSet,
+            });
+          let plan = await planWith(edges);
+          if (plan.kind === "stopped") {
+            // The polled edge set can lag the row's disappearance by a cycle,
+            // and "nothing was trusted" is irreversible on screen — one fresh
+            // read closes the lag race before it is declared (same discipline
+            // as the introductions re-read above).
+            const fresh = await trust.accountEndorsements().catch(() => null);
+            if (fresh !== null) plan = await planWith(fresh);
+          }
+          if (plan.kind === "stopped") {
+            patch(id, { stopped: true });
+            return;
+          }
+          // In both remaining plans this side's entry provably matched, so the
+          // pinned peer bytes are human-verified: remember them.
+          persistCeremonyPeerKey(id, record, remembered.role, remembered.peerDeviceId);
+          if (plan.kind === "half-done") {
+            if (!record.halfDone) patch(id, { halfDone: true });
+            return;
+          }
+          if (
+            plan.signReciprocal &&
+            record.pinnedKeys !== null &&
+            !actedRef.current.has(`reciprocate:${id}`)
+          ) {
+            // The approver's verified edge admitted this device but the row
+            // died before the live reciprocal path ran. Complete the mutual
+            // pair (P1) with the ceremony-pinned initiator key — the same
+            // bytes the live path would have signed.
+            actedRef.current.add(`reciprocate:${id}`);
+            try {
+              await signEndorsement(remembered.peerDeviceId, record.pinnedKeys.initiatorPublicKey);
+            } catch {
+              actedRef.current.delete(`reciprocate:${id}`); // retry next poll
+              setError(
+                "This device is approved, but the link back to the other device didn't finish — approve this device once more from it to finish the link.",
+              );
+            }
+          }
+          patch(id, { done: true, halfDone: false });
+        } finally {
+          actedRef.current.delete(guard);
+        }
+      })();
     }
   }, [pairings.data, endorsements.data, records]);
 
@@ -834,9 +1067,11 @@ export function useApproveDeviceCeremony({
           }
           // Host introductions FIRST (R7): they must be on the relay row
           // before the edge whose appearance lets the joiner finish.
-          await postIntroductions(pairing, pinned);
+          const handoverWarning = await postIntroductions(pairing, pinned);
           await signEndorsement(plan.endorsedDeviceId, plan.endorsedPublicKey);
-          setError(null); // a retried approve that lands clears the stale failure line
+          // A retried approve that lands clears the stale failure line — but a
+          // handover warning from THIS attempt survives its own success.
+          setError(handoverWarning);
           patch(pairing.id, { signedMine: true, waitingSince: Date.now(), entryError: null });
         } catch (e) {
           setError(e instanceof Error ? e.message : "Could not record the approval");
@@ -905,29 +1140,38 @@ export function useApproveDeviceCeremony({
         ? "stopped"
         : record.done
           ? "done"
-          : record.sas === null
-            ? "connecting"
-            : record.signedMine
-              ? "waiting"
-              : "compare",
+          : record.halfDone
+            ? "half-done"
+            : record.sas === null
+              ? "connecting"
+              : record.signedMine
+                ? "waiting"
+                : "compare",
       number: record.sas,
       entryError: record.entryError,
       waitingSince: record.waitingSince,
     });
   }
   // Ceremonies whose pairing vanished after finishing still deserve their
-  // terminal screen — done OR stopped — until dismissed, with the role and
-  // peer they ran under. Stopped must survive the row's deletion exactly like
-  // done: the relay row is gone precisely because the ceremony was aborted.
+  // terminal screen — done, half-done, OR stopped — until dismissed, with the
+  // role and peer they ran under. Stopped must survive the row's deletion
+  // exactly like done: the relay row is gone precisely because the ceremony
+  // was aborted. Half-done is the honest in-between (C1) and keeps showing
+  // until dismissed or upgraded to done by a late reciprocal.
   for (const [id, record] of records) {
-    if ((!record.done && !record.stopped) || views.some((v) => v.pairingId === id)) continue;
+    if (
+      (!record.done && !record.stopped && !record.halfDone) ||
+      views.some((v) => v.pairingId === id)
+    ) {
+      continue;
+    }
     const remembered = rolesRef.current.get(id);
     views.push({
       pairingId: id,
       role: remembered?.role ?? "new-device",
       peerDeviceId: remembered?.peerDeviceId ?? "",
       peerName: remembered ? labelFor(remembered.peerDeviceId) : "the other device",
-      phase: record.stopped ? "stopped" : "done",
+      phase: record.stopped ? "stopped" : record.done ? "done" : "half-done",
       number: record.sas,
       entryError: null,
       waitingSince: record.waitingSince,

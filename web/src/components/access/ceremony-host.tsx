@@ -193,7 +193,7 @@ function CeremonyDialog({
   onDismiss: () => void;
 }) {
   const isApprover = view.role === "approver";
-  const finished = view.phase === "done" || view.phase === "stopped";
+  const finished = view.phase === "done" || view.phase === "half-done" || view.phase === "stopped";
   return (
     <Dialog.Root
       open
@@ -231,6 +231,11 @@ function CeremonyDialog({
             entryError={view.entryError ?? undefined}
             slowHint={view.waitingSince !== null && Date.now() - view.waitingSince > 20_000}
             stoppedText="The number wasn't right, so nothing was trusted. You can start over from the device list."
+            halfDoneText={
+              isApprover
+                ? `${view.peerName} can reach your hosts, but it didn't finish linking back. Approve it again from the device list to finish the link.`
+                : "Approved on this side, but the other device didn't finish. Approve this device again from a device you already use to finish the link."
+            }
             onSubmit={onSubmit}
             onNoMatch={onCancel}
             onDone={onDismiss}
