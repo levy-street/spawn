@@ -36,6 +36,10 @@ function Providers({ children }: PropsWithChildren): React.JSX.Element {
 }
 
 describe("overlay rendering and dismissal", () => {
+  beforeEach(() => {
+    jest.spyOn(AccessibilityInfo, "isReduceMotionEnabled").mockResolvedValue(false);
+  });
+
   test("Dialog renders its copy and dismisses from the close control", async () => {
     const onDismiss = jest.fn();
     const screen = await render(

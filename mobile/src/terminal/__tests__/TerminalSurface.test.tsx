@@ -71,6 +71,12 @@ describe("TerminalSurface", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockWebViewProps = {};
+    jest.spyOn(AppState, "addEventListener").mockReturnValue({
+      remove: jest.fn(),
+    } as unknown as ReturnType<typeof AppState.addEventListener>);
+    jest.spyOn(Keyboard, "addListener").mockReturnValue({
+      remove: jest.fn(),
+    } as unknown as ReturnType<typeof Keyboard.addListener>);
   });
 
   test("renders the worker and forwards imperative handle calls", async () => {

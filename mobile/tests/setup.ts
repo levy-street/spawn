@@ -4,6 +4,28 @@ import { setUpTests } from "react-native-reanimated";
 
 setUpTests();
 
+function networkTarget(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  return input.url;
+}
+
+globalThis.fetch = (async (input) => {
+  throw new Error(`Network access is disabled in tests: ${networkTarget(input)}`);
+}) as typeof fetch;
+
+class BlockedWebSocket {
+  constructor(url: string | URL) {
+    throw new Error(`WebSocket access is disabled in tests: ${url.toString()}`);
+  }
+}
+
+globalThis.WebSocket = BlockedWebSocket as unknown as typeof WebSocket;
+
+afterEach(() => {
+  jest.useRealTimers();
+});
+
 jest.mock("@react-native-async-storage/async-storage", () => ({
   clear: jest.fn(async () => undefined),
   getAllKeys: jest.fn(async () => []),

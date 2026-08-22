@@ -9,6 +9,7 @@ import { Text } from "@/components/ui/text";
 import { WorkspaceIcon } from "@/components/workspaces/workspace-icon";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import type { WorkspaceStats } from "@/data/types/domain";
+import { haptics } from "@/lib/haptics";
 import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
 
 export interface WorkspaceRowProps {
@@ -157,7 +158,10 @@ export function WorkspaceRow({
           accessibilityRole="button"
           accessibilityState={{ busy, disabled: busy }}
           disabled={busy}
-          onLongPress={() => setMenuVisible(true)}
+          onLongPress={() => {
+            haptics.impact("medium");
+            setMenuVisible(true);
+          }}
           onPress={onOpen}
           style={({ pressed }) => [
             styles.row,

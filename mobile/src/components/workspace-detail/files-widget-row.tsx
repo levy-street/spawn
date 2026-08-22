@@ -78,9 +78,12 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
           if (event.nativeEvent.actionName === "longpress") onActions();
           else if (event.nativeEvent.actionName === "activate") onOpen();
         }}
-        onLongPress={onActions}
+        onLongPress={() => {
+          haptics.impact("medium");
+          onActions();
+        }}
         onPress={() => {
-          haptics.impact("light");
+          haptics.selection();
           onOpen();
         }}
         style={({ pressed }) => [

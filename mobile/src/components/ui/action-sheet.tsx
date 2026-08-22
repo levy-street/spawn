@@ -37,7 +37,8 @@ export function ActionSheet({
   const theme = useTheme();
 
   const handleAction = (action: ActionSheetAction) => {
-    haptics.selection();
+    if (action.destructive) haptics.warning();
+    else haptics.selection();
     action.onPress();
     onDismiss();
   };

@@ -11,6 +11,7 @@ import { TerminalRow } from "@/components/workspace-detail/terminal-row";
 import { readingOrder } from "@/data/layout/mobile-order";
 import type { AgentDef, Host, Session, TransportState } from "@/data/types/domain";
 import { isFilesWidget, type Tile, type WorkspaceTab } from "@/data/types/layout";
+import { haptics } from "@/lib/haptics";
 import { borderWidth, chrome, useTheme } from "@/theme";
 
 export interface PaneListProps {
@@ -139,7 +140,10 @@ function MissingPaneRow({ paneId, onActions }: { paneId: string; onActions: () =
     <Pressable
       accessibilityLabel="Session unavailable"
       accessibilityRole="button"
-      onLongPress={onActions}
+      onLongPress={() => {
+        haptics.impact("medium");
+        onActions();
+      }}
       onPress={onActions}
       style={[
         styles.missing,

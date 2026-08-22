@@ -91,11 +91,11 @@ export const TerminalRow = memo(function TerminalRow({
           if (event.nativeEvent.actionName === "longpress") onActions();
           else if (event.nativeEvent.actionName === "activate") onOpen();
         }}
-        onLongPress={onActions}
-        onPress={() => {
-          haptics.impact("light");
-          onOpen();
+        onLongPress={() => {
+          haptics.impact("medium");
+          onActions();
         }}
+        onPress={onOpen}
         style={({ pressed }) => [
           styles.row,
           {

@@ -5,6 +5,8 @@ import Animated, { type SharedValue, useAnimatedStyle } from "react-native-reani
 import { IconButton } from "@/components/ui/icon-button";
 import { Text } from "@/components/ui/text";
 import type { WorkspaceTab } from "@/data/types/layout";
+import { haptics } from "@/lib/haptics";
+import { useReducedMotion } from "@/lib/motion/reduced-motion";
 import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
 
 const TAB_WIDTH = spacing[24];
@@ -30,6 +32,7 @@ export function TabStrip({
   onAdd,
 }: TabStripProps) {
   const theme = useTheme();
+  const reducedMotion = useReducedMotion();
   const scrollRef = useRef<ScrollView>(null);
   const indicatorStyle = useAnimatedStyle(() => ({
     transform: [{ translateX: dragProgress.value * TAB_WIDTH }],
@@ -37,10 +40,10 @@ export function TabStrip({
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
-      animated: true,
+      animated: !reducedMotion,
       x: Math.max(0, activeIndex * TAB_WIDTH - TAB_WIDTH),
     });
-  }, [activeIndex]);
+  }, [activeIndex, reducedMotion]);
 
   return (
     <View
@@ -69,7 +72,10 @@ export function TabStrip({
                 accessibilityRole="tab"
                 accessibilityState={{ selected }}
                 key={tab.id}
-                onLongPress={() => onActions(tab)}
+                onLongPress={() => {
+                  haptics.impact("medium");
+                  onActions(tab);
+                }}
                 onPress={() => onSelect(index)}
                 style={({ pressed }) => [
                   styles.tab,

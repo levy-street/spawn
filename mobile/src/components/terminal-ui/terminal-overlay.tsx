@@ -267,7 +267,6 @@ export function TerminalOverlay({
                   hostIdentityPublicKey={hostKey}
                   initialSize={INITIAL_TERMINAL_GRID}
                   key={`${session.id}-${surfaceGeneration}`}
-                  onBell={() => haptics.warning()}
                   onDiagnostic={setDiagnostic}
                   onError={(error) => {
                     setConnectionError(error);

@@ -5,6 +5,7 @@ import { IconButton } from "@/components/ui/icon-button";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
+import { haptics } from "@/lib/haptics";
 import { borderWidth, chrome, spacing, useTheme } from "@/theme";
 
 export interface HostListItemProps {
@@ -31,8 +32,14 @@ export function HostListItem({ host, onOpen, onOpenActions }: HostListItemProps)
       <Pressable
         accessibilityLabel={`${host.name}, ${online ? "online" : "offline"}`}
         accessibilityRole="button"
-        onLongPress={onOpenActions}
-        onPress={onOpen}
+        onLongPress={() => {
+          haptics.impact("medium");
+          onOpenActions();
+        }}
+        onPress={() => {
+          haptics.selection();
+          onOpen();
+        }}
         style={({ pressed }) => [
           styles.main,
           { backgroundColor: pressed ? theme.colors.accent : "transparent" },

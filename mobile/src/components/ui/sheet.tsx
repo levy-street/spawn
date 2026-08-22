@@ -109,6 +109,7 @@ export function Sheet({
 
   return (
     <BottomSheetModal
+      animationConfigs={theme.motion.transition.sheet}
       android_keyboardInputMode="adjustResize"
       backdropComponent={renderBackdrop}
       backgroundStyle={{

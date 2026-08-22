@@ -3,6 +3,7 @@ import { Pressable, StyleSheet, View } from "react-native";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
+import { haptics } from "@/lib/haptics";
 import { borderWidth, chrome, spacing, useTheme } from "@/theme";
 
 interface SettingsRowBaseProps {
@@ -65,7 +66,10 @@ export function SettingsLinkRow({
       accessibilityHint={accessibilityHint}
       accessibilityLabel={label}
       accessibilityRole="button"
-      onPress={onPress}
+      onPress={() => {
+        haptics.selection();
+        onPress();
+      }}
       style={({ pressed }) => [
         styles.row,
         {

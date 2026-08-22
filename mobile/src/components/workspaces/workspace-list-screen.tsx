@@ -99,7 +99,6 @@ export function WorkspaceListScreen() {
         queryClient.invalidateQueries({ queryKey: qk.workspaces() }),
         queryClient.invalidateQueries({ queryKey: qk.sessions() }),
       ]);
-      haptics.success();
       const detail =
         result.agentLaunchesSkipped > 0
           ? `${result.agentLaunchesSkipped} agent ${result.agentLaunchesSkipped === 1 ? "command could" : "commands could"} not be queued; ${result.agentLaunchesSkipped === 1 ? "the shell was" : "the shells were"} kept.`
@@ -116,7 +115,6 @@ export function WorkspaceListScreen() {
       }
     },
     onError: (error) => {
-      haptics.error();
       toast.error("Workspace action failed", { detail: workspaceErrorMessage(error) });
     },
   });
@@ -170,7 +168,7 @@ export function WorkspaceListScreen() {
       });
       if (!accepted) return;
     }
-    haptics.warning();
+    if (row.stats.running === 0) haptics.warning();
     archiveMutation.mutate(row.workspace.id, {
       onSuccess: () => toast.success(`Archived ${row.workspace.name}`),
       onError: (error) =>
@@ -189,7 +187,6 @@ export function WorkspaceListScreen() {
       destructive: true,
     });
     if (!accepted) return;
-    haptics.warning();
     deleteMutation.mutate(workspace.id, {
       onSuccess: () => toast.success(`Deleted ${workspace.name}`),
       onError: (error) =>

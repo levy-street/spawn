@@ -17,6 +17,7 @@ import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import { identifyAgent } from "@/data/selectors/agent";
 import { sessionAttention } from "@/data/selectors/session";
+import { haptics } from "@/lib/haptics";
 import type { TransportState } from "@/terminal/transport/types";
 import { borderWidth, spacing, useTheme } from "@/theme";
 
@@ -76,7 +77,10 @@ export function LegionHostCard({
     <Pressable
       accessibilityLabel={`Open ${host.name}`}
       accessibilityRole="button"
-      onPress={onOpen}
+      onPress={() => {
+        haptics.selection();
+        onOpen();
+      }}
       style={({ pressed }) => [
         styles.card,
         {

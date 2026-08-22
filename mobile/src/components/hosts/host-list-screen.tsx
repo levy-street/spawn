@@ -17,6 +17,7 @@ import { useToast } from "@/components/ui/toast";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import { useHostsQuery, useRemoveHostMutation, useRenameHostMutation } from "@/data/queries/hosts";
 import { sortHosts } from "@/data/selectors/host";
+import { haptics } from "@/lib/haptics";
 import { borderWidth, spacing, useTheme } from "@/theme";
 
 export interface HostListViewProps {
@@ -59,7 +60,10 @@ export function HostListView({
           <Pressable
             accessibilityLabel="Open fleet overview"
             accessibilityRole="button"
-            onPress={onOpenLegion}
+            onPress={() => {
+              haptics.selection();
+              onOpenLegion();
+            }}
             style={({ pressed }) => [
               styles.fleet,
               {

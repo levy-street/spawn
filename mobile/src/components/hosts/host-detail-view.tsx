@@ -8,6 +8,7 @@ import { Text } from "@/components/ui/text";
 import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
+import { haptics } from "@/lib/haptics";
 import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
 
 function DestinationRow({
@@ -30,7 +31,10 @@ function DestinationRow({
       accessibilityRole="button"
       accessibilityState={{ disabled }}
       disabled={disabled}
-      onPress={onPress}
+      onPress={() => {
+        haptics.selection();
+        onPress();
+      }}
       style={({ pressed }) => [
         styles.destination,
         {

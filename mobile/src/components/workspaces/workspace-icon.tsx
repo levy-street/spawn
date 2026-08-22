@@ -4,6 +4,7 @@ import { Image } from "expo-image";
 import { type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
 
 import { Monogram } from "@/components/ui/monogram";
+import { useReducedMotion } from "@/lib/motion/reduced-motion";
 import { borderWidth, useTheme } from "@/theme";
 
 export const WORKSPACE_ICON_MAX_CHARACTERS = 32 * 1024;
@@ -64,6 +65,7 @@ export async function pickWorkspaceIcon(): Promise<WorkspaceIconChoice | null> {
 
 export function WorkspaceIcon({ icon, name, size, style, testID }: WorkspaceIconProps) {
   const theme = useTheme();
+  const reducedMotion = useReducedMotion();
   if (!icon) {
     return (
       <Monogram
@@ -96,7 +98,7 @@ export function WorkspaceIcon({ icon, name, size, style, testID }: WorkspaceIcon
         contentFit="cover"
         source={{ uri: icon }}
         style={StyleSheet.absoluteFill}
-        transition={theme.motion.duration.base}
+        transition={reducedMotion ? theme.motion.duration.instant : theme.motion.duration.base}
       />
     </View>
   );

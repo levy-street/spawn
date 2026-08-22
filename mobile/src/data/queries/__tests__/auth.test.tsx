@@ -40,7 +40,7 @@ describe("useLoginMutation", () => {
     const wrapper = ({ children }: PropsWithChildren) => (
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     );
-    const { result } = await renderHook(() => useLoginMutation(), { wrapper });
+    const { result, unmount } = await renderHook(() => useLoginMutation(), { wrapper });
     queryClient.setQueryData(qk.hosts(), [{ id: "previous-account-host" }]);
 
     await act(async () => {
@@ -51,6 +51,7 @@ describe("useLoginMutation", () => {
     expect(set).not.toHaveBeenCalledWith("short-token");
     expect(queryClient.getQueryData<MeResponse>(qk.me())).toEqual({ user: USER });
     expect(queryClient.getQueryData(qk.hosts())).toBeUndefined();
+    await unmount();
     queryClient.clear();
   });
 
