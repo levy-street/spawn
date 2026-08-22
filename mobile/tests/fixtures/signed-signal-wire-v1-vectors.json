@@ -1,0 +1,116 @@
+{
+  "format": "spawn-signed-signal-wire-v1",
+  "intended_peer_public_key_wire": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+  "key_material_source": "RFC 8032 section 7.1 test vectors 1 and 2; test use only",
+  "mutation_fields": [
+    "type",
+    "signature_algorithm",
+    "sender_identity_public_key",
+    "intended_peer_identity_public_key",
+    "protocol",
+    "protocol_version",
+    "session_id",
+    "scope_type",
+    "scope_id",
+    "sender_role",
+    "sdp",
+    "signature"
+  ],
+  "protocol_version_json_tokens": {
+    "host_accepted": [
+      "1",
+      "1.0",
+      "1e0",
+      "1E+0"
+    ],
+    "rejected": [
+      "0",
+      "-1",
+      "1.5",
+      "2.5",
+      "4294967296",
+      "1e309",
+      "NaN"
+    ],
+    "session_accepted": [
+      "2",
+      "2.0",
+      "2e0",
+      "2E+0"
+    ]
+  },
+  "sender_public_key_wire": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+  "signing_seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "vectors": [
+    {
+      "envelope": {
+        "intended_peer_identity_public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "protocol": "spawn.pty",
+        "protocol_version": 2,
+        "scope_id": "11111111-2222-4333-8444-555555555555",
+        "scope_type": "session",
+        "sdp": "v=0\r\no=- 461173305954868531 2 IN IP4 127.0.0.1\r\ns=spawn-session\r\nt=0 0\r\na=setup:actpass\r\n",
+        "sender_identity_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "sender_role": "browser",
+        "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+        "signature": "Axc3xSw-lL6IxTn450AW-TCZhpAyKICuWyIFOPJ10X7A4JVd1Z_k34I0nheEuoaQWsK-rGlACSCkElO5DZNEBA",
+        "signature_algorithm": "ed25519",
+        "type": "rtc.offer"
+      },
+      "id": "session-offer"
+    },
+    {
+      "envelope": {
+        "intended_peer_identity_public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "protocol": "spawn.host.ctl",
+        "protocol_version": 1,
+        "scope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "scope_type": "host",
+        "sdp": "v=0\r\no=- 461173305954868532 2 IN IP4 127.0.0.1\r\ns=spawn-host\r\nt=0 0\r\na=setup:active\r\n",
+        "sender_identity_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "sender_role": "daemon",
+        "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2b2",
+        "signature": "AH1t-tqSvBOUfYbYv7QI4ptplsFzSzcbYQ5EdEQVuIzXe-XtYa6Af8Ib3iMN2qpmDWQXwu58EUe-fHzoevEyDA",
+        "signature_algorithm": "ed25519",
+        "type": "rtc.answer"
+      },
+      "id": "host-answer"
+    }
+  ],
+  "wrong_topology_vectors": [
+    {
+      "envelope": {
+        "intended_peer_identity_public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "protocol": "spawn.pty",
+        "protocol_version": 1,
+        "scope_id": "11111111-2222-4333-8444-555555555555",
+        "scope_type": "session",
+        "sdp": "v=0\r\no=- 461173305954868531 2 IN IP4 127.0.0.1\r\ns=spawn-session\r\nt=0 0\r\na=setup:actpass\r\n",
+        "sender_identity_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "sender_role": "browser",
+        "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+        "signature": "2toca8jLCimUPmdgXH_pjxZDg2tKlDwB-4ZNcg2RiBSdX6wdfxRpkqmm-vp_J5LKZe-FCxFO-KUCxpoULrW3Bw",
+        "signature_algorithm": "ed25519",
+        "type": "rtc.offer"
+      },
+      "id": "session-offer-wrong-version-1"
+    },
+    {
+      "envelope": {
+        "intended_peer_identity_public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+        "protocol": "spawn.host.ctl",
+        "protocol_version": 2,
+        "scope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        "scope_type": "host",
+        "sdp": "v=0\r\no=- 461173305954868532 2 IN IP4 127.0.0.1\r\ns=spawn-host\r\nt=0 0\r\na=setup:active\r\n",
+        "sender_identity_public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+        "sender_role": "daemon",
+        "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2b2",
+        "signature": "99aafh_vu06cCWlxBk3WCrI7FSZ2qL4da5Wshfj5RaN6ZSysOn2T2LPalIEa06V0mnvCZ6RH9UTjgEgbnkq2Cw",
+        "signature_algorithm": "ed25519",
+        "type": "rtc.answer"
+      },
+      "id": "host-answer-wrong-version-2"
+    }
+  ]
+}
