@@ -51,6 +51,10 @@ export const sizing = {
       rich: 40,
     },
     trailingTarget: 44,
+    /** Where a full-bleed row separator starts, so it clears the leading slot. */
+    separatorInset: 16,
+    /** A separator that runs the full width instead of clearing the leading slot. */
+    separatorFullBleed: 0,
   },
   sectionHeader: {
     minHeight: 48,
@@ -82,6 +86,9 @@ export const sizing = {
     bodyMaxWidth: 384,
     iconPlate: 48,
     icon: 20,
+    /** The bordered plate every empty state now sits on. */
+    containerPadding: 24,
+    containerMinHeight: 200,
   },
   badge: {
     horizontalPadding: 8,
@@ -96,6 +103,26 @@ export const sizing = {
   header: {
     customContentHeight: 52,
   },
+  appHeader: {
+    /** The bar itself, below the status bar. Matches a UIKit navigation bar. */
+    minHeight: 52,
+    horizontalPadding: 8,
+    /** Gap between the title block and whatever flanks it. */
+    titleGap: 8,
+    /** Gap between adjacent trailing actions. */
+    actionGap: 4,
+    /** Square target for the back chevron and each trailing action. */
+    actionTarget: 44,
+    /** Reserved width either side so a centred title never jitters. */
+    sideSlot: 44,
+    subtitleGap: 2,
+  },
+  /** A search field docked to the foot of a list screen. */
+  searchDock: {
+    horizontalPadding: 16,
+    verticalPadding: 12,
+    topGap: 8,
+  },
   tab: {
     stripHeight: 56,
     visualHeight: 44,
@@ -105,6 +132,12 @@ export const sizing = {
     closePlate: 20,
     closeGlyph: 14,
     actionTarget: 44,
+    /** Radius of the flare that joins the active tab's foot to the panel. */
+    connectionRadius: 6,
+    /** How far the active tab overlaps the panel below it. */
+    connectionOverlap: 6,
+    horizontalPadding: 12,
+    labelGap: 6,
   },
   type: {
     micro: { fontSize: 11, lineHeight: 16 },
