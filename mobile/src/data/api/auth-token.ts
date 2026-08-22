@@ -74,17 +74,42 @@ async function get(): Promise<string | null> {
   return stored.jwt;
 }
 
+// Consumers need to know when credentials appear or disappear. Without this the
+// auth gate can only re-read the token by coincidence — e.g. on a navigation —
+// which leaves a fresh login invisible until something else happens to change.
+const changeListeners = new Set<() => void>();
+
+function notifyTokenChanged(): void {
+  for (const listener of [...changeListeners]) {
+    try {
+      listener();
+    } catch {
+      // A bad listener must not stop the others, or block a login.
+    }
+  }
+}
+
+/** Subscribe to credential changes. Returns an unsubscribe function. */
+function subscribe(listener: () => void): () => void {
+  changeListeners.add(listener);
+  return () => {
+    changeListeners.delete(listener);
+  };
+}
+
 async function set(jwt: string): Promise<void> {
   const key = await currentStorageKey();
   const stored: StoredToken = { jwt, expiresAt: decodeExpiry(jwt) };
   await secureStorage.set(key, JSON.stringify(stored));
   tokenCache.set(key, stored);
+  notifyTokenChanged();
 }
 
 async function clear(): Promise<void> {
   const key = await currentStorageKey();
   tokenCache.set(key, null);
   await secureStorage.delete(key);
+  notifyTokenChanged();
 }
 
 function sessionCookie(header: string): string | null {
@@ -102,4 +127,4 @@ async function captureFromResponse(response: Response): Promise<string | null> {
   return jwt;
 }
 
-export const authToken = { get, set, clear, captureFromResponse };
+export const authToken = { get, set, clear, captureFromResponse, subscribe };

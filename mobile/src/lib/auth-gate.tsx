@@ -80,6 +80,11 @@ type BootstrapState =
 
 export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
   const [tokenAttempt, setTokenAttempt] = useState(0);
+
+  // Re-read whenever credentials change, so a successful login is picked up
+  // immediately rather than waiting for some unrelated re-render.
+  useEffect(() => authToken.subscribe(() => setTokenAttempt((attempt) => attempt + 1)), []);
+
   const requestId = `${refreshKey}:${tokenAttempt}`;
   const [tokenState, setTokenState] = useState<TokenState>({
     status: "loading",
@@ -254,7 +259,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   const router = useRouter();
   const queryClient = useQueryClient();
   const theme = useTheme();
-  const bootstrap = useAuthBootstrap(pathname);
+  const bootstrap = useAuthBootstrap();
   const redirectRef = useRef<OnceRedirect | null>(null);
   if (redirectRef.current === null) {
     redirectRef.current = createUnauthenticatedRedirect((destination) => {
@@ -280,24 +285,33 @@ export function AuthGate({ children }: { children: ReactNode }) {
     }
   }, [bootstrap, router, shouldRender]);
 
-  if (bootstrap.status === "error") {
-    return (
-      <View style={[styles.root, { backgroundColor: theme.colors.background }]}>
-        <GateError kind={bootstrap.kind} retry={bootstrap.retry} />
-      </View>
-    );
-  }
-  if (!shouldRender) {
-    return (
-      <View style={[styles.root, { backgroundColor: theme.colors.background }]}>
-        <GateLoading />
-      </View>
-    );
-  }
-  return children;
+  // The navigator stays mounted in every state. Swapping it out for a loading
+  // view unmounts the Stack, which resets Expo Router to "/" and re-triggers
+  // the redirect that produced the loading state — an infinite boot loop.
+  return (
+    <View style={styles.root}>
+      {children}
+      {bootstrap.status === "error" ? (
+        <View style={[styles.overlay, { backgroundColor: theme.colors.background }]}>
+          <GateError kind={bootstrap.kind} retry={bootstrap.retry} />
+        </View>
+      ) : shouldRender ? null : (
+        <View style={[styles.overlay, { backgroundColor: theme.colors.background }]}>
+          <GateLoading />
+        </View>
+      )}
+    </View>
+  );
 }
 
 const styles = StyleSheet.create({
+  overlay: {
+    bottom: 0,
+    left: 0,
+    position: "absolute",
+    right: 0,
+    top: 0,
+  },
   centered: {
     alignItems: "center",
     flex: 1,
