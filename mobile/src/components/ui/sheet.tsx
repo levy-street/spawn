@@ -2,10 +2,11 @@ import {
   BottomSheetBackdrop,
   type BottomSheetBackdropProps,
   BottomSheetModal,
+  BottomSheetScrollView,
   BottomSheetView,
 } from "@gorhom/bottom-sheet";
 import type { ReactNode } from "react";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type StyleProp,
   StyleSheet,
@@ -36,6 +37,8 @@ export interface SheetHeaderProps {
   title: string;
   action?: ReactNode;
 }
+
+export const SheetScrollView = BottomSheetScrollView;
 
 /**
  * Route-backed sheet defaults for Expo Router Stack.Screen options. The system owns the
@@ -79,29 +82,37 @@ export function Sheet({
   children,
   contentStyle,
   testID,
-}: SheetProps): React.JSX.Element {
+}: SheetProps): React.JSX.Element | null {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const { height } = useWindowDimensions();
   const modalRef = useRef<BottomSheetModal>(null);
   const previousIndex = useRef<number | null>(null);
+  const [mounted, setMounted] = useState(visible);
   const resolvedSnapPoints = useMemo<SheetSnapPoint[] | undefined>(
     () => (snapPoints ? [...snapPoints] : enableDynamicSizing ? undefined : ["48%", "90%"]),
     [enableDynamicSizing, snapPoints],
   );
 
   useEffect(() => {
+    if (visible) setMounted(true);
+  }, [visible]);
+
+  useEffect(() => {
+    if (!mounted) return;
     const frame = requestAnimationFrame(() => {
       if (visible) modalRef.current?.present();
       else modalRef.current?.dismiss();
     });
     return () => cancelAnimationFrame(frame);
-  }, [visible]);
+  }, [mounted, visible]);
 
   const renderBackdrop = useCallback(
     (props: BottomSheetBackdropProps) => (
       <BottomSheetBackdrop
         {...props}
+        accessibilityLabel="Dismiss drawer"
+        accessibilityRole="button"
         appearsOnIndex={0}
         disappearsOnIndex={-1}
         opacity={alpha.a50}
@@ -118,6 +129,13 @@ export function Sheet({
     previousIndex.current = index;
   };
 
+  const handleDismiss = useCallback(() => {
+    setMounted(false);
+    onDismiss();
+  }, [onDismiss]);
+
+  if (!mounted) return null;
+
   return (
     <BottomSheetModal
       animationConfigs={theme.motion.transition.sheet}
@@ -126,12 +144,14 @@ export function Sheet({
       backgroundStyle={{
         backgroundColor: theme.colors.popover,
         borderColor: theme.colors.border,
+        borderBottomLeftRadius: borderWidth.none,
+        borderBottomRightRadius: borderWidth.none,
         borderTopLeftRadius: theme.radii.xxl,
         borderTopRightRadius: theme.radii.xxl,
         borderTopWidth: borderWidth.hairline,
         boxShadow: shadow.xxl,
       }}
-      bottomInset={insets.bottom}
+      bottomInset={borderWidth.none}
       containerStyle={{ zIndex: layer.modal }}
       enableBlurKeyboardOnGesture
       enableDismissOnClose
@@ -147,18 +167,18 @@ export function Sheet({
       index={initialSnapIndex}
       keyboardBehavior="interactive"
       keyboardBlurBehavior="restore"
-      maxDynamicContentSize={Math.max(
-        0,
-        height - insets.top - insets.bottom - chrome.sheetTopClearance,
-      )}
+      maxDynamicContentSize={Math.max(0, height - insets.top - chrome.sheetTopClearance)}
       onChange={handleChange}
-      onDismiss={onDismiss}
+      onDismiss={handleDismiss}
       ref={modalRef}
       stackBehavior="push"
       topInset={insets.top + chrome.sheetTopClearance}
       {...(resolvedSnapPoints === undefined ? {} : { snapPoints: resolvedSnapPoints })}
     >
-      <BottomSheetView style={contentStyle} testID={testID ?? "sheet-content"}>
+      <BottomSheetView
+        style={[contentStyle, { paddingBottom: Math.max(insets.bottom, theme.space(3)) }]}
+        testID={testID ?? "sheet-content"}
+      >
         {children}
       </BottomSheetView>
     </BottomSheetModal>

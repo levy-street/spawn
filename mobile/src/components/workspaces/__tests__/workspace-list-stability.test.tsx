@@ -7,7 +7,8 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import { ListSeparator } from "@/components/ui/list-row";
 import { WorkspaceListScreen } from "@/components/workspaces/workspace-list-screen";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
-import { ThemeProvider } from "@/theme";
+import { borderWidth, ThemeProvider } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 interface CapturedFlashListProps {
   data: ReadonlyArray<{ workspace: { id: string } }>;
@@ -87,19 +88,6 @@ jest.mock("@shopify/flash-list", () => {
 jest.mock("expo-router", () => ({
   useRouter: () => ({ push: mockPush }),
 }));
-
-jest.mock("react-native-keyboard-controller", () => {
-  const React = jest.requireActual<typeof import("react")>("react");
-  const { View } = jest.requireActual<typeof import("react-native")>("react-native");
-  return {
-    KeyboardAwareScrollView: ({ children }: PropsWithChildren) =>
-      React.createElement(View, null, children),
-    KeyboardStickyView: ({ children }: PropsWithChildren) =>
-      React.createElement(View, { testID: "keyboard-sticky-view" }, children),
-    useKeyboardState: (selector: (state: { isVisible: boolean }) => boolean) =>
-      selector({ isVisible: false }),
-  };
-});
 
 jest.mock("@/components/ui/toast", () => ({ useToast: () => mockToast }));
 jest.mock("@/components/workspaces/change-workspace-icon-dialog", () => ({
@@ -238,14 +226,23 @@ describe("workspace list refresh stability", () => {
     await screen.unmount();
   });
 
-  it("docks search in the keyboard-sticky footer below the list", async () => {
+  it("renders search directly below the header with one divider on each boundary", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
-    const stickyFooter = screen.getByTestId("keyboard-sticky-view");
+    const searchSection = screen.getByTestId("workspace-search-section");
+    const sectionStyle = StyleSheet.flatten(searchSection.props["style"]);
 
-    expect(within(stickyFooter).getByTestId("workspace-search")).toBeTruthy();
-    expect(
-      within(screen.getByTestId("workspace-list-screen")).queryByTestId("workspace-search"),
-    ).toBeNull();
+    expect(within(searchSection).getByTestId("workspace-search")).toBeTruthy();
+    expect(searchSection.parent).toBe(screen.getByTestId("workspace-list-screen"));
+    expect(screen.queryByTestId("keyboard-sticky-view")).toBeNull();
+    expect(screen.getByTestId("workspace-list-header")).toHaveStyle({
+      borderBottomWidth: borderWidth.hairline,
+    });
+    expect(sectionStyle?.borderTopWidth).toBeUndefined();
+    expect(sectionStyle?.borderBottomWidth).toBeUndefined();
+    expect(within(searchSection).getByTestId("list-separator")).toHaveStyle({
+      height: borderWidth.hairline,
+      marginLeft: sizing.listRow.separatorFullBleed,
+    });
     expect(screen.getByTestId("workspace-list")).toBeTruthy();
     await screen.unmount();
   });
@@ -253,7 +250,7 @@ describe("workspace list refresh stability", () => {
   it("joins full-width list items with the global separator", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
     expect(latestList().ItemSeparatorComponent).toBe(ListSeparator);
-    expect(screen.getByTestId("list-separator")).toBeTruthy();
+    expect(within(screen.getByTestId("workspace-list")).getByTestId("list-separator")).toBeTruthy();
     await screen.unmount();
   });
 

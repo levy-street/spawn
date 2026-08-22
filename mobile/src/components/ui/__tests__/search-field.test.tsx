@@ -1,9 +1,8 @@
 import { act, fireEvent, render } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
-import { StyleSheet } from "react-native";
 
 import { SearchField } from "@/components/ui/search-field";
-import { borderWidth, lightColors, ThemeProvider } from "@/theme";
+import { spacing, ThemeProvider } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
 jest.mock(
@@ -66,19 +65,14 @@ describe("SearchField", () => {
     expect(onDebouncedChange).toHaveBeenLastCalledWith("");
   });
 
-  test("wraps a docked field in the global bottom-dock treatment", async () => {
-    const screen = await render(<SearchField dock testID="search" />, { wrapper });
-    const inputContainer = screen.getByTestId("search").parent;
-    const dock = inputContainer?.parent;
+  test("centres text and leaves tokenized clearance after the search icon", async () => {
+    const screen = await render(<SearchField testID="search" />, { wrapper });
 
-    expect(dock).not.toBeNull();
-    expect(StyleSheet.flatten(dock?.props["style"])).toMatchObject({
-      backgroundColor: lightColors.background,
-      borderTopColor: lightColors.border,
-      borderTopWidth: borderWidth.hairline,
-      paddingBottom: sizing.searchDock.verticalPadding,
-      paddingHorizontal: sizing.searchDock.horizontalPadding,
-      paddingTop: sizing.searchDock.topGap,
+    expect(screen.getByTestId("search")).toHaveStyle({
+      lineHeight: sizing.type.componentLabel.lineHeight,
+      paddingLeft: spacing[2],
+      paddingVertical: spacing[0],
+      textAlignVertical: "center",
     });
   });
 });

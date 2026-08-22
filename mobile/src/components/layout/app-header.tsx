@@ -1,4 +1,4 @@
-import { type ReactNode, useContext } from "react";
+import { createContext, type ReactNode, useContext } from "react";
 import { StyleSheet, View } from "react-native";
 import { SafeAreaInsetsContext } from "react-native-safe-area-context";
 
@@ -21,6 +21,8 @@ export interface AppHeaderProps {
   title: string;
   /** Optional second line under the title. */
   subtitle?: string;
+  /** A root-screen control rendered instead of the back chevron. */
+  leading?: ReactNode;
   /** Shows a standard back chevron. Omit on a root screen. */
   onBack?: () => void;
   /** Trailing icon actions, laid out right-aligned. Max 3. */
@@ -33,16 +35,33 @@ export interface AppHeaderProps {
 }
 
 const MAX_ACTIONS = 3;
+const AppHeaderDefaultLeadingContext = createContext<ReactNode>(null);
+
+export function AppHeaderLeadingProvider({
+  children,
+  leading,
+}: {
+  children: ReactNode;
+  leading: ReactNode;
+}): React.JSX.Element {
+  return (
+    <AppHeaderDefaultLeadingContext.Provider value={leading}>
+      {children}
+    </AppHeaderDefaultLeadingContext.Provider>
+  );
+}
 
 export function AppHeader({
   title,
   subtitle,
+  leading,
   onBack,
   actions,
   accessory,
   divider = true,
   testID,
 }: AppHeaderProps): React.JSX.Element {
+  const defaultLeading = useContext(AppHeaderDefaultLeadingContext);
   const insets = useContext(SafeAreaInsetsContext) ?? {
     bottom: spacing[0],
     left: spacing[0],
@@ -51,6 +70,7 @@ export function AppHeader({
   };
   const theme = useTheme();
   const visibleActions = actions?.slice(0, MAX_ACTIONS);
+  const resolvedLeading = leading ?? defaultLeading;
 
   return (
     <View
@@ -75,16 +95,17 @@ export function AppHeader({
         ]}
       >
         <View style={styles.leadingSlot} testID="app-header-leading-slot">
-          {onBack === undefined ? null : (
-            <IconButton
-              accessibilityLabel="Go back"
-              icon="ChevronLeft"
-              onPress={onBack}
-              size="lg"
-              style={styles.action}
-              variant="ghost"
-            />
-          )}
+          {resolvedLeading ??
+            (onBack === undefined ? null : (
+              <IconButton
+                accessibilityLabel="Go back"
+                icon="ChevronLeft"
+                onPress={onBack}
+                size="lg"
+                style={styles.action}
+                variant="ghost"
+              />
+            ))}
         </View>
 
         <View pointerEvents="none" style={styles.titleFrame} testID="app-header-title-frame">
@@ -127,6 +148,8 @@ export function AppHeader({
 const styles = StyleSheet.create({
   action: {
     height: sizing.appHeader.actionTarget,
+    minHeight: sizing.appHeader.actionTarget,
+    minWidth: sizing.appHeader.actionTarget,
     width: sizing.appHeader.actionTarget,
   },
   actions: {

@@ -1,7 +1,11 @@
 import { Stack, usePathname, useRouter } from "expo-router";
 import type { ReactNode } from "react";
+import { StyleSheet, View } from "react-native";
 
 import { AdminAccessBoundary, resolveAdminAccess } from "@/components/admin/admin-access";
+import { AppHeaderLeadingProvider } from "@/components/layout/app-header";
+import { BottomNav, isBottomNavRoute } from "@/components/nav/bottom-nav";
+import { ProfileMenu } from "@/components/nav/profile-menu";
 import { useMeQuery } from "@/data/queries/auth";
 import { useAuthenticatedAccount } from "@/lib/auth-gate";
 import { useTheme } from "@/theme";
@@ -65,19 +69,33 @@ function AdminRouteBoundary({ children }: { children: ReactNode }): React.JSX.El
 export default function AppStackLayout(): React.JSX.Element | null {
   const theme = useTheme();
   const account = useAuthenticatedAccount();
+  const pathname = usePathname();
 
   if (!account.ready) return null;
 
+  const showRootNavigation = isBottomNavRoute(pathname);
+
   return (
     <AdminRouteBoundary>
-      <Stack
-        initialRouteName="workspaces/index"
-        screenOptions={{
-          ...FULL_SCREEN_BACK_OPTIONS,
-          contentStyle: { backgroundColor: theme.colors.background },
-          headerShown: false,
-        }}
-      />
+      <View style={styles.shell}>
+        <AppHeaderLeadingProvider leading={showRootNavigation ? <ProfileMenu /> : null}>
+          <Stack
+            initialRouteName="workspaces/index"
+            screenOptions={{
+              ...FULL_SCREEN_BACK_OPTIONS,
+              contentStyle: { backgroundColor: theme.colors.background },
+              headerShown: false,
+            }}
+          />
+        </AppHeaderLeadingProvider>
+        {showRootNavigation ? <BottomNav /> : null}
+      </View>
     </AdminRouteBoundary>
   );
 }
+
+const styles = StyleSheet.create({
+  shell: {
+    flex: 1,
+  },
+});

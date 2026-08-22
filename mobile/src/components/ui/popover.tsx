@@ -1,25 +1,8 @@
 import type { ReactNode, RefObject } from "react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import {
-  type LayoutChangeEvent,
-  Modal,
-  Pressable,
-  type StyleProp,
-  StyleSheet,
-  useWindowDimensions,
-  View,
-  type ViewStyle,
-} from "react-native";
-import Animated, { useAnimatedStyle, useSharedValue, withTiming } from "react-native-reanimated";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { useReducedMotionPreference } from "@/components/ui/swipe-dismiss-overlay";
-import { alpha, borderWidth, chrome, layer, shadow, useTheme } from "@/theme";
+import { type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
 
-function shadowWithAlpha(value: string, channelAlpha: number): string {
-  return value.replace(/rgba\((\d+,\d+,\d+),[\d.]+\)/g, `rgba($1,${channelAlpha})`);
-}
-
-const OVERLAY_XL_SHADOW = shadowWithAlpha(shadow.xl, alpha.a50);
+import { Sheet } from "@/components/ui/sheet";
+import { chrome } from "@/theme";
 
 export type PopoverAlign = "start" | "center" | "end";
 export type PopoverSide = "top" | "bottom" | "left" | "right";
@@ -195,190 +178,28 @@ export interface PopoverProps {
 export function Popover({
   visible,
   onDismiss,
-  anchorRef,
-  anchorRect,
-  side = "right",
-  align = "start",
   interactive = false,
-  width,
-  maxWidth,
-  fallbackWidth,
   accessibilityLabel,
   contentStyle,
-  overlayLayer = layer.previewPopover,
-  margin,
-  offset,
-  animateScale = true,
   children,
-}: PopoverProps): React.JSX.Element | null {
-  const theme = useTheme();
-  const reducedMotion = useReducedMotionPreference();
-  const insets = useSafeAreaInsets();
-  const viewport = useWindowDimensions();
-  const [measuredAnchor, setMeasuredAnchor] = useState<PopoverAnchorRect | null>(
-    anchorRect ?? null,
-  );
-  const [contentSize, setContentSize] = useState({
-    width: width ?? fallbackWidth ?? theme.space(136),
-    height: 0,
-  });
-  const progress = useSharedValue(0);
-
-  const measureAnchor = useCallback(() => {
-    if (anchorRect) {
-      setMeasuredAnchor(anchorRect);
-      return;
-    }
-    anchorRef?.current?.measureInWindow((x, y, measuredWidth, measuredHeight) => {
-      setMeasuredAnchor({
-        top: y,
-        bottom: y + measuredHeight,
-        left: x,
-        right: x + measuredWidth,
-      });
-    });
-  }, [anchorRect, anchorRef]);
-
-  useEffect(() => {
-    if (!visible || viewport.width <= 0 || viewport.height <= 0) return;
-    measureAnchor();
-  }, [measureAnchor, viewport.height, viewport.width, visible]);
-
-  useEffect(() => {
-    if (!visible) return;
-    progress.value = 0;
-    progress.value = withTiming(1, {
-      duration: reducedMotion ? theme.motion.duration.reduced : theme.motion.duration.fast,
-      easing: theme.motion.easing.cssEase,
-    });
-  }, [progress, reducedMotion, theme.motion, visible]);
-
-  const placement = useMemo(
-    () =>
-      measuredAnchor
-        ? positionPopover({
-            anchor: measuredAnchor,
-            popoverWidth: contentSize.width,
-            popoverHeight: contentSize.height,
-            align,
-            side,
-            viewportWidth: viewport.width,
-            viewportHeight: viewport.height,
-            insets,
-            ...(margin === undefined ? {} : { margin }),
-            ...(offset === undefined ? {} : { offset }),
-          })
-        : null,
-    [
-      align,
-      contentSize,
-      insets,
-      margin,
-      measuredAnchor,
-      offset,
-      side,
-      viewport.height,
-      viewport.width,
-    ],
-  );
-
-  const animatedStyle = useAnimatedStyle(() => {
-    const scale =
-      reducedMotion || !animateScale
-        ? 1
-        : theme.motion.transform.enterScale +
-          (1 - theme.motion.transform.enterScale) * progress.value;
-    const measuredWidth = contentSize.width;
-    const measuredHeight = contentSize.height;
-    const originX =
-      placement?.originX === "right"
-        ? measuredWidth
-        : placement?.originX === "center"
-          ? measuredWidth / 2
-          : 0;
-    const originY =
-      placement?.originY === "bottom"
-        ? measuredHeight
-        : placement?.originY === "center"
-          ? measuredHeight / 2
-          : 0;
-    return {
-      opacity: progress.value,
-      transform:
-        reducedMotion || !animateScale
-          ? []
-          : [
-              { translateX: originX - measuredWidth / 2 },
-              { translateY: originY - measuredHeight / 2 },
-              { scale },
-              { translateX: -(originX - measuredWidth / 2) },
-              { translateY: -(originY - measuredHeight / 2) },
-            ],
-    };
-  });
-
-  const handleLayout = (event: LayoutChangeEvent) => {
-    const next = event.nativeEvent.layout;
-    if (next.width !== contentSize.width || next.height !== contentSize.height) {
-      setContentSize({ width: next.width, height: next.height });
-    }
-  };
-
-  if (!visible || !measuredAnchor || !placement) return null;
-
+}: PopoverProps): React.JSX.Element {
+  // Anchor geometry stays in the public contract for existing callers, but every
+  // popover now deliberately shares the app's bottom-drawer presentation.
   return (
-    <Modal
-      animationType="none"
-      onRequestClose={onDismiss}
-      presentationStyle="overFullScreen"
-      statusBarTranslucent
-      transparent
-      visible
-    >
-      <View style={[styles.root, { zIndex: overlayLayer }]}>
-        <Pressable
-          accessibilityLabel="Dismiss popover"
-          accessibilityRole="button"
-          onPress={onDismiss}
-          style={StyleSheet.absoluteFill}
-        />
-        <Animated.View
-          accessibilityLabel={accessibilityLabel}
-          accessibilityRole={interactive ? "menu" : "text"}
-          onLayout={handleLayout}
-          pointerEvents={interactive ? "auto" : "none"}
-          style={[
-            styles.surface,
-            {
-              backgroundColor: theme.colors.popover,
-              borderColor: theme.colors.popoverBorder,
-              borderRadius: theme.radii.lg,
-              boxShadow: OVERLAY_XL_SHADOW,
-              left: placement.left,
-              maxHeight: placement.maxHeight,
-              maxWidth: Math.min(maxWidth ?? placement.maxWidth, placement.maxWidth),
-              top: placement.top,
-              width,
-            },
-            contentStyle,
-            animatedStyle,
-          ]}
-          testID="popover-content"
-        >
-          {children}
-        </Animated.View>
+    <Sheet enableDynamicSizing onDismiss={onDismiss} testID="popover-content" visible={visible}>
+      <View
+        accessibilityLabel={accessibilityLabel}
+        accessibilityRole={interactive ? "menu" : "text"}
+        style={[styles.content, contentStyle]}
+      >
+        {children}
       </View>
-    </Modal>
+    </Sheet>
   );
 }
 
 const styles = StyleSheet.create({
-  root: {
-    ...StyleSheet.absoluteFillObject,
-  },
-  surface: {
-    borderWidth: borderWidth.hairline,
-    overflow: "hidden",
-    position: "absolute",
+  content: {
+    width: "100%",
   },
 });

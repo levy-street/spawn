@@ -2,7 +2,6 @@ import { type ReactNode, useState } from "react";
 import {
   Pressable,
   type PressableProps,
-  ScrollView,
   type StyleProp,
   StyleSheet,
   View,
@@ -16,7 +15,7 @@ import Animated, {
 } from "react-native-reanimated";
 import { ActionSheet, type ActionSheetAction } from "@/components/ui/action-sheet";
 import { Icon } from "@/components/ui/icon";
-import { Sheet, SheetHeader } from "@/components/ui/sheet";
+import { Sheet, SheetHeader, SheetScrollView } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
 import { useTheme } from "@/theme";
@@ -167,7 +166,7 @@ export function Select<Value extends string>({
       ) : (
         <Sheet enableDynamicSizing onDismiss={() => setVisible(false)} visible={visible}>
           <SheetHeader title={placeholder} />
-          <ScrollView bounces={false} keyboardShouldPersistTaps="handled">
+          <SheetScrollView bounces={false} keyboardShouldPersistTaps="handled">
             {options.map((option, index) => {
               const selected = option.value === value;
               return (
@@ -217,7 +216,7 @@ export function Select<Value extends string>({
                 </View>
               );
             })}
-          </ScrollView>
+          </SheetScrollView>
         </Sheet>
       )}
     </>

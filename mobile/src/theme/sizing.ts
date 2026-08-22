@@ -115,7 +115,17 @@ export const sizing = {
     actionTarget: 44,
     /** Reserved width either side so a centred title never jitters. */
     sideSlot: 44,
+    /** Visible monogram inside the square profile action target. */
+    profileAvatar: 32,
     subtitleGap: 2,
+  },
+  bottomNav: {
+    /** Navigation content above the device bottom safe-area inset. */
+    contentHeight: 56,
+    horizontalPadding: 8,
+    verticalPadding: 4,
+    itemGap: 2,
+    icon: 20,
   },
   /** A search field docked to the foot of a list screen. */
   searchDock: {

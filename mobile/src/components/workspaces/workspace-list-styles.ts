@@ -11,6 +11,10 @@ export const workspaceListStyles = StyleSheet.create({
   screen: {
     flex: 1,
   },
+  searchControls: {
+    paddingHorizontal: sizing.screen.gutter,
+    paddingVertical: sizing.space.cluster,
+  },
   skeletonCopy: {
     flex: 1,
     gap: sizing.space.peer,
@@ -44,7 +48,6 @@ export const workspaceListStyles = StyleSheet.create({
   statusError: {
     alignItems: "center",
     borderBottomWidth: borderWidth.hairline,
-    borderTopWidth: borderWidth.hairline,
     flexDirection: "row",
     justifyContent: "space-between",
     paddingHorizontal: sizing.screen.gutter,

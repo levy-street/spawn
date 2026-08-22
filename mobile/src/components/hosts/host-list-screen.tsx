@@ -1,24 +1,25 @@
 import { useRouter } from "expo-router";
 import { useMemo, useState } from "react";
-import { FlatList, Pressable, RefreshControl, StyleSheet, View } from "react-native";
+import { FlatList, RefreshControl, StyleSheet, View } from "react-native";
 import { HostActionsSheet } from "@/components/hosts/host-actions-sheet";
 import { HostListItem } from "@/components/hosts/host-list-item";
-import { errorMessage } from "@/components/hosts/host-model";
+import { errorMessage, pluralize } from "@/components/hosts/host-model";
 import { RenameHostDialog } from "@/components/hosts/rename-host-dialog";
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
+import { ListRow, ListSeparator } from "@/components/ui/list-row";
 import { Spinner } from "@/components/ui/spinner";
-import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import { useHostsQuery, useRemoveHostMutation, useRenameHostMutation } from "@/data/queries/hosts";
 import { sortHosts } from "@/data/selectors/host";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, spacing, useTheme } from "@/theme";
+import { spacing, useTheme } from "@/theme";
 
 export interface HostListViewProps {
   hosts: readonly HostOut[];
@@ -42,6 +43,7 @@ export function HostListView({
   const theme = useTheme();
   const online = hosts.filter((host) => host.status === "online").length;
   const offline = hosts.length - online;
+  const sessionCount = hosts.reduce((total, host) => total + host.session_count, 0);
   return (
     <FlatList
       contentContainerStyle={hosts.length === 0 ? styles.emptyList : styles.list}
@@ -57,33 +59,22 @@ export function HostListView({
       }
       ListHeaderComponent={
         hosts.length > 0 ? (
-          <Pressable
-            accessibilityLabel="Open fleet overview"
-            accessibilityRole="button"
-            onPress={() => {
-              haptics.selection();
-              onOpenLegion();
-            }}
-            style={({ pressed }) => [
-              styles.fleet,
-              {
-                backgroundColor: pressed ? theme.colors.accent : theme.colors.card,
-                borderColor: theme.colors.border,
-                borderRadius: theme.radii.lg,
-              },
-            ]}
-          >
-            <Icon color="mutedForeground" name="Network" size={spacing[5]} />
-            <View style={styles.fleetCopy}>
-              <Text variant="label">Fleet overview</Text>
-              <Text color="mutedForeground" variant="caption">
-                {online} online · {offline} offline
-              </Text>
-            </View>
-            <Icon color="mutedForeground" name="ChevronRight" />
-          </Pressable>
+          <Card padded={false} style={styles.fleet} variant="flat">
+            <ListRow
+              height="tall"
+              leading={<Icon color="mutedForeground" name="Network" size={spacing[5]} />}
+              onPress={() => {
+                haptics.selection();
+                onOpenLegion();
+              }}
+              subtitle={`${online} online · ${offline} offline · ${pluralize(sessionCount, "session")}`}
+              title="Fleet overview"
+              trailing={<Icon color="mutedForeground" name="ChevronRight" />}
+            />
+          </Card>
         ) : null
       }
+      ItemSeparatorComponent={() => <ListSeparator inset={false} />}
       refreshControl={
         <RefreshControl
           refreshing={refreshing}
@@ -235,16 +226,8 @@ const styles = StyleSheet.create({
     padding: spacing[6],
   },
   fleet: {
-    alignItems: "center",
-    borderWidth: borderWidth.hairline,
-    flexDirection: "row",
-    gap: spacing[3],
     margin: spacing[4],
-    padding: spacing[4],
-  },
-  fleetCopy: {
-    flex: 1,
-    gap: spacing[1],
+    overflow: "hidden",
   },
   list: {
     paddingBottom: spacing[8],

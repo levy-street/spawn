@@ -2,7 +2,7 @@ import { type ForwardedRef, forwardRef, useCallback, useEffect, useRef, useState
 import { Pressable, StyleSheet, type TextInput, View } from "react-native";
 import { Icon } from "@/components/ui/icon";
 import { Input, type InputProps } from "@/components/ui/input";
-import { borderWidth, useTheme } from "@/theme";
+import { useTheme } from "@/theme";
 import { alpha } from "@/theme/effects";
 import { sizing } from "@/theme/sizing";
 import { chrome, radii, spacing } from "@/theme/spacing";
@@ -14,7 +14,6 @@ export type SearchFieldVariant = "default" | "sidebar" | "inline";
 export interface SearchFieldProps
   extends Omit<InputProps, "leading" | "purpose" | "showFocusHalo" | "trailing"> {
   debounceMs?: number;
-  dock?: boolean;
   onDebouncedChange?: (value: string) => void;
   variant?: SearchFieldVariant;
 }
@@ -38,7 +37,6 @@ function assignRef(ref: ForwardedRef<TextInput>, value: TextInput | null) {
 export const SearchField = forwardRef<TextInput, SearchFieldProps>(function SearchField(
   {
     debounceMs = DEFAULT_SEARCH_DEBOUNCE_MS,
-    dock = false,
     onDebouncedChange,
     onChangeText,
     value,
@@ -88,7 +86,7 @@ export const SearchField = forwardRef<TextInput, SearchFieldProps>(function Sear
     }
   };
 
-  const field = (
+  return (
     <Input
       {...props}
       ref={setInputRef}
@@ -105,7 +103,7 @@ export const SearchField = forwardRef<TextInput, SearchFieldProps>(function Sear
       ]}
       placeholder={placeholder}
       showFocusHalo={!isSidebar}
-      style={[isSidebar && styles.sidebarInput, style]}
+      style={[styles.input, style]}
       value={displayedValue}
       onChangeText={updateValue}
       leading={
@@ -131,22 +129,6 @@ export const SearchField = forwardRef<TextInput, SearchFieldProps>(function Sear
       }
     />
   );
-
-  if (!dock) return field;
-
-  return (
-    <View
-      style={[
-        styles.dock,
-        {
-          backgroundColor: theme.colors.background,
-          borderTopColor: theme.colors.border,
-        },
-      ]}
-    >
-      {field}
-    </View>
-  );
 });
 
 const styles = StyleSheet.create({
@@ -162,17 +144,13 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     width: spacing[6],
   },
-  dock: {
-    borderTopWidth: borderWidth.hairline,
-    paddingBottom: sizing.searchDock.verticalPadding,
-    paddingHorizontal: sizing.searchDock.horizontalPadding,
-    paddingTop: sizing.searchDock.topGap,
-    width: "100%",
+  input: {
+    lineHeight: sizing.type.componentLabel.lineHeight,
+    paddingLeft: spacing[2],
+    paddingVertical: spacing[0],
+    textAlignVertical: "center",
   },
   sidebarContainer: {
     borderRadius: radii.lg,
-  },
-  sidebarInput: {
-    paddingLeft: spacing[1.5],
   },
 });

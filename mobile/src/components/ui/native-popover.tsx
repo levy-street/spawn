@@ -1,12 +1,13 @@
 import type { SFSymbol } from "expo-symbols";
 import { useEffect, useRef } from "react";
-import { Pressable, ScrollView, StyleSheet, useWindowDimensions, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 
 import { Icon, type IconName, iconSet } from "@/components/ui/icon";
 import { Popover } from "@/components/ui/popover";
+import { SheetScrollView } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, layer, opacity, useTheme } from "@/theme";
+import { borderWidth, chrome, opacity, useTheme } from "@/theme";
 
 export interface NativePopoverProps {
   visible: boolean;
@@ -34,16 +35,10 @@ function PopoverIcon({ name, size }: { name: string; size: number }): React.JSX.
 export function NativePopover({
   visible,
   onDismiss,
-  anchor,
   items,
 }: NativePopoverProps): React.JSX.Element {
   const theme = useTheme();
-  const viewport = useWindowDimensions();
   const wasVisible = useRef(false);
-  const minimumWidth = theme.space(65);
-  const maximumWidth = theme.space(80);
-  const viewportWidth = viewport.width - theme.space(8);
-  const width = Math.max(minimumWidth, Math.min(maximumWidth, viewportWidth));
 
   useEffect(() => {
     if (visible && !wasVisible.current) haptics.overlayOpen();
@@ -56,43 +51,19 @@ export function NativePopover({
   };
 
   return (
-    <Popover
-      accessibilityLabel="Actions"
-      align="end"
-      anchorRect={{
-        bottom: anchor.y + anchor.height,
-        left: anchor.x,
-        right: anchor.x + anchor.width,
-        top: anchor.y,
-      }}
-      contentStyle={{
-        backgroundColor: "transparent",
-        borderColor: "transparent",
-        borderRadius: theme.radii.lg,
-        borderWidth: borderWidth.none,
-      }}
-      interactive
-      maxWidth={maximumWidth}
-      onDismiss={dismiss}
-      overlayLayer={layer.menu}
-      side="bottom"
-      visible={visible}
-      width={width}
-    >
+    <Popover accessibilityLabel="Actions" interactive onDismiss={dismiss} visible={visible}>
       <View
         style={[
           styles.surface,
           {
             backgroundColor: theme.colors.popover,
-            borderColor: theme.colors.popoverBorder,
-            borderRadius: theme.radii.lg,
-            minWidth: minimumWidth,
-            padding: theme.space(1.5),
+            borderWidth: borderWidth.none,
+            paddingHorizontal: theme.space(2),
           },
         ]}
         testID="native-popover-surface"
       >
-        <ScrollView
+        <SheetScrollView
           bounces={false}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator
@@ -161,7 +132,7 @@ export function NativePopover({
               </View>
             );
           })}
-        </ScrollView>
+        </SheetScrollView>
       </View>
     </Popover>
   );
@@ -181,6 +152,6 @@ const styles = StyleSheet.create({
     width: "100%",
   },
   surface: {
-    borderWidth: borderWidth.hairline,
+    width: "100%",
   },
 });

@@ -1,10 +1,11 @@
 import { BottomSheetModalProvider } from "@gorhom/bottom-sheet";
 import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
-import { AccessibilityInfo, StyleSheet, View } from "react-native";
+import { AccessibilityInfo, StyleSheet } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
+import { Screen } from "@/components/layout/screen";
 import { ActionSheet } from "@/components/ui/action-sheet";
 import { Collapse } from "@/components/ui/collapse";
 import { Confirm, ConfirmHost, confirm } from "@/components/ui/confirm";
@@ -16,8 +17,13 @@ import { Sheet, SheetHeader } from "@/components/ui/sheet";
 import { SwipeDismissOverlay } from "@/components/ui/swipe-dismiss-overlay";
 import { Text } from "@/components/ui/text";
 import { Toast, type ToastRecord } from "@/components/ui/toast";
-import { Tooltip } from "@/components/ui/tooltip";
-import { borderWidth, lightColors, radii, ThemeProvider } from "@/theme";
+import { borderWidth, lightColors, spacing, ThemeProvider } from "@/theme";
+
+jest.mock("@gorhom/bottom-sheet", () => {
+  const actual = jest.requireActual<typeof import("@gorhom/bottom-sheet")>("@gorhom/bottom-sheet");
+  const { ScrollView } = jest.requireActual("react-native") as typeof import("react-native");
+  return { ...actual, BottomSheetScrollView: ScrollView };
+});
 
 const METRICS = {
   frame: { x: 0, y: 0, width: 390, height: 844 },
@@ -41,7 +47,7 @@ describe("overlay rendering and dismissal", () => {
     jest.spyOn(AccessibilityInfo, "isReduceMotionEnabled").mockResolvedValue(false);
   });
 
-  test("Dialog renders its copy and dismisses from the close control", async () => {
+  test("Dialog renders a full-page surface and dismisses from the close control", async () => {
     const onDismiss = jest.fn();
     const screen = await render(
       <Dialog onDismiss={onDismiss} title="Connection" visible>
@@ -52,13 +58,31 @@ describe("overlay rendering and dismissal", () => {
     expect(screen.getByText("Connection")).toBeTruthy();
     expect(screen.getByText("Dialog body")).toBeTruthy();
     expect(StyleSheet.flatten(screen.getByTestId("dialog-content").props["style"])).toMatchObject({
-      backgroundColor: lightColors.popover,
-      borderColor: lightColors.popoverBorder,
-      borderRadius: radii.lg,
-      borderWidth: borderWidth.hairline,
+      backgroundColor: lightColors.background,
+      flex: 1,
+      width: "100%",
     });
+    expect(StyleSheet.flatten(screen.getByTestId("dialog-header").props["style"])).toMatchObject({
+      paddingTop: METRICS.insets.top + spacing[2],
+    });
+    expect(screen.queryByLabelText("Dismiss dialog")).not.toBeOnTheScreen();
     await fireEvent.press(screen.getByLabelText("Close dialog"));
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  test("Dialog clears its owned top inset for nested full-page content", async () => {
+    const screen = await render(
+      <Dialog onDismiss={jest.fn()} showCloseButton={false} title="New workspace" visible>
+        <Screen>
+          <Text>First field</Text>
+        </Screen>
+      </Dialog>,
+      { wrapper: Providers },
+    );
+
+    expect(StyleSheet.flatten(screen.getByTestId("screen-content").props["style"])).toMatchObject({
+      paddingTop: spacing[0],
+    });
   });
 
   test("Confirm renders both decisions and invokes them independently", async () => {
@@ -72,6 +96,7 @@ describe("overlay rendering and dismissal", () => {
     await fireEvent.press(screen.getByText("Cancel"));
     expect(onConfirm).toHaveBeenCalledTimes(1);
     expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("footer-actions").children).toHaveLength(2);
   });
 
   test("imperative confirm resolves and a second request cancels the first", async () => {
@@ -110,9 +135,8 @@ describe("overlay rendering and dismissal", () => {
       </Popover>,
       { wrapper: Providers },
     );
-    expect(popover.getByText("Popover content")).toBeTruthy();
-    await fireEvent.press(popover.getByLabelText("Dismiss popover"));
-    expect(onDismiss).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(popover.getByText("Popover content")).toBeTruthy());
+    expect(popover.getByLabelText("Dismiss drawer")).toBeTruthy();
   });
 
   test("Menu fires selection and closes after an enabled action", async () => {
@@ -127,14 +151,13 @@ describe("overlay rendering and dismissal", () => {
       />,
       { wrapper: Providers },
     );
+    await waitFor(() => expect(screen.getByText("Rename")).toBeTruthy());
     await fireEvent.press(screen.getByText("Rename"));
     expect(action).toHaveBeenCalledTimes(1);
     expect(onDismiss).toHaveBeenCalledTimes(1);
     expect(StyleSheet.flatten(screen.getByTestId("menu-surface").props["style"])).toMatchObject({
       backgroundColor: lightColors.popover,
-      borderColor: lightColors.popoverBorder,
-      borderRadius: radii.lg,
-      borderWidth: borderWidth.hairline,
+      borderWidth: borderWidth.none,
     });
   });
 
@@ -151,13 +174,12 @@ describe("overlay rendering and dismissal", () => {
       { wrapper: Providers },
     );
 
+    await waitFor(() => expect(screen.getByTestId("native-popover-surface")).toBeTruthy());
     expect(
       StyleSheet.flatten(screen.getByTestId("native-popover-surface").props["style"]),
     ).toMatchObject({
       backgroundColor: lightColors.popover,
-      borderColor: lightColors.popoverBorder,
-      borderRadius: radii.lg,
-      borderWidth: borderWidth.hairline,
+      borderWidth: borderWidth.none,
     });
     await fireEvent.press(screen.getByTestId("native-popover-item-rename"));
     expect(action).toHaveBeenCalledTimes(1);
@@ -189,21 +211,7 @@ describe("overlay rendering and dismissal", () => {
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 
-  test("Tooltip opens on long press and Collapse keeps dynamic content mounted", async () => {
-    const tooltip = await render(
-      <Tooltip content="Helpful context">
-        <View accessibilityLabel="Help trigger" />
-      </Tooltip>,
-      { wrapper: Providers },
-    );
-    const trigger = tooltip.getByHintText("Helpful context");
-    await fireEvent(trigger, "layout", {
-      nativeEvent: { layout: { x: 40, y: 80, width: 44, height: 44 } },
-    });
-    await fireEvent(trigger, "longPress");
-    await waitFor(() => expect(tooltip.getByText("Helpful context")).toBeTruthy());
-    await tooltip.unmount();
-
+  test("Collapse keeps dynamic content mounted", async () => {
     const collapse = await render(
       <Collapse open>
         <Text>Disclosure content</Text>

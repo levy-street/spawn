@@ -1,22 +1,24 @@
-import type { ReactNode } from "react";
-import { useEffect } from "react";
 import {
-  Modal,
-  Pressable,
-  type StyleProp,
-  StyleSheet,
-  useWindowDimensions,
-  View,
-  type ViewStyle,
-} from "react-native";
-import Animated, { useAnimatedStyle, useSharedValue, withTiming } from "react-native-reanimated";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
+  Children,
+  Fragment,
+  isValidElement,
+  type ReactNode,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+} from "react";
+import { Modal, type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
+import { KeyboardContext } from "react-native-keyboard-controller/src/context";
+import { useSharedValue } from "react-native-reanimated";
+import { SafeAreaInsetsContext, useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { Icon } from "@/components/ui/icon";
+import { FooterActions } from "@/components/ui/footer-actions";
+import { IconButton } from "@/components/ui/icon-button";
 import { useReducedMotionPreference } from "@/components/ui/swipe-dismiss-overlay";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { alpha, borderWidth, layer, pressroomColors, shadow, useTheme } from "@/theme";
+import { layer, spacing, useTheme } from "@/theme";
 
 export type DialogSize = "sm" | "md" | "lg" | "full-mobile" | "viewer";
 
@@ -34,18 +36,49 @@ export interface DialogProps {
   testID?: string;
 }
 
-const WIDTH_UNITS: Record<Exclude<DialogSize, "full-mobile" | "viewer">, number> = {
-  sm: 96,
-  md: 128,
-  lg: 168,
-};
+function flattenFooterActions(node: ReactNode): ReactNode[] {
+  return Children.toArray(node).flatMap((child) => {
+    if (isValidElement<{ children?: ReactNode }>(child) && child.type === Fragment) {
+      return flattenFooterActions(child.props.children);
+    }
+    return [child];
+  });
+}
+
+function DialogFooter({ children }: { children: ReactNode }): React.JSX.Element {
+  // Read the provider's context directly so importing Dialog does not eagerly load native
+  // bindings in provider-light routes and tests.
+  const keyboard = useContext(KeyboardContext);
+  const { height, progress } = keyboard.reanimated;
+  const targetProgress = useSharedValue(progress.value);
+
+  useLayoutEffect(
+    () =>
+      keyboard.setKeyboardHandlers({
+        onStart: (event) => {
+          "worklet";
+          targetProgress.value = event.progress;
+        },
+        onEnd: (event) => {
+          "worklet";
+          targetProgress.value = event.progress;
+        },
+      }),
+    [keyboard, targetProgress],
+  );
+
+  return (
+    <FooterActions keyboardAnimation={{ height, progress, targetProgress }}>
+      {children}
+    </FooterActions>
+  );
+}
 
 export function Dialog({
   visible,
   onDismiss,
   title,
   description,
-  size = "md",
   showCloseButton = true,
   closeAccessibilityLabel = "Close dialog",
   footer,
@@ -56,101 +89,58 @@ export function Dialog({
   const theme = useTheme();
   const reducedMotion = useReducedMotionPreference();
   const insets = useSafeAreaInsets();
-  const viewport = useWindowDimensions();
-  const progress = useSharedValue(0);
-  const fullScreen = size === "full-mobile" || size === "viewer";
+  const childInsets = useMemo(() => ({ ...insets, top: spacing[0] }), [insets]);
 
   useEffect(() => {
-    if (!visible) return;
-    progress.value = 0;
-    progress.value = withTiming(1, {
-      duration: reducedMotion ? theme.motion.duration.reduced : theme.motion.duration.base,
-      easing: theme.motion.easing.cssEase,
-    });
-    haptics.overlayOpen();
-  }, [progress, reducedMotion, theme.motion, visible]);
-
-  const animatedStyle = useAnimatedStyle(() => ({
-    opacity: progress.value,
-    transform: reducedMotion
-      ? []
-      : [
-          {
-            scale:
-              theme.motion.transform.enterScale +
-              (1 - theme.motion.transform.enterScale) * progress.value,
-          },
-        ],
-  }));
+    if (visible) haptics.overlayOpen();
+  }, [visible]);
 
   if (!visible) return null;
 
-  const centeredWidth = fullScreen ? viewport.width : theme.space(WIDTH_UNITS[size]);
-  const horizontalGutter = fullScreen ? 0 : theme.space(4);
+  const hasHeader = title !== undefined || description !== undefined;
+  const footerActions = footer === undefined ? [] : flattenFooterActions(footer);
+  const ChildInsetsProvider = SafeAreaInsetsContext?.Provider;
 
   return (
     <Modal
-      animationType="none"
+      animationType={reducedMotion ? "none" : "slide"}
       onRequestClose={onDismiss}
-      presentationStyle="overFullScreen"
+      presentationStyle="fullScreen"
       statusBarTranslucent
-      transparent
       visible
     >
-      <View style={[styles.root, { zIndex: layer.modal }]}>
-        <Pressable
-          accessibilityLabel="Dismiss dialog"
-          accessibilityRole="button"
-          onPress={onDismiss}
-          style={[styles.scrim, { backgroundColor: pressroomColors.void, opacity: alpha.a60 }]}
-        />
-        <Animated.View
-          accessibilityViewIsModal
-          style={[
-            styles.content,
-            contentStyle,
-            {
-              backgroundColor: theme.colors.popover,
-              borderColor: theme.colors.popoverBorder,
-              borderRadius: fullScreen ? borderWidth.none : theme.radii.lg,
-              borderWidth: fullScreen ? 0 : borderWidth.hairline,
-              boxShadow: fullScreen
-                ? undefined
-                : theme.isDark
-                  ? shadow.dialogDark
-                  : shadow.dialogLight,
-              height: fullScreen ? viewport.height : undefined,
-              maxHeight: fullScreen
-                ? viewport.height
-                : viewport.height - insets.top - insets.bottom - theme.space(8),
-              maxWidth: viewport.width - horizontalGutter * 2,
-              paddingBottom: fullScreen ? insets.bottom : 0,
-              paddingTop: fullScreen ? insets.top : 0,
-              width: centeredWidth,
-            },
-            animatedStyle,
-          ]}
-          testID={testID ?? "dialog-content"}
-        >
-          {title || description ? (
-            <View
-              style={[
-                styles.header,
-                {
-                  gap: theme.space(1),
-                  paddingBottom: theme.space(2),
-                  paddingHorizontal: theme.space(4),
-                  paddingRight: showCloseButton ? theme.space(12) : theme.space(4),
-                  paddingTop: theme.space(4),
-                },
-              ]}
-            >
-              {title ? (
-                <Text accessibilityRole="header" variant="label" weight="semibold">
+      <View
+        accessibilityViewIsModal
+        style={[
+          styles.surface,
+          {
+            paddingBottom: footer === undefined ? insets.bottom : spacing[0],
+          },
+          contentStyle,
+          { backgroundColor: theme.colors.background, zIndex: layer.modal },
+        ]}
+        testID={testID ?? "dialog-content"}
+      >
+        {hasHeader ? (
+          <View
+            style={[
+              styles.header,
+              {
+                gap: theme.space(3),
+                paddingBottom: theme.space(4),
+                paddingHorizontal: theme.space(4),
+                paddingTop: insets.top + theme.space(2),
+              },
+            ]}
+            testID="dialog-header"
+          >
+            <View style={[styles.headerCopy, { gap: theme.space(1) }]}>
+              {title !== undefined ? (
+                <Text accessibilityRole="header" variant="uiLg" weight="semibold">
                   {title}
                 </Text>
               ) : null}
-              {description ? (
+              {description !== undefined ? (
                 typeof description === "string" ? (
                   <Text color="mutedForeground" variant="body">
                     {description}
@@ -160,71 +150,66 @@ export function Dialog({
                 )
               ) : null}
             </View>
-          ) : null}
-          {children}
-          {footer ? (
-            <View
-              style={[
-                styles.footer,
-                {
-                  gap: theme.space(2),
-                  padding: theme.space(4),
-                  paddingTop: theme.space(2),
-                },
-              ]}
-            >
-              {footer}
+            {showCloseButton ? (
+              <IconButton
+                accessibilityLabel={closeAccessibilityLabel}
+                icon="X"
+                onPress={onDismiss}
+                size="sm"
+              />
+            ) : null}
+          </View>
+        ) : null}
+
+        {ChildInsetsProvider === undefined ? (
+          <View style={styles.body} testID="dialog-body">
+            {children}
+          </View>
+        ) : (
+          <ChildInsetsProvider value={childInsets}>
+            <View style={styles.body} testID="dialog-body">
+              {children}
             </View>
-          ) : null}
-          {showCloseButton ? (
-            <Pressable
+          </ChildInsetsProvider>
+        )}
+
+        {footerActions.length > 0 ? <DialogFooter>{footerActions}</DialogFooter> : null}
+
+        {!hasHeader && showCloseButton ? (
+          <View
+            pointerEvents="box-none"
+            style={[styles.close, { right: theme.space(3), top: insets.top + theme.space(2) }]}
+          >
+            <IconButton
               accessibilityLabel={closeAccessibilityLabel}
-              accessibilityRole="button"
-              hitSlop={theme.space(2)}
+              icon="X"
               onPress={onDismiss}
-              style={({ pressed }) => [
-                styles.close,
-                {
-                  backgroundColor: pressed ? theme.colors.accent : "transparent",
-                  borderRadius: theme.radii.md,
-                  padding: theme.space(1.5),
-                  right: theme.space(3),
-                  top: (fullScreen ? insets.top : 0) + theme.space(3),
-                },
-              ]}
-            >
-              <Icon color="mutedForeground" name="X" size={theme.space(4)} />
-            </Pressable>
-          ) : null}
-        </Animated.View>
+              size="sm"
+            />
+          </View>
+        ) : null}
       </View>
     </Modal>
   );
 }
 
 const styles = StyleSheet.create({
+  body: {
+    flex: 1,
+  },
   close: {
-    alignItems: "center",
-    justifyContent: "center",
     position: "absolute",
   },
-  content: {
-    overflow: "hidden",
-  },
-  footer: {
-    alignItems: "center",
-    flexDirection: "row",
-    justifyContent: "flex-end",
-  },
   header: {
-    flexDirection: "column",
+    alignItems: "flex-start",
+    flexDirection: "row",
   },
-  root: {
-    ...StyleSheet.absoluteFillObject,
-    alignItems: "center",
-    justifyContent: "center",
+  headerCopy: {
+    flex: 1,
+    minWidth: 0,
   },
-  scrim: {
-    ...StyleSheet.absoluteFillObject,
+  surface: {
+    flex: 1,
+    width: "100%",
   },
 });

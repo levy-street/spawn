@@ -8,6 +8,7 @@ import { CreateWorkspaceDialog } from "@/components/workspaces/create-workspace-
 import { ThemeProvider } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
+const MOCK_KEYBOARD_HEIGHT = 300;
 let mockKeyboardVisible = false;
 
 jest.mock("react-native-keyboard-controller", () => ({
@@ -32,6 +33,13 @@ jest.mock("react-native-keyboard-controller", () => ({
       ),
       useKeyboardState: (selector: (state: { isVisible: boolean }) => boolean) =>
         selector({ isVisible: mockKeyboardVisible }),
+      // The footer rides an animated keyboard height rather than a boolean, so the
+      // mock has to hand back shared-value shapes the component can read.
+      useGenericKeyboardHandler: () => undefined,
+      useReanimatedKeyboardAnimation: () => ({
+        height: { value: mockKeyboardVisible ? -MOCK_KEYBOARD_HEIGHT : 0 },
+        progress: { value: mockKeyboardVisible ? 1 : 0 },
+      }),
     };
   })(),
 }));
@@ -129,7 +137,9 @@ describe("new workspace form layout", () => {
     expect(screen.getByTestId("create-workspace-submit")).toHaveStyle({
       minHeight: sizing.control.button.default,
     });
-    expect(screen.getByTestId("keyboard-sticky-view")).toBeTruthy();
+    // The footer no longer rides KeyboardStickyView: round 5 replaced it with an
+    // animated container so the inset travels with the keyboard instead of snapping.
+    expect(screen.getByTestId("screen-footer")).toBeTruthy();
     await screen.unmount();
   });
 

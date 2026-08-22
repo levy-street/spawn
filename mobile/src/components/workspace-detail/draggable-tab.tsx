@@ -3,9 +3,10 @@ import { Pressable, StyleSheet, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, { type SharedValue, useAnimatedStyle, withTiming } from "react-native-reanimated";
 import { scheduleOnRN } from "react-native-worklets";
-import { AttentionBadge, attentionAccessibilityLabel } from "@/components/alerts/attention-badge";
+import { attentionAccessibilityLabel } from "@/components/alerts/attention-badge";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
+import { TabAttentionBadge } from "@/components/workspace-detail/tab-attention-badge";
 import { tabDestinationIndex } from "@/components/workspace-detail/tab-reorder";
 import type { AttentionSummary } from "@/data/queries/alerts";
 import type { WorkspaceTab } from "@/data/types/layout";
@@ -285,7 +286,7 @@ export function DraggableTab({
           ]}
           testID={`workspace-tab-surface-${tab.id}`}
         >
-          <AttentionBadge summary={attention} testID={`tab-attention-${tab.id}`} />
+          <TabAttentionBadge summary={attention} testID={`tab-attention-${tab.id}`} />
           <Text
             color={active ? "foreground" : "mutedForeground"}
             numberOfLines={1}

@@ -1,7 +1,7 @@
 import { Link } from "expo-router";
 import type { ReactNode, RefObject } from "react";
 import { useEffect, useRef } from "react";
-import { Pressable, ScrollView, StyleSheet, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 
 import {
   Popover,
@@ -9,9 +9,10 @@ import {
   type PopoverAnchorRect,
   type PopoverSide,
 } from "@/components/ui/popover";
+import { SheetScrollView } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, layer, opacity, useTheme } from "@/theme";
+import { borderWidth, chrome, opacity, useTheme } from "@/theme";
 
 export interface MenuItem {
   type?: "item";
@@ -79,8 +80,6 @@ export function Menu({
 }: MenuProps): React.JSX.Element {
   const theme = useTheme();
   const wasVisible = useRef(false);
-  const minimumWidth = theme.space(65);
-  const resolvedWidth = Math.max(width ?? theme.space(70), minimumWidth);
 
   useEffect(() => {
     if (visible && !wasVisible.current) haptics.overlayOpen();
@@ -96,32 +95,23 @@ export function Menu({
     <Popover
       accessibilityLabel={accessibilityLabel}
       align={align}
-      contentStyle={{
-        backgroundColor: "transparent",
-        borderColor: "transparent",
-        borderWidth: borderWidth.none,
-      }}
       interactive
       onDismiss={dismiss}
-      overlayLayer={layer.menu}
       side={side}
       visible={visible}
-      width={resolvedWidth}
+      {...(width === undefined ? {} : { width })}
       {...(anchorRect === undefined ? {} : { anchorRect })}
       {...(anchorRef === undefined ? {} : { anchorRef })}
     >
       <View
         style={{
           backgroundColor: theme.colors.popover,
-          borderColor: theme.colors.popoverBorder,
-          borderRadius: theme.radii.lg,
-          borderWidth: borderWidth.hairline,
-          minWidth: minimumWidth,
-          padding: theme.space(1.5),
+          borderWidth: borderWidth.none,
+          paddingHorizontal: theme.space(2),
         }}
         testID="menu-surface"
       >
-        <ScrollView
+        <SheetScrollView
           bounces={false}
           contentContainerStyle={styles.scrollContent}
           keyboardShouldPersistTaps="handled"
@@ -202,7 +192,7 @@ export function Menu({
               </Pressable>
             );
           })}
-        </ScrollView>
+        </SheetScrollView>
       </View>
     </Popover>
   );

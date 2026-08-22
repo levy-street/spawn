@@ -104,8 +104,9 @@ describe("TabStrip", () => {
     expect(screen.queryByTestId("tab-connection-left-tests")).toBeNull();
   });
 
-  it("shows the global attention count before a tab label", async () => {
-    const waiting = makeSession({ id: "waiting", activity_state: "waiting" });
+  it("centres the attention count in its plate and beside the tab label", async () => {
+    const waitingOne = makeSession({ id: "waiting-one", activity_state: "waiting" });
+    const waitingTwo = makeSession({ id: "waiting-two", activity_state: "waiting" });
     const screen = await render(
       <TabStrip
         activeIndex={0}
@@ -115,17 +116,49 @@ describe("TabStrip", () => {
         onClose={jest.fn()}
         onReorder={jest.fn()}
         onSelect={jest.fn()}
-        sessionsById={new Map([[waiting.id, waiting]])}
+        sessionsById={
+          new Map([
+            [waitingOne.id, waitingOne],
+            [waitingTwo.id, waitingTwo],
+          ])
+        }
         tabs={[
-          makeTab("main", [{ session_id: waiting.id, x: 0, y: 0, w: 24, h: 24 }]),
+          makeTab("main", [
+            { session_id: waitingOne.id, x: 0, y: 0, w: 12, h: 24 },
+            { session_id: waitingTwo.id, x: 12, y: 0, w: 12, h: 24 },
+          ]),
           makeTab("tests"),
         ]}
       />,
       { wrapper: ThemeProvider },
     );
 
-    expect(screen.getByTestId("tab-attention-main-count")).toHaveTextContent("1");
-    expect(screen.getByLabelText("main, 1 session awaiting input")).toBeTruthy();
+    expect(screen.getByTestId("tab-attention-main-count")).toHaveTextContent("2");
+    expect(screen.getByTestId("tab-attention-main")).toHaveStyle({
+      alignItems: "center",
+      alignSelf: "center",
+      justifyContent: "center",
+    });
+    expect(screen.getByTestId("tab-attention-main-count")).toHaveStyle({
+      alignSelf: "center",
+      height: sizing.tab.closePlate,
+      justifyContent: "center",
+      minWidth: sizing.tab.closePlate,
+      paddingHorizontal: sizing.space.tight,
+      paddingVertical: 0,
+    });
+    expect(screen.getByTestId("tab-attention-main-numeral")).toHaveStyle({
+      fontVariant: ["tabular-nums"],
+      includeFontPadding: false,
+      lineHeight: sizing.type.micro.lineHeight,
+      textAlign: "center",
+      textAlignVertical: "center",
+    });
+    expect(screen.getByTestId("workspace-tab-surface-main")).toHaveStyle({
+      alignItems: "center",
+      gap: sizing.tab.labelGap,
+    });
+    expect(screen.getByLabelText("main, 2 sessions awaiting input")).toBeTruthy();
   });
 
   it("keeps adjacent reorder actions as an accessible drag fallback", async () => {

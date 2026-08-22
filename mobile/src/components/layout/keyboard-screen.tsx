@@ -1,6 +1,11 @@
 import { type ReactNode, useState } from "react";
 import { type LayoutChangeEvent, StyleSheet, View } from "react-native";
-import { KeyboardAwareScrollView, KeyboardStickyView } from "react-native-keyboard-controller";
+import {
+  KeyboardAwareScrollView,
+  useGenericKeyboardHandler,
+  useReanimatedKeyboardAnimation,
+} from "react-native-keyboard-controller";
+import { useSharedValue } from "react-native-reanimated";
 
 import { FooterActions } from "@/components/ui/footer-actions";
 import { spacing } from "@/theme";
@@ -16,6 +21,38 @@ interface KeyboardScreenProps {
   footer: ReactNode | undefined;
   header: ReactNode | undefined;
   scroll: boolean;
+}
+
+interface KeyboardFooterProps {
+  children: ReactNode;
+  onLayout: (event: LayoutChangeEvent) => void;
+}
+
+function KeyboardFooter({ children, onLayout }: KeyboardFooterProps): React.JSX.Element {
+  const { height, progress } = useReanimatedKeyboardAnimation();
+  const targetProgress = useSharedValue(progress.value);
+
+  useGenericKeyboardHandler(
+    {
+      onStart: (event) => {
+        "worklet";
+        targetProgress.value = event.progress;
+      },
+      onEnd: (event) => {
+        "worklet";
+        targetProgress.value = event.progress;
+      },
+    },
+    [targetProgress],
+  );
+
+  return (
+    <View onLayout={onLayout} style={styles.footer} testID="screen-footer">
+      <FooterActions keyboardAnimation={{ height, progress, targetProgress }}>
+        {children}
+      </FooterActions>
+    </View>
+  );
 }
 
 export function KeyboardScreen({
@@ -52,11 +89,7 @@ export function KeyboardScreen({
       )}
 
       {footer === undefined ? null : (
-        <KeyboardStickyView offset={{ closed: spacing[0], opened: spacing[0] }}>
-          <View onLayout={onFooterLayout} style={styles.footer} testID="screen-footer">
-            <FooterActions>{footer}</FooterActions>
-          </View>
-        </KeyboardStickyView>
+        <KeyboardFooter onLayout={onFooterLayout}>{footer}</KeyboardFooter>
       )}
     </View>
   );

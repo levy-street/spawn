@@ -1,12 +1,14 @@
-import { Pressable, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { hostConnectionLabel, pluralize } from "@/components/hosts/host-model";
+import { Badge } from "@/components/ui/badge";
 import { Icon } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
+import { ListRow } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
-import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, spacing, useTheme } from "@/theme";
+import { borderWidth, spacing, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export interface HostListItemProps {
   host: HostOut;
@@ -17,21 +19,34 @@ export interface HostListItemProps {
 export function HostListItem({ host, onOpen, onOpenActions }: HostListItemProps) {
   const theme = useTheme();
   const online = host.status === "online";
+  const system = `${host.os ?? "unknown"}/${host.arch ?? "unknown"} · daemon ${host.version ?? "unknown"}`;
+
   return (
-    <View
-      style={[
-        styles.row,
-        {
-          borderBottomColor: theme.colors.border,
-          minHeight: chrome.touchTarget + spacing[6],
-          paddingLeft: spacing[4],
-        },
-      ]}
-      testID={`host-row-${host.id}`}
-    >
-      <Pressable
-        accessibilityLabel={`${host.name}, ${online ? "online" : "offline"}`}
-        accessibilityRole="button"
+    <View testID={`host-row-${host.id}`}>
+      <ListRow
+        height="tall"
+        leading={
+          <View
+            style={[
+              styles.machine,
+              {
+                backgroundColor: theme.colors.muted,
+                borderColor: theme.colors.border,
+                borderRadius: theme.radii.md,
+              },
+            ]}
+          >
+            <Icon color="mutedForeground" name="Server" size={spacing[4]} />
+            <StatusDot
+              accessibilityLabel={online ? "Online" : "Offline"}
+              bordered
+              pulse={false}
+              style={styles.statusDot}
+              testID={`host-status-${host.id}`}
+              tone={online ? "active" : "offline"}
+            />
+          </View>
+        }
         onLongPress={() => {
           haptics.impact("medium");
           onOpenActions();
@@ -40,67 +55,44 @@ export function HostListItem({ host, onOpen, onOpenActions }: HostListItemProps)
           haptics.selection();
           onOpen();
         }}
-        style={({ pressed }) => [
-          styles.main,
-          { backgroundColor: pressed ? theme.colors.accent : "transparent" },
-        ]}
-      >
-        <StatusDot
-          accessibilityLabel={online ? "Online" : "Offline"}
-          pulse={false}
-          tone={online ? "active" : "offline"}
-        />
-        <View style={styles.copy}>
-          <View style={styles.titleRow}>
-            <Text numberOfLines={1} style={styles.title} variant="label">
-              {host.name}
-            </Text>
-            <Text color="mutedForeground" variant="caption">
+        shape="fullBleed"
+        subtitle={`${hostConnectionLabel(host)}\n${system}`}
+        title={host.name}
+        trailing={
+          <View style={styles.trailing}>
+            <Badge testID={`host-session-count-${host.id}`} variant="outline">
               {pluralize(host.session_count, "session")}
-            </Text>
+            </Badge>
+            <IconButton
+              accessibilityLabel={`Actions for ${host.name}`}
+              icon="Ellipsis"
+              onPress={onOpenActions}
+              size="sm"
+            />
           </View>
-          <Text color="mutedForeground" numberOfLines={1} variant="caption">
-            {online
-              ? `${host.os ?? "unknown"}/${host.arch ?? "unknown"} · daemon ${host.version ?? "unknown"}`
-              : hostConnectionLabel(host)}
-          </Text>
-        </View>
-        <Icon color="mutedForeground" name="ChevronRight" size={spacing[4]} />
-      </Pressable>
-      <IconButton
-        accessibilityLabel={`Actions for ${host.name}`}
-        icon="Ellipsis"
-        onPress={onOpenActions}
-        size="sm"
+        }
       />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  copy: {
-    flex: 1,
+  machine: {
+    alignItems: "center",
+    borderWidth: borderWidth.hairline,
+    height: sizing.listRow.leading.rich,
+    justifyContent: "center",
+    position: "relative",
+    width: sizing.listRow.leading.rich,
+  },
+  statusDot: {
+    bottom: -spacing[0.5],
+    position: "absolute",
+    right: -spacing[0.5],
+  },
+  trailing: {
+    alignItems: "center",
+    flexDirection: "row",
     gap: spacing[1],
-    minWidth: 0,
-  },
-  main: {
-    alignItems: "center",
-    flex: 1,
-    flexDirection: "row",
-    gap: spacing[3],
-    paddingRight: spacing[1],
-  },
-  row: {
-    alignItems: "center",
-    borderBottomWidth: borderWidth.hairline,
-    flexDirection: "row",
-  },
-  title: {
-    flex: 1,
-  },
-  titleRow: {
-    alignItems: "center",
-    flexDirection: "row",
-    gap: spacing[2],
   },
 });

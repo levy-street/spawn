@@ -30,11 +30,14 @@ jest.mock("@/components/ui/action-sheet", () => {
 });
 
 jest.mock("@/components/ui/sheet", () => {
-  const { Text, View } = jest.requireActual("react-native") as typeof import("react-native");
+  const { ScrollView, Text, View } = jest.requireActual(
+    "react-native",
+  ) as typeof import("react-native");
   return {
     Sheet: ({ children, visible }: { children: ReactNode; visible: boolean }) =>
       visible ? <View testID="sheet">{children}</View> : null,
     SheetHeader: ({ title }: { title: string }) => <Text>{title}</Text>,
+    SheetScrollView: ScrollView,
   };
 });
 

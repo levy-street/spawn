@@ -303,23 +303,22 @@ export function WorkspaceListScreen() {
   }
 
   return (
-    <Screen
-      footer={
-        <SearchField
-          dock
-          onChangeText={setQuery}
-          placeholder="Search workspaces"
-          testID="workspace-search"
-          value={query}
-        />
-      }
-      header={header}
-      padded={false}
-    >
+    <Screen header={header} padded={false}>
       <View
         style={[styles.screen, { backgroundColor: theme.colors.background }]}
         testID="workspace-list-screen"
       >
+        <View testID="workspace-search-section">
+          <View style={styles.searchControls}>
+            <SearchField
+              onChangeText={setQuery}
+              placeholder="Search workspaces"
+              testID="workspace-search"
+              value={query}
+            />
+          </View>
+          <ListSeparator inset={false} />
+        </View>
         {sessionsQuery.error ? (
           <View
             accessibilityRole="alert"
