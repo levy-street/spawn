@@ -33,6 +33,7 @@ from ..models import (
     TrustBundle,
     User,
 )
+from ..pin_liveness import live_browser_device_id_set
 from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/trust", tags=["trust"])
@@ -633,11 +634,18 @@ async def list_host_browser_pin_details(
     session: AsyncSession = Depends(get_session),
 ) -> list[HostPinDetail]:
     """Pin records with provenance, for the Access screen's host rows
-    (docs/TRUST_UX.md). Display data only — admission stays daemon-side."""
+    (docs/TRUST_UX.md). Display data only — admission stays daemon-side.
+
+    Filtered through the same transitive-liveness computation the daemon pin
+    push uses: a raw row whose device (or whole endorsement subtree) is revoked
+    must not read as approved here — that is exactly the state the R5 sole-trust
+    warning has to see through (a host "pinned" by a live device plus a revoked
+    root is sole-trust, not doubly covered)."""
 
     host = await session.get(Host, host_id)
     if host is None or host.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="host not found")
+    live_ids = await live_browser_device_id_set(session, host_id)
     rows = (
         await session.execute(
             select(
@@ -656,6 +664,7 @@ async def list_host_browser_pin_details(
             created_at=row.created_at,
         )
         for row in rows
+        if row.browser_device_id in live_ids
     ]
 
 
@@ -665,16 +674,13 @@ async def list_host_browser_pins(
     user: User = Depends(auth.current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[str]:
-    """Browser device IDs this host trusts, so the UI can offer to endorse the rest."""
+    """Browser device IDs this host trusts, so the UI can offer to endorse the rest.
+
+    Transitively-live pins only (the daemon's own computation): revoked devices
+    and dead endorsement subtrees are omitted, so the roster's advisory anchors
+    and the R5 sole-trust warning see what the daemon would actually admit."""
 
     host = await session.get(Host, host_id)
     if host is None or host.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="host not found")
-    rows = (
-        await session.execute(
-            select(HostBrowserPin.browser_device_id)
-            .where(HostBrowserPin.host_id == host_id)
-            .order_by(HostBrowserPin.browser_device_id)
-        )
-    ).scalars()
-    return list(rows)
+    return sorted(await live_browser_device_id_set(session, host_id))
