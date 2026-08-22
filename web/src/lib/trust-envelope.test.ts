@@ -471,39 +471,52 @@ describe("retired-root retention through rotation (hardening B2)", () => {
     expect(opened.retiredRoots).toEqual([first]);
   });
 
-  test("rotation refuses beyond the archive cap rather than evicting history", async () => {
+  test("rotation at the archive cap evicts the OLDEST seed and still succeeds", async () => {
+    // Fail-soft at the cap (passkey-lifecycle review): the old behavior THREW
+    // here, out of the unlock itself — so from the 9th rotation on, every
+    // unlock imported pins and then errored forever: recovery permanently
+    // broken. Rotation is the compromise response and must keep working; the
+    // price is the single OLDEST retired seed (revoked longest, anchors long
+    // severed), while the newest MAX_RETIRED_ROOTS seeds all survive in order.
     const { MAX_RETIRED_ROOTS } = await import("./trust-bundle");
     const { setEnvelopeRoot } = await import("./trust-envelope");
+    const lineage = [await rootMaterial()];
     let sealed = await sealTrustEnvelope(
       ACCOUNT,
       [await host()],
       [passkey("laptop", 1)],
       1,
-      await rootMaterial(),
+      lineage[0],
     );
     for (let i = 0; i < MAX_RETIRED_ROOTS; i += 1) {
+      lineage.push(await rootMaterial());
       sealed = await setEnvelopeRoot(
         ACCOUNT,
         sealed,
         passkey("laptop", 1),
-        await rootMaterial(),
+        lineage[lineage.length - 1],
         i + 2,
         true,
       );
     }
     const full = await openTrustEnvelope(ACCOUNT, sealed, passkey("laptop", 1));
     expect(full.retiredRoots).toHaveLength(MAX_RETIRED_ROOTS);
-    // One more fabricated "rotation" must fail loudly, not push the original
-    // root off the end of the archive.
-    await expect(
-      setEnvelopeRoot(
-        ACCOUNT,
-        sealed,
-        passkey("laptop", 1),
-        await rootMaterial(),
-        MAX_RETIRED_ROOTS + 2,
-        true,
-      ),
-    ).rejects.toThrow("retired root");
+
+    // One more rotation succeeds; the ORIGINAL (oldest) seed is the one paid.
+    const successor = await rootMaterial();
+    const rotated = await setEnvelopeRoot(
+      ACCOUNT,
+      sealed,
+      passkey("laptop", 1),
+      successor,
+      MAX_RETIRED_ROOTS + 2,
+      true,
+    );
+    const opened = await openTrustEnvelope(ACCOUNT, rotated, passkey("laptop", 1));
+    expect(opened.root).toEqual(successor);
+    expect(opened.retiredRoots).toHaveLength(MAX_RETIRED_ROOTS);
+    // Newest-8 retained, in lineage order: the first seed is gone, the
+    // previously-live root was retired at the end.
+    expect(opened.retiredRoots).toEqual(lineage.slice(1));
   });
 });
