@@ -38,7 +38,7 @@ async def _register(client, auth, user_id, key: Ed25519PrivateKey, *, is_root: b
         json={
             "key_algorithm": "ed25519",
             "public_key": _wire(pub),
-            "signature": _wire(key.sign(encode_browser_registration_transcript(user_id, pub))),
+            "signature": _wire(key.sign(encode_browser_registration_transcript(user_id, pub, is_root=is_root))),
             "is_root": is_root,
         },
         headers=auth,

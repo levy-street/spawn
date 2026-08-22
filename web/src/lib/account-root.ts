@@ -84,7 +84,10 @@ export async function createRootRegistrationProof(
   root: AccountRoot,
   accountId: string,
 ): Promise<string> {
-  const transcript = encodeBrowserDeviceRegistrationTranscript(accountId, root.publicKeyWire);
+  // is_root=true is bound inside the V2 transcript: only the holder of sk_R can
+  // produce a proof that registers pk_R AS the root, and the same signature can
+  // never be replayed to register it as an ordinary device (or vice versa).
+  const transcript = encodeBrowserDeviceRegistrationTranscript(accountId, root.publicKeyWire, true);
   const owned = new ArrayBuffer(transcript.byteLength);
   new Uint8Array(owned).set(transcript);
   const signature = new Uint8Array(

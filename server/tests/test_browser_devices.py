@@ -22,7 +22,7 @@ from spawn_server.browser_registration import (
 VECTORS_PATH = (
     Path(__file__).resolve().parents[2]
     / "proto"
-    / "browser-device-registration-v1-vectors.json"
+    / "browser-device-registration-v2-vectors.json"
 )
 
 
@@ -30,14 +30,19 @@ def _wire(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
-def _proof(user_id: str, private_key: Ed25519PrivateKey) -> dict[str, str]:
+def _proof(
+    user_id: str, private_key: Ed25519PrivateKey, *, is_root: bool = False
+) -> dict[str, str | bool]:
     public_key = private_key.public_key().public_bytes_raw()
-    transcript = encode_browser_registration_transcript(user_id, public_key)
-    return {
+    transcript = encode_browser_registration_transcript(user_id, public_key, is_root=is_root)
+    body: dict[str, str | bool] = {
         "key_algorithm": "ed25519",
         "public_key": _wire(public_key),
         "signature": _wire(private_key.sign(transcript)),
     }
+    if is_root:
+        body["is_root"] = True
+    return body
 
 
 async def _signup(client, email: str) -> tuple[str, str]:
@@ -53,37 +58,65 @@ async def _signup(client, email: str) -> tuple[str, str]:
 def test_shared_registration_vectors_pin_bytes_and_reject_mutations_and_malformed_wire():
     vectors = json.loads(VECTORS_PATH.read_text())
     positive = vectors["positive"]
-    public_key = base64.urlsafe_b64decode(positive["public_key"] + "=")
-    transcript = encode_browser_registration_transcript(positive["user_id"], public_key)
-    assert transcript.hex() == positive["transcript_hex"]
-    assert hashlib.sha256(transcript).hexdigest() == positive["transcript_sha256"]
-    verify_browser_registration_proof(
-        user_id=positive["user_id"],
-        public_key_wire=positive["public_key"],
-        signature_wire=positive["signature"],
-    )
+    positive_root = vectors["positive_root"]
+    assert positive["is_root"] is False
+    assert positive_root["is_root"] is True
+    for vector in (positive, positive_root):
+        public_key = base64.urlsafe_b64decode(vector["public_key"] + "=")
+        transcript = encode_browser_registration_transcript(
+            vector["user_id"], public_key, is_root=vector["is_root"]
+        )
+        assert transcript.hex() == vector["transcript_hex"]
+        assert hashlib.sha256(transcript).hexdigest() == vector["transcript_sha256"]
+        verify_browser_registration_proof(
+            user_id=vector["user_id"],
+            public_key_wire=vector["public_key"],
+            signature_wire=vector["signature"],
+            is_root=vector["is_root"],
+        )
 
+    public_key = base64.urlsafe_b64decode(positive["public_key"] + "=")
     for malformed in vectors["malformed_user_ids"]:
         with pytest.raises(ValueError, match="user id must be"):
-            encode_browser_registration_transcript(malformed, public_key)
+            encode_browser_registration_transcript(malformed, public_key, is_root=False)
 
     with pytest.raises(HTTPException, match="proof is invalid"):
         verify_browser_registration_proof(
             user_id=vectors["mutations"]["user_id"],
             public_key_wire=positive["public_key"],
             signature_wire=positive["signature"],
+            is_root=positive["is_root"],
         )
     with pytest.raises(HTTPException, match="proof is invalid"):
         verify_browser_registration_proof(
             user_id=positive["user_id"],
             public_key_wire=vectors["mutations"]["public_key"],
             signature_wire=positive["signature"],
+            is_root=positive["is_root"],
         )
     with pytest.raises(HTTPException, match="proof is invalid"):
         verify_browser_registration_proof(
             user_id=positive["user_id"],
             public_key_wire=positive["public_key"],
             signature_wire=vectors["mutations"]["signature"],
+            is_root=positive["is_root"],
+        )
+    # B1: the root claim is inside the signed bytes, so a flipped flag breaks
+    # the proof in BOTH directions — a device proof cannot claim root-hood and
+    # a root proof cannot be laundered into an ordinary device registration.
+    with pytest.raises(HTTPException, match="proof is invalid"):
+        verify_browser_registration_proof(
+            user_id=positive["user_id"],
+            public_key_wire=positive["public_key"],
+            signature_wire=positive["signature"],
+            is_root=True,
+        )
+    with pytest.raises(HTTPException, match="proof is invalid"):
+        verify_browser_registration_proof(
+            user_id=positive_root["user_id"],
+            public_key_wire=positive_root["public_key"],
+            signature_wire=positive_root["signature"],
+            is_root=False,
         )
 
     for malformed in vectors["malformed_public_keys"]:
@@ -92,10 +125,67 @@ def test_shared_registration_vectors_pin_bytes_and_reject_mutations_and_malforme
                 user_id=positive["user_id"],
                 public_key_wire=malformed,
                 signature_wire=positive["signature"],
+                is_root=positive["is_root"],
             )
     for malformed in vectors["malformed_signatures"]:
         with pytest.raises(HTTPException, match="invalid Ed25519 signature"):
             decode_ed25519_signature(malformed)
+
+
+async def test_root_claim_must_match_the_signed_proof_and_the_stored_row(client):
+    """B1 route-level: a mutable `is_root` body field never outruns the proof."""
+
+    user_id, token = await _signup(client, "root-binding@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    key = Ed25519PrivateKey.generate()
+
+    # A root claim with a device-flagged (unflagged) proof is refused...
+    unflagged = dict(_proof(user_id, key))
+    unflagged["is_root"] = True
+    refused = await client.post(
+        "/api/browser-devices/register", json=unflagged, headers=headers
+    )
+    assert refused.status_code == 422
+
+    # ...and a device claim with a root-flagged proof is refused too.
+    root_signed = dict(_proof(user_id, key, is_root=True))
+    root_signed["is_root"] = False
+    refused_device = await client.post(
+        "/api/browser-devices/register", json=root_signed, headers=headers
+    )
+    assert refused_device.status_code == 422
+
+    # Honestly flagged proofs register, and a key's role is immutable: the same
+    # key cannot later be re-registered under the other designation even WITH a
+    # freshly signed proof for it.
+    registered = await client.post(
+        "/api/browser-devices/register", json=_proof(user_id, key), headers=headers
+    )
+    assert registered.status_code == 200
+    assert registered.json()["is_root"] is False
+    reclaimed = await client.post(
+        "/api/browser-devices/register",
+        json=_proof(user_id, key, is_root=True),
+        headers=headers,
+    )
+    assert reclaimed.status_code == 409
+    assert "root designation" in reclaimed.json()["detail"]
+
+    root_key = Ed25519PrivateKey.generate()
+    minted = await client.post(
+        "/api/browser-devices/register",
+        json=_proof(user_id, root_key, is_root=True),
+        headers=headers,
+    )
+    assert minted.status_code == 200
+    assert minted.json()["is_root"] is True
+    demoted = await client.post(
+        "/api/browser-devices/register",
+        json=_proof(user_id, root_key),
+        headers=headers,
+    )
+    assert demoted.status_code == 409
+    assert "root designation" in demoted.json()["detail"]
 
 
 async def test_registration_is_authenticated_idempotent_and_account_scoped(client):

@@ -36,13 +36,25 @@ def _to_out(device: BrowserDevice) -> schemas.BrowserDeviceOut:
     )
 
 
-def _registration_result(device: BrowserDevice, user_id: str) -> schemas.BrowserDeviceOut:
+def _registration_result(
+    device: BrowserDevice, user_id: str, claimed_is_root: bool
+) -> schemas.BrowserDeviceOut:
     if device.owner_user_id != user_id:
         raise HTTPException(status_code=409, detail="browser public key is unavailable")
     if device.revoked_at is not None:
         raise HTTPException(
             status_code=409,
             detail="revoked browser public keys cannot be registered again",
+        )
+    if device.is_root != claimed_is_root:
+        # A key is minted as either the account root or an ordinary device and
+        # never changes role. No legitimate client re-registers a key under the
+        # other designation, so a mismatch is confusion or mischief — refuse
+        # rather than silently answering with a row whose authority differs
+        # from what the proof attested.
+        raise HTTPException(
+            status_code=409,
+            detail="browser public key is already registered with a different root designation",
         )
     return _to_out(device)
 
@@ -54,10 +66,14 @@ async def register_browser_device(
     session: AsyncSession = Depends(get_session),
 ) -> schemas.BrowserDeviceOut:
     user_id = user.id
+    # The V2 proof binds the root claim: `body.is_root` is only ever consumed
+    # after this verification, so the flag the row is inserted with is attested
+    # by the key holder, never a bare server-mutable request field (mesh B1).
     verify_browser_registration_proof(
         user_id=user_id,
         public_key_wire=body.public_key,
         signature_wire=body.signature,
+        is_root=body.is_root,
     )
 
     existing = (
@@ -77,7 +93,7 @@ async def register_browser_device(
         if existing.owner_user_id == user_id and existing.revoked_at is None:
             existing.last_seen_at = datetime.now(UTC)
             await session.commit()
-        return _registration_result(existing, user_id)
+        return _registration_result(existing, user_id, body.is_root)
 
     # A key this account revoked stays revoked forever (R10), even after the
     # roster tombstone was pruned away: re-admission takes a fresh ceremony
@@ -160,7 +176,7 @@ async def register_browser_device(
             raise HTTPException(
                 status_code=409, detail="browser public key is unavailable"
             ) from None
-        return _registration_result(winner, user_id)
+        return _registration_result(winner, user_id, body.is_root)
     await session.refresh(device)
     return _to_out(device)
 

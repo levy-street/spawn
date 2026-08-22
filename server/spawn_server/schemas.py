@@ -66,9 +66,11 @@ class BrowserDeviceRegisterRequest(BaseModel):
         max_length=ED25519_SIGNATURE_B64URL_LENGTH,
     )
     # Register this key as the account ROOT (pk_R), not a browser (device mesh
-    # §3). Not bound in the registration proof: is_root grants no trust on its
-    # own (a root anchors only via possess/re-anchor, never automatically), so a
-    # server flipping it is at most a denial of service, which it can do anyway.
+    # §3). BOUND in the V2 registration proof (security hardening B1): the
+    # stored flag feeds real server-side authority (the R9 per-host endorsement
+    # exemption and the pin-liveness ratchet), so the claim must carry the key
+    # holder's signature — a flipped flag fails proof verification and is
+    # refused.
     is_root: bool = False
 
     @field_validator("public_key")

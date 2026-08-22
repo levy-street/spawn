@@ -94,7 +94,9 @@ async def _register_browser(client, user_id: str, auth: dict[str, str]):
             "key_algorithm": "ed25519",
             "public_key": public_wire,
             "signature": _wire(
-                private_key.sign(encode_browser_registration_transcript(user_id, public_key))
+                private_key.sign(
+                    encode_browser_registration_transcript(user_id, public_key, is_root=False)
+                )
             ),
         },
         headers=auth,

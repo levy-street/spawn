@@ -48,7 +48,7 @@ async def _register_device(client, auth, user_id: str) -> tuple[str, Ed25519Priv
         json={
             "key_algorithm": "ed25519",
             "public_key": _b64u(public),
-            "signature": _b64u(key.sign(encode_browser_registration_transcript(user_id, public))),
+            "signature": _b64u(key.sign(encode_browser_registration_transcript(user_id, public, is_root=False))),
         },
         headers=auth,
     )
