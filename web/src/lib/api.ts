@@ -664,8 +664,14 @@ export const trust = {
       schema: TrustBundleSchema,
     }),
   /** Abandon the sealed bundle (removing the last passkey). Forgets recovery
-   * material only — never grants or restores anything. */
-  deleteBundle: () => api<void>("/api/trust/bundle", { method: "DELETE" }),
+   * material only — never grants or restores anything. `expectedRevision` must
+   * be the revision the bundle was read at: the server 409s a mismatch, so a
+   * delete racing another device's enrollment (its putBundle landed, its
+   * addPasskey had not yet) cannot strand that credential without its bundle. */
+  deleteBundle: (expectedRevision: number) =>
+    api<void>(`/api/trust/bundle?expected_revision=${encodeURIComponent(expectedRevision)}`, {
+      method: "DELETE",
+    }),
   listPasskeys: () =>
     api("/api/trust/passkeys", {
       method: "GET",
