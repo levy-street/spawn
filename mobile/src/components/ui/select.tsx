@@ -1,12 +1,19 @@
 import { type ReactNode, useState } from "react";
 import {
   Pressable,
+  type PressableProps,
   ScrollView,
   type StyleProp,
   StyleSheet,
   View,
   type ViewStyle,
 } from "react-native";
+import Animated, {
+  ReduceMotion,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
 import { ActionSheet, type ActionSheetAction } from "@/components/ui/action-sheet";
 import { Icon } from "@/components/ui/icon";
 import { Sheet, SheetHeader } from "@/components/ui/sheet";
@@ -38,7 +45,10 @@ export interface SelectProps<Value extends string = string> {
   placeholder: string;
   renderOption?: (option: SelectOption<Value>, state: SelectRenderState) => ReactNode;
   disabled?: boolean;
+  error?: boolean;
   accessibilityLabel?: string;
+  onBlur?: PressableProps["onBlur"];
+  onFocus?: PressableProps["onFocus"];
   style?: StyleProp<ViewStyle>;
   testID?: string;
 }
@@ -50,14 +60,34 @@ export function Select<Value extends string>({
   placeholder,
   renderOption,
   disabled = false,
+  error = false,
   accessibilityLabel,
+  onBlur,
+  onFocus,
   style,
   testID,
 }: SelectProps<Value>) {
   const theme = useTheme();
+  const focusProgress = useSharedValue(0);
   const [visible, setVisible] = useState(false);
   const selectedOption = options.find((option) => option.value === value);
   const usesActionSheet = options.length <= ACTION_SHEET_OPTION_LIMIT && renderOption === undefined;
+
+  const animatedHaloStyle = useAnimatedStyle(
+    () => ({
+      borderColor: error ? theme.colors.destructive : theme.colors.ring,
+      opacity: focusProgress.value,
+    }),
+    [error, theme.colors.destructive, theme.colors.ring],
+  );
+
+  const animateFocus = (focused: boolean) => {
+    focusProgress.value = withTiming(focused ? 1 : 0, {
+      duration: theme.motion.duration.base,
+      easing: theme.motion.easing.inOut,
+      reduceMotion: ReduceMotion.System,
+    });
+  };
 
   const choose = (option: SelectOption<Value>) => {
     if (option.disabled === true) return;
@@ -86,7 +116,16 @@ export function Select<Value extends string>({
         accessibilityLabel={accessibilityLabel}
         accessibilityState={{ disabled, expanded: visible }}
         accessibilityValue={{ text: selectedOption?.label ?? placeholder }}
+        aria-invalid={error || undefined}
         disabled={disabled}
+        onBlur={(event) => {
+          animateFocus(false);
+          onBlur?.(event);
+        }}
+        onFocus={(event) => {
+          animateFocus(true);
+          onFocus?.(event);
+        }}
         onPress={() => setVisible(true)}
         style={[styles.touchTarget, disabled && styles.disabled, style]}
         testID={testID}
@@ -96,11 +135,16 @@ export function Select<Value extends string>({
             style={[
               styles.control,
               {
-                backgroundColor: pressed ? theme.colors.accent : theme.colors.background,
-                borderColor: theme.colors.input,
+                backgroundColor: pressed ? theme.colors.accent : "transparent",
+                borderColor: error ? theme.colors.destructive : theme.colors.input,
               },
             ]}
           >
+            <Animated.View
+              pointerEvents="none"
+              style={[styles.focusHalo, animatedHaloStyle]}
+              testID={testID === undefined ? undefined : `${testID}-focus-halo`}
+            />
             <Text
               color={selectedOption === undefined ? "mutedForeground" : "foreground"}
               numberOfLines={1}
@@ -194,8 +238,18 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
     borderWidth: borderWidth.hairline,
     flexDirection: "row",
-    height: spacing[10],
+    height: chrome.touchTarget,
     paddingHorizontal: spacing[3],
+    position: "relative",
+  },
+  focusHalo: {
+    borderRadius: radii.md,
+    borderWidth: borderWidth.hairline,
+    bottom: -borderWidth.hairline,
+    left: -borderWidth.hairline,
+    position: "absolute",
+    right: -borderWidth.hairline,
+    top: -borderWidth.hairline,
   },
   value: {
     ...typeStyles.uiSm,

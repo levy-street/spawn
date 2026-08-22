@@ -64,7 +64,7 @@ export function StatusDot({
 }: StatusDotProps) {
   const theme = useTheme();
   const reduceMotion = useReducedMotionPreference();
-  const shouldPulse = pulse ?? tone === "active";
+  const shouldPulse = pulse ?? false;
   const pulseScale = useSharedValue<number>(1);
   const pulseOpacity = useSharedValue<number>(opacity.pulse);
   const toneColor = theme.colors[TONE_COLOR[tone]];

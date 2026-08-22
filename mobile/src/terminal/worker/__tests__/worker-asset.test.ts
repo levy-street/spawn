@@ -8,6 +8,12 @@ describe("offline terminal worker", () => {
     expect(TERMINAL_WORKER_HTML).not.toMatch(/<link[^>]+href=/i);
   });
 
+  test("forwards xterm links through the native bridge", () => {
+    expect(TERMINAL_WORKER_HTML).toContain(
+      'new WebLinksAddon.WebLinksAddon((_event, uri) => api.post({ type: "link", url: uri }))',
+    );
+  });
+
   test("contains exact xterm parity configuration and addons", () => {
     expect(TERMINAL_WORKER_HTML).toContain("scrollback: 100_000");
     expect(TERMINAL_WORKER_HTML).toContain("lineHeight: 1.2");

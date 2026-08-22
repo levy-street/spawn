@@ -9,7 +9,6 @@ import {
   type ViewStyle,
 } from "react-native";
 import Animated, {
-  interpolateColor,
   ReduceMotion,
   useAnimatedStyle,
   useSharedValue,
@@ -146,6 +145,7 @@ export interface InputProps extends Omit<TextInputProps, "style"> {
   nextRef?: RefObject<TextInput | null>;
   leading?: ReactNode;
   trailing?: ReactNode;
+  showFocusHalo?: boolean;
   containerStyle?: StyleProp<ViewStyle>;
   style?: StyleProp<TextStyle>;
 }
@@ -157,6 +157,7 @@ export const Input = forwardRef<TextInput, InputProps>(function Input(
     nextRef,
     leading,
     trailing,
+    showFocusHalo = true,
     containerStyle,
     style,
     editable = true,
@@ -173,6 +174,7 @@ export const Input = forwardRef<TextInput, InputProps>(function Input(
     onBlur,
     onSubmitEditing,
     accessibilityState,
+    testID,
     ...props
   },
   ref,
@@ -184,13 +186,12 @@ export const Input = forwardRef<TextInput, InputProps>(function Input(
   const isPasswordPurpose = purpose === "password" || purpose === "newPassword";
   const purposeSecureEntry = secureTextEntry ?? config.secureTextEntry;
 
-  const animatedBorderStyle = useAnimatedStyle(
+  const animatedHaloStyle = useAnimatedStyle(
     () => ({
-      borderColor: error
-        ? theme.colors.destructive
-        : interpolateColor(focusProgress.value, [0, 1], [theme.colors.input, theme.colors.ring]),
+      borderColor: error ? theme.colors.destructive : theme.colors.ring,
+      opacity: showFocusHalo ? focusProgress.value : opacity.hidden,
     }),
-    [error, theme.colors.destructive, theme.colors.input, theme.colors.ring],
+    [error, showFocusHalo, theme.colors.destructive, theme.colors.ring],
   );
 
   const animateFocus = (focused: boolean) => {
@@ -211,14 +212,25 @@ export const Input = forwardRef<TextInput, InputProps>(function Input(
 
   return (
     <Animated.View
-      style={[styles.container, animatedBorderStyle, !editable && styles.disabled, containerStyle]}
+      style={[
+        styles.container,
+        { borderColor: error ? theme.colors.destructive : theme.colors.input },
+        !editable && styles.disabled,
+        containerStyle,
+      ]}
     >
+      <Animated.View
+        pointerEvents="none"
+        style={[styles.focusHalo, animatedHaloStyle]}
+        testID={testID === undefined ? undefined : `${testID}-focus-halo`}
+      />
       {leading !== undefined ? (
         <Animated.View style={styles.leading}>{leading}</Animated.View>
       ) : null}
       <TextInput
         {...props}
         ref={ref}
+        testID={testID}
         editable={editable}
         autoCapitalize={autoCapitalize ?? config.autoCapitalize}
         autoCorrect={autoCorrect ?? config.autoCorrect}
@@ -242,7 +254,7 @@ export const Input = forwardRef<TextInput, InputProps>(function Input(
         accessibilityState={{ ...accessibilityState, disabled: !editable }}
         aria-invalid={error || undefined}
         placeholderTextColor={props.placeholderTextColor ?? theme.colors.mutedForeground}
-        selectionColor={props.selectionColor ?? theme.colors.ring}
+        selectionColor={props.selectionColor ?? theme.colors.brandAccent}
         style={[
           styles.input,
           leading !== undefined && styles.inputWithLeading,
@@ -279,8 +291,18 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
     borderWidth: borderWidth.hairline,
     flexDirection: "row",
-    height: spacing[10],
+    height: chrome.touchTarget,
+    position: "relative",
     width: "100%",
+  },
+  focusHalo: {
+    borderRadius: radii.md,
+    borderWidth: borderWidth.hairline,
+    bottom: -borderWidth.hairline,
+    left: -borderWidth.hairline,
+    position: "absolute",
+    right: -borderWidth.hairline,
+    top: -borderWidth.hairline,
   },
   disabled: {
     opacity: opacity.disabled,
@@ -290,7 +312,7 @@ const styles = StyleSheet.create({
     flex: 1,
     height: "100%",
     paddingHorizontal: spacing[3],
-    paddingVertical: spacing[2],
+    paddingVertical: spacing[2.5],
   },
   inputWithLeading: {
     paddingLeft: spacing[1],

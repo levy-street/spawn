@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
-import SettingsIndexRoute from "@/app/(tabs)/settings/index";
+import SettingsIndexRoute from "@/app/(drawer)/settings/index";
 import { ServerPanel, testServerConnection } from "@/components/settings/server-panel";
 import { authToken } from "@/data/api/auth-token";
 import { getBaseUrlResolution, setBaseUrl } from "@/data/api/config";
@@ -159,9 +159,9 @@ describe("Settings connectivity routes", () => {
     const screen = await render(<SettingsIndexRoute />, { wrapper });
 
     await fireEvent.press(screen.getByTestId("settings-panel-server"));
-    expect(mockPush).toHaveBeenLastCalledWith("/(tabs)/settings/server");
+    expect(mockPush).toHaveBeenLastCalledWith("/settings/server");
 
     await fireEvent.press(screen.getByTestId("settings-panel-about"));
-    expect(mockPush).toHaveBeenLastCalledWith("/(tabs)/settings/about");
+    expect(mockPush).toHaveBeenLastCalledWith("/settings/about");
   });
 });

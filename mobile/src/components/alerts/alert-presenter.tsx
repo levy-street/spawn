@@ -10,10 +10,11 @@ import {
   planAlertDelivery,
   selectPendingStoredAlerts,
 } from "@/components/alerts/alert-delivery";
-import { Icon, type IconName } from "@/components/ui/icon";
 import { useToast } from "@/components/ui/toast";
+import { AgentIcon } from "@/components/workspace-detail/agent-icon";
 import { getAlertQueryContext, refreshAlertSession } from "@/data/queries/alerts";
 import type { AlertEvent } from "@/data/realtime/alert-socket";
+import { identifyAgent } from "@/data/selectors/agent";
 import { alertEventKey, useAlertStore } from "@/data/stores/alerts";
 import { haptics } from "@/lib/haptics";
 import {
@@ -29,19 +30,6 @@ import {
 export interface AlertPresenterProps {
   currentSessionId?: string | null;
   onOpenSession?: (sessionId: string) => void;
-}
-
-function alertIcon(event: AlertEvent): React.JSX.Element {
-  const values: Record<
-    AlertEvent["event"],
-    { name: IconName; color: "success" | "warning" | "destructive" }
-  > = {
-    "agent.finished": { name: "BellRing", color: "success" },
-    "agent.awaiting_input": { name: "MessageCircleQuestion", color: "warning" },
-    "session.died": { name: "Skull", color: "destructive" },
-  };
-  const value = values[event.event];
-  return <Icon color={value.color} name={value.name} />;
 }
 
 function fireAlertHaptic(feedback: AlertHaptic): void {
@@ -136,6 +124,10 @@ export function AlertPresenter({
             claimed: false,
           });
       const context = getAlertQueryContext(queryClient, alert);
+      const identity = identifyAgent(
+        alert.command ?? context.session?.foreground_command ?? null,
+        context.agents,
+      );
       const title = alertTitle(alert, context.agents);
       const body = alertBody(alert, {
         ...(context.session ? { session: context.session } : {}),
@@ -146,7 +138,7 @@ export function AlertPresenter({
       if (plan.toast) {
         toast.show(title, {
           detail: body,
-          icon: alertIcon(alert),
+          icon: <AgentIcon identity={identity} />,
           onPress: () => openSession(alert.session_id),
           actionLabel: `Go to ${title}`,
         });

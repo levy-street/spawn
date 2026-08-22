@@ -12,7 +12,7 @@ import { readingOrder } from "@/data/layout/mobile-order";
 import type { AgentDef, Host, Session, TransportState } from "@/data/types/domain";
 import { isFilesWidget, type Tile, type WorkspaceTab } from "@/data/types/layout";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, useTheme } from "@/theme";
+import { borderWidth, chrome, spacing, specialSpace, useTheme } from "@/theme";
 
 export interface PaneListProps {
   tab: WorkspaceTab;
@@ -45,7 +45,6 @@ export const PaneList = memo(function PaneList({
   onMovePane,
   onRemovePane,
 }: PaneListProps) {
-  const theme = useTheme();
   const tiles = useMemo(() => readingOrder(tab), [tab]);
 
   const renderItem = useCallback(
@@ -101,9 +100,9 @@ export const PaneList = memo(function PaneList({
 
   return (
     <FlashList
-      contentContainerStyle={{ padding: theme.space(3) }}
+      contentContainerStyle={{ padding: specialSpace.paneHalfGap }}
       data={tiles}
-      ItemSeparatorComponent={() => <View style={{ height: theme.space(2) }} />}
+      ItemSeparatorComponent={PaneSeparator}
       keyExtractor={(tile) => tile.session_id}
       ListEmptyComponent={
         <EmptyState
@@ -119,7 +118,7 @@ export const PaneList = memo(function PaneList({
       }
       ListFooterComponent={
         tiles.length > 0 ? (
-          <View style={[styles.footer, { paddingTop: theme.space(3) }]}>
+          <View style={styles.footer}>
             <Button disabled={!canAddPane} onPress={onAddPane} size="sm" variant="outline">
               <Icon name="Plus" />
               Add
@@ -133,6 +132,10 @@ export const PaneList = memo(function PaneList({
     />
   );
 });
+
+function PaneSeparator() {
+  return <View style={styles.separator} />;
+}
 
 function MissingPaneRow({ paneId, onActions }: { paneId: string; onActions: () => void }) {
   const theme = useTheme();
@@ -149,13 +152,13 @@ function MissingPaneRow({ paneId, onActions }: { paneId: string; onActions: () =
         styles.missing,
         {
           backgroundColor: theme.colors.card,
-          borderColor: theme.colors.border,
-          borderRadius: theme.radii.lg,
+          borderColor: theme.colors.paneDivider,
+          borderRadius: theme.radii.md,
           borderWidth: borderWidth.hairline,
-          gap: theme.space(3),
-          minHeight: theme.space(18),
-          paddingHorizontal: theme.space(3),
-          paddingVertical: theme.space(2.5),
+          gap: spacing[3],
+          minHeight: spacing[14],
+          paddingHorizontal: spacing[3],
+          paddingVertical: spacing[2],
         },
       ]}
       testID={`missing-row-${paneId}`}
@@ -175,6 +178,7 @@ function MissingPaneRow({ paneId, onActions }: { paneId: string; onActions: () =
 const styles = StyleSheet.create({
   footer: {
     alignItems: "center",
+    paddingTop: chrome.paneGap,
   },
   missing: {
     alignItems: "center",
@@ -184,5 +188,8 @@ const styles = StyleSheet.create({
   missingCopy: {
     flex: 1,
     minWidth: 0,
+  },
+  separator: {
+    height: chrome.paneGap,
   },
 });

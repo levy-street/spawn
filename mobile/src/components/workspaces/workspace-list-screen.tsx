@@ -1,7 +1,7 @@
 import { FlashList, type ListRenderItem } from "@shopify/flash-list";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type Href, useRouter } from "expo-router";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -75,6 +75,7 @@ export function WorkspaceListScreen() {
   const [createVisible, setCreateVisible] = useState(false);
   const [renameTarget, setRenameTarget] = useState<WorkspaceOut | null>(null);
   const [iconTarget, setIconTarget] = useState<WorkspaceOut | null>(null);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
 
   const operationMutation = useMutation({
     mutationFn: async (input: WorkspaceOperationInput): Promise<WorkspaceOperationResult> => {
@@ -225,14 +226,24 @@ export function WorkspaceListScreen() {
     />
   );
 
-  const refresh = async () => {
-    await Promise.all([
-      workspacesQuery.refetch(),
-      archivedQuery.refetch(),
-      sessionsQuery.refetch(),
-      templatesQuery.refetch(),
-    ]);
-  };
+  const refreshWorkspaces = workspacesQuery.refetch;
+  const refreshArchived = archivedQuery.refetch;
+  const refreshSessions = sessionsQuery.refetch;
+  const refreshTemplates = templatesQuery.refetch;
+  const refresh = useCallback(async () => {
+    if (manualRefreshing) return;
+    setManualRefreshing(true);
+    try {
+      await Promise.all([
+        refreshWorkspaces(),
+        refreshArchived(),
+        refreshSessions(),
+        refreshTemplates(),
+      ]);
+    } finally {
+      setManualRefreshing(false);
+    }
+  }, [manualRefreshing, refreshArchived, refreshSessions, refreshTemplates, refreshWorkspaces]);
 
   if (workspacesQuery.isLoading) {
     return (
@@ -286,7 +297,9 @@ export function WorkspaceListScreen() {
         </View>
       ) : null}
       <FlashList
+        contentContainerStyle={styles.listContent}
         data={rows}
+        ItemSeparatorComponent={WorkspaceRowSeparator}
         keyExtractor={(item) => item.workspace.id}
         ListEmptyComponent={
           <WorkspaceListEmpty onCreate={() => setCreateVisible(true)} query={query} />
@@ -298,7 +311,7 @@ export function WorkspaceListScreen() {
           />
         }
         onRefresh={() => void refresh()}
-        refreshing={workspacesQuery.isRefetching || sessionsQuery.isRefetching}
+        refreshing={manualRefreshing}
         renderItem={renderItem}
         testID="workspace-list"
       />
@@ -388,4 +401,8 @@ export function WorkspaceListScreen() {
       />
     </SafeAreaView>
   );
+}
+
+function WorkspaceRowSeparator() {
+  return <View style={styles.rowSeparator} />;
 }

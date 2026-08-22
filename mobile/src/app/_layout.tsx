@@ -92,9 +92,7 @@ function RootNavigator(): React.JSX.Element {
           <Stack.Screen name="index" />
           <Stack.Screen name="(auth)" />
           <Stack.Screen name="onboarding" />
-          <Stack.Screen name="(tabs)" />
-          <Stack.Screen name="workspace/[id]" />
-          <Stack.Screen name="host/[id]" />
+          <Stack.Screen name="(drawer)" />
           <Stack.Screen name="terminal/[sessionId]" options={TERMINAL_ROUTE_OPTIONS} />
         </Stack>
       </AuthGate>

@@ -21,7 +21,7 @@ export function HostsPanel(): React.JSX.Element {
           hint="View details, rename, remove, and manage agent installs."
           icon="Server"
           label="Open Hosts"
-          onPress={() => router.push("/(tabs)/hosts")}
+          onPress={() => router.push("/hosts")}
         />
         <SettingsLinkRow
           hint="Approve a daemon using its eight-character code."

@@ -10,7 +10,7 @@ import { WorkspaceIcon } from "@/components/workspaces/workspace-icon";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import type { WorkspaceStats } from "@/data/types/domain";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
+import { chrome, opacity, spacing, useTheme } from "@/theme";
 
 export interface WorkspaceRowProps {
   workspace: WorkspaceOut;
@@ -163,55 +163,69 @@ export function WorkspaceRow({
             setMenuVisible(true);
           }}
           onPress={onOpen}
-          style={({ pressed }) => [
-            styles.row,
+          style={[
+            styles.touchRow,
             {
-              backgroundColor: pressed ? theme.colors.accent : theme.colors.background,
-              borderBottomColor: theme.colors.border,
               opacity: busy ? opacity.disabled : opacity.opaque,
             },
           ]}
+          testID={`workspace-row-touch-${workspace.id}`}
         >
-          <WorkspaceIcon icon={workspace.icon} name={workspace.name} size={spacing[11]} />
-          <View style={styles.copy}>
-            <Text numberOfLines={1} variant="title">
-              {workspace.name}
-            </Text>
-            <Text color="mutedForeground" numberOfLines={1} variant="caption">
-              {rollup}
-            </Text>
-          </View>
-          {stats.attention > 0 ? (
-            <View style={styles.attention}>
-              <StatusDot
-                accessibilityLabel={`${stats.attention} need attention`}
-                pulse={false}
-                tone="waiting"
-              />
-              <Text color="mutedForeground" variant="micro">
-                {stats.attention}
-              </Text>
+          {({ pressed }) => (
+            <View
+              style={[
+                styles.visualRow,
+                {
+                  backgroundColor: pressed ? theme.colors.accent : theme.colors.background,
+                  borderRadius: theme.radii.lg,
+                },
+              ]}
+              testID={`workspace-row-visual-${workspace.id}`}
+            >
+              <View style={styles.iconSlot}>
+                <WorkspaceIcon icon={workspace.icon} name={workspace.name} size={spacing[6]} />
+              </View>
+              <View style={styles.copy}>
+                <Text numberOfLines={1} variant="label">
+                  {workspace.name}
+                </Text>
+                <Text color="mutedForeground" numberOfLines={1} variant="caption">
+                  {rollup}
+                </Text>
+              </View>
+              {stats.attention > 0 ? (
+                <View style={styles.attention}>
+                  <StatusDot
+                    accessibilityLabel={`${stats.attention} need attention`}
+                    pulse={false}
+                    tone="waiting"
+                  />
+                  <Text color="mutedForeground" variant="micro">
+                    {stats.attention}
+                  </Text>
+                </View>
+              ) : null}
+              <Pressable
+                accessibilityLabel={`${workspace.name} actions`}
+                accessibilityRole="button"
+                disabled={busy}
+                hitSlop={spacing[1]}
+                onPress={(event) => {
+                  event.stopPropagation();
+                  setMenuVisible(true);
+                }}
+                style={({ pressed: actionsPressed }) => [
+                  styles.more,
+                  {
+                    backgroundColor: actionsPressed ? theme.colors.accent : "transparent",
+                    borderRadius: theme.radii.md,
+                  },
+                ]}
+              >
+                <Icon color="mutedForeground" name="MoreHorizontal" size={spacing[4]} />
+              </Pressable>
             </View>
-          ) : null}
-          <Pressable
-            accessibilityLabel={`${workspace.name} actions`}
-            accessibilityRole="button"
-            disabled={busy}
-            onPress={(event) => {
-              event.stopPropagation();
-              setMenuVisible(true);
-            }}
-            style={({ pressed }) => [
-              styles.more,
-              {
-                backgroundColor: pressed ? theme.colors.accent : "transparent",
-                borderRadius: theme.radii.md,
-              },
-            ]}
-          >
-            <Icon color="mutedForeground" name="MoreHorizontal" size={spacing[4]} />
-          </Pressable>
-          <Icon color="mutedForeground" name="ChevronRight" size={spacing[4]} />
+          )}
         </Pressable>
       </SwipeableRow>
       <Menu
@@ -234,22 +248,29 @@ const styles = StyleSheet.create({
   },
   copy: {
     flex: 1,
-    gap: spacing[1],
     minWidth: 0,
+  },
+  iconSlot: {
+    alignItems: "center",
+    height: spacing[9],
+    justifyContent: "center",
+    width: spacing[9],
   },
   more: {
     alignItems: "center",
+    height: spacing[9],
+    justifyContent: "center",
+    width: spacing[9],
+  },
+  touchRow: {
     height: chrome.touchTarget,
     justifyContent: "center",
-    width: chrome.touchTarget,
   },
-  row: {
+  visualRow: {
     alignItems: "center",
-    borderBottomWidth: borderWidth.hairline,
     flexDirection: "row",
-    gap: spacing[3],
-    minHeight: spacing[16] + spacing[2],
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[3],
+    gap: spacing[2],
+    height: chrome.rowHeight,
+    paddingRight: spacing[1],
   },
 });

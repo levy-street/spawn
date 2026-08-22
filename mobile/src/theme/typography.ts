@@ -88,6 +88,16 @@ export const typeStyles = {
   uiSmMedium: { fontSize: 14, lineHeight: 20, fontWeight: "500" },
   uiSmSemibold: { fontSize: 14, lineHeight: 20, fontWeight: "600" },
   uiBase: { fontSize: 16, lineHeight: 24, fontWeight: "400" },
+  uiLg: {
+    fontSize: fontSize.lg,
+    lineHeight: lineHeight.lg,
+    fontWeight: fontWeight.normal,
+  },
+  uiXl: {
+    fontSize: fontSize.xl,
+    lineHeight: lineHeight.lg,
+    fontWeight: fontWeight.normal,
+  },
   cardTitle: { fontSize: 16, lineHeight: 20, fontWeight: "600", letterSpacing: 0 },
   micro: { fontSize: 11, lineHeight: 16, fontWeight: "500" },
   sigilLabel: {
@@ -105,6 +115,18 @@ export const typeStyles = {
     fontWeight: "500",
     letterSpacing: 1.2,
     textTransform: "uppercase",
+  },
+  grimoireBody: {
+    fontFamily: fontFamily.grimoireRegular,
+    fontSize: fontSize.fifteen,
+    lineHeight: lineHeight.base,
+    fontWeight: fontWeight.normal,
+  },
+  grimoireBodyLoose: {
+    fontFamily: fontFamily.grimoireRegular,
+    fontSize: fontSize.fifteen,
+    lineHeight: lineHeight.lg,
+    fontWeight: fontWeight.normal,
   },
   terminal: {
     fontFamily: fontFamily.mono,

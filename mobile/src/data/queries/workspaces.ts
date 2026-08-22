@@ -114,6 +114,7 @@ export function useWorkspaceSessionsQuery() {
     queryKey: qk.sessions(),
     queryFn: () => listSessions(),
     refetchInterval: SESSION_POLL_MS,
+    refetchIntervalInBackground: false,
   });
 }
 

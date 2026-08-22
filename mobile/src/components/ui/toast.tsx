@@ -23,7 +23,7 @@ import { Icon } from "@/components/ui/icon";
 import { useReducedMotionPreference } from "@/components/ui/swipe-dismiss-overlay";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { alpha, borderWidth, chrome, layer, shadow, useTheme } from "@/theme";
+import { alpha, borderWidth, chrome, layer, shadow, spacing, useTheme } from "@/theme";
 
 const MAX_VISIBLE_TOASTS = 5;
 const TOAST_SWIPE_THRESHOLD_RATIO = 0.3;
@@ -261,15 +261,13 @@ export function Toast({ toast, onDismiss }: ToastProps): React.JSX.Element {
         <Pressable
           accessibilityLabel="Dismiss notification"
           accessibilityRole="button"
+          hitSlop={theme.space(3)}
           onPress={dismiss}
           style={({ pressed }) => [
             styles.dismiss,
             {
               backgroundColor: pressed ? theme.colors.accent : "transparent",
               borderRadius: theme.radii.sm,
-              marginBottom: -theme.space(2.5),
-              marginRight: -theme.space(3),
-              marginTop: -theme.space(2.5),
             },
           ]}
         >
@@ -422,9 +420,9 @@ export function useToast(): ToastApi {
 const styles = StyleSheet.create({
   dismiss: {
     alignItems: "center",
-    height: chrome.touchTarget,
+    height: spacing[5],
     justifyContent: "center",
-    width: chrome.touchTarget,
+    width: spacing[5],
   },
   host: {
     position: "absolute",

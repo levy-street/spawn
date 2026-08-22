@@ -1,6 +1,6 @@
 import { act, render } from "@testing-library/react-native";
 
-import WorkspaceDetailRoute from "@/app/workspace/[id]";
+import WorkspaceDetailRoute from "@/app/(drawer)/workspace/[id]";
 import type { WorkspaceDetailProps } from "@/components/workspace-detail/workspace-detail";
 
 const mockPush = jest.fn();

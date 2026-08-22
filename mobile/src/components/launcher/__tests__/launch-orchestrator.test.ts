@@ -47,15 +47,23 @@ describe("two-stage launch orchestration", () => {
         return { sessionId, command, createdAt: 1, expiresAt: 2 };
       },
     });
+    const patchWorkspace = jest.fn<
+      ReturnType<LaunchDependencies["patchWorkspace"]>,
+      Parameters<LaunchDependencies["patchWorkspace"]>
+    >(async (_id, patch) => {
+      events.push("patch");
+      return { ...makeWorkspace(), layout: patch.layout };
+    });
+    const createSession = jest.fn<
+      ReturnType<LaunchDependencies["createSession"]>,
+      Parameters<LaunchDependencies["createSession"]>
+    >(async (input) => {
+      events.push(`create:${input.host_id}:${input.cwd}`);
+      return session;
+    });
     const dependencies = makeDependencies({
-      patchWorkspace: async (_id, patch) => {
-        events.push("patch");
-        return { ...makeWorkspace(), layout: patch.layout };
-      },
-      createSession: async (input) => {
-        events.push(`create:${input.host_id}:${input.cwd}`);
-        return session;
-      },
+      patchWorkspace,
+      createSession,
       pending,
     });
     const orchestrator = createLaunchOrchestrator(dependencies);
@@ -74,6 +82,18 @@ describe("two-stage launch orchestration", () => {
       `create:${makeHost().id}:/Users/ada/spawn`,
       `persist:${session.id}`,
     ]);
+    expect(patchWorkspace).toHaveBeenCalledWith(
+      makeWorkspace().id,
+      expect.objectContaining({
+        layout: expect.objectContaining({ active_tab: "tab-1" }),
+      }),
+    );
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspace_id: makeWorkspace().id,
+        tile: expect.objectContaining({ x: 0, y: 0 }),
+      }),
+    );
     expect(savedCommand).toBe("codex --dangerously-bypass-approvals-and-sandbox");
   });
 

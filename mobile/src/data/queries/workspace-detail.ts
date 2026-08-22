@@ -45,6 +45,7 @@ export function useWorkspaceDetail(workspaceId: string) {
     queryFn: () => listSessions(),
     enabled,
     refetchInterval: 5_000,
+    refetchIntervalInBackground: false,
   });
   const hosts = useQuery({ queryKey: qk.hosts(), queryFn: listHosts, enabled });
   const agents = useQuery({ queryKey: qk.agents(), queryFn: listAgents, enabled });

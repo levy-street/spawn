@@ -81,7 +81,7 @@ export function ProfileScreen(): React.JSX.Element {
         </View>
       </View>
 
-      <Button onPress={() => router.push("/(tabs)/settings/account")} variant="outline">
+      <Button onPress={() => router.push("/settings/account")} variant="outline">
         Account settings
       </Button>
 

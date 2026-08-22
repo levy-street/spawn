@@ -8,7 +8,7 @@ import {
   StyleSheet,
   type ViewStyle,
 } from "react-native";
-import WebView, { type WebViewMessageEvent, type WebViewNavigation } from "react-native-webview";
+import WebView, { type WebViewMessageEvent } from "react-native-webview";
 import {
   BridgeProtocolError,
   TERMINAL_BRIDGE_VERSION,
@@ -23,6 +23,7 @@ import type {
   TransportState,
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
+import { isWorkerBootstrapNavigation, WORKER_BASE_URL } from "@/terminal/worker/navigation-policy";
 import { TERMINAL_WORKER_HTML } from "@/terminal/worker/worker-html";
 import { useTheme } from "@/theme";
 import terminalWorkerAsset from "../../assets/terminal/worker.html";
@@ -30,7 +31,6 @@ import terminalWorkerAsset from "../../assets/terminal/worker.html";
 // Switch this to true if inline HTML is not a secure WebRTC context on the target WKWebView.
 // A future third fallback is serving this immutable asset from the spawn HTTPS origin.
 const USE_FILE_WORKER_FALLBACK = false;
-const WORKER_BASE_URL = "https://spawn.local/";
 
 export interface TerminalSurfaceHandle {
   focus(): void;
@@ -58,14 +58,6 @@ export interface TerminalSurfaceProps extends Omit<SessionTransportOptions, "bri
 interface SelectionWaiter {
   resolve(value: string | null): void;
   timer: ReturnType<typeof setTimeout>;
-}
-
-function navigationAllowed(request: WebViewNavigation): boolean {
-  return (
-    request.url === "about:blank" ||
-    request.url.startsWith(WORKER_BASE_URL) ||
-    request.url.startsWith("file://")
-  );
 }
 
 export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurfaceProps>(
@@ -351,8 +343,11 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       else retiredForBackground.current = true;
     };
 
-    const source = USE_FILE_WORKER_FALLBACK
-      ? { uri: Image.resolveAssetSource(terminalWorkerAsset).uri }
+    const fileWorkerUrl = USE_FILE_WORKER_FALLBACK
+      ? Image.resolveAssetSource(terminalWorkerAsset).uri
+      : null;
+    const source = fileWorkerUrl
+      ? { uri: fileWorkerUrl }
       : { html: TERMINAL_WORKER_HTML, baseUrl: WORKER_BASE_URL };
 
     return (
@@ -362,7 +357,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
         style={[styles.surface, { backgroundColor: theme.terminal.background }, style]}
         accessibilityLabel="Terminal"
         accessible
-        originWhitelist={["https://spawn.local/*", "file://*"]}
+        originWhitelist={["*"]}
         scrollEnabled={false}
         bounces={false}
         overScrollMode="never"
@@ -371,7 +366,13 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
         textInteractionEnabled={false}
         allowsLinkPreview={false}
         setSupportMultipleWindows={false}
-        onShouldStartLoadWithRequest={navigationAllowed}
+        javaScriptCanOpenWindowsAutomatically={false}
+        onShouldStartLoadWithRequest={(request) =>
+          isWorkerBootstrapNavigation(request, fileWorkerUrl)
+        }
+        onOpenWindow={({ nativeEvent: { targetUrl } }) => {
+          callbacks.current.onLink?.(targetUrl);
+        }}
         onMessage={handleMessage}
         onLoad={handleLoad}
         onLayout={fitAfterLayout}

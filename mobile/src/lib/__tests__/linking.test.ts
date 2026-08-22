@@ -46,7 +46,7 @@ describe("incoming spawn links", () => {
       route: "/host/[id]/files",
       params: { id: HOST_ID, path: "/Users/spawn project" },
     },
-    { input: "/legion", route: "/(tabs)/hosts/legion", params: {} },
+    { input: "/legion", route: "/legion", params: {} },
     { input: "/admin", route: "/admin", params: {} },
     {
       input: `/w/${WORKSPACE_ID}?tab=${TAB_ID}&focus=${SESSION_ID}`,
@@ -60,12 +60,12 @@ describe("incoming spawn links", () => {
     },
     {
       input: "/download",
-      route: "/(tabs)/settings",
+      route: "/settings",
       params: { section: "download" },
     },
     {
       input: "/security",
-      route: "/(tabs)/settings",
+      route: "/settings",
       params: { section: "security" },
     },
   ])("maps $input to $route", ({ input, route, params }) => {
@@ -82,6 +82,14 @@ describe("incoming spawn links", () => {
     expect(resolveIncomingLink(`exp://192.0.2.1:8081/--/sessions/${SESSION_ID}`)?.route).toBe(
       "/terminal/[sessionId]",
     );
+  });
+
+  it("keeps drawer destination links public and route-group independent", () => {
+    expect(resolveIncomingLink("/legion")).toMatchObject({ href: "/legion", route: "/legion" });
+    expect(resolveIncomingLink("/security")).toMatchObject({
+      href: "/settings?section=security",
+      route: "/settings",
+    });
   });
 
   it("rejects malformed credentials, identifiers, steps, paths, and foreign origins", () => {

@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 
 import { Icon, type IconName } from "@/components/ui/icon";
@@ -9,7 +10,8 @@ export interface ChoiceRowProps {
   accessibilityLabel: string;
   detail: string;
   disabled?: boolean;
-  icon: IconName;
+  icon?: IconName;
+  leading?: ReactNode;
   onPress(): void;
   selected: boolean;
   statusTone?: StatusTone;
@@ -21,6 +23,7 @@ export function ChoiceRow({
   detail,
   disabled = false,
   icon,
+  leading,
   onPress,
   selected,
   statusTone,
@@ -48,14 +51,17 @@ export function ChoiceRow({
         },
       ]}
     >
-      <View
-        style={[
-          styles.iconPlate,
-          { backgroundColor: theme.colors.muted, borderRadius: theme.radii.md },
-        ]}
-      >
-        <Icon color="foreground" name={icon} size={spacing[5]} />
-      </View>
+      {leading ??
+        (icon ? (
+          <View
+            style={[
+              styles.iconPlate,
+              { backgroundColor: theme.colors.muted, borderRadius: theme.radii.md },
+            ]}
+          >
+            <Icon color="foreground" name={icon} size={spacing[5]} />
+          </View>
+        ) : null)}
       <View style={styles.copy}>
         <View style={styles.titleRow}>
           {statusTone ? <StatusDot pulse={false} tone={statusTone} /> : null}

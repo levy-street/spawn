@@ -38,7 +38,7 @@ describe("Field", () => {
     expect(controlProps.accessibilityLabelledBy).toBe("email-field-label");
   });
 
-  test("replaces the hint with an error in the same reserved slot", async () => {
+  test("replaces the hint with an error", async () => {
     const initial = await render(
       <Field hint="Helpful hint" label="Name">
         <TextInput />
@@ -46,7 +46,7 @@ describe("Field", () => {
       { wrapper },
     );
 
-    expect(initial.getByTestId("field-helper-slot")).toHaveStyle({ minHeight: 16 });
+    expect(initial.getByTestId("field-helper-slot")).toBeOnTheScreen();
     await initial.rerender(
       <Field error="Name is required." hint="Helpful hint" label="Name">
         <TextInput />
@@ -55,10 +55,10 @@ describe("Field", () => {
 
     expect(initial.queryByText("Helpful hint")).not.toBeOnTheScreen();
     expect(initial.getByText("Name is required.")).toBeOnTheScreen();
-    expect(initial.getByTestId("field-helper-slot")).toHaveStyle({ minHeight: 16 });
+    expect(initial.getByTestId("field-helper-slot")).toBeOnTheScreen();
   });
 
-  test("reserves helper height when neither hint nor error is present", async () => {
+  test("renders no helper row when there is neither hint nor error", async () => {
     const screen = await render(
       <Field label="Name">
         <TextInput />
@@ -66,6 +66,6 @@ describe("Field", () => {
       { wrapper },
     );
 
-    expect(screen.getByTestId("field-helper-slot")).toHaveStyle({ minHeight: 16 });
+    expect(screen.queryByTestId("field-helper-slot")).not.toBeOnTheScreen();
   });
 });

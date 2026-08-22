@@ -1,4 +1,5 @@
-import { render, screen } from "@testing-library/react-native";
+import { act, render, screen } from "@testing-library/react-native";
+import * as Linking from "expo-linking";
 
 import { TerminalOverlay } from "@/components/terminal-ui/terminal-overlay";
 import type { HostOut } from "@/data/api/schemas/hosts";
@@ -8,6 +9,10 @@ import { ThemeProvider } from "@/theme";
 jest.mock("expo-keep-awake", () => ({
   activateKeepAwakeAsync: jest.fn(async () => undefined),
   deactivateKeepAwake: jest.fn(async () => undefined),
+}));
+
+jest.mock("expo-linking", () => ({
+  openURL: jest.fn(async () => undefined),
 }));
 
 jest.mock("@/components/ui/swipe-dismiss-overlay", () => {
@@ -26,6 +31,15 @@ jest.mock("@/components/ui/swipe-dismiss-overlay", () => {
   };
 });
 
+jest.mock("@/components/terminal-ui/full-surface-dismiss", () => {
+  const React = require("react") as typeof import("react");
+  const { View } = require("react-native") as typeof import("react-native");
+  return {
+    FullSurfaceDismiss: ({ children }: React.PropsWithChildren) =>
+      React.createElement(View, { testID: "mock-full-surface-dismiss" }, children),
+  };
+});
+
 jest.mock("@/components/terminal-ui/terminal-header", () => ({ TerminalHeader: () => null }));
 jest.mock("@/components/terminal-ui/modifier-bar", () => ({ ModifierBar: () => null }));
 jest.mock("@/components/terminal-ui/search-bar", () => ({ TerminalSearchBar: () => null }));
@@ -39,20 +53,30 @@ jest.mock("@/components/terminal-ui/connection-status", () => ({
   ConnectionStateOverlay: () => null,
 }));
 jest.mock("@/components/ui/confirm", () => ({ Confirm: () => null }));
+const mockSetNotice = jest.fn();
+
 jest.mock("@/components/terminal-ui/use-terminal-transfers", () => ({
   useTerminalTransfers: () => ({
     notice: null,
-    setNotice: jest.fn(),
+    setNotice: mockSetNotice,
     progressRatio: null,
     paste: jest.fn(async () => undefined),
     uploadFile: jest.fn(async () => undefined),
   }),
 }));
+
+let mockTerminalSurfaceProps: { onLink?: (url: string) => void } = {};
+
 jest.mock("@/terminal/TerminalSurface", () => {
   const React = require("react") as typeof import("react");
   const { View } = require("react-native") as typeof import("react-native");
   return {
-    TerminalSurface: React.forwardRef(() => React.createElement(View, { testID: "terminal" })),
+    TerminalSurface: React.forwardRef(
+      (props: { onLink?: (url: string) => void }, _ref: React.ForwardedRef<unknown>) => {
+        mockTerminalSurfaceProps = props;
+        return React.createElement(View, { testID: "terminal" });
+      },
+    ),
   };
 });
 
@@ -97,7 +121,12 @@ const host: HostOut = {
 };
 
 describe("terminal overlay dismissal", () => {
-  test("only starts drag dismissal from the header region", async () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockTerminalSurfaceProps = {};
+  });
+
+  test("keeps header drag and adds a full-surface horizontal recognizer", async () => {
     await render(
       <ThemeProvider>
         <TerminalOverlay
@@ -112,5 +141,30 @@ describe("terminal overlay dismissal", () => {
       </ThemeProvider>,
     );
     expect(screen.getByTestId("mock-swipe-overlay")).toHaveProp("accessibilityLabel", "header");
+    expect(screen.getByTestId("mock-full-surface-dismiss")).toBeTruthy();
+  });
+
+  test("opens safe terminal links deliberately and rejects unsupported schemes", async () => {
+    await render(
+      <ThemeProvider>
+        <TerminalOverlay
+          focused={false}
+          host={host}
+          onDismiss={jest.fn()}
+          onKill={jest.fn(async () => undefined)}
+          onRename={jest.fn(async () => undefined)}
+          onRestart={jest.fn(async () => undefined)}
+          session={session}
+        />
+      </ThemeProvider>,
+    );
+
+    await act(() => mockTerminalSurfaceProps.onLink?.("https://example.com/docs"));
+    expect(Linking.openURL).toHaveBeenCalledTimes(1);
+    expect(Linking.openURL).toHaveBeenCalledWith("https://example.com/docs");
+
+    await act(() => mockTerminalSurfaceProps.onLink?.("javascript:alert(1)"));
+    expect(Linking.openURL).toHaveBeenCalledTimes(1);
+    expect(mockSetNotice).toHaveBeenCalledWith("The terminal link uses an unsupported URL scheme.");
   });
 });

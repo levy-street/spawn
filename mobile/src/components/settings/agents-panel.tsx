@@ -10,8 +10,10 @@ import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
+import { AgentIcon } from "@/components/workspace-detail/agent-icon";
 import type { AgentOut } from "@/data/api/schemas/agents";
 import { useAgentMutations, useAgentsSettingsQuery } from "@/data/queries/settings";
+import { identifyAgent } from "@/data/selectors/agent";
 import { spacing } from "@/theme";
 
 function hasYoloMode(agent: AgentOut): boolean {
@@ -33,9 +35,11 @@ function AgentRow({
 }): React.JSX.Element {
   const custom = agent.owner_user_id !== null;
   const canYolo = hasYoloMode(agent);
+  const identity = identifyAgent(agent.command, [agent]);
   return (
     <Card variant="flat">
       <View style={styles.row}>
+        <AgentIcon identity={identity} size={spacing[9]} />
         <View style={styles.rowCopy}>
           <View style={styles.titleLine}>
             <Text variant="label">{agent.name}</Text>

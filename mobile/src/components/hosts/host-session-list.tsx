@@ -1,7 +1,7 @@
 import { Pressable, StyleSheet, View } from "react-native";
-import { Monogram } from "@/components/ui/monogram";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
+import { AgentIcon } from "@/components/workspace-detail/agent-icon";
 import type { AgentOut } from "@/data/api/schemas/agents";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import { identifyAgent } from "@/data/selectors/agent";
@@ -53,7 +53,7 @@ export function HostSessionList({ agents, sessions, onOpen }: HostSessionListPro
                   },
                 ]}
               >
-                <Monogram seed={identity.displayName} size={spacing[8]} />
+                <AgentIcon identity={identity} size={spacing[8]} />
                 <View style={styles.copy}>
                   <View style={styles.titleRow}>
                     <Text numberOfLines={1} style={styles.title} variant="label">

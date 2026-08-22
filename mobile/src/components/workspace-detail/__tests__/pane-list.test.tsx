@@ -1,4 +1,5 @@
 import { fireEvent, render } from "@testing-library/react-native";
+import type { StyleProp, ViewStyle } from "react-native";
 import { makeMutable } from "react-native-reanimated";
 
 import { PaneList } from "@/components/workspace-detail/pane-list";
@@ -6,7 +7,7 @@ import { TabStrip } from "@/components/workspace-detail/tab-strip";
 import { canAddTab } from "@/data/layout/tabs";
 import { canAddTile } from "@/data/layout/tiles";
 import type { Tile } from "@/data/types/layout";
-import { ThemeProvider } from "@/theme";
+import { chrome, radii, spacing, specialSpace, ThemeProvider } from "@/theme";
 
 import { makeHost, makeTab } from "./fixtures";
 
@@ -21,6 +22,7 @@ jest.mock("@shopify/flash-list", () => {
     ListEmptyComponent?: React.ReactNode;
     ListFooterComponent?: React.ReactNode;
     ItemSeparatorComponent?: React.ComponentType;
+    contentContainerStyle?: StyleProp<ViewStyle>;
     testID?: string;
   }
 
@@ -32,11 +34,12 @@ jest.mock("@shopify/flash-list", () => {
       ListEmptyComponent,
       ListFooterComponent,
       ItemSeparatorComponent,
+      contentContainerStyle,
       testID,
     }: MockFlashListProps<Item>) =>
       React.createElement(
         View,
-        { testID },
+        { style: contentContainerStyle, testID },
         data.length === 0 ? ListEmptyComponent : null,
         ...data.flatMap((item, index) => [
           React.createElement(
@@ -86,6 +89,15 @@ describe("workspace tab pane lists", () => {
     expect(screen.getByText("Files — dev")).toBeTruthy();
     expect(screen.getByText("office-mac · /Users/spawn/dev")).toBeTruthy();
     expect(screen.getByText("Online")).toBeTruthy();
+    expect(screen.getByTestId("pane-list-main")).toHaveStyle({
+      padding: specialSpace.paneHalfGap,
+    });
+    expect(screen.getByTestId("files-row-files-1")).toHaveStyle({
+      borderRadius: radii.md,
+      minHeight: spacing[14],
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[2],
+    });
     fireEvent.press(screen.getByTestId("files-row-files-1"));
     expect(onOpenFiles).toHaveBeenCalledWith("host-1", "/Users/spawn/dev");
   });
@@ -107,6 +119,12 @@ describe("workspace tab pane lists", () => {
     );
 
     expect(screen.getByTestId("add-tab-button")).toBeDisabled();
+    expect(screen.getByTestId("workspace-tab-tab-1")).toHaveStyle({
+      height: chrome.touchTarget,
+    });
+    expect(screen.getByTestId("workspace-tab-surface-tab-1")).toHaveStyle({
+      height: spacing[8],
+    });
   });
 
   it("disables add-pane at the sixteen-tile ceiling", async () => {

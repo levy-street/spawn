@@ -26,7 +26,7 @@ export const SETTINGS_PANELS = [
     label: "Account",
     description: "Email, verification, sign out, and account deletion",
     icon: "User",
-    route: "/(tabs)/settings/account",
+    route: "/settings/account",
     controls: [
       "Signed in as",
       "Resend verification email",
@@ -43,7 +43,7 @@ export const SETTINGS_PANELS = [
     label: "Appearance",
     description: "Choose how spawn looks on this device",
     icon: "Palette",
-    route: "/(tabs)/settings/appearance",
+    route: "/settings/appearance",
     controls: ["Light", "Dark", "System"],
   },
   {
@@ -51,7 +51,7 @@ export const SETTINGS_PANELS = [
     label: "Notifications",
     description: "Local alerts from the live host stream",
     icon: "Bell",
-    route: "/(tabs)/settings/notifications",
+    route: "/settings/notifications",
     controls: [
       "An agent finishes",
       "An agent is waiting for you",
@@ -68,7 +68,7 @@ export const SETTINGS_PANELS = [
     label: "Hosts",
     description: "Open host settings and connect another machine",
     icon: "Server",
-    route: "/(tabs)/settings/hosts",
+    route: "/settings/hosts",
     controls: ["Open Hosts", "Connect a host"],
   },
   {
@@ -76,7 +76,7 @@ export const SETTINGS_PANELS = [
     label: "Agents",
     description: "Manage account-level command shortcuts",
     icon: "Bot",
-    route: "/(tabs)/settings/agents",
+    route: "/settings/agents",
     controls: [
       "Add agent",
       "Name",
@@ -95,7 +95,7 @@ export const SETTINGS_PANELS = [
     label: "Skills",
     description: "Manage reusable instructions for agents",
     icon: "Wrench",
-    route: "/(tabs)/settings/skills",
+    route: "/settings/skills",
     controls: [
       "Name",
       "Description",
@@ -112,7 +112,7 @@ export const SETTINGS_PANELS = [
     label: "Templates",
     description: "Rename, re-icon, or remove saved workspace layouts",
     icon: "LayoutTemplate",
-    route: "/(tabs)/settings/templates",
+    route: "/settings/templates",
     controls: ["Change icon", "Rename", "Delete template"],
   },
   {
@@ -120,7 +120,7 @@ export const SETTINGS_PANELS = [
     label: "Browser devices",
     description: "Registered device identities and endorsements",
     icon: "MonitorSmartphone",
-    route: "/(tabs)/settings/devices",
+    route: "/settings/devices",
     controls: ["Rename", "Approve…", "Revoke", "Retry registration", "Clear history"],
   },
   {
@@ -128,7 +128,7 @@ export const SETTINGS_PANELS = [
     label: "Device trust",
     description: "This phone's identity, host pins, and saved trust",
     icon: "ShieldCheck",
-    route: "/(tabs)/settings/trust",
+    route: "/settings/trust",
     controls: [
       "Set up a passkey",
       "Unlock saved trust here",

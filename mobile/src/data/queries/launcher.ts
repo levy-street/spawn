@@ -113,6 +113,10 @@ export function useLaunchSession() {
     mutationFn: (request: LaunchRequest) => launcherOrchestrator.launch(request),
     onSuccess: async (result, request) => {
       queryClient.setQueryData<SessionOut>(qk.session(result.session.id), result.session);
+      queryClient.setQueryData<SessionOut[]>(qk.sessions(), (sessions) => [
+        ...(sessions ?? []).filter((session) => session.id !== result.session.id),
+        result.session,
+      ]);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: qk.workspace(request.workspaceId) }),
         queryClient.invalidateQueries({ queryKey: qk.workspaces() }),

@@ -22,7 +22,7 @@
       "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
-        "backgroundColor": "#030303"
+        "backgroundColor": "#E11E15"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": true
@@ -35,10 +35,10 @@
           "image": "./assets/images/splash.png",
           "imageWidth": 200,
           "resizeMode": "contain",
-          "backgroundColor": "#F4F2ED",
+          "backgroundColor": "#000000",
           "dark": {
             "image": "./assets/images/splash.png",
-            "backgroundColor": "#030303"
+            "backgroundColor": "#000000"
           }
         }
       ],

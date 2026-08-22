@@ -1,38 +1,44 @@
-import { render } from "@testing-library/react-native";
+import { fireEvent, render } from "@testing-library/react-native";
 import type { ReactNode } from "react";
 
-interface MockTabsProps {
+interface MockDrawerProps {
   children: ReactNode;
+  screenOptions: (props: { navigation: { dispatch: (action: unknown) => void } }) => {
+    drawerType?: string;
+    headerLeft?: () => ReactNode;
+    swipeEdgeWidth?: number;
+    swipeEnabled?: boolean;
+  };
 }
 
-interface MockTabScreenProps {
+interface MockDrawerScreenProps {
   name: string;
   options: {
-    tabBarAccessibilityLabel?: string;
+    headerShown?: boolean;
     title?: string;
   };
 }
 
-jest.mock("expo-router", () => {
+let capturedDrawerProps: MockDrawerProps | null = null;
+
+jest.mock("expo-router/drawer", () => {
   const { createElement } = require("react");
   const { View } = require("react-native");
-  const Tabs = ({ children }: MockTabsProps) =>
-    createElement(View, { testID: "root-tabs" }, children);
-  Tabs.Screen = ({ name, options }: MockTabScreenProps) =>
+  const Drawer = (props: MockDrawerProps) => {
+    capturedDrawerProps = props;
+    return createElement(View, { testID: "root-drawer" }, props.children);
+  };
+  Drawer.Screen = ({ name, options }: MockDrawerScreenProps) =>
     createElement(View, {
-      accessibilityLabel: options.tabBarAccessibilityLabel,
-      testID: `tab-${name}`,
+      accessibilityLabel: options.title,
+      testID: `drawer-screen-${name}`,
     });
-  return { Tabs };
+  return { Drawer };
 });
 
-jest.mock("@/data/queries/workspaces", () => ({
-  useWorkspaceSessionsQuery: () => ({ data: [] }),
-}));
-
-jest.mock("@/data/queries/alerts", () => ({
-  attentionSummaryFromCounts: () => null,
-  sessionAttentionSummary: () => null,
+jest.mock("expo-router", () => ({
+  usePathname: () => "/workspaces",
+  useRouter: () => ({ navigate: jest.fn(), replace: jest.fn() }),
 }));
 
 jest.mock("expo-splash-screen", () => ({
@@ -45,31 +51,49 @@ jest.mock("expo-font", () => ({
 
 jest.mock("expo-notifications", () => ({}));
 
-jest.mock("expo-font", () => ({
-  useFonts: () => [true, null],
-}));
-
 jest.mock("react-native-keyboard-controller", () => ({
-  KeyboardProvider: ({ children }: MockTabsProps) => children,
+  KeyboardProvider: ({ children }: { children: ReactNode }) => children,
 }));
 
 import { TERMINAL_ROUTE_OPTIONS } from "@/app/_layout";
-import TabsLayout, { ROOT_TABS } from "@/app/(tabs)/_layout";
+import DrawerLayout, { DRAWER_SWIPE_EDGE_WIDTH, ROOT_DRAWER_ROUTES } from "@/app/(drawer)/_layout";
 import { ThemeProvider } from "@/theme";
 
 describe("app navigation shell", () => {
-  it("renders exactly the four native root tabs", async () => {
+  it("renders the drawer destinations without a root Files screen", async () => {
     const screen = await render(
       <ThemeProvider>
-        <TabsLayout />
+        <DrawerLayout />
       </ThemeProvider>,
     );
 
-    expect(ROOT_TABS.map((tab) => tab.name)).toEqual(["workspaces", "hosts", "files", "settings"]);
-    for (const tab of ROOT_TABS) {
-      expect(screen.getByTestId(`tab-${tab.name}`)).toBeTruthy();
-      expect(screen.getByLabelText(`${tab.title} tab`)).toBeTruthy();
+    expect(ROOT_DRAWER_ROUTES).toEqual(["workspaces", "hosts", "legion", "settings"]);
+    for (const route of ROOT_DRAWER_ROUTES) {
+      expect(screen.getByTestId(`drawer-screen-${route}`)).toBeTruthy();
     }
+    expect(screen.queryByTestId("drawer-screen-files")).toBeNull();
+  });
+
+  it("uses a back drawer with a narrow edge swipe", async () => {
+    await render(
+      <ThemeProvider>
+        <DrawerLayout />
+      </ThemeProvider>,
+    );
+
+    expect(capturedDrawerProps).not.toBeNull();
+    const dispatch = jest.fn();
+    const options = capturedDrawerProps?.screenOptions({ navigation: { dispatch } });
+    expect(options).toMatchObject({
+      drawerType: "back",
+      swipeEdgeWidth: DRAWER_SWIPE_EDGE_WIDTH,
+      swipeEnabled: true,
+    });
+    expect(DRAWER_SWIPE_EDGE_WIDTH).toBe(20);
+
+    const header = await render(<ThemeProvider>{options?.headerLeft?.()}</ThemeProvider>);
+    await fireEvent.press(header.getByLabelText("Open navigation menu"));
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: "OPEN_DRAWER" }));
   });
 
   it("configures terminal as a vertically dismissable card", () => {

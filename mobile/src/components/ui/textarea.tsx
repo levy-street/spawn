@@ -9,7 +9,6 @@ import {
   type TextStyle,
 } from "react-native";
 import Animated, {
-  interpolateColor,
   ReduceMotion,
   useAnimatedStyle,
   useSharedValue,
@@ -50,6 +49,7 @@ export const Textarea = forwardRef<TextInput, TextareaProps>(function Textarea(
     onFocus,
     onBlur,
     accessibilityState,
+    testID,
     ...props
   },
   ref,
@@ -64,13 +64,12 @@ export const Textarea = forwardRef<TextInput, TextareaProps>(function Textarea(
     setMeasuredHeight((height) => Math.max(minHeight, Math.min(maxHeight, height)));
   }, [maxHeight, minHeight]);
 
-  const animatedBorderStyle = useAnimatedStyle(
+  const animatedHaloStyle = useAnimatedStyle(
     () => ({
-      borderColor: error
-        ? theme.colors.destructive
-        : interpolateColor(focusProgress.value, [0, 1], [theme.colors.input, theme.colors.ring]),
+      borderColor: error ? theme.colors.destructive : theme.colors.ring,
+      opacity: focusProgress.value,
     }),
-    [error, theme.colors.destructive, theme.colors.input, theme.colors.ring],
+    [error, theme.colors.destructive, theme.colors.ring],
   );
 
   const animateFocus = (focused: boolean) => {
@@ -94,14 +93,20 @@ export const Textarea = forwardRef<TextInput, TextareaProps>(function Textarea(
     <Animated.View
       style={[
         styles.container,
-        animatedBorderStyle,
+        { borderColor: error ? theme.colors.destructive : theme.colors.input },
         !editable && styles.disabled,
         { height: measuredHeight, minHeight, maxHeight },
       ]}
     >
+      <Animated.View
+        pointerEvents="none"
+        style={[styles.focusHalo, animatedHaloStyle]}
+        testID={testID === undefined ? undefined : `${testID}-focus-halo`}
+      />
       <TextInput
         {...props}
         ref={ref}
+        testID={testID}
         multiline
         editable={editable}
         autoCapitalize={autoCapitalize ?? config.autoCapitalize}
@@ -125,7 +130,7 @@ export const Textarea = forwardRef<TextInput, TextareaProps>(function Textarea(
         accessibilityState={{ ...accessibilityState, disabled: !editable }}
         aria-invalid={error || undefined}
         placeholderTextColor={props.placeholderTextColor ?? theme.colors.mutedForeground}
-        selectionColor={props.selectionColor ?? theme.colors.ring}
+        selectionColor={props.selectionColor ?? theme.colors.brandAccent}
         style={[styles.input, { color: theme.colors.foreground }, style]}
       />
     </Animated.View>
@@ -136,8 +141,17 @@ const styles = StyleSheet.create({
   container: {
     borderRadius: radii.md,
     borderWidth: borderWidth.hairline,
-    overflow: "hidden",
+    position: "relative",
     width: "100%",
+  },
+  focusHalo: {
+    borderRadius: radii.md,
+    borderWidth: borderWidth.hairline,
+    bottom: -borderWidth.hairline,
+    left: -borderWidth.hairline,
+    position: "absolute",
+    right: -borderWidth.hairline,
+    top: -borderWidth.hairline,
   },
   disabled: {
     opacity: opacity.disabled,

@@ -1,6 +1,6 @@
 import { type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
 import { Text } from "@/components/ui/text";
-import { fontSize, useTheme } from "@/theme";
+import { borderWidth, fontSize, useTheme } from "@/theme";
 
 const MONOGRAM_PALETTES = [
   { background: "brandAccentSoft", foreground: "brandAccent" },
@@ -16,6 +16,7 @@ export interface MonogramProps {
   size?: number;
   style?: StyleProp<ViewStyle>;
   testID?: string;
+  variant?: "palette" | "neutral";
 }
 
 export function monogramLetter(seed: string): string {
@@ -31,11 +32,19 @@ export function monogramPaletteIndex(seed: string): number {
   return (hash >>> 0) % MONOGRAM_PALETTES.length;
 }
 
-export function Monogram({ accessibilityLabel, seed, size, style, testID }: MonogramProps) {
+export function Monogram({
+  accessibilityLabel,
+  seed,
+  size,
+  style,
+  testID,
+  variant = "palette",
+}: MonogramProps) {
   const theme = useTheme();
   const resolvedSize = size ?? theme.space(7);
   const palette = MONOGRAM_PALETTES[monogramPaletteIndex(seed)] ?? MONOGRAM_PALETTES[0];
   const resolvedFontSize = Math.max(fontSize.ten, Math.round(resolvedSize * 0.45));
+  const neutral = variant === "neutral";
 
   return (
     <View
@@ -44,8 +53,10 @@ export function Monogram({ accessibilityLabel, seed, size, style, testID }: Mono
       style={[
         styles.base,
         {
-          backgroundColor: theme.colors[palette.background],
-          borderRadius: theme.radii.pill,
+          backgroundColor: neutral ? theme.colors.muted : theme.colors[palette.background],
+          borderColor: neutral ? theme.colors.border : "transparent",
+          borderRadius: neutral ? theme.radii.md : theme.radii.pill,
+          borderWidth: neutral ? borderWidth.hairline : borderWidth.none,
           height: resolvedSize,
           width: resolvedSize,
         },
@@ -54,7 +65,7 @@ export function Monogram({ accessibilityLabel, seed, size, style, testID }: Mono
       testID={testID}
     >
       <Text
-        color={palette.foreground}
+        color={neutral ? "mutedForeground" : palette.foreground}
         numberOfLines={1}
         style={{ fontSize: resolvedFontSize, lineHeight: resolvedSize }}
         variant="label"

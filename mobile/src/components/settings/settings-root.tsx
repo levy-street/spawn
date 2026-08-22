@@ -44,7 +44,7 @@ export function SettingsRoot(): React.JSX.Element {
           </View>
           <Button
             accessibilityLabel="Open profile"
-            onPress={() => router.push("/(tabs)/settings/profile")}
+            onPress={() => router.push("/settings/profile")}
             size="sm"
             variant="outline"
           >

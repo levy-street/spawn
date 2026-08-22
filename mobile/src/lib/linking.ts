@@ -17,8 +17,8 @@ export type DeepLinkRoute =
   | "/(auth)/verify-email"
   | "/onboarding"
   | "/onboarding/device"
-  | "/(tabs)/hosts/legion"
-  | "/(tabs)/settings"
+  | "/legion"
+  | "/settings"
   | "/admin"
   | "/host/[id]"
   | "/host/[id]/files"
@@ -160,13 +160,13 @@ export function resolveIncomingLink(input: string): ResolvedDeepLink | null {
     });
   }
   if (path === "/legion") {
-    return result("/(tabs)/hosts/legion", "/hosts/legion", { requiresAuth: true });
+    return result("/legion", "/legion", { requiresAuth: true });
   }
   if (path === "/admin") return result("/admin", "/admin", { requiresAuth: true });
   if (path === "/download" || path === "/security") {
     const section = path.slice(1);
     const params = { section };
-    return result("/(tabs)/settings", withQuery("/settings", params), {
+    return result("/settings", withQuery("/settings", params), {
       params,
       requiresAuth: true,
     });

@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 
 import { TerminalRow } from "@/components/workspace-detail/terminal-row";
 import * as sessionSelectors from "@/data/selectors/session";
-import { ThemeProvider } from "@/theme";
+import { radii, spacing, ThemeProvider } from "@/theme";
 
 import { makeAgent, makeHost, makeSession } from "./fixtures";
 
@@ -120,6 +120,12 @@ describe("TerminalRow", () => {
 
     expect(displayStatus).toHaveBeenCalledWith(session, host, "idle");
     expect(screen.getByText("Composed status")).toBeTruthy();
+    expect(screen.getByTestId(`terminal-row-${session.id}`)).toHaveStyle({
+      borderRadius: radii.md,
+      minHeight: spacing[14],
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[2],
+    });
     displayStatus.mockRestore();
   });
 });

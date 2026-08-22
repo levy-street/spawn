@@ -9,7 +9,7 @@ import { identifyAgent } from "@/data/selectors/agent";
 import { attentionRank, displayStatus, sessionTitle } from "@/data/selectors/session";
 import type { AgentDef, Host, Session, TransportState } from "@/data/types/domain";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, opacity, useTheme } from "@/theme";
+import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
 
 export interface TerminalRowProps {
   session: Session;
@@ -79,7 +79,7 @@ export const TerminalRow = memo(function TerminalRow({
     <SwipeableRow
       contentStyle={{ backgroundColor: theme.colors.card }}
       leadingActions={leadingActions}
-      style={{ borderRadius: theme.radii.lg }}
+      style={{ borderRadius: theme.radii.md }}
       testID={`terminal-swipe-${session.id}`}
       trailingActions={trailingActions}
     >
@@ -100,14 +100,14 @@ export const TerminalRow = memo(function TerminalRow({
           styles.row,
           {
             backgroundColor: pressed ? theme.colors.accent : theme.colors.card,
-            borderColor: theme.colors.border,
-            borderRadius: theme.radii.lg,
+            borderColor: theme.colors.paneDivider,
+            borderRadius: theme.radii.md,
             borderWidth: borderWidth.hairline,
-            gap: theme.space(3),
-            minHeight: theme.space(18),
+            gap: spacing[3],
+            minHeight: spacing[14],
             opacity: pressed ? opacity.hoverButton : opacity.opaque,
-            paddingHorizontal: theme.space(3),
-            paddingVertical: theme.space(2.5),
+            paddingHorizontal: spacing[3],
+            paddingVertical: spacing[2],
           },
         ]}
         testID={`terminal-row-${session.id}`}

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { AppState, Image, StyleSheet } from "react-native";
-import WebView, { type WebViewMessageEvent, type WebViewNavigation } from "react-native-webview";
+import WebView, { type WebViewMessageEvent } from "react-native-webview";
 import { WorkerBridge } from "@/terminal/transport/bridge";
 import { createHostTransport } from "@/terminal/transport/host-transport";
 import type {
@@ -10,27 +10,19 @@ import type {
   TransportState,
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
+import { isWorkerBootstrapNavigation, WORKER_BASE_URL } from "@/terminal/worker/navigation-policy";
 import { TERMINAL_WORKER_HTML } from "@/terminal/worker/worker-html";
 import { opacity, spacing } from "@/theme";
 import terminalWorkerAsset from "../../assets/terminal/worker.html";
 
 // A future third fallback is serving this immutable asset from the spawn HTTPS origin.
 const USE_FILE_WORKER_FALLBACK = false;
-const WORKER_BASE_URL = "https://spawn.local/";
 
 export interface HostTransportSurfaceProps extends Omit<HostTransportOptions, "bridge"> {
   onTransport(transport: HostTransport): void;
   onStateChange?(state: TransportState): void;
   onError?(error: TransportError): void;
   onDiagnostic?(diagnostic: WorkerDiagnostic): void;
-}
-
-function navigationAllowed(request: WebViewNavigation): boolean {
-  return (
-    request.url === "about:blank" ||
-    request.url.startsWith(WORKER_BASE_URL) ||
-    request.url.startsWith("file://")
-  );
 }
 
 export function HostTransportSurface({
@@ -114,8 +106,11 @@ export function HostTransportSurface({
     }
   };
 
-  const source = USE_FILE_WORKER_FALLBACK
-    ? { uri: Image.resolveAssetSource(terminalWorkerAsset).uri }
+  const fileWorkerUrl = USE_FILE_WORKER_FALLBACK
+    ? Image.resolveAssetSource(terminalWorkerAsset).uri
+    : null;
+  const source = fileWorkerUrl
+    ? { uri: fileWorkerUrl }
     : { html: TERMINAL_WORKER_HTML, baseUrl: WORKER_BASE_URL };
 
   return (
@@ -125,10 +120,16 @@ export function HostTransportSurface({
       style={styles.hiddenWorker}
       accessible={false}
       pointerEvents="none"
-      originWhitelist={["https://spawn.local/*", "file://*"]}
+      originWhitelist={["*"]}
       scrollEnabled={false}
       bounces={false}
-      onShouldStartLoadWithRequest={navigationAllowed}
+      allowsLinkPreview={false}
+      setSupportMultipleWindows={false}
+      javaScriptCanOpenWindowsAutomatically={false}
+      onShouldStartLoadWithRequest={(request) =>
+        isWorkerBootstrapNavigation(request, fileWorkerUrl)
+      }
+      onOpenWindow={() => undefined}
       onMessage={handleMessage}
       onLoad={() => {
         workerLoaded.current = true;

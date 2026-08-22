@@ -173,7 +173,7 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
             onError: (error) => toast.error("Could not remove host", { detail: error.message }),
             onSuccess: () => {
               toast.success("Host removed");
-              router.replace("/(tabs)/hosts");
+              router.replace("/hosts");
             },
           });
         }}

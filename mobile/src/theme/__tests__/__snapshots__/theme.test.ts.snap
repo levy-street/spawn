@@ -490,6 +490,18 @@ exports[`assembled themes matches the dark token snapshot 1`] = `
         "letterSpacing": 0,
         "lineHeight": 20,
       },
+      "grimoireBody": {
+        "fontFamily": "IBMPlexSans_400Regular",
+        "fontSize": 15,
+        "fontWeight": "400",
+        "lineHeight": 24,
+      },
+      "grimoireBodyLoose": {
+        "fontFamily": "IBMPlexSans_400Regular",
+        "fontSize": 15,
+        "fontWeight": "400",
+        "lineHeight": 28,
+      },
       "micro": {
         "fontSize": 11,
         "fontWeight": "500",
@@ -523,6 +535,11 @@ exports[`assembled themes matches the dark token snapshot 1`] = `
         "fontWeight": "400",
         "lineHeight": 24,
       },
+      "uiLg": {
+        "fontSize": 18,
+        "fontWeight": "400",
+        "lineHeight": 28,
+      },
       "uiSm": {
         "fontSize": 14,
         "fontWeight": "400",
@@ -537,6 +554,11 @@ exports[`assembled themes matches the dark token snapshot 1`] = `
         "fontSize": 14,
         "fontWeight": "600",
         "lineHeight": 20,
+      },
+      "uiXl": {
+        "fontSize": 20,
+        "fontWeight": "400",
+        "lineHeight": 28,
       },
       "uiXs": {
         "fontSize": 12,
@@ -1038,6 +1060,18 @@ exports[`assembled themes matches the light token snapshot 1`] = `
         "letterSpacing": 0,
         "lineHeight": 20,
       },
+      "grimoireBody": {
+        "fontFamily": "IBMPlexSans_400Regular",
+        "fontSize": 15,
+        "fontWeight": "400",
+        "lineHeight": 24,
+      },
+      "grimoireBodyLoose": {
+        "fontFamily": "IBMPlexSans_400Regular",
+        "fontSize": 15,
+        "fontWeight": "400",
+        "lineHeight": 28,
+      },
       "micro": {
         "fontSize": 11,
         "fontWeight": "500",
@@ -1071,6 +1105,11 @@ exports[`assembled themes matches the light token snapshot 1`] = `
         "fontWeight": "400",
         "lineHeight": 24,
       },
+      "uiLg": {
+        "fontSize": 18,
+        "fontWeight": "400",
+        "lineHeight": 28,
+      },
       "uiSm": {
         "fontSize": 14,
         "fontWeight": "400",
@@ -1085,6 +1124,11 @@ exports[`assembled themes matches the light token snapshot 1`] = `
         "fontSize": 14,
         "fontWeight": "600",
         "lineHeight": 20,
+      },
+      "uiXl": {
+        "fontSize": 20,
+        "fontWeight": "400",
+        "lineHeight": 28,
       },
       "uiXs": {
         "fontSize": 12,

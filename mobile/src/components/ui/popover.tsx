@@ -13,7 +13,13 @@ import {
 import Animated, { useAnimatedStyle, useSharedValue, withTiming } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useReducedMotionPreference } from "@/components/ui/swipe-dismiss-overlay";
-import { borderWidth, chrome, layer, shadow, useTheme } from "@/theme";
+import { alpha, borderWidth, chrome, layer, shadow, useTheme } from "@/theme";
+
+function shadowWithAlpha(value: string, channelAlpha: number): string {
+  return value.replace(/rgba\((\d+,\d+,\d+),[\d.]+\)/g, `rgba($1,${channelAlpha})`);
+}
+
+const OVERLAY_XL_SHADOW = shadowWithAlpha(shadow.xl, alpha.a50);
 
 export type PopoverAlign = "start" | "center" | "end";
 export type PopoverSide = "top" | "bottom" | "left" | "right";
@@ -347,7 +353,7 @@ export function Popover({
               backgroundColor: theme.colors.popover,
               borderColor: theme.colors.popoverBorder,
               borderRadius: theme.radii.lg,
-              boxShadow: shadow.xl,
+              boxShadow: OVERLAY_XL_SHADOW,
               left: placement.left,
               maxHeight: placement.maxHeight,
               maxWidth: Math.min(maxWidth ?? placement.maxWidth, placement.maxWidth),

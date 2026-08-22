@@ -12,7 +12,7 @@ import {
 } from "@/components/workspaces/workspace-row";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import type { WorkspaceStats } from "@/data/types/domain";
-import { ThemeProvider } from "@/theme";
+import { chrome, ThemeProvider } from "@/theme";
 
 jest.mock("react-native-gesture-handler", () => {
   const actual = jest.requireActual<typeof import("react-native-gesture-handler")>(
@@ -169,5 +169,19 @@ describe("workspace list presentation", () => {
     expect(workspaceRollupLabel({ ...stats, tabs: 1, running: 1, attention: 0 })).toBe(
       "1 tab · 1 running",
     );
+  });
+
+  test("uses a 40pt visual row inside a 44pt touch target", async () => {
+    const screen = await render(
+      <WorkspaceRow {...callbacks} stats={stats} workspace={workspace()} />,
+      { wrapper: Providers },
+    );
+    expect(screen.getByTestId("workspace-row-touch-workspace-1")).toHaveStyle({
+      height: chrome.touchTarget,
+    });
+    expect(screen.getByTestId("workspace-row-visual-workspace-1")).toHaveStyle({
+      height: chrome.rowHeight,
+    });
+    await screen.unmount();
   });
 });

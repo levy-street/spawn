@@ -46,7 +46,7 @@ export function AdminHomeScreen(): React.JSX.Element {
           onPress={() => router.push("/admin/emails")}
         />
       </SettingsSection>
-      <Button onPress={() => router.replace("/(tabs)/settings")} variant="outline">
+      <Button onPress={() => router.replace("/settings")} variant="outline">
         Exit admin
       </Button>
     </SettingsScreen>

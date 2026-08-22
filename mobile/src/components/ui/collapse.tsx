@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import {
   type LayoutChangeEvent,
   type StyleProp,
@@ -31,20 +31,28 @@ export function Collapse({
   const reducedMotion = useReducedMotionPreference();
   const measuredHeight = useSharedValue(0);
   const height = useSharedValue(0);
-  const opacity = useSharedValue(open ? 1 : 0);
+  const armed = useRef(false);
+  const hasMeasured = useRef(false);
 
   useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      armed.current = true;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, []);
+
+  useEffect(() => {
+    const transition = theme.motion.transition.collapse;
     const config = {
-      duration: reducedMotion ? theme.motion.duration.reduced : theme.motion.duration.base,
-      easing: theme.motion.easing.swift,
+      duration: reducedMotion ? theme.motion.duration.reduced : transition.duration,
+      easing: transition.easing,
     };
-    height.value = withTiming(open ? measuredHeight.value : 0, config);
-    opacity.value = withTiming(open ? 1 : 0, config);
-  }, [height, measuredHeight, open, opacity, reducedMotion, theme.motion]);
+    const nextHeight = open ? measuredHeight.value : 0;
+    height.value = armed.current ? withTiming(nextHeight, config) : nextHeight;
+  }, [height, measuredHeight, open, reducedMotion, theme.motion]);
 
   const animatedStyle = useAnimatedStyle(() => ({
     height: height.value,
-    opacity: opacity.value,
   }));
 
   const handleLayout = (event: LayoutChangeEvent) => {
@@ -52,11 +60,15 @@ export function Collapse({
     if (nextHeight === measuredHeight.value) return;
     measuredHeight.value = nextHeight;
     if (open) {
-      height.value = withTiming(nextHeight, {
-        duration: reducedMotion ? theme.motion.duration.reduced : theme.motion.duration.base,
-        easing: theme.motion.easing.swift,
-      });
+      const transition = theme.motion.transition.collapse;
+      const config = {
+        duration: reducedMotion ? theme.motion.duration.reduced : transition.duration,
+        easing: transition.easing,
+      };
+      height.value =
+        armed.current && hasMeasured.current ? withTiming(nextHeight, config) : nextHeight;
     }
+    hasMeasured.current = true;
   };
 
   return (

@@ -14,6 +14,7 @@ import {
   shouldShowJumpToLatest,
 } from "@/components/terminal-ui/follow-state";
 import { FontSizeSheet } from "@/components/terminal-ui/font-size-sheet";
+import { FullSurfaceDismiss } from "@/components/terminal-ui/full-surface-dismiss";
 import { JumpToLatest } from "@/components/terminal-ui/jump-to-latest";
 import { ModifierBar } from "@/components/terminal-ui/modifier-bar";
 import { TerminalSearchBar } from "@/components/terminal-ui/search-bar";
@@ -248,148 +249,150 @@ export function TerminalOverlay({
 
   return (
     <SwipeDismissOverlay dragHandleRegion="header" onDismiss={onDismiss} visible>
-      <View style={[styles.root, { backgroundColor: theme.colors.background }]}>
-        <TerminalHeader
-          connectionState={connectionState}
-          cwd={session.cwd}
-          foregroundCommand={session.foreground_command}
-          hostName={session.host_name ?? host.name}
-          onCopyMode={enterSelection}
-          onDiagnostics={() => setDiagnosticsVisible(true)}
-          onDismiss={onDismiss}
-          onFontSize={() => setFontSheetVisible(true)}
-          onKill={() => setKillConfirmVisible(true)}
-          onRename={async (name) => {
-            try {
-              await onRename(name);
-            } catch (error) {
-              transfers.setNotice(
-                error instanceof Error ? error.message : "Session rename failed.",
-              );
-            }
-          }}
-          onRestart={() => {
-            void onRestart()
-              .then(() => {
-                transfers.setNotice("Session restarted.");
-                retry();
-              })
-              .catch((error: unknown) => {
+      <FullSurfaceDismiss onDismiss={onDismiss}>
+        <View style={[styles.root, { backgroundColor: theme.colors.background }]}>
+          <TerminalHeader
+            connectionState={connectionState}
+            cwd={session.cwd}
+            foregroundCommand={session.foreground_command}
+            hostName={session.host_name ?? host.name}
+            onCopyMode={enterSelection}
+            onDiagnostics={() => setDiagnosticsVisible(true)}
+            onDismiss={onDismiss}
+            onFontSize={() => setFontSheetVisible(true)}
+            onKill={() => setKillConfirmVisible(true)}
+            onRename={async (name) => {
+              try {
+                await onRename(name);
+              } catch (error) {
                 transfers.setNotice(
-                  error instanceof Error ? error.message : "Session restart failed.",
+                  error instanceof Error ? error.message : "Session rename failed.",
                 );
-              });
-          }}
-          onSearch={() => setSearchVisible(true)}
-          onUpload={() => void transfers.uploadFile()}
-          title={title}
-        />
-        <TerminalSearchBar
-          onDismiss={() => setSearchVisible(false)}
-          onSearch={(query, direction) => surfaceRef.current?.search(query, direction)}
-          visible={searchVisible}
-        />
-        <View style={[styles.surfaceFrame, { backgroundColor: theme.colors.terminalBg }]}>
-          {hostKey ? (
-            <GestureDetector gesture={selectionGesture}>
-              <View style={styles.surface}>
-                <TerminalSurface
-                  fontSize={fontSize}
-                  hostIdentityPublicKey={hostKey}
-                  initialSize={INITIAL_TERMINAL_GRID}
-                  key={`${session.id}-${surfaceGeneration}`}
-                  onDiagnostic={setDiagnostic}
-                  onError={(error) => {
-                    setConnectionError(error);
-                    if (!error.retryable) setConnectionState("failed");
-                  }}
-                  onLink={(url) => {
-                    if (safeTerminalLink(url)) void Linking.openURL(url);
-                    else transfers.setNotice("The terminal link uses an unsupported URL scheme.");
-                  }}
-                  onStateChange={handleConnectionState}
-                  onTitleChange={(next) => setLastKnownTitle(session.id, next)}
-                  onTransport={handleTransport}
-                  ref={surfaceRef}
-                  sessionId={session.id}
-                />
-              </View>
-            </GestureDetector>
-          ) : (
-            <View style={[styles.unavailable, { gap: theme.space(2), padding: theme.space(6) }]}>
-              <Text variant="label">Host identity unavailable</Text>
-              <Text color="mutedForeground" style={styles.centered} variant="body">
-                This host does not have a trusted identity key, so a secure terminal cannot open.
-              </Text>
-            </View>
-          )}
-          <UploadProgressBar ratio={transfers.progressRatio} />
-          <ConnectionStateOverlay
-            error={connectionError}
-            hasEverBeenReady={hasEverBeenReady}
-            onRetry={retry}
-            state={hostKey ? connectionState : "failed"}
+              }
+            }}
+            onRestart={() => {
+              void onRestart()
+                .then(() => {
+                  transfers.setNotice("Session restarted.");
+                  retry();
+                })
+                .catch((error: unknown) => {
+                  transfers.setNotice(
+                    error instanceof Error ? error.message : "Session restart failed.",
+                  );
+                });
+            }}
+            onSearch={() => setSearchVisible(true)}
+            onUpload={() => void transfers.uploadFile()}
+            title={title}
           />
-          {shouldShowJumpToLatest(followState) ? (
+          <TerminalSearchBar
+            onDismiss={() => setSearchVisible(false)}
+            onSearch={(query, direction) => surfaceRef.current?.search(query, direction)}
+            visible={searchVisible}
+          />
+          <View style={[styles.surfaceFrame, { backgroundColor: theme.colors.terminalBg }]}>
+            {hostKey ? (
+              <GestureDetector gesture={selectionGesture}>
+                <View style={styles.surface}>
+                  <TerminalSurface
+                    fontSize={fontSize}
+                    hostIdentityPublicKey={hostKey}
+                    initialSize={INITIAL_TERMINAL_GRID}
+                    key={`${session.id}-${surfaceGeneration}`}
+                    onDiagnostic={setDiagnostic}
+                    onError={(error) => {
+                      setConnectionError(error);
+                      if (!error.retryable) setConnectionState("failed");
+                    }}
+                    onLink={(url) => {
+                      if (safeTerminalLink(url)) void Linking.openURL(url);
+                      else transfers.setNotice("The terminal link uses an unsupported URL scheme.");
+                    }}
+                    onStateChange={handleConnectionState}
+                    onTitleChange={(next) => setLastKnownTitle(session.id, next)}
+                    onTransport={handleTransport}
+                    ref={surfaceRef}
+                    sessionId={session.id}
+                  />
+                </View>
+              </GestureDetector>
+            ) : (
+              <View style={[styles.unavailable, { gap: theme.space(2), padding: theme.space(6) }]}>
+                <Text variant="label">Host identity unavailable</Text>
+                <Text color="mutedForeground" style={styles.centered} variant="body">
+                  This host does not have a trusted identity key, so a secure terminal cannot open.
+                </Text>
+              </View>
+            )}
+            <UploadProgressBar ratio={transfers.progressRatio} />
+            <ConnectionStateOverlay
+              error={connectionError}
+              hasEverBeenReady={hasEverBeenReady}
+              onRetry={retry}
+              state={hostKey ? connectionState : "failed"}
+            />
+            {shouldShowJumpToLatest(followState) ? (
+              <View
+                pointerEvents="box-none"
+                style={[styles.jump, { bottom: theme.space(3), zIndex: layer.floatingChrome }]}
+              >
+                <JumpToLatest unread={followState.unread} onPress={jumpToLatest} />
+              </View>
+            ) : null}
             <View
               pointerEvents="box-none"
-              style={[styles.jump, { bottom: theme.space(3), zIndex: layer.floatingChrome }]}
+              style={[styles.selection, { top: theme.space(3), zIndex: layer.floatingChrome }]}
             >
-              <JumpToLatest unread={followState.unread} onPress={jumpToLatest} />
+              <SelectionToolbar
+                onCancel={leaveSelection}
+                onCopy={() => void copySelection()}
+                visible={selectionVisible}
+              />
             </View>
-          ) : null}
-          <View
-            pointerEvents="box-none"
-            style={[styles.selection, { top: theme.space(3), zIndex: layer.floatingChrome }]}
-          >
-            <SelectionToolbar
-              onCancel={leaveSelection}
-              onCopy={() => void copySelection()}
-              visible={selectionVisible}
-            />
+            <TerminalNotice message={transfers.notice} />
           </View>
-          <TerminalNotice message={transfers.notice} />
+          <ModifierBar
+            disabled={connectionState !== "ready" || !hostKey}
+            onDismissKeyboard={() => surfaceRef.current?.blur()}
+            onPaste={() => void transfers.paste()}
+            onSend={sendAccessoryKey}
+            sessionId={session.id}
+          />
+          <FontSizeSheet
+            onChange={changeFontSize}
+            onDismiss={() => setFontSheetVisible(false)}
+            value={fontSize}
+            visible={fontSheetVisible}
+          />
+          <DiagnosticsSheet
+            diagnostic={diagnostic}
+            error={connectionError}
+            onDismiss={() => setDiagnosticsVisible(false)}
+            state={connectionState}
+            visible={diagnosticsVisible}
+          />
+          <Confirm
+            cancelLabel="Keep session"
+            confirmLabel="Kill session"
+            description="This stops the running process and removes the session."
+            destructive
+            onCancel={() => setKillConfirmVisible(false)}
+            onConfirm={() => {
+              setKillConfirmVisible(false);
+              void onKill()
+                .then(onDismiss)
+                .catch((error: unknown) => {
+                  transfers.setNotice(
+                    error instanceof Error ? error.message : "Session could not be killed.",
+                  );
+                });
+            }}
+            title="Kill this session?"
+            visible={killConfirmVisible}
+          />
         </View>
-        <ModifierBar
-          disabled={connectionState !== "ready" || !hostKey}
-          onDismissKeyboard={() => surfaceRef.current?.blur()}
-          onPaste={() => void transfers.paste()}
-          onSend={sendAccessoryKey}
-          sessionId={session.id}
-        />
-        <FontSizeSheet
-          onChange={changeFontSize}
-          onDismiss={() => setFontSheetVisible(false)}
-          value={fontSize}
-          visible={fontSheetVisible}
-        />
-        <DiagnosticsSheet
-          diagnostic={diagnostic}
-          error={connectionError}
-          onDismiss={() => setDiagnosticsVisible(false)}
-          state={connectionState}
-          visible={diagnosticsVisible}
-        />
-        <Confirm
-          cancelLabel="Keep session"
-          confirmLabel="Kill session"
-          description="This stops the running process and removes the session."
-          destructive
-          onCancel={() => setKillConfirmVisible(false)}
-          onConfirm={() => {
-            setKillConfirmVisible(false);
-            void onKill()
-              .then(onDismiss)
-              .catch((error: unknown) => {
-                transfers.setNotice(
-                  error instanceof Error ? error.message : "Session could not be killed.",
-                );
-              });
-          }}
-          title="Kill this session?"
-          visible={killConfirmVisible}
-        />
-      </View>
+      </FullSurfaceDismiss>
     </SwipeDismissOverlay>
   );
 }

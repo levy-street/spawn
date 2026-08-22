@@ -65,16 +65,7 @@ export function Switch({
     value,
   ]);
 
-  const focusStyle = useAnimatedStyle(
-    () => ({
-      borderColor: interpolateColor(
-        focusProgress.value,
-        [0, 1],
-        [theme.colors.background, theme.colors.ring],
-      ),
-    }),
-    [theme.colors.background, theme.colors.ring],
-  );
+  const focusStyle = useAnimatedStyle(() => ({ opacity: focusProgress.value }), []);
 
   const trackStyle = useAnimatedStyle(
     () => ({
@@ -126,12 +117,18 @@ export function Switch({
       }}
       style={[styles.touchTarget, isDisabled && styles.disabled, style]}
     >
-      <Animated.View style={[styles.focusFrame, focusStyle]}>
-        <Animated.View style={[styles.track, trackStyle]}>
-          <Animated.View
-            style={[styles.thumb, { backgroundColor: theme.colors.background }, thumbStyle]}
-          />
-        </Animated.View>
+      <Animated.View
+        pointerEvents="none"
+        style={[
+          styles.focusRing,
+          { backgroundColor: theme.colors.background, borderColor: theme.colors.ring },
+          focusStyle,
+        ]}
+      />
+      <Animated.View style={[styles.track, trackStyle]}>
+        <Animated.View
+          style={[styles.thumb, { backgroundColor: theme.colors.background }, thumbStyle]}
+        />
       </Animated.View>
     </Pressable>
   );
@@ -142,18 +139,18 @@ const styles = StyleSheet.create({
     alignItems: "center",
     height: chrome.touchTarget,
     justifyContent: "center",
-    width: chrome.touchTarget,
+    position: "relative",
+    width: spacing[12],
   },
   disabled: {
     opacity: opacity.disabled,
   },
-  focusFrame: {
-    alignItems: "center",
+  focusRing: {
     borderRadius: radii.pill,
     borderWidth: borderWidth.emphasis,
-    height: spacing[7],
-    justifyContent: "center",
-    width: chrome.touchTarget,
+    height: spacing[7] + borderWidth.emphasis,
+    position: "absolute",
+    width: chrome.touchTarget + borderWidth.emphasis,
   },
   track: {
     borderRadius: radii.pill,

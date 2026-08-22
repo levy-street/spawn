@@ -7,7 +7,21 @@ import {
 
 import { type Colors, useTheme } from "@/theme";
 
-export type TextVariant = "title" | "body" | "label" | "caption" | "mono" | "micro";
+export type TextVariant =
+  | "title"
+  | "body"
+  | "label"
+  | "caption"
+  | "mono"
+  | "micro"
+  | "uiBase"
+  | "uiSmSemibold"
+  | "uiLg"
+  | "uiXl"
+  | "sigilLabel"
+  | "sigilButton"
+  | "grimoireBody"
+  | "grimoireBodyLoose";
 export type TextColor = keyof Colors;
 export type TextWeight = "light" | "normal" | "medium" | "semibold";
 
@@ -40,6 +54,22 @@ export function Text({
         return theme.type.typeStyles.terminal;
       case "micro":
         return theme.type.typeStyles.micro;
+      case "uiBase":
+        return theme.type.typeStyles.uiBase;
+      case "uiSmSemibold":
+        return theme.type.typeStyles.uiSmSemibold;
+      case "uiLg":
+        return theme.type.typeStyles.uiLg;
+      case "uiXl":
+        return theme.type.typeStyles.uiXl;
+      case "sigilLabel":
+        return theme.type.typeStyles.sigilLabel;
+      case "sigilButton":
+        return theme.type.typeStyles.sigilButton;
+      case "grimoireBody":
+        return theme.type.typeStyles.grimoireBody;
+      case "grimoireBodyLoose":
+        return theme.type.typeStyles.grimoireBodyLoose;
     }
   })();
 

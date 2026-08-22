@@ -8,21 +8,22 @@ import { IconButton } from "@/components/ui/icon-button";
 import { Input } from "@/components/ui/input";
 import { Menu, type MenuEntry } from "@/components/ui/menu";
 import { Text } from "@/components/ui/text";
+import { AgentIcon } from "@/components/workspace-detail/agent-icon";
+import { identifyAgent } from "@/data/selectors/agent";
 import type { TransportState } from "@/terminal/transport/types";
 import { borderWidth, useTheme } from "@/theme";
 
 export interface AgentPresentation {
   label: string;
-  icon: "Bot" | "Terminal";
 }
 
 export function inferAgentPresentation(command: string | null): AgentPresentation {
   const normalized = command?.toLowerCase() ?? "";
-  if (normalized.includes("claude")) return { label: "Claude Code", icon: "Bot" };
-  if (normalized.includes("codex")) return { label: "Codex", icon: "Bot" };
-  if (normalized.includes("opencode")) return { label: "OpenCode", icon: "Bot" };
-  if (normalized.includes("aider")) return { label: "Aider", icon: "Bot" };
-  return { label: "Shell", icon: "Terminal" };
+  if (normalized.includes("claude")) return { label: "Claude Code" };
+  if (normalized.includes("codex")) return { label: "Codex" };
+  if (normalized.includes("opencode")) return { label: "OpenCode" };
+  if (normalized.includes("aider")) return { label: "Aider" };
+  return { label: "Shell" };
 }
 
 export interface TerminalHeaderProps {
@@ -66,6 +67,7 @@ export function TerminalHeader({
   const [draftName, setDraftName] = useState(title);
   const [saving, setSaving] = useState(false);
   const agent = inferAgentPresentation(foregroundCommand);
+  const agentIdentity = identifyAgent(foregroundCommand, []);
 
   const beginRename = (): void => {
     setDraftName(title);
@@ -155,19 +157,7 @@ export function TerminalHeader({
     >
       <View style={[styles.primaryRow, { gap: theme.space(1) }]}>
         <IconButton accessibilityLabel="Close terminal" icon="ChevronDown" onPress={onDismiss} />
-        <View
-          style={[
-            styles.agentIcon,
-            {
-              backgroundColor: theme.colors.secondary,
-              borderRadius: theme.radii.md,
-              height: theme.space(8),
-              width: theme.space(8),
-            },
-          ]}
-        >
-          <Icon color="mutedForeground" name={agent.icon} size={theme.space(4)} />
-        </View>
+        <AgentIcon identity={agentIdentity} size={theme.space(8)} />
         <View style={styles.titleColumn}>
           {renaming ? (
             <View style={[styles.renameRow, { gap: theme.space(1) }]}>
@@ -238,10 +228,6 @@ export function TerminalHeader({
 }
 
 const styles = StyleSheet.create({
-  agentIcon: {
-    alignItems: "center",
-    justifyContent: "center",
-  },
   header: {
     flexDirection: "column",
   },

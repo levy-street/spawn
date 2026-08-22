@@ -1,3 +1,4 @@
+import { Image } from "expo-image";
 import type { ReactNode } from "react";
 import {
   KeyboardAvoidingView,
@@ -8,8 +9,10 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { BrandMark, Wordmark } from "@/components/brand/brand-mark";
 import { Text } from "@/components/ui/text";
 import {
+  alpha,
   borderWidth,
   clampDisplay,
   displayLineHeightRatio,
@@ -18,9 +21,10 @@ import {
   fontWeight,
   layer,
   opacity,
+  pressroomColors,
+  radii,
   shadow,
   spacing,
-  useTheme,
 } from "@/theme";
 
 export interface AuthShellProps {
@@ -30,7 +34,6 @@ export interface AuthShellProps {
 }
 
 function RegistrationMarks() {
-  const theme = useTheme();
   const marks = [
     { key: "top-left", position: styles.markTopLeft },
     { key: "top-right", position: styles.markTopRight },
@@ -42,7 +45,7 @@ function RegistrationMarks() {
       {marks.map(({ key, position }) => (
         <Text
           key={key}
-          style={[styles.registrationMark, position, { color: theme.colors.brandAccent }]}
+          style={[styles.registrationMark, position, { color: pressroomColors.hellfire }]}
         >
           +
         </Text>
@@ -52,32 +55,37 @@ function RegistrationMarks() {
 }
 
 function BrandLockup() {
-  const theme = useTheme();
   return (
-    <View accessibilityLabel="spawn" accessible style={styles.brandLockup}>
-      <View
-        accessibilityElementsHidden
-        style={[styles.brandMark, { backgroundColor: theme.colors.brandAccent }]}
-      >
-        <View style={[styles.brandMarkCut, { backgroundColor: theme.colors.background }]} />
-      </View>
-      <Text
-        accessibilityElementsHidden
-        style={[styles.wordmark, { color: theme.colors.brandAccent }]}
-      >
-        SPAWN
-      </Text>
+    <View accessibilityLabel="spawnd" accessible style={styles.brandLockup}>
+      <BrandMark color={pressroomColors.hellfire} size={spacing[6.5]} testID="auth-brand-mark" />
+      <Wordmark color={pressroomColors.hellfire} height={spacing[5]} testID="auth-wordmark" />
     </View>
   );
 }
 
 export function AuthShell({ children, description, title }: AuthShellProps) {
-  const theme = useTheme();
   const { width } = useWindowDimensions();
   const titleSize = clampDisplay(width, spacing[6] + spacing[0.5], 5.9, spacing[8]);
 
   return (
-    <SafeAreaView style={[styles.safeArea, { backgroundColor: theme.colors.background }]}>
+    <SafeAreaView
+      style={[styles.safeArea, { backgroundColor: pressroomColors.void }]}
+      testID="auth-pressroom"
+    >
+      <Image
+        accessibilityElementsHidden
+        contentFit="cover"
+        contentPosition={{ left: "50%", top: "32%" }}
+        pointerEvents="none"
+        source={require("../../../assets/images/altar-ink.png")}
+        style={styles.backdrop}
+        testID="auth-altar"
+      />
+      <View
+        accessibilityElementsHidden
+        pointerEvents="none"
+        style={[styles.scrim, { backgroundColor: pressroomColors.void }]}
+      />
       <RegistrationMarks />
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -97,19 +105,20 @@ export function AuthShell({ children, description, title }: AuthShellProps) {
               style={[
                 styles.plate,
                 {
-                  backgroundColor: theme.colors.card,
-                  borderColor: theme.colors.border,
-                  borderRadius: theme.radii.sm,
+                  backgroundColor: pressroomColors.char,
+                  borderColor: pressroomColors.lineG,
+                  borderRadius: radii.sm,
                 },
               ]}
+              testID="auth-plate"
             >
-              <View style={[styles.header, { borderBottomColor: theme.colors.border }]}>
+              <View style={[styles.header, { borderBottomColor: pressroomColors.lineG }]}>
                 <Text
                   accessibilityRole="header"
                   style={[
                     styles.title,
                     {
-                      color: theme.colors.cardForeground,
+                      color: pressroomColors.bone,
                       fontSize: titleSize,
                       lineHeight: titleSize * displayLineHeightRatio.r106,
                     },
@@ -119,7 +128,7 @@ export function AuthShell({ children, description, title }: AuthShellProps) {
                 </Text>
                 {description !== undefined ? (
                   typeof description === "string" || typeof description === "number" ? (
-                    <Text color="mutedForeground" style={styles.description}>
+                    <Text style={[styles.description, { color: pressroomColors.ash }]}>
                       {description}
                     </Text>
                   ) : (
@@ -137,25 +146,14 @@ export function AuthShell({ children, description, title }: AuthShellProps) {
 }
 
 const styles = StyleSheet.create({
+  backdrop: {
+    ...StyleSheet.absoluteFillObject,
+  },
   brandLockup: {
     alignItems: "center",
     flexDirection: "row",
     gap: spacing[3],
     minHeight: spacing[11],
-  },
-  brandMark: {
-    height: spacing[6.5],
-    overflow: "hidden",
-    position: "relative",
-    width: spacing[6.5],
-  },
-  brandMarkCut: {
-    bottom: -spacing[2],
-    height: spacing[4],
-    position: "absolute",
-    right: -spacing[2],
-    transform: [{ rotate: "45deg" }],
-    width: spacing[4],
   },
   content: {
     padding: spacing[5],
@@ -205,6 +203,10 @@ const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
   },
+  scrim: {
+    ...StyleSheet.absoluteFillObject,
+    opacity: alpha.a80,
+  },
   scrollContent: {
     flexGrow: 1,
     justifyContent: "center",
@@ -222,11 +224,5 @@ const styles = StyleSheet.create({
     fontFamily: fontFamily.posterLight,
     fontWeight: fontWeight.light,
     textTransform: "uppercase",
-  },
-  wordmark: {
-    fontFamily: fontFamily.sigil,
-    fontSize: fontSize.base,
-    fontWeight: fontWeight.semibold,
-    letterSpacing: spacing[0.5],
   },
 });

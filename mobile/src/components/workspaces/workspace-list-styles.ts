@@ -1,6 +1,6 @@
 import { StyleSheet } from "react-native";
 
-import { borderWidth, fontSize, lineHeight, spacing } from "@/theme";
+import { borderWidth, chrome, radii, spacing, typeStyles } from "@/theme";
 
 export const workspaceListStyles = StyleSheet.create({
   archivedButton: {
@@ -11,19 +11,24 @@ export const workspaceListStyles = StyleSheet.create({
     alignItems: "center",
     flexDirection: "row",
     justifyContent: "space-between",
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[3],
+    minHeight: spacing[12],
+    paddingHorizontal: spacing[2.5],
   },
   heading: {
-    fontSize: fontSize.displaySm,
-    lineHeight: lineHeight.xl,
+    ...typeStyles.uiSmMedium,
+  },
+  listContent: {
+    paddingHorizontal: spacing[2.5],
+  },
+  rowSeparator: {
+    height: spacing[1],
   },
   screen: {
     flex: 1,
   },
   search: {
-    paddingBottom: spacing[2],
-    paddingHorizontal: spacing[4],
+    paddingBottom: spacing[2.5],
+    paddingHorizontal: spacing[2.5],
   },
   skeletonCopy: {
     flex: 1,
@@ -34,16 +39,16 @@ export const workspaceListStyles = StyleSheet.create({
     width: "48%",
   },
   skeletonIcon: {
-    height: spacing[11],
-    width: spacing[11],
+    height: spacing[6],
+    width: spacing[6],
   },
   skeletonRow: {
     alignItems: "center",
+    borderRadius: radii.lg,
     flexDirection: "row",
-    gap: spacing[3],
-    minHeight: spacing[16] + spacing[2],
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[3],
+    gap: spacing[2],
+    height: chrome.touchTarget,
+    paddingHorizontal: spacing[1.5],
   },
   skeletonTitle: {
     height: spacing[4],
@@ -51,6 +56,7 @@ export const workspaceListStyles = StyleSheet.create({
   },
   skeletons: {
     gap: spacing[1],
+    paddingHorizontal: spacing[2.5],
   },
   statusError: {
     alignItems: "center",
@@ -58,6 +64,6 @@ export const workspaceListStyles = StyleSheet.create({
     borderTopWidth: borderWidth.hairline,
     flexDirection: "row",
     justifyContent: "space-between",
-    paddingHorizontal: spacing[4],
+    paddingHorizontal: spacing[2.5],
   },
 });

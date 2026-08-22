@@ -150,7 +150,7 @@ export function HostListScreen() {
           onConnect={() => router.push("/onboarding/host")}
           onOpen={openHost}
           onOpenActions={setActionsHost}
-          onOpenLegion={() => router.push("/(tabs)/hosts/legion")}
+          onOpenLegion={() => router.push("/legion")}
           onRefresh={() => void hostsQuery.refetch()}
           refreshing={hostsQuery.isRefetching}
         />

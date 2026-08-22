@@ -6,7 +6,7 @@ import { Icon } from "@/components/ui/icon";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, opacity, useTheme } from "@/theme";
+import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
 
 export interface FilesWidgetRowProps {
   paneId: string;
@@ -66,7 +66,7 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
     <SwipeableRow
       contentStyle={{ backgroundColor: theme.colors.card }}
       leadingActions={leadingActions}
-      style={{ borderRadius: theme.radii.lg }}
+      style={{ borderRadius: theme.radii.md }}
       testID={`files-swipe-${paneId}`}
       trailingActions={trailingActions}
     >
@@ -90,14 +90,14 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
           styles.row,
           {
             backgroundColor: pressed ? theme.colors.accent : theme.colors.card,
-            borderColor: theme.colors.border,
-            borderRadius: theme.radii.lg,
+            borderColor: theme.colors.paneDivider,
+            borderRadius: theme.radii.md,
             borderWidth: borderWidth.hairline,
-            gap: theme.space(3),
-            minHeight: theme.space(18),
+            gap: spacing[3],
+            minHeight: spacing[14],
             opacity: pressed ? opacity.hoverButton : opacity.opaque,
-            paddingHorizontal: theme.space(3),
-            paddingVertical: theme.space(2.5),
+            paddingHorizontal: spacing[3],
+            paddingVertical: spacing[2],
           },
         ]}
         testID={`files-row-${paneId}`}

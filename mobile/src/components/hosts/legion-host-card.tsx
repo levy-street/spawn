@@ -12,6 +12,7 @@ import { Badge } from "@/components/ui/badge";
 import { Icon } from "@/components/ui/icon";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
+import { AgentIcon } from "@/components/workspace-detail/agent-icon";
 import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
@@ -45,15 +46,15 @@ export function LegionHostCard({
     (session) => session.status !== "exited" && session.status !== "killed",
   );
   const needYou = sessions.filter((session) => sessionAttention(session) !== null).length;
-  const runningSummary = useMemo(() => {
-    const names = liveSessions.map(
-      (session) => identifyAgent(session.foreground_command, agents).displayName,
-    );
-    const counts = new Map<string, number>();
-    for (const name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
-    return [...counts.entries()]
-      .map(([name, count]) => (count > 1 ? `${name} ×${count}` : name))
-      .join(" · ");
+  const runningAgents = useMemo(() => {
+    const counts = new Map<string, { count: number; identity: ReturnType<typeof identifyAgent> }>();
+    for (const session of liveSessions) {
+      const identity = identifyAgent(session.foreground_command, agents);
+      const key = `${identity.logoKey ?? "custom"}:${identity.kind}:${identity.displayName}`;
+      const current = counts.get(key);
+      counts.set(key, { count: (current?.count ?? 0) + 1, identity });
+    }
+    return [...counts.entries()].map(([key, value]) => ({ key, ...value }));
   }, [agents, liveSessions]);
 
   useEffect(() => {
@@ -136,10 +137,32 @@ export function LegionHostCard({
         </Text>
         {needYou > 0 ? <Badge variant="warning">{`${needYou} need you`}</Badge> : null}
       </View>
-      {runningSummary ? (
-        <Text color="mutedForeground" numberOfLines={2} variant="caption">
-          {runningSummary}
-        </Text>
+      {runningAgents.length > 0 ? (
+        <View accessibilityLabel="Running agents" style={styles.agentChips}>
+          {runningAgents.slice(0, 3).map(({ count, identity, key }) => (
+            <View
+              key={key}
+              style={[
+                styles.agentChip,
+                {
+                  backgroundColor: theme.colors.muted,
+                  borderRadius: theme.radii.md,
+                },
+              ]}
+            >
+              <AgentIcon identity={identity} size={spacing[5]} />
+              <Text color="mutedForeground" variant="caption">
+                {identity.displayName}
+                {count > 1 ? ` ×${count}` : ""}
+              </Text>
+            </View>
+          ))}
+          {runningAgents.length > 3 ? (
+            <Text color="mutedForeground" variant="caption">
+              +{runningAgents.length - 3}
+            </Text>
+          ) : null}
+        </View>
       ) : null}
       <LiveCapacityProbe
         enabled={canProbe}
@@ -157,6 +180,19 @@ export function LegionHostCard({
 }
 
 const styles = StyleSheet.create({
+  agentChip: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: spacing[1.5],
+    padding: spacing[1],
+    paddingRight: spacing[2],
+  },
+  agentChips: {
+    alignItems: "center",
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: spacing[2],
+  },
   card: {
     borderWidth: borderWidth.hairline,
     gap: spacing[3],
