@@ -202,9 +202,17 @@ terminal state precisely so the residual is a chosen, contained trade.
   "Remove it and it must be possessed again from its terminal — or add a passkey first";
   primary becomes *Add a passkey first*, with *Remove anyway* still available (matches
   the shipped warn-not-refuse). With a passkey **and the host online**: "You'll confirm
-  with your passkey so it stays reachable" — the passkey touch heals the host before the
-  removal lands. An **offline** host can't be healed in time, so it always gets the
-  honest wording — the passkey promise is only made where it can be kept.
+  with your passkey so it stays reachable" — the passkey touch protects the host before
+  the removal lands. An **offline** host can't be protected in time, so it always gets
+  the honest wording — the passkey promise is only made where it can be kept.
+- **the promise is verified, or withdrawn** *(2026-08-22, after an owner-hit field
+  bug)* — "so it stays reachable" is a claim, and the flow now proves it before acting
+  on it: after the passkey step, every at-risk host must be confirmed protected, or the
+  dialog returns with the honest wording instead — *"Your passkey could not confirm
+  mac-studio stays reachable. Remove iPhone and it must be possessed again from its
+  terminal."* — with *Remove anyway* still available and the promise sentence gone.
+  The dialog never proceeds on a promise it could not verify, and it refreshes host
+  presence the moment it opens so the online gate is not judging stale data.
 - **this device** — same dialog, "You're using this device right now" note.
 
 ### 6. Passkeys — deliberately not here
@@ -214,6 +222,17 @@ removing the last one retires it — the consequence copy at that action says so
 including that removing it does **not** lock out a stolen passkey (delete it from the
 password manager too; remove compromised devices). Root rotation happens automatically at
 the next passkey sign-in. No dialogs in the trust UX.
+
+**Status copy says only what happened** *(2026-08-22)*. Adding a passkey before any
+host exists says so: *"Passkey added. If you lose every device, it brings everything
+back. No hosts are protected yet — the next time you use this passkey after possessing
+a host, it starts protecting them."* (True by construction: each passkey use silently
+picks up the hosts this device has since possessed.) A passkey use that could not
+finish approving the device says that, plainly — *"Approving this device did not
+finish. Use your passkey again in a moment."* — instead of celebrating a partial
+result; a simultaneous update from another device is named as such. The blocked-session
+card (§3) shows these failure lines too, so a failed passkey attempt is never a silent
+spinner.
 
 ### 7. Connection refused — `AccessBlocked`
 - **removed** — *(refined 2026-08-21, owner review during field test)* there is no removed
@@ -326,7 +345,11 @@ What a naive design would show, what we show instead, and why the protocol survi
   removed it.
 - **R5 orphan hazard** — the remove dialog names the hosts that would be orphaned and
   steers to a passkey first; *Remove anyway* remains (matches the shipped
-  warn-not-refuse); the passkey promise is gated on the host being online.
+  warn-not-refuse); the passkey promise is gated on the host being online AND is
+  verified after the passkey step — an unverified promise is withdrawn and the honest
+  wording shown instead (2026-08-22). The at-risk set itself is computed from live
+  trust only, so a removed device or a retired safety net can never mask a host that
+  would in truth be stranded.
 - **R8 no-passkey mode** — fully supported: it is simply not having a passkey. Cost
   stated once (the nudge) and re-stated where it bites (the orphan dialog).
 

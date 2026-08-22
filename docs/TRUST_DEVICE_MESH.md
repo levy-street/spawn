@@ -172,10 +172,50 @@ revocation blast radius to zero** — Proof of P3′ depends on it.
   one, and heals off the successor. Consistent with R10: the old root is never
   un-revoked.
 - **`pk_R` provenance rule (client discipline).** A device only ever treats a
-  key as "the root" if it learned `pk_R` firsthand — at mint, or from the
-  unsealed bundle. The server's claim of which key is the root is
+  key as "the root" if it learned `pk_R` firsthand — at mint, from the
+  unsealed bundle, or (since 2026-08-22) from a **verified root
+  introduction** (below). The server's claim of which key is the root is
   cross-checked against that and a mismatch aborts loudly; a substituted root
   must never be endorsed or anchored.
+- **Root introductions + the pinned-device anchor sweep (2026-08-22).** The
+  per-host anchor upgrade must be signed by a device the host *pins*, but the
+  passkey can live on an unpinned (chain-admitted) device — in which case the
+  heal's upgrade 409s everywhere and the root anchors nowhere (the field bug,
+  §9). The cure is structural: `pk_R` rides the same firsthand gossip channel
+  as host keys. A device that knows the root firsthand (mint/unlock) signs a
+  domain-separated `SPAWN-ROOT-INTRO-V1` statement
+  (`account ‖ introducer_pk ‖ root_pk`), published durably (one row per
+  introducer, `root_introductions`, migration 0041; the server hygiene-checks
+  and withholds revoked introducers — mailbox only). A recipient honors a row
+  ONLY when the introducer's key is in its ceremony-seeded firsthand
+  peer-key store and the signature re-verifies against that copy; it then
+  records `pk_R` in a durable firsthand-root store. **Conflict rule
+  (fail-closed):** a verified introduction naming a different key than one
+  already held records nothing and surfaces loudly; a *successor* is adopted
+  only when the old key's revocation is corroborated roster+tombstone (B2's
+  rule), the verified introducers are unanimous, and the successor is alive.
+  **The sweep:** on the continuous-gossip cadence, a device holding active
+  local pins that firsthand-knows `pk_R` and observes (advisory pin lists) a
+  pinned host lacking the root anchor signs the existing per-host
+  `SPAWN-BROWSER-ENDORSE-V1` upgrade for it — over the host key from its
+  LOCAL pin store, binding the roster root row's id only after checking that
+  row's key equals the firsthand `pk_R`. The daemon re-verifies as with any
+  pin adoption (P2 preserved); repeats are idempotent. This also closes the
+  former "possess-time anchor-on-`R`" gap: a newly possessed host is anchored
+  by the possessing device's next sweep.
+- **Heal robustness + honesty (2026-08-22).** Every heal statement is
+  isolated: one failed `R→d` endorsement neither aborts the remaining
+  endorsements nor skips the anchor half. The report is per-id
+  (endorsed/failed device ids, upgraded/refused host ids with reasons) and
+  carries `rootEndorsedSelf` — verified against *re-fetched* edges with real
+  signature checks, so a server that answers 200 without storing reads as
+  false. The unlock claims success only on that flag; anything less is
+  surfaced as the partial result it is. The anchor loop iterates the UNION of
+  bundle hosts and the device's active local pins (both firsthand), and
+  **every unlock reseals** the bundle with any local pins it lacks — under
+  the same data key at a bumped revision (CAS; a concurrent loser skips and
+  converges next unlock) — so the bundle tracks the fleet instead of
+  fossilizing at setup time.
 - **No-passkey mode** remains supported: pure device-chain operation, no heal,
   R8's lockout cost applies and is the mode's documented price.
 
@@ -349,6 +389,14 @@ Only devices still on a *transient* pre-heal chain through `pk_d` are collateral
 and that window closes at the next heal. This is why "collapse to the passkey
 root" is the mechanism that minimizes blast radius: in steady state it is zero.
 
+*Caveat made explicit by the F1 field bug (§9): the theorem's premise is that
+healing actually installed the `R` anchors. When the passkey lives on an
+unpinned device, the heal alone cannot install any (the per-host upgrade must
+be signed by a pinned device), so the steady state was never reached. The
+root-introduction channel + pinned-device sweep (§4.1) restore the premise:
+any pinned device that firsthand-knows `pk_R` drives hosts toward the anchored
+state, and the remove flow verifies the anchor before relying on this theorem.*
+
 ### P4 — One human check per device
 
 > **Theorem.** Admitting a device to the entire mesh costs exactly one human
@@ -461,10 +509,13 @@ peer (which blocks cross-session/cross-host splicing), not on a nonce `h` picks.
 | R7 | Host-key gossip over the add-device exchange: the approver signs `SPAWN-HOST-INTRO-V1` (`account ‖ approver_pk ‖ host_pk ‖ joiner_pk`) per host it holds an ACTIVE local pin for, posts the set on the pairing relay (set-once, post-reveal, before its endorsement edge so the joiner's completion cue implies the list is present); the joiner verifies each against the **ceremony-pinned** approver key + its own key and approves the host key locally like a hand-run possession. Web-only; the daemon never sees the statement (deliberately not `SPAWN-BROWSER-ENDORSE-V1` — no cross-protocol signature reuse) | unit (tamper: swapped host key / signer / joiner / account); live: two-context SAS, joiner's first terminal connect reads fully verified |
 | R7-cont | CONTINUOUS gossip: (a) a device that verifies a host publishes a durable `SPAWN-HOST-INTRO-BCAST-V1` vouch (`account ‖ publisher_pk ‖ host_pk`) to the account store (`host_introductions`, migration 0040) — at possess time and via a reconcile sweep that retroactively publishes pre-existing pins; (b) every device keeps a durable FIRSTHAND peer-device-key store, seeded ONLY at ceremony completion (both roles persist the SAS-pinned peer key) and by `SPAWN-DEVICE-INTRO-V1` device introductions the approver signs into the same ceremony payload — NEVER from server-claimed metadata (a self-signed edge naming an attacker key verifies under its own claim: honoring it would be a full MITM; unit-tested as the trap case); (c) recipients honor a broadcast row only when its publisher key is in that firsthand store and the signature re-verifies against the firsthand copy, then pin locally (a conflicting binding never overwrites — the held pin is the substitution signal). Server hygiene-verifies at insert against the registered key, caps per account, and withholds rows from revoked publishers on GET; recipients also drop revoked peers from their firsthand memory | unit (trap: unknown-publisher self-signed row moves no trust; tamper; replay-to-wrong-joiner); server (idempotent republish, revoked-publisher filter, cap); live: second host possessed AFTER the ceremony arrives verified on the peer with no new ceremony |
 
-Not yet done: merge to master + prod rollout; folding possess-time anchor-on-`R`
-(§4 possess) into the possess flow — as built, a new host gains `R` at the next
-heal moment rather than at possess itself (sound, one heal later than the doc's
-ideal). R7 residuals after the continuous leg: a device approved BEFORE the
+| R-intro | Root introductions + pinned-device anchor sweep (§4.1, 2026-08-22): `SPAWN-ROOT-INTRO-V1` store (0041, one row per introducer, rotation replaces own row), firsthand-root memory with the fail-closed conflict rule, sweep signs the per-host upgrade only where the device is pinned and only over local-pin host keys; heal made per-statement with the per-id honest report and `rootEndorsedSelf` gate; reseal-on-unlock merges local pins into the bundle; `/pins` + `/pin-details` filtered through the daemon's shared transitive-liveness helper; the remove dialog's reachable promise gated on verified anchoring | unit (web 372 / server suites), shared web⟷server transcript vector; live: the field sequence re-run — passkey minted on an UNPINNED device, pinned device's sweep anchored both hosts, sole-pinned-device removal kept them reachable |
+
+Not yet done: merge to master + prod rollout. ~~Folding possess-time
+anchor-on-`R` into the possess flow~~ — subsumed by the anchor sweep
+(2026-08-22): a newly possessed host is anchored by the possessing device's
+next sweep cycle if any of its devices firsthand-knows `pk_R`. R7 residuals
+after the continuous leg: a device approved BEFORE the
 continuous build holds no firsthand peer keys, so it needs ONE more ceremony
 (re-approval) — or a passkey heal — to seed its store; from then on coverage is
 continuous. And an introduction is only as honest as the publishing device:
@@ -516,9 +567,14 @@ plus a newest-first trust log of every live endorsement.)*
 root) and `d` is revoked, every chain must pass the revoked anchor → `h` is
 unreachable; re-possess required. **Resolution:** healing a host to a root anchor
 is a **precondition** for cleanly revoking a device that is some host's sole
-anchor; the revoke flow must refuse or auto-heal first. *(As built, stage 6: the
-revoke confirm computes and names the hosts that would be orphaned and warns —
-it does not yet refuse or auto-heal; residual UX hardening.)*
+anchor; the revoke flow must refuse or auto-heal first. *(As built, stage 6 +
+2026-08-22: the revoke confirm computes the orphan set from the
+transitively-LIVE pin lists — a revoked co-pin or revoked root no longer masks
+sole-trust (F1d) — and, with a passkey and the host online, auto-heals via the
+pre-removal unlock. The "stays reachable" promise is honored only when the
+heal VERIFIABLY anchored (or found anchored) every at-risk host; otherwise
+the dialog withdraws it and removal stays available only as an explicit
+"Remove anyway" — warn-not-refuse, but never warn-then-lie.)*
 
 **R6 — SAS `session` underspecified (relay/reflection).** A short SAS needs
 `session` to be a **fresh nonce with entropy contributed by both endpoints**, or
@@ -612,6 +668,31 @@ on the wire are the possession-ceremony ones the daemon prints/verifies —
 `DevicePendingResponse`/`DevicePollSuccess` and the signed approve request
 — each cross-checked against the key at the point of use.)*
 
+**F1 — FIELD BUG (owner-hit, 2026-08-22): the unpinned passkey anchored the
+root nowhere, and the remove flow promised protection it never verified.** A
+passkey was created on a chain-admitted (UNPINNED) device. The heal's per-host
+root anchor upgrade must be signed by a device the host pins (the server 409s
+otherwise — correctly, per R9/P2), so every upgrade was refused and `R`
+anchored **nowhere**; the failure was additionally invisible because one
+refused statement aborted the whole loop and the reports were count-only.
+The R5 remove dialog then promised *"you'll confirm with your passkey so it
+stays reachable"* gated only on passkey-exists + host-online; the pre-removal
+unlock "succeeded" vacuously, and revoking the sole pinned device orphaned
+every host. Two independent security reviews confirmed the cluster
+(P-C1/C2/C3/C4/C7). **Resolved (same date):** (a) the structural cure — root
+introductions + the pinned-device anchor sweep (§4.1), so `pk_R` reaches
+pinned devices over the firsthand channel and they anchor it; (b) the heal
+made per-statement with a per-id report and the `rootEndorsedSelf` honesty
+gate; (c) reseal-on-unlock + local-pin union, so the bundle and the anchor
+loop track the fleet; (d) `/pins` and `/pin-details` filtered through the
+daemon's own transitive-liveness computation (a revoked root can no longer
+pose as a co-pin and suppress the R5 warning); (e) the remove dialog's
+promise is now *verified or withdrawn* — every at-risk online host must be in
+the heal's `upgradedHostIds` or show the live root anchor in refreshed pins,
+else the dialog returns in its honest branch (warn-not-refuse preserved).
+The general lesson is B5's, one level up: **a flow must never promise an
+outcome it did not verify** — success copy is part of the trust surface.
+
 **Verdict.** The core claim — *the server can slam doors, never open them* —
 survives, and now with code-level backing: A2 (private keys never leave) and P5
 (connection requires proof-of-possession of a pinned key) were audited in the
@@ -638,7 +719,12 @@ what ships.
   (`SPAWN-HOST-INTRO-BCAST-V1` + firsthand peer-key stores, §8 R7-cont row);
   the bundle is now the catch-up channel of last resort only.
 
-**Still open:** possess-time anchor-on-`R` (§8); merge + prod rollout.
+- ~~Possess-time anchor-on-`R`~~ → subsumed by the root-introduction channel
+  and the pinned-device anchor sweep (§4.1, 2026-08-22): a newly possessed
+  host gains the `R` anchor at the possessing device's next sweep cycle, with
+  `pk_R` always firsthand-derived, never the server's `is_root` claim.
+
+**Still open:** merge + prod rollout (alembic 0031–0041).
 
 ---
 
