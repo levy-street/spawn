@@ -121,6 +121,7 @@ async def put_trust_bundle(
 
 @router.delete("/bundle", status_code=204)
 async def delete_trust_bundle(
+    expected_revision: int | None = None,
     user: User = Depends(auth.current_user),
     session: AsyncSession = Depends(get_session),
 ) -> None:
@@ -129,11 +130,30 @@ async def delete_trust_bundle(
     Deleting only forgets recovery material the account owner sealed — it never
     grants or restores anything, so no pin push is needed. Idempotent: an
     account with no bundle is the normal pre-bootstrap state.
+
+    ``expected_revision`` is a compare-and-set guard, mirroring PUT: without it,
+    a delete interleaving between another device's putBundle and addPasskey
+    (backup enrollment) silently destroyed the bundle that credential had just
+    been wrapped into, stranding an enrolled passkey that opens nothing. A
+    mismatch is a 409 — the client re-reads and re-confirms. The parameter is
+    optional only for wire compatibility; the web client always sends it.
     """
-    row = await session.get(TrustBundle, user.id)
-    if row is not None:
-        await session.delete(row)
-        await session.commit()
+    user_id = user.id
+    row = await session.get(TrustBundle, user_id)
+    if row is None:
+        # Idempotent: nothing to delete, whatever revision the caller expected.
+        return
+    stmt = delete(TrustBundle).where(TrustBundle.owner_user_id == user_id)
+    if expected_revision is not None:
+        stmt = stmt.where(TrustBundle.revision == expected_revision)
+    result = await session.execute(stmt)
+    if result.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="trust bundle changed since it was read; re-read and confirm before deleting",
+        )
+    await session.commit()
 
 
 @router.get("/passkeys", response_model=list[schemas.PasskeyCredentialOut])
