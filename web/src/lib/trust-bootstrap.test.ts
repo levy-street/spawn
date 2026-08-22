@@ -527,3 +527,68 @@ describe("mergeEnvelopeHosts", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Forget vs targeted revocation: tombstone provenance (review P-C6)
+// ---------------------------------------------------------------------------
+
+import { forgetTrustOnThisDevice } from "./trust-bootstrap";
+
+describe("forgetTrustOnThisDevice", () => {
+  test("a forgotten host is re-pinned by the next import — forget is not a revocation", async () => {
+    const dev = device();
+    await pin(dev, HOST_KEY);
+    const bundleKey = key(41);
+    const scope = { accountId: ACCOUNT, origin: ORIGIN, pinStorage: dev };
+    const { sealed } = await sealTrust(bundleKey, scope);
+
+    const { forgotten } = await forgetTrustOnThisDevice(scope);
+    expect(forgotten).toBe(1);
+    expect(
+      await listActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, dev),
+    ).toHaveLength(0);
+
+    // The old tombstoning forget made this import skip forever ("this device
+    // already knows your hosts", over zero pins). Deletion means the passkey
+    // path genuinely brings the host back.
+    const imported = await importTrustBundle(bundleKey, sealed, scope);
+    expect(imported.added).toEqual([HOST_KEY]);
+    expect(imported.skippedRevoked).toHaveLength(0);
+    const pins = await listActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, dev);
+    expect(pins.map((p) => p.hostPublicKey)).toEqual([HOST_KEY]);
+  });
+
+  test("forget spares a targeted-revocation tombstone, which imports keep honouring", async () => {
+    const dev = device();
+    await pin(dev, HOST_KEY);
+    await pin(dev, OTHER_HOST_KEY);
+    const bundleKey = key(42);
+    const scope = { accountId: ACCOUNT, origin: ORIGIN, pinStorage: dev };
+    const { sealed } = await sealTrust(bundleKey, scope);
+
+    // Operator's deliberate per-host removal…
+    await resolveActiveBrowserHostPin(
+      { accountId: ACCOUNT, origin: ORIGIN, hostId: HOST_ID, claimedHostPublicKey: HOST_KEY },
+      dev,
+    );
+    await revokeBrowserHostPin(
+      {
+        accountId: ACCOUNT,
+        origin: ORIGIN,
+        targetHostId: HOST_ID,
+        claimedHostId: HOST_ID,
+        claimedHostPublicKey: HOST_KEY,
+      },
+      dev,
+    );
+    // …then a device reset, which only clears the remaining ACTIVE pin.
+    const { forgotten } = await forgetTrustOnThisDevice(scope);
+    expect(forgotten).toBe(1);
+
+    const imported = await importTrustBundle(bundleKey, sealed, scope);
+    expect(imported.added).toEqual([OTHER_HOST_KEY]);
+    expect(imported.skippedRevoked).toEqual([HOST_KEY]);
+    const pins = await listActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, dev);
+    expect(pins.map((p) => p.hostPublicKey)).toEqual([OTHER_HOST_KEY]);
+  });
+});
