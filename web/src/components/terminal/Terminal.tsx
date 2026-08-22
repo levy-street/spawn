@@ -1277,6 +1277,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       dcOpen: socket.dcOpen,
       signedRtcRefusal: socket.signedRtcRefusal,
       signalingTrust: socket.signalingTrust,
+      // Lets a refusal surface deep-link its safe next step (the host page).
+      hostId: signalingHostId,
       ...socket.connInfo,
     });
   }, [
@@ -1286,6 +1288,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     socket.signedRtcRefusal,
     socket.signalingTrust,
     socket.connInfo,
+    signalingHostId,
   ]);
 
   // Only surface "waiting for the direct channel" after a grace period —

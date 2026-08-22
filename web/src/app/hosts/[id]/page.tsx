@@ -37,6 +37,7 @@ import {
   resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
 } from "@/lib/browser-host-pins";
+import { SIGNED_RTC_REFUSAL_DETAIL, SIGNED_RTC_REFUSAL_NEXT_STEP } from "@/lib/signed-rtc-trust";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class HostDeletionFlowError extends Error {
@@ -69,6 +70,11 @@ function HostDetail() {
   const [draftName, setDraftName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [localDeletionPending, setLocalDeletionPending] = useState(false);
+  // The served key conflicts with the identity this browser approved for this
+  // Host ID (review R-b): a legitimate reinstall/re-key and a substitution
+  // look identical, so connections are hard-refused elsewhere — this page owns
+  // explaining the fork and offering the one safe exit (remove, possess again).
+  const [identityConflict, setIdentityConflict] = useState(false);
 
   const q = useQuery({
     queryKey: ["host", id],
@@ -187,7 +193,18 @@ function HostDetail() {
             hostId: id,
             claimedHostPublicKey: hostPublicKey,
           });
+          if (!cancelled) setIdentityConflict(false);
         } catch (err) {
+          // The served key is not the one this browser approved for this Host
+          // ID: reinstall/re-key or substitution. Show the guided panel (with
+          // the safe exit) instead of a generic storage error.
+          if (err instanceof BrowserHostPinError && err.code === "host_id_key_conflict") {
+            if (!cancelled) {
+              setIdentityConflict(true);
+              setLocalDeletionPending(false);
+            }
+            return;
+          }
           // An already-bound tombstone is expected after a failed server
           // DELETE. Confirm its exact binding below without reactivating it.
           if (!(err instanceof BrowserHostPinError) || err.code !== "revoked_pin") throw err;
@@ -335,6 +352,42 @@ function HostDetail() {
         <p className="mb-3 text-sm text-destructive" role="alert">
           {error}
         </p>
+      )}
+      {identityConflict && (
+        <div
+          className="mb-4 rounded-xl border border-amber-500/40 bg-amber-500/5 p-4"
+          data-testid="host-identity-conflict"
+          role="alert"
+        >
+          <p className="text-sm font-medium text-foreground">
+            This host's identity changed — connections are blocked
+          </p>
+          <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+            {SIGNED_RTC_REFUSAL_DETAIL.host_key_substituted}
+          </p>
+          <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+            {SIGNED_RTC_REFUSAL_NEXT_STEP.host_key_substituted}
+          </p>
+          <div className="mt-3">
+            {/* The safe exit and nothing else: removal, then a fresh possession
+                ceremony from the host's own terminal. There is deliberately no
+                "trust the new identity" control here. */}
+            <Button
+              variant="destructive"
+              size="sm"
+              data-testid="conflict-remove-host"
+              disabled={removeM.isPending}
+              onClick={() => {
+                if (host && confirm(`Remove host ${host.name}? Its daemon token is revoked.`)) {
+                  removeM.mutate();
+                }
+              }}
+            >
+              <Trash2 className="size-4" aria-hidden />
+              Remove this host
+            </Button>
+          </div>
+        </div>
       )}
       {localDeletionPending && (
         <p className="mb-3 text-sm text-foreground" role="status">

@@ -19,6 +19,7 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
+import Link from "next/link";
 import {
   type DragEvent,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -40,7 +41,7 @@ import { useHostControl } from "@/hooks/useHostControl";
 import { ApiError, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { HostControlClient, type HostDirEntry, type HostDirList } from "@/lib/hostControl";
-import { resolveSignedRtcTrust } from "@/lib/signed-rtc-trust";
+import { resolveSignedRtcTrust, SIGNED_RTC_REFUSAL_DETAIL } from "@/lib/signed-rtc-trust";
 import { cn } from "@/lib/utils";
 import { FILE_EXPLORER_RETAINED_PAGE_LIMIT, retainDirectoryPages } from "./fileExplorerPaging";
 
@@ -147,7 +148,7 @@ export function FileExplorer({
   // previous account's pin and signing identity.
   const liveAccountIdRef = useRef<string | null>(user?.id ?? null);
   liveAccountIdRef.current = user?.id ?? null;
-  const { client: hostControl, state: hostControlState } = useHostControl(hostId);
+  const { client: hostControl, state: hostControlState, signedRtcRefusal } = useHostControl(hostId);
   const controlReady = hostControlState === "ready" && hostControl !== null;
 
   const rootQ = useQuery({
@@ -777,6 +778,24 @@ export function FileExplorer({
         {rootBusy && (
           <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
             <Loader2 className="size-3.5 animate-spin" aria-hidden /> Loading...
+          </div>
+        )}
+        {signedRtcRefusal && (
+          // A trust refusal is not a transport hiccup: say why the channel is
+          // blocked and point at the page that carries the safe next step
+          // (remove + possess again for a re-keyed host). Never an override.
+          <div
+            className="px-3 py-2 text-xs leading-relaxed text-destructive"
+            role="alert"
+            data-testid="files-trust-refusal"
+          >
+            {SIGNED_RTC_REFUSAL_DETAIL[signedRtcRefusal]}{" "}
+            <Link
+              href={`/hosts/${hostId}`}
+              className="font-medium underline underline-offset-2 text-foreground"
+            >
+              Review this host
+            </Link>
           </div>
         )}
         {rootQ.error && (
