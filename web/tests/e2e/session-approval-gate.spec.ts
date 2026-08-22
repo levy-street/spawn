@@ -11,7 +11,6 @@ import { AGENT_ID, BROWSER_DEVICE_ID, HOST_ID, agent, host, mockAuthenticatedApi
 const KEYED_HOST = {
   ...host,
   host_public_key: "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
-  host_key_fingerprint: "SHA256:AAAAAAAAAAAAAAAA",
 };
 
 test("an unapproved device opening an agent session gets the approval card and asks out loud", async ({
@@ -111,7 +110,6 @@ test("a device actively asking re-labels the approval toast for the approver", a
         id: "00000000-0000-4000-8000-000000000078",
         key_algorithm: "ed25519",
         public_key: "QUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
-        fingerprint: "SHA256:BBBBBBBBBBBBBBBB",
         label: "Pixel phone",
         created_at: "2026-08-01T00:00:00Z",
         approval_requested_at: "2026-08-21T00:00:00Z",

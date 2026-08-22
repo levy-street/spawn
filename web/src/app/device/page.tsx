@@ -313,19 +313,24 @@ function DeviceInner() {
         browser_device_id: registration.data.device.id,
         browser_key_algorithm: registration.data.device.key_algorithm,
         browser_public_key: registration.data.device.public_key,
-        browser_key_fingerprint: registration.data.device.fingerprint,
+        // Derived locally from this browser's own key (mesh B5): the server
+        // serves no fingerprint next to a key, so the wire copy the daemon
+        // stores originates here, from the key holder.
+        browser_key_fingerprint: await ed25519PublicKeyFingerprint(
+          registration.data.device.public_key,
+        ),
         signature,
       });
+      // The approve echo carries the keys alone (mesh B5); comparing them
+      // byte-for-byte subsumes any fingerprint comparison.
       if (
         r.host_name !== pending.host_name ||
         r.approval_nonce !== pending.approval_nonce ||
         r.host_key_algorithm !== pending.host_key_algorithm ||
         r.host_public_key !== pending.host_public_key ||
-        r.host_key_fingerprint !== pending.host_key_fingerprint ||
         r.browser_device_id !== registration.data.device.id ||
         r.browser_key_algorithm !== registration.data.device.key_algorithm ||
-        r.browser_public_key !== registration.data.device.public_key ||
-        r.browser_key_fingerprint !== registration.data.device.fingerprint
+        r.browser_public_key !== registration.data.device.public_key
       ) {
         throw new ApprovalIdentityError(
           "The approval response changed the reviewed host or browser identity",

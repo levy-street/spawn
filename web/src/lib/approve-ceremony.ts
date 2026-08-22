@@ -678,7 +678,6 @@ export function useApproveDeviceCeremony({
                 origin,
                 hostId: intro.hostId,
                 claimedHostPublicKey: intro.hostPublicKey,
-                claimedHostFingerprint: intro.hostFingerprint,
               });
             } catch (cause) {
               failures.push(

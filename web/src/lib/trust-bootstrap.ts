@@ -295,7 +295,6 @@ export async function forgetTrustOnThisDevice(
           targetHostId: hostId,
           claimedHostId: hostId,
           claimedHostPublicKey: pin.hostPublicKey,
-          claimedHostFingerprint: pin.hostFingerprint,
         },
         scope.pinStorage ?? {},
       );

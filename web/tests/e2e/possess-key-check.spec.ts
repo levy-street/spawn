@@ -85,7 +85,6 @@ async function installRoutes(page: Page, opts: { claimedKey: string }): Promise<
           id: BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
           public_key: body.public_key,
-          fingerprint: fingerprint(body.public_key),
           created_at: "2026-07-17T00:00:00Z",
           revoked_at: null,
         },
@@ -116,11 +115,9 @@ async function installRoutes(page: Page, opts: { claimedKey: string }): Promise<
           approval_nonce: APPROVAL_NONCE,
           host_key_algorithm: "ed25519",
           host_public_key: opts.claimedKey,
-          host_key_fingerprint: fingerprint(opts.claimedKey),
           browser_device_id: body.browser_device_id,
           browser_key_algorithm: body.browser_key_algorithm,
           browser_public_key: body.browser_public_key,
-          browser_key_fingerprint: body.browser_key_fingerprint,
         },
       });
       return;
@@ -155,6 +152,8 @@ test("a matching fragment key makes possession a single Approve click", async ({
     approval_nonce: APPROVAL_NONCE,
     host_key_algorithm: "ed25519",
     host_public_key: HOST_PUBLIC_KEY,
+    // Still sent in the signed approve REQUEST (cross-checked wire data the
+    // daemon prints; mesh B5 removed only the redundant response copies).
     host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
     browser_device_id: BROWSER_DEVICE_ID,
     browser_key_algorithm: "ed25519",

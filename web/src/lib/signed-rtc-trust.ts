@@ -64,10 +64,10 @@ export type SignedRtcTrustDecision =
 export interface ResolveSignedRtcTrustInput {
   readonly accountId: string;
   readonly hostId: string;
-  /** Host public key as CLAIMED by the (untrusted) server Host API; may be null. */
+  /** Host public key as CLAIMED by the (untrusted) server Host API; may be
+   * null. Its fingerprint is always derived locally from this key (mesh B5)
+   * — the server serves no fingerprint and none would be accepted here. */
   readonly claimedHostPublicKey: string | null;
-  /** Host fingerprint as CLAIMED by the (untrusted) server Host API; may be null. */
-  readonly claimedHostFingerprint: string | null;
   /** Defaults to the current server origin used for pin scoping. */
   readonly origin?: string;
   /**
@@ -85,10 +85,10 @@ export interface ResolveSignedRtcTrustInput {
 
 /**
  * Decide, from LOCAL trust state only, whether a live RTC connection to `hostId`
- * must be signed, may be raw, or must be refused. The server's claimed key and
- * fingerprint are treated as untrusted inputs — a pin match is required to trust
- * them, and their absence or divergence for an already-pinned host is a
- * downgrade signal, not a reason to fall back to raw.
+ * must be signed, may be raw, or must be refused. The server's claimed key is
+ * an untrusted input — a pin match is required to trust it, and its absence or
+ * divergence for an already-pinned host is a downgrade signal, not a reason to
+ * fall back to raw.
  */
 export async function resolveSignedRtcTrust(
   input: ResolveSignedRtcTrustInput,
@@ -113,7 +113,6 @@ export async function resolveSignedRtcTrust(
         origin,
         hostId: input.hostId,
         claimedHostPublicKey: input.claimedHostPublicKey,
-        claimedHostFingerprint: input.claimedHostFingerprint,
       },
       input.hostPinStorage ?? {},
     );
@@ -166,17 +165,15 @@ async function decideAfterResolveFailure(
     case "fingerprint_mismatch":
       return { mode: "refuse", reason: "host_key_substituted" };
     case "missing_pin":
-    case "null_key":
-    case "null_fingerprint": {
+    case "null_key": {
       // The server's claimed key is not (or not yet) an approved pin. That is a
       // legitimate unpinned/TOFU host UNLESS this hostId is already locally
       // pinned — in which case a null/absent/foreign key is a downgrade attempt
       // and the connection must be refused.
       if (await hostIdIsLocallyPinned(input, origin)) {
-        const withheld = error.code === "null_key" || error.code === "null_fingerprint";
         return {
           mode: "refuse",
-          reason: withheld ? "host_key_withheld" : "host_key_substituted",
+          reason: error.code === "null_key" ? "host_key_withheld" : "host_key_substituted",
         };
       }
       return await signedTofuOrUnpinned(input);

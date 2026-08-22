@@ -50,7 +50,6 @@ test("an endorsed browser verifies its hosts from the endorsement itself", async
       {
         ...host,
         host_public_key: wire(hostRaw),
-        host_key_fingerprint: fingerprintOf(hostRaw),
       },
     ],
   });
@@ -143,7 +142,6 @@ test("a server-substituted host key cannot be introduced", async ({ page }) => {
       {
         ...host,
         host_public_key: wire(attackerRaw),
-        host_key_fingerprint: fingerprintOf(attackerRaw),
       },
     ],
   });

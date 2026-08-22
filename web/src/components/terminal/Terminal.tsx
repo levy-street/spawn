@@ -990,7 +990,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const liveAccountIdRef = useRef<string | null>(signalingAccountId);
   liveAccountIdRef.current = signalingAccountId;
   const claimedHostPublicKey = hostIdentityQuery.data?.host_public_key ?? null;
-  const claimedHostFingerprint = hostIdentityQuery.data?.host_key_fingerprint ?? null;
   // Trust can only be evaluated once the account and hostId are known, and the
   // first connection must not race the host record: until the claimed key
   // query settles (success or error — a keyless host legitimately resolves to
@@ -1007,10 +1006,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         accountId: signalingAccountId as string,
         hostId: signalingHostId as string,
         claimedHostPublicKey,
-        claimedHostFingerprint,
         isActive: () => liveAccountIdRef.current === signalingAccountId,
       }),
-    [signalingAccountId, signalingHostId, claimedHostPublicKey, claimedHostFingerprint],
+    [signalingAccountId, signalingHostId, claimedHostPublicKey],
   );
   const loadCarriedEndorsements = useCallback(async (): Promise<CarriedEndorsement[]> => {
     const accountId = signalingAccountId;

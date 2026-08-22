@@ -110,9 +110,10 @@ export function EndorseDevicePanel({
       // The fingerprint the operator compared is only meaningful if it is the
       // fingerprint of the key being signed. Re-derive and refuse on mismatch
       // so a hostile server cannot pair the victim's fingerprint with its own
-      // key and harvest a signature over the attacker key.
+      // key and harvest a signature over the attacker key. (The server serves
+      // no fingerprint of its own to disagree with — mesh B5.)
       const derived = await ed25519PublicKeyFingerprint(target.public_key);
-      if (derived !== targetFingerprint || derived !== target.fingerprint) {
+      if (derived !== targetFingerprint) {
         throw new Error(
           "This device's fingerprint does not match its key. Refusing to approve — the server may be substituting a key.",
         );

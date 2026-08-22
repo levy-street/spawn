@@ -603,7 +603,14 @@ control plane must never be DISPLAYED as a comparison value without local
 recomputation from the accompanying key — every current surface re-derives
 (`canonicalHost`, roster fingerprints), and any future surface must too, or
 the human check of A4/A5 silently degrades into trusting the adversary's
-label.
+label. *(Follow-up, same review: the invariant is now structural — the
+server no longer serves a fingerprint next to a key the response already
+carries (`BrowserDeviceOut.fingerprint`, `HostOut.host_key_fingerprint`,
+the approve-response fingerprints, `endorsed_key_fingerprint`), so a lazy
+consumer of the redundant field cannot exist. The only fingerprints still
+on the wire are the possession-ceremony ones the daemon prints/verifies —
+`DevicePendingResponse`/`DevicePollSuccess` and the signed approve request
+— each cross-checked against the key at the point of use.)*
 
 **Verdict.** The core claim — *the server can slam doors, never open them* —
 survives, and now with code-level backing: A2 (private keys never leave) and P5

@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import auth, schemas
 from ..browser_registration import verify_browser_registration_proof
 from ..db import get_session
-from ..host_identity import ed25519_key_fingerprint
 from ..models import BrowserDevice, Host, RevokedBrowserKey, User
 from ..ws.daemon import push_browser_pins
 
@@ -25,7 +24,6 @@ def _to_out(device: BrowserDevice) -> schemas.BrowserDeviceOut:
         id=device.id,
         key_algorithm="ed25519",
         public_key=device.public_key,
-        fingerprint=ed25519_key_fingerprint(device.public_key),
         label=device.label,
         created_at=device.created_at,
         last_seen_at=device.last_seen_at,
@@ -453,7 +451,6 @@ async def rename_browser_device(
         id=device_id,
         key_algorithm="ed25519",
         public_key=public_key,
-        fingerprint=ed25519_key_fingerprint(public_key),
         label=label,
         created_at=created_at,
         last_seen_at=last_seen_at,

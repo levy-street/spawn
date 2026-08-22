@@ -90,7 +90,6 @@ describe("trust bootstrap", () => {
         origin: ORIGIN,
         hostId: HOST_ID,
         claimedHostPublicKey: HOST_KEY,
-        claimedHostFingerprint: await ed25519PublicKeyFingerprint(HOST_KEY),
       },
       first,
     );
@@ -101,7 +100,6 @@ describe("trust bootstrap", () => {
         targetHostId: HOST_ID,
         claimedHostId: HOST_ID,
         claimedHostPublicKey: HOST_KEY,
-        claimedHostFingerprint: await ed25519PublicKeyFingerprint(HOST_KEY),
       },
       first,
     );
@@ -246,7 +244,6 @@ describe("trust bootstrap", () => {
         origin: ORIGIN,
         hostId: HOST_ID,
         claimedHostPublicKey: HOST_KEY,
-        claimedHostFingerprint: await ed25519PublicKeyFingerprint(HOST_KEY),
       },
       first,
     );

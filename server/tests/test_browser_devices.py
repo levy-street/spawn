@@ -208,7 +208,9 @@ async def test_registration_is_authenticated_idempotent_and_account_scoped(clien
     assert repeated_body.pop("last_seen_at") >= first_body.pop("last_seen_at")
     assert repeated_body == first_body
     assert first.json()["public_key"] == proof["public_key"]
-    assert first.json()["fingerprint"].startswith("SHA256:")
+    # Mesh B5: the key travels alone — no server-derived fingerprint rides
+    # next to it for a lazy client to display without re-deriving.
+    assert "fingerprint" not in first.json()
     assert first.json()["revoked_at"] is None
 
     second_id, second_token = await _signup(client, "browser-two@example.com")

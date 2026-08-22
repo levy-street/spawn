@@ -558,11 +558,6 @@ export async function mockAuthenticatedApi(
       const body = (await request.postDataJSON()) as Record<string, string>;
       let device = browserDeviceList.find((item) => item.public_key === body.public_key);
       if (!device) {
-        const digest = createHash("sha256")
-          .update(Buffer.from(body.public_key, "base64url"))
-          .digest()
-          .subarray(0, 12)
-          .toString("base64url");
         device = {
           // The browser's own registration always gets the stable id, even
           // when extra fixture devices are pre-seeded.
@@ -570,8 +565,9 @@ export async function mockAuthenticatedApi(
             ? `00000000-0000-4000-8000-${String(browserDeviceList.length + 9).padStart(12, "0")}`
             : BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
+          // No fingerprint field (mesh B5): the real server serves the key
+          // alone and the client derives any fingerprint it displays.
           public_key: body.public_key,
-          fingerprint: `SHA256:${digest}`,
           label: body.label ?? null,
           created_at: CREATED_AT,
           revoked_at: null,
@@ -761,7 +757,6 @@ export async function mockAuthenticatedApi(
         json: {
           host_id: body.host_id,
           endorsed_device_id: body.endorsed_device_id,
-          endorsed_key_fingerprint: endorsed.fingerprint,
           endorser_device_id: body.endorser_device_id,
           created_at: CREATED_AT,
         },

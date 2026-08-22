@@ -387,7 +387,6 @@ async def create_browser_endorsement(
         return schemas.BrowserEndorsementOut(
             host_id=host.id,
             endorsed_device_id=endorsed.id,
-            endorsed_key_fingerprint=existing.browser_key_fingerprint,
             endorser_device_id=body.endorser_device_id,
             created_at=existing.created_at,
         )
@@ -429,7 +428,6 @@ async def create_browser_endorsement(
     return schemas.BrowserEndorsementOut(
         host_id=host.id,
         endorsed_device_id=body.endorsed_device_id,
-        endorsed_key_fingerprint=fingerprint,
         endorser_device_id=body.endorser_device_id,
         created_at=created_at,
     )

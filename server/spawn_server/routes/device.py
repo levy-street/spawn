@@ -903,11 +903,15 @@ async def device_approve(
             detail="host identity or approval state changed; review the device code again",
         )
     await session.commit()
+    # Echo the reviewed identity minus the SAS relay fields (pending-only) and
+    # minus the fingerprint (mesh B5: the response carries the keys themselves,
+    # so the client derives any fingerprint it needs locally).
     return schemas.DeviceApproveResponse(
-        **reviewed.model_dump(),
+        **reviewed.model_dump(
+            exclude={"host_key_fingerprint", "sas_commit", "sas_host_nonce"}
+        ),
         browser_device_id=body.browser_device_id,
         browser_key_algorithm=body.browser_key_algorithm,
         browser_public_key=body.browser_public_key,
-        browser_key_fingerprint=body.browser_key_fingerprint,
         host_id=pinned_host.id if pinned_host is not None else None,
     )

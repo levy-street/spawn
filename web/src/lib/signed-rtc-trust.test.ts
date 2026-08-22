@@ -18,7 +18,6 @@ const OTHER_HOST_KEY = "11qYAYdk9Jt0uvL7Tp_5eQK8heP0LOEYVVt4dSK3M3A";
 let hostFactory: IDBFactory;
 let deviceFactory: IDBFactory;
 let HOST_FP: string;
-let OTHER_FP: string;
 
 const hostPinStorage = () => ({ indexedDBFactory: hostFactory, now: () => 1_000 }) as const;
 const deviceIdentityStorage = () => ({ indexedDBFactory: deviceFactory }) as const;
@@ -31,14 +30,13 @@ async function seedPin(key = HOST_KEY, fingerprint = HOST_FP): Promise<void> {
 }
 
 /** Bind HOST_ID to a locally-approved key by performing one honest resolve. */
-async function bindHostId(key = HOST_KEY, fingerprint = HOST_FP): Promise<void> {
+async function bindHostId(key = HOST_KEY): Promise<void> {
   await resolveActiveBrowserHostPin(
     {
       accountId: ACCOUNT,
       origin: ORIGIN,
       hostId: HOST_ID,
       claimedHostPublicKey: key,
-      claimedHostFingerprint: fingerprint,
     },
     hostPinStorage(),
   );
@@ -54,7 +52,6 @@ function resolve(overrides: Partial<Parameters<typeof resolveSignedRtcTrust>[0]>
     hostId: HOST_ID,
     origin: ORIGIN,
     claimedHostPublicKey: HOST_KEY,
-    claimedHostFingerprint: HOST_FP,
     isActive: () => true,
     hostPinStorage: hostPinStorage(),
     deviceIdentityStorage: deviceIdentityStorage(),
@@ -66,7 +63,6 @@ beforeEach(async () => {
   hostFactory = new IDBFactory();
   deviceFactory = new IDBFactory();
   HOST_FP = await ed25519PublicKeyFingerprint(HOST_KEY);
-  OTHER_FP = await ed25519PublicKeyFingerprint(OTHER_HOST_KEY);
 });
 
 describe("resolveSignedRtcTrust gate", () => {
@@ -108,28 +104,19 @@ describe("resolveSignedRtcTrust gate", () => {
     // A later withheld key must still be treated as a never-pinned host (raw
     // or refused elsewhere), not as a downgrade from a pin this path must not
     // have created.
-    const withheld = await resolve({
-      claimedHostPublicKey: null,
-      claimedHostFingerprint: null,
-    });
+    const withheld = await resolve({ claimedHostPublicKey: null });
     expect(withheld.mode).toBe("unpinned");
   });
 
   test("null claimed key on a never-pinned host => unpinned (legacy preserved)", async () => {
-    const decision = await resolve({
-      claimedHostPublicKey: null,
-      claimedHostFingerprint: null,
-    });
+    const decision = await resolve({ claimedHostPublicKey: null });
     expect(decision.mode).toBe("unpinned");
   });
 
   test("DOWNGRADE: null claimed key on an already-pinned hostId => refuse (withheld)", async () => {
     await seedPin();
     await bindHostId();
-    const decision = await resolve({
-      claimedHostPublicKey: null,
-      claimedHostFingerprint: null,
-    });
+    const decision = await resolve({ claimedHostPublicKey: null });
     expect(decision.mode).toBe("refuse");
     if (decision.mode !== "refuse") throw new Error("unreachable");
     expect(decision.reason).toBe("host_key_withheld");
@@ -138,10 +125,7 @@ describe("resolveSignedRtcTrust gate", () => {
   test("SUBSTITUTION: foreign key on an already-pinned hostId => refuse (substituted)", async () => {
     await seedPin();
     await bindHostId();
-    const decision = await resolve({
-      claimedHostPublicKey: OTHER_HOST_KEY,
-      claimedHostFingerprint: OTHER_FP,
-    });
+    const decision = await resolve({ claimedHostPublicKey: OTHER_HOST_KEY });
     expect(decision.mode).toBe("refuse");
     if (decision.mode !== "refuse") throw new Error("unreachable");
     expect(decision.reason).toBe("host_key_substituted");
@@ -157,7 +141,6 @@ describe("resolveSignedRtcTrust gate", () => {
         targetHostId: HOST_ID,
         claimedHostId: HOST_ID,
         claimedHostPublicKey: HOST_KEY,
-        claimedHostFingerprint: HOST_FP,
       },
       hostPinStorage(),
     );

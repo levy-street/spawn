@@ -37,6 +37,7 @@ import {
   resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
 } from "@/lib/browser-host-pins";
+import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class HostDeletionFlowError extends Error {
   constructor(
@@ -81,6 +82,14 @@ function HostDetail() {
     enabled: !!id,
     refetchInterval: 10_000,
   });
+  // Displayed fingerprint, derived LOCALLY from the served key (mesh B5): the
+  // server no longer serves one, and this page would not show it if it did.
+  const hostFingerprintQ = useQuery({
+    queryKey: ["host-key-fingerprint", q.data?.host_public_key ?? null],
+    queryFn: () => ed25519PublicKeyFingerprint(q.data?.host_public_key as string),
+    enabled: Boolean(q.data?.host_public_key),
+    staleTime: Number.POSITIVE_INFINITY,
+  });
 
   const renameM = useMutation({
     mutationFn: (name: string) => hosts.rename(id as string, name),
@@ -115,7 +124,7 @@ function HostDetail() {
         // browser (missing_pin), or the pin is already a tombstone. In all those
         // cases proceed straight to the server delete instead of failing "before
         // any server DELETE"; only a genuine local-storage fault still blocks.
-        if (host.host_public_key && host.host_key_fingerprint) {
+        if (host.host_public_key) {
           try {
             await revokeBrowserHostPin({
               accountId: user.id,
@@ -123,15 +132,12 @@ function HostDetail() {
               targetHostId,
               claimedHostId: host.id,
               claimedHostPublicKey: host.host_public_key,
-              claimedHostFingerprint: host.host_key_fingerprint,
             });
             localTombstoneWritten = true;
           } catch (revokeErr) {
             const nothingToRevoke =
               revokeErr instanceof BrowserHostPinError &&
-              ["revoked_pin", "missing_pin", "null_key", "null_fingerprint"].includes(
-                revokeErr.code,
-              );
+              ["revoked_pin", "missing_pin", "null_key"].includes(revokeErr.code);
             if (!nothingToRevoke) throw revokeErr;
           }
         }
@@ -165,21 +171,21 @@ function HostDetail() {
 
   useEffect(() => {
     const hostPublicKey = host?.host_public_key;
-    const hostFingerprint = host?.host_key_fingerprint;
-    if (!host || !user || !hostPublicKey || !hostFingerprint) return;
+    if (!host || !user || !hostPublicKey) return;
     let cancelled = false;
     void (async () => {
       try {
         if (host.id !== id) {
           throw new Error("Host API response ID does not exactly match this route");
         }
+        // Locally derived (mesh B5) — the pin store never sees a served label.
+        const hostFingerprint = await ed25519PublicKeyFingerprint(hostPublicKey);
         try {
           await resolveActiveBrowserHostPin({
             accountId: user.id,
             origin: browserHostPinServerOrigin(),
             hostId: id,
             claimedHostPublicKey: hostPublicKey,
-            claimedHostFingerprint: hostFingerprint,
           });
         } catch (err) {
           // An already-bound tombstone is expected after a failed server
@@ -357,7 +363,12 @@ function HostDetail() {
             <Fact label="Daemon" value={`spawnd ${host.version ?? "?"}`} />
             <Fact label="Files" value="end-to-end encrypted" />
             <Fact label="Host identity" value={host.host_key_algorithm ?? "legacy unpaired"} />
-            <Fact label="Fingerprint" value={host.host_key_fingerprint ?? "not pinned"} mono />
+            <Fact
+              label="Fingerprint"
+              // Derived locally from the served key (mesh B5), never served.
+              value={host.host_public_key ? (hostFingerprintQ.data ?? "…") : "not pinned"}
+              mono
+            />
             <Fact
               label="Connection"
               value={
