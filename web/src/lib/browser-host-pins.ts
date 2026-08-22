@@ -542,6 +542,11 @@ async function compareAndWrite<T>(
   database: IDBDatabase,
   mutate: (records: readonly StoredBrowserHostPinV1[]) => {
     readonly nextRecord?: StoredBrowserHostPinV1;
+    /** Additional records written in the SAME transaction (e.g. a routing
+     * binding migrating between two records must move atomically). */
+    readonly nextRecords?: readonly StoredBrowserHostPinV1[];
+    /** Records to DELETE outright (device-local forget). Applied before any put. */
+    readonly removeRecordIds?: readonly string[];
     readonly result: T;
   },
 ): Promise<T> {
@@ -575,8 +580,14 @@ async function compareAndWrite<T>(
         throw RETRY_COMPARE_WRITE;
       }
       const transition = mutate(validated);
+      for (const id of transition.removeRecordIds ?? []) {
+        await requestResult(store.delete(id));
+      }
       if (transition.nextRecord !== undefined) {
         await requestResult(store.put(transition.nextRecord));
+      }
+      for (const record of transition.nextRecords ?? []) {
+        await requestResult(store.put(record));
       }
       await completion;
       return transition.result;
@@ -814,6 +825,43 @@ export async function revokeBrowserHostPin(
         state: "revoked",
       };
       return { nextRecord: revoked, result: publicPin(revoked) };
+    });
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * Forget every ACTIVE pin in scope by DELETING the records outright — the
+ * device-local reset behind "Forget hosts on this device".
+ *
+ * Deletion (not tombstoning) is deliberate tombstone PROVENANCE (review P-C6):
+ * a retained `state: "revoked"` record means an operator's TARGETED host
+ * revocation — a statement about the HOST — which a bundle import must never
+ * resurrect and the signed-RTC gate must keep refusing. A forget is the
+ * opposite statement — "this DEVICE should remember nothing" — so the record
+ * disappears entirely and a later passkey import may re-pin the host as if
+ * first seen, instead of skipping it forever while the unlock claims the
+ * device "already knows" hosts it cannot reach. Targeted-revocation
+ * tombstones already in scope are retained untouched: a forget is a reset,
+ * not an amnesty for hosts the operator deliberately removed here.
+ */
+export async function forgetActiveBrowserHostPins(
+  input: { readonly accountId: string; readonly origin: string },
+  options: BrowserHostPinStorageOptions = {},
+): Promise<{ readonly forgotten: number }> {
+  assertScope(input.accountId, input.origin);
+  const factory = resolveIndexedDB(options);
+  const database = await openDatabase(factory);
+  try {
+    return await compareAndWrite(database, (records) => {
+      const active = recordsInScope(records, input.accountId, input.origin).filter(
+        (record) => record.state === "active",
+      );
+      return {
+        removeRecordIds: active.map((record) => record.recordId),
+        result: { forgotten: active.length },
+      };
     });
   } finally {
     database.close();

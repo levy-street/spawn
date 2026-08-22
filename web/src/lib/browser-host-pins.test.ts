@@ -8,6 +8,7 @@ import {
   BROWSER_HOST_PIN_STORAGE_VERSION,
   BROWSER_HOST_PIN_STORE_NAME,
   BrowserHostPinError,
+  forgetActiveBrowserHostPins,
   loadBrowserHostPin,
   loadBrowserHostPinByHostId,
   resolveActiveBrowserHostPin,
@@ -597,5 +598,72 @@ describe("approveBrowserHostPin Host ID seeding", () => {
       options(factory),
     );
     expect(approved.hostIds).toEqual([HOST_ID]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Device-local forget: deletion, not tombstoning (review P-C6)
+// ---------------------------------------------------------------------------
+
+describe("forgetActiveBrowserHostPins", () => {
+  test("deletes every active pin in scope so the host reads as never seen", async () => {
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await approveBrowserHostPin(
+      approvalInput({
+        hostPublicKey: OTHER_HOST_KEY,
+        hostFingerprint: await ed25519PublicKeyFingerprint(OTHER_HOST_KEY),
+      }),
+      options(factory),
+    );
+
+    const { forgotten } = await forgetActiveBrowserHostPins(
+      { accountId: ACCOUNT, origin: ORIGIN },
+      options(factory),
+    );
+    expect(forgotten).toBe(2);
+    // No record at all — not a revoked tombstone. The signed-RTC gate and a
+    // later bundle import both see a host this device never met.
+    expect(await loadBrowserHostPin(approvalInput(), options(factory))).toBeNull();
+    // Re-approval (e.g. a passkey import) recreates trust from scratch.
+    const again = await approveBrowserHostPin(approvalInput(), options(factory));
+    expect(again.state).toBe("active");
+  });
+
+  test("retains an operator's targeted-revocation tombstone untouched", async () => {
+    const factory = new IDBFactory();
+    await approveBrowserHostPin({ ...approvalInput(), hostIds: [HOST_ID] }, options(factory));
+    await revokeBrowserHostPin(revokeInput(), options(factory));
+    await approveBrowserHostPin(
+      approvalInput({
+        hostPublicKey: OTHER_HOST_KEY,
+        hostFingerprint: await ed25519PublicKeyFingerprint(OTHER_HOST_KEY),
+      }),
+      options(factory),
+    );
+
+    const { forgotten } = await forgetActiveBrowserHostPins(
+      { accountId: ACCOUNT, origin: ORIGIN },
+      options(factory),
+    );
+    expect(forgotten).toBe(1);
+    // The targeted removal is a statement about the HOST, not this device's
+    // memory — a forget must not turn it into an amnesty.
+    const tombstone = await loadBrowserHostPin(approvalInput(), options(factory));
+    expect(tombstone?.state).toBe("revoked");
+  });
+
+  test("is scoped: other accounts and origins keep their pins", async () => {
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await approveBrowserHostPin(approvalInput({ accountId: OTHER_ACCOUNT }), options(factory));
+    const { forgotten } = await forgetActiveBrowserHostPins(
+      { accountId: ACCOUNT, origin: ORIGIN },
+      options(factory),
+    );
+    expect(forgotten).toBe(1);
+    expect(
+      await loadBrowserHostPin(approvalInput({ accountId: OTHER_ACCOUNT }), options(factory)),
+    ).not.toBeNull();
   });
 });

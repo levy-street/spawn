@@ -15,9 +15,9 @@ import {
   type BrowserHostPin,
   type BrowserHostPinStorageOptions,
   browserHostPinServerOrigin,
+  forgetActiveBrowserHostPins,
   listActiveBrowserHostPins,
   loadBrowserHostPin,
-  revokeBrowserHostPin,
 } from "./browser-host-pins";
 import type { TrustBundleHost } from "./trust-bundle";
 import {
@@ -291,7 +291,10 @@ export async function importTrustBundle(
     }
     // Honour a local tombstone: importing must never silently resurrect a host
     // the operator revoked on this device. approveBrowserHostPin would otherwise
-    // reactivate it, undoing a deliberate withdrawal.
+    // reactivate it, undoing a deliberate withdrawal. A tombstone here always
+    // means a TARGETED revocation — a device-local "forget" deletes its records
+    // outright (see forgetTrustOnThisDevice), so a forgotten host re-imports
+    // freely while a removed one stays removed.
     const existing = await loadBrowserHostPin(
       {
         accountId: scope.accountId,
@@ -333,31 +336,22 @@ export async function importTrustBundle(
  * can be re-endorsed afterwards. Without this the only remedy is clearing site
  * data through browser settings, which also destroys the device identity and so
  * invalidates any endorsement already granted to it.
+ *
+ * Forgetting DELETES the records rather than writing `revoked` tombstones
+ * (review P-C6). A tombstone here meant three lies at once: the device did not
+ * return to the unpinned path (the signed-RTC gate refuses a revoked pin), a
+ * later passkey import skipped the host forever, and the unlock then claimed
+ * the device "already knows your hosts" while it could reach none of them.
+ * Retained tombstones now always mean an operator's TARGETED host revocation
+ * (`revokeBrowserHostPin`), which imports still honour and the gate still
+ * refuses; such tombstones are untouched by a forget.
  */
 export async function forgetTrustOnThisDevice(
   scope: TrustBootstrapScope,
 ): Promise<{ readonly forgotten: number }> {
   const origin = scope.origin ?? browserHostPinServerOrigin();
-  const pins = await listActiveBrowserHostPins(
+  return forgetActiveBrowserHostPins(
     { accountId: scope.accountId, origin },
     scope.pinStorage ?? {},
   );
-  let forgotten = 0;
-  for (const pin of pins) {
-    for (const hostId of pin.hostIds) {
-      await revokeBrowserHostPin(
-        {
-          accountId: scope.accountId,
-          origin,
-          targetHostId: hostId,
-          claimedHostId: hostId,
-          claimedHostPublicKey: pin.hostPublicKey,
-        },
-        scope.pinStorage ?? {},
-      );
-      forgotten += 1;
-      break;
-    }
-  }
-  return { forgotten };
 }
