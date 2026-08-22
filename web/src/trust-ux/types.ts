@@ -6,7 +6,7 @@ export interface DeviceVM {
   name: string;
   kind: DeviceKind;
   isThisDevice?: boolean;
-  /** "Approved by MacBook Pro · Jun 3" | "First device" | "Signed in with passkey · Jul 2"
+  /** "Approved by MacBook Pro · Jun 3" | "First device" | "Approved by your passkey · Jul 2"
       — or, while waiting, "Signed in 2m ago". */
   provenance: string;
   /** "Now" | "2h ago" | "Jun 12" */

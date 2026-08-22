@@ -88,7 +88,9 @@ describe("device rows", () => {
       NOW,
     );
     expect(vms.find((v) => v.id === "phone")?.provenance).toBe("Approved by MacBook Pro · Jun 3");
-    expect(vms.find((v) => v.id === "pixel")?.provenance).toBe("Signed in with passkey · Jul 2");
+    // Honest R→d rendering: "approved by", never a sign-in claim — the edge is
+    // minted by heals as well as actual passkey sign-ins.
+    expect(vms.find((v) => v.id === "pixel")?.provenance).toBe("Approved by your passkey · Jul 2");
     expect(vms.find((v) => v.id === "pixel")?.kind).toBe("phone");
   });
 
@@ -250,7 +252,7 @@ describe("trust history", () => {
     );
     expect(events.map((e) => e.text)).toEqual([
       "Old iPad removed by MacBook Pro",
-      "Pixel 9 signed in with passkey",
+      "Your passkey approved Pixel 9",
       "MacBook Pro approved iPhone",
       "MacBook Pro possessed mac-studio",
       "Passkey added",

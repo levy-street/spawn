@@ -8,7 +8,7 @@
  *
  * Vocabulary discipline lives here too — this is the one place raw mesh
  * concepts (roots, endorsements, pins) are translated into the screen's words
- * (approved, possessed, signed in with passkey), so nothing below this module
+ * (approved, possessed, approved by your passkey), so nothing below this module
  * needs to know the banned list.
  */
 
@@ -201,8 +201,15 @@ export function deriveDeviceVMs(input: AccessViewInput, now: Date): DeviceVM[] {
     if (d.id === firstId) {
       provenance = "First device";
     } else if (edge !== undefined) {
+      // A root-endorsed device says "approved by your passkey", never "signed
+      // in with passkey" (R4 honesty): the R→d edge proves the passkey's
+      // protection covered the device — minted either by an actual passkey
+      // sign-in here or by the account-wide re-approval another device's
+      // passkey use performs — and the view cannot tell those apart. Claiming
+      // a sign-in the operator may never have made would teach them to
+      // shrug at exactly the line a rogue passkey enrollment would produce.
       provenance = roots.has(edge.endorser_device_id)
-        ? `Signed in with passkey · ${shortDate(edge.created_at, now)}`
+        ? `Approved by your passkey · ${shortDate(edge.created_at, now)}`
         : `Approved by ${nameOf.get(edge.endorser_device_id) ?? "a removed device"} · ${shortDate(edge.created_at, now)}`;
     } else {
       const pinned = earliestPin.get(d.id);
@@ -282,9 +289,12 @@ export function deriveTrustEvents(input: AccessViewInput, now: Date): TrustEvent
     if (isReciprocal(e)) continue;
     events.push(
       roots.has(e.endorser_device_id)
-        ? {
-            id: `passkey-signin:${e.endorsed_device_id}:${e.created_at}`,
-            text: `${named(e.endorsed_device_id)} signed in with passkey`,
+        ? // Same honesty rule as the roster provenance above: an R→d edge is
+          // the passkey's approval of the device, not evidence the device
+          // itself performed a passkey sign-in.
+          {
+            id: `passkey-approved:${e.endorsed_device_id}:${e.created_at}`,
+            text: `Your passkey approved ${named(e.endorsed_device_id)}`,
             when: shortDate(e.created_at, now),
             kind: "passkey",
             at: parse(e.created_at),

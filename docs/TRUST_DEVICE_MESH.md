@@ -693,6 +693,33 @@ else the dialog returns in its honest branch (warn-not-refuse preserved).
 The general lesson is B5's, one level up: **a flow must never promise an
 outcome it did not verify** — success copy is part of the trust surface.
 
+**Passkey-lifecycle hardening (fresh-context review, 2026-08-22).** A second
+review pass over the passkey layer found a cluster of lifecycle-edge bugs
+(P-C5/P-C6 plus three adjacent), all closed the same day. (a) *Seal before
+enroll:* setup ordered server-enroll → second gesture → seal, so a failure
+mid-way (Safari's user-activation expiry is routine) left a GHOST credential —
+listed, offered, opening nothing; now the order is create → PRF → seal →
+putBundle (CAS) → enroll, unlock offers only the server-list ∩ envelope-wraps
+intersection (falling back to the wraps themselves for the half-enrolled
+state, then re-registering after the verified open — no retry deadlocks), and
+a provably wrap-less credential can be removed as cleanup after a working
+passkey proves a fresh envelope. (b) *Forget honesty:* the device-local
+"forget hosts" wrote `revoked` tombstones, so the device never returned to the
+unpinned path, imports skipped those hosts forever, and the unlock claimed
+"already knows your hosts" over zero pins; forgetting now DELETES the records
+(tombstone provenance: a retained tombstone always means a targeted per-host
+removal, which imports still honour and signed-RTC still refuses), and the
+unlock status reports every bucket including "stayed removed". (c) The bundle
+DELETE gained the same revision CAS as PUT (a delete racing another device's
+backup enrollment stranded the fresh credential); the final-passkey removal
+abandons an unreadable-but-present bundle only after a second, exact
+acknowledgement, and fails outright on transient errors. (d) The retired-root
+archive cap no longer throws out of the unlock (the 9th rotation permanently
+broke recovery): rotation now evicts the OLDEST retired seed. (e) History/roster
+honesty: `R→d` edges render as "Approved by your passkey", never as a sign-in
+claim the operator may not have made — the same lesson as F1, applied to the
+audit surface: **display copy must not overclaim provenance**.
+
 **Verdict.** The core claim — *the server can slam doors, never open them* —
 survives, and now with code-level backing: A2 (private keys never leave) and P5
 (connection requires proof-of-possession of a pinned key) were audited in the
