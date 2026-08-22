@@ -197,8 +197,7 @@ export async function rememberFirsthandRoot(
       origin: input.origin,
       rootPublicKey: input.rootPublicKey,
       source: input.source,
-      learnedAtMs:
-        existing?.rootPublicKey === input.rootPublicKey ? existing.learnedAtMs : now,
+      learnedAtMs: existing?.rootPublicKey === input.rootPublicKey ? existing.learnedAtMs : now,
       version: 1,
     };
     await requestResult(store.put(record));

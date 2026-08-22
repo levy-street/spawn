@@ -1,17 +1,17 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
 import {
-  loadFirsthandRoot,
-  rememberFirsthandRoot,
-  RootKnowledgeConflictError,
-} from "./root-knowledge";
-import {
   type ClaimedRootIntroduction,
   encodeRootIntroductionTranscript,
   planRootAnchorSweep,
   planRootIntroductionAcceptance,
   ROOT_INTRO_TRANSCRIPT_BYTES,
 } from "./root-introduction";
+import {
+  loadFirsthandRoot,
+  RootKnowledgeConflictError,
+  rememberFirsthandRoot,
+} from "./root-knowledge";
 import { encodeBase64Url } from "./signed-signal";
 
 const ACCOUNT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
