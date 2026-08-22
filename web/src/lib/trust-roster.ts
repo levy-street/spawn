@@ -106,3 +106,33 @@ export function hostsSolelyTrustedBy(
   }
   return orphaned;
 }
+
+/**
+ * The fail-closed gate on the remove dialog's "stays reachable" promise
+ * (P-C7 / the field bug): after the pre-removal passkey step, an at-risk host
+ * counts as protected ONLY if the heal verifiably upgraded it this run
+ * (`upgradedHostIds` — this device signed the statement and the server
+ * accepted it) or its REFRESHED, liveness-filtered pin list already shows the
+ * root anchor. Everything else stays at risk, and the caller must withdraw
+ * the promise rather than proceed on it. A null report (the heal never ran)
+ * protects nothing.
+ *
+ * Both inputs are advisory server data used in the DENY direction only: a
+ * lying server can make this gate refuse the promise (the honest dialog
+ * appears; removal stays possible as "Remove anyway"), never manufacture it —
+ * the promise additionally requires ids the heal itself reported.
+ */
+export function unprotectedOrphanHostIds(
+  atRiskHostIds: readonly string[],
+  report: { upgradedHostIds: readonly string[] } | null,
+  refreshedPinsByHost: ReadonlyMap<string, readonly string[]>,
+  rootDeviceId: string | null,
+): string[] {
+  const upgraded = new Set(report?.upgradedHostIds ?? []);
+  return atRiskHostIds.filter((hostId) => {
+    if (upgraded.has(hostId)) return false;
+    if (rootDeviceId === null) return true;
+    const pins = refreshedPinsByHost.get(hostId);
+    return pins === undefined || !pins.includes(rootDeviceId);
+  });
+}

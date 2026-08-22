@@ -1,88 +1,72 @@
 import { describe, expect, test } from "bun:test";
-import { computeTrustRoster, hostsSolelyTrustedBy } from "./trust-roster";
+import { hostsSolelyTrustedBy, unprotectedOrphanHostIds } from "./trust-roster";
 
-const device = (id: string, opts: { revoked?: boolean; isRoot?: boolean } = {}) => ({
-  id,
-  revoked_at: opts.revoked ? "2026-08-20T00:00:00Z" : null,
-  is_root: opts.isRoot ?? false,
-});
-
-const edge = (endorser: string, endorsed: string) => ({
-  endorser_device_id: endorser,
-  endorsed_device_id: endorsed,
-});
-
-describe("computeTrustRoster", () => {
-  test("chains from pinned anchors and the root; provenance lists live vouchers", () => {
-    const devices = [
-      device("root", { isRoot: true }),
-      device("laptop"), // pinned anchor
-      device("phone"), // chained via laptop
-      device("tablet"), // root-child
-      device("stray"), // no edges at all
-    ];
-    const edges = [edge("laptop", "phone"), edge("root", "tablet")];
-    const roster = computeTrustRoster(devices, edges, new Set(["laptop"]));
-
-    expect(roster.get("laptop")).toEqual({
-      vouchedForBy: [],
-      chainTrusted: true,
-      rootChild: false,
-    });
-    expect(roster.get("phone")).toEqual({
-      vouchedForBy: ["laptop"],
-      chainTrusted: true,
-      rootChild: false,
-    });
-    expect(roster.get("tablet")).toEqual({
-      vouchedForBy: ["root"],
-      chainTrusted: true,
-      rootChild: true,
-    });
-    expect(roster.get("stray")).toEqual({
-      vouchedForBy: [],
-      chainTrusted: false,
-      rootChild: false,
-    });
-  });
-
-  test("edges from a revoked device grant nothing — the subtree goes dark", () => {
-    // Mirrors the daemon's RevocationSet subtraction: revoking mid severs leaf
-    // even though leaf itself is unrevoked.
-    const devices = [device("anchor"), device("mid", { revoked: true }), device("leaf")];
-    const edges = [edge("anchor", "mid"), edge("mid", "leaf")];
-    const roster = computeTrustRoster(devices, edges, new Set(["anchor"]));
-    expect(roster.get("leaf")?.chainTrusted).toBe(false);
-    expect(roster.get("leaf")?.vouchedForBy).toEqual([]);
-  });
-
-  test("a revoked root neither anchors nor makes root-children", () => {
-    const devices = [device("root", { isRoot: true, revoked: true }), device("orphan")];
-    const roster = computeTrustRoster(devices, [edge("root", "orphan")], new Set());
-    expect(roster.get("orphan")).toEqual({
-      vouchedForBy: [],
-      chainTrusted: false,
-      rootChild: false,
-    });
-  });
-
-  test("multi-hop chains resolve (anchor → a → b → c)", () => {
-    const devices = [device("anchor"), device("a"), device("b"), device("c")];
-    const edges = [edge("anchor", "a"), edge("a", "b"), edge("b", "c")];
-    const roster = computeTrustRoster(devices, edges, new Set(["anchor"]));
-    expect(roster.get("c")?.chainTrusted).toBe(true);
-  });
-});
+const HOST = "00000000-0000-4000-8000-00000000000a";
+const OTHER_HOST = "00000000-0000-4000-8000-00000000000b";
+const DEVICE_X = "00000000-0000-4000-8000-000000000101";
+const DEVICE_Y = "00000000-0000-4000-8000-000000000102";
+const ROOT_DEVICE = "00000000-0000-4000-8000-000000000103";
 
 describe("hostsSolelyTrustedBy (R5)", () => {
-  test("flags hosts whose only live pin is the device", () => {
-    const pins = new Map([
-      ["host-solo", ["laptop"]],
-      ["host-shared", ["laptop", "root-device"]],
-      ["host-other", ["phone"]],
+  test("REGRESSION (field bug / P-C4): a revoked-root co-pin no longer hides sole-trust", () => {
+    // The pins routes now serve transitively-LIVE pins (the daemon's own
+    // computation), so a host whose raw rows were {X, revoked-root} arrives
+    // here as {X} — and removing X MUST warn as sole-trust. Before the
+    // liveness fix the dead root row padded the list to two and silenced the
+    // warning exactly when it mattered.
+    const pinsByHost = new Map<string, readonly string[]>([[HOST, [DEVICE_X]]]);
+    expect(hostsSolelyTrustedBy(DEVICE_X, pinsByHost)).toEqual([HOST]);
+  });
+
+  test("a live co-pin (a genuinely shared host) does not warn", () => {
+    const pinsByHost = new Map<string, readonly string[]>([[HOST, [DEVICE_X, DEVICE_Y]]]);
+    expect(hostsSolelyTrustedBy(DEVICE_X, pinsByHost)).toEqual([]);
+  });
+});
+
+describe("unprotectedOrphanHostIds (P-C7: the promise gate)", () => {
+  test("a host the heal verifiably upgraded is protected", () => {
+    expect(unprotectedOrphanHostIds([HOST], { upgradedHostIds: [HOST] }, new Map(), null)).toEqual(
+      [],
+    );
+  });
+
+  test("a host already showing the root anchor in the REFRESHED pins is protected", () => {
+    const refreshed = new Map<string, readonly string[]>([[HOST, [DEVICE_X, ROOT_DEVICE]]]);
+    expect(
+      unprotectedOrphanHostIds([HOST], { upgradedHostIds: [] }, refreshed, ROOT_DEVICE),
+    ).toEqual([]);
+  });
+
+  test("the field-bug shape blocks: unlock 'succeeded' but nothing was anchored", () => {
+    // The passkey lived on an unpinned device: the heal reported no upgraded
+    // hosts and no root anchor exists. The old flow proceeded on the promise
+    // anyway and orphaned every host; the gate must refuse it now.
+    const refreshed = new Map<string, readonly string[]>([[HOST, [DEVICE_X]]]);
+    expect(
+      unprotectedOrphanHostIds([HOST], { upgradedHostIds: [] }, refreshed, ROOT_DEVICE),
+    ).toEqual([HOST]);
+  });
+
+  test("a null heal report protects nothing", () => {
+    expect(unprotectedOrphanHostIds([HOST], null, new Map(), ROOT_DEVICE)).toEqual([HOST]);
+  });
+
+  test("no live root row means the anchor check cannot pass", () => {
+    const refreshed = new Map<string, readonly string[]>([[HOST, [DEVICE_X, ROOT_DEVICE]]]);
+    expect(unprotectedOrphanHostIds([HOST], { upgradedHostIds: [] }, refreshed, null)).toEqual([
+      HOST,
     ]);
-    expect(hostsSolelyTrustedBy("laptop", pins)).toEqual(["host-solo"]);
-    expect(hostsSolelyTrustedBy("phone", pins)).toEqual(["host-other"]);
-    expect(hostsSolelyTrustedBy("root-device", pins)).toEqual([]);
+  });
+
+  test("an unfetchable refreshed pin list fails closed for that host", () => {
+    expect(
+      unprotectedOrphanHostIds(
+        [HOST, OTHER_HOST],
+        { upgradedHostIds: [OTHER_HOST] },
+        new Map(),
+        ROOT_DEVICE,
+      ),
+    ).toEqual([HOST]);
   });
 });
