@@ -17,35 +17,49 @@ through `npx`.
 
 ## 1. Point the app at your server
 
-An iPhone cannot reach a server at the app's default `http://localhost:8000`; on the phone,
-`localhost` means the phone itself.
+An iPhone cannot reach a server at `localhost`; on the phone, `localhost` means the phone itself.
 
-Add `extra.apiUrl` inside the `expo` object in `app.json` before starting Metro:
+### Running against a local dev server (the usual case)
 
-```json
-{
-  "expo": {
-    "extra": {
-      "apiUrl": "https://spawn.example.com"
-    }
-  }
-}
+The app derives its default API origin from the Metro host Expo Go connected to — which is your
+Mac's LAN address — and appends port **8010**, the port `scripts/dev.sh` serves. So on the LAN
+this needs **no configuration at all**.
+
+The one thing you must do is let the dev API listen on more than loopback. `scripts/dev.sh` binds
+`127.0.0.1` by default; start it like this instead:
+
+```bash
+SPAWN_DEV_API_HOST=0.0.0.0 ./scripts/dev.sh
 ```
 
-Use the server origin only, without `/api`, credentials, a query, or a fragment. Both `http` and
-`https` are accepted by the client, but HTTPS avoids iOS transport-security and certificate
-problems. For a development server on the Mac, use an address that is reachable from the phone,
-not `127.0.0.1` or `localhost`, and bind the server to a non-loopback interface.
+Then confirm from the phone: open `http://<your-mac-lan-ip>:8010/healthz` in Safari on the
+iPhone. If that does not load, the app cannot reach it either, and the problem is the network or
+the bind — not the app.
+
+`dev.sh` also sets `SPAWN_REQUIRE_EMAIL_VERIFICATION=false`, so local signup skips the email step.
+
+### Pointing at any other server
+
+Use **Settings → Server** in the app. It is also reachable **before signing in**, via the
+"Server" control on the login screen — a wrong URL would otherwise be a deadlock, since signing in
+is what you need the setting for. The panel shows the currently effective URL and where it came
+from, and offers a "Test connection" action that reports the real error.
+
+Enter the server origin only, without `/api`, credentials, a query, or a fragment. Both `http` and
+`https` work, though HTTPS avoids iOS transport-security friction.
+
+To bake in a default instead, add `extra.apiUrl` inside the `expo` object in `app.json`. Note that
+doing so **overrides the LAN derivation above**, so leave it unset while developing locally.
 
 The resolution order is:
 
-1. A previously persisted runtime override set through the internal `setBaseUrl` API.
-2. `expo.extra.apiUrl` from `app.json`.
-3. `http://localhost:8000`.
+1. A runtime override persisted from Settings → Server.
+2. `expo.extra.apiUrl` from `app.json`, if set.
+3. The Metro-host-derived LAN default, `http://<metro-host>:8010`.
+4. `http://localhost:8010` when the host cannot be derived (simulator).
 
-The current UI does not expose the runtime setter, so a fresh Expo Go install/project state uses
-the `app.json` value above. Server credentials are stored per normalized server URL, preventing a
-token for one server from being sent to another.
+Credentials are stored per normalized server URL, so a token for one server is never sent to
+another.
 
 Before opening the app, load `https://your-server.example/healthz` in Safari on the iPhone. This
 checks phone-to-server routing and TLS independently of Metro.
@@ -155,7 +169,7 @@ Use `--tunnel` instead of `--lan` if the LAN remains unreachable.
 
 ### Sign-in or data loading fails
 
-- Verify `extra.apiUrl` is an origin reachable from Safari on the iPhone.
+- Verify the effective server URL (Settings → Server) is reachable from Safari on the iPhone.
 - Do not use `localhost`, `127.0.0.1`, or a Mac-only hostname.
 - Confirm the server certificate is trusted by iOS and `/healthz` responds.
 - Restart Metro after changing `app.json`; use `--clear` if the old value persists.
