@@ -200,6 +200,41 @@ async def list_browser_devices(
     return [_to_out(device) for device in devices]
 
 
+@router.get("/revoked-keys", response_model=list[schemas.RevokedBrowserKeyOut])
+async def list_revoked_browser_keys(
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[schemas.RevokedBrowserKeyOut]:
+    """The account's permanent key tombstones (R10 deny-list source).
+
+    Read-only corroboration surface (hardening B2): before a client acts
+    destructively on a roster row's revocation claim — root rotation retires
+    the sealed root — it cross-checks the key against this ADD-ONLY table, so
+    a fabricated `revoked_at` on the mutable roster alone is not enough. The
+    rows here survive roster pruning and are never deleted.
+    """
+
+    rows = (
+        (
+            await session.execute(
+                select(RevokedBrowserKey)
+                .where(RevokedBrowserKey.owner_user_id == user.id)
+                .order_by(RevokedBrowserKey.revoked_at, RevokedBrowserKey.public_key)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        schemas.RevokedBrowserKeyOut(
+            public_key=row.public_key,
+            key_algorithm=row.key_algorithm,
+            revoked_at=row.revoked_at,
+        )
+        for row in rows
+    ]
+
+
 @router.post("/prune", response_model=schemas.BrowserDevicePruneResponse)
 async def prune_revoked_browser_devices(
     user: User = Depends(auth.current_user),

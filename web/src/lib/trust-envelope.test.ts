@@ -383,3 +383,127 @@ describe("root rotation (replace a revoked root)", () => {
     }
   });
 });
+
+describe("retired-root retention through rotation (hardening B2)", () => {
+  async function rootMaterial() {
+    const { exportAccountRootMaterial, generateAccountRoot } = await import("./account-root");
+    return exportAccountRootMaterial(await generateAccountRoot());
+  }
+
+  test("rotation retires the old seed instead of destroying it, oldest first", async () => {
+    const { setEnvelopeRoot } = await import("./trust-envelope");
+    const first = await rootMaterial();
+    const second = await rootMaterial();
+    const third = await rootMaterial();
+    const sealed = await sealTrustEnvelope(
+      ACCOUNT,
+      [await host()],
+      [passkey("laptop", 1)],
+      1,
+      first,
+    );
+
+    const once = await setEnvelopeRoot(ACCOUNT, sealed, passkey("laptop", 1), second, 2, true);
+    const openedOnce = await openTrustEnvelope(ACCOUNT, once, passkey("laptop", 1));
+    expect(openedOnce.root).toEqual(second);
+    expect(openedOnce.retiredRoots).toEqual([first]);
+
+    // A second (e.g. fabricated) rotation still loses nothing: the full
+    // lineage of firsthand seeds survives, in order.
+    const twice = await setEnvelopeRoot(ACCOUNT, once, passkey("laptop", 1), third, 3, true);
+    const openedTwice = await openTrustEnvelope(ACCOUNT, twice, passkey("laptop", 1));
+    expect(openedTwice.root).toEqual(third);
+    expect(openedTwice.retiredRoots).toEqual([first, second]);
+  });
+
+  test("a fresh or retrofitted bundle has an empty archive", async () => {
+    const { setEnvelopeRoot } = await import("./trust-envelope");
+    const sealed = await sealEnvelope(ACCOUNT, [await host()], [passkey("laptop", 1)]);
+    expect((await openTrustEnvelope(ACCOUNT, sealed, passkey("laptop", 1))).retiredRoots).toEqual(
+      [],
+    );
+    const retro = await setEnvelopeRoot(
+      ACCOUNT,
+      sealed,
+      passkey("laptop", 1),
+      await rootMaterial(),
+      2,
+    );
+    expect((await openTrustEnvelope(ACCOUNT, retro, passkey("laptop", 1))).retiredRoots).toEqual(
+      [],
+    );
+  });
+
+  test("passkey revocation reseals WITH the retired archive", async () => {
+    const { setEnvelopeRoot } = await import("./trust-envelope");
+    const first = await rootMaterial();
+    const second = await rootMaterial();
+    const sealed = await sealTrustEnvelope(
+      ACCOUNT,
+      [await host()],
+      [passkey("laptop", 1)],
+      1,
+      first,
+    );
+    const withBackup = await enrollPasskeyInEnvelope(
+      ACCOUNT,
+      sealed,
+      passkey("laptop", 1),
+      passkey("yubikey", 2),
+    );
+    const rotated = await setEnvelopeRoot(
+      ACCOUNT,
+      withBackup,
+      passkey("laptop", 1),
+      second,
+      2,
+      true,
+    );
+    const survivorOnly = await revokePasskeyFromEnvelope(
+      ACCOUNT,
+      rotated,
+      [passkey("laptop", 1)],
+      "yubikey",
+      3,
+    );
+    const opened = await openTrustEnvelope(ACCOUNT, survivorOnly, passkey("laptop", 1));
+    expect(opened.root).toEqual(second);
+    expect(opened.retiredRoots).toEqual([first]);
+  });
+
+  test("rotation refuses beyond the archive cap rather than evicting history", async () => {
+    const { MAX_RETIRED_ROOTS } = await import("./trust-bundle");
+    const { setEnvelopeRoot } = await import("./trust-envelope");
+    let sealed = await sealTrustEnvelope(
+      ACCOUNT,
+      [await host()],
+      [passkey("laptop", 1)],
+      1,
+      await rootMaterial(),
+    );
+    for (let i = 0; i < MAX_RETIRED_ROOTS; i += 1) {
+      sealed = await setEnvelopeRoot(
+        ACCOUNT,
+        sealed,
+        passkey("laptop", 1),
+        await rootMaterial(),
+        i + 2,
+        true,
+      );
+    }
+    const full = await openTrustEnvelope(ACCOUNT, sealed, passkey("laptop", 1));
+    expect(full.retiredRoots).toHaveLength(MAX_RETIRED_ROOTS);
+    // One more fabricated "rotation" must fail loudly, not push the original
+    // root off the end of the archive.
+    await expect(
+      setEnvelopeRoot(
+        ACCOUNT,
+        sealed,
+        passkey("laptop", 1),
+        await rootMaterial(),
+        MAX_RETIRED_ROOTS + 2,
+        true,
+      ),
+    ).rejects.toThrow("retired root");
+  });
+});

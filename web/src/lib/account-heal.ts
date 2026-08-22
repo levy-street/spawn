@@ -63,6 +63,32 @@ export class AccountHealError extends Error {
   }
 }
 
+/**
+ * Corroborate a server claim that the SEALED root's key was revoked, before
+ * anything destructive (rotation) acts on it (hardening B2).
+ *
+ * The mutable roster row alone is not evidence: a fabricated `revoked_at`
+ * would trigger a rotation. So the claim must ALSO appear in the account's
+ * permanent, add-only key tombstone table (`revoked_browser_keys`) — the
+ * server can still lie, but only by committing the lie into permanent
+ * deny-list state that irreversibly bans the key everywhere, a visible and
+ * self-defeating commitment rather than a free roster edit. Any half-claim is
+ * `uncorroborated`: the caller must NOT rotate, and should say so out loud.
+ */
+export function assessSealedRootRevocation(
+  sealedRootPublicKey: string,
+  devices: readonly { public_key: string; revoked_at: string | null }[],
+  tombstonedKeys: readonly string[],
+): "live" | "revoked" | "uncorroborated" {
+  const rosterClaimsRevoked = devices.some(
+    (d) => d.public_key === sealedRootPublicKey && d.revoked_at !== null,
+  );
+  const tombstoned = tombstonedKeys.includes(sealedRootPublicKey);
+  if (rosterClaimsRevoked && tombstoned) return "revoked";
+  if (!rosterClaimsRevoked && !tombstoned) return "live";
+  return "uncorroborated";
+}
+
 export interface AccountHealReport {
   readonly rootDeviceId: string;
   /** Devices that received a fresh `R→d` endorsement in this heal. */

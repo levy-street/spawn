@@ -454,6 +454,21 @@ export const browserDevices = {
       method: "GET",
       schema: z.array(BrowserDeviceSchema),
     }),
+  /** The account's PERMANENT key deny-list (R10 tombstones). Corroboration
+   * data for destructive revocation-claim handling (hardening B2): the roster
+   * is mutable, this table is add-only, so a claim must appear in BOTH before
+   * the client rotates the sealed root over it. */
+  revokedKeys: () =>
+    api("/api/browser-devices/revoked-keys", {
+      method: "GET",
+      schema: z.array(
+        z.object({
+          public_key: z.string().length(43),
+          key_algorithm: z.string(),
+          revoked_at: z.string(),
+        }),
+      ),
+    }),
   rename: (deviceId: string, label: string | null) =>
     api(`/api/browser-devices/${deviceId}`, {
       method: "PATCH",

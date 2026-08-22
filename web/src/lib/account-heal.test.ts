@@ -1,5 +1,9 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import { AccountHealError, planAccountHeal } from "./account-heal";
+import {
+  AccountHealError,
+  assessSealedRootRevocation,
+  planAccountHeal,
+} from "./account-heal";
 import { encodeAcctEndorsementTranscript } from "./acct-endorsement-transcript";
 import { encodeBase64Url } from "./signed-signal";
 
@@ -296,3 +300,45 @@ describe("planAccountHeal", () => {
     expect(plan.devicesToEndorse.map((d) => d.id).sort()).toEqual([SELF_ID, LAPTOP_ID].sort());
   });
 });
+
+describe("assessSealedRootRevocation (hardening B2): rotation needs corroboration", () => {
+  const SEALED_PK = "R".repeat(43);
+  const OTHER_PK = "X".repeat(43);
+
+  test("a bare roster claim — the fabricated-rotation server response — is uncorroborated", () => {
+    const devices = [device(ROOT_ID, SEALED_PK, { isRoot: true, revoked: true })];
+    expect(assessSealedRootRevocation(SEALED_PK, devices, [])).toBe("uncorroborated");
+  });
+
+  test("a bare tombstone with no roster row is equally insufficient", () => {
+    expect(assessSealedRootRevocation(SEALED_PK, [], [SEALED_PK])).toBe("uncorroborated");
+  });
+
+  test("roster row AND permanent tombstone together corroborate the revocation", () => {
+    const devices = [device(ROOT_ID, SEALED_PK, { isRoot: true, revoked: true })];
+    expect(assessSealedRootRevocation(SEALED_PK, devices, [SEALED_PK])).toBe("revoked");
+  });
+
+  test("no claim anywhere means the sealed root is live", () => {
+    const devices = [device(ROOT_ID, SEALED_PK, { isRoot: true })];
+    expect(assessSealedRootRevocation(SEALED_PK, devices, [])).toBe("live");
+  });
+
+  test("claims about OTHER keys never implicate the sealed root", () => {
+    // A revoked sibling device and its tombstone are normal account history;
+    // the revoked_at-bearing row must carry the sealed root's exact key.
+    const devices = [
+      device(ROOT_ID, SEALED_PK, { isRoot: true }),
+      device(LAPTOP_ID, OTHER_PK, { revoked: true }),
+    ];
+    expect(assessSealedRootRevocation(SEALED_PK, devices, [OTHER_PK])).toBe("live");
+  });
+
+  test("the roster row corroborates by KEY, not by is_root labeling", () => {
+    // Even a non-root row wearing the sealed key counts as the roster half —
+    // the key is the identity; the label is server-editable display data.
+    const devices = [device(LAPTOP_ID, SEALED_PK, { revoked: true })];
+    expect(assessSealedRootRevocation(SEALED_PK, devices, [SEALED_PK])).toBe("revoked");
+  });
+});
+

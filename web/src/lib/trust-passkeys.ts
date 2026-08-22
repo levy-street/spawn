@@ -17,6 +17,7 @@ import { useState } from "react";
 import {
   AccountHealError,
   type AccountHealReport,
+  assessSealedRootRevocation,
   ensureRootRegistered,
   healAccount,
 } from "@/lib/account-heal";
@@ -261,18 +262,33 @@ export function usePasskeyTrust() {
       // sealed root is legitimately in memory. Re-root every device off R and
       // upgrade hosts to anchor on it, then let the key go out of scope.
       let report: AccountHealReport | null = null;
+      let rotationWarning: string | null = null;
       if (imported.root !== null) {
         // Root ROTATION (compromise response): if the sealed root's key was
         // revoked, mint a successor over it and heal off that instead. The old
         // key stays dead — revocation is a permanent tombstone (R10) — and the
         // deny-list has already severed everything anchored on it.
+        //
+        // The trigger is CORROBORATED, never a bare roster claim (hardening
+        // B2): rotation retires the sealed root, so the revoked_at-bearing row
+        // must carry the sealed root's exact key AND the key must appear in
+        // the account's permanent add-only tombstone table. A server that
+        // wants to fake this has to commit the lie into irreversible
+        // deny-list state — and even then, rotation now retires the old seed
+        // into the bundle instead of destroying it.
         const deviceRows = await browserDevices.list();
         const sealedPk = imported.root.publicKeyWire;
-        const sealedRootRevoked = deviceRows.some(
-          (d) => d.public_key === sealedPk && d.revoked_at !== null,
-        );
+        let tombstonedKeys: string[] = [];
+        try {
+          tombstonedKeys = (await browserDevices.revokedKeys()).map((row) => row.public_key);
+        } catch {
+          // Unfetchable tombstones corroborate nothing: with an empty list a
+          // roster claim assesses as uncorroborated and rotation is skipped —
+          // a denial of service, which the server can always inflict anyway.
+        }
+        const verdict = assessSealedRootRevocation(sealedPk, deviceRows, tombstonedKeys);
         const liveRoot = deviceRows.find((d) => d.is_root && d.revoked_at === null);
-        if (sealedRootRevoked && liveRoot === undefined) {
+        if (verdict === "revoked" && liveRoot === undefined) {
           const successor = await generateAccountRoot();
           const rotated = await retrofitAccountRoot(
             { accountId: id },
@@ -286,12 +302,18 @@ export function usePasskeyTrust() {
             try {
               await trust.putBundle(rotated.sealed, stored.revision);
             } catch {
-              return { imported, report };
+              return { imported, report, rotationWarning };
             }
             await recordBundleRevision({ accountId: id }, rotated.revision);
             report = await healBestEffort(id, successor, imported.hosts);
           }
         } else {
+          if (verdict === "uncorroborated") {
+            rotationWarning =
+              "The server claims your account root was revoked, but its permanent " +
+              "revocation record does not corroborate that. Nothing was rotated or " +
+              "destroyed; if you really revoked it, retry once the record is consistent.";
+          }
           report = await healBestEffort(id, await importAccountRoot(imported.root), imported.hosts);
         }
       } else {
@@ -311,21 +333,24 @@ export function usePasskeyTrust() {
           try {
             await trust.putBundle(retro.sealed, stored.revision);
           } catch {
-            return { imported, report };
+            return { imported, report, rotationWarning };
           }
           await recordBundleRevision({ accountId: id }, retro.revision);
           report = await healBestEffort(id, root, imported.hosts);
         }
       }
-      return { imported, report };
+      return { imported, report, rotationWarning };
     },
     onMutate: begin,
-    onSuccess: ({ imported, report }) => {
+    onSuccess: ({ imported, report, rotationWarning }) => {
       const base =
         imported.added.length === 0
           ? "This device already knows your hosts."
           : `${imported.added.length} host${imported.added.length === 1 ? "" : "s"} now reachable from this device.`;
       setStatus(base + describeHeal(report));
+      // A skipped rotation is a trust inconsistency worth saying out loud, even
+      // though the unlock itself succeeded and destroyed nothing.
+      if (rotationWarning !== null) setError(rotationWarning);
       queryClient.invalidateQueries({ queryKey: ["trust"] });
       queryClient.invalidateQueries({ queryKey: ["browser-devices"] });
       queryClient.invalidateQueries({ queryKey: ["account-endorsements"] });
