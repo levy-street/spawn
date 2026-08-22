@@ -680,6 +680,37 @@ class HostIntroductionOut(BaseModel):
     created_at: datetime
 
 
+class RootIntroductionPublish(BaseModel):
+    """One durable root-key introduction (mesh §4.1 provenance channel). The
+    signature is over the SPAWN-ROOT-INTRO-V1 transcript; the server verifies
+    it against the introducer's registered key as hygiene, recipients
+    re-verify it against the introducer key they learned firsthand."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    introducer_device_id: str = Field(min_length=36, max_length=36)
+    root_public_key: str = Field(min_length=43, max_length=43)
+    signature: str = Field(min_length=86, max_length=86)
+
+    @field_validator("root_public_key")
+    @classmethod
+    def _validate_root_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class RootIntroductionOut(BaseModel):
+    id: str
+    introducer_device_id: str
+    # The introducer's registered key, echoed for the recipient's convenience;
+    # display-adjacent — acceptance requires the FIRSTHAND copy to match.
+    introducer_public_key: str
+    root_public_key: str
+    signature: str
+    created_at: datetime
+    updated_at: datetime
+
+
 # ---------- hosts ----------
 
 

@@ -572,6 +572,57 @@ class HostIntroduction(Base):
     )
 
 
+class RootIntroduction(Base):
+    """One device's DURABLE, signed introduction of the account root's public
+    key to its own account — the firsthand delivery channel for `pk_R`
+    (SPAWN-ROOT-INTRO-V1; docs/TRUST_DEVICE_MESH.md §4.1 provenance rule).
+
+    Published at the passkey moments (mint, unlock) — the only times a device
+    holds `pk_R` firsthand — and re-published durably by the gossip sweep. One
+    row per introducer: publishing a successor root (rotation) REPLACES the
+    introducer's row. The server stores, caps, and serves these rows but is
+    NOT their authority: a recipient honors a row only when it holds the
+    INTRODUCER's device key FIRSTHAND and the signature verifies against that
+    firsthand copy — and it accepts a successor over a root it already knows
+    only when the old key's revocation is corroborated (roster + permanent
+    tombstone). GET filters out rows from revoked introducers — the
+    fail-closed direction the server is trusted for.
+    """
+
+    __tablename__ = "root_introductions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    introducer_device_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("browser_devices.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    root_public_key: Mapped[str] = mapped_column(String(43), nullable=False)
+    # base64url Ed25519 signature over the SPAWN-ROOT-INTRO-V1 transcript.
+    signature: Mapped[str] = mapped_column(String(86), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "length(root_public_key) = 43",
+            name="ck_root_introductions_root_key",
+        ),
+        CheckConstraint(
+            "length(signature) = 86",
+            name="ck_root_introductions_signature",
+        ),
+    )
+
+
 class Preset(Base):
     __tablename__ = "presets"
 
