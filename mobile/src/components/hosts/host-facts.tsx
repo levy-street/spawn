@@ -1,6 +1,7 @@
 import { StyleSheet, View } from "react-native";
 import { hostConnectionLabel, pluralize } from "@/components/hosts/host-model";
 import { Divider } from "@/components/ui/divider";
+import { SectionHeader } from "@/components/ui/section-header";
 import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import { spacing } from "@/theme";
@@ -21,9 +22,7 @@ function Fact({ label, value, mono = false }: { label: string; value: string; mo
 export function HostFacts({ host }: { host: HostOut }) {
   return (
     <View style={styles.section} testID="host-facts">
-      <Text accessibilityRole="header" variant="label" weight="semibold">
-        Details
-      </Text>
+      <SectionHeader style={styles.sectionHeader} title="Details" />
       <View style={styles.facts}>
         <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
         <Divider />
@@ -63,5 +62,8 @@ const styles = StyleSheet.create({
   },
   section: {
     gap: spacing[2],
+  },
+  sectionHeader: {
+    paddingHorizontal: spacing[0],
   },
 });

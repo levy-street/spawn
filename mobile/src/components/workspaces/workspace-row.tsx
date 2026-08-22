@@ -188,6 +188,7 @@ export function WorkspaceRow({
               />
             }
             subtitle={rollup}
+            shape="fullBleed"
             title={workspace.name}
             trailing={
               <View style={styles.trailing}>

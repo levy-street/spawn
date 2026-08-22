@@ -1,7 +1,7 @@
 import { BottomSheetModalProvider } from "@gorhom/bottom-sheet";
 import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
-import { AccessibilityInfo, View } from "react-native";
+import { AccessibilityInfo, StyleSheet, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
@@ -10,13 +10,14 @@ import { Collapse } from "@/components/ui/collapse";
 import { Confirm, ConfirmHost, confirm } from "@/components/ui/confirm";
 import { Dialog } from "@/components/ui/dialog";
 import { Menu } from "@/components/ui/menu";
+import { NativePopover } from "@/components/ui/native-popover";
 import { Popover } from "@/components/ui/popover";
 import { Sheet, SheetHeader } from "@/components/ui/sheet";
 import { SwipeDismissOverlay } from "@/components/ui/swipe-dismiss-overlay";
 import { Text } from "@/components/ui/text";
 import { Toast, type ToastRecord } from "@/components/ui/toast";
 import { Tooltip } from "@/components/ui/tooltip";
-import { ThemeProvider } from "@/theme";
+import { borderWidth, lightColors, radii, ThemeProvider } from "@/theme";
 
 const METRICS = {
   frame: { x: 0, y: 0, width: 390, height: 844 },
@@ -50,6 +51,12 @@ describe("overlay rendering and dismissal", () => {
     );
     expect(screen.getByText("Connection")).toBeTruthy();
     expect(screen.getByText("Dialog body")).toBeTruthy();
+    expect(StyleSheet.flatten(screen.getByTestId("dialog-content").props["style"])).toMatchObject({
+      backgroundColor: lightColors.popover,
+      borderColor: lightColors.popoverBorder,
+      borderRadius: radii.lg,
+      borderWidth: borderWidth.hairline,
+    });
     await fireEvent.press(screen.getByLabelText("Close dialog"));
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
@@ -121,6 +128,38 @@ describe("overlay rendering and dismissal", () => {
       { wrapper: Providers },
     );
     await fireEvent.press(screen.getByText("Rename"));
+    expect(action).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    expect(StyleSheet.flatten(screen.getByTestId("menu-surface").props["style"])).toMatchObject({
+      backgroundColor: lightColors.popover,
+      borderColor: lightColors.popoverBorder,
+      borderRadius: radii.lg,
+      borderWidth: borderWidth.hairline,
+    });
+  });
+
+  test("NativePopover renders and selects from a solid themed surface", async () => {
+    const action = jest.fn();
+    const onDismiss = jest.fn();
+    const screen = await render(
+      <NativePopover
+        anchor={{ x: 40, y: 80, width: 44, height: 44 }}
+        items={[{ key: "rename", label: "Rename", onPress: action }]}
+        onDismiss={onDismiss}
+        visible
+      />,
+      { wrapper: Providers },
+    );
+
+    expect(
+      StyleSheet.flatten(screen.getByTestId("native-popover-surface").props["style"]),
+    ).toMatchObject({
+      backgroundColor: lightColors.popover,
+      borderColor: lightColors.popoverBorder,
+      borderRadius: radii.lg,
+      borderWidth: borderWidth.hairline,
+    });
+    await fireEvent.press(screen.getByTestId("native-popover-item-rename"));
     expect(action).toHaveBeenCalledTimes(1);
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });

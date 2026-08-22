@@ -1,4 +1,3 @@
-import { BlurView } from "expo-blur";
 import type { ReactNode } from "react";
 import { useEffect } from "react";
 import {
@@ -17,7 +16,7 @@ import { Icon } from "@/components/ui/icon";
 import { useReducedMotionPreference } from "@/components/ui/swipe-dismiss-overlay";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { alpha, blurRadius, borderWidth, layer, pressroomColors, shadow, useTheme } from "@/theme";
+import { alpha, borderWidth, layer, pressroomColors, shadow, useTheme } from "@/theme";
 
 export type DialogSize = "sm" | "md" | "lg" | "full-mobile" | "viewer";
 
@@ -99,11 +98,6 @@ export function Dialog({
       visible
     >
       <View style={[styles.root, { zIndex: layer.modal }]}>
-        <BlurView
-          intensity={blurRadius.modal}
-          style={StyleSheet.absoluteFill}
-          tint={theme.isDark ? "dark" : "light"}
-        />
         <Pressable
           accessibilityLabel="Dismiss dialog"
           accessibilityRole="button"
@@ -114,10 +108,11 @@ export function Dialog({
           accessibilityViewIsModal
           style={[
             styles.content,
+            contentStyle,
             {
-              backgroundColor: theme.colors.background,
-              borderColor: theme.colors.border,
-              borderRadius: fullScreen ? 0 : theme.radii.xl,
+              backgroundColor: theme.colors.popover,
+              borderColor: theme.colors.popoverBorder,
+              borderRadius: fullScreen ? borderWidth.none : theme.radii.lg,
               borderWidth: fullScreen ? 0 : borderWidth.hairline,
               boxShadow: fullScreen
                 ? undefined
@@ -133,7 +128,6 @@ export function Dialog({
               paddingTop: fullScreen ? insets.top : 0,
               width: centeredWidth,
             },
-            contentStyle,
             animatedStyle,
           ]}
           testID={testID ?? "dialog-content"}

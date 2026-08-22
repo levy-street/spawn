@@ -1,8 +1,10 @@
 import { act, fireEvent, render } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
+import { StyleSheet } from "react-native";
 
 import { SearchField } from "@/components/ui/search-field";
-import { ThemeProvider } from "@/theme";
+import { borderWidth, lightColors, ThemeProvider } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 jest.mock(
   "@/components/ui/icon",
@@ -62,5 +64,21 @@ describe("SearchField", () => {
     expect(screen.queryByLabelText("Clear search")).not.toBeOnTheScreen();
     await act(() => jest.advanceTimersByTime(250));
     expect(onDebouncedChange).toHaveBeenLastCalledWith("");
+  });
+
+  test("wraps a docked field in the global bottom-dock treatment", async () => {
+    const screen = await render(<SearchField dock testID="search" />, { wrapper });
+    const inputContainer = screen.getByTestId("search").parent;
+    const dock = inputContainer?.parent;
+
+    expect(dock).not.toBeNull();
+    expect(StyleSheet.flatten(dock?.props["style"])).toMatchObject({
+      backgroundColor: lightColors.background,
+      borderTopColor: lightColors.border,
+      borderTopWidth: borderWidth.hairline,
+      paddingBottom: sizing.searchDock.verticalPadding,
+      paddingHorizontal: sizing.searchDock.horizontalPadding,
+      paddingTop: sizing.searchDock.topGap,
+    });
   });
 });

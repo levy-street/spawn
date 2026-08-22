@@ -1,84 +1,56 @@
 import { StyleSheet, View } from "react-native";
 import { Badge } from "@/components/ui/badge";
-import { Divider } from "@/components/ui/divider";
+import { Card } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
+import { ListRow, ListSeparator } from "@/components/ui/list-row";
+import { SectionHeader } from "@/components/ui/section-header";
 import { Text } from "@/components/ui/text";
 import type { SkillOut } from "@/data/api/schemas/skills";
-import { borderWidth, spacing, useTheme } from "@/theme";
+import { spacing } from "@/theme";
 
 export function HostSkillsList({ skills }: { skills: readonly SkillOut[] }) {
-  const theme = useTheme();
   return (
     <View style={styles.section}>
-      <View style={styles.heading}>
-        <Text accessibilityRole="header" variant="label" weight="semibold">
-          Skills
-        </Text>
-        <Text color="mutedForeground" variant="caption">
-          {skills.length}
-        </Text>
-      </View>
+      <SectionHeader
+        style={styles.sectionHeader}
+        title="Skills"
+        trailing={
+          <Text color="mutedForeground" variant="caption">
+            {skills.length}
+          </Text>
+        }
+      />
       {skills.length === 0 ? (
-        <Text color="mutedForeground" variant="body">
-          No skills yet.
-        </Text>
+        <EmptyState icon="Wrench" title="No skills yet." />
       ) : (
-        <View
-          style={[
-            styles.rows,
-            {
-              backgroundColor: theme.colors.card,
-              borderColor: theme.colors.border,
-              borderRadius: theme.radii.lg,
-            },
-          ]}
-        >
+        <Card padded={false} style={styles.rows} variant="flat">
           {skills.map((skill, index) => (
             <View key={skill.id}>
-              {index > 0 ? <Divider /> : null}
-              <View style={styles.row}>
-                <View style={styles.copy}>
-                  <View style={styles.titleRow}>
-                    <Text variant="label">{skill.name}</Text>
-                    {skill.enabled_by_default ? <Badge>default</Badge> : null}
-                  </View>
-                  {skill.description ? (
-                    <Text color="mutedForeground" variant="caption">
-                      {skill.description}
-                    </Text>
-                  ) : null}
-                </View>
-              </View>
+              {index > 0 ? <ListSeparator inset={false} /> : null}
+              <ListRow
+                height={skill.description ? "tall" : "regular"}
+                shape="fullBleed"
+                {...(skill.description ? { subtitle: skill.description } : {})}
+                title={skill.name}
+                trailing={skill.enabled_by_default ? <Badge>default</Badge> : undefined}
+              />
             </View>
           ))}
-        </View>
+        </Card>
       )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  copy: {
-    flex: 1,
-    gap: spacing[1],
-  },
-  heading: {
-    alignItems: "center",
-    flexDirection: "row",
-    gap: spacing[2],
-  },
-  row: {
-    flexDirection: "row",
-    padding: spacing[4],
-  },
   rows: {
-    borderWidth: borderWidth.hairline,
+    gap: spacing[0],
+    overflow: "hidden",
   },
   section: {
     gap: spacing[3],
   },
-  titleRow: {
-    alignItems: "center",
-    flexDirection: "row",
-    gap: spacing[2],
+  sectionHeader: {
+    paddingHorizontal: spacing[0],
   },
 });

@@ -12,11 +12,13 @@ import { ThemeProvider } from "@/theme";
 
 const mockReplace = jest.fn();
 const mockPush = jest.fn();
+const mockBack = jest.fn();
 const mockToastShow = jest.fn();
 const mockToastError = jest.fn();
 
 jest.mock("expo-router", () => ({
-  useRouter: () => ({ replace: mockReplace, push: mockPush }),
+  router: { push: mockPush },
+  useRouter: () => ({ back: mockBack, replace: mockReplace, push: mockPush }),
 }));
 
 jest.mock("@/components/ui/toast", () => ({
@@ -121,6 +123,8 @@ describe("settings panel behavior", () => {
   test("settings root renders exactly the nine documented panel entries", async () => {
     const screen = await render(<SettingsRoot />, { wrapper });
     expect(screen.getAllByTestId(/^settings-panel-/)).toHaveLength(9);
+    expect(screen.getByRole("button", { name: "Open hosts" })).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Open admin" })).toBeOnTheScreen();
     expect(screen.queryByText("Terminal")).toBeNull();
     expect(screen.queryByText("Sessions")).toBeNull();
     expect(screen.queryByText("Security")).toBeNull();
@@ -152,5 +156,16 @@ describe("settings panel behavior", () => {
       expect(authToken.clear).toHaveBeenCalledTimes(1);
       expect(mockReplace).toHaveBeenCalledWith("/login");
     });
+  });
+
+  test("account confirmation input stays unmounted until deletion is expanded", async () => {
+    const screen = await render(<AccountPanel />, { wrapper });
+
+    expect(screen.queryByPlaceholderText(mockUser.email)).toBeNull();
+    expect(screen.getAllByText("Account")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Go back" })).toBeOnTheScreen();
+
+    await fireEvent.press(screen.getByRole("button", { name: "Delete account…" }));
+    expect(screen.getByPlaceholderText(mockUser.email)).toHaveProp("autoFocus", true);
   });
 });

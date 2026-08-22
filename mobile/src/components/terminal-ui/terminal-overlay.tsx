@@ -246,11 +246,15 @@ export function TerminalOverlay({
   const hostKey = host.host_public_key;
 
   return (
-    <View style={[styles.root, { backgroundColor: theme.colors.background }]}>
+    <View
+      style={[styles.root, { backgroundColor: theme.colors.background }]}
+      testID="terminal-overlay-route-scene"
+    >
       <TerminalHeader
         connectionState={connectionState}
         foregroundCommand={session.foreground_command}
         hostName={session.host_name ?? host.name}
+        onBack={onDismiss}
         onCopyMode={enterSelection}
         onDiagnostics={() => setDiagnosticsVisible(true)}
         onFontSize={() => setFontSheetVisible(true)}

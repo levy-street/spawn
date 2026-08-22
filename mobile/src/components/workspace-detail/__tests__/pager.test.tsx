@@ -32,6 +32,7 @@ describe("workspace tab pager", () => {
           onClose={jest.fn()}
           onReorder={jest.fn()}
           onSelect={jest.fn()}
+          sessionsById={new Map()}
           tabs={tabs}
         />
         <TabPager

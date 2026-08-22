@@ -1,4 +1,3 @@
-import { HeaderHeightContext } from "@react-navigation/elements";
 import { type ReactNode, useContext } from "react";
 import { StyleSheet, View } from "react-native";
 import { SafeAreaInsetsContext } from "react-native-safe-area-context";
@@ -7,6 +6,8 @@ import { spacing } from "@/theme";
 
 export interface ScreenProps {
   children: ReactNode;
+  /** Rendered above the content, outside the gutter, owning the top inset. */
+  header?: ReactNode;
   scroll?: boolean;
   footer?: ReactNode;
   padded?: boolean;
@@ -14,6 +15,7 @@ export interface ScreenProps {
 
 export function Screen({
   children,
+  header,
   scroll = false,
   footer,
   padded = true,
@@ -24,15 +26,13 @@ export function Screen({
     right: spacing[0],
     top: spacing[0],
   };
-  const headerHeight = useContext(HeaderHeightContext) ?? 0;
   const gutter = padded ? spacing[4] : spacing[0];
   const contentInsets = {
     paddingBottom:
       footer === undefined ? Math.max(spacing[6], insets.bottom + spacing[4]) : spacing[0],
     paddingLeft: insets.left + gutter,
     paddingRight: insets.right + gutter,
-    // Native-stack headers already place their scene below the status bar.
-    paddingTop: headerHeight > 0 ? spacing[0] : insets.top,
+    paddingTop: header === undefined ? insets.top : spacing[0],
   };
 
   if (scroll || footer !== undefined) {
@@ -40,7 +40,7 @@ export function Screen({
     const { KeyboardScreen } =
       require("@/components/layout/keyboard-screen") as typeof import("@/components/layout/keyboard-screen");
     return (
-      <KeyboardScreen contentInsets={contentInsets} footer={footer} scroll={scroll}>
+      <KeyboardScreen contentInsets={contentInsets} footer={footer} header={header} scroll={scroll}>
         {children}
       </KeyboardScreen>
     );
@@ -48,6 +48,7 @@ export function Screen({
 
   return (
     <View style={styles.root} testID="screen">
+      {header}
       <View style={[styles.content, contentInsets]} testID="screen-content">
         {children}
       </View>

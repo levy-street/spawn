@@ -1,21 +1,24 @@
 import { useMemo } from "react";
-import { Pressable, StyleSheet } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, { type SharedValue, useAnimatedStyle, withTiming } from "react-native-reanimated";
 import { scheduleOnRN } from "react-native-worklets";
+import { AttentionBadge, attentionAccessibilityLabel } from "@/components/alerts/attention-badge";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import { tabDestinationIndex } from "@/components/workspace-detail/tab-reorder";
+import type { AttentionSummary } from "@/data/queries/alerts";
 import type { WorkspaceTab } from "@/data/types/layout";
-import { borderWidth, duration, layer, shadow, space, spacing, useTheme } from "@/theme";
+import { duration, layer, shadow, spacing, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
-export const TAB_WIDTH = space(40);
-export const TAB_GAP = spacing[1.5];
+export const TAB_WIDTH = sizing.tab.minWidth;
+export const TAB_GAP = sizing.tab.itemGap;
 export const TAB_STEP = TAB_WIDTH + TAB_GAP;
-export const TAB_STRIP_HEIGHT = space(13);
-const TAB_VISUAL_HEIGHT = spacing[10];
-export const TAB_CONNECTED_HEIGHT = TAB_VISUAL_HEIGHT + TAB_GAP;
-export const TAB_ACTION_TARGET = spacing[11];
+export const TAB_STRIP_HEIGHT = sizing.tab.stripHeight;
+const TAB_VISUAL_HEIGHT = sizing.tab.visualHeight;
+export const TAB_CONNECTED_HEIGHT = TAB_VISUAL_HEIGHT + sizing.tab.connectionOverlap;
+export const TAB_ACTION_TARGET = sizing.tab.actionTarget;
 const TAB_PICKUP_SCALE = 1.02;
 export const TAB_GEOMETRY = { tabGap: TAB_GAP, tabWidth: TAB_WIDTH } as const;
 
@@ -34,6 +37,7 @@ export interface TabDragValues {
 
 interface DraggableTabProps {
   active: boolean;
+  attention: AttentionSummary | null;
   canClose: boolean;
   dragValues: TabDragValues;
   dragging: boolean;
@@ -60,6 +64,7 @@ interface DraggableTabProps {
 
 export function DraggableTab({
   active,
+  attention,
   canClose,
   dragValues,
   dragging,
@@ -80,6 +85,9 @@ export function DraggableTab({
   const theme = useTheme();
   const connected = active && tab.layout.tiles.length > 0;
   const dragEnabled = tabCount > 1;
+  const tabAccessibilityLabel = attention
+    ? `${tab.name}, ${attentionAccessibilityLabel(attention)}`
+    : tab.name;
 
   const gesture = useMemo(
     () =>
@@ -174,9 +182,52 @@ export function DraggableTab({
 
   return (
     <Animated.View
-      style={[styles.tabSlot, dragging ? styles.dragging : undefined, animatedStyle]}
+      style={[
+        styles.tabSlot,
+        connected ? undefined : styles.restingSlot,
+        dragging ? styles.dragging : undefined,
+        animatedStyle,
+      ]}
       testID={`workspace-tab-${tab.id}`}
     >
+      {connected ? (
+        <>
+          <View
+            pointerEvents="none"
+            style={[
+              styles.connection,
+              styles.connectionLeft,
+              { backgroundColor: surfaces.focused },
+            ]}
+            testID={`tab-connection-left-${tab.id}`}
+          >
+            <View
+              style={[
+                styles.connectionCutout,
+                styles.connectionCutoutLeft,
+                { backgroundColor: theme.colors.shell },
+              ]}
+            />
+          </View>
+          <View
+            pointerEvents="none"
+            style={[
+              styles.connection,
+              styles.connectionRight,
+              { backgroundColor: surfaces.focused },
+            ]}
+            testID={`tab-connection-right-${tab.id}`}
+          >
+            <View
+              style={[
+                styles.connectionCutout,
+                styles.connectionCutoutRight,
+                { backgroundColor: theme.colors.shell },
+              ]}
+            />
+          </View>
+        </>
+      ) : null}
       <GestureDetector gesture={gesture}>
         <Pressable
           accessibilityActions={[
@@ -186,7 +237,7 @@ export function DraggableTab({
             { name: "increment", label: "Move right" },
           ]}
           accessibilityHint="Long press, then drag to reorder"
-          accessibilityLabel={tab.name}
+          accessibilityLabel={tabAccessibilityLabel}
           accessibilityRole="tab"
           accessibilityState={{ selected: active }}
           onAccessibilityAction={(event) => {
@@ -228,12 +279,13 @@ export function DraggableTab({
               borderBottomRightRadius: connected ? 0 : theme.radii.md,
               borderTopLeftRadius: theme.radii.md,
               borderTopRightRadius: theme.radii.md,
-              paddingLeft: spacing[3],
-              paddingRight: canClose ? TAB_ACTION_TARGET : spacing[3.5],
+              paddingLeft: sizing.tab.horizontalPadding,
+              paddingRight: canClose ? TAB_ACTION_TARGET : sizing.tab.horizontalPadding,
             },
           ]}
           testID={`workspace-tab-surface-${tab.id}`}
         >
+          <AttentionBadge summary={attention} testID={`tab-attention-${tab.id}`} />
           <Text
             color={active ? "foreground" : "mutedForeground"}
             numberOfLines={1}
@@ -250,16 +302,23 @@ export function DraggableTab({
           accessibilityLabel={`Close ${tab.name}`}
           accessibilityRole="button"
           onPress={onClose}
-          style={({ pressed }) => [
-            styles.closeButton,
-            {
-              backgroundColor: pressed ? theme.colors.accent : "transparent",
-              borderRadius: theme.radii.sm,
-            },
-          ]}
+          style={styles.closeButton}
           testID={`close-tab-${tab.id}`}
         >
-          <Icon color="mutedForeground" name="X" size={spacing[3.5]} />
+          {({ pressed }) => (
+            <View
+              style={[
+                styles.closePlate,
+                {
+                  backgroundColor: pressed ? theme.colors.accent : "transparent",
+                  borderRadius: theme.radii.sm,
+                },
+              ]}
+              testID={`close-tab-plate-${tab.id}`}
+            >
+              <Icon color="mutedForeground" name="X" size={sizing.tab.closeGlyph} />
+            </View>
+          )}
         </Pressable>
       ) : null}
     </Animated.View>
@@ -273,19 +332,54 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     position: "absolute",
     right: 0,
-    top: borderWidth.hairline,
+    top: 0,
     width: TAB_ACTION_TARGET,
     zIndex: layer.mobileChrome,
   },
+  closePlate: {
+    alignItems: "center",
+    height: sizing.tab.closePlate,
+    justifyContent: "center",
+    width: sizing.tab.closePlate,
+  },
+  connection: {
+    bottom: 0,
+    height: sizing.tab.connectionRadius,
+    overflow: "hidden",
+    position: "absolute",
+    width: sizing.tab.connectionRadius,
+  },
+  connectionCutout: {
+    borderRadius: sizing.tab.connectionRadius,
+    height: sizing.tab.connectionRadius * 2,
+    position: "absolute",
+    top: -sizing.tab.connectionRadius,
+    width: sizing.tab.connectionRadius * 2,
+  },
+  connectionCutoutLeft: {
+    left: -sizing.tab.connectionRadius,
+  },
+  connectionCutoutRight: {
+    right: -sizing.tab.connectionRadius,
+  },
+  connectionLeft: {
+    left: -sizing.tab.connectionRadius,
+  },
+  connectionRight: {
+    right: -sizing.tab.connectionRadius,
+  },
   connectedTab: {
     height: TAB_CONNECTED_HEIGHT,
-    paddingBottom: TAB_GAP,
+    paddingBottom: sizing.tab.connectionOverlap,
   },
   dragging: {
     boxShadow: shadow.sm,
   },
   restingTab: {
     height: TAB_VISUAL_HEIGHT,
+  },
+  restingSlot: {
+    paddingBottom: sizing.tab.connectionOverlap,
   },
   tabLabel: {
     flex: 1,
@@ -300,6 +394,7 @@ const styles = StyleSheet.create({
   tabSurface: {
     alignItems: "center",
     flexDirection: "row",
+    gap: sizing.tab.labelGap,
     width: TAB_WIDTH,
   },
 });

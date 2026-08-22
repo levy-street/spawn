@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { Keyboard, Pressable, ScrollView, StyleSheet, View } from "react-native";
+import { Keyboard, ScrollView, StyleSheet, View } from "react-native";
 import {
   KeyboardController,
   KeyboardStickyView,
@@ -16,12 +16,14 @@ import {
   withActiveModifiers,
 } from "@/components/terminal-ui/modifier-state";
 import { TerminalKeysSheet } from "@/components/terminal-ui/terminal-keys-sheet";
-import { Icon } from "@/components/ui/icon";
+import { Button } from "@/components/ui/button";
+import { IconButton } from "@/components/ui/icon-button";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
 import { encodeKey } from "@/terminal/key-encoder";
 import type { KeySpec } from "@/terminal/transport/types";
-import { borderWidth, chrome, useTheme } from "@/theme";
+import { borderWidth, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 type KeyEncoder = (key: KeySpec) => string;
 
@@ -61,9 +63,8 @@ function KeyCap({
   const theme = useTheme();
   const longPressed = useRef(false);
   return (
-    <Pressable
+    <Button
       accessibilityLabel={accessibilityLabel ?? label}
-      accessibilityRole="button"
       accessibilityState={{ disabled, selected: active }}
       delayLongPress={theme.motion.duration.successHold}
       disabled={disabled}
@@ -82,29 +83,20 @@ function KeyCap({
         }
         onPress();
       }}
-      style={({ pressed }) => [
+      size="sm"
+      style={[
         styles.key,
         {
-          backgroundColor: active
-            ? theme.colors.primary
-            : pressed
-              ? theme.colors.accent
-              : theme.colors.secondary,
-          borderColor: active ? theme.colors.primary : theme.colors.border,
-          borderRadius: theme.radii.md,
-          borderWidth: borderWidth.hairline,
-          minHeight: chrome.touchTarget,
-          minWidth: chrome.touchTarget,
-          opacity: disabled ? 0.5 : 1,
-          paddingHorizontal: theme.space(2.5),
+          minWidth: sizing.control.minimumTouchTarget,
         },
       ]}
+      variant={active ? "default" : "secondary"}
       {...(testID === undefined ? {} : { testID })}
     >
       <Text color={active ? "primaryForeground" : "foreground"} variant="mono">
         {label}
       </Text>
-    </Pressable>
+    </Button>
   );
 }
 
@@ -302,14 +294,11 @@ export function ModifierBar({
               />
             ))}
             <KeyCap disabled={keyDisabled} label="More" onPress={() => setMoreVisible(true)} />
-            <Pressable
+            <IconButton
               accessibilityLabel="Dismiss keyboard"
-              accessibilityRole="button"
+              icon="ChevronDown"
               onPress={dismissKeyboard}
-              style={[styles.dismiss, { height: chrome.touchTarget, width: chrome.touchTarget }]}
-            >
-              <Icon color="mutedForeground" name="ChevronDown" size={theme.space(4)} />
-            </Pressable>
+            />
           </ScrollView>
           <KeyCap
             accessibilityLabel="Send"
@@ -330,10 +319,6 @@ export function ModifierBar({
 }
 
 const styles = StyleSheet.create({
-  dismiss: {
-    alignItems: "center",
-    justifyContent: "center",
-  },
   key: {
     alignItems: "center",
     justifyContent: "center",

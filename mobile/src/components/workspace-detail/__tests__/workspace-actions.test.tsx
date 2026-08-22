@@ -107,7 +107,11 @@ jest.mock("@/components/workspace-detail/workspace-header", () => ({
       null,
       React.createElement(
         Pressable,
-        { accessibilityLabel: "Header add", onPress: props["onAddPane"] as () => void },
+        {
+          accessibilityLabel: "Header add",
+          disabled: props["canAddPane"] !== true,
+          onPress: props["onAddPane"] as () => void,
+        },
         React.createElement(Text, null, "Header add"),
       ),
       React.createElement(
@@ -237,6 +241,31 @@ describe("workspace action wiring", () => {
     }
   });
 
+  it("routes the header plus and ellipsis to mounted, visible sheets", async () => {
+    const screen = await render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+
+    expect(mockCaptured.launcher?.["visible"]).toBe(false);
+    expect(mockCaptured.workspaceActions?.["visible"]).toBe(false);
+
+    await fireEvent.press(screen.getByLabelText("Header add"));
+    expect(mockCaptured.launcher?.["visible"]).toBe(true);
+    expect(mockCaptured.launcher?.["initialTabId"]).toBe("main");
+
+    await act(() => {
+      (mockCaptured.launcher?.["onDismiss"] as (() => void) | undefined)?.();
+    });
+    await fireEvent.press(screen.getByLabelText("Header actions"));
+    expect(mockCaptured.workspaceActions?.["visible"]).toBe(true);
+  });
+
   it("opens the launcher from each add-pane affordance for the active tab", async () => {
     const screen = await render(
       <WorkspaceDetail
@@ -278,7 +307,7 @@ describe("workspace action wiring", () => {
     expect(mockCaptured.workspaceActions?.["visible"]).toBe(true);
   });
 
-  it("surfaces the 16-pane reason when the header add control is blocked", async () => {
+  it("disables the header add control at the 16-pane ceiling", async () => {
     const tiles: Tile[] = Array.from({ length: 16 }, (_, index) => ({
       session_id: `session-${index}`,
       x: index,
@@ -297,8 +326,9 @@ describe("workspace action wiring", () => {
       { wrapper: Providers },
     );
 
-    await fireEvent.press(screen.getByLabelText("Header add"));
-    expect(screen.getByText("This tab is full. A tab can contain up to 16 panes.")).toBeTruthy();
+    const add = screen.getByLabelText("Header add");
+    expect(add).toBeDisabled();
+    await fireEvent.press(add);
     expect(mockCaptured.launcher?.["visible"]).toBe(false);
   });
 
@@ -386,7 +416,7 @@ describe("workspace action wiring", () => {
       { wrapper: Providers },
     );
 
-    expectHandlers("header", ["onAddPane", "onActions"]);
+    expectHandlers("header", ["onBack", "onAddPane", "onActions"]);
     expectHandlers("tabStrip", ["onSelect", "onActions", "onAdd", "onClose", "onReorder"]);
     expectHandlers("paneList", [
       "onAddPane",

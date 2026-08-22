@@ -1,15 +1,17 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, fireEvent, render } from "@testing-library/react-native";
-import type { PropsWithChildren } from "react";
+import { act, fireEvent, render, within } from "@testing-library/react-native";
+import type { ComponentType, PropsWithChildren } from "react";
 import { StyleSheet } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
+import { ListSeparator } from "@/components/ui/list-row";
 import { WorkspaceListScreen } from "@/components/workspaces/workspace-list-screen";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import { ThemeProvider } from "@/theme";
 
 interface CapturedFlashListProps {
   data: ReadonlyArray<{ workspace: { id: string } }>;
+  ItemSeparatorComponent?: ComponentType;
   keyExtractor(item: { workspace: { id: string } }): string;
   onRefresh(): void;
   refreshing: boolean;
@@ -21,7 +23,6 @@ let mockFlashListMounts = 0;
 let mockSessionsRefetching = false;
 let mockCreateVisible = false;
 const mockPush = jest.fn();
-const mockSetOptions = jest.fn();
 const mockRefetchWorkspaces = jest.fn(() => Promise.resolve({}));
 const mockRefetchArchived = jest.fn(() => Promise.resolve({}));
 const mockRefetchSessions = jest.fn(() => Promise.resolve({}));
@@ -53,7 +54,10 @@ const mockWorkspace: WorkspaceOut = {
   created_at: "2026-08-22T00:00:00Z",
   updated_at: "2026-08-22T00:00:00Z",
 };
-const mockWorkspaces = [mockWorkspace];
+const mockWorkspaces = [
+  mockWorkspace,
+  { ...mockWorkspace, id: "workspace-2", name: "Web", position: 1 },
+];
 const mockArchived: WorkspaceOut[] = [];
 const mockSessions: never[] = [];
 const mockTemplates: never[] = [];
@@ -70,7 +74,12 @@ jest.mock("@shopify/flash-list", () => {
         mockFlashListMounts += 1;
       }, []);
       mockFlashListRenders.push(props);
-      return React.createElement(View, { testID: props.testID });
+      const Separator = props.ItemSeparatorComponent;
+      return React.createElement(
+        View,
+        { testID: props.testID },
+        props.data.length > 1 && Separator !== undefined ? React.createElement(Separator) : null,
+      );
     },
   };
 });
@@ -79,11 +88,17 @@ jest.mock("expo-router", () => ({
   useRouter: () => ({ push: mockPush }),
 }));
 
-jest.mock("@react-navigation/native", () => {
-  const actual = jest.requireActual<typeof import("@react-navigation/native")>(
-    "@react-navigation/native",
-  );
-  return { ...actual, useNavigation: () => ({ setOptions: mockSetOptions }) };
+jest.mock("react-native-keyboard-controller", () => {
+  const React = jest.requireActual<typeof import("react")>("react");
+  const { View } = jest.requireActual<typeof import("react-native")>("react-native");
+  return {
+    KeyboardAwareScrollView: ({ children }: PropsWithChildren) =>
+      React.createElement(View, null, children),
+    KeyboardStickyView: ({ children }: PropsWithChildren) =>
+      React.createElement(View, { testID: "keyboard-sticky-view" }, children),
+    useKeyboardState: (selector: (state: { isVisible: boolean }) => boolean) =>
+      selector({ isVisible: false }),
+  };
 });
 
 jest.mock("@/components/ui/toast", () => ({ useToast: () => mockToast }));
@@ -206,23 +221,39 @@ describe("workspace list refresh stability", () => {
     await screen.unmount();
   });
 
-  it("configures create and destination actions in the native header", async () => {
+  it("renders one global header with create and destination actions", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
-    const options = mockSetOptions.mock.calls.at(-1)?.[0] as
-      | { headerRight?: () => React.JSX.Element }
-      | undefined;
-    const headerRight = options?.headerRight;
-    if (!headerRight) throw new Error("Workspace header actions were not configured.");
+    expect(screen.getAllByText("Workspaces")).toHaveLength(1);
+    expect(screen.getByLabelText("New workspace")).toBeTruthy();
+    expect(screen.getByLabelText("Open hosts")).toBeTruthy();
+    expect(screen.getByLabelText("Open settings")).toBeTruthy();
 
-    const header = await render(headerRight(), { wrapper: Providers });
-    expect(header.getByLabelText("New workspace")).toBeTruthy();
-    expect(header.getByLabelText("Open hosts")).toBeTruthy();
-    expect(header.getByLabelText("Open settings")).toBeTruthy();
-    await fireEvent.press(header.getByTestId("new-workspace-button"));
+    await fireEvent.press(screen.getByTestId("new-workspace-button"));
     expect(mockCreateVisible).toBe(true);
-    expect(screen.queryByText("Workspaces")).toBeNull();
+    await fireEvent.press(screen.getByLabelText("Open hosts"));
+    await fireEvent.press(screen.getByLabelText("Open settings"));
+    expect(mockPush).toHaveBeenNthCalledWith(1, "/hosts");
+    expect(mockPush).toHaveBeenNthCalledWith(2, "/settings");
 
-    await header.unmount();
+    await screen.unmount();
+  });
+
+  it("docks search in the keyboard-sticky footer below the list", async () => {
+    const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
+    const stickyFooter = screen.getByTestId("keyboard-sticky-view");
+
+    expect(within(stickyFooter).getByTestId("workspace-search")).toBeTruthy();
+    expect(
+      within(screen.getByTestId("workspace-list-screen")).queryByTestId("workspace-search"),
+    ).toBeNull();
+    expect(screen.getByTestId("workspace-list")).toBeTruthy();
+    await screen.unmount();
+  });
+
+  it("joins full-width list items with the global separator", async () => {
+    const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
+    expect(latestList().ItemSeparatorComponent).toBe(ListSeparator);
+    expect(screen.getByTestId("list-separator")).toBeTruthy();
     await screen.unmount();
   });
 

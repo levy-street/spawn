@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 import { Divider } from "@/components/ui/divider";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
@@ -68,23 +69,14 @@ function EndorsementReview({
       <Text color="mutedForeground">
         Compare this fingerprint with the trusted device named below.
       </Text>
-      <View
-        style={[
-          styles.fingerprintWell,
-          {
-            backgroundColor: theme.colors.muted,
-            borderColor: theme.colors.border,
-            borderRadius: theme.radii.md,
-          },
-        ]}
-      >
+      <Card style={styles.fingerprintWell} variant="flat">
         <Text color="mutedForeground" variant="caption">
           {record.endorser_label ?? "Trusted device"}
         </Text>
         <Text selectable style={styles.fingerprint} variant="mono">
           {endorserFingerprint}
         </Text>
-      </View>
+      </Card>
       <Pressable
         accessibilityLabel="I compared the trusted device fingerprint"
         accessibilityRole="checkbox"
@@ -199,9 +191,7 @@ const styles = StyleSheet.create({
     fontSize: fontSize.base,
   },
   fingerprintWell: {
-    borderWidth: borderWidth.hairline,
     gap: spacing[2],
-    padding: spacing[3],
   },
   heading: {
     gap: spacing[2],

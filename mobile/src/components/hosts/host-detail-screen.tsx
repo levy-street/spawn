@@ -1,16 +1,16 @@
 import { useRouter } from "expo-router";
 import { useState } from "react";
 import { RefreshControl, ScrollView, StyleSheet, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
 import { HostDetailView } from "@/components/hosts/host-detail-view";
 import { errorMessage } from "@/components/hosts/host-model";
 import { RenameHostDialog } from "@/components/hosts/rename-host-dialog";
+import { AppHeader } from "@/components/layout/app-header";
+import { Screen } from "@/components/layout/screen";
 import { ActionSheet } from "@/components/ui/action-sheet";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
-import { IconButton } from "@/components/ui/icon-button";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
@@ -22,7 +22,7 @@ import {
   useRenameHostMutation,
 } from "@/data/queries/hosts";
 import { sessionsForHost } from "@/data/selectors/host";
-import { borderWidth, spacing, useTheme } from "@/theme";
+import { spacing, useTheme } from "@/theme";
 
 export function HostDetailScreen({ hostId }: { hostId: string }) {
   const theme = useTheme();
@@ -43,144 +43,143 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
   };
 
   return (
-    <SafeAreaView
-      edges={["top"]}
-      style={[styles.screen, { backgroundColor: theme.colors.background }]}
+    <Screen
+      header={
+        <AppHeader
+          actions={[
+            {
+              accessibilityLabel: "Host actions",
+              disabled: host === undefined,
+              icon: "Ellipsis",
+              onPress: () => setActionsVisible(true),
+            },
+          ]}
+          onBack={router.back}
+          title={host?.name ?? "Host"}
+        />
+      }
+      padded={false}
     >
-      <View style={[styles.header, { borderBottomColor: theme.colors.border }]}>
-        <IconButton accessibilityLabel="Back to hosts" icon="ChevronLeft" onPress={router.back} />
-        <Text
-          accessibilityRole="header"
-          numberOfLines={1}
-          style={styles.headerTitle}
-          variant="title"
-        >
-          {host?.name ?? "Host"}
-        </Text>
-        <IconButton
-          accessibilityLabel="Host actions"
-          icon="Ellipsis"
-          onPress={() => setActionsVisible(true)}
+      <View style={[styles.screen, { backgroundColor: theme.colors.background }]}>
+        {hostQuery.isPending ? (
+          <View style={styles.centered}>
+            <Spinner label="Loading host" />
+          </View>
+        ) : hostQuery.isError || !host ? (
+          <EmptyState
+            action={
+              <View style={styles.errorActions}>
+                <Button onPress={() => void hostQuery.refetch()}>Retry</Button>
+                <Button onPress={router.back} variant="outline">
+                  Back
+                </Button>
+              </View>
+            }
+            description={`Failed to load host: ${errorMessage(hostQuery.error)}`}
+            icon="AlertCircle"
+            title="Host unavailable"
+          />
+        ) : (
+          <ScrollView
+            contentContainerStyle={styles.scrollContent}
+            refreshControl={
+              <RefreshControl
+                onRefresh={refresh}
+                refreshing={hostQuery.isRefetching || sessionsQuery.isRefetching}
+                tintColor={theme.colors.mutedForeground}
+              />
+            }
+          >
+            <HostDetailView
+              agents={agentsQuery.data ?? []}
+              host={host}
+              onOpenAgents={() =>
+                router.push({ pathname: "/host/[id]/agents", params: { id: host.id } })
+              }
+              onOpenFiles={() =>
+                router.push({ pathname: "/host/[id]/files", params: { id: host.id } })
+              }
+              onOpenSession={(session) => router.push(`/terminal/${session.id}`)}
+              sessions={sessionsForHost(sessionsQuery.data ?? [], host.id)}
+            />
+            {sessionsQuery.isError ? (
+              <View style={styles.inlineError}>
+                <Text accessibilityRole="alert" color="destructive" variant="caption">
+                  Failed to load sessions: {errorMessage(sessionsQuery.error)}
+                </Text>
+                <Button onPress={() => void sessionsQuery.refetch()} size="sm" variant="outline">
+                  Retry
+                </Button>
+              </View>
+            ) : null}
+          </ScrollView>
+        )}
+        <ActionSheet
+          actions={
+            host
+              ? [
+                  {
+                    id: "rename",
+                    label: "Rename",
+                    icon: <Icon color="mutedForeground" name="Pencil" />,
+                    onPress: () => setRenameVisible(true),
+                  },
+                  {
+                    id: "remove",
+                    label: "Remove",
+                    destructive: true,
+                    icon: <Icon color="destructive" name="Trash2" />,
+                    onPress: () => setRemoveVisible(true),
+                  },
+                ]
+              : []
+          }
+          onDismiss={() => setActionsVisible(false)}
+          visible={actionsVisible && host !== undefined}
+          {...(host === undefined ? {} : { title: host.name })}
+        />
+        <RenameHostDialog
+          currentName={host?.name ?? ""}
+          error={rename.error ? errorMessage(rename.error) : null}
+          loading={rename.isPending}
+          onCancel={() => {
+            setRenameVisible(false);
+            rename.reset();
+          }}
+          onRename={(name) => {
+            if (!host) return;
+            rename.mutate(
+              { hostId: host.id, name },
+              {
+                onSuccess: () => {
+                  toast.success("Host renamed");
+                  setRenameVisible(false);
+                },
+              },
+            );
+          }}
+          visible={renameVisible && host !== undefined}
+        />
+        <Confirm
+          confirmLabel={remove.error ? "Retry deletion" : "Remove host"}
+          description="Its daemon token will be revoked. Existing session processes on that machine may continue locally, but spawn will no longer connect to them."
+          destructive
+          onCancel={() => setRemoveVisible(false)}
+          onConfirm={() => {
+            if (!host || remove.isPending) return;
+            remove.mutate(host, {
+              onError: (error) => toast.error("Could not remove host", { detail: error.message }),
+              onSuccess: () => {
+                toast.success("Host removed");
+                router.replace("/hosts");
+              },
+            });
+          }}
+          title={`Remove ${host?.name ?? "host"}?`}
+          visible={removeVisible && host !== undefined}
         />
       </View>
-      {hostQuery.isPending ? (
-        <View style={styles.centered}>
-          <Spinner label="Loading host" />
-        </View>
-      ) : hostQuery.isError || !host ? (
-        <EmptyState
-          action={
-            <View style={styles.errorActions}>
-              <Button onPress={() => void hostQuery.refetch()}>Retry</Button>
-              <Button onPress={router.back} variant="outline">
-                Back
-              </Button>
-            </View>
-          }
-          description={`Failed to load host: ${errorMessage(hostQuery.error)}`}
-          icon="AlertCircle"
-          title="Host unavailable"
-        />
-      ) : (
-        <ScrollView
-          contentContainerStyle={styles.scrollContent}
-          refreshControl={
-            <RefreshControl
-              onRefresh={refresh}
-              refreshing={hostQuery.isRefetching || sessionsQuery.isRefetching}
-              tintColor={theme.colors.mutedForeground}
-            />
-          }
-        >
-          <HostDetailView
-            agents={agentsQuery.data ?? []}
-            host={host}
-            onOpenAgents={() =>
-              router.push({ pathname: "/host/[id]/agents", params: { id: host.id } })
-            }
-            onOpenFiles={() =>
-              router.push({ pathname: "/host/[id]/files", params: { id: host.id } })
-            }
-            onOpenSession={(session) => router.push(`/terminal/${session.id}`)}
-            sessions={sessionsForHost(sessionsQuery.data ?? [], host.id)}
-          />
-          {sessionsQuery.isError ? (
-            <View style={styles.inlineError}>
-              <Text accessibilityRole="alert" color="destructive" variant="caption">
-                Failed to load sessions: {errorMessage(sessionsQuery.error)}
-              </Text>
-              <Button onPress={() => void sessionsQuery.refetch()} size="sm" variant="outline">
-                Retry
-              </Button>
-            </View>
-          ) : null}
-        </ScrollView>
-      )}
-      <ActionSheet
-        actions={
-          host
-            ? [
-                {
-                  id: "rename",
-                  label: "Rename",
-                  icon: <Icon color="mutedForeground" name="Pencil" />,
-                  onPress: () => setRenameVisible(true),
-                },
-                {
-                  id: "remove",
-                  label: "Remove",
-                  destructive: true,
-                  icon: <Icon color="destructive" name="Trash2" />,
-                  onPress: () => setRemoveVisible(true),
-                },
-              ]
-            : []
-        }
-        onDismiss={() => setActionsVisible(false)}
-        visible={actionsVisible && host !== undefined}
-        {...(host === undefined ? {} : { title: host.name })}
-      />
-      <RenameHostDialog
-        currentName={host?.name ?? ""}
-        error={rename.error ? errorMessage(rename.error) : null}
-        loading={rename.isPending}
-        onCancel={() => {
-          setRenameVisible(false);
-          rename.reset();
-        }}
-        onRename={(name) => {
-          if (!host) return;
-          rename.mutate(
-            { hostId: host.id, name },
-            {
-              onSuccess: () => {
-                toast.success("Host renamed");
-                setRenameVisible(false);
-              },
-            },
-          );
-        }}
-        visible={renameVisible && host !== undefined}
-      />
-      <Confirm
-        confirmLabel={remove.error ? "Retry deletion" : "Remove host"}
-        description="Its daemon token will be revoked. Existing session processes on that machine may continue locally, but spawn will no longer connect to them."
-        destructive
-        onCancel={() => setRemoveVisible(false)}
-        onConfirm={() => {
-          if (!host || remove.isPending) return;
-          remove.mutate(host, {
-            onError: (error) => toast.error("Could not remove host", { detail: error.message }),
-            onSuccess: () => {
-              toast.success("Host removed");
-              router.replace("/hosts");
-            },
-          });
-        }}
-        title={`Remove ${host?.name ?? "host"}?`}
-        visible={removeVisible && host !== undefined}
-      />
-    </SafeAreaView>
+    </Screen>
   );
 }
 
@@ -193,17 +192,6 @@ const styles = StyleSheet.create({
   errorActions: {
     flexDirection: "row",
     gap: spacing[2],
-  },
-  header: {
-    alignItems: "center",
-    borderBottomWidth: borderWidth.hairline,
-    flexDirection: "row",
-    minHeight: spacing[14],
-    paddingHorizontal: spacing[2],
-  },
-  headerTitle: {
-    flex: 1,
-    textAlign: "center",
   },
   inlineError: {
     alignItems: "flex-start",

@@ -9,6 +9,7 @@ import {
 } from "@/components/hosts/host-model";
 import { LiveCapacityProbe } from "@/components/hosts/live-capacity-probe";
 import { Badge } from "@/components/ui/badge";
+import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
@@ -20,7 +21,7 @@ import { identifyAgent } from "@/data/selectors/agent";
 import { sessionAttention } from "@/data/selectors/session";
 import { haptics } from "@/lib/haptics";
 import type { TransportState } from "@/terminal/transport/types";
-import { borderWidth, spacing, useTheme } from "@/theme";
+import { spacing, useTheme } from "@/theme";
 
 export interface LegionHostCardProps {
   agents: readonly AgentOut[];
@@ -82,99 +83,98 @@ export function LegionHostCard({
         haptics.selection();
         onOpen();
       }}
-      style={({ pressed }) => [
-        styles.card,
-        {
-          backgroundColor: pressed ? theme.colors.accent : theme.colors.card,
-          borderColor: theme.colors.border,
-          borderRadius: theme.radii.lg,
-        },
-      ]}
       testID={`legion-host-${host.id}`}
     >
-      <View style={styles.heading}>
-        <StatusDot
-          accessibilityLabel={online ? "Online" : "Offline"}
-          pulse={false}
-          tone={online ? "active" : "offline"}
-        />
-        <View style={styles.headingCopy}>
-          <Text numberOfLines={1} variant="label">
-            {host.name}
-          </Text>
-          <Text color="mutedForeground" variant="caption">
-            {online ? (host.os ?? "unknown") : "Offline"}
-          </Text>
-        </View>
-        {liveEnabled && metrics !== null ? <Badge variant="success">Live</Badge> : null}
-        <Icon color="mutedForeground" name="ChevronRight" />
-      </View>
-      {host.cpu_cores !== null || host.memory_bytes !== null || host.gpu !== null ? (
-        <Text color="mutedForeground" variant="caption">
-          {[
-            host.cpu_cores === null ? null : pluralize(host.cpu_cores, "core"),
-            host.memory_bytes === null ? null : formatBytes(host.memory_bytes),
-            host.gpu,
-          ]
-            .filter((value): value is string => Boolean(value))
-            .join(" · ")}
-        </Text>
-      ) : null}
-      {online ? <CapacityMeter capacity={capacity} /> : null}
-      {liveEnabled && online && metrics === null && !liveUnavailable ? (
-        <Text color="mutedForeground" variant="caption">
-          Connecting live capacity…
-        </Text>
-      ) : null}
-      {liveUnavailable ? (
-        <Text color="mutedForeground" variant="caption">
-          This host does not report live capacity.
-        </Text>
-      ) : null}
-      <View style={styles.summary}>
-        <Text color="mutedForeground" variant="caption">
-          {pluralize(liveSessions.length, "live session")}
-        </Text>
-        {needYou > 0 ? <Badge variant="warning">{`${needYou} need you`}</Badge> : null}
-      </View>
-      {runningAgents.length > 0 ? (
-        <View accessibilityLabel="Running agents" style={styles.agentChips}>
-          {runningAgents.slice(0, 3).map(({ count, identity, key }) => (
-            <View
-              key={key}
-              style={[
-                styles.agentChip,
-                {
-                  backgroundColor: theme.colors.muted,
-                  borderRadius: theme.radii.md,
-                },
-              ]}
-            >
-              <AgentIcon identity={identity} size={spacing[5]} />
+      {({ pressed }) => (
+        <Card
+          style={{ backgroundColor: pressed ? theme.colors.accent : theme.colors.card }}
+          variant="flat"
+        >
+          <View style={styles.heading}>
+            <StatusDot
+              accessibilityLabel={online ? "Online" : "Offline"}
+              pulse={false}
+              tone={online ? "active" : "offline"}
+            />
+            <View style={styles.headingCopy}>
+              <Text numberOfLines={1} variant="label">
+                {host.name}
+              </Text>
               <Text color="mutedForeground" variant="caption">
-                {identity.displayName}
-                {count > 1 ? ` ×${count}` : ""}
+                {online ? (host.os ?? "unknown") : "Offline"}
               </Text>
             </View>
-          ))}
-          {runningAgents.length > 3 ? (
+            {liveEnabled && metrics !== null ? <Badge variant="success">Live</Badge> : null}
+            <Icon color="mutedForeground" name="ChevronRight" />
+          </View>
+          {host.cpu_cores !== null || host.memory_bytes !== null || host.gpu !== null ? (
             <Text color="mutedForeground" variant="caption">
-              +{runningAgents.length - 3}
+              {[
+                host.cpu_cores === null ? null : pluralize(host.cpu_cores, "core"),
+                host.memory_bytes === null ? null : formatBytes(host.memory_bytes),
+                host.gpu,
+              ]
+                .filter((value): value is string => Boolean(value))
+                .join(" · ")}
             </Text>
           ) : null}
-        </View>
-      ) : null}
-      <LiveCapacityProbe
-        enabled={canProbe}
-        hostId={host.id}
-        hostIdentityPublicKey={host.host_public_key}
-        onMetrics={(next) => {
-          setMetrics(next);
-          setLiveError(null);
-        }}
-        onStateChange={setTransportState}
-        onUnavailable={setLiveError}
-      />
+          {online ? <CapacityMeter capacity={capacity} /> : null}
+          {liveEnabled && online && metrics === null && !liveUnavailable ? (
+            <Text color="mutedForeground" variant="caption">
+              Connecting live capacity…
+            </Text>
+          ) : null}
+          {liveUnavailable ? (
+            <Text color="mutedForeground" variant="caption">
+              This host does not report live capacity.
+            </Text>
+          ) : null}
+          <View style={styles.summary}>
+            <Text color="mutedForeground" variant="caption">
+              {pluralize(liveSessions.length, "live session")}
+            </Text>
+            {needYou > 0 ? <Badge variant="warning">{`${needYou} need you`}</Badge> : null}
+          </View>
+          {runningAgents.length > 0 ? (
+            <View accessibilityLabel="Running agents" style={styles.agentChips}>
+              {runningAgents.slice(0, 3).map(({ count, identity, key }) => (
+                <View
+                  key={key}
+                  style={[
+                    styles.agentChip,
+                    {
+                      backgroundColor: theme.colors.muted,
+                      borderRadius: theme.radii.md,
+                    },
+                  ]}
+                >
+                  <AgentIcon identity={identity} size={spacing[5]} />
+                  <Text color="mutedForeground" variant="caption">
+                    {identity.displayName}
+                    {count > 1 ? ` ×${count}` : ""}
+                  </Text>
+                </View>
+              ))}
+              {runningAgents.length > 3 ? (
+                <Text color="mutedForeground" variant="caption">
+                  +{runningAgents.length - 3}
+                </Text>
+              ) : null}
+            </View>
+          ) : null}
+          <LiveCapacityProbe
+            enabled={canProbe}
+            hostId={host.id}
+            hostIdentityPublicKey={host.host_public_key}
+            onMetrics={(next) => {
+              setMetrics(next);
+              setLiveError(null);
+            }}
+            onStateChange={setTransportState}
+            onUnavailable={setLiveError}
+          />
+        </Card>
+      )}
     </Pressable>
   );
 }
@@ -192,11 +192,6 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     flexWrap: "wrap",
     gap: spacing[2],
-  },
-  card: {
-    borderWidth: borderWidth.hairline,
-    gap: spacing[3],
-    padding: spacing[4],
   },
   heading: {
     alignItems: "center",

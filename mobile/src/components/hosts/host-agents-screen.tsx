@@ -1,13 +1,14 @@
 import { useRouter } from "expo-router";
 import { useState } from "react";
 import { RefreshControl, ScrollView, StyleSheet, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
 import { HostAgentRow } from "@/components/hosts/host-agent-row";
 import { errorMessage } from "@/components/hosts/host-model";
 import { HostSkillsList } from "@/components/hosts/host-skills-list";
+import { AppHeader } from "@/components/layout/app-header";
+import { Screen } from "@/components/layout/screen";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
-import { IconButton } from "@/components/ui/icon-button";
+import { SectionHeader } from "@/components/ui/section-header";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
@@ -19,7 +20,7 @@ import {
   useInstallHostAgentMutation,
   useSkillsQuery,
 } from "@/data/queries/hosts";
-import { borderWidth, spacing, useTheme } from "@/theme";
+import { spacing, useTheme } from "@/theme";
 
 export function HostAgentsScreen({ hostId }: { hostId: string }) {
   const theme = useTheme();
@@ -43,161 +44,163 @@ export function HostAgentsScreen({ hostId }: { hostId: string }) {
   };
 
   return (
-    <SafeAreaView
-      edges={["top"]}
-      style={[styles.screen, { backgroundColor: theme.colors.background }]}
+    <Screen
+      header={
+        <AppHeader
+          actions={[
+            {
+              accessibilityLabel: "Refresh agents and skills",
+              icon: "RefreshCw",
+              onPress: refresh,
+            },
+          ]}
+          onBack={router.back}
+          {...(host === undefined ? {} : { subtitle: host.name })}
+          title="Agents & skills"
+        />
+      }
+      padded={false}
     >
-      <View style={[styles.header, { borderBottomColor: theme.colors.border }]}>
-        <IconButton accessibilityLabel="Back to host" icon="ChevronLeft" onPress={router.back} />
-        <View style={styles.headerCopy}>
-          <Text accessibilityRole="header" numberOfLines={1} variant="title">
-            Agents & skills
-          </Text>
-          {host ? (
-            <Text color="mutedForeground" numberOfLines={1} variant="caption">
-              {host.name}
-            </Text>
-          ) : null}
-        </View>
-        <IconButton
-          accessibilityLabel="Refresh agents and skills"
-          icon="RefreshCw"
-          onPress={refresh}
-        />
-      </View>
-      {hostQuery.isPending ? (
-        <View style={styles.centered}>
-          <Spinner label="Loading host" />
-        </View>
-      ) : hostQuery.isError || !host ? (
-        <EmptyState
-          action={<Button onPress={() => void hostQuery.refetch()}>Retry</Button>}
-          description={`Failed to load host: ${errorMessage(hostQuery.error)}`}
-          icon="AlertCircle"
-          title="Host unavailable"
-        />
-      ) : (
-        <ScrollView
-          contentContainerStyle={styles.content}
-          refreshControl={
-            <RefreshControl
-              onRefresh={refresh}
-              refreshing={
-                hostQuery.isRefetching || agentsQuery.isRefetching || skillsQuery.isRefetching
-              }
-              tintColor={theme.colors.mutedForeground}
-            />
-          }
-        >
-          <View style={styles.section}>
-            <View style={styles.sectionHeading}>
-              <Text accessibilityRole="header" variant="label" weight="semibold">
-                Agent availability
-              </Text>
-              {online ? (
-                <Button onPress={() => void agentsQuery.refetch()} size="sm" variant="ghost">
-                  Refresh
-                </Button>
-              ) : null}
+      <View style={[styles.screen, { backgroundColor: theme.colors.background }]}>
+        {hostQuery.isPending ? (
+          <View style={styles.centered}>
+            <Spinner label="Loading host" />
+          </View>
+        ) : hostQuery.isError || !host ? (
+          <EmptyState
+            action={<Button onPress={() => void hostQuery.refetch()}>Retry</Button>}
+            description={`Failed to load host: ${errorMessage(hostQuery.error)}`}
+            icon="AlertCircle"
+            title="Host unavailable"
+          />
+        ) : (
+          <ScrollView
+            contentContainerStyle={styles.content}
+            refreshControl={
+              <RefreshControl
+                onRefresh={refresh}
+                refreshing={
+                  hostQuery.isRefetching || agentsQuery.isRefetching || skillsQuery.isRefetching
+                }
+                tintColor={theme.colors.mutedForeground}
+              />
+            }
+          >
+            <View style={styles.section}>
+              <SectionHeader
+                style={styles.sectionHeader}
+                title="Agent availability"
+                trailing={
+                  online ? (
+                    <Button onPress={() => void agentsQuery.refetch()} size="sm" variant="ghost">
+                      Refresh
+                    </Button>
+                  ) : undefined
+                }
+              />
+              {!online ? (
+                <View
+                  style={[
+                    styles.callout,
+                    { backgroundColor: theme.colors.muted, borderRadius: theme.radii.lg },
+                  ]}
+                >
+                  <Text color="mutedForeground" variant="body">
+                    Agent availability is unavailable while the daemon is offline.
+                  </Text>
+                </View>
+              ) : agentsQuery.isPending ? (
+                <View style={styles.loadingRow}>
+                  <Spinner label="Checking agent availability" />
+                  <Text color="mutedForeground" variant="body">
+                    Checking agents…
+                  </Text>
+                </View>
+              ) : agentsQuery.isError ? (
+                <View style={styles.errorBlock}>
+                  <Text accessibilityRole="alert" color="destructive" variant="body">
+                    {errorMessage(agentsQuery.error)}
+                  </Text>
+                  <Button onPress={() => void agentsQuery.refetch()} size="sm" variant="outline">
+                    Retry
+                  </Button>
+                </View>
+              ) : agentsQuery.data.agents.length === 0 ? (
+                <EmptyState icon="Bot" title="No agent definitions are available." />
+              ) : (
+                <View style={styles.agentList}>
+                  {agentsQuery.data.agents.map((agent) => (
+                    <HostAgentRow
+                      agent={agent}
+                      hostName={host.name}
+                      installing={
+                        install.isPending && install.variables?.agentId === agent.agent_id
+                      }
+                      key={agent.agent_id}
+                      onInstall={() => {
+                        install.mutate(
+                          { agentId: agent.agent_id, hostId },
+                          {
+                            onError: (error) =>
+                              toast.error(`${agent.agent_name}: failed`, { detail: error.message }),
+                            onSuccess: (result) => {
+                              setResults((current) => ({
+                                ...current,
+                                [agent.agent_id]: result,
+                              }));
+                              if (result.success) toast.success(`${agent.agent_name}: completed`);
+                              else
+                                toast.error(
+                                  `${agent.agent_name}: failed`,
+                                  result.error ? { detail: result.error } : {},
+                                );
+                            },
+                          },
+                        );
+                      }}
+                      onPolicyChange={(value) => {
+                        policy.mutate(
+                          { agentId: agent.agent_id, autoUpdate: value, hostId },
+                          {
+                            onError: (error) =>
+                              toast.error("Could not update auto update", {
+                                detail: error.message,
+                              }),
+                          },
+                        );
+                      }}
+                      policySaving={
+                        policy.isPending && policy.variables?.agentId === agent.agent_id
+                      }
+                      result={results[agent.agent_id] ?? null}
+                    />
+                  ))}
+                </View>
+              )}
             </View>
-            {!online ? (
-              <View
-                style={[
-                  styles.callout,
-                  { backgroundColor: theme.colors.muted, borderRadius: theme.radii.lg },
-                ]}
-              >
-                <Text color="mutedForeground" variant="body">
-                  Agent availability is unavailable while the daemon is offline.
-                </Text>
-              </View>
-            ) : agentsQuery.isPending ? (
+            {skillsQuery.isPending ? (
               <View style={styles.loadingRow}>
-                <Spinner label="Checking agent availability" />
+                <Spinner label="Loading skills" />
                 <Text color="mutedForeground" variant="body">
-                  Checking agents…
+                  Loading skills...
                 </Text>
               </View>
-            ) : agentsQuery.isError ? (
+            ) : skillsQuery.isError ? (
               <View style={styles.errorBlock}>
                 <Text accessibilityRole="alert" color="destructive" variant="body">
-                  {errorMessage(agentsQuery.error)}
+                  Failed to load skills: {errorMessage(skillsQuery.error)}
                 </Text>
-                <Button onPress={() => void agentsQuery.refetch()} size="sm" variant="outline">
+                <Button onPress={() => void skillsQuery.refetch()} size="sm" variant="outline">
                   Retry
                 </Button>
               </View>
-            ) : agentsQuery.data.agents.length === 0 ? (
-              <Text color="mutedForeground" variant="body">
-                No agent definitions are available.
-              </Text>
             ) : (
-              <View style={styles.agentList}>
-                {agentsQuery.data.agents.map((agent) => (
-                  <HostAgentRow
-                    agent={agent}
-                    hostName={host.name}
-                    installing={install.isPending && install.variables?.agentId === agent.agent_id}
-                    key={agent.agent_id}
-                    onInstall={() => {
-                      install.mutate(
-                        { agentId: agent.agent_id, hostId },
-                        {
-                          onError: (error) =>
-                            toast.error(`${agent.agent_name}: failed`, { detail: error.message }),
-                          onSuccess: (result) => {
-                            setResults((current) => ({
-                              ...current,
-                              [agent.agent_id]: result,
-                            }));
-                            if (result.success) toast.success(`${agent.agent_name}: completed`);
-                            else
-                              toast.error(
-                                `${agent.agent_name}: failed`,
-                                result.error ? { detail: result.error } : {},
-                              );
-                          },
-                        },
-                      );
-                    }}
-                    onPolicyChange={(value) => {
-                      policy.mutate(
-                        { agentId: agent.agent_id, autoUpdate: value, hostId },
-                        {
-                          onError: (error) =>
-                            toast.error("Could not update auto update", { detail: error.message }),
-                        },
-                      );
-                    }}
-                    policySaving={policy.isPending && policy.variables?.agentId === agent.agent_id}
-                    result={results[agent.agent_id] ?? null}
-                  />
-                ))}
-              </View>
+              <HostSkillsList skills={skillsQuery.data} />
             )}
-          </View>
-          {skillsQuery.isPending ? (
-            <View style={styles.loadingRow}>
-              <Spinner label="Loading skills" />
-              <Text color="mutedForeground" variant="body">
-                Loading skills...
-              </Text>
-            </View>
-          ) : skillsQuery.isError ? (
-            <View style={styles.errorBlock}>
-              <Text accessibilityRole="alert" color="destructive" variant="body">
-                Failed to load skills: {errorMessage(skillsQuery.error)}
-              </Text>
-              <Button onPress={() => void skillsQuery.refetch()} size="sm" variant="outline">
-                Retry
-              </Button>
-            </View>
-          ) : (
-            <HostSkillsList skills={skillsQuery.data} />
-          )}
-        </ScrollView>
-      )}
-    </SafeAreaView>
+          </ScrollView>
+        )}
+      </View>
+    </Screen>
   );
 }
 
@@ -222,17 +225,6 @@ const styles = StyleSheet.create({
     alignItems: "flex-start",
     gap: spacing[2],
   },
-  header: {
-    alignItems: "center",
-    borderBottomWidth: borderWidth.hairline,
-    flexDirection: "row",
-    minHeight: spacing[14],
-    paddingHorizontal: spacing[2],
-  },
-  headerCopy: {
-    flex: 1,
-    minWidth: 0,
-  },
   loadingRow: {
     alignItems: "center",
     flexDirection: "row",
@@ -244,9 +236,7 @@ const styles = StyleSheet.create({
   section: {
     gap: spacing[3],
   },
-  sectionHeading: {
-    alignItems: "center",
-    flexDirection: "row",
-    justifyContent: "space-between",
+  sectionHeader: {
+    paddingHorizontal: spacing[0],
   },
 });

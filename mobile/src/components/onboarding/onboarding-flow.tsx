@@ -1,8 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
+import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
 
+import { AppHeader } from "@/components/layout/app-header";
+import { Screen } from "@/components/layout/screen";
 import { HostPairingStep } from "@/components/onboarding/host-pairing-step";
+import { leaveOnboarding } from "@/components/onboarding/onboarding-navigation";
 import {
   type OnboardingStep,
   readHostSkipped,
@@ -66,8 +70,9 @@ function ProgressRail({
   );
 }
 
-export function OnboardingFlow() {
+export function OnboardingFlow(): React.JSX.Element {
   const theme = useTheme();
+  const router = useRouter();
   const meQuery = useQuery({ queryKey: qk.me(), queryFn: getMe });
   const configQuery = useQuery({ queryKey: qk.authConfig(), queryFn: getAuthConfig });
   const hostsQuery = useQuery({ queryKey: qk.hosts(), queryFn: listHosts, refetchInterval: 3000 });
@@ -173,14 +178,23 @@ export function OnboardingFlow() {
   }
 
   return (
-    <View style={[styles.screen, { backgroundColor: theme.colors.background }]}>
-      <View style={styles.content}>
-        <ProgressRail
-          current={step}
-          verificationRequired={configQuery.data?.email_verification_required ?? false}
-        />
-        {content}
-      </View>
+    <View
+      style={[styles.screen, { backgroundColor: theme.colors.background }]}
+      testID="onboarding-flow"
+    >
+      <Screen
+        header={<AppHeader onBack={() => leaveOnboarding(router)} title="Set up Spawn" />}
+        padded={false}
+        scroll
+      >
+        <View style={styles.content}>
+          <ProgressRail
+            current={step}
+            verificationRequired={configQuery.data?.email_verification_required ?? false}
+          />
+          {content}
+        </View>
+      </Screen>
     </View>
   );
 }

@@ -104,7 +104,7 @@ describe("FullSurfaceDismiss", () => {
     expect(manager.activate).not.toHaveBeenCalled();
   });
 
-  test("fires one threshold haptic while rightward movement remains committed", async () => {
+  test("activates from a centre-of-screen pan and fires one threshold haptic", async () => {
     await render(
       <FullSurfaceDismiss onDismiss={jest.fn()}>
         <Text>Terminal</Text>
@@ -113,9 +113,9 @@ describe("FullSurfaceDismiss", () => {
     const manager = { activate: jest.fn(), fail: jest.fn() };
 
     await act(() => {
-      mockPanHandlers.onTouchesDown?.({ allTouches: [{ absoluteX: 100, absoluteY: 100 }] });
+      mockPanHandlers.onTouchesDown?.({ allTouches: [{ absoluteX: 375, absoluteY: 400 }] });
       mockPanHandlers.onTouchesMove?.(
-        { allTouches: [{ absoluteX: 120, absoluteY: 103 }] },
+        { allTouches: [{ absoluteX: 395, absoluteY: 403 }] },
         manager,
       );
       mockPanHandlers.onUpdate?.({ translationX: 50, velocityX: 0 });

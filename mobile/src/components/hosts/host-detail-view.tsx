@@ -1,15 +1,17 @@
-import { Pressable, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { HostFacts } from "@/components/hosts/host-facts";
 import { hostConnectionLabel } from "@/components/hosts/host-model";
 import { HostSessionList } from "@/components/hosts/host-session-list";
+import { Card } from "@/components/ui/card";
 import { Icon, type IconName } from "@/components/ui/icon";
+import { ListRow, ListSeparator } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, opacity, spacing, useTheme } from "@/theme";
+import { opacity, spacing } from "@/theme";
 
 function DestinationRow({
   detail,
@@ -24,37 +26,28 @@ function DestinationRow({
   label: string;
   onPress(): void;
 }) {
-  const theme = useTheme();
   return (
-    <Pressable
-      accessibilityLabel={label}
-      accessibilityRole="button"
-      accessibilityState={{ disabled }}
-      disabled={disabled}
-      onPress={() => {
-        haptics.selection();
-        onPress();
-      }}
-      style={({ pressed }) => [
-        styles.destination,
-        {
-          backgroundColor: pressed ? theme.colors.accent : "transparent",
-          borderColor: theme.colors.border,
-          borderRadius: theme.radii.lg,
-          minHeight: chrome.touchTarget + spacing[3],
-          opacity: disabled ? opacity.disabled : opacity.opaque,
-        },
-      ]}
+    <View
+      pointerEvents={disabled ? "none" : "auto"}
+      style={{ opacity: disabled ? opacity.disabled : opacity.opaque }}
     >
-      <Icon color="mutedForeground" name={icon} size={spacing[5]} />
-      <View style={styles.destinationCopy}>
-        <Text variant="label">{label}</Text>
-        <Text color="mutedForeground" variant="caption">
-          {detail}
-        </Text>
-      </View>
-      <Icon color="mutedForeground" name="ChevronRight" />
-    </Pressable>
+      <ListRow
+        height="tall"
+        leading={<Icon color="mutedForeground" name={icon} size={spacing[5]} />}
+        {...(disabled
+          ? {}
+          : {
+              onPress: () => {
+                haptics.selection();
+                onPress();
+              },
+            })}
+        shape="fullBleed"
+        subtitle={detail}
+        title={label}
+        trailing={<Icon color="mutedForeground" name="ChevronRight" />}
+      />
+    </View>
   );
 }
 
@@ -93,7 +86,7 @@ export function HostDetailView({
           {host.os ?? "unknown"} · {host.arch ?? "unknown"} · daemon {host.version ?? "unknown"}
         </Text>
       </View>
-      <View style={styles.destinations}>
+      <Card padded={false} style={styles.destinations} variant="flat">
         <DestinationRow
           detail={online ? "Browse this machine" : "Unavailable while the daemon is offline"}
           disabled={!online}
@@ -101,13 +94,14 @@ export function HostDetailView({
           label="Files"
           onPress={onOpenFiles}
         />
+        <ListSeparator />
         <DestinationRow
           detail={online ? "Availability, installs, updates and skills" : "Availability is offline"}
           icon="Bot"
           label="Agents & skills"
           onPress={onOpenAgents}
         />
-      </View>
+      </Card>
       <HostFacts host={host} />
       <HostSessionList agents={agents} onOpen={onOpenSession} sessions={sessions} />
     </View>
@@ -119,19 +113,9 @@ const styles = StyleSheet.create({
     gap: spacing[8],
     padding: spacing[4],
   },
-  destination: {
-    alignItems: "center",
-    borderWidth: borderWidth.hairline,
-    flexDirection: "row",
-    gap: spacing[3],
-    padding: spacing[3],
-  },
-  destinationCopy: {
-    flex: 1,
-    gap: spacing[1],
-  },
   destinations: {
-    gap: spacing[2],
+    gap: spacing[0],
+    overflow: "hidden",
   },
   hero: {
     gap: spacing[2],

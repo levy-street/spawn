@@ -1,6 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 import { AppearancePanel } from "@/components/settings/appearance-panel";
 import { saveAgentYoloPreference } from "@/data/queries/settings";
 import { THEME_STORAGE_KEY, ThemeProvider } from "@/theme";
@@ -16,7 +17,16 @@ jest.mock("@/data/api/endpoints/agents", () => ({
 }));
 
 function themeWrapper({ children }: PropsWithChildren): React.JSX.Element {
-  return <ThemeProvider>{children}</ThemeProvider>;
+  return (
+    <SafeAreaProvider
+      initialMetrics={{
+        frame: { x: 0, y: 0, width: 390, height: 844 },
+        insets: { top: 0, right: 0, bottom: 0, left: 0 },
+      }}
+    >
+      <ThemeProvider>{children}</ThemeProvider>
+    </SafeAreaProvider>
+  );
 }
 
 describe("settings persistence scope", () => {

@@ -1,15 +1,13 @@
-import { Stack } from "expo-router";
-import { useCallback, useRef, useState } from "react";
-import { type LayoutChangeEvent, Pressable, StyleSheet, View } from "react-native";
+import { useMemo, useState } from "react";
+import { useWindowDimensions, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { AppHeader, type AppHeaderAction } from "@/components/layout/app-header";
 import { ConnectionChip } from "@/components/terminal-ui/connection-status";
-import { Icon } from "@/components/ui/icon";
-import { IconButton } from "@/components/ui/icon-button";
+import { Button } from "@/components/ui/button";
+import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { NativePopover, type NativePopoverProps } from "@/components/ui/native-popover";
-import { Text } from "@/components/ui/text";
-import { AgentIcon } from "@/components/workspace-detail/agent-icon";
-import { identifyAgent } from "@/data/selectors/agent";
 import type { TransportState } from "@/terminal/transport/types";
 import { useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
@@ -32,6 +30,7 @@ export interface TerminalHeaderProps {
   hostName: string;
   foregroundCommand: string | null;
   connectionState: TransportState;
+  onBack: () => void;
   onRename: (name: string) => Promise<void>;
   onRestart: () => void;
   onKill: () => void;
@@ -42,18 +41,12 @@ export interface TerminalHeaderProps {
   onDiagnostics: () => void;
 }
 
-const EMPTY_ANCHOR: NativePopoverProps["anchor"] = {
-  x: 0,
-  y: 0,
-  width: sizing.control.minimumTouchTarget,
-  height: sizing.control.minimumTouchTarget,
-};
-
 export function TerminalHeader({
   title,
   hostName,
   foregroundCommand,
   connectionState,
+  onBack,
   onRename,
   onRestart,
   onKill,
@@ -64,14 +57,13 @@ export function TerminalHeader({
   onDiagnostics,
 }: TerminalHeaderProps): React.JSX.Element {
   const theme = useTheme();
-  const anchorRef = useRef<View>(null);
-  const [anchor, setAnchor] = useState(EMPTY_ANCHOR);
+  const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
   const [menuVisible, setMenuVisible] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [draftName, setDraftName] = useState(title);
   const [saving, setSaving] = useState(false);
   const agent = inferAgentPresentation(foregroundCommand);
-  const agentIdentity = identifyAgent(foregroundCommand, []);
 
   const beginRename = (): void => {
     setDraftName(title);
@@ -90,18 +82,15 @@ export function TerminalHeader({
     }
   };
 
-  const measureAnchor = useCallback((): void => {
-    anchorRef.current?.measureInWindow((x, y, width, height) => {
-      setAnchor({ x, y, width, height });
-    });
-  }, []);
-
-  const handleAnchorLayout = useCallback(
-    (event: LayoutChangeEvent): void => {
-      setAnchor(event.nativeEvent.layout);
-      measureAnchor();
-    },
-    [measureAnchor],
+  // AppHeader owns this geometry; using the same tokens keeps the popover anchored to its action.
+  const actionAnchor = useMemo<NativePopoverProps["anchor"]>(
+    () => ({
+      x: width - insets.right - sizing.appHeader.horizontalPadding - sizing.appHeader.actionTarget,
+      y: insets.top + (sizing.appHeader.minHeight - sizing.appHeader.actionTarget) / 2,
+      width: sizing.appHeader.actionTarget,
+      height: sizing.appHeader.actionTarget,
+    }),
+    [insets.right, insets.top, width],
   );
 
   const items: NativePopoverProps["items"] = [
@@ -126,140 +115,80 @@ export function TerminalHeader({
     },
   ];
 
+  const actions: readonly AppHeaderAction[] = [
+    {
+      accessibilityLabel: "Terminal actions",
+      icon: "Ellipsis",
+      onPress: () => setMenuVisible(true),
+      testID: "terminal-header-menu-button",
+    },
+  ];
+
   return (
     <>
-      <Stack.Screen
-        options={{
-          headerRight: () => (
-            <View
-              collapsable={false}
-              onLayout={handleAnchorLayout}
-              ref={anchorRef}
-              testID="terminal-header-menu-anchor"
-            >
-              <Pressable
-                accessibilityLabel="Terminal actions"
-                accessibilityRole="button"
-                onPress={() => {
-                  measureAnchor();
-                  setMenuVisible(true);
-                }}
-                style={({ pressed }) => [
-                  styles.action,
-                  {
-                    backgroundColor: pressed ? theme.colors.accent : "transparent",
-                    borderRadius: theme.radii.md,
-                  },
-                ]}
-                testID="terminal-header-menu-button"
-              >
-                <Icon
-                  name="Ellipsis"
-                  size={sizing.control.icon}
-                  symbol="ellipsis"
-                  variant="chrome"
-                />
-              </Pressable>
-            </View>
-          ),
-          headerShown: true,
-          headerTitle: () =>
-            renaming ? (
-              <View style={[styles.renameRow, { gap: sizing.space.peer }]}>
-                <Input
-                  accessibilityLabel="Session name"
-                  autoFocus
-                  containerStyle={styles.renameInput}
-                  editable={!saving}
-                  onChangeText={setDraftName}
-                  onSubmitEditing={() => void saveRename()}
-                  purpose="name"
-                  returnKeyType="done"
-                  selectTextOnFocus
-                  value={draftName}
-                />
-                <IconButton
-                  accessibilityLabel="Save session name"
-                  disabled={draftName.trim().length === 0 || saving}
-                  icon="Check"
-                  loading={saving}
-                  onPress={() => void saveRename()}
-                  size="sm"
-                />
-                <IconButton
-                  accessibilityLabel="Cancel rename"
-                  disabled={saving}
-                  icon="X"
-                  onPress={() => setRenaming(false)}
-                  size="sm"
-                />
-              </View>
-            ) : (
-              <View
-                style={[styles.headerTitle, { gap: sizing.space.cluster }]}
-                testID="terminal-header"
-              >
-                <AgentIcon identity={agentIdentity} size={sizing.listRow.leading.glyph} />
-                <View style={styles.titleColumn}>
-                  <View
-                    style={[styles.titleLine, { gap: sizing.space.peer }]}
-                    testID="terminal-header-title-line"
-                  >
-                    <Text numberOfLines={1} style={styles.title} variant="label" weight="semibold">
-                      {title}
-                    </Text>
-                    <ConnectionChip state={connectionState} />
-                  </View>
-                  <Text color="mutedForeground" numberOfLines={1} variant="micro">
-                    {agent.label} · {hostName}
-                  </Text>
-                </View>
-              </View>
-            ),
-          title,
-        }}
+      <AppHeader
+        accessory={<ConnectionChip state={connectionState} />}
+        actions={actions}
+        onBack={onBack}
+        subtitle={`${agent.label} · ${hostName}`}
+        testID="terminal-header"
+        title={title}
       />
       <NativePopover
-        anchor={anchor}
+        anchor={actionAnchor}
         items={items}
         onDismiss={() => setMenuVisible(false)}
         visible={menuVisible}
       />
+      <Dialog
+        footer={
+          <>
+            <Button
+              disabled={saving}
+              onPress={() => setRenaming(false)}
+              size="sm"
+              variant="outline"
+            >
+              Cancel
+            </Button>
+            <Button
+              disabled={draftName.trim().length === 0}
+              loading={saving}
+              onPress={() => void saveRename()}
+              size="sm"
+            >
+              Save
+            </Button>
+          </>
+        }
+        onDismiss={() => {
+          if (!saving) setRenaming(false);
+        }}
+        showCloseButton={false}
+        size="sm"
+        title="Rename session"
+        visible={renaming}
+      >
+        <View
+          style={{
+            gap: theme.space(2),
+            paddingHorizontal: theme.space(4),
+            paddingVertical: theme.space(2),
+          }}
+        >
+          <Input
+            accessibilityLabel="Session name"
+            autoFocus
+            editable={!saving}
+            onChangeText={setDraftName}
+            onSubmitEditing={() => void saveRename()}
+            purpose="name"
+            returnKeyType="done"
+            selectTextOnFocus
+            value={draftName}
+          />
+        </View>
+      </Dialog>
     </>
   );
 }
-
-const styles = StyleSheet.create({
-  action: {
-    alignItems: "center",
-    height: sizing.control.minimumTouchTarget,
-    justifyContent: "center",
-    width: sizing.control.minimumTouchTarget,
-  },
-  headerTitle: {
-    alignItems: "center",
-    flexDirection: "row",
-    flexShrink: 1,
-    minWidth: 0,
-  },
-  renameInput: {
-    flex: 1,
-  },
-  renameRow: {
-    alignItems: "center",
-    flex: 1,
-    flexDirection: "row",
-  },
-  title: {
-    flexShrink: 1,
-  },
-  titleColumn: {
-    flexShrink: 1,
-    minWidth: 0,
-  },
-  titleLine: {
-    alignItems: "center",
-    flexDirection: "row",
-    minHeight: sizing.type.cardTitle.lineHeight,
-  },
-});

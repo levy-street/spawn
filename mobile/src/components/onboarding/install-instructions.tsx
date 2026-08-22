@@ -3,10 +3,11 @@ import { useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import { apiConfig } from "@/data/api/config";
-import { borderWidth, chrome, duration, spacing, useTheme } from "@/theme";
+import { chrome, duration, spacing, useTheme } from "@/theme";
 
 export const DEFAULT_INSTALL_ORIGIN = "https://spawnd.dev";
 export const DEFAULT_INSTALL_COMMAND = `curl -fsSL ${DEFAULT_INSTALL_ORIGIN}/install.sh | sh`;
@@ -78,16 +79,7 @@ export function InstallInstructions({
         </View>
       </View>
 
-      <View
-        style={[
-          styles.commandWell,
-          {
-            backgroundColor: theme.colors.muted,
-            borderColor: theme.colors.border,
-            borderRadius: theme.radii.md,
-          },
-        ]}
-      >
+      <Card style={styles.commandWell} variant="flat">
         <Text selectable style={styles.command} variant="mono">
           {command}
         </Text>
@@ -100,7 +92,7 @@ export function InstallInstructions({
           <Icon color="foreground" name={copied ? "Check" : "Copy"} size={spacing[4]} />
           {copied ? "Copied" : "Copy command"}
         </Button>
-      </View>
+      </Card>
 
       <View style={styles.instruction}>
         <View
@@ -143,10 +135,8 @@ const styles = StyleSheet.create({
   },
   commandWell: {
     alignItems: "center",
-    borderWidth: borderWidth.hairline,
     gap: spacing[3],
     minHeight: chrome.touchTarget,
-    padding: spacing[3],
   },
   container: {
     gap: spacing[6],

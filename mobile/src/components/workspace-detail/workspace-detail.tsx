@@ -3,6 +3,8 @@ import { StyleSheet, View } from "react-native";
 import { useSharedValue } from "react-native-reanimated";
 import { TabPager } from "@/components/gestures/tab-pager";
 import { LauncherSheet } from "@/components/launcher/launcher-sheet";
+import { AppHeader } from "@/components/layout/app-header";
+import { Screen } from "@/components/layout/screen";
 import { Confirm } from "@/components/ui/confirm";
 import {
   MovePaneSheet,
@@ -29,7 +31,7 @@ import { useConnectionStore } from "@/data/stores/connection";
 import type { Session, Workspace } from "@/data/types/domain";
 import type { Tile, WorkspaceTab } from "@/data/types/layout";
 import { haptics } from "@/lib/haptics";
-import { useTheme } from "@/theme";
+import { tabSurfaces, useTheme } from "@/theme";
 
 export interface WorkspaceDetailProps {
   workspaceId: string;
@@ -58,10 +60,12 @@ function errorMessage(error: unknown): string {
 
 export function WorkspaceDetail({
   workspaceId,
+  onBack,
   onOpenTerminal,
   onOpenFiles,
 }: WorkspaceDetailProps) {
   const theme = useTheme();
+  const surfaces = theme.isDark ? tabSurfaces.dark : tabSurfaces.light;
   const detail = useWorkspaceDetail(workspaceId);
   const workspace = detail.workspace.data ?? null;
   const sessions = detail.sessions.data ?? [];
@@ -228,191 +232,210 @@ export function WorkspaceDetail({
   );
 
   if (detail.loading && !workspace) {
-    return <WorkspaceLoadingState />;
+    return (
+      <Screen header={<AppHeader onBack={onBack} title="Workspace" />} padded={false}>
+        <WorkspaceLoadingState />
+      </Screen>
+    );
   }
 
   if (!workspace) {
     return (
-      <WorkspaceUnavailableState
-        message={errorMessage(detail.error)}
-        onRetry={() => void detail.workspace.refetch()}
-      />
+      <Screen header={<AppHeader onBack={onBack} title="Workspace" />} padded={false}>
+        <WorkspaceUnavailableState
+          message={errorMessage(detail.error)}
+          onRetry={() => void detail.workspace.refetch()}
+        />
+      </Screen>
     );
   }
 
   return (
-    <View style={[styles.screen, { backgroundColor: theme.colors.background }]}>
-      <WorkspaceHeader
-        canAddPane={activeTab ? canAddTile(activeTab.layout) : false}
-        onActions={presentWorkspaceActions}
-        onAddPane={presentActiveLauncher}
-        workspace={workspace}
-      />
-      <TabStrip
-        activeIndex={activeIndex}
-        addBusy={busy}
-        canAdd={canAddTab(workspace.layout)}
-        onActions={setTabTarget}
-        onAdd={() => {
-          void run(async () => {
-            const saved = await actions.createTab(workspace);
-            if (saved.layout.active_tab) setSelectedTabId(saved.layout.active_tab);
-          });
-        }}
-        onClose={closeTab}
-        onReorder={(tabId, toIndex) => actions.reorderTab(workspace, tabId, toIndex)}
-        onSelect={(index) => {
-          const tab = workspace.layout.tabs[index];
-          if (tab) setSelectedTabId(tab.id);
-        }}
-        tabs={workspace.layout.tabs}
-      />
-      {operationError ? <WorkspaceErrorBanner message={operationError} /> : null}
-      <TabPager
-        lazyWindow={1}
-        onDragProgress={dragProgress}
-        onPageChange={(index) => {
-          const tab = workspace.layout.tabs[index];
-          if (tab) setSelectedTabId(tab.id);
-        }}
-        page={activeIndex}
-        pages={workspace.layout.tabs}
-        renderPage={renderPage}
-        testID="workspace-tab-pager"
-      />
+    <Screen
+      header={
+        <WorkspaceHeader
+          canAddPane={activeTab ? canAddTile(activeTab.layout) : false}
+          onActions={presentWorkspaceActions}
+          onAddPane={presentActiveLauncher}
+          onBack={onBack}
+          workspace={workspace}
+        />
+      }
+      padded={false}
+    >
+      <View style={[styles.screen, { backgroundColor: theme.colors.background }]}>
+        <TabStrip
+          activeIndex={activeIndex}
+          addBusy={busy}
+          canAdd={canAddTab(workspace.layout)}
+          onActions={setTabTarget}
+          onAdd={() => {
+            void run(async () => {
+              const saved = await actions.createTab(workspace);
+              if (saved.layout.active_tab) setSelectedTabId(saved.layout.active_tab);
+            });
+          }}
+          onClose={closeTab}
+          onReorder={(tabId, toIndex) => actions.reorderTab(workspace, tabId, toIndex)}
+          onSelect={(index) => {
+            const tab = workspace.layout.tabs[index];
+            if (tab) setSelectedTabId(tab.id);
+          }}
+          sessionsById={sessionsById}
+          tabs={workspace.layout.tabs}
+        />
+        {operationError ? <WorkspaceErrorBanner message={operationError} /> : null}
+        <TabPager
+          lazyWindow={1}
+          onDragProgress={dragProgress}
+          onPageChange={(index) => {
+            const tab = workspace.layout.tabs[index];
+            if (tab) setSelectedTabId(tab.id);
+          }}
+          page={activeIndex}
+          pages={workspace.layout.tabs}
+          renderPage={renderPage}
+          style={{
+            backgroundColor:
+              activeTab && activeTab.layout.tiles.length > 0 ? surfaces.focused : surfaces.empty,
+          }}
+          testID="workspace-tab-pager"
+        />
 
-      <PaneActionsSheet
-        agents={agents}
-        onDismiss={() => setPaneTarget(null)}
-        onDuplicate={(tile, session) => {
-          void run(
-            () => actions.duplicatePane(workspace, tile, session, agents),
-            () => setPaneTarget(null),
-          );
-        }}
-        onMove={(tile) => setMoveTile(tile)}
-        onRemove={(tile) => confirmRemove(workspace, tile)}
-        onRename={(session) =>
-          setRenameTarget({ kind: "session", id: session.id, value: session.name ?? "" })
-        }
-        onReorder={(target, offset) => {
-          actions.reorderPane(workspace, target.tabId, target.tile.session_id, offset);
-          setPaneTarget(null);
-        }}
-        onRestart={(session) => {
-          void run(
-            () => actions.restartSession(session),
-            () => setPaneTarget(null),
-          );
-        }}
-        sessionsById={sessionsById}
-        target={paneTarget}
-        visible={paneTarget !== null}
-        workspace={workspace}
-      />
-      <MovePaneSheet
-        onDismiss={() => setMoveTile(null)}
-        onMove={(tabId) => {
-          if (moveTile) {
+        <PaneActionsSheet
+          agents={agents}
+          onDismiss={() => setPaneTarget(null)}
+          onDuplicate={(tile, session) => {
             void run(
-              () => actions.movePane(workspace, moveTile.session_id, tabId),
-              () => {
-                setMoveTile(null);
-                setPaneTarget(null);
-              },
+              () => actions.duplicatePane(workspace, tile, session, agents),
+              () => setPaneTarget(null),
             );
+          }}
+          onMove={(tile) => setMoveTile(tile)}
+          onRemove={(tile) => confirmRemove(workspace, tile)}
+          onRename={(session) =>
+            setRenameTarget({ kind: "session", id: session.id, value: session.name ?? "" })
           }
-        }}
-        tile={moveTile}
-        visible={moveTile !== null}
-        workspace={workspace}
-      />
-      <TabActionsSheet
-        onDelete={closeTab}
-        onDismiss={() => setTabTarget(null)}
-        onRename={(tab) => setRenameTarget({ kind: "tab", id: tab.id, value: tab.name })}
-        onReorder={(tab, offset) => {
-          const index = workspace.layout.tabs.findIndex((candidate) => candidate.id === tab.id);
-          actions.reorderTab(workspace, tab.id, index + offset);
-          setTabTarget(null);
-        }}
-        tab={tabTarget}
-        visible={tabTarget !== null}
-        workspace={workspace}
-      />
-      <WorkspaceActionsSheet
-        canAddTab={canAddTab(workspace.layout)}
-        onAddTab={() => {
-          void run(async () => {
-            const saved = await actions.createTab(workspace);
-            if (saved.layout.active_tab) setSelectedTabId(saved.layout.active_tab);
-          });
-        }}
-        onDismiss={() => setWorkspaceActionsVisible(false)}
-        onRename={() =>
-          setRenameTarget({ kind: "workspace", id: workspace.id, value: workspace.name })
-        }
-        visible={workspaceActionsVisible}
-        workspace={workspace}
-      />
-      <RenameDialog
-        allowEmpty={renameTarget?.kind === "session"}
-        initialValue={renameTarget?.value ?? ""}
-        loading={busy}
-        maxLength={renameTarget?.kind === "tab" ? 64 : 128}
-        onDismiss={() => setRenameTarget(null)}
-        onSubmit={(value) => {
-          if (!renameTarget) return;
-          const operation = (() => {
-            if (renameTarget.kind === "workspace") return actions.renameWorkspace(workspace, value);
-            if (renameTarget.kind === "tab")
-              return actions.renameTab(workspace, renameTarget.id, value);
-            const session: Session | undefined = sessionsById.get(renameTarget.id);
-            if (!session) return Promise.reject(new Error("Session unavailable."));
-            return actions.renameSession(session, value);
-          })();
-          void run(
-            () => operation,
-            () => setRenameTarget(null),
-          );
-        }}
-        title={
-          renameTarget?.kind === "workspace"
-            ? "Rename workspace"
-            : renameTarget?.kind === "tab"
-              ? "Rename tab"
-              : "Rename session"
-        }
-        visible={renameTarget !== null}
-      />
-      <Confirm
-        destructive
-        onCancel={() => setConfirmation(null)}
-        onConfirm={() => {
-          confirmation?.onConfirm();
-        }}
-        title={confirmation?.title ?? "Confirm"}
-        visible={confirmation !== null}
-        {...(confirmation === null
-          ? {}
-          : {
-              confirmLabel: confirmation.confirmLabel,
-              description: confirmation.description,
-            })}
-      />
-      <LauncherSheet
-        initialTabId={launcherTabId}
-        onDismiss={() => setLauncherTabId(null)}
-        onLaunchError={(message) => setOperationError(message)}
-        onLaunched={({ session, warning }) => {
-          setLauncherTabId(null);
-          if (warning) setOperationError(warning);
-          onOpenTerminal(session.id);
-        }}
-        visible={launcherTabId !== null}
-        workspaceId={workspace.id}
-      />
-    </View>
+          onReorder={(target, offset) => {
+            actions.reorderPane(workspace, target.tabId, target.tile.session_id, offset);
+            setPaneTarget(null);
+          }}
+          onRestart={(session) => {
+            void run(
+              () => actions.restartSession(session),
+              () => setPaneTarget(null),
+            );
+          }}
+          sessionsById={sessionsById}
+          target={paneTarget}
+          visible={paneTarget !== null}
+          workspace={workspace}
+        />
+        <MovePaneSheet
+          onDismiss={() => setMoveTile(null)}
+          onMove={(tabId) => {
+            if (moveTile) {
+              void run(
+                () => actions.movePane(workspace, moveTile.session_id, tabId),
+                () => {
+                  setMoveTile(null);
+                  setPaneTarget(null);
+                },
+              );
+            }
+          }}
+          tile={moveTile}
+          visible={moveTile !== null}
+          workspace={workspace}
+        />
+        <TabActionsSheet
+          onDelete={closeTab}
+          onDismiss={() => setTabTarget(null)}
+          onRename={(tab) => setRenameTarget({ kind: "tab", id: tab.id, value: tab.name })}
+          onReorder={(tab, offset) => {
+            const index = workspace.layout.tabs.findIndex((candidate) => candidate.id === tab.id);
+            actions.reorderTab(workspace, tab.id, index + offset);
+            setTabTarget(null);
+          }}
+          tab={tabTarget}
+          visible={tabTarget !== null}
+          workspace={workspace}
+        />
+        <WorkspaceActionsSheet
+          canAddTab={canAddTab(workspace.layout)}
+          onAddTab={() => {
+            void run(async () => {
+              const saved = await actions.createTab(workspace);
+              if (saved.layout.active_tab) setSelectedTabId(saved.layout.active_tab);
+            });
+          }}
+          onDismiss={() => setWorkspaceActionsVisible(false)}
+          onRename={() =>
+            setRenameTarget({ kind: "workspace", id: workspace.id, value: workspace.name })
+          }
+          visible={workspaceActionsVisible}
+          workspace={workspace}
+        />
+        <RenameDialog
+          allowEmpty={renameTarget?.kind === "session"}
+          initialValue={renameTarget?.value ?? ""}
+          loading={busy}
+          maxLength={renameTarget?.kind === "tab" ? 64 : 128}
+          onDismiss={() => setRenameTarget(null)}
+          onSubmit={(value) => {
+            if (!renameTarget) return;
+            const operation = (() => {
+              if (renameTarget.kind === "workspace")
+                return actions.renameWorkspace(workspace, value);
+              if (renameTarget.kind === "tab")
+                return actions.renameTab(workspace, renameTarget.id, value);
+              const session: Session | undefined = sessionsById.get(renameTarget.id);
+              if (!session) return Promise.reject(new Error("Session unavailable."));
+              return actions.renameSession(session, value);
+            })();
+            void run(
+              () => operation,
+              () => setRenameTarget(null),
+            );
+          }}
+          title={
+            renameTarget?.kind === "workspace"
+              ? "Rename workspace"
+              : renameTarget?.kind === "tab"
+                ? "Rename tab"
+                : "Rename session"
+          }
+          visible={renameTarget !== null}
+        />
+        <Confirm
+          destructive
+          onCancel={() => setConfirmation(null)}
+          onConfirm={() => {
+            confirmation?.onConfirm();
+          }}
+          title={confirmation?.title ?? "Confirm"}
+          visible={confirmation !== null}
+          {...(confirmation === null
+            ? {}
+            : {
+                confirmLabel: confirmation.confirmLabel,
+                description: confirmation.description,
+              })}
+        />
+        <LauncherSheet
+          initialTabId={launcherTabId}
+          onDismiss={() => setLauncherTabId(null)}
+          onLaunchError={(message) => setOperationError(message)}
+          onLaunched={({ session, warning }) => {
+            setLauncherTabId(null);
+            if (warning) setOperationError(warning);
+            onOpenTerminal(session.id);
+          }}
+          visible={launcherTabId !== null}
+          workspaceId={workspace.id}
+        />
+      </View>
+    </Screen>
   );
 }
 

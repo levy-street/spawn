@@ -1,6 +1,7 @@
-import { Stack, useLocalSearchParams } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import { StyleSheet, View } from "react-native";
 import { FileExplorer } from "@/components/files/file-explorer";
+import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -14,13 +15,15 @@ function param(value: string | string[] | undefined): string {
 
 export default function HostFilesRoute() {
   const theme = useTheme();
+  const router = useRouter();
   const params = useLocalSearchParams<{ id?: string | string[]; path?: string | string[] }>();
   const hostId = param(params.id);
   const initialPath = param(params.path) || undefined;
   const host = useFileHost(hostId);
+  const header = <AppHeader onBack={router.back} title="Files" />;
   if (host.isLoading) {
     return (
-      <Screen padded={false}>
+      <Screen header={header} padded={false}>
         <View style={[styles.center, { backgroundColor: theme.colors.background }]}>
           <Spinner label="Loading host" size={spacing[6]} />
         </View>
@@ -29,7 +32,7 @@ export default function HostFilesRoute() {
   }
   if (host.isError || !host.data) {
     return (
-      <Screen padded={false}>
+      <Screen header={header} padded={false}>
         <View style={[styles.root, { backgroundColor: theme.colors.background }]}>
           <EmptyState
             action={
@@ -47,7 +50,7 @@ export default function HostFilesRoute() {
   }
   if (host.data.status !== "online") {
     return (
-      <Screen padded={false}>
+      <Screen header={header} padded={false}>
         <View style={[styles.root, { backgroundColor: theme.colors.background }]}>
           <EmptyState
             description="File browsing needs a live, direct connection to this host."
@@ -60,7 +63,7 @@ export default function HostFilesRoute() {
   }
   if (!host.data.host_public_key) {
     return (
-      <Screen padded={false}>
+      <Screen header={header} padded={false}>
         <View style={[styles.root, { backgroundColor: theme.colors.background }]}>
           <EmptyState
             description="Reconnect this host to establish its trusted identity before browsing files."
@@ -72,8 +75,7 @@ export default function HostFilesRoute() {
     );
   }
   return (
-    <Screen padded={false}>
-      <Stack.Screen options={{ title: host.data.name }} />
+    <Screen header={header} padded={false}>
       <FileExplorer
         hostId={host.data.id}
         hostIdentityPublicKey={host.data.host_public_key}

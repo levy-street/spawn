@@ -1,31 +1,28 @@
-import { fireEvent, render } from "@testing-library/react-native";
-
-import { HeaderDestinations } from "@/components/nav/header-destinations";
-import { ThemeProvider } from "@/theme";
+import { headerDestinationActions } from "@/components/nav/header-destinations";
 
 const mockPush = jest.fn();
 
 jest.mock("expo-router", () => ({
-  useRouter: () => ({ push: mockPush }),
+  router: { push: (...args: unknown[]) => mockPush(...args) },
 }));
 
-describe("HeaderDestinations", () => {
+describe("headerDestinationActions", () => {
   beforeEach(() => {
     mockPush.mockClear();
   });
 
-  it("navigates directly without opening a menu", async () => {
-    const screen = await render(
-      <ThemeProvider>
-        <HeaderDestinations destinations={["hosts", "settings"]} />
-      </ThemeProvider>,
-    );
+  it("builds actions that navigate directly to each destination", () => {
+    const actions = headerDestinationActions(["hosts", "settings"]);
 
-    await fireEvent.press(screen.getByLabelText("Open hosts"));
-    await fireEvent.press(screen.getByLabelText("Open settings"));
+    expect(actions.map(({ accessibilityLabel, icon }) => ({ accessibilityLabel, icon }))).toEqual([
+      { accessibilityLabel: "Open hosts", icon: "Server" },
+      { accessibilityLabel: "Open settings", icon: "Settings" },
+    ]);
+
+    actions[0]?.onPress();
+    actions[1]?.onPress();
 
     expect(mockPush).toHaveBeenNthCalledWith(1, "/hosts");
     expect(mockPush).toHaveBeenNthCalledWith(2, "/settings");
-    expect(screen.queryByLabelText(/menu/i)).toBeNull();
   });
 });

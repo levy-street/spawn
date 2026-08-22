@@ -1,11 +1,28 @@
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
+import type { ReactNode } from "react";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import {
   inferAgentPresentation,
   TerminalHeader,
   type TerminalHeaderProps,
 } from "@/components/terminal-ui/terminal-header";
-import { sizing } from "@/theme/sizing";
+
+interface MockHeaderAction {
+  icon: string;
+  accessibilityLabel: string;
+  onPress: () => void;
+  testID?: string;
+}
+
+interface MockAppHeaderProps {
+  title: string;
+  subtitle?: string;
+  onBack?: () => void;
+  actions?: readonly MockHeaderAction[];
+  accessory?: ReactNode;
+  testID?: string;
+}
 
 interface MockPopoverProps {
   visible: boolean;
@@ -18,26 +35,70 @@ interface MockPopoverProps {
   }>;
 }
 
-let mockStackScreenOptions: Record<string, unknown> = {};
+let mockAppHeaderProps: MockAppHeaderProps | null = null;
 let mockPopoverProps: MockPopoverProps | null = null;
 
-jest.mock("expo-router", () => {
+jest.mock("@/components/layout/app-header", () => {
   const React = require("react") as typeof import("react");
-  const { View } = require("react-native") as typeof import("react-native");
+  const { Pressable, Text, View } = require("react-native") as typeof import("react-native");
   return {
-    Stack: {
-      Screen: ({ options }: { options: Record<string, unknown> }) => {
-        mockStackScreenOptions = options;
-        const headerTitle = options["headerTitle"] as (() => React.ReactNode) | undefined;
-        const headerRight = options["headerRight"] as (() => React.ReactNode) | undefined;
-        return React.createElement(
-          View,
-          { testID: "mock-terminal-stack-screen" },
-          headerTitle?.(),
-          headerRight?.(),
-        );
-      },
+    AppHeader: (props: MockAppHeaderProps) => {
+      mockAppHeaderProps = props;
+      return React.createElement(
+        View,
+        { testID: props.testID },
+        props.onBack
+          ? React.createElement(
+              Pressable,
+              { accessibilityLabel: "Back", accessibilityRole: "button", onPress: props.onBack },
+              React.createElement(Text, null, "Back"),
+            )
+          : null,
+        React.createElement(Text, null, props.title),
+        props.subtitle ? React.createElement(Text, null, props.subtitle) : null,
+        props.accessory,
+        props.actions?.map((action) =>
+          React.createElement(
+            Pressable,
+            {
+              accessibilityLabel: action.accessibilityLabel,
+              accessibilityRole: "button",
+              key: action.accessibilityLabel,
+              onPress: action.onPress,
+              testID: action.testID,
+            },
+            React.createElement(Text, null, action.icon),
+          ),
+        ),
+      );
     },
+  };
+});
+
+jest.mock("@/components/ui/dialog", () => {
+  const React = require("react") as typeof import("react");
+  const { Text, View } = require("react-native") as typeof import("react-native");
+  return {
+    Dialog: ({
+      children,
+      footer,
+      title,
+      visible,
+    }: {
+      children?: React.ReactNode;
+      footer?: React.ReactNode;
+      title?: string;
+      visible: boolean;
+    }) =>
+      visible
+        ? React.createElement(
+            View,
+            { accessibilityViewIsModal: true, testID: "mock-dialog" },
+            React.createElement(Text, null, title),
+            children,
+            footer,
+          )
+        : null,
   };
 });
 
@@ -56,18 +117,6 @@ jest.mock("@/components/ui/native-popover", () => {
   };
 });
 
-jest.mock("@/components/workspace-detail/agent-icon", () => {
-  const React = require("react") as typeof import("react");
-  const { View } = require("react-native") as typeof import("react-native");
-  return {
-    AgentIcon: ({ size }: { size: number }) =>
-      React.createElement(View, {
-        accessibilityLabel: "Terminal agent mark",
-        style: { height: size, width: size },
-      }),
-  };
-});
-
 jest.mock("@/theme", () => {
   const actual = jest.requireActual<typeof import("@/theme")>("@/theme");
   return { ...actual, useTheme: () => actual.darkTheme };
@@ -79,6 +128,7 @@ function props(overrides: Partial<TerminalHeaderProps> = {}): TerminalHeaderProp
     hostName: "studio",
     foregroundCommand: "codex",
     connectionState: "failed",
+    onBack: jest.fn(),
     onRename: jest.fn(async () => undefined),
     onRestart: jest.fn(),
     onKill: jest.fn(),
@@ -91,41 +141,56 @@ function props(overrides: Partial<TerminalHeaderProps> = {}): TerminalHeaderProp
   };
 }
 
+async function renderHeader(input: TerminalHeaderProps) {
+  return render(
+    <SafeAreaProvider
+      initialMetrics={{
+        frame: { x: 0, y: 0, width: 390, height: 844 },
+        insets: { top: 47, left: 0, right: 0, bottom: 34 },
+      }}
+    >
+      <TerminalHeader {...input} />
+    </SafeAreaProvider>,
+  );
+}
+
 describe("TerminalHeader", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockStackScreenOptions = {};
+    mockAppHeaderProps = null;
     mockPopoverProps = null;
   });
 
-  test("uses the native header without a custom back control or folder path", async () => {
-    await render(<TerminalHeader {...props()} />);
+  test("uses AppHeader with its standard back action and terminal metadata", async () => {
+    const input = props();
+    await renderHeader(input);
 
-    expect(mockStackScreenOptions["headerShown"]).toBe(true);
-    expect(mockStackScreenOptions["headerLeft"]).toBeUndefined();
-    expect(screen.queryByLabelText("Close terminal")).toBeNull();
-    expect(screen.queryByText("/workspace")).toBeNull();
-    expect(screen.getByText("Build")).toBeTruthy();
-    expect(screen.getByText("Codex · studio")).toBeTruthy();
+    expect(mockAppHeaderProps).toMatchObject({
+      title: "Build",
+      subtitle: "Codex · studio",
+      testID: "terminal-header",
+    });
+    expect(mockAppHeaderProps?.actions).toEqual([
+      expect.objectContaining({
+        accessibilityLabel: "Terminal actions",
+        icon: "Ellipsis",
+      }),
+    ]);
+    expect(screen.getByText("Failed")).toBeTruthy();
+
+    await act(() => fireEvent.press(screen.getByRole("button", { name: "Back" })));
+    expect(input.onBack).toHaveBeenCalledTimes(1);
   });
 
-  test("spaces the agent mark and aligns the status with the title row", async () => {
-    await render(<TerminalHeader {...props()} />);
+  test("centres the connection badge on the header title baseline", async () => {
+    await renderHeader(props());
 
-    expect(screen.getByTestId("terminal-header")).toHaveStyle({
-      alignItems: "center",
-      gap: sizing.space.cluster,
-    });
-    expect(screen.getByTestId("terminal-header-title-line")).toHaveStyle({
-      alignItems: "center",
-      minHeight: sizing.type.cardTitle.lineHeight,
-    });
-    expect(screen.getByText("Failed")).toBeTruthy();
+    expect(screen.getByTestId("terminal-connection-chip")).toHaveStyle({ alignSelf: "center" });
   });
 
   test("renders every action through NativePopover and marks kill destructive", async () => {
     const input = props();
-    await render(<TerminalHeader {...input} />);
+    await renderHeader(input);
     const items = mockPopoverProps?.items ?? [];
 
     expect(items.map((item) => item.label)).toEqual([
@@ -148,10 +213,7 @@ describe("TerminalHeader", () => {
       "wrench.and.screwdriver",
       "trash",
     ]);
-    expect(items.at(-1)).toMatchObject({
-      key: "kill",
-      destructive: true,
-    });
+    expect(items.at(-1)).toMatchObject({ key: "kill", destructive: true });
 
     await act(() => fireEvent.press(screen.getByLabelText("Terminal actions")));
     expect(screen.getByTestId("mock-native-popover")).toHaveProp("accessibilityState", {
@@ -159,6 +221,7 @@ describe("TerminalHeader", () => {
     });
 
     await act(() => items.find((item) => item.key === "rename")?.onPress());
+    expect(screen.getByTestId("mock-dialog")).toBeTruthy();
     expect(screen.getByLabelText("Session name")).toBeTruthy();
     items.find((item) => item.key === "restart")?.onPress();
     items.find((item) => item.key === "upload")?.onPress();

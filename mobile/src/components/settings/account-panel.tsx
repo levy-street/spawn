@@ -78,11 +78,9 @@ export function AccountPanel(): React.JSX.Element {
 
   return (
     <SettingsScreen testID="account-panel" title="Account">
-      <View style={styles.accountHeader}>
-        <Text color="mutedForeground" variant="body">
-          Signed in as {user?.email ?? "—"}
-        </Text>
-      </View>
+      <Text color="mutedForeground" variant="body">
+        Signed in as {user?.email ?? "—"}
+      </Text>
 
       {user?.email_verified_at === null ? (
         <Card
@@ -143,57 +141,59 @@ export function AccountPanel(): React.JSX.Element {
             </Button>
           ) : null}
           <Collapse open={confirming} testID="delete-account-form">
-            <View style={styles.form}>
-              <Field label="Type your email to confirm">
-                <Input
-                  autoComplete="off"
-                  autoFocus
-                  editable={!remove.isPending}
-                  onChangeText={setConfirmEmail}
-                  placeholder={user?.email ?? ""}
-                  purpose="email"
-                  value={confirmEmail}
-                />
-              </Field>
-              <Field
-                hint="Signed up through a provider without a password? Leave this empty."
-                label="Password"
-              >
-                <Input
-                  editable={!remove.isPending}
-                  onChangeText={setPassword}
-                  purpose="password"
-                  value={password}
-                />
-              </Field>
-              {remove.error ? (
-                <Text accessibilityRole="alert" color="destructive" variant="body">
-                  {remove.error.message}
-                </Text>
-              ) : null}
-              <View style={styles.actions}>
-                <Button
-                  disabled={!emailMatches}
-                  loading={remove.isPending}
-                  onPress={() => void deletePermanently()}
-                  variant="destructive"
+            {confirming ? (
+              <View style={styles.form}>
+                <Field label="Type your email to confirm">
+                  <Input
+                    autoComplete="off"
+                    autoFocus
+                    editable={!remove.isPending}
+                    onChangeText={setConfirmEmail}
+                    placeholder={user?.email ?? ""}
+                    purpose="email"
+                    value={confirmEmail}
+                  />
+                </Field>
+                <Field
+                  hint="Signed up through a provider without a password? Leave this empty."
+                  label="Password"
                 >
-                  {remove.isPending ? "Deleting…" : "Permanently delete"}
-                </Button>
-                <Button
-                  disabled={remove.isPending}
-                  onPress={() => {
-                    setConfirming(false);
-                    setConfirmEmail("");
-                    setPassword("");
-                    remove.reset();
-                  }}
-                  variant="secondary"
-                >
-                  Cancel
-                </Button>
+                  <Input
+                    editable={!remove.isPending}
+                    onChangeText={setPassword}
+                    purpose="password"
+                    value={password}
+                  />
+                </Field>
+                {remove.error ? (
+                  <Text accessibilityRole="alert" color="destructive" variant="body">
+                    {remove.error.message}
+                  </Text>
+                ) : null}
+                <View style={styles.actions}>
+                  <Button
+                    disabled={!emailMatches}
+                    loading={remove.isPending}
+                    onPress={() => void deletePermanently()}
+                    variant="destructive"
+                  >
+                    {remove.isPending ? "Deleting…" : "Permanently delete"}
+                  </Button>
+                  <Button
+                    disabled={remove.isPending}
+                    onPress={() => {
+                      setConfirming(false);
+                      setConfirmEmail("");
+                      setPassword("");
+                      remove.reset();
+                    }}
+                    variant="secondary"
+                  >
+                    Cancel
+                  </Button>
+                </View>
               </View>
-            </View>
+            ) : null}
           </Collapse>
         </View>
       </Card>
@@ -202,9 +202,6 @@ export function AccountPanel(): React.JSX.Element {
 }
 
 const styles = StyleSheet.create({
-  accountHeader: {
-    marginTop: -spacing[5],
-  },
   actions: {
     flexDirection: "row",
     flexWrap: "wrap",

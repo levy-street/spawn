@@ -4,8 +4,11 @@ import { type Href, useRouter } from "expo-router";
 import { useCallback, useMemo, useState } from "react";
 import { View } from "react-native";
 
+import { AppHeader, type AppHeaderAction } from "@/components/layout/app-header";
+import { Screen } from "@/components/layout/screen";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
+import { ListSeparator } from "@/components/ui/list-row";
 import { SearchField } from "@/components/ui/search-field";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
@@ -15,7 +18,6 @@ import { CreateWorkspaceDialog } from "@/components/workspaces/create-workspace-
 import { RenameWorkspaceDialog } from "@/components/workspaces/rename-workspace-dialog";
 import { WorkspaceListEmpty } from "@/components/workspaces/workspace-list-empty";
 import { WorkspaceListError } from "@/components/workspaces/workspace-list-error";
-import { WorkspaceListHeader } from "@/components/workspaces/workspace-list-header";
 import {
   type WorkspaceOperationInput,
   type WorkspaceRowModel,
@@ -76,6 +78,32 @@ export function WorkspaceListScreen() {
   const [iconTarget, setIconTarget] = useState<WorkspaceOut | null>(null);
   const [manualRefreshing, setManualRefreshing] = useState(false);
   const openCreate = useCallback(() => setCreateVisible(true), []);
+  const canCreate = !workspacesQuery.isLoading && workspacesQuery.error === null;
+  const headerActions = useMemo<readonly AppHeaderAction[]>(
+    () => [
+      {
+        accessibilityLabel: "New workspace",
+        disabled: !canCreate,
+        icon: "Plus",
+        onPress: openCreate,
+        testID: "new-workspace-button",
+      },
+      {
+        accessibilityLabel: "Open hosts",
+        icon: "Server",
+        onPress: () => router.push("/hosts"),
+      },
+      {
+        accessibilityLabel: "Open settings",
+        icon: "Settings",
+        onPress: () => router.push("/settings"),
+      },
+    ],
+    [canCreate, openCreate, router],
+  );
+  const header = (
+    <AppHeader actions={headerActions} testID="workspace-list-header" title="Workspaces" />
+  );
 
   const operationMutation = useMutation({
     mutationFn: async (input: WorkspaceOperationInput): Promise<WorkspaceOperationResult> => {
@@ -247,158 +275,165 @@ export function WorkspaceListScreen() {
 
   if (workspacesQuery.isLoading) {
     return (
-      <View
-        style={[styles.screen, { backgroundColor: theme.colors.background }]}
-        testID="workspace-list-screen"
-      >
-        <WorkspaceListHeader canCreate={false} onCreate={openCreate} />
-        <WorkspaceListSkeletons />
-      </View>
+      <Screen header={header} padded={false}>
+        <View
+          style={[styles.screen, { backgroundColor: theme.colors.background }]}
+          testID="workspace-list-screen"
+        >
+          <WorkspaceListSkeletons />
+        </View>
+      </Screen>
     );
   }
 
   if (workspacesQuery.error) {
     return (
-      <View
-        style={[styles.screen, { backgroundColor: theme.colors.background }]}
-        testID="workspace-list-screen"
-      >
-        <WorkspaceListHeader canCreate={false} onCreate={openCreate} />
-        <WorkspaceListError
-          message={workspaceErrorMessage(workspacesQuery.error)}
-          onRetry={() => void refresh()}
-        />
-      </View>
+      <Screen header={header} padded={false}>
+        <View
+          style={[styles.screen, { backgroundColor: theme.colors.background }]}
+          testID="workspace-list-screen"
+        >
+          <WorkspaceListError
+            message={workspaceErrorMessage(workspacesQuery.error)}
+            onRetry={() => void refresh()}
+          />
+        </View>
+      </Screen>
     );
   }
 
   return (
-    <View
-      style={[styles.screen, { backgroundColor: theme.colors.background }]}
-      testID="workspace-list-screen"
+    <Screen
+      footer={
+        <SearchField
+          dock
+          onChangeText={setQuery}
+          placeholder="Search workspaces"
+          testID="workspace-search"
+          value={query}
+        />
+      }
+      header={header}
+      padded={false}
     >
-      <WorkspaceListHeader canCreate onCreate={openCreate} />
-      <View style={styles.search}>
-        <SearchField onChangeText={setQuery} placeholder="Search workspaces" value={query} />
-      </View>
-      {sessionsQuery.error ? (
-        <View
-          accessibilityRole="alert"
-          style={[styles.statusError, { borderColor: theme.colors.border }]}
-        >
-          <Text color="mutedForeground" variant="caption">
-            Session status is unavailable.
-          </Text>
-          <Button onPress={() => void sessionsQuery.refetch()} size="sm" variant="ghost">
-            Retry
-          </Button>
-        </View>
-      ) : null}
-      <FlashList
-        contentContainerStyle={styles.listContent}
-        data={rows}
-        ItemSeparatorComponent={WorkspaceRowSeparator}
-        keyExtractor={(item) => item.workspace.id}
-        ListEmptyComponent={<WorkspaceListEmpty onCreate={openCreate} query={query} />}
-        ListFooterComponent={
-          <ArchivedWorkspacesLink
-            count={archivedQuery.data?.length ?? 0}
-            onPress={() => router.push("/workspaces/archived" as Href)}
-          />
-        }
-        onRefresh={() => void refresh()}
-        refreshing={manualRefreshing}
-        renderItem={renderItem}
-        testID="workspace-list"
-      />
-      <CreateWorkspaceDialog
-        busy={busy}
-        onCreate={(draft) => {
-          if (draft.templateId) {
-            operationMutation.mutate({
-              kind: "template",
-              draft,
-              templateId: draft.templateId,
-              agents,
-            });
-            return;
+      <View
+        style={[styles.screen, { backgroundColor: theme.colors.background }]}
+        testID="workspace-list-screen"
+      >
+        {sessionsQuery.error ? (
+          <View
+            accessibilityRole="alert"
+            style={[styles.statusError, { borderColor: theme.colors.border }]}
+          >
+            <Text color="mutedForeground" variant="caption">
+              Session status is unavailable.
+            </Text>
+            <Button onPress={() => void sessionsQuery.refetch()} size="sm" variant="ghost">
+              Retry
+            </Button>
+          </View>
+        ) : null}
+        <FlashList
+          data={rows}
+          ItemSeparatorComponent={ListSeparator}
+          keyExtractor={(item) => item.workspace.id}
+          ListEmptyComponent={<WorkspaceListEmpty onCreate={openCreate} query={query} />}
+          ListFooterComponent={
+            <ArchivedWorkspacesLink
+              count={archivedQuery.data?.length ?? 0}
+              onPress={() => router.push("/workspaces/archived" as Href)}
+            />
           }
-          createMutation.mutate(
-            {
-              name: draft.name,
-              ...(draft.iconChoice
-                ? {
-                    icon: draft.iconChoice.icon,
-                    icon_source: draft.iconChoice.iconSource,
-                  }
-                : {}),
-            },
-            {
-              onSuccess: ({ workspace }) => {
-                setCreateVisible(false);
-                toast.success("Workspace created");
-                router.push({
-                  pathname: "/workspace/[id]",
-                  params: { id: workspace.id },
-                } as Href);
+          onRefresh={() => void refresh()}
+          refreshing={manualRefreshing}
+          renderItem={renderItem}
+          testID="workspace-list"
+        />
+        <CreateWorkspaceDialog
+          busy={busy}
+          onCreate={(draft) => {
+            if (draft.templateId) {
+              operationMutation.mutate({
+                kind: "template",
+                draft,
+                templateId: draft.templateId,
+                agents,
+              });
+              return;
+            }
+            createMutation.mutate(
+              {
+                name: draft.name,
+                ...(draft.iconChoice
+                  ? {
+                      icon: draft.iconChoice.icon,
+                      icon_source: draft.iconChoice.iconSource,
+                    }
+                  : {}),
               },
-              onError: (error) =>
-                toast.error("Workspace could not be created", {
-                  detail: workspaceErrorMessage(error),
-                }),
-            },
-          );
-        }}
-        onDismiss={() => setCreateVisible(false)}
-        templates={templatesQuery.data ?? []}
-        visible={createVisible}
-      />
-      <RenameWorkspaceDialog
-        busy={renameMutation.isPending}
-        onDismiss={() => setRenameTarget(null)}
-        onRename={(name) => {
-          if (!renameTarget) return;
-          renameMutation.mutate(
-            { id: renameTarget.id, name },
-            {
-              onSuccess: () => {
-                setRenameTarget(null);
-                toast.success("Workspace renamed");
+              {
+                onSuccess: ({ workspace }) => {
+                  setCreateVisible(false);
+                  toast.success("Workspace created");
+                  router.push({
+                    pathname: "/workspace/[id]",
+                    params: { id: workspace.id },
+                  } as Href);
+                },
+                onError: (error) =>
+                  toast.error("Workspace could not be created", {
+                    detail: workspaceErrorMessage(error),
+                  }),
               },
-              onError: (error) =>
-                toast.error("Workspace could not be renamed", {
-                  detail: workspaceErrorMessage(error),
-                }),
-            },
-          );
-        }}
-        workspace={renameTarget}
-      />
-      <ChangeWorkspaceIconDialog
-        busy={iconMutation.isPending}
-        onDismiss={() => setIconTarget(null)}
-        onSave={(choice) => {
-          if (!iconTarget) return;
-          iconMutation.mutate(
-            { id: iconTarget.id, icon: choice.icon, icon_source: choice.iconSource },
-            {
-              onSuccess: () => {
-                setIconTarget(null);
-                toast.success("Workspace icon updated");
+            );
+          }}
+          onDismiss={() => setCreateVisible(false)}
+          templates={templatesQuery.data ?? []}
+          visible={createVisible}
+        />
+        <RenameWorkspaceDialog
+          busy={renameMutation.isPending}
+          onDismiss={() => setRenameTarget(null)}
+          onRename={(name) => {
+            if (!renameTarget) return;
+            renameMutation.mutate(
+              { id: renameTarget.id, name },
+              {
+                onSuccess: () => {
+                  setRenameTarget(null);
+                  toast.success("Workspace renamed");
+                },
+                onError: (error) =>
+                  toast.error("Workspace could not be renamed", {
+                    detail: workspaceErrorMessage(error),
+                  }),
               },
-              onError: (error) =>
-                toast.error("Workspace icon could not be updated", {
-                  detail: workspaceErrorMessage(error),
-                }),
-            },
-          );
-        }}
-        workspace={iconTarget}
-      />
-    </View>
+            );
+          }}
+          workspace={renameTarget}
+        />
+        <ChangeWorkspaceIconDialog
+          busy={iconMutation.isPending}
+          onDismiss={() => setIconTarget(null)}
+          onSave={(choice) => {
+            if (!iconTarget) return;
+            iconMutation.mutate(
+              { id: iconTarget.id, icon: choice.icon, icon_source: choice.iconSource },
+              {
+                onSuccess: () => {
+                  setIconTarget(null);
+                  toast.success("Workspace icon updated");
+                },
+                onError: (error) =>
+                  toast.error("Workspace icon could not be updated", {
+                    detail: workspaceErrorMessage(error),
+                  }),
+              },
+            );
+          }}
+          workspace={iconTarget}
+        />
+      </View>
+    </Screen>
   );
-}
-
-function WorkspaceRowSeparator() {
-  return <View style={styles.rowSeparator} />;
 }

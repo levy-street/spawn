@@ -1,16 +1,16 @@
 import { useRouter } from "expo-router";
 import { useMemo, useState } from "react";
 import { FlatList, Pressable, RefreshControl, StyleSheet, View } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
 import { HostActionsSheet } from "@/components/hosts/host-actions-sheet";
 import { HostListItem } from "@/components/hosts/host-list-item";
 import { errorMessage } from "@/components/hosts/host-model";
 import { RenameHostDialog } from "@/components/hosts/rename-host-dialog";
+import { AppHeader } from "@/components/layout/app-header";
+import { Screen } from "@/components/layout/screen";
 import { Button } from "@/components/ui/button";
 import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
-import { IconButton } from "@/components/ui/icon-button";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
@@ -119,90 +119,107 @@ export function HostListScreen() {
   };
 
   return (
-    <SafeAreaView
-      edges={["top"]}
-      style={[styles.screen, { backgroundColor: theme.colors.background }]}
+    <Screen
+      header={
+        <AppHeader
+          actions={[
+            {
+              accessibilityLabel: "Open the legion",
+              icon: "Network",
+              onPress: () => router.push("/legion"),
+              testID: "hosts-legion-action",
+            },
+            {
+              accessibilityLabel: "Open settings",
+              icon: "Settings",
+              onPress: () => router.push("/settings"),
+              testID: "hosts-settings-action",
+            },
+            {
+              accessibilityLabel: "Connect a host",
+              icon: "Plus",
+              onPress: () => router.push("/onboarding/host"),
+              testID: "hosts-connect-action",
+            },
+          ]}
+          onBack={router.back}
+          title="Hosts"
+        />
+      }
+      padded={false}
     >
-      <View style={[styles.header, { borderBottomColor: theme.colors.border }]}>
-        <Text accessibilityRole="header" style={styles.headerTitle} variant="title">
-          Hosts
-        </Text>
-        <IconButton
-          accessibilityLabel="Connect a host"
-          icon="Plus"
-          onPress={() => router.push("/onboarding/host")}
+      <View style={[styles.screen, { backgroundColor: theme.colors.background }]}>
+        {hostsQuery.isPending ? (
+          <View style={styles.centered}>
+            <Spinner label="Loading hosts" />
+          </View>
+        ) : hostsQuery.isError ? (
+          <EmptyState
+            action={<Button onPress={() => void hostsQuery.refetch()}>Retry</Button>}
+            description={`Failed to load hosts: ${errorMessage(hostsQuery.error)}`}
+            icon="AlertCircle"
+            title="Hosts unavailable"
+          />
+        ) : (
+          <HostListView
+            hosts={hosts}
+            onConnect={() => router.push("/onboarding/host")}
+            onOpen={openHost}
+            onOpenActions={setActionsHost}
+            onOpenLegion={() => router.push("/legion")}
+            onRefresh={() => void hostsQuery.refetch()}
+            refreshing={hostsQuery.isRefetching}
+          />
+        )}
+        <HostActionsSheet
+          host={actionsHost}
+          onDismiss={() => setActionsHost(null)}
+          onOpen={openHost}
+          onRemove={setRemoveHost}
+          onRename={setRenameHost}
+        />
+        <RenameHostDialog
+          currentName={renameHost?.name ?? ""}
+          error={rename.error ? errorMessage(rename.error) : null}
+          loading={rename.isPending}
+          onCancel={() => {
+            setRenameHost(null);
+            rename.reset();
+          }}
+          onRename={(name) => {
+            if (!renameHost) return;
+            rename.mutate(
+              { hostId: renameHost.id, name },
+              {
+                onSuccess: () => {
+                  toast.success("Host renamed");
+                  setRenameHost(null);
+                },
+              },
+            );
+          }}
+          visible={renameHost !== null}
+        />
+        <Confirm
+          confirmLabel={remove.error ? "Retry deletion" : "Remove host"}
+          description="Its daemon token will be revoked and it will no longer be able to connect."
+          destructive
+          onCancel={() => setRemoveHost(null)}
+          onConfirm={() => {
+            if (!removeHost || remove.isPending) return;
+            remove.mutate(removeHost, {
+              onError: (error) => toast.error("Could not remove host", { detail: error.message }),
+              onSuccess: () => {
+                toast.success("Host removed");
+                setRemoveHost(null);
+              },
+            });
+          }}
+          title={`Remove ${removeHost?.name ?? "host"}?`}
+          visible={removeHost !== null}
         />
       </View>
-      {hostsQuery.isPending ? (
-        <View style={styles.centered}>
-          <Spinner label="Loading hosts" />
-        </View>
-      ) : hostsQuery.isError ? (
-        <EmptyState
-          action={<Button onPress={() => void hostsQuery.refetch()}>Retry</Button>}
-          description={`Failed to load hosts: ${errorMessage(hostsQuery.error)}`}
-          icon="AlertCircle"
-          title="Hosts unavailable"
-        />
-      ) : (
-        <HostListView
-          hosts={hosts}
-          onConnect={() => router.push("/onboarding/host")}
-          onOpen={openHost}
-          onOpenActions={setActionsHost}
-          onOpenLegion={() => router.push("/legion")}
-          onRefresh={() => void hostsQuery.refetch()}
-          refreshing={hostsQuery.isRefetching}
-        />
-      )}
-      <HostActionsSheet
-        host={actionsHost}
-        onDismiss={() => setActionsHost(null)}
-        onOpen={openHost}
-        onRemove={setRemoveHost}
-        onRename={setRenameHost}
-      />
-      <RenameHostDialog
-        currentName={renameHost?.name ?? ""}
-        error={rename.error ? errorMessage(rename.error) : null}
-        loading={rename.isPending}
-        onCancel={() => {
-          setRenameHost(null);
-          rename.reset();
-        }}
-        onRename={(name) => {
-          if (!renameHost) return;
-          rename.mutate(
-            { hostId: renameHost.id, name },
-            {
-              onSuccess: () => {
-                toast.success("Host renamed");
-                setRenameHost(null);
-              },
-            },
-          );
-        }}
-        visible={renameHost !== null}
-      />
-      <Confirm
-        confirmLabel={remove.error ? "Retry deletion" : "Remove host"}
-        description="Its daemon token will be revoked and it will no longer be able to connect."
-        destructive
-        onCancel={() => setRemoveHost(null)}
-        onConfirm={() => {
-          if (!removeHost || remove.isPending) return;
-          remove.mutate(removeHost, {
-            onError: (error) => toast.error("Could not remove host", { detail: error.message }),
-            onSuccess: () => {
-              toast.success("Host removed");
-              setRemoveHost(null);
-            },
-          });
-        }}
-        title={`Remove ${removeHost?.name ?? "host"}?`}
-        visible={removeHost !== null}
-      />
-    </SafeAreaView>
+    </Screen>
   );
 }
 
@@ -228,16 +245,6 @@ const styles = StyleSheet.create({
   fleetCopy: {
     flex: 1,
     gap: spacing[1],
-  },
-  header: {
-    alignItems: "center",
-    borderBottomWidth: borderWidth.hairline,
-    flexDirection: "row",
-    minHeight: spacing[14],
-    paddingHorizontal: spacing[4],
-  },
-  headerTitle: {
-    flex: 1,
   },
   list: {
     paddingBottom: spacing[8],

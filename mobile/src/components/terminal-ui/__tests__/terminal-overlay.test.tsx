@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react-native";
+import { act, render, screen, within } from "@testing-library/react-native";
 import * as Linking from "expo-linking";
 
 import { TerminalOverlay } from "@/components/terminal-ui/terminal-overlay";
@@ -15,7 +15,13 @@ jest.mock("expo-linking", () => ({
   openURL: jest.fn(async () => undefined),
 }));
 
-jest.mock("@/components/terminal-ui/terminal-header", () => ({ TerminalHeader: () => null }));
+jest.mock("@/components/terminal-ui/terminal-header", () => {
+  const React = require("react") as typeof import("react");
+  const { View } = require("react-native") as typeof import("react-native");
+  return {
+    TerminalHeader: () => React.createElement(View, { testID: "mock-terminal-header" }),
+  };
+});
 jest.mock("@/components/terminal-ui/modifier-bar", () => ({ ModifierBar: () => null }));
 jest.mock("@/components/terminal-ui/search-bar", () => ({ TerminalSearchBar: () => null }));
 jest.mock("@/components/terminal-ui/font-size-sheet", () => ({ FontSizeSheet: () => null }));
@@ -101,7 +107,7 @@ describe("terminal overlay dismissal", () => {
     mockTerminalSurfaceProps = {};
   });
 
-  test("renders connected content without a competing nested page-dismiss recognizer", async () => {
+  test("keeps the header and terminal together in the native route's transformed scene", async () => {
     await render(
       <ThemeProvider>
         <TerminalOverlay
@@ -115,7 +121,9 @@ describe("terminal overlay dismissal", () => {
         />
       </ThemeProvider>,
     );
-    expect(screen.getByTestId("terminal")).toBeTruthy();
+    const routeScene = within(screen.getByTestId("terminal-overlay-route-scene"));
+    expect(routeScene.getByTestId("mock-terminal-header")).toBeTruthy();
+    expect(routeScene.getByTestId("terminal")).toBeTruthy();
     expect(screen.queryByTestId("terminal-full-surface-dismiss")).toBeNull();
     expect(screen.queryByTestId("swipe-dismiss-overlay")).toBeNull();
   });

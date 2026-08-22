@@ -2,7 +2,6 @@ import type { SFSymbol } from "expo-symbols";
 import { useEffect, useRef } from "react";
 import { Pressable, ScrollView, StyleSheet, useWindowDimensions, View } from "react-native";
 
-import { GlassSurface } from "@/components/ui/glass";
 import { Icon, type IconName, iconSet } from "@/components/ui/icon";
 import { Popover } from "@/components/ui/popover";
 import { Text } from "@/components/ui/text";
@@ -69,7 +68,7 @@ export function NativePopover({
       contentStyle={{
         backgroundColor: "transparent",
         borderColor: "transparent",
-        borderRadius: theme.radii.xxl,
+        borderRadius: theme.radii.lg,
         borderWidth: borderWidth.none,
       }}
       interactive
@@ -80,16 +79,18 @@ export function NativePopover({
       visible={visible}
       width={width}
     >
-      <GlassSurface
+      <View
         style={[
           styles.surface,
           {
+            backgroundColor: theme.colors.popover,
             borderColor: theme.colors.popoverBorder,
-            borderRadius: theme.radii.xxl,
+            borderRadius: theme.radii.lg,
             minWidth: minimumWidth,
             padding: theme.space(1.5),
           },
         ]}
+        testID="native-popover-surface"
       >
         <ScrollView
           bounces={false}
@@ -161,7 +162,7 @@ export function NativePopover({
             );
           })}
         </ScrollView>
-      </GlassSurface>
+      </View>
     </Popover>
   );
 }

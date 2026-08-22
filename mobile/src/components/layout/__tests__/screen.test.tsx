@@ -1,4 +1,3 @@
-import { HeaderHeightContext } from "@react-navigation/elements";
 import { render } from "@testing-library/react-native";
 import type { ReactNode } from "react";
 import { StyleSheet, Text } from "react-native";
@@ -43,12 +42,8 @@ jest.mock("react-native-keyboard-controller", () => ({
   })(),
 }));
 
-async function renderScreen(node: ReactNode, headerHeight = 0) {
-  return render(
-    <ThemeProvider>
-      <HeaderHeightContext.Provider value={headerHeight}>{node}</HeaderHeightContext.Provider>
-    </ThemeProvider>,
-  );
+function renderScreen(node: ReactNode) {
+  return render(<ThemeProvider>{node}</ThemeProvider>);
 }
 
 describe("Screen", () => {
@@ -68,14 +63,29 @@ describe("Screen", () => {
     });
   });
 
-  it("does not repeat the top inset below a native header", async () => {
+  it("renders a full-bleed header and does not repeat its top inset", async () => {
     const screen = await renderScreen(
-      <Screen padded={false}>
+      <Screen header={<Text testID="scene-header">Header</Text>}>
         <Text>Content</Text>
       </Screen>,
-      103,
     );
 
+    expect(screen.getByTestId("scene-header")).toBeTruthy();
+    expect(StyleSheet.flatten(screen.getByTestId("screen-content").props["style"])).toMatchObject({
+      paddingLeft: 16,
+      paddingRight: 16,
+      paddingTop: 0,
+    });
+  });
+
+  it("threads the header through a scrolling keyboard screen", async () => {
+    const screen = await renderScreen(
+      <Screen header={<Text testID="scene-header">Header</Text>} scroll>
+        <Text>Content</Text>
+      </Screen>,
+    );
+
+    expect(screen.getByTestId("scene-header")).toBeTruthy();
     expect(StyleSheet.flatten(screen.getByTestId("screen-content").props["style"])).toMatchObject({
       paddingTop: 0,
     });
@@ -95,11 +105,9 @@ describe("Screen", () => {
     mockKeyboardVisible = true;
     await view.rerender(
       <ThemeProvider>
-        <HeaderHeightContext.Provider value={0}>
-          <Screen footer={<Text>Continue</Text>} scroll>
-            <Text>Form</Text>
-          </Screen>
-        </HeaderHeightContext.Provider>
+        <Screen footer={<Text>Continue</Text>} scroll>
+          <Text>Form</Text>
+        </Screen>
       </ThemeProvider>,
     );
 

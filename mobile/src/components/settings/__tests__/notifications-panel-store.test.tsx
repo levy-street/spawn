@@ -2,6 +2,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { AlertPresenter } from "@/components/alerts/alert-presenter";
 import { NotificationsPanel } from "@/components/settings/notifications-panel";
@@ -51,7 +52,14 @@ function wrapper({ children }: PropsWithChildren): React.JSX.Element {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return (
     <QueryClientProvider client={queryClient}>
-      <ThemeProvider>{children}</ThemeProvider>
+      <SafeAreaProvider
+        initialMetrics={{
+          frame: { x: 0, y: 0, width: 390, height: 844 },
+          insets: { top: 0, right: 0, bottom: 0, left: 0 },
+        }}
+      >
+        <ThemeProvider>{children}</ThemeProvider>
+      </SafeAreaProvider>
     </QueryClientProvider>
   );
 }

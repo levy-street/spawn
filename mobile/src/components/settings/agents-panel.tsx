@@ -8,16 +8,26 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
+import { Icon } from "@/components/ui/icon";
 import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
 import { AgentIcon } from "@/components/workspace-detail/agent-icon";
 import type { AgentOut } from "@/data/api/schemas/agents";
 import { useAgentMutations, useAgentsSettingsQuery } from "@/data/queries/settings";
 import { identifyAgent } from "@/data/selectors/agent";
-import { spacing } from "@/theme";
+import { opacity, spacing } from "@/theme";
 
 function hasYoloMode(agent: AgentOut): boolean {
   return Boolean(agent.yolo_args) || Object.keys(agent.yolo_env).length > 0;
+}
+
+/** What yolo mode visibly adds to the command that the agent will type. */
+function yoloSuffix(agent: AgentOut): string {
+  const environment = Object.keys(agent.yolo_env);
+  const argumentsSuffix = agent.yolo_args?.trim();
+  return `${environment.length > 0 ? ` +${environment.join(" +")}` : ""}${
+    argumentsSuffix ? ` ${argumentsSuffix}` : ""
+  }`;
 }
 
 function AgentRow({
@@ -35,6 +45,7 @@ function AgentRow({
 }): React.JSX.Element {
   const custom = agent.owner_user_id !== null;
   const canYolo = hasYoloMode(agent);
+  const yoloActive = canYolo && agent.yolo;
   const identity = identifyAgent(agent.command, [agent]);
   return (
     <Card variant="flat">
@@ -47,6 +58,11 @@ function AgentRow({
           </View>
           <Text color="mutedForeground" numberOfLines={2} variant="mono">
             {agent.command}
+            {yoloActive ? (
+              <Text color="warning" testID={`agent-yolo-suffix-${agent.id}`} variant="mono">
+                {yoloSuffix(agent)}
+              </Text>
+            ) : null}
           </Text>
           <Text color="mutedForeground" variant="caption">
             {canYolo
@@ -54,12 +70,23 @@ function AgentRow({
               : `${agent.name} has no way to skip its permission prompts`}
           </Text>
         </View>
-        <Switch
-          accessibilityLabel={`Run ${agent.name} without permission prompts`}
-          disabled={!canYolo || busy}
-          onValueChange={onYoloChange}
-          value={agent.yolo}
-        />
+        <View style={styles.yoloControl}>
+          <View
+            style={[styles.yoloLabel, !canYolo ? styles.yoloUnavailable : undefined]}
+            testID={`agent-yolo-label-${agent.id}`}
+          >
+            <Icon color={yoloActive ? "warning" : "mutedForeground"} name="Zap" size={spacing[4]} />
+            <Text color={yoloActive ? "warning" : "mutedForeground"} variant="label">
+              yolo
+            </Text>
+          </View>
+          <Switch
+            accessibilityLabel={`Yolo mode for ${agent.name}`}
+            disabled={!canYolo || busy}
+            onValueChange={onYoloChange}
+            value={yoloActive}
+          />
+        </View>
       </View>
       {custom ? (
         <View style={styles.actions}>
@@ -229,5 +256,18 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     flexWrap: "wrap",
     gap: spacing[2],
+  },
+  yoloControl: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: spacing[4],
+  },
+  yoloLabel: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: spacing[1.5],
+  },
+  yoloUnavailable: {
+    opacity: opacity.disabled,
   },
 });

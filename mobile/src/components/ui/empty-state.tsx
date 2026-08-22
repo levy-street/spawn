@@ -34,7 +34,21 @@ export function EmptyState({
   const theme = useTheme();
 
   return (
-    <View style={[styles.container, style]} testID={testID}>
+    <View
+      style={[
+        styles.container,
+        style,
+        {
+          backgroundColor: theme.colors.card,
+          borderColor: theme.colors.border,
+          borderRadius: theme.radii.lg,
+          borderWidth: borderWidth.hairline,
+          minHeight: sizing.emptyState.containerMinHeight,
+          padding: sizing.emptyState.containerPadding,
+        },
+      ]}
+      testID={testID}
+    >
       {icon !== undefined &&
         (iconPlate ? (
           <View
@@ -91,8 +105,6 @@ const styles = StyleSheet.create({
     alignSelf: "stretch",
     gap: sizing.emptyState.contentGap,
     justifyContent: "center",
-    paddingHorizontal: sizing.emptyState.horizontalPadding,
-    paddingVertical: sizing.emptyState.verticalPadding,
   },
   copy: {
     gap: sizing.emptyState.copyGap,

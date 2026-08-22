@@ -4,7 +4,7 @@ import { StyleSheet, View } from "react-native";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
-import { ListRow } from "@/components/ui/list-row";
+import { ListRow, ListSeparator } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import { FilesWidgetRow } from "@/components/workspace-detail/files-widget-row";
@@ -103,7 +103,7 @@ export const PaneList = memo(function PaneList({
     <FlashList
       contentContainerStyle={styles.listContent}
       data={tiles}
-      ItemSeparatorComponent={PaneSeparator}
+      ItemSeparatorComponent={ListSeparator}
       keyExtractor={(tile) => tile.session_id}
       ListEmptyComponent={
         <EmptyState
@@ -126,10 +126,6 @@ export const PaneList = memo(function PaneList({
     />
   );
 });
-
-function PaneSeparator() {
-  return <View style={styles.separator} />;
-}
 
 function AddPaneControl({ canAddPane, onAddPane }: { canAddPane: boolean; onAddPane: () => void }) {
   return (
@@ -166,6 +162,7 @@ function MissingPaneRow({ paneId, onActions }: { paneId: string; onActions: () =
           onActions();
         }}
         onPress={onActions}
+        shape="fullBleed"
         subtitle="Refresh or remove this pane."
         title="Session unavailable"
         trailing={<Icon color="mutedForeground" name="Ellipsis" />}
@@ -193,8 +190,5 @@ const styles = StyleSheet.create({
     paddingBottom: sizing.space.block,
     paddingHorizontal: sizing.screen.gutter,
     paddingTop: sizing.space.cluster,
-  },
-  separator: {
-    height: sizing.listRow.betweenRows,
   },
 });

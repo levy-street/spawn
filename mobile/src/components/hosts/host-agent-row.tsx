@@ -2,12 +2,13 @@ import { useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 import { Confirm } from "@/components/ui/confirm";
 import { Monogram } from "@/components/ui/monogram";
 import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
 import type { HostAgentInstallResult, HostAgentStatus } from "@/data/api/schemas/hosts";
-import { borderWidth, spacing, useTheme } from "@/theme";
+import { spacing, useTheme } from "@/theme";
 
 export interface HostAgentRowProps {
   agent: HostAgentStatus;
@@ -33,17 +34,7 @@ export function HostAgentRow({
   const action = agent.installed ? "Update" : "Install";
   const canInstall = Boolean(agent.install?.trim());
   return (
-    <View
-      style={[
-        styles.card,
-        {
-          backgroundColor: theme.colors.card,
-          borderColor: theme.colors.border,
-          borderRadius: theme.radii.lg,
-        },
-      ]}
-      testID={`host-agent-${agent.agent_id}`}
-    >
+    <Card testID={`host-agent-${agent.agent_id}`} variant="flat">
       <View style={styles.heading}>
         <Monogram seed={agent.agent_name} size={spacing[8]} />
         <View style={styles.headingCopy}>
@@ -134,16 +125,11 @@ export function HostAgentRow({
         title={`${action} ${agent.agent_name}?`}
         visible={confirmVisible}
       />
-    </View>
+    </Card>
   );
 }
 
 const styles = StyleSheet.create({
-  card: {
-    borderWidth: borderWidth.hairline,
-    gap: spacing[3],
-    padding: spacing[4],
-  },
   controls: {
     alignItems: "center",
     flexDirection: "row",

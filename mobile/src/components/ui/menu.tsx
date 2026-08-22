@@ -3,7 +3,6 @@ import type { ReactNode, RefObject } from "react";
 import { useEffect, useRef } from "react";
 import { Pressable, ScrollView, StyleSheet, View } from "react-native";
 
-import { GlassSurface } from "@/components/ui/glass";
 import {
   Popover,
   type PopoverAlign,
@@ -111,14 +110,16 @@ export function Menu({
       {...(anchorRect === undefined ? {} : { anchorRect })}
       {...(anchorRef === undefined ? {} : { anchorRef })}
     >
-      <GlassSurface
+      <View
         style={{
+          backgroundColor: theme.colors.popover,
           borderColor: theme.colors.popoverBorder,
-          borderRadius: theme.radii.xxl,
+          borderRadius: theme.radii.lg,
           borderWidth: borderWidth.hairline,
           minWidth: minimumWidth,
           padding: theme.space(1.5),
         }}
+        testID="menu-surface"
       >
         <ScrollView
           bounces={false}
@@ -202,7 +203,7 @@ export function Menu({
             );
           })}
         </ScrollView>
-      </GlassSurface>
+      </View>
     </Popover>
   );
 }

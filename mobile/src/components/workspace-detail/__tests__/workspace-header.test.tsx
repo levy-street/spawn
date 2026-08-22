@@ -1,5 +1,6 @@
 import { fireEvent, render } from "@testing-library/react-native";
-import type { ReactElement } from "react";
+import type { PropsWithChildren } from "react";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { WorkspaceHeader } from "@/components/workspace-detail/workspace-header";
 import { ThemeProvider } from "@/theme";
@@ -7,47 +8,68 @@ import { sizing } from "@/theme/sizing";
 
 import { makeWorkspace } from "./fixtures";
 
-const mockSetOptions = jest.fn();
-
-jest.mock("@react-navigation/native", () => ({
-  useNavigation: () => ({ setOptions: mockSetOptions }),
-}));
+function Providers({ children }: PropsWithChildren) {
+  return (
+    <SafeAreaProvider
+      initialMetrics={{
+        frame: { x: 0, y: 0, width: 390, height: 844 },
+        insets: { top: 47, right: 0, bottom: 34, left: 0 },
+      }}
+    >
+      <ThemeProvider>{children}</ThemeProvider>
+    </SafeAreaProvider>
+  );
+}
 
 describe("WorkspaceHeader", () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it("wires both native header controls and explains a blocked add", async () => {
+  it("renders in-scene chrome and wires back, launcher, and workspace actions", async () => {
+    const onBack = jest.fn();
     const onAddPane = jest.fn();
     const onActions = jest.fn();
-    await render(
+    const screen = await render(
       <WorkspaceHeader
-        canAddPane={false}
+        canAddPane
         onActions={onActions}
         onAddPane={onAddPane}
+        onBack={onBack}
         workspace={makeWorkspace()}
       />,
-      { wrapper: ThemeProvider },
+      { wrapper: Providers },
     );
 
-    const options = mockSetOptions.mock.calls.at(-1)?.[0] as
-      | { title: string; headerRight: () => ReactElement }
-      | undefined;
-    expect(options?.title).toBe("spawn mobile");
-    const controls = await render(options?.headerRight() as ReactElement, {
-      wrapper: ThemeProvider,
-    });
-    const add = controls.getByLabelText("Add terminal or files");
-    expect(add.props["accessibilityHint"]).toBe(
-      "This tab is full. A tab can contain up to 16 panes.",
-    );
+    expect(screen.getByRole("header", { name: "spawn mobile" })).toBeTruthy();
+    const add = screen.getByLabelText("Add terminal or files");
     expect(add).toHaveStyle({
-      height: sizing.control.iconButton.default,
-      width: sizing.control.iconButton.default,
+      height: sizing.appHeader.actionTarget,
+      width: sizing.appHeader.actionTarget,
     });
 
     await fireEvent.press(add);
-    await fireEvent.press(controls.getByLabelText("Workspace actions"));
+    await fireEvent.press(screen.getByLabelText("Workspace actions"));
+    await fireEvent.press(screen.getByLabelText("Go back"));
     expect(onAddPane).toHaveBeenCalledTimes(1);
     expect(onActions).toHaveBeenCalledTimes(1);
+    expect(onBack).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables launcher access when the active tab is full", async () => {
+    const onAddPane = jest.fn();
+    const screen = await render(
+      <WorkspaceHeader
+        canAddPane={false}
+        onActions={jest.fn()}
+        onAddPane={onAddPane}
+        onBack={jest.fn()}
+        workspace={makeWorkspace()}
+      />,
+      { wrapper: Providers },
+    );
+
+    const add = screen.getByLabelText("Add terminal or files");
+    expect(add).toBeDisabled();
+    await fireEvent.press(add);
+    expect(onAddPane).not.toHaveBeenCalled();
   });
 });

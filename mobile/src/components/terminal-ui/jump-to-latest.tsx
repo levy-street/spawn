@@ -1,10 +1,9 @@
-import { Pressable, StyleSheet } from "react-native";
+import { StyleSheet, View } from "react-native";
 
+import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { StatusDot } from "@/components/ui/status-dot";
-import { Text } from "@/components/ui/text";
-import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, shadow, useTheme } from "@/theme";
+import { borderWidth, shadow, useTheme } from "@/theme";
 
 export interface JumpToLatestProps {
   unread: boolean;
@@ -14,42 +13,40 @@ export interface JumpToLatestProps {
 export function JumpToLatest({ unread, onPress }: JumpToLatestProps): React.JSX.Element {
   const theme = useTheme();
   return (
-    <Pressable
-      accessibilityLabel={
-        unread ? "Jump to latest output, new output available" : "Jump to latest output"
-      }
-      accessibilityRole="button"
-      onPress={() => {
-        haptics.impact("light");
-        onPress();
-      }}
-      style={({ pressed }) => [
-        styles.pill,
+    <View
+      style={[
+        styles.surface,
         {
-          backgroundColor: pressed ? theme.colors.accent : theme.colors.popover,
+          backgroundColor: theme.colors.popover,
           borderColor: theme.colors.border,
           borderRadius: theme.radii.pill,
           borderWidth: borderWidth.hairline,
           boxShadow: shadow.md,
-          gap: theme.space(1.5),
-          minHeight: chrome.touchTarget,
-          paddingHorizontal: theme.space(unread ? 3 : 2.5),
         },
       ]}
-      testID="jump-to-latest"
     >
-      {unread ? <StatusDot pulse={false} tone="active" /> : null}
-      {unread ? <Text variant="label">New</Text> : null}
-      <Icon color="mutedForeground" name="ChevronDown" size={theme.space(4)} />
-    </Pressable>
+      <Button
+        accessibilityLabel={
+          unread ? "Jump to latest output, new output available" : "Jump to latest output"
+        }
+        onPress={onPress}
+        style={[styles.button, { borderRadius: theme.radii.pill }]}
+        testID="jump-to-latest"
+        variant="ghost"
+      >
+        {unread ? <StatusDot pulse={false} tone="active" /> : null}
+        {unread ? "New" : null}
+        <Icon name="ChevronDown" size={theme.space(4)} />
+      </Button>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  pill: {
-    alignItems: "center",
+  button: {
+    borderWidth: borderWidth.none,
+  },
+  surface: {
     alignSelf: "center",
-    flexDirection: "row",
-    justifyContent: "center",
   },
 });

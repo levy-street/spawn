@@ -14,6 +14,7 @@ interface KeyboardScreenProps {
     paddingTop: number;
   };
   footer: ReactNode | undefined;
+  header: ReactNode | undefined;
   scroll: boolean;
 }
 
@@ -21,6 +22,7 @@ export function KeyboardScreen({
   children,
   contentInsets,
   footer,
+  header,
   scroll,
 }: KeyboardScreenProps): React.JSX.Element {
   const [footerHeight, setFooterHeight] = useState(0);
@@ -30,6 +32,7 @@ export function KeyboardScreen({
 
   return (
     <View style={styles.root} testID="screen">
+      {header}
       {scroll ? (
         <KeyboardAwareScrollView
           bottomOffset={spacing[3]}

@@ -1,9 +1,11 @@
-import { Pressable, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 
+import { Button } from "@/components/ui/button";
 import { Sheet, SheetHeader } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import type { KeySpec, NamedTerminalKey } from "@/terminal/transport/types";
-import { borderWidth, chrome, useTheme } from "@/theme";
+import { useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 interface KeyChoice {
   label: string;
@@ -37,27 +39,16 @@ export interface TerminalKeysSheetProps {
 }
 
 function SheetKey({ choice, onPress }: { choice: KeyChoice; onPress: () => void }) {
-  const theme = useTheme();
   return (
-    <Pressable
+    <Button
       accessibilityLabel={choice.accessibilityLabel}
-      accessibilityRole="button"
       onPress={onPress}
-      style={({ pressed }) => [
-        styles.key,
-        {
-          backgroundColor: pressed ? theme.colors.accent : theme.colors.secondary,
-          borderColor: theme.colors.border,
-          borderRadius: theme.radii.md,
-          borderWidth: borderWidth.hairline,
-          minHeight: chrome.touchTarget,
-          minWidth: chrome.touchTarget,
-          paddingHorizontal: theme.space(2),
-        },
-      ]}
+      size="sm"
+      style={styles.key}
+      variant="secondary"
     >
       <Text variant="mono">{choice.label}</Text>
-    </Pressable>
+    </Button>
   );
 }
 
@@ -112,7 +103,6 @@ const styles = StyleSheet.create({
     flexDirection: "column",
   },
   key: {
-    alignItems: "center",
-    justifyContent: "center",
+    minWidth: sizing.control.minimumTouchTarget,
   },
 });

@@ -178,6 +178,7 @@ describe("workspace list presentation", () => {
       { wrapper: Providers },
     );
     expect(screen.getByLabelText(/spawn mobile, 2 tabs/)).toHaveStyle({
+      borderRadius: 0,
       minHeight: sizing.listRow.tall,
       paddingHorizontal: sizing.listRow.horizontalPadding,
       paddingVertical: sizing.listRow.verticalPadding,

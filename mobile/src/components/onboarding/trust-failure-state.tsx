@@ -1,10 +1,10 @@
 import { StyleSheet, View } from "react-native";
 
 import { Button } from "@/components/ui/button";
-import { Icon } from "@/components/ui/icon";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Text } from "@/components/ui/text";
 import type { PairingFailure, PairingFailureKind } from "@/data/queries/pairing";
-import { borderWidth, spacing, useTheme } from "@/theme";
+import { spacing } from "@/theme";
 
 interface FailureCopy {
   title: string;
@@ -85,45 +85,38 @@ export interface TrustFailureStateProps {
 }
 
 export function TrustFailureState({ failure, onAction, onRestart }: TrustFailureStateProps) {
-  const theme = useTheme();
   const copy = FAILURE_COPY[failure.kind];
-
-  return (
-    <View style={styles.container} testID={`trust-failure-${failure.kind}`}>
-      <View
-        style={[
-          styles.icon,
-          {
-            backgroundColor: theme.colors.destructiveSoft,
-            borderColor: theme.colors.destructive,
-            borderRadius: theme.radii.xl,
-          },
-        ]}
-      >
-        <Icon color="destructive" name="ShieldAlert" size={spacing[6]} />
-      </View>
+  const description =
+    failure.detail === undefined ? (
+      copy.description
+    ) : (
       <View style={styles.copy}>
-        <Text accessibilityRole="header" style={styles.centered} variant="title">
-          {copy.title}
-        </Text>
         <Text color="mutedForeground" style={styles.centered}>
           {copy.description}
         </Text>
-        {failure.detail !== undefined ? (
-          <Text color="destructive" style={styles.centered} variant="caption">
-            {failure.detail}
-          </Text>
-        ) : null}
+        <Text color="destructive" style={styles.centered} variant="caption">
+          {failure.detail}
+        </Text>
       </View>
-      <View style={styles.actions}>
-        <Button onPress={onAction}>{copy.action}</Button>
-        {onRestart !== undefined ? (
-          <Button onPress={onRestart} variant="ghost">
-            Enter a new code
-          </Button>
-        ) : null}
-      </View>
-    </View>
+    );
+
+  return (
+    <EmptyState
+      action={
+        <View style={styles.actions}>
+          <Button onPress={onAction}>{copy.action}</Button>
+          {onRestart !== undefined ? (
+            <Button onPress={onRestart} variant="ghost">
+              Enter a new code
+            </Button>
+          ) : null}
+        </View>
+      }
+      description={description}
+      icon="ShieldAlert"
+      testID={`trust-failure-${failure.kind}`}
+      title={copy.title}
+    />
   );
 }
 
@@ -135,19 +128,7 @@ const styles = StyleSheet.create({
   centered: {
     textAlign: "center",
   },
-  container: {
-    alignItems: "center",
-    gap: spacing[5],
-    paddingVertical: spacing[8],
-  },
   copy: {
     gap: spacing[2],
-  },
-  icon: {
-    alignItems: "center",
-    borderWidth: borderWidth.hairline,
-    height: spacing[12],
-    justifyContent: "center",
-    width: spacing[12],
   },
 });

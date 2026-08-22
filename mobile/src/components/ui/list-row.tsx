@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 
 import { Text } from "@/components/ui/text";
-import { useTheme } from "@/theme";
+import { borderWidth, useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
 export interface ListRowProps {
@@ -13,6 +13,8 @@ export interface ListRowProps {
   onPress?: () => void;
   onLongPress?: () => void;
   height?: "regular" | "tall";
+  /** Full-bleed row with square corners, for separator-joined lists. Default "inset". */
+  shape?: "inset" | "fullBleed";
 }
 
 export function ListRow({
@@ -20,6 +22,7 @@ export function ListRow({
   leading,
   onLongPress,
   onPress,
+  shape = "inset",
   subtitle,
   title,
   trailing,
@@ -39,7 +42,7 @@ export function ListRow({
         height === "tall" ? styles.tall : styles.regular,
         {
           backgroundColor: pressed ? theme.colors.accent : "transparent",
-          borderRadius: theme.radii.lg,
+          borderRadius: shape === "fullBleed" ? borderWidth.none : theme.radii.lg,
         },
       ]}
     >
@@ -60,6 +63,23 @@ export function ListRow({
       </View>
       {trailing !== undefined ? <View style={styles.trailing}>{trailing}</View> : null}
     </Pressable>
+  );
+}
+
+export function ListSeparator({ inset = true }: { inset?: boolean }): React.JSX.Element {
+  const theme = useTheme();
+
+  return (
+    <View
+      style={[
+        styles.separator,
+        {
+          backgroundColor: theme.colors.border,
+          marginLeft: inset ? sizing.listRow.separatorInset : sizing.listRow.separatorFullBleed,
+        },
+      ]}
+      testID="list-separator"
+    />
   );
 }
 
@@ -85,6 +105,9 @@ const styles = StyleSheet.create({
   },
   regular: {
     minHeight: sizing.listRow.regular,
+  },
+  separator: {
+    height: borderWidth.hairline,
   },
   subtitle: {
     fontSize: sizing.type.caption.fontSize,

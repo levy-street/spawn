@@ -83,7 +83,6 @@ export const TerminalRow = memo(function TerminalRow({
     <SwipeableRow
       contentStyle={{ backgroundColor: theme.colors.background }}
       leadingActions={leadingActions}
-      style={{ borderRadius: theme.radii.lg }}
       testID={`terminal-swipe-${session.id}`}
       trailingActions={trailingActions}
     >
@@ -110,6 +109,7 @@ export const TerminalRow = memo(function TerminalRow({
             haptics.selection();
             onOpen();
           }}
+          shape="fullBleed"
           subtitle={detail}
           title={title}
           trailing={

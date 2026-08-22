@@ -34,8 +34,16 @@ jest.mock("@/components/layout/screen", () => {
   const React = require("react") as typeof import("react");
   const { View } = require("react-native") as typeof import("react-native");
   return {
-    Screen: ({ children }: React.PropsWithChildren) =>
-      React.createElement(View, { testID: "mock-screen" }, children),
+    Screen: ({ children, header }: React.PropsWithChildren<{ header?: React.ReactNode }>) =>
+      React.createElement(View, { testID: "mock-screen" }, header, children),
+  };
+});
+
+jest.mock("@/components/layout/app-header", () => {
+  const React = require("react") as typeof import("react");
+  const { View } = require("react-native") as typeof import("react-native");
+  return {
+    AppHeader: () => React.createElement(View, { testID: "mock-terminal-state-header" }),
   };
 });
 
@@ -93,7 +101,7 @@ describe("TerminalScreen dismissal", () => {
   });
 
   test.each(["loading", "error", "connected"] as const)(
-    "enables the native full-screen horizontal back gesture while %s",
+    "enables an unrestricted native full-screen horizontal back gesture while %s",
     async (state) => {
       mockTerminalData = dataFor(state);
       await render(<TerminalScreen />);
@@ -104,13 +112,17 @@ describe("TerminalScreen dismissal", () => {
         fullScreenGestureEnabled: true,
         gestureDirection: "horizontal",
         gestureEnabled: true,
-        headerShown: true,
+        headerShown: false,
         presentation: "card",
       });
+      // An omitted response distance is what lets the native recognizer begin at screen centre.
+      expect(mockStackScreenOptions).not.toHaveProperty("gestureResponseDistance");
       if (state === "connected") {
         expect(screen.getByTestId("mock-terminal-overlay")).toBeTruthy();
+        expect(screen.queryByTestId("mock-terminal-state-header")).toBeNull();
       } else {
         expect(screen.queryByTestId("mock-terminal-overlay")).toBeNull();
+        expect(screen.getByTestId("mock-terminal-state-header")).toBeTruthy();
       }
     },
   );

@@ -1,9 +1,7 @@
-import { type Href, useRouter } from "expo-router";
-import { StyleSheet, View } from "react-native";
+import { type Href, router } from "expo-router";
 
+import type { AppHeaderAction } from "@/components/layout/app-header";
 import type { IconName } from "@/components/ui/icon";
-import { IconButton } from "@/components/ui/icon-button";
-import { spacing } from "@/theme";
 
 export type HeaderDestination = "hosts" | "legion" | "settings" | "admin";
 
@@ -17,34 +15,15 @@ const DESTINATIONS: Record<
   admin: { accessibilityLabel: "Open admin", href: "/admin", icon: "ShieldCheck" },
 };
 
-export function HeaderDestinations({
-  destinations,
-}: {
-  destinations: readonly HeaderDestination[];
-}): React.JSX.Element {
-  const router = useRouter();
-
-  return (
-    <View style={styles.actions}>
-      {destinations.map((destination) => {
-        const item = DESTINATIONS[destination];
-        return (
-          <IconButton
-            accessibilityLabel={item.accessibilityLabel}
-            icon={item.icon}
-            key={destination}
-            onPress={() => router.push(item.href)}
-            size="lg"
-          />
-        );
-      })}
-    </View>
-  );
+export function headerDestinationActions(
+  destinations: readonly HeaderDestination[],
+): readonly AppHeaderAction[] {
+  return destinations.map((destination) => {
+    const item = DESTINATIONS[destination];
+    return {
+      accessibilityLabel: item.accessibilityLabel,
+      icon: item.icon,
+      onPress: () => router.push(item.href),
+    };
+  });
 }
-
-const styles = StyleSheet.create({
-  actions: {
-    flexDirection: "row",
-    gap: spacing[1],
-  },
-});

@@ -20,7 +20,6 @@ import { Spinner } from "@/components/ui/spinner";
 import {
   DraggableTab,
   TAB_ACTION_TARGET,
-  TAB_CONNECTED_HEIGHT,
   TAB_GAP,
   TAB_GEOMETRY,
   TAB_STEP,
@@ -28,10 +27,13 @@ import {
   type TabDragValues,
 } from "@/components/workspace-detail/draggable-tab";
 import { tabDestinationIndex, tabInsertionX } from "@/components/workspace-detail/tab-reorder";
+import { tabAttentionSummary } from "@/data/queries/alerts";
+import type { Session } from "@/data/types/domain";
 import type { WorkspaceTab } from "@/data/types/layout";
 import { haptics } from "@/lib/haptics";
 import { useReducedMotion } from "@/lib/motion/reduced-motion";
 import { borderWidth, duration, layer, opacity, spacing, tabSurfaces, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 const TAB_EDGE_SCROLL_BAND = spacing[12];
 const TAB_DROP_INDICATOR_HEIGHT = spacing[7];
@@ -41,6 +43,7 @@ const MILLISECONDS_PER_SECOND = 1_000;
 
 export interface TabStripProps {
   tabs: readonly WorkspaceTab[];
+  sessionsById: ReadonlyMap<string, Session>;
   activeIndex: number;
   canAdd: boolean;
   addBusy?: boolean;
@@ -72,6 +75,7 @@ function endDragFeedback(name: string, index: number, count: number): void {
 
 export function TabStrip({
   tabs,
+  sessionsById,
   activeIndex,
   canAdd,
   addBusy = false,
@@ -241,7 +245,11 @@ export function TabStrip({
   };
 
   return (
-    <View ref={stripRef} style={[styles.frame, { backgroundColor: theme.colors.shell }]}>
+    <View
+      ref={stripRef}
+      style={[styles.frame, { backgroundColor: theme.colors.shell }]}
+      testID="workspace-tab-strip-frame"
+    >
       <Animated.ScrollView
         contentContainerStyle={styles.content}
         horizontal
@@ -260,6 +268,7 @@ export function TabStrip({
           {tabs.map((tab, index) => (
             <DraggableTab
               active={index === activeIndex}
+              attention={tabAttentionSummary(tab, sessionsById)}
               canClose={tabs.length > 1}
               dragValues={dragValues}
               dragging={draggingId === tab.id}
@@ -320,13 +329,14 @@ const styles = StyleSheet.create({
     alignItems: "center",
     height: TAB_ACTION_TARGET,
     justifyContent: "center",
+    marginBottom: sizing.tab.connectionOverlap,
     width: TAB_ACTION_TARGET,
   },
   content: {
     alignItems: "flex-end",
     gap: TAB_GAP,
     minHeight: TAB_STRIP_HEIGHT,
-    paddingBottom: TAB_GAP,
+    paddingLeft: sizing.tab.connectionRadius,
     paddingRight: TAB_GAP,
   },
   dropIndicator: {
@@ -334,13 +344,15 @@ const styles = StyleSheet.create({
     height: TAB_DROP_INDICATOR_HEIGHT,
     left: 0,
     position: "absolute",
-    top: (TAB_CONNECTED_HEIGHT - TAB_DROP_INDICATOR_HEIGHT) / 2,
+    top: (sizing.tab.visualHeight - TAB_DROP_INDICATOR_HEIGHT) / 2,
     width: borderWidth.emphasis,
     zIndex: layer.launcherDropPreview,
   },
   frame: {
     flexShrink: 0,
-    minHeight: TAB_STRIP_HEIGHT,
+    height: TAB_STRIP_HEIGHT,
+    marginBottom: -sizing.tab.connectionOverlap,
+    zIndex: layer.mobileChrome,
   },
   tabs: {
     flexDirection: "row",

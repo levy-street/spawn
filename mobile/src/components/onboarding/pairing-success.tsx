@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
@@ -52,16 +53,7 @@ export function PairingSuccess({
           value.
         </Text>
       </View>
-      <View
-        style={[
-          styles.fingerprintWell,
-          {
-            backgroundColor: theme.colors.muted,
-            borderColor: theme.colors.border,
-            borderRadius: theme.radii.lg,
-          },
-        ]}
-      >
+      <Card style={styles.fingerprintWell} variant="flat">
         <View style={styles.fingerprintHeading}>
           <Icon color="foreground" name="Smartphone" size={spacing[5]} />
           <Text variant="label">This phone</Text>
@@ -69,7 +61,7 @@ export function PairingSuccess({
         <Text selectable style={styles.fingerprint} variant="mono">
           {phoneFingerprint}
         </Text>
-      </View>
+      </Card>
       <Pressable
         accessibilityLabel="The machine shows this phone fingerprint"
         accessibilityRole="checkbox"
@@ -139,9 +131,7 @@ const styles = StyleSheet.create({
     gap: spacing[2],
   },
   fingerprintWell: {
-    borderWidth: borderWidth.hairline,
     gap: spacing[4],
-    padding: spacing[5],
   },
   heading: {
     gap: spacing[2],

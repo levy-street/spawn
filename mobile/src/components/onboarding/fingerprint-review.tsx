@@ -3,6 +3,7 @@ import { Pressable, StyleSheet, View } from "react-native";
 
 import { PairingCountdown } from "@/components/onboarding/pairing-countdown";
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import type { PendingPairingCeremony } from "@/data/queries/pairing";
@@ -60,16 +61,7 @@ export function FingerprintReview({
 
       <PairingCountdown deadlineMs={ceremony.expiresAtMs} onExpired={onExpired} />
 
-      <View
-        style={[
-          styles.fingerprintWell,
-          {
-            backgroundColor: theme.colors.muted,
-            borderColor: theme.colors.border,
-            borderRadius: theme.radii.lg,
-          },
-        ]}
-      >
+      <Card style={styles.fingerprintWell} variant="flat">
         <View style={styles.fingerprintHeading}>
           <Icon color="foreground" name="Fingerprint" size={spacing[5]} />
           <Text variant="label">Host fingerprint</Text>
@@ -82,7 +74,7 @@ export function FingerprintReview({
         >
           {ceremony.hostFingerprint}
         </Text>
-      </View>
+      </Card>
 
       <View style={styles.phoneIdentity}>
         <View style={styles.fingerprintHeading}>
@@ -99,20 +91,17 @@ export function FingerprintReview({
         </Text>
       </View>
 
-      <View
-        style={[
-          styles.notice,
-          {
-            backgroundColor: theme.colors.warningSoft,
-            borderColor: theme.colors.warning,
-            borderRadius: theme.radii.md,
-          },
-        ]}
+      <Card
+        style={{
+          backgroundColor: theme.colors.warningSoft,
+          borderColor: theme.colors.warning,
+        }}
+        variant="flat"
       >
         <Text color="warning" variant="caption">
           {pinCopy} Approval grants terminal, file, tool, and agent access on this host.
         </Text>
-      </View>
+      </Card>
 
       <Pressable
         accessibilityLabel="I compared the host fingerprint and it matches"
@@ -199,16 +188,10 @@ const styles = StyleSheet.create({
     gap: spacing[2],
   },
   fingerprintWell: {
-    borderWidth: borderWidth.hairline,
     gap: spacing[4],
-    padding: spacing[5],
   },
   heading: {
     gap: spacing[2],
-  },
-  notice: {
-    borderWidth: borderWidth.hairline,
-    padding: spacing[3],
   },
   phoneFingerprint: {
     fontFamily: fontFamily.mono,

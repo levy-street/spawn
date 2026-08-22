@@ -69,7 +69,6 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
     <SwipeableRow
       contentStyle={{ backgroundColor: theme.colors.background }}
       leadingActions={leadingActions}
-      style={{ borderRadius: theme.radii.lg }}
       testID={`files-swipe-${paneId}`}
       trailingActions={trailingActions}
     >
@@ -98,6 +97,7 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
             haptics.selection();
             onOpen();
           }}
+          shape="fullBleed"
           subtitle={detail}
           title={title}
           trailing={

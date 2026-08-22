@@ -80,7 +80,7 @@ export function connectionCopy(state: TransportState): ConnectionCopy {
 export function ConnectionChip({ state }: { state: TransportState }): React.JSX.Element {
   const copy = connectionCopy(state);
   return (
-    <Badge testID="terminal-connection-chip" variant={copy.variant}>
+    <Badge style={styles.headerChip} testID="terminal-connection-chip" variant={copy.variant}>
       {copy.chip}
     </Badge>
   );
@@ -178,6 +178,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     flex: 1,
     flexDirection: "row",
+  },
+  headerChip: {
+    // Badge defaults to flex-start for body copy; header accessories sit on the title baseline.
+    alignSelf: "center",
   },
   overlay: {
     ...StyleSheet.absoluteFillObject,

@@ -2,6 +2,7 @@ import { useIsFocused } from "@react-navigation/native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { StyleSheet, View } from "react-native";
 
+import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
 import { TerminalOverlay } from "@/components/terminal-ui/terminal-overlay";
 import { Button } from "@/components/ui/button";
@@ -25,7 +26,7 @@ export const TERMINAL_ROUTE_GESTURE_OPTIONS = {
   fullScreenGestureEnabled: true,
   gestureDirection: "horizontal",
   gestureEnabled: true,
-  headerShown: true,
+  headerShown: false,
   presentation: "card",
 } as const;
 
@@ -45,10 +46,6 @@ export default function TerminalScreen(): React.JSX.Element {
       options={{
         ...TERMINAL_ROUTE_GESTURE_OPTIONS,
         contentStyle: { backgroundColor: theme.colors.background },
-        headerShadowVisible: false,
-        headerStyle: { backgroundColor: theme.colors.background },
-        headerTintColor: theme.colors.foreground,
-        title: "Terminal",
       }}
     />
   );
@@ -57,7 +54,7 @@ export default function TerminalScreen(): React.JSX.Element {
     return (
       <>
         {screenOptions}
-        <Screen padded={false}>
+        <Screen header={<AppHeader onBack={() => router.back()} title="Terminal" />} padded={false}>
           <View
             style={[
               styles.center,
@@ -91,7 +88,7 @@ export default function TerminalScreen(): React.JSX.Element {
     return (
       <>
         {screenOptions}
-        <Screen padded={false}>
+        <Screen header={<AppHeader onBack={() => router.back()} title="Terminal" />} padded={false}>
           <View
             accessibilityLabel="Loading terminal"
             accessibilityRole="progressbar"

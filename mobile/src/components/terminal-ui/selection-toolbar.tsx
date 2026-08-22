@@ -1,8 +1,8 @@
-import { Pressable, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 
+import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
-import { Text } from "@/components/ui/text";
-import { borderWidth, chrome, shadow, useTheme } from "@/theme";
+import { borderWidth, shadow, useTheme } from "@/theme";
 
 export interface SelectionToolbarProps {
   visible: boolean;
@@ -33,39 +33,29 @@ export function SelectionToolbar({
       ]}
       testID="terminal-selection-toolbar"
     >
-      <Pressable
+      <Button
         accessibilityLabel="Copy terminal selection"
-        accessibilityRole="button"
         onPress={onCopy}
-        style={[
-          styles.action,
-          { minHeight: chrome.touchTarget, paddingHorizontal: theme.space(3) },
-        ]}
+        size="sm"
+        variant="ghost"
       >
-        <Icon color="mutedForeground" name="Copy" size={theme.space(4)} />
-        <Text variant="label">Copy</Text>
-      </Pressable>
-      <Pressable
+        <Icon name="Copy" size={theme.space(4)} />
+        Copy
+      </Button>
+      <Button
         accessibilityLabel="Cancel terminal selection"
-        accessibilityRole="button"
         onPress={onCancel}
-        style={[
-          styles.action,
-          { minHeight: chrome.touchTarget, paddingHorizontal: theme.space(3) },
-        ]}
+        size="sm"
+        variant="ghost"
       >
-        <Icon color="mutedForeground" name="X" size={theme.space(4)} />
-        <Text variant="label">Cancel</Text>
-      </Pressable>
+        <Icon name="X" size={theme.space(4)} />
+        Cancel
+      </Button>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  action: {
-    alignItems: "center",
-    flexDirection: "row",
-  },
   toolbar: {
     alignItems: "center",
     flexDirection: "row",

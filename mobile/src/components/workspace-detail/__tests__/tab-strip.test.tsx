@@ -2,9 +2,10 @@ import { fireEvent, render } from "@testing-library/react-native";
 
 import { TAB_CONNECTED_HEIGHT, TAB_WIDTH } from "@/components/workspace-detail/draggable-tab";
 import { TabStrip } from "@/components/workspace-detail/tab-strip";
-import { spacing, ThemeProvider } from "@/theme";
+import { ThemeProvider } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
-import { makeTab } from "./fixtures";
+import { makeSession, makeTab } from "./fixtures";
 
 describe("TabStrip", () => {
   it("hides close for the sole tab and shows a separate 44pt close target for every closable tab", async () => {
@@ -17,6 +18,7 @@ describe("TabStrip", () => {
         onClose={jest.fn()}
         onReorder={jest.fn()}
         onSelect={jest.fn()}
+        sessionsById={new Map()}
         tabs={[makeTab("main")]}
       />,
       { wrapper: ThemeProvider },
@@ -35,14 +37,19 @@ describe("TabStrip", () => {
         onClose={onClose}
         onReorder={jest.fn()}
         onSelect={onSelect}
+        sessionsById={new Map()}
         tabs={[makeTab("main"), makeTab("tests")]}
       />,
       { wrapper: ThemeProvider },
     );
 
     expect(screen.getByLabelText("Close main")).toHaveStyle({
-      height: spacing[11],
-      width: spacing[11],
+      height: sizing.tab.actionTarget,
+      width: sizing.tab.actionTarget,
+    });
+    expect(screen.getByTestId("close-tab-plate-main")).toHaveStyle({
+      height: sizing.tab.closePlate,
+      width: sizing.tab.closePlate,
     });
     expect(screen.getByLabelText("Close tests")).toBeTruthy();
     await fireEvent.press(screen.getByLabelText("Close tests"));
@@ -50,7 +57,7 @@ describe("TabStrip", () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
-  it("uses separate 160pt filled tabs and connects the active tab to populated content", async () => {
+  it("uses tokenized filled tabs and connects populated active content with concave flares", async () => {
     const screen = await render(
       <TabStrip
         activeIndex={0}
@@ -60,6 +67,7 @@ describe("TabStrip", () => {
         onClose={jest.fn()}
         onReorder={jest.fn()}
         onSelect={jest.fn()}
+        sessionsById={new Map()}
         tabs={[
           makeTab("main", [{ session_id: "one", x: 0, y: 0, w: 24, h: 24 }]),
           makeTab("tests"),
@@ -69,14 +77,55 @@ describe("TabStrip", () => {
     );
 
     expect(screen.getByTestId("workspace-tab-main")).toHaveStyle({ width: TAB_WIDTH });
+    expect(TAB_WIDTH).toBe(sizing.tab.minWidth);
+    expect(screen.getByTestId("workspace-tab-strip-frame")).toHaveStyle({
+      height: sizing.tab.stripHeight,
+      marginBottom: -sizing.tab.connectionOverlap,
+    });
     expect(screen.getByTestId("workspace-tab-surface-main")).toHaveStyle({
       borderBottomLeftRadius: 0,
       borderBottomRightRadius: 0,
       height: TAB_CONNECTED_HEIGHT,
+      paddingBottom: sizing.tab.connectionOverlap,
     });
     expect(screen.getByTestId("workspace-tab-surface-tests")).toHaveStyle({
-      height: spacing[10],
+      height: sizing.tab.visualHeight,
     });
+    expect(screen.getByTestId("tab-connection-left-main")).toHaveStyle({
+      height: sizing.tab.connectionRadius,
+      left: -sizing.tab.connectionRadius,
+      width: sizing.tab.connectionRadius,
+    });
+    expect(screen.getByTestId("tab-connection-right-main")).toHaveStyle({
+      height: sizing.tab.connectionRadius,
+      right: -sizing.tab.connectionRadius,
+      width: sizing.tab.connectionRadius,
+    });
+    expect(screen.queryByTestId("tab-connection-left-tests")).toBeNull();
+  });
+
+  it("shows the global attention count before a tab label", async () => {
+    const waiting = makeSession({ id: "waiting", activity_state: "waiting" });
+    const screen = await render(
+      <TabStrip
+        activeIndex={0}
+        canAdd
+        onActions={jest.fn()}
+        onAdd={jest.fn()}
+        onClose={jest.fn()}
+        onReorder={jest.fn()}
+        onSelect={jest.fn()}
+        sessionsById={new Map([[waiting.id, waiting]])}
+        tabs={[
+          makeTab("main", [{ session_id: waiting.id, x: 0, y: 0, w: 24, h: 24 }]),
+          makeTab("tests"),
+        ]}
+      />,
+      { wrapper: ThemeProvider },
+    );
+
+    expect(screen.getByTestId("tab-attention-main-count")).toHaveTextContent("1");
+    expect(screen.getByLabelText("main, 1 session awaiting input")).toBeTruthy();
   });
 
   it("keeps adjacent reorder actions as an accessible drag fallback", async () => {
@@ -90,6 +139,7 @@ describe("TabStrip", () => {
         onClose={jest.fn()}
         onReorder={onReorder}
         onSelect={jest.fn()}
+        sessionsById={new Map()}
         tabs={[makeTab("main"), makeTab("tests")]}
       />,
       { wrapper: ThemeProvider },

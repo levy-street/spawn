@@ -8,19 +8,8 @@ export const workspaceListStyles = StyleSheet.create({
     alignSelf: "center",
     marginVertical: sizing.space.block,
   },
-  listContent: {
-    paddingHorizontal: sizing.screen.gutter,
-  },
-  rowSeparator: {
-    height: sizing.listRow.betweenRows,
-  },
   screen: {
     flex: 1,
-  },
-  search: {
-    paddingBottom: sizing.space.peer,
-    paddingHorizontal: sizing.screen.gutter,
-    paddingTop: sizing.space.peer,
   },
   skeletonCopy: {
     flex: 1,
