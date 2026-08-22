@@ -37,7 +37,7 @@ export function useDeviceTrustMap(enabled: boolean) {
           byDevice.set(deviceId, [...(byDevice.get(deviceId) ?? []), hostId]);
         }
       }
-      return byDevice;
+      return { byDevice, byHost: new Map(entries) };
     },
     enabled: enabled && keyedHosts.length > 0,
     refetchInterval: 15_000,
@@ -45,7 +45,11 @@ export function useDeviceTrustMap(enabled: boolean) {
   return {
     keyedHosts,
     hostsById: new Map(keyedHosts.map((host) => [host.id, host])),
-    trustedHostIdsFor: (deviceId: string): string[] => pins.data?.get(deviceId) ?? [],
+    trustedHostIdsFor: (deviceId: string): string[] => pins.data?.byDevice.get(deviceId) ?? [],
+    /** Live pin device-ids per host, for R5 sole-trust warnings and the roster. */
+    pinsByHost: pins.data?.byHost ?? new Map<string, string[]>(),
+    /** Devices holding at least one per-host pin: the roster's advisory anchors. */
+    pinnedDeviceIds: new Set(pins.data ? pins.data.byDevice.keys() : []),
     ready: pins.data !== undefined || keyedHosts.length === 0,
   };
 }
@@ -87,7 +91,12 @@ export function EndorseDevicePanel({
       if (mine === undefined) {
         throw new Error("This browser is not registered with the server.");
       }
-      const keyed = (await hosts.list()).filter((host) => (host.host_public_key ?? null) !== null);
+      // Mesh R9: chain-capable hosts refuse per-host device endorsements (the
+      // add-device ceremony covers them account-wide), so this legacy path only
+      // targets hosts that have not advertised chain support.
+      const keyed = (await hosts.list()).filter(
+        (host) => (host.host_public_key ?? null) !== null && !host.supports_account_chains,
+      );
       const myHostIds = new Set<string>();
       for (const host of keyed) {
         if ((await trust.hostPins(host.id)).includes(mine.id)) myHostIds.add(host.id);
@@ -95,15 +104,16 @@ export function EndorseDevicePanel({
       const targets = keyed.filter((host) => myHostIds.has(host.id));
       if (targets.length === 0) {
         throw new Error(
-          "This browser is not trusted by any host yet, so it cannot vouch for another. Approve from a browser that can already open terminals.",
+          "Every host you can vouch toward accepts account-wide trust — use “Add a device to your account” above instead of per-host approval.",
         );
       }
       // The fingerprint the operator compared is only meaningful if it is the
       // fingerprint of the key being signed. Re-derive and refuse on mismatch
       // so a hostile server cannot pair the victim's fingerprint with its own
-      // key and harvest a signature over the attacker key.
+      // key and harvest a signature over the attacker key. (The server serves
+      // no fingerprint of its own to disagree with — mesh B5.)
       const derived = await ed25519PublicKeyFingerprint(target.public_key);
-      if (derived !== targetFingerprint || derived !== target.fingerprint) {
+      if (derived !== targetFingerprint) {
         throw new Error(
           "This device's fingerprint does not match its key. Refusing to approve — the server may be substituting a key.",
         );

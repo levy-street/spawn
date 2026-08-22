@@ -1,4 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import {
+  createRootEndorsementProof,
+  exportAccountRootMaterial,
+  generateAccountRoot,
+  importAccountRoot,
+} from "./account-root";
 import { ed25519PublicKeyFingerprint, generateEd25519IdentityKeyPair } from "./signed-signal";
 import {
   deriveTrustBundleKey,
@@ -160,5 +166,43 @@ describe("trust bundle", () => {
     const forward = await openTrustBundle(key, ACCOUNT, await sealBundle(key, ACCOUNT, [a, b]));
     const reverse = await openTrustBundle(key, ACCOUNT, await sealBundle(key, ACCOUNT, [b, a]));
     expect(forward.hosts).toEqual(reverse.hosts);
+  });
+
+  test("a bundle with no root opens as root: null (legacy / device-chain mode)", async () => {
+    const key = await deriveTrustBundleKey(prf(13), ACCOUNT);
+    const opened = await openTrustBundle(
+      key,
+      ACCOUNT,
+      await sealBundle(key, ACCOUNT, [await host()]),
+    );
+    expect(opened.root).toBeNull();
+  });
+
+  test("the sealed account root round-trips and reconstructs a signing root", async () => {
+    const key = await deriveTrustBundleKey(prf(14), ACCOUNT);
+    const root = await generateAccountRoot();
+    const material = await exportAccountRootMaterial(root);
+    const sealed = await sealTrustBundle(key, ACCOUNT, [await host()], 1, material);
+
+    // Only a holder of the passkey key can recover the root seed.
+    const opened = await openTrustBundle(key, ACCOUNT, sealed);
+    expect(opened.root).toEqual(material);
+
+    // The recovered material reconstructs a root that signs a valid R→d (the
+    // healing signature a passkey unlock would produce).
+    const restored = await importAccountRoot(opened.root!);
+    const DEVICE = "11111111-2222-4333-8444-555555555555";
+    const DEVICE_KEY = "kaKKC3Q4FZOk2UaVeSCJJq_IrYLIg5t2RDWbnrqaSzo";
+    const sig = await createRootEndorsementProof(restored, ACCOUNT, DEVICE_KEY, DEVICE);
+    expect(sig).toMatch(/^[A-Za-z0-9_-]{86}$/);
+    expect(restored.publicKeyWire).toBe(root.publicKeyWire);
+  });
+
+  test("a wrong passkey cannot recover the sealed root", async () => {
+    const sealKey = await deriveTrustBundleKey(prf(15), ACCOUNT);
+    const wrongKey = await deriveTrustBundleKey(prf(16), ACCOUNT);
+    const material = await exportAccountRootMaterial(await generateAccountRoot());
+    const sealed = await sealTrustBundle(sealKey, ACCOUNT, [await host()], 1, material);
+    await expect(openTrustBundle(wrongKey, ACCOUNT, sealed)).rejects.toThrow(TrustBundleError);
   });
 });

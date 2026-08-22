@@ -30,6 +30,53 @@ where
     Ok(Some(value))
 }
 
+/// Bound the carried endorsement edge-set at the wire, independently of the
+/// relay's own `MAX_RELAYED_ENDORSEMENTS` (the same 64 — see the constant's
+/// rationale). The honest relay never forwards more, so an over-cap list can
+/// only come from a party driving this socket directly; refusing the frame at
+/// deserialization stops it before the vector is even fully allocated, and the
+/// admission path re-checks the same cap for defense in depth. `#[serde(default)]`
+/// still handles an absent field; a present field must be a sequence, so
+/// `carried_endorsements: null` cannot collapse to "none carried".
+fn deserialize_bounded_carried_endorsements<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CarriedEndorsement>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use spawnd::endorsement_chain::MAX_CARRIED_ENDORSEMENTS;
+
+    struct BoundedEdges;
+    impl<'de> serde::de::Visitor<'de> for BoundedEdges {
+        type Value = Vec<CarriedEndorsement>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(
+                formatter,
+                "a sequence of at most {MAX_CARRIED_ENDORSEMENTS} carried endorsement edges"
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut edges = Vec::new();
+            while let Some(edge) = seq.next_element::<CarriedEndorsement>()? {
+                if edges.len() == MAX_CARRIED_ENDORSEMENTS {
+                    return Err(serde::de::Error::custom(
+                        "carried endorsement edges exceed the daemon cap",
+                    ));
+                }
+                edges.push(edge);
+            }
+            Ok(edges)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedEdges)
+}
+
 fn serialize_bounded_signed_envelope<S>(
     value: &Option<String>,
     serializer: S,
@@ -62,6 +109,12 @@ pub enum Outbound {
         arch: String,
         version: String,
         existing_agents: Vec<Uuid>,
+        /// This build admits browsers via account-scoped endorsement chains
+        /// (`endorsement_chain::find_valid_chain`), so the server may refuse the
+        /// legacy per-host device-endorsement path toward this host (mesh R9:
+        /// while both paths validate, a hostile server picks the weaker one).
+        /// Old servers ignore the unknown field.
+        supports_account_chains: bool,
     },
     #[serde(rename = "host.heartbeat")]
     HostHeartbeat,
@@ -206,6 +259,12 @@ pub enum Inbound {
         // every local pin to be dropped.
         #[serde(default)]
         browser_device_ids: Option<Vec<String>>,
+        /// Account deny-list (device mesh §3): wire keys of revoked devices this
+        /// host must subtract from acceptance, so a revoked device cannot connect
+        /// even through a chain to an anchor. Server-delivered, add-only for the
+        /// owner, subtract-only here; a wrong value can only DENY, never grant.
+        #[serde(default)]
+        revoked_browser_keys: Option<Vec<String>>,
     },
     /// Pushed when a host's browser pin set changes, so an endorsement takes
     /// effect without waiting for the daemon to reconnect.
@@ -217,6 +276,8 @@ pub enum Inbound {
         browser_pins: Option<Vec<InboundBrowserPin>>,
         #[serde(default)]
         browser_device_ids: Option<Vec<String>>,
+        #[serde(default)]
+        revoked_browser_keys: Option<Vec<String>>,
     },
     #[serde(rename = "host.heartbeat")]
     HostHeartbeat,
@@ -269,6 +330,16 @@ pub enum Inbound {
             deserialize_with = "deserialize_present_bounded_signed_envelope"
         )]
         signed_envelope: Option<String>,
+        /// Account endorsement edges the browser carries so a daemon that does
+        /// not directly pin the offering key can admit it via a chain to an
+        /// anchor (device mesh §3). Empty for a directly-pinned browser.
+        /// Bounded at the wire: a set larger than the daemon's independent cap
+        /// rejects the whole frame (see the deserializer).
+        #[serde(
+            default,
+            deserialize_with = "deserialize_bounded_carried_endorsements"
+        )]
+        carried_endorsements: Vec<CarriedEndorsement>,
         #[serde(default)]
         ice_servers: Vec<RtcIceServerConfig>,
         #[serde(default)]
@@ -320,6 +391,21 @@ pub struct RtcIceServerConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub credential: Option<String>,
+}
+
+/// One account-scoped endorsement edge a browser carries on an RTC offer so a
+/// daemon that does not directly pin the offering key can still admit it via a
+/// chain to a key it does pin (docs/TRUST_DEVICE_MESH.md §3). Every field is
+/// server-relayed and untrusted; the daemon re-verifies each signature and finds
+/// the chain (`endorsement_chain::find_valid_chain`). Wire strings, so the daemon
+/// reconstructs the exact `SPAWN-ACCT-ENDORSE-V1` transcript it re-verifies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CarriedEndorsement {
+    pub account_id: String,
+    pub endorser_public_key: String,
+    pub endorsed_public_key: String,
+    pub endorsed_device_id: String,
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,31 +496,6 @@ pub struct DeviceStartRequest<'a> {
     pub version: &'a str,
     pub host_key_algorithm: &'a str,
     pub host_public_key: &'a str,
-    /// Committed-ephemeral SAS commitment `Cd`. Skipped when absent so a retry
-    /// against a pre-SAS server (which forbids unknown fields) is clean.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sas_commit: Option<&'a str>,
-}
-
-/// Daemon's side of the SAS handshake — fetch the browser's `Nb`/`B` and, once
-/// present, reveal our own `Nd`. See docs/TRUST_DEVICE_MESH.md Appendix A.
-#[derive(Debug, Serialize)]
-pub struct DeviceSasHostRequest<'a> {
-    pub device_code: &'a str,
-    pub host_key_algorithm: &'a str,
-    pub host_public_key: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sas_host_nonce: Option<&'a str>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DeviceSasHostResponse {
-    #[serde(default)]
-    pub sas_browser_nonce: Option<String>,
-    #[serde(default)]
-    pub sas_browser_key: Option<String>,
-    // The server also echoes sas_host_nonce; the daemon has no use for it back,
-    // and serde drops the unrecognized field.
 }
 
 #[derive(Debug, Deserialize)]
@@ -701,6 +762,68 @@ mod signed_rtc_relay_tests {
                 }))
                 .is_err(),
                 "present answer field must require a non-null string"
+            );
+        }
+    }
+
+    #[test]
+    fn carried_endorsements_are_bounded_at_the_wire() {
+        use spawnd::endorsement_chain::MAX_CARRIED_ENDORSEMENTS;
+
+        let session_id = "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1";
+        let edge = serde_json::json!({
+            "account_id": "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
+            "endorser_public_key": "endorser",
+            "endorsed_public_key": "endorsed",
+            "endorsed_device_id": "11111111-2222-4333-8444-555555555551",
+            "signature": "sig",
+        });
+        let offer = |count: usize| {
+            serde_json::json!({
+                "type": "rtc.offer",
+                "session_id": session_id,
+                "signed_envelope": "{\"opaque\":true}",
+                "carried_endorsements": vec![edge.clone(); count],
+            })
+        };
+
+        // The honest relay never forwards more than 64 edges, so exactly the
+        // cap must parse and one over must reject the whole frame — an
+        // over-cap set only ever comes from a party driving the daemon socket
+        // directly, and it must not buy any admission work.
+        let at_cap: Inbound = serde_json::from_value(offer(MAX_CARRIED_ENDORSEMENTS))
+            .expect("an at-cap carried edge set parses");
+        assert!(matches!(
+            at_cap,
+            Inbound::RtcOffer { ref carried_endorsements, .. }
+                if carried_endorsements.len() == MAX_CARRIED_ENDORSEMENTS
+        ));
+        assert!(
+            serde_json::from_value::<Inbound>(offer(MAX_CARRIED_ENDORSEMENTS + 1)).is_err(),
+            "an over-cap carried edge set must reject the frame"
+        );
+
+        // Absent stays the empty default; present-but-not-a-sequence rejects.
+        let absent: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "rtc.offer",
+            "session_id": session_id,
+            "signed_envelope": "{\"opaque\":true}",
+        }))
+        .expect("absent carried edges remain valid");
+        assert!(matches!(
+            absent,
+            Inbound::RtcOffer { ref carried_endorsements, .. } if carried_endorsements.is_empty()
+        ));
+        for bad in [serde_json::Value::Null, serde_json::json!("edges")] {
+            assert!(
+                serde_json::from_value::<Inbound>(serde_json::json!({
+                    "type": "rtc.offer",
+                    "session_id": session_id,
+                    "signed_envelope": "{\"opaque\":true}",
+                    "carried_endorsements": bad,
+                }))
+                .is_err(),
+                "a present non-sequence carried_endorsements must reject"
             );
         }
     }

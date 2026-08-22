@@ -48,6 +48,11 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: server/uv.lock
+          # The post-job "Pruning cache" step can fail on runner teardown
+          # (uv exit 2 five minutes after "all repeatable checks passed")
+          # and paint a fully green matrix red. Skip it; the cache key
+          # already rotates on uv.lock changes.
+          prune-cache: false
 
       - name: Install server dependencies
         working-directory: server

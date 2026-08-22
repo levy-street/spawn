@@ -81,11 +81,14 @@ export const HostSchema = z.object({
   arch: z.string().nullable().optional(),
   version: z.string().nullable().optional(),
   host_key_algorithm: z.literal("ed25519").nullable().optional(),
+  // The key travels alone (mesh B5): any fingerprint shown or compared is
+  // derived locally from it, never read off a server response.
   host_public_key: z.string().nullable().optional(),
-  host_key_fingerprint: z.string().nullable().optional(),
   status: z.enum(["online", "offline"]),
   last_seen_at: z.string().nullable(),
   agent_count: z.number().int(),
+  /** Mesh R9: chain-capable hosts refuse the legacy per-host endorsement path. */
+  supports_account_chains: z.boolean().default(false),
 });
 export type Host = z.infer<typeof HostSchema>;
 
@@ -258,18 +261,23 @@ export const DevicePendingResponseSchema = z.object({
   host_key_algorithm: z.literal("ed25519"),
   host_public_key: z.string(),
   host_key_fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
-  // Committed-ephemeral SAS: the daemon's commitment Cd (present ⇒ run the SAS)
-  // and its opened nonce Nd (present ⇒ verify the commit and show the number).
-  sas_commit: z.string().nullable().default(null),
-  sas_host_nonce: z.string().nullable().default(null),
+  // The server may still relay legacy possession-SAS fields (sas_commit,
+  // sas_host_nonce) for pre-fragment daemons; this client ignores them — the
+  // host key is verified against the out-of-band `#k=` URL fragment instead,
+  // with the full-fingerprint compare as the only fallback.
 });
 export type DevicePendingApproval = z.infer<typeof DevicePendingResponseSchema>;
 
-export const DeviceApproveResponseSchema = DevicePendingResponseSchema.extend({
+// Unlike the pending review (whose fingerprint the daemon prints for the
+// out-of-band compare), the approve echo carries the keys alone (mesh B5):
+// the client verifies the echoed keys byte-for-byte and derives any
+// fingerprint it needs locally.
+export const DeviceApproveResponseSchema = DevicePendingResponseSchema.omit({
+  host_key_fingerprint: true,
+}).extend({
   browser_device_id: z.string().uuid(),
   browser_key_algorithm: z.literal("ed25519"),
   browser_public_key: z.string().length(43),
-  browser_key_fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
   // Present only when this key was already paired (re-pair): the Host row's
   // UUID, used to bind the local pin immediately. First pairings get null and
   // seed from /api/hosts once the daemon's poll creates the row.
@@ -291,12 +299,24 @@ export type AuthProviderList = z.infer<typeof AuthProviderListSchema>;
 export const BrowserDeviceSchema = z.object({
   id: z.string().uuid(),
   key_algorithm: z.literal("ed25519"),
+  // No fingerprint field (mesh B5): the roster derives display fingerprints
+  // from this key locally (ed25519PublicKeyFingerprint), never from a
+  // server-authored label.
   public_key: z.string().length(43),
-  fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
   /** Recognition only; never a trust input. See the server model. */
   label: z.string().nullable().default(null),
   created_at: z.string(),
+  /** Stamped each time this device's registration reconciles (every app load). */
+  last_seen_at: z.string().nullable().default(null),
+  /** When this device last actively asked to be approved (it tried to open an
+   * agent session). Surfaces — and re-surfaces — the approval toast elsewhere. */
+  approval_requested_at: z.string().nullable().default(null),
   revoked_at: z.string().nullable(),
+  /** Which of the account's devices asked for the removal (attribution, R4). */
+  revoked_by_device_id: z.string().nullable().default(null),
+  /** The account root (pk_R): endorses + anchors, never connects. Filtered out
+   * of connect/ceremony lists. */
+  is_root: z.boolean().default(false),
 });
 export type BrowserDevice = z.infer<typeof BrowserDeviceSchema>;
 
@@ -379,18 +399,6 @@ export const auth = {
       body: JSON.stringify(body),
       schema: DeviceApproveResponseSchema,
     }),
-  // Browser's committed-ephemeral SAS contribution: its nonce Nb + key B.
-  contributeSas: (body: {
-    user_code?: string;
-    approval_ref?: string;
-    sas_browser_nonce: string;
-    browser_public_key: string;
-  }) =>
-    api("/api/auth/device/sas", {
-      method: "POST",
-      body: JSON.stringify(body),
-      schema: z.object({ ok: z.boolean() }),
-    }),
   pendingDevice: (body: { user_code?: string; approval_ref?: string }) =>
     api("/api/auth/device/pending", {
       method: "POST",
@@ -441,6 +449,8 @@ export const browserDevices = {
     public_key: string;
     signature: string;
     label?: string | null;
+    /** Registers the account ROOT (mesh stage 5): at most one per account. */
+    is_root?: boolean;
   }) =>
     api("/api/browser-devices/register", {
       method: "POST",
@@ -452,16 +462,34 @@ export const browserDevices = {
       method: "GET",
       schema: z.array(BrowserDeviceSchema),
     }),
+  /** The account's PERMANENT key deny-list (R10 tombstones). Corroboration
+   * data for destructive revocation-claim handling (hardening B2): the roster
+   * is mutable, this table is add-only, so a claim must appear in BOTH before
+   * the client rotates the sealed root over it. */
+  revokedKeys: () =>
+    api("/api/browser-devices/revoked-keys", {
+      method: "GET",
+      schema: z.array(
+        z.object({
+          public_key: z.string().length(43),
+          key_algorithm: z.string(),
+          revoked_at: z.string(),
+        }),
+      ),
+    }),
   rename: (deviceId: string, label: string | null) =>
     api(`/api/browser-devices/${deviceId}`, {
       method: "PATCH",
       body: JSON.stringify({ label }),
       schema: BrowserDeviceSchema,
     }),
-  revoke: (deviceId: string, expectedPublicKey: string) =>
+  revoke: (deviceId: string, expectedPublicKey: string, revokedByDeviceId?: string | null) =>
     api(`/api/browser-devices/${deviceId}/revoke`, {
       method: "POST",
-      body: JSON.stringify({ expected_public_key: expectedPublicKey }),
+      body: JSON.stringify({
+        expected_public_key: expectedPublicKey,
+        revoked_by_device_id: revokedByDeviceId ?? null,
+      }),
       schema: BrowserDeviceSchema,
     }),
   /** Hard-deletes this account's revoked device tombstones. */
@@ -469,6 +497,14 @@ export const browserDevices = {
     api("/api/browser-devices/prune", {
       method: "POST",
       schema: z.object({ pruned: z.number().int() }),
+    }),
+  /** This (unapproved) device asks out loud to be approved — other devices'
+   * roster poll surfaces, or re-surfaces, the approval toast. Advisory only. */
+  requestApproval: (deviceId: string, publicKey: string) =>
+    api(`/api/browser-devices/${deviceId}/request-approval`, {
+      method: "POST",
+      body: JSON.stringify({ public_key: publicKey }),
+      schema: BrowserDeviceSchema,
     }),
 };
 
@@ -546,6 +582,69 @@ export const account = {
     api<void>("/api/account/delete", { method: "POST", body: JSON.stringify(body) }),
 };
 
+/** One relayed host-key introduction (mesh R7); untrusted until the joiner
+ * verifies its signature against the ceremony-pinned initiator key. */
+export const PairingIntroductionSchema = z.object({
+  host_id: z.string(),
+  host_name: z.string(),
+  host_public_key: z.string().length(43),
+  signature: z.string().length(86),
+});
+export type PairingIntroduction = z.infer<typeof PairingIntroductionSchema>;
+
+/** One relayed device-key introduction (continuous gossip bootstrap); untrusted
+ * until the joiner verifies it against the ceremony-pinned initiator key. */
+export const PairingDeviceIntroductionSchema = z.object({
+  device_id: z.string(),
+  device_label: z.string(),
+  device_public_key: z.string().length(43),
+  signature: z.string().length(86),
+});
+export type PairingDeviceIntroduction = z.infer<typeof PairingDeviceIntroductionSchema>;
+
+const PairingStateSchema = z.object({
+  id: z.string(),
+  initiator_device_id: z.string(),
+  joiner_device_id: z.string(),
+  initiator_public_key: z.string(),
+  initiator_commit: z.string(),
+  joiner_public_key: z.string().nullable().optional(),
+  joiner_nonce: z.string().nullable().optional(),
+  initiator_nonce: z.string().nullable().optional(),
+  introductions: z.array(PairingIntroductionSchema).nullable().optional(),
+  device_introductions: z.array(PairingDeviceIntroductionSchema).nullable().optional(),
+  created_at: z.string(),
+  expires_at: z.string(),
+});
+export type PairingState = z.infer<typeof PairingStateSchema>;
+
+/** One durable broadcast introduction as served; untrusted until verified
+ * against a FIRSTHAND copy of the publisher's key. */
+export const HostIntroductionRowSchema = z.object({
+  id: z.string(),
+  publisher_device_id: z.string(),
+  publisher_public_key: z.string().length(43),
+  host_id: z.string(),
+  host_name: z.string(),
+  host_public_key: z.string().length(43),
+  signature: z.string().length(86),
+  created_at: z.string(),
+});
+export type HostIntroductionRow = z.infer<typeof HostIntroductionRowSchema>;
+
+/** One durable root-key introduction as served; untrusted until verified
+ * against a FIRSTHAND copy of the introducer's key (mesh §4.1). */
+export const RootIntroductionRowSchema = z.object({
+  id: z.string(),
+  introducer_device_id: z.string(),
+  introducer_public_key: z.string().length(43),
+  root_public_key: z.string().length(43),
+  signature: z.string().length(86),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+export type RootIntroductionRow = z.infer<typeof RootIntroductionRowSchema>;
+
 export const trust = {
   /** null when this account has never sealed a bundle. */
   getBundle: () =>
@@ -564,6 +663,15 @@ export const trust = {
       body: JSON.stringify({ sealed, expected_revision: expectedRevision ?? null }),
       schema: TrustBundleSchema,
     }),
+  /** Abandon the sealed bundle (removing the last passkey). Forgets recovery
+   * material only — never grants or restores anything. `expectedRevision` must
+   * be the revision the bundle was read at: the server 409s a mismatch, so a
+   * delete racing another device's enrollment (its putBundle landed, its
+   * addPasskey had not yet) cannot strand that credential without its bundle. */
+  deleteBundle: (expectedRevision: number) =>
+    api<void>(`/api/trust/bundle?expected_revision=${encodeURIComponent(expectedRevision)}`, {
+      method: "DELETE",
+    }),
   listPasskeys: () =>
     api("/api/trust/passkeys", {
       method: "GET",
@@ -580,6 +688,22 @@ export const trust = {
   /** Browser device IDs a host already trusts. */
   hostPins: (hostId: string) =>
     api(`/api/trust/hosts/${hostId}/pins`, { method: "GET", schema: z.array(z.string()) }),
+  /**
+   * Pin records with provenance for the Access screen's host rows: `direct`
+   * means the pin came from the possess ceremony itself. Display only —
+   * admission stays daemon-side.
+   */
+  hostPinDetails: (hostId: string) =>
+    api(`/api/trust/hosts/${hostId}/pin-details`, {
+      method: "GET",
+      schema: z.array(
+        z.object({
+          device_id: z.string(),
+          direct: z.boolean(),
+          created_at: z.string(),
+        }),
+      ),
+    }),
   /**
    * Endorsements naming this device, so it can verify them locally and learn
    * its hosts' true keys. Every field is server-claimed; the caller verifies.
@@ -611,10 +735,132 @@ export const trust = {
       schema: z.object({
         host_id: z.string(),
         endorsed_device_id: z.string(),
-        endorsed_key_fingerprint: z.string(),
         endorser_device_id: z.string(),
         created_at: z.string(),
       }),
+    }),
+
+  // ----- device mesh: account-scoped endorsements (§3) -----
+
+  /**
+   * Every account-scoped endorsement edge, for a device to assemble the carried
+   * chain it presents on connect. Server-claimed; the daemon re-verifies each.
+   */
+  accountEndorsements: () =>
+    api("/api/trust/account-endorsements", {
+      method: "GET",
+      schema: z.array(
+        z.object({
+          endorser_device_id: z.string(),
+          endorser_public_key: z.string(),
+          endorsed_device_id: z.string(),
+          endorsed_public_key: z.string(),
+          signature: z.string(),
+          created_at: z.string(),
+        }),
+      ),
+    }),
+  createAccountEndorsement: (body: {
+    endorser_device_id: string;
+    endorsed_device_id: string;
+    signature: string;
+  }) =>
+    api("/api/trust/account-endorsements", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: z.object({
+        id: z.string(),
+        endorser_device_id: z.string(),
+        endorsed_device_id: z.string(),
+        created_at: z.string(),
+      }),
+    }),
+
+  // ----- device mesh: browser↔browser add-device SAS ceremony (§4) -----
+
+  startPairing: (body: {
+    initiator_device_id: string;
+    joiner_device_id: string;
+    initiator_public_key: string;
+    initiator_commit: string;
+  }) =>
+    api("/api/trust/pairing", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: z.object({ id: z.string(), expires_at: z.string() }),
+    }),
+  listPairings: (deviceId: string) =>
+    api(`/api/trust/pairing?device_id=${encodeURIComponent(deviceId)}`, {
+      method: "GET",
+      schema: z.array(PairingStateSchema),
+    }),
+  contributePairing: (id: string, body: { joiner_public_key: string; joiner_nonce: string }) =>
+    api(`/api/trust/pairing/${id}/contribute`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: PairingStateSchema,
+    }),
+  revealPairing: (id: string, body: { initiator_nonce: string }) =>
+    api(`/api/trust/pairing/${id}/reveal`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: PairingStateSchema,
+    }),
+  cancelPairing: (id: string) =>
+    api(`/api/trust/pairing/${id}`, { method: "DELETE", schema: z.unknown() }),
+  /** Initiator only in practice: the signatures bind ITS key; a joiner-posted
+   * list would verify for no one. Set-once on the relay. */
+  postPairingIntroductions: (
+    id: string,
+    introductions: PairingIntroduction[],
+    deviceIntroductions: PairingDeviceIntroduction[] = [],
+  ) =>
+    api(`/api/trust/pairing/${id}/introductions`, {
+      method: "POST",
+      body: JSON.stringify({
+        introductions,
+        device_introductions: deviceIntroductions,
+      }),
+      schema: PairingStateSchema,
+    }),
+  /** The durable broadcast store (continuous gossip): every live introduction
+   * for this account, minus rows from revoked publishers. */
+  listHostIntroductions: () =>
+    api("/api/trust/host-introductions", {
+      method: "GET",
+      schema: z.array(HostIntroductionRowSchema),
+    }),
+  /** Publish (or idempotently re-publish) one broadcast introduction. */
+  publishHostIntroduction: (body: {
+    publisher_device_id: string;
+    host_id: string;
+    host_name: string;
+    host_public_key: string;
+    signature: string;
+  }) =>
+    api("/api/trust/host-introductions", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: HostIntroductionRowSchema,
+    }),
+  /** The durable root-introduction store (mesh §4.1 provenance channel):
+   * every live introduction of pk_R, minus rows from revoked introducers. */
+  listRootIntroductions: () =>
+    api("/api/trust/root-introductions", {
+      method: "GET",
+      schema: z.array(RootIntroductionRowSchema),
+    }),
+  /** Publish (or idempotently re-publish) this device's root introduction;
+   * publishing a successor key replaces this introducer's own row. */
+  publishRootIntroduction: (body: {
+    introducer_device_id: string;
+    root_public_key: string;
+    signature: string;
+  }) =>
+    api("/api/trust/root-introductions", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: RootIntroductionRowSchema,
     }),
 };
 

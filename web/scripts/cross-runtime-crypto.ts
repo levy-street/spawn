@@ -82,6 +82,7 @@ interface WireArtifact {
 interface RegistrationArtifact {
   user_id: string;
   browser_public_key: string;
+  is_root: boolean;
   canonical_bytes: string;
   canonical_sha256: string;
   signature: string;
@@ -392,6 +393,7 @@ async function verifyRustArtifact(artifact: ExchangeArtifact): Promise<void> {
   const registrationBytes = encodeBrowserDeviceRegistrationTranscript(
     artifact.registration.user_id,
     artifact.registration.browser_public_key,
+    artifact.registration.is_root,
   );
   assertEqual(
     "registration bytes",
@@ -408,10 +410,25 @@ async function verifyRustArtifact(artifact: ExchangeArtifact): Promise<void> {
       artifact.registration.user_id,
       artifact.registration.browser_public_key,
       artifact.registration.signature,
+      artifact.registration.is_root,
     ))
   ) {
     throw new Error(
       "WebCrypto rejected the Rust browser-registration signature",
+    );
+  }
+  // B1: the root flag is inside the signed transcript, so the same signature
+  // must fail when the claim is flipped.
+  if (
+    await verifyBrowserDeviceRegistrationProof(
+      artifact.registration.user_id,
+      artifact.registration.browser_public_key,
+      artifact.registration.signature,
+      !artifact.registration.is_root,
+    )
+  ) {
+    throw new Error(
+      "Rust browser-registration signature verified with a flipped root flag",
     );
   }
 
@@ -527,9 +544,14 @@ async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
   );
 
   const userId = crypto.randomUUID();
+  // WebCrypto produces the root-flagged (is_root = true) variant; the Rust
+  // producer emits the ordinary-device one, so both flag values cross the
+  // runtime boundary in both directions.
+  const registrationIsRoot = true;
   const registrationBytes = encodeBrowserDeviceRegistrationTranscript(
     userId,
     browserPublicKey,
+    registrationIsRoot,
   );
   const approvalNonce = encodeBase64Url(
     crypto.getRandomValues(new Uint8Array(32)),
@@ -581,6 +603,7 @@ async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
     registration: {
       user_id: userId,
       browser_public_key: browserPublicKey,
+      is_root: registrationIsRoot,
       canonical_bytes: encodeBase64Url(registrationBytes),
       canonical_sha256: await sha256Wire(registrationBytes),
       signature: await rawSignature(browserKey.privateKey, registrationBytes),

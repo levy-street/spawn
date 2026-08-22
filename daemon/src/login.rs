@@ -1,23 +1,21 @@
 //! `spawnd login` — interactive device-code flow.
 //!
 //! Flow per `proto/README.md`:
-//!   1. POST /api/auth/device/start  -> { device_code, user_code, verification_uri, interval, expires_in }
+//!   1. POST /api/auth/device/start  -> { device_code, approval_ref, verification_uri, … }
 //!   2. Sign and POST /api/auth/device/possession for that exact ceremony.
-//!   3. Only after proof succeeds, print the verification URI and user code.
+//!   3. Only after proof succeeds, open/print the approval URL — with this
+//!      host's public key appended LOCALLY as a `#k=` URL fragment, the
+//!      out-of-band value the browser checks the server's claimed key against.
 //!   4. Poll /api/auth/device/poll until success / expiry / denial.
 //!   5. On success store {access_token, host_id, server_url}.
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::StatusCode;
-use tokio::time::Instant;
 use zeroize::{Zeroize, Zeroizing};
 
 use spawnd::host_pair_approval::{self, HostPairApprovalTranscript};
-use spawnd::sas;
 use spawnd::signed_signal::public_key_from_wire;
 
 use crate::cli::LoginArgs;
@@ -26,7 +24,7 @@ use crate::creds;
 use crate::creds::HostIdentity;
 use crate::proto::{
     DevicePollRequest, DevicePollResponse, DevicePossessionRequest, DevicePossessionResponse,
-    DeviceSasHostRequest, DeviceSasHostResponse, DeviceStartRequest, DeviceStartResponse,
+    DeviceStartRequest, DeviceStartResponse,
 };
 
 /// What a successful login learned — enough for `possess` to place this
@@ -54,46 +52,22 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    // Committed-ephemeral SAS: our fresh nonce Nd and its commitment Cd, sent in
-    // start. The browser cannot make its number match ours without the Nd we
-    // reveal only after it has committed to its own nonce (Appendix A). The host
-    // key bytes anchor the SAS to this exact host.
-    let host_key_bytes = public_key_from_wire(&identity.public_key)
-        .context("decoding our host public key")?
-        .to_bytes();
-    let mut host_nonce = [0u8; sas::FIELD_BYTES];
-    getrandom::getrandom(&mut host_nonce).context("generating the SAS host nonce")?;
-    let commit_wire = URL_SAFE_NO_PAD.encode(sas::commit(&host_key_bytes, &host_nonce));
-
-    // 1. start — offer the SAS commitment; a pre-SAS server (unknown-field 422)
-    // makes us retry without it and fall back to the full fingerprint compare.
+    // 1. start
     let start_url = config::api_url(&server, "/api/auth/device/start")?;
-    let mut start_req = DeviceStartRequest {
+    let start_req = DeviceStartRequest {
         host_name: &host_name,
         os: &os,
         arch: &arch,
         version: &version,
         host_key_algorithm: identity.algorithm,
         host_public_key: &identity.public_key,
-        sas_commit: Some(&commit_wire),
     };
-    let mut resp = client
+    let start: DeviceStartResponse = client
         .post(start_url.as_str())
         .json(&start_req)
         .send()
         .await
-        .context("POST /api/auth/device/start")?;
-    if resp.status() == StatusCode::UNPROCESSABLE_ENTITY {
-        start_req.sas_commit = None;
-        resp = client
-            .post(start_url.as_str())
-            .json(&start_req)
-            .send()
-            .await
-            .context("POST /api/auth/device/start (no-SAS retry)")?;
-    }
-    let sas_offered = start_req.sas_commit.is_some();
-    let start: DeviceStartResponse = resp
+        .context("POST /api/auth/device/start")?
         .error_for_status()?
         .json()
         .await
@@ -127,67 +101,29 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
     }
 
     // Match a browser login's ease: open the approval page directly, carrying a
-    // handle so it lands on the fingerprint check with nothing to type, and poll
-    // to completion ourselves. We bake the opaque approval_ref into the URL (the
+    // handle so it lands on the approval with nothing to type, and poll to
+    // completion ourselves. We bake the opaque approval_ref into the URL (the
     // short user_code never appears in a link); a pre-0029 server without a ref
-    // falls back to the user_code. The host-key possession proof above is
-    // unchanged — this only touches how the human reaches the approval page.
-    let approve_url = match url::Url::parse(&start.verification_uri) {
-        Ok(mut parsed) => {
-            match start.approval_ref.as_deref() {
-                Some(reference) => parsed.query_pairs_mut().append_pair("ref", reference),
-                None => parsed
-                    .query_pairs_mut()
-                    .append_pair("code", &start.user_code),
-            };
-            parsed.to_string()
-        }
-        Err(_) => start.verification_uri.clone(),
-    };
+    // falls back to the user_code. The URL additionally carries this host's
+    // public key as a `#k=` fragment appended LOCALLY — see `approval_url` for
+    // why that is the ceremony's out-of-band host-key check.
+    let approve_url = approval_url(&server, &start, &identity.public_key)?;
     if open_browser(&approve_url) {
         println!("spawn: opened your browser to approve this host.");
-        println!("spawn:   didn't open? visit {approve_url}");
+        println!("spawn:   didn't open? use this link on any device:");
     } else {
-        println!("spawn: approve this host in your browser:");
-        println!("spawn:   {approve_url}");
+        println!("spawn: approve this host in your browser — open this link on any device:");
     }
+    println!("spawn:   {approve_url}");
     println!();
 
-    // Always print the fingerprint first: it is sound, immediate, and the value
-    // the browser also shows — so there is something to compare even before the
-    // shorter SAS number is ready, and the two screens can never desync. When a
-    // commitment was offered, run the SAS handshake *concurrently* with the
-    // approval poll below; it prints the short code the moment the browser
-    // contributes, however long the human takes to open the page.
-    println!("spawn:   verify host fingerprint   {}", identity.fingerprint);
-    if sas_offered {
-        println!(
-            "spawn:   (a shorter 6-digit code appears here once your browser loads — match either)"
-        );
-        let sas_client = client.clone();
-        let sas_server = server.clone();
-        let sas_device_code = start.device_code.clone();
-        let sas_public_key = identity.public_key.clone();
-        let sas_algorithm = identity.algorithm;
-        tokio::spawn(async move {
-            if let Ok(Some(code)) = run_sas_handshake(
-                &sas_client,
-                &sas_server,
-                &sas_device_code,
-                sas_algorithm,
-                &sas_public_key,
-                &host_key_bytes,
-                &host_nonce,
-            )
-            .await
-            {
-                println!("spawn:   verification code   {code}");
-                println!("spawn:   confirm it matches the code in your browser, then approve.");
-            }
-        });
-    } else {
-        println!("spawn:   confirm it matches the fingerprint in your browser, then approve.");
-    }
+    // The link's fragment carries the key check; the fingerprint stays printed
+    // for the fallback (a browser that never received the fragment — retyped
+    // URL, older page — falls back to comparing exactly this value).
+    println!("spawn:   the link carries this host's identity key (the part after '#');");
+    println!("spawn:   your browser checks it automatically before asking you to approve.");
+    println!("spawn:   asked to compare a fingerprint instead? it must be exactly:");
+    println!("spawn:     {}", identity.fingerprint);
     println!();
     println!("spawn: waiting for approval…");
 
@@ -258,80 +194,50 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
     }
 }
 
-/// Drive the daemon's side of the committed-ephemeral SAS: poll for the
-/// browser's nonce `Nb` and key `B`, and once present compute the number, reveal
-/// our own `Nd`, and return the number. Returns `Ok(None)` if the browser never
-/// contributes within the window (old page, or a server without the endpoint) —
-/// the caller then falls back to the fingerprint.
-async fn run_sas_handshake(
-    client: &reqwest::Client,
+/// Build the browser approval URL for this ceremony.
+///
+/// This URL is the possession ceremony's out-of-band channel (it travels
+/// terminal→browser without passing through the server again), so two rules
+/// are load-bearing:
+///
+/// 1. **The fragment is ours.** `#k=<host_public_key_wire>` is appended
+///    locally from the key this daemon holds; `set_fragment` also overwrites
+///    anything the server smuggled into `verification_uri`. Fragments are
+///    never sent in HTTP requests, so the server cannot observe or rewrite
+///    this value in flight — the browser compares the server's claimed host
+///    key against it and refuses to pin on any difference.
+/// 2. **Same origin or nothing.** A hostile server could otherwise point
+///    `verification_uri` at a page it controls, read or replace the fragment
+///    there, and bounce the human into the real approval page with a key of
+///    its choosing. The approval page must live on the origin the operator
+///    pointed this daemon at, or we refuse to continue.
+fn approval_url(
     server: &url::Url,
-    device_code: &str,
-    host_key_algorithm: &str,
+    start: &DeviceStartResponse,
     host_public_key: &str,
-    host_key_bytes: &[u8; sas::FIELD_BYTES],
-    host_nonce: &[u8; sas::FIELD_BYTES],
-) -> Result<Option<String>> {
-    let url = config::api_url(server, "/api/auth/device/sas-host")?;
-    let nd_wire = URL_SAFE_NO_PAD.encode(host_nonce);
-    // Keep trying for most of the ceremony window, not a few seconds: the human
-    // may take a while to open the page, and giving up early would desync (the
-    // daemon on the fingerprint, the browser stuck waiting for a code).
-    let deadline = Instant::now() + Duration::from_secs(20 * 60);
-    loop {
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        let resp = client
-            .post(url.as_str())
-            .json(&DeviceSasHostRequest {
-                device_code,
-                host_key_algorithm,
-                host_public_key,
-                sas_host_nonce: None,
-            })
-            .send()
-            .await
-            .context("POST /api/auth/device/sas-host")?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None); // pre-SAS server / unknown ceremony
-        }
-        let body: DeviceSasHostResponse = resp
-            .error_for_status()?
-            .json()
-            .await
-            .context("decoding device/sas-host response")?;
-        if let (Some(nb_wire), Some(b_wire)) = (body.sas_browser_nonce, body.sas_browser_key) {
-            let browser_nonce = decode_sas_field(&nb_wire).context("decoding browser SAS nonce")?;
-            let browser_key = public_key_from_wire(&b_wire)
-                .context("decoding approved browser key")?
-                .to_bytes();
-            let code = sas::sas(host_key_bytes, &browser_key, host_nonce, &browser_nonce);
-            // Reveal Nd only now — after Nb — so a relay cannot rush our open.
-            let _ = client
-                .post(url.as_str())
-                .json(&DeviceSasHostRequest {
-                    device_code,
-                    host_key_algorithm,
-                    host_public_key,
-                    sas_host_nonce: Some(&nd_wire),
-                })
-                .send()
-                .await;
-            return Ok(Some(code));
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+) -> Result<String> {
+    let mut parsed = url::Url::parse(&start.verification_uri).with_context(|| {
+        format!(
+            "the server sent an unusable approval page URL {:?}",
+            start.verification_uri
+        )
+    })?;
+    if parsed.origin() != server.origin() {
+        bail!(
+            "the server's approval page ({}) is not on the server this daemon was pointed at ({}); \
+             refusing — a relay that redirects approval elsewhere could substitute the host key",
+            parsed.origin().ascii_serialization(),
+            server.origin().ascii_serialization(),
+        );
     }
-}
-
-fn decode_sas_field(wire: &str) -> Result<[u8; sas::FIELD_BYTES]> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(wire)
-        .context("SAS field is not canonical base64url")?;
-    bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("SAS field has the wrong length"))
+    match start.approval_ref.as_deref() {
+        Some(reference) => parsed.query_pairs_mut().append_pair("ref", reference),
+        None => parsed
+            .query_pairs_mut()
+            .append_pair("code", &start.user_code),
+    };
+    parsed.set_fragment(Some(&format!("k={host_public_key}")));
+    Ok(parsed.to_string())
 }
 
 /// Best-effort: open `url` in the operator's default browser. Returns whether a
@@ -606,6 +512,84 @@ mod tests {
         body.browser_public_key = Some(BROWSER_KEY.into());
         body.browser_key_fingerprint = Some(creds::browser_key_fingerprint(BROWSER_KEY).unwrap());
         body
+    }
+
+    fn start_response(verification_uri: &str, approval_ref: Option<&str>) -> DeviceStartResponse {
+        DeviceStartResponse {
+            device_code: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into(),
+            user_code: "ABCD-EFGH".into(),
+            approval_ref: approval_ref.map(str::to_string),
+            approval_nonce: TEST_APPROVAL_NONCE.into(),
+            verification_uri: verification_uri.into(),
+            interval: 5,
+            expires_in: 600,
+        }
+    }
+
+    #[test]
+    fn approval_url_bakes_the_ref_and_appends_our_key_as_the_fragment() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let url = approval_url(
+            &server,
+            &start_response("https://spawn.example/device", Some("REFxyz")),
+            BROWSER_KEY, // any wire-encoded key literal works here
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            format!("https://spawn.example/device?ref=REFxyz#k={BROWSER_KEY}")
+        );
+    }
+
+    #[test]
+    fn approval_url_overwrites_any_server_supplied_fragment() {
+        // A hostile server pre-baking `#k=<its key>` into verification_uri must
+        // not survive: the fragment is this daemon's channel, set locally.
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let url = approval_url(
+            &server,
+            &start_response("https://spawn.example/device#k=EVILKEY", Some("REFxyz")),
+            BROWSER_KEY,
+        )
+        .unwrap();
+        assert!(!url.contains("EVILKEY"), "server fragment survived: {url}");
+        assert!(url.ends_with(&format!("#k={BROWSER_KEY}")));
+    }
+
+    #[test]
+    fn approval_url_refuses_a_cross_origin_approval_page() {
+        // Same host, different scheme/port/host each count as a different
+        // origin — a page the server chose, not the one the operator trusts.
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        for evil in [
+            "https://evil.example/device",
+            "http://spawn.example/device",
+            "https://spawn.example:8443/device",
+        ] {
+            let error = approval_url(&server, &start_response(evil, Some("REFxyz")), BROWSER_KEY)
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("refusing"),
+                "unexpected error for {evil}: {error:#}"
+            );
+        }
+        // Unparseable is refused too — an origin we cannot check is unchecked.
+        assert!(approval_url(&server, &start_response("not a url", None), BROWSER_KEY).is_err());
+    }
+
+    #[test]
+    fn approval_url_falls_back_to_the_user_code_without_a_ref() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let url = approval_url(
+            &server,
+            &start_response("https://spawn.example/device", None),
+            BROWSER_KEY,
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            format!("https://spawn.example/device?code=ABCD-EFGH#k={BROWSER_KEY}")
+        );
     }
 
     #[test]

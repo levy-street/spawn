@@ -50,7 +50,6 @@ test("an endorsed browser verifies its hosts from the endorsement itself", async
       {
         ...host,
         host_public_key: wire(hostRaw),
-        host_key_fingerprint: fingerprintOf(hostRaw),
       },
     ],
   });
@@ -100,6 +99,8 @@ test("an endorsed browser verifies its hosts from the endorsement itself", async
   });
 
   await page.goto("/settings");
+  // Introductions live under Advanced on the Access tab.
+  await page.getByTestId("access-advanced").locator("summary").click();
   const panel = page.getByTestId("introduction-panel");
   await expect(panel).toBeVisible({ timeout: 20_000 });
   // The fingerprint shown is the ENDORSER's, derived locally from its key.
@@ -141,7 +142,6 @@ test("a server-substituted host key cannot be introduced", async ({ page }) => {
       {
         ...host,
         host_public_key: wire(attackerRaw),
-        host_key_fingerprint: fingerprintOf(attackerRaw),
       },
     ],
   });
@@ -197,6 +197,7 @@ test("a server-substituted host key cannot be introduced", async ({ page }) => {
   });
 
   await page.goto("/settings");
+  await page.getByTestId("access-advanced").locator("summary").click();
   await expect(page.getByTestId("browser-fingerprint")).toBeVisible({ timeout: 20_000 });
   await page.waitForTimeout(2_000);
   // Nothing verifies, so the panel never offers the substituted key.

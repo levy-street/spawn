@@ -1,5 +1,11 @@
-//! Committed-ephemeral Short Authentication String (SAS) for host↔browser and
-//! browser↔browser pairing — the number a human compares across two screens.
+//! Committed-ephemeral Short Authentication String (SAS) — the number a human
+//! compares across two screens during the browser↔browser add-device ceremony.
+//!
+//! Host possession no longer uses the SAS: since the out-of-band URL-fragment
+//! key check (2026-08, see `login::approval_url`), the daemon neither commits
+//! nor reveals a nonce. This module remains the normative Rust twin of the web
+//! implementation — the ceremony that still uses it runs entirely in browsers,
+//! and the shared vectors below keep `web/src/lib/sas.ts` byte-identical.
 //!
 //! This is the construction docs/TRUST_DEVICE_MESH.md Appendix A requires: a
 //! 6-digit code a substituting/grinding server **cannot** forge. It is Bluetooth

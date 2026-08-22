@@ -18,7 +18,8 @@ from sqlalchemy.orm import aliased
 from .. import auth as auth_mod
 from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
-from ..models import Agent, BrowserDevice, Host, HostBrowserPin
+from ..models import Agent, BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey
+from ..pin_liveness import live_browser_device_id_set
 from ..redis import agent_event_channel, get_backend
 from .broker import DaemonConn, RtcSessionBinding, get_broker
 from .host_signal import (
@@ -191,6 +192,11 @@ async def _prepare_host_activation(
         value = registration.get(field)
         if isinstance(value, str) and value:
             values[field] = value
+    # Ratchet, never lower: once a chain-capable daemon has registered, the
+    # legacy per-host endorsement path stays retired for this host (mesh R9)
+    # even if an older build reconnects later.
+    if registration.get("supports_account_chains") is True:
+        values["supports_account_chains"] = True
     result = await session.execute(
         update(Host)
         .where(
@@ -230,9 +236,7 @@ async def _attempt_host_activation(
     active = await get_backend().get_ephemeral(host_presence_key(host_id))
     if active is not None:
         active_owner = decode_host_presence_owner(active)
-        if active_owner is None or (
-            active_owner.generation >= generation and active != value
-        ):
+        if active_owner is None or (active_owner.generation >= generation and active != value):
             return
     async with _bounded_host_ownership_session() as session:
         if not await _prepare_host_activation(
@@ -685,12 +689,16 @@ def _agent_owner_exists(conn: DaemonConn) -> Any:
 async def _redis_owner_is_current(conn: DaemonConn) -> bool:
     expected = _host_presence_value(conn)
     generation = conn.host_generation
-    return expected is not None and generation is not None and (
-        await get_backend().host_owner_is_current(
-            host_presence_key(conn.host_id),
-            host_pending_presence_key(conn.host_id),
-            expected,
-            generation=generation,
+    return (
+        expected is not None
+        and generation is not None
+        and (
+            await get_backend().host_owner_is_current(
+                host_presence_key(conn.host_id),
+                host_pending_presence_key(conn.host_id),
+                expected,
+                generation=generation,
+            )
         )
     )
 
@@ -698,57 +706,14 @@ async def _redis_owner_is_current(conn: DaemonConn) -> bool:
 async def _live_browser_device_id_set(session: AsyncSession, host_id: str) -> set[str]:
     """Device IDs whose pin on this host is *transitively* live.
 
-    A pin is live iff its endorsed device is not revoked AND either the pin was
-    directly approved (no endorser) or its endorser device is not revoked and the
-    endorser's own pin on this host is itself live. Revoking a device therefore
-    drops the whole endorsement subtree beneath it, not just the pins it directly
-    endorsed: checking only the immediate endorser's revoked flag would let a
-    2+-hop chain of attacker devices (root->mid->leaf) survive revocation of the
-    compromised root, because leaf's endorser `mid` still reads as not-revoked
-    even though `mid`'s own pin was dropped.
-
-    Computed as a fixpoint over the host's pins (bounded by
-    MAX_BROWSER_PINS_PER_HOST) rather than a recursive SQL CTE, so the logic is
-    identical on SQLite and Postgres. A missing endorser row (no FK on
-    endorser_device_id, so a hard-deleted endorser leaves a dangling id) fails
-    closed: endorser_id is NULL, so the pin is never admitted.
+    Thin alias over the shared authority in ``spawn_server.pin_liveness`` —
+    the same computation now also filters the ``/api/trust/hosts/{id}/pins``
+    routes, so what the UI reports as trusted and what the daemon adopts can
+    never fork. See that module for the full semantics (fixpoint, fail-closed
+    dangling endorsers, and the root-anchor ratchet exception).
     """
 
-    endorser = aliased(BrowserDevice)
-    rows = (
-        await session.execute(
-            select(
-                HostBrowserPin.browser_device_id,
-                HostBrowserPin.endorser_device_id,
-                BrowserDevice.revoked_at.label("endorsed_revoked_at"),
-                endorser.id.label("endorser_id"),
-                endorser.revoked_at.label("endorser_revoked_at"),
-            )
-            .join(BrowserDevice, BrowserDevice.id == HostBrowserPin.browser_device_id)
-            .outerjoin(endorser, endorser.id == HostBrowserPin.endorser_device_id)
-            .where(HostBrowserPin.host_id == host_id)
-        )
-    ).all()
-
-    # Only pins whose own endorsed device is not revoked are ever eligible.
-    eligible = [row for row in rows if row.endorsed_revoked_at is None]
-    live: set[str] = set()
-    changed = True
-    while changed:
-        changed = False
-        for row in eligible:
-            if row.browser_device_id in live:
-                continue
-            rooted = row.endorser_device_id is None
-            endorsed_by_live = (
-                row.endorser_id is not None
-                and row.endorser_revoked_at is None
-                and row.endorser_device_id in live
-            )
-            if rooted or endorsed_by_live:
-                live.add(row.browser_device_id)
-                changed = True
-    return live
+    return await live_browser_device_id_set(session, host_id)
 
 
 async def _live_browser_pins(host_id: str) -> list[dict[str, object]]:
@@ -802,6 +767,35 @@ async def _live_browser_device_ids(host_id: str) -> list[str]:
 
     async with _bounded_host_ownership_session() as session:
         return sorted(await _live_browser_device_id_set(session, host_id))
+
+
+async def _revoked_browser_keys(account_id: str) -> list[str]:
+    """Public keys of the account's revoked browser devices — the deny-list a
+    host subtracts from acceptance (device mesh §3). Account-scoped, not
+    host-scoped: a revoked device must be denied even where it would connect via
+    a chain to another host's anchor. Add-only in FACT, not just in effect
+    (R10): the union of currently-revoked roster rows and the permanent
+    ``revoked_browser_keys`` tombstones, which "Clear history" never deletes —
+    a daemon replaces its deny-list wholesale on every push, so computing from
+    prunable rows alone would silently un-revoke a pruned key and re-admit a
+    stolen device via its cached endorsement chain. The roster arm is kept as
+    belt-and-braces for any stamp that has not (yet) been mirrored. The daemon
+    can only reject with this list, never admit."""
+
+    async with _bounded_host_ownership_session() as session:
+        rows = await session.execute(
+            select(BrowserDevice.public_key)
+            .where(
+                BrowserDevice.owner_user_id == account_id,
+                BrowserDevice.revoked_at.is_not(None),
+            )
+            .union(
+                select(RevokedBrowserKey.public_key).where(
+                    RevokedBrowserKey.owner_user_id == account_id
+                )
+            )
+        )
+        return sorted(row[0] for row in rows)
 
 
 async def _bounded_send_text(target: Any, payload: dict[str, object]) -> None:
@@ -978,13 +972,17 @@ async def _process_host_rtc_signal(
                 frame_type == "rtc.close"
                 and isinstance(binding_nonce, str)
                 and signal.get("binding_generation") == generation
-                and await broker.rtc_binding_identity_is_retired(
-                    session_id, conn, binding_nonce
-                )
+                and await broker.rtc_binding_identity_is_retired(session_id, conn, binding_nonce)
             ):
                 await _bounded_send_text(conn, signal)
             return True
         if frame_type == "rtc.offer":
+            # Redis->daemon hop: carried_endorsements pass through here without
+            # re-running sanitize_carried_endorsements — the field was sanitized
+            # once at the authenticated browser ingress before dispatch, this
+            # hop only ever forwards what that ingress published, and the
+            # daemon independently caps the list at 64 edges and re-verifies
+            # every signature before trusting any of it (mesh P2/P5).
             try:
                 if binding.signed_signal:
                     if not signed_mode_selected(signal):
@@ -1019,6 +1017,9 @@ async def _process_host_rtc_signal(
         return True
     frame_type = signal.get("type")
     if frame_type == "rtc.offer":
+        # Redis->daemon hop: as on the agent path above, carried_endorsements
+        # are forwarded without re-running sanitize — the browser ingress
+        # sanitized before dispatch, and the daemon re-caps and re-verifies.
         signed_signal = signed_mode_selected(signal)
         try:
             if signed_signal:
@@ -1343,6 +1344,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 "account_id": host.owner_user_id,
                                 "browser_device_ids": await _live_browser_device_ids(host.id),
                                 "browser_pins": await _live_browser_pins(host.id),
+                                "revoked_browser_keys": await _revoked_browser_keys(
+                                    host.owner_user_id
+                                ),
                             },
                         )
                         registered = True
@@ -1806,6 +1810,7 @@ async def _browser_pins_frame(host_id: str) -> dict[str, Any] | None:
         "account_id": owner_user_id,
         "browser_device_ids": await _live_browser_device_ids(host_id),
         "browser_pins": await _live_browser_pins(host_id),
+        "revoked_browser_keys": await _revoked_browser_keys(owner_user_id),
     }
 
 
