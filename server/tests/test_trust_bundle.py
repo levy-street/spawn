@@ -523,3 +523,132 @@ async def test_bundle_delete_is_account_scoped(client):
     assert (await client.delete("/api/trust/bundle", headers=auth_b)).status_code == 204
     kept = await client.get("/api/trust/bundle", headers=auth_a)
     assert kept.json() is not None
+
+
+# ---------------------------------------------------------------------------
+# Pin-route liveness (P-C4): /pins and /pin-details serve the daemon's answer
+# ---------------------------------------------------------------------------
+
+
+async def _pin_liveness_fixture(client, email: str):
+    """A host pinned by device X (direct) plus a revoked co-pin and a root pin.
+
+    Returns enough handles to arrange the field-bug shape: the R5 sole-trust
+    warning reads these routes, so a revoked device or a revoked root that
+    still shows up as a pin suppresses the warning exactly when it matters.
+    """
+
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from spawn_server.host_identity import ed25519_key_fingerprint
+    from spawn_server.models import BrowserDevice, Host, HostBrowserPin
+
+    user_id, auth = await _signup(client, email)
+
+    def wire(key) -> str:
+        return (
+            base64.urlsafe_b64encode(key.public_key().public_bytes_raw()).rstrip(b"=").decode()
+        )
+
+    async with get_sessionmaker()() as session:
+        host = Host(
+            name="liveness-box",
+            owner_user_id=user_id,
+            host_key_algorithm="ed25519",
+            host_public_key=wire(Ed25519PrivateKey.generate()),
+        )
+        session.add(host)
+        x = BrowserDevice(
+            owner_user_id=user_id,
+            key_algorithm="ed25519",
+            public_key=wire(Ed25519PrivateKey.generate()),
+        )
+        root = BrowserDevice(
+            owner_user_id=user_id,
+            key_algorithm="ed25519",
+            public_key=wire(Ed25519PrivateKey.generate()),
+            is_root=True,
+        )
+        session.add_all([x, root])
+        await session.flush()
+        for device, endorser_id in ((x, None), (root, x.id)):
+            session.add(
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=device.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=device.public_key,
+                    browser_key_fingerprint=ed25519_key_fingerprint(device.public_key),
+                    endorser_device_id=endorser_id,
+                )
+            )
+        await session.commit()
+        ids = (host.id, x.id, root.id)
+    return user_id, auth, ids
+
+
+async def _revoke_device(device_id: str) -> None:
+    from datetime import UTC, datetime
+
+    from spawn_server.models import BrowserDevice
+
+    async with get_sessionmaker()() as session:
+        device = await session.get(BrowserDevice, device_id)
+        device.revoked_at = datetime.now(UTC)
+        await session.commit()
+
+
+async def test_pins_routes_serve_transitively_live_pins_only(client):
+    """A revoked ROOT pin must vanish from both routes (the field-bug shape).
+
+    With X live and the root revoked, the host is sole-trust on X: the raw
+    rows would report two pins and silence the R5 warning for removing X."""
+
+    _, auth, (host_id, x_id, root_id) = await _pin_liveness_fixture(
+        client, "pin-liveness-root@example.com"
+    )
+
+    both = await client.get(f"/api/trust/hosts/{host_id}/pins", headers=auth)
+    assert both.status_code == 200
+    assert sorted(both.json()) == sorted([x_id, root_id])
+
+    await _revoke_device(root_id)
+    pins = await client.get(f"/api/trust/hosts/{host_id}/pins", headers=auth)
+    assert pins.json() == [x_id]
+    details = await client.get(f"/api/trust/hosts/{host_id}/pin-details", headers=auth)
+    assert [row["device_id"] for row in details.json()] == [x_id]
+
+
+async def test_pins_routes_drop_a_revoked_direct_pin(client):
+    """A revoked co-pin device disappears; its endorsement subtree dies with it —
+    except the root-anchor ratchet, which outlives its endorser by design."""
+
+    _, auth, (host_id, x_id, root_id) = await _pin_liveness_fixture(
+        client, "pin-liveness-direct@example.com"
+    )
+
+    await _revoke_device(x_id)
+    pins = await client.get(f"/api/trust/hosts/{host_id}/pins", headers=auth)
+    # X's own pin is gone. The ROOT pin it endorsed survives (mesh §3 ratchet):
+    # anchoring on R exists precisely to outlive any single device's fate.
+    assert pins.json() == [root_id]
+    details = await client.get(f"/api/trust/hosts/{host_id}/pin-details", headers=auth)
+    assert [row["device_id"] for row in details.json()] == [root_id]
+
+
+async def test_pins_routes_match_the_daemon_computation(client):
+    """The routes and the daemon share one helper; a fork here would let the UI
+    and admission disagree about who is trusted."""
+
+    from spawn_server.pin_liveness import live_browser_device_id_set
+
+    _, auth, (host_id, x_id, root_id) = await _pin_liveness_fixture(
+        client, "pin-liveness-shared@example.com"
+    )
+    await _revoke_device(root_id)
+    async with get_sessionmaker()() as session:
+        expected = sorted(await live_browser_device_id_set(session, host_id))
+    pins = await client.get(f"/api/trust/hosts/{host_id}/pins", headers=auth)
+    assert pins.json() == expected == [x_id]
