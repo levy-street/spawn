@@ -321,8 +321,14 @@ export async function openTrustEnvelope(
  * bundle rather than destroyed (hardening B2): rotation was triggered by a
  * server-claimed revocation, and however well corroborated, a server claim
  * must never be able to erase the operator's only copy of firsthand key
- * material. The retired archive is bounded; at the cap rotation refuses
- * loudly instead of silently evicting older material.
+ * material. The retired archive is bounded; AT the cap the OLDEST retired
+ * seed is evicted to admit the newest. Refusing instead (the previous
+ * behavior) threw out of the unlock itself, so the 9th rotation permanently
+ * broke recovery — pins imported but every unlock errored forever after.
+ * Rotation is the compromise response and must keep working unboundedly; the
+ * evicted seed is the least valuable one (its key has been revoked longest,
+ * every anchor on it long severed), while the newest MAX_RETIRED_ROOTS seeds
+ * — the only ones plausibly still referenced anywhere — all survive.
  */
 export async function setEnvelopeRoot(
   accountId: string,
@@ -346,14 +352,12 @@ export async function setEnvelopeRoot(
     );
   }
   const retiredRoots =
-    replace && bundle.root !== null ? [...bundle.retiredRoots, bundle.root] : bundle.retiredRoots;
-  if (retiredRoots.length > MAX_RETIRED_ROOTS) {
-    throw new TrustBundleError(
-      "invalid_bundle",
-      `rotation would exceed the ${MAX_RETIRED_ROOTS} retained retired roots; ` +
-        "refusing rather than destroying retired root material",
-    );
-  }
+    replace && bundle.root !== null
+      ? [...bundle.retiredRoots, bundle.root]
+      : [...bundle.retiredRoots];
+  // Fail-soft at the archive cap: evict the OLDEST retired seed rather than
+  // throwing out of the caller's unlock (see the rotation note above).
+  while (retiredRoots.length > MAX_RETIRED_ROOTS) retiredRoots.shift();
   const amended = await canonicalBundle(accountId, bundle.hosts, revision, root, retiredRoots);
   const sealed = await sealBytes(
     await importDataKey(dataKey),
