@@ -79,7 +79,8 @@ describe("account root", () => {
     const root = await generateAccountRoot();
     const sig = await createRootRegistrationProof(root, ACCOUNT);
 
-    const transcript = encodeBrowserDeviceRegistrationTranscript(ACCOUNT, root.publicKeyWire);
+    // The root's registration proof always carries the root flag (B1).
+    const transcript = encodeBrowserDeviceRegistrationTranscript(ACCOUNT, root.publicKeyWire, true);
     const owned = new ArrayBuffer(transcript.byteLength);
     new Uint8Array(owned).set(transcript);
     const rawKey = decodeEd25519PublicKeyWire(root.publicKeyWire);

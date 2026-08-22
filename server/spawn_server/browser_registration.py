@@ -12,14 +12,23 @@ from fastapi import HTTPException
 
 from .host_identity import decode_ed25519_public_key
 
-BROWSER_REGISTRATION_MAGIC = b"SPAWN-BROWSER-REGISTER-V1"
-BROWSER_REGISTRATION_VERSION = 1
+BROWSER_REGISTRATION_MAGIC = b"SPAWN-BROWSER-REGISTER-V2"
+BROWSER_REGISTRATION_VERSION = 2
+# V2 flags byte, bit 0: the key holder's own claim to be the account ROOT
+# (pk_R) rather than an ordinary browser device. Root-hood is load-bearing
+# server-side (the R9 per-host endorsement exemption and the pin-liveness
+# ratchet), so it must be attested inside the signed transcript, never taken
+# from a mutable request field alone. All other bits are zero in V2.
+BROWSER_REGISTRATION_FLAG_ROOT = 0x01
 ED25519_SIGNATURE_BYTES = 64
 ED25519_SIGNATURE_B64URL_LENGTH = 86
 
 
-def encode_browser_registration_transcript(user_id: str, public_key: bytes) -> bytes:
-    """Encode the fixed-width v1 transcript bound to one authenticated UUID and key."""
+def encode_browser_registration_transcript(
+    user_id: str, public_key: bytes, *, is_root: bool
+) -> bytes:
+    """Encode the fixed-width v2 transcript: one authenticated UUID, one key,
+    and the root/device flag the signature must attest."""
 
     try:
         parsed_user_id = uuid.UUID(user_id)
@@ -33,6 +42,7 @@ def encode_browser_registration_transcript(user_id: str, public_key: bytes) -> b
         BROWSER_REGISTRATION_MAGIC
         + bytes([BROWSER_REGISTRATION_VERSION])
         + parsed_user_id.bytes
+        + bytes([BROWSER_REGISTRATION_FLAG_ROOT if is_root else 0])
         + public_key
     )
 
@@ -53,13 +63,19 @@ def decode_ed25519_signature(encoded: str) -> bytes:
 
 
 def verify_browser_registration_proof(
-    *, user_id: str, public_key_wire: str, signature_wire: str
+    *, user_id: str, public_key_wire: str, signature_wire: str, is_root: bool
 ) -> None:
-    """Verify strict key/signature wire forms and possession of the corresponding key."""
+    """Verify strict key/signature wire forms and possession of the corresponding key.
+
+    ``is_root`` is the caller's CLAIM (the request field). Because the flag is
+    bound inside the signed transcript, a claim the proof does not carry — a
+    root registration with an unflagged proof, or an ordinary registration with
+    a root-flagged proof — fails signature verification here and is refused.
+    """
 
     public_key = decode_ed25519_public_key(public_key_wire)
     signature = decode_ed25519_signature(signature_wire)
-    transcript = encode_browser_registration_transcript(user_id, public_key)
+    transcript = encode_browser_registration_transcript(user_id, public_key, is_root=is_root)
     try:
         Ed25519PublicKey.from_public_bytes(public_key).verify(signature, transcript)
     except InvalidSignature as exc:

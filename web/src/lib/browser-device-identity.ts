@@ -413,7 +413,14 @@ export async function createBrowserDeviceRegistrationProof(
       "browser device identity does not belong to the authenticated account",
     );
   }
-  const transcript = encodeBrowserDeviceRegistrationTranscript(accountId, record.publicKeyWire);
+  // An ordinary browser device, never the account root: this signer attests
+  // is_root=false inside the V2 transcript, so the server cannot promote this
+  // key to root authority by flipping the request flag.
+  const transcript = encodeBrowserDeviceRegistrationTranscript(
+    accountId,
+    record.publicKeyWire,
+    false,
+  );
   const ownedTranscript = new ArrayBuffer(transcript.byteLength);
   new Uint8Array(ownedTranscript).set(transcript);
   const signature = new Uint8Array(
