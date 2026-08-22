@@ -1029,6 +1029,12 @@ async def _process_host_rtc_signal(
                 await _bounded_send_text(conn, signal)
             return True
         if frame_type == "rtc.offer":
+            # Redis->daemon hop: carried_endorsements pass through here without
+            # re-running sanitize_carried_endorsements — the field was sanitized
+            # once at the authenticated browser ingress before dispatch, this
+            # hop only ever forwards what that ingress published, and the
+            # daemon independently caps the list at 64 edges and re-verifies
+            # every signature before trusting any of it (mesh P2/P5).
             try:
                 if binding.signed_signal:
                     if not signed_mode_selected(signal):
@@ -1063,6 +1069,9 @@ async def _process_host_rtc_signal(
         return True
     frame_type = signal.get("type")
     if frame_type == "rtc.offer":
+        # Redis->daemon hop: as on the agent path above, carried_endorsements
+        # are forwarded without re-running sanitize — the browser ingress
+        # sanitized before dispatch, and the daemon re-caps and re-verifies.
         signed_signal = signed_mode_selected(signal)
         try:
             if signed_signal:

@@ -89,6 +89,51 @@ export function assessSealedRootRevocation(
   return "uncorroborated";
 }
 
+/**
+ * Choose which server roster row (if any) to revoke as "the account root",
+ * trusting only the FIRSTHAND `pk_R` read from the sealed bundle (hardening
+ * B3). The server's `is_root` labeling is never sufficient on its own: a row
+ * must carry the sealed root's exact public key to be revoked. Returns the row
+ * to revoke, or null with a human-readable reason when the revoke must be
+ * skipped loudly (`reason === null` means there was simply nothing to revoke).
+ */
+export function selectSealedRootRowForRevocation(
+  sealedRootPublicKey: string | null,
+  devices: readonly {
+    id: string;
+    public_key: string;
+    revoked_at: string | null;
+    is_root: boolean;
+  }[],
+): {
+  row: { id: string; public_key: string } | null;
+  reason: string | null;
+} {
+  const liveRoots = devices.filter((d) => d.is_root && d.revoked_at === null);
+  if (sealedRootPublicKey === null) {
+    return liveRoots.length === 0
+      ? { row: null, reason: null }
+      : {
+          row: null,
+          reason:
+            "The server lists an account root, but your passkey bundle holds none — " +
+            "that key was not verified here, so it was left untouched.",
+        };
+  }
+  const match = liveRoots.find((d) => d.public_key === sealedRootPublicKey);
+  if (match !== undefined) {
+    return { row: { id: match.id, public_key: match.public_key }, reason: null };
+  }
+  return liveRoots.length === 0
+    ? { row: null, reason: null }
+    : {
+        row: null,
+        reason:
+          "The server's account root does not match the root sealed in your trust bundle, " +
+          "so it was not revoked on the server's word.",
+      };
+}
+
 export interface AccountHealReport {
   readonly rootDeviceId: string;
   /** Devices that received a fresh `R→d` endorsement in this heal. */
@@ -273,13 +318,27 @@ export async function ensureRootRegistered(root: AccountRoot, accountId: string)
     }
     return;
   }
-  await browserDevices.register({
+  const registered = await browserDevices.register({
     key_algorithm: "ed25519",
     public_key: root.publicKeyWire,
     signature: await createRootRegistrationProof(root, accountId),
     label: "Account root",
     is_root: true,
   });
+  // Verify the row the server answered with is the row that was submitted
+  // (hardening B3): a response naming another key or dropping the root mark
+  // means the roster does NOT hold pk_R as the root, and healing on top of
+  // that would endorse and anchor against a substituted row. Abort loudly.
+  if (
+    registered.public_key !== root.publicKeyWire ||
+    registered.is_root !== true ||
+    registered.revoked_at !== null
+  ) {
+    throw new AccountHealError(
+      "root_conflict",
+      "the server did not record the account root as submitted",
+    );
+  }
 }
 
 /**
