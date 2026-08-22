@@ -9,7 +9,7 @@ that firsthand key. The verification here is hygiene only: it keeps rows that
 could never verify for anyone out of the store.
 
 Domain-separated from the ceremony-scoped SPAWN-HOST-INTRO-V1 (which binds a
-specific joiner) and from every endorsement transcript; a signature is never
+specific joiner) and from every endorsement statement; a signature is never
 replayable across protocols.
 """
 

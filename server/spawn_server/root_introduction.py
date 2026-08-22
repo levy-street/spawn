@@ -19,7 +19,7 @@ republish with a successor root REPLACES that introducer's row (rotation),
 and consumers accept a successor only when the old key's revocation is
 corroborated (roster + permanent tombstone, mirroring hardening B2).
 
-Domain-separated from every endorsement and host-introduction transcript; a
+Domain-separated from every endorsement and host-introduction statement; a
 signature is never replayable across protocols. Web ⟷ server byte identity is
 pinned by a shared test vector on both sides.
 """
