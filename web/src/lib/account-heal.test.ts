@@ -3,6 +3,7 @@ import {
   AccountHealError,
   assessSealedRootRevocation,
   planAccountHeal,
+  selectSealedRootRowForRevocation,
 } from "./account-heal";
 import { encodeAcctEndorsementTranscript } from "./acct-endorsement-transcript";
 import { encodeBase64Url } from "./signed-signal";
@@ -342,3 +343,54 @@ describe("assessSealedRootRevocation (hardening B2): rotation needs corroboratio
   });
 });
 
+describe("selectSealedRootRowForRevocation (hardening B3): firsthand pk_R chooses", () => {
+  const SEALED_PK = "R".repeat(43);
+  const IMPOSTOR_PK = "X".repeat(43);
+
+  test("revokes exactly the live row carrying the sealed root's key", () => {
+    const devices = [device(LAPTOP_ID, IMPOSTOR_PK), device(ROOT_ID, SEALED_PK, { isRoot: true })];
+    expect(selectSealedRootRowForRevocation(SEALED_PK, devices)).toEqual({
+      row: { id: ROOT_ID, public_key: SEALED_PK },
+      reason: null,
+    });
+  });
+
+  test("a mismatched server-labeled root is skipped loudly, never revoked on its word", () => {
+    const devices = [device(ROOT_ID, IMPOSTOR_PK, { isRoot: true })];
+    const result = selectSealedRootRowForRevocation(SEALED_PK, devices);
+    expect(result.row).toBeNull();
+    expect(result.reason).toContain("does not match");
+  });
+
+  test("no live root row means nothing to revoke, quietly", () => {
+    expect(selectSealedRootRowForRevocation(SEALED_PK, [device(LAPTOP_ID, IMPOSTOR_PK)])).toEqual({
+      row: null,
+      reason: null,
+    });
+    // An already-revoked root row is history, not a live endorser.
+    expect(
+      selectSealedRootRowForRevocation(SEALED_PK, [
+        device(ROOT_ID, SEALED_PK, { isRoot: true, revoked: true }),
+      ]),
+    ).toEqual({ row: null, reason: null });
+  });
+
+  test("with no firsthand pk_R, a server-listed root is skipped loudly", () => {
+    const result = selectSealedRootRowForRevocation(null, [
+      device(ROOT_ID, IMPOSTOR_PK, { isRoot: true }),
+    ]);
+    expect(result.row).toBeNull();
+    expect(result.reason).toContain("holds none");
+  });
+
+  test("with no firsthand pk_R and no server root, there is nothing to do", () => {
+    expect(selectSealedRootRowForRevocation(null, [])).toEqual({ row: null, reason: null });
+  });
+
+  test("the sealed key must match a row marked live AND root — plain devices stay untouched", () => {
+    // A live NON-root row wearing pk_R would be server mischief; this flow only
+    // ever revokes a row the server itself presents as the live root.
+    const result = selectSealedRootRowForRevocation(SEALED_PK, [device(LAPTOP_ID, SEALED_PK)]);
+    expect(result).toEqual({ row: null, reason: null });
+  });
+});

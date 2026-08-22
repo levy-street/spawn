@@ -20,6 +20,7 @@ import {
   assessSealedRootRevocation,
   ensureRootRegistered,
   healAccount,
+  selectSealedRootRowForRevocation,
 } from "@/lib/account-heal";
 import {
   type AccountRoot,
@@ -48,6 +49,8 @@ import {
   sealCurrentTrust,
 } from "@/lib/trust-bootstrap";
 import type { TrustBundleHost } from "@/lib/trust-bundle";
+import { openTrustEnvelope } from "@/lib/trust-envelope";
+import { enforceBundleFreshness } from "@/lib/trust-revision";
 
 export function describePasskeyError(error: unknown): string {
   if (error instanceof PasskeyPrfError) {
@@ -472,25 +475,59 @@ export function usePasskeyTrust() {
    */
   const removeLastPasskey = useMutation({
     mutationFn: async (target: PasskeyCredential) => {
+      const id = accountId as string;
       const remaining = await trust.listPasskeys();
       if (remaining.length !== 1 || remaining[0].id !== target.id) {
         throw new Error("This path removes only the final passkey.");
       }
-      // The root this passkey sealed must not outlive it as a live endorser.
-      const liveRoot = (await browserDevices.list()).find(
-        (d) => d.is_root && d.revoked_at === null,
+      // The root this passkey sealed must not outlive it as a live endorser —
+      // but WHICH row is "the root" is decided by the sealed bundle's own
+      // pk_R, read firsthand before the bundle is deleted, never by the
+      // server's is_root labeling (hardening B3). A hostile roster could
+      // otherwise nominate any row and have this flow revoke it on its word.
+      let sealedRootPk: string | null = null;
+      let bundleUnreadable = false;
+      const stored = await trust.getBundle();
+      if (stored !== null) {
+        try {
+          const { secret } = await evaluateTrustPrf(id, [target.credential_id]);
+          const bundle = await openTrustEnvelope(id, stored.sealed, {
+            credentialId: target.credential_id,
+            prfSecret: secret,
+          });
+          await enforceBundleFreshness(id, bundle.revision);
+          sealedRootPk = bundle.root?.publicKeyWire ?? null;
+        } catch (error) {
+          if (error instanceof PasskeyPrfError) throw error;
+          // An unopenable or rolled-back bundle yields no firsthand pk_R. The
+          // operator is deliberately abandoning passkey protection, so do not
+          // hold that hostage — but revoke nothing on the server's say-so.
+          bundleUnreadable = true;
+        }
+      }
+      const { row, reason } = selectSealedRootRowForRevocation(
+        sealedRootPk,
+        await browserDevices.list(),
       );
-      if (liveRoot !== undefined) {
-        await browserDevices.revoke(liveRoot.id, liveRoot.public_key);
+      if (row !== null) {
+        await browserDevices.revoke(row.id, row.public_key);
       }
       await trust.deleteBundle();
       await trust.removePasskey(target.id);
+      const skippedRootReason =
+        reason !== null && bundleUnreadable
+          ? "Your trust bundle could not be opened to verify the account root, so it was not revoked on the server's word."
+          : reason;
+      return { skippedRootReason };
     },
     onMutate: begin,
-    onSuccess: () => {
+    onSuccess: ({ skippedRootReason }) => {
       setStatus(
         "Passkey removed. Your devices keep working, but if you lose them all, nothing brings this account's hosts back.",
       );
+      // Loud skip (hardening B3): a live root row the sealed bundle did not
+      // vouch for stays untouched, and the operator hears why.
+      if (skippedRootReason !== null) setError(skippedRootReason);
       queryClient.invalidateQueries({ queryKey: ["trust"] });
       queryClient.invalidateQueries({ queryKey: ["browser-devices"] });
       queryClient.invalidateQueries({ queryKey: ["account-endorsements"] });

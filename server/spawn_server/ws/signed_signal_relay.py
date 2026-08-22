@@ -52,6 +52,40 @@ _ENDORSEMENT_KEYS = (
     "signature",
 )
 _MAX_ENDORSEMENT_FIELD_LEN = 128
+# Every legitimate field value is a canonical UUID, base64url key, or base64url
+# signature, so this token alphabet loses nothing — and it is what makes the
+# worst-case arithmetic below honest: each accepted character is exactly one
+# UTF-8 byte and never JSON-escaped (json.dumps with ensure_ascii=False), so
+# serialized bytes == character count. Without it a 128-char field of control
+# characters would serialize as up to 6 bytes each and the fit proof would be
+# false.
+_ENDORSEMENT_FIELD_TOKEN = re.compile(rf"\A[0-9A-Za-z_-]{{1,{_MAX_ENDORSEMENT_FIELD_LEN}}}\Z")
+
+# Compile-time fit proof (hardening B4), mirroring the frame-bound RuntimeError
+# above: a maximal sanitizer-accepted endorsement set must fit the routing
+# metadata bound enforced downstream at validate_signed_relay_container,
+# otherwise the largest LEGITIMATE chain-carrying offer would be silently
+# droppable at the container boundary. Exact worst-case serialized-JSON bytes
+# (compact separators, ensure_ascii=False, token-alphabet values):
+#   per field: "key":"value"  -> len(key) + 3 punctuation + value + 2 quotes
+#   per edge:  {} + 4 commas + the 5 fields
+#   list:      [] + (n-1) commas + n edges
+#   container: ,"carried_endorsements": -> len(field name) + 4 punctuation
+_WORST_ENDORSEMENT_EDGE_BYTES = (
+    2  # braces
+    + (len(_ENDORSEMENT_KEYS) - 1)  # commas between fields
+    + sum(len(key) + 3 + 2 + _MAX_ENDORSEMENT_FIELD_LEN for key in _ENDORSEMENT_KEYS)
+)
+_WORST_CARRIED_ENDORSEMENTS_BYTES = (
+    len(CARRIED_ENDORSEMENTS_FIELD) + 4  # ,"carried_endorsements":
+    + 2  # brackets
+    + (MAX_RELAYED_ENDORSEMENTS - 1)  # commas between edges
+    + MAX_RELAYED_ENDORSEMENTS * _WORST_ENDORSEMENT_EDGE_BYTES
+)
+# 8 KiB allowance for everything else in the routing frame (type, UUIDs,
+# nonces, protocol tuple, and the TURN ice_servers block with credentials).
+if _WORST_CARRIED_ENDORSEMENTS_BYTES + 8 * 1024 > MAX_RTC_ROUTING_METADATA_BYTES:
+    raise RuntimeError("carried endorsements cannot fit the RTC routing metadata bound")
 
 
 def sanitize_carried_endorsements(value: Any) -> list[dict[str, str]] | None:
@@ -68,7 +102,7 @@ def sanitize_carried_endorsements(value: Any) -> list[dict[str, str]] | None:
         edge: dict[str, str] = {}
         for key in _ENDORSEMENT_KEYS:
             field = item.get(key)
-            if not isinstance(field, str) or not 1 <= len(field) <= _MAX_ENDORSEMENT_FIELD_LEN:
+            if not isinstance(field, str) or _ENDORSEMENT_FIELD_TOKEN.fullmatch(field) is None:
                 return None
             edge[key] = field
         sanitized.append(edge)
