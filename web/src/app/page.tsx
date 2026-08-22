@@ -105,7 +105,7 @@ function ScrollStamp() {
   );
 }
 
-const AGENT_SPECIMENS = ["claude", "codex", "opencode", "aider", "$SHELL"];
+const AGENT_SPECIMENS = ["claude", "codex", "opencode", "aider", "hermes", "$SHELL"];
 
 /** The specimen strip is driven by the scroll position itself — it slides as
  * you scroll and slides back when you do. */

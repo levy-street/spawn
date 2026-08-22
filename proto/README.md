@@ -313,8 +313,17 @@ Built-in agents (server-seeded, idempotent, `owner_user_id = null`):
 - **codex** — command `codex`, install `curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh`, yolo `--dangerously-bypass-approvals-and-sandbox`
 - **opencode** — command `opencode`, install `npm install -g opencode-ai`, yolo `OPENCODE_PERMISSION` (it has no flag; permissions are configuration)
 - **aider-sonnet** — command `aider --model claude-sonnet-4-6`, install `pipx install aider-chat || pip install --user aider-chat`, yolo `--yes-always`
+- **hermes** — command `hermes`, install `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`, yolo `--yolo`
 
 There is no `shell` built-in: sessions *are* shells.
+
+`hermes` installs from a vendor script rather than a registry, so
+`latest_tool_version` cannot resolve an update target for it and the tools
+panel shows its installed version with no "latest" — the only npm package
+carrying that name is an unofficial third-party bridge, and pointing a
+built-in at one would be a supply-chain decision, not a version check. It does
+get the daemon's self-updater (`hermes update --yes`), the same treatment as
+`claude-code`.
 
 > spawn does not manage agent-CLI provider credentials. Each agent CLI handles
 > its own login interactively on the host (e.g. `claude /login` writes

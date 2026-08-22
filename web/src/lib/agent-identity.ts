@@ -6,7 +6,7 @@
 const SHELL_RE = /^(bash|zsh|fish|sh|dash)$/;
 
 export type ResolvedAgentIcon = {
-  icon: "claude-code" | "codex" | "opencode" | "aider" | "shell" | "monogram";
+  icon: "claude-code" | "codex" | "opencode" | "aider" | "hermes" | "shell" | "monogram";
   /** Tooltip / accessible name: brand name, shell name, or the raw input. */
   label: string;
   /** Monogram letter (only for `icon: "monogram"`). */
@@ -28,6 +28,7 @@ function matchName(name: string): ResolvedAgentIcon | null {
   if (lower.includes("codex")) return { icon: "codex", label: "Codex" };
   if (lower.includes("opencode")) return { icon: "opencode", label: "OpenCode" };
   if (lower.includes("aider")) return { icon: "aider", label: "Aider" };
+  if (lower.includes("hermes")) return { icon: "hermes", label: "Hermes Agent" };
   if (SHELL_RE.test(lower)) return { icon: "shell", label: lower };
   return null;
 }
