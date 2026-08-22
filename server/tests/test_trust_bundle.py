@@ -512,6 +512,42 @@ async def test_bundle_delete_abandons_it_idempotently(client):
     assert fresh.json()["revision"] == 1
 
 
+async def test_bundle_delete_cas_refuses_a_stale_revision(client):
+    """The addBackup race: another device's putBundle between this device's read
+    and its delete must 409, not silently destroy the bundle that device's
+    freshly wrapped credential depends on."""
+
+    _, auth = await _signup(client, "bundle-delete-cas@example.com")
+    await client.put("/api/trust/bundle", json={"sealed": "base"}, headers=auth)
+    # Another device replaces the bundle (revision 1 → 2)…
+    replaced = await client.put(
+        "/api/trust/bundle", json={"sealed": "enrolled", "expected_revision": 1}, headers=auth
+    )
+    assert replaced.status_code == 200
+    assert replaced.json()["revision"] == 2
+
+    # …so a delete still expecting revision 1 loses the race loudly.
+    stale = await client.delete("/api/trust/bundle?expected_revision=1", headers=auth)
+    assert stale.status_code == 409
+    kept = await client.get("/api/trust/bundle", headers=auth)
+    assert kept.json()["sealed"] == "enrolled"
+
+    # Re-read, re-confirm: the current revision deletes.
+    fresh = await client.delete("/api/trust/bundle?expected_revision=2", headers=auth)
+    assert fresh.status_code == 204
+    assert (await client.get("/api/trust/bundle", headers=auth)).json() is None
+
+
+async def test_bundle_delete_with_expected_revision_is_idempotent_when_absent(client):
+    """No bundle at all is the normal pre-bootstrap state, whatever revision the
+    caller believed it had read — there is nothing left to guard."""
+
+    _, auth = await _signup(client, "bundle-delete-absent@example.com")
+    assert (
+        await client.delete("/api/trust/bundle?expected_revision=7", headers=auth)
+    ).status_code == 204
+
+
 async def test_bundle_delete_is_account_scoped(client):
     _, auth_a = await _signup(client, "bundle-del-a@example.com")
     _, auth_b = await _signup(client, "bundle-del-b@example.com")
