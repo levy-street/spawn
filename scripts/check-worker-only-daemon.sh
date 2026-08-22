@@ -76,7 +76,11 @@ run_guard() {
     --glob '!server/data/**' \
     --glob '!test-results/**' \
     --glob '!web/test-results/**' \
-    --glob '!check-worker-only-daemon.sh' || true)"
+    --glob '!check-worker-only-daemon.sh' \
+    --glob '!web/src/trust-ux/presentation.html' || true)"
+  # The trust-ux presentation is a frozen design snapshot whose inline
+  # base64 screenshots randomly contain case-insensitive "tmux" byte runs
+  # (e.g. "TMuXEejQBwC"). Its sibling .tsx sources stay in scope.
   if [[ -n "$matches" ]]; then
     printf '%s\n' "worker-only guard: retired backend surface found:" >&2
     printf '%s\n' "$matches" >&2
