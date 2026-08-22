@@ -8,6 +8,7 @@ import {
   BROWSER_HOST_PIN_STORAGE_VERSION,
   BROWSER_HOST_PIN_STORE_NAME,
   BrowserHostPinError,
+  forgetActiveBrowserHostPins,
   loadBrowserHostPin,
   loadBrowserHostPinByHostId,
   resolveActiveBrowserHostPin,
@@ -74,7 +75,6 @@ function resolveInput(
     origin: string;
     hostId: string;
     claimedHostPublicKey: string | null;
-    claimedHostFingerprint: string | null;
   }> = {},
 ) {
   return {
@@ -82,7 +82,6 @@ function resolveInput(
     origin: ORIGIN,
     hostId: HOST_ID,
     claimedHostPublicKey: HOST_KEY,
-    claimedHostFingerprint: "SHA256:OfcT0KZEJT8EUpQh",
     ...overrides,
   };
 }
@@ -94,7 +93,6 @@ function revokeInput(
     targetHostId: string;
     claimedHostId: string;
     claimedHostPublicKey: string | null;
-    claimedHostFingerprint: string | null;
   }> = {},
 ) {
   return {
@@ -103,7 +101,6 @@ function revokeInput(
     targetHostId: HOST_ID,
     claimedHostId: HOST_ID,
     claimedHostPublicKey: HOST_KEY,
-    claimedHostFingerprint: "SHA256:OfcT0KZEJT8EUpQh",
     ...overrides,
   };
 }
@@ -391,8 +388,10 @@ describe("browser-local host pins", () => {
     expect(await factory.databases()).toEqual([]);
   });
 
-  test("rejects fingerprint and key substitution at approval and resolver ingress", async () => {
+  test("rejects fingerprint substitution at approval; the resolver takes no fingerprint at all", async () => {
     const factory = new IDBFactory();
+    // Approval still takes the ceremony-derived fingerprint and cross-checks
+    // it against the key: a mismatched pair is refused before persistence.
     await expectPinError(
       approveBrowserHostPin(
         approvalInput({ hostFingerprint: "SHA256:AAAAAAAAAAAAAAAA" }),
@@ -402,28 +401,20 @@ describe("browser-local host pins", () => {
     );
     expect(await factory.databases()).toEqual([]);
 
+    // The resolver's identity input is the claimed KEY alone (mesh B5): its
+    // fingerprint is derived locally, so a foreign key simply fails to match
+    // any pin — there is no served fingerprint left to substitute.
     await approveBrowserHostPin(approvalInput(), options(factory));
-    const otherFingerprint = await ed25519PublicKeyFingerprint(OTHER_HOST_KEY);
     await expectPinError(
       resolveActiveBrowserHostPin(
         resolveInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
-        options(factory),
-      ),
-      "fingerprint_mismatch",
-    );
-    await expectPinError(
-      resolveActiveBrowserHostPin(
-        resolveInput({
-          claimedHostPublicKey: OTHER_HOST_KEY,
-          claimedHostFingerprint: otherFingerprint,
-        }),
         options(factory),
       ),
       "missing_pin",
     );
   });
 
-  test("resolver fails loudly on missing, null, mismatch, revoked, and same-ID/new-key", async () => {
+  test("resolver fails loudly on missing, null, mismatch, and revoked", async () => {
     const factory = new IDBFactory();
     await expectPinError(
       resolveActiveBrowserHostPin(resolveInput(), options(factory)),
@@ -433,11 +424,6 @@ describe("browser-local host pins", () => {
       resolveActiveBrowserHostPin(resolveInput({ claimedHostPublicKey: null }), options(factory)),
       "null_key",
     );
-    await expectPinError(
-      resolveActiveBrowserHostPin(resolveInput({ claimedHostFingerprint: null }), options(factory)),
-      "null_fingerprint",
-    );
-
     await approveBrowserHostPin(approvalInput(), options(factory));
     expect(await resolveActiveBrowserHostPin(resolveInput(), options(factory))).toBe(HOST_KEY);
     await revokeBrowserHostPin(revokeInput(), options(factory, 2_000));
@@ -445,22 +431,136 @@ describe("browser-local host pins", () => {
       resolveActiveBrowserHostPin(resolveInput(), options(factory)),
       "revoked_pin",
     );
+  });
 
+  test("an ACTIVE binding under a different served key is the substitution signal — hard conflict", async () => {
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await resolveActiveBrowserHostPin(resolveInput(), options(factory));
     const otherFingerprint = await ed25519PublicKeyFingerprint(OTHER_HOST_KEY);
     await approveBrowserHostPin(
       approvalInput({ hostPublicKey: OTHER_HOST_KEY, hostFingerprint: otherFingerprint }),
       options(factory),
     );
+    // Both keys actively pinned, the Host ID bound to the first: a server now
+    // serving the second key for that ID must never quietly re-bind it.
     await expectPinError(
       resolveActiveBrowserHostPin(
-        resolveInput({
-          claimedHostPublicKey: OTHER_HOST_KEY,
-          claimedHostFingerprint: otherFingerprint,
-        }),
+        resolveInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
         options(factory),
       ),
       "host_id_key_conflict",
     );
+    const records = await rawRecords(factory);
+    expect(records.find((r) => r.hostPublicKey === HOST_KEY)?.hostIds).toEqual([HOST_ID]);
+    expect(records.find((r) => r.hostPublicKey === OTHER_HOST_KEY)?.hostIds).toEqual([]);
+  });
+
+  test("a REVOKED binding plus a freshly approved key migrates: re-possess clears the conflict (R-b)", async () => {
+    // The owner's re-key cycle: possess (old key) → remove the host here →
+    // possess again (new key, same Host ID). Before the migration rule this
+    // wedged on host_id_key_conflict forever — the tombstone kept the binding
+    // and the fresh explicit approval could never claim it.
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await resolveActiveBrowserHostPin(resolveInput(), options(factory));
+    await revokeBrowserHostPin(revokeInput(), options(factory, 2_000));
+
+    const otherFingerprint = await ed25519PublicKeyFingerprint(OTHER_HOST_KEY);
+    await approveBrowserHostPin(
+      approvalInput({ hostPublicKey: OTHER_HOST_KEY, hostFingerprint: otherFingerprint }),
+      options(factory, 3_000),
+    );
+    expect(
+      await resolveActiveBrowserHostPin(
+        resolveInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
+        options(factory, 3_000),
+      ),
+    ).toBe(OTHER_HOST_KEY);
+    // The binding moved atomically; the tombstone survives (R10) without it.
+    const records = await rawRecords(factory);
+    const old = records.find((r) => r.hostPublicKey === HOST_KEY);
+    const fresh = records.find((r) => r.hostPublicKey === OTHER_HOST_KEY);
+    expect(old?.state).toBe("revoked");
+    expect(old?.hostIds).toEqual([]);
+    expect(fresh?.state).toBe("active");
+    expect(fresh?.hostIds).toEqual([HOST_ID]);
+    // And it stays resolvable (the gossip consumer's later rows no longer
+    // conflict-warn every session).
+    expect(
+      await resolveActiveBrowserHostPin(
+        resolveInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
+        options(factory, 4_000),
+      ),
+    ).toBe(OTHER_HOST_KEY);
+  });
+
+  test("a REVOKED binding with no active pin for the served key still conflicts", async () => {
+    // Tombstoned Host IDs never re-bind on the server's say-so alone: only an
+    // explicit fresh approval of the served key earns the migration.
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await resolveActiveBrowserHostPin(resolveInput(), options(factory));
+    await revokeBrowserHostPin(revokeInput(), options(factory, 2_000));
+    await expectPinError(
+      resolveActiveBrowserHostPin(
+        resolveInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
+        options(factory),
+      ),
+      "host_id_key_conflict",
+    );
+  });
+
+  test("device-local forget composes with the re-key exit: the retained tombstone still migrates (R-b × P-C6)", async () => {
+    // Forget (P-C6) DELETES active pins but retains targeted-revocation
+    // tombstones — including their Host-ID bindings. That retained binding is
+    // exactly the state the re-possess migration must clear, so the two
+    // semantics are proven together: revoke a re-keyed host, forget the
+    // device's other pins, then possess the host again with its new key.
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await resolveActiveBrowserHostPin(resolveInput(), options(factory));
+    await revokeBrowserHostPin(revokeInput(), options(factory, 2_000)); // targeted removal
+    const otherFingerprint = await ed25519PublicKeyFingerprint(OTHER_HOST_KEY);
+    await approveBrowserHostPin(
+      approvalInput({ hostPublicKey: OTHER_HOST_KEY, hostFingerprint: otherFingerprint }),
+      options(factory, 3_000),
+    );
+
+    const { forgotten } = await forgetActiveBrowserHostPins(
+      { accountId: ACCOUNT, origin: ORIGIN },
+      options(factory, 4_000),
+    );
+    expect(forgotten).toBe(1); // the active pin died; the tombstone did not
+    const afterForget = await rawRecords(factory);
+    expect(afterForget).toHaveLength(1);
+    expect(afterForget[0]).toMatchObject({
+      hostPublicKey: HOST_KEY,
+      state: "revoked",
+      hostIds: [HOST_ID], // the binding rides the retained tombstone
+    });
+
+    // Re-possess with the host's new key: the fresh explicit approval plus
+    // the migration clear the conflict — a forget in between changes nothing.
+    await approveBrowserHostPin(
+      approvalInput({ hostPublicKey: OTHER_HOST_KEY, hostFingerprint: otherFingerprint }),
+      options(factory, 5_000),
+    );
+    expect(
+      await resolveActiveBrowserHostPin(
+        resolveInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
+        options(factory, 5_000),
+      ),
+    ).toBe(OTHER_HOST_KEY);
+    const records = await rawRecords(factory);
+    expect(records.find((r) => r.hostPublicKey === HOST_KEY)).toMatchObject({
+      state: "revoked",
+      hostIds: [], // R10: the tombstone survives, just without the binding
+    });
+    expect(records.find((r) => r.hostPublicKey === OTHER_HOST_KEY)).toMatchObject({
+      state: "active",
+      hostIds: [HOST_ID],
+    });
   });
 
   test("bounds observed routing Host IDs by evicting, never refusing or replacing the key", async () => {
@@ -485,7 +585,7 @@ describe("browser-local host pins", () => {
     expect(record.hostPublicKey).toBe(HOST_KEY);
   });
 
-  test("deletion refuses split, substituted, and unbound identities without mutation or DELETE", async () => {
+  test("deletion refuses split and unbound identities without mutation or DELETE", async () => {
     const unboundFactory = new IDBFactory();
     await approveBrowserHostPin(approvalInput(), options(unboundFactory));
     await expectRevokeBlockedWithoutDelete(unboundFactory, revokeInput(), "missing_pin");
@@ -499,10 +599,7 @@ describe("browser-local host pins", () => {
     );
     await expectRevokeBlockedWithoutDelete(
       multipleUnboundFactory,
-      revokeInput({
-        claimedHostPublicKey: OTHER_HOST_KEY,
-        claimedHostFingerprint: otherFingerprint,
-      }),
+      revokeInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
       "missing_pin",
     );
 
@@ -518,18 +615,31 @@ describe("browser-local host pins", () => {
       revokeInput({ claimedHostId: OTHER_HOST_ID }),
       "host_id_response_mismatch",
     );
-    await expectRevokeBlockedWithoutDelete(
-      boundFactory,
-      revokeInput({
-        claimedHostPublicKey: OTHER_HOST_KEY,
-        claimedHostFingerprint: otherFingerprint,
-      }),
-      "host_id_key_conflict",
+  });
+
+  test("removal tombstones the BOUND record even when the server claims a different key (R-b)", async () => {
+    // A re-keyed host serves its new key while the local binding still names
+    // the old one. The server cannot veto a local trust withdrawal — blocking
+    // here wedged the only safe exit (remove, then possess again). The record
+    // that dies is the bound one: the key this device actually approved.
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await resolveActiveBrowserHostPin(resolveInput(), options(factory));
+    const revoked = await revokeBrowserHostPin(
+      revokeInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
+      options(factory, 2_000),
     );
-    await expectRevokeBlockedWithoutDelete(
-      boundFactory,
-      revokeInput({ claimedHostFingerprint: "SHA256:AAAAAAAAAAAAAAAA" }),
-      "fingerprint_mismatch",
+    expect(revoked.state).toBe("revoked");
+    expect(revoked.hostPublicKey).toBe(HOST_KEY);
+    expect(revoked.hostIds).toEqual([HOST_ID]);
+    // The claimed key is still strictly validated — garbage never drives a
+    // deletion flow.
+    await expectPinError(
+      revokeBrowserHostPin(
+        revokeInput({ claimedHostPublicKey: "not-a-key" }),
+        options(factory, 3_000),
+      ),
+      "invalid_key",
     );
   });
 
@@ -567,6 +677,41 @@ describe("browser-local host pins", () => {
     expect(reactivated.revokedAtMs).toBeNull();
     expect(reactivated.hostIds).toEqual([HOST_ID]);
     expect(await resolveActiveBrowserHostPin(resolveInput(), options(factory))).toBe(HOST_KEY);
+  });
+
+  test("introduction-driven approvals never resurrect a tombstone (reactivateRevoked: false)", async () => {
+    // A peer's standing broadcast row for a key the operator removed HERE
+    // must not quietly undo the removal — and, in the re-key cycle, must not
+    // re-activate the stale old-key record and re-wedge the binding the
+    // re-possess just migrated. Only the explicit ceremony (default) may.
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await resolveActiveBrowserHostPin(resolveInput(), options(factory));
+    await revokeBrowserHostPin(revokeInput(), options(factory, 2_000));
+    await expectPinError(
+      approveBrowserHostPin(
+        { ...approvalInput(), reactivateRevoked: false },
+        options(factory, 3_000),
+      ),
+      "revoked_pin",
+    );
+    expect((await rawRecords(factory))[0].state).toBe("revoked");
+    // A never-revoked key is unaffected: creation and idempotent re-approval
+    // work identically with the flag.
+    const otherFingerprint = await ed25519PublicKeyFingerprint(OTHER_HOST_KEY);
+    const created = await approveBrowserHostPin(
+      approvalInput({ hostPublicKey: OTHER_HOST_KEY, hostFingerprint: otherFingerprint }),
+      options(factory, 4_000),
+    );
+    expect(created.state).toBe("active");
+    const again = await approveBrowserHostPin(
+      {
+        ...approvalInput({ hostPublicKey: OTHER_HOST_KEY, hostFingerprint: otherFingerprint }),
+        reactivateRevoked: false,
+      },
+      options(factory, 5_000),
+    );
+    expect(again.state).toBe("active");
   });
 
   test("fails closed when IndexedDB is unavailable", async () => {
@@ -626,5 +771,72 @@ describe("approveBrowserHostPin Host ID seeding", () => {
       options(factory),
     );
     expect(approved.hostIds).toEqual([HOST_ID]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Device-local forget: deletion, not tombstoning (review P-C6)
+// ---------------------------------------------------------------------------
+
+describe("forgetActiveBrowserHostPins", () => {
+  test("deletes every active pin in scope so the host reads as never seen", async () => {
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await approveBrowserHostPin(
+      approvalInput({
+        hostPublicKey: OTHER_HOST_KEY,
+        hostFingerprint: await ed25519PublicKeyFingerprint(OTHER_HOST_KEY),
+      }),
+      options(factory),
+    );
+
+    const { forgotten } = await forgetActiveBrowserHostPins(
+      { accountId: ACCOUNT, origin: ORIGIN },
+      options(factory),
+    );
+    expect(forgotten).toBe(2);
+    // No record at all — not a revoked tombstone. The signed-RTC gate and a
+    // later bundle import both see a host this device never met.
+    expect(await loadBrowserHostPin(approvalInput(), options(factory))).toBeNull();
+    // Re-approval (e.g. a passkey import) recreates trust from scratch.
+    const again = await approveBrowserHostPin(approvalInput(), options(factory));
+    expect(again.state).toBe("active");
+  });
+
+  test("retains an operator's targeted-revocation tombstone untouched", async () => {
+    const factory = new IDBFactory();
+    await approveBrowserHostPin({ ...approvalInput(), hostIds: [HOST_ID] }, options(factory));
+    await revokeBrowserHostPin(revokeInput(), options(factory));
+    await approveBrowserHostPin(
+      approvalInput({
+        hostPublicKey: OTHER_HOST_KEY,
+        hostFingerprint: await ed25519PublicKeyFingerprint(OTHER_HOST_KEY),
+      }),
+      options(factory),
+    );
+
+    const { forgotten } = await forgetActiveBrowserHostPins(
+      { accountId: ACCOUNT, origin: ORIGIN },
+      options(factory),
+    );
+    expect(forgotten).toBe(1);
+    // The targeted removal is a statement about the HOST, not this device's
+    // memory — a forget must not turn it into an amnesty.
+    const tombstone = await loadBrowserHostPin(approvalInput(), options(factory));
+    expect(tombstone?.state).toBe("revoked");
+  });
+
+  test("is scoped: other accounts and origins keep their pins", async () => {
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await approveBrowserHostPin(approvalInput({ accountId: OTHER_ACCOUNT }), options(factory));
+    const { forgotten } = await forgetActiveBrowserHostPins(
+      { accountId: ACCOUNT, origin: ORIGIN },
+      options(factory),
+    );
+    expect(forgotten).toBe(1);
+    expect(
+      await loadBrowserHostPin(approvalInput({ accountId: OTHER_ACCOUNT }), options(factory)),
+    ).not.toBeNull();
   });
 });

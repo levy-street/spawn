@@ -97,7 +97,6 @@ describe("endorsement introductions", () => {
         origin: ORIGIN,
         hostId: HOST_ID,
         claimedHostPublicKey: host.wire,
-        claimedHostFingerprint: await ed25519PublicKeyFingerprint(host.wire),
       },
       storage,
     );

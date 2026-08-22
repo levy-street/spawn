@@ -358,7 +358,8 @@ test("soft keyboard inset freezes the grid and pans instead of reflowing", async
 
   const setInset = (px: number) =>
     page.evaluate(
-      (p) => (window as unknown as { __setKeyboardInset: (px: number) => void }).__setKeyboardInset(p),
+      (p) =>
+        (window as unknown as { __setKeyboardInset: (px: number) => void }).__setKeyboardInset(p),
       px,
     );
 

@@ -130,11 +130,11 @@ test("landing page install CTA opens the download page", async ({ page }) => {
   });
   await page.goto("/");
 
-  await page.getByRole("link", { name: "Install daemon" }).click();
+  await page.getByRole("link", { name: "Install the daemon" }).first().click();
 
   await expect(page).toHaveURL(/\/download$/);
   await expect(
-    page.getByRole("heading", { name: "Download the right daemon for this host." }),
+    page.getByRole("heading", { name: "Install the daemon. Possess the host." }),
   ).toBeVisible();
 });
 
@@ -150,7 +150,7 @@ test("download page does not overflow on desktop or mobile", async ({ browser })
     });
     await page.goto("/download");
     await expect(
-      page.getByRole("heading", { name: "Download the right daemon for this host." }),
+      page.getByRole("heading", { name: "Install the daemon. Possess the host." }),
     ).toBeVisible();
     await expectNoHorizontalOverflow(page);
     await page.screenshot({ path: `test-results/download-${name}.png`, fullPage: true });

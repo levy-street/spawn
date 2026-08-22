@@ -12,8 +12,10 @@ The strict, still-offline JSON adapter is specified in
 Neither foundation is connected to the live WebSocket routes yet.
 
 Authenticated browser identity registration uses
-[`BROWSER_DEVICE_REGISTRATION_V1.md`](BROWSER_DEVICE_REGISTRATION_V1.md) and
-the shared `browser-device-registration-v1-vectors.json` corpus.
+[`BROWSER_DEVICE_REGISTRATION_V2.md`](BROWSER_DEVICE_REGISTRATION_V2.md) and
+the shared `browser-device-registration-v2-vectors.json` corpus (v2 binds the
+account-root claim into the signed transcript; v1 is retired with no
+acceptance window).
 Browser-authorized host pairing uses
 [`HOST_PAIR_APPROVAL_V1.md`](HOST_PAIR_APPROVAL_V1.md) and the shared
 `host-pair-approval-v1-vectors.json` corpus.
@@ -122,7 +124,8 @@ independently add immutable browser pins to that Host.
 | POST | `/api/browser-devices/{id}/revoke` | `{expected_public_key}` → the retained revoked row |
 
 Registration verifies the exact proof in
-[`BROWSER_DEVICE_REGISTRATION_V1.md`](BROWSER_DEVICE_REGISTRATION_V1.md).
+[`BROWSER_DEVICE_REGISTRATION_V2.md`](BROWSER_DEVICE_REGISTRATION_V2.md)
+(the optional `is_root` body field is bound inside the signed transcript).
 The response fingerprint is server-derived. A public key is globally immutable
 to its first account; exact active re-registration is idempotent, and a revoked
 key remains a tombstone that cannot be registered again. Revocation is scoped

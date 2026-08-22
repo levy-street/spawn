@@ -90,7 +90,6 @@ describe("trust bootstrap", () => {
         origin: ORIGIN,
         hostId: HOST_ID,
         claimedHostPublicKey: HOST_KEY,
-        claimedHostFingerprint: await ed25519PublicKeyFingerprint(HOST_KEY),
       },
       first,
     );
@@ -101,7 +100,6 @@ describe("trust bootstrap", () => {
         targetHostId: HOST_ID,
         claimedHostId: HOST_ID,
         claimedHostPublicKey: HOST_KEY,
-        claimedHostFingerprint: await ed25519PublicKeyFingerprint(HOST_KEY),
       },
       first,
     );
@@ -246,7 +244,6 @@ describe("trust bootstrap", () => {
         origin: ORIGIN,
         hostId: HOST_ID,
         claimedHostPublicKey: HOST_KEY,
-        claimedHostFingerprint: await ed25519PublicKeyFingerprint(HOST_KEY),
       },
       first,
     );
@@ -321,5 +318,277 @@ describe("trust bootstrap", () => {
       revoked.revision,
     );
     await expect(openTrustEnvelope(ACCOUNT, revoked.sealed, backup)).rejects.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reseal-on-unlock (review P-C1a): the bundle tracks the fleet
+// ---------------------------------------------------------------------------
+
+import { resealBundleWithLocalPins } from "./trust-bootstrap";
+import { mergeEnvelopeHosts } from "./trust-envelope";
+
+describe("resealBundleWithLocalPins", () => {
+  test("merges hosts possessed after the seal into the bundle at a bumped revision", async () => {
+    const minter = device();
+    await pin(minter, HOST_KEY);
+    const bundleKey = key(31);
+    const { sealed, revision } = await sealTrust(bundleKey, {
+      accountId: ACCOUNT,
+      origin: ORIGIN,
+      pinStorage: minter,
+    });
+
+    // The same device later possesses a second host — the exact C1-A ordering
+    // gap: nothing ever resealed, so the passkey never learned it.
+    await pin(minter, OTHER_HOST_KEY);
+    const reseal = await resealBundleWithLocalPins(
+      { accountId: ACCOUNT, origin: ORIGIN, pinStorage: minter },
+      sealed,
+      bundleKey,
+      revision,
+    );
+    expect(reseal).not.toBeNull();
+    expect(reseal!.addedHostKeys).toEqual([OTHER_HOST_KEY]);
+    expect(reseal!.revision).toBeGreaterThan(revision);
+
+    const bundle = await openTrustEnvelope(ACCOUNT, reseal!.sealed, bundleKey);
+    expect(new Set(bundle.hosts.map((h) => h.hostPublicKey))).toEqual(
+      new Set([HOST_KEY, OTHER_HOST_KEY]),
+    );
+  });
+
+  test("returns null when the bundle already covers every local pin", async () => {
+    const minter = device();
+    await pin(minter, HOST_KEY);
+    const bundleKey = key(32);
+    const { sealed, revision } = await sealTrust(bundleKey, {
+      accountId: ACCOUNT,
+      origin: ORIGIN,
+      pinStorage: minter,
+    });
+    expect(
+      await resealBundleWithLocalPins(
+        { accountId: ACCOUNT, origin: ORIGIN, pinStorage: minter },
+        sealed,
+        bundleKey,
+        revision,
+      ),
+    ).toBeNull();
+  });
+
+  test("UNION, never replacement: a locally-revoked host stays sealed for the others", async () => {
+    // Device 1 seals two hosts. Device 2 imports, locally revokes one (its own
+    // withdrawal), pins a third, and reseals: the merge must keep the host
+    // device 2 dropped — local tombstones are this-device-only.
+    const first = device();
+    await pin(first, HOST_KEY);
+    await pin(first, OTHER_HOST_KEY);
+    const bundleKey = key(33);
+    const { sealed, revision } = await sealTrust(bundleKey, {
+      accountId: ACCOUNT,
+      origin: ORIGIN,
+      pinStorage: first,
+    });
+
+    const second = device();
+    await importTrustBundle(bundleKey, sealed, {
+      accountId: ACCOUNT,
+      origin: ORIGIN,
+      pinStorage: second,
+    });
+    await resolveActiveBrowserHostPin(
+      { accountId: ACCOUNT, origin: ORIGIN, hostId: HOST_ID, claimedHostPublicKey: HOST_KEY },
+      second,
+    );
+    await revokeBrowserHostPin(
+      {
+        accountId: ACCOUNT,
+        origin: ORIGIN,
+        targetHostId: HOST_ID,
+        claimedHostId: HOST_ID,
+        claimedHostPublicKey: HOST_KEY,
+      },
+      second,
+    );
+    const THIRD_HOST_KEY = "9wLNcag6789rk5UUFLPS3mIhplKKC8zVUEWdIYkAcNQ";
+    await pin(second, THIRD_HOST_KEY);
+
+    const reseal = await resealBundleWithLocalPins(
+      { accountId: ACCOUNT, origin: ORIGIN, pinStorage: second },
+      sealed,
+      bundleKey,
+      revision,
+    );
+    expect(reseal!.addedHostKeys).toEqual([THIRD_HOST_KEY]);
+    const bundle = await openTrustEnvelope(ACCOUNT, reseal!.sealed, bundleKey);
+    expect(new Set(bundle.hosts.map((h) => h.hostPublicKey))).toEqual(
+      new Set([HOST_KEY, OTHER_HOST_KEY, THIRD_HOST_KEY]),
+    );
+  });
+
+  test("a CAS loser converges by resealing on top of the winner's bundle", async () => {
+    // Two devices race their merges from the same base revision. The server's
+    // CAS lets exactly one in; the loser SKIPS (nothing lost) and its next
+    // unlock reseals against the winner's bundle — ending with the union.
+    const first = device();
+    await pin(first, HOST_KEY);
+    const bundleKey = key(34);
+    const base = await sealTrust(bundleKey, {
+      accountId: ACCOUNT,
+      origin: ORIGIN,
+      pinStorage: first,
+    });
+
+    const deviceA = device();
+    await importTrustBundle(bundleKey, base.sealed, {
+      accountId: ACCOUNT,
+      origin: ORIGIN,
+      pinStorage: deviceA,
+    });
+    await pin(deviceA, OTHER_HOST_KEY);
+    const winner = await resealBundleWithLocalPins(
+      { accountId: ACCOUNT, origin: ORIGIN, pinStorage: deviceA },
+      base.sealed,
+      bundleKey,
+      base.revision,
+    );
+    expect(winner!.addedHostKeys).toEqual([OTHER_HOST_KEY]);
+
+    const deviceB = device();
+    await importTrustBundle(bundleKey, base.sealed, {
+      accountId: ACCOUNT,
+      origin: ORIGIN,
+      pinStorage: deviceB,
+    });
+    const THIRD_HOST_KEY = "9wLNcag6789rk5UUFLPS3mIhplKKC8zVUEWdIYkAcNQ";
+    await pin(deviceB, THIRD_HOST_KEY);
+    // B's write of its own merge would 409 server-side (same expected
+    // revision as the winner's) — the loser path. Next unlock: B reseals
+    // from the WINNER's stored bundle and revision.
+    const retry = await resealBundleWithLocalPins(
+      { accountId: ACCOUNT, origin: ORIGIN, pinStorage: deviceB },
+      winner!.sealed,
+      bundleKey,
+      winner!.revision,
+    );
+    expect(retry!.addedHostKeys).toEqual([THIRD_HOST_KEY]);
+    expect(retry!.revision).toBeGreaterThan(winner!.revision);
+    const bundle = await openTrustEnvelope(ACCOUNT, retry!.sealed, bundleKey);
+    expect(new Set(bundle.hosts.map((h) => h.hostPublicKey))).toEqual(
+      new Set([HOST_KEY, OTHER_HOST_KEY, THIRD_HOST_KEY]),
+    );
+  });
+});
+
+describe("mergeEnvelopeHosts", () => {
+  test("reseals under the same data key: every enrolled passkey still opens, root survives", async () => {
+    const minter = device();
+    await pin(minter, HOST_KEY);
+    const primary = key(35);
+    const backup = key(36);
+    const root = {
+      publicKeyWire: "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+      seedWire: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    };
+    const { sealed, revision } = await sealCurrentTrust(
+      primary,
+      { accountId: ACCOUNT, origin: ORIGIN, pinStorage: minter },
+      0,
+      root,
+    );
+    const withBackup = await enrollBackupPasskey(
+      { accountId: ACCOUNT, origin: ORIGIN, pinStorage: minter },
+      sealed,
+      primary,
+      backup,
+    );
+
+    const merged = await mergeEnvelopeHosts(
+      ACCOUNT,
+      withBackup,
+      primary,
+      [
+        {
+          hostPublicKey: OTHER_HOST_KEY,
+          hostFingerprint: await ed25519PublicKeyFingerprint(OTHER_HOST_KEY),
+          hostIds: [],
+        },
+      ],
+      revision + 1,
+    );
+    expect(merged!.addedHostKeys).toEqual([OTHER_HOST_KEY]);
+    // BOTH passkeys open the merged envelope (same data key, wraps intact)…
+    for (const opener of [primary, backup]) {
+      const bundle = await openTrustEnvelope(ACCOUNT, merged!.sealed, opener);
+      expect(bundle.hosts).toHaveLength(2);
+      // …and the sealed root is carried, never dropped by the merge.
+      expect(bundle.root?.publicKeyWire).toBe(root.publicKeyWire);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Forget vs targeted revocation: tombstone provenance (review P-C6)
+// ---------------------------------------------------------------------------
+
+import { forgetTrustOnThisDevice } from "./trust-bootstrap";
+
+describe("forgetTrustOnThisDevice", () => {
+  test("a forgotten host is re-pinned by the next import — forget is not a revocation", async () => {
+    const dev = device();
+    await pin(dev, HOST_KEY);
+    const bundleKey = key(41);
+    const scope = { accountId: ACCOUNT, origin: ORIGIN, pinStorage: dev };
+    const { sealed } = await sealTrust(bundleKey, scope);
+
+    const { forgotten } = await forgetTrustOnThisDevice(scope);
+    expect(forgotten).toBe(1);
+    expect(
+      await listActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, dev),
+    ).toHaveLength(0);
+
+    // The old tombstoning forget made this import skip forever ("this device
+    // already knows your hosts", over zero pins). Deletion means the passkey
+    // path genuinely brings the host back.
+    const imported = await importTrustBundle(bundleKey, sealed, scope);
+    expect(imported.added).toEqual([HOST_KEY]);
+    expect(imported.skippedRevoked).toHaveLength(0);
+    const pins = await listActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, dev);
+    expect(pins.map((p) => p.hostPublicKey)).toEqual([HOST_KEY]);
+  });
+
+  test("forget spares a targeted-revocation tombstone, which imports keep honouring", async () => {
+    const dev = device();
+    await pin(dev, HOST_KEY);
+    await pin(dev, OTHER_HOST_KEY);
+    const bundleKey = key(42);
+    const scope = { accountId: ACCOUNT, origin: ORIGIN, pinStorage: dev };
+    const { sealed } = await sealTrust(bundleKey, scope);
+
+    // Operator's deliberate per-host removal…
+    await resolveActiveBrowserHostPin(
+      { accountId: ACCOUNT, origin: ORIGIN, hostId: HOST_ID, claimedHostPublicKey: HOST_KEY },
+      dev,
+    );
+    await revokeBrowserHostPin(
+      {
+        accountId: ACCOUNT,
+        origin: ORIGIN,
+        targetHostId: HOST_ID,
+        claimedHostId: HOST_ID,
+        claimedHostPublicKey: HOST_KEY,
+      },
+      dev,
+    );
+    // …then a device reset, which only clears the remaining ACTIVE pin.
+    const { forgotten } = await forgetTrustOnThisDevice(scope);
+    expect(forgotten).toBe(1);
+
+    const imported = await importTrustBundle(bundleKey, sealed, scope);
+    expect(imported.added).toEqual([OTHER_HOST_KEY]);
+    expect(imported.skippedRevoked).toEqual([HOST_KEY]);
+    const pins = await listActiveBrowserHostPins({ accountId: ACCOUNT, origin: ORIGIN }, dev);
+    expect(pins.map((p) => p.hostPublicKey)).toEqual([OTHER_HOST_KEY]);
   });
 });

@@ -243,6 +243,46 @@ async def test_daemon_ws_register_accepts_old_shape_and_heartbeat_query_token(cl
         assert host.last_seen_at is not None
 
 
+async def test_register_ratchets_account_chain_support(client):
+    """Mesh R9: chain capability is set by an advertising daemon and never
+    lowered by an older build reconnecting — the per-host endorsement path
+    stays retired once retired."""
+
+    user_id, _ = await _signup(client, "ws-chain-ratchet@example.com")
+    host_id = await _create_host(user_id)
+
+    async def register(payload: dict) -> None:
+        ws = FakeDaemonWebSocket()
+        ws.queue_text(payload)
+        ws.queue_disconnect()
+        await daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+
+    sm = get_sessionmaker()
+
+    await register({"type": "register", "host_name": "new-spawnd", "version": "0.2.0"})
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None and host.supports_account_chains is False
+
+    await register(
+        {
+            "type": "register",
+            "host_name": "new-spawnd",
+            "version": "0.2.0",
+            "supports_account_chains": True,
+        }
+    )
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None and host.supports_account_chains is True
+
+    # An old build (no flag) reconnects: the ratchet holds.
+    await register({"type": "register", "host_name": "old-spawnd", "version": "0.1.0"})
+    async with sm() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None and host.supports_account_chains is True
+
+
 async def test_daemon_ws_register_resyncs_only_owned_existing_agents_while_connected(client):
     user_id, _ = await _signup(client, "ws-daemon-resync@example.com")
     host_id = await _create_host(user_id, name="primary")
@@ -1706,6 +1746,98 @@ async def test_revoking_endorser_drops_its_endorsed_pins_from_live_set(client):
     assert {row["browser_device_id"] for row in await _live_browser_pins(host_id)} == {
         direct_id
     }
+
+
+async def test_account_root_pin_survives_its_endorsers_revocation(client):
+    """The account root's pin is a ratchet (mesh stage 5c).
+
+    A host anchors on pk_R via an endorsement from an already-pinned device.
+    Revoking that device must NOT drop the root's pin — surviving the loss of
+    every ordinary device is the root's entire purpose (P3'). An ordinary pin
+    endorsed by the same device dies with it, and revoking the root itself
+    still drops the root's pin.
+    """
+
+    from datetime import UTC, datetime
+
+    from spawn_server.models import BrowserDevice, HostBrowserPin
+    from spawn_server.ws.daemon import _live_browser_device_ids, _live_browser_pins
+
+    async with get_sessionmaker()() as session:
+        user = User(email="root-ratchet@example.com", password_hash="x")
+        session.add(user)
+        await session.flush()
+        host = Host(name="root-ratchet-box", owner_user_id=user.id)
+        session.add(host)
+        await session.flush()
+
+        endorser = BrowserDevice(
+            owner_user_id=user.id, key_algorithm="ed25519", public_key="E" * 43
+        )
+        account_root = BrowserDevice(
+            owner_user_id=user.id, key_algorithm="ed25519", public_key="R" * 43, is_root=True
+        )
+        ordinary = BrowserDevice(
+            owner_user_id=user.id, key_algorithm="ed25519", public_key="D" * 43
+        )
+        session.add_all([endorser, account_root, ordinary])
+        await session.flush()
+
+        session.add_all(
+            [
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=endorser.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=endorser.public_key,
+                    browser_key_fingerprint="SHA256:" + "e" * 16,
+                ),
+                # Both endorsed by the same device: the root pin and a control.
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=account_root.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=account_root.public_key,
+                    browser_key_fingerprint="SHA256:" + "r" * 16,
+                    endorser_device_id=endorser.id,
+                    endorsement_signature="s" * 86,
+                ),
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=ordinary.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=ordinary.public_key,
+                    browser_key_fingerprint="SHA256:" + "d" * 16,
+                    endorser_device_id=endorser.id,
+                    endorsement_signature="t" * 86,
+                ),
+            ]
+        )
+        await session.commit()
+        host_id = host.id
+        endorser_id, root_id, ordinary_id = endorser.id, account_root.id, ordinary.id
+
+    assert await _live_browser_device_ids(host_id) == sorted(
+        [endorser_id, root_id, ordinary_id]
+    )
+
+    async with get_sessionmaker()() as session:
+        endorser_device = await session.get(BrowserDevice, endorser_id)
+        assert endorser_device is not None
+        endorser_device.revoked_at = datetime.now(UTC)
+        await session.commit()
+
+    # The root's pin survives its endorser; the ordinary pin dies with it.
+    assert await _live_browser_device_ids(host_id) == [root_id]
+    assert {row["browser_device_id"] for row in await _live_browser_pins(host_id)} == {root_id}
+
+    # Revoking the root itself still drops it — the ratchet is not immortality.
+    async with get_sessionmaker()() as session:
+        root_device = await session.get(BrowserDevice, root_id)
+        assert root_device is not None
+        root_device.revoked_at = datetime.now(UTC)
+        await session.commit()
+    assert await _live_browser_device_ids(host_id) == []
 
 
 async def test_revoking_root_drops_the_whole_endorsement_subtree(client):

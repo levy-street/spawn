@@ -169,7 +169,12 @@ describe("browser device identity", () => {
     const identity = await loadOrCreateBrowserDeviceIdentity(accountId, options(factory));
     const signature = await createBrowserDeviceRegistrationProof(identity, accountId);
     expect(
-      await verifyBrowserDeviceRegistrationProof(accountId, identity.publicKeyWire, signature),
+      await verifyBrowserDeviceRegistrationProof(
+        accountId,
+        identity.publicKeyWire,
+        signature,
+        false,
+      ),
     ).toBe(true);
     await expect(
       createBrowserDeviceRegistrationProof(identity, "00000000-0000-4000-8000-000000000002"),

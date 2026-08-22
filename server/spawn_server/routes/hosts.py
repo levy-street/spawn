@@ -19,7 +19,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
 from ..db import get_session, get_sessionmaker
-from ..host_identity import host_key_fingerprint
 from ..host_key_claims import lock_host_key_claim
 from ..models import Agent, DeviceCode, Host, HostBrowserPin, HostToolPolicy, Preset, User
 from ..ws.broker import get_broker
@@ -47,11 +46,6 @@ def _aware(dt: datetime | None) -> datetime | None:
 
 
 def _to_out(host: Host, agent_count: int) -> schemas.HostOut:
-    fingerprint = (
-        host_key_fingerprint(host.host_key_algorithm, host.host_public_key)
-        if host.host_key_algorithm is not None and host.host_public_key is not None
-        else None
-    )
     return schemas.HostOut(
         id=host.id,
         name=host.name,
@@ -60,10 +54,10 @@ def _to_out(host: Host, agent_count: int) -> schemas.HostOut:
         version=host.version,
         host_key_algorithm=host.host_key_algorithm,
         host_public_key=host.host_public_key,
-        host_key_fingerprint=fingerprint,
         status=host.status,
         last_seen_at=host.last_seen_at,
         agent_count=agent_count,
+        supports_account_chains=host.supports_account_chains,
     )
 
 

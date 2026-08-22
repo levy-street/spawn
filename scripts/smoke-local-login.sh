@@ -202,7 +202,7 @@ import urllib.request
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from spawn_server.browser_registration import encode_browser_registration_transcript
-from spawn_server.host_identity import decode_ed25519_public_key
+from spawn_server.host_identity import decode_ed25519_public_key, ed25519_key_fingerprint
 from spawn_server.host_pair_approval import (
     decode_approval_nonce,
     encode_host_pair_approval_transcript,
@@ -242,7 +242,7 @@ browser = post(
         "key_algorithm": "ed25519",
         "public_key": wire(browser_public),
         "signature": wire(
-            browser_key.sign(encode_browser_registration_transcript(user_id, browser_public))
+            browser_key.sign(encode_browser_registration_transcript(user_id, browser_public, is_root=False))
         ),
     },
 )
@@ -265,13 +265,13 @@ approval = {
     "browser_device_id": browser["id"],
     "browser_key_algorithm": browser["key_algorithm"],
     "browser_public_key": browser["public_key"],
-    "browser_key_fingerprint": browser["fingerprint"],
+    "browser_key_fingerprint": ed25519_key_fingerprint(browser["public_key"]),
     "signature": wire(browser_key.sign(approval_transcript)),
 }
 body = post("/api/auth/device/approve", approval)
 if body.get("host_name") != "cli-login-smoke":
     raise SystemExit(f"unexpected approve response: {body!r}")
-if any(body.get(field) != approval[field] for field in approval if field != "user_code" and field != "signature"):
+if any(body.get(field) != approval[field] for field in approval if field not in {"user_code", "signature", "host_key_fingerprint", "browser_key_fingerprint"}):
     raise SystemExit(f"approval response changed reviewed identity: {body!r}")
 with open(approved_browser_path, "w", encoding="utf-8") as approved_browser_file:
     json.dump(
@@ -279,7 +279,7 @@ with open(approved_browser_path, "w", encoding="utf-8") as approved_browser_file
             "browser_device_id": browser["id"],
             "browser_key_algorithm": browser["key_algorithm"],
             "browser_public_key": browser["public_key"],
-            "browser_key_fingerprint": browser["fingerprint"],
+            "browser_key_fingerprint": ed25519_key_fingerprint(browser["public_key"]),
         },
         approved_browser_file,
         sort_keys=True,
@@ -294,7 +294,12 @@ approve_device_code "$user_code" "$approved_browser"
 wait_for_login() {
   (
     sleep 35
-    if [[ -n "$login_pid" ]]; then
+    # Kill only if the PID still belongs to OUR spawnd login: a watchdog that
+    # outlives an early script exit otherwise fires at a recycled PID and
+    # assassinates an unrelated process (observed: the NEXT smoke run's
+    # daemon, on a box churning PIDs through cargo builds).
+    if [[ -n "$login_pid" ]] \
+      && grep -qa "spawnd" "/proc/$login_pid/cmdline" 2>/dev/null; then
       kill "$login_pid" >/dev/null 2>&1 || true
     fi
   ) &
@@ -311,7 +316,7 @@ wait_for_login() {
 
 wait_for_login
 
-grep -F "enter code:" "$login_out" >/dev/null
+grep -F "/device?ref=" "$login_out" >/dev/null
 grep -F "logged in. host_id =" "$login_out" >/dev/null
 
 printf '%s\n' "smoke-local-login: re-running login in the same scoped keyring namespace"
@@ -358,7 +363,7 @@ PY
 printf '%s\n' "smoke-local-login: approving second device code"
 approve_device_code "$user_code_2" "$approved_browser_2"
 wait_for_login
-grep -F "enter code:" "$login_out_2" >/dev/null
+grep -F "/device?ref=" "$login_out_2" >/dev/null
 grep -F "logged in. host_id =" "$login_out_2" >/dev/null
 
 printf '%s\n' "smoke-local-login: verifying stored credentials and host"
@@ -414,7 +419,16 @@ approved_browsers = sorted(
     ],
     key=lambda pin: pin["browser_device_id"],
 )
-if creds.get("browser_pins") != approved_browsers:
+# Compare the identity tuple field-wise: stored pins additionally retain the
+# signed approval_proof (possession ceremony), which the approval response
+# never carried — extra fields must not fail the identity check.
+stored_pins = sorted(
+    creds.get("browser_pins") or [], key=lambda pin: pin["browser_device_id"]
+)
+stored_identity = [
+    {field: pin.get(field) for field in approved_browsers[0]} for pin in stored_pins
+]
+if stored_identity != approved_browsers:
     raise SystemExit(
         "daemon did not preserve both exact approving browser tuples across re-login: "
         f"expected {approved_browsers!r}, got {creds.get('browser_pins')!r}"

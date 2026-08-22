@@ -699,10 +699,16 @@ async def device_sas(
     session: AsyncSession = Depends(get_session),
     _user: User = Depends(auth.current_user),
 ) -> schemas.DeviceSasResponse:
-    """Browser's committed-ephemeral SAS contribution: its nonce Nb and key B.
-    The server only stores/forwards them (it is a dumb relay); the daemon reads
-    them on its next poll and reveals its own Nd. Set-once, and only while the
-    ceremony is still pending with a daemon commitment present."""
+    """LEGACY (pre-fragment daemons only). Browser's committed-ephemeral SAS
+    contribution: its nonce Nb and key B. The server only stores/forwards them
+    (it is a dumb relay); the daemon reads them on its next poll and reveals its
+    own Nd. Set-once, and only while the ceremony is still pending with a daemon
+    commitment present.
+
+    Since 2026-08-21 possession verifies the host key via the out-of-band URL
+    fragment instead (docs/TRUST_DEVICE_MESH.md Appendix A note): new daemons
+    send no sas_commit and new web builds never call this. It remains so that
+    an old daemon paired against an old cached web build keeps working."""
 
     dc = await _pending_device_code(
         session, user_code=body.user_code, approval_ref=body.approval_ref
@@ -897,11 +903,15 @@ async def device_approve(
             detail="host identity or approval state changed; review the device code again",
         )
     await session.commit()
+    # Echo the reviewed identity minus the SAS relay fields (pending-only) and
+    # minus the fingerprint (mesh B5: the response carries the keys themselves,
+    # so the client derives any fingerprint it needs locally).
     return schemas.DeviceApproveResponse(
-        **reviewed.model_dump(),
+        **reviewed.model_dump(
+            exclude={"host_key_fingerprint", "sas_commit", "sas_host_nonce"}
+        ),
         browser_device_id=body.browser_device_id,
         browser_key_algorithm=body.browser_key_algorithm,
         browser_public_key=body.browser_public_key,
-        browser_key_fingerprint=body.browser_key_fingerprint,
         host_id=pinned_host.id if pinned_host is not None else None,
     )

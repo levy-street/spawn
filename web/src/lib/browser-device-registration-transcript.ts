@@ -8,10 +8,20 @@ import {
 
 const textEncoder = new TextEncoder();
 
-export const BROWSER_DEVICE_REGISTRATION_MAGIC = textEncoder.encode("SPAWN-BROWSER-REGISTER-V1");
-export const BROWSER_DEVICE_REGISTRATION_VERSION = 1;
+export const BROWSER_DEVICE_REGISTRATION_MAGIC = textEncoder.encode("SPAWN-BROWSER-REGISTER-V2");
+export const BROWSER_DEVICE_REGISTRATION_VERSION = 2;
+/**
+ * V2 flags byte. Bit 0 is the root claim: it binds "register this key as the
+ * account root pk_R" (vs. an ordinary browser device) into the signed proof, so
+ * the server-stored `is_root` column is attested by the key holder rather than
+ * being a server-mutable request field. Root-hood is load-bearing server-side
+ * (the R9 per-host endorsement exemption and the pin-liveness ratchet), so a
+ * flag the proof does not cover would be exactly the unsigned authority the
+ * trust model forbids. All other bits must be zero.
+ */
+export const BROWSER_DEVICE_REGISTRATION_FLAG_ROOT = 0x01;
 export const BROWSER_DEVICE_REGISTRATION_TRANSCRIPT_BYTES =
-  BROWSER_DEVICE_REGISTRATION_MAGIC.byteLength + 1 + 16 + ED25519_PUBLIC_KEY_BYTES;
+  BROWSER_DEVICE_REGISTRATION_MAGIC.byteLength + 1 + 16 + 1 + ED25519_PUBLIC_KEY_BYTES;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -39,6 +49,7 @@ function uuidBytes(userId: string): Uint8Array {
 export function encodeBrowserDeviceRegistrationTranscript(
   userId: string,
   publicKeyWire: string,
+  isRoot: boolean,
 ): Uint8Array {
   const publicKey = decodeEd25519PublicKeyWire(publicKeyWire);
   const output = new Uint8Array(BROWSER_DEVICE_REGISTRATION_TRANSCRIPT_BYTES);
@@ -49,6 +60,8 @@ export function encodeBrowserDeviceRegistrationTranscript(
   offset += 1;
   output.set(uuidBytes(userId), offset);
   offset += 16;
+  output[offset] = isRoot ? BROWSER_DEVICE_REGISTRATION_FLAG_ROOT : 0;
+  offset += 1;
   output.set(publicKey, offset);
   return output;
 }
@@ -63,9 +76,10 @@ export async function verifyBrowserDeviceRegistrationProof(
   userId: string,
   publicKeyWire: string,
   signatureWire: string,
+  isRoot: boolean,
 ): Promise<boolean> {
   const publicKey = await importEd25519PublicKeyWire(publicKeyWire);
-  const transcript = encodeBrowserDeviceRegistrationTranscript(userId, publicKeyWire);
+  const transcript = encodeBrowserDeviceRegistrationTranscript(userId, publicKeyWire, isRoot);
   const signature = decodeBase64Url(signatureWire, ED25519_SIGNATURE_BYTES);
   try {
     return await crypto.subtle.verify(

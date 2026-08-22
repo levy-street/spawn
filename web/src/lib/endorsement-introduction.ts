@@ -165,7 +165,6 @@ export async function acceptEndorsementIntroductions(
           origin,
           hostId: introduction.hostId,
           claimedHostPublicKey: introduction.hostPublicKey,
-          claimedHostFingerprint: introduction.hostFingerprint,
         },
         storage,
       );
