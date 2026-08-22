@@ -1,0 +1,103 @@
+import { buildHostSocketUrl } from "@/data/api/socket-urls";
+import type { SignalChannel } from "@/data/realtime/session-signal";
+import { ReconnectingSocket, type SocketState } from "@/data/realtime/socket";
+import { useConnectionStore } from "@/data/stores/connection";
+
+export const HOST_SIGNAL_PROTOCOL = "spawn.host.v1";
+const SIGNAL_RECONNECT_CAP_MS = 10_000;
+const SIGNAL_RECONNECT_STEP_MS = 500;
+
+type SignalFrameObserver = (hostId: string, frame: unknown) => void;
+const FRAME_OBSERVERS = new Set<SignalFrameObserver>();
+
+export function subscribeHostSignalFrames(observer: SignalFrameObserver): () => void {
+  FRAME_OBSERVERS.add(observer);
+  return () => {
+    FRAME_OBSERVERS.delete(observer);
+  };
+}
+
+function parseSignalFrame(value: string): unknown | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+class HostSignalChannel implements SignalChannel {
+  private readonly socket: ReconnectingSocket<unknown>;
+  private readonly listeners = new Set<(frame: unknown) => void>();
+  private readonly unsubscribers: Array<() => void>;
+
+  constructor(private readonly hostId: string) {
+    this.socket = new ReconnectingSocket({
+      url: () => buildHostSocketUrl(hostId),
+      protocol: HOST_SIGNAL_PROTOCOL,
+      watchdogMs: null,
+      reconnectDelayMs: (attempt) =>
+        Math.min(SIGNAL_RECONNECT_CAP_MS, SIGNAL_RECONNECT_STEP_MS * (attempt + 1)),
+      maxReconnectAttempt: SIGNAL_RECONNECT_CAP_MS / SIGNAL_RECONNECT_STEP_MS,
+    });
+    this.unsubscribers = [
+      this.socket.subscribe((state) => {
+        useConnectionStore.getState().setHostSignal(this.hostId, state);
+      }),
+      this.socket.onMessage((value) => {
+        if (typeof value !== "string") {
+          this.socket.failProtocol("binary signalling frame");
+          return;
+        }
+        const frame = parseSignalFrame(value);
+        if (!frame) {
+          return;
+        }
+        for (const observer of FRAME_OBSERVERS) {
+          try {
+            observer(this.hostId, frame);
+          } catch {
+            // A cache observer cannot interrupt the transport relay.
+          }
+        }
+        for (const listener of this.listeners) {
+          try {
+            listener(frame);
+          } catch {
+            // The WebView bridge and other consumers are isolated.
+          }
+        }
+      }),
+    ];
+    this.socket.connect();
+  }
+
+  get state(): SocketState {
+    return this.socket.state;
+  }
+
+  send(frame: unknown): void {
+    this.socket.send(frame);
+  }
+
+  onFrame(fn: (frame: unknown) => void): () => void {
+    this.listeners.add(fn);
+    return () => {
+      this.listeners.delete(fn);
+    };
+  }
+
+  close(): void {
+    for (const unsubscribe of this.unsubscribers) {
+      unsubscribe();
+    }
+    this.unsubscribers.length = 0;
+    this.listeners.clear();
+    this.socket.close();
+    useConnectionStore.getState().removeHost(this.hostId);
+  }
+}
+
+export function openHostSignal(hostId: string): SignalChannel {
+  return new HostSignalChannel(hostId);
+}

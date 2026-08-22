@@ -1,0 +1,242 @@
+// biome-ignore-all lint: This source executes inside WKWebView, not the React Native runtime.
+(() => {
+  "use strict";
+  const api = globalThis.spawnWorker;
+  const state = api.state;
+  const CHANNEL_OPTIONS = Object.freeze({ ordered: true });
+
+  function protocolTuple() {
+    return state.mode === "session"
+      ? { scopeType: "session", protocol: "spawn.pty", protocolVersion: 2 }
+      : { scopeType: "host", protocol: "spawn.host.ctl", protocolVersion: 1 };
+  }
+
+  function outerTuple() {
+    const tuple = protocolTuple();
+    return {
+      session_id: state.rtcSessionId,
+      binding_nonce: state.bindingNonce,
+      ...(state.bindingGeneration === null ? {} : { binding_generation: state.bindingGeneration }),
+      scope_type: tuple.scopeType,
+      scope_id: state.scopeId,
+      protocol: tuple.protocol,
+      protocol_version: tuple.protocolVersion,
+    };
+  }
+
+  function emitSignal(frame) {
+    api.post({ type: "signal-frame", frame });
+  }
+
+  function channelFailed(label) {
+    api.error("channel_closed", `${label} closed before the session retired.`, true);
+    api.post({ type: "state", state: "reconnecting" });
+    teardown(false);
+  }
+
+  function configureChannel(channel, kind) {
+    channel.binaryType = "arraybuffer";
+    channel.onopen = () => {
+      if (kind === "pty") api.sessionChannelOpened?.("ptyOpen");
+      else api.sessionChannelOpened?.("ctlOpen");
+      if (state.mode === "host") api.hostChannelOpened?.();
+    };
+    channel.onclose = () => channelFailed(channel.label);
+    channel.onerror = () => channelFailed(channel.label);
+    channel.onmessage = (event) => {
+      if (kind === "pty") api.receivePty?.(event.data);
+      else if (state.mode === "session") api.receiveSessionCtl?.(event.data);
+      else api.receiveHostCtl?.(event.data);
+    };
+  }
+
+  async function startPeer(message) {
+    if (state.pc && state.rtcSessionId === message.rtcSessionId) return;
+    teardown(false);
+    state.stopped = false;
+    state.rtcSessionId = message.rtcSessionId;
+    state.bindingNonce = message.bindingNonce;
+    state.bindingGeneration = null;
+    const pc = new RTCPeerConnection({
+      iceServers: message.iceServers,
+      iceTransportPolicy: message.forceRelay ? "relay" : "all",
+    });
+    state.pc = pc;
+    if (state.mode === "session") {
+      state.pty = pc.createDataChannel("spawn.pty", CHANNEL_OPTIONS);
+      state.ctl = pc.createDataChannel("spawn.ctl", CHANNEL_OPTIONS);
+      configureChannel(state.pty, "pty");
+      configureChannel(state.ctl, "ctl");
+      api.resetSessionGeneration?.();
+    } else {
+      state.ctl = pc.createDataChannel("spawn.host.ctl", CHANNEL_OPTIONS);
+      configureChannel(state.ctl, "ctl");
+      api.resetHostGeneration?.();
+    }
+    pc.onicecandidate = ({ candidate }) => {
+      if (!candidate) return;
+      const frame = { type: "rtc.candidate", ...outerTuple(), candidate: candidate.toJSON() };
+      if (state.bindingGeneration === null) state.pendingLocalCandidates.push(frame);
+      else emitSignal(frame);
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "failed") channelFailed("RTCPeerConnection");
+      if (pc.connectionState === "disconnected") {
+        clearTimeout(state.disconnectTimer);
+        state.disconnectTimer = setTimeout(() => channelFailed("RTCPeerConnection"), 5_000);
+      } else if (pc.connectionState === "connected") {
+        clearTimeout(state.disconnectTimer);
+      }
+    };
+    api.post({ type: "state", state: "connecting" });
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const tuple = protocolTuple();
+    const requestId = crypto.randomUUID();
+    const transcript = {
+      signalKind: "offer",
+      protocolVersion: tuple.protocolVersion,
+      sessionId: state.rtcSessionId,
+      scopeType: tuple.scopeType,
+      scopeId: state.scopeId,
+      senderRole: "browser",
+      intendedPeerIdentityPublicKey: state.hostKey,
+      sdp: offer.sdp,
+    };
+    state.pendingSign.set(requestId, transcript);
+    api.post({ type: "sign-request", requestId, transcript });
+  }
+
+  async function acceptSignResponse(message) {
+    const transcript = state.pendingSign.get(message.requestId);
+    if (!transcript) return;
+    state.pendingSign.delete(message.requestId);
+    if (!message.signature) {
+      api.error("signal_signing", message.error ?? "Signal signing failed.");
+      return;
+    }
+    const tuple = protocolTuple();
+    const envelope = {
+      type: "rtc.offer",
+      signature_algorithm: "ed25519",
+      sender_identity_public_key: state.browserKey,
+      intended_peer_identity_public_key: state.hostKey,
+      protocol: tuple.protocol,
+      protocol_version: tuple.protocolVersion,
+      session_id: state.rtcSessionId,
+      scope_type: tuple.scopeType,
+      scope_id: state.scopeId,
+      sender_role: "browser",
+      sdp: transcript.sdp,
+      signature: message.signature,
+    };
+    emitSignal({ type: "rtc.offer", ...outerTuple(), signed_envelope: JSON.stringify(envelope) });
+  }
+
+  function frameMatches(value) {
+    const tuple = protocolTuple();
+    return (
+      value?.session_id === state.rtcSessionId &&
+      value?.binding_nonce === state.bindingNonce &&
+      value?.scope_type === tuple.scopeType &&
+      value?.scope_id === state.scopeId &&
+      value?.protocol === tuple.protocol &&
+      value?.protocol_version === tuple.protocolVersion
+    );
+  }
+
+  async function acceptSignal(frame) {
+    if (frame?.type === "rtc.config") return;
+    if (frame?.type === "rtc.status") {
+      if (!frameMatches(frame)) return;
+      if (frame.status === "negotiating" || frame.status === "connected") {
+        if (Number.isSafeInteger(frame.binding_generation) && frame.binding_generation > 0) {
+          state.bindingGeneration = frame.binding_generation;
+          if (state.mode === "session") api.sessionGate?.("bindingAccepted");
+          else api.hostBindingAccepted?.();
+          for (const candidate of state.pendingLocalCandidates.splice(0)) {
+            emitSignal({ ...candidate, binding_generation: frame.binding_generation });
+          }
+        }
+      }
+      if (["failed", "unavailable", "collision", "disabled"].includes(frame.status)) {
+        channelFailed(`RTC ${frame.status}`);
+      }
+      return;
+    }
+    if (!frameMatches(frame) || !state.pc) return;
+    if (frame.type === "rtc.answer") {
+      const envelope =
+        typeof frame.signed_envelope === "string" ? JSON.parse(frame.signed_envelope) : null;
+      if (
+        !envelope ||
+        envelope.sender_identity_public_key !== state.hostKey ||
+        envelope.sdp.length === 0
+      ) {
+        throw new Error("Signed RTC answer identity or shape mismatch.");
+      }
+      await state.pc.setRemoteDescription({ type: "answer", sdp: envelope.sdp });
+      for (const candidate of state.pendingRemoteCandidates.splice(0))
+        await state.pc.addIceCandidate(candidate);
+      return;
+    }
+    if (frame.type === "rtc.candidate" && frame.candidate) {
+      if (!state.pc.remoteDescription) state.pendingRemoteCandidates.push(frame.candidate);
+      else await state.pc.addIceCandidate(frame.candidate);
+    }
+  }
+
+  function teardown(sendClose) {
+    if (sendClose && state.rtcSessionId && state.bindingNonce) {
+      emitSignal({ type: "rtc.close", ...outerTuple() });
+    }
+    clearTimeout(state.disconnectTimer);
+    state.disconnectTimer = null;
+    for (const channel of [state.pty, state.ctl]) {
+      if (!channel) continue;
+      channel.onclose = null;
+      channel.onerror = null;
+      channel.close();
+    }
+    state.pty = null;
+    state.ctl = null;
+    state.pc?.close();
+    state.pc = null;
+    state.pendingLocalCandidates.splice(0);
+    state.pendingRemoteCandidates.splice(0);
+    state.pendingSign.clear();
+  }
+
+  api.handleTransportMessage = async (message) => {
+    switch (message.type) {
+      case "connect":
+        await startPeer(message);
+        break;
+      case "sign-response":
+        await acceptSignResponse(message);
+        break;
+      case "signal-frame":
+        await acceptSignal(message.frame);
+        break;
+      case "request-replay":
+        api.requestReplay?.(message.fromOffset);
+        break;
+      case "upload-start":
+      case "upload-chunk":
+      case "upload-cancel":
+        await api.handleUploadMessage?.(message);
+        break;
+      case "host-request":
+      case "host-cancel":
+        api.handleHostMessage?.(message);
+        break;
+      case "close":
+        state.stopped = true;
+        teardown(true);
+        api.post({ type: "state", state: "closed" });
+        break;
+      default:
+        api.error("bridge_message", `Unknown worker command: ${String(message.type)}.`);
+    }
+  };
+})();
