@@ -225,7 +225,7 @@ export function DeviceTrustPanel(): React.JSX.Element {
           hint="Pair a host directly using its eight-character code."
           icon="Plus"
           label="Connect a host"
-          onPress={() => router.push("/(onboarding)/host")}
+          onPress={() => router.push("/onboarding/host")}
         />
       </SettingsSection>
 

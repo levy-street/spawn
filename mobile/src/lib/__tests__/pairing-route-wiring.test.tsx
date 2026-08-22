@@ -48,7 +48,7 @@ jest.mock("@/components/hosts/rename-host-dialog", () => ({
   RenameHostDialog: () => null,
 }));
 
-import HostPairingScreen from "@/app/(onboarding)/host";
+import HostPairingScreen from "@/app/onboarding/host";
 import { HostListScreen } from "@/components/hosts/host-list-screen";
 import { HostsPanel } from "@/components/settings/hosts-panel";
 import { ThemeProvider } from "@/theme";
@@ -87,13 +87,13 @@ describe("standalone host pairing route", () => {
     for (const button of connectButtons) await fireEvent.press(button);
 
     expect(mockPush).toHaveBeenCalledTimes(2);
-    expect(mockPush).toHaveBeenNthCalledWith(1, "/(onboarding)/host");
-    expect(mockPush).toHaveBeenNthCalledWith(2, "/(onboarding)/host");
+    expect(mockPush).toHaveBeenNthCalledWith(1, "/onboarding/host");
+    expect(mockPush).toHaveBeenNthCalledWith(2, "/onboarding/host");
   });
 
   it("is reachable from Settings Hosts", async () => {
     const screen = await render(<HostsPanel />, { wrapper: Providers });
     await fireEvent.press(screen.getByRole("button", { name: "Connect a host" }));
-    expect(mockPush).toHaveBeenCalledWith("/(onboarding)/host");
+    expect(mockPush).toHaveBeenCalledWith("/onboarding/host");
   });
 });

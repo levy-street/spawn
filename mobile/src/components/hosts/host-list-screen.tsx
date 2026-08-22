@@ -130,7 +130,7 @@ export function HostListScreen() {
         <IconButton
           accessibilityLabel="Connect a host"
           icon="Plus"
-          onPress={() => router.push("/(onboarding)/host")}
+          onPress={() => router.push("/onboarding/host")}
         />
       </View>
       {hostsQuery.isPending ? (
@@ -147,7 +147,7 @@ export function HostListScreen() {
       ) : (
         <HostListView
           hosts={hosts}
-          onConnect={() => router.push("/(onboarding)/host")}
+          onConnect={() => router.push("/onboarding/host")}
           onOpen={openHost}
           onOpenActions={setActionsHost}
           onOpenLegion={() => router.push("/(tabs)/hosts/legion")}

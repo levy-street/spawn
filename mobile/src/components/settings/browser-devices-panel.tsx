@@ -218,7 +218,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
               Open Browser devices on a working device and approve this fingerprint, or connect a
               host directly.
             </Text>
-            <Button onPress={() => router.push("/(onboarding)/host")} size="sm" variant="outline">
+            <Button onPress={() => router.push("/onboarding/host")} size="sm" variant="outline">
               Connect a host
             </Button>
           </View>

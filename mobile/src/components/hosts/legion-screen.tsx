@@ -82,7 +82,7 @@ export function LegionScreen() {
       ) : hosts.length === 0 ? (
         <EmptyState
           action={
-            <Button onPress={() => router.push("/(onboarding)/host")}>Possess a machine</Button>
+            <Button onPress={() => router.push("/onboarding/host")}>Possess a machine</Button>
           }
           description="Connect a host to see fleet capacity and sessions here."
           icon="Network"
@@ -134,7 +134,7 @@ export function LegionScreen() {
               />
             ))}
           </View>
-          <Button onPress={() => router.push("/(onboarding)/host")} variant="outline">
+          <Button onPress={() => router.push("/onboarding/host")} variant="outline">
             Possess another machine
           </Button>
         </ScrollView>

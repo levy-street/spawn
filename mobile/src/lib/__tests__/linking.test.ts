@@ -31,10 +31,10 @@ describe("incoming spawn links", () => {
       route: "/(auth)/reset-password",
       params: { token: ACCOUNT_TOKEN },
     },
-    { input: "/device", route: "/(onboarding)/device", params: {} },
+    { input: "/device", route: "/onboarding/device", params: {} },
     {
       input: "/onboarding?step=host",
-      route: "/(onboarding)",
+      route: "/onboarding",
       params: { step: "host" },
     },
     { input: "/login", route: "/(auth)/login", params: {} },

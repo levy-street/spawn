@@ -15,8 +15,8 @@ export type DeepLinkRoute =
   | "/(auth)/forgot-password"
   | "/(auth)/reset-password"
   | "/(auth)/verify-email"
-  | "/(onboarding)"
-  | "/(onboarding)/device"
+  | "/onboarding"
+  | "/onboarding/device"
   | "/(tabs)/hosts/legion"
   | "/(tabs)/settings"
   | "/admin"
@@ -148,13 +148,13 @@ export function resolveIncomingLink(input: string): ResolvedDeepLink | null {
     return result(route, withQuery(path, params), { params, sensitive: true });
   }
   if (path === "/device") {
-    return result("/(onboarding)/device", "/device", { requiresAuth: true });
+    return result("/onboarding/device", "/device", { requiresAuth: true });
   }
   if (path === "/onboarding") {
     const step = searchParams.get("step");
     if (step !== null && !ONBOARDING_STEPS.has(step)) return null;
     const params = step === null ? {} : { step };
-    return result("/(onboarding)", withQuery("/onboarding", params), {
+    return result("/onboarding", withQuery("/onboarding", params), {
       params,
       requiresAuth: true,
     });

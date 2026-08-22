@@ -3,7 +3,7 @@ import Constants from "expo-constants";
 
 const API_URL_STORAGE_KEY = "spawn.api.base-url.v1";
 const API_URL_EXTRA_KEY = "apiUrl";
-const DEV_API_PORT = "8010";
+const DEV_API_PORT = "3000";
 const FALLBACK_API_URL = `http://localhost:${DEV_API_PORT}`;
 
 /**

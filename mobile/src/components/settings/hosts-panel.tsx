@@ -27,7 +27,7 @@ export function HostsPanel(): React.JSX.Element {
           hint="Approve a daemon using its eight-character code."
           icon="Plus"
           label="Connect a host"
-          onPress={() => router.push("/(onboarding)/host")}
+          onPress={() => router.push("/onboarding/host")}
         />
       </SettingsSection>
 
