@@ -130,6 +130,100 @@ export interface HostControlError {
   detail?: string;
 }
 
+export interface HostControlLimits {
+  readonly frameBytes: number;
+  readonly chunkBytes: number;
+  readonly fileBytes: number;
+  readonly rangeBytes: number;
+  readonly previewBytes: number;
+  readonly previewPixels: readonly (128 | 256 | 512 | 1024)[];
+  readonly normalQueue: number | null;
+  readonly fastQueue: number | null;
+}
+
+export interface HostCapabilities {
+  readonly protocol: "spawn.host.ctl";
+  readonly version: 1;
+  readonly operations: readonly string[];
+  readonly limits: HostControlLimits;
+}
+
+export interface HostRequestOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export interface HostReadableFile {
+  readonly streamId: string;
+  readonly path: string;
+  readonly name: string;
+  readonly length: number;
+  readonly sha256: string;
+  readonly stream: ReadableStream<Uint8Array>;
+}
+
+export interface HostRangeFile extends HostReadableFile {
+  readonly offset: number;
+  readonly fileSize: number;
+  readonly version: string | null;
+  readonly contentType: string | null;
+  readonly openAllowed: boolean;
+  readonly eof: boolean;
+}
+
+export interface HostPreviewFile extends HostReadableFile {
+  readonly mime: string;
+  readonly width: number;
+  readonly height: number;
+  readonly version?: string | null;
+}
+
+export interface HostReadHead {
+  readonly bytes: Uint8Array;
+  readonly total: number;
+  readonly truncated: boolean;
+}
+
+export interface HostFileSource {
+  readonly size: number;
+  /** Sources used by writeFile must support the hashing pass and the later upload pass. */
+  read(offset: number, length: number): Promise<Uint8Array>;
+}
+
+export interface HostWriteDeclaration {
+  readonly dir: string;
+  readonly name: string;
+  readonly length: number;
+  readonly sha256: string;
+  readonly overwrite?: boolean;
+}
+
+export type HostWritePhase =
+  | "hashing"
+  | "declaring"
+  | "streaming"
+  | "finalizing"
+  | "outcome_unknown"
+  | "complete"
+  | "failed"
+  | "cancelled";
+
+export interface HostWriteProgress {
+  readonly phase: HostWritePhase;
+  readonly transferred: number;
+  readonly total: number;
+}
+
+export interface HostWriteOptions extends HostRequestOptions {
+  onProgress?(progress: HostWriteProgress): void;
+}
+
+export interface HostWriteResult {
+  readonly path: string;
+  readonly length: number;
+  readonly sha256: string;
+}
+
 export interface HostControlResponse<T = unknown> {
   version: 1;
   type: "response";
@@ -145,18 +239,95 @@ export interface HostTransportOptions {
   bridge: WorkerEndpoint;
   forceRelay?: boolean;
   openSignal?: (hostId: string) => SignalChannelLike;
+  /** Defaults to the protocol maximum of 60 seconds; lower values support deterministic tests. */
+  streamTimeoutMs?: number;
 }
 
 export interface HostTransport {
   readonly hostId: string;
   readonly state: TransportState;
+  /** Null until this RTC generation's hello frame is decoded. */
+  readonly capabilities?: HostCapabilities | null;
   open(): Promise<void>;
   close(): void;
-  request<T>(operation: string, payload?: unknown): Promise<T>;
+  request<T>(operation: string, payload?: unknown, options?: HostRequestOptions): Promise<T>;
   cancel(requestId: string): void;
+  hasCapability?(operation: string): boolean;
+  readFile?(path: string, options?: HostRequestOptions): Promise<HostReadableFile>;
+  readRange?(
+    path: string,
+    offset: number,
+    length: number,
+    options?: HostRequestOptions,
+  ): Promise<HostRangeFile>;
+  readHead?(
+    path: string,
+    limit: number,
+    options?: HostRequestOptions & { size?: number | null },
+  ): Promise<HostReadHead>;
+  previewImage?(
+    path: string,
+    maxPixels: 128 | 256 | 512 | 1024,
+    options?: HostRequestOptions,
+  ): Promise<HostPreviewFile>;
+  writeStream?(
+    stream: ReadableStream<Uint8Array>,
+    declaration: HostWriteDeclaration,
+    options?: HostWriteOptions,
+  ): Promise<HostWriteResult>;
+  writeFile?(
+    source: HostFileSource,
+    destination: Omit<HostWriteDeclaration, "length" | "sha256">,
+    options?: HostWriteOptions,
+  ): Promise<HostWriteResult>;
+  transferFileTo?(
+    destination: HostTransport,
+    path: string,
+    destinationDirectory: string,
+    options?: HostWriteOptions & { overwrite?: boolean },
+  ): Promise<HostWriteResult>;
   on(ev: "state", fn: (state: TransportState) => void): () => void;
   on(ev: "error", fn: (error: TransportError) => void): () => void;
   on(ev: "diagnostic", fn: (diagnostic: WorkerDiagnostic) => void): () => void;
+}
+
+/** Production host-control surface. HostTransport keeps stream members optional for test doubles. */
+export interface StreamingHostTransport extends HostTransport {
+  readonly capabilities: HostCapabilities | null;
+  hasCapability(operation: string): boolean;
+  readFile(path: string, options?: HostRequestOptions): Promise<HostReadableFile>;
+  readRange(
+    path: string,
+    offset: number,
+    length: number,
+    options?: HostRequestOptions,
+  ): Promise<HostRangeFile>;
+  readHead(
+    path: string,
+    limit: number,
+    options?: HostRequestOptions & { size?: number | null },
+  ): Promise<HostReadHead>;
+  previewImage(
+    path: string,
+    maxPixels: 128 | 256 | 512 | 1024,
+    options?: HostRequestOptions,
+  ): Promise<HostPreviewFile>;
+  writeStream(
+    stream: ReadableStream<Uint8Array>,
+    declaration: HostWriteDeclaration,
+    options?: HostWriteOptions,
+  ): Promise<HostWriteResult>;
+  writeFile(
+    source: HostFileSource,
+    destination: Omit<HostWriteDeclaration, "length" | "sha256">,
+    options?: HostWriteOptions,
+  ): Promise<HostWriteResult>;
+  transferFileTo(
+    destination: HostTransport,
+    path: string,
+    destinationDirectory: string,
+    options?: HostWriteOptions & { overwrite?: boolean },
+  ): Promise<HostWriteResult>;
 }
 
 export type NamedTerminalKey =

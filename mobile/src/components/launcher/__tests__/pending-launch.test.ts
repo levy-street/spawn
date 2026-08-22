@@ -37,8 +37,31 @@ describe("pending agent launches", () => {
         expiresAt: 1_000 + PENDING_LAUNCH_TTL_MS,
       },
     });
+    await restartedProcess.complete?.("session-1");
     await expect(restartedProcess.take("session-1")).resolves.toEqual({ status: "missing" });
     expect(storage.values.size).toBe(0);
+  });
+
+  test("does not expose a command again after a restart between claim and completion", async () => {
+    const storage = new MemoryStorage();
+    const firstProcess = createPendingLaunchStore(storage, { now: () => 1_000 });
+    await firstProcess.persist("session-claim", "claude");
+    await expect(firstProcess.take("session-claim")).resolves.toMatchObject({ status: "ready" });
+
+    const restartedProcess = createPendingLaunchStore(storage, { now: () => 2_000 });
+    await expect(restartedProcess.take("session-claim")).resolves.toEqual({
+      status: "already_delivered",
+    });
+    expect(storage.values.size).toBe(0);
+  });
+
+  test("serializes competing claims so only one caller receives command bytes", async () => {
+    const storage = new MemoryStorage();
+    const store = createPendingLaunchStore(storage, { now: () => 100 });
+    await store.persist("session-race", "codex");
+
+    const results = await Promise.all([store.take("session-race"), store.take("session-race")]);
+    expect(results.map((result) => result.status).sort()).toEqual(["already_delivered", "ready"]);
   });
 
   test("abandons stale persisted commands cleanly", async () => {
@@ -61,7 +84,7 @@ describe("pending agent launches", () => {
 
     const result = await store.take("session-3");
     expect(result.status).toBe("lost");
-    if (result.status === "lost") expect(result.reason).toContain("missing");
+    if (result.status === "lost") expect(result.reason).toBe("missing_chunk");
     expect(storage.values.size).toBe(0);
   });
 
@@ -71,5 +94,13 @@ describe("pending agent launches", () => {
     await store.persist("session-4", "opencode");
     await store.clear("session-4");
     await expect(store.take("session-4")).resolves.toEqual({ status: "missing" });
+  });
+
+  test("abandons a command without leaving it eligible for delivery", async () => {
+    const storage = new MemoryStorage();
+    const store = createPendingLaunchStore(storage);
+    await store.persist("session-5", "aider");
+    await store.abandon?.("session-5");
+    await expect(store.take("session-5")).resolves.toEqual({ status: "missing" });
   });
 });

@@ -35,6 +35,10 @@ jest.mock("react-native-keyboard-controller", () => ({
   KeyboardProvider: mockOrderedProvider("KeyboardProvider"),
 }));
 
+jest.mock("@gorhom/bottom-sheet", () => ({
+  BottomSheetModalProvider: mockOrderedProvider("BottomSheetModalProvider"),
+}));
+
 jest.mock("@/theme", () => ({
   ThemeProvider: mockOrderedProvider("ThemeProvider"),
   useTheme: () => ({ colors: { background: "#FAFAFA" } }),
@@ -54,6 +58,10 @@ jest.mock("@/data/realtime/provider", () => ({
 
 jest.mock("@/components/ui/toast", () => ({
   ToastProvider: mockOrderedProvider("ToastProvider"),
+}));
+
+jest.mock("@/components/ui/confirm", () => ({
+  ConfirmHost: mockOrderedProvider("ConfirmHost"),
 }));
 
 import {

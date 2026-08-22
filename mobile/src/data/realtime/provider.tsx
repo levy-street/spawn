@@ -19,6 +19,7 @@ import {
   reopenRegisteredGenerations,
   retireRegisteredGenerations,
 } from "@/data/realtime/lifecycle";
+import { createProductionNetworkSource } from "@/data/realtime/network-source";
 import { subscribeSessionSignalFrames } from "@/data/realtime/session-signal";
 import { retireAll, type SocketState } from "@/data/realtime/socket";
 import { useAlertStore } from "@/data/stores/alerts";
@@ -69,6 +70,8 @@ export function RealtimeProvider({
 
   useEffect(() => {
     const alertClient = new AlertSocketClient(buildAlertsSocketUrl);
+    const productionNetworkSource = networkSource ? null : createProductionNetworkSource();
+    const activeNetworkSource = networkSource ?? productionNetworkSource;
     alertClientRef.current = alertClient;
     useConnectionStore.getState().setAlertSocket(alertClient.state);
 
@@ -89,13 +92,19 @@ export function RealtimeProvider({
       }
     };
     let hasOpened = false;
+    let previousAlertSocketState = alertClient.state;
     const unsubscribeState = alertClient.subscribe((state) => {
+      const previous = previousAlertSocketState;
+      previousAlertSocketState = state;
       useConnectionStore.getState().setAlertSocket(state);
       if (state === "open") {
+        productionNetworkSource?.reportSocketOpen();
         if (hasOpened) {
           void refetchRecoveryQueries();
         }
         hasOpened = true;
+      } else if (previous === "open" && state === "reconnecting") {
+        productionNetworkSource?.reportSocketFailure();
       }
     });
     const unsubscribeAlertFrames = alertClient.onFrame((frame) => {
@@ -124,7 +133,7 @@ export function RealtimeProvider({
           await reopenVisibleTransports?.();
         },
       },
-      ...(networkSource ? { networkSource } : {}),
+      ...(activeNetworkSource ? { networkSource: activeNetworkSource } : {}),
     });
 
     alertClient.connect();

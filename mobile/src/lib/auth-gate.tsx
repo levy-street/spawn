@@ -3,6 +3,7 @@ import { usePathname, useRouter } from "expo-router";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
+import { readHostSkipped } from "@/components/onboarding/onboarding-state";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
@@ -26,6 +27,7 @@ export interface AuthGateDecisionInput {
   emailVerified: boolean;
   verificationRequired: boolean;
   hostCount: number;
+  hostSkipped: boolean;
 }
 
 export function resolveAuthGateDestination({
@@ -33,10 +35,11 @@ export function resolveAuthGateDestination({
   emailVerified,
   verificationRequired,
   hostCount,
+  hostSkipped,
 }: AuthGateDecisionInput): AuthGateDestination {
   if (!hasToken) return AUTH_GATE_DESTINATIONS.login;
   if (verificationRequired && !emailVerified) return AUTH_GATE_DESTINATIONS.verifyEmail;
-  if (hostCount === 0) return AUTH_GATE_DESTINATIONS.onboarding;
+  if (hostCount === 0 && !hostSkipped) return AUTH_GATE_DESTINATIONS.onboarding;
   return AUTH_GATE_DESTINATIONS.tabs;
 }
 
@@ -66,6 +69,10 @@ type TokenState =
   | { status: "ready"; token: string | null; requestId: string }
   | { status: "error"; error: unknown; requestId: string };
 
+type HostSkipState =
+  | { status: "loading"; requestId: string }
+  | { status: "ready"; skipped: boolean; requestId: string };
+
 type BootstrapState =
   | { status: "loading"; hasToken: boolean }
   | { status: "error"; kind: "account" | "config"; error: unknown; retry(): void }
@@ -75,6 +82,10 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
   const [tokenAttempt, setTokenAttempt] = useState(0);
   const requestId = `${refreshKey}:${tokenAttempt}`;
   const [tokenState, setTokenState] = useState<TokenState>({
+    status: "loading",
+    requestId,
+  });
+  const [hostSkipState, setHostSkipState] = useState<HostSkipState>({
     status: "loading",
     requestId,
   });
@@ -96,6 +107,25 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
   }, [requestId]);
 
   const hasToken = tokenState.status === "ready" && tokenState.token !== null;
+
+  useEffect(() => {
+    if (!hasToken) return;
+    let active = true;
+    setHostSkipState({ status: "loading", requestId });
+    readHostSkipped().then(
+      (skipped) => {
+        if (active) setHostSkipState({ status: "ready", skipped, requestId });
+      },
+      () => {
+        // If account-local preferences cannot be read, keep the safer first-run gate.
+        if (active) setHostSkipState({ status: "ready", skipped: false, requestId });
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [hasToken, requestId]);
+
   const configQuery = useAuthConfigQuery(hasToken);
   const meQuery = useMeQuery(hasToken);
   const hostsQuery = useAuthHostsQuery(hasToken && meQuery.data !== undefined);
@@ -138,7 +168,9 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
   if (
     configQuery.data === undefined ||
     meQuery.data === undefined ||
-    hostsQuery.data === undefined
+    hostsQuery.data === undefined ||
+    hostSkipState.status !== "ready" ||
+    hostSkipState.requestId !== requestId
   ) {
     return { status: "loading", hasToken: true };
   }
@@ -151,12 +183,19 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
       emailVerified: meQuery.data.user.email_verified_at !== null,
       verificationRequired: configQuery.data.email_verification_required,
       hostCount: hostsQuery.data.length,
+      hostSkipped: hostSkipState.skipped,
     }),
   };
 }
 
 const ALWAYS_PUBLIC_PATHS = new Set(["/reset-password", "/verify-email"]);
-const SIGNED_OUT_PUBLIC_PATHS = new Set(["/login", "/signup", "/forgot-password"]);
+const SIGNED_OUT_PUBLIC_PATHS = new Set(["/login", "/signup", "/forgot-password", "/server"]);
+const STANDALONE_PAIRING_PATHS = new Set([
+  "/device",
+  "/host",
+  `${AUTH_GATE_DESTINATIONS.onboarding}/device`,
+  `${AUTH_GATE_DESTINATIONS.onboarding}/host`,
+]);
 
 export function shouldRenderAuthPath(
   pathname: string,
@@ -165,6 +204,13 @@ export function shouldRenderAuthPath(
 ): boolean {
   if (ALWAYS_PUBLIC_PATHS.has(pathname)) return true;
   if (!hasToken && SIGNED_OUT_PUBLIC_PATHS.has(pathname)) return true;
+  if (
+    hasToken &&
+    destination !== AUTH_GATE_DESTINATIONS.verifyEmail &&
+    STANDALONE_PAIRING_PATHS.has(pathname)
+  ) {
+    return true;
+  }
   if (destination === AUTH_GATE_DESTINATIONS.login) return pathname === destination;
   if (destination === AUTH_GATE_DESTINATIONS.verifyEmail) return pathname === destination;
   if (destination === AUTH_GATE_DESTINATIONS.onboarding) {

@@ -15,6 +15,7 @@ interface PendingManifest extends Omit<PendingLaunchRecord, "command"> {
   version: 1;
   generation: string;
   chunks: number;
+  delivered: boolean;
 }
 
 export interface PendingLaunchStorage {
@@ -25,13 +26,17 @@ export interface PendingLaunchStorage {
 
 export type PendingLaunchRead =
   | { status: "ready"; record: PendingLaunchRecord }
+  | { status: "already_delivered" }
   | { status: "missing" }
   | { status: "stale" }
-  | { status: "lost"; reason: string };
+  | { status: "lost"; reason: "invalid_manifest" | "missing_chunk" };
 
 export interface PendingLaunchStore {
   persist(sessionId: string, command: string): Promise<PendingLaunchRecord>;
+  /** Durably claims delivery before exposing command bytes. */
   take(sessionId: string): Promise<PendingLaunchRead>;
+  complete?(sessionId: string): Promise<void>;
+  abandon?(sessionId: string): Promise<void>;
   clear(sessionId: string): Promise<void>;
 }
 
@@ -83,7 +88,8 @@ function isManifest(value: unknown): value is PendingManifest {
     typeof candidate["expiresAt"] === "number" &&
     typeof candidate["generation"] === "string" &&
     Number.isInteger(candidate["chunks"]) &&
-    Number(candidate["chunks"]) > 0
+    Number(candidate["chunks"]) > 0 &&
+    (candidate["delivered"] === undefined || typeof candidate["delivered"] === "boolean")
   );
 }
 
@@ -95,7 +101,9 @@ async function parseManifest(
   if (raw === null) return null;
   try {
     const parsed: unknown = JSON.parse(raw);
-    return isManifest(parsed) && parsed.sessionId === sessionId ? parsed : "invalid";
+    return isManifest(parsed) && parsed.sessionId === sessionId
+      ? { ...parsed, delivered: parsed.delivered ?? false }
+      : "invalid";
   } catch {
     return "invalid";
   }
@@ -120,6 +128,61 @@ export function createPendingLaunchStore(
 ): PendingLaunchStore {
   const now = options.now ?? Date.now;
   const ttlMs = options.ttlMs ?? PENDING_LAUNCH_TTL_MS;
+  const claimQueues = new Map<string, Promise<unknown>>();
+
+  async function takePending(sessionId: string): Promise<PendingLaunchRead> {
+    const manifest = await parseManifest(storage, sessionId);
+    if (manifest === null) return { status: "missing" };
+    if (manifest === "invalid") {
+      await storage.delete(manifestKey(sessionId));
+      return { status: "lost", reason: "invalid_manifest" };
+    }
+    if (manifest.delivered) {
+      await Promise.allSettled([
+        storage.delete(manifestKey(sessionId)),
+        ...Array.from({ length: manifest.chunks }, (_, index) =>
+          storage.delete(chunkKey(sessionId, manifest.generation, index)),
+        ),
+      ]);
+      return { status: "already_delivered" };
+    }
+    if (manifest.expiresAt <= now()) {
+      await deleteManifestChunks(storage, sessionId, manifest);
+      return { status: "stale" };
+    }
+    const chunks = await Promise.all(
+      Array.from({ length: manifest.chunks }, (_, index) =>
+        storage.get(chunkKey(sessionId, manifest.generation, index)),
+      ),
+    );
+    if (chunks.some((chunk) => chunk === null)) {
+      await deleteManifestChunks(storage, sessionId, manifest);
+      return { status: "lost", reason: "missing_chunk" };
+    }
+
+    // The flag is written before bytes leave JS. A crash can lose a launch, but cannot replay it.
+    await storage.set(manifestKey(sessionId), JSON.stringify({ ...manifest, delivered: true }));
+    return {
+      status: "ready",
+      record: {
+        sessionId,
+        command: chunks.join(""),
+        createdAt: manifest.createdAt,
+        expiresAt: manifest.expiresAt,
+      },
+    };
+  }
+
+  async function queueTake(sessionId: string): Promise<PendingLaunchRead> {
+    const previous = claimQueues.get(sessionId) ?? Promise.resolve();
+    const queued = previous.catch(() => undefined).then(() => takePending(sessionId));
+    claimQueues.set(sessionId, queued);
+    try {
+      return await queued;
+    } finally {
+      if (claimQueues.get(sessionId) === queued) claimQueues.delete(sessionId);
+    }
+  }
 
   return {
     async persist(sessionId, command) {
@@ -134,6 +197,7 @@ export function createPendingLaunchStore(
         expiresAt: createdAt + ttlMs,
         generation,
         chunks: chunks.length,
+        delivered: false,
       };
 
       try {
@@ -158,36 +222,29 @@ export function createPendingLaunchStore(
       return { sessionId, command, createdAt, expiresAt: manifest.expiresAt };
     },
 
-    async take(sessionId) {
+    take: queueTake,
+
+    async complete(sessionId) {
       const manifest = await parseManifest(storage, sessionId);
-      if (manifest === null) return { status: "missing" };
+      if (manifest === null) return;
       if (manifest === "invalid") {
         await storage.delete(manifestKey(sessionId));
-        return { status: "lost", reason: "The saved launch command could not be read." };
-      }
-      if (manifest.expiresAt <= now()) {
-        await deleteManifestChunks(storage, sessionId, manifest);
-        return { status: "stale" };
-      }
-      const chunks = await Promise.all(
-        Array.from({ length: manifest.chunks }, (_, index) =>
-          storage.get(chunkKey(sessionId, manifest.generation, index)),
-        ),
-      );
-      if (chunks.some((chunk) => chunk === null)) {
-        await deleteManifestChunks(storage, sessionId, manifest);
-        return { status: "lost", reason: "Part of the saved launch command is missing." };
+        return;
       }
       await deleteManifestChunks(storage, sessionId, manifest);
-      return {
-        status: "ready",
-        record: {
-          sessionId,
-          command: chunks.join(""),
-          createdAt: manifest.createdAt,
-          expiresAt: manifest.expiresAt,
-        },
-      };
+    },
+
+    async abandon(sessionId) {
+      const manifest = await parseManifest(storage, sessionId);
+      if (manifest === null) return;
+      if (manifest === "invalid") {
+        await storage.delete(manifestKey(sessionId));
+        return;
+      }
+      if (!manifest.delivered) {
+        await storage.set(manifestKey(sessionId), JSON.stringify({ ...manifest, delivered: true }));
+      }
+      await deleteManifestChunks(storage, sessionId, manifest);
     },
 
     async clear(sessionId) {

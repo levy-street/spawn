@@ -121,6 +121,15 @@ export function LoginScreen() {
           </Button>
         </View>
         <View style={styles.accountLink}>
+          <Button
+            accessibilityLabel="Server settings"
+            onPress={() => router.push("/server")}
+            variant="link"
+          >
+            Server
+          </Button>
+        </View>
+        <View style={styles.accountLink}>
           <Text color="mutedForeground">No account?</Text>
           <Button
             accessibilityLabel="Create one"

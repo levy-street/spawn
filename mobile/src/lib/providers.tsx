@@ -1,3 +1,4 @@
+import { BottomSheetModalProvider } from "@gorhom/bottom-sheet";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useFonts } from "expo-font";
 import * as SplashScreen from "expo-splash-screen";
@@ -9,6 +10,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
+import { ConfirmHost } from "@/components/ui/confirm";
 import { ToastProvider } from "@/components/ui/toast";
 import { RealtimeProvider } from "@/data/realtime/provider";
 import { ThemeProvider, useTheme } from "@/theme";
@@ -17,10 +19,12 @@ export const APP_PROVIDER_ORDER = [
   "SafeAreaProvider",
   "GestureHandlerRootView",
   "ThemeProvider",
+  "BottomSheetModalProvider",
   "QueryClientProvider",
   "RealtimeProvider",
   "ToastProvider",
   "KeyboardProvider",
+  "ConfirmHost",
   "Router",
 ] as const;
 
@@ -72,19 +76,25 @@ export function AppProviders({ children }: PropsWithChildren): React.JSX.Element
   if (!fontsLoaded && !fontError) return null;
 
   // Safe area supplies geometry; gestures need the full view; theme feeds every visual provider;
-  // query state feeds realtime; toasts need theme/gestures; keyboard management wraps the router.
+  // sheets need the gesture root; query state feeds realtime; visual hosts need the theme;
+  // keyboard management and the global confirmation host stay above the router.
   return (
     <SafeAreaProvider>
       <GestureHandlerRootView style={styles.root}>
         <ThemeProvider>
           <LaunchAppearance>
-            <QueryClientProvider client={queryClient}>
-              <RealtimeProvider>
-                <ToastProvider>
-                  <KeyboardProvider>{children}</KeyboardProvider>
-                </ToastProvider>
-              </RealtimeProvider>
-            </QueryClientProvider>
+            <BottomSheetModalProvider>
+              <QueryClientProvider client={queryClient}>
+                <RealtimeProvider>
+                  <ToastProvider>
+                    <KeyboardProvider>
+                      <ConfirmHost />
+                      {children}
+                    </KeyboardProvider>
+                  </ToastProvider>
+                </RealtimeProvider>
+              </QueryClientProvider>
+            </BottomSheetModalProvider>
           </LaunchAppearance>
         </ThemeProvider>
       </GestureHandlerRootView>

@@ -16,6 +16,8 @@ function makePending(overrides: Partial<PendingLaunchStore> = {}): PendingLaunch
       expiresAt: 2,
     }),
     take: async () => ({ status: "missing" }),
+    complete: async () => undefined,
+    abandon: async () => undefined,
     clear: async () => undefined,
     ...overrides,
   };
@@ -34,7 +36,7 @@ function makeDependencies(overrides: Partial<LaunchDependencies> = {}): LaunchDe
 }
 
 describe("two-stage launch orchestration", () => {
-  test("patches the target tab, creates a shell, then types the persisted agent command", async () => {
+  test("patches the target tab, creates a shell, then persists the constructed agent command", async () => {
     const events: string[] = [];
     let savedCommand: string | null = null;
     const session = makeSession();
@@ -43,15 +45,6 @@ describe("two-stage launch orchestration", () => {
         events.push(`persist:${sessionId}`);
         savedCommand = command;
         return { sessionId, command, createdAt: 1, expiresAt: 2 };
-      },
-      take: async () => {
-        if (!savedCommand) return { status: "missing" };
-        const command = savedCommand;
-        savedCommand = null;
-        return {
-          status: "ready",
-          record: { sessionId: session.id, command, createdAt: 1, expiresAt: 2 },
-        };
       },
     });
     const dependencies = makeDependencies({
@@ -81,18 +74,7 @@ describe("two-stage launch orchestration", () => {
       `create:${makeHost().id}:/Users/ada/spawn`,
       `persist:${session.id}`,
     ]);
-
-    const terminal = { sendInput: jest.fn(), focus: jest.fn() };
-    await expect(orchestrator.deliverPending(session.id, terminal)).resolves.toEqual({
-      status: "sent",
-    });
-    expect(terminal.sendInput).toHaveBeenCalledWith(
-      "codex --dangerously-bypass-approvals-and-sandbox\r",
-    );
-    expect(terminal.focus).toHaveBeenCalled();
-    await expect(orchestrator.deliverPending(session.id, terminal)).resolves.toEqual({
-      status: "missing",
-    });
+    expect(savedCommand).toBe("codex --dangerously-bypass-approvals-and-sandbox");
   });
 
   test("reports an honest recoverable state when persistence fails after creation", async () => {
@@ -133,24 +115,6 @@ describe("two-stage launch orchestration", () => {
     );
     await expect(orchestrator.discard(makeSession().id)).rejects.toThrow("Keychain unavailable");
     expect(deleteSession).toHaveBeenCalledWith(makeSession().id);
-  });
-
-  test("reports a pending-read failure instead of silently leaving a shell", async () => {
-    const orchestrator = createLaunchOrchestrator(
-      makeDependencies({
-        pending: makePending({
-          take: async () => {
-            throw new Error("Saved command unreadable");
-          },
-        }),
-      }),
-    );
-    await expect(
-      orchestrator.deliverPending(makeSession().id, {
-        sendInput: jest.fn(),
-        focus: jest.fn(),
-      }),
-    ).resolves.toEqual({ status: "lost", message: "Saved command unreadable" });
   });
 
   test("blocks a launch into a full tab before creating a session", async () => {

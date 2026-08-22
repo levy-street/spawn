@@ -1,28 +1,64 @@
 import * as Notifications from "expo-notifications";
+import { useCallback, useEffect, useState } from "react";
 import { StyleSheet } from "react-native";
 import { SettingsInfoRow, SettingsToggleRow } from "@/components/settings/settings-row";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { UnavailableRow } from "@/components/settings/unavailable-row";
-import { useNotificationPreferences } from "@/components/settings/use-notification-preferences";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
+import { useNotificationPreferences } from "@/data/queries/alerts";
 import { useConnectionStore } from "@/data/stores/connection";
 import { haptics } from "@/lib/haptics";
+import {
+  hydrateNotificationPreferences,
+  type NotificationPreferenceKey,
+} from "@/lib/notifications";
 import { spacing } from "@/theme";
 
 const PUSH_UNAVAILABLE_REASON =
   "Remote notifications are unavailable in Expo Go, and spawn has no server push delivery path. Alerts arrive only while the app is running.";
+type NotificationBooleanPreferenceKey = Exclude<NotificationPreferenceKey, "mutedSessions">;
 
 export function NotificationsPanel(): React.JSX.Element {
   const toast = useToast();
   const alertSocket = useConnectionStore((state) => state.alertSocket);
-  const { preferences, setPreference, error } = useNotificationPreferences();
+  const { prefs: preferences, setPreference: setSharedPreference } = useNotificationPreferences();
+  const [ready, setReady] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  if (preferences === null) {
+  useEffect(() => {
+    let active = true;
+    void hydrateNotificationPreferences().then(
+      () => {
+        if (active) setReady(true);
+      },
+      () => {
+        if (active) {
+          setError("Notification preferences could not be loaded on this device.");
+          setReady(true);
+        }
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const setPreference = useCallback(
+    (key: NotificationBooleanPreferenceKey, value: boolean) => {
+      void setSharedPreference(key, value).then(
+        () => setError(null),
+        () => setError("Notification preferences could not be saved on this device."),
+      );
+    },
+    [setSharedPreference],
+  );
+
+  if (!ready) {
     return (
       <SettingsScreen title="Notifications">
         <Skeleton style={styles.skeleton} />

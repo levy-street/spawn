@@ -31,6 +31,10 @@ import { SwipeDismissOverlay } from "@/components/ui/swipe-dismiss-overlay";
 import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
+import {
+  attachPendingLaunchDelivery,
+  type PendingLaunchDeliveryResult,
+} from "@/data/queries/launcher";
 import { DEFAULT_SESSION_UI, useSessionUiStore } from "@/data/stores/session-ui";
 import { haptics } from "@/lib/haptics";
 import { TerminalSurface, type TerminalSurfaceHandle } from "@/terminal/TerminalSurface";
@@ -66,6 +70,20 @@ function safeTerminalLink(url: string): boolean {
   }
 }
 
+function pendingLaunchNotice(result: PendingLaunchDeliveryResult): string | null {
+  if (result.status === "sent" || result.status === "missing") return null;
+  if (result.status === "stale") {
+    return "The saved agent launch expired. This session was left as a shell.";
+  }
+  if (result.status === "lost") {
+    return "The saved agent launch could not be read safely. This session was left as a shell.";
+  }
+  if (result.reason === "session_dead") {
+    return "The session ended before the agent command was ready. Nothing was sent.";
+  }
+  return "The agent command could not be delivered safely and was not retried.";
+}
+
 export function TerminalOverlay({
   session,
   host,
@@ -79,6 +97,7 @@ export function TerminalOverlay({
   const surfaceRef = useRef<TerminalSurfaceHandle>(null);
   const transportRef = useRef<SessionTransport | null>(null);
   const scrollUnsubscribeRef = useRef<(() => void) | null>(null);
+  const pendingLaunchUnsubscribeRef = useRef<(() => void) | null>(null);
   const previousConnectionState = useRef<TransportState>("idle");
   const sessionUi = useSessionUiStore((state) => state.sessions[session.id]);
   const setStoredFollow = useSessionUiStore((state) => state.setFollow);
@@ -109,6 +128,7 @@ export function TerminalOverlay({
   useEffect(
     () => () => {
       scrollUnsubscribeRef.current?.();
+      pendingLaunchUnsubscribeRef.current?.();
     },
     [],
   );
@@ -135,13 +155,22 @@ export function TerminalOverlay({
   const handleTransport = useCallback(
     (transport: SessionTransport): void => {
       scrollUnsubscribeRef.current?.();
+      pendingLaunchUnsubscribeRef.current?.();
       transportRef.current = transport;
       scrollUnsubscribeRef.current = transport.on("scroll", (scroll) => {
         updateFollow({ type: "scroll", scroll });
         if (scroll.newOutputWhileAway) updateFollow({ type: "output-while-away" });
       });
+      pendingLaunchUnsubscribeRef.current = attachPendingLaunchDelivery(transport, {
+        initialSessionStatus: session.status,
+        onResult: (result) => {
+          if (result.status === "sent") updateFollow({ type: "input-sent" });
+          const notice = pendingLaunchNotice(result);
+          if (notice) transfers.setNotice(notice);
+        },
+      });
     },
-    [updateFollow],
+    [session.status, transfers.setNotice, updateFollow],
   );
 
   const handleConnectionState = (next: TransportState): void => {
@@ -163,6 +192,8 @@ export function TerminalOverlay({
   const retry = (): void => {
     scrollUnsubscribeRef.current?.();
     scrollUnsubscribeRef.current = null;
+    pendingLaunchUnsubscribeRef.current?.();
+    pendingLaunchUnsubscribeRef.current = null;
     transportRef.current = null;
     previousConnectionState.current = "idle";
     setConnectionState("idle");

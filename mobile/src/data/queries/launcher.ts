@@ -3,9 +3,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   createLaunchOrchestrator,
   type LaunchRequest,
-  type TerminalCommandSink,
 } from "@/components/launcher/launch-orchestrator";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
+import {
+  observePendingLaunchDelivery,
+  type PendingLaunchDeliveryResult,
+  type PendingSessionLife,
+  pendingSessionLifeFromStatus,
+} from "@/components/launcher/pending-launch-delivery";
+import { ApiError } from "@/data/api/client";
 import { listAgents } from "@/data/api/endpoints/agents";
 import { listHosts, listRecentDirectories } from "@/data/api/endpoints/hosts";
 import { createSession, deleteSession, getSession } from "@/data/api/endpoints/sessions";
@@ -14,6 +20,7 @@ import type { RecentDirOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import { qk } from "@/data/queryKeys";
+import type { SessionTransport } from "@/terminal/transport/types";
 
 export const launcherOrchestrator = createLaunchOrchestrator({
   getWorkspace,
@@ -115,8 +122,34 @@ export function useLaunchSession() {
   });
 }
 
-export async function deliverPendingLaunch(sessionId: string, terminal: TerminalCommandSink) {
-  return launcherOrchestrator.deliverPending(sessionId, terminal);
+export interface PendingLaunchBindingOptions {
+  initialSessionStatus?: string;
+  onResult?(result: PendingLaunchDeliveryResult): void;
+}
+
+async function pendingSessionLife(sessionId: string): Promise<PendingSessionLife> {
+  try {
+    const session = await getSession(sessionId);
+    return pendingSessionLifeFromStatus(session.status);
+  } catch (error) {
+    return error instanceof ApiError && error.status === 404 ? "dead" : "unknown";
+  }
+}
+
+export function attachPendingLaunchDelivery(
+  transport: SessionTransport,
+  options: PendingLaunchBindingOptions = {},
+): () => void {
+  return observePendingLaunchDelivery({
+    transport,
+    pending: pendingLaunches,
+    initialSessionLife:
+      options.initialSessionStatus === undefined
+        ? "unknown"
+        : pendingSessionLifeFromStatus(options.initialSessionStatus),
+    getSessionLife: () => pendingSessionLife(transport.sessionId),
+    ...(options.onResult ? { onResult: options.onResult } : {}),
+  });
 }
 
 export async function discardLaunchedSession(sessionId: string): Promise<void> {
@@ -127,5 +160,5 @@ export async function keepLaunchedShell(sessionId: string): Promise<void> {
   await launcherOrchestrator.keepShell(sessionId);
 }
 
-export type { LaunchRequest, TerminalCommandSink, WorkspaceOut };
+export type { LaunchRequest, PendingLaunchDeliveryResult, WorkspaceOut };
 export { getSession };

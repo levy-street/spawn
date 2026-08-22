@@ -1,6 +1,6 @@
 import { agentRunCommand } from "@/components/launcher/agent-command";
 import { autoPlaceWorkspaceTiles } from "@/components/launcher/launcher-selection";
-import type { PendingLaunchRead, PendingLaunchStore } from "@/components/launcher/pending-launch";
+import type { PendingLaunchStore } from "@/components/launcher/pending-launch";
 import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
@@ -35,17 +35,6 @@ export interface LaunchDependencies {
 export type LaunchResult =
   | { status: "launched"; session: SessionOut; pendingCommand: boolean }
   | { status: "created_unqueued"; session: SessionOut; command: string; message: string };
-
-export type PendingDeliveryResult =
-  | { status: "sent" }
-  | { status: "missing" }
-  | { status: "stale" }
-  | { status: "lost"; message: string };
-
-export interface TerminalCommandSink {
-  sendInput(data: string): void;
-  focus(): void;
-}
 
 export class LauncherError extends Error {
   constructor(
@@ -139,41 +128,8 @@ export function createLaunchOrchestrator(dependencies: LaunchDependencies) {
     },
 
     async keepShell(sessionId: string): Promise<void> {
-      await dependencies.pending.clear(sessionId);
-    },
-
-    async deliverPending(
-      sessionId: string,
-      terminal: TerminalCommandSink,
-    ): Promise<PendingDeliveryResult> {
-      let pending: PendingLaunchRead;
-      try {
-        pending = await dependencies.pending.take(sessionId);
-      } catch (error) {
-        return {
-          status: "lost",
-          message:
-            error instanceof Error
-              ? error.message
-              : "The saved agent command could not be consumed safely.",
-        };
-      }
-      if (pending.status === "missing") return { status: "missing" };
-      if (pending.status === "stale") return { status: "stale" };
-      if (pending.status === "lost") return { status: "lost", message: pending.reason };
-      try {
-        terminal.sendInput(`${pending.record.command}\r`);
-        terminal.focus();
-        return { status: "sent" };
-      } catch (error) {
-        return {
-          status: "lost",
-          message:
-            error instanceof Error
-              ? error.message
-              : "The saved agent command could not be sent to the terminal.",
-        };
-      }
+      if (dependencies.pending.abandon) await dependencies.pending.abandon(sessionId);
+      else await dependencies.pending.clear(sessionId);
     },
   };
 }
