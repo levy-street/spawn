@@ -97,10 +97,12 @@ class BrowserDeviceRevokeRequest(BaseModel):
 
 
 class BrowserDeviceOut(BaseModel):
+    # No fingerprint field on purpose (mesh B5): the key is right here, so a
+    # display fingerprint must be derived locally from it — a served one is a
+    # server-authored comparison label a lazy consumer could trust.
     id: str
     key_algorithm: Literal["ed25519"]
     public_key: str
-    fingerprint: str
     label: str | None = None
     created_at: datetime
     last_seen_at: datetime | None = None
@@ -438,15 +440,16 @@ class DeviceApproveRequest(DevicePendingRequest):
 
 
 class DeviceApproveResponse(BaseModel):
+    # Both keys are echoed below, so no fingerprints ride along (mesh B5): the
+    # approving browser verifies the echoed keys byte-for-byte and derives any
+    # fingerprint it displays locally.
     host_name: str
     approval_nonce: str
     host_key_algorithm: Literal["ed25519"]
     host_public_key: str
-    host_key_fingerprint: str
     browser_device_id: str
     browser_key_algorithm: Literal["ed25519"]
     browser_public_key: str
-    browser_key_fingerprint: str
     # Existing Host row for this key (re-pair only): lets the approving
     # browser bind its local pin to the host UUID immediately. Null on a
     # first pairing — the Host row is created later by the daemon's poll, and
@@ -688,8 +691,9 @@ class HostOut(BaseModel):
     arch: str | None = None
     version: str | None = None
     host_key_algorithm: Literal["ed25519"] | None = None
+    # The key travels alone (mesh B5): its display fingerprint is derived
+    # locally by the client, never served next to the key it must vouch for.
     host_public_key: str | None = None
-    host_key_fingerprint: str | None = None
     status: str
     last_seen_at: datetime | None = None
     agent_count: int = 0
@@ -965,9 +969,11 @@ class BrowserEndorsementCreate(BaseModel):
 
 
 class BrowserEndorsementOut(BaseModel):
+    # No endorsed_key_fingerprint (mesh B5): the endorser just signed over the
+    # endorsed key it verified on-screen, so a server-derived fingerprint here
+    # is at best redundant and at worst a substituted comparison label.
     host_id: str
     endorsed_device_id: str
-    endorsed_key_fingerprint: str
     endorser_device_id: str
     created_at: datetime
 

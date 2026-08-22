@@ -21,8 +21,8 @@ const host = {
   arch: "x86_64",
   version: "0.1.0",
   host_key_algorithm: "ed25519",
+  // No host_key_fingerprint (mesh B5): the app derives it from the key.
   host_public_key: HOST_PUBLIC_KEY,
-  host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
   status: "online",
   last_seen_at: "2026-07-17T00:00:00Z",
   agent_count: 0,
@@ -170,7 +170,6 @@ async function installRoutes(
           id: BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
           public_key: body.public_key,
-          fingerprint: fingerprint(body.public_key),
           created_at: "2026-07-17T00:00:00Z",
           revoked_at: null,
         },
@@ -195,15 +194,14 @@ async function installRoutes(
       await route.fulfill({
         status: 200,
         json: {
+          // Keys alone, like the real approve echo (mesh B5).
           host_name: host.name,
           approval_nonce: APPROVAL_NONCE,
           host_key_algorithm: "ed25519",
           host_public_key: HOST_PUBLIC_KEY,
-          host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
           browser_device_id: body.browser_device_id,
           browser_key_algorithm: body.browser_key_algorithm,
           browser_public_key: body.browser_public_key,
-          browser_key_fingerprint: body.browser_key_fingerprint,
         },
       });
       return;
@@ -261,7 +259,7 @@ test("response-ID substitution blocks local mutation and the route-target DELETE
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 });
 
-test("key and fingerprint substitution cannot retarget an established Host-ID binding", async ({
+test("key substitution cannot retarget an established Host-ID binding", async ({
   page,
 }) => {
   const state: {
@@ -280,27 +278,17 @@ test("key and fingerprint substitution cannot retarget an established Host-ID bi
   await expectExactHostBinding(page);
   const before = JSON.stringify(await readHostPins(page));
 
-  state.hostResponse = {
-    ...host,
-    host_public_key: OTHER_HOST_PUBLIC_KEY,
-    host_key_fingerprint: fingerprint(OTHER_HOST_PUBLIC_KEY),
-  };
+  state.hostResponse = { ...host, host_public_key: OTHER_HOST_PUBLIC_KEY };
   await page.reload();
   await expect(page.locator("p[role=alert]")).toContainText("bound to a different local key");
   await requestHostDeletion(page);
   await expect(page.locator("p[role=alert]")).toContainText("blocked before any server DELETE");
   expect(state.deleteCalls).toBe(0);
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
-
-  state.hostResponse = { ...host, host_key_fingerprint: "SHA256:AAAAAAAAAAAAAAAA" };
-  await page.reload();
-  await expect(page.locator("p[role=alert]")).toContainText(
-    "claimed host fingerprint does not match",
-  );
-  await requestHostDeletion(page);
-  await expect(page.locator("p[role=alert]")).toContainText("blocked before any server DELETE");
-  expect(state.deleteCalls).toBe(0);
-  expect(JSON.stringify(await readHostPins(page))).toBe(before);
+  // NOTE (mesh B5): the old fingerprint-substitution half of this test is
+  // structurally impossible now — the Host API serves no fingerprint field,
+  // so the only identity a server can lie about is the key itself, covered
+  // above.
 });
 
 test("deletion never revokes among multiple active unbound host pins", async ({ page }) => {

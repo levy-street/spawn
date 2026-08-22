@@ -74,7 +74,6 @@ function resolveInput(
     origin: string;
     hostId: string;
     claimedHostPublicKey: string | null;
-    claimedHostFingerprint: string | null;
   }> = {},
 ) {
   return {
@@ -82,7 +81,6 @@ function resolveInput(
     origin: ORIGIN,
     hostId: HOST_ID,
     claimedHostPublicKey: HOST_KEY,
-    claimedHostFingerprint: "SHA256:OfcT0KZEJT8EUpQh",
     ...overrides,
   };
 }
@@ -94,7 +92,6 @@ function revokeInput(
     targetHostId: string;
     claimedHostId: string;
     claimedHostPublicKey: string | null;
-    claimedHostFingerprint: string | null;
   }> = {},
 ) {
   return {
@@ -103,7 +100,6 @@ function revokeInput(
     targetHostId: HOST_ID,
     claimedHostId: HOST_ID,
     claimedHostPublicKey: HOST_KEY,
-    claimedHostFingerprint: "SHA256:OfcT0KZEJT8EUpQh",
     ...overrides,
   };
 }
@@ -391,8 +387,10 @@ describe("browser-local host pins", () => {
     expect(await factory.databases()).toEqual([]);
   });
 
-  test("rejects fingerprint and key substitution at approval and resolver ingress", async () => {
+  test("rejects fingerprint substitution at approval; the resolver takes no fingerprint at all", async () => {
     const factory = new IDBFactory();
+    // Approval still takes the ceremony-derived fingerprint and cross-checks
+    // it against the key: a mismatched pair is refused before persistence.
     await expectPinError(
       approveBrowserHostPin(
         approvalInput({ hostFingerprint: "SHA256:AAAAAAAAAAAAAAAA" }),
@@ -402,21 +400,13 @@ describe("browser-local host pins", () => {
     );
     expect(await factory.databases()).toEqual([]);
 
+    // The resolver's identity input is the claimed KEY alone (mesh B5): its
+    // fingerprint is derived locally, so a foreign key simply fails to match
+    // any pin — there is no served fingerprint left to substitute.
     await approveBrowserHostPin(approvalInput(), options(factory));
-    const otherFingerprint = await ed25519PublicKeyFingerprint(OTHER_HOST_KEY);
     await expectPinError(
       resolveActiveBrowserHostPin(
         resolveInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
-        options(factory),
-      ),
-      "fingerprint_mismatch",
-    );
-    await expectPinError(
-      resolveActiveBrowserHostPin(
-        resolveInput({
-          claimedHostPublicKey: OTHER_HOST_KEY,
-          claimedHostFingerprint: otherFingerprint,
-        }),
         options(factory),
       ),
       "missing_pin",
@@ -433,11 +423,6 @@ describe("browser-local host pins", () => {
       resolveActiveBrowserHostPin(resolveInput({ claimedHostPublicKey: null }), options(factory)),
       "null_key",
     );
-    await expectPinError(
-      resolveActiveBrowserHostPin(resolveInput({ claimedHostFingerprint: null }), options(factory)),
-      "null_fingerprint",
-    );
-
     await approveBrowserHostPin(approvalInput(), options(factory));
     expect(await resolveActiveBrowserHostPin(resolveInput(), options(factory))).toBe(HOST_KEY);
     await revokeBrowserHostPin(revokeInput(), options(factory, 2_000));
@@ -453,10 +438,7 @@ describe("browser-local host pins", () => {
     );
     await expectPinError(
       resolveActiveBrowserHostPin(
-        resolveInput({
-          claimedHostPublicKey: OTHER_HOST_KEY,
-          claimedHostFingerprint: otherFingerprint,
-        }),
+        resolveInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
         options(factory),
       ),
       "host_id_key_conflict",
@@ -499,10 +481,7 @@ describe("browser-local host pins", () => {
     );
     await expectRevokeBlockedWithoutDelete(
       multipleUnboundFactory,
-      revokeInput({
-        claimedHostPublicKey: OTHER_HOST_KEY,
-        claimedHostFingerprint: otherFingerprint,
-      }),
+      revokeInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
       "missing_pin",
     );
 
@@ -520,16 +499,8 @@ describe("browser-local host pins", () => {
     );
     await expectRevokeBlockedWithoutDelete(
       boundFactory,
-      revokeInput({
-        claimedHostPublicKey: OTHER_HOST_KEY,
-        claimedHostFingerprint: otherFingerprint,
-      }),
+      revokeInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
       "host_id_key_conflict",
-    );
-    await expectRevokeBlockedWithoutDelete(
-      boundFactory,
-      revokeInput({ claimedHostFingerprint: "SHA256:AAAAAAAAAAAAAAAA" }),
-      "fingerprint_mismatch",
     );
   });
 

@@ -476,7 +476,6 @@ export function FileExplorer({
               accountId,
               hostId: destHostId,
               claimedHostPublicKey: destHost.host_public_key ?? null,
-              claimedHostFingerprint: destHost.host_key_fingerprint ?? null,
               isActive: () => liveAccountIdRef.current === accountId,
             }),
         });

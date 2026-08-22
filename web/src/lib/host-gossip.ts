@@ -199,7 +199,6 @@ export function useHostGossipSync(): void {
                 origin,
                 hostId: intro.hostId,
                 claimedHostPublicKey: intro.hostPublicKey,
-                claimedHostFingerprint: intro.hostFingerprint,
               });
             } catch (cause) {
               // A conflicting binding is the substitution signal: the pin this

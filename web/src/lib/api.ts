@@ -81,8 +81,9 @@ export const HostSchema = z.object({
   arch: z.string().nullable().optional(),
   version: z.string().nullable().optional(),
   host_key_algorithm: z.literal("ed25519").nullable().optional(),
+  // The key travels alone (mesh B5): any fingerprint shown or compared is
+  // derived locally from it, never read off a server response.
   host_public_key: z.string().nullable().optional(),
-  host_key_fingerprint: z.string().nullable().optional(),
   status: z.enum(["online", "offline"]),
   last_seen_at: z.string().nullable(),
   agent_count: z.number().int(),
@@ -267,11 +268,16 @@ export const DevicePendingResponseSchema = z.object({
 });
 export type DevicePendingApproval = z.infer<typeof DevicePendingResponseSchema>;
 
-export const DeviceApproveResponseSchema = DevicePendingResponseSchema.extend({
+// Unlike the pending review (whose fingerprint the daemon prints for the
+// out-of-band compare), the approve echo carries the keys alone (mesh B5):
+// the client verifies the echoed keys byte-for-byte and derives any
+// fingerprint it needs locally.
+export const DeviceApproveResponseSchema = DevicePendingResponseSchema.omit({
+  host_key_fingerprint: true,
+}).extend({
   browser_device_id: z.string().uuid(),
   browser_key_algorithm: z.literal("ed25519"),
   browser_public_key: z.string().length(43),
-  browser_key_fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
   // Present only when this key was already paired (re-pair): the Host row's
   // UUID, used to bind the local pin immediately. First pairings get null and
   // seed from /api/hosts once the daemon's poll creates the row.
@@ -293,8 +299,10 @@ export type AuthProviderList = z.infer<typeof AuthProviderListSchema>;
 export const BrowserDeviceSchema = z.object({
   id: z.string().uuid(),
   key_algorithm: z.literal("ed25519"),
+  // No fingerprint field (mesh B5): the roster derives display fingerprints
+  // from this key locally (ed25519PublicKeyFingerprint), never from a
+  // server-authored label.
   public_key: z.string().length(43),
-  fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
   /** Recognition only; never a trust input. See the server model. */
   label: z.string().nullable().default(null),
   created_at: z.string(),
@@ -708,7 +716,6 @@ export const trust = {
       schema: z.object({
         host_id: z.string(),
         endorsed_device_id: z.string(),
-        endorsed_key_fingerprint: z.string(),
         endorser_device_id: z.string(),
         created_at: z.string(),
       }),

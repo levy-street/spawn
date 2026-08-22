@@ -9,7 +9,6 @@ import {
   loadBrowserDeviceIdentity,
   loadOrCreateBrowserDeviceIdentity,
 } from "./browser-device-identity";
-import { ed25519PublicKeyFingerprint } from "./signed-signal";
 
 const REVOCATION_MARKER_PREFIX = "spawn.browser-device.revocation.v1.";
 
@@ -196,11 +195,12 @@ async function registerBrowserDevice(
     }
     throw error;
   }
-  const expectedFingerprint = await ed25519PublicKeyFingerprint(identity.publicKeyWire);
+  // The response carries the key alone (mesh B5); the exact-key comparison is
+  // the whole check, and any fingerprint shown for this device is derived
+  // locally from the key.
   if (
     device.key_algorithm !== "ed25519" ||
     device.public_key !== identity.publicKeyWire ||
-    device.fingerprint !== expectedFingerprint ||
     device.revoked_at !== null
   ) {
     throw new Error("browser registration response did not match the submitted active key");

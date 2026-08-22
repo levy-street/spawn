@@ -214,7 +214,9 @@ def _approval_body(
         "browser_device_id": device["id"],
         "browser_key_algorithm": device["key_algorithm"],
         "browser_public_key": device["public_key"],
-        "browser_key_fingerprint": device["fingerprint"],
+        # Derived locally, as the real client does (mesh B5): the register
+        # response no longer serves a fingerprint next to the key.
+        "browser_key_fingerprint": ed25519_key_fingerprint(device["public_key"]),
         "signature": _wire(private_key.sign(transcript)),
     }
 
@@ -298,15 +300,19 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
     approval = await _approve(client, start, user_id, auth, review, browser)
     assert approval.status_code == 200
     assert approval.json() == {
-        # The approve response mirrors the review minus the SAS relay fields,
-        # which live only on the pending response.
-        **{k: v for k, v in review.items() if k not in ("sas_commit", "sas_host_nonce")},
+        # The approve response mirrors the review minus the SAS relay fields
+        # (pending-only) and minus the fingerprint — it carries the keys, so
+        # any fingerprint is derived client-side (mesh B5).
+        **{
+            k: v
+            for k, v in review.items()
+            if k not in ("sas_commit", "sas_host_nonce", "host_key_fingerprint")
+        },
         # First pairing: the Host row does not exist yet, so no UUID to bind.
         "host_id": None,
         "browser_device_id": browser[0]["id"],
         "browser_key_algorithm": "ed25519",
         "browser_public_key": browser[0]["public_key"],
-        "browser_key_fingerprint": browser[0]["fingerprint"],
     }
 
     # Move the earlier pending poll outside the rate-limit window.
@@ -337,13 +343,17 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
     assert len(hosts) == 1
     assert hosts[0]["id"] == success["host_id"]
     assert hosts[0]["host_public_key"] == public_key
-    assert hosts[0]["host_key_fingerprint"] == fingerprint
+    # Mesh B5: the hosts listing serves the key alone; fingerprints shown in
+    # the UI are locally derived from it, never read off this response.
+    assert "host_key_fingerprint" not in hosts[0]
 
     async with get_sessionmaker()() as session:
         pin = await session.get(HostBrowserPin, (success["host_id"], browser[0]["id"]))
         assert pin is not None
         assert pin.browser_public_key == browser[0]["public_key"]
-        assert pin.browser_key_fingerprint == browser[0]["fingerprint"]
+        assert pin.browser_key_fingerprint == ed25519_key_fingerprint(
+            browser[0]["public_key"]
+        )
 
 
 async def test_host_possession_is_required_before_review_approval_or_token_issue(client):
@@ -853,9 +863,13 @@ async def test_approval_rejects_stale_nonce_and_substituted_browser_tuple(client
     review = await _review(client, start, auth)
     body = _approval_body(start, review, user_id, browser)
 
+    # Deterministic mangle: flip the first character to one it is not, so the
+    # nonce ALWAYS differs (a fixed "_" prefix was a no-op whenever the random
+    # nonce already started with "_" — a 1-in-64 flake).
+    nonce = body["approval_nonce"]
     stale_nonce = await client.post(
         "/api/auth/device/approve",
-        json={**body, "approval_nonce": "_" + body["approval_nonce"][1:]},
+        json={**body, "approval_nonce": ("_" if nonce[0] != "_" else "-") + nonce[1:]},
         headers=auth,
     )
     assert stale_nonce.status_code == 409
@@ -1029,7 +1043,7 @@ async def _assert_browser_binding_constraint_is_exact(client, *, email: str) -> 
         "browser_device_id": browser["id"],
         "browser_key_algorithm": "ed25519",
         "browser_public_key": browser["public_key"],
-        "browser_key_fingerprint": browser["fingerprint"],
+        "browser_key_fingerprint": ed25519_key_fingerprint(browser["public_key"]),
     }
 
     async with get_sessionmaker()() as session:

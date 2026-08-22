@@ -12,7 +12,6 @@ import { BROWSER_DEVICE_ID, HOST_ID, host, mockAuthenticatedApi } from "./app-mo
 const KEYED_HOST = {
   ...host,
   host_public_key: "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
-  host_key_fingerprint: "SHA256:AAAAAAAAAAAAAAAA",
 };
 
 // A real Ed25519 key: the fingerprint derivation imports the key, so an
@@ -36,8 +35,9 @@ function fingerprintOf(publicKey: string): string {
 const secondDevice = {
   id: SECOND_DEVICE_ID,
   key_algorithm: "ed25519",
+  // No served fingerprint (mesh B5): every fingerprint the UI shows or the
+  // ceremony compares is derived locally from this key.
   public_key: SECOND_DEVICE_KEY,
-  fingerprint: fingerprintOf(SECOND_DEVICE_KEY),
   label: "Pixel phone",
   created_at: "2026-08-01T00:00:00Z",
   revoked_at: null,
@@ -92,28 +92,9 @@ test("a trusted browser approves a waiting device through the fingerprint ceremo
   await expect(page.getByTestId("untrusted-callout")).toHaveCount(0);
 });
 
-test("a server-substituted key cannot be approved", async ({ page }) => {
-  // The server lists the device with a fingerprint that does not match its
-  // key. The ceremony re-derives locally and must refuse to sign.
-  await mockAuthenticatedApi(page, {
-    hosts: [KEYED_HOST],
-    extraBrowserDevices: [{ ...secondDevice, fingerprint: "SHA256:attackerchoice_A" }],
-    hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] },
-  });
-  await page.goto("/settings");
-
-  const pixelRow = page.getByTestId("device-row").filter({ hasText: "Pixel phone" });
-  const advanced = page.getByTestId("access-advanced");
-  await advanced.locator("summary").click();
-  await advanced
-    .locator("div", { hasText: "Approve for older hosts" })
-    .getByRole("button", { name: "Approve…" })
-    .first()
-    .click();
-  await page
-    .getByTestId("endorse-panel")
-    .getByRole("button", { name: "It matches — approve" })
-    .click();
-  await expect(page.getByTestId("endorse-panel")).toContainText("does not match its key");
-  await expect(pixelRow.getByTestId("waiting-pill")).toBeVisible();
-});
+// NOTE (mesh B5): the old "server lists the device with a fingerprint that
+// does not match its key" scenario is structurally impossible now — the roster
+// serves no fingerprint field at all, so the comparison value the operator
+// sees is always derived locally from the key being signed. The ceremony's
+// belt-and-braces re-derivation check (device-endorsement.tsx) remains as
+// defense in depth against caller-state skew.

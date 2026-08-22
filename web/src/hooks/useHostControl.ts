@@ -23,18 +23,16 @@ export function useHostControl(hostId: string | null, enabled = true) {
 
   // Latest trust inputs, read by a stable resolver so the client (and its
   // connection) is not recreated whenever the host record refreshes. The
-  // server-claimed key/fingerprint are untrusted; the local pin gate decides.
+  // server-claimed key is untrusted; the local pin gate decides.
   const trustRef = useRef({
     accountId: null as string | null,
     hostId,
     claimedHostPublicKey: null as string | null,
-    claimedHostFingerprint: null as string | null,
   });
   trustRef.current = {
     accountId: user?.id ?? null,
     hostId,
     claimedHostPublicKey: hostQuery.data?.host_public_key ?? null,
-    claimedHostFingerprint: hostQuery.data?.host_key_fingerprint ?? null,
   };
 
   const client = useMemo(
@@ -48,7 +46,6 @@ export function useHostControl(hostId: string | null, enabled = true) {
                 accountId: epochAccountId as string,
                 hostId: t.hostId as string,
                 claimedHostPublicKey: t.claimedHostPublicKey,
-                claimedHostFingerprint: t.claimedHostFingerprint,
                 // The trust epoch ends the moment the signed-in account changes:
                 // a negotiation spanning a logout or account switch must abort
                 // rather than complete under the previous account's pin and

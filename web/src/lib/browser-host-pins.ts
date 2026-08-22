@@ -99,8 +99,9 @@ export interface ResolveBrowserHostPinInput {
   readonly accountId: string;
   readonly origin: string;
   readonly hostId: string;
+  /** As claimed by the (untrusted) server Host API. Its fingerprint is always
+   * derived locally from this key (mesh B5) — never accepted as input. */
   readonly claimedHostPublicKey: string | null;
-  readonly claimedHostFingerprint: string | null;
 }
 
 export interface RevokeBrowserHostPinInput {
@@ -109,8 +110,9 @@ export interface RevokeBrowserHostPinInput {
   readonly targetHostId: string;
   /** Host ID returned by the Host API response for the route. */
   readonly claimedHostId: string;
+  /** As claimed by the (untrusted) server Host API. Its fingerprint is always
+   * derived locally from this key (mesh B5) — never accepted as input. */
   readonly claimedHostPublicKey: string | null;
-  readonly claimedHostFingerprint: string | null;
   readonly origin: string;
 }
 
@@ -326,6 +328,26 @@ function openDatabase(factory: IDBFactory): Promise<IDBDatabase> {
 
 function recordId(accountId: string, origin: string, hostPublicKey: string): string {
   return JSON.stringify([accountId, origin, hostPublicKey]);
+}
+
+/**
+ * The identity a server-CLAIMED key resolves to. The fingerprint is always
+ * derived locally from the key (mesh B5): the server no longer serves one next
+ * to a key, and this module would not accept it as input if it did — a claimed
+ * fingerprint could otherwise become the comparison value a substituted key
+ * hides behind.
+ */
+async function claimedIdentity(hostPublicKey: string | null): Promise<StrictIdentity> {
+  if (hostPublicKey === null) {
+    throw new BrowserHostPinError("null_key", "the Host API did not provide a host public key");
+  }
+  let derived: string;
+  try {
+    derived = await ed25519PublicKeyFingerprint(hostPublicKey);
+  } catch {
+    throw new BrowserHostPinError("invalid_key", "the host public key is not strict Ed25519");
+  }
+  return { hostFingerprint: derived, hostPublicKey };
 }
 
 async function strictIdentity(
@@ -693,8 +715,8 @@ export async function approveBrowserHostPin(
 
 /**
  * Resolve and bind routing metadata only after an exact active local key pin
- * matches. This never creates key trust, never reactivates, and never accepts a
- * Host API fingerprint as authority.
+ * matches. This never creates key trust, never reactivates, and never consults
+ * a Host API fingerprint — identity is the claimed key, locally fingerprinted.
  */
 export async function resolveActiveBrowserHostPin(
   input: ResolveBrowserHostPinInput,
@@ -702,7 +724,7 @@ export async function resolveActiveBrowserHostPin(
 ): Promise<string> {
   assertScope(input.accountId, input.origin);
   assertCanonicalUuid(input.hostId, "hostId");
-  const identity = await strictIdentity(input.claimedHostPublicKey, input.claimedHostFingerprint);
+  const identity = await claimedIdentity(input.claimedHostPublicKey);
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
@@ -765,7 +787,7 @@ export async function revokeBrowserHostPin(
       "the Host API response ID does not exactly match the route and DELETE target",
     );
   }
-  const identity = await strictIdentity(input.claimedHostPublicKey, input.claimedHostFingerprint);
+  const identity = await claimedIdentity(input.claimedHostPublicKey);
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {

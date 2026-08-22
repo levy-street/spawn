@@ -96,7 +96,6 @@ test("device approval shows the locally derived fingerprint before confirmation"
           id: BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
           public_key: browserPublicKey,
-          fingerprint: browserFingerprint,
           created_at: "2026-07-17T00:00:00Z",
           revoked_at: null,
         },
@@ -130,11 +129,9 @@ test("device approval shows the locally derived fingerprint before confirmation"
           approval_nonce: APPROVAL_NONCE,
           host_key_algorithm: "ed25519",
           host_public_key: hostPublicKey,
-          host_key_fingerprint: hostFingerprint,
           browser_device_id: body.browser_device_id,
           browser_key_algorithm: body.browser_key_algorithm,
           browser_public_key: body.browser_public_key,
-          browser_key_fingerprint: body.browser_key_fingerprint,
         },
       });
       return;
@@ -166,6 +163,9 @@ test("device approval shows the locally derived fingerprint before confirmation"
     approval_nonce: APPROVAL_NONCE,
     host_key_algorithm: "ed25519",
     host_public_key: hostPublicKey,
+    // Both request fingerprints are still sent — the reviewed one from the
+    // pending response and this browser's own, both derived/cross-checked
+    // client-side (mesh B5) and binding-validated by the server.
     host_key_fingerprint: hostFingerprint,
     browser_device_id: BROWSER_DEVICE_ID,
     browser_key_algorithm: "ed25519",
@@ -202,7 +202,6 @@ test("the bare page instructs — one command, no code to type", async ({ page }
           id: BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
           public_key: body.public_key,
-          fingerprint: fingerprint(body.public_key),
           created_at: "2026-07-17T00:00:00Z",
           revoked_at: null,
         },
@@ -251,7 +250,6 @@ test("blocks first contact when the server fingerprint disagrees with the host k
           id: BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
           public_key: body.public_key,
-          fingerprint: fingerprint(body.public_key),
           created_at: "2026-07-17T00:00:00Z",
           revoked_at: null,
         },
@@ -313,7 +311,6 @@ test("server approval failure retains a reload-safe local pin and offers explici
           id: BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
           public_key: body.public_key,
-          fingerprint: fingerprint(body.public_key),
           created_at: "2026-07-17T00:00:00Z",
           revoked_at: null,
         },
@@ -394,7 +391,6 @@ test("substituted approval response fails loudly while preserving retryable loca
           id: BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
           public_key: body.public_key,
-          fingerprint: fingerprint(body.public_key),
           created_at: "2026-07-17T00:00:00Z",
           revoked_at: null,
         },
@@ -425,11 +421,9 @@ test("substituted approval response fails loudly while preserving retryable loca
           approval_nonce: APPROVAL_NONCE,
           host_key_algorithm: "ed25519",
           host_public_key: hostPublicKey,
-          host_key_fingerprint: hostFingerprint,
           browser_device_id: "00000000-0000-4000-8000-000000000010",
           browser_key_algorithm: body.browser_key_algorithm,
           browser_public_key: body.browser_public_key,
-          browser_key_fingerprint: body.browser_key_fingerprint,
         },
       });
       return;
@@ -470,7 +464,6 @@ test("local pin write corruption blocks approval before any server call", async 
           id: BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
           public_key: body.public_key,
-          fingerprint: fingerprint(body.public_key),
           created_at: "2026-07-17T00:00:00Z",
           revoked_at: null,
         },
@@ -529,7 +522,6 @@ test("two native Chromium tabs converge on one exact local pin", async ({ contex
             id: BROWSER_DEVICE_ID,
             key_algorithm: "ed25519",
             public_key: body.public_key,
-            fingerprint: fingerprint(body.public_key),
             created_at: "2026-07-17T00:00:00Z",
             revoked_at: null,
           },
@@ -558,11 +550,9 @@ test("two native Chromium tabs converge on one exact local pin", async ({ contex
             approval_nonce: APPROVAL_NONCE,
             host_key_algorithm: "ed25519",
             host_public_key: HOST_PUBLIC_KEY,
-            host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
             browser_device_id: body.browser_device_id,
             browser_key_algorithm: body.browser_key_algorithm,
             browser_public_key: body.browser_public_key,
-            browser_key_fingerprint: body.browser_key_fingerprint,
           },
         });
         return;
