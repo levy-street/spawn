@@ -182,7 +182,7 @@ import uuid
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from spawn_server.browser_registration import encode_browser_registration_transcript
-from spawn_server.host_identity import decode_ed25519_public_key
+from spawn_server.host_identity import decode_ed25519_public_key, ed25519_key_fingerprint
 from spawn_server.host_pair_approval import (
     decode_approval_nonce,
     encode_host_pair_approval_transcript,
@@ -253,7 +253,7 @@ reviewed = request("POST", "/api/auth/device/pending", {"user_code": start["user
 browser_key = Ed25519PrivateKey.generate()
 browser_public = browser_key.public_key().public_bytes_raw()
 browser_public_key = base64.urlsafe_b64encode(browser_public).rstrip(b"=").decode()
-registration = encode_browser_registration_transcript(user_id, browser_public)
+registration = encode_browser_registration_transcript(user_id, browser_public, is_root=False)
 browser = request(
     "POST",
     "/api/browser-devices/register",
@@ -279,7 +279,7 @@ approval = {
     "browser_device_id": browser["id"],
     "browser_key_algorithm": browser["key_algorithm"],
     "browser_public_key": browser["public_key"],
-    "browser_key_fingerprint": browser["fingerprint"],
+    "browser_key_fingerprint": ed25519_key_fingerprint(browser["public_key"]),
     "signature": base64.urlsafe_b64encode(browser_key.sign(approval_transcript)).rstrip(b"=").decode(),
 }
 approved = request(
@@ -288,7 +288,7 @@ approved = request(
     approval,
     token,
 )
-if any(approved.get(field) != value for field, value in approval.items() if field not in {"user_code", "signature"}):
+if any(approved.get(field) != value for field, value in approval.items() if field not in {"user_code", "signature", "host_key_fingerprint", "browser_key_fingerprint"}):
     raise SystemExit(f"approval response changed reviewed identity: {approved!r}")
 poll = request(
     "POST",
@@ -323,11 +323,33 @@ for config_dir in (
         json.dump(creds, handle)
     os.chmod(os.path.join(config_dir, "credentials.json"), 0o600)
 
-print(json.dumps({"token": token, "host_id": poll["host_id"]}))
+print(
+    json.dumps(
+        {
+            "token": token,
+            "host_id": poll["host_id"],
+            # The synthetic approved browser is the daemon's pin (its anchor).
+            # The live Playwright browser registers its OWN device key and the
+            # mesh daemon rightly refuses it without a chain — so the live flow
+            # below endorses it FROM this anchor, exactly as the product's
+            # add-device ceremony would.
+            "account_id": user_id,
+            "anchor_device_id": browser["id"],
+            "anchor_public_key": browser["public_key"],
+            "anchor_seed": base64.urlsafe_b64encode(
+                browser_key.private_bytes_raw()
+            ).rstrip(b"=").decode(),
+        }
+    )
+)
 PY
 )"
 user_token="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<<"$creds")"
 host_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["host_id"])' <<<"$creds")"
+account_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["account_id"])' <<<"$creds")"
+anchor_device_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["anchor_device_id"])' <<<"$creds")"
+anchor_public_key="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["anchor_public_key"])' <<<"$creds")"
+anchor_seed="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["anchor_seed"])' <<<"$creds")"
 
 printf '%s\n' "smoke-local-browser-live: starting spawnd for host $host_id"
 env \
@@ -389,6 +411,10 @@ printf '%s\n' "smoke-local-browser-live: driving real browser flow"
     SPAWN_LIVE_AGENT_CWD="$agent_cwd" \
     SPAWN_LIVE_AGENT_ID_FILE="$agent_id_file" \
     SPAWN_LIVE_UPLOAD_PATH="$upload_path" \
+    SPAWN_LIVE_ACCOUNT_ID="$account_id" \
+    SPAWN_LIVE_ANCHOR_DEVICE_ID="$anchor_device_id" \
+    SPAWN_LIVE_ANCHOR_PUBLIC_KEY="$anchor_public_key" \
+    SPAWN_LIVE_ANCHOR_SEED="$anchor_seed" \
     bun - <<'JS'
 import { chromium, expect } from "@playwright/test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -399,8 +425,74 @@ const password = process.env.SPAWN_LIVE_PASSWORD;
 const agentCwd = process.env.SPAWN_LIVE_AGENT_CWD;
 const agentIdFile = process.env.SPAWN_LIVE_AGENT_ID_FILE;
 const uploadPath = process.env.SPAWN_LIVE_UPLOAD_PATH;
-if (!webUrl || !email || !password || !agentCwd || !agentIdFile || !uploadPath) {
+const accountId = process.env.SPAWN_LIVE_ACCOUNT_ID;
+const anchorDeviceId = process.env.SPAWN_LIVE_ANCHOR_DEVICE_ID;
+const anchorPublicKey = process.env.SPAWN_LIVE_ANCHOR_PUBLIC_KEY;
+const anchorSeed = process.env.SPAWN_LIVE_ANCHOR_SEED;
+if (
+  !webUrl || !email || !password || !agentCwd || !agentIdFile || !uploadPath ||
+  !accountId || !anchorDeviceId || !anchorPublicKey || !anchorSeed
+) {
   throw new Error("missing live browser smoke environment");
+}
+
+const b64urlToBytes = (wire) => {
+  const padded = wire + "=".repeat((4 - (wire.length % 4)) % 4);
+  return Uint8Array.from(Buffer.from(padded, "base64url"));
+};
+const bytesToB64url = (bytes) => Buffer.from(bytes).toString("base64url");
+const uuidBytes = (value) => {
+  const hex = value.replaceAll("-", "");
+  return Uint8Array.from({ length: 16 }, (_, i) => Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16));
+};
+
+// Endorse the live browser's freshly-registered device from the synthetic
+// pinned anchor: SPAWN-ACCT-ENDORSE-V1, byte-identical to
+// web/src/lib/acct-endorsement-transcript.ts. Without this edge the mesh
+// daemon refuses the browser's signed RTC offers (no chain to an anchor) —
+// exactly what the add-device ceremony provides for a real second device.
+async function endorseLiveDevice(page) {
+  let device = null;
+  for (let attempt = 0; attempt < 60 && !device; attempt += 1) {
+    const listed = await page.request.get(`${webUrl}/api/browser-devices`);
+    if (listed.ok()) {
+      const rows = await listed.json();
+      device =
+        rows.find((row) => row.id !== anchorDeviceId && !row.is_root && row.revoked_at === null) ??
+        null;
+    }
+    if (!device) await page.waitForTimeout(500);
+  }
+  if (!device) throw new Error("live browser device never registered");
+
+  const magic = new TextEncoder().encode("SPAWN-ACCT-ENDORSE-V1");
+  const anchorPk = b64urlToBytes(anchorPublicKey);
+  const endorsedPk = b64urlToBytes(device.public_key);
+  const transcript = new Uint8Array(magic.length + 1 + 16 + 32 + 32 + 16);
+  let offset = 0;
+  for (const field of [magic, Uint8Array.of(1), uuidBytes(accountId), anchorPk, endorsedPk, uuidBytes(device.id)]) {
+    transcript.set(field, offset);
+    offset += field.length;
+  }
+
+  const pkcs8 = new Uint8Array([
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+    0x04, 0x22, 0x04, 0x20, ...b64urlToBytes(anchorSeed),
+  ]);
+  const key = await crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false, ["sign"]);
+  const signature = new Uint8Array(await crypto.subtle.sign({ name: "Ed25519" }, key, transcript));
+
+  const posted = await page.request.post(`${webUrl}/api/trust/account-endorsements`, {
+    data: {
+      endorser_device_id: anchorDeviceId,
+      endorsed_device_id: device.id,
+      signature: bytesToB64url(signature),
+    },
+  });
+  if (!posted.ok()) {
+    throw new Error(`endorsing the live browser failed: ${posted.status()} ${await posted.text()}`);
+  }
+  console.log(`live browser device ${device.id} endorsed by the pinned anchor`);
 }
 
 const command =
@@ -448,6 +540,8 @@ try {
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible({ timeout: 15_000 });
+
+  await endorseLiveDevice(page);
 
   await page.goto(`${webUrl}/agents`);
   await page
