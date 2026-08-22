@@ -621,7 +621,7 @@ class DevicePairingIntroductions(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _require_some_payload(self) -> "DevicePairingIntroductions":
+    def _require_some_payload(self) -> DevicePairingIntroductions:
         if not self.introductions and not self.device_introductions:
             raise ValueError("introductions must carry at least one host or device entry")
         return self

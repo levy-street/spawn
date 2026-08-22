@@ -24,10 +24,10 @@ from .routes import capabilities as capabilities_routes
 from .routes import device as device_routes
 from .routes import device_pairing as device_pairing_routes
 from .routes import host_introductions as host_introductions_routes
-from .routes import root_introductions as root_introductions_routes
 from .routes import hosts as hosts_routes
 from .routes import install as install_routes
 from .routes import presets as presets_routes
+from .routes import root_introductions as root_introductions_routes
 from .routes import screens as screens_routes
 from .routes import trust_bundle as trust_bundle_routes
 from .ws import browser as browser_ws

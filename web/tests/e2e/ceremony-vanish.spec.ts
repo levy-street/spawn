@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync, type KeyObject, randomBytes, sign } from "node:crypto";
 import { expect, type Page, test } from "@playwright/test";
-import { BROWSER_DEVICE_ID, USER_ID, mockAuthenticatedApi } from "./app-mocks";
+import { BROWSER_DEVICE_ID, mockAuthenticatedApi, USER_ID } from "./app-mocks";
 
 // The C1 terminal-state truth, joiner side (docs/TRUST_DEVICE_MESH.md §4 —
 // mutual endorsement is a REQUIRED P1 invariant; the relay row's absence
