@@ -511,6 +511,58 @@ describe("browser-local host pins", () => {
     );
   });
 
+  test("device-local forget composes with the re-key exit: the retained tombstone still migrates (R-b × P-C6)", async () => {
+    // Forget (P-C6) DELETES active pins but retains targeted-revocation
+    // tombstones — including their Host-ID bindings. That retained binding is
+    // exactly the state the re-possess migration must clear, so the two
+    // semantics are proven together: revoke a re-keyed host, forget the
+    // device's other pins, then possess the host again with its new key.
+    const factory = new IDBFactory();
+    await approveBrowserHostPin(approvalInput(), options(factory));
+    await resolveActiveBrowserHostPin(resolveInput(), options(factory));
+    await revokeBrowserHostPin(revokeInput(), options(factory, 2_000)); // targeted removal
+    const otherFingerprint = await ed25519PublicKeyFingerprint(OTHER_HOST_KEY);
+    await approveBrowserHostPin(
+      approvalInput({ hostPublicKey: OTHER_HOST_KEY, hostFingerprint: otherFingerprint }),
+      options(factory, 3_000),
+    );
+
+    const { forgotten } = await forgetActiveBrowserHostPins(
+      { accountId: ACCOUNT, origin: ORIGIN },
+      options(factory, 4_000),
+    );
+    expect(forgotten).toBe(1); // the active pin died; the tombstone did not
+    const afterForget = await rawRecords(factory);
+    expect(afterForget).toHaveLength(1);
+    expect(afterForget[0]).toMatchObject({
+      hostPublicKey: HOST_KEY,
+      state: "revoked",
+      hostIds: [HOST_ID], // the binding rides the retained tombstone
+    });
+
+    // Re-possess with the host's new key: the fresh explicit approval plus
+    // the migration clear the conflict — a forget in between changes nothing.
+    await approveBrowserHostPin(
+      approvalInput({ hostPublicKey: OTHER_HOST_KEY, hostFingerprint: otherFingerprint }),
+      options(factory, 5_000),
+    );
+    expect(
+      await resolveActiveBrowserHostPin(
+        resolveInput({ claimedHostPublicKey: OTHER_HOST_KEY }),
+        options(factory, 5_000),
+      ),
+    ).toBe(OTHER_HOST_KEY);
+    const records = await rawRecords(factory);
+    expect(records.find((r) => r.hostPublicKey === HOST_KEY)).toMatchObject({
+      state: "revoked",
+      hostIds: [], // R10: the tombstone survives, just without the binding
+    });
+    expect(records.find((r) => r.hostPublicKey === OTHER_HOST_KEY)).toMatchObject({
+      state: "active",
+      hostIds: [HOST_ID],
+    });
+  });
+
   test("bounds observed routing Host IDs by evicting, never refusing or replacing the key", async () => {
     const factory = new IDBFactory();
     await approveBrowserHostPin(approvalInput(), options(factory));
