@@ -365,6 +365,70 @@ export async function setEnvelopeRoot(
 }
 
 /**
+ * Merge additional verified hosts into the sealed bundle — the reseal half of
+ * "the bundle tracks the fleet" (review P-C1).
+ *
+ * Reseals the bundle's content — the union of its hosts and `hosts`, same
+ * root and retired-root archive, at an advanced revision — under the SAME
+ * data key, so every enrolled passkey's wrap keeps working without gathering
+ * the other passkeys' PRF secrets (exactly the `setEnvelopeRoot` discipline).
+ * `hosts` must be firsthand-verified by the caller (this device's own active
+ * pin store): what goes in here is what every future passkey unlock will pin.
+ *
+ * Returns null when the union adds nothing — the caller skips the write.
+ */
+export async function mergeEnvelopeHosts(
+  accountId: string,
+  wire: string,
+  unlockWith: PasskeyWrapInput,
+  hosts: readonly TrustBundleHost[],
+  revision: number,
+): Promise<{ readonly sealed: string; readonly addedHostKeys: readonly string[] } | null> {
+  requireAccountId(accountId);
+  const envelope = parseEnvelope(accountId, wire);
+  const dataKey = await recoverDataKey(envelope, accountId, unlockWith);
+  const bundle = await openSealedBundle(dataKey, accountId, envelope.sealed);
+  const byKey = new Map(bundle.hosts.map((host) => [host.hostPublicKey, host]));
+  const addedHostKeys: string[] = [];
+  for (const host of hosts) {
+    const existing = byKey.get(host.hostPublicKey);
+    if (existing === undefined) {
+      byKey.set(host.hostPublicKey, host);
+      addedHostKeys.push(host.hostPublicKey);
+      continue;
+    }
+    // Same key, possibly new host-id bindings (an id learned since the seal
+    // keeps the signed-RTC downgrade check working right after an import).
+    const hostIds = [...new Set([...existing.hostIds, ...host.hostIds])].sort();
+    if (hostIds.length !== existing.hostIds.length) {
+      byKey.set(host.hostPublicKey, { ...existing, hostIds });
+      addedHostKeys.push(host.hostPublicKey);
+    }
+  }
+  if (addedHostKeys.length === 0) return null;
+  if (revision <= bundle.revision) {
+    throw new TrustBundleError("invalid_bundle", "a host merge must advance the bundle revision");
+  }
+  const amended = await canonicalBundle(
+    accountId,
+    [...byKey.values()],
+    revision,
+    bundle.root,
+    bundle.retiredRoots,
+  );
+  const sealed = await sealBytes(
+    await importDataKey(dataKey),
+    aad(BUNDLE_AAD_MAGIC, accountId),
+    new TextEncoder().encode(JSON.stringify(amended)),
+  );
+  const next: EnvelopeWire = { ...envelope, sealed };
+  return {
+    sealed: encodeBase64Url(new TextEncoder().encode(JSON.stringify(next))),
+    addedHostKeys,
+  };
+}
+
+/**
  * Enroll another passkey by adding a wrap of the same data key.
  *
  * Requires a passkey that can already unlock, and the new passkey's PRF secret,

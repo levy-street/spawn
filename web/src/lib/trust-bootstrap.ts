@@ -22,6 +22,7 @@ import {
 import type { TrustBundleHost } from "./trust-bundle";
 import {
   enrollPasskeyInEnvelope,
+  mergeEnvelopeHosts,
   openTrustEnvelope,
   type PasskeyWrapInput,
   revokePasskeyFromEnvelope,
@@ -156,6 +157,62 @@ export async function retrofitAccountRoot(
     sealed: await setEnvelopeRoot(scope.accountId, sealed, unlockWith, root, revision, replace),
     revision,
   };
+}
+
+/**
+ * RESEAL-ON-UNLOCK (review P-C1): merge this device's ACTIVE local pins into
+ * the sealed bundle's host set, under the same data key at a bumped revision.
+ *
+ * `sealCurrentTrust` runs exactly once ever (passkey setup) and seals only the
+ * minting device's pins at that instant; without this, a host possessed later
+ * never enters the bundle and the "passkey brings everything back" promise
+ * silently rots. Every unlock already proves the passkey and holds the data
+ * key, so the merge costs no extra gesture. Local pins are firsthand by
+ * definition — this device verified each host key out of band (possess,
+ * ceremony gossip, or a previous import).
+ *
+ * Deliberately a UNION, never a replacement: a host another device sealed
+ * that this device has locally revoked (a local tombstone) stays in the
+ * bundle — local withdrawal is this-device-only, and resealing from local
+ * pins alone would evict it for everyone.
+ *
+ * Returns null when the bundle already covers everything. The caller stores
+ * with CAS at the revision it read; a 409 loser just skips — another device's
+ * merge won and the next unlock retries.
+ */
+export async function resealBundleWithLocalPins(
+  scope: TrustBootstrapScope,
+  sealed: string,
+  unlockWith: PasskeyWrapInput,
+  serverRevision: number,
+): Promise<{
+  readonly sealed: string;
+  readonly revision: number;
+  readonly addedHostKeys: readonly string[];
+} | null> {
+  const origin = scope.origin ?? browserHostPinServerOrigin();
+  const pins = await listActiveBrowserHostPins(
+    { accountId: scope.accountId, origin },
+    scope.pinStorage ?? {},
+  );
+  if (pins.length === 0) return null;
+  // Refuse to merge on top of a rolled-back bundle (same guard as retrofit):
+  // a server replaying an old authentic envelope must not launder it back to
+  // the current revision via this device's own write.
+  const opened = await openTrustEnvelope(scope.accountId, sealed, unlockWith);
+  await enforceBundleFreshness(scope.accountId, opened.revision, revisionOptions(scope));
+  const floor = await readHighestSeenRevision(scope.accountId, revisionOptions(scope));
+  const revision =
+    Math.max(floor, Number.isInteger(serverRevision) ? serverRevision : 0, opened.revision) + 1;
+  const merged = await mergeEnvelopeHosts(
+    scope.accountId,
+    sealed,
+    unlockWith,
+    pins.map(pinToBundleHost),
+    revision,
+  );
+  if (merged === null) return null;
+  return { sealed: merged.sealed, revision, addedHostKeys: merged.addedHostKeys };
 }
 
 /**

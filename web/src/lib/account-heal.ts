@@ -113,14 +113,31 @@ export function selectSealedRootRowForRevocation(
       };
 }
 
+export interface RefusedHealHost {
+  readonly hostId: string;
+  readonly reason: string;
+}
+
 export interface AccountHealReport {
   readonly rootDeviceId: string;
+  /** This device's roster row id, when its key is registered and live. */
+  readonly currentDeviceId: string | null;
   /** Devices that received a fresh `R→d` endorsement in this heal. */
   readonly endorsedDeviceIds: readonly string[];
-  /** Host rows that accepted a root anchor-upgrade endorsement. */
-  readonly hostsUpgraded: number;
-  /** Host rows that refused one (e.g. this device is not pinned there). */
-  readonly hostsSkipped: number;
+  /** Devices whose `R→d` endorsement FAILED — isolated per statement, so one
+   * failure never aborts the rest of the loop or the anchor half. */
+  readonly failedEndorsementDeviceIds: readonly string[];
+  /** Host ids that accepted a root anchor-upgrade endorsement this heal. */
+  readonly upgradedHostIds: readonly string[];
+  /** Host ids that refused or failed one, with the reason (e.g. this device
+   * is not pinned there — the 409 gate). */
+  readonly refusedHosts: readonly RefusedHealHost[];
+  /** Whether this device's own `R→d` edge exists AFTER the heal, verified
+   * against re-fetched edges with the same signature discipline as
+   * `planAccountHeal`. Null when this device has no live roster row to
+   * verify. The unlock flow's honesty gate: "approved" may only be claimed
+   * when this is true. */
+  readonly rootEndorsedSelf: boolean | null;
 }
 
 interface DeviceRow {
@@ -321,18 +338,78 @@ export async function ensureRootRegistered(root: AccountRoot, accountId: string)
 }
 
 /**
+ * The union of the sealed bundle's hosts and this device's ACTIVE local pins,
+ * for the heal's anchor-upgrade loop. Both inputs are FIRSTHAND: the bundle
+ * was passkey-unsealed (or is the mint-time pin snapshot), and a local pin
+ * exists only because THIS device verified the host key out of band. Without
+ * the union, a host possessed after the bundle was last sealed never gains
+ * the root anchor at a passkey moment on this device — one half of the
+ * "root anchored nowhere" field bug.
+ */
+export function unionHealHosts(
+  bundleHosts: readonly TrustBundleHost[],
+  localPins: readonly TrustBundleHost[],
+): TrustBundleHost[] {
+  const byKey = new Map<string, TrustBundleHost>();
+  for (const host of [...bundleHosts, ...localPins]) {
+    const existing = byKey.get(host.hostPublicKey);
+    if (existing === undefined) {
+      byKey.set(host.hostPublicKey, host);
+      continue;
+    }
+    const hostIds = [...new Set([...existing.hostIds, ...host.hostIds])].sort();
+    byKey.set(host.hostPublicKey, { ...existing, hostIds });
+  }
+  return [...byKey.values()];
+}
+
+/**
+ * The heal's I/O seam, so per-statement isolation and the report are directly
+ * testable against injected failures. Defaults to the real API.
+ */
+export interface AccountHealIo {
+  listDevices(): Promise<readonly DeviceRow[]>;
+  listEdges(): Promise<readonly EdgeRow[]>;
+  createAccountEndorsement(body: {
+    endorser_device_id: string;
+    endorsed_device_id: string;
+    signature: string;
+  }): Promise<unknown>;
+  endorse(body: {
+    host_id: string;
+    endorser_device_id: string;
+    endorsed_device_id: string;
+    signature: string;
+  }): Promise<unknown>;
+}
+
+const defaultHealIo: AccountHealIo = {
+  listDevices: () => browserDevices.list(),
+  listEdges: () => trust.accountEndorsements(),
+  createAccountEndorsement: (body) => trust.createAccountEndorsement(body),
+  endorse: (body) => trust.endorse(body),
+};
+
+/**
  * Heal the whole account off `R`, then let `root` go out of scope — the caller
  * must not retain it. `identity` is this device's own signer for the per-host
- * anchor upgrades; hosts it is not pinned on simply refuse (counted, not fatal).
- * Device selection trusts nothing the server claims — see `planAccountHeal`.
+ * anchor upgrades; hosts it is not pinned on simply refuse (reported, not
+ * fatal). Device selection trusts nothing the server claims — see
+ * `planAccountHeal`.
+ *
+ * Robustness contract (P-C2): every statement is isolated. One failed `R→d`
+ * endorsement neither aborts the remaining endorsements nor skips the anchor
+ * half; every outcome lands in the per-id report, and the caller decides what
+ * counts as success (the unlock gates on `rootEndorsedSelf`).
  */
 export async function healAccount(
   root: AccountRoot,
   accountId: string,
   identity: BrowserDeviceIdentity,
-  bundleHosts: readonly TrustBundleHost[],
+  hosts: readonly TrustBundleHost[],
+  io: AccountHealIo = defaultHealIo,
 ): Promise<AccountHealReport> {
-  const [devices, edges] = await Promise.all([browserDevices.list(), trust.accountEndorsements()]);
+  const [devices, edges] = await Promise.all([io.listDevices(), io.listEdges()]);
   const { rootDevice, currentDevice, devicesToEndorse } = await planAccountHeal(
     accountId,
     root.publicKeyWire,
@@ -348,30 +425,41 @@ export async function healAccount(
   }
 
   const endorsedDeviceIds: string[] = [];
+  const failedEndorsementDeviceIds: string[] = [];
   for (const device of devicesToEndorse) {
-    const signature = await createRootEndorsementProof(
-      root,
-      accountId,
-      device.public_key,
-      device.id,
-    );
-    await trust.createAccountEndorsement({
-      endorser_device_id: rootDevice.id,
-      endorsed_device_id: device.id,
-      signature,
-    });
-    endorsedDeviceIds.push(device.id);
+    try {
+      const signature = await createRootEndorsementProof(
+        root,
+        accountId,
+        device.public_key,
+        device.id,
+      );
+      await io.createAccountEndorsement({
+        endorser_device_id: rootDevice.id,
+        endorsed_device_id: device.id,
+        signature,
+      });
+      endorsedDeviceIds.push(device.id);
+    } catch {
+      // Isolated: the next device's endorsement and the anchor loop still run.
+      failedEndorsementDeviceIds.push(device.id);
+    }
   }
 
   // Anchor upgrade: this device vouches for pk_R toward each host it is pinned
   // on. Idempotent server-side; a host that does not trust this device answers
-  // 409 and is skipped — it gains the root at its own possess/heal moment.
-  let hostsUpgraded = 0;
-  let hostsSkipped = 0;
-  for (const host of bundleHosts) {
+  // 409 and is reported — it gains the root at another device's sweep or its
+  // own possess/heal moment. This loop ALWAYS runs, whatever the endorsement
+  // half did.
+  const upgradedHostIds: string[] = [];
+  const refusedHosts: RefusedHealHost[] = [];
+  for (const host of hosts) {
     for (const hostId of host.hostIds) {
       if (currentDevice === null) {
-        hostsSkipped += 1;
+        refusedHosts.push({
+          hostId,
+          reason: "this device's key is not registered with the account",
+        });
         continue;
       }
       try {
@@ -382,18 +470,54 @@ export async function healAccount(
           rootDevice.public_key,
           rootDevice.id,
         );
-        await trust.endorse({
+        await io.endorse({
           host_id: hostId,
           endorser_device_id: currentDevice.id,
           endorsed_device_id: rootDevice.id,
           signature,
         });
-        hostsUpgraded += 1;
-      } catch {
-        hostsSkipped += 1;
+        upgradedHostIds.push(hostId);
+      } catch (cause) {
+        refusedHosts.push({
+          hostId,
+          reason: cause instanceof Error ? cause.message : String(cause),
+        });
       }
     }
   }
 
-  return { rootDeviceId: rootDevice.id, endorsedDeviceIds, hostsUpgraded, hostsSkipped };
+  // The honesty check: does this device's own R→d edge exist NOW? Verified
+  // against a fresh fetch with the same signature discipline as the planner —
+  // a server that merely echoed a 200 without storing (or a failed statement
+  // above) reads as false here, and the unlock will not claim success on it.
+  let rootEndorsedSelf: boolean | null = null;
+  if (currentDevice !== null) {
+    rootEndorsedSelf = false;
+    try {
+      const after = await io.listEdges();
+      for (const edge of after) {
+        if (
+          edge.endorser_public_key === root.publicKeyWire &&
+          edge.endorsed_public_key === currentDevice.public_key &&
+          edge.endorsed_device_id === currentDevice.id &&
+          (await verifyEdgeSignature(accountId, edge))
+        ) {
+          rootEndorsedSelf = true;
+          break;
+        }
+      }
+    } catch {
+      // Unfetchable edges prove nothing; stay false (the honest default).
+    }
+  }
+
+  return {
+    rootDeviceId: rootDevice.id,
+    currentDeviceId: currentDevice?.id ?? null,
+    endorsedDeviceIds,
+    failedEndorsementDeviceIds,
+    upgradedHostIds,
+    refusedHosts,
+    rootEndorsedSelf,
+  };
 }

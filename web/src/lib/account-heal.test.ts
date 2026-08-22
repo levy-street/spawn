@@ -394,3 +394,152 @@ describe("selectSealedRootRowForRevocation (hardening B3): firsthand pk_R choose
     expect(result).toEqual({ row: null, reason: null });
   });
 });
+
+// ---------------------------------------------------------------------------
+// healAccount execution: per-statement isolation and the per-id report (P-C2/3)
+// ---------------------------------------------------------------------------
+
+import { IDBFactory } from "fake-indexeddb";
+import { type AccountHealIo, healAccount, unionHealHosts } from "./account-heal";
+import { generateAccountRoot } from "./account-root";
+import { loadOrCreateBrowserDeviceIdentity } from "./browser-device-identity";
+
+const HOST_1 = uuid(0x11);
+const HOST_2 = uuid(0x12);
+const HOST_KEY_1 = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
+const HOST_KEY_2 = "11qYAYdk9Jt0uvL7Tp_5eQK8heP0LOEYVVt4dSK3M3A";
+
+/**
+ * A fake heal I/O: a roster of {root, self, laptop, phone}, no prior edges,
+ * per-call failure injection, and a second listEdges() that serves back the
+ * genuinely-signed R→d edges the heal stored — so the post-heal R→SELF check
+ * verifies real signatures, not bookkeeping.
+ */
+function makeHealIo(input: {
+  rootPk: string;
+  selfPk: string;
+  devices: { id: string; public_key: string; revoked_at: string | null; is_root: boolean }[];
+  failEndorsementFor?: string[];
+  failEndorseHostIds?: string[];
+}) {
+  const stored: { endorsed_device_id: string; signature: string }[] = [];
+  const endorseCalls: { host_id: string; endorsed_device_id: string }[] = [];
+  const pkById = new Map(input.devices.map((d) => [d.id, d.public_key]));
+  const io: AccountHealIo = {
+    listDevices: async () => input.devices,
+    listEdges: async () =>
+      stored.map((row) => ({
+        endorser_device_id: uuid(1),
+        endorser_public_key: input.rootPk,
+        endorsed_device_id: row.endorsed_device_id,
+        endorsed_public_key: pkById.get(row.endorsed_device_id) as string,
+        signature: row.signature,
+      })),
+    createAccountEndorsement: async (body) => {
+      if (input.failEndorsementFor?.includes(body.endorsed_device_id)) {
+        throw new Error("injected endorsement failure");
+      }
+      stored.push({ endorsed_device_id: body.endorsed_device_id, signature: body.signature });
+      return {};
+    },
+    endorse: async (body) => {
+      if (input.failEndorseHostIds?.includes(body.host_id)) {
+        throw new Error("the endorsing device is not trusted by this host");
+      }
+      endorseCalls.push({ host_id: body.host_id, endorsed_device_id: body.endorsed_device_id });
+      return {};
+    },
+  };
+  return { io, stored, endorseCalls };
+}
+
+describe("healAccount (execution half, injected I/O)", () => {
+  async function fixture(opts: { failEndorsementFor?: string[]; failEndorseHostIds?: string[] }) {
+    const accountRoot = await generateAccountRoot();
+    const identity = await loadOrCreateBrowserDeviceIdentity(ACCOUNT_ID, {
+      indexedDBFactory: new IDBFactory(),
+    });
+    const devices = [
+      device(ROOT_ID, accountRoot.publicKeyWire, { isRoot: true }),
+      device(SELF_ID, identity.publicKeyWire),
+      device(LAPTOP_ID, laptop.pk),
+    ];
+    const made = makeHealIo({
+      rootPk: accountRoot.publicKeyWire,
+      selfPk: identity.publicKeyWire,
+      devices,
+      ...opts,
+    });
+    return { accountRoot, identity, ...made };
+  }
+
+  const hosts = [
+    { hostPublicKey: HOST_KEY_1, hostFingerprint: "f1", hostIds: [HOST_1] },
+    { hostPublicKey: HOST_KEY_2, hostFingerprint: "f2", hostIds: [HOST_2] },
+  ];
+
+  test("one failed R→d endorsement neither stops the loop nor skips the anchors", async () => {
+    // LAPTOP has no verified chain in this fixture, so only SELF is planned;
+    // fail SELF's endorsement and prove the anchor half still ran in full.
+    const { accountRoot, identity, io, endorseCalls } = await fixture({
+      failEndorsementFor: [SELF_ID],
+    });
+    const report = await healAccount(accountRoot, ACCOUNT_ID, identity, hosts, io);
+    expect(report.failedEndorsementDeviceIds).toEqual([SELF_ID]);
+    expect(report.endorsedDeviceIds).toEqual([]);
+    // The anchor loop ALWAYS runs (P-C2): both hosts were attempted.
+    expect(endorseCalls.map((c) => c.host_id).sort()).toEqual([HOST_1, HOST_2].sort());
+    expect([...report.upgradedHostIds].sort()).toEqual([HOST_1, HOST_2].sort());
+    // And the honesty flag reflects the failure: no verified R→self edge.
+    expect(report.rootEndorsedSelf).toBe(false);
+  });
+
+  test("per-host report: refused hosts carry their reason; upgraded carry their id", async () => {
+    const { accountRoot, identity, io } = await fixture({ failEndorseHostIds: [HOST_2] });
+    const report = await healAccount(accountRoot, ACCOUNT_ID, identity, hosts, io);
+    expect(report.upgradedHostIds).toEqual([HOST_1]);
+    expect(report.refusedHosts).toEqual([
+      { hostId: HOST_2, reason: "the endorsing device is not trusted by this host" },
+    ]);
+    // The endorsement half succeeded, so this device is verifiably approved.
+    expect(report.endorsedDeviceIds).toEqual([SELF_ID]);
+    expect(report.rootEndorsedSelf).toBe(true);
+  });
+
+  test("rootEndorsedSelf verifies the FETCHED edge's signature, not bookkeeping", async () => {
+    // A server that answers 200 but stores a corrupted edge must read false.
+    const { accountRoot, identity, io, stored } = await fixture({});
+    const originalCreate = io.createAccountEndorsement;
+    io.createAccountEndorsement = async (body) => {
+      await originalCreate(body);
+      stored[stored.length - 1] = {
+        ...stored[stored.length - 1],
+        signature: encodeBase64Url(new Uint8Array(64)),
+      };
+      return {};
+    };
+    const report = await healAccount(accountRoot, ACCOUNT_ID, identity, hosts, io);
+    expect(report.endorsedDeviceIds).toEqual([SELF_ID]);
+    expect(report.rootEndorsedSelf).toBe(false);
+  });
+});
+
+describe("unionHealHosts (P-C1c)", () => {
+  test("bundle hosts and local pins merge by key, union their host ids", () => {
+    const union = unionHealHosts(
+      [{ hostPublicKey: HOST_KEY_1, hostFingerprint: "f1", hostIds: [HOST_1] }],
+      [
+        { hostPublicKey: HOST_KEY_1, hostFingerprint: "f1", hostIds: [HOST_2] },
+        { hostPublicKey: HOST_KEY_2, hostFingerprint: "f2", hostIds: [] },
+      ],
+    );
+    expect(union).toHaveLength(2);
+    expect(
+      union
+        .find((h) => h.hostPublicKey === HOST_KEY_1)
+        ?.hostIds.slice()
+        .sort(),
+    ).toEqual([HOST_1, HOST_2].sort());
+    expect(union.find((h) => h.hostPublicKey === HOST_KEY_2)).toBeDefined();
+  });
+});

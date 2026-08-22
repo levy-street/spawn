@@ -21,6 +21,7 @@ import {
   ensureRootRegistered,
   healAccount,
   selectSealedRootRowForRevocation,
+  unionHealHosts,
 } from "@/lib/account-heal";
 import {
   type AccountRoot,
@@ -28,9 +29,12 @@ import {
   generateAccountRoot,
   importAccountRoot,
 } from "@/lib/account-root";
-import { browserDevices, type PasskeyCredential, trust } from "@/lib/api";
+import { ApiError, browserDevices, type PasskeyCredential, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
+import {
+  createRootIntroductionProof,
+  loadBrowserDeviceIdentity,
+} from "@/lib/browser-device-identity";
 import { browserHostPinServerOrigin, listActiveBrowserHostPins } from "@/lib/browser-host-pins";
 import {
   createTrustPasskey,
@@ -38,12 +42,14 @@ import {
   isPasskeySupported,
   PasskeyPrfError,
 } from "@/lib/passkey-prf";
+import { rememberFirsthandRoot } from "@/lib/root-knowledge";
 import { probeStoragePersistence } from "@/lib/storage-diagnostics";
 import {
   enrollBackupPasskey,
   forgetTrustOnThisDevice,
   importTrustBundle,
   recordBundleRevision,
+  resealBundleWithLocalPins,
   retrofitAccountRoot,
   revokeBackupPasskey,
   sealCurrentTrust,
@@ -70,46 +76,129 @@ export function describePasskeyError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+export interface HealOutcome {
+  readonly report: AccountHealReport | null;
+  /** Human-readable reason the heal could not run (or run fully). */
+  readonly failure: string | null;
+}
+
 /**
  * Heal the account off the root while `sk_R` is legitimately in memory — the
- * mint and unlock moments only. Best-effort by design: the passkey action it
- * rides on must succeed even when healing cannot (e.g. this device's identity
- * is not registered yet); trust already granted is never at stake, and the next
- * passkey moment simply heals again.
+ * mint and unlock moments only. Best-effort in the sense that the passkey
+ * action it rides on proceeds even when healing cannot — but never silently:
+ * the outcome always carries the report or the reason (P-C3), and the caller
+ * decides what to claim on screen. A conflicting root (a substituted is_root
+ * row) still throws — that is a trust failure, never a partial one.
+ *
+ * Device SELECTION inside healAccount trusts nothing server-claimed (C1): it
+ * verifies every endorsement edge's signature and anchors only on the sealed
+ * root and this device's own key. The host ANCHOR-UPGRADE half iterates the
+ * UNION of the caller's hosts (the sealed bundle at unlock, the pin snapshot
+ * at mint) and this device's ACTIVE local pins — local-pin host keys are
+ * firsthand by definition (P-C1c), so a host possessed after the last seal
+ * still gains its anchor at this device's passkey moments.
+ *
+ * The same moments feed the §4.1 root-introduction channel: pk_R lands in
+ * this device's durable firsthand memory and is published (best-effort; the
+ * gossip sweep republishes) so PINNED devices can anchor a root whose passkey
+ * lives on an unpinned device — the structural fix for the field bug.
  */
 async function healBestEffort(
   accountId: string,
   root: AccountRoot,
   hosts: readonly TrustBundleHost[],
-): Promise<AccountHealReport | null> {
+  source: "mint" | "bundle",
+): Promise<HealOutcome> {
   try {
     await ensureRootRegistered(root, accountId);
     const identity = await loadBrowserDeviceIdentity(accountId);
-    if (identity === null) return null;
-    // Device SELECTION inside healAccount trusts nothing server-claimed (C1):
-    // it verifies every endorsement edge's signature and anchors only on the
-    // sealed root and this device's own key. Server pin-membership is
-    // deliberately not consulted — it is not firsthand-verifiable. The host
-    // ANCHOR-UPGRADE half still uses `hosts`, whose ids and keys are firsthand
-    // (the sealed bundle at unlock, local pins at mint).
-    return await healAccount(root, accountId, identity, hosts);
+    if (identity === null) {
+      return {
+        report: null,
+        failure: "this device has not finished setting up its own identity here",
+      };
+    }
+    const origin = browserHostPinServerOrigin();
+    const pins = await listActiveBrowserHostPins({ accountId, origin }, {}).catch(
+      () => [] as { hostPublicKey: string; hostFingerprint: string; hostIds: readonly string[] }[],
+    );
+    const report = await healAccount(
+      root,
+      accountId,
+      identity,
+      unionHealHosts(
+        hosts,
+        pins.map((pin) => ({
+          hostPublicKey: pin.hostPublicKey,
+          hostFingerprint: pin.hostFingerprint,
+          hostIds: pin.hostIds,
+        })),
+      ),
+    );
+
+    // Root-introduction leg — never fatal to the heal it rides on.
+    try {
+      await rememberFirsthandRoot({
+        accountId,
+        origin,
+        rootPublicKey: root.publicKeyWire,
+        source,
+      });
+    } catch {
+      // Unrecordable storage only mutes this device's own future sweep.
+    }
+    if (report.currentDeviceId !== null) {
+      try {
+        await trust.publishRootIntroduction({
+          introducer_device_id: report.currentDeviceId,
+          root_public_key: root.publicKeyWire,
+          signature: await createRootIntroductionProof(identity, accountId, root.publicKeyWire),
+        });
+      } catch {
+        // The gossip sweep republishes durably.
+      }
+    }
+    return { report, failure: null };
   } catch (error) {
     // A conflicting root is a trust failure (a substituted is_root row), never
     // something to paper over silently.
     if (error instanceof AccountHealError && error.code === "root_conflict") throw error;
-    return null;
+    return { report: null, failure: describePasskeyError(error) };
   }
 }
 
 function describeHeal(report: AccountHealReport | null): string {
   if (report === null) return "";
   const healed = report.endorsedDeviceIds.length;
+  const upgraded = new Set(report.upgradedHostIds).size;
   const parts: string[] = [];
   if (healed > 0) parts.push(`${healed} device${healed === 1 ? "" : "s"} approved`);
-  if (report.hostsUpgraded > 0)
-    parts.push(`${report.hostsUpgraded} host${report.hostsUpgraded === 1 ? "" : "s"} protected`);
+  if (upgraded > 0) parts.push(`${upgraded} host${upgraded === 1 ? "" : "s"} protected`);
   return parts.length === 0 ? "" : ` (${parts.join(", ")}.)`;
 }
+
+/**
+ * Store a bundle with CAS, distinguishing the one benign failure. A 409 means
+ * another device updated the bundle concurrently — the caller says so and
+ * re-fetches rather than retrying blind. Anything else is a real failure and
+ * propagates (P-C3: no more swallowed putBundle errors).
+ */
+async function putBundleGuarded(
+  sealed: string,
+  expectedRevision: number,
+): Promise<"stored" | "lost_cas"> {
+  try {
+    await trust.putBundle(sealed, expectedRevision);
+    return "stored";
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409) return "lost_cas";
+    throw error;
+  }
+}
+
+const CONCURRENT_UPDATE_WARNING =
+  "Another device updated your passkey's protection at the same time; nothing was " +
+  "changed here. Use your passkey again to finish on this device.";
 
 export function usePasskeyTrust() {
   const { user } = useAuth();
@@ -215,11 +304,13 @@ export function usePasskeyTrust() {
 
       // Register + heal only after the sealed seed is durably stored: a root
       // the bundle cannot recover must never become an endorser or anchor.
+      // healBestEffort re-reads the active pins itself (the anchor half runs
+      // on the union of these and the local store — identical at mint).
       const pins = await listActiveBrowserHostPins(
         { accountId: id, origin: browserHostPinServerOrigin() },
         {},
       );
-      const report = await healBestEffort(
+      const heal = await healBestEffort(
         id,
         root,
         pins.map((pin) => ({
@@ -227,14 +318,31 @@ export function usePasskeyTrust() {
           hostFingerprint: pin.hostFingerprint,
           hostIds: pin.hostIds,
         })),
+        "mint",
       );
-      return { hostCount, report };
+      return { hostCount, heal };
     },
     onMutate: begin,
-    onSuccess: ({ report }) => {
+    onSuccess: ({ hostCount, heal }) => {
+      // HONEST about coverage (P-C1b): a passkey sealed over zero hosts
+      // protects nothing yet — say when that changes (which reseal-on-unlock
+      // makes true) instead of implying it already did.
+      const coverage =
+        hostCount === 0
+          ? " No hosts are protected yet — the next time you use this passkey after " +
+            "possessing a host, it starts protecting them."
+          : "";
       setStatus(
-        `Passkey added. If you lose every device, it brings everything back.${describeHeal(report)}`,
+        "Passkey added. If you lose every device, it brings everything back." +
+          coverage +
+          describeHeal(heal.report),
       );
+      if (heal.failure !== null) {
+        setError(
+          `Part of the setup did not finish: ${heal.failure} ` +
+            "It completes the next time you use this passkey.",
+        );
+      }
       queryClient.invalidateQueries({ queryKey: ["trust"] });
       queryClient.invalidateQueries({ queryKey: ["browser-devices"] });
       queryClient.invalidateQueries({ queryKey: ["account-endorsements"] });
@@ -257,15 +365,18 @@ export function usePasskeyTrust() {
       }
       const known = (await trust.listPasskeys()).map((row) => row.credential_id);
       const { credentialId, secret } = await evaluateTrustPrf(id, known);
-      const imported = await importTrustBundle({ credentialId, prfSecret: secret }, stored.sealed, {
+      const passkeyInput = { credentialId, prfSecret: secret };
+      const imported = await importTrustBundle(passkeyInput, stored.sealed, {
         accountId: id,
       });
 
       // The heal moment (mesh stage 5c): the unlock proved the passkey, so the
       // sealed root is legitimately in memory. Re-root every device off R and
       // upgrade hosts to anchor on it, then let the key go out of scope.
-      let report: AccountHealReport | null = null;
-      let rotationWarning: string | null = null;
+      let heal: HealOutcome = { report: null, failure: null };
+      let warning: string | null = null;
+      // The latest durably-stored envelope, for the pin-merge reseal below.
+      let latest = { sealed: stored.sealed, revision: stored.revision };
       if (imported.root !== null) {
         // Root ROTATION (compromise response): if the sealed root's key was
         // revoked, mint a successor over it and heal off that instead. The old
@@ -296,64 +407,112 @@ export function usePasskeyTrust() {
           const rotated = await retrofitAccountRoot(
             { accountId: id },
             stored.sealed,
-            { credentialId, prfSecret: secret },
+            passkeyInput,
             stored.revision,
             await exportAccountRootMaterial(successor),
             true,
           );
           if (rotated !== null) {
-            try {
-              await trust.putBundle(rotated.sealed, stored.revision);
-            } catch {
-              return { imported, report, rotationWarning };
+            // A CAS loss is said out loud and the winner's state re-fetched
+            // (onSuccess invalidates); any OTHER storage failure propagates
+            // instead of being swallowed into a cheerful success (P-C3).
+            if ((await putBundleGuarded(rotated.sealed, stored.revision)) === "lost_cas") {
+              warning = CONCURRENT_UPDATE_WARNING;
+            } else {
+              await recordBundleRevision({ accountId: id }, rotated.revision);
+              latest = { sealed: rotated.sealed, revision: rotated.revision };
+              heal = await healBestEffort(id, successor, imported.hosts, "bundle");
             }
-            await recordBundleRevision({ accountId: id }, rotated.revision);
-            report = await healBestEffort(id, successor, imported.hosts);
           }
         } else {
           if (verdict === "uncorroborated") {
-            rotationWarning =
+            warning =
               "The server claims your account root was revoked, but its permanent " +
               "revocation record does not corroborate that. Nothing was rotated or " +
               "destroyed; if you really revoked it, retry once the record is consistent.";
           }
-          report = await healBestEffort(id, await importAccountRoot(imported.root), imported.hosts);
+          heal = await healBestEffort(
+            id,
+            await importAccountRoot(imported.root),
+            imported.hosts,
+            "bundle",
+          );
         }
       } else {
         // Pre-root bundle: retrofit a freshly minted root under the same data
         // key (every enrolled passkey keeps working), store it durably, and
         // only then let the root endorse and anchor. A concurrent unlock loses
-        // the server's revision CAS and simply skips — the winner's root heals.
+        // the server's revision CAS — said out loud, and the winner's root
+        // heals; a real storage failure propagates (P-C3).
         const root = await generateAccountRoot();
         const retro = await retrofitAccountRoot(
           { accountId: id },
           stored.sealed,
-          { credentialId, prfSecret: secret },
+          passkeyInput,
           stored.revision,
           await exportAccountRootMaterial(root),
         );
         if (retro !== null) {
-          try {
-            await trust.putBundle(retro.sealed, stored.revision);
-          } catch {
-            return { imported, report, rotationWarning };
+          if ((await putBundleGuarded(retro.sealed, stored.revision)) === "lost_cas") {
+            warning = CONCURRENT_UPDATE_WARNING;
+          } else {
+            await recordBundleRevision({ accountId: id }, retro.revision);
+            latest = { sealed: retro.sealed, revision: retro.revision };
+            heal = await healBestEffort(id, root, imported.hosts, "bundle");
           }
-          await recordBundleRevision({ accountId: id }, retro.revision);
-          report = await healBestEffort(id, root, imported.hosts);
         }
       }
-      return { imported, report, rotationWarning };
+
+      // RESEAL-ON-UNLOCK (P-C1a): merge this device's active local pins into
+      // the bundle so the fleet the passkey protects tracks the fleet that
+      // exists. The unlock already holds the data key — no extra gesture. A
+      // CAS loser just skips (another device's merge won; the next unlock
+      // retries); a real failure is reported, not swallowed.
+      let resealFailure: string | null = null;
+      try {
+        const reseal = await resealBundleWithLocalPins(
+          { accountId: id },
+          latest.sealed,
+          passkeyInput,
+          latest.revision,
+        );
+        if (
+          reseal !== null &&
+          (await putBundleGuarded(reseal.sealed, latest.revision)) === "stored"
+        ) {
+          await recordBundleRevision({ accountId: id }, reseal.revision);
+        }
+      } catch (cause) {
+        resealFailure = describePasskeyError(cause);
+      }
+
+      return { imported, heal, warning, resealFailure };
     },
     onMutate: begin,
-    onSuccess: ({ imported, report, rotationWarning }) => {
+    onSuccess: ({ imported, heal, warning, resealFailure }) => {
       const base =
         imported.added.length === 0
           ? "This device already knows your hosts."
           : `${imported.added.length} host${imported.added.length === 1 ? "" : "s"} now reachable from this device.`;
-      setStatus(base + describeHeal(report));
-      // A skipped rotation is a trust inconsistency worth saying out loud, even
-      // though the unlock itself succeeded and destroyed nothing.
-      if (rotationWarning !== null) setError(rotationWarning);
+      // HONESTY GATE: "approved" is claimed only when this device's own R→d
+      // edge verifiably exists after the heal. Anything less is said as the
+      // partial result it is, in UX voice.
+      const healed = heal.report !== null && heal.report.rootEndorsedSelf === true;
+      setStatus(base + (healed ? describeHeal(heal.report) : ""));
+      const problems: string[] = [];
+      if (warning !== null) {
+        problems.push(warning);
+      } else if (!healed) {
+        problems.push(
+          heal.failure !== null
+            ? `Approving this device did not finish: ${heal.failure} Use your passkey again in a moment.`
+            : "Approving this device did not finish. Use your passkey again in a moment.",
+        );
+      }
+      if (resealFailure !== null) {
+        problems.push(`Saving your newly possessed hosts for the passkey failed: ${resealFailure}`);
+      }
+      if (problems.length > 0) setError(problems.join(" "));
       queryClient.invalidateQueries({ queryKey: ["trust"] });
       queryClient.invalidateQueries({ queryKey: ["browser-devices"] });
       queryClient.invalidateQueries({ queryKey: ["account-endorsements"] });

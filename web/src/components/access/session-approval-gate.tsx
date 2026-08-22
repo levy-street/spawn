@@ -143,6 +143,13 @@ export function SessionApprovalGate() {
               {passkey.status}
             </p>
           )}
+          {/* A failed or partial passkey attempt must be visible here — the
+              card otherwise keeps saying "waiting" over a silent failure. */}
+          {passkey.error !== null && (
+            <p className="mt-3 text-center text-sm text-destructive" role="alert">
+              {passkey.error}
+            </p>
+          )}
 
           <div className="mt-5 flex flex-col items-center gap-3">
             {passkey.hasBundle && (
