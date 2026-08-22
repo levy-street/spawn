@@ -79,17 +79,26 @@ def _intro_body(
 
 def test_transcript_vector_matches_the_browser_bytes():
     """Shared cross-runtime vector (also asserted in root-introduction.test.ts):
-    a drift on either side silently forks the signed bytes."""
+    a drift on either side silently forks the signed bytes. Real curve points
+    (from fixed seeds) because the browser encoder validates its keys."""
 
+    introducer = Ed25519PrivateKey.from_private_bytes(bytes([7]) * 32)
+    root = Ed25519PrivateKey.from_private_bytes(bytes([11]) * 32)
+    assert _b64u(introducer.public_key().public_bytes_raw()) == (
+        "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw"
+    )
+    assert _b64u(root.public_key().public_bytes_raw()) == (
+        "Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo"
+    )
     transcript = encode_root_intro_transcript(
         "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        bytes(range(1, 33)),
-        bytes(range(101, 133)),
+        introducer.public_key().public_bytes_raw(),
+        root.public_key().public_bytes_raw(),
     )
     assert len(transcript) == 100
     assert (
         hashlib.sha256(transcript).hexdigest()
-        == "e602f3e3b4671a7ff3559328b2aa4d68b6a19a0d8c16132c153520478ba4fe22"
+        == "e96fcac0039e3ceedce84e4b1f055975efe6be19da4aba71c2ce2bd75ddf5389"
     )
 
 

@@ -632,6 +632,19 @@ export const HostIntroductionRowSchema = z.object({
 });
 export type HostIntroductionRow = z.infer<typeof HostIntroductionRowSchema>;
 
+/** One durable root-key introduction as served; untrusted until verified
+ * against a FIRSTHAND copy of the introducer's key (mesh §4.1). */
+export const RootIntroductionRowSchema = z.object({
+  id: z.string(),
+  introducer_device_id: z.string(),
+  introducer_public_key: z.string().length(43),
+  root_public_key: z.string().length(43),
+  signature: z.string().length(86),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+export type RootIntroductionRow = z.infer<typeof RootIntroductionRowSchema>;
+
 export const trust = {
   /** null when this account has never sealed a bundle. */
   getBundle: () =>
@@ -823,6 +836,25 @@ export const trust = {
       method: "POST",
       body: JSON.stringify(body),
       schema: HostIntroductionRowSchema,
+    }),
+  /** The durable root-introduction store (mesh §4.1 provenance channel):
+   * every live introduction of pk_R, minus rows from revoked introducers. */
+  listRootIntroductions: () =>
+    api("/api/trust/root-introductions", {
+      method: "GET",
+      schema: z.array(RootIntroductionRowSchema),
+    }),
+  /** Publish (or idempotently re-publish) this device's root introduction;
+   * publishing a successor key replaces this introducer's own row. */
+  publishRootIntroduction: (body: {
+    introducer_device_id: string;
+    root_public_key: string;
+    signature: string;
+  }) =>
+    api("/api/trust/root-introductions", {
+      method: "POST",
+      body: JSON.stringify(body),
+      schema: RootIntroductionRowSchema,
     }),
 };
 
