@@ -259,9 +259,7 @@ test("response-ID substitution blocks local mutation and the route-target DELETE
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 });
 
-test("key substitution cannot retarget an established Host-ID binding", async ({
-  page,
-}) => {
+test("key substitution cannot retarget an established Host-ID binding", async ({ page }) => {
   const state: {
     deleteCalls: number;
     hostVisible: boolean;

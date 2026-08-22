@@ -18,8 +18,8 @@ from sqlalchemy.orm import aliased
 from .. import auth as auth_mod
 from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
-from ..pin_liveness import live_browser_device_id_set
 from ..models import Agent, BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey
+from ..pin_liveness import live_browser_device_id_set
 from ..redis import agent_event_channel, get_backend
 from .broker import DaemonConn, RtcSessionBinding, get_broker
 from .host_signal import (

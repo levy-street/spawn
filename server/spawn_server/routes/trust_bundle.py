@@ -12,8 +12,8 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession

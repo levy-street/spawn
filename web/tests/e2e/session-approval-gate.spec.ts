@@ -1,5 +1,12 @@
 import { expect, test } from "@playwright/test";
-import { AGENT_ID, BROWSER_DEVICE_ID, HOST_ID, agent, host, mockAuthenticatedApi } from "./app-mocks";
+import {
+  AGENT_ID,
+  agent,
+  BROWSER_DEVICE_ID,
+  HOST_ID,
+  host,
+  mockAuthenticatedApi,
+} from "./app-mocks";
 
 // Opening an agent session on an unapproved device cannot connect — the daemon
 // refuses the offer. The session approval gate (docs/TRUST_UX.md §3, §7) turns
@@ -99,9 +106,7 @@ test("the card yields to the number check when an approver starts", async ({ pag
   await expect(page.getByTestId("session-approval-gate")).toHaveCount(0);
 });
 
-test("a device actively asking re-labels the approval toast for the approver", async ({
-  page,
-}) => {
+test("a device actively asking re-labels the approval toast for the approver", async ({ page }) => {
   await mockAuthenticatedApi(page, {
     hosts: [KEYED_HOST],
     hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] },
