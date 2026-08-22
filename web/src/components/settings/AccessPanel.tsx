@@ -25,7 +25,11 @@ import {
 } from "@/lib/browser-device-registration";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { usePasskeyTrust } from "@/lib/trust-passkeys";
-import { computeTrustRoster, hostsSolelyTrustedBy } from "@/lib/trust-roster";
+import {
+  computeTrustRoster,
+  hostsSolelyTrustedBy,
+  unprotectedOrphanHostIds,
+} from "@/lib/trust-roster";
 
 const NUDGE_DISMISSED_KEY = (accountId: string) => `spawn:access:passkey-nudge:${accountId}`;
 
@@ -286,21 +290,62 @@ export function AccessPanel() {
       ? []
       : hostsSolelyTrustedBy(removeTarget.id, trustMap.pinsByHost).map((hostId) => {
           const host = trustMap.hostsById.get(hostId);
-          return { name: host?.name ?? hostId, online: host?.status === "online" };
+          return { id: hostId, name: host?.name ?? hostId, online: host?.status === "online" };
         });
   const hasPasskeyProtection = passkey.hasBundle && (passkey.passkeys.data?.length ?? 0) > 0;
+  const [protectionFailedFor, setProtectionFailedFor] = useState<string[] | null>(null);
+
+  // The dialog's online gate must not run on up-to-15s-stale presence: refresh
+  // hosts and the pin map the moment a remove dialog opens.
+  useEffect(() => {
+    setProtectionFailedFor(null);
+    if (removeTarget !== null) {
+      void qc.invalidateQueries({ queryKey: ["trust", "hosts"] });
+      void qc.invalidateQueries({ queryKey: ["trust", "host-pin-map"] });
+      void qc.invalidateQueries({ queryKey: ["trust", "host-pin-details"] });
+    }
+  }, [qc, removeTarget]);
 
   /**
    * Removal, per the dialog's promise: when the passkey protects an
    * about-to-be-orphaned online host, prove the passkey FIRST — the unlock's
    * heal re-anchors those hosts — and only then remove the device.
+   *
+   * FAIL-CLOSED on the promise (P-C7, the field bug): "you'll confirm with
+   * your passkey so it stays reachable" is only honored when every at-risk
+   * online host is VERIFIABLY protected — upgraded by this heal, or already
+   * showing the root anchor in a fresh, liveness-filtered pin list. Anything
+   * less withdraws the promise: the dialog returns in its honest branch and
+   * removal proceeds only as an explicit "Remove anyway".
    */
   const removeWithProtection = async (device: BrowserDevice, orphans: OrphanVM[]) => {
-    if (hasPasskeyProtection && orphans.some((o) => o.online)) {
+    const onlineOrphans = orphans.filter((o) => o.online);
+    if (hasPasskeyProtection && onlineOrphans.length > 0) {
+      let unlocked: Awaited<ReturnType<typeof passkey.unlock.mutateAsync>>;
       try {
-        await passkey.unlock.mutateAsync();
+        unlocked = await passkey.unlock.mutateAsync();
       } catch {
         return; // the hook surfaced the error; nothing was removed
+      }
+      // Refreshed, liveness-filtered pin lists (the routes now serve the
+      // daemon's transitive-liveness answer, so a revoked root cannot pose
+      // as protection). Advisory, deny-direction only.
+      const refreshed = new Map<string, readonly string[]>();
+      for (const orphan of onlineOrphans) {
+        const pins = await trust.hostPins(orphan.id).catch(() => undefined);
+        if (pins !== undefined) refreshed.set(orphan.id, pins);
+      }
+      const rootRow = (devices.data ?? []).find((d) => d.is_root && d.revoked_at === null);
+      const stillAtRisk = unprotectedOrphanHostIds(
+        onlineOrphans.map((o) => o.id),
+        unlocked.heal.report,
+        refreshed,
+        rootRow?.id ?? null,
+      );
+      if (stillAtRisk.length > 0) {
+        const atRisk = new Set(stillAtRisk);
+        setProtectionFailedFor(onlineOrphans.filter((o) => atRisk.has(o.id)).map((o) => o.name));
+        return; // the promise could not be kept; nothing was removed
       }
     }
     revoke.mutate(device);
@@ -905,9 +950,15 @@ export function AccessPanel() {
                 isThisDevice={removeTarget.public_key === currentPublicKey}
                 orphans={removeOrphans}
                 hasPasskey={hasPasskeyProtection}
+                protectionFailedFor={protectionFailedFor}
                 busy={revoke.isPending || passkey.unlock.isPending}
                 error={error}
-                onRemove={() => void removeWithProtection(removeTarget, removeOrphans)}
+                onRemove={() => {
+                  // After a failed protection check the promise is withdrawn:
+                  // "Remove anyway" removes without re-running the passkey.
+                  if (protectionFailedFor !== null) revoke.mutate(removeTarget);
+                  else void removeWithProtection(removeTarget, removeOrphans);
+                }}
                 onCancel={() => setRemoveTarget(null)}
                 onAddPasskey={() => {
                   setRemoveTarget(null);
