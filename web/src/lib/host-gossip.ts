@@ -34,7 +34,9 @@ import {
 import { useAuth } from "./auth";
 import {
   type BrowserDeviceIdentity,
+  createBrowserEndorsementProof,
   createHostIntroductionBroadcastProof,
+  createRootIntroductionProof,
   loadBrowserDeviceIdentity,
 } from "./browser-device-identity";
 import { useBrowserDeviceRegistration } from "./browser-device-registration";
@@ -47,9 +49,12 @@ import {
 } from "./browser-host-pins";
 import { planBroadcastIntroductionAcceptance } from "./host-introduction";
 import { forgetPeerDeviceKey, listPeerDeviceKeys } from "./peer-device-keys";
+import { planRootAnchorSweep, planRootIntroductionAcceptance } from "./root-introduction";
+import { loadFirsthandRoot, rememberFirsthandRoot } from "./root-knowledge";
 
 export const PEER_DEVICE_KEYS_QUERY_KEY = ["peer-device-keys"] as const;
 export const HOST_INTRODUCTIONS_QUERY_KEY = ["host-introductions"] as const;
+export const ROOT_INTRODUCTIONS_QUERY_KEY = ["root-introductions"] as const;
 
 export interface BroadcastPublishTarget {
   readonly hostId: string;
@@ -135,11 +140,19 @@ export function useHostGossipSync(): void {
     queryFn: () => hostsApi.list(),
     enabled: ready,
   });
+  const rootRows = useQuery({
+    queryKey: [...ROOT_INTRODUCTIONS_QUERY_KEY],
+    queryFn: trust.listRootIntroductions,
+    enabled: ready,
+    refetchInterval: 60_000,
+  });
 
   // Session-scoped work ledgers so each poll cycle only touches new rows.
   const publishedRef = useRef<Set<string>>(new Set());
   const consumedRef = useRef<Set<string>>(new Set());
   const forgottenRef = useRef<Set<string>>(new Set());
+  const sweptRef = useRef<Set<string>>(new Set());
+  const rootIntroPublishedRef = useRef<string | null>(null);
   const busyRef = useRef(false);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: poll-driven effect keyed on poll data
@@ -255,9 +268,193 @@ export function useHostGossipSync(): void {
             void qc.invalidateQueries({ queryKey: [...HOST_INTRODUCTIONS_QUERY_KEY] });
           }
         }
+
+        // ---- ROOT leg (mesh §4.1): learn pk_R firsthand, keep it published,
+        // ---- and anchor it on every host this PINNED device can speak for.
+        if (identity !== null && identity.publicKeyWire === ownDevice.public_key) {
+          await runRootLeg({
+            accountId,
+            origin,
+            identity,
+            ownDevice,
+            deviceRows,
+            hostRows,
+            trustedPeerKeys,
+            claimedRootRows: rootRows.data ?? [],
+            sweptHostIds: sweptRef.current,
+            publishedRootRef: rootIntroPublishedRef,
+          });
+        }
       } finally {
         busyRef.current = false;
       }
     })();
-  }, [ready, rows.data, devices.data, hostList.data, registration.data]);
+  }, [ready, rows.data, devices.data, hostList.data, rootRows.data, registration.data]);
+}
+
+/**
+ * The root gossip + sweep cycle. Everything here is deny-only against a lying
+ * server: consumption honors only firsthand-verified introductions (with the
+ * fail-closed conflict rule), and the sweep's pin lists are advisory — a lie
+ * causes at most a skipped or refused statement, never a forged anchor (the
+ * daemon re-verifies every signature against keys it already pins).
+ */
+async function runRootLeg(input: {
+  accountId: string;
+  origin: string;
+  identity: BrowserDeviceIdentity;
+  ownDevice: { id: string; public_key: string };
+  deviceRows: readonly BrowserDevice[];
+  hostRows: readonly { id: string; name: string; host_public_key?: string | null }[];
+  trustedPeerKeys: ReadonlySet<string>;
+  claimedRootRows: readonly {
+    introducer_device_id: string;
+    introducer_public_key: string;
+    root_public_key: string;
+    signature: string;
+  }[];
+  sweptHostIds: Set<string>;
+  publishedRootRef: { current: string | null };
+}): Promise<void> {
+  const { accountId, origin, identity, ownDevice } = input;
+
+  // CONSUME: a verified introduction may hand this device pk_R (or a
+  // corroborated successor). Conflicts record nothing and are loud.
+  let held = await loadFirsthandRoot({ accountId, origin }).catch(() => null);
+  if (input.trustedPeerKeys.size > 0 && input.claimedRootRows.length > 0) {
+    let tombstonedKeys: string[] = [];
+    try {
+      tombstonedKeys = (await browserDevices.revokedKeys()).map((row) => row.public_key);
+    } catch {
+      // Unfetchable tombstones corroborate nothing; rotation simply waits.
+    }
+    const plan = await planRootIntroductionAcceptance({
+      accountId,
+      ownPublicKey: ownDevice.public_key,
+      trustedPeerKeys: input.trustedPeerKeys,
+      knownRootPublicKey: held?.rootPublicKey ?? null,
+      devices: input.deviceRows,
+      tombstonedKeys,
+      claimed: input.claimedRootRows,
+    });
+    for (const conflict of plan.conflicts) {
+      console.error(`spawn: root introduction conflict: ${conflict}`);
+    }
+    for (const reason of plan.rejected) {
+      console.warn(`spawn: root introduction rejected: ${reason}`);
+    }
+    if (plan.accept !== null) {
+      try {
+        await rememberFirsthandRoot(
+          {
+            accountId,
+            origin,
+            rootPublicKey: plan.accept,
+            source: "introduction",
+            // planRootIntroductionAcceptance only yields a successor over a
+            // held key after corroborated rotation — replace is earned.
+            replace: held !== null,
+          },
+          {},
+        );
+        held = await loadFirsthandRoot({ accountId, origin }).catch(() => null);
+      } catch (cause) {
+        console.error(
+          "spawn: recording the introduced root failed:",
+          cause instanceof Error ? cause.message : cause,
+        );
+      }
+    }
+  }
+  if (held === null) return;
+
+  // REPUBLISH: keep this device's own durable introduction current — but only
+  // from provenance the channel is defined for (mint/unlock knowledge; an
+  // introduction-derived key is consumed here, not re-vouched).
+  if (held.source !== "introduction" && input.publishedRootRef.current !== held.rootPublicKey) {
+    const mine = input.claimedRootRows.find((row) => row.introducer_device_id === ownDevice.id);
+    if (mine === undefined || mine.root_public_key !== held.rootPublicKey) {
+      try {
+        await trust.publishRootIntroduction({
+          introducer_device_id: ownDevice.id,
+          root_public_key: held.rootPublicKey,
+          signature: await createRootIntroductionProof(identity, accountId, held.rootPublicKey),
+        });
+      } catch (cause) {
+        console.warn(
+          "spawn: publishing the root introduction failed:",
+          cause instanceof Error ? cause.message : cause,
+        );
+      }
+    }
+    input.publishedRootRef.current = held.rootPublicKey;
+  }
+
+  // THE SWEEP: anchor the firsthand-known root on hosts this device pins that
+  // do not carry it yet. The roster's is_root row supplies only the DEVICE ID
+  // to bind; its key must equal the firsthand pk_R or nothing is signed —
+  // a substituted root row aborts loudly (provenance rule, P2).
+  const rosterRoot = input.deviceRows.find((d) => d.is_root && d.revoked_at === null);
+  if (rosterRoot === undefined) return; // nothing registered to anchor yet
+  if (rosterRoot.public_key !== held.rootPublicKey) {
+    console.error(
+      "spawn: the server's account root does not match the firsthand-known root; " +
+        "no anchors were written",
+    );
+    return;
+  }
+
+  const pins = await listActiveBrowserHostPins({ accountId, origin }).catch(
+    () => [] as BrowserHostPin[],
+  );
+  if (pins.length === 0) return;
+  const sweepPins = pins.map((pin) => ({
+    hostPublicKey: pin.hostPublicKey,
+    hostIds:
+      pin.hostIds.length > 0
+        ? pin.hostIds
+        : input.hostRows
+            .filter((host) => host.host_public_key === pin.hostPublicKey)
+            .map((host) => host.id),
+  }));
+  const pinsByHost = new Map<string, readonly string[]>();
+  for (const pin of sweepPins) {
+    for (const hostId of pin.hostIds) {
+      if (pinsByHost.has(hostId) || input.sweptHostIds.has(hostId)) continue;
+      const pinned = await trust.hostPins(hostId).catch(() => undefined);
+      if (pinned !== undefined) pinsByHost.set(hostId, pinned);
+    }
+  }
+  const targets = planRootAnchorSweep({
+    ownDeviceId: ownDevice.id,
+    rootDeviceId: rosterRoot.id,
+    pins: sweepPins,
+    pinsByHost,
+  });
+  for (const target of targets) {
+    try {
+      input.sweptHostIds.add(target.hostId);
+      const signature = await createBrowserEndorsementProof(
+        identity,
+        accountId,
+        target.hostPublicKey, // from the LOCAL pin — firsthand
+        held.rootPublicKey,
+        rosterRoot.id,
+      );
+      await trust.endorse({
+        host_id: target.hostId,
+        endorser_device_id: ownDevice.id,
+        endorsed_device_id: rosterRoot.id,
+        signature,
+      });
+    } catch (cause) {
+      // 409 = this device is not pinned there after all (advisory data was
+      // stale) — harmless; retry next cycle in case it was transient.
+      input.sweptHostIds.delete(target.hostId);
+      console.warn(
+        "spawn: root anchor sweep skipped a host:",
+        cause instanceof Error ? cause.message : cause,
+      );
+    }
+  }
 }
