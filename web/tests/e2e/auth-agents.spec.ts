@@ -12,8 +12,10 @@ test("logged-out root shows the public landing page", async ({ page }) => {
 
   await page.goto("/");
 
-  await expect(page.getByRole("heading", { name: "spawn" })).toBeVisible();
-  await expect(page.getByText("Browser control for CLI coding agents")).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "A daemon on every host you own." }),
+  ).toBeVisible();
+  await expect(page.getByText("Open-source control plane for CLI coding agents")).toBeVisible();
 });
 
 test("logged-in root shows the dashboard", async ({ page }) => {
