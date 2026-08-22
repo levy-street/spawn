@@ -43,6 +43,7 @@ export function WidgetPane({
   canDuplicate = false,
   onFocus,
   onMoveStart,
+  onExpand,
   onDuplicate,
   onChangePath,
   onRemove,
@@ -56,6 +57,8 @@ export function WidgetPane({
   canDuplicate?: boolean;
   onFocus: (tileId: string) => void;
   onMoveStart: (tileId: string, event: ReactPointerEvent<HTMLElement>) => void;
+  /** Fill the empty grid space around this pane (desktop grid only). */
+  onExpand?: (tileId: string) => void;
   /** Add a second explorer on the same host and path. */
   onDuplicate?: (tileId: string) => void;
   /** Re-root this explorer at another folder on the same host. */
@@ -87,7 +90,7 @@ export function WidgetPane({
       <header
         role="toolbar"
         aria-label={`${title} window controls`}
-        title={canDrag ? "Drag to move" : undefined}
+        title={canDrag ? "Drag to move · Double-click to fill empty space" : undefined}
         className={cn(
           "flex h-9 shrink-0 items-center gap-2 border-b border-pane-divider bg-card/75 px-2 select-none",
           canDrag && "cursor-grab active:cursor-grabbing",
@@ -95,6 +98,10 @@ export function WidgetPane({
         onPointerDown={(event) => {
           if ((event.target as Element).closest?.("button, input, a")) return;
           onMoveStart(id, event);
+        }}
+        onDoubleClick={(event) => {
+          if ((event.target as Element).closest?.("button, input, a")) return;
+          onExpand?.(id);
         }}
       >
         {/* The pane's folder, as a control — the same chip a shell pane wears,

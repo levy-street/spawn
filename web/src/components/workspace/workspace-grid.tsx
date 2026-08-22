@@ -63,6 +63,7 @@ import {
   dockPane,
   dockZoneAt,
   type EdgeTargets,
+  expandTileIntoEmptySpace,
   freeRects,
   type GridDivider,
   gridDividers,
@@ -1549,6 +1550,15 @@ export function WorkspaceGrid({
     [commitLayout, setFocus],
   );
 
+  const expandPane = useCallback(
+    (tileId: string) => {
+      const current = latestTilesRef.current;
+      const expanded = expandTileIntoEmptySpace(current, tileId);
+      if (!tilesEqual(current, expanded)) commitLayout(expanded);
+    },
+    [commitLayout],
+  );
+
   const canGesture = wide && finePointer;
 
   // What the panes are showing right now: a gesture of this grid's own while
@@ -1611,6 +1621,7 @@ export function WorkspaceGrid({
                     canDuplicate={canDuplicate(tile.session_id)}
                     onFocus={(id) => setFocus(id)}
                     onMoveStart={startMove}
+                    onExpand={canGesture ? expandPane : undefined}
                     onDuplicate={(id) => duplicateRef.current(id, null)}
                     onChangePath={changeWidgetPath}
                     onRemove={removeFromWorkspace}
@@ -1879,6 +1890,7 @@ export function WorkspaceGrid({
           canMoveDown={!wide && index < orderedIds.length - 1}
           onFocus={(id) => setFocus(id)}
           onMoveStart={startMove}
+          onExpand={canGesture ? expandPane : undefined}
           onDuplicate={(id) => duplicateRef.current(id, null)}
           onMoveUp={(id) => moveMobile(id, -1)}
           onMoveDown={(id) => moveMobile(id, 1)}

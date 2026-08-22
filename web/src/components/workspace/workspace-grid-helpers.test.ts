@@ -5,6 +5,7 @@ import {
   dockInsert,
   dockPane,
   dockZoneAt,
+  expandTileIntoEmptySpace,
   freeRects,
   type GridDivider,
   gridDividers,
@@ -350,6 +351,40 @@ describe("resizeEdges", () => {
         }
       }
     }
+  });
+});
+
+describe("expandTileIntoEmptySpace", () => {
+  test("fills the largest surrounding empty rectangle", () => {
+    const tiles: Tile[] = [
+      { session_id: "a", x: 6, y: 6, w: 6, h: 6 },
+      { session_id: "b", x: 18, y: 0, w: 6, h: 24 },
+    ];
+    expect(expandTileIntoEmptySpace(tiles, "a")).toEqual([
+      { session_id: "a", x: 0, y: 0, w: 18, h: 24 },
+      { session_id: "b", x: 18, y: 0, w: 6, h: 24 },
+    ]);
+  });
+
+  test("leaves every other window unchanged", () => {
+    const tiles: Tile[] = [
+      { session_id: "a", x: 0, y: 0, w: 8, h: 12 },
+      { session_id: "b", x: 0, y: 12, w: 8, h: 12 },
+      { session_id: "c", x: 16, y: 0, w: 8, h: 24 },
+    ];
+    expect(expandTileIntoEmptySpace(tiles, "a")).toEqual([
+      { session_id: "a", x: 0, y: 0, w: 16, h: 12 },
+      { session_id: "c", x: 16, y: 0, w: 8, h: 24 },
+      { session_id: "b", x: 0, y: 12, w: 8, h: 12 },
+    ]);
+  });
+
+  test("is a no-op when no rectangular empty space touches the window", () => {
+    const tiles: Tile[] = [
+      { session_id: "a", x: 0, y: 0, w: 12, h: 24 },
+      { session_id: "b", x: 12, y: 0, w: 12, h: 24 },
+    ];
+    expect(expandTileIntoEmptySpace(tiles, "a")).toEqual(tiles);
   });
 });
 

@@ -263,6 +263,46 @@ export function resizeEdges(tiles: Tile[], id: string, targets: EdgeTargets): Ti
   return result;
 }
 
+/**
+ * Grow one tile into the empty canvas around it without changing any other
+ * tile. Windows stay rectangular, so "all available space" means the largest
+ * empty rectangle that contains the tile's current bounds. Equal-area choices
+ * prefer keeping its top-left corner in place, which makes the common
+ * right/down expansion feel anchored rather than jumpy.
+ */
+export function expandTileIntoEmptySpace(tiles: Tile[], id: string): Tile[] {
+  const target = tiles.find((tile) => tile.session_id === id);
+  if (!target) return tiles;
+  const others = tiles.filter((tile) => tile.session_id !== id);
+  let best: Rect = { x: target.x, y: target.y, w: target.w, h: target.h };
+  let bestArea = best.w * best.h;
+  let bestOriginShift = 0;
+
+  const targetRight = target.x + target.w;
+  const targetBottom = target.y + target.h;
+  for (let x = target.x; x >= 0; x--) {
+    for (let right = targetRight; right <= GRID_SIZE; right++) {
+      for (let y = target.y; y >= 0; y--) {
+        for (let bottom = targetBottom; bottom <= GRID_SIZE; bottom++) {
+          const candidate: Rect = { x, y, w: right - x, h: bottom - y };
+          if (others.some((tile) => rectsOverlap(candidate, tile))) continue;
+          const area = candidate.w * candidate.h;
+          const originShift = target.x - candidate.x + (target.y - candidate.y);
+          if (area > bestArea || (area === bestArea && originShift < bestOriginShift)) {
+            best = candidate;
+            bestArea = area;
+            bestOriginShift = originShift;
+          }
+        }
+      }
+    }
+  }
+
+  return tiles
+    .map((tile) => (tile.session_id === id ? { ...tile, ...best } : { ...tile }))
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
 /** Which side of a hovered pane a drag would dock against. */
 export type DockZone = "left" | "right" | "top" | "bottom";
 

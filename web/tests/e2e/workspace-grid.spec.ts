@@ -218,6 +218,27 @@ test("shrinking a pane leaves empty canvas you can drop a pane into", async ({ p
   await expect(page.locator("[data-grid-opening='12,0,12,24']")).toBeVisible();
 });
 
+test("double-clicking a header expands only that window into empty space", async ({ page }) => {
+  const initial: Tile[] = [
+    { session_id: SESSION_ID, x: 0, y: 0, w: 8, h: 12 },
+    { session_id: SESSION_B_ID, x: 0, y: 12, w: 8, h: 12 },
+    { session_id: THIRD_SESSION_ID, x: 16, y: 0, w: 8, h: 24 },
+  ];
+  const { store } = await setupGrid(page, initial);
+  await page.getByRole("toolbar", { name: "palette window controls" }).dblclick();
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  expect(store.requests.workspacePatches[0]?.body).toEqual({
+    layout: envelope({
+      version: 3,
+      tiles: [
+        { session_id: SESSION_ID, x: 0, y: 0, w: 16, h: 12 },
+        { session_id: THIRD_SESSION_ID, x: 16, y: 0, w: 8, h: 24 },
+        { session_id: SESSION_B_ID, x: 0, y: 12, w: 8, h: 12 },
+      ],
+    }),
+  });
+});
+
 test("removing a tile re-packs and expands the survivor", async ({ page }) => {
   const initial: Tile[] = [
     { session_id: SESSION_ID, x: 0, y: 0, w: 12, h: 24 },

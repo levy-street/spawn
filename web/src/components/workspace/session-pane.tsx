@@ -83,6 +83,7 @@ export function SessionPane({
   canMoveDown,
   onFocus,
   onMoveStart,
+  onExpand,
   onDuplicate,
   onMoveUp,
   onMoveDown,
@@ -104,6 +105,8 @@ export function SessionPane({
   canMoveDown: boolean;
   onFocus: (sessionId: string) => void;
   onMoveStart: (sessionId: string, event: ReactPointerEvent<HTMLElement>) => void;
+  /** Fill the empty grid space around this pane (desktop grid only). */
+  onExpand?: (sessionId: string) => void;
   /** Open a second pane on the same host, folder, skills and agent (workspace
    *  grid only — the grid owns placement). */
   onDuplicate?: (sessionId: string) => void;
@@ -303,7 +306,7 @@ export function SessionPane({
       <header
         role="toolbar"
         aria-label={`${title} window controls`}
-        title={canDrag ? "Drag to move" : undefined}
+        title={canDrag ? "Drag to move · Double-click to fill empty space" : undefined}
         className={cn(
           // Tighter on the right than the left: the bar ends in icon buttons, whose
           // own padding already holds the glyph clear of the edge.
@@ -314,6 +317,10 @@ export function SessionPane({
           // Anywhere on the bar starts a move — except the controls sitting on it.
           if ((event.target as Element).closest?.("button, input, a")) return;
           onMoveStart(sessionId, event);
+        }}
+        onDoubleClick={(event) => {
+          if ((event.target as Element).closest?.("button, input, a")) return;
+          onExpand?.(sessionId);
         }}
       >
         <span className="relative shrink-0">
