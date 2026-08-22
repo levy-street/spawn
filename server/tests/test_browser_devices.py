@@ -734,3 +734,61 @@ async def test_request_approval_stamps_own_live_row_only(client):
         headers=headers,
     )
     assert after.status_code == 409
+
+
+async def test_revoked_keys_tombstones_are_account_scoped_and_survive_prune(client):
+    """B2 corroboration surface: the permanent deny-list GET.
+
+    A client only rotates its sealed root when the roster's revocation claim is
+    ALSO present here, so this endpoint must be authenticated, account-scoped,
+    reflect revocations immediately, and keep serving keys whose roster rows
+    were pruned away.
+    """
+
+    user_id, token = await _signup(client, "tombstones@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    _, other_token = await _signup(client, "tombstones-other@example.com")
+    other_headers = {"Authorization": f"Bearer {other_token}"}
+
+    client.cookies.clear()
+    anonymous = await client.get("/api/browser-devices/revoked-keys")
+    assert anonymous.status_code == 401
+
+    empty = await client.get("/api/browser-devices/revoked-keys", headers=headers)
+    assert empty.status_code == 200
+    assert empty.json() == []
+
+    key = Ed25519PrivateKey.generate()
+    proof = _proof(user_id, key)
+    device = (
+        await client.post("/api/browser-devices/register", json=proof, headers=headers)
+    ).json()
+
+    # A live key is not tombstoned.
+    live = await client.get("/api/browser-devices/revoked-keys", headers=headers)
+    assert live.json() == []
+
+    revoked = await client.post(
+        f"/api/browser-devices/{device['id']}/revoke",
+        json={"expected_public_key": proof["public_key"]},
+        headers=headers,
+    )
+    assert revoked.status_code == 200
+
+    listed = await client.get("/api/browser-devices/revoked-keys", headers=headers)
+    assert listed.status_code == 200
+    entries = listed.json()
+    assert [entry["public_key"] for entry in entries] == [proof["public_key"]]
+    assert entries[0]["key_algorithm"] == "ed25519"
+    assert entries[0]["revoked_at"] is not None
+
+    # Another account never sees this tombstone.
+    other = await client.get("/api/browser-devices/revoked-keys", headers=other_headers)
+    assert other.json() == []
+
+    # Pruning the roster history must NOT shrink the permanent deny-list.
+    pruned = await client.post("/api/browser-devices/prune", headers=headers)
+    assert pruned.status_code == 200
+    assert pruned.json()["pruned"] == 1
+    after_prune = await client.get("/api/browser-devices/revoked-keys", headers=headers)
+    assert [entry["public_key"] for entry in after_prune.json()] == [proof["public_key"]]

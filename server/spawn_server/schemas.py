@@ -114,6 +114,20 @@ class BrowserDeviceOut(BaseModel):
     is_root: bool = False
 
 
+class RevokedBrowserKeyOut(BaseModel):
+    """One entry of the account's PERMANENT key deny-list (R10 tombstones).
+
+    Served so a client can corroborate a roster row's revocation claim against
+    the add-only tombstone table before acting on it destructively (hardening
+    B2): a bare roster lie is then insufficient — the server must also commit
+    the claim into permanent, add-only state.
+    """
+
+    public_key: str
+    key_algorithm: str
+    revoked_at: datetime
+
+
 class BrowserDeviceRenameRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
