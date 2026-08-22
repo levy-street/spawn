@@ -33,6 +33,40 @@ export type SignedRtcRefusalReason =
   | "pin_storage_error";
 
 /**
+ * One honest explanation per refusal, shared by every surface that shows one
+ * (the terminal's connection chip, the host page, the file explorer). The
+ * refusal itself never softens — there is no "accept the new identity" path
+ * anywhere — but `host_key_substituted` names BOTH possibilities truthfully:
+ * the owner's own reinstall/re-key cycle is indistinguishable from a
+ * substitution attack by design, so the copy explains the fork instead of
+ * accusing, and SIGNED_RTC_REFUSAL_NEXT_STEP carries the one safe exit.
+ */
+export const SIGNED_RTC_REFUSAL_DETAIL: Record<SignedRtcRefusalReason, string> = {
+  host_key_substituted:
+    "This host answered with a different identity than the one this device approved. Either the host's software was reinstalled — a reinstall gives it a new identity — or something between you and the host is impersonating it. This device won't connect either way.",
+  host_key_revoked:
+    "You removed this host's approved identity from this device. Possess it again from its terminal to reconnect.",
+  host_key_withheld:
+    "The server presented no identity for this host, but this device holds an approved one for it. Connection blocked.",
+  browser_identity_unavailable:
+    "This browser has no signing identity for your account, so it cannot make a verified connection to this approved host.",
+  pin_storage_error:
+    "This device's saved host approvals could not be read; connection blocked to stay safe.",
+};
+
+/**
+ * The safe next step for a refusal that has one. For `host_key_substituted`
+ * it is deliberately the full re-verification ceremony — remove, then possess
+ * again from the host's own terminal — NEVER an accept-the-new-key shortcut:
+ * accepting in place is precisely what an impersonator needs.
+ */
+export const SIGNED_RTC_REFUSAL_NEXT_STEP: Partial<Record<SignedRtcRefusalReason, string>> = {
+  host_key_substituted:
+    "If you reinstalled this host yourself, remove it here, then run `spawnd possess` in its terminal — possessing it again is the re-verification.",
+  host_key_revoked: "Run `spawnd possess` in the host's terminal to verify it fresh.",
+};
+
+/**
  * The trust decision for one live RTC connection generation.
  * - `signed`   — offers are signed with this browser's identity. Either a
  *   local pin matched (host fully verified), or the host is unpinned and the

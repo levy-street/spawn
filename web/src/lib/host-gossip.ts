@@ -206,6 +206,13 @@ export function useHostGossipSync(): void {
                 origin,
                 hostPublicKey: intro.hostPublicKey,
                 hostFingerprint: intro.hostFingerprint,
+                // A broadcast row must never resurrect a key the operator
+                // removed HERE: reactivation is reserved for a fresh explicit
+                // ceremony. Without this, a stale peer's standing row for a
+                // re-keyed host's OLD key would re-activate the tombstone on
+                // every fresh session and re-wedge the Host-ID binding the
+                // re-possess just migrated to the new key.
+                reactivateRevoked: false,
               });
               await resolveActiveBrowserHostPin({
                 accountId,

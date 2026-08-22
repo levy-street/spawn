@@ -280,11 +280,30 @@ test("key substitution cannot retarget an established Host-ID binding", async ({
 
   state.hostResponse = { ...host, host_public_key: OTHER_HOST_PUBLIC_KEY };
   await page.reload();
-  await expect(page.locator("p[role=alert]")).toContainText("bound to a different local key");
-  await requestHostDeletion(page);
-  await expect(page.locator("p[role=alert]")).toContainText("blocked before any server DELETE");
-  expect(state.deleteCalls).toBe(0);
+  // The guided panel (review R-b) replaces the raw storage error: it names
+  // both possibilities honestly — the owner's own reinstall/re-key cycle and
+  // a substitution attack are indistinguishable — keeps connections blocked,
+  // and offers exactly one exit: removal, then a fresh possession ceremony.
+  // There is no "accept the new identity" control anywhere.
+  const panel = page.getByTestId("host-identity-conflict");
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText("identity changed");
+  await expect(panel).toContainText("spawnd possess");
+  await expect(panel.getByRole("button")).toHaveText(/Remove this host/u);
+  // Nothing was rebound or reactivated by the substituted key.
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
+
+  // The safe exit works (previously this wedged on host_id_key_conflict):
+  // removal tombstones the BOUND record — the key this device actually
+  // approved; the server's claimed key cannot veto a local trust withdrawal —
+  // and the server DELETE proceeds, clearing the way for `spawnd possess`.
+  page.once("dialog", (dialog) => dialog.accept());
+  await panel.getByTestId("conflict-remove-host").click();
+  await page.waitForURL("**/hosts");
+  expect(state.deleteCalls).toBe(1);
+  const pins = await readHostPins(page);
+  expect(pins).toHaveLength(1);
+  expect(pins[0]).toMatchObject({ hostPublicKey: HOST_PUBLIC_KEY, state: "revoked" });
   // NOTE (mesh B5): the old fingerprint-substitution half of this test is
   // structurally impossible now — the Host API serves no fingerprint field,
   // so the only identity a server can lie about is the key itself, covered
