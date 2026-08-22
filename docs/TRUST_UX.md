@@ -85,7 +85,7 @@ overload the noun. It contains, top to bottom:
 1. **Devices** — every device that has signed in. A device appears here **the moment it
    signs in** (R4: every sign-in is immediately visible), wearing *Waiting for approval*
    until someone approves it. Approved rows: name, platform icon, *how it got here*
-   ("Approved by MacBook Pro · Jun 3" / "Signed in with passkey · Jul 2" / "First
+   ("Approved by MacBook Pro · Jun 3" / "Approved by your passkey · Jul 2" / "First
    device"), last seen, overflow → Rename / Remove. Row provenance **is** the audit
    surface.
 2. **Hosts** — every possessed host, same row grammar ("Possessed by MacBook Pro" —
@@ -249,10 +249,15 @@ spinner.
   which carries the same sentence and both escapes.
 
 ### 8. History — `TrustHistory`
-- Plain sentences, newest first: "MacBook Pro approved iPhone", "Pixel 9 signed in with
-  passkey", "Old iPad removed by MacBook Pro — access ended everywhere", "MacBook Pro
+- Plain sentences, newest first: "MacBook Pro approved iPhone", "Your passkey approved
+  Pixel 9", "Old iPad removed by MacBook Pro — access ended everywhere", "MacBook Pro
   possessed mac-studio", "Passkey added". Every live approval and every removal is one
-  visible line (R4). No filters, no tabs.
+  visible line (R4). No filters, no tabs. *(Refined 2026-08-22: the passkey line says
+  "approved", never "signed in with passkey" — the underlying record proves the
+  passkey's protection covered the device, which happens both at an actual passkey
+  sign-in and when a passkey use on ANOTHER device re-approves the account's devices.
+  Claiming a sign-in the operator never made would train them to shrug at exactly the
+  line a rogue passkey enrollment produces.)*
 
 ## Flows
 
@@ -301,7 +306,7 @@ What a naive design would show, what we show instead, and why the protocol survi
 | "Endorsements" as inspectable objects | One phrase per row: "Approved by MacBook Pro · Jun 3" | The signature set is machine-verified (P2); humans only ever needed the *who/when*, which is exactly R4's detection requirement |
 | The trust graph / chains | A flat list | P1 proves the mesh is complete, so "approved" is a truthful single state; chains are transport, not status |
 | A recovery object with on/off state, reset dialogs, status | A passkey in account settings, one caption, one dismissible nudge | §4.1: the heal is what using the passkey means; mint/retrofit/rotation are automatic at passkey moments; the only decision a user ever makes is "have a passkey or not," and that decision already exists in every product |
-| Root key status, heal progress, re-anchor events | "Signed in with passkey" as provenance | Healing is machine work authorized by the passkey (P4); surfacing it creates decisions no user can make better than the protocol |
+| Root key status, heal progress, re-anchor events | "Approved by your passkey" as provenance | Healing is machine work authorized by the passkey (P4); surfacing it creates decisions no user can make better than the protocol |
 | Per-host trust matrices (which device may reach which host) | Nothing | P1: every device reaches every host. A matrix would be an N×M grid of identical checkmarks |
 | Pairing modes, SAS vs fingerprint fallback, protocol versions | One number check | The rollout rule (Appendix A) already guarantees the *stronger* check is chosen; the UI never offers the choice |
 | A revocation list to manage | The Remove button + one sentence in its dialog | Rev is add-only and account-wide (P3/P3′); "instantly and permanently, everywhere" is the whole truth |
