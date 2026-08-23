@@ -36,9 +36,10 @@ async function openPicker(page: Page) {
     files: (_hostId, path) => listings[path ?? ""] ?? listings["/Users/tester"],
   });
   await page.goto(`/w/${WORKSPACE_ID}`);
-  await page.getByRole("button", { name: "New session" }).click();
-  await page.getByRole("menuitem", { name: /^Shell/ }).click();
-  await page.getByRole("menuitem", { name: "Select folder…" }).click();
+  // Desktop entry to the picker. The mobile chrome's session menu is
+  // `@md/shell:hidden`, so on this viewport the tab-home chip is the
+  // affordance that opens the same folder-picker dialog.
+  await page.getByRole("button", { name: /Choose this tab.s folder/ }).click();
   return page.getByRole("dialog", { name: "Select a folder on Mac" });
 }
 
@@ -84,14 +85,17 @@ test("home is the ceiling: no way up and no crumbs above it", async ({ page }) =
   await expect(dialog.getByRole("button", { name: "Users", exact: true })).toHaveCount(0);
 });
 
-test("the .. row appears below home and steps back up to it", async ({ page }) => {
+test("a crumb steps back up, and there is none above home", async ({ page }) => {
   const dialog = await openPicker(page);
   await dialog.getByRole("option", { name: "projects" }).click();
   await expect(
     dialog.getByRole("listbox", { name: "Folders in /Users/tester/projects" }),
   ).toBeVisible();
 
-  await dialog.getByRole("button", { name: "Parent folder" }).click();
+  // The columns layout replaced the ".." row deliberately (folder-picker.tsx:
+  // "stepping back is a glance left rather than a '..' round trip"), so the
+  // way back up is the crumb to the left — and home has nothing to its left.
+  await dialog.getByRole("button", { name: "Home", exact: true }).click();
   await expect(dialog.getByRole("listbox", { name: "Folders in /Users/tester" })).toBeVisible();
-  await expect(dialog.getByRole("button", { name: "Parent folder" })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Users", exact: true })).toHaveCount(0);
 });

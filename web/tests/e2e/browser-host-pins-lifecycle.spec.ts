@@ -135,9 +135,14 @@ async function approveExactHost(page: Page): Promise<void> {
 }
 
 async function requestHostDeletion(page: Page): Promise<void> {
-  page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Host actions" }).click();
   await page.getByText(/^(?:Remove host|Retry server deletion)$/u).click();
+  // The overhaul replaced window.confirm with an in-app dialog, so accepting
+  // is a click inside it rather than a native dialog handler.
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: /^(?:Remove host|Retry deletion)$/u })
+    .click();
 }
 
 async function installRoutes(
@@ -310,9 +315,13 @@ test("key substitution cannot retarget an established Host-ID binding", async ({
   // removal tombstones the BOUND record — the key this device actually
   // approved; the server's claimed key cannot veto a local trust withdrawal —
   // and the server DELETE proceeds, clearing the way for `spawnd possess`.
-  page.once("dialog", (dialog) => dialog.accept());
   await panel.getByTestId("conflict-remove-host").click();
-  await page.waitForURL("**/hosts");
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: /^(?:Remove host|Retry deletion)$/u })
+    .click();
+  // The overhaul retired the /hosts index; a removed host lands on /app.
+  await page.waitForURL("**/app");
   expect(state.deleteCalls).toBe(1);
   const pins = await readHostPins(page);
   expect(pins).toHaveLength(1);
@@ -342,7 +351,8 @@ test("deletion never revokes among multiple active unbound host pins", async ({ 
 
   await requestHostDeletion(page);
 
-  await page.waitForURL("**/");
+  // The overhaul retired the /hosts index; a removed host lands on /app.
+  await page.waitForURL("**/app");
   expect(state.deleteCalls).toBe(1);
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 });

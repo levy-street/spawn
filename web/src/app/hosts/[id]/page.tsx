@@ -171,7 +171,7 @@ function HostDetail() {
         return;
       }
       setError(
-        `Host deletion was blocked before any server delete: ${caught instanceof Error ? caught.message : String(caught)}`,
+        `Host deletion was blocked before any server DELETE: ${caught instanceof Error ? caught.message : String(caught)}`,
       );
     },
   });
@@ -182,7 +182,9 @@ function HostDetail() {
     let cancelled = false;
     void (async () => {
       try {
-        if (host.id !== id) throw new Error("Host API response ID does not match this route");
+        if (host.id !== id) {
+          throw new Error("Host API response ID does not exactly match this route");
+        }
         // Locally derived (mesh B5) — the pin store never sees a served label.
         const hostFingerprint = await ed25519PublicKeyFingerprint(hostPublicKey);
         try {

@@ -7,8 +7,9 @@ const CODE = "const answer = 42; // the answer\n";
 
 /** Home holds one of everything the viewer has to cope with. */
 function previewFiles(_hostId: string, path: string | null) {
-  // The root request carries no path at all, so anything falsy is home.
-  if (path && path !== "/Users/tester") return fileListing();
+  // mockApp normalises an absent path to "~" (app-mocks: `payload.path ?? "~"`),
+  // so home arrives either as that, as the absolute home dir, or as nothing.
+  if (path && path !== "~" && path !== "/Users/tester") return fileListing();
   return fileListing({
     entries: [
       fileEntry({ name: "logo.svg", path: "/Users/tester/logo.svg", size: SVG.length }),
@@ -93,12 +94,14 @@ test("next and previous step between files and skip folders", async ({ page }) =
 
   await row(page, "logo.svg").click();
   const dialog = page.getByRole("dialog");
-  await expect(dialog.getByText("logo.svg")).toBeVisible();
+  // The viewer names the file twice — title bar and footer path — so pin the
+  // heading rather than any text match.
+  await expect(dialog.getByRole("heading", { name: "logo.svg" })).toBeVisible();
 
   await dialog.getByRole("button", { name: "Next file" }).click();
-  await expect(dialog.getByText("notes.txt")).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "notes.txt" })).toBeVisible();
   await dialog.getByRole("button", { name: "Previous file" }).click();
-  await expect(dialog.getByText("logo.svg")).toBeVisible();
+  await expect(dialog.getByRole("heading", { name: "logo.svg" })).toBeVisible();
   // First file: there is nothing before it.
   await expect(dialog.getByRole("button", { name: "Previous file" })).toBeDisabled();
 });
@@ -155,8 +158,12 @@ test("a host-rendered document falls back to a metadata card without a renderer"
 
   await row(page, "report.docx").click();
   const dialog = page.getByRole("dialog");
-  await expect(dialog.getByText("Word document")).toBeVisible();
-  await expect(dialog.getByRole("button", { name: "Download" })).toBeVisible();
+  // The kind is named in the title bar too; the fallback card's own line is
+  // the one that proves the metadata card rendered.
+  await expect(dialog.getByRole("paragraph").filter({ hasText: "Word document" })).toBeVisible();
+  // The toolbar carries an icon-only Download too; the card's own button is
+  // the one with visible text, and it is what the fallback has to offer.
+  await expect(dialog.locator("button").filter({ hasText: "Download" })).toBeVisible();
 });
 
 test("a file over the budget waits to be asked before streaming", async ({ page }) => {
