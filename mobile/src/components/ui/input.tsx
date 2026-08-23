@@ -17,9 +17,8 @@ import Animated, {
 import { Icon } from "@/components/ui/icon";
 import { useTheme } from "@/theme";
 import { opacity } from "@/theme/effects";
-import { sizing } from "@/theme/sizing";
 import { borderWidth, chrome, spacing } from "@/theme/spacing";
-import { fontFamily, fontSize, typeStyles } from "@/theme/typography";
+import { typeStyles } from "@/theme/typography";
 
 export type InputPurpose =
   | "email"
@@ -140,17 +139,8 @@ export function getInputPurposeConfig(purpose: InputPurpose): InputPurposeConfig
   return INPUT_PURPOSE_CONFIG[purpose];
 }
 
-export type InputVariant = "box" | "rule";
-
 export interface InputProps extends Omit<TextInputProps, "style"> {
   purpose?: InputPurpose;
-  /**
-   * `box` is the app's plated field. `rule` is the press cut: the value is
-   * typed straight onto the sheet and only a ruled line under it says where the
-   * field is — the shape a printed form has, and the one that stops a stack of
-   * fields from reading as a stack of containers.
-   */
-  variant?: InputVariant;
   error?: boolean;
   nextRef?: RefObject<TextInput | null>;
   leading?: ReactNode;
@@ -163,7 +153,6 @@ export interface InputProps extends Omit<TextInputProps, "style"> {
 export const Input = forwardRef<TextInput, InputProps>(function Input(
   {
     purpose = "plain",
-    variant = "box",
     error = false,
     nextRef,
     leading,
@@ -192,7 +181,6 @@ export const Input = forwardRef<TextInput, InputProps>(function Input(
 ) {
   const theme = useTheme();
   const config = getInputPurposeConfig(purpose);
-  const ruled = variant === "rule";
   const focusProgress = useSharedValue(0);
   const [passwordVisible, setPasswordVisible] = useState(false);
   const isPasswordPurpose = purpose === "password" || purpose === "newPassword";
@@ -204,17 +192,6 @@ export const Input = forwardRef<TextInput, InputProps>(function Input(
       opacity: showFocusHalo ? focusProgress.value : opacity.hidden,
     }),
     [error, showFocusHalo, theme.colors.destructive, theme.colors.ring],
-  );
-
-  // The struck rule: it is drawn from the leading edge outwards rather than
-  // faded in, so focus reads as the line being ruled under what you are about
-  // to type. An error holds the line struck whether or not the field has focus.
-  const animatedRuleStyle = useAnimatedStyle(
-    () => ({
-      backgroundColor: error ? theme.colors.destructive : theme.colors.foreground,
-      transform: [{ scaleX: error ? 1 : focusProgress.value }],
-    }),
-    [error, theme.colors.destructive, theme.colors.foreground],
   );
 
   const animateFocus = (focused: boolean) => {
@@ -237,29 +214,19 @@ export const Input = forwardRef<TextInput, InputProps>(function Input(
     <Animated.View
       style={[
         styles.container,
-        ruled
-          ? [styles.ruleContainer, { borderBottomColor: theme.colors.paneDivider }]
-          : {
-              borderColor: error ? theme.colors.destructive : theme.colors.input,
-              borderRadius: theme.radii.md,
-            },
+        {
+          borderColor: error ? theme.colors.destructive : theme.colors.input,
+          borderRadius: theme.radii.md,
+        },
         !editable && styles.disabled,
         containerStyle,
       ]}
     >
-      {ruled ? (
-        <Animated.View
-          pointerEvents="none"
-          style={[styles.rule, animatedRuleStyle]}
-          testID={testID === undefined ? undefined : `${testID}-rule`}
-        />
-      ) : (
-        <Animated.View
-          pointerEvents="none"
-          style={[styles.focusHalo, { borderRadius: theme.radii.md }, animatedHaloStyle]}
-          testID={testID === undefined ? undefined : `${testID}-focus-halo`}
-        />
-      )}
+      <Animated.View
+        pointerEvents="none"
+        style={[styles.focusHalo, { borderRadius: theme.radii.md }, animatedHaloStyle]}
+        testID={testID === undefined ? undefined : `${testID}-focus-halo`}
+      />
       {leading !== undefined ? (
         <Animated.View style={styles.leading}>{leading}</Animated.View>
       ) : null}
@@ -293,9 +260,8 @@ export const Input = forwardRef<TextInput, InputProps>(function Input(
         selectionColor={props.selectionColor ?? theme.colors.brandAccent}
         style={[
           styles.input,
-          ruled && styles.ruleInput,
-          leading !== undefined && (ruled ? styles.ruleInputWithLeading : styles.inputWithLeading),
-          hasTrailingContent && !ruled && styles.inputWithTrailing,
+          leading !== undefined && styles.inputWithLeading,
+          hasTrailingContent && styles.inputWithTrailing,
           { color: theme.colors.foreground },
           style,
         ]}
@@ -309,7 +275,7 @@ export const Input = forwardRef<TextInput, InputProps>(function Input(
           accessibilityLabel={passwordVisible ? "Hide password" : "Show password"}
           disabled={!editable}
           onPress={() => setPasswordVisible((visible) => !visible)}
-          style={[styles.trailingAction, ruled && styles.ruleTrailingAction]}
+          style={styles.trailingAction}
         >
           <Icon
             name={passwordVisible ? "EyeOff" : "Eye"}
@@ -330,23 +296,6 @@ const styles = StyleSheet.create({
     height: chrome.touchTarget,
     position: "relative",
     width: "100%",
-  },
-  // The rule carries the whole field: there is no box behind it to say where
-  // the control is, so it takes the stronger of the two neutral hairlines.
-  ruleContainer: {
-    borderBottomWidth: borderWidth.hairline,
-    borderLeftWidth: borderWidth.none,
-    borderRightWidth: borderWidth.none,
-    borderTopWidth: borderWidth.none,
-    height: sizing.control.ruledField,
-  },
-  rule: {
-    bottom: -borderWidth.hairline,
-    height: borderWidth.emphasis,
-    left: 0,
-    position: "absolute",
-    right: 0,
-    transformOrigin: "left",
   },
   focusHalo: {
     borderWidth: borderWidth.hairline,
@@ -374,19 +323,6 @@ const styles = StyleSheet.create({
   inputWithLeading: {
     // Clear of the leading glyph rather than crowding it.
     paddingLeft: spacing[2],
-  },
-  ruleInput: {
-    // Nothing pads a ruled field: the value starts on the sheet's own margin,
-    // flush with the label above it and the rule beneath.
-    fontFamily: fontFamily.mono,
-    fontSize: fontSize.seventeen,
-    paddingHorizontal: 0,
-  },
-  ruleInputWithLeading: {
-    paddingLeft: spacing[3],
-  },
-  ruleTrailingAction: {
-    alignItems: "flex-end",
   },
   inputWithTrailing: {
     paddingRight: spacing[1],

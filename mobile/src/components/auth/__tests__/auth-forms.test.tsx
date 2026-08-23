@@ -86,24 +86,21 @@ describe("auth form wiring", () => {
     expect(logIn).not.toHaveBeenCalled();
   });
 
-  it("prints the sign-in form on the sheet: ruled fields, no plate, no boxes", async () => {
+  it("prints the sign-in form on the sheet, using the app's own fields", async () => {
     const screen = await renderAuth(<LoginScreen />);
     await screen.findByText("Available in installed builds");
 
-    // The rule *is* the field. A halo belongs to the app's plated input, and a
-    // plate belongs to the web layout this screen used to be a port of.
-    expect(screen.getByTestId("login-email-rule")).toBeTruthy();
-    expect(screen.queryByTestId("login-email-focus-halo")).toBeNull();
+    // The controls are the shared plated input, not a field cut only for auth.
+    expect(screen.getByTestId("login-email-focus-halo")).toBeTruthy();
+    // No card returns between the ground and the form printed on it.
     expect(screen.queryByTestId("auth-plate")).toBeNull();
-    // The server escape hatch is marginalia at the foot — no icon, but still
-    // reachable, or a wrong address is a deadlock you cannot sign in to fix.
-    await fireEvent.press(screen.getByTestId("login-server"));
-    expect(mockPush).toHaveBeenCalledWith("/server");
+    // Sign-in carries no server switch of its own any more.
+    expect(screen.queryByTestId("login-server")).toBeNull();
   });
 
   it("sets the masthead as a poster line, not a card heading", async () => {
     const screen = await renderAuth(<LoginScreen />);
-    const heading = await screen.findByRole("header", { name: "Welcome back" });
+    const heading = await screen.findByRole("header", { name: "Enter the circle" });
     const style = StyleSheet.flatten(heading.props["style"]) as {
       fontFamily?: string;
       fontSize?: number;

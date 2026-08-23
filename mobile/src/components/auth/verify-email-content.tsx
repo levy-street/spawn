@@ -27,7 +27,7 @@ function VerifySuccess({ signedIn }: { signedIn: boolean }) {
   const router = useRouter();
   return (
     <>
-      <AuthMessage tone="success">Your email address is verified.</AuthMessage>
+      <AuthMessage tone="success">Your true name is confirmed.</AuthMessage>
       <AuthBlock>
         <AuthAction
           label={signedIn ? "Continue to spawn" : "Sign in to continue"}
@@ -89,8 +89,8 @@ function VerificationFailure({ message }: { message: string }) {
       <AuthMessage tone="error">{message}</AuthMessage>
       <AuthBlock>
         <Text color="mutedForeground" style={styles.copy}>
-          Verification links work once and expire after two days. Sign in and request a fresh one
-          from Settings.
+          A verification link burns out after two days, and works only once. Sign in and call for a
+          fresh one from Settings.
         </Text>
       </AuthBlock>
       <AuthBlock>
@@ -151,7 +151,7 @@ function VerificationWaiting() {
           .
         </Text>
         <Text color="mutedForeground" style={[styles.copy, styles.secondLine]}>
-          Open it anywhere. This screen checks every few seconds and continues on its own.
+          Open it anywhere. This screen is watching, and moves on the moment it is done.
         </Text>
       </AuthBlock>
       {message !== null ? <AuthMessage tone="success">{message}</AuthMessage> : null}
@@ -206,8 +206,8 @@ export function VerifyEmailScreen({ token }: { token?: string }) {
 
   return (
     <AuthShell
-      description="Confirm the address attached to your spawnd account."
-      title="Verify your email"
+      description="Confirm the address bound to your account. Nothing answers to a name it cannot verify."
+      title="Your true name"
     >
       {content}
     </AuthShell>
