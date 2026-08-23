@@ -1,9 +1,22 @@
 import { render, screen } from "@testing-library/react-native";
 import { StyleSheet } from "react-native";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import TerminalScreen, { TERMINAL_ROUTE_GESTURE_OPTIONS } from "@/app/terminal/[sessionId]";
 import { darkTheme } from "@/theme";
-import { sizing } from "@/theme/sizing";
+import { bottomNavHeight } from "@/theme/sizing";
+
+const INSETS = { top: 47, left: 0, right: 0, bottom: 34 };
+
+function renderScreen() {
+  return render(
+    <SafeAreaProvider
+      initialMetrics={{ frame: { x: 0, y: 0, width: 390, height: 844 }, insets: INSETS }}
+    >
+      <TerminalScreen />
+    </SafeAreaProvider>,
+  );
+}
 
 interface MockTerminalData {
   error: Error | null;
@@ -107,7 +120,7 @@ describe("TerminalScreen dismissal", () => {
     "uses one rounded full-screen card gesture while %s",
     async (state) => {
       mockTerminalData = dataFor(state);
-      await render(<TerminalScreen />);
+      await renderScreen();
 
       expect(screen.getByTestId("mock-terminal-route-options")).toBeTruthy();
       expect(mockStackScreenOptions).toMatchObject(TERMINAL_ROUTE_GESTURE_OPTIONS);
@@ -125,18 +138,21 @@ describe("TerminalScreen dismissal", () => {
         borderRadius: darkTheme.radii.xxl,
         overflow: "hidden",
       });
-      expect(
-        StyleSheet.flatten(screen.getByTestId("terminal-nav-clearance").props["style"])
-          .paddingBottom,
-      ).toBe(sizing.bottomNav.contentHeight + sizing.bottomNav.verticalPadding);
       // An omitted response distance is what lets the native recognizer begin at screen centre.
       expect(mockStackScreenOptions).not.toHaveProperty("gestureResponseDistance");
       if (state === "connected") {
         expect(screen.getByTestId("mock-terminal-overlay")).toBeTruthy();
         expect(screen.queryByTestId("mock-terminal-state-header")).toBeNull();
+        // The overlay reserves the nav bar itself, and gives that reservation
+        // back when the keyboard covers the bar; a wrapper here could not.
+        expect(screen.queryByTestId("terminal-nav-clearance")).toBeNull();
       } else {
         expect(screen.queryByTestId("mock-terminal-overlay")).toBeNull();
         expect(screen.getByTestId("mock-terminal-state-header")).toBeTruthy();
+        expect(
+          StyleSheet.flatten(screen.getByTestId("terminal-nav-clearance").props["style"])
+            .paddingBottom,
+        ).toBe(bottomNavHeight(INSETS.bottom));
       }
     },
   );

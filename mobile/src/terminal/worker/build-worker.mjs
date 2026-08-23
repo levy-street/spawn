@@ -41,7 +41,13 @@ const html = `<!doctype html>
 <base href="https://spawn.local/">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' https: wss: ws:; img-src data:; font-src 'none'; base-uri 'none'; form-action 'none'">
 <style>${xtermCss}
-html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;padding:0;overflow:hidden;touch-action:none;-webkit-text-size-adjust:none}body{overscroll-behavior:none}.xterm{height:100%;padding:0}.xterm-viewport{touch-action:pan-y;overscroll-behavior:contain}</style>
+html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;padding:0;overflow:hidden;touch-action:none;-webkit-text-size-adjust:none}body{overscroll-behavior:none}
+/* A gutter either side so the first column does not sit on the bezel. FitAddon
+   subtracts this element's horizontal padding, so the grid still fits exactly. */
+.xterm{height:100%;padding:0 8px}
+/* Scrolling is driven from the worker, not the browser: nothing here may pan
+   on its own or the two would fight. */
+.xterm-viewport{touch-action:none;overscroll-behavior:contain}</style>
 </head>
 <body><div id="terminal" role="application" aria-label="Terminal"></div><script>${scripts}</script></body>
 </html>`;

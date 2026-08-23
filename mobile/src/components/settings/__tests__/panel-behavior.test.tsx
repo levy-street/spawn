@@ -6,6 +6,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import { AccountPanel } from "@/components/settings/account-panel";
 import { DeviceTrustPanel } from "@/components/settings/device-trust-panel";
 import { NotificationsPanel } from "@/components/settings/notifications-panel";
+import { SETTINGS_PANELS } from "@/components/settings/settings-inventory";
 import { SettingsRoot } from "@/components/settings/settings-root";
 import { authToken } from "@/data/api/auth-token";
 import { ThemeProvider } from "@/theme";
@@ -120,13 +121,22 @@ describe("settings panel behavior", () => {
     jest.mocked(AsyncStorage.getItem).mockResolvedValue(null);
   });
 
-  test("settings root renders exactly the nine documented panel entries", async () => {
+  test("settings root renders the documented panels plus connectivity", async () => {
     const screen = await render(<SettingsRoot />, { wrapper });
-    expect(screen.getAllByTestId(/^settings-panel-/)).toHaveLength(9);
-    // Hosts is a bottom-nav destination now and must not be duplicated in the
-    // header; Admin is not in the nav, so it keeps its header entry.
+
+    expect(SETTINGS_PANELS).toHaveLength(9);
+    for (const panel of SETTINGS_PANELS) {
+      expect(screen.getByTestId(`settings-panel-${panel.key}`)).toBeOnTheScreen();
+    }
+    // Server and About are not inventory panels but the root still owns them.
+    expect(screen.getByTestId("settings-panel-server")).toBeOnTheScreen();
+    expect(screen.getByTestId("settings-panel-about")).toBeOnTheScreen();
+    expect(screen.getAllByTestId(/^settings-panel-/)).toHaveLength(SETTINGS_PANELS.length + 2);
+    // Hosts and Settings are bottom-nav roots and are not linked from any header;
+    // Admin is not in the nav, but it only belongs to an account that can use it.
     expect(screen.queryByRole("button", { name: "Open hosts" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Open admin" })).toBeOnTheScreen();
+    expect(screen.queryByRole("button", { name: "Open settings" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open admin" })).toBeNull();
     expect(screen.queryByText("Terminal")).toBeNull();
     expect(screen.queryByText("Sessions")).toBeNull();
     expect(screen.queryByText("Security")).toBeNull();

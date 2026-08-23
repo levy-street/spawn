@@ -16,6 +16,7 @@ import { ListRow, ListSeparator } from "@/components/ui/list-row";
 import { Spinner } from "@/components/ui/spinner";
 import { useToast } from "@/components/ui/toast";
 import type { HostOut } from "@/data/api/schemas/hosts";
+import { useDeviceHostApprovals } from "@/data/queries/device-trust";
 import { useHostsQuery, useRemoveHostMutation, useRenameHostMutation } from "@/data/queries/hosts";
 import { sortHosts } from "@/data/selectors/host";
 import { haptics } from "@/lib/haptics";
@@ -24,21 +25,26 @@ import { spacing, useTheme } from "@/theme";
 export interface HostListViewProps {
   hosts: readonly HostOut[];
   refreshing: boolean;
+  /** Hosts that have not pinned this device; they cannot open a terminal here. */
+  unapprovedCount?: number;
   onConnect(): void;
   onOpen(host: HostOut): void;
   onOpenActions(host: HostOut): void;
   onOpenLegion(): void;
   onRefresh(): void;
+  onApproveDevice?(): void;
 }
 
 export function HostListView({
   hosts,
   refreshing,
+  unapprovedCount = 0,
   onConnect,
   onOpen,
   onOpenActions,
   onOpenLegion,
   onRefresh,
+  onApproveDevice,
 }: HostListViewProps) {
   const theme = useTheme();
   const online = hosts.filter((host) => host.status === "online").length;
@@ -46,11 +52,12 @@ export function HostListView({
   const sessionCount = hosts.reduce((total, host) => total + host.session_count, 0);
   return (
     <FlatList
-      contentContainerStyle={hosts.length === 0 ? styles.emptyList : styles.list}
+      contentContainerStyle={styles.list}
       data={[...hosts]}
       keyExtractor={(host) => host.id}
       ListEmptyComponent={
         <EmptyState
+          style={styles.emptyState}
           action={<Button onPress={onConnect}>Connect a host</Button>}
           description="Run the installer and spawnd login on a supported Mac or Linux machine."
           icon="Server"
@@ -59,19 +66,36 @@ export function HostListView({
       }
       ListHeaderComponent={
         hosts.length > 0 ? (
-          <Card padded={false} style={styles.fleet} variant="flat">
-            <ListRow
-              height="tall"
-              leading={<Icon color="mutedForeground" name="Network" size={spacing[5]} />}
-              onPress={() => {
-                haptics.selection();
-                onOpenLegion();
-              }}
-              subtitle={`${online} online · ${offline} offline · ${pluralize(sessionCount, "session")}`}
-              title="Fleet overview"
-              trailing={<Icon color="mutedForeground" name="ChevronRight" />}
-            />
-          </Card>
+          <View style={styles.header}>
+            {unapprovedCount > 0 && onApproveDevice ? (
+              <Card padded={false} variant="flat">
+                <ListRow
+                  height="tall"
+                  leading={<Icon color="warning" name="ShieldAlert" size={spacing[5]} />}
+                  onPress={() => {
+                    haptics.selection();
+                    onApproveDevice();
+                  }}
+                  subtitle={`${pluralize(unapprovedCount, "host")} will not open a terminal here until this device is approved.`}
+                  title="This device is not approved yet"
+                  trailing={<Icon color="mutedForeground" name="ChevronRight" />}
+                />
+              </Card>
+            ) : null}
+            <Card padded={false} style={styles.fleet} variant="flat">
+              <ListRow
+                height="tall"
+                leading={<Icon color="mutedForeground" name="Network" size={spacing[5]} />}
+                onPress={() => {
+                  haptics.selection();
+                  onOpenLegion();
+                }}
+                subtitle={`${online} online · ${offline} offline · ${pluralize(sessionCount, "session")}`}
+                title="Fleet overview"
+                trailing={<Icon color="mutedForeground" name="ChevronRight" />}
+              />
+            </Card>
+          </View>
         ) : null
       }
       ItemSeparatorComponent={() => <ListSeparator inset={false} />}
@@ -103,7 +127,9 @@ export function HostListScreen() {
   const [actionsHost, setActionsHost] = useState<HostOut | null>(null);
   const [renameHost, setRenameHost] = useState<HostOut | null>(null);
   const [removeHost, setRemoveHost] = useState<HostOut | null>(null);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
   const hosts = useMemo(() => sortHosts(hostsQuery.data ?? []), [hostsQuery.data]);
+  const approvals = useDeviceHostApprovals();
 
   const openHost = (host: HostOut) => {
     router.push({ pathname: "/host/[id]", params: { id: host.id } });
@@ -121,19 +147,12 @@ export function HostListScreen() {
               testID: "hosts-legion-action",
             },
             {
-              accessibilityLabel: "Open settings",
-              icon: "Settings",
-              onPress: () => router.push("/settings"),
-              testID: "hosts-settings-action",
-            },
-            {
               accessibilityLabel: "Connect a host",
               icon: "Plus",
               onPress: () => router.push("/onboarding/host"),
               testID: "hosts-connect-action",
             },
           ]}
-          onBack={router.back}
           title="Hosts"
         />
       }
@@ -154,12 +173,18 @@ export function HostListScreen() {
         ) : (
           <HostListView
             hosts={hosts}
+            onApproveDevice={() => router.push("/device-approval")}
             onConnect={() => router.push("/onboarding/host")}
             onOpen={openHost}
             onOpenActions={setActionsHost}
             onOpenLegion={() => router.push("/legion")}
-            onRefresh={() => void hostsQuery.refetch()}
-            refreshing={hostsQuery.isRefetching}
+            onRefresh={() => {
+              if (manualRefreshing) return;
+              setManualRefreshing(true);
+              void hostsQuery.refetch().finally(() => setManualRefreshing(false));
+            }}
+            refreshing={manualRefreshing}
+            unapprovedCount={approvals.awaiting.length}
           />
         )}
         <HostActionsSheet
@@ -215,21 +240,24 @@ export function HostListScreen() {
 }
 
 const styles = StyleSheet.create({
+  header: {
+    gap: spacing[3],
+  },
   centered: {
     alignItems: "center",
     flex: 1,
     justifyContent: "center",
   },
-  emptyList: {
-    flexGrow: 1,
-    justifyContent: "center",
-    padding: spacing[6],
+  emptyState: {
+    marginHorizontal: spacing[4],
+    marginTop: spacing[6],
   },
   fleet: {
     margin: spacing[4],
     overflow: "hidden",
   },
   list: {
+    flexGrow: 1,
     paddingBottom: spacing[8],
   },
   screen: {

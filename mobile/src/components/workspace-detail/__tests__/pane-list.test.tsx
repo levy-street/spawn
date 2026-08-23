@@ -73,12 +73,9 @@ describe("workspace tab pane lists", () => {
         canAddPane
         hostsById={new Map([["host-1", makeHost()]])}
         onAddPane={jest.fn()}
-        onMovePane={jest.fn()}
         onOpenFiles={onOpenFiles}
         onOpenTerminal={jest.fn()}
         onPaneActions={jest.fn()}
-        onRemovePane={jest.fn()}
-        onRenameSession={jest.fn()}
         sessionsById={new Map()}
         tab={makeTab("main", [tile])}
         transports={{}}
@@ -96,9 +93,10 @@ describe("workspace tab pane lists", () => {
     expect(
       StyleSheet.flatten(screen.getByTestId("pane-list-main").props["style"]).paddingHorizontal,
     ).toBeUndefined();
-    expect(screen.getByTestId("files-swipe-files-1-content")).toHaveStyle({
-      backgroundColor: "transparent",
-    });
+    // The swipe layer was removed in round 7 — move and remove live in the ...
+    // menu — so the row's own frame is what carries the transparent ground.
+    expect(screen.queryByTestId("files-swipe-files-1-content")).toBeNull();
+    expect(screen.getByTestId("files-row-files-1")).toBeTruthy();
     const row = screen.getByLabelText("Files — dev, office-mac");
     expect(row).toHaveStyle({
       minHeight: sizing.listRow.regular,
@@ -124,12 +122,9 @@ describe("workspace tab pane lists", () => {
         canAddPane
         hostsById={new Map([["host-1", makeHost()]])}
         onAddPane={jest.fn()}
-        onMovePane={jest.fn()}
         onOpenFiles={jest.fn()}
         onOpenTerminal={jest.fn()}
         onPaneActions={jest.fn()}
-        onRemovePane={jest.fn()}
-        onRenameSession={jest.fn()}
         sessionsById={new Map()}
         tab={makeTab("main", tiles)}
         transports={{}}
@@ -177,12 +172,9 @@ describe("workspace tab pane lists", () => {
         canAddPane={canAddTile(tab.layout)}
         hostsById={new Map([["host-1", makeHost()]])}
         onAddPane={jest.fn()}
-        onMovePane={jest.fn()}
         onOpenFiles={jest.fn()}
         onOpenTerminal={jest.fn()}
         onPaneActions={jest.fn()}
-        onRemovePane={jest.fn()}
-        onRenameSession={jest.fn()}
         sessionsById={new Map()}
         tab={tab}
         transports={{}}
@@ -201,12 +193,9 @@ describe("workspace tab pane lists", () => {
         canAddPane
         hostsById={new Map()}
         onAddPane={jest.fn()}
-        onMovePane={jest.fn()}
         onOpenFiles={jest.fn()}
         onOpenTerminal={jest.fn()}
         onPaneActions={jest.fn()}
-        onRemovePane={jest.fn()}
-        onRenameSession={jest.fn()}
         sessionsById={new Map()}
         tab={makeTab("main", [{ session_id: "missing", x: 0, y: 0, w: 24, h: 24 }])}
         transports={{}}

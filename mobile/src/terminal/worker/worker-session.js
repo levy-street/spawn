@@ -20,6 +20,8 @@
   const session = {
     ready: false,
     bootstrapStarted: false,
+    displaySeen: false,
+    claiming: false,
     history: null,
     preboot: [],
     prebootBytes: 0,
@@ -42,6 +44,11 @@
     for (const key of Object.keys(gates)) gates[key] = false;
     session.ready = false;
     session.bootstrapStarted = false;
+    session.displaySeen = false;
+    session.claiming = false;
+    state.displayOwner = null;
+    state.displayGeometry = null;
+    state.displayViewers = 1;
     session.history = null;
     session.preboot.splice(0);
     session.prebootBytes = 0;
@@ -68,6 +75,11 @@
     if (!allReady() || session.ready) return;
     session.ready = true;
     api.post({ type: "state", state: "ready" });
+    // The grid was fitted long before the control channel could carry it. A
+    // session that never publishes it leaves the PTY at whatever size it was
+    // created with, and every row the daemon renders is written for a terminal
+    // this phone does not have.
+    api.sendResize(state.cols, state.rows);
   }
 
   api.sessionGate = (gate) => {
@@ -454,7 +466,9 @@
       }
       if (message?.version !== 1) return;
       if (message.kind === "event" && message.event === "ready") handleReady(message);
-      else if (message.kind === "response") {
+      else if (message.kind === "event" && message.event === "display_state") {
+        handleDisplayState(message);
+      } else if (message.kind === "response") {
         if (!handleUploadResponse(message)) acceptReplayMetadata(message);
       }
       return;
@@ -474,9 +488,66 @@
   };
 
   api.sendResize = (cols, rows) => {
-    if (!session.ready) return;
+    if (session.claiming || !session.ready) return;
+    // Only the display owner may resize the shared PTY; a follower's request is
+    // refused, and acting as though it succeeded is what leaves the grid lying
+    // about its width.
+    if (state.displayOwner === false) return;
+    const geometry = state.displayGeometry;
+    if (geometry && geometry.cols === cols && geometry.rows === rows) return;
     sendCtlText(crypto.randomUUID(), "resize", { cols, rows });
   };
+
+  /**
+   * Claims the shared display at this phone's own geometry. The daemon resizes
+   * the PTY and redraws, so the next frame is rendered for this screen instead
+   * of whatever desk the session was last read from.
+   */
+  api.takeDisplayControl = () => {
+    if (!state.term) return false;
+    session.claiming = true;
+    state.displayOwner = true;
+    state.displayGeometry = null;
+    try {
+      api.fitTerminal();
+    } finally {
+      session.claiming = false;
+    }
+    return sendCtlText(crypto.randomUUID(), "take_control", {
+      cols: state.cols,
+      rows: state.rows,
+    });
+  };
+
+  function handleDisplayState(message) {
+    const owner = message.owner === true;
+    const cols = Number.isSafeInteger(message.cols) ? message.cols : null;
+    const rows = Number.isSafeInteger(message.rows) ? message.rows : null;
+    state.displayOwner = owner;
+    state.displayGeometry = cols === null || rows === null ? null : { cols, rows };
+    state.displayViewers = Number.isSafeInteger(message.viewers) ? message.viewers : 1;
+    api.post({
+      type: "display",
+      owner,
+      viewers: state.displayViewers,
+      ...(cols === null ? {} : { cols }),
+      ...(rows === null ? {} : { rows }),
+    });
+    // A frame that lands before the grid exists is recorded but not acted on,
+    // so the claim below still happens off the first frame that can carry it.
+    if (!state.term) return;
+    // Opening a terminal claims the display, matching the web client. Only off
+    // the first frame, though: reacting to later ownership changes would have
+    // two open viewers steal control from each other forever. A follower re-takes
+    // it deliberately, from the banner.
+    const first = !session.displaySeen;
+    session.displaySeen = true;
+    if (!owner && first) {
+      api.takeDisplayControl();
+      return;
+    }
+    api.fitTerminal();
+  }
 
   function requestReplay() {
     if (!gates.ctlOpen || !gates.daemonReady || session.history) return;

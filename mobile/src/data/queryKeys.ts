@@ -42,6 +42,10 @@ export const qk = {
   trustHostPinMap: (hostIdsCsv: string) => ["trust", "host-pin-map", hostIdsCsv] as const,
   trustIntroductions: (accountId: string, deviceId: string) =>
     ["trust", "introductions", accountId, deviceId] as const,
+  deviceHostTrust: (hostIds: readonly string[]) =>
+    ["trust", "device-host-trust", [...hostIds].sort().join(",")] as const,
+  deviceHostApproval: (hostId: string) => ["trust", "device-host-approval", hostId] as const,
+  deviceApprovals: () => ["trust", "device-approvals"] as const,
 
   hostFiles: (hostId: string, path = "") => ["host-files", hostId, path] as const,
   hostFilesPage: (hostId: string, path: string, cursor: string) =>

@@ -1,14 +1,16 @@
-import { useBottomSheetModal } from "@gorhom/bottom-sheet";
 import { type Href, usePathname, useRouter } from "expo-router";
+import { useEffect } from "react";
 import { useRef } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { FullWindowOverlay } from "react-native-screens";
 import { dismissNavigationOverlays } from "@/components/nav/overlay-dismiss";
+import { switchToTab } from "@/components/nav/tab-switcher";
 import { Icon, type IconName } from "@/components/ui/icon";
+import { dismissAllSheets } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, useTheme } from "@/theme";
+import { borderWidth, opacity, useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
 const DESTINATIONS = [
@@ -23,32 +25,6 @@ const DESTINATIONS = [
 }[];
 
 export type BottomNavRoute = (typeof DESTINATIONS)[number]["href"];
-
-interface RetainedTabRoute {
-  key: string;
-  name: string;
-  params?: object;
-}
-
-export interface BottomNavTabState {
-  index: number;
-  routes: readonly RetainedTabRoute[];
-}
-
-export interface BottomNavTabNavigation {
-  navigate: (name: string, params?: object) => void;
-}
-
-export interface BottomNavProps {
-  navigation: BottomNavTabNavigation;
-  state: BottomNavTabState;
-}
-
-const ROOT_TAB_ROUTES: Record<BottomNavRoute, string> = {
-  "/hosts": "hosts",
-  "/settings": "settings",
-  "/workspaces": "workspaces",
-};
 
 /** Exact roots receive profile chrome; pushed routes still map to a selected destination. */
 export function isBottomNavRoute(pathname: string): pathname is BottomNavRoute {
@@ -77,44 +53,18 @@ export function bottomNavDestinationForPath(pathname: string): BottomNavRoute | 
   return null;
 }
 
-/** Companion tabs need a route fallback because their first screen has no local stack parent. */
-export function companionTabBackDestination(pathname: string): BottomNavRoute | null {
-  const segments = pathname.split("/").filter(Boolean);
-  if (segments.length === 2 && segments[0] === "workspace") return "/workspaces";
-  if (segments.length === 2 && segments[0] === "host") return "/hosts";
-  if (pathname === "/legion") return "/hosts";
-  if (pathname === "/admin") return "/settings";
-  return null;
-}
-
-function destinationForTabRoute(routeName: string): BottomNavRoute | null {
-  if (routeName === "workspaces" || routeName === "workspace") return "/workspaces";
-  if (routeName === "hosts" || routeName === "host" || routeName === "legion") return "/hosts";
-  if (routeName === "settings" || routeName === "admin") return "/settings";
-  return null;
-}
-
-export function BottomNav({ navigation, state }: BottomNavProps): React.JSX.Element {
+export function BottomNav(): React.JSX.Element {
   const insets = useSafeAreaInsets();
   const pathname = usePathname();
   const router = useRouter();
-  const { dismissAll: dismissAllSheets } = useBottomSheetModal();
   const theme = useTheme();
-  const activeDestination = bottomNavDestinationForPath(pathname);
-  const currentTab = state.routes[state.index];
-  const retainedTabs = useRef<Record<BottomNavRoute, RetainedTabRoute | undefined>>({
-    "/hosts": undefined,
-    "/settings": undefined,
-    "/workspaces": undefined,
-  });
-  const currentTabDestination = currentTab ? destinationForTabRoute(currentTab.name) : null;
-
-  // Companion routes such as `host` and `workspace` remain part of their visible
-  // destination. Remembering the actual tab preserves its nested stack on return.
-  if (currentTab && currentTabDestination) {
-    retainedTabs.current[currentTabDestination] = currentTab;
-  }
-
+  // A card pushed over the tabs — profile, the terminal — belongs to no root, and
+  // blanking the bar there reads as having left the app. It stays on whichever
+  // root the card was opened from until a nav tap moves it.
+  const destinationForPath = bottomNavDestinationForPath(pathname);
+  const lastDestination = useRef<BottomNavRoute>(DESTINATIONS[0].href);
+  if (destinationForPath !== null) lastDestination.current = destinationForPath;
+  const activeDestination = destinationForPath ?? lastDestination.current;
   return (
     <View
       accessibilityLabel="Primary navigation"
@@ -144,33 +94,23 @@ export function BottomNav({ navigation, state }: BottomNavProps): React.JSX.Elem
             key={destination.href}
             onPress={() => {
               haptics.selection();
+              // A nav tap always lands on a root, so anything covering the tabs —
+              // sheets, a pushed detail, the terminal — is cleared first. The
+              // check matters: dispatching a pop with nothing to pop is an
+              // unhandled action, which React Navigation reports on every tap.
               dismissAllSheets();
-              const dismissedOverlay = dismissNavigationOverlays();
-              const shouldResetToRoot =
-                activeDestination === null ||
-                activeDestination === destination.href ||
-                dismissedOverlay;
-
-              if (shouldResetToRoot) {
-                // POP_TO_TOP clears a root-stack overlay such as Terminal. `navigate` then
-                // focuses the destination root without appending another stack entry.
-                router.dismissAll();
-                router.navigate(destination.href);
-                return;
-              }
-
-              const retained = retainedTabs.current[destination.href];
-              navigation.navigate(
-                retained?.name ?? ROOT_TAB_ROUTES[destination.href],
-                retained?.params,
-              );
+              dismissNavigationOverlays();
+              if (router.canDismiss()) router.dismissAll();
+              // Switching roots is a tab jump, not a push: routing to the href
+              // from out here appends a card and slides the destination in over
+              // the app, which is not what a nav bar does.
+              switchToTab(destination.rootRoute, () => router.navigate(destination.href));
             }}
             style={({ pressed }) => [
               styles.item,
-              {
-                backgroundColor: pressed ? theme.colors.accent : "transparent",
-                borderRadius: theme.radii.md,
-              },
+              // Matches every other icon control: the content dims on press
+              // rather than a plate appearing behind the glyph and its label.
+              { opacity: pressed ? opacity.pressedContent : opacity.opaque },
             ]}
           >
             <Icon color={color} name={destination.icon} size={sizing.bottomNav.icon} />
@@ -185,20 +125,18 @@ export function BottomNav({ navigation, state }: BottomNavProps): React.JSX.Elem
 }
 
 /**
- * Keeps the navigator's layout reservation separate from its window-level control.
- * Screens already reserve the device inset, so the placeholder reserves only nav chrome;
- * the portalled bar owns and paints the physical bottom inset without charging it twice.
+ * The bar itself, portalled to window level so it stays above pushed detail
+ * screens, the terminal, sheets and modals. Mounted once by the signed-in
+ * layout; nothing holds its footprint open in the layout flow, so `Screen`
+ * reserves it via BottomChromeProvider.
  */
-export function PersistentBottomNav(props: BottomNavProps): React.JSX.Element {
+export function PersistentBottomNav(): React.JSX.Element {
   return (
-    <>
-      <View style={styles.layoutReservation} testID="bottom-nav-layout-reservation" />
-      <FullWindowOverlay unstable_accessibilityContainerViewIsModal={false}>
-        <View pointerEvents="box-none" style={styles.portal}>
-          <BottomNav {...props} />
-        </View>
-      </FullWindowOverlay>
-    </>
+    <FullWindowOverlay unstable_accessibilityContainerViewIsModal={false}>
+      <View pointerEvents="box-none" style={styles.portal}>
+        <BottomNav />
+      </View>
+    </FullWindowOverlay>
   );
 }
 
@@ -209,9 +147,6 @@ const styles = StyleSheet.create({
     gap: sizing.bottomNav.itemGap,
     justifyContent: "center",
     minHeight: sizing.bottomNav.contentHeight,
-  },
-  layoutReservation: {
-    height: sizing.bottomNav.contentHeight + sizing.bottomNav.verticalPadding,
   },
   portal: {
     ...StyleSheet.absoluteFillObject,

@@ -28,7 +28,7 @@ export function FontSizeSheet({
   const theme = useTheme();
   const change = (next: number): void => onChange(clampTerminalFontSize(next));
   return (
-    <Sheet enableDynamicSizing onDismiss={onDismiss} visible={visible}>
+    <Sheet onDismiss={onDismiss} visible={visible}>
       <SheetHeader title="Terminal font size" />
       <View style={[styles.content, { gap: theme.space(4), padding: theme.space(4) }]}>
         <View style={[styles.stepper, { gap: theme.space(3) }]}>

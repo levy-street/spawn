@@ -1,4 +1,9 @@
 import { openHostSignal } from "@/data/realtime/host-signal";
+import {
+  DEVICE_NOT_TRUSTED_CODE,
+  DEVICE_NOT_TRUSTED_MESSAGE,
+  probeDeviceHostTrust,
+} from "@/data/trust/device-trust";
 import { randomBytes } from "@/lib/crypto/bootstrap";
 import { bytesToUuid, encodeHex } from "@/lib/crypto/bytes";
 import { TERMINAL_BRIDGE_VERSION, type WorkerToNativeMessage } from "@/terminal/transport/bridge";
@@ -17,6 +22,10 @@ import {
   parseHostReadDeclaration,
   parseHostWriteStreamId,
 } from "@/terminal/transport/host-ctl-codec";
+import {
+  CONNECT_TIMEOUT_MESSAGE,
+  CONNECT_TIMEOUT_MS,
+} from "@/terminal/transport/session-transport";
 import {
   browserIdentityWire,
   signWorkerRequest,
@@ -113,6 +122,7 @@ class WebViewHostTransport implements StreamingHostTransport {
   #signalUnsubscribe: (() => void) | null = null;
   #bridgeUnsubscribe: (() => void) | null = null;
   #opening: Promise<void> | null = null;
+  #connectTimer: ReturnType<typeof setTimeout> | null = null;
   #resolveOpen: (() => void) | null = null;
   #rejectOpen: ((error: Error) => void) | null = null;
   readonly #pending = new Map<string, PendingRequest>();
@@ -173,6 +183,8 @@ class WebViewHostTransport implements StreamingHostTransport {
         fontSize: terminalMetrics.fontSize,
       });
       this.#setState("signalling");
+      this.#armConnectWatchdog();
+      this.#preflightTrust();
       this.#startSignal();
     } catch (error) {
       this.#fail(
@@ -185,6 +197,7 @@ class WebViewHostTransport implements StreamingHostTransport {
 
   close(): void {
     if (this.#state === "closed") return;
+    this.#clearConnectWatchdog();
     try {
       this.options.bridge.send({ v: TERMINAL_BRIDGE_VERSION, type: "close" });
     } catch {
@@ -761,6 +774,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     this.#state = state;
     for (const listener of this.#stateListeners) listener(state);
     if (state === "ready") {
+      this.#clearConnectWatchdog();
       if (!this.#capabilities) {
         this.#fail("host_hello", "Host became ready without a capability hello.");
         return;
@@ -770,7 +784,35 @@ class WebViewHostTransport implements StreamingHostTransport {
     }
   }
 
+  #armConnectWatchdog(): void {
+    this.#clearConnectWatchdog();
+    this.#connectTimer = setTimeout(() => {
+      this.#connectTimer = null;
+      if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
+      this.#fail("connect_timeout", CONNECT_TIMEOUT_MESSAGE);
+    }, this.options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS);
+  }
+
+  #clearConnectWatchdog(): void {
+    if (this.#connectTimer === null) return;
+    clearTimeout(this.#connectTimer);
+    this.#connectTimer = null;
+  }
+
+  /** Mirrors the session transport: a host that never pinned this device drops
+   * its offers silently, so name that instead of waiting out the watchdog. */
+  #preflightTrust(): void {
+    const probe = this.options.probeTrust ?? probeDeviceHostTrust;
+    void probe(this.hostId).then((trust) => {
+      if (trust !== "untrusted") return;
+      if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
+      this.#fail(DEVICE_NOT_TRUSTED_CODE, DEVICE_NOT_TRUSTED_MESSAGE);
+    });
+  }
+
   #fail(code: string, message: string): void {
+    if (this.#state === "failed" || this.#state === "closed") return;
+    this.#clearConnectWatchdog();
     const error = new HostControlTransportError(code, message);
     this.#emitError({ code, message, retryable: false });
     this.#setState("failed");

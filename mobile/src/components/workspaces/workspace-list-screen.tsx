@@ -8,10 +8,12 @@ import { Screen } from "@/components/layout/screen";
 import { confirm } from "@/components/ui/confirm";
 import { ListSeparator } from "@/components/ui/list-row";
 import { useToast } from "@/components/ui/toast";
-import { ChangeWorkspaceIconDialog } from "@/components/workspaces/change-workspace-icon-dialog";
+import { ChangeWorkspaceIconSheet } from "@/components/workspaces/change-workspace-icon-sheet";
 import { CreateWorkspaceDialog } from "@/components/workspaces/create-workspace-dialog";
 import { RenameWorkspaceDialog } from "@/components/workspaces/rename-workspace-dialog";
 import {
+  ArchivedWorkspacesFooter,
+  NewWorkspaceRow,
   WorkspaceListControls,
   WorkspaceListStatusError,
 } from "@/components/workspaces/workspace-list-chrome";
@@ -276,15 +278,7 @@ export function WorkspaceListScreen() {
         style={[styles.screen, { backgroundColor: theme.colors.background }]}
         testID="workspace-list-screen"
       >
-        <WorkspaceListControls
-          archivedCount={archivedQuery.data?.length ?? 0}
-          onOpenArchived={() => {
-            haptics.selection();
-            router.push("/workspaces/archived" as Href);
-          }}
-          onQueryChange={setQuery}
-          query={query}
-        />
+        <WorkspaceListControls onQueryChange={setQuery} query={query} />
         {sessionsQuery.error ? (
           <WorkspaceListStatusError onRetry={() => void sessionsQuery.refetch()} />
         ) : null}
@@ -293,10 +287,30 @@ export function WorkspaceListScreen() {
           ItemSeparatorComponent={WorkspaceListSeparator}
           keyExtractor={(item) => item.workspace.id}
           ListEmptyComponent={<WorkspaceListEmpty onCreate={openCreate} query={query} />}
+          ListFooterComponent={
+            // The empty state carries its own create button, so the row would
+            // only ever be a second one standing under it.
+            rows.length > 0 ? (
+              <NewWorkspaceRow
+                disabled={!canCreate}
+                onPress={() => {
+                  haptics.selection();
+                  openCreate();
+                }}
+              />
+            ) : null
+          }
           onRefresh={() => void refresh()}
           refreshing={manualRefreshing}
           renderItem={renderItem}
           testID="workspace-list"
+        />
+        <ArchivedWorkspacesFooter
+          count={archivedQuery.data?.length ?? 0}
+          onPress={() => {
+            haptics.selection();
+            router.push("/workspaces/archived" as Href);
+          }}
         />
         <CreateWorkspaceDialog
           busy={busy}
@@ -361,7 +375,7 @@ export function WorkspaceListScreen() {
           }}
           workspace={renameTarget}
         />
-        <ChangeWorkspaceIconDialog
+        <ChangeWorkspaceIconSheet
           busy={iconMutation.isPending}
           onDismiss={() => setIconTarget(null)}
           onSave={(choice) => {

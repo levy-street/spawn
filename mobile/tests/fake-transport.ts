@@ -1,4 +1,5 @@
 import type {
+  DisplayControlState,
   ScrollState,
   SessionTransport,
   TransportError,
@@ -16,6 +17,7 @@ type TitleListener = (title: string) => void;
 type BellListener = () => void;
 type ScrollListener = (state: ScrollState) => void;
 type DiagnosticListener = (diagnostic: WorkerDiagnostic) => void;
+type DisplayListener = (display: DisplayControlState) => void;
 
 export class FakeUploadHandle implements UploadHandle {
   readonly result: Promise<UploadResult>;
@@ -108,8 +110,10 @@ export class FakeSessionTransport implements SessionTransport {
   private readonly bellListeners = new Set<BellListener>();
   private readonly scrollListeners = new Set<ScrollListener>();
   private readonly diagnosticListeners = new Set<DiagnosticListener>();
+  private readonly displayListeners = new Set<DisplayListener>();
   readonly writes: Uint8Array[] = [];
   readonly resizes: Array<{ cols: number; rows: number }> = [];
+  takeControlCalls = 0;
   readonly replayRequests: Array<number | undefined> = [];
   readonly uploads: Array<{ request: UploadRequest; handle: FakeUploadHandle }> = [];
   openCalls = 0;
@@ -142,6 +146,10 @@ export class FakeSessionTransport implements SessionTransport {
     this.resizes.push({ cols, rows });
   }
 
+  takeControl(): void {
+    this.takeControlCalls += 1;
+  }
+
   requestReplay(fromOffset?: number): void {
     this.replayRequests.push(fromOffset);
   }
@@ -159,15 +167,17 @@ export class FakeSessionTransport implements SessionTransport {
   on(ev: "bell", fn: BellListener): () => void;
   on(ev: "scroll", fn: ScrollListener): () => void;
   on(ev: "diagnostic", fn: DiagnosticListener): () => void;
+  on(ev: "display", fn: DisplayListener): () => void;
   on(
-    ev: "state" | "error" | "title" | "bell" | "scroll" | "diagnostic",
+    ev: "state" | "error" | "title" | "bell" | "scroll" | "diagnostic" | "display",
     fn:
       | StateListener
       | ErrorListener
       | TitleListener
       | BellListener
       | ScrollListener
-      | DiagnosticListener,
+      | DiagnosticListener
+      | DisplayListener,
   ): () => void {
     switch (ev) {
       case "state":
@@ -182,7 +192,13 @@ export class FakeSessionTransport implements SessionTransport {
         return this.subscribe(this.scrollListeners, fn as ScrollListener);
       case "diagnostic":
         return this.subscribe(this.diagnosticListeners, fn as DiagnosticListener);
+      case "display":
+        return this.subscribe(this.displayListeners, fn as DisplayListener);
     }
+  }
+
+  emitDisplay(display: DisplayControlState): void {
+    for (const listener of this.displayListeners) listener(display);
   }
 
   setState(state: TransportState): void {

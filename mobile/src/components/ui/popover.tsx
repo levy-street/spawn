@@ -186,7 +186,7 @@ export function Popover({
   // Anchor geometry stays in the public contract for existing callers, but every
   // popover now deliberately shares the app's bottom-drawer presentation.
   return (
-    <Sheet enableDynamicSizing onDismiss={onDismiss} testID="popover-content" visible={visible}>
+    <Sheet onDismiss={onDismiss} testID="popover-content" visible={visible}>
       <View
         accessibilityLabel={accessibilityLabel}
         accessibilityRole={interactive ? "menu" : "text"}

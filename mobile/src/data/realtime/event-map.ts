@@ -22,6 +22,11 @@ export function effectsForFrame(frame: RealtimeFrame): CacheEffect[] {
   switch (frame.type) {
     case "alert":
       return [{ kind: "invalidate", key: qk.sessions() }];
+    case "trust":
+      // A knock or its answer changes who may connect, so every cached trust
+      // fact goes at once: the pending list, and each host's verdict on this
+      // device. They all live under the one prefix.
+      return [{ kind: "invalidate", key: qk.trust() }];
     case "alerts.ping":
       return [{ kind: "none", reason: "keepalive only" }];
     case "protocol.required":

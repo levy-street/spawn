@@ -13,6 +13,7 @@ import {
   resolveOnboardingStep,
   setHostSkipped,
 } from "@/components/onboarding/onboarding-state";
+import { DeviceApprovalBody } from "@/components/trust/device-approval-screen";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
@@ -20,6 +21,7 @@ import { Text } from "@/components/ui/text";
 import { getMe } from "@/data/api/endpoints/account";
 import { getAuthConfig } from "@/data/api/endpoints/auth";
 import { listHosts } from "@/data/api/endpoints/hosts";
+import { useDeviceHostApprovals } from "@/data/queries/device-trust";
 import { qk } from "@/data/queryKeys";
 import { borderWidth, chrome, spacing, useTheme } from "@/theme";
 
@@ -76,6 +78,10 @@ export function OnboardingFlow(): React.JSX.Element {
   const meQuery = useQuery({ queryKey: qk.me(), queryFn: getMe });
   const configQuery = useQuery({ queryKey: qk.authConfig(), queryFn: getAuthConfig });
   const hostsQuery = useQuery({ queryKey: qk.hosts(), queryFn: listHosts, refetchInterval: 3000 });
+  const hostIds = (hostsQuery.data ?? []).map((host) => host.id);
+  // Which of those hosts will actually answer this device. Polls live so an
+  // approval made on a laptop finishes setup without restarting it here.
+  const approvals = useDeviceHostApprovals(true);
   const [hostSkipped, setHostSkippedState] = useState<boolean | null>(null);
 
   useEffect(() => {
@@ -95,6 +101,9 @@ export function OnboardingFlow(): React.JSX.Element {
     account: meQuery.data ? { emailVerified: meQuery.data.user.email_verified_at !== null } : null,
     emailVerificationRequired: configQuery.data?.email_verification_required ?? false,
     hostCount: hostsQuery.data?.length ?? 0,
+    // Unknown trust must not gate setup, so an unresolved probe counts as the
+    // optimistic case and the terminal's own preflight catches the rest.
+    deviceTrustedHostCount: approvals.resolved ? approvals.approved.length : hostIds.length,
     hostSkipped: hostSkipped ?? false,
   });
 
@@ -159,14 +168,22 @@ export function OnboardingFlow(): React.JSX.Element {
       />
     );
   } else if (step === "host" && meQuery.data !== undefined) {
-    content = (
-      <HostPairingStep
-        accountId={meQuery.data.user.id}
-        onSkip={() => {
-          void setHostSkipped(true).then(() => setHostSkippedState(true));
-        }}
-      />
-    );
+    // Two different problems wear the same step. With no host at all, the work
+    // is installing spawnd and pairing it. With hosts the account already owns,
+    // the work is getting THIS device admitted to them — a different ceremony
+    // with a different first move, and the one a phone added to an existing
+    // account always lands on.
+    content =
+      hostIds.length > 0 ? (
+        <DeviceApprovalBody />
+      ) : (
+        <HostPairingStep
+          accountId={meQuery.data.user.id}
+          onSkip={() => {
+            void setHostSkipped(true).then(() => setHostSkippedState(true));
+          }}
+        />
+      );
   } else {
     content = (
       <EmptyState

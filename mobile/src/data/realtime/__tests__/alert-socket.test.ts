@@ -92,6 +92,58 @@ describe("parseAlertFrame", () => {
     expect(parseAlertFrame(input)).toBeNull();
   });
 
+  it("parses a device-approval knock and its answer", () => {
+    expect(
+      parseAlertFrame({
+        type: "trust",
+        event: "device.approval_requested",
+        request_id: "req-1",
+        browser_device_id: "dev-1",
+        label: "iPhone",
+        fingerprint: "SHA256:abcdefghijklmnop",
+        at: "2026-08-23T00:00:00Z",
+      }),
+    ).toEqual({
+      type: "trust",
+      event: "device.approval_requested",
+      request_id: "req-1",
+      browser_device_id: "dev-1",
+      label: "iPhone",
+      fingerprint: "SHA256:abcdefghijklmnop",
+      status: null,
+      at: "2026-08-23T00:00:00Z",
+    });
+    expect(
+      parseAlertFrame({
+        type: "trust",
+        event: "device.approval_resolved",
+        request_id: "req-1",
+        browser_device_id: "dev-1",
+        status: "approved",
+      }),
+    ).toMatchObject({ event: "device.approval_resolved", status: "approved" });
+  });
+
+  it.each([
+    { type: "trust", event: "device.exfiltrated", request_id: "r", browser_device_id: "d" },
+    { type: "trust", event: "device.approval_requested", request_id: "", browser_device_id: "d" },
+    { type: "trust", event: "device.approval_requested", request_id: "r" },
+  ])("returns null for a malformed trust frame %#", (input) => {
+    expect(parseAlertFrame(input)).toBeNull();
+  });
+
+  it("drops a status a client would not know how to act on", () => {
+    expect(
+      parseAlertFrame({
+        type: "trust",
+        event: "device.approval_resolved",
+        request_id: "req-1",
+        browser_device_id: "dev-1",
+        status: "elevated",
+      }),
+    ).toMatchObject({ status: null });
+  });
+
   it("preserves web parity by normalizing invalid optional fields", () => {
     expect(
       parseAlertFrame({

@@ -1,7 +1,13 @@
 import type { NativeToWorkerMessage, WorkerToNativeMessage } from "@/terminal/transport/bridge";
 import { decodeBridgeBytes } from "@/terminal/transport/bridge";
 import { createSessionTransport } from "@/terminal/transport/session-transport";
-import type { SignalChannelLike, UploadProgress, WorkerEndpoint } from "@/terminal/transport/types";
+import type {
+  SignalChannelLike,
+  TransportError,
+  TransportState,
+  UploadProgress,
+  WorkerEndpoint,
+} from "@/terminal/transport/types";
 import { SESSION_UPLOAD_CHUNK_BYTES } from "@/terminal/transport/upload";
 import { terminalDark } from "@/theme";
 
@@ -256,5 +262,108 @@ describe("SessionTransport", () => {
     });
     expect(progress.some((value) => value.state === "outcome_unknown")).toBe(true);
     transport.close();
+  });
+});
+
+describe("SessionTransport connect failures", () => {
+  test("names an unapproved device instead of waiting out the watchdog", async () => {
+    const bridge = new FakeBridge();
+    const signal = new FakeSignal();
+    const errors: TransportError[] = [];
+    const states: TransportState[] = [];
+    const transport = createSessionTransport({
+      sessionId: "00112233-4455-6677-8899-aabbccddeeff",
+      hostIdentityPublicKey: "host-key",
+      initialSize: { cols: 80, rows: 24 },
+      theme: terminalDark,
+      bridge,
+      openSignal: () => signal,
+      hostId: "b3ae000c-1da3-4c6c-aeda-23a37ecb01ac",
+      probeTrust: async () => "untrusted",
+    });
+    transport.on("error", (error) => errors.push(error));
+    transport.on("state", (state) => states.push(state));
+    await expect(transport.open()).rejects.toThrow(/has not approved this device/i);
+    expect(errors).toContainEqual(
+      expect.objectContaining({ code: "device_not_trusted", retryable: false }),
+    );
+    expect(states).toContain("failed");
+    transport.close();
+  });
+
+  test("fails a stalled connect on the watchdog rather than spinning forever", async () => {
+    jest.useFakeTimers();
+    try {
+      const bridge = new FakeBridge();
+      const signal = new FakeSignal();
+      const errors: TransportError[] = [];
+      const transport = createSessionTransport({
+        sessionId: "00112233-4455-6677-8899-aabbccddeeff",
+        hostIdentityPublicKey: "host-key",
+        initialSize: { cols: 80, rows: 24 },
+        theme: terminalDark,
+        bridge,
+        openSignal: () => signal,
+        connectTimeoutMs: 1_000,
+      });
+      transport.on("error", (error) => errors.push(error));
+      const opening = transport.open().catch(() => undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+      signal.emit({
+        type: "rtc.config",
+        enabled: true,
+        binding_nonce_required: true,
+        ice_servers: [],
+      });
+      expect(transport.state).toBe("connecting");
+      jest.advanceTimersByTime(1_000);
+      await opening;
+      expect(transport.state).toBe("failed");
+      expect(errors).toContainEqual(
+        expect.objectContaining({ code: "connect_timeout", retryable: false }),
+      );
+      transport.close();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("clears the watchdog once the session is ready", async () => {
+    jest.useFakeTimers();
+    try {
+      const bridge = new FakeBridge();
+      const signal = new FakeSignal();
+      const errors: TransportError[] = [];
+      const transport = createSessionTransport({
+        sessionId: "00112233-4455-6677-8899-aabbccddeeff",
+        hostIdentityPublicKey: "host-key",
+        initialSize: { cols: 80, rows: 24 },
+        theme: terminalDark,
+        bridge,
+        openSignal: () => signal,
+        connectTimeoutMs: 1_000,
+      });
+      transport.on("error", (error) => errors.push(error));
+      const opening = transport.open();
+      await Promise.resolve();
+      await Promise.resolve();
+      signal.emit({
+        type: "rtc.config",
+        enabled: true,
+        binding_nonce_required: true,
+        ice_servers: [],
+      });
+      for (const gate of ["bindingAccepted", "ptyOpen", "ctlOpen", "daemonReady", "historyReady"]) {
+        bridge.emit({ v: 1, type: "state", state: "connecting", gate });
+      }
+      await opening;
+      jest.advanceTimersByTime(10_000);
+      expect(transport.state).toBe("ready");
+      expect(errors).toEqual([]);
+      transport.close();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

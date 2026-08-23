@@ -26,9 +26,6 @@ export interface PaneListProps {
   onOpenTerminal: (sessionId: string) => void;
   onOpenFiles: (hostId: string, path: string) => void;
   onPaneActions: (tile: Tile) => void;
-  onRenameSession: (session: Session) => void;
-  onMovePane: (tile: Tile) => void;
-  onRemovePane: (tile: Tile) => void;
 }
 
 export const PaneList = memo(function PaneList({
@@ -42,9 +39,6 @@ export const PaneList = memo(function PaneList({
   onOpenTerminal,
   onOpenFiles,
   onPaneActions,
-  onRenameSession,
-  onMovePane,
-  onRemovePane,
 }: PaneListProps) {
   const tiles = useMemo(() => readingOrder(tab), [tab]);
 
@@ -58,9 +52,7 @@ export const PaneList = memo(function PaneList({
             hostName={host?.name ?? null}
             hostOnline={host?.status === "online"}
             onActions={() => onPaneActions(tile)}
-            onMove={() => onMovePane(tile)}
             onOpen={() => onOpenFiles(widget.host_id, widget.path)}
-            onRemove={() => onRemovePane(tile)}
             paneId={tile.session_id}
             path={widget.path}
           />
@@ -76,27 +68,13 @@ export const PaneList = memo(function PaneList({
           agents={agents}
           host={hostsById.get(session.host_id) ?? null}
           onActions={() => onPaneActions(tile)}
-          onClose={() => onRemovePane(tile)}
-          onMove={() => onMovePane(tile)}
           onOpen={() => onOpenTerminal(session.id)}
-          onRename={() => onRenameSession(session)}
           session={session}
           transport={transports[session.id] ?? "idle"}
         />
       );
     },
-    [
-      agents,
-      hostsById,
-      onMovePane,
-      onOpenFiles,
-      onOpenTerminal,
-      onPaneActions,
-      onRemovePane,
-      onRenameSession,
-      sessionsById,
-      transports,
-    ],
+    [agents, hostsById, onOpenFiles, onOpenTerminal, onPaneActions, sessionsById, transports],
   );
 
   return (

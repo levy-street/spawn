@@ -52,7 +52,6 @@ export function RenameDialog({
         </>
       }
       onDismiss={onDismiss}
-      showCloseButton={false}
       size="sm"
       title={title}
       visible={visible}

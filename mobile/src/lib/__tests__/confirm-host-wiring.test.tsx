@@ -14,18 +14,24 @@ jest.mock("expo-system-ui", () => ({
   setBackgroundColorAsync: jest.fn(async () => undefined),
 }));
 
-jest.mock("@gorhom/bottom-sheet", () => ({
-  BottomSheetModalProvider: ({ children }: PropsWithChildren) => children,
-}));
-
 jest.mock("react-native-safe-area-context", () => ({
   SafeAreaProvider: ({ children }: PropsWithChildren) => children,
   useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
 }));
 
-jest.mock("react-native-gesture-handler", () => ({
-  GestureHandlerRootView: ({ children }: PropsWithChildren) => children,
-}));
+jest.mock("react-native-gesture-handler", () => {
+  const Native = jest.requireActual("react-native") as typeof import("react-native");
+  const chain: Record<string, unknown> = {};
+  for (const stage of ["maxDistance", "onBegin", "onUpdate", "onEnd", "onFinalize"]) {
+    chain[stage] = () => chain;
+  }
+  return {
+    Gesture: { Pan: () => chain, Tap: () => chain },
+    GestureDetector: ({ children }: PropsWithChildren) => children,
+    GestureHandlerRootView: ({ children }: PropsWithChildren) => children,
+    ScrollView: Native.ScrollView,
+  };
+});
 
 jest.mock("react-native-keyboard-controller", () => ({
   KeyboardProvider: ({ children }: PropsWithChildren) => children,

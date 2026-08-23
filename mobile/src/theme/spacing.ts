@@ -37,6 +37,13 @@ export const radii = {
   lg: 10,
   xl: 12,
   xxl: 16,
+  /**
+   * The physical corner radius of a modern iPhone display. Surfaces that meet a
+   * screen edge — a card mid dismiss-drag, a drawer's foot — use this so their
+   * corners sit concentric with the device rather than cutting across it. iOS
+   * exposes no API for it, so it is a measured constant.
+   */
+  device: 48,
   pill: 9999,
 } as const;
 
@@ -48,6 +55,7 @@ export const radius = {
   lg: radii.lg,
   xl: radii.xl,
   xxl: radii.xxl,
+  device: radii.device,
   full: radii.pill,
 } as const;
 

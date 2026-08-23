@@ -144,12 +144,15 @@ export function Button({
           pressedOpacity: opacity.opaque,
         };
       case "ghost":
+        // Ghost carries the app's icon buttons. A tinted plate appearing under a
+        // bare glyph on press reads as a stray box, so the press dims the content
+        // instead and the ground stays transparent throughout.
         return {
           backgroundColor: "transparent",
           borderColor: "transparent",
           contentColor,
-          pressedBackgroundColor: theme.colors.accent,
-          pressedOpacity: opacity.opaque,
+          pressedBackgroundColor: "transparent",
+          pressedOpacity: opacity.pressedContent,
         };
       case "destructive":
         return {

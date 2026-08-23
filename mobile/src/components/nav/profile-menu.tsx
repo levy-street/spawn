@@ -6,7 +6,7 @@ import { Pressable, StyleSheet, View } from "react-native";
 import { Icon } from "@/components/ui/icon";
 import { ListRow, ListSeparator } from "@/components/ui/list-row";
 import { Monogram } from "@/components/ui/monogram";
-import { Sheet, SheetHeader } from "@/components/ui/sheet";
+import { Sheet } from "@/components/ui/sheet";
 import { logOut } from "@/data/api/endpoints/auth";
 import { useMeQuery } from "@/data/queries/auth";
 import { useConnectionStore } from "@/data/stores/connection";
@@ -23,7 +23,6 @@ export function ProfileMenu(): React.JSX.Element {
   const me = useMeQuery();
   const [visible, setVisible] = useState(false);
   const seed = me.data?.user.email ?? account.accountId ?? "Profile";
-  const sheetTitle = me.data?.user.email ?? "Account";
 
   const signOut = async (): Promise<void> => {
     await logOut().catch(() => undefined);
@@ -50,18 +49,17 @@ export function ProfileMenu(): React.JSX.Element {
         ]}
         testID="profile-menu-trigger"
       >
-        <Monogram seed={seed} size={sizing.appHeader.profileAvatar} />
+        <Monogram seed={seed} size={sizing.appHeader.profileAvatar} variant="brand" />
       </Pressable>
 
-      <Sheet enableDynamicSizing onDismiss={() => setVisible(false)} visible={visible}>
-        <SheetHeader title={sheetTitle} />
+      <Sheet onDismiss={() => setVisible(false)} visible={visible}>
         <View style={styles.sheetContent}>
           <ListRow
             leading={<Icon color="popoverForeground" name="UserRound" />}
             onPress={() => {
               haptics.selection();
               setVisible(false);
-              router.push("/settings/profile");
+              router.push("/profile");
             }}
             shape="fullBleed"
             title="Profile"

@@ -20,6 +20,9 @@ export const sizing = {
     comfortableTouchTarget: 52,
     spinner: 16,
     icon: 20,
+    /** A search field stands taller than a plain control: it is the primary
+     *  target on the screens it heads, and its text needs room to sit centred. */
+    searchField: 48,
     button: {
       sm: 44,
       default: 48,
@@ -53,6 +56,8 @@ export const sizing = {
     trailingTarget: 44,
     /** Where a full-bleed row separator starts, so it clears the leading slot. */
     separatorInset: 16,
+    /** Inset of a row's trailing overflow control from the screen edge. */
+    trailingActionInset: 8,
     /** A separator that runs the full width instead of clearing the leading slot. */
     separatorFullBleed: 0,
   },
@@ -90,6 +95,38 @@ export const sizing = {
     containerPadding: 24,
     containerMinHeight: 200,
   },
+  /** A bottom drawer's action rows: roomier than a plain list row, since a drawer
+   *  is a deliberate stop rather than something you scan past. */
+  actionSheet: {
+    rowMinHeight: 64,
+    verticalPadding: 16,
+    horizontalPadding: 20,
+    icon: 22,
+    /** Clearance between an action's glyph and its label. */
+    iconGap: 16,
+    iconSlot: 24,
+  },
+  /** The drawn connection the terminal shows before it has output: two endpoints,
+   *  a padlock plate, and the channel closing between them. */
+  connectionChannel: {
+    endpoint: 6,
+    lineWidth: 40,
+    lineHeight: 2,
+    /** The travelling highlight that says a half is carrying. */
+    pulseWidth: 16,
+    plate: 36,
+    gap: 10,
+  },
+  sheet: {
+    handleWidth: 36,
+    handleHeight: 4,
+    handleTopPadding: 10,
+    handleGap: 8,
+  },
+  dialog: {
+    /** How far a full-page dialog travels on its way in. */
+    riseDistance: 72,
+  },
   badge: {
     horizontalPadding: 8,
     verticalPadding: 2,
@@ -116,7 +153,7 @@ export const sizing = {
     /** Reserved width either side so a centred title never jitters. */
     sideSlot: 44,
     /** Visible monogram inside the square profile action target. */
-    profileAvatar: 32,
+    profileAvatar: 36,
     subtitleGap: 2,
   },
   bottomNav: {
@@ -127,6 +164,21 @@ export const sizing = {
     itemGap: 2,
     icon: 20,
   },
+  /**
+   * The strip above the keyboard in a terminal. It is a composer, not a control
+   * bar: its plates sit below the standard control height so the strip reads as
+   * a thin edge to the keyboard rather than a second toolbar. Button's own
+   * hit-slop carries each target back out to a comfortable one.
+   */
+  terminalAccessory: {
+    controlHeight: 36,
+    keyMinWidth: 40,
+    keyHorizontalPadding: 10,
+    horizontalPadding: 8,
+    verticalPadding: 5,
+    gap: 6,
+  },
+
   /** A search field docked to the foot of a list screen. */
   searchDock: {
     horizontalPadding: 16,
@@ -167,3 +219,15 @@ export const sizing = {
 } as const;
 
 export type Sizing = typeof sizing;
+
+/**
+ * What the persistent bottom nav occupies at the foot of the window.
+ *
+ * The bar is portalled to window level, so nothing holds its footprint open in
+ * the layout flow — screens reserve it with this. It lives here rather than with
+ * the bar so a layout primitive can read it without importing the navigator and
+ * everything the navigator imports.
+ */
+export function bottomNavHeight(bottomInset: number): number {
+  return sizing.bottomNav.contentHeight + sizing.bottomNav.verticalPadding + bottomInset;
+}

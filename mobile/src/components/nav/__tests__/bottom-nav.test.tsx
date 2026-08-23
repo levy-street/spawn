@@ -4,28 +4,31 @@ import { SafeAreaInsetsContext } from "react-native-safe-area-context";
 
 import {
   BottomNav,
-  type BottomNavTabState,
   bottomNavDestinationForPath,
-  companionTabBackDestination,
   isBottomNavRoute,
 } from "@/components/nav/bottom-nav";
 import { registerNavigationOverlayDismiss } from "@/components/nav/overlay-dismiss";
 import { haptics } from "@/lib/haptics";
 import { borderWidth, ThemeProvider } from "@/theme";
 
+const mockCanDismissRoutes = jest.fn(() => true);
 const mockDismissAllRoutes = jest.fn();
 const mockDismissAllSheets = jest.fn();
 const mockNavigateRoute = jest.fn();
-const mockNavigateTab = jest.fn();
 let mockPathname = "/workspaces";
 
-jest.mock("@gorhom/bottom-sheet", () => ({
-  useBottomSheetModal: () => ({ dismissAll: mockDismissAllSheets }),
+jest.mock("@/components/ui/sheet", () => ({
+  // Read lazily: the factory is hoisted above the const it closes over.
+  dismissAllSheets: () => mockDismissAllSheets(),
 }));
 
 jest.mock("expo-router", () => ({
   usePathname: () => mockPathname,
-  useRouter: () => ({ dismissAll: mockDismissAllRoutes, navigate: mockNavigateRoute }),
+  useRouter: () => ({
+    canDismiss: () => mockCanDismissRoutes(),
+    dismissAll: mockDismissAllRoutes,
+    navigate: mockNavigateRoute,
+  }),
 }));
 
 jest.mock("@/lib/haptics", () => ({
@@ -33,28 +36,19 @@ jest.mock("@/lib/haptics", () => ({
 }));
 
 const INSETS = { bottom: 34, left: 0, right: 0, top: 59 };
-const ROOT_STATE: BottomNavTabState = {
-  index: 0,
-  routes: [
-    { key: "workspaces-key", name: "workspaces" },
-    { key: "hosts-key", name: "hosts" },
-    { key: "settings-key", name: "settings" },
-  ],
-};
-
-function nav(state = ROOT_STATE) {
+function nav() {
   return (
     <SafeAreaInsetsContext.Provider value={INSETS}>
       <ThemeProvider>
-        <BottomNav navigation={{ navigate: mockNavigateTab }} state={state} />
+        <BottomNav />
       </ThemeProvider>
     </SafeAreaInsetsContext.Provider>
   );
 }
 
-function renderNav(pathname: string, state = ROOT_STATE) {
+function renderNav(pathname: string) {
   mockPathname = pathname;
-  return render(nav(state));
+  return render(nav());
 }
 
 describe("BottomNav", () => {
@@ -72,9 +66,6 @@ describe("BottomNav", () => {
     expect(bottomNavDestinationForPath("/host/one/agents")).toBe("/hosts");
     expect(bottomNavDestinationForPath("/admin/users")).toBe("/settings");
     expect(bottomNavDestinationForPath("/terminal/one")).toBeNull();
-    expect(companionTabBackDestination("/host/one")).toBe("/hosts");
-    expect(companionTabBackDestination("/host/one/agents")).toBeNull();
-    expect(companionTabBackDestination("/workspace/one")).toBe("/workspaces");
   });
 
   it("keeps the current destination selected over a pushed screen", async () => {
@@ -88,54 +79,30 @@ describe("BottomNav", () => {
     });
   });
 
-  it("switches tabs without pushing or replacing a route", async () => {
+  // Detail screens are pushed over the tab host now rather than being tabs of
+  // their own, so a nav tap has exactly one behaviour: clear anything covering
+  // the tabs, then focus that destination's root.
+  it("switches tabs by focusing the destination root", async () => {
     const screen = await renderNav("/workspaces");
 
     await fireEvent.press(screen.getByRole("tab", { name: "Settings" }));
 
     expect(haptics.selection).toHaveBeenCalledTimes(1);
     expect(mockDismissAllSheets).toHaveBeenCalledTimes(1);
-    expect(mockNavigateTab).toHaveBeenCalledWith("settings", undefined);
-    expect(mockNavigateRoute).not.toHaveBeenCalled();
-    expect(mockDismissAllRoutes).not.toHaveBeenCalled();
+    expect(mockNavigateRoute).toHaveBeenCalledWith("/settings");
   });
 
-  it("returns to the retained companion tab and its nested stack", async () => {
-    const hostState: BottomNavTabState = {
-      index: 1,
-      routes: [
-        { key: "workspaces-key", name: "workspaces" },
-        { key: "host-key", name: "host", params: { screen: "[id]", id: "host-one" } },
-        { key: "settings-key", name: "settings" },
-      ],
-    };
-    const screen = await renderNav("/host/host-one", hostState);
+  it("pops a pushed screen before landing on the root", async () => {
+    const screen = await renderNav("/host/one");
 
-    mockPathname = "/workspaces";
-    await screen.rerender(nav(ROOT_STATE));
     await fireEvent.press(screen.getByRole("tab", { name: "Hosts" }));
-
-    expect(mockNavigateTab).toHaveBeenCalledWith("host", {
-      screen: "[id]",
-      id: "host-one",
-    });
-  });
-
-  it("pops overlays and lands on the root when the active tab is tapped", async () => {
-    const screen = await renderNav("/settings/profile", {
-      ...ROOT_STATE,
-      index: 2,
-    });
-
-    await fireEvent.press(screen.getByRole("tab", { name: "Settings" }));
 
     expect(mockDismissAllSheets).toHaveBeenCalledTimes(1);
     expect(mockDismissAllRoutes).toHaveBeenCalledTimes(1);
-    expect(mockNavigateRoute).toHaveBeenCalledWith("/settings");
-    expect(mockNavigateTab).not.toHaveBeenCalled();
+    expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts");
   });
 
-  it("closes registered overlays before landing on a different destination root", async () => {
+  it("closes registered overlays before landing on a destination root", async () => {
     const onDismiss = jest.fn();
     const unregister = registerNavigationOverlayDismiss(onDismiss);
     const screen = await renderNav("/workspaces");
@@ -145,8 +112,19 @@ describe("BottomNav", () => {
     expect(onDismiss).toHaveBeenCalledTimes(1);
     expect(mockDismissAllRoutes).toHaveBeenCalledTimes(1);
     expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts");
-    expect(mockNavigateTab).not.toHaveBeenCalled();
     unregister();
+  });
+
+  it("leaves the stack alone when there is nothing above the roots", async () => {
+    // Dispatching a pop with nothing to pop is an unhandled action, which React
+    // Navigation reports — on every single nav tap.
+    mockCanDismissRoutes.mockReturnValueOnce(false);
+    const screen = await renderNav("/workspaces");
+
+    await fireEvent.press(screen.getByRole("tab", { name: "Hosts" }));
+
+    expect(mockDismissAllRoutes).not.toHaveBeenCalled();
+    expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts");
   });
 
   it("owns its bottom safe-area inset and top hairline", async () => {

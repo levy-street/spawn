@@ -2,7 +2,9 @@ import { type ReactNode, useContext } from "react";
 import { StyleSheet, View } from "react-native";
 import { SafeAreaInsetsContext } from "react-native-safe-area-context";
 
+import { useBottomChromeOwnsInset } from "@/components/layout/bottom-chrome";
 import { spacing } from "@/theme";
+import { bottomNavHeight } from "@/theme/sizing";
 
 export interface ScreenProps {
   children: ReactNode;
@@ -27,9 +29,18 @@ export function Screen({
     top: spacing[0],
   };
   const gutter = padded ? spacing[4] : spacing[0];
+  // Persistent bottom chrome reserves and paints the device inset itself, so a
+  // screen above it adds only its own breathing room — or none at all when it
+  // runs edge to edge and should meet the bar's border directly.
+  const bottomChromeOwnsInset = useBottomChromeOwnsInset();
+  // The bar is portalled to window level, so nothing holds its footprint open in
+  // the layout flow but this. It already paints the device inset, so the screen
+  // must not add that inset again on top.
+  const restingBottomInset = bottomChromeOwnsInset
+    ? bottomNavHeight(insets.bottom) + gutter
+    : Math.max(spacing[6], insets.bottom + spacing[4]);
   const contentInsets = {
-    paddingBottom:
-      footer === undefined ? Math.max(spacing[6], insets.bottom + spacing[4]) : spacing[0],
+    paddingBottom: footer === undefined ? restingBottomInset : spacing[0],
     paddingLeft: insets.left + gutter,
     paddingRight: insets.right + gutter,
     paddingTop: header === undefined ? insets.top : spacing[0],

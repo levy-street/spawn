@@ -76,7 +76,6 @@ export function RenameHostDialog({
         </>
       }
       onDismiss={onCancel}
-      showCloseButton={false}
       size="sm"
       title="Host name"
       visible={visible}

@@ -3,12 +3,10 @@ import { useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppHeader, type AppHeaderAction } from "@/components/layout/app-header";
-import { ConnectionChip } from "@/components/terminal-ui/connection-status";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { NativePopover, type NativePopoverProps } from "@/components/ui/native-popover";
-import type { TransportState } from "@/terminal/transport/types";
 import { useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
@@ -29,7 +27,6 @@ export interface TerminalHeaderProps {
   title: string;
   hostName: string;
   foregroundCommand: string | null;
-  connectionState: TransportState;
   onBack: () => void;
   onRename: (name: string) => Promise<void>;
   onRestart: () => void;
@@ -39,13 +36,14 @@ export interface TerminalHeaderProps {
   onFontSize: () => void;
   onCopyMode: () => void;
   onDiagnostics: () => void;
+  /** Reported so the screen can stand the keyboard down under the menu. */
+  onMenuVisibilityChange?: (visible: boolean) => void;
 }
 
 export function TerminalHeader({
   title,
   hostName,
   foregroundCommand,
-  connectionState,
   onBack,
   onRename,
   onRestart,
@@ -55,6 +53,7 @@ export function TerminalHeader({
   onFontSize,
   onCopyMode,
   onDiagnostics,
+  onMenuVisibilityChange,
 }: TerminalHeaderProps): React.JSX.Element {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
@@ -64,6 +63,11 @@ export function TerminalHeader({
   const [draftName, setDraftName] = useState(title);
   const [saving, setSaving] = useState(false);
   const agent = inferAgentPresentation(foregroundCommand);
+
+  const showMenu = (visible: boolean): void => {
+    setMenuVisible(visible);
+    onMenuVisibilityChange?.(visible);
+  };
 
   const beginRename = (): void => {
     setDraftName(title);
@@ -119,7 +123,7 @@ export function TerminalHeader({
     {
       accessibilityLabel: "Terminal actions",
       icon: "Ellipsis",
-      onPress: () => setMenuVisible(true),
+      onPress: () => showMenu(true),
       testID: "terminal-header-menu-button",
     },
   ];
@@ -127,7 +131,6 @@ export function TerminalHeader({
   return (
     <>
       <AppHeader
-        accessory={<ConnectionChip state={connectionState} />}
         actions={actions}
         onBack={onBack}
         subtitle={`${agent.label} · ${hostName}`}
@@ -137,7 +140,7 @@ export function TerminalHeader({
       <NativePopover
         anchor={actionAnchor}
         items={items}
-        onDismiss={() => setMenuVisible(false)}
+        onDismiss={() => showMenu(false)}
         visible={menuVisible}
       />
       <Dialog
@@ -164,7 +167,6 @@ export function TerminalHeader({
         onDismiss={() => {
           if (!saving) setRenaming(false);
         }}
-        showCloseButton={false}
         size="sm"
         title="Rename session"
         visible={renaming}

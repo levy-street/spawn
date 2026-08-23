@@ -1,14 +1,13 @@
-import { Tabs, usePathname, useRouter } from "expo-router";
+import { Stack, usePathname, useRouter } from "expo-router";
 import type { ReactNode } from "react";
 
 import { AdminAccessBoundary, resolveAdminAccess } from "@/components/admin/admin-access";
 import { AppHeaderLeadingProvider } from "@/components/layout/app-header";
-import {
-  companionTabBackDestination,
-  isBottomNavRoute,
-  PersistentBottomNav,
-} from "@/components/nav/bottom-nav";
+import { BottomChromeProvider } from "@/components/layout/bottom-chrome";
+import { PersistentBottomNav } from "@/components/nav/bottom-nav";
+import { ROUNDED_CARD_GESTURE_OPTIONS } from "@/components/nav/navigation-options";
 import { ProfileMenu } from "@/components/nav/profile-menu";
+import { DeviceApprovalPrompt } from "@/components/trust/device-approval-prompt";
 import { useMeQuery } from "@/data/queries/auth";
 import { useAuthenticatedAccount } from "@/lib/auth-gate";
 import { useTheme } from "@/theme";
@@ -29,6 +28,8 @@ export const APP_ROUTE_MAP = {
   "/host/[id]/agents": "host/[id]/agents",
   "/host/[id]/files": "host/[id]/files",
   "/legion": "legion",
+  "/profile": "profile",
+  "/device-approval": "device-approval",
   "/settings": "settings/index",
   "/settings/account": "settings/account",
   "/settings/appearance": "settings/appearance",
@@ -39,7 +40,6 @@ export const APP_ROUTE_MAP = {
   "/settings/templates": "settings/templates",
   "/settings/devices": "settings/devices",
   "/settings/trust": "settings/trust",
-  "/settings/profile": "settings/profile",
   "/settings/server": "settings/server",
   "/settings/about": "settings/about",
   "/admin": "admin/index",
@@ -60,7 +60,11 @@ function AdminRouteBoundary({ children }: { children: ReactNode }): React.JSX.El
   return (
     <AdminAccessBoundary
       errorMessage={me.error instanceof Error ? me.error.message : undefined}
-      onBack={() => router.replace("/settings")}
+      // Admin sits on a card pushed over the tabs, so a refusal pops back to
+      // wherever it was opened from rather than jumping to a hardcoded root.
+      onBack={() => {
+        if (router.canGoBack()) router.back();
+      }}
       onRetry={() => void me.refetch()}
       state={state}
     >
@@ -72,55 +76,45 @@ function AdminRouteBoundary({ children }: { children: ReactNode }): React.JSX.El
 export default function AppStackLayout(): React.JSX.Element | null {
   const theme = useTheme();
   const account = useAuthenticatedAccount();
-  const pathname = usePathname();
-  const router = useRouter();
 
   if (!account.ready) return null;
 
-  const showRootNavigation = isBottomNavRoute(pathname);
-  const companionBackDestination = companionTabBackDestination(pathname);
-
   return (
     <AdminRouteBoundary>
-      <AppHeaderLeadingProvider
-        {...(companionBackDestination === null
-          ? {}
-          : { backOverride: () => router.navigate(companionBackDestination) })}
-        leading={showRootNavigation ? <ProfileMenu /> : null}
-      >
-        <Tabs
-          backBehavior="none"
-          initialRouteName="workspaces"
-          screenOptions={{
-            animation: "none",
-            headerShown: false,
-            popToTopOnBlur: false,
-            sceneStyle: { backgroundColor: theme.colors.background },
-          }}
-          tabBar={({ navigation, state }) => (
-            <PersistentBottomNav
-              navigation={{
-                navigate: (name, params) => navigation.navigate(name, params),
-              }}
-              state={{
-                index: state.index,
-                routes: state.routes.map((route) => ({
-                  key: route.key,
-                  name: route.name,
-                  ...(route.params === undefined ? {} : { params: route.params }),
-                })),
-              }}
-            />
-          )}
-        >
-          <Tabs.Screen name="workspaces" />
-          <Tabs.Screen name="workspace" />
-          <Tabs.Screen name="hosts" />
-          <Tabs.Screen name="host" />
-          <Tabs.Screen name="legion" />
-          <Tabs.Screen name="settings" />
-          <Tabs.Screen name="admin" />
-        </Tabs>
+      <AppHeaderLeadingProvider leading={<ProfileMenu />}>
+        <BottomChromeProvider>
+          <Stack
+            screenOptions={{
+              ...ROUNDED_CARD_GESTURE_OPTIONS,
+              contentStyle: {
+                backgroundColor: theme.colors.background,
+                borderRadius: theme.radii.device,
+                overflow: "hidden",
+              },
+              headerShown: false,
+            }}
+          >
+            {/* The tab host itself never slides: it is the ground everything else
+              is pushed over, so animating it would animate the whole app. */}
+            <Stack.Screen name="(tabs)" options={{ animation: "none", gestureEnabled: false }} />
+            <Stack.Screen name="workspace/[id]" />
+            <Stack.Screen name="host/[id]/index" />
+            <Stack.Screen name="host/[id]/agents" />
+            <Stack.Screen name="host/[id]/files" />
+            <Stack.Screen name="legion" />
+            <Stack.Screen name="profile" />
+            <Stack.Screen name="device-approval" />
+            <Stack.Screen name="admin/index" />
+            <Stack.Screen name="admin/invites" />
+            <Stack.Screen name="admin/users" />
+            <Stack.Screen name="admin/emails" />
+          </Stack>
+          {/* One mount for the whole signed-in app: the bar has to outlive any card
+            pushed over the tabs, and a device knocking has to be seen wherever the
+            operator happens to be, not on one screen. */}
+          <PersistentBottomNav />
+          <DeviceApprovalPrompt />
+        </BottomChromeProvider>
       </AppHeaderLeadingProvider>
     </AdminRouteBoundary>
   );

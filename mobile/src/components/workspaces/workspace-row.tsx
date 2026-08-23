@@ -11,7 +11,7 @@ import { WorkspaceIcon } from "@/components/workspaces/workspace-icon";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import type { WorkspaceStats } from "@/data/types/domain";
 import { haptics } from "@/lib/haptics";
-import { opacity, useTheme } from "@/theme";
+import { opacity } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
 export interface WorkspaceRowProps {
@@ -52,7 +52,6 @@ export function WorkspaceRow({
   onUnarchive,
   onDelete,
 }: WorkspaceRowProps) {
-  const theme = useTheme();
   const anchorRef = useRef<View>(null);
   const [menuVisible, setMenuVisible] = useState(false);
   const archived = workspace.archived_at !== null;
@@ -215,10 +214,9 @@ export function WorkspaceRow({
                   }}
                   style={({ pressed }) => [
                     styles.more,
-                    {
-                      backgroundColor: pressed ? theme.colors.accent : "transparent",
-                      borderRadius: theme.radii.md,
-                    },
+                    // A tinted plate appearing under a bare glyph reads as a stray
+                    // box, so the press dims the glyph the way every icon button does.
+                    { opacity: pressed ? opacity.pressedContent : opacity.opaque },
                   ]}
                 >
                   <Icon color="mutedForeground" name="MoreHorizontal" size={sizing.control.icon} />

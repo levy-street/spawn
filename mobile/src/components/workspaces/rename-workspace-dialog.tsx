@@ -58,7 +58,6 @@ export function RenameWorkspaceDialog({
     <Dialog
       footer={footer}
       onDismiss={onDismiss}
-      showCloseButton={false}
       size="sm"
       title="Rename workspace"
       visible={workspace !== null}

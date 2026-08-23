@@ -1,4 +1,3 @@
-import { useRouter } from "expo-router";
 import { useMemo } from "react";
 
 import { AppHeader, type AppHeaderAction } from "@/components/layout/app-header";
@@ -12,7 +11,8 @@ export function WorkspaceListHeader({
   canCreate,
   onCreate,
 }: WorkspaceListHeaderProps): React.JSX.Element {
-  const router = useRouter();
+  // Hosts and Settings are reached from the persistent tab bar and nowhere else,
+  // so this header carries only what is specific to the workspace list.
   const actions = useMemo<readonly AppHeaderAction[]>(
     () => [
       {
@@ -22,18 +22,8 @@ export function WorkspaceListHeader({
         onPress: onCreate,
         testID: "new-workspace-button",
       },
-      {
-        accessibilityLabel: "Open hosts",
-        icon: "Server",
-        onPress: () => router.push("/hosts"),
-      },
-      {
-        accessibilityLabel: "Open settings",
-        icon: "Settings",
-        onPress: () => router.push("/settings"),
-      },
     ],
-    [canCreate, onCreate, router],
+    [canCreate, onCreate],
   );
 
   return <AppHeader actions={actions} testID="workspace-list-header" title="Workspaces" />;

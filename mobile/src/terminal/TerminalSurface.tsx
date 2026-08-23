@@ -9,6 +9,7 @@ import {
   type ViewStyle,
 } from "react-native";
 import WebView, { type WebViewMessageEvent } from "react-native-webview";
+import { createKeyboardFitGate } from "@/components/terminal-ui/keyboard-fit-gate";
 import {
   BridgeProtocolError,
   TERMINAL_BRIDGE_VERSION,
@@ -17,6 +18,7 @@ import {
 } from "@/terminal/transport/bridge";
 import { createSessionTransport } from "@/terminal/transport/session-transport";
 import type {
+  DisplayControlState,
   SessionTransport,
   SessionTransportOptions,
   TransportError,
@@ -41,6 +43,7 @@ export interface TerminalSurfaceHandle {
   setFontSize(px: number): void;
   copySelection(): Promise<string | null>;
   search(q: string, dir: "next" | "prev"): void;
+  takeControl(): void;
 }
 
 export interface TerminalSurfaceProps extends Omit<SessionTransportOptions, "bridge" | "theme"> {
@@ -50,6 +53,7 @@ export interface TerminalSurfaceProps extends Omit<SessionTransportOptions, "bri
   onError?(error: TransportError): void;
   onDiagnostic?(diagnostic: WorkerDiagnostic): void;
   onTitleChange?(title: string): void;
+  onDisplayChange?(display: DisplayControlState): void;
   onBell?(): void;
   onLink?(url: string): void;
   onContentProcessTerminated?(): void;
@@ -69,12 +73,14 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       fontSize,
       forceRelay,
       openSignal,
+      hostId,
       style,
       onTransport,
       onStateChange,
       onError,
       onDiagnostic,
       onTitleChange,
+      onDisplayChange,
       onBell,
       onLink,
       onContentProcessTerminated,
@@ -85,11 +91,8 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
     const webViewRef = useRef<WebView>(null);
     const bridge = useMemo(() => new WorkerBridge(), []);
     const initialTheme = useRef(theme.terminal);
-    const fitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const workerLoaded = useRef(false);
     const retiredForBackground = useRef(false);
-    const keyboardTransitioning = useRef(false);
-    const pendingFit = useRef(false);
     const selectionSequence = useRef(0);
     const selectionWaiters = useRef(new Map<string, SelectionWaiter>());
     const callbacks = useRef({
@@ -98,6 +101,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       onError,
       onDiagnostic,
       onTitleChange,
+      onDisplayChange,
       onBell,
       onLink,
       onContentProcessTerminated,
@@ -108,6 +112,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       onError,
       onDiagnostic,
       onTitleChange,
+      onDisplayChange,
       onBell,
       onLink,
       onContentProcessTerminated,
@@ -124,11 +129,13 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
           ...(fontSize === undefined ? {} : { fontSize }),
           ...(forceRelay === undefined ? {} : { forceRelay }),
           ...(openSignal === undefined ? {} : { openSignal }),
+          ...(hostId === undefined ? {} : { hostId }),
         }),
       [
         bridge,
         fontSize,
         forceRelay,
+        hostId,
         hostIdentityPublicKey,
         initialSize.cols,
         initialSize.rows,
@@ -152,17 +159,19 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       [bridge],
     );
 
-    const fitAfterLayout = useCallback((): void => {
-      pendingFit.current = true;
-      if (keyboardTransitioning.current) return;
-      if (fitTimer.current) clearTimeout(fitTimer.current);
-      fitTimer.current = setTimeout(() => {
-        fitTimer.current = null;
-        if (!pendingFit.current) return;
-        pendingFit.current = false;
-        send({ v: TERMINAL_BRIDGE_VERSION, type: "fit" });
-      }, theme.motion.duration.fast);
-    }, [send, theme.motion.duration.fast]);
+    // The worker refits itself off a ResizeObserver, which is the authority on
+    // its own frame. This gate exists for the one thing the observer cannot see
+    // coming: a keyboard transition, where refitting mid-animation churns the
+    // PTY geometry on every intermediate frame.
+    const fitGate = useMemo(
+      () =>
+        createKeyboardFitGate(
+          () => send({ v: TERMINAL_BRIDGE_VERSION, type: "fit" }),
+          theme.motion.duration.fast,
+        ),
+      [send, theme.motion.duration.fast],
+    );
+    useEffect(() => () => fitGate.dispose(), [fitGate]);
 
     useEffect(() => {
       const detach = bridge.attach((raw) => webViewRef.current?.postMessage(raw));
@@ -176,6 +185,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
         transport.on("error", (error) => callbacks.current.onError?.(error)),
         transport.on("diagnostic", (diagnostic) => callbacks.current.onDiagnostic?.(diagnostic)),
         transport.on("title", (title) => callbacks.current.onTitleChange?.(title)),
+        transport.on("display", (display) => callbacks.current.onDisplayChange?.(display)),
         transport.on("bell", () => callbacks.current.onBell?.()),
       ];
       return () => {
@@ -215,14 +225,10 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
     }, [send, theme.terminal]);
 
     useEffect(() => {
-      const start = (): void => {
-        keyboardTransitioning.current = true;
-        if (fitTimer.current) clearTimeout(fitTimer.current);
-        fitTimer.current = null;
-      };
+      const start = (): void => fitGate.beginTransition();
       const finish = (): void => {
-        keyboardTransitioning.current = false;
-        fitAfterLayout();
+        fitGate.requestFit();
+        fitGate.endTransition();
       };
       const subscriptions = [
         Keyboard.addListener("keyboardWillShow", start),
@@ -232,9 +238,8 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       ];
       return () => {
         for (const subscription of subscriptions) subscription.remove();
-        if (fitTimer.current) clearTimeout(fitTimer.current);
       };
-    }, [fitAfterLayout]);
+    }, [fitGate]);
 
     const handleSurfaceMessage = useCallback(
       async (message: WorkerToNativeMessage): Promise<void> => {
@@ -318,6 +323,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
             query,
             direction,
           }),
+        takeControl: () => send({ v: TERMINAL_BRIDGE_VERSION, type: "take-control" }),
       }),
       [send, theme.motion.duration.toastInfo, transport],
     );
@@ -376,7 +382,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
         }}
         onMessage={handleMessage}
         onLoad={handleLoad}
-        onLayout={fitAfterLayout}
+        onLayout={() => fitGate.requestFit()}
         onContentProcessDidTerminate={() => {
           workerLoaded.current = false;
           transport.close();

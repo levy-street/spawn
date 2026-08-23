@@ -1,3 +1,4 @@
+import type { DeviceHostTrust } from "@/data/trust/device-trust";
 import type { TerminalTheme } from "@/theme";
 
 export type TransportState =
@@ -22,6 +23,18 @@ export interface ScrollState {
   baseY: number;
   buffer: "normal" | "alternate";
   newOutputWhileAway: boolean;
+}
+
+/**
+ * Who owns the shared PTY geometry. Several viewers can watch one session, but
+ * only the owner's grid sizes it — a follower that resizes anyway is refused,
+ * and every row it draws is written for a terminal it does not have.
+ */
+export interface DisplayControlState {
+  owner: boolean;
+  viewers: number;
+  cols: number | null;
+  rows: number | null;
 }
 
 export interface WorkerDiagnostic {
@@ -106,6 +119,11 @@ export interface SessionTransportOptions {
   fontSize?: number;
   forceRelay?: boolean;
   openSignal?: (sessionId: string) => SignalChannelLike;
+  /** Enables the trust preflight; without it an unapproved device only learns from the watchdog. */
+  hostId?: string;
+  probeTrust?: (hostId: string) => Promise<DeviceHostTrust>;
+  /** Defaults to {@link CONNECT_TIMEOUT_MS}; lower values support deterministic tests. */
+  connectTimeoutMs?: number;
 }
 
 export interface SessionTransport {
@@ -115,6 +133,8 @@ export interface SessionTransport {
   close(): void;
   write(bytes: Uint8Array): void;
   resize(cols: number, rows: number): void;
+  /** Claims the shared display so this viewer's grid sizes the PTY. */
+  takeControl(): void;
   requestReplay(fromOffset?: number): void;
   upload(file: UploadRequest): UploadHandle;
   on(ev: "state", fn: (s: TransportState) => void): () => void;
@@ -123,6 +143,7 @@ export interface SessionTransport {
   on(ev: "bell", fn: () => void): () => void;
   on(ev: "scroll", fn: (s: ScrollState) => void): () => void;
   on(ev: "diagnostic", fn: (d: WorkerDiagnostic) => void): () => void;
+  on(ev: "display", fn: (d: DisplayControlState) => void): () => void;
 }
 
 export interface HostControlError {
@@ -241,6 +262,9 @@ export interface HostTransportOptions {
   openSignal?: (hostId: string) => SignalChannelLike;
   /** Defaults to the protocol maximum of 60 seconds; lower values support deterministic tests. */
   streamTimeoutMs?: number;
+  probeTrust?: (hostId: string) => Promise<DeviceHostTrust>;
+  /** Defaults to {@link CONNECT_TIMEOUT_MS}; lower values support deterministic tests. */
+  connectTimeoutMs?: number;
 }
 
 export interface HostTransport {

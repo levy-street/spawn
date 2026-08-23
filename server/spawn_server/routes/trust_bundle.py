@@ -9,7 +9,7 @@ serve at all.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, select, update
@@ -21,7 +21,20 @@ from .. import auth, schemas
 from ..browser_endorsement import verify_browser_endorsement_proof
 from ..db import get_session
 from ..host_identity import ed25519_key_fingerprint
-from ..models import BrowserDevice, Host, HostBrowserPin, PasskeyCredential, TrustBundle, User
+from ..models import (
+    BrowserDevice,
+    DeviceApprovalRequest,
+    Host,
+    HostBrowserPin,
+    PasskeyCredential,
+    TrustBundle,
+    User,
+)
+from ..trust_events import (
+    approval_requested_payload,
+    approval_resolved_payload,
+    publish_trust_event,
+)
 from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/trust", tags=["trust"])
@@ -30,6 +43,10 @@ router = APIRouter(prefix="/api/trust", tags=["trust"])
 # while leaving generous headroom for a legitimate one.
 MAX_SEALED_BYTES = 256 * 1024
 MAX_PASSKEYS_PER_ACCOUNT = 32
+
+#: How long a knock stays live. Long enough to walk to another machine, short
+#: enough that a request nobody answered stops nagging every device that opens.
+APPROVAL_REQUEST_TTL = timedelta(minutes=30)
 
 
 @router.get("/bundle", response_model=schemas.TrustBundleOut | None)
@@ -337,7 +354,18 @@ async def create_browser_endorsement(
     created_at = datetime.now(UTC)
     existing = await session.get(HostBrowserPin, (host.id, endorsed.id))
     if existing is not None:
-        # Idempotent: re-endorsing an already-admitted device is a retry.
+        # Idempotent: re-endorsing an already-admitted device is a retry. The
+        # knock still closes, or a device admitted between the request and the
+        # retry would keep prompting every screen on the account.
+        resolved = await _resolve_pending_requests(
+            session, user_id, endorsed.id, "approved", endorser.id
+        )
+        if resolved:
+            await session.commit()
+            for request_id in resolved:
+                await publish_trust_event(
+                    user_id, approval_resolved_payload(request_id, endorsed.id, "approved")
+                )
         return schemas.BrowserEndorsementOut(
             host_id=host.id,
             endorsed_device_id=endorsed.id,
@@ -370,11 +398,22 @@ async def create_browser_endorsement(
             created_at=created_at,
         )
     )
+    # The knock and the pin are resolved in one transaction: an endorsement is
+    # exactly the answer the request was waiting for, whether it came from this
+    # prompt or from the Devices panel as before.
+    resolved = await _resolve_pending_requests(
+        session, user_id, endorsed.id, "approved", endorser.id
+    )
     try:
         await session.commit()
     except IntegrityError:
         await session.rollback()
         raise HTTPException(status_code=409, detail="endorsement could not be stored") from None
+
+    for request_id in resolved:
+        await publish_trust_event(
+            user_id, approval_resolved_payload(request_id, endorsed.id, "approved")
+        )
 
     # Nudge the daemon so the endorsement applies now rather than whenever it
     # next reconnects. Failure is fine: registration reconciles regardless.
@@ -387,6 +426,157 @@ async def create_browser_endorsement(
         endorser_device_id=body.endorser_device_id,
         created_at=created_at,
     )
+
+
+async def _resolve_pending_requests(
+    session: AsyncSession,
+    user_id: str,
+    browser_device_id: str,
+    status: str,
+    resolved_by_device_id: str | None,
+) -> list[str]:
+    """Close out any live knock from this device and report which ones closed."""
+    now = datetime.now(UTC)
+    rows = (
+        (
+            await session.execute(
+                select(DeviceApprovalRequest).where(
+                    DeviceApprovalRequest.owner_user_id == user_id,
+                    DeviceApprovalRequest.browser_device_id == browser_device_id,
+                    DeviceApprovalRequest.status == "pending",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        row.status = status
+        row.resolved_at = now
+        row.resolved_by_device_id = resolved_by_device_id
+    return [row.id for row in rows]
+
+
+def _approval_out(
+    row: DeviceApprovalRequest, device: BrowserDevice
+) -> schemas.DeviceApprovalRequestOut:
+    return schemas.DeviceApprovalRequestOut(
+        id=row.id,
+        browser_device_id=device.id,
+        label=device.label,
+        fingerprint=ed25519_key_fingerprint(device.public_key),
+        status=row.status,
+        created_at=row.created_at,
+        expires_at=row.expires_at,
+    )
+
+
+@router.post("/device-approvals", response_model=schemas.DeviceApprovalRequestOut)
+async def request_device_approval(
+    body: schemas.DeviceApprovalRequestCreate,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.DeviceApprovalRequestOut:
+    """Raise (or refresh) this device's knock.
+
+    Deliberately unsigned. The caller is already the account owner, the device
+    must already be registered under that account by a signed registration, and
+    the row grants nothing on its own — the pin still comes from an endorsement
+    signed on a device the host trusts. Requiring a second signature here would
+    add a transcript to maintain and stop nothing.
+    """
+    device = await session.get(BrowserDevice, body.browser_device_id)
+    if device is None or device.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="browser device not found")
+    if device.revoked_at is not None:
+        raise HTTPException(status_code=409, detail="revoked devices cannot request approval")
+
+    now = datetime.now(UTC)
+    existing = (
+        await session.execute(
+            select(DeviceApprovalRequest).where(
+                DeviceApprovalRequest.browser_device_id == device.id,
+                DeviceApprovalRequest.status == "pending",
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        # Re-asking extends the same knock rather than minting a second one, so
+        # a device that reopens the app does not stack prompts elsewhere.
+        existing.expires_at = now + APPROVAL_REQUEST_TTL
+        row = existing
+    else:
+        row = DeviceApprovalRequest(
+            owner_user_id=user.id,
+            browser_device_id=device.id,
+            status="pending",
+            created_at=now,
+            expires_at=now + APPROVAL_REQUEST_TTL,
+        )
+        session.add(row)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="approval request already exists") from None
+
+    out = _approval_out(row, device)
+    await publish_trust_event(
+        user.id,
+        approval_requested_payload(row.id, device.id, device.label, out.fingerprint),
+    )
+    return out
+
+
+@router.get("/device-approvals", response_model=list[schemas.DeviceApprovalRequestOut])
+async def list_device_approvals(
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[schemas.DeviceApprovalRequestOut]:
+    """Live knocks, so a device that opens later still offers the ceremony."""
+    now = datetime.now(UTC)
+    rows = (
+        (
+            await session.execute(
+                select(DeviceApprovalRequest, BrowserDevice)
+                .join(BrowserDevice, BrowserDevice.id == DeviceApprovalRequest.browser_device_id)
+                .where(
+                    DeviceApprovalRequest.owner_user_id == user.id,
+                    DeviceApprovalRequest.status == "pending",
+                    DeviceApprovalRequest.expires_at > now,
+                    BrowserDevice.revoked_at.is_(None),
+                )
+                .order_by(DeviceApprovalRequest.created_at)
+            )
+        )
+        .all()
+    )
+    return [_approval_out(row, device) for row, device in rows]
+
+
+@router.post(
+    "/device-approvals/{request_id}/deny", response_model=schemas.DeviceApprovalRequestOut
+)
+async def deny_device_approval(
+    request_id: str,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.DeviceApprovalRequestOut:
+    """Dismiss a knock. Denial is not a revocation: it closes this request only."""
+    row = await session.get(DeviceApprovalRequest, request_id)
+    if row is None or row.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="approval request not found")
+    device = await session.get(BrowserDevice, row.browser_device_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="approval request not found")
+    if row.status == "pending":
+        row.status = "denied"
+        row.resolved_at = datetime.now(UTC)
+        await session.commit()
+        await publish_trust_event(
+            user.id, approval_resolved_payload(row.id, device.id, "denied")
+        )
+    return _approval_out(row, device)
 
 
 @router.get("/hosts/{host_id}/pins", response_model=list[str])

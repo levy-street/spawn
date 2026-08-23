@@ -122,9 +122,10 @@ describe("TerminalRow", () => {
     expect(displayStatus).toHaveBeenCalledWith(session, host, "idle");
     expect(screen.getByText("Composed status")).toBeTruthy();
     expect(screen.queryByText(/Users\/spawn\/dev\/spawn/)).toBeNull();
-    expect(screen.getByTestId("terminal-swipe-session-1-content")).toHaveStyle({
-      backgroundColor: "transparent",
-    });
+    // Round 7 removed the swipe layer — rename, move and close live in the ...
+    // menu — so the row renders its own frame directly.
+    expect(screen.queryByTestId("terminal-swipe-session-1-content")).toBeNull();
+    expect(screen.getByTestId("terminal-row-session-1")).toBeTruthy();
     expect(screen.getByLabelText("Implement mobile, Codex · office-mac")).toHaveStyle({
       minHeight: sizing.listRow.regular,
       paddingHorizontal: sizing.listRow.horizontalPadding,

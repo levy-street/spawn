@@ -94,6 +94,7 @@ export const SearchField = forwardRef<TextInput, SearchFieldProps>(function Sear
       editable={editable}
       accessibilityLabel={accessibilityLabel ?? placeholder ?? "Search"}
       containerStyle={[
+        !isSidebar && styles.container,
         isSidebar && styles.sidebarContainer,
         isSidebar && {
           backgroundColor: colorWithAlpha(theme.colors.muted, alpha.a50),
@@ -144,8 +145,14 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     width: spacing[6],
   },
+  container: {
+    height: sizing.control.searchField,
+  },
   input: {
-    lineHeight: sizing.type.componentLabel.lineHeight,
+    // No lineHeight: iOS lays a single-line TextInput out from the top of its
+    // content box the moment one is set, which parked the query and placeholder
+    // below the field's optical centre. The field's height plus flex centring
+    // does the work instead.
     paddingLeft: spacing[2],
     paddingVertical: spacing[0],
     textAlignVertical: "center",

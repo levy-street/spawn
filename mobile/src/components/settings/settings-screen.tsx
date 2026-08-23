@@ -1,9 +1,8 @@
 import { useRouter } from "expo-router";
 import type { ReactNode } from "react";
 import { ScrollView, type ScrollViewProps, StyleSheet } from "react-native";
-import { AppHeader } from "@/components/layout/app-header";
+import { AppHeader, type AppHeaderProps } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
-import { headerDestinationActions } from "@/components/nav/header-destinations";
 import { Text } from "@/components/ui/text";
 import { spacing, useTheme } from "@/theme";
 
@@ -12,6 +11,14 @@ export interface SettingsScreenProps extends Pick<ScrollViewProps, "refreshContr
   description?: string;
   children: ReactNode;
   testID?: string;
+  /**
+   * A destination root rather than a page pushed onto one. Roots carry the
+   * profile control and no back chevron, exactly like Workspaces; panels pushed
+   * from a root carry the chevron.
+   */
+  root?: boolean;
+  /** Header actions for this screen. Primary nav destinations are filtered out. */
+  actions?: AppHeaderProps["actions"];
 }
 
 export function SettingsScreen({
@@ -20,22 +27,18 @@ export function SettingsScreen({
   children,
   refreshControl,
   testID,
+  root = false,
+  actions,
 }: SettingsScreenProps): React.JSX.Element {
   const router = useRouter();
   const theme = useTheme();
-  const actions =
-    title === "Settings"
-      ? headerDestinationActions(["hosts", "admin"])
-      : title === "Admin"
-        ? headerDestinationActions(["hosts", "settings"])
-        : undefined;
 
   return (
     <Screen
       header={
         <AppHeader
           {...(actions === undefined ? {} : { actions })}
-          onBack={router.back}
+          {...(root ? {} : { onBack: router.back })}
           title={title}
         />
       }

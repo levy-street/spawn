@@ -257,7 +257,7 @@ export function SwipeDismissOverlay({
               styles.panel,
               {
                 backgroundColor: theme.colors.background,
-                borderRadius: theme.radii.xxl,
+                borderRadius: theme.radii.device,
               },
               panelStyle,
             ]}

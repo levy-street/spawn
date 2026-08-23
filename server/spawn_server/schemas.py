@@ -1039,6 +1039,30 @@ class PasskeyCredentialCreate(BaseModel):
     label: str | None = Field(default=None, max_length=128)
 
 
+class DeviceApprovalRequestCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    browser_device_id: str = Field(min_length=36, max_length=36)
+
+
+class DeviceApprovalRequestOut(BaseModel):
+    """One device waiting to be admitted, as shown to the account's others.
+
+    `fingerprint` is derived server-side from the stored key, but the approving
+    device re-derives it from the key it signs over — the operator compares
+    what the two screens show, and that comparison, not this field, is what
+    makes the ceremony safe.
+    """
+
+    id: str
+    browser_device_id: str
+    label: str | None
+    fingerprint: str
+    status: str
+    created_at: datetime
+    expires_at: datetime
+
+
 class BrowserEndorsementCreate(BaseModel):
     """One trusted browser admitting another to a host."""
 

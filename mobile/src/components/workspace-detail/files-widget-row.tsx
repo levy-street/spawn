@@ -1,7 +1,6 @@
-import { memo, useMemo } from "react";
+import { memo } from "react";
 import { StyleSheet, View } from "react-native";
 
-import { type SwipeAction, SwipeableRow } from "@/components/gestures/swipeable-row";
 import { Icon } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
 import { ListRow } from "@/components/ui/list-row";
@@ -19,8 +18,6 @@ export interface FilesWidgetRowProps {
   path: string;
   onOpen: () => void;
   onActions: () => void;
-  onMove: () => void;
-  onRemove: () => void;
 }
 
 function pathLeaf(path: string): string {
@@ -35,87 +32,58 @@ export const FilesWidgetRow = memo(function FilesWidgetRow({
   path,
   onOpen,
   onActions,
-  onMove,
-  onRemove,
 }: FilesWidgetRowProps) {
   const theme = useTheme();
   const title = `Files — ${pathLeaf(path)}`;
   const status = hostOnline ? "Online" : "Offline";
-  const leadingActions = useMemo<SwipeAction[]>(
-    () => [
-      {
-        key: "move",
-        label: "Move",
-        icon: <Icon name="ArrowRightLeft" />,
-        onPress: onMove,
-      },
-    ],
-    [onMove],
-  );
-  const trailingActions = useMemo<SwipeAction[]>(
-    () => [
-      {
-        key: "remove",
-        label: "Remove",
-        icon: <Icon color="destructiveForeground" name="Trash2" />,
-        tone: "destructive",
-        onPress: onRemove,
-      },
-    ],
-    [onRemove],
-  );
 
+  // Move and remove live in the row's ... menu; the swipe layer was a second
+  // hidden path to the same actions.
   return (
-    <SwipeableRow
-      contentStyle={paneRowStyles.swipeContent}
-      leadingActions={leadingActions}
-      testID={`files-swipe-${paneId}`}
-      trailingActions={trailingActions}
-    >
-      <View style={paneRowStyles.frame} testID={`files-row-${paneId}`}>
-        <ListRow
-          leading={
-            <View
-              style={[
-                styles.iconPlate,
-                {
-                  backgroundColor: theme.colors.muted,
-                  borderColor: theme.colors.border,
-                  borderRadius: theme.radii.lg,
-                },
-              ]}
-            >
-              <Icon color="mutedForeground" name="FolderTree" size={sizing.control.icon} />
-            </View>
-          }
-          onLongPress={() => {
-            haptics.impact("medium");
-            onActions();
-          }}
-          onPress={() => {
-            haptics.selection();
-            onOpen();
-          }}
-          shape="fullBleed"
-          {...(hostName ? { subtitle: hostName } : {})}
-          title={title}
-          trailing={
-            <View style={paneRowStyles.status}>
-              <StatusDot pulse={false} tone={hostOnline ? "active" : "offline"} />
-              <Text color="mutedForeground" variant="caption">
-                {status}
-              </Text>
-            </View>
-          }
-        />
-        <IconButton
-          accessibilityLabel={`Actions for ${title}`}
-          icon="Ellipsis"
-          onPress={onActions}
-          style={paneRowStyles.action}
-        />
-      </View>
-    </SwipeableRow>
+    <View style={paneRowStyles.frame} testID={`files-row-${paneId}`}>
+      <ListRow
+        leading={
+          <View
+            style={[
+              styles.iconPlate,
+              {
+                backgroundColor: theme.colors.muted,
+                borderColor: theme.colors.border,
+                borderRadius: theme.radii.lg,
+              },
+            ]}
+          >
+            <Icon color="mutedForeground" name="FolderTree" size={sizing.control.icon} />
+          </View>
+        }
+        onLongPress={() => {
+          haptics.impact("medium");
+          onActions();
+        }}
+        onPress={() => {
+          haptics.selection();
+          onOpen();
+        }}
+        shape="fullBleed"
+        {...(hostName ? { subtitle: hostName } : {})}
+        title={title}
+        trailing={
+          <View style={paneRowStyles.status}>
+            <StatusDot pulse={false} tone={hostOnline ? "active" : "offline"} />
+            <Text color="mutedForeground" variant="caption">
+              {status}
+            </Text>
+          </View>
+        }
+      />
+      <IconButton
+        accessibilityLabel={`Actions for ${title}`}
+        icon="Ellipsis"
+        onPress={onActions}
+        size="lg"
+        style={paneRowStyles.action}
+      />
+    </View>
   );
 });
 

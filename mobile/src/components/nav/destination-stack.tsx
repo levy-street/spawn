@@ -21,7 +21,7 @@ export function DestinationStack({ initialRouteName }: DestinationStackProps): R
         // physical display corners through its header and bottom navigation insets.
         contentStyle: {
           backgroundColor: theme.colors.background,
-          borderRadius: theme.radii.xxl,
+          borderRadius: theme.radii.device,
           overflow: "hidden",
         },
         headerShown: false,

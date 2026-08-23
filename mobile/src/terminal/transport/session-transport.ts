@@ -1,4 +1,9 @@
 import { openSessionSignal } from "@/data/realtime/session-signal";
+import {
+  DEVICE_NOT_TRUSTED_CODE,
+  DEVICE_NOT_TRUSTED_MESSAGE,
+  probeDeviceHostTrust,
+} from "@/data/trust/device-trust";
 import { randomBytes } from "@/lib/crypto/bootstrap";
 import { bytesToUuid, encodeHex } from "@/lib/crypto/bytes";
 import {
@@ -20,6 +25,7 @@ import {
   reduceConnection,
 } from "@/terminal/transport/state-machine";
 import type {
+  DisplayControlState,
   ScrollState,
   SessionTransport,
   SessionTransportOptions,
@@ -32,12 +38,23 @@ import type {
 } from "@/terminal/transport/types";
 import { terminalMetrics } from "@/theme";
 
+/**
+ * A daemon that refuses an offer — an unpinned browser key, a stale binding —
+ * drops it without replying, and ICE itself can stall with no event at all.
+ * Without a deadline the surface sits on "Connecting" forever, which is
+ * indistinguishable from a slow network and tells the operator nothing.
+ */
+export const CONNECT_TIMEOUT_MS = 25_000;
+export const CONNECT_TIMEOUT_MESSAGE =
+  "The host did not answer in time. It may be offline, or it may not have approved this device.";
+
 type StateListener = (state: TransportState) => void;
 type ErrorListener = (error: TransportError) => void;
 type TitleListener = (title: string) => void;
 type BellListener = () => void;
 type ScrollListener = (scroll: ScrollState) => void;
 type DiagnosticListener = (diagnostic: WorkerDiagnostic) => void;
+type DisplayListener = (display: DisplayControlState) => void;
 
 interface ConfigFrame extends Record<string, unknown> {
   type?: unknown;
@@ -71,6 +88,7 @@ class WebViewSessionTransport implements SessionTransport {
   #pendingInputBytes = 0;
   #inputSequence = 0;
   #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  #connectTimer: ReturnType<typeof setTimeout> | null = null;
   #opening: Promise<void> | null = null;
   #resolveOpen: (() => void) | null = null;
   #rejectOpen: ((error: Error) => void) | null = null;
@@ -81,6 +99,7 @@ class WebViewSessionTransport implements SessionTransport {
   readonly #bellListeners = new Set<BellListener>();
   readonly #scrollListeners = new Set<ScrollListener>();
   readonly #diagnosticListeners = new Set<DiagnosticListener>();
+  readonly #displayListeners = new Set<DisplayListener>();
 
   constructor(private readonly options: SessionTransportOptions) {
     this.sessionId = options.sessionId;
@@ -118,6 +137,8 @@ class WebViewSessionTransport implements SessionTransport {
       });
       this.#machine = reduceConnection(this.#machine, { type: "open" });
       this.#setState(this.#machine.phase);
+      this.#armConnectWatchdog();
+      this.#preflightTrust();
       this.#startSignal();
     } catch (error) {
       this.#fail(
@@ -132,6 +153,7 @@ class WebViewSessionTransport implements SessionTransport {
     if (this.#state === "closed") return;
     clearTimeout(this.#reconnectTimer ?? undefined);
     this.#reconnectTimer = null;
+    this.#clearConnectWatchdog();
     try {
       this.options.bridge.send({ v: TERMINAL_BRIDGE_VERSION, type: "close" });
     } catch {
@@ -187,6 +209,10 @@ class WebViewSessionTransport implements SessionTransport {
     this.options.bridge.send({ v: TERMINAL_BRIDGE_VERSION, type: "resize", cols, rows });
   }
 
+  takeControl(): void {
+    this.options.bridge.send({ v: TERMINAL_BRIDGE_VERSION, type: "take-control" });
+  }
+
   requestReplay(fromOffset?: number): void {
     this.options.bridge.send(
       fromOffset === undefined
@@ -205,22 +231,26 @@ class WebViewSessionTransport implements SessionTransport {
   on(ev: "bell", fn: BellListener): () => void;
   on(ev: "scroll", fn: ScrollListener): () => void;
   on(ev: "diagnostic", fn: DiagnosticListener): () => void;
+  on(ev: "display", fn: DisplayListener): () => void;
   on(
-    ev: "state" | "error" | "title" | "bell" | "scroll" | "diagnostic",
+    ev: "state" | "error" | "title" | "bell" | "scroll" | "diagnostic" | "display",
     fn:
       | StateListener
       | ErrorListener
       | TitleListener
       | BellListener
       | ScrollListener
-      | DiagnosticListener,
+      | DiagnosticListener
+      | DisplayListener,
   ): () => void {
     const listeners = this.#listenersFor(ev);
     listeners.add(fn as never);
     return () => listeners.delete(fn as never);
   }
 
-  #listenersFor(ev: "state" | "error" | "title" | "bell" | "scroll" | "diagnostic"): Set<never> {
+  #listenersFor(
+    ev: "state" | "error" | "title" | "bell" | "scroll" | "diagnostic" | "display",
+  ): Set<never> {
     return {
       state: this.#stateListeners,
       error: this.#errorListeners,
@@ -228,6 +258,7 @@ class WebViewSessionTransport implements SessionTransport {
       bell: this.#bellListeners,
       scroll: this.#scrollListeners,
       diagnostic: this.#diagnosticListeners,
+      display: this.#displayListeners,
     }[ev] as Set<never>;
   }
 
@@ -339,6 +370,16 @@ class WebViewSessionTransport implements SessionTransport {
       case "bell":
         for (const listener of this.#bellListeners) listener();
         break;
+      case "display": {
+        const display: DisplayControlState = {
+          owner: message.owner,
+          viewers: message.viewers,
+          cols: message.cols ?? null,
+          rows: message.rows ?? null,
+        };
+        for (const listener of this.#displayListeners) listener(display);
+        break;
+      }
       case "scroll-state":
         for (const listener of this.#scrollListeners) listener(message.scroll);
         break;
@@ -378,6 +419,7 @@ class WebViewSessionTransport implements SessionTransport {
     this.#state = next;
     for (const listener of this.#stateListeners) listener(next);
     if (next !== "ready") return;
+    this.#clearConnectWatchdog();
     this.#resolveOpen?.();
     this.#settleOpening();
     for (const bytes of this.#pendingInput.splice(0)) {
@@ -404,6 +446,7 @@ class WebViewSessionTransport implements SessionTransport {
 
   #scheduleReconnect(): void {
     if (this.#state === "closed" || this.#state === "failed" || this.#reconnectTimer) return;
+    this.#clearConnectWatchdog();
     this.#machine = reduceConnection(this.#machine, { type: "disconnect" });
     this.#setState("reconnecting");
     const delay = this.#machine.reconnectDelayMs ?? reconnectDelay(0);
@@ -411,11 +454,45 @@ class WebViewSessionTransport implements SessionTransport {
       this.#reconnectTimer = null;
       this.#machine = reduceConnection(this.#machine, { type: "retry" });
       this.#setState("signalling");
+      this.#armConnectWatchdog();
       this.#startSignal();
     }, delay);
   }
 
+  #armConnectWatchdog(): void {
+    this.#clearConnectWatchdog();
+    this.#connectTimer = setTimeout(() => {
+      this.#connectTimer = null;
+      if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
+      this.#fail("connect_timeout", CONNECT_TIMEOUT_MESSAGE);
+    }, this.options.connectTimeoutMs ?? CONNECT_TIMEOUT_MS);
+  }
+
+  #clearConnectWatchdog(): void {
+    if (this.#connectTimer === null) return;
+    clearTimeout(this.#connectTimer);
+    this.#connectTimer = null;
+  }
+
+  /**
+   * Runs alongside signalling rather than gating it: a trusted device pays no
+   * latency, and an unapproved one gets the real reason in a few hundred
+   * milliseconds instead of waiting out the watchdog.
+   */
+  #preflightTrust(): void {
+    const hostId = this.options.hostId;
+    if (hostId === undefined) return;
+    const probe = this.options.probeTrust ?? probeDeviceHostTrust;
+    void probe(hostId).then((trust) => {
+      if (trust !== "untrusted") return;
+      if (this.#state === "ready" || this.#state === "closed" || this.#state === "failed") return;
+      this.#fail(DEVICE_NOT_TRUSTED_CODE, DEVICE_NOT_TRUSTED_MESSAGE);
+    });
+  }
+
   #fail(code: string, message: string): void {
+    if (this.#state === "failed" || this.#state === "closed") return;
+    this.#clearConnectWatchdog();
     const error = { code, message, retryable: false } satisfies TransportError;
     this.#emitError(error);
     this.#machine = reduceConnection(this.#machine, { type: "fail" });

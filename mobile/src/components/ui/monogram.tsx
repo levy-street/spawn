@@ -16,7 +16,8 @@ export interface MonogramProps {
   size?: number;
   style?: StyleProp<ViewStyle>;
   testID?: string;
-  variant?: "palette" | "neutral";
+  /** "brand" pins the mark to the product red; "palette" hashes the seed. */
+  variant?: "palette" | "neutral" | "brand";
 }
 
 export function monogramLetter(seed: string): string {
@@ -42,7 +43,10 @@ export function Monogram({
 }: MonogramProps) {
   const theme = useTheme();
   const resolvedSize = size ?? theme.space(7);
-  const palette = MONOGRAM_PALETTES[monogramPaletteIndex(seed)] ?? MONOGRAM_PALETTES[0];
+  const palette =
+    variant === "brand"
+      ? MONOGRAM_PALETTES[0]
+      : (MONOGRAM_PALETTES[monogramPaletteIndex(seed)] ?? MONOGRAM_PALETTES[0]);
   const resolvedFontSize = Math.max(fontSize.ten, Math.round(resolvedSize * 0.45));
   const neutral = variant === "neutral";
 

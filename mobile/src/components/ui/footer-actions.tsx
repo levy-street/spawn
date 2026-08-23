@@ -18,20 +18,45 @@ export interface FooterKeyboardAnimation {
 
 export interface FooterActionsProps {
   children: ReactNode;
-  keyboardAnimation: FooterKeyboardAnimation;
+  /**
+   * Omit inside a container that already owns the bottom inset and is not
+   * keyboard-aware — a bottom sheet, say. The footer then simply sits at the
+   * foot of its parent instead of tracking the keyboard itself.
+   */
+  keyboardAnimation?: FooterKeyboardAnimation;
+  /**
+   * Height of persistent chrome drawn *over* this footer's container — the
+   * window-level nav bar above a full-page dialog. Held open while the keyboard
+   * is down; a raised keyboard covers that chrome, so the reservation goes with it.
+   */
+  reservedBottomChrome?: number;
 }
 
 export function FooterActions({
   children,
   keyboardAnimation,
+  reservedBottomChrome = 0,
 }: FooterActionsProps): React.JSX.Element {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const reducedMotion = useReducedMotion();
-  const closedBottomPadding = Math.max(sizing.footer.minimumBottomPadding, insets.bottom);
-  const { height, progress, targetProgress } = keyboardAnimation;
+  const tracksKeyboard = keyboardAnimation !== undefined;
+  // Reserved chrome already covers the device inset it stands on, so it replaces
+  // that inset rather than stacking on top of it.
+  const closedBottomPadding =
+    reservedBottomChrome > 0
+      ? reservedBottomChrome + sizing.footer.minimumBottomPadding
+      : tracksKeyboard
+        ? Math.max(sizing.footer.minimumBottomPadding, insets.bottom)
+        : sizing.footer.minimumBottomPadding;
+  const height = keyboardAnimation?.height;
+  const progress = keyboardAnimation?.progress;
+  const targetProgress = keyboardAnimation?.targetProgress;
 
   const animatedStyle = useAnimatedStyle(() => {
+    if (progress === undefined || targetProgress === undefined || height === undefined) {
+      return { paddingBottom: closedBottomPadding, transform: [{ translateY: 0 }] };
+    }
     const insetProgress = reducedMotion ? targetProgress.value : progress.value;
 
     return {

@@ -11,15 +11,17 @@ export function ArchivedWorkspacesNavigationRow({
   count,
   onPress,
 }: ArchivedWorkspacesNavigationRowProps): React.JSX.Element {
-  const countLabel = `${count} ${count === 1 ? "workspace" : "workspaces"}`;
+  // The count is the whole story here, so it belongs in the label rather than on
+  // a second line restating the word "workspace" underneath it.
+  const label = `${count} ${count === 1 ? "Archived workspace" : "Archived workspaces"}`;
 
   return (
     <ListRow
       leading={<Icon color="mutedForeground" name="Archive" size={sizing.control.icon} />}
       onPress={onPress}
       shape="fullBleed"
-      subtitle={countLabel}
-      title="Archived workspaces"
+      title={label}
+      titleWeight="normal"
       trailing={<Icon color="mutedForeground" name="ChevronRight" size={sizing.control.icon} />}
     />
   );

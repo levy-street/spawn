@@ -1,10 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react-native";
 
-import {
-  ConnectionChip,
-  ConnectionStateOverlay,
-  connectionCopy,
-} from "@/components/terminal-ui/connection-status";
+import { ConnectionStateOverlay, connectionCopy } from "@/components/terminal-ui/connection-status";
 import type { TransportState } from "@/terminal/transport/types";
 import { ThemeProvider } from "@/theme";
 
@@ -23,12 +19,13 @@ describe("connection-state rendering", () => {
     const copy = connectionCopy(state);
     await render(
       <ThemeProvider>
-        <ConnectionChip state={state} />
         <ConnectionStateOverlay hasEverBeenReady={false} onRetry={jest.fn()} state={state} />
       </ThemeProvider>,
     );
 
-    expect(screen.getAllByText(copy.chip)[0]).toBeOnTheScreen();
+    // The header chip is gone: the overlay is the single place a connection
+    // reports itself, so there is nothing to say the same thing twice.
+    expect(screen.queryByTestId("terminal-connection-chip")).toBeNull();
     if (state === "ready") {
       expect(screen.queryByTestId("connection-state-ready")).not.toBeOnTheScreen();
     } else {

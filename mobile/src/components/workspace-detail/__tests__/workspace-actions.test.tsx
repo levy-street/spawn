@@ -418,15 +418,9 @@ describe("workspace action wiring", () => {
 
     expectHandlers("header", ["onBack", "onAddPane", "onActions"]);
     expectHandlers("tabStrip", ["onSelect", "onActions", "onAdd", "onClose", "onReorder"]);
-    expectHandlers("paneList", [
-      "onAddPane",
-      "onOpenTerminal",
-      "onOpenFiles",
-      "onPaneActions",
-      "onRenameSession",
-      "onMovePane",
-      "onRemovePane",
-    ]);
+    // Rename, move and remove reach the pane through its ... sheet only; the row
+    // itself no longer takes them, since round 7 removed the swipe shortcut.
+    expectHandlers("paneList", ["onAddPane", "onOpenTerminal", "onOpenFiles", "onPaneActions"]);
     expectHandlers("paneActions", [
       "onDismiss",
       "onRename",

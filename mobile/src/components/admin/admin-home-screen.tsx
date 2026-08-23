@@ -1,6 +1,5 @@
 import { useRouter } from "expo-router";
 import { StyleSheet, View } from "react-native";
-
 import { SettingsLinkRow } from "@/components/settings/settings-row";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
@@ -46,7 +45,13 @@ export function AdminHomeScreen(): React.JSX.Element {
           onPress={() => router.push("/admin/emails")}
         />
       </SettingsSection>
-      <Button onPress={() => router.replace("/settings")} variant="outline">
+      {/* Admin is pushed from Settings, so leaving it is a pop rather than a jump
+        to a hardcoded root — the tab bar is what owns landing on Settings. */}
+      <Button
+        disabled={!router.canGoBack()}
+        onPress={() => router.back()}
+        variant="outline"
+      >
         Exit admin
       </Button>
     </SettingsScreen>

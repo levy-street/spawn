@@ -1,3 +1,4 @@
+import { QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen } from "@testing-library/react-native";
 import { AccessibilityInfo } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
@@ -66,6 +67,7 @@ import { HostDetailScreen } from "@/components/hosts/host-detail-screen";
 import { HostListScreen } from "@/components/hosts/host-list-screen";
 import { LegionScreen } from "@/components/hosts/legion-screen";
 import { ThemeProvider } from "@/theme";
+import { createTestQueryClient } from "../../../../tests/render";
 
 const SAFE_AREA_METRICS = {
   frame: { x: 0, y: 0, width: 390, height: 844 },
@@ -82,11 +84,15 @@ function successfulQuery<T>(data: T) {
   };
 }
 
+const queryClient = createTestQueryClient();
+
 function Providers({ children }: React.PropsWithChildren): React.JSX.Element {
   return (
-    <SafeAreaProvider initialMetrics={SAFE_AREA_METRICS}>
-      <ThemeProvider>{children}</ThemeProvider>
-    </SafeAreaProvider>
+    <QueryClientProvider client={queryClient}>
+      <SafeAreaProvider initialMetrics={SAFE_AREA_METRICS}>
+        <ThemeProvider>{children}</ThemeProvider>
+      </SafeAreaProvider>
+    </QueryClientProvider>
   );
 }
 
@@ -107,7 +113,7 @@ describe("host screen headers", () => {
 
   afterEach(() => jest.restoreAllMocks());
 
-  test("Hosts renders one title and keeps only its own screen actions", async () => {
+  test("Hosts is a root: one title, its own actions, no back control", async () => {
     await render(<HostListScreen />, { wrapper: Providers });
 
     expect(screen.getAllByText("Hosts")).toHaveLength(1);
@@ -117,13 +123,16 @@ describe("host screen headers", () => {
     // time. Legion and Connect stay: neither is a nav destination.
     expect(screen.queryByTestId("hosts-settings-action")).toBeNull();
 
+    // Hosts is a destination root like Workspaces: there is nothing behind it to
+    // go back to, so it carries the profile control rather than a chevron.
+    expect(screen.queryByRole("button", { name: "Go back" })).toBeNull();
+
     await fireEvent.press(screen.getByTestId("hosts-legion-action"));
     await fireEvent.press(screen.getByTestId("hosts-connect-action"));
-    await fireEvent.press(screen.getByRole("button", { name: "Go back" }));
 
     expect(mockPush).toHaveBeenNthCalledWith(1, "/legion");
     expect(mockPush).toHaveBeenNthCalledWith(2, "/onboarding/host");
-    expect(mockBack).toHaveBeenCalledTimes(1);
+    expect(mockBack).not.toHaveBeenCalled();
   });
 
   test("Legion moves its rollup and live switch into its only title bar", async () => {

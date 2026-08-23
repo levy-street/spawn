@@ -3,10 +3,15 @@ import * as Linking from "expo-linking";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
+import Animated, { useAnimatedStyle } from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { scheduleOnRN } from "react-native-worklets";
-
+import { TerminalAccessoryBar } from "@/components/terminal-ui/accessory-bar";
+import { AttachmentSheet } from "@/components/terminal-ui/attachment-sheet";
 import { ConnectionStateOverlay } from "@/components/terminal-ui/connection-status";
 import { DiagnosticsSheet } from "@/components/terminal-ui/diagnostics-sheet";
+import { DisplayControlBar } from "@/components/terminal-ui/display-control-bar";
 import {
   type FollowState,
   INITIAL_FOLLOW_STATE,
@@ -15,10 +20,11 @@ import {
 } from "@/components/terminal-ui/follow-state";
 import { FontSizeSheet } from "@/components/terminal-ui/font-size-sheet";
 import { JumpToLatest } from "@/components/terminal-ui/jump-to-latest";
-import { ModifierBar } from "@/components/terminal-ui/modifier-bar";
+import { useTerminalKeyboardHold } from "@/components/terminal-ui/keyboard-hold";
 import { TerminalSearchBar } from "@/components/terminal-ui/search-bar";
 import { SelectionToolbar } from "@/components/terminal-ui/selection-toolbar";
 import { TerminalHeader } from "@/components/terminal-ui/terminal-header";
+import { TerminalKeysSheet } from "@/components/terminal-ui/terminal-keys-sheet";
 import {
   useTerminalFontSizeGate,
   useTerminalKeepAwake,
@@ -35,9 +41,13 @@ import {
   type PendingLaunchDeliveryResult,
 } from "@/data/queries/launcher";
 import { DEFAULT_SESSION_UI, useSessionUiStore } from "@/data/stores/session-ui";
+import { DEVICE_NOT_TRUSTED_CODE, invalidateDeviceHostTrust } from "@/data/trust/device-trust";
+import { useHostApprovalWatch } from "@/data/trust/use-host-approval-watch";
 import { haptics } from "@/lib/haptics";
+import { encodeKey } from "@/terminal/key-encoder";
 import { TerminalSurface, type TerminalSurfaceHandle } from "@/terminal/TerminalSurface";
 import type {
+  DisplayControlState,
   KeySpec,
   SessionTransport,
   TransportError,
@@ -45,6 +55,7 @@ import type {
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
 import { layer, useTheme } from "@/theme";
+import { bottomNavHeight } from "@/theme/sizing";
 
 const INITIAL_TERMINAL_GRID = { cols: 80, rows: 24 } as const;
 
@@ -56,6 +67,8 @@ export interface TerminalOverlayProps {
   onRename: (name: string) => Promise<void>;
   onRestart: () => Promise<void>;
   onKill: () => Promise<void>;
+  /** Opens the device-trust settings when a host has not approved this device. */
+  onDeviceTrust?: () => void;
 }
 
 function safeTerminalLink(url: string): boolean {
@@ -91,6 +104,7 @@ export function TerminalOverlay({
   onRename,
   onRestart,
   onKill,
+  onDeviceTrust,
 }: TerminalOverlayProps): React.JSX.Element {
   const theme = useTheme();
   const surfaceRef = useRef<TerminalSurfaceHandle>(null);
@@ -115,6 +129,38 @@ export function TerminalOverlay({
   const [diagnosticsVisible, setDiagnosticsVisible] = useState(false);
   const [selectionVisible, setSelectionVisible] = useState(false);
   const [killConfirmVisible, setKillConfirmVisible] = useState(false);
+  const [attachVisible, setAttachVisible] = useState(false);
+  const [moreVisible, setMoreVisible] = useState(false);
+  const [headerMenuVisible, setHeaderMenuVisible] = useState(false);
+
+  // Every drawer this screen can raise. The keyboard is taller than most of
+  // them, so it stands down while one is open and comes back afterwards. The
+  // search field and the rename dialog are deliberately absent: those two ask
+  // for the keyboard themselves.
+  useTerminalKeyboardHold({
+    held:
+      attachVisible ||
+      moreVisible ||
+      headerMenuVisible ||
+      fontSheetVisible ||
+      diagnosticsVisible ||
+      killConfirmVisible,
+    onHold: () => surfaceRef.current?.blur(),
+    onRelease: () => surfaceRef.current?.focus(),
+  });
+  const [display, setDisplay] = useState<DisplayControlState | null>(null);
+
+  // The bottom nav is portalled to window level and nothing holds its footprint
+  // open, so the terminal reserves it — and drops that reservation the moment
+  // the keyboard covers the bar, which is when the phantom gap under the key row
+  // used to appear.
+  const insets = useSafeAreaInsets();
+  const keyboard = useReanimatedKeyboardAnimation();
+  const restingInset = bottomNavHeight(insets.bottom);
+  const bottomInset = useAnimatedStyle(
+    () => ({ paddingBottom: Math.max(-keyboard.height.value, restingInset) }),
+    [keyboard.height, restingInset],
+  );
 
   useTerminalKeepAwake(session.id, focused, connectionState);
   const changeFontSize = useTerminalFontSizeGate(
@@ -149,6 +195,7 @@ export function TerminalOverlay({
     transport: () => transportRef.current,
     ready: connectionState === "ready",
     onInputSent: () => updateFollow({ type: "input-sent" }),
+    onFocusTerminal: () => surfaceRef.current?.focus(),
   });
 
   const handleTransport = useCallback(
@@ -188,7 +235,10 @@ export function TerminalOverlay({
     }
   };
 
-  const retry = (): void => {
+  const retry = useCallback((): void => {
+    // Retry means "something may have changed since last time", and the thing
+    // most likely to have changed is an approval granted on another device.
+    invalidateDeviceHostTrust(host.id);
     scrollUnsubscribeRef.current?.();
     scrollUnsubscribeRef.current = null;
     pendingLaunchUnsubscribeRef.current?.();
@@ -198,11 +248,26 @@ export function TerminalOverlay({
     setConnectionState("idle");
     setConnectionError(null);
     setSurfaceGeneration((generation) => generation + 1);
-  };
+  }, [host.id]);
+
+  // Approval is granted somewhere else entirely, so the phone watches for it
+  // and reconnects itself. Making the operator walk back here and press Retry
+  // is the part of this that used to feel broken.
+  const awaitingApproval =
+    connectionState === "failed" && connectionError?.code === DEVICE_NOT_TRUSTED_CODE;
+  const hostApproval = useHostApprovalWatch(host.id, awaitingApproval);
+  useEffect(() => {
+    if (awaitingApproval && hostApproval === "trusted") retry();
+  }, [awaitingApproval, hostApproval, retry]);
 
   const sendAccessoryKey = (sequence: string, _spec: KeySpec): void => {
     surfaceRef.current?.sendKey(sequence);
     updateFollow({ type: "input-sent" });
+  };
+
+  const takeDisplayControl = (): void => {
+    surfaceRef.current?.takeControl();
+    setDisplay((current) => (current === null ? current : { ...current, owner: true }));
   };
 
   const jumpToLatest = (): void => {
@@ -246,12 +311,11 @@ export function TerminalOverlay({
   const hostKey = host.host_public_key;
 
   return (
-    <View
-      style={[styles.root, { backgroundColor: theme.colors.background }]}
+    <Animated.View
+      style={[styles.root, { backgroundColor: theme.colors.background }, bottomInset]}
       testID="terminal-overlay-route-scene"
     >
       <TerminalHeader
-        connectionState={connectionState}
         foregroundCommand={session.foreground_command}
         hostName={session.host_name ?? host.name}
         onBack={onDismiss}
@@ -259,6 +323,7 @@ export function TerminalOverlay({
         onDiagnostics={() => setDiagnosticsVisible(true)}
         onFontSize={() => setFontSheetVisible(true)}
         onKill={() => setKillConfirmVisible(true)}
+        onMenuVisibilityChange={setHeaderMenuVisible}
         onRename={async (name) => {
           try {
             await onRename(name);
@@ -279,7 +344,7 @@ export function TerminalOverlay({
             });
         }}
         onSearch={() => setSearchVisible(true)}
-        onUpload={() => void transfers.uploadFile()}
+        onUpload={() => setAttachVisible(true)}
         title={title}
       />
       <TerminalSearchBar
@@ -287,16 +352,19 @@ export function TerminalOverlay({
         onSearch={(query, direction) => surfaceRef.current?.search(query, direction)}
         visible={searchVisible}
       />
+      <DisplayControlBar display={display} onTakeControl={takeDisplayControl} />
       <View style={[styles.surfaceFrame, { backgroundColor: theme.colors.terminalBg }]}>
         {hostKey ? (
           <GestureDetector gesture={selectionGesture}>
             <View style={styles.surface}>
               <TerminalSurface
                 fontSize={fontSize}
+                hostId={host.id}
                 hostIdentityPublicKey={hostKey}
                 initialSize={INITIAL_TERMINAL_GRID}
                 key={`${session.id}-${surfaceGeneration}`}
                 onDiagnostic={setDiagnostic}
+                onDisplayChange={setDisplay}
                 onError={(error) => {
                   setConnectionError(error);
                   if (!error.retryable) setConnectionState("failed");
@@ -326,6 +394,7 @@ export function TerminalOverlay({
           error={connectionError}
           hasEverBeenReady={hasEverBeenReady}
           onRetry={retry}
+          {...(onDeviceTrust === undefined ? {} : { onDeviceTrust })}
           state={hostKey ? connectionState : "failed"}
         />
         {shouldShowJumpToLatest(followState) ? (
@@ -348,12 +417,23 @@ export function TerminalOverlay({
         </View>
         <TerminalNotice message={transfers.notice} />
       </View>
-      <ModifierBar
+      <TerminalAccessoryBar
         disabled={connectionState !== "ready" || !hostKey}
+        onAttach={() => setAttachVisible(true)}
         onDismissKeyboard={() => surfaceRef.current?.blur()}
-        onPaste={() => void transfers.paste()}
+        onMore={() => setMoreVisible(true)}
         onSend={sendAccessoryKey}
-        sessionId={session.id}
+      />
+      <TerminalKeysSheet
+        onDismiss={() => setMoreVisible(false)}
+        onKey={(key) => sendAccessoryKey(encodeKey(key), key)}
+        visible={moreVisible}
+      />
+      <AttachmentSheet
+        onAttach={(source) => void transfers.attach(source)}
+        onDismiss={() => setAttachVisible(false)}
+        onPaste={() => void transfers.paste()}
+        visible={attachVisible}
       />
       <FontSizeSheet
         onChange={changeFontSize}
@@ -387,7 +467,7 @@ export function TerminalOverlay({
         title="Kill this session?"
         visible={killConfirmVisible}
       />
-    </View>
+    </Animated.View>
   );
 }
 

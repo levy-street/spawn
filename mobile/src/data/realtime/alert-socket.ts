@@ -14,12 +14,33 @@ export interface AlertEvent {
   at: string;
 }
 
+/**
+ * Trust events share this socket because they have the same shape of problem
+ * attention events do: something happened that the operator must see on
+ * whichever device they are looking at, not the one it happened on. A distinct
+ * frame `type` keeps the alert validation exactly as narrow as it was.
+ */
+export type TrustEventKind = "device.approval_requested" | "device.approval_resolved";
+
+export interface TrustEvent {
+  event: TrustEventKind;
+  request_id: string;
+  browser_device_id: string;
+  label: string | null;
+  /** Present on a request; the operator compares it against the asking device. */
+  fingerprint: string | null;
+  status: "approved" | "denied" | null;
+  at: string;
+}
+
 export type AlertFrame =
   | ({ type: "alert" } & AlertEvent)
+  | ({ type: "trust" } & TrustEvent)
   | { type: "alerts.ping" }
   | { type: "protocol.required"; protocol: "spawn.alerts.v1"; version: 1 };
 
 type AlertListener = (alert: AlertEvent) => void;
+type TrustListener = (event: TrustEvent) => void;
 type FrameListener = (frame: AlertFrame) => void;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -53,6 +74,29 @@ function isAlertEventKind(value: unknown): value is AlertEventKind {
   return value === "agent.finished" || value === "agent.awaiting_input" || value === "session.died";
 }
 
+function isTrustEventKind(value: unknown): value is TrustEventKind {
+  return value === "device.approval_requested" || value === "device.approval_resolved";
+}
+
+function parseTrustFrame(frame: Record<string, unknown>): AlertFrame | null {
+  if (!isTrustEventKind(frame["event"])) return null;
+  const requestId = frame["request_id"];
+  const deviceId = frame["browser_device_id"];
+  if (typeof requestId !== "string" || requestId.length === 0) return null;
+  if (typeof deviceId !== "string" || deviceId.length === 0) return null;
+  const status = frame["status"];
+  return {
+    type: "trust",
+    event: frame["event"],
+    request_id: requestId,
+    browser_device_id: deviceId,
+    label: typeof frame["label"] === "string" ? frame["label"] : null,
+    fingerprint: typeof frame["fingerprint"] === "string" ? frame["fingerprint"] : null,
+    status: status === "approved" || status === "denied" ? status : null,
+    at: typeof frame["at"] === "string" ? frame["at"] : "",
+  };
+}
+
 export function parseAlertFrame(value: unknown): AlertFrame | null {
   const parsed = parseJson(value);
   if (!isRecord(parsed)) {
@@ -64,6 +108,9 @@ export function parseAlertFrame(value: unknown): AlertFrame | null {
   }
   if (frame.type === "alerts.ping") {
     return { type: "alerts.ping" };
+  }
+  if (frame.type === "trust") {
+    return parseTrustFrame(parsed as Record<string, unknown>);
   }
   if (frame.type === "protocol.required") {
     return frame.protocol === ALERT_PROTOCOL && frame.version === 1
@@ -102,6 +149,7 @@ export class AlertSocketClient {
   private readonly socket: ReconnectingSocket<never>;
   private readonly frameListeners = new Set<FrameListener>();
   private readonly alertListeners = new Set<AlertListener>();
+  private readonly trustListeners = new Set<TrustListener>();
   private readonly unsubscribeMessage: () => void;
 
   constructor(
@@ -132,6 +180,15 @@ export class AlertSocketClient {
             listener(alert);
           } catch {
             // Alert delivery stays isolated per subscriber.
+          }
+        }
+      } else if (frame.type === "trust") {
+        const { type: _trustType, ...trustEvent } = frame;
+        for (const listener of this.trustListeners) {
+          try {
+            listener(trustEvent);
+          } catch {
+            // Trust delivery stays isolated per subscriber.
           }
         }
       }
@@ -168,6 +225,13 @@ export class AlertSocketClient {
     };
   }
 
+  onTrustEvent(listener: TrustListener): () => void {
+    this.trustListeners.add(listener);
+    return () => {
+      this.trustListeners.delete(listener);
+    };
+  }
+
   retire(): void {
     this.socket.retire();
   }
@@ -177,6 +241,7 @@ export class AlertSocketClient {
     this.socket.close();
     this.frameListeners.clear();
     this.alertListeners.clear();
+    this.trustListeners.clear();
   }
 }
 

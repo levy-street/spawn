@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 
-import { Text } from "@/components/ui/text";
+import { Text, type TextWeight } from "@/components/ui/text";
 import { borderWidth, useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
@@ -15,6 +15,8 @@ export interface ListRowProps {
   height?: "regular" | "tall";
   /** Full-bleed row with square corners, for separator-joined lists. Default "inset". */
   shape?: "inset" | "fullBleed";
+  /** Weight of the row's title. Default "medium"; "normal" for a quieter row. */
+  titleWeight?: TextWeight;
 }
 
 export interface ListSeparatorProps {
@@ -30,6 +32,7 @@ export function ListRow({
   shape = "inset",
   subtitle,
   title,
+  titleWeight = "medium",
   trailing,
 }: ListRowProps): React.JSX.Element {
   const theme = useTheme();
@@ -57,7 +60,7 @@ export function ListRow({
         </View>
       ) : null}
       <View style={styles.copy}>
-        <Text numberOfLines={1} style={styles.title} variant="label" weight="medium">
+        <Text numberOfLines={1} style={styles.title} variant="label" weight={titleWeight}>
           {title}
         </Text>
         {subtitle !== undefined ? (

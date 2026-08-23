@@ -43,6 +43,13 @@
         }
       ],
       [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow spawn to attach photos to a terminal session.",
+          "cameraPermission": "Allow spawn to take a photo and attach it to a terminal session."
+        }
+      ],
+      [
         "expo-camera",
         {
           "cameraPermission": "Allow spawn to scan a machine pairing QR code.",

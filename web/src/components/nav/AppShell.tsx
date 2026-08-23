@@ -16,6 +16,7 @@ import { Wordmark } from "@/components/icons/BrandMark";
 import { Sidebar } from "@/components/nav/Sidebar";
 import { ProfileDialog } from "@/components/profile/ProfileDialog";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
+import { DeviceApprovalPrompt } from "@/components/trust/DeviceApprovalPrompt";
 import { Button } from "@/components/ui/button";
 import { ConfirmHost } from "@/components/ui/confirm";
 import { Drawer } from "@/components/ui/drawer";
@@ -23,6 +24,7 @@ import { ToastHost } from "@/components/ui/toast";
 import { NewSessionMenu } from "@/components/workspace/new-session-menu";
 import { useSessionAlerts } from "@/hooks/useSessionAlerts";
 import { workspaces } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
 const useIsoLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
@@ -79,6 +81,7 @@ export function AppShell({
    * would drop the events it exists to deliver.
    */
   useSessionAlerts();
+  const { user } = useAuth();
   const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
   const currentWorkspaceName = useMemo(
     () => workspacesQ.data?.find((workspace) => workspace.id === currentWorkspaceId)?.name,
@@ -286,6 +289,7 @@ export function AppShell({
       <ToastHost />
       <SettingsDialog />
       <ProfileDialog />
+      <DeviceApprovalPrompt accountId={user?.id ?? null} />
     </div>
   );
 }

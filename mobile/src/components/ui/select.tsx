@@ -1,5 +1,6 @@
 import { type ReactNode, useState } from "react";
 import {
+  Keyboard,
   Pressable,
   type PressableProps,
   type StyleProp,
@@ -125,7 +126,11 @@ export function Select<Value extends string>({
           animateFocus(true);
           onFocus?.(event);
         }}
-        onPress={() => setVisible(true)}
+        onPress={() => {
+          // An open keyboard would cover the options it is about to show.
+          Keyboard.dismiss();
+          setVisible(true);
+        }}
         style={[styles.touchTarget, disabled && styles.disabled, style]}
         testID={testID}
       >
@@ -164,7 +169,7 @@ export function Select<Value extends string>({
           visible={visible}
         />
       ) : (
-        <Sheet enableDynamicSizing onDismiss={() => setVisible(false)} visible={visible}>
+        <Sheet onDismiss={() => setVisible(false)} visible={visible}>
           <SheetHeader title={placeholder} />
           <SheetScrollView bounces={false} keyboardShouldPersistTaps="handled">
             {options.map((option, index) => {

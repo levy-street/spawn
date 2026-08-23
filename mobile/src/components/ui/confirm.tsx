@@ -1,8 +1,11 @@
 import type { ReactNode } from "react";
 import { useSyncExternalStore } from "react";
-
+import { StyleSheet, View } from "react-native";
 import { Button } from "@/components/ui/button";
-import { Dialog } from "@/components/ui/dialog";
+import { FooterActions } from "@/components/ui/footer-actions";
+import { Sheet } from "@/components/ui/sheet";
+import { Text } from "@/components/ui/text";
+import { sizing } from "@/theme/sizing";
 
 export interface ConfirmOptions {
   title: string;
@@ -67,29 +70,45 @@ export function Confirm({
   cancelLabel = "Cancel",
   destructive = false,
 }: ConfirmProps): React.JSX.Element {
-  const footer = (
-    <>
-      <Button onPress={onCancel} size="sm" variant="outline">
-        {cancelLabel}
-      </Button>
-      <Button onPress={onConfirm} size="sm" variant={destructive ? "destructive" : "default"}>
-        {confirmLabel}
-      </Button>
-    </>
-  );
-
+  // A confirmation is a question with two answers, not a page. It comes up from
+  // the bottom where the thumb already is; full-page presentation is reserved for
+  // forms, which need the room and the keyboard.
   return (
-    <Dialog
-      description={description}
-      footer={footer}
-      onDismiss={onCancel}
-      showCloseButton={false}
-      size="sm"
-      title={title}
-      visible={visible}
-    />
+    <Sheet onDismiss={onCancel} testID="confirm-sheet" visible={visible}>
+      <View style={styles.body}>
+        <Text accessibilityRole="header" variant="uiLg" weight="semibold">
+          {title}
+        </Text>
+        {description !== undefined ? (
+          typeof description === "string" || typeof description === "number" ? (
+            <Text color="mutedForeground" variant="body">
+              {description}
+            </Text>
+          ) : (
+            description
+          )
+        ) : null}
+      </View>
+      <FooterActions>
+        <Button onPress={onCancel} variant="outline">
+          {cancelLabel}
+        </Button>
+        <Button onPress={onConfirm} variant={destructive ? "destructive" : "default"}>
+          {confirmLabel}
+        </Button>
+      </FooterActions>
+    </Sheet>
   );
 }
+
+const styles = StyleSheet.create({
+  body: {
+    gap: sizing.space.peer,
+    paddingBottom: sizing.space.block,
+    paddingHorizontal: sizing.space.block,
+    paddingTop: sizing.space.tight,
+  },
+});
 
 /** Mount once near the app root for the promise-returning `confirm()` helper. */
 export function ConfirmHost(): React.JSX.Element | null {

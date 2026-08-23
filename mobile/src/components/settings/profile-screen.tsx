@@ -81,10 +81,6 @@ export function ProfileScreen(): React.JSX.Element {
         </View>
       </View>
 
-      <Button onPress={() => router.push("/settings/account")} variant="outline">
-        Account settings
-      </Button>
-
       <SettingsSection title="THE LEGION">
         <Card variant="flat">
           <View style={styles.metrics}>

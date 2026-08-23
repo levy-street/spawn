@@ -6,9 +6,12 @@ import {
   useReanimatedKeyboardAnimation,
 } from "react-native-keyboard-controller";
 import { useSharedValue } from "react-native-reanimated";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { useBottomChromeOwnsInset } from "@/components/layout/bottom-chrome";
 import { FooterActions } from "@/components/ui/footer-actions";
 import { spacing } from "@/theme";
+import { bottomNavHeight } from "@/theme/sizing";
 
 interface KeyboardScreenProps {
   children: ReactNode;
@@ -31,6 +34,11 @@ interface KeyboardFooterProps {
 function KeyboardFooter({ children, onLayout }: KeyboardFooterProps): React.JSX.Element {
   const { height, progress } = useReanimatedKeyboardAnimation();
   const targetProgress = useSharedValue(progress.value);
+  const insets = useSafeAreaInsets();
+  // The nav bar is portalled to window level and draws over this footer — over a
+  // form dialog's actions as readily as a route's. Nothing else holds its
+  // footprint open down here, so the footer reserves it while the keyboard is down.
+  const reservedBottomChrome = useBottomChromeOwnsInset() ? bottomNavHeight(insets.bottom) : 0;
 
   useGenericKeyboardHandler(
     {
@@ -48,7 +56,10 @@ function KeyboardFooter({ children, onLayout }: KeyboardFooterProps): React.JSX.
 
   return (
     <View onLayout={onLayout} style={styles.footer} testID="screen-footer">
-      <FooterActions keyboardAnimation={{ height, progress, targetProgress }}>
+      <FooterActions
+        keyboardAnimation={{ height, progress, targetProgress }}
+        reservedBottomChrome={reservedBottomChrome}
+      >
         {children}
       </FooterActions>
     </View>

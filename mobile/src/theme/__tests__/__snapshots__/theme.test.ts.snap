@@ -293,6 +293,7 @@ exports[`assembled themes matches the dark token snapshot 1`] = `
     },
   },
   "radii": {
+    "device": 48,
     "lg": 10,
     "md": 8,
     "pill": 9999,
@@ -863,6 +864,7 @@ exports[`assembled themes matches the light token snapshot 1`] = `
     },
   },
   "radii": {
+    "device": 48,
     "lg": 10,
     "md": 8,
     "pill": 9999,

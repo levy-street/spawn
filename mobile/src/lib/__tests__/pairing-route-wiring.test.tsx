@@ -48,10 +48,16 @@ jest.mock("@/components/hosts/rename-host-dialog", () => ({
   RenameHostDialog: () => null,
 }));
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import HostPairingScreen from "@/app/onboarding/host";
 import { HostListScreen } from "@/components/hosts/host-list-screen";
 import { HostsPanel } from "@/components/settings/hosts-panel";
 import { ThemeProvider } from "@/theme";
+
+/** The shell renders a device-approval watcher that queries; give it a client. */
+function testQueryClient(): QueryClient {
+  return new QueryClient({ defaultOptions: { queries: { retry: false } } });
+}
 
 const METRICS = {
   frame: { x: 0, y: 0, width: 390, height: 844 },
@@ -62,9 +68,11 @@ function Providers({ children }: React.PropsWithChildren): React.JSX.Element {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider initialMetrics={METRICS}>
-        <ThemeProvider>
-          <BottomSheetModalProvider>{children}</BottomSheetModalProvider>
-        </ThemeProvider>
+        <QueryClientProvider client={testQueryClient()}>
+          <ThemeProvider>
+            <BottomSheetModalProvider>{children}</BottomSheetModalProvider>
+          </ThemeProvider>
+        </QueryClientProvider>
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );

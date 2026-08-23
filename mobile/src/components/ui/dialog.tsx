@@ -10,17 +10,29 @@ import {
 } from "react";
 import { Modal, type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
 import { KeyboardContext } from "react-native-keyboard-controller/src/context";
-import { useSharedValue } from "react-native-reanimated";
+import Animated, {
+  Easing,
+  interpolate,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
 import { SafeAreaInsetsContext, useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { useBottomChromeOwnsInset } from "@/components/layout/bottom-chrome";
+import { registerNavigationOverlayDismiss } from "@/components/nav/overlay-dismiss";
 import { FooterActions } from "@/components/ui/footer-actions";
 import { IconButton } from "@/components/ui/icon-button";
 import { useReducedMotionPreference } from "@/components/ui/swipe-dismiss-overlay";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { layer, spacing, useTheme } from "@/theme";
+import { layer, opacity, spacing, useTheme } from "@/theme";
+import { bottomNavHeight, sizing } from "@/theme/sizing";
 
 export type DialogSize = "sm" | "md" | "lg" | "full-mobile" | "viewer";
+
+/** Long enough to read as an arrival, short enough not to delay the first tap. */
+const DIALOG_RISE_MS = 300;
 
 export interface DialogProps {
   visible: boolean;
@@ -28,8 +40,10 @@ export interface DialogProps {
   title?: string;
   description?: ReactNode;
   size?: DialogSize;
+  /** The header's X. The way out of a dialog; its actions are the caller's own. */
   showCloseButton?: boolean;
   closeAccessibilityLabel?: string;
+  /** The pinned action row. A dialog states its own answers — there is no default. */
   footer?: ReactNode;
   contentStyle?: StyleProp<ViewStyle>;
   children?: ReactNode;
@@ -45,7 +59,13 @@ function flattenFooterActions(node: ReactNode): ReactNode[] {
   });
 }
 
-function DialogFooter({ children }: { children: ReactNode }): React.JSX.Element {
+function DialogFooter({
+  children,
+  reservedBottomChrome,
+}: {
+  children: ReactNode;
+  reservedBottomChrome: number;
+}): React.JSX.Element {
   // Read the provider's context directly so importing Dialog does not eagerly load native
   // bindings in provider-light routes and tests.
   const keyboard = useContext(KeyboardContext);
@@ -68,7 +88,10 @@ function DialogFooter({ children }: { children: ReactNode }): React.JSX.Element 
   );
 
   return (
-    <FooterActions keyboardAnimation={{ height, progress, targetProgress }}>
+    <FooterActions
+      keyboardAnimation={{ height, progress, targetProgress }}
+      reservedBottomChrome={reservedBottomChrome}
+    >
       {children}
     </FooterActions>
   );
@@ -88,12 +111,41 @@ export function Dialog({
 }: DialogProps): React.JSX.Element | null {
   const theme = useTheme();
   const reducedMotion = useReducedMotionPreference();
+  // Rises a short distance rather than travelling the screen's full height: the
+  // page is already there, this is something arriving on top of it.
+  const rise = useSharedValue(reducedMotion ? 0 : sizing.dialog.riseDistance);
+  const riseStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(rise.value, [sizing.dialog.riseDistance, 0], [0, opacity.opaque]),
+    transform: [{ translateY: rise.value }],
+  }));
   const insets = useSafeAreaInsets();
   const childInsets = useMemo(() => ({ ...insets, top: spacing[0] }), [insets]);
+  // The nav bar is portalled to window level, which puts it *over* this modal
+  // rather than behind it. Nothing else holds its footprint open here, so a
+  // dialog's own foot has to, or the bar sits on top of the actions.
+  const reservedBottomChrome = useBottomChromeOwnsInset() ? bottomNavHeight(insets.bottom) : 0;
 
   useEffect(() => {
     if (visible) haptics.overlayOpen();
   }, [visible]);
+
+  // A dialog is state-driven rather than a route, so a nav tap had nothing to pop
+  // and left the form standing over the destination. Registering here puts it in
+  // the same set of overlays the bar clears before it lands on a root.
+  useEffect(() => {
+    if (!visible) return;
+    return registerNavigationOverlayDismiss(onDismiss);
+  }, [onDismiss, visible]);
+
+  useEffect(() => {
+    if (!visible) {
+      rise.value = reducedMotion ? 0 : sizing.dialog.riseDistance;
+      return;
+    }
+    rise.value = reducedMotion
+      ? 0
+      : withTiming(0, { duration: DIALOG_RISE_MS, easing: Easing.out(Easing.cubic) });
+  }, [reducedMotion, rise, visible]);
 
   if (!visible) return null;
 
@@ -103,21 +155,23 @@ export function Dialog({
 
   return (
     <Modal
-      animationType={reducedMotion ? "none" : "slide"}
+      animationType="none"
       onRequestClose={onDismiss}
       presentationStyle="fullScreen"
       statusBarTranslucent
       visible
     >
-      <View
+      <Animated.View
         accessibilityViewIsModal
         style={[
           styles.surface,
           {
-            paddingBottom: footer === undefined ? insets.bottom : spacing[0],
+            paddingBottom:
+              footer === undefined ? Math.max(insets.bottom, reservedBottomChrome) : spacing[0],
           },
           contentStyle,
           { backgroundColor: theme.colors.background, zIndex: layer.modal },
+          riseStyle,
         ]}
         testID={testID ?? "dialog-content"}
       >
@@ -126,37 +180,43 @@ export function Dialog({
             style={[
               styles.header,
               {
-                gap: theme.space(3),
+                gap: theme.space(1),
                 paddingBottom: theme.space(4),
                 paddingHorizontal: theme.space(4),
-                paddingTop: insets.top + theme.space(2),
+                // The title row stands as tall as its close control now, which
+                // carries part of the clearance the padding used to owe on its own.
+                paddingTop: insets.top + theme.space(3),
               },
             ]}
             testID="dialog-header"
           >
-            <View style={[styles.headerCopy, { gap: theme.space(1) }]}>
-              {title !== undefined ? (
-                <Text accessibilityRole="header" variant="uiLg" weight="semibold">
-                  {title}
-                </Text>
-              ) : null}
-              {description !== undefined ? (
-                typeof description === "string" ? (
-                  <Text color="mutedForeground" variant="body">
-                    {description}
+            {/* The close control shares a row with the title alone, so it centres
+                on that line rather than on a copy block a description may extend. */}
+            <View style={[styles.titleRow, { gap: theme.space(3) }]}>
+              <View style={styles.titleCopy}>
+                {title !== undefined ? (
+                  <Text accessibilityRole="header" variant="uiLg" weight="semibold">
+                    {title}
                   </Text>
-                ) : (
-                  description
-                )
+                ) : null}
+              </View>
+              {showCloseButton ? (
+                <IconButton
+                  accessibilityLabel={closeAccessibilityLabel}
+                  icon="X"
+                  onPress={onDismiss}
+                  size="lg"
+                />
               ) : null}
             </View>
-            {showCloseButton ? (
-              <IconButton
-                accessibilityLabel={closeAccessibilityLabel}
-                icon="X"
-                onPress={onDismiss}
-                size="sm"
-              />
+            {description !== undefined ? (
+              typeof description === "string" ? (
+                <Text color="mutedForeground" variant="body">
+                  {description}
+                </Text>
+              ) : (
+                description
+              )
             ) : null}
           </View>
         ) : null}
@@ -173,7 +233,9 @@ export function Dialog({
           </ChildInsetsProvider>
         )}
 
-        {footerActions.length > 0 ? <DialogFooter>{footerActions}</DialogFooter> : null}
+        {footerActions.length > 0 ? (
+          <DialogFooter reservedBottomChrome={reservedBottomChrome}>{footerActions}</DialogFooter>
+        ) : null}
 
         {!hasHeader && showCloseButton ? (
           <View
@@ -188,7 +250,7 @@ export function Dialog({
             />
           </View>
         ) : null}
-      </View>
+      </Animated.View>
     </Modal>
   );
 }
@@ -201,12 +263,16 @@ const styles = StyleSheet.create({
     position: "absolute",
   },
   header: {
-    alignItems: "flex-start",
-    flexDirection: "row",
+    alignItems: "stretch",
   },
-  headerCopy: {
+  titleCopy: {
     flex: 1,
+    justifyContent: "center",
     minWidth: 0,
+  },
+  titleRow: {
+    alignItems: "center",
+    flexDirection: "row",
   },
   surface: {
     flex: 1,

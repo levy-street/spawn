@@ -11,7 +11,7 @@ import {
 import { type RunChoice, RunStep } from "@/components/launcher/run-step";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
-import { Sheet, SheetHeader } from "@/components/ui/sheet";
+import { Sheet } from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
@@ -65,7 +65,6 @@ export function LauncherSheet({
   const [tabId, setTabId] = useState("");
   const [hostTransport, setHostTransport] = useState<HostTransport | null>(null);
   const [hostTransportState, setHostTransportState] = useState<TransportState>("idle");
-  const [isCancelling, setIsCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [recovery, setRecovery] = useState<{
     session: SessionOut;
@@ -83,7 +82,6 @@ export function LauncherSheet({
     setTabId("");
     setHostTransport(null);
     setHostTransportState("idle");
-    setIsCancelling(false);
     setError(null);
     setRecovery(null);
     cancelRequested.current = false;
@@ -101,11 +99,9 @@ export function LauncherSheet({
   };
 
   const handleCancel = () => {
-    if (launch.isPending) {
-      cancelRequested.current = true;
-      setIsCancelling(true);
-      return;
-    }
+    // A launch already in flight cannot be recalled, so the drawer leaves and the
+    // session it creates is discarded the moment the request lands.
+    if (launch.isPending) cancelRequested.current = true;
     onDismiss();
   };
 
@@ -162,13 +158,6 @@ export function LauncherSheet({
     }
   };
 
-  const stepTitle: Record<LauncherStep, string> = {
-    host: "New session",
-    folder: selectedHost?.name ?? "Choose folder",
-    run: "New session",
-    details: "New session",
-    recovery: "Launch incomplete",
-  };
   const previousStep: Partial<Record<LauncherStep, LauncherStep>> = {
     folder: "host",
     run: "folder",
@@ -180,21 +169,7 @@ export function LauncherSheet({
       : null;
 
   return (
-    <Sheet
-      contentStyle={styles.sheetContent}
-      initialSnapIndex={1}
-      onDismiss={handleCancel}
-      testID="launcher-sheet"
-      visible={visible}
-    >
-      <SheetHeader
-        action={
-          <Button disabled={isCancelling} onPress={handleCancel} size="sm" variant="ghost">
-            {isCancelling ? "Cancelling…" : "Cancel"}
-          </Button>
-        }
-        title={stepTitle[step]}
-      />
+    <Sheet onDismiss={handleCancel} size="tall" testID="launcher-sheet" visible={visible}>
       <View style={[styles.stepBar, { borderBottomColor: theme.colors.border }]}>
         {previousStep[step] ? (
           <IconButton
@@ -339,7 +314,6 @@ export function LauncherSheet({
 }
 
 const styles = StyleSheet.create({
-  sheetContent: { flex: 1 },
   stepBar: {
     alignItems: "center",
     borderBottomWidth: borderWidth.hairline,

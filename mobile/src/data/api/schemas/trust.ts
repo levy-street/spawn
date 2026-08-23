@@ -20,6 +20,19 @@ export const PasskeyCredentialCreateSchema = z.object({
   credential_id: z.string().min(1).max(512),
   label: z.string().max(128).nullable().optional(),
 });
+export const DeviceApprovalRequestCreateSchema = z.object({
+  browser_device_id: UUIDSchema,
+});
+export const DeviceApprovalRequestOutSchema = z.object({
+  id: UUIDSchema,
+  browser_device_id: UUIDSchema,
+  label: z.string().nullable(),
+  /** Re-derived from the key before anything is signed; shown for comparison. */
+  fingerprint: z.string(),
+  status: z.string(),
+  created_at: IsoDateTimeSchema,
+  expires_at: IsoDateTimeSchema,
+});
 export const BrowserEndorsementCreateSchema = z.object({
   host_id: UUIDSchema,
   endorser_device_id: UUIDSchema,
@@ -50,3 +63,5 @@ export type PasskeyCredentialCreate = z.infer<typeof PasskeyCredentialCreateSche
 export type BrowserEndorsementCreate = z.infer<typeof BrowserEndorsementCreateSchema>;
 export type BrowserEndorsementOut = z.infer<typeof BrowserEndorsementOutSchema>;
 export type BrowserEndorsementRecord = z.infer<typeof BrowserEndorsementRecordSchema>;
+export type DeviceApprovalRequestCreate = z.infer<typeof DeviceApprovalRequestCreateSchema>;
+export type DeviceApprovalRequestOut = z.infer<typeof DeviceApprovalRequestOutSchema>;

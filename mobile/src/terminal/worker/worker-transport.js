@@ -28,8 +28,10 @@
     api.post({ type: "signal-frame", frame });
   }
 
-  function channelFailed(label) {
-    api.error("channel_closed", `${label} closed before the session retired.`, true);
+  function channelFailed(label, reason) {
+    // A daemon-authored reason (an unapproved device, a refused binding) is the
+    // only thing that tells the operator why, so it wins over the generic text.
+    api.error("channel_closed", reason || `${label} closed before the session retired.`, true);
     api.post({ type: "state", state: "reconnecting" });
     teardown(false);
   }
@@ -160,7 +162,8 @@
         }
       }
       if (["failed", "unavailable", "collision", "disabled"].includes(frame.status)) {
-        channelFailed(`RTC ${frame.status}`);
+        const reason = typeof frame.message === "string" ? frame.message.slice(0, 512) : "";
+        channelFailed(`RTC ${frame.status}`, reason);
       }
       return;
     }

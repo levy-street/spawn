@@ -49,7 +49,6 @@ export function NameDialog({
         </>
       }
       onDismiss={onDismiss}
-      showCloseButton={false}
       size="sm"
       title={title}
       visible={visible}

@@ -11,8 +11,8 @@ describe("headerDestinationActions", () => {
     mockPush.mockClear();
   });
 
-  it("keeps secondary destinations while dropping the primary tab routes", () => {
-    const actions = headerDestinationActions(["hosts", "legion", "settings", "admin"]);
+  it("offers the secondary destinations a header may push to", () => {
+    const actions = headerDestinationActions(["legion", "admin"]);
 
     expect(actions.map(({ accessibilityLabel, icon }) => ({ accessibilityLabel, icon }))).toEqual([
       { accessibilityLabel: "Open Legion", icon: "RadioTower" },
@@ -24,5 +24,18 @@ describe("headerDestinationActions", () => {
 
     expect(mockPush).toHaveBeenNthCalledWith(1, "/legion");
     expect(mockPush).toHaveBeenNthCalledWith(2, "/admin");
+  });
+
+  it("has no route to a tab root at all", () => {
+    // Hosts and Settings are roots of the tab bar. A header link to one pushed a
+    // card over the screen you were on, so they are not destinations any more —
+    // this is a type-level guarantee, asserted here so it stays one.
+    const destinations: readonly string[] = ["legion", "admin"];
+
+    expect(destinations).not.toContain("hosts");
+    expect(destinations).not.toContain("settings");
+    expect(
+      headerDestinationActions(["legion", "admin"]).map((action) => action.accessibilityLabel),
+    ).not.toContain("Open settings");
   });
 });

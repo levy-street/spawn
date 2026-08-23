@@ -7,7 +7,8 @@ export const paneRowStyles = StyleSheet.create({
   action: {
     height: sizing.listRow.trailingTarget,
     position: "absolute",
-    right: 0,
+    // Pulled in from the edge so the glyph is not crowding the screen border.
+    right: sizing.listRow.trailingActionInset,
     top: (sizing.listRow.regular - sizing.listRow.trailingTarget) / 2,
     width: sizing.listRow.trailingTarget,
   },
@@ -18,7 +19,7 @@ export const paneRowStyles = StyleSheet.create({
     alignItems: "center",
     flexDirection: "row",
     gap: sizing.space.peer,
-    paddingRight: sizing.listRow.trailingTarget,
+    paddingRight: sizing.listRow.trailingTarget + sizing.listRow.trailingActionInset,
   },
   swipeContent: {
     // The action tray remains themed, while the resting row reveals its parent surface.

@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
 import { SafeAreaProvider } from "react-native-safe-area-context";
-import SettingsIndexRoute from "@/app/(drawer)/settings/index";
+import SettingsIndexRoute from "@/app/(drawer)/(tabs)/settings/index";
 import { ServerPanel, testServerConnection } from "@/components/settings/server-panel";
 import { authToken } from "@/data/api/auth-token";
 import { getBaseUrlResolution, setBaseUrl } from "@/data/api/config";

@@ -1,4 +1,3 @@
-import { BottomSheetModalProvider } from "@gorhom/bottom-sheet";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useFonts } from "expo-font";
 import * as SplashScreen from "expo-splash-screen";
@@ -19,7 +18,6 @@ export const APP_PROVIDER_ORDER = [
   "SafeAreaProvider",
   "GestureHandlerRootView",
   "ThemeProvider",
-  "BottomSheetModalProvider",
   "QueryClientProvider",
   "RealtimeProvider",
   "ToastProvider",
@@ -83,18 +81,16 @@ export function AppProviders({ children }: PropsWithChildren): React.JSX.Element
       <GestureHandlerRootView style={styles.root}>
         <ThemeProvider>
           <LaunchAppearance>
-            <BottomSheetModalProvider>
-              <QueryClientProvider client={queryClient}>
-                <RealtimeProvider>
-                  <ToastProvider>
-                    <KeyboardProvider>
-                      <ConfirmHost />
-                      {children}
-                    </KeyboardProvider>
-                  </ToastProvider>
-                </RealtimeProvider>
-              </QueryClientProvider>
-            </BottomSheetModalProvider>
+            <QueryClientProvider client={queryClient}>
+              <RealtimeProvider>
+                <ToastProvider>
+                  <KeyboardProvider>
+                    <ConfirmHost />
+                    {children}
+                  </KeyboardProvider>
+                </ToastProvider>
+              </RealtimeProvider>
+            </QueryClientProvider>
           </LaunchAppearance>
         </ThemeProvider>
       </GestureHandlerRootView>

@@ -23,6 +23,8 @@ export const opacity = {
   pulse: 0.6,
   skeleton: 0.7,
   hoverButton: 0.9,
+  /** A pressed control that dims its own content instead of tinting its ground. */
+  pressedContent: 0.8,
   opaque: 1,
 } as const;
 

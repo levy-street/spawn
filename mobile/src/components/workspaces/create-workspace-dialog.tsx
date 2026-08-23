@@ -104,7 +104,6 @@ export function CreateWorkspaceDialog({
     <Dialog
       contentStyle={styles.dialogContent}
       onDismiss={onDismiss}
-      showCloseButton={false}
       size="full-mobile"
       title="New workspace"
       visible={visible}

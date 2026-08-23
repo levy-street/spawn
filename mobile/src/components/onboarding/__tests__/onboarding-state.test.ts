@@ -10,6 +10,7 @@ function state(overrides: Partial<OnboardingStepInput> = {}): OnboardingStepInpu
     account: READY_ACCOUNT,
     emailVerificationRequired: false,
     hostCount: 0,
+    deviceTrustedHostCount: 0,
     hostSkipped: false,
     ...overrides,
   };
@@ -34,8 +35,12 @@ describe("resolveOnboardingStep", () => {
     ).toBe("host");
   });
 
-  it("finishes for an existing host or an explicit local skip", () => {
-    expect(resolveOnboardingStep(state({ hostCount: 1 }))).toBe("done");
+  it("finishes for a host that trusts this device or an explicit local skip", () => {
+    expect(resolveOnboardingStep(state({ hostCount: 1, deviceTrustedHostCount: 1 }))).toBe("done");
     expect(resolveOnboardingStep(state({ hostSkipped: true }))).toBe("done");
+  });
+
+  it("keeps the host gate when the account owns hosts none of which trust this device", () => {
+    expect(resolveOnboardingStep(state({ hostCount: 2, deviceTrustedHostCount: 0 }))).toBe("host");
   });
 });

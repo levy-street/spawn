@@ -204,14 +204,9 @@ export function WorkspaceDetail({
           canAddPane={canAddTile(tab.layout)}
           hostsById={hostsById}
           onAddPane={() => presentLauncher(tab.id)}
-          onMovePane={(tile) => setMoveTile(tile)}
           onOpenFiles={onOpenFiles}
           onOpenTerminal={onOpenTerminal}
           onPaneActions={(tile) => setPaneTarget({ tabId: tab.id, tile })}
-          onRemovePane={(tile) => confirmRemove(workspace, tile)}
-          onRenameSession={(session) =>
-            setRenameTarget({ kind: "session", id: session.id, value: session.name ?? "" })
-          }
           sessionsById={sessionsById}
           tab={tab}
           transports={transports}
@@ -220,7 +215,6 @@ export function WorkspaceDetail({
     },
     [
       agents,
-      confirmRemove,
       hostsById,
       onOpenFiles,
       onOpenTerminal,

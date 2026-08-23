@@ -35,6 +35,10 @@ jest.mock("expo-router", () => {
   };
 });
 
+jest.mock("@gorhom/bottom-sheet", () => ({
+  useBottomSheetModal: () => ({ dismissAll: jest.fn() }),
+}));
+
 jest.mock("@/data/queries/auth", () => ({
   useMeQuery: () => ({ data: { user: { id: "u1", is_admin: false } }, isLoading: false }),
 }));
@@ -43,24 +47,41 @@ jest.mock("@/lib/auth-gate", () => ({
   useAuthenticatedAccount: () => ({ accountId: "u1", ready: true }),
 }));
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 import AppStackLayout, { APP_ROUTE_MAP, FULL_SCREEN_BACK_OPTIONS } from "@/app/(drawer)/_layout";
 import { ThemeProvider } from "@/theme";
 
+/** The shell renders a device-approval watcher that queries; give it a client. */
+function testQueryClient(): QueryClient {
+  return new QueryClient({ defaultOptions: { queries: { retry: false } } });
+}
+
 describe("app navigation shell", () => {
-  // Round 6 reinstated a persistent bottom nav, reversing round 3's "no menu at
-  // all". The shell is a tab navigator whose destinations each retain their own
-  // stack; the burger drawer stays gone.
-  it("renders a tab shell with a persistent nav, and no drawer", async () => {
+  // Round 8 made the shell a plain stack again: the three roots live in a tab
+  // group it pushes over, so every detail screen is an ordinary card with a real
+  // back entry rather than a tab masquerading as one.
+  it("pushes detail screens over the tab group, with no drawer", async () => {
     const screen = await render(
-      <ThemeProvider>
-        <AppStackLayout />
-      </ThemeProvider>,
+      <SafeAreaProvider
+        initialMetrics={{
+          frame: { x: 0, y: 0, width: 390, height: 844 },
+          insets: { bottom: 34, left: 0, right: 0, top: 47 },
+        }}
+      >
+        <QueryClientProvider client={testQueryClient()}>
+          <ThemeProvider>
+            <AppStackLayout />
+          </ThemeProvider>
+        </QueryClientProvider>
+      </SafeAreaProvider>,
     );
 
     expect(screen.queryByTestId("root-drawer")).toBeNull();
-    expect(screen.getByTestId("root-tabs")).toBeTruthy();
-    for (const destination of ["workspaces", "hosts", "settings"]) {
-      expect(screen.getByTestId(`app-screen-${destination}`)).toBeTruthy();
+    expect(screen.getByTestId("root-stack")).toBeTruthy();
+    expect(screen.getByTestId("app-screen-(tabs)")).toBeTruthy();
+    for (const pushed of ["workspace/[id]", "host/[id]/index", "legion"]) {
+      expect(screen.getByTestId(`app-screen-${pushed}`)).toBeTruthy();
     }
   });
 

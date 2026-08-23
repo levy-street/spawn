@@ -8,6 +8,8 @@ import {
   BrowserEndorsementOutSchema,
   type BrowserEndorsementRecord,
   BrowserEndorsementRecordSchema,
+  type DeviceApprovalRequestOut,
+  DeviceApprovalRequestOutSchema,
   type PasskeyCredentialCreate,
   PasskeyCredentialCreateSchema,
   type PasskeyCredentialOut,
@@ -57,6 +59,32 @@ export function createEndorsement(body: BrowserEndorsementCreate): Promise<Brows
     method: "POST",
     body: jsonBody(BrowserEndorsementCreateSchema.parse(body)),
     schema: BrowserEndorsementOutSchema,
+  });
+}
+
+/**
+ * Raise (or refresh) this device's knock so the account's other devices can
+ * offer to admit it. Grants nothing on its own — the pin still comes from an
+ * endorsement signed on a device the host already trusts.
+ */
+export function requestDeviceApproval(browserDeviceId: string): Promise<DeviceApprovalRequestOut> {
+  return api("/api/trust/device-approvals", {
+    method: "POST",
+    body: jsonBody({ browser_device_id: browserDeviceId }),
+    schema: DeviceApprovalRequestOutSchema,
+  });
+}
+
+export function listDeviceApprovals(): Promise<DeviceApprovalRequestOut[]> {
+  return api("/api/trust/device-approvals", {
+    schema: z.array(DeviceApprovalRequestOutSchema),
+  });
+}
+
+export function denyDeviceApproval(requestId: string): Promise<DeviceApprovalRequestOut> {
+  return api(`/api/trust/device-approvals/${pathPart(requestId)}/deny`, {
+    method: "POST",
+    schema: DeviceApprovalRequestOutSchema,
   });
 }
 

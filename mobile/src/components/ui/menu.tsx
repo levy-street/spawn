@@ -1,8 +1,8 @@
 import { Link } from "expo-router";
 import type { ReactNode, RefObject } from "react";
 import { useEffect, useRef } from "react";
-import { Pressable, StyleSheet, View } from "react-native";
-
+import { StyleSheet, View } from "react-native";
+import { DrawerRow, DrawerSeparator } from "@/components/ui/drawer-row";
 import {
   Popover,
   type PopoverAlign,
@@ -12,7 +12,8 @@ import {
 import { SheetScrollView } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { borderWidth, chrome, opacity, useTheme } from "@/theme";
+import { borderWidth, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 export interface MenuItem {
   type?: "item";
@@ -107,7 +108,6 @@ export function Menu({
         style={{
           backgroundColor: theme.colors.popover,
           borderWidth: borderWidth.none,
-          paddingHorizontal: theme.space(2),
         }}
         testID="menu-surface"
       >
@@ -119,24 +119,17 @@ export function Menu({
         >
           {entries.map((entry) => {
             if (isSeparator(entry)) {
-              return (
-                <View
-                  key={entry.id}
-                  style={{
-                    backgroundColor: theme.colors.popoverBorder,
-                    height: borderWidth.hairline,
-                    marginHorizontal: theme.space(1),
-                    marginVertical: theme.space(1),
-                  }}
-                />
-              );
+              return <DrawerSeparator key={entry.id} />;
             }
             if (isLabel(entry)) {
               return (
                 <Text
                   color="mutedForeground"
                   key={entry.id}
-                  style={{ paddingHorizontal: theme.space(2), paddingVertical: theme.space(1.5) }}
+                  style={{
+                    paddingHorizontal: sizing.actionSheet.horizontalPadding,
+                    paddingVertical: theme.space(1.5),
+                  }}
                   variant="micro"
                 >
                   {entry.label}
@@ -144,52 +137,24 @@ export function Menu({
               );
             }
 
-            const textColor = entry.destructive ? "destructive" : "popoverForeground";
             return (
-              <Pressable
-                accessibilityLabel={entry.accessibilityLabel ?? entry.label}
+              <DrawerRow
                 accessibilityRole="menuitem"
-                accessibilityState={{ disabled: entry.disabled }}
-                disabled={entry.disabled}
+                destructive={entry.destructive ?? false}
+                disabled={entry.disabled ?? false}
                 key={entry.id}
                 onPress={() => {
                   haptics.selection();
                   entry.onPress();
                   dismiss();
                 }}
-                style={({ pressed }) => [
-                  styles.item,
-                  {
-                    backgroundColor: pressed
-                      ? entry.destructive
-                        ? theme.colors.destructiveSoft
-                        : theme.colors.popoverAccent
-                      : "transparent",
-                    borderRadius: theme.radii.md,
-                    gap: theme.space(2),
-                    minHeight: chrome.touchTarget,
-                    opacity: entry.disabled ? opacity.disabled : opacity.opaque,
-                    paddingHorizontal: theme.space(2),
-                    paddingVertical: theme.space(2),
-                  },
-                ]}
-              >
-                {entry.icon ? (
-                  <View style={[styles.icon, { height: theme.space(4), width: theme.space(4) }]}>
-                    {entry.icon}
-                  </View>
-                ) : null}
-                <View style={styles.copy}>
-                  <Text color={textColor} variant="uiBase">
-                    {entry.label}
-                  </Text>
-                  {entry.detail ? (
-                    <Text color="mutedForeground" variant="caption">
-                      {entry.detail}
-                    </Text>
-                  ) : null}
-                </View>
-              </Pressable>
+                {...(entry.accessibilityLabel === undefined
+                  ? {}
+                  : { accessibilityLabel: entry.accessibilityLabel })}
+                {...(entry.detail === undefined ? {} : { detail: entry.detail })}
+                {...(entry.icon === undefined ? {} : { icon: entry.icon })}
+                label={entry.label}
+              />
             );
           })}
         </SheetScrollView>
@@ -199,19 +164,6 @@ export function Menu({
 }
 
 const styles = StyleSheet.create({
-  copy: {
-    flex: 1,
-    minWidth: 0,
-  },
-  icon: {
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  item: {
-    alignItems: "center",
-    flexDirection: "row",
-    width: "100%",
-  },
   scrollContent: {
     flexGrow: 1,
   },

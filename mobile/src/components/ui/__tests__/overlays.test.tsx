@@ -63,8 +63,11 @@ describe("overlay rendering and dismissal", () => {
       width: "100%",
     });
     expect(StyleSheet.flatten(screen.getByTestId("dialog-header").props["style"])).toMatchObject({
-      paddingTop: METRICS.insets.top + spacing[2],
+      paddingTop: METRICS.insets.top + spacing[3],
     });
+    // The dialog states its own answers: nothing is pinned to the foot unless the
+    // caller passes actions, so a lone "Close" never stacks under a form's own row.
+    expect(screen.queryByTestId("footer-actions")).toBeNull();
     expect(screen.queryByLabelText("Dismiss dialog")).not.toBeOnTheScreen();
     await fireEvent.press(screen.getByLabelText("Close dialog"));
     expect(onDismiss).toHaveBeenCalledTimes(1);
@@ -186,7 +189,7 @@ describe("overlay rendering and dismissal", () => {
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 
-  test("Sheet mounts content and ActionSheet exposes a cancel affordance", async () => {
+  test("Sheet mounts content and ActionSheet carries only its actions", async () => {
     const sheet = await render(
       <Sheet onDismiss={jest.fn()} visible>
         <SheetHeader title="Sheet title" />
@@ -206,8 +209,11 @@ describe("overlay rendering and dismissal", () => {
       />,
       { wrapper: Providers },
     );
-    await waitFor(() => expect(actionSheet.getByText("Cancel")).toBeTruthy());
-    await fireEvent.press(actionSheet.getByText("Cancel"));
+    // Drawers carry their actions and nothing else now — no title, no cancel row.
+    // Dismissing is the scrim, the drag, or the system gesture.
+    await waitFor(() => expect(actionSheet.getByText("Archive")).toBeTruthy());
+    expect(actionSheet.queryByText("Cancel")).toBeNull();
+    await fireEvent.press(actionSheet.getByText("Archive"));
     expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 

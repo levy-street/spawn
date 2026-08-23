@@ -53,6 +53,7 @@ export type NativeToWorkerMessage =
   | (NativeMessage & { type: "input"; sequence: number; data: string })
   | (NativeMessage & { type: "resize"; cols: number; rows: number })
   | (NativeMessage & { type: "fit" })
+  | (NativeMessage & { type: "take-control" })
   | (NativeMessage & { type: "set-theme"; theme: TerminalTheme })
   | (NativeMessage & { type: "set-font-size"; fontSize: number })
   | (NativeMessage & { type: "scroll"; target: "top" | "bottom"; lines?: number })
@@ -104,6 +105,13 @@ export type WorkerToNativeMessage =
       type: "sign-request";
       requestId: string;
       transcript: SignalTranscriptRequest;
+    })
+  | (WorkerMessage & {
+      type: "display";
+      owner: boolean;
+      viewers: number;
+      cols?: number;
+      rows?: number;
     })
   | (WorkerMessage & { type: "title"; title: string })
   | (WorkerMessage & { type: "bell" })
@@ -210,6 +218,7 @@ const NATIVE_MESSAGE_TYPES = new Set([
   "input",
   "resize",
   "fit",
+  "take-control",
   "set-theme",
   "set-font-size",
   "scroll",
@@ -231,6 +240,7 @@ const NATIVE_MESSAGE_TYPES = new Set([
 const WORKER_MESSAGE_TYPES = new Set([
   "ready",
   "state",
+  "display",
   "signal-frame",
   "sign-request",
   "title",

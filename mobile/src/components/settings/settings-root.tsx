@@ -1,5 +1,6 @@
 import { useRouter } from "expo-router";
 import { StyleSheet, View } from "react-native";
+import { headerDestinationActions } from "@/components/nav/header-destinations";
 import { SETTINGS_PANELS } from "@/components/settings/settings-inventory";
 import { SettingsLinkRow } from "@/components/settings/settings-row";
 import { SettingsScreen } from "@/components/settings/settings-screen";
@@ -19,7 +20,9 @@ export function SettingsRoot(): React.JSX.Element {
 
   return (
     <SettingsScreen
+      actions={headerDestinationActions(user?.is_admin ? ["admin"] : [])}
       description="Manage your account, appearance, notifications, hosts, agents, skills, browser devices, and device trust."
+      root
       testID="settings-root"
       title="Settings"
     >
@@ -44,7 +47,7 @@ export function SettingsRoot(): React.JSX.Element {
           </View>
           <Button
             accessibilityLabel="Open profile"
-            onPress={() => router.push("/settings/profile")}
+            onPress={() => router.push("/profile")}
             size="sm"
             variant="outline"
           >
@@ -63,6 +66,23 @@ export function SettingsRoot(): React.JSX.Element {
             testID={`settings-panel-${panel.key}`}
           />
         ))}
+      </SettingsSection>
+
+      <SettingsSection title="Connectivity & support">
+        <SettingsLinkRow
+          hint="Connection URL and health check"
+          icon="Network"
+          label="Server"
+          onPress={() => router.push("/settings/server")}
+          testID="settings-panel-server"
+        />
+        <SettingsLinkRow
+          hint="Version, installation, security, source, and legal information"
+          icon="ShieldCheck"
+          label="About & security"
+          onPress={() => router.push("/settings/about")}
+          testID="settings-panel-about"
+        />
       </SettingsSection>
     </SettingsScreen>
   );

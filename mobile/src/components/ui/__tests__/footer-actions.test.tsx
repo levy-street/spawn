@@ -87,6 +87,39 @@ describe("FooterActions", () => {
     });
   });
 
+  it("holds chrome drawn over it open until the keyboard covers that chrome", async () => {
+    const height = makeMutable(0);
+    const progress = makeMutable(0);
+    const targetProgress = makeMutable(0);
+    const footer = () => (
+      <ThemeProvider>
+        <FooterActions
+          keyboardAnimation={{ height, progress, targetProgress }}
+          reservedBottomChrome={94}
+        >
+          <Text>Cancel</Text>
+          <Text>Create</Text>
+        </FooterActions>
+      </ThemeProvider>
+    );
+    const screen = await render(footer());
+
+    // The nav bar's 94pt footprint already covers the 34pt device inset, so the
+    // reservation replaces it rather than stacking on top: 94 + the 12pt gap.
+    expect(StyleSheet.flatten(screen.getByTestId("footer-actions").props["style"])).toMatchObject({
+      paddingBottom: 106,
+    });
+
+    height.value = -300;
+    progress.value = 1;
+    await screen.rerender(footer());
+
+    // A raised keyboard covers the bar, so the reservation goes with it.
+    expect(StyleSheet.flatten(screen.getByTestId("footer-actions").props["style"])).toMatchObject({
+      paddingBottom: 12,
+    });
+  });
+
   it("uses the destination inset immediately when reduced motion is enabled", async () => {
     mockReducedMotion = true;
     const screen = await render(

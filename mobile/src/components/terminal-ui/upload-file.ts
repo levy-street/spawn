@@ -1,6 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Crypto from "expo-crypto";
-import type { DocumentPickerAsset } from "expo-document-picker";
 import { File } from "expo-file-system";
 
 import type { UploadRequest } from "@/terminal/transport/types";
@@ -66,8 +65,15 @@ export function bytesToLowerHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+/** The common ground between a document-picker asset and an image-picker one. */
+export interface TerminalUploadAsset {
+  uri: string;
+  name: string;
+  mimeType?: string | null;
+}
+
 export async function prepareTerminalUpload(
-  asset: DocumentPickerAsset,
+  asset: TerminalUploadAsset,
   destination: "attachments" | "cwd" = "cwd",
 ): Promise<UploadRequest & { uploadId: string }> {
   const bytes = await new File(asset.uri).bytes();

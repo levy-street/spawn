@@ -51,7 +51,7 @@ export function DiagnosticsSheet({
 }: DiagnosticsSheetProps): React.JSX.Element {
   const theme = useTheme();
   return (
-    <Sheet enableDynamicSizing onDismiss={onDismiss} visible={visible}>
+    <Sheet onDismiss={onDismiss} visible={visible}>
       <SheetHeader title="Terminal diagnostics" />
       <View style={{ paddingHorizontal: theme.space(4), paddingBottom: theme.space(4) }}>
         <View style={[styles.summary, { gap: theme.space(2), paddingVertical: theme.space(2) }]}>

@@ -21,13 +21,13 @@ function overlay(onDismiss: () => void) {
 }
 
 describe("SwipeDismissOverlay presentation", () => {
-  it("clips the moving panel to the shared overlay radius", async () => {
+  it("clips the moving panel to the device corner radius", async () => {
     const screen = await render(overlay(jest.fn()));
     const style = StyleSheet.flatten(
       screen.getByTestId("swipe-dismiss-overlay-panel").props["style"],
     );
 
-    expect(style.borderRadius).toBe(darkTheme.radii.xxl);
+    expect(style.borderRadius).toBe(darkTheme.radii.device);
     expect(style.overflow).toBe("hidden");
   });
 

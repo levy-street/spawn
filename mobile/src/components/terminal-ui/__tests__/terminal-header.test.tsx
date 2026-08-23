@@ -127,7 +127,6 @@ function props(overrides: Partial<TerminalHeaderProps> = {}): TerminalHeaderProp
     title: "Build",
     hostName: "studio",
     foregroundCommand: "codex",
-    connectionState: "failed",
     onBack: jest.fn(),
     onRename: jest.fn(async () => undefined),
     onRestart: jest.fn(),
@@ -176,16 +175,12 @@ describe("TerminalHeader", () => {
         icon: "Ellipsis",
       }),
     ]);
-    expect(screen.getByText("Failed")).toBeTruthy();
+    // No connection chip in the header any more — the overlay is the one place
+    // the connection reports itself.
+    expect(screen.queryByTestId("terminal-connection-chip")).toBeNull();
 
     await act(() => fireEvent.press(screen.getByRole("button", { name: "Back" })));
     expect(input.onBack).toHaveBeenCalledTimes(1);
-  });
-
-  test("centres the connection badge on the header title baseline", async () => {
-    await renderHeader(props());
-
-    expect(screen.getByTestId("terminal-connection-chip")).toHaveStyle({ alignSelf: "center" });
   });
 
   test("renders every action through NativePopover and marks kill destructive", async () => {

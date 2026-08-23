@@ -84,8 +84,13 @@ export function AppHeader({
   const visibleActions = actions
     ?.filter((action) => !isPrimaryHeaderDestinationAction(action))
     .slice(0, MAX_ACTIONS);
-  const resolvedLeading = leading ?? navigationDefaults.leading;
   const resolvedBack = navigationDefaults.backOverride ?? onBack;
+  // A screen has a back control or a root control, never both — and which it is
+  // is a property of the screen, not of the current path. Deciding by pathname
+  // blanked the avatar the instant a push began, so it vanished for the length of
+  // the animation and reappeared on the way back.
+  const resolvedLeading =
+    leading ?? (resolvedBack === undefined ? navigationDefaults.leading : null);
 
   return (
     <View

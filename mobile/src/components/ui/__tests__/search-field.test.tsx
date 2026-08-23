@@ -1,5 +1,6 @@
 import { act, fireEvent, render } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
+import { StyleSheet } from "react-native";
 
 import { SearchField } from "@/components/ui/search-field";
 import { spacing, ThemeProvider } from "@/theme";
@@ -67,12 +68,22 @@ describe("SearchField", () => {
 
   test("centres text and leaves tokenized clearance after the search icon", async () => {
     const screen = await render(<SearchField testID="search" />, { wrapper });
+    const inputStyle = StyleSheet.flatten(screen.getByTestId("search").props["style"]);
 
     expect(screen.getByTestId("search")).toHaveStyle({
-      lineHeight: sizing.type.componentLabel.lineHeight,
       paddingLeft: spacing[2],
       paddingVertical: spacing[0],
       textAlignVertical: "center",
     });
+    // A lineHeight lays iOS single-line text out from the top of the content box,
+    // which parked the query below the field's optical centre.
+    expect(inputStyle.lineHeight).toBeUndefined();
+  });
+
+  test("stands at the taller search height", async () => {
+    const screen = await render(<SearchField testID="search" />, { wrapper });
+    const container = screen.getByTestId("search").parent;
+
+    expect(StyleSheet.flatten(container?.props["style"]).height).toBe(sizing.control.searchField);
   });
 });

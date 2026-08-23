@@ -88,14 +88,16 @@ describe("ProfileMenu", () => {
     await fireEvent.press(screen.getByLabelText("Open profile menu"));
 
     expect(haptics.overlayOpen).toHaveBeenCalledTimes(1);
-    expect(screen.getByText("charlie@example.com")).toBeTruthy();
+    // The email header was removed: the drawer is two actions, and whose account
+    // it is is already answered by the avatar you tapped to open it.
+    expect(screen.queryByText("charlie@example.com")).toBeNull();
     expect(screen.getByRole("button", { name: "Profile" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Log out" })).toBeTruthy();
 
     await fireEvent.press(screen.getByRole("button", { name: "Profile" }));
 
     expect(haptics.selection).toHaveBeenCalledTimes(1);
-    expect(mockPush).toHaveBeenCalledWith("/settings/profile");
+    expect(mockPush).toHaveBeenCalledWith("/profile");
     expect(screen.queryByTestId("profile-sheet")).toBeNull();
   });
 

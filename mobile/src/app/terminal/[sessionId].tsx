@@ -1,6 +1,7 @@
 import { useIsFocused } from "@react-navigation/native";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
 import { StyleSheet, View } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
@@ -16,7 +17,7 @@ import {
   useTerminalData,
 } from "@/data/queries/terminal";
 import { useTheme } from "@/theme";
-import { sizing } from "@/theme/sizing";
+import { bottomNavHeight } from "@/theme/sizing";
 
 function routeSessionId(value: string | string[] | undefined): string {
   return Array.isArray(value) ? (value[0] ?? "") : (value ?? "");
@@ -29,6 +30,7 @@ export const TERMINAL_ROUTE_GESTURE_OPTIONS = {
 
 export default function TerminalScreen(): React.JSX.Element {
   const theme = useTheme();
+  const insets = useSafeAreaInsets();
   const focused = useIsFocused();
   const router = useRouter();
   const params = useLocalSearchParams<{ sessionId?: string | string[] }>();
@@ -55,7 +57,10 @@ export default function TerminalScreen(): React.JSX.Element {
     return (
       <>
         {screenOptions}
-        <View style={styles.navClearance} testID="terminal-nav-clearance">
+        <View
+          style={[styles.navClearance, { paddingBottom: bottomNavHeight(insets.bottom) }]}
+          testID="terminal-nav-clearance"
+        >
           <Screen
             header={<AppHeader onBack={() => router.back()} title="Terminal" />}
             padded={false}
@@ -94,7 +99,10 @@ export default function TerminalScreen(): React.JSX.Element {
     return (
       <>
         {screenOptions}
-        <View style={styles.navClearance} testID="terminal-nav-clearance">
+        <View
+          style={[styles.navClearance, { paddingBottom: bottomNavHeight(insets.bottom) }]}
+          testID="terminal-nav-clearance"
+        >
           <Screen
             header={<AppHeader onBack={() => router.back()} title="Terminal" />}
             padded={false}
@@ -112,20 +120,28 @@ export default function TerminalScreen(): React.JSX.Element {
     );
   }
 
+  const host = data.host;
   return (
     <>
       {screenOptions}
-      <View style={styles.navClearance} testID="terminal-nav-clearance">
-        <TerminalOverlay
-          focused={focused}
-          host={data.host}
-          onDismiss={() => router.back()}
-          onKill={() => kill.mutateAsync()}
-          onRename={(name) => rename.mutateAsync(name).then(() => undefined)}
-          onRestart={() => restart.mutateAsync().then(() => undefined)}
-          session={data.session}
-        />
-      </View>
+      {/* No clearance wrapper here: the overlay reserves the nav bar itself and
+        gives that reservation back the moment the keyboard covers the bar. A
+        fixed padding is what left a dead band under the key row. */}
+      <TerminalOverlay
+        focused={focused}
+        host={host}
+        onDeviceTrust={() =>
+          router.push({
+            pathname: "/device-approval",
+            params: { hostId: host.id },
+          })
+        }
+        onDismiss={() => router.back()}
+        onKill={() => kill.mutateAsync()}
+        onRename={(name) => rename.mutateAsync(name).then(() => undefined)}
+        onRestart={() => restart.mutateAsync().then(() => undefined)}
+        session={data.session}
+      />
     </>
   );
 }
@@ -141,6 +157,5 @@ const styles = StyleSheet.create({
   },
   navClearance: {
     flex: 1,
-    paddingBottom: sizing.bottomNav.contentHeight + sizing.bottomNav.verticalPadding,
   },
 });

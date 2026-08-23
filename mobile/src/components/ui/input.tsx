@@ -308,14 +308,20 @@ const styles = StyleSheet.create({
     opacity: opacity.disabled,
   },
   input: {
-    ...typeStyles.uiSm,
+    // iOS lays a single-line TextInput's text out from the top of its content
+    // box when a lineHeight is set, which pushed the value and placeholder below
+    // the field's optical centre. Height plus flex centring does the job without
+    // it, so only the face and weight are taken from the shared type style.
+    fontSize: typeStyles.uiSm.fontSize,
+    fontWeight: typeStyles.uiSm.fontWeight,
     flex: 1,
     height: "100%",
     paddingHorizontal: spacing[3],
-    paddingVertical: spacing[2.5],
+    paddingVertical: 0,
   },
   inputWithLeading: {
-    paddingLeft: spacing[1],
+    // Clear of the leading glyph rather than crowding it.
+    paddingLeft: spacing[2],
   },
   inputWithTrailing: {
     paddingRight: spacing[1],

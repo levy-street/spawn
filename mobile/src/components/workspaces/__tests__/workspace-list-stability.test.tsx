@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, within } from "@testing-library/react-native";
-import type { ComponentType, PropsWithChildren } from "react";
+import type { ComponentType, PropsWithChildren, ReactNode } from "react";
 import { StyleSheet } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
@@ -12,6 +12,7 @@ import { sizing } from "@/theme/sizing";
 interface CapturedFlashListProps {
   data: ReadonlyArray<{ workspace: { id: string } }>;
   ItemSeparatorComponent?: ComponentType;
+  ListFooterComponent?: ReactNode;
   keyExtractor(item: { workspace: { id: string } }): string;
   onRefresh(): void;
   refreshing: boolean;
@@ -86,6 +87,7 @@ jest.mock("@shopify/flash-list", () => {
         View,
         { testID: props.testID },
         props.data.length > 1 && Separator !== undefined ? React.createElement(Separator) : null,
+        props.ListFooterComponent ?? null,
       );
     },
   };
@@ -96,8 +98,8 @@ jest.mock("expo-router", () => ({
 }));
 
 jest.mock("@/components/ui/toast", () => ({ useToast: () => mockToast }));
-jest.mock("@/components/workspaces/change-workspace-icon-dialog", () => ({
-  ChangeWorkspaceIconDialog: () => null,
+jest.mock("@/components/workspaces/change-workspace-icon-sheet", () => ({
+  ChangeWorkspaceIconSheet: () => null,
 }));
 jest.mock("@/components/workspaces/create-workspace-dialog", () => ({
   CreateWorkspaceDialog: ({ visible }: { visible: boolean }) => {
@@ -218,7 +220,7 @@ describe("workspace list refresh stability", () => {
   it("renders one global header carrying only the create action", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
     expect(screen.getAllByText("Workspaces")).toHaveLength(1);
-    expect(screen.getByLabelText("New workspace")).toBeTruthy();
+    expect(screen.getByTestId("new-workspace-button")).toBeTruthy();
 
     // Hosts and Settings moved to the bottom nav; offering them here too was the
     // duplication round 6 removed. Creating a workspace is not navigation, so it stays.
@@ -231,20 +233,41 @@ describe("workspace list refresh stability", () => {
     await screen.unmount();
   });
 
-  it("renders archived navigation directly above search with its count and chevron", async () => {
+  it("offers a create row under the last workspace", async () => {
+    const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
+    const createRow = within(screen.getByTestId("new-workspace-row")).getByLabelText(
+      "New workspace",
+    );
+
+    // The row sits inside the list's footer, so it trails the workspaces rather
+    // than floating over them.
+    expect(within(screen.getByTestId("workspace-list")).getByTestId("new-workspace-row")).toBe(
+      screen.getByTestId("new-workspace-row"),
+    );
+
+    await fireEvent.press(createRow);
+    expect(mockCreateVisible).toBe(true);
+
+    await screen.unmount();
+  });
+
+  it("pins archived navigation to the foot of the screen with its count and chevron", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
     const root = screen.getByTestId("workspace-list-screen");
     const archivedSection = screen.getByTestId("archived-workspaces-section");
     const searchSection = screen.getByTestId("workspace-search-section");
     const sectionStyle = StyleSheet.flatten(searchSection.props["style"]);
-    const archivedRow = screen.getByLabelText("Archived workspaces, 1 workspace");
+    const archivedRow = screen.getByLabelText("1 Archived workspace");
 
-    expect(root.children.indexOf(archivedSection)).toBeLessThan(
+    // Archived sits below the list now, pinned above the nav bar: a rarely-taken
+    // side road should not stand between the search and the workspaces.
+    expect(root.children.indexOf(archivedSection)).toBeGreaterThan(
       root.children.indexOf(searchSection),
     );
     expect(archivedRow).toHaveStyle({ borderRadius: borderWidth.none });
-    expect(within(archivedSection).getByText("Archived workspaces")).toBeTruthy();
-    expect(within(archivedSection).getByText("1 workspace")).toBeTruthy();
+    // The count carries the label rather than a second line restating "workspace".
+    expect(within(archivedSection).getByText("1 Archived workspace")).toBeTruthy();
+    expect(within(archivedSection).queryByText("1 workspace")).toBeNull();
     expect(within(searchSection).getByTestId("workspace-search")).toBeTruthy();
     expect(searchSection.parent).toBe(screen.getByTestId("workspace-list-screen"));
     expect(screen.queryByTestId("keyboard-sticky-view")).toBeNull();
@@ -267,9 +290,12 @@ describe("workspace list refresh stability", () => {
   it("joins workspace rows with a global separator at zero left inset", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
     expect(latestList().ItemSeparatorComponent).toBeDefined();
-    expect(within(screen.getByTestId("workspace-list")).getByTestId("list-separator")).toHaveStyle({
-      marginLeft: 0,
-    });
+    // The row separators and the one above the create row all run edge to edge.
+    for (const separator of within(screen.getByTestId("workspace-list")).getAllByTestId(
+      "list-separator",
+    )) {
+      expect(separator).toHaveStyle({ marginLeft: 0 });
+    }
     await screen.unmount();
   });
 
