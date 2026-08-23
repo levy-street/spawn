@@ -6,6 +6,9 @@ cd "$repo_root"
 
 web_port="${SPAWN_DEV_WEB_PORT:-3000}"
 api_port="${SPAWN_DEV_API_PORT:-8010}"
+# Bind host for the API. Defaults to loopback; set to 0.0.0.0 to reach the dev
+# server from another device on the LAN (the native mobile app in Expo Go).
+api_host="${SPAWN_DEV_API_HOST:-127.0.0.1}"
 public_url="http://localhost:${web_port}"
 api_url="http://127.0.0.1:${api_port}"
 daemon_config_dir="${SPAWN_DEV_DAEMON_CONFIG_DIR:-$repo_root/.spawn/local-daemon}"
@@ -147,7 +150,7 @@ trap 'exit 143' TERM
 
 printf '== starting API at %s ==\n' "$api_url"
 launch_group "$repo_root/server" \
-  uv run uvicorn spawn_server.main:app --reload --host 127.0.0.1 --port "$api_port" \
+  uv run uvicorn spawn_server.main:app --reload --host "$api_host" --port "$api_port" \
   --ws websockets-sansio
 child_pids+=("$launched_pid")
 child_labels+=("API")

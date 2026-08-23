@@ -1,6 +1,6 @@
 "use client";
 
-import { Archive, ImagePlus, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
+import { Archive, ImagePlus, MoreHorizontal, Pencil, Trash2, Unlink } from "lucide-react";
 import Link from "next/link";
 import {
   type FormEvent,
@@ -27,11 +27,13 @@ import { Input } from "@/components/ui/input";
 import { RailTooltip } from "@/components/ui/tooltip";
 import { WorkspaceIconDialog } from "@/components/workspace/workspace-icon-dialog";
 import type { Workspace } from "@/lib/api";
+import type { SplitSide } from "@/lib/split-store";
 import { cn } from "@/lib/utils";
 
 export function SidebarWorkspaceRow({
   workspace,
   active,
+  beside = false,
   collapsed,
   attentionCount,
   busy,
@@ -44,6 +46,12 @@ export function SidebarWorkspaceRow({
 }: {
   workspace: Workspace;
   active: boolean;
+  /**
+   * Shown in the other half of a split. On screen just as much as the active
+   * row, so it cannot look unvisited — but it is not what the URL is about,
+   * so it does not wear the full selection either.
+   */
+  beside?: boolean;
   collapsed: boolean;
   attentionCount: number;
   busy: boolean;
@@ -81,7 +89,7 @@ export function SidebarWorkspaceRow({
           <Link
             href={`/w/${workspace.id}`}
             onClick={onNavigate}
-            aria-current={active ? "page" : undefined}
+            aria-current={active ? "page" : beside ? "true" : undefined}
             className="relative"
           >
             <WorkspaceAvatar
@@ -96,7 +104,10 @@ export function SidebarWorkspaceRow({
                 // instead of eating 2px of the artwork.
                 active
                   ? "border-foreground/20 bg-accent text-accent-foreground ring-1 ring-foreground"
-                  : "border-border bg-muted/50 text-muted-foreground hover:bg-accent hover:text-foreground",
+                  : beside
+                    ? // The same ring, half lit: the same fact, said quieter.
+                      "border-foreground/20 bg-accent/50 text-foreground ring-1 ring-foreground/40"
+                    : "border-border bg-muted/50 text-muted-foreground hover:bg-accent hover:text-foreground",
               )}
             />
             {attentionCount > 0 && (
@@ -111,6 +122,10 @@ export function SidebarWorkspaceRow({
   return (
     <li
       data-workspace-row={workspace.id}
+      // The workspaces this row holds. One, here — but the drag reads it off
+      // every row uniformly to turn a row index into stored positions, and a
+      // paired row holds two.
+      data-row-ids={workspace.id}
       onPointerDown={editing ? undefined : onRowPointerDown}
       // The row wraps an anchor, whose native HTML5 drag would otherwise
       // hijack the pointer and freeze the reorder gesture.
@@ -139,8 +154,14 @@ export function SidebarWorkspaceRow({
           <Link
             href={`/w/${workspace.id}`}
             onClick={onNavigate}
-            aria-current={active ? "page" : undefined}
-            className={cn(sidebarRowClass(active), "pr-10 [@media(pointer:coarse)]:pr-16")}
+            aria-current={active ? "page" : beside ? "true" : undefined}
+            className={cn(
+              sidebarRowClass(active),
+              // Between rest and selection, and not a hover state: the row is
+              // held there whether or not the pointer is anywhere near it.
+              !active && beside && "bg-accent/50 text-foreground",
+              "pr-10 [@media(pointer:coarse)]:pr-16",
+            )}
           >
             <SidebarIconSlot>
               <WorkspaceAvatar name={workspace.name} icon={workspace.icon} />
@@ -227,6 +248,156 @@ export function SidebarWorkspaceRow({
           onSelect={onIcon}
         />
       )}
+    </li>
+  );
+}
+
+/**
+ * One half of a paired row. A real `<button>`, not a link: the two workspaces
+ * of a split are both already on screen, so pressing one is a request to work
+ * in it, not to go to it. Navigating to the right-hand one would in fact close
+ * the split — the route would equal the pair's second workspace, which is the
+ * store's definition of "that one is the whole window now".
+ */
+function SidebarPairHalf({
+  workspace,
+  side,
+  active,
+  attentionCount,
+  onActivate,
+}: {
+  workspace: Workspace;
+  side: SplitSide;
+  active: boolean;
+  attentionCount: number;
+  onActivate: (side: SplitSide) => void;
+}) {
+  return (
+    <button
+      type="button"
+      // Read by the drag: which half was pressed decides which workspace is
+      // carried out to the canvas, while the row as a whole is what reorders.
+      data-pair-half={workspace.id}
+      aria-pressed={active}
+      title={workspace.name}
+      onClick={() => onActivate(side)}
+      className={cn(
+        "flex h-(--row-h) min-w-0 flex-1 items-center gap-1.5 rounded-lg px-1.5 text-sm transition-colors",
+        // Both halves are on screen, so neither may read as unvisited. The
+        // one holding the gestures wears the full selection and the other the
+        // same tint at half strength.
+        active
+          ? "bg-accent text-accent-foreground"
+          : "bg-accent/50 text-foreground hover:bg-accent/70",
+      )}
+    >
+      <span className="relative shrink-0">
+        <WorkspaceAvatar name={workspace.name} icon={workspace.icon} />
+        {/* The pip sits on the mark rather than beside it: a paired row has no
+            width to spare for a badge, and the mark is what the eye is
+            scanning for anyway. The count itself goes into the button's name,
+            where it is a fact rather than a coloured dot. */}
+        {attentionCount > 0 && (
+          <span
+            aria-hidden
+            className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-shell bg-warning"
+          />
+        )}
+      </span>
+      <span className="min-w-0 flex-1 truncate text-left font-medium">{workspace.name}</span>
+      {attentionCount > 0 && <span className="sr-only">{attentionCount} need attention</span>}
+    </button>
+  );
+}
+
+/**
+ * A split, as one row holding both of its workspaces side by side in the
+ * order they are on screen.
+ *
+ * Two separate rows would say the workspaces are two independent destinations,
+ * which while they are split they are not: one window holds both, and clicking
+ * either is a move within it. Drawing them joined, in the same left-to-right
+ * order as the halves themselves, is what makes the rail a picture of the
+ * window rather than a list that happens to contain it.
+ *
+ * Expanded rail only. Collapsed, the two keep their own tiles: two containers
+ * and a control between them do not survive a 56px column, and no drag starts
+ * from there anyway.
+ */
+export function SidebarWorkspacePair({
+  primary,
+  secondary,
+  activeSide,
+  primaryAttention,
+  secondaryAttention,
+  onActivate,
+  onUnsplit,
+  onRowPointerDown,
+}: {
+  primary: Workspace;
+  secondary: Workspace;
+  activeSide: SplitSide;
+  primaryAttention: number;
+  secondaryAttention: number;
+  onActivate: (side: SplitSide) => void;
+  /** Back to one workspace, keeping the routed (left) one. */
+  onUnsplit: () => void;
+  onRowPointerDown?: (event: ReactPointerEvent<HTMLLIElement>) => void;
+}) {
+  return (
+    <li
+      // The anchor id, as every row carries; `data-row-ids` is what the drag
+      // reads to turn a row index into the positions the server stores, which
+      // for this row is two of them.
+      data-workspace-row={primary.id}
+      data-row-ids={`${primary.id} ${secondary.id}`}
+      onPointerDown={onRowPointerDown}
+    >
+      {/* The halves sit all but touching and the control rides the seam
+          between them rather than taking a column of its own: out of flow,
+          both halves keep the width, and the icon reads as the join it undoes
+          instead of as a third thing in a row of three. */}
+      <div className="relative flex items-center gap-4">
+        <SidebarPairHalf
+          workspace={primary}
+          side="primary"
+          active={activeSide === "primary"}
+          attentionCount={primaryAttention}
+          onActivate={onActivate}
+        />
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          // Between the halves in the markup as well as on screen, though it
+          // is out of flow and could sit anywhere: reading order is the only
+          // thing its position here still decides.
+          //
+          // Names what survives, because the control cannot: the icon says
+          // "separate these", not which of the two you keep.
+          aria-label={`Unsplit, keep ${primary.name}`}
+          title={`Unsplit, keep ${primary.name}`}
+          onClick={onUnsplit}
+          className={cn(
+            // Both halves are flex-1, so half the row is exactly the seam.
+            "absolute left-1/2 top-1/2 z-10 size-7 -translate-x-1/2 -translate-y-1/2",
+            // No plate at rest: the mark alone straddles the gap, and the
+            // tiles either side are what give it its shape. A ground only
+            // appears under the pointer, where it is answering a hover rather
+            // than decorating a seam.
+            "rounded-full text-muted-foreground hover:bg-accent hover:text-foreground",
+          )}
+        >
+          <Unlink className="size-3.5" aria-hidden />
+        </Button>
+        <SidebarPairHalf
+          workspace={secondary}
+          side="secondary"
+          active={activeSide === "secondary"}
+          attentionCount={secondaryAttention}
+          onActivate={onActivate}
+        />
+      </div>
     </li>
   );
 }

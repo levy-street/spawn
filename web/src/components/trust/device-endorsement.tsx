@@ -63,25 +63,33 @@ export function useDeviceTrustMap(enabled: boolean) {
  * re-derived locally from the key (a server-substituted key is refused), and
  * the endorsement covers every host this endorsing device is trusted by.
  */
-export function EndorseDevicePanel({
-  accountId,
-  target,
-  targetFingerprint,
-  onDone,
-  onCancel,
-}: {
-  accountId: string;
-  target: BrowserDevice;
-  /** Locally derived by the caller (never the server's claim). */
-  targetFingerprint: string;
-  onDone: (summary: string) => void;
-  onCancel: () => void;
-}) {
-  const queryClient = useQueryClient();
-  const [failure, setFailure] = useState<string | null>(null);
+export interface EndorsementResult {
+  count: number;
+  fingerprint: string;
+}
 
-  const endorse = useMutation({
-    mutationFn: async () => {
+/**
+ * The endorsement ceremony itself, shared by the Devices panel and the
+ * approval prompt.
+ *
+ * The security-relevant part is the fingerprint re-derivation: the operator
+ * compared a fingerprint on two screens, and that comparison only means
+ * anything if the key being signed is the key that fingerprint describes. A
+ * server that pairs the victim's fingerprint with its own key gets a refusal,
+ * not a signature.
+ */
+export function useEndorseDevice(
+  accountId: string,
+  onSuccess?: (result: EndorsementResult, target: BrowserDevice) => void,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: {
+      target: BrowserDevice;
+      /** Locally derived by the caller — never the server's claim. */
+      targetFingerprint: string;
+    }): Promise<EndorsementResult> => {
+      const { target, targetFingerprint } = input;
       const identity = await loadBrowserDeviceIdentity(accountId);
       if (identity === null) {
         throw new Error("This browser has no identity to approve with.");
@@ -137,17 +145,35 @@ export function EndorseDevicePanel({
       }
       return { count, fingerprint: derived };
     },
-    onMutate: () => setFailure(null),
-    onSuccess: (result) => {
+    onSuccess: (result, variables) => {
       queryClient.invalidateQueries({ queryKey: ["trust"] });
-      onDone(
-        `Approved ${target.label ?? "the device"} (${result.fingerprint}) for ${result.count} host${
-          result.count === 1 ? "" : "s"
-        }. It can connect within a few seconds.`,
-      );
+      onSuccess?.(result, variables.target);
     },
-    onError: (error) => setFailure(error instanceof Error ? error.message : String(error)),
   });
+}
+
+export function EndorseDevicePanel({
+  accountId,
+  target,
+  targetFingerprint,
+  onDone,
+  onCancel,
+}: {
+  accountId: string;
+  target: BrowserDevice;
+  /** Locally derived by the caller (never the server's claim). */
+  targetFingerprint: string;
+  onDone: (summary: string) => void;
+  onCancel: () => void;
+}) {
+  const [failure, setFailure] = useState<string | null>(null);
+  const endorse = useEndorseDevice(accountId, (result) =>
+    onDone(
+      `Approved ${target.label ?? "the device"} (${result.fingerprint}) for ${result.count} host${
+        result.count === 1 ? "" : "s"
+      }. It can connect within a few seconds.`,
+    ),
+  );
 
   return (
     <div
@@ -175,7 +201,16 @@ export function EndorseDevicePanel({
           type="button"
           size="sm"
           disabled={endorse.isPending}
-          onClick={() => endorse.mutate()}
+          onClick={() => {
+            setFailure(null);
+            endorse.mutate(
+              { target, targetFingerprint },
+              {
+                onError: (error) =>
+                  setFailure(error instanceof Error ? error.message : String(error)),
+              },
+            );
+          }}
         >
           {endorse.isPending ? "Approving…" : "It matches — approve"}
         </Button>

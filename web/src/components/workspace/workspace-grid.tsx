@@ -52,6 +52,7 @@ import {
 import { cn } from "@/lib/utils";
 import { agentRunCommand } from "./agent-command";
 import { NewSessionLozenges, NewSessionMenu } from "./new-session-menu";
+import { queryInPane, usePaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
 import { type PaneSlotTarget, SessionPane } from "./session-pane";
 import { TabHomeButton } from "./tab-home";
@@ -79,7 +80,20 @@ import {
   wantsDuplicate,
 } from "./workspace-grid-helpers";
 
+/**
+ * How much canvas the real grid needs; narrower than this the panes stack into
+ * the mobile layout instead.
+ *
+ * A half of a split is held to a lower bar. Two halves of a 1440-wide laptop
+ * come out around 600px each, so keeping them to 768 would turn both into
+ * phone stacks the moment the window split — the feature would look broken on
+ * the most ordinary machine there is. 560 is low enough that every laptop
+ * splits into two real grids, and high enough that the halves of a genuinely
+ * small window still stack, where side-by-side panes would be narrower than a
+ * terminal has any use for.
+ */
 const WIDE_CONTAINER_PX = 768;
+const WIDE_CONTAINER_SPLIT_PX = 560;
 /**
  * Where the first window of an empty tab lands: the left half, full height.
  * Auto-placing would hand it the whole canvas, and a full canvas has nowhere
@@ -161,6 +175,27 @@ type ArmedMove = {
   move: (event: PointerEvent) => void;
   end: () => void;
 };
+
+/**
+ * The tab under the pointer, when it is one of `workspaceId`'s own.
+ *
+ * A split window has two tab strips on screen and a hit-test finds either, but
+ * a grid can only carry a pane into a tab of the workspace it is showing:
+ * switching to a foreign tab id would leave this grid pointed at a tab that
+ * does not exist in its envelope. Dragging a pane across the seam is not a
+ * gesture yet, so the other strip has to read as no strip at all rather than
+ * as a target that half-works.
+ *
+ * A tab has to name this workspace to count. One that names nobody is not
+ * treated as ours: the strip stamps its owner on every button, so an unowned
+ * one means the markup moved and the safe answer is the one that cannot switch
+ * this grid to a foreign tab.
+ */
+function ownTabAt(under: Element | null | undefined, workspaceId: string): string | null {
+  const tab = under?.closest?.("[data-workspace-tab]");
+  if (!tab || tab.getAttribute("data-workspace-tab-owner") !== workspaceId) return null;
+  return tab.getAttribute("data-workspace-tab");
+}
 
 /** The tile a gesture is actually dragging — the copy, when ⌘ is down. */
 function draggedTileId(gesture: GridGesture): string | null {
@@ -332,6 +367,9 @@ export function WorkspaceGrid({
 }) {
   const router = useRouter();
   const queryClient = useQueryClient();
+  // This half of the window: whether it shares the screen with a second
+  // workspace, and whether it is the half the keyboard is meant for.
+  const { active: paneActive, split, rootRef: paneRootRef } = usePaneScope();
   const areaRef = useRef<HTMLDivElement>(null);
   const ghostRef = useRef<HTMLDivElement>(null);
   const tileElementsRef = useRef(new Map<string, HTMLDivElement>());
@@ -363,6 +401,10 @@ export function WorkspaceGrid({
   const [revision, setRevision] = useState(0);
 
   const latestTilesRef = useRef(tiles);
+  // Read through a ref for the same reason as the callbacks below: the live
+  // gesture closures must not be rebuilt when a prop identity changes.
+  const workspaceIdRef = useRef(workspace.id);
+  workspaceIdRef.current = workspace.id;
   const onSwitchTabRef = useRef(onSwitchTab);
   onSwitchTabRef.current = onSwitchTab;
   // Read through a ref everywhere below: an inline onError prop must not
@@ -453,12 +495,13 @@ export function WorkspaceGrid({
   useLayoutEffect(() => {
     const area = areaRef.current;
     if (!area) return;
+    const threshold = split ? WIDE_CONTAINER_SPLIT_PX : WIDE_CONTAINER_PX;
     const observer = new ResizeObserver(([entry]) => {
-      setWide((entry?.contentRect.width ?? 0) >= WIDE_CONTAINER_PX);
+      setWide((entry?.contentRect.width ?? 0) >= threshold);
     });
     observer.observe(area);
     return () => observer.disconnect();
-  }, []);
+  }, [split]);
 
   useEffect(() => {
     const query = window.matchMedia("(pointer: fine)");
@@ -707,10 +750,10 @@ export function WorkspaceGrid({
       divider.removeAttribute("data-dragging");
       dividerElementRef.current = null;
     }
-    document.querySelector("[data-launcher-fab]")?.removeAttribute("data-trash-hover");
+    queryInPane(paneRootRef.current, "[data-launcher-fab]")?.removeAttribute("data-trash-hover");
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
-  }, []);
+  }, [paneRootRef]);
 
   const previewLayout = useCallback((gesture: GridGesture) => {
     const { preview, areaRect } = gesture;
@@ -990,7 +1033,12 @@ export function WorkspaceGrid({
         // the canvas, so aiming at it has to take the placement off the table
         // rather than dock the pane into whatever sits behind it.
         const overBin = Boolean(under?.closest?.("[data-launcher-fab]"));
-        document.querySelector("[data-launcher-fab]")?.toggleAttribute("data-trash-hover", overBin);
+        // The bin that will act is this half's own, whichever one the pointer
+        // found: the drop discards a pane out of this grid.
+        queryInPane(paneRootRef.current, "[data-launcher-fab]")?.toggleAttribute(
+          "data-trash-hover",
+          overBin,
+        );
         if (overBin !== gesture.discarding) {
           gesture.discarding = overBin;
           // Either direction, the placement has to be derived again from here.
@@ -1006,9 +1054,7 @@ export function WorkspaceGrid({
         // it mid-drag; the tabId-change effect below re-seeds the gesture so
         // the pane is carried into the newly visible grid. A duplicating drag
         // stays home: the copy belongs beside the pane it came from.
-        const overTab = gesture.clone
-          ? null
-          : under?.closest?.("[data-workspace-tab]")?.getAttribute("data-workspace-tab");
+        const overTab = gesture.clone ? null : ownTabAt(under, workspaceIdRef.current);
         if (overTab && overTab !== tabIdRef.current) {
           const hovered = hoveredTabRef.current;
           if (!hovered || hovered.id !== overTab) {
@@ -1069,7 +1115,7 @@ export function WorkspaceGrid({
       gesture.preview = resizeEdges(gesture.preview, gesture.sessionId, targets);
       previewLayout(gesture);
     },
-    [applyMovePointer, previewLayout, setCloneMode],
+    [applyMovePointer, paneRootRef, previewLayout, setCloneMode],
   );
 
   const onGestureUp = useCallback(
@@ -1084,10 +1130,10 @@ export function WorkspaceGrid({
         if (!clone) void discardPane(sessionId);
         return;
       }
-      const overTab = document
-        .elementFromPoint(event.clientX, event.clientY)
-        ?.closest?.("[data-workspace-tab]")
-        ?.getAttribute("data-workspace-tab");
+      const overTab = ownTabAt(
+        document.elementFromPoint(event.clientX, event.clientY),
+        workspaceIdRef.current,
+      );
       if (gesture?.kind === "move" && !gesture.clone && overTab && overTab !== tabIdRef.current) {
         // Dropped on the strip before the dwell switch fired: move the pane
         // into that tab directly, auto-placed, and follow it.
@@ -1416,6 +1462,12 @@ export function WorkspaceGrid({
   );
 
   useEffect(() => {
+    // Only the half being worked in listens at all, rather than every half
+    // listening and filtering: two grids on the document answer one Alt+2
+    // with two navigations and walk the focus through both their panes. The
+    // whole window is the active half when it holds a single workspace, so
+    // this is the same registration it has always been.
+    if (!paneActive) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
       const digit = /^Digit([1-9])$/u.exec(event.code)?.[1];
@@ -1441,7 +1493,7 @@ export function WorkspaceGrid({
     };
     document.addEventListener("keydown", onKeyDown, true);
     return () => document.removeEventListener("keydown", onKeyDown, true);
-  }, [allWorkspacesQ.data, focusedId, orderedIds, router, setFocus, workspace.id]);
+  }, [allWorkspacesQ.data, focusedId, orderedIds, paneActive, router, setFocus, workspace.id]);
 
   /** Re-root a file widget, keeping its rect and its place in the tab. */
   const changeWidgetPath = useCallback(

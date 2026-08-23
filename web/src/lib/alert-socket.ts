@@ -1,6 +1,11 @@
 "use client";
 
-import { ALERTS_WS_SUBPROTOCOL, type AlertEvent, parseAlertFrame } from "@/lib/alerts";
+import {
+  ALERTS_WS_SUBPROTOCOL,
+  type AlertEvent,
+  parseAlertFrame,
+  type TrustEvent,
+} from "@/lib/alerts";
 import { buildAlertsWsUrl } from "@/lib/ws";
 
 /**
@@ -23,6 +28,7 @@ import { buildAlertsWsUrl } from "@/lib/ws";
 export type AlertSocketState = "idle" | "connecting" | "open" | "closed";
 
 type AlertListener = (event: AlertEvent) => void;
+type TrustListener = (event: TrustEvent) => void;
 
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 15_000;
@@ -35,7 +41,13 @@ const WATCHDOG_MS = 80_000;
 const LINGER_MS = 15_000;
 
 const listeners = new Set<AlertListener>();
+const trustListeners = new Set<TrustListener>();
 const stateListeners = new Set<() => void>();
+
+/** Alerts and trust events share one socket, so either family keeps it alive. */
+function hasSubscribers(): boolean {
+  return listeners.size > 0 || trustListeners.size > 0;
+}
 
 let socket: WebSocket | null = null;
 let state: AlertSocketState = "idle";
@@ -73,7 +85,7 @@ function armWatchdog(): void {
 }
 
 function scheduleReconnect(): void {
-  if (stopped || listeners.size === 0) return;
+  if (stopped || !hasSubscribers()) return;
   reconnectTimer = clearTimer(reconnectTimer);
   // Exponential with a ceiling, jittered so many tabs waking together do not
   // redial in lockstep.
@@ -84,7 +96,7 @@ function scheduleReconnect(): void {
 }
 
 function connect(): void {
-  if (stopped || listeners.size === 0) return;
+  if (stopped || !hasSubscribers()) return;
   if (
     socket &&
     (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)
@@ -115,7 +127,19 @@ function connect(): void {
     armWatchdog();
     if (typeof message.data !== "string") return;
     const frame = parseAlertFrame(message.data);
-    if (!frame || frame.type !== "alert") return;
+    if (!frame) return;
+    if (frame.type === "trust") {
+      const { type: _trustType, ...trustEvent } = frame;
+      for (const listener of [...trustListeners]) {
+        try {
+          listener(trustEvent);
+        } catch {
+          // One bad consumer must not stop the others hearing about it.
+        }
+      }
+      return;
+    }
+    if (frame.type !== "alert") return;
     const { type: _type, ...event } = frame;
     for (const listener of [...listeners]) {
       try {
@@ -141,7 +165,7 @@ function wake(): void {
   // Coming back from a hidden tab or a dropped network is the moment a
   // half-open socket gets discovered, so retry immediately rather than
   // waiting out the backoff.
-  if (listeners.size === 0 || stopped) return;
+  if (!hasSubscribers() || stopped) return;
   if (socket && socket.readyState === WebSocket.OPEN) return;
   attempt = 0;
   connect();
@@ -161,22 +185,37 @@ function installGlobalListeners(): void {
 }
 
 /** Listen for alerts. Opens the socket on the first subscriber. */
-export function subscribeToAlerts(listener: AlertListener): () => void {
+function subscribe(add: () => void, remove: () => void): () => void {
   if (typeof window === "undefined") return () => {};
   installGlobalListeners();
   stopped = false;
-  listeners.add(listener);
+  add();
   lingerTimer = clearTimer(lingerTimer);
   connect();
   return () => {
-    listeners.delete(listener);
-    if (listeners.size > 0) return;
+    remove();
+    if (hasSubscribers()) return;
     lingerTimer = clearTimer(lingerTimer);
     lingerTimer = window.setTimeout(() => {
-      if (listeners.size > 0) return;
+      if (hasSubscribers()) return;
       closeAlertSocket();
     }, LINGER_MS);
   };
+}
+
+export function subscribeToAlerts(listener: AlertListener): () => void {
+  return subscribe(
+    () => listeners.add(listener),
+    () => listeners.delete(listener),
+  );
+}
+
+/** Device-approval knocks and their resolutions, for the prompt in AppShell. */
+export function subscribeToTrustEvents(listener: TrustListener): () => void {
+  return subscribe(
+    () => trustListeners.add(listener),
+    () => trustListeners.delete(listener),
+  );
 }
 
 export function subscribeToAlertSocketState(listener: () => void): () => void {

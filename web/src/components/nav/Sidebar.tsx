@@ -13,18 +13,42 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
+import {
+  type PointerEvent as ReactPointerEvent,
+  type RefObject,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { LegionStrip } from "@/components/legion/LegionStrip";
 import { SidebarArchivedSection } from "@/components/nav/SidebarArchivedSection";
-import { SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
+import { SidebarWorkspacePair, SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
 import {
   SidebarIconSlot,
   SidebarNoMatches,
   SidebarRowLabel,
   SidebarSearch,
   sidebarRowClass,
+  WorkspaceAvatar,
 } from "@/components/nav/sidebar-parts";
+import {
+  type Arrangement,
+  arrangementAfter,
+  type DragMode,
+  type DropZone,
+  dragModeAt,
+  dropZones,
+  type PaneTarget,
+  pairRows,
+  reorderShift,
+  reorderTargetIndex,
+  reorderWrites,
+  sideOf,
+  splitDropPlan,
+  zoneAt,
+} from "@/components/nav/workspace-drag";
 import { openProfile } from "@/components/profile/profile-dialog-store";
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
@@ -37,14 +61,72 @@ import {
 import { toast } from "@/components/ui/toast";
 import { RailTooltip } from "@/components/ui/tooltip";
 import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
+import { PANE_SCOPE_ATTR, paneRootAt } from "@/components/workspace/pane-scope";
 import { hosts, sessions, type Workspace, workspaces } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
+import { type SplitSide, splitStore, useSplit } from "@/lib/split-store";
 import { cn } from "@/lib/utils";
 import {
   filterWorkspacesByName,
   workspaceAttentionCount,
   workspaceLiveSessionCount,
 } from "@/lib/workspaces";
+
+/**
+ * The halves of the window as they stand right now. Measured fresh whenever
+ * the answer is used rather than cached with the drag: a split that has just
+ * been opened is still widening, and a drop has to land in the window the
+ * user can see rather than the one that was there when they picked the row up.
+ */
+function measurePanes(): PaneTarget[] {
+  return Array.from(
+    document.querySelectorAll<HTMLElement>(`[${PANE_SCOPE_ATTR}]`),
+    (root): PaneTarget => {
+      // Copied edge by edge out of the DOMRect: it is handed to pure helpers
+      // that build new rects from it, and a DOMRect cannot be spread — its
+      // edges live on the prototype, so `{...rect}` is empty.
+      const { left, top, right, bottom } = root.getBoundingClientRect();
+      return {
+        side: root.dataset.splitSide === "secondary" ? "secondary" : "primary",
+        rect: { left, top, right, bottom },
+      };
+    },
+  );
+}
+
+/** A workspace row in flight, and the halves it may be released into. */
+interface CarriedWorkspace {
+  workspace: Workspace;
+  /**
+   * Where a release lands — and, drawn, the panels the preview is composed
+   * of. Deliberately the same rectangles for both: the boundary the pointer
+   * flips at has to be the boundary the user can see.
+   */
+  zones: DropZone[];
+  /**
+   * Every workspace that can appear in the preview: the one being carried,
+   * plus whichever are on screen now. One panel is rendered per member and
+   * then moved between halves, rather than panels being built and thrown away
+   * per arrangement — a panel that persists can travel, and travelling is what
+   * shows that two workspaces swapped rather than that one blinked.
+   */
+  cast: Workspace[];
+  /** What is on screen at the moment the carry begins. */
+  arrangement: Arrangement;
+  /**
+   * The row's resting box, with no drag applied. The travel is the ghost's
+   * transform and only its transform — folding it in here as well counted it
+   * twice, and the ghost pulled away from the cursor at double rate.
+   */
+  origin: { left: number; top: number; width: number; height: number };
+  /**
+   * The travel at the moment the carry began, rendered as the ghost's opening
+   * transform. `trackCarry` cannot reach the element until the commit after
+   * this one, so without it the ghost would draw one frame back at the row it
+   * came from and then jump to the pointer.
+   */
+  offset: { x: number; y: number };
+}
 
 export function Sidebar({
   pathname,
@@ -64,6 +146,13 @@ export function Sidebar({
   const { user } = useAuth();
   const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+  // Set only while a row is out on the canvas. Everything that changes on a
+  // per-frame basis inside a carry — the ghost's transform, where each preview
+  // panel sits — is written straight to the DOM through these refs, so React
+  // renders the overlay once per carry rather than once per pointer move.
+  const [carried, setCarried] = useState<CarriedWorkspace | null>(null);
+  const carryGhostRef = useRef<HTMLDivElement>(null);
+  const carryPreviewRef = useRef<HTMLDivElement>(null);
 
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
@@ -100,12 +189,40 @@ export function Sidebar({
     [orderedWorkspaces, query],
   );
   const searching = query.trim().length > 0;
+  // Archived rows are in here too: a workspace on screen can have been put
+  // away since, and the drop preview still has to be able to name and draw
+  // whatever is currently occupying a half.
+  const workspaceById = useMemo(() => {
+    const index = new Map<string, Workspace>();
+    for (const item of [...orderedWorkspaces, ...(archivedQ.data ?? [])]) index.set(item.id, item);
+    return index;
+  }, [archivedQ.data, orderedWorkspaces]);
   const sessionsById = useMemo(
     () => new Map((sessionsQ.data ?? []).map((session) => [session.id, session])),
     [sessionsQ.data],
   );
   const onlineHosts = (hostsQ.data ?? []).filter((host) => host.status === "online");
   const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
+  // The workspace beside the routed one. It is on screen just as much as the
+  // routed one is, so the rail has to say so — a row that reads as unvisited
+  // while its workspace fills half the window is simply wrong. The *rendered*
+  // one, not the stored pair: a window too narrow to draw a split is showing
+  // one workspace, whatever arrangement it is holding for when it widens.
+  const { renderedSecondaryId, activeSide } = useSplit();
+  // What the tree draws, row by row: normally one workspace each, but a split
+  // draws as a single paired row so the rail is a picture of the window
+  // rather than a list that happens to contain it. The collapsed rail opts
+  // out — two containers and a control between them do not survive a 56px
+  // column, so there the pair stays two separately ringed tiles.
+  const rowModel = useMemo(
+    () =>
+      pairRows(
+        visibleWorkspaces.map((workspace) => workspace.id),
+        collapsed ? null : currentWorkspaceId,
+        collapsed ? null : renderedSecondaryId,
+      ),
+    [collapsed, currentWorkspaceId, renderedSecondaryId, visibleWorkspaces],
+  );
 
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ["sessions"] });
@@ -134,20 +251,27 @@ export function Sidebar({
   });
   const reorderWorkspaceM = useMutation({
     // The server reorders by removal + reinsertion, so a single position
-    // write is a proper insert-at-index for the drag drop.
-    mutationFn: ({ id, position }: { id: string; position: number }) =>
-      workspaces.update(id, { position }),
+    // write is a proper insert-at-index for the drag drop. A row can hold two
+    // workspaces — a split draws as one paired row — so this takes a sequence
+    // and applies it strictly in order: the second write's index is only
+    // correct against the list the first one leaves behind.
+    mutationFn: async (writes: { id: string; position: number }[]) => {
+      for (const write of writes) await workspaces.update(write.id, { position: write.position });
+    },
     // Optimistic: the drop lands instantly instead of snapping back for a
     // round-trip; refresh reconciles either way.
-    onMutate: ({ id, position }) => {
+    onMutate: (writes) => {
       queryClient.setQueryData<Workspace[]>(["workspaces"], (current) => {
         if (!current) return current;
-        const ordered = [...current].sort((a, b) => a.position - b.position);
-        const moving = ordered.find((workspace) => workspace.id === id);
-        if (!moving) return current;
-        const without = ordered.filter((workspace) => workspace.id !== id);
-        without.splice(position, 0, moving);
-        return without.map((workspace, index) => ({ ...workspace, position: index }));
+        let ordered = [...current].sort((a, b) => a.position - b.position);
+        for (const write of writes) {
+          const moving = ordered.find((workspace) => workspace.id === write.id);
+          if (!moving) continue;
+          const without = ordered.filter((workspace) => workspace.id !== write.id);
+          without.splice(write.position, 0, moving);
+          ordered = without;
+        }
+        return ordered.map((workspace, index) => ({ ...workspace, position: index }));
       });
     },
     onSuccess: refresh,
@@ -161,7 +285,13 @@ export function Sidebar({
     onSuccess: (_result, id) => {
       setActionError(null);
       refresh();
-      if (currentWorkspaceId === id) router.push("/app");
+      // A workspace on the right of a split is not the page it is on, so the
+      // correction is to close that half. Routing away would take the
+      // workspace on the left — which nothing happened to — with it. The
+      // stored pair, not the rendered one: a deleted workspace must not be
+      // left queued up to reappear when the window widens.
+      if (splitStore.get().secondaryId === id) splitStore.close();
+      else if (currentWorkspaceId === id) router.push("/app");
     },
     onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
   });
@@ -174,6 +304,14 @@ export function Sidebar({
       // Said out loud, because the row leaves the list under your cursor and
       // the only other evidence is a drawer that is probably closed.
       toast(`Archived ${name}`);
+      // Archived out of the right of a split: that half closes and the window
+      // goes back to one workspace. Nothing about the left half changed, so
+      // nothing about it should move. The stored pair again — an archived
+      // workspace must not come back with the next widening.
+      if (splitStore.get().secondaryId === id) {
+        splitStore.close();
+        return;
+      }
       // And carry on next door: the workspace you were looking at is stopped
       // now, so the useful place to be is the one that took its slot.
       if (currentWorkspaceId === id) {
@@ -204,36 +342,189 @@ export function Sidebar({
     unarchiveWorkspaceM.isPending;
 
   /**
-   * Drag a workspace row up or down to reorder. Pointer-based with a small
-   * threshold, so a plain click still navigates: past the threshold the row
-   * translates with the pointer, the drop index is the number of other rows
-   * whose midpoint sits above the release point, and the click that follows
-   * a real drag is swallowed.
+   * Drag a workspace row. Pointer-based with a small threshold, so a plain
+   * click still navigates, and the click that follows a real drag is
+   * swallowed either way.
+   *
+   * Past the threshold the gesture has two modes, and which one is live is
+   * decided by where the pointer is, freshly, on every move — so a row can be
+   * taken out to the canvas and brought back without lifting. Over the rail
+   * it reorders: the row translates with the pointer and the drop index is
+   * the number of other rows whose midpoint sits above the release point.
+   * Out on the canvas it is being carried into a half of the window instead,
+   * the rail settles back into its resting order, and the reorder is off the
+   * table until the pointer comes home.
    */
-  const startWorkspaceDrag = (workspaceId: string, event: ReactPointerEvent<HTMLLIElement>) => {
+  const startWorkspaceDrag = (workspace: Workspace, event: ReactPointerEvent<HTMLLIElement>) => {
     if (event.button !== 0 || event.pointerType === "touch") return;
-    if ((event.target as Element).closest?.("button, input, [role='menu']")) return;
+    // A paired row's halves are real buttons, so the usual "pressed a control,
+    // not the row" guard would refuse to start a drag on one. They are the row
+    // for dragging purposes; everything else that is a button still blocks.
+    const pressedControl = (event.target as Element).closest?.("button, input, [role='menu']");
+    if (pressedControl && !pressedControl.hasAttribute("data-pair-half")) return;
     const rowElement = event.currentTarget;
     const startY = event.clientY;
     const startX = event.clientX;
     let dragging = false;
+    let mode: DragMode = "reorder";
+    let litSide: SplitSide | null = null;
+    let capturedPointer: number | null = null;
     // Geometry is captured up front: rows shift with transforms mid-drag, so
     // both the target index and the shift math must use the resting rects.
     const rows = Array.from(document.querySelectorAll<HTMLElement>("[data-workspace-row]"));
     const restingRects = rows.map((row) => row.getBoundingClientRect());
+    // What each row actually holds. A paired row is one row and two
+    // workspaces, so the index counted over rows is not the position the
+    // server stores and this is what closes that gap.
+    // Falling back to the row's own id rather than to nothing: an empty entry
+    // here yields no writes at all, so a row type that ever forgets the
+    // attribute would silently stop reordering rather than fail loudly.
+    const rowIds = rows.map((row) => {
+      const held = (row.dataset.rowIds ?? "").split(" ").filter(Boolean);
+      return held.length > 0 ? held : [row.dataset.workspaceRow ?? ""].filter(Boolean);
+    });
     const from = rows.indexOf(rowElement);
     const fromRect = restingRects[from];
     const rowStride = (fromRect?.height ?? 36) + 8; // + the list's space-y-2
+    // The box the pointer has to leave for this to stop being a reorder. Read
+    // once, because the rail does not resize under a drag it is hosting.
+    const railRect = rowElement.closest("[data-sidebar-rail]")?.getBoundingClientRect() ?? null;
     let lastTarget = from;
 
-    const targetIndexFor = (clientY: number) => {
-      let target = 0;
-      for (const [index, row] of rows.entries()) {
-        const rect = restingRects[index];
-        if (row === rowElement || !rect) continue;
-        if (clientY > rect.top + rect.height / 2) target += 1;
+    /** The lifted-off-the-list treatment, worn by whichever thing is moving. */
+    const lift = (on: boolean) => {
+      rowElement.style.zIndex = on ? "10" : "";
+      rowElement.style.position = on ? "relative" : "";
+      rowElement.style.background = on ? "var(--shell)" : "";
+      rowElement.style.borderRadius = on ? "0.5rem" : "";
+      rowElement.style.boxShadow = on ? "0 6px 16px rgb(0 0 0 / 0.35)" : "";
+    };
+
+    const enterCarry = (clientX: number, clientY: number) => {
+      // The rows keep the transition they were displaced with, so clearing
+      // the transforms springs them home rather than snapping them.
+      rowElement.style.transition =
+        "transform 150ms var(--ease-swift, ease-out), opacity 150ms var(--ease-swift, ease-out)";
+      for (const row of rows) row.style.transform = "";
+      lastTarget = from;
+      lift(false);
+      // The row itself stays in the rail, dimmed, and a ghost is what follows
+      // the pointer: pulling the element out of flow would close the list up
+      // under it and invalidate the very rects the reorder half measures from.
+      rowElement.style.opacity = "0.4";
+      const { ratio, renderedSecondaryId: rendered } = splitStore.get();
+      const arrangement: Arrangement = { primary: currentWorkspaceId, secondary: rendered };
+      setCarried({
+        workspace,
+        zones: dropZones(measurePanes(), ratio),
+        // The carried workspace first, so a preview built while the workspace
+        // list is still loading at least has the thing being dragged in it.
+        cast: [workspace.id, arrangement.primary, arrangement.secondary]
+          .filter((id, index, all): id is string => Boolean(id) && all.indexOf(id) === index)
+          .map((id) => workspaceById.get(id))
+          .filter((member): member is Workspace => Boolean(member)),
+        arrangement,
+        origin: {
+          left: fromRect?.left ?? 0,
+          top: fromRect?.top ?? 0,
+          width: fromRect?.width ?? 0,
+          height: fromRect?.height ?? 0,
+        },
+        offset: { x: clientX - startX, y: clientY - startY },
+      });
+    };
+
+    const enterReorder = () => {
+      rowElement.style.transition = "";
+      rowElement.style.opacity = "";
+      lift(true);
+      litSide = null;
+      setCarried(null);
+    };
+
+    /**
+     * Which half the pointer is offering to drop into. `paneRootAt` first, so
+     * a pointer over something stacked above the canvas — a dialog, an open
+     * menu — does not read as a drop into the half behind it.
+     */
+    const sideUnder = (clientX: number, clientY: number): SplitSide | null => {
+      if (!paneRootAt(clientX, clientY)) return null;
+      const zones = dropZones(measurePanes(), splitStore.get().ratio);
+      return zoneAt(clientX, clientY, zones)?.side ?? null;
+    };
+
+    /**
+     * Redraw the preview as the window it would leave behind. Each panel is a
+     * workspace rather than a slot, so a workspace that changes halves travels
+     * there and one that is being displaced fades where it stands — which is
+     * the whole answer to "what happens if I let go here".
+     */
+    const showArrangement = (side: SplitSide | null) => {
+      const layer = carryPreviewRef.current;
+      if (!layer) return;
+      // Off the canvas the preview withdraws but keeps its last arrangement,
+      // so leaving reads as the preview fading rather than as it rearranging
+      // itself into something nobody asked for on the way out.
+      layer.dataset.live = String(side !== null);
+      if (!side) return;
+      const { ratio, renderedSecondaryId: rendered } = splitStore.get();
+      const zones = dropZones(measurePanes(), ratio);
+      const next = arrangementAfter(
+        splitDropPlan(side, workspace.id, currentWorkspaceId, rendered),
+        currentWorkspaceId,
+        rendered,
+      );
+      for (const panel of layer.querySelectorAll<HTMLElement>("[data-preview-panel]")) {
+        const memberId = panel.dataset.previewPanel ?? "";
+        const zone = zones.find((candidate) => candidate.side === sideOf(memberId, next));
+        panel.dataset.shown = String(Boolean(zone));
+        panel.dataset.lit = String(memberId === workspace.id);
+        if (!zone) continue;
+        panel.style.transform = `translate(${zone.rect.left}px, ${zone.rect.top}px)`;
+        panel.style.width = `${zone.rect.right - zone.rect.left}px`;
+        panel.style.height = `${zone.rect.bottom - zone.rect.top}px`;
       }
-      return target;
+    };
+
+    const trackCarry = (clientX: number, clientY: number) => {
+      const ghost = carryGhostRef.current;
+      // The overlay is one render behind the move that started the carry. It
+      // renders itself already in position, so there is nothing to correct
+      // until it exists — and `litSide` must not advance without it, or the
+      // arrangement it names would never be drawn.
+      if (!ghost || !carryPreviewRef.current) return;
+      ghost.style.transform = `translate(${clientX - startX}px, ${clientY - startY}px)`;
+      const side = sideUnder(clientX, clientY);
+      if (side === litSide) return;
+      litSide = side;
+      showArrangement(side);
+    };
+
+    const drop = (clientX: number, clientY: number) => {
+      const side = sideUnder(clientX, clientY);
+      if (!side) return;
+      // Judged against the half that is *rendered*, because that is what the
+      // zones were drawn from: a window too narrow to draw a split offers the
+      // two halves of its one pane, and reading the stored pair here would
+      // answer a drop on those halves as though a split were already up.
+      const plan = splitDropPlan(
+        side,
+        workspace.id,
+        currentWorkspaceId,
+        splitStore.get().renderedSecondaryId,
+      );
+      // Null is the drop that asks for the arrangement already on screen —
+      // released onto the half the workspace is in. Ending here rather than
+      // reasserting it is what keeps that from flickering.
+      if (!plan) return;
+      // The pair is set before the route changes, so the reconcile that
+      // follows navigation sees the arrangement this drop asked for rather
+      // than the one it is replacing.
+      if (plan.setSecondary) splitStore.open(plan.setSecondary, plan.routeTo ?? currentWorkspaceId);
+      if (plan.routeTo) {
+        router.push(`/w/${plan.routeTo}`);
+        onNavigate?.();
+      }
     };
 
     const onMove = (moveEvent: PointerEvent) => {
@@ -242,42 +533,62 @@ export function Sidebar({
           return;
         }
         dragging = true;
-        rowElement.style.zIndex = "10";
-        rowElement.style.position = "relative";
-        rowElement.style.background = "var(--shell)";
-        rowElement.style.borderRadius = "0.5rem";
-        rowElement.style.boxShadow = "0 6px 16px rgb(0 0 0 / 0.35)";
+        // Claimed only now, never at pointerdown: capture retargets the
+        // compatibility mouse events too, so a captured press that turns out
+        // to be a plain click would fire that click on the row instead of the
+        // anchor inside it and stop navigating. Past the threshold the click
+        // is being swallowed anyway, and from here the pointer has to cross
+        // the whole canvas — over terminals and grids that handle pointer
+        // events of their own, any one of which could otherwise stop a move
+        // from reaching the document and strand the drag mid-flight.
+        try {
+          rowElement.setPointerCapture(moveEvent.pointerId);
+          capturedPointer = moveEvent.pointerId;
+        } catch {
+          // The pointer went away between the move and this call; the
+          // document listeners below still carry the drag on their own.
+        }
+        lift(true);
         document.body.style.cursor = "grabbing";
         document.body.style.userSelect = "none";
       }
       moveEvent.preventDefault();
+      const nextMode = dragModeAt(moveEvent.clientX, moveEvent.clientY, railRect);
+      if (nextMode !== mode) {
+        mode = nextMode;
+        if (mode === "carry") enterCarry(moveEvent.clientX, moveEvent.clientY);
+        else enterReorder();
+      }
+      if (mode === "carry") {
+        trackCarry(moveEvent.clientX, moveEvent.clientY);
+        return;
+      }
       rowElement.style.transform = `translateY(${moveEvent.clientY - startY}px)`;
       // Everything between the old and prospective slot slides one stride to
       // make room, so the drop target is always visible.
-      const target = targetIndexFor(moveEvent.clientY);
+      const target = reorderTargetIndex(moveEvent.clientY, restingRects, from);
       if (target === lastTarget) return;
       lastTarget = target;
       rows.forEach((row, index) => {
         if (row === rowElement) return;
-        let shift = 0;
-        if (from < target && index > from && index <= target) shift = -rowStride;
-        if (from > target && index < from && index >= target) shift = rowStride;
+        const shift = reorderShift(index, from, target, rowStride);
         row.style.transition = "transform 150ms var(--ease-swift, ease-out)";
         row.style.transform = shift === 0 ? "" : `translateY(${shift}px)`;
       });
     };
-    const finish = (commit: boolean, clientY: number) => {
+    const finish = (commit: boolean, clientX: number, clientY: number) => {
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointercancel", onCancel);
+      if (capturedPointer !== null && rowElement.hasPointerCapture(capturedPointer)) {
+        rowElement.releasePointerCapture(capturedPointer);
+      }
       for (const row of rows) {
         row.style.transform = "";
         row.style.transition = "";
       }
-      rowElement.style.zIndex = "";
-      rowElement.style.position = "";
-      rowElement.style.background = "";
-      rowElement.style.borderRadius = "";
-      rowElement.style.boxShadow = "";
+      lift(false);
+      rowElement.style.opacity = "";
+      setCarried(null);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       if (!dragging) return;
@@ -291,11 +602,19 @@ export function Sidebar({
         0,
       );
       if (!commit) return;
-      const target = targetIndexFor(clientY);
-      if (target !== from) reorderWorkspaceM.mutate({ id: workspaceId, position: target });
+      if (mode === "carry") {
+        drop(clientX, clientY);
+        return;
+      }
+      const target = reorderTargetIndex(clientY, restingRects, from);
+      if (target === from) return;
+      // The whole row moves, however many workspaces it holds: a split was
+      // dragged as one thing, so it arrives as one thing.
+      const writes = reorderWrites(rowIds, from, target);
+      if (writes.length > 0) reorderWorkspaceM.mutate(writes);
     };
-    const onUp = (upEvent: PointerEvent) => finish(true, upEvent.clientY);
-    const onCancel = () => finish(false, startY);
+    const onUp = (upEvent: PointerEvent) => finish(true, upEvent.clientX, upEvent.clientY);
+    const onCancel = () => finish(false, startX, startY);
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onUp, { once: true });
     document.addEventListener("pointercancel", onCancel);
@@ -371,7 +690,9 @@ export function Sidebar({
   );
 
   return (
-    <div className="group/rail flex h-full min-h-0 flex-col bg-shell">
+    // `data-sidebar-rail` is what a workspace drag measures itself against:
+    // leaving this box is the moment the gesture stops being a reorder.
+    <div data-sidebar-rail className="group/rail flex h-full min-h-0 flex-col bg-shell">
       {/* h-9, not the --row-h nav rhythm: this row holds the 36px trident
        * plate and nothing that has to line up with the tree below it, so the
        * lockup sits tighter to the top edge than a nav row would. */}
@@ -514,12 +835,46 @@ export function Sidebar({
           <SidebarNoMatches query={query.trim()} />
         )}
         <ul className="space-y-2">
-          {visibleWorkspaces.map((workspace) => {
+          {rowModel.map((ids) => {
+            const [firstId, secondId] = ids;
+            const workspace = firstId ? workspaceById.get(firstId) : undefined;
+            if (!workspace) return null;
+            const partner = secondId ? workspaceById.get(secondId) : undefined;
+            if (partner) {
+              return (
+                <SidebarWorkspacePair
+                  key={ids.join("+")}
+                  primary={workspace}
+                  secondary={partner}
+                  activeSide={activeSide}
+                  primaryAttention={workspaceAttentionCount(workspace, sessionsById)}
+                  secondaryAttention={workspaceAttentionCount(partner, sessionsById)}
+                  onActivate={(side) => splitStore.setActiveSide(side)}
+                  onUnsplit={() => splitStore.close()}
+                  onRowPointerDown={
+                    searching
+                      ? undefined
+                      : (event) => {
+                          // Which half was pressed decides what gets carried
+                          // out to the canvas; the row as a whole is still
+                          // what reorders.
+                          const half = (event.target as Element).closest?.("[data-pair-half]");
+                          const pressed = half?.getAttribute("data-pair-half");
+                          startWorkspaceDrag(
+                            (pressed ? workspaceById.get(pressed) : null) ?? workspace,
+                            event,
+                          );
+                        }
+                  }
+                />
+              );
+            }
             return (
               <SidebarWorkspaceRow
                 key={workspace.id}
                 workspace={workspace}
                 active={currentWorkspaceId === workspace.id}
+                beside={renderedSecondaryId === workspace.id}
                 collapsed={collapsed}
                 attentionCount={workspaceAttentionCount(workspace, sessionsById)}
                 busy={workspaceBusy}
@@ -529,7 +884,7 @@ export function Sidebar({
                 onArchive={() => void requestWorkspaceArchive(workspace)}
                 onDelete={() => void requestWorkspaceDelete(workspace)}
                 onRowPointerDown={
-                  searching ? undefined : (event) => startWorkspaceDrag(workspace.id, event)
+                  searching ? undefined : (event) => startWorkspaceDrag(workspace, event)
                 }
               />
             );
@@ -631,6 +986,129 @@ export function Sidebar({
           </DropdownMenuItem>
         </DropdownMenu>
       </div>
+
+      {carried && (
+        <WorkspaceCarryOverlay
+          carried={carried}
+          ghostRef={carryGhostRef}
+          previewRef={carryPreviewRef}
+        />
+      )}
     </div>
+  );
+}
+
+/**
+ * A workspace row on its way out of the rail: the row itself, lifted, and a
+ * live picture of the window it is about to make.
+ *
+ * The preview is one panel per workspace, not one per half. A panel is a
+ * workspace's own box that moves to whichever half it will occupy, so a drop
+ * that swaps two workspaces is drawn as two boxes trading places and a drop
+ * that displaces one is drawn as its box fading where it stood. Panels keyed
+ * by half instead would only ever be able to cut from one label to another,
+ * which says that something changed without saying what.
+ *
+ * Portalled to the body because the shell is a container query, and a
+ * container establishes the containing block for `fixed` descendants — an
+ * overlay rendered inside it would be positioned against the shell rather
+ * than the viewport. It also keeps this out of the workspace tree entirely,
+ * which is somebody else's file.
+ *
+ * Nothing here re-renders during the drag. The ghost's transform and every
+ * panel's position are written to the DOM by the gesture through the two
+ * refs; React's style prop holds only the opening values, so a sidebar
+ * re-render (the session poll fires every five seconds) re-applies identical
+ * values and therefore writes nothing.
+ *
+ * The ghost is dressed as an expanded row unconditionally: the collapsed rail
+ * draws its workspaces as tiles that carry no `data-workspace-row`, so no drag
+ * ever starts there and there is no rail-width ghost to draw.
+ */
+function WorkspaceCarryOverlay({
+  carried,
+  ghostRef,
+  previewRef,
+}: {
+  carried: CarriedWorkspace;
+  ghostRef: RefObject<HTMLDivElement | null>;
+  previewRef: RefObject<HTMLDivElement | null>;
+}) {
+  const zoneFor = (side: SplitSide | null) =>
+    carried.zones.find((zone) => zone.side === side) ?? carried.zones[0];
+  return createPortal(
+    <div aria-hidden className="pointer-events-none fixed inset-0 z-[105]">
+      <div
+        ref={previewRef}
+        data-live="false"
+        className="opacity-0 transition-opacity duration-120 ease-swift data-[live=true]:opacity-100"
+      >
+        {carried.cast.map((member) => {
+          const side = sideOf(member.id, carried.arrangement);
+          // A member with nowhere to be yet — the carried workspace, which is
+          // still in the rail — waits at the half it would most likely take,
+          // so its first move is a short slide rather than a flight in from
+          // the corner an unset transform would start it at.
+          const zone = zoneFor(side);
+          return (
+            <div
+              key={member.id}
+              data-preview-panel={member.id}
+              data-shown={String(side !== null)}
+              data-lit="false"
+              style={{
+                transform: zone ? `translate(${zone.rect.left}px, ${zone.rect.top}px)` : undefined,
+                width: zone ? zone.rect.right - zone.rect.left : undefined,
+                height: zone ? zone.rect.bottom - zone.rect.top : undefined,
+              }}
+              className={cn(
+                "fixed left-0 top-0 flex flex-col items-center justify-center gap-2.5 p-4",
+                "rounded-xl border-2 border-dashed border-border bg-foreground/5",
+                "backdrop-blur-[2px] text-center",
+                "transition-[transform,width,height,opacity,border-color,background-color]",
+                "duration-120 ease-swift",
+                // Displaced: it is not in the window this drop would make.
+                "data-[shown=false]:opacity-0",
+                // The half the carried workspace lands in, in the same ink the
+                // tab strip's duplicate ghost uses for the same promise.
+                "data-[lit=true]:border-solid data-[lit=true]:border-ring data-[lit=true]:bg-ring/10",
+              )}
+            >
+              <WorkspaceAvatar
+                name={member.name}
+                icon={member.icon}
+                rail
+                className="size-12 rounded-xl text-sm"
+              />
+              <span className="max-w-full truncate text-sm font-medium text-foreground">
+                {member.name}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <div
+        ref={ghostRef}
+        style={{
+          left: carried.origin.left,
+          top: carried.origin.top,
+          width: carried.origin.width,
+          height: carried.origin.height,
+          transform: `translate(${carried.offset.x}px, ${carried.offset.y}px)`,
+        }}
+        className={cn(
+          "fixed z-[110] flex items-center rounded-lg bg-shell text-sm text-foreground",
+          "shadow-[0_6px_16px_rgb(0_0_0/0.35)]",
+        )}
+      >
+        <SidebarIconSlot>
+          <WorkspaceAvatar name={carried.workspace.name} icon={carried.workspace.icon} />
+        </SidebarIconSlot>
+        <SidebarRowLabel collapsed={false} className="font-medium">
+          {carried.workspace.name}
+        </SidebarRowLabel>
+      </div>
+    </div>,
+    document.body,
   );
 }

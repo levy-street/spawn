@@ -476,6 +476,18 @@ export const BrowserDeviceSchema = z.object({
 });
 export type BrowserDevice = z.infer<typeof BrowserDeviceSchema>;
 
+export const DeviceApprovalRequestSchema = z.object({
+  id: z.string().uuid(),
+  browser_device_id: z.string().uuid(),
+  label: z.string().nullable().default(null),
+  /** Re-derived from the key before it is signed over; shown for comparison. */
+  fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9_-]{16}$/u),
+  status: z.string(),
+  created_at: z.string(),
+  expires_at: z.string(),
+});
+export type DeviceApprovalRequest = z.infer<typeof DeviceApprovalRequestSchema>;
+
 /** Opaque ciphertext: the server stores it and cannot read it. */
 export const TrustBundleSchema = z.object({
   sealed: z.string().min(1),
@@ -889,6 +901,27 @@ export const trust = {
           signature: z.string(),
         }),
       ),
+    }),
+  /**
+   * Live knocks from devices waiting to be admitted. A device that opens the
+   * app after the knock still sees it here, which is what makes the live frame
+   * an accelerator rather than the mechanism.
+   */
+  listDeviceApprovals: () =>
+    api("/api/trust/device-approvals", {
+      method: "GET",
+      schema: z.array(DeviceApprovalRequestSchema),
+    }),
+  requestDeviceApproval: (browserDeviceId: string) =>
+    api("/api/trust/device-approvals", {
+      method: "POST",
+      body: JSON.stringify({ browser_device_id: browserDeviceId }),
+      schema: DeviceApprovalRequestSchema,
+    }),
+  denyDeviceApproval: (requestId: string) =>
+    api(`/api/trust/device-approvals/${encodeURIComponent(requestId)}/deny`, {
+      method: "POST",
+      schema: DeviceApprovalRequestSchema,
     }),
   endorse: (body: {
     host_id: string;

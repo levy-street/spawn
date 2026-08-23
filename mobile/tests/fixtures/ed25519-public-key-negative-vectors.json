@@ -1,0 +1,103 @@
+{
+  "format": "spawn-ed25519-public-key-negative-v1",
+  "sources": [
+    "curve25519-dalek 4.1.3 constants::EIGHT_TORSION",
+    "@noble/ed25519 3.1.0 test/ed25519.helpers.ts ED25519_TORSION_SUBGROUP",
+    "C2SP/CCTV commit 5ea85644 ed25519vectors: low_order_component_A without low_order_A"
+  ],
+  "weak_public_keys": [
+    {
+      "id": "identity",
+      "public_key_hex": "0100000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "order_8_positive",
+      "public_key_hex": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"
+    },
+    {
+      "id": "order_4_negative_x",
+      "public_key_hex": "0000000000000000000000000000000000000000000000000000000000000080"
+    },
+    {
+      "id": "order_8_negative",
+      "public_key_hex": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"
+    },
+    {
+      "id": "order_2",
+      "public_key_hex": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+    },
+    {
+      "id": "order_8_negative_sign",
+      "public_key_hex": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85"
+    },
+    {
+      "id": "order_4_positive_x",
+      "public_key_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "order_8_positive_sign",
+      "public_key_hex": "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa"
+    }
+  ],
+  "noncanonical_public_key_hex": [
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "efffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "f1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "f1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "f2ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "f2ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "f3ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "f3ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "f4ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "f4ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "f5ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "f5ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "f6ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "f6ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "f7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "f7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "f8ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "f8ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "f9ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "f9ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "faffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "faffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "fbffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "fbffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "fcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "fcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "fdffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "fdffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "feffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "feffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "0100000000000000000000000000000000000000000000000000000000000080",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  ],
+  "invalid_encodings": [
+    {
+      "id": "off_curve_y_2",
+      "public_key_hex": "0200000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "accepted_mixed_torsion_public_key_hex": [
+    "015ff595e4e0add00dde896efa66ea4f6848c4396410c693c92232aa64861d4f",
+    "10eb7c3acfb2bed3e0d6ab89bf5a3d6afddd1176ce4812e38d9fd485058fdb1f",
+    "6718d0a3d58deaeaefa655eae3f119071deaa2cfebfd0ca28b670f879d657086",
+    "86e72f5c2a7215151059aa151c0ee6f8e2155d301402f35d7498f078629a8f79",
+    "dd1483c5304d412c1f29547640a5c2950222ee8931b7ed1c72602b7afa7024e0",
+    "eca00a6a1b1f522ff2217691059915b097b73bc69bef396c36ddcd559b79e2b0",
+    "fe894df18abf1c20088bfbe6c9ad45d42ec20663eaf7111eaea1d851da0d7f89"
+  ],
+  "universal_forgery": {
+    "public_key_id": "identity",
+    "signature_hex": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

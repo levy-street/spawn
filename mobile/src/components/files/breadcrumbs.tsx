@@ -1,0 +1,75 @@
+import { Pressable, ScrollView, StyleSheet, View } from "react-native";
+import { breadcrumbParts } from "@/components/files/paths";
+import { Icon } from "@/components/ui/icon";
+import { Text } from "@/components/ui/text";
+import { haptics } from "@/lib/haptics";
+import { chrome, spacing, useTheme } from "@/theme";
+
+export function FileBreadcrumbs({
+  path,
+  homeDir,
+  onNavigate,
+}: {
+  path: string;
+  homeDir: string;
+  onNavigate: (path: string) => void;
+}) {
+  const theme = useTheme();
+  const crumbs = breadcrumbParts(path, homeDir);
+  return (
+    <ScrollView
+      contentContainerStyle={styles.content}
+      horizontal
+      keyboardShouldPersistTaps="handled"
+      showsHorizontalScrollIndicator={false}
+    >
+      {crumbs.map((crumb, index) => (
+        <View key={crumb.path} style={styles.crumbGroup}>
+          {index > 0 ? (
+            <Icon color="mutedForeground" name="ChevronRight" size={spacing[3]} />
+          ) : null}
+          <Pressable
+            accessibilityLabel={`Open ${crumb.label}`}
+            accessibilityRole="button"
+            onPress={() => {
+              haptics.selection();
+              onNavigate(crumb.path);
+            }}
+            style={({ pressed }) => [
+              styles.crumb,
+              {
+                backgroundColor: pressed ? theme.colors.accent : "transparent",
+                borderRadius: theme.radii.md,
+              },
+            ]}
+          >
+            <Text
+              color={index === crumbs.length - 1 ? "foreground" : "mutedForeground"}
+              numberOfLines={1}
+              variant="caption"
+            >
+              {crumb.label}
+            </Text>
+          </Pressable>
+        </View>
+      ))}
+    </ScrollView>
+  );
+}
+
+const styles = StyleSheet.create({
+  content: {
+    alignItems: "center",
+    paddingHorizontal: spacing[3],
+  },
+  crumb: {
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: chrome.touchTarget,
+    paddingHorizontal: spacing[2],
+  },
+  crumbGroup: {
+    alignItems: "center",
+    flexDirection: "row",
+  },
+});

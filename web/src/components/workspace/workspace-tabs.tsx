@@ -9,6 +9,7 @@ import {
   FolderOpen,
   ImagePlus,
   LayoutTemplate,
+  Merge,
   Pencil,
   Plus,
   Server,
@@ -55,7 +56,7 @@ import {
   workspaces,
   workspaceTemplates,
 } from "@/lib/api";
-import type { Tile } from "@/lib/grid";
+import type { Rect, Tile } from "@/lib/grid";
 import { GRID_SIZE } from "@/lib/grid";
 import { basename } from "@/lib/paths";
 import { runningAgent } from "@/lib/sessions";
@@ -71,19 +72,35 @@ import {
   renameTab,
   reorderTab,
   tabById,
+  tabTiles,
   type WorkspaceTab,
+  withActiveTab,
 } from "@/lib/tabs";
 import { cn } from "@/lib/utils";
 import { templateSpecFromWorkspace } from "@/lib/workspace-templates";
 import { tabAttentionCount, workspaceLiveSessionCount } from "@/lib/workspaces";
 import { agentRunCommand } from "./agent-command";
 import { FolderPicker } from "./folder-picker";
+import { NewSessionMenu } from "./new-session-menu";
+import { queryInPane, useOptionalPaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
+import { type SplitChrome, SplitWorkspaceLabel, UnsplitButton } from "./split-chrome";
 import { useTabHome } from "./tab-home";
-import { wantsDuplicate } from "./workspace-grid-helpers";
+import { type MergeDrop, type MergeRefusal, planMerge, WHOLE_CANVAS } from "./tab-merge";
+import { dockZoneAt, freeRects, wantsDuplicate } from "./workspace-grid-helpers";
 
 /** Travel that tells a reorder drag apart from a click, as in the grid. */
 const DRAG_THRESHOLD_PX = 4;
+
+/**
+ * How far below the strip a tab has to be carried before the drag stops being
+ * a reorder and becomes a merge, and how far back up it comes before it is a
+ * reorder again. Two figures rather than one so a hand resting on the
+ * boundary does not flicker between the two gestures, and the deeper of them
+ * so ordinary sideways travel with a little downward drift never trips it.
+ */
+const MERGE_ENTER_PX = 28;
+const MERGE_EXIT_PX = 8;
 
 /** A pointerdown on a tab, waiting to see whether it becomes a reorder. */
 type ArmedTabDrag = {
@@ -114,6 +131,17 @@ type TabDrag = {
   /** The slot the copy would take were the pointer lifted now, counted in the
    *  strip as it stands (so `tabs.length` means the end). */
   insertAt: number;
+  /** This half's canvas, for the hit-test that turns the drag into a merge.
+   *  Null when the strip is not inside a workspace half. */
+  canvas: HTMLElement | null;
+  /** True while the pointer is over the canvas: the drop folds this tab's
+   *  windows into the open one instead of reordering the strip. */
+  merging: boolean;
+  /** The envelope the merge would write, recomputed whenever the aim moves
+   *  to another opening or dock zone. Null while merging means the drop is
+   *  refused, and `mergeRefusal` says why. */
+  mergeInto: LayoutV3 | null;
+  mergeRefusal: MergeRefusal | null;
   move: (event: PointerEvent) => void;
   key: (event: KeyboardEvent) => void;
   end: () => void;
@@ -122,6 +150,42 @@ type TabDrag = {
 
 const slotMiddle = (slot: TabSlot) => slot.left + slot.width / 2;
 
+/** What a merge drop is promising, as the outline over the canvas draws it. */
+type MergeAim = {
+  sourceName: string;
+  targetName: string;
+  /** How many windows are arriving, for the refusal's wording. */
+  count: number;
+  /** Where they land, in canvas cells. Empty when the drop is refused. */
+  incoming: Tile[];
+  /** The canvas in viewport pixels; the cells above are fractions of it. */
+  canvas: { left: number; top: number; width: number; height: number };
+  refusal: MergeRefusal | null;
+};
+
+/** The bounding box of a set of tiles, in canvas cells. */
+function tilesBounds(tiles: Tile[]): Rect {
+  if (tiles.length === 0) return WHOLE_CANVAS;
+  const x = Math.min(...tiles.map((tile) => tile.x));
+  const y = Math.min(...tiles.map((tile) => tile.y));
+  return {
+    x,
+    y,
+    w: Math.max(...tiles.map((tile) => tile.x + tile.w)) - x,
+    h: Math.max(...tiles.map((tile) => tile.y + tile.h)) - y,
+  };
+}
+
+/** What the outline says the drop will do, or why it cannot. */
+function mergeAimLabel(aim: MergeAim): string {
+  if (aim.refusal === "capacity") {
+    const windows = aim.count === 1 ? "another window" : `${aim.count} more windows`;
+    return `${aim.targetName} has no room for ${windows}`;
+  }
+  if (aim.refusal === "fit") return `Too small here for ${aim.sourceName}`;
+  return `Merge ${aim.sourceName} into ${aim.targetName}`;
+}
+
 /**
  * The workspace's tab strip: one button per tab — click to switch, click the
  * active tab again to rename it in place, drag it sideways to reorder the
@@ -129,7 +193,8 @@ const slotMiddle = (slot: TabSlot) => slot.left + slot.width / 2;
  * x to close, and a trailing + to add. Every button carries
  * `data-workspace-tab` so the grid's pane drag can hit-test the strip —
  * hovering a tab mid-drag switches to it, dropping on one moves the pane
- * into it (see WorkspaceGrid).
+ * into it (see WorkspaceGrid) — and `data-workspace-tab-owner`, which says
+ * whose strip it is, since in a split window a hit-test finds either.
  *
  * Tab CRUD writes the whole v3 envelope through PATCH and updates both query
  * caches optimistically, mirroring the grid's own save path.
@@ -139,6 +204,8 @@ export function WorkspaceTabs({
   activeTabId,
   previewTiles,
   focusedId,
+  splitChrome,
+  onPreviewTiles,
   onSwitch,
   onError,
 }: {
@@ -150,6 +217,14 @@ export function WorkspaceTabs({
   /** The focused session — a connected tab wears the same dim as the pane
    *  beneath it when that pane is not the focused one. */
   focusedId?: string | null;
+  /** Set only when this strip is one of two on screen: it grows a label saying
+   *  whose tabs these are and a control that keeps this half. Absent — every
+   *  ordinary window — the strip is exactly what it was before split view. */
+  splitChrome?: SplitChrome | null;
+  /** The layout this strip's own gesture is promising — a tab dragged onto the
+   *  canvas moves the windows already there aside to make its room, and the
+   *  grid is what draws that. Null puts the canvas back. */
+  onPreviewTiles?: (tiles: Tile[] | null) => void;
   onSwitch: (tabId: string) => void;
   onError?: (message: string | null) => void;
 }) {
@@ -192,6 +267,24 @@ export function WorkspaceTabs({
   const tabHomeM = useTabHome(workspace, homeTabId ?? activeTabId, onError, settingsButtonRef);
   const tabGhostRef = useRef<HTMLDivElement>(null);
   const tabGhostLabelRef = useRef<HTMLSpanElement>(null);
+  // The merge drag's two pieces of chrome: the tab carried under the pointer
+  // once it leaves the strip, and the outline over the canvas it would land
+  // in. Both are fixed to the viewport — the strip scrolls sideways, and a
+  // tab dragged out of it would otherwise be clipped by that overflow.
+  const mergeGhostRef = useRef<HTMLDivElement>(null);
+  const mergeGhostLabelRef = useRef<HTMLSpanElement>(null);
+  const paneScope = useOptionalPaneScope();
+  /*
+   * What the merge drop is currently promising. React state, unlike the rest
+   * of this drag's chrome, because the outline is a whole arrangement of rects
+   * that changes shape as the aim moves from one opening to another — building
+   * that by hand would be worse than a render. It only changes when the aim
+   * lands somewhere new, so the pointer's own rate never reaches it; the ghost
+   * under the cursor, which does move every frame, stays imperative.
+   */
+  const [mergeAim, setMergeAim] = useState<MergeAim | null>(null);
+  const onPreviewTilesRef = useRef(onPreviewTiles);
+  onPreviewTilesRef.current = onPreviewTiles;
   const [contextTabId, setContextTabId] = useState<string | null>(null);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 30_000 });
   const sessionsQ = useQuery({ queryKey: ["sessions"], queryFn: () => sessions.list() });
@@ -292,6 +385,19 @@ export function WorkspaceTabs({
     document.removeEventListener("pointercancel", armed.end);
   };
 
+  /** The reason a merge drop was refused, worded as the outline worded it. */
+  const mergeRefusalMessage = (drag: TabDrag): string => {
+    const layout = layoutRef.current;
+    return mergeAimLabel({
+      sourceName: tabById(layout, drag.tabId)?.name ?? "That tab",
+      targetName: tabById(layout, activeTabId)?.name ?? "this tab",
+      count: tabTiles(layout, drag.tabId).length,
+      incoming: [],
+      canvas: { left: 0, top: 0, width: 0, height: 0 },
+      refusal: drag.mergeRefusal,
+    });
+  };
+
   const finishDrag = (commit: boolean) => {
     const drag = dragRef.current;
     if (!drag) return;
@@ -309,14 +415,31 @@ export function WorkspaceTabs({
       element.style.transform = "";
       element.removeAttribute("data-dragging");
       element.removeAttribute("data-duplicating");
+      element.removeAttribute("data-merging");
     }
     const ghost = tabGhostRef.current;
     if (ghost) {
       ghost.hidden = true;
       ghost.style.transform = "";
     }
+    if (mergeGhostRef.current) mergeGhostRef.current.hidden = true;
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
+    if (drag.merging) {
+      setMergeAim(null);
+      onPreviewTilesRef.current?.(null);
+      // Whatever the outline last promised, rather than working the aim out
+      // again from the pointer: the canvas underneath has already moved to
+      // show this drop, and re-reading it would land the windows somewhere
+      // they were never shown.
+      if (!commit) return;
+      if (drag.mergeInto) mergeM.mutate(drag.mergeInto);
+      // Dropped where the outline said it would not go. Saying so beats a tab
+      // that snaps back with nothing said, which reads as a gesture that
+      // simply did not take.
+      else if (drag.mergeRefusal) onError?.(mergeRefusalMessage(drag));
+      return;
+    }
     if (commit && drag.duplicating) {
       duplicateM.mutate({ tabId: drag.tabId, index: drag.insertAt });
       return;
@@ -355,6 +478,13 @@ export function WorkspaceTabs({
     /** Every place a copy can go: the resting left edge of each tab, and the
      *  strip's end — which is where the ghost already sits in flow. */
     const gaps = [...slots.map((slot) => slot.left), last.left + last.width + gap];
+    const stripBottom = stripRef.current?.getBoundingClientRect().bottom ?? 0;
+    /** The merge's own measurements, taken when the pointer crosses onto the
+     *  canvas: where the canvas is, and the free space it is offering. */
+    let canvasBox: DOMRect | null = null;
+    let openings: Rect[] = [];
+    /** The aim as last resolved, so an unchanged one costs nothing. */
+    let aimKey: string | null = null;
     /** The ghost's resting geometry, read the first time it is shown. */
     let ghostLeft = 0;
     let ghostStep = 0;
@@ -426,6 +556,134 @@ export function WorkspaceTabs({
     };
 
     /**
+     * The pointer has crossed out of the strip onto the canvas — or come back.
+     * Merging, the strip closes over the gap and the tab is carried under the
+     * pointer instead, with the canvas outlined as what it would fold into:
+     * the drop moves every window of the dragged tab into the open one and
+     * closes the tab it emptied.
+     */
+    const setMerging = (wanted: boolean, pointerX: number, pointerY: number) => {
+      const drag = dragRef.current;
+      if (!drag || drag.merging === wanted) return;
+      drag.merging = wanted;
+      const element = tabElementsRef.current.get(drag.tabId);
+      const ghost = mergeGhostRef.current;
+      if (!wanted) {
+        drag.mergeInto = null;
+        drag.mergeRefusal = null;
+        aimKey = null;
+        setMergeAim(null);
+        onPreviewTilesRef.current?.(null);
+        if (element) {
+          // Reordering, the tab is back under the cursor and has to snap;
+          // copying, it eases home with the rest of the strip, exactly as
+          // `setDuplicating` leaves it.
+          element.style.transition = drag.duplicating ? "transform 150ms ease-out" : "none";
+          element.removeAttribute("data-merging");
+        }
+        if (ghost) ghost.hidden = true;
+        // The copy's ghost was put away on the way in; a drag still holding
+        // ⌘/⌥ wants it back, and `setDuplicating` will not run again for a
+        // modifier that never changed.
+        if (drag.duplicating && tabGhostRef.current) tabGhostRef.current.hidden = false;
+        document.body.style.cursor = drag.duplicating ? "copy" : "grabbing";
+        // Re-preview from where the pointer is: the strip was left at rest.
+        drag.insertAt = -1;
+        drag.to = drag.from;
+        apply(pointerX);
+        return;
+      }
+      // Nothing in the strip should still be parting around a tab that is
+      // being carried out of it.
+      for (const slot of slots) {
+        const sibling = tabElementsRef.current.get(slot.id);
+        if (sibling) sibling.style.transform = "";
+      }
+      if (tabGhostRef.current) {
+        tabGhostRef.current.hidden = true;
+        tabGhostRef.current.style.transform = "";
+      }
+      if (element) {
+        element.style.transition = "transform 150ms ease-out";
+        element.style.transform = "";
+        element.setAttribute("data-merging", "true");
+      }
+      const source = tabById(layoutRef.current, drag.tabId);
+      if (ghost && source) {
+        if (mergeGhostLabelRef.current) mergeGhostLabelRef.current.textContent = source.name;
+        ghost.hidden = false;
+        ghost.style.left = `${pointerX}px`;
+        ghost.style.top = `${pointerY}px`;
+      }
+      // Measured once per crossing: the canvas does not move while a drag is
+      // running, and the openings are worked out against the resting layout
+      // rather than the one being previewed — a pane that has already slid
+      // aside would keep re-answering where the pointer is aimed.
+      canvasBox = drag.canvas?.getBoundingClientRect() ?? null;
+      openings = freeRects(tabTiles(layoutRef.current, activeTabId));
+      aim(pointerX, pointerY);
+    };
+
+    /**
+     * Where on the canvas the block would land, and what that costs the
+     * windows already there. Free canvas takes it whole; a window under the
+     * pointer gives up the half nearest the edge you are aimed at; anything
+     * else falls back to auto-placing them one by one. Recomputed only when
+     * the answer changes — the pointer moves far more often than the aim does.
+     */
+    const aim = (pointerX: number, pointerY: number) => {
+      const drag = dragRef.current;
+      if (!drag?.merging || !canvasBox) return;
+      const layout = layoutRef.current;
+      const resting = tabTiles(layout, activeTabId);
+      const cellX = ((pointerX - canvasBox.left) / canvasBox.width) * GRID_SIZE;
+      const cellY = ((pointerY - canvasBox.top) / canvasBox.height) * GRID_SIZE;
+      const covers = (rect: Rect) =>
+        cellX >= rect.x && cellX < rect.x + rect.w && cellY >= rect.y && cellY < rect.y + rect.h;
+
+      let drop: MergeDrop;
+      if (resting.length === 0) {
+        // An empty tab is all one opening, and the block arrives unchanged.
+        drop = { kind: "region", rect: WHOLE_CANVAS };
+      } else {
+        const opening = openings.find(covers) ?? null;
+        const hovered = opening ? null : (resting.find(covers) ?? null);
+        if (opening) drop = { kind: "region", rect: opening };
+        else if (hovered) {
+          drop = {
+            kind: "dock",
+            paneId: hovered.session_id,
+            zone: dockZoneAt((cellX - hovered.x) / hovered.w, (cellY - hovered.y) / hovered.h),
+          };
+        } else drop = { kind: "auto" };
+      }
+
+      const key = JSON.stringify(drop);
+      if (key === aimKey) return;
+      aimKey = key;
+      const { plan, refusal } = planMerge(layout, drag.tabId, activeTabId, drop);
+      drag.mergeInto = plan?.layout ?? null;
+      drag.mergeRefusal = refusal;
+      document.body.style.cursor = plan ? "grabbing" : "not-allowed";
+      setMergeAim({
+        sourceName: tabById(layout, drag.tabId)?.name ?? "this tab",
+        targetName: tabById(layout, activeTabId)?.name ?? "this tab",
+        count: tabTiles(layout, drag.tabId).length,
+        incoming: plan?.incoming ?? [],
+        canvas: {
+          left: canvasBox.left,
+          top: canvasBox.top,
+          width: canvasBox.width,
+          height: canvasBox.height,
+        },
+        refusal,
+      });
+      // Only a dock moves anything already on the canvas; the rest leave it be,
+      // and passing the plan either way keeps one path.
+      onPreviewTilesRef.current?.(plan ? plan.resting : null);
+    };
+
+    /**
      * ⌘/⌥ down or up, flipping a live drag between the two previews. Either
      * way the strip parts around what the hand is carrying; what differs is
      * what ends up in the gap — the tab itself, or the ghost of its copy.
@@ -472,6 +730,28 @@ export function WorkspaceTabs({
       if (!drag) return;
       event.preventDefault();
       drag.lastClientX = event.clientX;
+      // Over this half's canvas the gesture stops being about the strip. The
+      // tab already open is the merge's target, so dragging it has nothing to
+      // fold into and goes on reordering.
+      const depth = event.clientY - stripBottom;
+      const belowStrip = depth > (drag.merging ? MERGE_EXIT_PX : MERGE_ENTER_PX);
+      const under = belowStrip ? document.elementFromPoint(event.clientX, event.clientY) : null;
+      setMerging(
+        drag.canvas !== null &&
+          drag.tabId !== activeTabId &&
+          under?.closest?.("[data-workspace-canvas]") === drag.canvas,
+        event.clientX,
+        event.clientY,
+      );
+      if (drag.merging) {
+        const ghost = mergeGhostRef.current;
+        if (ghost) {
+          ghost.style.left = `${event.clientX}px`;
+          ghost.style.top = `${event.clientY}px`;
+        }
+        aim(event.clientX, event.clientY);
+        return;
+      }
       setDuplicating(wantsDuplicate(event));
       apply(event.clientX);
     };
@@ -487,6 +767,16 @@ export function WorkspaceTabs({
       step: grabbed.width + gap,
       duplicating: false,
       insertAt: -1,
+      // This half's canvas, not the document's first — in a split window the
+      // other workspace's grid is on screen too, and a tab can only be folded
+      // into a tab of its own workspace.
+      canvas: queryInPane<HTMLElement>(
+        paneScope?.rootRef.current ?? null,
+        "[data-workspace-canvas]",
+      ),
+      merging: false,
+      mergeInto: null,
+      mergeRefusal: null,
       move,
       key: (event) => {
         // Escape abandons the drag; the strip closes back over the gap.
@@ -599,12 +889,55 @@ export function WorkspaceTabs({
     return () => window.removeEventListener("resize", measure);
   }, [activeTabId, focusedId, previewTiles, renamingId, workspace.layout]);
 
-  const add = () => {
-    const next = addTab(workspace.layout, crypto.randomUUID(), nextTabName(workspace.layout));
-    if (!next) return;
-    patchM.mutate(next);
-    onSwitch(next.active_tab as string);
+  /**
+   * The "+" makes the tab and the first window in it in one gesture: this runs
+   * when the picker's choice is made, writes the tab and makes it active —
+   * which is what tells the create that follows where its window goes — and
+   * hands back the undo for a create that never lands.
+   */
+  const addTabForWindow = async () => {
+    const layout = layoutRef.current;
+    const id = crypto.randomUUID();
+    const next = addTab(layout, id, nextTabName(layout));
+    if (!next) throw new Error(`A workspace holds at most ${MAX_TABS} tabs.`);
+    const wasActive = activeTabId;
+    writeCaches(await workspaces.update(workspace.id, { layout: next }));
+    onSwitch(id);
+    return () => {
+      const rolled = removeTab(layoutRef.current, id);
+      if (!rolled) return;
+      onSwitch(wasActive);
+      workspaces
+        .update(workspace.id, { layout: withActiveTab(rolled, wasActive) })
+        .then(writeCaches)
+        .catch(() => queryClient.invalidateQueries({ queryKey: ["workspace", workspace.id] }));
+    };
   };
+
+  /**
+   * Fold one tab's windows into the open one and close the tab it emptied —
+   * the drop at the end of dragging a tab down onto the canvas. Pure layout:
+   * the sessions are the same sessions, moved, so nothing is created or
+   * killed and the drag is undone by dragging a window back out.
+   */
+  const mergeM = useMutation({
+    mutationFn: (next: LayoutV3) => workspaces.update(workspace.id, { layout: next }),
+    // Optimistic, like every other tab write: the canvas has been showing this
+    // arrangement all the way through the drag, and letting it snap back to
+    // the old one for the length of a round trip would undo the drop on screen.
+    onMutate: (next) => {
+      onError?.(null);
+      writeCaches({ ...workspace, layout: next });
+    },
+    onSuccess: (saved) => {
+      writeCaches(saved);
+      onSwitch(saved.layout.active_tab ?? activeTabId);
+    },
+    onError: (error) => {
+      queryClient.invalidateQueries({ queryKey: ["workspace", workspace.id] });
+      onError?.(error instanceof Error ? error.message : String(error));
+    },
+  });
 
   /**
    * Duplicate a tab: same geometry, a second pane per pane, each on the same
@@ -787,6 +1120,14 @@ export function WorkspaceTabs({
     patchM.mutate(renameTab(workspace.layout, tabId, name.slice(0, 64)));
   };
 
+  // The middle of the arriving block, where the outline's label sits.
+  const mergeAimCentre = mergeAim
+    ? (() => {
+        const bounds = tilesBounds(mergeAim.incoming);
+        return { x: bounds.x + bounds.w / 2, y: bounds.y + bounds.h / 2 };
+      })()
+    : null;
+
   const canClose = workspace.layout.tabs.length > 1;
   const sessionsById = useMemo(
     () => new Map((sessionsQ.data ?? []).map((session) => [session.id, session])),
@@ -825,14 +1166,20 @@ export function WorkspaceTabs({
      * sliver of ground beneath the resting tabs; the selected tab alone
      * extends down through it — a few px more room at its bottom — staying
      * flush with the content so tab and panel read as one connected sheet.
-     * The first tab sits flush with the panel's left edge.
+     * The strip starts flush with the panel's left edge — with the first tab,
+     * or in a split window with the label saying whose tabs these are.
      */
     <div
       ref={stripRef}
       role="tablist"
-      aria-label="Workspace tabs"
+      // Two strips are two tablists, and "Workspace tabs" twice over says
+      // nothing about which workspace either one holds.
+      aria-label={splitChrome ? `${splitChrome.workspaceName} tabs` : "Workspace tabs"}
       className="flex h-11 shrink-0 items-end gap-1.5 overflow-x-auto bg-shell pr-1.5 pb-1.5"
     >
+      {splitChrome && (
+        <SplitWorkspaceLabel name={splitChrome.workspaceName} icon={splitChrome.workspaceIcon} />
+      )}
       {orderedTabs.map((tab) => {
         const active = tab.id === activeTabId;
         const attention = tabAttentionCount(tab, sessionsById);
@@ -871,7 +1218,7 @@ export function WorkspaceTabs({
               if (element) tabElementsRef.current.set(tab.id, element);
               else tabElementsRef.current.delete(tab.id);
             }}
-            className="relative shrink-0 data-[dragging]:z-10"
+            className="relative shrink-0 data-[dragging]:z-10 data-[merging]:opacity-35"
           >
             <button
               type="button"
@@ -879,6 +1226,7 @@ export function WorkspaceTabs({
               aria-selected={active}
               aria-keyshortcuts="Alt+Shift+ArrowLeft Alt+Shift+ArrowRight"
               data-workspace-tab={tab.id}
+              data-workspace-tab-owner={workspace.id}
               onPointerDown={(event) => armDrag(tab.id, event)}
               onContextMenu={(event) => {
                 event.preventDefault();
@@ -971,17 +1319,41 @@ export function WorkspaceTabs({
         <Copy className="size-3.5 shrink-0" aria-hidden />
         <span ref={tabGhostLabelRef} className="max-w-48 truncate" />
       </div>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon"
-        aria-label="New tab"
-        disabled={workspace.layout.tabs.length >= MAX_TABS || patchM.isPending}
-        onClick={add}
-        className="mb-0.5 size-7 shrink-0 text-muted-foreground hover:text-foreground"
-      >
-        <Plus className="size-3.5" aria-hidden />
-      </Button>
+      {/* A tab is only ever wanted for what goes in it, so the "+" asks what
+          that is first and makes the tab and the window together. The tab is
+          empty until a choice is made, so nothing is left behind by closing
+          the picker. */}
+      <NewSessionMenu
+        mode="session"
+        workspaceId={workspace.id}
+        // The tab does not exist yet: what it inherits is the workspace's
+        // home, which is where these choices will open.
+        tabId={null}
+        // The "+" is already labelled New tab, so the menu does not repeat it
+        // — only the sheet, which opens with the button out of sight, does.
+        heading="New tab"
+        hideHeading
+        // A new tab opens at the workspace's folder and "Change tab folder"
+        // re-points it, so the "somewhere else" row says nothing new here.
+        hideElsewhere
+        beforeCreate={addTabForWindow}
+        className="mb-0.5 shrink-0"
+        // Roomier than the default: agent rows carry a command underneath the
+        // name, and at w-60 the longer ones truncate mid-flag.
+        menuClassName="w-72"
+        trigger={
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label="New tab"
+            disabled={workspace.layout.tabs.length >= MAX_TABS || patchM.isPending}
+            className="size-7 text-muted-foreground hover:text-foreground"
+          >
+            <Plus className="size-3.5" aria-hidden />
+          </Button>
+        }
+      />
 
       {/* Right-click on any tab. Rendered once for the whole strip and opened
           at the cursor, so it is not eight menus deep in the DOM. */}
@@ -1049,7 +1421,15 @@ export function WorkspaceTabs({
           is the floating launcher's job (bottom-right of the viewport). */}
       <DropdownMenu
         align="end"
-        className="mb-0.5 ml-auto shrink-0"
+        className={cn(
+          "mb-0.5 ml-auto shrink-0",
+          // Pinned beside the unsplit control at a half-width strip's end.
+          // Left scrolling, it would come to rest exactly underneath that
+          // button at full scroll and be unreachable; 2.125rem is that
+          // button's width plus the strip's gap, so pinned and resting
+          // positions coincide and nothing shifts as the tabs scroll past.
+          splitChrome && "sticky right-8.5 z-20 bg-shell",
+        )}
         // Wider than the base min-width: two of these rows carry a host or
         // folder name that truncates, and the default leaves them almost no
         // room to say which one.
@@ -1121,6 +1501,14 @@ export function WorkspaceTabs({
           Delete workspace
         </DropdownMenuItem>
       </DropdownMenu>
+
+      {splitChrome && (
+        <UnsplitButton
+          workspaceName={splitChrome.workspaceName}
+          side={splitChrome.side}
+          onUnsplit={splitChrome.onUnsplit}
+        />
+      )}
 
       <WorkspaceIconDialog
         open={iconOpen}
@@ -1258,6 +1646,74 @@ export function WorkspaceTabs({
           )
         }
       />
+
+      {/* What a tab dragged onto the canvas is promising: one outline per
+          arriving window, laid out exactly where the drop would put them, and
+          the tab itself carried under the pointer. Both sit outside the strip's
+          flow — it scrolls sideways, so anything moved out of it would be
+          clipped — and both are inert to hit-testing, which the drag does
+          against the canvas every move. */}
+      {mergeAim && (
+        <div
+          aria-hidden
+          style={{
+            left: `${mergeAim.canvas.left}px`,
+            top: `${mergeAim.canvas.top}px`,
+            width: `${mergeAim.canvas.width}px`,
+            height: `${mergeAim.canvas.height}px`,
+          }}
+          className="pointer-events-none fixed z-[105]"
+        >
+          {mergeAim.incoming.length > 0 ? (
+            mergeAim.incoming.map((tile) => (
+              <div
+                key={tile.session_id}
+                data-merge-window={tile.session_id}
+                style={{
+                  left: `${(tile.x / GRID_SIZE) * 100}%`,
+                  top: `${(tile.y / GRID_SIZE) * 100}%`,
+                  width: `${(tile.w / GRID_SIZE) * 100}%`,
+                  height: `${(tile.h / GRID_SIZE) * 100}%`,
+                }}
+                // The padding is the seam between neighbouring outlines, so a
+                // pair that share an edge read as two windows, not one.
+                className="absolute p-px"
+              >
+                <div className="size-full rounded-md border-2 border-dashed border-ring bg-ring/10" />
+              </div>
+            ))
+          ) : (
+            // Refused: nothing lands, so the whole canvas says so at once.
+            <div className="absolute inset-px rounded-md border-2 border-dashed border-destructive bg-destructive/10" />
+          )}
+          {/* Over the middle of what is arriving, so the words sit on the
+              thing they describe rather than on the canvas at large. */}
+          <span
+            style={{
+              left: `${((mergeAimCentre?.x ?? 0) / GRID_SIZE) * 100}%`,
+              top: `${((mergeAimCentre?.y ?? 0) / GRID_SIZE) * 100}%`,
+            }}
+            className={cn(
+              "absolute -translate-x-1/2 -translate-y-1/2 whitespace-nowrap rounded-full border px-3 py-1.5",
+              "text-xs font-medium shadow-lg",
+              mergeAim.refusal
+                ? "border-destructive/40 bg-popover text-destructive"
+                : "border-border bg-popover text-foreground",
+            )}
+          >
+            {mergeAimLabel(mergeAim)}
+          </span>
+        </div>
+      )}
+      <div
+        ref={mergeGhostRef}
+        hidden
+        aria-hidden
+        className="pointer-events-none fixed z-[110] flex -translate-x-1/2 -translate-y-1/2 items-center gap-2 rounded-md border border-border bg-popover px-3 py-1.5 text-xs font-medium text-foreground shadow-lg"
+      >
+        <Merge className="size-3.5 shrink-0" aria-hidden />
+        <span ref={mergeGhostLabelRef} className="max-w-48 truncate" />
+      </div>
     </div>
   );
 }

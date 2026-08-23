@@ -73,6 +73,69 @@ describe("parseAlertFrame", () => {
     expect(frame).toMatchObject({ event: "session.died", exit_code: 137, signal: "KILL" });
   });
 
+  test("accepts a device-approval knock and its answer", () => {
+    expect(
+      parseAlertFrame(
+        JSON.stringify({
+          type: "trust",
+          event: "device.approval_requested",
+          request_id: "req-1",
+          browser_device_id: "dev-1",
+          label: "iPhone",
+          fingerprint: "SHA256:abcdefghijklmnop",
+          at: "2026-08-23T00:00:00+00:00",
+        }),
+      ),
+    ).toEqual({
+      type: "trust",
+      event: "device.approval_requested",
+      request_id: "req-1",
+      browser_device_id: "dev-1",
+      label: "iPhone",
+      fingerprint: "SHA256:abcdefghijklmnop",
+      status: null,
+      at: "2026-08-23T00:00:00+00:00",
+    });
+    expect(
+      parseAlertFrame(
+        JSON.stringify({
+          type: "trust",
+          event: "device.approval_resolved",
+          request_id: "req-1",
+          browser_device_id: "dev-1",
+          status: "approved",
+        }),
+      ),
+    ).toMatchObject({ event: "device.approval_resolved", status: "approved" });
+  });
+
+  test("rejects a trust frame this build cannot act on", () => {
+    const rejected = [
+      JSON.stringify({
+        type: "trust",
+        event: "device.seized",
+        request_id: "r",
+        browser_device_id: "d",
+      }),
+      JSON.stringify({ type: "trust", event: "device.approval_requested", request_id: "" }),
+      JSON.stringify({ type: "trust", event: "device.approval_requested", request_id: "r" }),
+    ];
+    for (const raw of rejected) expect(parseAlertFrame(raw)).toBeNull();
+    // An unknown status normalizes away rather than reaching a consumer that
+    // would have to guess what it meant.
+    expect(
+      parseAlertFrame(
+        JSON.stringify({
+          type: "trust",
+          event: "device.approval_resolved",
+          request_id: "r",
+          browser_device_id: "d",
+          status: "elevated",
+        }),
+      ),
+    ).toMatchObject({ status: null });
+  });
+
   test("recognizes the keepalive", () => {
     expect(parseAlertFrame(JSON.stringify({ type: "alerts.ping" }))).toEqual({
       type: "alerts.ping",

@@ -1,0 +1,409 @@
+import { forwardRef, type ReactNode, type RefObject, useState } from "react";
+import {
+  Pressable,
+  type StyleProp,
+  StyleSheet,
+  TextInput,
+  type TextInputProps,
+  type TextStyle,
+  type ViewStyle,
+} from "react-native";
+import Animated, {
+  ReduceMotion,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
+import { Icon } from "@/components/ui/icon";
+import { useTheme } from "@/theme";
+import { opacity } from "@/theme/effects";
+import { sizing } from "@/theme/sizing";
+import { borderWidth, chrome, spacing } from "@/theme/spacing";
+import { fontFamily, fontSize, typeStyles } from "@/theme/typography";
+
+export type InputPurpose =
+  | "email"
+  | "password"
+  | "newPassword"
+  | "oneTimeCode"
+  | "url"
+  | "path"
+  | "name"
+  | "search"
+  | "plain";
+
+export interface InputPurposeConfig {
+  autoCapitalize: NonNullable<TextInputProps["autoCapitalize"]>;
+  autoCorrect: boolean;
+  spellCheck: boolean;
+  keyboardType: NonNullable<TextInputProps["keyboardType"]>;
+  textContentType: NonNullable<TextInputProps["textContentType"]>;
+  autoComplete: NonNullable<TextInputProps["autoComplete"]>;
+  smartInsertDelete: boolean;
+  secureTextEntry: boolean;
+}
+
+const INPUT_PURPOSE_CONFIG = {
+  email: {
+    autoCapitalize: "none",
+    autoCorrect: false,
+    spellCheck: false,
+    keyboardType: "email-address",
+    textContentType: "emailAddress",
+    autoComplete: "email",
+    smartInsertDelete: false,
+    secureTextEntry: false,
+  },
+  password: {
+    autoCapitalize: "none",
+    autoCorrect: false,
+    spellCheck: false,
+    keyboardType: "default",
+    textContentType: "password",
+    autoComplete: "current-password",
+    smartInsertDelete: false,
+    secureTextEntry: true,
+  },
+  newPassword: {
+    autoCapitalize: "none",
+    autoCorrect: false,
+    spellCheck: false,
+    keyboardType: "default",
+    textContentType: "newPassword",
+    autoComplete: "new-password",
+    smartInsertDelete: false,
+    secureTextEntry: true,
+  },
+  oneTimeCode: {
+    autoCapitalize: "characters",
+    autoCorrect: false,
+    spellCheck: false,
+    keyboardType: "default",
+    textContentType: "oneTimeCode",
+    autoComplete: "one-time-code",
+    smartInsertDelete: false,
+    secureTextEntry: false,
+  },
+  url: {
+    autoCapitalize: "none",
+    autoCorrect: false,
+    spellCheck: false,
+    keyboardType: "url",
+    textContentType: "URL",
+    autoComplete: "url",
+    smartInsertDelete: false,
+    secureTextEntry: false,
+  },
+  path: {
+    autoCapitalize: "none",
+    autoCorrect: false,
+    spellCheck: false,
+    keyboardType: "default",
+    textContentType: "none",
+    autoComplete: "off",
+    smartInsertDelete: false,
+    secureTextEntry: false,
+  },
+  name: {
+    autoCapitalize: "words",
+    autoCorrect: false,
+    spellCheck: false,
+    keyboardType: "default",
+    textContentType: "name",
+    autoComplete: "name",
+    smartInsertDelete: true,
+    secureTextEntry: false,
+  },
+  search: {
+    autoCapitalize: "none",
+    autoCorrect: false,
+    spellCheck: false,
+    keyboardType: "web-search",
+    textContentType: "none",
+    autoComplete: "off",
+    smartInsertDelete: false,
+    secureTextEntry: false,
+  },
+  plain: {
+    autoCapitalize: "none",
+    autoCorrect: false,
+    spellCheck: false,
+    keyboardType: "default",
+    textContentType: "none",
+    autoComplete: "off",
+    smartInsertDelete: false,
+    secureTextEntry: false,
+  },
+} as const satisfies Record<InputPurpose, InputPurposeConfig>;
+
+export function getInputPurposeConfig(purpose: InputPurpose): InputPurposeConfig {
+  return INPUT_PURPOSE_CONFIG[purpose];
+}
+
+export type InputVariant = "box" | "rule";
+
+export interface InputProps extends Omit<TextInputProps, "style"> {
+  purpose?: InputPurpose;
+  /**
+   * `box` is the app's plated field. `rule` is the press cut: the value is
+   * typed straight onto the sheet and only a ruled line under it says where the
+   * field is — the shape a printed form has, and the one that stops a stack of
+   * fields from reading as a stack of containers.
+   */
+  variant?: InputVariant;
+  error?: boolean;
+  nextRef?: RefObject<TextInput | null>;
+  leading?: ReactNode;
+  trailing?: ReactNode;
+  showFocusHalo?: boolean;
+  containerStyle?: StyleProp<ViewStyle>;
+  style?: StyleProp<TextStyle>;
+}
+
+export const Input = forwardRef<TextInput, InputProps>(function Input(
+  {
+    purpose = "plain",
+    variant = "box",
+    error = false,
+    nextRef,
+    leading,
+    trailing,
+    showFocusHalo = true,
+    containerStyle,
+    style,
+    editable = true,
+    autoCapitalize,
+    autoCorrect,
+    spellCheck,
+    keyboardType,
+    textContentType,
+    autoComplete,
+    smartInsertDelete,
+    secureTextEntry,
+    returnKeyType,
+    onFocus,
+    onBlur,
+    onSubmitEditing,
+    accessibilityState,
+    testID,
+    ...props
+  },
+  ref,
+) {
+  const theme = useTheme();
+  const config = getInputPurposeConfig(purpose);
+  const ruled = variant === "rule";
+  const focusProgress = useSharedValue(0);
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const isPasswordPurpose = purpose === "password" || purpose === "newPassword";
+  const purposeSecureEntry = secureTextEntry ?? config.secureTextEntry;
+
+  const animatedHaloStyle = useAnimatedStyle(
+    () => ({
+      borderColor: error ? theme.colors.destructive : theme.colors.ring,
+      opacity: showFocusHalo ? focusProgress.value : opacity.hidden,
+    }),
+    [error, showFocusHalo, theme.colors.destructive, theme.colors.ring],
+  );
+
+  // The struck rule: it is drawn from the leading edge outwards rather than
+  // faded in, so focus reads as the line being ruled under what you are about
+  // to type. An error holds the line struck whether or not the field has focus.
+  const animatedRuleStyle = useAnimatedStyle(
+    () => ({
+      backgroundColor: error ? theme.colors.destructive : theme.colors.foreground,
+      transform: [{ scaleX: error ? 1 : focusProgress.value }],
+    }),
+    [error, theme.colors.destructive, theme.colors.foreground],
+  );
+
+  const animateFocus = (focused: boolean) => {
+    focusProgress.value = withTiming(focused ? 1 : 0, {
+      duration: theme.motion.duration.base,
+      easing: theme.motion.easing.inOut,
+      reduceMotion: ReduceMotion.System,
+    });
+  };
+
+  const handleSubmit: NonNullable<TextInputProps["onSubmitEditing"]> = (event) => {
+    onSubmitEditing?.(event);
+    nextRef?.current?.focus();
+  };
+
+  const hasPasswordToggle = isPasswordPurpose && purposeSecureEntry;
+  const hasTrailingContent = trailing !== undefined || hasPasswordToggle;
+
+  return (
+    <Animated.View
+      style={[
+        styles.container,
+        ruled
+          ? [styles.ruleContainer, { borderBottomColor: theme.colors.paneDivider }]
+          : {
+              borderColor: error ? theme.colors.destructive : theme.colors.input,
+              borderRadius: theme.radii.md,
+            },
+        !editable && styles.disabled,
+        containerStyle,
+      ]}
+    >
+      {ruled ? (
+        <Animated.View
+          pointerEvents="none"
+          style={[styles.rule, animatedRuleStyle]}
+          testID={testID === undefined ? undefined : `${testID}-rule`}
+        />
+      ) : (
+        <Animated.View
+          pointerEvents="none"
+          style={[styles.focusHalo, { borderRadius: theme.radii.md }, animatedHaloStyle]}
+          testID={testID === undefined ? undefined : `${testID}-focus-halo`}
+        />
+      )}
+      {leading !== undefined ? (
+        <Animated.View style={styles.leading}>{leading}</Animated.View>
+      ) : null}
+      <TextInput
+        {...props}
+        ref={ref}
+        testID={testID}
+        editable={editable}
+        autoCapitalize={autoCapitalize ?? config.autoCapitalize}
+        autoCorrect={autoCorrect ?? config.autoCorrect}
+        spellCheck={spellCheck ?? config.spellCheck}
+        keyboardType={keyboardType ?? config.keyboardType}
+        textContentType={textContentType ?? config.textContentType}
+        autoComplete={autoComplete ?? config.autoComplete}
+        smartInsertDelete={smartInsertDelete ?? config.smartInsertDelete}
+        secureTextEntry={hasPasswordToggle ? !passwordVisible : purposeSecureEntry}
+        returnKeyType={returnKeyType ?? (nextRef === undefined ? "done" : "next")}
+        onFocus={(event) => {
+          animateFocus(true);
+          onFocus?.(event);
+        }}
+        onBlur={(event) => {
+          animateFocus(false);
+          onBlur?.(event);
+        }}
+        onSubmitEditing={handleSubmit}
+        accessibilityRole={purpose === "search" ? "search" : props.accessibilityRole}
+        accessibilityState={{ ...accessibilityState, disabled: !editable }}
+        aria-invalid={error || undefined}
+        placeholderTextColor={props.placeholderTextColor ?? theme.colors.mutedForeground}
+        selectionColor={props.selectionColor ?? theme.colors.brandAccent}
+        style={[
+          styles.input,
+          ruled && styles.ruleInput,
+          leading !== undefined && (ruled ? styles.ruleInputWithLeading : styles.inputWithLeading),
+          hasTrailingContent && !ruled && styles.inputWithTrailing,
+          { color: theme.colors.foreground },
+          style,
+        ]}
+      />
+      {trailing !== undefined ? (
+        <Animated.View style={styles.trailing}>{trailing}</Animated.View>
+      ) : null}
+      {hasPasswordToggle ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={passwordVisible ? "Hide password" : "Show password"}
+          disabled={!editable}
+          onPress={() => setPasswordVisible((visible) => !visible)}
+          style={[styles.trailingAction, ruled && styles.ruleTrailingAction]}
+        >
+          <Icon
+            name={passwordVisible ? "EyeOff" : "Eye"}
+            size={spacing[4]}
+            color="mutedForeground"
+          />
+        </Pressable>
+      ) : null}
+    </Animated.View>
+  );
+});
+
+const styles = StyleSheet.create({
+  container: {
+    alignItems: "center",
+    borderWidth: borderWidth.hairline,
+    flexDirection: "row",
+    height: chrome.touchTarget,
+    position: "relative",
+    width: "100%",
+  },
+  // The rule carries the whole field: there is no box behind it to say where
+  // the control is, so it takes the stronger of the two neutral hairlines.
+  ruleContainer: {
+    borderBottomWidth: borderWidth.hairline,
+    borderLeftWidth: borderWidth.none,
+    borderRightWidth: borderWidth.none,
+    borderTopWidth: borderWidth.none,
+    height: sizing.control.ruledField,
+  },
+  rule: {
+    bottom: -borderWidth.hairline,
+    height: borderWidth.emphasis,
+    left: 0,
+    position: "absolute",
+    right: 0,
+    transformOrigin: "left",
+  },
+  focusHalo: {
+    borderWidth: borderWidth.hairline,
+    bottom: -borderWidth.hairline,
+    left: -borderWidth.hairline,
+    position: "absolute",
+    right: -borderWidth.hairline,
+    top: -borderWidth.hairline,
+  },
+  disabled: {
+    opacity: opacity.disabled,
+  },
+  input: {
+    // iOS lays a single-line TextInput's text out from the top of its content
+    // box when a lineHeight is set, which pushed the value and placeholder below
+    // the field's optical centre. Height plus flex centring does the job without
+    // it, so only the face and weight are taken from the shared type style.
+    fontSize: typeStyles.uiSm.fontSize,
+    fontWeight: typeStyles.uiSm.fontWeight,
+    flex: 1,
+    height: "100%",
+    paddingHorizontal: spacing[3],
+    paddingVertical: 0,
+  },
+  inputWithLeading: {
+    // Clear of the leading glyph rather than crowding it.
+    paddingLeft: spacing[2],
+  },
+  ruleInput: {
+    // Nothing pads a ruled field: the value starts on the sheet's own margin,
+    // flush with the label above it and the rule beneath.
+    fontFamily: fontFamily.mono,
+    fontSize: fontSize.seventeen,
+    paddingHorizontal: 0,
+  },
+  ruleInputWithLeading: {
+    paddingLeft: spacing[3],
+  },
+  ruleTrailingAction: {
+    alignItems: "flex-end",
+  },
+  inputWithTrailing: {
+    paddingRight: spacing[1],
+  },
+  leading: {
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: spacing[3],
+  },
+  trailing: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  trailingAction: {
+    alignItems: "center",
+    height: chrome.touchTarget,
+    justifyContent: "center",
+    width: chrome.touchTarget,
+  },
+});

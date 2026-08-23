@@ -8,6 +8,7 @@ import {
   duplicateTab,
   type LayoutV3,
   MAX_TABS,
+  mergeTabs,
   moveSessionToTab,
   nextTabName,
   removeTab,
@@ -276,5 +277,82 @@ describe("duplicateTab", () => {
     named.tabs[1].name = "Build copy";
     expect(copyTabName(named, "Build")).toBe("Build copy 2");
     expect(copyTabName(named, "Ship")).toBe("Ship copy");
+  });
+});
+
+describe("mergeTabs", () => {
+  test("moves every window into the target and drops the source tab", () => {
+    const layout = envelope([
+      { id: "t1", tiles: [tile("s1", 0, 0, 24, 24)] },
+      { id: "t2", tiles: [tile("s2", 0, 0, 12, 24), tile("s3", 12, 0, 12, 24)] },
+    ]);
+    const next = mergeTabs(layout, "t2", "t1");
+    expect(next?.tabs.map((tab) => tab.id)).toEqual(["t1"]);
+    expect(next?.active_tab).toBe("t1");
+    expect(allSessionIds(next as LayoutV3).sort()).toEqual(["s1", "s2", "s3"]);
+  });
+
+  test("keeps a widget tile's widget through the move", () => {
+    const files = { kind: "files" as const, host_id: "h", path: "/tmp" };
+    const layout = envelope([
+      { id: "t1", tiles: [tile("s1", 0, 0, 24, 24)] },
+      { id: "t2", tiles: [{ ...tile("w1", 0, 0, 24, 24), widget: files }] },
+    ]);
+    const next = mergeTabs(layout, "t2", "t1");
+    expect(next?.tabs[0]?.layout.tiles.find((t) => t.session_id === "w1")?.widget).toEqual(files);
+  });
+
+  test("an empty source tab merges to nothing but is still dropped", () => {
+    const layout = envelope([{ id: "t1", tiles: [tile("s1", 0, 0, 24, 24)] }, { id: "t2" }]);
+    const next = mergeTabs(layout, "t2", "t1");
+    expect(next?.tabs.map((tab) => tab.id)).toEqual(["t1"]);
+    expect(next?.tabs[0]?.layout.tiles).toEqual([tile("s1", 0, 0, 24, 24)]);
+  });
+
+  test("merging the tab you are on leaves the survivor active", () => {
+    const layout = withActiveTab(
+      envelope([
+        { id: "t1", tiles: [tile("s1", 0, 0, 24, 24)] },
+        { id: "t2", tiles: [tile("s2", 0, 0, 24, 24)] },
+        { id: "t3", tiles: [] },
+      ]),
+      "t3",
+    );
+    expect(mergeTabs(layout, "t3", "t2")?.active_tab).toBe("t2");
+  });
+
+  test("refuses an unknown tab, itself, and a target with no room", () => {
+    const layout = envelope([
+      { id: "t1", tiles: [tile("s1", 0, 0, 24, 24)] },
+      { id: "t2", tiles: [tile("s2", 0, 0, 24, 24)] },
+    ]);
+    expect(mergeTabs(layout, "ghost", "t1")).toBeNull();
+    expect(mergeTabs(layout, "t1", "ghost")).toBeNull();
+    expect(mergeTabs(layout, "t1", "t1")).toBeNull();
+
+    // A full target takes nothing at all: all or nothing, so the layout the
+    // caller has is left exactly as it was.
+    const size = 24 / 4;
+    const packed = Array.from({ length: MAX_TILES }, (_, i) =>
+      tile(`f${i}`, (i % size) * 4, Math.floor(i / size) * 4, 4, 4),
+    );
+    const full = envelope([
+      { id: "t1", tiles: packed },
+      { id: "t2", tiles: [tile("s2", 0, 0, 24, 24)] },
+    ]);
+    expect(mergeTabs(full, "t2", "t1")).toBeNull();
+  });
+
+  test("refuses when only some of the source fits", () => {
+    const size = 24 / 4;
+    // One short of full: the first window lands, the second has nowhere to go.
+    const nearly = Array.from({ length: MAX_TILES - 1 }, (_, i) =>
+      tile(`f${i}`, (i % size) * 4, Math.floor(i / size) * 4, 4, 4),
+    );
+    const layout = envelope([
+      { id: "t1", tiles: nearly },
+      { id: "t2", tiles: [tile("s1", 0, 0, 12, 24), tile("s2", 12, 0, 12, 24)] },
+    ]);
+    expect(mergeTabs(layout, "t2", "t1")).toBeNull();
   });
 });
