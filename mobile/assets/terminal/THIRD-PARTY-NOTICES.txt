@@ -1,0 +1,6 @@
+xterm.js 5.5.0 and the bundled @xterm addons are copyright their contributors
+and licensed under the MIT License. The vendored worker artifact is generated
+from the packages already installed for spawn's reference web client.
+
+See https://github.com/xtermjs/xterm.js/blob/5.5.0/LICENSE
+

@@ -30,8 +30,55 @@ export interface AlertEvent {
   at: string;
 }
 
+/**
+ * Trust events share this socket because they have the same shape of problem:
+ * something happened that the operator must see on whichever device they are
+ * looking at, which is not the device it happened on. They are a separate
+ * frame `type` so the alert validation below stays exactly as narrow.
+ */
+export type TrustEventKind = "device.approval_requested" | "device.approval_resolved";
+
+export interface TrustEvent {
+  event: TrustEventKind;
+  request_id: string;
+  browser_device_id: string;
+  label: string | null;
+  /** Present on a request; the operator compares it against the asking device. */
+  fingerprint: string | null;
+  status: "approved" | "denied" | null;
+  at: string;
+}
+
 /** Frames the socket can deliver. `alerts.ping` is an idle keepalive. */
-export type AlertFrame = ({ type: "alert" } & AlertEvent) | { type: "alerts.ping" };
+export type AlertFrame =
+  | ({ type: "alert" } & AlertEvent)
+  | ({ type: "trust" } & TrustEvent)
+  | { type: "alerts.ping" };
+
+const TRUST_EVENT_KINDS = new Set<string>([
+  "device.approval_requested",
+  "device.approval_resolved",
+]);
+
+function parseTrustFrame(record: Record<string, unknown>): AlertFrame | null {
+  const event = record.event;
+  if (typeof event !== "string" || !TRUST_EVENT_KINDS.has(event)) return null;
+  const requestId = record.request_id;
+  const deviceId = record.browser_device_id;
+  if (typeof requestId !== "string" || !requestId) return null;
+  if (typeof deviceId !== "string" || !deviceId) return null;
+  const status = record.status;
+  return {
+    type: "trust",
+    event: event as TrustEventKind,
+    request_id: requestId,
+    browser_device_id: deviceId,
+    label: typeof record.label === "string" ? record.label : null,
+    fingerprint: typeof record.fingerprint === "string" ? record.fingerprint : null,
+    status: status === "approved" || status === "denied" ? status : null,
+    at: typeof record.at === "string" ? record.at : "",
+  };
+}
 
 const EVENT_KINDS = new Set<string>(["agent.finished", "agent.awaiting_input", "session.died"]);
 
@@ -50,6 +97,7 @@ export function parseAlertFrame(raw: string): AlertFrame | null {
   if (typeof parsed !== "object" || parsed === null) return null;
   const frame = parsed as Record<string, unknown>;
   if (frame.type === "alerts.ping") return { type: "alerts.ping" };
+  if (frame.type === "trust") return parseTrustFrame(frame);
   if (frame.type !== "alert") return null;
   if (typeof frame.event !== "string" || !EVENT_KINDS.has(frame.event)) return null;
   if (typeof frame.session_id !== "string" || !frame.session_id) return null;

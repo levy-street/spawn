@@ -1,0 +1,37 @@
+{
+  "contract": "SPAWN-BROWSER-REGISTER-V1",
+  "version": 1,
+  "positive": {
+    "user_id": "00000000-0000-4000-8000-000000000001",
+    "public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "transcript_hex": "535041574e2d42524f575345522d52454749535445522d56310100000000000040008000000000000001d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "transcript_sha256": "f098d90322cea5e8fd61b061f8f3c4358afda2f0b20a9117f643aa8327a80dce",
+    "signature": "LxBc6xLla_I36Xy8Uvd3VwbbywP_QnH0pIlONVYrUUkpWoIeHrpbqdSjJyaqKWmbo27xTmX7hXuggrM5Iw5DAA"
+  },
+  "mutations": {
+    "user_id": "00000000-0000-4000-8000-000000000002",
+    "public_key": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+    "signature": "MxBc6xLla_I36Xy8Uvd3VwbbywP_QnH0pIlONVYrUUkpWoIeHrpbqdSjJyaqKWmbo27xTmX7hXuggrM5Iw5DAA"
+  },
+  "malformed_user_ids": [
+    "ABCDEFAB-1234-4ABC-8DEF-ABCDEFABCDEF",
+    "abcdefab12344abc8defabcdefabcdef",
+    "{abcdefab-1234-4abc-8def-abcdefabcdef}",
+    "urn:uuid:abcdefab-1234-4abc-8def-abcdefabcdef",
+    "uuid:abcdefab-1234-4abc-8def-abcdefabcdef",
+    " abcdefab-1234-4abc-8def-abcdefabcdef",
+    "abcdefab-1234-4abc-8def-abcdefabcdef "
+  ],
+  "malformed_public_keys": [
+    "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHUR",
+    "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+    "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHUR+",
+    "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "7f_______________________________________38"
+  ],
+  "malformed_signatures": [
+    "LxBc6xLla_I36Xy8Uvd3VwbbywP_QnH0pIlONVYrUUkpWoIeHrpbqdSjJyaqKWmbo27xTmX7hXuggrM5Iw5DA",
+    "LxBc6xLla_I36Xy8Uvd3VwbbywP_QnH0pIlONVYrUUkpWoIeHrpbqdSjJyaqKWmbo27xTmX7hXuggrM5Iw5DAA=",
+    "LxBc6xLla_I36Xy8Uvd3VwbbywP_QnH0pIlONVYrUUkpWoIeHrpbqdSjJyaqKWmbo27xTmX7hXuggrM5Iw5D+A"
+  ]
+}
