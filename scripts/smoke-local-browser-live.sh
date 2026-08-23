@@ -54,12 +54,12 @@ def request(method: str, path: str, payload: dict | None = None) -> dict | list 
         return None
 
 
-agents = request("GET", "/api/agents?" + urllib.parse.urlencode({"include_archived": "true"}))
+agents = request("GET", "/api/sessions")
 if isinstance(agents, list):
     for agent in agents:
         agent_id = agent.get("id")
         if agent_id:
-            request("DELETE", f"/api/agents/{agent_id}")
+            request("DELETE", f"/api/sessions/{agent_id}")
 PY
   fi
 
@@ -118,11 +118,25 @@ daemon_log="$tmp_dir/daemon.log"
 browser_log="$tmp_dir/browser.log"
 daemon_home="$tmp_dir/daemon-home"
 agent_cwd="$tmp_dir/agent-cwd"
-agent_id_file="$tmp_dir/agent-id"
 upload_path="$agent_cwd/live-upload.txt"
 email="browser-live@example.com"
 password="passpasspass"
 mkdir -p "$daemon_home" "$agent_cwd" "$worker_dir"
+
+# Sessions are always the host's login shell (resolved from $SHELL in the
+# daemon's environment), so the argv-era custom command becomes the shell
+# itself: ready marker, an ANSI-red line for the color assertion, then an
+# echo loop the typing assertions drive.
+live_shell="$tmp_dir/live-shell"
+cat >"$live_shell" <<'SH'
+#!/usr/bin/env sh
+printf 'browser-live-ready\n'
+printf '\033[31mLIVE_RED\033[0m\n'
+while IFS= read -r line; do
+  printf 'browser-live:%s\n' "$line"
+done
+SH
+chmod 755 "$live_shell"
 
 wait_for_url() {
   local url="$1"
@@ -362,6 +376,7 @@ env \
   SPAWN_CONFIG_DIR="$daemon_home/.config/spawn" \
   SPAWN_DISABLE_KEYRING=1 \
   SPAWND_WORKER_DIR="$worker_dir" \
+  SHELL="$live_shell" \
   daemon/target/debug/spawnd --server "$base_url" run \
   >"$daemon_log" 2>&1 &
 daemon_pid=$!
@@ -391,6 +406,47 @@ for _ in range(120):
 raise SystemExit("daemon did not come online")
 PY
 
+# The since-replaced creation form is covered by the web e2e suite; the live
+# smoke's unique value is the real daemon + WebRTC path, so the workspace and
+# its first shell session come from the API the form itself would call.
+printf '%s\n' "smoke-local-browser-live: creating live workspace and first shell session"
+live_ids="$(
+  python3 - "$base_url" "$user_token" "$host_id" "$agent_cwd" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+base_url, token, host_id, cwd = sys.argv[1:]
+req = urllib.request.Request(
+    f"{base_url}/api/workspaces",
+    data=json.dumps(
+        {
+            "name": "browser live",
+            "first_session": {"host_id": host_id, "cwd": cwd},
+        }
+    ).encode(),
+    method="POST",
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+)
+try:
+    with urllib.request.urlopen(req, timeout=10) as response:
+        created = json.loads(response.read().decode())
+except urllib.error.HTTPError as error:
+    raise SystemExit(f"workspace create failed: {error.code} {error.read().decode()}")
+print(
+    json.dumps(
+        {
+            "workspace_id": created["workspace"]["id"],
+            "session_id": created["session"]["id"],
+        }
+    )
+)
+PY
+)"
+workspace_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["workspace_id"])' <<<"$live_ids")"
+live_session_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])' <<<"$live_ids")"
+
 printf '%s\n' "smoke-local-browser-live: starting web server on $web_url"
 (
   cd web
@@ -408,8 +464,8 @@ printf '%s\n' "smoke-local-browser-live: driving real browser flow"
   SPAWN_LIVE_WEB_URL="$web_url" \
     SPAWN_LIVE_EMAIL="$email" \
     SPAWN_LIVE_PASSWORD="$password" \
-    SPAWN_LIVE_AGENT_CWD="$agent_cwd" \
-    SPAWN_LIVE_AGENT_ID_FILE="$agent_id_file" \
+    SPAWN_LIVE_WORKSPACE_ID="$workspace_id" \
+    SPAWN_LIVE_SESSION_ID="$live_session_id" \
     SPAWN_LIVE_UPLOAD_PATH="$upload_path" \
     SPAWN_LIVE_ACCOUNT_ID="$account_id" \
     SPAWN_LIVE_ANCHOR_DEVICE_ID="$anchor_device_id" \
@@ -417,20 +473,20 @@ printf '%s\n' "smoke-local-browser-live: driving real browser flow"
     SPAWN_LIVE_ANCHOR_SEED="$anchor_seed" \
     bun - <<'JS'
 import { chromium, expect } from "@playwright/test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const webUrl = process.env.SPAWN_LIVE_WEB_URL;
 const email = process.env.SPAWN_LIVE_EMAIL;
 const password = process.env.SPAWN_LIVE_PASSWORD;
-const agentCwd = process.env.SPAWN_LIVE_AGENT_CWD;
-const agentIdFile = process.env.SPAWN_LIVE_AGENT_ID_FILE;
+const workspaceId = process.env.SPAWN_LIVE_WORKSPACE_ID;
+const sessionId = process.env.SPAWN_LIVE_SESSION_ID;
 const uploadPath = process.env.SPAWN_LIVE_UPLOAD_PATH;
 const accountId = process.env.SPAWN_LIVE_ACCOUNT_ID;
 const anchorDeviceId = process.env.SPAWN_LIVE_ANCHOR_DEVICE_ID;
 const anchorPublicKey = process.env.SPAWN_LIVE_ANCHOR_PUBLIC_KEY;
 const anchorSeed = process.env.SPAWN_LIVE_ANCHOR_SEED;
 if (
-  !webUrl || !email || !password || !agentCwd || !agentIdFile || !uploadPath ||
+  !webUrl || !email || !password || !workspaceId || !sessionId || !uploadPath ||
   !accountId || !anchorDeviceId || !anchorPublicKey || !anchorSeed
 ) {
   throw new Error("missing live browser smoke environment");
@@ -495,9 +551,6 @@ async function endorseLiveDevice(page) {
   console.log(`live browser device ${device.id} endorsed by the pinned anchor`);
 }
 
-const command =
-  'sh -lc \'printf "browser-live-ready\\n\\033[31mLIVE_RED\\033[0m\\n"; while IFS= read -r line; do printf "browser-live:%s\\n" "$line"; done\'';
-
 const browser = await chromium.launch();
 try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -539,33 +592,17 @@ try {
   await page.getByLabel("Email").fill(email);
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible({ timeout: 15_000 });
+  await page.waitForURL((url) => !url.pathname.startsWith("/login"), { timeout: 15_000 });
 
   await endorseLiveDevice(page);
 
-  await page.goto(`${webUrl}/agents`);
-  await page
-    .getByRole("main")
-    .getByRole("link", { name: "New agent", exact: true })
-    .click();
-  await expect(page.getByRole("button", { name: /browser-live-host/ })).toHaveAttribute(
-    "aria-pressed",
-    "true",
-    { timeout: 15_000 },
-  );
-  await page.getByRole("button", { name: "Shell shell", exact: true }).click();
-  await page.getByLabel("Name").fill("browser live");
-  await page.getByRole("combobox", { name: "Directory" }).fill(agentCwd);
-  await page.getByRole("button", { name: "Advanced options" }).click();
-  await page.getByLabel("Custom command").fill(command);
-  await page.getByRole("button", { name: "Spawn agent" }).click();
+  // The workspace and its first shell session already exist — created through
+  // the same API the launcher calls, so the live flow starts at the surface
+  // this smoke uniquely covers: the real terminal over the real daemon.
+  await page.goto(`${webUrl}/w/${workspaceId}`);
 
-  const agentLink = page.getByRole("link", { name: /browser live/i }).first();
-  await expect(agentLink).toBeVisible({ timeout: 20_000 });
-  await agentLink.click();
-
-  await expect(page.getByLabel("Agent terminal")).toBeVisible({ timeout: 20_000 });
-  const terminalBox = await page.getByLabel("Agent terminal").boundingBox();
+  await expect(page.getByLabel("Session terminal")).toBeVisible({ timeout: 20_000 });
+  const terminalBox = await page.getByLabel("Session terminal").boundingBox();
   if (!terminalBox || terminalBox.width < 600 || terminalBox.height < 300) {
     throw new Error(`terminal layout too small: ${JSON.stringify(terminalBox)}`);
   }
@@ -597,12 +634,7 @@ try {
       { timeout: 20_000 },
     )
     .toBe(true);
-  const match = page.url().match(/\/agents\/([0-9a-f-]{36})/i);
-  if (!match) throw new Error(`could not extract agent id from ${page.url()}`);
-  const agentId = match[1];
-  writeFileSync(agentIdFile, `${match[1]}\n`);
-
-  await page.getByLabel("Agent terminal").click();
+  await page.getByLabel("Session terminal").click();
   await page.keyboard.type("ping");
   await page.keyboard.press("Enter");
   await expect(page.locator('[data-testid="terminal-live-host"] .xterm-rows')).toContainText("browser-live:ping", {
@@ -650,15 +682,15 @@ try {
     .toBe("uploaded from live browser\n");
 
   const secondPage = await page.context().newPage();
-  await secondPage.goto(`${webUrl}/agents/${agentId}`);
-  await expect(secondPage.getByLabel("Agent terminal")).toBeVisible({ timeout: 20_000 });
+  await secondPage.goto(`${webUrl}/w/${workspaceId}`);
+  await expect(secondPage.getByLabel("Session terminal")).toBeVisible({ timeout: 20_000 });
   // A newly opened active terminal claims control automatically. The original
   // viewer becomes dimmed and may explicitly reclaim it.
   await expect(page.getByRole("button", { name: "Take control" })).toBeVisible({
     timeout: 20_000,
   });
   await expect(secondPage.getByRole("button", { name: "Take control" })).toHaveCount(0);
-  await secondPage.getByLabel("Agent terminal").click();
+  await secondPage.getByLabel("Session terminal").click();
   await secondPage.keyboard.type("second");
   await secondPage.keyboard.press("Enter");
   await expect(secondPage.locator('[data-testid="terminal-live-host"] .xterm-rows')).toContainText("browser-live:second", {
@@ -674,11 +706,8 @@ JS
 
 grep -Fx "uploaded from live browser" "$upload_path" >/dev/null
 
-if [[ -f "$agent_id_file" ]]; then
-  live_agent_id="$(cat "$agent_id_file")"
-  curl -fsS -X DELETE \
-    -H "Authorization: Bearer $user_token" \
-    "$base_url/api/agents/$live_agent_id" >/dev/null
-fi
+curl -fsS -X DELETE \
+  -H "Authorization: Bearer $user_token" \
+  "$base_url/api/sessions/$live_session_id" >/dev/null
 
 printf '%s\n' "smoke-local-browser-live: passed"
