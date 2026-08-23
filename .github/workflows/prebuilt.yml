@@ -53,6 +53,11 @@ jobs:
       - name: Test on macOS
         working-directory: daemon
         continue-on-error: true
+        # Bounded for the same reason it is non-blocking: this step is signal,
+        # not a gate, and a wedged test must not starve the build steps of the
+        # job's 40-minute budget (observed: an upload test hung ~37 minutes on
+        # the runner and the release never built).
+        timeout-minutes: 10
         run: cargo test --locked
 
       - name: Build arm64 (aarch64-apple-darwin)
