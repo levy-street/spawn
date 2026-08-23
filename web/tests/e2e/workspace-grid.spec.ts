@@ -345,7 +345,7 @@ test("a failed layout PATCH rolls the optimistic drag back", async ({ page }) =>
   await dragTile(page, SESSION_ID, 0, 12);
   // A failed save is a toast now, not an inline banner (w/[id]/page.tsx:
   // "Errors surface as toasts"); error toasts carry role="alert".
-  await expect(page.getByRole("alert")).toContainText("layout unavailable");
+  await expect(page.getByRole("alert").filter({ hasText: "layout unavailable" })).toBeVisible();
   // Measured against the grid area rather than the viewport, so the assertion
   // holds regardless of anything the failure adds above the grid.
   await expect
