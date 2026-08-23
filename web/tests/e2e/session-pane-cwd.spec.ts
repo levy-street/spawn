@@ -50,7 +50,12 @@ async function openPaneFolderPicker(page: Page, foreground: string) {
   await page.goto(`/w/${WORKSPACE_ID}`);
   await page.getByRole("button", { name: "Change directory" }).click();
   const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
-  await dialog.getByRole("option", { name: "projects" }).click();
+  // Miller columns can show the same folder name in several columns; pick it
+  // from the home column explicitly.
+  await dialog
+    .getByRole("listbox", { name: "Folders in /Users/tester", exact: true })
+    .getByRole("option", { name: "projects" })
+    .click();
   await dialog.getByRole("button", { name: "Select this folder" }).click();
   return { messages, store };
 }
@@ -70,7 +75,12 @@ test("an agent in the foreground is stopped first, and only with permission", as
 
   await page.getByRole("button", { name: "Change directory" }).click();
   const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
-  await dialog.getByRole("option", { name: "projects" }).click();
+  // Miller columns can show the same folder name in several columns; pick it
+  // from the home column explicitly.
+  await dialog
+    .getByRole("listbox", { name: "Folders in /Users/tester", exact: true })
+    .getByRole("option", { name: "projects" })
+    .click();
   await dialog.getByRole("button", { name: "Select this folder" }).click();
   await page.getByRole("button", { name: "Stop Claude Code" }).click();
 
