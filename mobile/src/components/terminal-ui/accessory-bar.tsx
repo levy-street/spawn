@@ -1,7 +1,7 @@
-import { useRef } from "react";
 import { Keyboard, ScrollView, StyleSheet, View } from "react-native";
-import { KeyboardController } from "react-native-keyboard-controller";
+import { KeyboardController, useKeyboardState } from "react-native-keyboard-controller";
 
+import type { TerminalCommand } from "@/components/terminal-ui/terminal-commands";
 import { Button } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
 import { Text } from "@/components/ui/text";
@@ -13,59 +13,15 @@ import { sizing } from "@/theme/sizing";
 
 type KeyEncoder = (key: KeySpec) => string;
 
-interface KeyCapProps {
-  label: string;
-  accessibilityLabel?: string;
-  disabled?: boolean;
-  onPress: () => void;
-  onLongPress?: () => void;
-}
-
-function KeyCap({
-  label,
-  accessibilityLabel,
-  disabled = false,
-  onPress,
-  onLongPress,
-}: KeyCapProps): React.JSX.Element {
-  const theme = useTheme();
-  const longPressed = useRef(false);
-  return (
-    <Button
-      accessibilityLabel={accessibilityLabel ?? label}
-      accessibilityState={{ disabled }}
-      delayLongPress={theme.motion.duration.successHold}
-      disabled={disabled}
-      onLongPress={
-        onLongPress
-          ? () => {
-              longPressed.current = true;
-              onLongPress();
-            }
-          : undefined
-      }
-      onPress={() => {
-        if (longPressed.current) {
-          longPressed.current = false;
-          return;
-        }
-        onPress();
-      }}
-      size="sm"
-      style={styles.key}
-      variant="secondary"
-    >
-      <Text variant="mono">{label}</Text>
-    </Button>
-  );
-}
-
 export interface TerminalAccessoryBarProps {
   disabled?: boolean;
   onSend: (sequence: string, spec: KeySpec) => void;
+  /** The keys pinned for this agent, in the order they were pinned. */
+  commands?: readonly TerminalCommand[];
+  onCommand?: (command: TerminalCommand) => void;
   /** Opens the attach-or-paste drawer; everything that inserts content lives there. */
   onAttach: () => void;
-  /** Opens the drawer holding every key this row does not carry. */
+  /** Opens the drawer holding every key this agent has a use for. */
   onMore: () => void;
   onDismissKeyboard: () => void;
   encode?: KeyEncoder;
@@ -74,20 +30,28 @@ export interface TerminalAccessoryBarProps {
 /**
  * The strip above the keyboard.
  *
- * It carries only what an agent session reaches for constantly — interrupt,
- * complete, cancel — because a phone keyboard already leaves little room and a
- * wall of key caps reads as clutter rather than as help. Everything else is one
- * tap into More, and everything that inserts content is one tap into the plus.
+ * Four round controls and, between them, whatever keys the operator pinned for
+ * the agent they are talking to. It used to carry a fixed rank of key caps —
+ * Esc, Tab, ^C, More — which put a second, partial keyboard above the real one
+ * and was the same rank whether a shell or Claude Code was running. The middle
+ * is chosen per agent now, and everything else is one drawer away.
+ *
+ * The keyboard dismissal only appears while there is a keyboard to dismiss; at
+ * rest the button is a control that does nothing, and the strip is quieter for
+ * losing it.
  */
 export function TerminalAccessoryBar({
   disabled = false,
   onSend,
+  commands = [],
+  onCommand,
   onAttach,
   onMore,
   onDismissKeyboard,
   encode = encodeKey,
 }: TerminalAccessoryBarProps): React.JSX.Element {
   const theme = useTheme();
+  const keyboardVisible = useKeyboardState((state) => state.isVisible);
 
   const send = (key: KeySpec, impact: "selection" | "light" = "selection"): void => {
     const sequence = encode(key);
@@ -136,54 +100,66 @@ export function TerminalAccessoryBar({
           testID="accessory-attach"
           variant="secondary"
         />
+        <IconButton
+          accessibilityLabel="Keyboard shortcuts"
+          disabled={disabled}
+          icon="Command"
+          onPress={() => {
+            haptics.selection();
+            onMore();
+          }}
+          size="sm"
+          style={styles.round}
+          testID="accessory-shortcuts"
+          variant="secondary"
+        />
         <ScrollView
-          bounces={false}
-          contentContainerStyle={styles.scrollContent}
+          contentContainerStyle={[styles.pinned, { gap: sizing.terminalAccessory.gap }]}
           horizontal
           keyboardShouldPersistTaps="always"
           showsHorizontalScrollIndicator={false}
+          style={styles.pinnedViewport}
+          testID="accessory-pinned"
         >
-          <KeyCap
-            disabled={disabled}
-            label="Esc"
-            onPress={() => send({ kind: "named", key: "Escape" })}
-          />
-          <KeyCap
-            accessibilityLabel="Tab, hold for Shift Tab"
-            disabled={disabled}
-            label="Tab"
-            onLongPress={() => send({ kind: "named", key: "BackTab" })}
-            onPress={() => send({ kind: "named", key: "Tab" })}
-          />
-          <KeyCap
-            accessibilityLabel="Control C"
-            disabled={disabled}
-            label="^C"
-            onPress={() => send({ kind: "text", text: "c", modifiers: { ctrl: true } }, "light")}
-          />
-          <KeyCap
-            disabled={disabled}
-            label="More"
-            onPress={() => {
-              haptics.selection();
-              onMore();
-            }}
-          />
+          {commands.map((command) => (
+            <Button
+              accessibilityLabel={command.label}
+              disabled={disabled}
+              key={command.id}
+              onPress={() => {
+                haptics.selection();
+                onCommand?.(command);
+              }}
+              size="sm"
+              style={styles.cap}
+              testID={`accessory-command-${command.id}`}
+              variant="secondary"
+            >
+              <Text color="secondaryForeground" variant="mono">
+                {command.cap}
+              </Text>
+            </Button>
+          ))}
         </ScrollView>
-        <IconButton
-          accessibilityLabel="Dismiss keyboard"
-          icon="ChevronDown"
-          onPress={dismissKeyboard}
-          size="sm"
-          style={styles.round}
-        />
+        {keyboardVisible ? (
+          <IconButton
+            accessibilityLabel="Dismiss keyboard"
+            icon="ChevronDown"
+            iconSize={sizing.terminalAccessory.dismissIcon}
+            onPress={dismissKeyboard}
+            size="sm"
+            style={styles.round}
+            testID="accessory-dismiss-keyboard"
+          />
+        ) : null}
         <IconButton
           accessibilityLabel="Send"
           disabled={disabled}
           icon="SendHorizontal"
+          iconSize={sizing.terminalAccessory.sendIcon}
           onPress={() => send({ kind: "named", key: "Enter" }, "light")}
           size="sm"
-          style={styles.round}
+          style={styles.send}
           testID="accessory-send"
           variant="default"
         />
@@ -196,13 +172,21 @@ const styles = StyleSheet.create({
   bar: {
     width: "100%",
   },
-  key: {
-    alignItems: "center",
+  cap: {
+    borderRadius: radii.md,
     height: sizing.terminalAccessory.controlHeight,
-    justifyContent: "center",
     minHeight: sizing.terminalAccessory.controlHeight,
     minWidth: sizing.terminalAccessory.keyMinWidth,
     paddingHorizontal: sizing.terminalAccessory.keyHorizontalPadding,
+  },
+  pinned: {
+    alignItems: "center",
+    flexDirection: "row",
+  },
+  // Takes the space the four round controls leave, so an empty pin list simply
+  // reads as the gap that was there before.
+  pinnedViewport: {
+    flex: 1,
   },
   round: {
     borderRadius: radii.pill,
@@ -210,14 +194,16 @@ const styles = StyleSheet.create({
     minHeight: sizing.terminalAccessory.controlHeight,
     width: sizing.terminalAccessory.controlHeight,
   },
+  send: {
+    borderRadius: radii.pill,
+    height: sizing.terminalAccessory.sendControlHeight,
+    minHeight: sizing.terminalAccessory.sendControlHeight,
+    width: sizing.terminalAccessory.sendControlHeight,
+  },
   row: {
     alignItems: "center",
     flexDirection: "row",
     gap: sizing.terminalAccessory.gap,
     paddingHorizontal: sizing.terminalAccessory.horizontalPadding,
-  },
-  scrollContent: {
-    alignItems: "center",
-    gap: sizing.terminalAccessory.gap,
   },
 });

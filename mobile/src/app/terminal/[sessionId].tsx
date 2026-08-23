@@ -10,6 +10,7 @@ import { TerminalOverlay } from "@/components/terminal-ui/terminal-overlay";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
+import { useToast } from "@/components/ui/toast";
 import {
   useKillTerminalSession,
   useRenameTerminalSession,
@@ -21,6 +22,12 @@ import { bottomNavHeight } from "@/theme/sizing";
 
 function routeSessionId(value: string | string[] | undefined): string {
   return Array.isArray(value) ? (value[0] ?? "") : (value ?? "");
+}
+
+function killReason(error: unknown): string {
+  return error instanceof Error && error.message.trim()
+    ? error.message
+    : "The server did not answer.";
 }
 
 export const TERMINAL_ROUTE_GESTURE_OPTIONS = {
@@ -39,14 +46,40 @@ export default function TerminalScreen(): React.JSX.Element {
   const rename = useRenameTerminalSession(sessionId);
   const restart = useRestartTerminalSession(sessionId);
   const kill = useKillTerminalSession(sessionId);
+  const toast = useToast();
+
+  /**
+   * The kill runs on after the terminal has closed over it, so the answer has
+   * to arrive somewhere that outlives this screen. It never rethrows for the
+   * same reason: there is no longer anything mounted to catch it.
+   */
+  const killSession = async (name: string | null): Promise<void> => {
+    try {
+      const result = await kill.mutateAsync();
+      if (result.paneError) {
+        toast.error("Session killed, but its pane stayed in the workspace", {
+          detail: result.paneError.message,
+        });
+      } else if (result.alreadyGone) {
+        toast.success("Session removed", { detail: "It had already ended on the host." });
+      } else {
+        toast.success("Session killed", name ? { detail: name } : undefined);
+      }
+    } catch (error) {
+      toast.error("Session could not be killed", { detail: killReason(error) });
+    }
+  };
 
   const screenOptions = (
     <Stack.Screen
       options={{
         ...TERMINAL_ROUTE_GESTURE_OPTIONS,
+        // The same clipped corner every other pushed card carries: the terminal
+        // is dragged away from the screen edge too, and a smaller radius there
+        // cuts across the display's own curve mid-swipe.
         contentStyle: {
           backgroundColor: theme.colors.background,
-          borderRadius: theme.radii.xxl,
+          borderRadius: theme.radii.device,
           overflow: "hidden",
         },
       }}
@@ -121,6 +154,7 @@ export default function TerminalScreen(): React.JSX.Element {
   }
 
   const host = data.host;
+  const sessionName = data.session.name?.trim() || null;
   return (
     <>
       {screenOptions}
@@ -137,7 +171,7 @@ export default function TerminalScreen(): React.JSX.Element {
           })
         }
         onDismiss={() => router.back()}
-        onKill={() => kill.mutateAsync()}
+        onKill={() => killSession(sessionName)}
         onRename={(name) => rename.mutateAsync(name).then(() => undefined)}
         onRestart={() => restart.mutateAsync().then(() => undefined)}
         session={data.session}

@@ -43,6 +43,8 @@
     rtcSessionId: null,
     bindingNonce: null,
     bindingGeneration: null,
+    /** Host mode has no binding generation; the sent offer arms its candidates. */
+    offerSent: false,
     pendingLocalCandidates: [],
     pendingRemoteCandidates: [],
     pendingSign: new Map(),
@@ -471,28 +473,12 @@
       }),
     );
     terminal.open(document.getElementById("terminal"));
+    // The DOM renderer, chosen rather than fallen back to. WebGL draws every
+    // glyph into a canvas, and a canvas holds no text the system can select,
+    // magnify, look up or copy — which is why selecting output used to need a
+    // bespoke mode bolted on beside it. Real text nodes cost some scrolling
+    // throughput and buy back every text interaction the phone already knows.
     state.renderer = "dom";
-    try {
-      const webgl = new WebglAddon.WebglAddon();
-      webgl.onContextLoss(() => {
-        webgl.dispose();
-        state.webglAddon = null;
-        state.renderer = "dom";
-        api.post({
-          type: "diagnostic",
-          diagnostic: {
-            ...api.capability,
-            renderer: "dom",
-            detail: "WebGL context lost; DOM fallback active.",
-          },
-        });
-      });
-      terminal.loadAddon(webgl);
-      state.webglAddon = webgl;
-      state.renderer = "webgl";
-    } catch {
-      state.renderer = "dom";
-    }
     terminal.resize(message.cols, message.rows);
     state.term = terminal;
     state.fitAddon = fitAddon;
@@ -515,9 +501,24 @@
     terminal.onSelectionChange(() =>
       api.telemetry({ type: "selection", text: terminal.getSelection() }),
     );
+    // A system selection is invisible to xterm, so the app hears about it here:
+    // output arriving mid-selection must not scroll the handles off the text
+    // they were placed on.
+    document.addEventListener("selectionchange", () => {
+      api.post({ type: "native-selection", active: documentSelection().length > 0 });
+    });
     configureTextarea();
     applyTheme(message.theme);
     api.post({ type: "ready", renderer: state.renderer });
+  }
+
+  /** What the system has selected in the document, if anything. */
+  function documentSelection() {
+    try {
+      return String(window.getSelection() ?? "");
+    } catch {
+      return "";
+    }
   }
 
   function searchTerminal(query, direction) {
@@ -587,10 +588,12 @@
         searchTerminal(message.query, message.direction);
         return true;
       case "copy-selection":
+        // Whatever is selected: the system's selection first, since that is now
+        // the one an operator makes, with xterm's own kept as the fallback.
         api.post({
           type: "selection",
           requestId: message.requestId,
-          text: state.term?.getSelection() ?? "",
+          text: documentSelection() || (state.term?.getSelection() ?? ""),
         });
         return true;
       case "focus":

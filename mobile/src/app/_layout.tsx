@@ -7,6 +7,7 @@ import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect } from "react";
 
 import { AlertPresenter } from "@/components/alerts/alert-presenter";
+import { ROUNDED_CARD_GESTURE_OPTIONS } from "@/components/nav/navigation-options";
 import { useToast } from "@/components/ui/toast";
 import { authToken } from "@/data/api/auth-token";
 import { AuthGate } from "@/lib/auth-gate";
@@ -22,14 +23,13 @@ import { useTheme } from "@/theme";
 
 void SplashScreen.preventAutoHideAsync();
 
-export const TERMINAL_ROUTE_OPTIONS = {
-  presentation: "card",
-  gestureEnabled: true,
-  gestureDirection: "vertical",
-  animation: "slide_from_bottom",
-  animationMatchesGesture: true,
-  fullScreenGestureEnabled: true,
-} as const;
+/**
+ * One configuration for the terminal card, not two. The route used to be
+ * declared here as a vertical slide-from-bottom while the screen itself asked
+ * for the horizontal rounded card every other pushed screen uses, so the same
+ * card was described with two different dismiss directions.
+ */
+export const TERMINAL_ROUTE_OPTIONS = ROUNDED_CARD_GESTURE_OPTIONS;
 
 export const ROOT_CARD_OPTIONS = {
   presentation: "card",
@@ -93,7 +93,14 @@ function RootNavigator(): React.JSX.Element {
         <Stack
           screenOptions={{
             ...ROOT_CARD_OPTIONS,
-            contentStyle: { backgroundColor: theme.colors.background },
+            // The same clipped corner every other pushed card has: a root card is
+            // dragged away from the screen edge too, and a square corner there cuts
+            // across the display's own curve.
+            contentStyle: {
+              backgroundColor: theme.colors.background,
+              borderRadius: theme.radii.device,
+              overflow: "hidden",
+            },
             headerShown: false,
           }}
         >

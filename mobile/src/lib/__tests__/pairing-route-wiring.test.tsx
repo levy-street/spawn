@@ -26,6 +26,9 @@ jest.mock("@/data/queries/hosts", () => ({
   }),
   useRemoveHostMutation: () => mockMutation,
   useRenameHostMutation: () => mockMutation,
+  // The Legion tab counts sessions and agents for its rollup.
+  useAllSessionsQuery: () => ({ data: [], isError: false, isPending: false }),
+  useAgentsQuery: () => ({ data: [], isError: false, isPending: false }),
 }));
 
 jest.mock("@/data/queries/settings", () => ({

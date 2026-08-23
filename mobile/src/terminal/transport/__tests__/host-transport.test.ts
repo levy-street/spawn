@@ -132,8 +132,11 @@ async function readyTransport(options?: {
   signal.emit({
     type: "rtc.config",
     enabled: true,
-    binding_nonce_required: true,
     ice_servers: [],
+    scope_type: "host",
+    scope_id: "00112233-4455-6677-8899-aabbccddeeff",
+    protocol: "spawn.host.ctl",
+    protocol_version: 1,
   });
   bridge.emit({
     v: 1,
@@ -178,6 +181,72 @@ async function beginRead(
   });
   return pending;
 }
+
+const HOST_ID = "00112233-4455-6677-8899-aabbccddeeff";
+
+function openTransport(bridge: FakeBridge, signal: FakeSignal) {
+  const transport = createHostTransport({
+    hostId: HOST_ID,
+    hostIdentityPublicKey: "host-key",
+    bridge,
+    openSignal: () => signal,
+  });
+  // Settle before any frame arrives: #fail rejects synchronously from emit().
+  const settled = transport.open().then(
+    () => null,
+    (error: unknown) => error,
+  );
+  return { transport, settled };
+}
+
+describe("HostTransport signalling", () => {
+  test("accepts the bound rtc.config /ws/host actually sends", async () => {
+    const bridge = new FakeBridge();
+    const signal = new FakeSignal();
+    const { transport, settled } = openTransport(bridge, signal);
+    await flush();
+
+    // Byte-for-byte the server frame: no `binding_nonce_required` field.
+    signal.emit({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      ice_transport_policy: "all",
+      scope_type: "host",
+      scope_id: HOST_ID,
+      protocol: "spawn.host.ctl",
+      protocol_version: 1,
+    });
+    await flush();
+
+    expect(transport.state).toBe("connecting");
+    expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(1);
+    transport.close();
+    await settled;
+  });
+
+  test("rejects an rtc.config bound to another host", async () => {
+    const bridge = new FakeBridge();
+    const signal = new FakeSignal();
+    const { transport, settled } = openTransport(bridge, signal);
+    await flush();
+
+    signal.emit({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      scope_type: "host",
+      scope_id: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+      protocol: "spawn.host.ctl",
+      protocol_version: 1,
+    });
+    await flush();
+
+    expect(transport.state).toBe("failed");
+    expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(0);
+    expect(await settled).toMatchObject({ code: "rtc_config" });
+  });
+});
 
 describe("HostTransport capabilities", () => {
   test("exposes supported operations and correlates unary requests", async () => {

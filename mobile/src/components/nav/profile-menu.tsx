@@ -1,12 +1,11 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
 import { useState } from "react";
-import { Pressable, StyleSheet, View } from "react-native";
+import { Pressable, StyleSheet } from "react-native";
 
+import { ActionSheet } from "@/components/ui/action-sheet";
 import { Icon } from "@/components/ui/icon";
-import { ListRow, ListSeparator } from "@/components/ui/list-row";
 import { Monogram } from "@/components/ui/monogram";
-import { Sheet } from "@/components/ui/sheet";
 import { logOut } from "@/data/api/endpoints/auth";
 import { useMeQuery } from "@/data/queries/auth";
 import { useConnectionStore } from "@/data/stores/connection";
@@ -52,35 +51,32 @@ export function ProfileMenu(): React.JSX.Element {
         <Monogram seed={seed} size={sizing.appHeader.profileAvatar} variant="brand" />
       </Pressable>
 
-      <Sheet onDismiss={() => setVisible(false)} visible={visible}>
-        <View style={styles.sheetContent}>
-          <ListRow
-            leading={<Icon color="popoverForeground" name="UserRound" />}
-            onPress={() => {
-              haptics.selection();
-              setVisible(false);
-              router.push("/profile");
-            }}
-            shape="fullBleed"
-            title="Profile"
-          />
-          <ListSeparator inset={false} />
-          <ListRow
-            leading={<Icon color="destructive" name="LogOut" />}
-            onPress={() => void signOut()}
-            shape="fullBleed"
-            title="Log out"
-          />
-        </View>
-      </Sheet>
+      {/* Presented through the shared drawer, so this menu carries the same row
+          height, icon size and spacing as every other one in the app. */}
+      <ActionSheet
+        actions={[
+          {
+            id: "profile",
+            label: "Profile",
+            icon: <Icon color="popoverForeground" name="UserRound" />,
+            onPress: () => router.push("/profile"),
+          },
+          {
+            id: "log-out",
+            label: "Log out",
+            destructive: true,
+            icon: <Icon color="destructive" name="LogOut" />,
+            onPress: () => void signOut(),
+          },
+        ]}
+        onDismiss={() => setVisible(false)}
+        visible={visible}
+      />
     </>
   );
 }
 
 const styles = StyleSheet.create({
-  sheetContent: {
-    paddingBottom: sizing.space.peer,
-  },
   trigger: {
     alignItems: "center",
     height: sizing.appHeader.actionTarget,

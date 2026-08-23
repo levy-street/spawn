@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { SkillForm, type SkillFormValue } from "@/components/settings/skill-form";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Text } from "@/components/ui/text";
@@ -56,14 +56,10 @@ export function SkillsPanel(): React.JSX.Element {
   };
 
   return (
-    <SettingsScreen
-      description="Skills are account-level agent-accessible text objects."
-      testID="skills-panel"
-      title="Skills"
-    >
-      <Card variant="flat">
+    <SettingsScreen testID="skills-panel" title="Skills">
+      <SettingsBlock>
         <SkillForm busy={busy} onSubmit={saveNew} />
-      </Card>
+      </SettingsBlock>
 
       {error || skills.error ? (
         <Text accessibilityRole="alert" color="destructive" variant="body">
@@ -80,7 +76,7 @@ export function SkillsPanel(): React.JSX.Element {
           <EmptyState icon="Wrench" title="No skills yet." />
         ) : (
           skills.data?.map((skill) => (
-            <Card key={skill.id} variant="flat">
+            <SettingsBlock key={skill.id}>
               {editing?.id === skill.id ? (
                 <SkillForm
                   busy={busy}
@@ -119,7 +115,7 @@ export function SkillsPanel(): React.JSX.Element {
                   </View>
                 </>
               )}
-            </Card>
+            </SettingsBlock>
           ))
         )}
       </SettingsSection>

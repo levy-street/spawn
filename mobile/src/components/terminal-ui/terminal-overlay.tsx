@@ -2,11 +2,10 @@ import * as Clipboard from "expo-clipboard";
 import * as Linking from "expo-linking";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
-import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { scheduleOnRN } from "react-native-worklets";
+import type { ShellCommandSink } from "@/components/launcher/shell-handoff";
 import { TerminalAccessoryBar } from "@/components/terminal-ui/accessory-bar";
 import { AttachmentSheet } from "@/components/terminal-ui/attachment-sheet";
 import { ConnectionStateOverlay } from "@/components/terminal-ui/connection-status";
@@ -21,10 +20,19 @@ import {
 import { FontSizeSheet } from "@/components/terminal-ui/font-size-sheet";
 import { JumpToLatest } from "@/components/terminal-ui/jump-to-latest";
 import { useTerminalKeyboardHold } from "@/components/terminal-ui/keyboard-hold";
+import { useLaunchAutoFocus } from "@/components/terminal-ui/launch-focus";
+import { usePinnedCommands } from "@/components/terminal-ui/pinned-commands";
 import { TerminalSearchBar } from "@/components/terminal-ui/search-bar";
 import { SelectionToolbar } from "@/components/terminal-ui/selection-toolbar";
+import { SessionTargetSheets } from "@/components/terminal-ui/session-target-sheets";
+import {
+  agentKindFor,
+  REPEAT_PRESS_GAP_MS,
+  resolvePinnedCommands,
+  type TerminalCommand,
+} from "@/components/terminal-ui/terminal-commands";
+import { TerminalCommandsSheet } from "@/components/terminal-ui/terminal-commands-sheet";
 import { TerminalHeader } from "@/components/terminal-ui/terminal-header";
-import { TerminalKeysSheet } from "@/components/terminal-ui/terminal-keys-sheet";
 import {
   useTerminalFontSizeGate,
   useTerminalKeepAwake,
@@ -66,6 +74,7 @@ export interface TerminalOverlayProps {
   onDismiss: () => void;
   onRename: (name: string) => Promise<void>;
   onRestart: () => Promise<void>;
+  /** Reports its own outcome and must not reject: the window is already gone. */
   onKill: () => Promise<void>;
   /** Opens the device-trust settings when a host has not approved this device. */
   onDeviceTrust?: () => void;
@@ -132,21 +141,45 @@ export function TerminalOverlay({
   const [attachVisible, setAttachVisible] = useState(false);
   const [moreVisible, setMoreVisible] = useState(false);
   const [headerMenuVisible, setHeaderMenuVisible] = useState(false);
+  const [folderVisible, setFolderVisible] = useState(false);
+  const [agentVisible, setAgentVisible] = useState(false);
+
+  // Which key list this session gets, and which of those keys ride above the
+  // keyboard. Read from the foreground command rather than from the agent
+  // registry: a terminal must know what it is talking to without a round trip.
+  const agentKind = agentKindFor(session.foreground_command);
+  const { pinned, toggle: togglePinned } = usePinnedCommands(agentKind);
+  const pinnedCommands = useMemo(
+    () => resolvePinnedCommands(agentKind, pinned),
+    [agentKind, pinned],
+  );
+  const repeatTimers = useRef(new Set<ReturnType<typeof setTimeout>>());
 
   // Every drawer this screen can raise. The keyboard is taller than most of
   // them, so it stands down while one is open and comes back afterwards. The
   // search field and the rename dialog are deliberately absent: those two ask
   // for the keyboard themselves.
+  const drawerOpen =
+    attachVisible ||
+    moreVisible ||
+    headerMenuVisible ||
+    fontSheetVisible ||
+    diagnosticsVisible ||
+    folderVisible ||
+    agentVisible ||
+    killConfirmVisible;
   useTerminalKeyboardHold({
-    held:
-      attachVisible ||
-      moreVisible ||
-      headerMenuVisible ||
-      fontSheetVisible ||
-      diagnosticsVisible ||
-      killConfirmVisible,
+    held: drawerOpen,
     onHold: () => surfaceRef.current?.blur(),
     onRelease: () => surfaceRef.current?.focus(),
+  });
+
+  // A session created on an agent opens to be typed into, so the keyboard comes
+  // up by itself once the agent command has actually gone out.
+  const armLaunchFocus = useLaunchAutoFocus({
+    focused,
+    held: drawerOpen,
+    onFocus: () => surfaceRef.current?.focus(),
   });
   const [display, setDisplay] = useState<DisplayControlState | null>(null);
 
@@ -170,13 +203,15 @@ export function TerminalOverlay({
     (next) => setStoredFontSize(session.id, next),
   );
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    const timers = repeatTimers.current;
+    return () => {
       scrollUnsubscribeRef.current?.();
       pendingLaunchUnsubscribeRef.current?.();
-    },
-    [],
-  );
+      for (const timer of timers) clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
 
   const updateFollow = useCallback(
     (event: Parameters<typeof reduceFollowState>[1]): void => {
@@ -210,13 +245,16 @@ export function TerminalOverlay({
       pendingLaunchUnsubscribeRef.current = attachPendingLaunchDelivery(transport, {
         initialSessionStatus: session.status,
         onResult: (result) => {
-          if (result.status === "sent") updateFollow({ type: "input-sent" });
+          if (result.status === "sent") {
+            updateFollow({ type: "input-sent" });
+            armLaunchFocus();
+          }
           const notice = pendingLaunchNotice(result);
           if (notice) transfers.setNotice(notice);
         },
       });
     },
-    [session.status, transfers.setNotice, updateFollow],
+    [armLaunchFocus, session.status, transfers.setNotice, updateFollow],
   );
 
   const handleConnectionState = (next: TransportState): void => {
@@ -265,6 +303,44 @@ export function TerminalOverlay({
     updateFollow({ type: "input-sent" });
   };
 
+  /**
+   * One pinned or drawer key. A command asking for more than one press sends them
+   * apart rather than as one packet: the double Escape that rewinds Claude Code
+   * and Codex is two presses to their input readers, and two escapes arriving
+   * together read as a single modified key instead.
+   */
+  const runCommand = (command: TerminalCommand): void => {
+    const sequence = encodeKey(command.spec);
+    if (sequence.length === 0) {
+      haptics.warning();
+      return;
+    }
+    sendAccessoryKey(sequence, command.spec);
+    for (let press = 1; press < (command.presses ?? 1); press += 1) {
+      const timer = setTimeout(() => {
+        repeatTimers.current.delete(timer);
+        sendAccessoryKey(sequence, command.spec);
+      }, press * REPEAT_PRESS_GAP_MS);
+      repeatTimers.current.add(timer);
+    }
+  };
+
+  /**
+   * What "change folder" and "change agent" type into. The command goes through
+   * this window's own keyboard path — the same one a pinned key uses — so
+   * nothing is ever run out of sight of the person watching the terminal.
+   */
+  const terminalSink = useMemo<ShellCommandSink>(
+    () => ({
+      sendInput: (data: string) => {
+        surfaceRef.current?.sendKey(data);
+        updateFollow({ type: "input-sent" });
+      },
+      focus: () => surfaceRef.current?.focus(),
+    }),
+    [updateFollow],
+  );
+
   const takeDisplayControl = (): void => {
     surfaceRef.current?.takeControl();
     setDisplay((current) => (current === null ? current : { ...current, owner: true }));
@@ -299,12 +375,16 @@ export function TerminalOverlay({
     leaveSelection();
   };
 
-  const selectionGesture = useMemo(
-    () =>
-      Gesture.LongPress()
-        .minDuration(theme.motion.duration.successHold)
-        .onStart(() => scheduleOnRN(enterSelection)),
-    [enterSelection, theme.motion.duration.successHold],
+  /**
+   * Output must not scroll out from under a live selection: iOS puts its handles
+   * on a position in the document, and anything arriving underneath would drag
+   * the text away from them. Follow resumes the moment the selection is dropped.
+   */
+  const onNativeSelection = useCallback(
+    (active: boolean): void => {
+      updateFollow({ type: active ? "enter-selection" : "leave-selection" });
+    },
+    [updateFollow],
   );
 
   const title = session.name ?? lastKnownTitle ?? "Terminal";
@@ -316,9 +396,11 @@ export function TerminalOverlay({
       testID="terminal-overlay-route-scene"
     >
       <TerminalHeader
+        cwd={session.cwd}
         foregroundCommand={session.foreground_command}
         hostName={session.host_name ?? host.name}
         onBack={onDismiss}
+        onChangeFolder={() => setFolderVisible(true)}
         onCopyMode={enterSelection}
         onDiagnostics={() => setDiagnosticsVisible(true)}
         onFontSize={() => setFontSheetVisible(true)}
@@ -344,6 +426,7 @@ export function TerminalOverlay({
             });
         }}
         onSearch={() => setSearchVisible(true)}
+        onSwitchAgent={() => setAgentVisible(true)}
         onUpload={() => setAttachVisible(true)}
         title={title}
       />
@@ -355,32 +438,34 @@ export function TerminalOverlay({
       <DisplayControlBar display={display} onTakeControl={takeDisplayControl} />
       <View style={[styles.surfaceFrame, { backgroundColor: theme.colors.terminalBg }]}>
         {hostKey ? (
-          <GestureDetector gesture={selectionGesture}>
-            <View style={styles.surface}>
-              <TerminalSurface
-                fontSize={fontSize}
-                hostId={host.id}
-                hostIdentityPublicKey={hostKey}
-                initialSize={INITIAL_TERMINAL_GRID}
-                key={`${session.id}-${surfaceGeneration}`}
-                onDiagnostic={setDiagnostic}
-                onDisplayChange={setDisplay}
-                onError={(error) => {
-                  setConnectionError(error);
-                  if (!error.retryable) setConnectionState("failed");
-                }}
-                onLink={(url) => {
-                  if (safeTerminalLink(url)) void Linking.openURL(url);
-                  else transfers.setNotice("The terminal link uses an unsupported URL scheme.");
-                }}
-                onStateChange={handleConnectionState}
-                onTitleChange={(next) => setLastKnownTitle(session.id, next)}
-                onTransport={handleTransport}
-                ref={surfaceRef}
-                sessionId={session.id}
-              />
-            </View>
-          </GestureDetector>
+          // Nothing wraps the surface in a gesture any more. A long press has to
+          // reach the web view for the system to answer it with its own selection
+          // handles and Copy/Look Up menu; a recogniser out here swallowed it.
+          <View style={styles.surface}>
+            <TerminalSurface
+              fontSize={fontSize}
+              hostId={host.id}
+              hostIdentityPublicKey={hostKey}
+              initialSize={INITIAL_TERMINAL_GRID}
+              key={`${session.id}-${surfaceGeneration}`}
+              onDiagnostic={setDiagnostic}
+              onDisplayChange={setDisplay}
+              onError={(error) => {
+                setConnectionError(error);
+                if (!error.retryable) setConnectionState("failed");
+              }}
+              onLink={(url) => {
+                if (safeTerminalLink(url)) void Linking.openURL(url);
+                else transfers.setNotice("The terminal link uses an unsupported URL scheme.");
+              }}
+              onNativeSelection={onNativeSelection}
+              onStateChange={handleConnectionState}
+              onTitleChange={(next) => setLastKnownTitle(session.id, next)}
+              onTransport={handleTransport}
+              ref={surfaceRef}
+              sessionId={session.id}
+            />
+          </View>
         ) : (
           <View style={[styles.unavailable, { gap: theme.space(2), padding: theme.space(6) }]}>
             <Text variant="label">Host identity unavailable</Text>
@@ -418,15 +503,20 @@ export function TerminalOverlay({
         <TerminalNotice message={transfers.notice} />
       </View>
       <TerminalAccessoryBar
+        commands={pinnedCommands}
         disabled={connectionState !== "ready" || !hostKey}
         onAttach={() => setAttachVisible(true)}
+        onCommand={runCommand}
         onDismissKeyboard={() => surfaceRef.current?.blur()}
         onMore={() => setMoreVisible(true)}
         onSend={sendAccessoryKey}
       />
-      <TerminalKeysSheet
+      <TerminalCommandsSheet
+        kind={agentKind}
+        onCommand={runCommand}
         onDismiss={() => setMoreVisible(false)}
-        onKey={(key) => sendAccessoryKey(encodeKey(key), key)}
+        onTogglePin={togglePinned}
+        pinned={pinned}
         visible={moreVisible}
       />
       <AttachmentSheet
@@ -448,6 +538,16 @@ export function TerminalOverlay({
         state={connectionState}
         visible={diagnosticsVisible}
       />
+      <SessionTargetSheets
+        agentVisible={agentVisible}
+        folderVisible={folderVisible}
+        host={host}
+        onDismissAgent={() => setAgentVisible(false)}
+        onDismissFolder={() => setFolderVisible(false)}
+        onNotice={transfers.setNotice}
+        session={session}
+        terminal={terminalSink}
+      />
       <Confirm
         cancelLabel="Keep session"
         confirmLabel="Kill session"
@@ -456,13 +556,13 @@ export function TerminalOverlay({
         onCancel={() => setKillConfirmVisible(false)}
         onConfirm={() => {
           setKillConfirmVisible(false);
-          void onKill()
-            .then(onDismiss)
-            .catch((error: unknown) => {
-              transfers.setNotice(
-                error instanceof Error ? error.message : "Session could not be killed.",
-              );
-            });
+          // The window closes on the way out rather than on the answer. There
+          // is nothing here worth looking at once the kill has been asked for,
+          // and a request that hangs or fails used to leave the operator
+          // stranded over a terminal they had just told the app to destroy —
+          // the outcome is reported by a toast that outlives this screen.
+          onDismiss();
+          void onKill();
         }}
         title="Kill this session?"
         visible={killConfirmVisible}

@@ -108,4 +108,22 @@ describe("TabPager", () => {
     expect(screen.getByTestId("tab-pager")).toBeTruthy();
     expect(renderPage).not.toHaveBeenCalled();
   });
+
+  // The native pager only builds its scroll view once it has a superview, which
+  // is after its first props update — so a swipe-blocking `false` has to arrive
+  // as a change of value, not as the initial one, or the pager keeps its pan and
+  // eats the card's back gesture.
+  it("turns the native pan off once the pager reports a page", async () => {
+    const screen = await render(
+      <TabPager pages={PAGES} renderPage={(page) => <Text>{page}</Text>} />,
+    );
+
+    expect(screen.getByTestId("tab-pager").props["scrollEnabled"]).toBe(true);
+
+    await fireEvent(screen.getByTestId("tab-pager"), "pageSelected", {
+      nativeEvent: { position: 0 },
+    });
+
+    expect(screen.getByTestId("tab-pager").props["scrollEnabled"]).toBe(false);
+  });
 });

@@ -1,3 +1,4 @@
+import { markSettingsRow } from "@/components/settings/settings-grouped";
 import { SettingsInfoRow } from "@/components/settings/settings-row";
 import { Badge } from "@/components/ui/badge";
 import type { IconName } from "@/components/ui/icon";
@@ -25,3 +26,5 @@ export function UnavailableRow({
     />
   );
 }
+
+markSettingsRow(UnavailableRow);

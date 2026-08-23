@@ -1,4 +1,4 @@
-import { fireEvent, render } from "@testing-library/react-native";
+import { act, fireEvent, render } from "@testing-library/react-native";
 import { StyleSheet } from "react-native";
 import { SafeAreaInsetsContext } from "react-native-safe-area-context";
 
@@ -35,6 +35,25 @@ jest.mock("@/lib/haptics", () => ({
   haptics: { selection: jest.fn() },
 }));
 
+jest.mock("react-native-keyboard-controller", () => {
+  const { makeMutable } =
+    require("react-native-reanimated") as typeof import("react-native-reanimated");
+  return {
+    __mockKeyboardProgress: makeMutable(0),
+    useReanimatedKeyboardAnimation() {
+      const { __mockKeyboardProgress: progress } = require("react-native-keyboard-controller") as {
+        __mockKeyboardProgress: { value: number };
+      };
+      return { height: makeMutable(0), progress };
+    },
+  };
+});
+
+const { __mockKeyboardProgress: mockKeyboardProgress } =
+  require("react-native-keyboard-controller") as { __mockKeyboardProgress: { value: number } };
+
+const BAR_HEIGHT = 68;
+
 const INSETS = { bottom: 34, left: 0, right: 0, top: 59 };
 function nav() {
   return (
@@ -56,6 +75,27 @@ describe("BottomNav", () => {
     jest.clearAllMocks();
   });
 
+  it("rides the keyboard down instead of ghosting through it", async () => {
+    mockKeyboardProgress.value = 0;
+    const screen = await renderNav("/workspaces");
+    const bar = screen.getByTestId("bottom-nav");
+    await act(() => {
+      fireEvent(bar, "layout", {
+        nativeEvent: { layout: { height: BAR_HEIGHT, width: 390, x: 0, y: 0 } },
+      });
+    });
+
+    expect(bar).toHaveAnimatedStyle({ transform: [{ translateY: 0 }] });
+
+    await act(() => {
+      mockKeyboardProgress.value = 1;
+    });
+
+    // Exactly its own height: the bar is off the bottom of the screen, not
+    // sitting behind a translucent keyboard.
+    expect(bar).toHaveAnimatedStyle({ transform: [{ translateY: BAR_HEIGHT }] });
+  });
+
   it("uses exact roots for profile chrome and maps pushed routes to their destination", () => {
     expect(isBottomNavRoute("/workspaces")).toBe(true);
     expect(isBottomNavRoute("/hosts")).toBe(true);
@@ -71,7 +111,7 @@ describe("BottomNav", () => {
   it("keeps the current destination selected over a pushed screen", async () => {
     const screen = await renderNav("/host/one");
 
-    expect(screen.getByRole("tab", { name: "Hosts" }).props["accessibilityState"]).toEqual({
+    expect(screen.getByRole("tab", { name: "Legion" }).props["accessibilityState"]).toEqual({
       selected: true,
     });
     expect(screen.getByRole("tab", { name: "Workspaces" }).props["accessibilityState"]).toEqual({
@@ -95,7 +135,7 @@ describe("BottomNav", () => {
   it("pops a pushed screen before landing on the root", async () => {
     const screen = await renderNav("/host/one");
 
-    await fireEvent.press(screen.getByRole("tab", { name: "Hosts" }));
+    await fireEvent.press(screen.getByRole("tab", { name: "Legion" }));
 
     expect(mockDismissAllSheets).toHaveBeenCalledTimes(1);
     expect(mockDismissAllRoutes).toHaveBeenCalledTimes(1);
@@ -107,7 +147,7 @@ describe("BottomNav", () => {
     const unregister = registerNavigationOverlayDismiss(onDismiss);
     const screen = await renderNav("/workspaces");
 
-    await fireEvent.press(screen.getByRole("tab", { name: "Hosts" }));
+    await fireEvent.press(screen.getByRole("tab", { name: "Legion" }));
 
     expect(onDismiss).toHaveBeenCalledTimes(1);
     expect(mockDismissAllRoutes).toHaveBeenCalledTimes(1);
@@ -121,7 +161,7 @@ describe("BottomNav", () => {
     mockCanDismissRoutes.mockReturnValueOnce(false);
     const screen = await renderNav("/workspaces");
 
-    await fireEvent.press(screen.getByRole("tab", { name: "Hosts" }));
+    await fireEvent.press(screen.getByRole("tab", { name: "Legion" }));
 
     expect(mockDismissAllRoutes).not.toHaveBeenCalled();
     expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts");

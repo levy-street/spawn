@@ -19,9 +19,22 @@ describe("offline terminal worker", () => {
     expect(TERMINAL_WORKER_HTML).toContain("lineHeight: 1.2");
     expect(TERMINAL_WORKER_HTML).toContain('terminal.unicode.activeVersion = "11"');
     expect(TERMINAL_WORKER_HTML).toContain("new FitAddon.FitAddon()");
-    expect(TERMINAL_WORKER_HTML).toContain("new WebglAddon.WebglAddon()");
     expect(TERMINAL_WORKER_HTML).toContain("new ClipboardAddon.ClipboardAddon");
     expect(TERMINAL_WORKER_HTML).toContain("new SerializeAddon.SerializeAddon()");
+  });
+
+  test("renders to the DOM so the system can select the output", () => {
+    // WebGL draws glyphs into a canvas, which holds no text for iOS to select,
+    // magnify, look up or copy. Real text nodes are what make a hold on terminal
+    // output behave the way a hold on text behaves everywhere else on the phone.
+    expect(TERMINAL_WORKER_HTML).not.toContain("new WebglAddon.WebglAddon()");
+    expect(TERMINAL_WORKER_HTML).toContain('state.renderer = "dom"');
+    expect(TERMINAL_WORKER_HTML).toContain(".xterm .xterm-rows *{user-select:text");
+    // The helper textarea and cursor must not be selectable, or a hold would
+    // catch those instead of the output underneath.
+    expect(TERMINAL_WORKER_HTML).toContain(
+      ".xterm .xterm-helpers,.xterm .xterm-helper-textarea,.xterm .xterm-cursor-layer{user-select:none",
+    );
   });
 
   test("creates only exact ordered reliable protocol channels", () => {

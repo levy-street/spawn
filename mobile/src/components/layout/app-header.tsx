@@ -1,6 +1,7 @@
 import { createContext, type ReactNode, useContext } from "react";
 import { StyleSheet, View } from "react-native";
 import { SafeAreaInsetsContext } from "react-native-safe-area-context";
+import { BrandMark } from "@/components/brand/brand-mark";
 import { isPrimaryHeaderDestinationAction } from "@/components/nav/primary-destinations";
 import type { IconName } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
@@ -19,6 +20,12 @@ export interface AppHeaderAction {
 
 export interface AppHeaderProps {
   title: string;
+  /**
+   * A destination root, which wears the spawnd mark instead of its own name. The
+   * title still names the screen for assistive tech; the bar just stops saying
+   * out loud what the tab bar underneath already says.
+   */
+  branded?: boolean;
   /** Optional second line under the title. */
   subtitle?: string;
   /** A root-screen control rendered instead of the back chevron. */
@@ -62,6 +69,7 @@ export function AppHeaderLeadingProvider({
 
 export function AppHeader({
   title,
+  branded = false,
   subtitle,
   leading,
   onBack,
@@ -129,9 +137,18 @@ export function AppHeader({
         </View>
 
         <View pointerEvents="none" style={styles.titleFrame} testID="app-header-title-frame">
-          <Text accessibilityRole="header" numberOfLines={1} style={styles.title} weight="semibold">
-            {title}
-          </Text>
+          {branded ? (
+            <BrandMark accessibilityLabel={title} size={sizing.appHeader.brandMark} />
+          ) : (
+            <Text
+              accessibilityRole="header"
+              numberOfLines={1}
+              style={styles.title}
+              weight="semibold"
+            >
+              {title}
+            </Text>
+          )}
           {subtitle === undefined ? null : (
             <Text color="mutedForeground" numberOfLines={1} style={styles.subtitle}>
               {subtitle}

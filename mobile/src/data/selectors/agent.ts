@@ -1,4 +1,4 @@
-import type { AgentDef, AgentIdentity, AgentLogoKey } from "@/data/types/domain";
+import type { AgentDef, AgentIdentity, AgentLogoKey, Session } from "@/data/types/domain";
 
 const SHELL_COMMANDS = new Set(["bash", "zsh", "fish", "sh", "dash"]);
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
@@ -102,4 +102,38 @@ export function agentRunCommand(agent: AgentDef): string {
 export function agentInstallAndRunCommand(agent: AgentDef): string | null {
   const install = agent.install?.trim();
   return install ? `${install} && ${agentRunCommand(agent)}` : null;
+}
+
+export interface RunningAgentGroup {
+  /** Stable identity of the group, for keys. */
+  key: string;
+  count: number;
+  identity: AgentIdentity;
+}
+
+/**
+ * What is running on a host, one entry per agent and most-first.
+ *
+ * Shells are kept rather than dropped: on a phone the answer "four shells" is
+ * as much of an answer as "two Claude", and a host row that showed nothing for
+ * a machine with work on it would read as idle.
+ *
+ * Ties break by name so the row does not reshuffle between polls.
+ */
+export function groupRunningAgents(
+  sessions: readonly Session[],
+  agents: readonly AgentDef[],
+): RunningAgentGroup[] {
+  const groups = new Map<string, RunningAgentGroup>();
+  for (const session of sessions) {
+    const identity = identifyAgent(session.foreground_command, agents);
+    const key = `${identity.logoKey ?? "custom"}:${identity.kind}:${identity.displayName}`;
+    const current = groups.get(key);
+    groups.set(key, { key, identity, count: (current?.count ?? 0) + 1 });
+  }
+  return [...groups.values()].sort(
+    (left, right) =>
+      right.count - left.count ||
+      left.identity.displayName.localeCompare(right.identity.displayName),
+  );
 }

@@ -79,28 +79,30 @@ async function renderShell() {
 }
 
 describe("primary navigation", () => {
-  it.each(["Hosts", "Settings"])(
-    "opens %s as a tab, never as a card over the screen you were on",
-    async (label) => {
-      const { rendered, view } = await renderShell();
+  // The Legion tab still lives at /hosts: it is the machines it always was, under
+  // the name the product uses for them.
+  it.each([
+    ["Legion", "/hosts"],
+    ["Settings", "/settings"],
+  ])("opens %s as a tab, never as a card over the screen you were on", async (label, path) => {
+    const { rendered, view } = await renderShell();
 
-      await act(async () => {
-        fireEvent.press(view.getByLabelText(label));
-      });
+    await act(async () => {
+      fireEvent.press(view.getByLabelText(label));
+    });
 
-      expect(rendered.getPathname()).toBe(`/${label.toLowerCase()}`);
+    expect(rendered.getPathname()).toBe(path);
 
-      // The regression this guards: when the three roots were siblings of the
-      // detail screens, a nav tap pushed a card and left the previous root
-      // underneath it, back-swipe and all.
-      const drawer = findState(rendered.getRouterState() as NavigationState, "(drawer)");
-      expect(drawer?.routes.map((route) => route.name)).toEqual(["(tabs)"]);
+    // The regression this guards: when the three roots were siblings of the
+    // detail screens, a nav tap pushed a card and left the previous root
+    // underneath it, back-swipe and all.
+    const drawer = findState(rendered.getRouterState() as NavigationState, "(drawer)");
+    expect(drawer?.routes.map((route) => route.name)).toEqual(["(tabs)"]);
 
-      const tabs = findState(rendered.getRouterState() as NavigationState, "(tabs)");
-      expect(tabs?.type).toBe("tab");
-      expect(tabs?.routes.map((route) => route.name)).toEqual(["workspaces", "hosts", "settings"]);
-    },
-  );
+    const tabs = findState(rendered.getRouterState() as NavigationState, "(tabs)");
+    expect(tabs?.type).toBe("tab");
+    expect(tabs?.routes.map((route) => route.name)).toEqual(["workspaces", "hosts", "settings"]);
+  });
 
   it("returns to workspaces without stacking either", async () => {
     const { rendered, view } = await renderShell();

@@ -34,8 +34,7 @@ const endpointApi: EndorsementApi = { createEndorsement };
 
 export const passkeyPrfCapability = {
   available: false as const,
-  reason:
-    "Passkey trust backup requires the installed spawn build. In Expo Go, approve this phone from another trusted device or pair each host directly.",
+  reason: "Needs the installed build, not Expo Go. Approve this phone from a trusted device.",
 };
 
 export function probePasskeyPrfCapability(): Promise<typeof passkeyPrfCapability> {

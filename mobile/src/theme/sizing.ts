@@ -46,6 +46,8 @@ export const sizing = {
     workspaceVerticalPadding: 10,
     contentGap: 12,
     textGap: 2,
+    /** Between a row's copy and the meters or chips drawn under it. */
+    bodyGap: 8,
     betweenRows: 8,
     leading: {
       glyph: 32,
@@ -54,19 +56,8 @@ export const sizing = {
       rich: 40,
     },
     trailingTarget: 44,
-    /** Where a full-bleed row separator starts, so it clears the leading slot. */
-    separatorInset: 16,
     /** Inset of a row's trailing overflow control from the screen edge. */
     trailingActionInset: 8,
-    /** A separator that runs the full width instead of clearing the leading slot. */
-    separatorFullBleed: 0,
-  },
-  sectionHeader: {
-    minHeight: 48,
-    horizontalPadding: 16,
-    verticalPadding: 12,
-    contentGap: 8,
-    childGap: 8,
   },
   card: {
     padding: 16,
@@ -154,6 +145,8 @@ export const sizing = {
     sideSlot: 44,
     /** Visible monogram inside the square profile action target. */
     profileAvatar: 36,
+    /** The spawnd mark a destination root wears in place of its name. */
+    brandMark: 28,
     subtitleGap: 2,
   },
   bottomNav: {
@@ -167,16 +160,26 @@ export const sizing = {
   /**
    * The strip above the keyboard in a terminal. It is a composer, not a control
    * bar: its plates sit below the standard control height so the strip reads as
-   * a thin edge to the keyboard rather than a second toolbar. Button's own
-   * hit-slop carries each target back out to a comfortable one.
+   * an edge to the keyboard rather than a second toolbar. Button's own hit-slop
+   * carries each target back out to a comfortable one. The plates still need
+   * room to breathe above and below, or they read as crammed against the
+   * keyboard rather than resting on it.
    */
   terminalAccessory: {
     controlHeight: 36,
     keyMinWidth: 40,
     keyHorizontalPadding: 10,
     horizontalPadding: 8,
-    verticalPadding: 5,
+    verticalPadding: 11,
     gap: 6,
+    /** The chevron that puts the keyboard away. Larger than a strip glyph: it is
+     *  the one control here aimed at while the keyboard is in the way. */
+    dismissIcon: 22,
+    /** Send sits on a larger plate than its neighbours, with a glyph a notch up
+     *  from a strip icon: it is the one control here that commits what was
+     *  typed, and the one aimed at most often. */
+    sendControlHeight: 46,
+    sendIcon: 19,
   },
 
   /** A search field docked to the foot of a list screen. */

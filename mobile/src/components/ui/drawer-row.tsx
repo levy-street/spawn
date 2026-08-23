@@ -9,10 +9,14 @@ export interface DrawerRowProps {
   label: string;
   detail?: string;
   icon?: ReactNode;
+  /** A mark at the row's tail — a selection check, say. Sized like the leading icon. */
+  trailing?: ReactNode;
+  /** Answers a choice: reports checked state and is what a drawer marks with a tick. */
+  selected?: boolean;
   destructive?: boolean;
   disabled?: boolean;
   accessibilityLabel?: string;
-  accessibilityRole?: "button" | "menuitem";
+  accessibilityRole?: "button" | "menuitem" | "radio";
   onPress: () => void;
   testID?: string;
 }
@@ -33,6 +37,8 @@ export function DrawerRow({
   label,
   detail,
   icon,
+  trailing,
+  selected,
   destructive = false,
   disabled = false,
   accessibilityLabel,
@@ -46,7 +52,7 @@ export function DrawerRow({
     <Pressable
       accessibilityLabel={accessibilityLabel ?? label}
       accessibilityRole={accessibilityRole}
-      accessibilityState={{ disabled }}
+      accessibilityState={{ disabled, ...(selected === undefined ? {} : { checked: selected }) }}
       disabled={disabled}
       onPress={onPress}
       style={({ pressed }) => [
@@ -62,7 +68,7 @@ export function DrawerRow({
       ]}
       {...(testID === undefined ? {} : { testID })}
     >
-      <DrawerRowIcon icon={icon} />
+      <DrawerRowGlyph glyph={icon} />
       <View style={styles.copy}>
         <Text color={destructive ? "destructive" : "popoverForeground"} variant="uiBase">
           {label}
@@ -73,15 +79,16 @@ export function DrawerRow({
           </Text>
         ) : null}
       </View>
+      <DrawerRowGlyph glyph={trailing} />
     </Pressable>
   );
 }
 
-function DrawerRowIcon({ icon }: { icon: ReactNode }): React.JSX.Element | null {
-  if (!isValidElement<{ size?: number }>(icon)) return null;
+function DrawerRowGlyph({ glyph }: { glyph: ReactNode }): React.JSX.Element | null {
+  if (!isValidElement<{ size?: number }>(glyph)) return null;
   return (
     <View style={styles.icon}>
-      {cloneElement(icon, { size: icon.props.size ?? sizing.actionSheet.icon })}
+      {cloneElement(glyph, { size: glyph.props.size ?? sizing.actionSheet.icon })}
     </View>
   );
 }
@@ -90,6 +97,7 @@ export function DrawerSeparator(): React.JSX.Element {
   const theme = useTheme();
   return (
     <View
+      testID="drawer-separator"
       style={[
         styles.separator,
         {

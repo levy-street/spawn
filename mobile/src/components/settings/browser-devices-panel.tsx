@@ -3,10 +3,10 @@ import { useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { BrowserDeviceRow } from "@/components/settings/browser-device-row";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Text } from "@/components/ui/text";
@@ -170,13 +170,9 @@ export function BrowserDevicesPanel(): React.JSX.Element {
   };
 
   return (
-    <SettingsScreen
-      description="Devices signed in to your account. A new device needs approval from one that already works before hosts will accept it."
-      testID="browser-devices-panel"
-      title="Browser devices"
-    >
+    <SettingsScreen testID="browser-devices-panel" title="Browser devices">
       {registrationError ? (
-        <Card variant="flat">
+        <SettingsBlock>
           <View style={styles.notice}>
             <Text accessibilityRole="alert" variant="label">
               This device's identity registration failed. Terminal access and approvals are
@@ -189,7 +185,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
               Retry registration
             </Button>
           </View>
-        </Card>
+        </SettingsBlock>
       ) : null}
       {revokedCurrent ? (
         <Button onPress={() => void register()} variant="outline">
@@ -208,7 +204,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
       ) : null}
 
       {currentDevice && trustedCount(currentDevice.id) === 0 ? (
-        <Card variant="flat">
+        <SettingsBlock>
           <View style={styles.notice}>
             <Text variant="label">This device can't open terminals yet</Text>
             <Text color="mutedForeground" selectable variant="mono">
@@ -227,7 +223,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
               </Button>
             </View>
           </View>
-        </Card>
+        </SettingsBlock>
       ) : null}
 
       <SettingsSection>
@@ -267,7 +263,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
       </SettingsSection>
 
       {approveTarget ? (
-        <Card variant="flat">
+        <SettingsBlock>
           <View style={styles.notice}>
             <Text variant="label">Approve {approveTarget.label ?? "this device"}?</Text>
             <Text color="mutedForeground" variant="body">
@@ -283,14 +279,14 @@ export function BrowserDevicesPanel(): React.JSX.Element {
                 loading={busy}
                 onPress={() => void approve()}
               >
-                {busy ? "Approving…" : "It matches — approve"}
+                {busy ? "Approving…" : "It matches, approve"}
               </Button>
               <Button onPress={() => setApproveTarget(null)} variant="secondary">
                 Cancel
               </Button>
             </View>
           </View>
-        </Card>
+        </SettingsBlock>
       ) : null}
 
       {revokedDevices.length > 0 ? (
@@ -300,12 +296,12 @@ export function BrowserDevicesPanel(): React.JSX.Element {
           </Button>
           {showRevoked
             ? revokedDevices.map((device) => (
-                <Card key={device.id} variant="flat">
+                <SettingsBlock key={device.id}>
                   <Text variant="label">{device.label ?? "Unnamed browser"}</Text>
                   <Text color="mutedForeground" selectable variant="mono">
                     {derivedDeviceFingerprint(device)}
                   </Text>
-                </Card>
+                </SettingsBlock>
               ))
             : null}
           {showRevoked ? (
@@ -334,7 +330,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
       />
       <Confirm
         confirmLabel="Clear history"
-        description="Revocation stays permanent. This only removes revoked devices from this list."
+        description="Only clears revoked devices from this list."
         destructive
         onCancel={() => setConfirmPrune(false)}
         onConfirm={() =>

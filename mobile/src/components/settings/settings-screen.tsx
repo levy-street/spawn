@@ -38,7 +38,7 @@ export function SettingsScreen({
       header={
         <AppHeader
           {...(actions === undefined ? {} : { actions })}
-          {...(root ? {} : { onBack: router.back })}
+          {...(root ? { branded: true } : { onBack: router.back })}
           title={title}
         />
       }

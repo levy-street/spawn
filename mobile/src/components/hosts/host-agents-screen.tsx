@@ -8,6 +8,7 @@ import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
+import { ListGroup } from "@/components/ui/list-group";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
@@ -128,7 +129,7 @@ export function HostAgentsScreen({ hostId }: { hostId: string }) {
               ) : agentsQuery.data.agents.length === 0 ? (
                 <EmptyState icon="Bot" title="No agent definitions are available." />
               ) : (
-                <View style={styles.agentList}>
+                <ListGroup testID="host-agent-rows">
                   {agentsQuery.data.agents.map((agent) => (
                     <HostAgentRow
                       agent={agent}
@@ -175,7 +176,7 @@ export function HostAgentsScreen({ hostId }: { hostId: string }) {
                       result={results[agent.agent_id] ?? null}
                     />
                   ))}
-                </View>
+                </ListGroup>
               )}
             </View>
             {skillsQuery.isPending ? (
@@ -205,9 +206,6 @@ export function HostAgentsScreen({ hostId }: { hostId: string }) {
 }
 
 const styles = StyleSheet.create({
-  agentList: {
-    gap: spacing[3],
-  },
   callout: {
     padding: spacing[4],
   },

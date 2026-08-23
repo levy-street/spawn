@@ -1,8 +1,7 @@
 import * as Clipboard from "expo-clipboard";
-import * as DocumentPicker from "expo-document-picker";
-import * as ImagePicker from "expo-image-picker";
 import { useState } from "react";
 import { Alert } from "react-native";
+import { type ImageSource, pickImage } from "@/components/media/image-source";
 import { attachmentPasteSequence } from "@/components/terminal-ui/attachment-paste";
 import {
   LARGE_PASTE_CONFIRM_BYTES,
@@ -32,62 +31,9 @@ function confirmLargePaste(): Promise<boolean> {
   });
 }
 
-function imageAssetName(asset: ImagePicker.ImagePickerAsset, fallback: string): string {
-  if (asset.fileName && asset.fileName.length > 0) return asset.fileName;
-  const extension = asset.uri.split(".").pop();
-  return extension && /^[A-Za-z0-9]{1,5}$/.test(extension)
-    ? `${fallback}.${extension.toLowerCase()}`
-    : fallback;
-}
-
-/**
- * Resolves one attachment, or null when the operator backed out. Permission is
- * asked for at the point of use rather than up front, so a refusal explains
- * itself against the thing that was just tapped.
- */
+/** A session takes any file, so its "files" source is not narrowed to images. */
 async function pickAttachment(source: AttachmentSource): Promise<TerminalUploadAsset | null> {
-  if (source === "files") {
-    const result = await DocumentPicker.getDocumentAsync({
-      copyToCacheDirectory: true,
-      multiple: false,
-      type: "*/*",
-    });
-    const asset = result.canceled ? undefined : result.assets[0];
-    return asset ? { uri: asset.uri, name: asset.name, mimeType: asset.mimeType ?? null } : null;
-  }
-
-  if (source === "camera") {
-    const permission = await ImagePicker.requestCameraPermissionsAsync();
-    if (!permission.granted) throw new Error("spawn needs camera access to take a photo.");
-    const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ["images"],
-      quality: 0.9,
-    });
-    const asset = result.canceled ? undefined : result.assets[0];
-    return asset
-      ? {
-          uri: asset.uri,
-          name: imageAssetName(asset, "photo.jpg"),
-          mimeType: asset.mimeType ?? "image/jpeg",
-        }
-      : null;
-  }
-
-  const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-  if (!permission.granted) throw new Error("spawn needs photo access to upload from your library.");
-  const result = await ImagePicker.launchImageLibraryAsync({
-    mediaTypes: ["images"],
-    quality: 0.9,
-    selectionLimit: 1,
-  });
-  const asset = result.canceled ? undefined : result.assets[0];
-  return asset
-    ? {
-        uri: asset.uri,
-        name: imageAssetName(asset, "image.jpg"),
-        mimeType: asset.mimeType ?? "image/jpeg",
-      }
-    : null;
+  return pickImage(source, { fileTypes: "*/*" });
 }
 
 export interface TerminalTransfersOptions {
@@ -99,7 +45,8 @@ export interface TerminalTransfersOptions {
 }
 
 /** Where the bytes for an attachment come from. */
-export type AttachmentSource = "camera" | "photos" | "files";
+/** The app's three image sources; the terminal's "files" is widened to any file. */
+export type AttachmentSource = ImageSource;
 
 export interface TerminalTransfers {
   notice: string | null;
@@ -209,11 +156,12 @@ export function useTerminalTransfers({
           // An image is an input, not a saved file. Bracket-pasting its path at
           // the prompt is what a desktop terminal does when one is dragged onto
           // it, and what an agent reads as an attached image.
+          // No notice: the pasted path lands in the input, which says it better
+          // than a banner repeating it does.
           const paste = new TextEncoder().encode(attachmentPasteSequence(completed.path));
           await writeTerminalInput(transport, paste);
           onInputSent();
           onFocusTerminal();
-          setNotice("Image attached");
         }
         haptics.success();
       } catch (error) {

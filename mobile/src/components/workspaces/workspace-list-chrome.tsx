@@ -29,7 +29,7 @@ export function WorkspaceListControls({
           value={query}
         />
       </View>
-      <ListSeparator inset={false} />
+      <ListSeparator />
     </View>
   );
 }
@@ -47,13 +47,15 @@ export function NewWorkspaceRow({
 }): React.JSX.Element {
   return (
     <View testID="new-workspace-row">
-      <ListSeparator inset={false} />
+      <ListSeparator />
       <ListRow
         leading={<Icon color="mutedForeground" name="Plus" size={sizing.control.icon} />}
         shape="fullBleed"
         title="New workspace"
         {...(disabled ? {} : { onPress })}
       />
+      {/* Last entry in the scrolling list, so this rule closes it. */}
+      <ListSeparator />
     </View>
   );
 }
@@ -72,7 +74,7 @@ export function ArchivedWorkspacesFooter({
 }): React.JSX.Element {
   return (
     <View testID="archived-workspaces-section">
-      <ListSeparator inset={false} />
+      <ListSeparator />
       <ArchivedWorkspacesNavigationRow count={count} onPress={onPress} />
     </View>
   );

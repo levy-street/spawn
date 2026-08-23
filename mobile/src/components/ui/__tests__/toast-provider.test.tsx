@@ -1,11 +1,12 @@
 import { fireEvent, render } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
-import { Pressable, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { ToastProvider, useToast } from "@/components/ui/toast";
 import { haptics } from "@/lib/haptics";
-import { ThemeProvider } from "@/theme";
+import { spacing, ThemeProvider } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 jest.mock("@/lib/haptics", () => ({
   haptics: {
@@ -55,5 +56,17 @@ describe("ToastProvider", () => {
     expect(screen.getByText("Failed")).toBeTruthy();
     expect(haptics.success).toHaveBeenCalledTimes(1);
     expect(haptics.error).toHaveBeenCalledTimes(1);
+  });
+
+  test("hangs its notices from the top edge, one gutter in from each side", async () => {
+    const screen = await render(<ToastHarness />, { wrapper: Providers });
+    await fireEvent.press(screen.getByLabelText("Show success"));
+
+    const host = StyleSheet.flatten(screen.getByTestId("toast-host").props["style"]);
+    expect(host["top"]).toBe(0);
+    expect(host["left"]).toBe(sizing.screen.gutter);
+    expect(host["right"]).toBe(sizing.screen.gutter);
+    // Clears the status bar and nothing else: the notice belongs to the top.
+    expect(host["paddingTop"]).toBe(METRICS.insets.top + spacing[2]);
   });
 });

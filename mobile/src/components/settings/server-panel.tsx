@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Badge } from "@/components/ui/badge";
@@ -133,13 +134,9 @@ export function ServerPanel(): React.JSX.Element {
   const connectionColor = connection.status === "failure" ? "destructive" : "success";
 
   return (
-    <SettingsScreen
-      description="Choose the spawn server this device connects to."
-      testID="server-panel"
-      title="Server"
-    >
+    <SettingsScreen testID="server-panel" title="Server">
       <SettingsSection title="Current server">
-        <Card style={styles.current} variant="flat">
+        <SettingsBlock>
           {resolution ? (
             <>
               <Text selectable testID="effective-server-url" variant="mono">
@@ -154,13 +151,13 @@ export function ServerPanel(): React.JSX.Element {
               {loadError ? `Could not load the current server: ${loadError}` : "Loading…"}
             </Text>
           )}
-        </Card>
+        </SettingsBlock>
       </SettingsSection>
 
       <SettingsSection title="Connection">
         <Field
           error={validationError}
-          hint="HTTPS is added when you omit a scheme. HTTP is supported when entered explicitly."
+          hint="HTTPS unless you type http:// yourself."
           label="Server URL"
         >
           <Input
@@ -234,9 +231,6 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     flexWrap: "wrap",
     gap: spacing[2],
-  },
-  current: {
-    gap: spacing[3],
   },
   warning: {
     gap: spacing[2],

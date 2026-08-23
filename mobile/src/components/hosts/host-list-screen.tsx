@@ -1,9 +1,10 @@
 import { useRouter } from "expo-router";
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { FlatList, RefreshControl, StyleSheet, View } from "react-native";
 import { HostActionsSheet } from "@/components/hosts/host-actions-sheet";
 import { HostListItem } from "@/components/hosts/host-list-item";
 import { errorMessage, pluralize } from "@/components/hosts/host-model";
+import { LegionSummary } from "@/components/hosts/legion-summary";
 import { RenameHostDialog } from "@/components/hosts/rename-host-dialog";
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
@@ -15,41 +16,53 @@ import { Icon } from "@/components/ui/icon";
 import { ListRow, ListSeparator } from "@/components/ui/list-row";
 import { Spinner } from "@/components/ui/spinner";
 import { useToast } from "@/components/ui/toast";
+import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
+import type { SessionOut } from "@/data/api/schemas/sessions";
 import { useDeviceHostApprovals } from "@/data/queries/device-trust";
-import { useHostsQuery, useRemoveHostMutation, useRenameHostMutation } from "@/data/queries/hosts";
-import { sortHosts } from "@/data/selectors/host";
+import {
+  useAgentsQuery,
+  useAllSessionsQuery,
+  useHostsQuery,
+  useRemoveHostMutation,
+  useRenameHostMutation,
+} from "@/data/queries/hosts";
+import { sessionsForHost, sortHosts } from "@/data/selectors/host";
 import { haptics } from "@/lib/haptics";
 import { spacing, useTheme } from "@/theme";
 
 export interface HostListViewProps {
   hosts: readonly HostOut[];
+  /** Every session in the fleet; each row takes its own. */
+  sessions?: readonly SessionOut[];
+  /** Account agents, so a session's command resolves to a known agent. */
+  agents?: readonly AgentOut[];
   refreshing: boolean;
   /** Hosts that have not pinned this device; they cannot open a terminal here. */
   unapprovedCount?: number;
   onConnect(): void;
   onOpen(host: HostOut): void;
   onOpenActions(host: HostOut): void;
-  onOpenLegion(): void;
   onRefresh(): void;
   onApproveDevice?(): void;
+  /** The legion's rollup, drawn above the machines it counts. */
+  summary?: ReactNode;
 }
 
 export function HostListView({
   hosts,
+  sessions = [],
+  agents = [],
   refreshing,
   unapprovedCount = 0,
   onConnect,
   onOpen,
   onOpenActions,
-  onOpenLegion,
   onRefresh,
   onApproveDevice,
+  summary,
 }: HostListViewProps) {
   const theme = useTheme();
-  const online = hosts.filter((host) => host.status === "online").length;
-  const offline = hosts.length - online;
-  const sessionCount = hosts.reduce((total, host) => total + host.session_count, 0);
   return (
     <FlatList
       contentContainerStyle={styles.list}
@@ -59,7 +72,7 @@ export function HostListView({
         <EmptyState
           style={styles.emptyState}
           action={<Button onPress={onConnect}>Connect a host</Button>}
-          description="Run the installer and spawnd login on a supported Mac or Linux machine."
+          description="Run the installer and spawnd login on a Mac or Linux machine."
           icon="Server"
           title="No hosts are connected yet."
         />
@@ -82,23 +95,14 @@ export function HostListView({
                 />
               </Card>
             ) : null}
-            <Card padded={false} style={styles.fleet} variant="flat">
-              <ListRow
-                height="tall"
-                leading={<Icon color="mutedForeground" name="Network" size={spacing[5]} />}
-                onPress={() => {
-                  haptics.selection();
-                  onOpenLegion();
-                }}
-                subtitle={`${online} online · ${offline} offline · ${pluralize(sessionCount, "session")}`}
-                title="Fleet overview"
-                trailing={<Icon color="mutedForeground" name="ChevronRight" />}
-              />
-            </Card>
+            {summary === undefined ? null : <View style={styles.fleet}>{summary}</View>}
           </View>
         ) : null
       }
-      ItemSeparatorComponent={() => <ListSeparator inset={false} />}
+      ItemSeparatorComponent={ListSeparator}
+      // Closes the list under the last host, rather than letting the rows stop
+      // mid-air above the empty space below them.
+      ListFooterComponent={hosts.length > 0 ? <ListSeparator /> : null}
       refreshControl={
         <RefreshControl
           refreshing={refreshing}
@@ -108,9 +112,11 @@ export function HostListView({
       }
       renderItem={({ item }) => (
         <HostListItem
+          agents={agents}
           host={item}
           onOpen={() => onOpen(item)}
           onOpenActions={() => onOpenActions(item)}
+          sessions={sessionsForHost(sessions, item.id)}
         />
       )}
     />
@@ -122,6 +128,8 @@ export function HostListScreen() {
   const router = useRouter();
   const toast = useToast();
   const hostsQuery = useHostsQuery();
+  const sessionsQuery = useAllSessionsQuery();
+  const agentsQuery = useAgentsQuery();
   const rename = useRenameHostMutation();
   const remove = useRemoveHostMutation();
   const [actionsHost, setActionsHost] = useState<HostOut | null>(null);
@@ -141,19 +149,14 @@ export function HostListScreen() {
         <AppHeader
           actions={[
             {
-              accessibilityLabel: "Open the legion",
-              icon: "Network",
-              onPress: () => router.push("/legion"),
-              testID: "hosts-legion-action",
-            },
-            {
               accessibilityLabel: "Connect a host",
               icon: "Plus",
               onPress: () => router.push("/onboarding/host"),
               testID: "hosts-connect-action",
             },
           ]}
-          title="Hosts"
+          branded
+          title="Legion"
         />
       }
       padded={false}
@@ -172,18 +175,26 @@ export function HostListScreen() {
           />
         ) : (
           <HostListView
+            agents={agentsQuery.data ?? []}
             hosts={hosts}
             onApproveDevice={() => router.push("/device-approval")}
             onConnect={() => router.push("/onboarding/host")}
             onOpen={openHost}
             onOpenActions={setActionsHost}
-            onOpenLegion={() => router.push("/legion")}
             onRefresh={() => {
               if (manualRefreshing) return;
               setManualRefreshing(true);
               void hostsQuery.refetch().finally(() => setManualRefreshing(false));
             }}
             refreshing={manualRefreshing}
+            sessions={sessionsQuery.data ?? []}
+            summary={
+              <LegionSummary
+                agents={agentsQuery.data ?? []}
+                hosts={hosts}
+                sessions={sessionsQuery.data ?? []}
+              />
+            }
             unapprovedCount={approvals.awaiting.length}
           />
         )}
@@ -253,8 +264,8 @@ const styles = StyleSheet.create({
     marginTop: spacing[6],
   },
   fleet: {
-    margin: spacing[4],
-    overflow: "hidden",
+    marginHorizontal: spacing[4],
+    marginTop: spacing[4],
   },
   list: {
     flexGrow: 1,

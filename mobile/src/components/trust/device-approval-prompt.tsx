@@ -75,7 +75,7 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
       const derived = formatHostFingerprint(target.public_key);
       if (derived !== request.fingerprint || derived !== target.fingerprint) {
         throw new Error(
-          "This device's fingerprint does not match its key. Refusing to approve — the server may be substituting a key.",
+          "This device's fingerprint does not match its key. The server may be substituting a key.",
         );
       }
       for (const { host } of endorsableHosts) {

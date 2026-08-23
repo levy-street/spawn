@@ -69,3 +69,28 @@ jest.mock("expo-secure-store", () => ({
   isAvailableAsync: jest.fn(async () => true),
   setItemAsync: jest.fn(async () => undefined),
 }));
+
+/**
+ * There is no native keyboard behind this library in a test runner, so importing
+ * it for real throws "doesn't seem to be linked" before a component can render.
+ * This is the quiet default — a keyboard that is never up. A test that needs to
+ * drive one mocks the module itself, which takes precedence over this.
+ */
+jest.mock("react-native-keyboard-controller", () => {
+  const { View } = require("react-native") as typeof import("react-native");
+  return {
+    KeyboardController: {
+      dismiss: jest.fn(async () => undefined),
+      setInputMode: jest.fn(),
+      setDefaultMode: jest.fn(),
+    },
+    KeyboardProvider: ({ children }: { children: React.ReactNode }) => children,
+    KeyboardAwareScrollView: View,
+    useGenericKeyboardHandler: jest.fn(),
+    useKeyboardState: (selector?: (state: { isVisible: boolean; height: number }) => unknown) => {
+      const state = { isVisible: false, height: 0 };
+      return selector ? selector(state) : state;
+    },
+    useReanimatedKeyboardAnimation: () => ({ height: { value: 0 }, progress: { value: 0 } }),
+  };
+});

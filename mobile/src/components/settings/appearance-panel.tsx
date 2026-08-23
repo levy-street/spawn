@@ -16,11 +16,7 @@ export function AppearancePanel(): React.JSX.Element {
   const { mode, setMode } = useThemeMode();
 
   return (
-    <SettingsScreen
-      description="Applies to this device. Terminals restyle in place — you do not lose a session by switching."
-      testID="appearance-panel"
-      title="Appearance"
-    >
+    <SettingsScreen testID="appearance-panel" title="Appearance">
       <SettingsSection title="Theme">
         <SegmentedControl<ThemeMode>
           accessibilityLabel="Theme"

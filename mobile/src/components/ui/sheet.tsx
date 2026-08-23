@@ -24,6 +24,15 @@ import Animated, {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { FullWindowOverlay } from "react-native-screens";
 
+import {
+  enterOverlay,
+  leaveOverlay,
+  markOverlayClosing,
+  type OverlayCloseReason,
+  type OverlayEntry,
+  resolveOverlayClose,
+  restoreOverlay,
+} from "@/components/ui/overlay-stack";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
 import { alpha, borderWidth, chrome, opacity, shadow, useTheme } from "@/theme";
@@ -56,6 +65,12 @@ export type SheetSize = "content" | "tall";
 export interface SheetProps {
   visible: boolean;
   onDismiss: () => void;
+  /**
+   * Called when this drawer comes back because the one raised over it was
+   * dismissed. Only owners that mirror the drawer's visibility elsewhere need
+   * it — the return itself is handled without any help (`overlay-stack.ts`).
+   */
+  onReturn?: () => void;
   children: ReactNode;
   contentStyle?: StyleProp<ViewStyle>;
   size?: SheetSize;
@@ -128,6 +143,7 @@ export function SheetHeader({ title, action }: SheetHeaderProps): React.JSX.Elem
 export function Sheet({
   visible,
   onDismiss,
+  onReturn,
   children,
   contentStyle,
   size = "content",
@@ -143,17 +159,59 @@ export function Sheet({
   /** Distance below its resting place, in points: 0 is open, `panelHeight` is gone. */
   const offset = useSharedValue(0);
   const closingRef = useRef(false);
+  /** Whether this presentation has already played its entrance. */
+  const enteredRef = useRef(false);
+  /** True while this drawer waits under one that was raised from inside it. */
+  const [suspended, setSuspended] = useState(false);
+  const closeReason = useRef<OverlayCloseReason>("owner");
+  const entryRef = useRef<OverlayEntry | null>(null);
+  /**
+   * What was last rendered while this drawer was open. An owner usually clears
+   * the state its rows were built from in the same breath as closing it, so a
+   * drawer that waits underneath — or simply plays its exit — has to show what
+   * it was, not the empty shape it has become.
+   */
+  const shownRef = useRef<ReactNode>(children);
+  if (visible) shownRef.current = children;
+
+  // The stack calls back into whichever render is current, so the entry holds
+  // refs rather than the closures it was built with.
+  const restoreRef = useRef<() => void>(() => undefined);
+  const teardownRef = useRef<() => void>(() => undefined);
+
+  const restore = useCallback(() => {
+    setSuspended(false);
+    offset.value = withTiming(0, { duration: OPEN_MS, easing: Easing.out(Easing.cubic) });
+    onReturn?.();
+  }, [offset, onReturn]);
+
+  const teardown = useCallback(() => {
+    closingRef.current = false;
+    setSuspended(false);
+    setMounted(false);
+    onDismiss();
+  }, [onDismiss]);
+
+  restoreRef.current = restore;
+  teardownRef.current = teardown;
 
   const finishDismiss = useCallback(() => {
     closingRef.current = false;
+    const entry = entryRef.current;
+    if (entry && resolveOverlayClose(entry, closeReason.current) === "suspend") {
+      setSuspended(true);
+      return;
+    }
     setMounted(false);
     onDismiss();
   }, [onDismiss]);
 
   const closeWith = useCallback(
-    (velocity: number | null) => {
+    (velocity: number | null, reason: OverlayCloseReason) => {
       if (closingRef.current) return;
       closingRef.current = true;
+      closeReason.current = reason;
+      if (entryRef.current) markOverlayClosing(entryRef.current);
       const travel = Math.max(panelHeight, chrome.touchTarget);
       const settled = (done?: boolean) => {
         "worklet";
@@ -167,11 +225,14 @@ export function Sheet({
     [finishDismiss, offset, panelHeight],
   );
 
-  const animateClosed = useCallback(() => closeWith(null), [closeWith]);
-  const animateClosedWithVelocity = useCallback(
-    (velocity: number) => closeWith(velocity),
+  /** Dismissed by the person: whatever was waiting underneath comes back. */
+  const dismissBySelf = useCallback(() => closeWith(null, "user"), [closeWith]);
+  const dismissBySelfWithVelocity = useCallback(
+    (velocity: number) => closeWith(velocity, "user"),
     [closeWith],
   );
+  /** Closed by whatever owns it, which means its work here is finished. */
+  const closeByOwner = useCallback(() => closeWith(null, "owner"), [closeWith]);
 
   useEffect(() => {
     if (visible) {
@@ -179,24 +240,65 @@ export function Sheet({
       setMounted(true);
       return;
     }
-    if (mounted) animateClosed();
-  }, [animateClosed, mounted, visible]);
+    if (mounted && !suspended) closeByOwner();
+  }, [closeByOwner, mounted, suspended, visible]);
+
+  // Raised again through its owner while it was waiting: the same return, with
+  // the owner's own state back in step, so its rows are live rather than the
+  // snapshot they were.
+  useEffect(() => {
+    if (visible && suspended && entryRef.current) restoreOverlay(entryRef.current);
+  }, [suspended, visible]);
+
+  // Registered for the whole time it is mounted, waiting included: a drawer
+  // underneath is still on screen as far as the stack is concerned.
+  useEffect(() => {
+    if (!mounted) return;
+    const entry: OverlayEntry = {
+      suspended: false,
+      closing: false,
+      restore: () => restoreRef.current(),
+      teardown: () => teardownRef.current(),
+    };
+    entryRef.current = entry;
+    enterOverlay(entry);
+    return () => {
+      leaveOverlay(entry);
+      entryRef.current = null;
+    };
+  }, [mounted]);
 
   useEffect(() => {
     if (!mounted) return;
-    openSheets.add(animateClosed);
+    openSheets.add(closeByOwner);
     return () => {
-      openSheets.delete(animateClosed);
+      openSheets.delete(closeByOwner);
     };
-  }, [animateClosed, mounted]);
+  }, [closeByOwner, mounted]);
 
-  // The panel rises only once measured, so it never flashes at the wrong place.
+  // The panel rises only once measured, so it never flashes at the wrong place —
+  // and only on the first measurement. A sheet whose content changes size while
+  // it is open (a drawer stepping into a picker, a list growing) measures again,
+  // and replaying the entrance from there dropped the panel off the bottom and
+  // rebuilt it, haptic and all. Later measurements simply resize it in place.
   useEffect(() => {
-    if (!mounted || panelHeight === 0) return;
+    if (!mounted || panelHeight === 0 || enteredRef.current) return;
+    enteredRef.current = true;
     offset.value = panelHeight;
     offset.value = withTiming(0, { duration: OPEN_MS, easing: Easing.out(Easing.cubic) });
     haptics.overlayOpen();
   }, [mounted, offset, panelHeight]);
+
+  useEffect(() => {
+    if (!mounted) enteredRef.current = false;
+  }, [mounted]);
+
+  // A drawer waiting underneath is parked exactly its own height below the
+  // screen. If that height changes while it waits — a rotation, say — the old
+  // parking distance would leave a strip of it showing.
+  useEffect(() => {
+    if (suspended) offset.value = Math.max(panelHeight, chrome.touchTarget);
+  }, [offset, panelHeight, suspended]);
 
   const pan = Gesture.Pan()
     .onUpdate((event) => {
@@ -213,7 +315,7 @@ export function Sheet({
       if (projected > CLOSE_DISTANCE) {
         // Carry the throw through the close rather than restarting from rest,
         // which is what made a fast flick stutter before it left.
-        runOnJS(animateClosedWithVelocity)(event.velocityY);
+        runOnJS(dismissBySelfWithVelocity)(event.velocityY);
         return;
       }
       offset.value = withSpring(0, { ...SETTLE_SPRING, velocity: event.velocityY });
@@ -229,7 +331,7 @@ export function Sheet({
     .maxDistance(TAP_SLOP)
     .onEnd((_event, success) => {
       "worklet";
-      if (success) runOnJS(animateClosed)();
+      if (success) runOnJS(dismissBySelf)();
     });
 
   const panelStyle = useAnimatedStyle(() => ({
@@ -246,12 +348,19 @@ export function Sheet({
 
   const overlay = (
     <GestureDetector gesture={pan}>
-      <View style={styles.overlay}>
+      {/* A drawer waiting under another is off-screen but still mounted, and a
+          full-screen overlay that swallowed touches would make the one above it
+          unusable. */}
+      <View
+        pointerEvents={suspended ? "none" : "auto"}
+        style={styles.overlay}
+        testID="sheet-overlay"
+      >
         <GestureDetector gesture={dismissTap}>
           <Animated.View
             accessibilityLabel="Dismiss drawer"
             accessibilityRole="button"
-            onAccessibilityTap={animateClosed}
+            onAccessibilityTap={dismissBySelf}
             style={[styles.scrim, { backgroundColor: theme.colors.foreground }, scrimStyle]}
             testID="sheet-scrim"
           />
@@ -295,7 +404,7 @@ export function Sheet({
             ]}
             testID={testID ?? "sheet-content"}
           >
-            {children}
+            {shownRef.current}
           </View>
         </Animated.View>
       </View>
@@ -309,7 +418,7 @@ export function Sheet({
     return <FullWindowOverlay>{overlay}</FullWindowOverlay>;
   }
   return (
-    <Modal animationType="none" onRequestClose={animateClosed} transparent visible>
+    <Modal animationType="none" onRequestClose={dismissBySelf} transparent visible>
       {overlay}
     </Modal>
   );

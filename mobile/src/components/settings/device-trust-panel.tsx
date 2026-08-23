@@ -1,13 +1,13 @@
 import { useRouter } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsInfoRow, SettingsLinkRow } from "@/components/settings/settings-row";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { UnavailableRow } from "@/components/settings/unavailable-row";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Text } from "@/components/ui/text";
@@ -94,16 +94,16 @@ export function DeviceTrustPanel(): React.JSX.Element {
 
   return (
     <SettingsScreen testID="device-trust-panel" title="Device trust">
-      <Card variant="flat">
+      <SettingsBlock>
         <View style={styles.summary}>
           <Text variant="label">This device recognizes {activePins.length} host(s).</Text>
           <Text color="mutedForeground" variant="body">
             {bundle.data
               ? `Your saved trust opens with any of ${passkeys.data?.length ?? 0} passkey(s).`
-              : `No saved trust yet — passkeys require the installed spawn build (${passkeys.data?.length ?? 0} passkeys registered).`}
+              : `No saved trust yet. Passkeys need the installed build (${passkeys.data?.length ?? 0} registered).`}
           </Text>
         </View>
-      </Card>
+      </SettingsBlock>
 
       {error ? (
         <Text accessibilityRole="alert" color="destructive" variant="body">
@@ -111,7 +111,7 @@ export function DeviceTrustPanel(): React.JSX.Element {
         </Text>
       ) : null}
 
-      <SettingsSection title="THIS DEVICE">
+      <SettingsSection title="This device">
         <SettingsInfoRow
           hint={identityFingerprint ?? "No local Ed25519 identity is available."}
           icon="Fingerprint"
@@ -156,7 +156,7 @@ export function DeviceTrustPanel(): React.JSX.Element {
         />
       </SettingsSection>
 
-      <SettingsSection title="SAVED TRUST PASSKEYS">
+      <SettingsSection title="Saved trust passkeys">
         {!bundle.data ? (
           <UnavailableRow
             icon="KeyRound"
@@ -184,7 +184,7 @@ export function DeviceTrustPanel(): React.JSX.Element {
         ))}
       </SettingsSection>
 
-      <SettingsSection title="HOST PINS">
+      <SettingsSection title="Host pins">
         {activePins.length === 0 ? (
           <EmptyState
             description="Approve this device from another trusted device, or pair a host directly."
@@ -222,7 +222,7 @@ export function DeviceTrustPanel(): React.JSX.Element {
 
       <SettingsSection>
         <SettingsLinkRow
-          hint="Pair a host directly using its eight-character code."
+          hint="Use a host\u2019s eight-character code."
           icon="Plus"
           label="Connect a host"
           onPress={() => router.push("/onboarding/host")}
@@ -231,7 +231,7 @@ export function DeviceTrustPanel(): React.JSX.Element {
 
       <Confirm
         confirmLabel="Forget"
-        description="This removes every locally recognized host. Pair or approve this device again before connecting."
+        description="Removes every host this device recognizes."
         destructive
         onCancel={() => setConfirmForget(false)}
         onConfirm={() => void forgetTrust()}

@@ -1,8 +1,9 @@
-import * as DocumentPicker from "expo-document-picker";
 import { File } from "expo-file-system";
 import { Image } from "expo-image";
 import { type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
 
+import { encodeIconDataUrl } from "@/components/media/icon-image";
+import { type ImageSource, pickImage } from "@/components/media/image-source";
 import { Monogram } from "@/components/ui/monogram";
 import { useReducedMotion } from "@/lib/motion/reduced-motion";
 import { borderWidth, useTheme } from "@/theme";
@@ -48,19 +49,30 @@ export function initialsWorkspaceIcon(): WorkspaceIconChoice {
   return { icon: null, iconSource: "custom" };
 }
 
-export async function pickWorkspaceIcon(): Promise<WorkspaceIconChoice | null> {
-  const result = await DocumentPicker.getDocumentAsync({
-    type: ["image/png", "image/webp"],
-    copyToCacheDirectory: true,
-    multiple: false,
-  });
-  if (result.canceled) return null;
-  const asset = result.assets[0];
-  if (!asset) return null;
-  const mime = normalizeMime(asset.mimeType, asset.name);
-  if (!mime) throw new Error("Choose a PNG or WebP image.");
-  const base64 = await new File(asset.uri).base64();
-  return { icon: workspaceIconDataUrl(mime, base64), iconSource: "custom" };
+/**
+ * Resolves an icon from any of the app's image sources.
+ *
+ * A PNG or WebP that already fits the budget is used as it is — a hand-made icon
+ * should not be re-encoded. Anything else, a camera photo above all, is squared
+ * down to a PNG that fits, because the server takes nothing else.
+ */
+export async function pickWorkspaceIcon(source: ImageSource): Promise<WorkspaceIconChoice | null> {
+  const picked = await pickImage(source, { fileTypes: ["image/png", "image/webp"] });
+  if (!picked) return null;
+
+  const mime = normalizeMime(picked.mimeType, picked.name);
+  if (mime !== null) {
+    const base64 = await new File(picked.uri).base64();
+    const direct = `data:${mime};base64,${base64.replaceAll(/\s/g, "")}`;
+    if (direct.length <= WORKSPACE_ICON_MAX_CHARACTERS) {
+      return { icon: direct, iconSource: "custom" };
+    }
+  }
+
+  return {
+    icon: await encodeIconDataUrl(picked.uri, WORKSPACE_ICON_MAX_CHARACTERS),
+    iconSource: "custom",
+  };
 }
 
 export function WorkspaceIcon({ icon, name, size, style, testID }: WorkspaceIconProps) {

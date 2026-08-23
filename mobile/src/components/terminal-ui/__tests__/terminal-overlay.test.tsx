@@ -1,7 +1,15 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react-native";
 import * as Linking from "expo-linking";
 import { SafeAreaProvider } from "react-native-safe-area-context";
-
+import { LAUNCH_FOCUS_DELAY_MS } from "@/components/terminal-ui/launch-focus";
+import { resetPinnedCommandsCache } from "@/components/terminal-ui/pinned-commands";
+import {
+  agentKindFor,
+  REPEAT_PRESS_GAP_MS,
+  resolvePinnedCommands,
+  type TerminalCommand,
+  terminalCommandsFor,
+} from "@/components/terminal-ui/terminal-commands";
 import { TerminalOverlay } from "@/components/terminal-ui/terminal-overlay";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
@@ -30,20 +38,36 @@ jest.mock("expo-linking", () => ({
   openURL: jest.fn(async () => undefined),
 }));
 
+interface MockHeaderProps {
+  onKill?: () => void;
+}
+
+let mockHeaderProps: MockHeaderProps = {};
+
 jest.mock("@/components/terminal-ui/terminal-header", () => {
   const React = require("react") as typeof import("react");
   const { View } = require("react-native") as typeof import("react-native");
   return {
-    TerminalHeader: () => React.createElement(View, { testID: "mock-terminal-header" }),
+    TerminalHeader: (props: MockHeaderProps) => {
+      mockHeaderProps = props;
+      return React.createElement(View, { testID: "mock-terminal-header" });
+    },
   };
 });
-let mockAccessoryBarProps: { onAttach?: () => void; onMore?: () => void } = {};
+interface MockAccessoryBarProps {
+  onAttach?: () => void;
+  onMore?: () => void;
+  onCommand?: (command: TerminalCommand) => void;
+  commands?: readonly TerminalCommand[];
+}
+
+let mockAccessoryBarProps: MockAccessoryBarProps = {};
 
 jest.mock("@/components/terminal-ui/accessory-bar", () => {
   const React = require("react") as typeof import("react");
   const { View } = require("react-native") as typeof import("react-native");
   return {
-    TerminalAccessoryBar: (props: { onAttach?: () => void; onMore?: () => void }) => {
+    TerminalAccessoryBar: (props: MockAccessoryBarProps) => {
       mockAccessoryBarProps = props;
       return React.createElement(View, { testID: "mock-accessory-bar" });
     },
@@ -63,6 +87,9 @@ jest.mock("@/components/terminal-ui/attachment-sheet", () => {
   };
 });
 jest.mock("@/components/terminal-ui/search-bar", () => ({ TerminalSearchBar: () => null }));
+jest.mock("@/components/terminal-ui/session-target-sheets", () => ({
+  SessionTargetSheets: () => null,
+}));
 jest.mock("@/components/terminal-ui/font-size-sheet", () => ({ FontSizeSheet: () => null }));
 jest.mock("@/components/terminal-ui/diagnostics-sheet", () => ({ DiagnosticsSheet: () => null }));
 jest.mock("@/components/terminal-ui/selection-toolbar", () => ({ SelectionToolbar: () => null }));
@@ -72,7 +99,33 @@ jest.mock("@/components/terminal-ui/upload-progress-bar", () => ({
 jest.mock("@/components/terminal-ui/connection-status", () => ({
   ConnectionStateOverlay: () => null,
 }));
-jest.mock("@/components/ui/confirm", () => ({ Confirm: () => null }));
+jest.mock("@/components/ui/confirm", () => {
+  const React = require("react") as typeof import("react");
+  const { Pressable, Text } = require("react-native") as typeof import("react-native");
+  return {
+    Confirm: ({ onConfirm, visible }: { onConfirm: () => void; visible: boolean }) =>
+      visible
+        ? React.createElement(
+            Pressable,
+            { accessibilityLabel: "Confirm kill", onPress: onConfirm },
+            React.createElement(Text, null, "Kill session"),
+          )
+        : null,
+  };
+});
+let mockLaunchResult: ((result: { status: string }) => void) | null = null;
+const mockDetachPendingLaunch = jest.fn();
+
+jest.mock("@/data/queries/launcher", () => ({
+  attachPendingLaunchDelivery: (
+    _transport: unknown,
+    options: { onResult?: (result: { status: string }) => void },
+  ) => {
+    mockLaunchResult = options.onResult ?? null;
+    return mockDetachPendingLaunch;
+  },
+}));
+
 const mockSetNotice = jest.fn();
 
 jest.mock("@/components/terminal-ui/use-terminal-transfers", () => ({
@@ -88,12 +141,15 @@ jest.mock("@/components/terminal-ui/use-terminal-transfers", () => ({
 interface MockSurfaceProps {
   onLink?: (url: string) => void;
   onDisplayChange?: (display: DisplayControlState) => void;
+  onTransport?: (transport: unknown) => void;
 }
 
 let mockTerminalSurfaceProps: MockSurfaceProps = {};
 const mockTakeControl = jest.fn();
 const mockBlur = jest.fn();
 const mockFocus = jest.fn();
+const mockSendKey = jest.fn();
+const mockSetFollow = jest.fn();
 
 jest.mock("@/terminal/TerminalSurface", () => {
   const React = require("react") as typeof import("react");
@@ -105,6 +161,8 @@ jest.mock("@/terminal/TerminalSurface", () => {
         ref: React.ForwardedRef<{
           blur: () => void;
           focus: () => void;
+          sendKey: (sequence: string) => void;
+          setFollow: (follow: boolean) => void;
           takeControl: () => void;
         }>,
       ) => {
@@ -112,6 +170,8 @@ jest.mock("@/terminal/TerminalSurface", () => {
         React.useImperativeHandle(ref, () => ({
           blur: mockBlur,
           focus: mockFocus,
+          sendKey: mockSendKey,
+          setFollow: mockSetFollow,
           takeControl: mockTakeControl,
         }));
         return React.createElement(View, { testID: "terminal" });
@@ -160,7 +220,15 @@ const host: HostOut = {
   capacity_at: null,
 };
 
-async function renderOverlay() {
+interface OverlayOverrides {
+  focused?: boolean;
+  onDismiss?: () => void;
+  onKill?: () => Promise<void>;
+}
+
+async function renderOverlay(overrides: boolean | OverlayOverrides = false) {
+  const options: OverlayOverrides =
+    typeof overrides === "boolean" ? { focused: overrides } : overrides;
   await render(
     <SafeAreaProvider
       initialMetrics={{
@@ -170,10 +238,10 @@ async function renderOverlay() {
     >
       <ThemeProvider>
         <TerminalOverlay
-          focused={false}
+          focused={options.focused ?? false}
           host={host}
-          onDismiss={jest.fn()}
-          onKill={jest.fn(async () => undefined)}
+          onDismiss={options.onDismiss ?? jest.fn()}
+          onKill={options.onKill ?? jest.fn(async () => undefined)}
           onRename={jest.fn(async () => undefined)}
           onRestart={jest.fn(async () => undefined)}
           session={session}
@@ -208,6 +276,43 @@ describe("terminal overlay dismissal", () => {
     await act(() => mockTerminalSurfaceProps.onLink?.("javascript:alert(1)"));
     expect(Linking.openURL).toHaveBeenCalledTimes(1);
     expect(mockSetNotice).toHaveBeenCalledWith("The terminal link uses an unsupported URL scheme.");
+  });
+});
+
+describe("terminal overlay kill", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockHeaderProps = {};
+  });
+
+  test("leaves the terminal as soon as the kill is confirmed", async () => {
+    const onDismiss = jest.fn();
+    const onKill = jest.fn(async () => undefined);
+    await renderOverlay({ onDismiss, onKill });
+
+    await act(() => {
+      mockHeaderProps.onKill?.();
+    });
+    await act(() => {
+      fireEvent.press(screen.getByLabelText("Confirm kill"));
+    });
+
+    expect(onKill).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  test("leaves even when the kill never answers", async () => {
+    const onDismiss = jest.fn();
+    await renderOverlay({ onDismiss, onKill: () => new Promise<void>(() => undefined) });
+
+    await act(() => {
+      mockHeaderProps.onKill?.();
+    });
+    await act(() => {
+      fireEvent.press(screen.getByLabelText("Confirm kill"));
+    });
+
+    expect(onDismiss).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -252,6 +357,45 @@ describe("terminal overlay display control", () => {
     });
     expect(mockTakeControl).toHaveBeenCalled();
     expect(screen.queryByTestId("terminal-display-control")).toBeNull();
+  });
+});
+
+describe("terminal overlay agent launch", () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.clearAllMocks();
+    mockTerminalSurfaceProps = {};
+    mockAccessoryBarProps = {};
+    mockLaunchResult = null;
+    mockKeyboard.visible = false;
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test("raises the keyboard once the launched agent command has gone out", async () => {
+    await renderOverlay(true);
+    await act(() => mockTerminalSurfaceProps.onTransport?.({ on: () => () => undefined }));
+
+    await act(() => mockLaunchResult?.({ status: "sent" }));
+    await act(async () => {
+      jest.advanceTimersByTime(LAUNCH_FOCUS_DELAY_MS);
+    });
+
+    expect(mockFocus).toHaveBeenCalledTimes(1);
+  });
+
+  test("leaves a session that carried no launch alone", async () => {
+    await renderOverlay(true);
+    await act(() => mockTerminalSurfaceProps.onTransport?.({ on: () => () => undefined }));
+
+    await act(() => mockLaunchResult?.({ status: "missing" }));
+    await act(async () => {
+      jest.advanceTimersByTime(LAUNCH_FOCUS_DELAY_MS * 4);
+    });
+
+    expect(mockFocus).not.toHaveBeenCalled();
   });
 });
 
@@ -307,5 +451,54 @@ describe("terminal overlay keyboard hold", () => {
 
     expect(mockBlur).not.toHaveBeenCalled();
     expect(mockFocus).not.toHaveBeenCalled();
+  });
+});
+
+describe("terminal overlay agent keys", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    resetPinnedCommandsCache();
+  });
+
+  test("hands the strip the keys pinned for whatever this session is running", async () => {
+    // The fixture session is running Codex, so the strip is Codex's, not a shell's.
+    expect(agentKindFor(session.foreground_command)).toBe("codex");
+    await renderOverlay();
+
+    const ids = mockAccessoryBarProps.commands?.map((command) => command.id) ?? [];
+    expect(ids).toContain("key-BackTab");
+    expect(ids.length).toBeGreaterThan(0);
+    for (const id of ids) {
+      expect(terminalCommandsFor("codex").map((command) => command.id)).toContain(id);
+    }
+  });
+
+  test("sends a pressed key straight through to the surface", async () => {
+    await renderOverlay();
+    const [cycleMode] = resolvePinnedCommands("codex", ["key-BackTab"]);
+
+    await act(() => mockAccessoryBarProps.onCommand?.(cycleMode as TerminalCommand));
+    expect(mockSendKey).toHaveBeenCalledTimes(1);
+    expect(mockSendKey).toHaveBeenCalledWith("\u001b[Z");
+  });
+
+  test("spaces a double press apart so the agent reads two of them", async () => {
+    jest.useFakeTimers();
+    try {
+      await renderOverlay();
+      const [rewind] = resolvePinnedCommands("codex", ["esc-esc"]);
+
+      await act(() => mockAccessoryBarProps.onCommand?.(rewind as TerminalCommand));
+      // Two escapes in one packet read as a single modified key, not as a rewind.
+      expect(mockSendKey).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        jest.advanceTimersByTime(REPEAT_PRESS_GAP_MS);
+      });
+      expect(mockSendKey).toHaveBeenCalledTimes(2);
+      expect(mockSendKey).toHaveBeenNthCalledWith(2, "\u001b");
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
-
+import type { ImageSource } from "@/components/media/image-source";
+import { ImageSourceSheet } from "@/components/media/image-source-sheet";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
@@ -20,11 +21,12 @@ export interface WorkspaceIconPickerProps {
 
 export function WorkspaceIconPicker({ name, value, onChange }: WorkspaceIconPickerProps) {
   const [error, setError] = useState<string | null>(null);
+  const [sourceVisible, setSourceVisible] = useState(false);
 
-  const chooseImage = async () => {
+  const chooseImage = async (source: ImageSource) => {
     setError(null);
     try {
-      const picked = await pickWorkspaceIcon();
+      const picked = await pickWorkspaceIcon(source);
       if (picked) onChange(picked);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "The image could not be read.");
@@ -43,12 +45,13 @@ export function WorkspaceIconPicker({ name, value, onChange }: WorkspaceIconPick
         <View style={styles.copy}>
           <Text variant="label">Workspace icon</Text>
           <Text color="mutedForeground" variant="caption">
-            PNG or WebP. Use initials to keep this workspace text-only.
+            Any photo works; it is squared down for you. Use initials to keep this workspace
+            text-only.
           </Text>
         </View>
       </View>
       <View style={styles.actions}>
-        <Button onPress={() => void chooseImage()} size="sm" variant="outline">
+        <Button onPress={() => setSourceVisible(true)} size="sm" variant="outline">
           <Icon color="foreground" name="ImagePlus" size={spacing[4]} />
           Upload image
         </Button>
@@ -62,6 +65,14 @@ export function WorkspaceIconPicker({ name, value, onChange }: WorkspaceIconPick
           {error}
         </Text>
       ) : null}
+      <ImageSourceSheet
+        onDismiss={() => setSourceVisible(false)}
+        onSelect={(source) => {
+          setSourceVisible(false);
+          void chooseImage(source);
+        }}
+        visible={sourceVisible}
+      />
     </View>
   );
 }

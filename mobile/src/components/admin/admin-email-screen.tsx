@@ -2,11 +2,11 @@ import { useState } from "react";
 import { Pressable, RefreshControl, StyleSheet, View } from "react-native";
 
 import { formatLongtailDate } from "@/components/longtail/longtail-format";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Badge, type BadgeVariant } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
 import { Spinner } from "@/components/ui/spinner";
@@ -39,27 +39,29 @@ interface MailStatusCardProps {
 
 function MailStatusCard({ mail, sending, onSendTest }: MailStatusCardProps): React.JSX.Element {
   return (
-    <Card style={styles.statusCard} variant="flat">
-      <View style={styles.rowHeader}>
-        <Text variant="label">Delivery</Text>
-        <Badge variant={mail.delivering ? "success" : "warning"}>
-          {mail.delivering ? "delivering" : "not delivering"}
-        </Badge>
+    <SettingsBlock>
+      <View style={styles.statusCard}>
+        <View style={styles.rowHeader}>
+          <Text variant="label">Delivery</Text>
+          <Badge variant={mail.delivering ? "success" : "warning"}>
+            {mail.delivering ? "delivering" : "not delivering"}
+          </Badge>
+        </View>
+        {mail.delivering ? (
+          <Text color="mutedForeground" variant="caption">
+            Delivering via {mail.smtp_host ?? mail.backend} as {mail.from_address}
+          </Text>
+        ) : (
+          <Text color="mutedForeground" variant="caption">
+            Not delivering — backend is {mail.backend}. Password resets and invitations are recorded
+            but never sent. Set SPAWN_SMTP_HOST to turn delivery on.
+          </Text>
+        )}
+        <Button loading={sending} onPress={onSendTest} size="sm" variant="outline">
+          {sending ? "Sending…" : "Send test email"}
+        </Button>
       </View>
-      {mail.delivering ? (
-        <Text color="mutedForeground" variant="caption">
-          Delivering via {mail.smtp_host ?? mail.backend} as {mail.from_address}
-        </Text>
-      ) : (
-        <Text color="mutedForeground" variant="caption">
-          Not delivering — backend is {mail.backend}. Password resets and invitations are recorded
-          but never sent. Set SPAWN_SMTP_HOST to turn delivery on.
-        </Text>
-      )}
-      <Button loading={sending} onPress={onSendTest} size="sm" variant="outline">
-        {sending ? "Sending…" : "Send test email"}
-      </Button>
-    </Card>
+    </SettingsBlock>
   );
 }
 
@@ -76,7 +78,7 @@ export function AdminEmailRecord({
 }: AdminEmailRecordProps): React.JSX.Element {
   const theme = useTheme();
   return (
-    <Card padded={false} testID={`admin-email-${email.id}`} variant="flat">
+    <SettingsBlock padded={false} testID={`admin-email-${email.id}`}>
       <Pressable
         accessibilityLabel={`${expanded ? "Collapse" : "Expand"} email ${email.subject}`}
         accessibilityRole="button"
@@ -116,7 +118,7 @@ export function AdminEmailRecord({
           </Text>
         </View>
       ) : null}
-    </Card>
+    </SettingsBlock>
   );
 }
 
@@ -152,7 +154,7 @@ export function AdminEmailScreen(): React.JSX.Element {
 
   return (
     <SettingsScreen
-      description="Every attempted message is logged. Reset and invitation credentials are stripped from the recorded body."
+      description="Every attempt is logged. Credentials are stripped from the body."
       refreshControl={
         <RefreshControl
           onRefresh={() => void refresh()}

@@ -1,8 +1,10 @@
 import { useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
+import { randomUUID } from "expo-crypto";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   createLaunchOrchestrator,
   type LaunchRequest,
+  type WidgetRequest,
 } from "@/components/launcher/launch-orchestrator";
 import { pendingLaunches } from "@/components/launcher/pending-launch";
 import {
@@ -27,6 +29,7 @@ export const launcherOrchestrator = createLaunchOrchestrator({
   patchWorkspace: (workspaceId, patch) => patchWorkspace(workspaceId, patch),
   createSession,
   deleteSession,
+  newId: randomUUID,
   pending: pendingLaunches,
 });
 
@@ -126,6 +129,20 @@ export function useLaunchSession() {
   });
 }
 
+/** Adds a file explorer pane: layout only, so there is no session to open after. */
+export function useAddFilesWidget() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (request: WidgetRequest) => launcherOrchestrator.addFilesWidget(request),
+    onSuccess: async (_workspace, request) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: qk.workspace(request.workspaceId) }),
+        queryClient.invalidateQueries({ queryKey: qk.workspaces() }),
+      ]);
+    },
+  });
+}
+
 export interface PendingLaunchBindingOptions {
   initialSessionStatus?: string;
   onResult?(result: PendingLaunchDeliveryResult): void;
@@ -164,5 +181,5 @@ export async function keepLaunchedShell(sessionId: string): Promise<void> {
   await launcherOrchestrator.keepShell(sessionId);
 }
 
-export type { LaunchRequest, PendingLaunchDeliveryResult, WorkspaceOut };
+export type { LaunchRequest, PendingLaunchDeliveryResult, WidgetRequest, WorkspaceOut };
 export { getSession };

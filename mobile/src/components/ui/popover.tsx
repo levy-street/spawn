@@ -158,6 +158,8 @@ export function positionPopover({
 export interface PopoverProps {
   visible: boolean;
   onDismiss: () => void;
+  /** Called when this popover comes back after the one raised over it closed. */
+  onReturn?: () => void;
   anchorRef?: RefObject<View | null>;
   anchorRect?: PopoverAnchorRect;
   side?: PopoverSide;
@@ -178,6 +180,7 @@ export interface PopoverProps {
 export function Popover({
   visible,
   onDismiss,
+  onReturn,
   interactive = false,
   accessibilityLabel,
   contentStyle,
@@ -186,7 +189,12 @@ export function Popover({
   // Anchor geometry stays in the public contract for existing callers, but every
   // popover now deliberately shares the app's bottom-drawer presentation.
   return (
-    <Sheet onDismiss={onDismiss} testID="popover-content" visible={visible}>
+    <Sheet
+      onDismiss={onDismiss}
+      testID="popover-content"
+      visible={visible}
+      {...(onReturn === undefined ? {} : { onReturn })}
+    >
       <View
         accessibilityLabel={accessibilityLabel}
         accessibilityRole={interactive ? "menu" : "text"}

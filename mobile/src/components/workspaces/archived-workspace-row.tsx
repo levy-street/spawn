@@ -53,7 +53,7 @@ export function ArchivedWorkspaceRow({
           trailing={<Icon color="mutedForeground" name="ChevronRight" size={sizing.control.icon} />}
         />
       </View>
-      <ListSeparator inset={false} />
+      <ListSeparator />
       <View style={styles.actions}>
         <Button disabled={busy} onPress={onRestore} size="sm" variant="outline">
           <Icon color="foreground" name="RotateCcw" size={sizing.control.spinner} />

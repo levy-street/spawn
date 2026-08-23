@@ -8,7 +8,7 @@ import {
   useReducer,
   useRef,
 } from "react";
-import { Pressable, StyleSheet, useWindowDimensions, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import Animated, {
   interpolate,
@@ -19,15 +19,25 @@ import Animated, {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { scheduleOnRN } from "react-native-worklets";
 
-import { Icon } from "@/components/ui/icon";
+import { Icon, type IconName } from "@/components/ui/icon";
 import { useReducedMotionPreference } from "@/components/ui/swipe-dismiss-overlay";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { alpha, borderWidth, chrome, layer, shadow, spacing, useTheme } from "@/theme";
+import { borderWidth, layer, opacity as opacityToken, shadow, spacing, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 const MAX_VISIBLE_TOASTS = 5;
 const TOAST_SWIPE_THRESHOLD_RATIO = 0.3;
 const TOAST_VELOCITY_PROJECTION_SECONDS = 0.15;
+/** How far a downward drag actually travels: the notice is pinned to the top. */
+const TOAST_DOWNWARD_RESISTANCE = 0.2;
+
+/** What each notice leads with: an outcome, a fault, or a plain remark. */
+const GLYPH = {
+  success: "Check",
+  error: "AlertTriangle",
+  default: "Bell",
+} as const satisfies Record<ToastVariant, IconName>;
 
 export type ToastVariant = "default" | "success" | "error";
 
@@ -121,15 +131,6 @@ export interface ToastApi {
 
 const ToastContext = createContext<ToastApi | null>(null);
 
-function rgbaFromHex(hex: string, opacity: number): string {
-  const match = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
-  if (!match) return hex;
-  return `rgba(${Number.parseInt(match[1] ?? "0", 16)},${Number.parseInt(
-    match[2] ?? "0",
-    16,
-  )},${Number.parseInt(match[3] ?? "0", 16)},${opacity})`;
-}
-
 export interface ToastProps {
   toast: ToastRecord;
   onDismiss: (id: string) => void;
@@ -138,9 +139,12 @@ export interface ToastProps {
 export function Toast({ toast, onDismiss }: ToastProps): React.JSX.Element {
   const theme = useTheme();
   const reducedMotion = useReducedMotionPreference();
-  const translateX = useSharedValue(reducedMotion ? 0 : theme.motion.transform.toastSlide);
+  const translateX = useSharedValue(0);
+  const translateY = useSharedValue(reducedMotion ? 0 : -theme.motion.transform.toastDrop);
   const opacity = useSharedValue(0);
   const width = useSharedValue(theme.space(80));
+  const height = useSharedValue(theme.space(16));
+  const remaining = useSharedValue(1);
 
   useEffect(() => {
     const transition = toast.leaving
@@ -148,64 +152,142 @@ export function Toast({ toast, onDismiss }: ToastProps): React.JSX.Element {
       : theme.motion.transition.toastEnter;
     const duration = reducedMotion ? theme.motion.duration.reduced : transition.duration;
     opacity.value = withTiming(toast.leaving ? 0 : 1, { duration, easing: transition.easing });
-    translateX.value = withTiming(
-      reducedMotion ? 0 : toast.leaving ? theme.motion.transform.toastSlide : 0,
+    // A notice arrives from above the screen and leaves the same way, because
+    // that is the edge it is pinned to.
+    translateY.value = withTiming(
+      reducedMotion ? 0 : toast.leaving ? -theme.motion.transform.toastDrop : 0,
       { duration, easing: transition.easing },
     );
-  }, [opacity, reducedMotion, theme.motion, toast.leaving, translateX]);
+  }, [opacity, reducedMotion, theme.motion, toast.leaving, translateY]);
+
+  // The hairline along the foot spends the notice's life: you can see how long
+  // is left rather than guessing whether it is about to go.
+  useEffect(() => {
+    if (reducedMotion || toast.leaving) return;
+    // Read from the deadline rather than the duration, so a notice that was
+    // refreshed by a repeat, or remounted, shows the time it actually has.
+    const timeLeft = Math.max(0, toast.expiresAt - Date.now());
+    remaining.value = Math.min(1, timeLeft / Math.max(1, toast.durationMs));
+    remaining.value = withTiming(0, {
+      duration: timeLeft,
+      easing: theme.motion.easing.linear,
+    });
+  }, [reducedMotion, remaining, theme.motion, toast.durationMs, toast.expiresAt, toast.leaving]);
 
   const dismiss = useCallback(() => onDismiss(toast.id), [onDismiss, toast.id]);
+
+  // Read on this thread and handed to the gesture as plain numbers and configs.
+  // A pan callback is a worklet: calling `theme.space` from inside one reaches
+  // for a function that does not exist on the UI thread, and that throws where
+  // nothing can catch it — the swipe took the app down with it.
+  const enterTransition = theme.motion.transition.toastEnter;
+  const exitTransition = theme.motion.transition.toastExit;
+  const exitClearance = theme.space(4);
 
   const swipe = useMemo(
     () =>
       Gesture.Pan()
-        .activeOffsetX([-theme.space(3), theme.space(3)])
-        .failOffsetY([-theme.space(2), theme.space(2)])
         .onUpdate((event) => {
+          "worklet";
           translateX.value = event.translationX;
-          opacity.value = interpolate(
-            Math.abs(event.translationX),
-            [0, Math.max(1, width.value)],
-            [1, 0],
-          );
+          // Up clears it; down is the direction it came from, so it only gives
+          // a little and springs back.
+          translateY.value =
+            event.translationY < 0
+              ? event.translationY
+              : event.translationY * TOAST_DOWNWARD_RESISTANCE;
+          const sideways = Math.abs(event.translationX) / Math.max(1, width.value);
+          const upward = Math.max(0, -event.translationY) / Math.max(1, height.value);
+          opacity.value = interpolate(Math.max(sideways, upward), [0, 1], [1, 0]);
         })
         .onEnd((event) => {
-          const projected =
+          "worklet";
+          const projectedX =
             event.translationX + event.velocityX * TOAST_VELOCITY_PROJECTION_SECONDS;
-          const shouldDismiss = Math.abs(projected) >= width.value * TOAST_SWIPE_THRESHOLD_RATIO;
-          if (shouldDismiss) {
-            const destination = projected < 0 ? -width.value : width.value;
-            translateX.value = withTiming(
-              reducedMotion ? 0 : destination,
-              theme.motion.transition.toastExit,
-              (finished) => {
-                if (finished) scheduleOnRN(dismiss);
-              },
-            );
-            opacity.value = withTiming(0, theme.motion.transition.toastExit);
+          const projectedY =
+            event.translationY + event.velocityY * TOAST_VELOCITY_PROJECTION_SECONDS;
+          const swipedAside = Math.abs(projectedX) >= width.value * TOAST_SWIPE_THRESHOLD_RATIO;
+          const swipedUp = -projectedY >= height.value * TOAST_SWIPE_THRESHOLD_RATIO;
+          if (swipedAside || swipedUp) {
+            if (swipedUp && !swipedAside) {
+              translateY.value = withTiming(
+                reducedMotion ? 0 : -(height.value + exitClearance),
+                exitTransition,
+                (finished) => {
+                  if (finished) scheduleOnRN(dismiss);
+                },
+              );
+            } else {
+              translateX.value = withTiming(
+                reducedMotion ? 0 : projectedX < 0 ? -width.value : width.value,
+                exitTransition,
+                (finished) => {
+                  if (finished) scheduleOnRN(dismiss);
+                },
+              );
+            }
+            opacity.value = withTiming(0, exitTransition);
           } else {
-            translateX.value = withTiming(0, theme.motion.transition.toastEnter);
-            opacity.value = withTiming(1, theme.motion.transition.toastEnter);
+            translateX.value = withTiming(0, enterTransition);
+            translateY.value = withTiming(0, enterTransition);
+            opacity.value = withTiming(1, enterTransition);
           }
         }),
-    [dismiss, opacity, reducedMotion, theme.motion, theme.space, translateX, width],
+    [
+      dismiss,
+      enterTransition,
+      exitClearance,
+      exitTransition,
+      height,
+      opacity,
+      reducedMotion,
+      translateX,
+      translateY,
+      width,
+    ],
   );
 
   const animatedStyle = useAnimatedStyle(() => ({
     opacity: opacity.value,
-    transform: reducedMotion ? [] : [{ translateX: translateX.value }],
+    transform: reducedMotion
+      ? []
+      : [{ translateX: translateX.value }, { translateY: translateY.value }],
   }));
 
-  const borderColor =
+  // Scaled from the left rather than resized: a width animation would relayout
+  // the notice sixty times a second for a two-pixel rule.
+  const countdownStyle = useAnimatedStyle(() => ({
+    transform: [
+      { translateX: -(width.value * (1 - remaining.value)) / 2 },
+      { scaleX: remaining.value },
+    ],
+  }));
+
+  const tone =
     toast.variant === "error"
-      ? rgbaFromHex(theme.colors.destructive, alpha.a40)
-      : theme.colors.border;
+      ? "destructive"
+      : toast.variant === "success"
+        ? "success"
+        : "mutedForeground";
+  const plateBackground =
+    toast.variant === "error"
+      ? theme.colors.destructiveSoft
+      : toast.variant === "success"
+        ? theme.colors.successSoft
+        : theme.colors.muted;
 
   const message = (
     <View style={styles.messageColumn}>
-      <Text variant="body">{toast.message}</Text>
+      <Text numberOfLines={2} variant="uiBase" weight="medium">
+        {toast.message}
+      </Text>
       {toast.detail ? (
-        <Text color="mutedForeground" style={{ marginTop: theme.space(0.5) }} variant="caption">
+        <Text
+          color="mutedForeground"
+          numberOfLines={2}
+          style={{ marginTop: theme.space(0.5) }}
+          variant="caption"
+        >
           {toast.detail}
         </Text>
       ) : null}
@@ -219,60 +301,71 @@ export function Toast({ toast, onDismiss }: ToastProps): React.JSX.Element {
         accessibilityRole={toast.variant === "error" ? "alert" : "summary"}
         onLayout={(event) => {
           width.value = event.nativeEvent.layout.width;
+          height.value = event.nativeEvent.layout.height;
         }}
         style={[
           styles.toast,
           {
             backgroundColor: theme.colors.popover,
-            borderColor,
-            borderRadius: theme.radii.lg,
+            borderColor: theme.colors.popoverBorder,
+            borderRadius: theme.radii.xxl,
             boxShadow: shadow.lg,
-            gap: theme.space(2.5),
-            paddingHorizontal: theme.space(3),
-            paddingVertical: theme.space(2.5),
           },
           animatedStyle,
         ]}
         testID={`toast-${toast.id}`}
       >
-        <View style={{ marginTop: theme.space(0.5) }}>
-          {toast.icon ??
-            (toast.variant === "error" ? (
-              <Icon color="destructive" name="AlertCircle" size={theme.space(4)} />
+        <View style={[styles.clip, { borderRadius: theme.radii.xxl - borderWidth.hairline }]}>
+          <View style={[styles.row, { gap: theme.space(3), padding: theme.space(3) }]}>
+            <View style={[styles.plate, { backgroundColor: plateBackground }]}>
+              {toast.icon ?? (
+                <Icon color={tone} name={GLYPH[toast.variant]} size={theme.space(4)} />
+              )}
+            </View>
+            {toast.onPress ? (
+              <Pressable
+                accessibilityLabel={toast.actionLabel ?? toast.message}
+                accessibilityRole="button"
+                onPress={() => {
+                  toast.onPress?.();
+                  dismiss();
+                }}
+                style={styles.messageColumn}
+              >
+                {message}
+              </Pressable>
             ) : (
-              <Icon color="success" name="CheckCircle2" size={theme.space(4)} />
-            ))}
+              message
+            )}
+            <Pressable
+              accessibilityLabel="Dismiss notification"
+              accessibilityRole="button"
+              hitSlop={theme.space(2)}
+              onPress={dismiss}
+              style={({ pressed }) => [
+                styles.dismiss,
+                {
+                  backgroundColor: pressed ? theme.colors.accent : "transparent",
+                  borderRadius: theme.radii.pill,
+                },
+              ]}
+            >
+              <Icon color="mutedForeground" name="X" size={theme.space(3.5)} />
+            </Pressable>
+          </View>
+          {reducedMotion ? null : (
+            <Animated.View
+              accessibilityElementsHidden
+              importantForAccessibility="no"
+              pointerEvents="none"
+              style={[
+                styles.countdown,
+                { backgroundColor: theme.colors[tone], opacity: opacityToken.countdown },
+                countdownStyle,
+              ]}
+            />
+          )}
         </View>
-        {toast.onPress ? (
-          <Pressable
-            accessibilityLabel={toast.actionLabel ?? toast.message}
-            accessibilityRole="button"
-            onPress={() => {
-              toast.onPress?.();
-              dismiss();
-            }}
-            style={styles.messageColumn}
-          >
-            {message}
-          </Pressable>
-        ) : (
-          message
-        )}
-        <Pressable
-          accessibilityLabel="Dismiss notification"
-          accessibilityRole="button"
-          hitSlop={theme.space(3)}
-          onPress={dismiss}
-          style={({ pressed }) => [
-            styles.dismiss,
-            {
-              backgroundColor: pressed ? theme.colors.accent : "transparent",
-              borderRadius: theme.radii.sm,
-            },
-          ]}
-        >
-          <Icon color="mutedForeground" name="X" size={theme.space(3.5)} />
-        </Pressable>
       </Animated.View>
     </GestureDetector>
   );
@@ -281,7 +374,6 @@ export function Toast({ toast, onDismiss }: ToastProps): React.JSX.Element {
 export function ToastProvider({ children }: PropsWithChildren): React.JSX.Element {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
-  const viewport = useWindowDimensions();
   const [queue, dispatch] = useReducer(toastQueueReducer, []);
   const queueRef = useRef<readonly ToastRecord[]>(queue);
   const nextId = useRef(1);
@@ -383,8 +475,6 @@ export function ToastProvider({ children }: PropsWithChildren): React.JSX.Elemen
     [clear, dismiss, show],
   );
 
-  const hostWidth = Math.min(theme.space(80), viewport.width - theme.space(8));
-
   return (
     <ToastContext.Provider value={api}>
       {children}
@@ -395,9 +485,12 @@ export function ToastProvider({ children }: PropsWithChildren): React.JSX.Elemen
           styles.host,
           {
             gap: theme.space(2),
-            right: theme.space(4),
-            top: insets.top + chrome.sidebarRailWidth,
-            width: hostWidth,
+            // Pinned to the top: a notice drops in from off-screen and spans the
+            // page's own measure, the screen less one gutter either side.
+            left: insets.left + sizing.screen.gutter,
+            paddingTop: insets.top + spacing[2],
+            right: insets.right + sizing.screen.gutter,
+            top: spacing[0],
             zIndex: layer.toast,
           },
         ]}
@@ -418,11 +511,22 @@ export function useToast(): ToastApi {
 }
 
 const styles = StyleSheet.create({
+  countdown: {
+    bottom: spacing[0],
+    height: spacing[0.5],
+    left: spacing[0],
+    position: "absolute",
+    right: spacing[0],
+  },
+  clip: {
+    overflow: "hidden",
+    width: "100%",
+  },
   dismiss: {
     alignItems: "center",
-    height: spacing[5],
+    height: spacing[7],
     justifyContent: "center",
-    width: spacing[5],
+    width: spacing[7],
   },
   host: {
     position: "absolute",
@@ -431,9 +535,20 @@ const styles = StyleSheet.create({
     flex: 1,
     minWidth: 0,
   },
-  toast: {
-    alignItems: "flex-start",
-    borderWidth: borderWidth.hairline,
+  plate: {
+    alignItems: "center",
+    borderRadius: spacing[2],
+    height: spacing[8],
+    justifyContent: "center",
+    width: spacing[8],
+  },
+  row: {
+    alignItems: "center",
     flexDirection: "row",
+    width: "100%",
+  },
+  toast: {
+    borderWidth: borderWidth.hairline,
+    width: "100%",
   },
 });

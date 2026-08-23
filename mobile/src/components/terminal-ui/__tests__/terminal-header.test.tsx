@@ -24,19 +24,21 @@ interface MockAppHeaderProps {
   testID?: string;
 }
 
-interface MockPopoverProps {
+interface MockMenuEntry {
+  id: string;
+  type?: "item" | "separator" | "label";
+  label?: string;
+  icon?: unknown;
+  destructive?: boolean;
+  onPress?: () => void;
+}
+interface MockMenuProps {
   visible: boolean;
-  items: Array<{
-    key: string;
-    label: string;
-    icon?: string;
-    destructive?: boolean;
-    onPress: () => void;
-  }>;
+  entries: readonly MockMenuEntry[];
 }
 
 let mockAppHeaderProps: MockAppHeaderProps | null = null;
-let mockPopoverProps: MockPopoverProps | null = null;
+let mockMenuProps: MockMenuProps | null = null;
 
 jest.mock("@/components/layout/app-header", () => {
   const React = require("react") as typeof import("react");
@@ -102,16 +104,16 @@ jest.mock("@/components/ui/dialog", () => {
   };
 });
 
-jest.mock("@/components/ui/native-popover", () => {
+jest.mock("@/components/ui/menu", () => {
   const React = require("react") as typeof import("react");
   const { Text, View } = require("react-native") as typeof import("react-native");
   return {
-    NativePopover: (props: MockPopoverProps) => {
-      mockPopoverProps = props;
+    Menu: (props: MockMenuProps) => {
+      mockMenuProps = props;
       return React.createElement(
         View,
-        { testID: "mock-native-popover", accessibilityState: { expanded: props.visible } },
-        props.items.map((item) => React.createElement(Text, { key: item.key }, item.label)),
+        { testID: "mock-menu", accessibilityState: { expanded: props.visible } },
+        props.entries.map((entry) => React.createElement(Text, { key: entry.id }, entry.label)),
       );
     },
   };
@@ -126,9 +128,12 @@ function props(overrides: Partial<TerminalHeaderProps> = {}): TerminalHeaderProp
   return {
     title: "Build",
     hostName: "studio",
+    cwd: "/Users/dev/spawn",
     foregroundCommand: "codex",
     onBack: jest.fn(),
     onRename: jest.fn(async () => undefined),
+    onChangeFolder: jest.fn(),
+    onSwitchAgent: jest.fn(),
     onRestart: jest.fn(),
     onKill: jest.fn(),
     onUpload: jest.fn(),
@@ -157,7 +162,7 @@ describe("TerminalHeader", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockAppHeaderProps = null;
-    mockPopoverProps = null;
+    mockMenuProps = null;
   });
 
   test("uses AppHeader with its standard back action and terminal metadata", async () => {
@@ -183,13 +188,16 @@ describe("TerminalHeader", () => {
     expect(input.onBack).toHaveBeenCalledTimes(1);
   });
 
-  test("renders every action through NativePopover and marks kill destructive", async () => {
+  test("presents every action as a drawer row and marks kill destructive", async () => {
     const input = props();
     await renderHeader(input);
-    const items = mockPopoverProps?.items ?? [];
+    const entries = mockMenuProps?.entries ?? [];
+    const items = entries.filter((entry) => entry.type !== "separator");
 
     expect(items.map((item) => item.label)).toEqual([
       "Rename",
+      "Change agent",
+      "Change folder",
       "Restart",
       "Upload file",
       "Search terminal",
@@ -198,33 +206,32 @@ describe("TerminalHeader", () => {
       "Diagnostics",
       "Kill session",
     ]);
-    expect(items.map((item) => item.icon)).toEqual([
-      "pencil",
-      "arrow.clockwise",
-      "square.and.arrow.up",
-      "magnifyingglass",
-      "textformat.size",
-      "doc.on.doc",
-      "wrench.and.screwdriver",
-      "trash",
-    ]);
-    expect(items.at(-1)).toMatchObject({ key: "kill", destructive: true });
+    // Every row carries a glyph, and the menu draws exactly one rule: the one
+    // that sets the destructive action apart. Rows are not divided from each other.
+    expect(items.every((item) => item.icon !== undefined)).toBe(true);
+    expect(entries.filter((entry) => entry.type === "separator")).toHaveLength(1);
+    expect(entries.at(-2)).toMatchObject({ type: "separator" });
+    expect(items.at(-1)).toMatchObject({ id: "kill", destructive: true });
 
     await act(() => fireEvent.press(screen.getByLabelText("Terminal actions")));
-    expect(screen.getByTestId("mock-native-popover")).toHaveProp("accessibilityState", {
+    expect(screen.getByTestId("mock-menu")).toHaveProp("accessibilityState", {
       expanded: true,
     });
 
-    await act(() => items.find((item) => item.key === "rename")?.onPress());
+    await act(() => items.find((item) => item.id === "rename")?.onPress?.());
     expect(screen.getByTestId("mock-dialog")).toBeTruthy();
     expect(screen.getByLabelText("Session name")).toBeTruthy();
-    items.find((item) => item.key === "restart")?.onPress();
-    items.find((item) => item.key === "upload")?.onPress();
-    items.find((item) => item.key === "search")?.onPress();
-    items.find((item) => item.key === "font-size")?.onPress();
-    items.find((item) => item.key === "copy-mode")?.onPress();
-    items.find((item) => item.key === "diagnostics")?.onPress();
-    items.find((item) => item.key === "kill")?.onPress();
+    items.find((item) => item.id === "switch-agent")?.onPress?.();
+    items.find((item) => item.id === "change-folder")?.onPress?.();
+    items.find((item) => item.id === "restart")?.onPress?.();
+    items.find((item) => item.id === "upload")?.onPress?.();
+    items.find((item) => item.id === "search")?.onPress?.();
+    items.find((item) => item.id === "font-size")?.onPress?.();
+    items.find((item) => item.id === "copy-mode")?.onPress?.();
+    items.find((item) => item.id === "diagnostics")?.onPress?.();
+    items.find((item) => item.id === "kill")?.onPress?.();
+    expect(input.onSwitchAgent).toHaveBeenCalledTimes(1);
+    expect(input.onChangeFolder).toHaveBeenCalledTimes(1);
     expect(input.onRestart).toHaveBeenCalledTimes(1);
     expect(input.onUpload).toHaveBeenCalledTimes(1);
     expect(input.onSearch).toHaveBeenCalledTimes(1);

@@ -18,6 +18,13 @@ export interface LaunchRequest {
   agent?: AgentOut;
 }
 
+export interface WidgetRequest {
+  workspaceId: string;
+  tabId: string;
+  hostId: string;
+  path: string;
+}
+
 export interface LaunchDependencies {
   getWorkspace(workspaceId: string): Promise<WorkspaceOut>;
   patchWorkspace(workspaceId: string, patch: { layout: WorkspaceLayoutV3 }): Promise<WorkspaceOut>;
@@ -29,6 +36,8 @@ export interface LaunchDependencies {
     tile: { x: number; y: number; w: number; h: number };
   }): Promise<SessionOut>;
   deleteSession(sessionId: string): Promise<void>;
+  /** Ids for widget tiles, which the server never mints one for. */
+  newId(): string;
   pending: PendingLaunchStore;
 }
 
@@ -44,6 +53,25 @@ export class LauncherError extends Error {
     super(message);
     this.name = "LauncherError";
   }
+}
+
+/** A placed tile as the workspace envelope carries it: no client-only keys. */
+function toWireTile(tile: {
+  session_id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  widget?: unknown;
+}) {
+  return {
+    session_id: tile.session_id,
+    x: tile.x,
+    y: tile.y,
+    w: tile.w,
+    h: tile.h,
+    ...(isFilesWidget(tile.widget as never) ? { widget: tile.widget as never } : {}),
+  };
 }
 
 export function launchAvailability(
@@ -74,14 +102,7 @@ export function createLaunchOrchestrator(dependencies: LaunchDependencies) {
                 ...tab,
                 layout: {
                   ...tab.layout,
-                  tiles: placement.tiles.map((tile) => ({
-                    session_id: tile.session_id,
-                    x: tile.x,
-                    y: tile.y,
-                    w: tile.w,
-                    h: tile.h,
-                    ...(isFilesWidget(tile.widget) ? { widget: tile.widget } : {}),
-                  })),
+                  tiles: placement.tiles.map(toWireTile),
                 },
               }
             : tab,
@@ -114,6 +135,42 @@ export function createLaunchOrchestrator(dependencies: LaunchDependencies) {
               : "The agent command could not be saved after the shell was created.",
         };
       }
+    },
+
+    /**
+     * A file explorer is layout, not a session: it is placed and saved in the
+     * same PATCH, and there is nothing to create afterwards.
+     */
+    async addFilesWidget(request: WidgetRequest): Promise<WorkspaceOut> {
+      const workspace = await dependencies.getWorkspace(request.workspaceId);
+      const target = workspace.layout.tabs.find((tab) => tab.id === request.tabId);
+      if (!target) throw new LauncherError("tab_missing", "The selected tab no longer exists.");
+      const placement = autoPlaceWorkspaceTiles(target.layout.tiles);
+      if (!placement.tile) {
+        throw new LauncherError("tab_full", "The selected tab has no room for another pane.");
+      }
+
+      const widget = {
+        ...placement.tile,
+        session_id: dependencies.newId(),
+        widget: { kind: "files" as const, host_id: request.hostId, path: request.path },
+      };
+      const layout: WorkspaceLayoutV3 = {
+        ...workspace.layout,
+        active_tab: target.id,
+        tabs: workspace.layout.tabs.map((tab) =>
+          tab.id === target.id
+            ? {
+                ...tab,
+                layout: {
+                  ...tab.layout,
+                  tiles: [...placement.tiles.map(toWireTile), toWireTile(widget)],
+                },
+              }
+            : tab,
+        ),
+      };
+      return dependencies.patchWorkspace(workspace.id, { layout });
     },
 
     async discard(sessionId: string): Promise<void> {

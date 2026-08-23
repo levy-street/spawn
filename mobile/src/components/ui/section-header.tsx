@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
 
+import { ListGroupHeading } from "@/components/ui/list-group";
 import { Text } from "@/components/ui/text";
 import { sizing } from "@/theme/sizing";
 
@@ -13,6 +14,13 @@ export interface SectionHeaderProps {
   trailing?: ReactNode;
 }
 
+/**
+ * A section's heading, drawn the way every list on every page draws one.
+ *
+ * The eyebrow is the only part this adds over `ListGroupHeading`; the heading
+ * itself deliberately lives there, so a section on a host page and a section in
+ * settings cannot drift apart.
+ */
 export function SectionHeader({
   description,
   eyebrow,
@@ -23,56 +31,27 @@ export function SectionHeader({
 }: SectionHeaderProps): React.JSX.Element {
   return (
     <View style={[styles.container, style]} testID={testID}>
-      <View style={styles.copy}>
-        {eyebrow !== undefined ? (
-          <Text color="mutedForeground" style={styles.eyebrow} variant="micro">
-            {eyebrow}
-          </Text>
-        ) : null}
-        <Text accessibilityRole="header" style={styles.title} variant="label" weight="semibold">
-          {title}
+      {eyebrow === undefined ? null : (
+        <Text color="mutedForeground" style={styles.eyebrow} variant="micro">
+          {eyebrow}
         </Text>
-        {description !== undefined ? (
-          <Text color="mutedForeground" style={styles.description} variant="caption">
-            {description}
-          </Text>
-        ) : null}
-      </View>
-      {trailing !== undefined ? <View style={styles.trailing}>{trailing}</View> : null}
+      )}
+      <ListGroupHeading
+        title={title}
+        {...(description === undefined ? {} : { description })}
+        {...(trailing === undefined ? {} : { trailing })}
+      />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
-    alignItems: "center",
-    flexDirection: "row",
-    gap: sizing.sectionHeader.contentGap,
-    minHeight: sizing.sectionHeader.minHeight,
-    paddingHorizontal: sizing.sectionHeader.horizontalPadding,
-    paddingVertical: sizing.sectionHeader.verticalPadding,
-    width: "100%",
-  },
-  copy: {
-    flex: 1,
     gap: sizing.space.tight,
-    minWidth: 0,
-  },
-  description: {
-    fontSize: sizing.type.caption.fontSize,
-    lineHeight: sizing.type.caption.lineHeight,
+    width: "100%",
   },
   eyebrow: {
     fontSize: sizing.type.micro.fontSize,
     lineHeight: sizing.type.micro.lineHeight,
-  },
-  title: {
-    fontSize: sizing.type.componentLabel.fontSize,
-    lineHeight: sizing.type.componentLabel.lineHeight,
-  },
-  trailing: {
-    alignItems: "center",
-    justifyContent: "center",
-    minHeight: sizing.control.minimumTouchTarget,
   },
 });

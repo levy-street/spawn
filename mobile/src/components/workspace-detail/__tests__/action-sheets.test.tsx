@@ -48,6 +48,7 @@ describe("workspace action sheets", () => {
         onDismiss={jest.fn()}
         onDuplicate={jest.fn()}
         onMove={jest.fn()}
+        onMoveToHost={jest.fn()}
         onRemove={jest.fn()}
         onRename={jest.fn()}
         onReorder={jest.fn()}

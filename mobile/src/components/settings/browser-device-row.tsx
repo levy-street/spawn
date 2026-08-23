@@ -1,8 +1,8 @@
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Text } from "@/components/ui/text";
@@ -36,7 +36,7 @@ export function BrowserDeviceRow({
   const [label, setLabel] = useState(device.label ?? "");
 
   return (
-    <Card testID={`browser-device-${device.id}`} variant="flat">
+    <SettingsBlock testID={`browser-device-${device.id}`}>
       <View style={styles.titleLine}>
         <Text variant="label">{device.label ?? "Unnamed browser"}</Text>
         {current ? <Badge variant="info">this device</Badge> : null}
@@ -102,7 +102,7 @@ export function BrowserDeviceRow({
           </Button>
         </View>
       )}
-    </Card>
+    </SettingsBlock>
   );
 }
 

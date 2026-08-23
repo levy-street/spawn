@@ -11,6 +11,12 @@ import { sizing } from "@/theme/sizing";
 
 import { makeHost, makeTab } from "./fixtures";
 
+interface CapturedRefreshControl {
+  props: { onRefresh?: () => void; refreshing?: boolean };
+}
+
+const mockRefreshControls: CapturedRefreshControl[] = [];
+
 jest.mock("@shopify/flash-list", () => {
   const React = jest.requireActual<typeof import("react")>("react");
   const { View } = jest.requireActual<typeof import("react-native")>("react-native");
@@ -23,6 +29,7 @@ jest.mock("@shopify/flash-list", () => {
     ListFooterComponent?: React.ReactNode;
     ItemSeparatorComponent?: React.ComponentType;
     contentContainerStyle?: StyleProp<ViewStyle>;
+    refreshControl?: React.ReactElement;
     testID?: string;
   }
 
@@ -35,9 +42,13 @@ jest.mock("@shopify/flash-list", () => {
       ListFooterComponent,
       ItemSeparatorComponent,
       contentContainerStyle,
+      refreshControl,
       testID,
-    }: MockFlashListProps<Item>) =>
-      React.createElement(
+    }: MockFlashListProps<Item>) => {
+      // React Native's own jest mock renders RefreshControl without its props,
+      // so the pull is asserted on the element the list was handed.
+      if (refreshControl) mockRefreshControls.push(refreshControl as CapturedRefreshControl);
+      return React.createElement(
         View,
         { style: contentContainerStyle, testID },
         data.length === 0 ? ListEmptyComponent : null,
@@ -52,11 +63,22 @@ jest.mock("@shopify/flash-list", () => {
             : null,
         ]),
         ListFooterComponent,
-      ),
+      );
+    },
   };
 });
 
+function latestRefreshControl(): CapturedRefreshControl["props"] {
+  const control = mockRefreshControls[mockRefreshControls.length - 1];
+  if (!control) throw new Error("The pane list rendered no refresh control.");
+  return control.props;
+}
+
 describe("workspace tab pane lists", () => {
+  beforeEach(() => {
+    mockRefreshControls.length = 0;
+  });
+
   it("renders a files widget and routes its host and path on press", async () => {
     const onOpenFiles = jest.fn();
     const tile: Tile = {
@@ -76,6 +98,8 @@ describe("workspace tab pane lists", () => {
         onOpenFiles={onOpenFiles}
         onOpenTerminal={jest.fn()}
         onPaneActions={jest.fn()}
+        onRefresh={jest.fn()}
+        refreshing={false}
         sessionsById={new Map()}
         tab={makeTab("main", [tile])}
         transports={{}}
@@ -107,7 +131,70 @@ describe("workspace tab pane lists", () => {
     expect(onOpenFiles).toHaveBeenCalledWith("host-1", "/Users/spawn/dev");
   });
 
-  it("uses the shared separator between full-bleed pane rows", async () => {
+  it("refreshes the tab on a pull, over the whole page rather than the rows alone", async () => {
+    const onRefresh = jest.fn();
+    const tab = makeTab("main", [
+      {
+        session_id: "files-1",
+        x: 0,
+        y: 0,
+        w: 24,
+        h: 24,
+        widget: { kind: "files", host_id: "host-1", path: "/tmp/one" },
+      },
+    ]);
+    const screen = await render(
+      <PaneList
+        agents={[]}
+        canAddPane
+        hostsById={new Map([["host-1", makeHost()]])}
+        onAddPane={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={jest.fn()}
+        onPaneActions={jest.fn()}
+        onRefresh={onRefresh}
+        refreshing={false}
+        sessionsById={new Map()}
+        tab={tab}
+        transports={{}}
+      />,
+      { wrapper: ThemeProvider },
+    );
+
+    latestRefreshControl().onRefresh?.();
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    // One pane leaves the rest of the tab empty, and content that stops under
+    // the last row takes the pull gesture with it.
+    expect(StyleSheet.flatten(screen.getByTestId("pane-list-main").props["style"]).flexGrow).toBe(
+      1,
+    );
+  });
+
+  it("keeps an empty tab pullable and spins only while the pull is served", async () => {
+    const screen = await render(
+      <PaneList
+        agents={[]}
+        canAddPane
+        hostsById={new Map()}
+        onAddPane={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={jest.fn()}
+        onPaneActions={jest.fn()}
+        onRefresh={jest.fn()}
+        refreshing
+        sessionsById={new Map()}
+        tab={makeTab("main")}
+        transports={{}}
+      />,
+      { wrapper: ThemeProvider },
+    );
+
+    // The empty tab is pullable too: the control lives on the list, not on a row.
+    expect(screen.getByText("Open your first window")).toBeTruthy();
+    expect(latestRefreshControl().refreshing).toBe(true);
+  });
+
+  it("joins full-bleed pane rows and closes the list under the last one", async () => {
     const tiles: Tile[] = ["first", "second"].map((id, index) => ({
       session_id: id,
       x: index,
@@ -125,6 +212,8 @@ describe("workspace tab pane lists", () => {
         onOpenFiles={jest.fn()}
         onOpenTerminal={jest.fn()}
         onPaneActions={jest.fn()}
+        onRefresh={jest.fn()}
+        refreshing={false}
         sessionsById={new Map()}
         tab={makeTab("main", tiles)}
         transports={{}}
@@ -132,7 +221,9 @@ describe("workspace tab pane lists", () => {
       { wrapper: ThemeProvider },
     );
 
-    expect(screen.getAllByTestId("list-separator")).toHaveLength(1);
+    // One between the two rows, and one under the last of them: a list that
+    // stopped mid-air read as though the panes had been cut off.
+    expect(screen.getAllByTestId("list-separator")).toHaveLength(2);
   });
 
   it("disables add-tab at the eight-tab ceiling", async () => {
@@ -175,6 +266,8 @@ describe("workspace tab pane lists", () => {
         onOpenFiles={jest.fn()}
         onOpenTerminal={jest.fn()}
         onPaneActions={jest.fn()}
+        onRefresh={jest.fn()}
+        refreshing={false}
         sessionsById={new Map()}
         tab={tab}
         transports={{}}
@@ -196,6 +289,8 @@ describe("workspace tab pane lists", () => {
         onOpenFiles={jest.fn()}
         onOpenTerminal={jest.fn()}
         onPaneActions={jest.fn()}
+        onRefresh={jest.fn()}
+        refreshing={false}
         sessionsById={new Map()}
         tab={makeTab("main", [{ session_id: "missing", x: 0, y: 0, w: 24, h: 24 }])}
         transports={{}}

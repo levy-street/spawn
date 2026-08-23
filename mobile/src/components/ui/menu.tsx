@@ -51,6 +51,12 @@ export const NativeLinkMenuAction = Link?.MenuAction ?? UnavailableNativeLinkMen
 export interface MenuProps {
   visible: boolean;
   onDismiss: () => void;
+  /**
+   * Called when this menu comes back after a drawer opened from one of its rows
+   * was dismissed. Owners that mirror `visible` elsewhere — a screen standing
+   * the keyboard down while a menu is up, say — set it back from here.
+   */
+  onReturn?: () => void;
   anchorRef?: RefObject<View | null>;
   anchorRect?: PopoverAnchorRect;
   entries: readonly MenuEntry[];
@@ -71,6 +77,7 @@ function isLabel(entry: MenuEntry): entry is MenuLabel {
 export function Menu({
   visible,
   onDismiss,
+  onReturn,
   anchorRef,
   anchorRect,
   entries,
@@ -100,6 +107,7 @@ export function Menu({
       onDismiss={dismiss}
       side={side}
       visible={visible}
+      {...(onReturn === undefined ? {} : { onReturn })}
       {...(width === undefined ? {} : { width })}
       {...(anchorRect === undefined ? {} : { anchorRect })}
       {...(anchorRef === undefined ? {} : { anchorRef })}

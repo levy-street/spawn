@@ -45,7 +45,7 @@ export function FingerprintReview({
   const approvalLabel =
     reapprovingRevokedPin || ceremony.pinState === "active"
       ? "Approve this host again"
-      : "Fingerprint matches — approve";
+      : "Fingerprint matches, approve";
 
   return (
     <View style={styles.container}>

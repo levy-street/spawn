@@ -1,15 +1,15 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, within } from "@testing-library/react-native";
 import type { ComponentType, PropsWithChildren, ReactNode } from "react";
-import { StyleSheet } from "react-native";
+import { type StyleProp, StyleSheet, type ViewStyle } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { WorkspaceListScreen } from "@/components/workspaces/workspace-list-screen";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
 import { borderWidth, ThemeProvider } from "@/theme";
-import { sizing } from "@/theme/sizing";
 
 interface CapturedFlashListProps {
+  contentContainerStyle?: StyleProp<ViewStyle>;
   data: ReadonlyArray<{ workspace: { id: string } }>;
   ItemSeparatorComponent?: ComponentType;
   ListFooterComponent?: ReactNode;
@@ -207,6 +207,16 @@ describe("workspace list refresh stability", () => {
     await screen.unmount();
   });
 
+  it("stretches the list content so a pull below the last row still refreshes", async () => {
+    const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
+
+    // Two workspaces leave most of the screen empty. Unless the content grows to
+    // the full height, the scroll surface ends under the last row and a pull
+    // started in the space beneath it reaches nothing.
+    expect(StyleSheet.flatten(latestList().contentContainerStyle)?.flexGrow).toBe(1);
+    await screen.unmount();
+  });
+
   it("leaves the top safe-area inset to the route Screen", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
     const rootStyle = StyleSheet.flatten(
@@ -219,7 +229,10 @@ describe("workspace list refresh stability", () => {
 
   it("renders one global header carrying only the create action", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
-    expect(screen.getAllByText("Workspaces")).toHaveLength(1);
+    // A destination root wears the spawnd mark rather than its own name: the tab
+    // bar underneath already says which root this is.
+    expect(screen.queryByText("Workspaces")).toBeNull();
+    expect(screen.getByLabelText("Workspaces")).toBeTruthy();
     expect(screen.getByTestId("new-workspace-button")).toBeTruthy();
 
     // Hosts and Settings moved to the bottom nav; offering them here too was the
@@ -278,7 +291,6 @@ describe("workspace list refresh stability", () => {
     expect(sectionStyle?.borderBottomWidth).toBeUndefined();
     expect(within(searchSection).getByTestId("list-separator")).toHaveStyle({
       height: borderWidth.hairline,
-      marginLeft: sizing.listRow.separatorFullBleed,
     });
     expect(screen.getByTestId("workspace-list")).toBeTruthy();
 
@@ -287,14 +299,16 @@ describe("workspace list refresh stability", () => {
     await screen.unmount();
   });
 
-  it("joins workspace rows with a global separator at zero left inset", async () => {
+  it("joins workspace rows with a global separator that runs edge to edge", async () => {
     const screen = await render(<WorkspaceListScreen />, { wrapper: Providers });
     expect(latestList().ItemSeparatorComponent).toBeDefined();
     // The row separators and the one above the create row all run edge to edge.
     for (const separator of within(screen.getByTestId("workspace-list")).getAllByTestId(
       "list-separator",
     )) {
-      expect(separator).toHaveStyle({ marginLeft: 0 });
+      const style = StyleSheet.flatten(separator.props["style"]);
+      expect(style["marginLeft"]).toBeUndefined();
+      expect(style["marginRight"]).toBeUndefined();
     }
     await screen.unmount();
   });

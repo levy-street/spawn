@@ -6,13 +6,17 @@ import { LauncherSheet } from "@/components/launcher/launcher-sheet";
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
 import { Confirm } from "@/components/ui/confirm";
+import { useToast } from "@/components/ui/toast";
 import {
+  MovePaneHostSheet,
   MovePaneSheet,
   PaneActionsSheet,
   type PaneActionTarget,
   TabActionsSheet,
   WorkspaceActionsSheet,
 } from "@/components/workspace-detail/action-sheets";
+import { type PaneGhost, usePaneDragValues } from "@/components/workspace-detail/pane-drag";
+import { PaneDragGhost } from "@/components/workspace-detail/pane-drag-ghost";
 import { PaneList } from "@/components/workspace-detail/pane-list";
 import { RenameDialog } from "@/components/workspace-detail/rename-dialog";
 import { TabStrip } from "@/components/workspace-detail/tab-strip";
@@ -66,22 +70,40 @@ export function WorkspaceDetail({
 }: WorkspaceDetailProps) {
   const theme = useTheme();
   const surfaces = theme.isDark ? tabSurfaces.dark : tabSurfaces.light;
+  const toast = useToast();
   const detail = useWorkspaceDetail(workspaceId);
   const workspace = detail.workspace.data ?? null;
   const sessions = detail.sessions.data ?? [];
   const hosts = detail.hosts.data ?? [];
   const agents = detail.agents.data ?? [];
+  // Pulled out of `detail` because the hook hands back a fresh object every
+  // render; the pages are memoised on these two alone.
+  const refreshDetail = detail.refresh;
+  const detailRefreshing = detail.refreshing;
   const transports = useConnectionStore((state) => state.sessionTransports);
   const dragProgress = useSharedValue(0);
   const progressEnvelopeRef = useRef("");
   const [selectedTabId, setSelectedTabId] = useState<string | null>(null);
   const [paneTarget, setPaneTarget] = useState<PaneActionTarget | null>(null);
   const [moveTile, setMoveTile] = useState<Tile | null>(null);
+  const [hostTarget, setHostTarget] = useState<{ tile: Tile; session: Session } | null>(null);
   const [tabTarget, setTabTarget] = useState<WorkspaceTab | null>(null);
   const [workspaceActionsVisible, setWorkspaceActionsVisible] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
   const [confirmation, setConfirmation] = useState<ConfirmationState | null>(null);
   const [launcherTabId, setLauncherTabId] = useState<string | null>(null);
+  const paneDrag = usePaneDragValues();
+  const screenRef = useRef<View>(null);
+  const [screenOrigin, setScreenOrigin] = useState({ x: 0, y: 0 });
+  const [draggingPane, setDraggingPane] = useState<{
+    tabId: string;
+    tile: Tile;
+    ghost: PaneGhost;
+  } | null>(null);
+  const draggingPaneRef = useRef<typeof draggingPane>(null);
+  draggingPaneRef.current = draggingPane;
+  const workspaceRef = useRef<Workspace | null>(null);
+  workspaceRef.current = workspace;
   const [busy, setBusy] = useState(false);
   const [operationError, setOperationError] = useState<string | null>(null);
   const actions = useWorkspaceActions((error) => {
@@ -121,20 +143,68 @@ export function WorkspaceDetail({
     }
   }, [resolvedTabId, selectedTabId]);
 
-  const run = useCallback(async (operation: () => Promise<unknown>, after?: () => void) => {
-    setBusy(true);
-    setOperationError(null);
-    try {
-      await operation();
-      after?.();
-      haptics.success();
-    } catch (error) {
-      setOperationError(errorMessage(error));
-      haptics.error();
-    } finally {
-      setBusy(false);
-    }
+  const run = useCallback(
+    /**
+     * @param done raised as a toast when the operation lands. Reserved for the
+     *   destructive ones: a row that vanishes is its own confirmation, but a
+     *   killed session leaves nothing behind to say what just happened to it.
+     */
+    async (operation: () => Promise<unknown>, after?: () => void, done?: string) => {
+      setBusy(true);
+      setOperationError(null);
+      try {
+        await operation();
+        after?.();
+        haptics.success();
+        if (done) toast.success(done);
+      } catch (error) {
+        setOperationError(errorMessage(error));
+        haptics.error();
+      } finally {
+        setBusy(false);
+      }
+    },
+    [toast],
+  );
+
+  /*
+   * Carrying a pane to another tab. The gesture reports window coordinates, so
+   * the ghost's container has to know where it sits; the drop itself is the
+   * same layout write the pane menu's "Move to another tab" performs.
+   */
+  const measureScreen = useCallback(() => {
+    screenRef.current?.measureInWindow((x: number, y: number) => setScreenOrigin({ x, y }));
   }, []);
+
+  const beginPaneDrag = useCallback(
+    (tabId: string, tile: Tile, ghost: PaneGhost) => {
+      haptics.impact("medium");
+      // Measured again on pickup rather than trusted from layout: a screen that
+      // has been pushed or rotated since then would put the ghost under the
+      // wrong finger.
+      measureScreen();
+      setDraggingPane({ tabId, tile, ghost });
+    },
+    [measureScreen],
+  );
+
+  const dropPane = useCallback(
+    (tabIndex: number) => {
+      const dragged = draggingPaneRef.current;
+      const current = workspaceRef.current;
+      setDraggingPane(null);
+      if (!dragged || !current) return;
+      const target = current.layout.tabs[tabIndex];
+      if (!target || target.id === dragged.tabId) return;
+      haptics.impact("light");
+      void run(
+        () => actions.movePane(current, dragged.tile.session_id, target.id),
+        // The pane is followed to where it landed, so the move is visible.
+        () => setSelectedTabId(target.id),
+      );
+    },
+    [actions, run],
+  );
 
   const presentLauncher = useCallback((tabId: string) => setLauncherTabId(tabId), []);
   const presentWorkspaceActions = useCallback(() => setWorkspaceActionsVisible(true), []);
@@ -162,6 +232,7 @@ export function WorkspaceDetail({
           void run(
             () => actions.removePane(currentWorkspace, tile),
             () => setPaneTarget(null),
+            session ? "Session killed" : "Pane removed",
           );
         },
       });
@@ -176,6 +247,7 @@ export function WorkspaceDetail({
         void run(
           () => actions.deleteTab(workspace, tab.id),
           () => setTabTarget(null),
+          `Closed ${tab.name}`,
         );
       };
       if (!tab.layout.tiles.some((tile) => !tile.widget)) {
@@ -198,27 +270,46 @@ export function WorkspaceDetail({
   const renderPage = useCallback(
     (tab: WorkspaceTab) => {
       if (!workspace) return null;
+      // Nowhere to carry a pane to while the workspace has a single tab.
+      const carryable = workspace.layout.tabs.length > 1;
       return (
         <PaneList
           agents={agents}
           canAddPane={canAddTile(tab.layout)}
+          draggingPaneId={draggingPane?.tile.session_id ?? null}
           hostsById={hostsById}
           onAddPane={() => presentLauncher(tab.id)}
           onOpenFiles={onOpenFiles}
           onOpenTerminal={onOpenTerminal}
           onPaneActions={(tile) => setPaneTarget({ tabId: tab.id, tile })}
+          onRefresh={refreshDetail}
+          refreshing={detailRefreshing}
           sessionsById={sessionsById}
           tab={tab}
           transports={transports}
+          {...(carryable
+            ? {
+                paneDrag,
+                onPaneDragBegin: (tile: Tile, ghost: PaneGhost) =>
+                  beginPaneDrag(tab.id, tile, ghost),
+                onPaneDragEnd: dropPane,
+              }
+            : {})}
         />
       );
     },
     [
       agents,
+      beginPaneDrag,
+      detailRefreshing,
+      draggingPane,
+      dropPane,
       hostsById,
       onOpenFiles,
       onOpenTerminal,
+      paneDrag,
       presentLauncher,
+      refreshDetail,
       sessionsById,
       transports,
       workspace,
@@ -257,7 +348,11 @@ export function WorkspaceDetail({
       }
       padded={false}
     >
-      <View style={[styles.screen, { backgroundColor: theme.colors.background }]}>
+      <View
+        onLayout={measureScreen}
+        ref={screenRef}
+        style={[styles.screen, { backgroundColor: theme.colors.background }]}
+      >
         <TabStrip
           activeIndex={activeIndex}
           addBusy={busy}
@@ -275,6 +370,7 @@ export function WorkspaceDetail({
             const tab = workspace.layout.tabs[index];
             if (tab) setSelectedTabId(tab.id);
           }}
+          paneDrag={paneDrag}
           sessionsById={sessionsById}
           tabs={workspace.layout.tabs}
         />
@@ -296,6 +392,13 @@ export function WorkspaceDetail({
           testID="workspace-tab-pager"
         />
 
+        <PaneDragGhost
+          drag={paneDrag}
+          originX={screenOrigin.x}
+          originY={screenOrigin.y}
+          pane={draggingPane?.ghost ?? null}
+        />
+
         <PaneActionsSheet
           agents={agents}
           onDismiss={() => setPaneTarget(null)}
@@ -306,6 +409,7 @@ export function WorkspaceDetail({
             );
           }}
           onMove={(tile) => setMoveTile(tile)}
+          onMoveToHost={(tile, session) => setHostTarget({ tile, session })}
           onRemove={(tile) => confirmRemove(workspace, tile)}
           onRename={(session) =>
             setRenameTarget({ kind: "session", id: session.id, value: session.name ?? "" })
@@ -324,6 +428,31 @@ export function WorkspaceDetail({
           target={paneTarget}
           visible={paneTarget !== null}
           workspace={workspace}
+        />
+        <MovePaneHostSheet
+          hosts={hosts}
+          onDismiss={() => setHostTarget(null)}
+          onSelect={(host) => {
+            const target = hostTarget;
+            if (!target) return;
+            setHostTarget(null);
+            setConfirmation({
+              title: `Move to ${host.name}?`,
+              description:
+                "This window's shell is closed and its running process killed; a new one starts in your home folder there.",
+              confirmLabel: "Move window",
+              onConfirm: () => {
+                setConfirmation(null);
+                void run(
+                  () =>
+                    actions.movePaneToHost(workspace, target.tile, host, target.session, agents),
+                  () => setPaneTarget(null),
+                );
+              },
+            });
+          }}
+          session={hostTarget?.session ?? null}
+          visible={hostTarget !== null}
         />
         <MovePaneSheet
           onDismiss={() => setMoveTile(null)}
@@ -423,7 +552,8 @@ export function WorkspaceDetail({
           onLaunched={({ session, warning }) => {
             setLauncherTabId(null);
             if (warning) setOperationError(warning);
-            onOpenTerminal(session.id);
+            // A file explorer has no session to open: it is already in the tab.
+            if (session) onOpenTerminal(session.id);
           }}
           visible={launcherTabId !== null}
           workspaceId={workspace.id}

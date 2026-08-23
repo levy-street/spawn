@@ -1,10 +1,11 @@
 import { StyleSheet, View } from "react-native";
 import { hostConnectionLabel, pluralize } from "@/components/hosts/host-model";
-import { Divider } from "@/components/ui/divider";
+import { ListGroup } from "@/components/ui/list-group";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import { spacing } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
 function Fact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return (
@@ -23,24 +24,18 @@ export function HostFacts({ host }: { host: HostOut }) {
   return (
     <View style={styles.section} testID="host-facts">
       <SectionHeader style={styles.sectionHeader} title="Details" />
-      <View style={styles.facts}>
+      <ListGroup>
         <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
-        <Divider />
         <Fact label="Daemon" value={host.version ?? "unknown"} />
-        <Divider />
         <Fact label="Sessions" value={pluralize(host.session_count, "session")} />
-        <Divider />
         <Fact label="Connection" value={hostConnectionLabel(host)} />
-        <Divider />
         <Fact
           label="Host identity"
           value={host.host_key_algorithm === "ed25519" ? "ed25519" : "legacy unpaired"}
         />
-        <Divider />
         <Fact label="Public key" mono value={host.host_public_key ?? "not pinned"} />
-        <Divider />
         <Fact label="Fingerprint" mono value={host.host_key_fingerprint ?? "not pinned"} />
-      </View>
+      </ListGroup>
     </View>
   );
 }
@@ -49,6 +44,7 @@ const styles = StyleSheet.create({
   fact: {
     flexDirection: "row",
     gap: spacing[3],
+    paddingHorizontal: sizing.screen.gutter,
     paddingVertical: spacing[3],
   },
   factLabel: {
@@ -57,11 +53,8 @@ const styles = StyleSheet.create({
   factValue: {
     flex: 1,
   },
-  facts: {
-    gap: spacing[0],
-  },
   section: {
-    gap: spacing[2],
+    gap: spacing[0],
   },
   sectionHeader: {
     paddingHorizontal: spacing[0],

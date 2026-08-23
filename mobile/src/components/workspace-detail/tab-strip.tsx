@@ -8,6 +8,7 @@ import {
 } from "react-native";
 import Animated, {
   scrollTo,
+  useAnimatedReaction,
   useAnimatedRef,
   useAnimatedScrollHandler,
   useAnimatedStyle,
@@ -24,8 +25,10 @@ import {
   TAB_GEOMETRY,
   TAB_STEP,
   TAB_STRIP_HEIGHT,
+  TAB_WIDTH,
   type TabDragValues,
 } from "@/components/workspace-detail/draggable-tab";
+import { type PaneDragValues, tabIndexAtPoint } from "@/components/workspace-detail/pane-drag";
 import { tabDestinationIndex, tabInsertionX } from "@/components/workspace-detail/tab-reorder";
 import { tabAttentionSummary } from "@/data/queries/alerts";
 import type { Session } from "@/data/types/domain";
@@ -39,6 +42,8 @@ const TAB_EDGE_SCROLL_BAND = spacing[12];
 const TAB_DROP_INDICATOR_HEIGHT = spacing[7];
 const TAB_SCROLL_BREATHING_ROOM = spacing[3];
 const AUTO_SCROLL_MAX_POINTS_PER_SECOND = 720;
+/** Left inset of the first tab inside the scroller's content. */
+const TAB_CONTENT_INSET = sizing.tab.connectionRadius;
 const MILLISECONDS_PER_SECOND = 1_000;
 
 export interface TabStripProps {
@@ -52,6 +57,8 @@ export interface TabStripProps {
   onClose: (tab: WorkspaceTab) => void;
   onReorder: (tabId: string, toIndex: number) => void;
   onAdd: () => void;
+  /** Shared with the pane list, so a carried pane can be dropped on a tab. */
+  paneDrag?: PaneDragValues;
 }
 
 function announce(message: string): void {
@@ -66,6 +73,11 @@ function beginDragFeedback(name: string, index: number, count: number): void {
 function indexDragFeedback(index: number, count: number): void {
   haptics.selection();
   announce(`Position ${index + 1} of ${count}`);
+}
+
+function paneHoverFeedback(name: string): void {
+  haptics.selection();
+  announce(`Drop on ${name}`);
 }
 
 function endDragFeedback(name: string, index: number, count: number): void {
@@ -84,6 +96,7 @@ export function TabStrip({
   onClose,
   onReorder,
   onAdd,
+  paneDrag,
 }: TabStripProps) {
   const theme = useTheme();
   const reducedMotion = useReducedMotion();
@@ -132,16 +145,27 @@ export function TabStrip({
 
   const scrollHandler = useAnimatedScrollHandler((event) => {
     scrollX.value = event.contentOffset.x;
+    if (paneDrag) paneDrag.stripScrollX.value = event.contentOffset.x;
   });
+
+  /** Where the strip sits on screen, for a pane being carried towards it. */
+  const publishStripRect = useCallback(() => {
+    stripRef.current?.measureInWindow((x: number, y: number, width: number, height: number) => {
+      stripWindowLeft.value = x;
+      if (!paneDrag) return;
+      paneDrag.stripLeft.value = x;
+      paneDrag.stripTop.value = y;
+      paneDrag.stripWidth.value = width;
+      paneDrag.stripHeight.value = height;
+    });
+  }, [paneDrag, stripWindowLeft]);
 
   const measureStrip = useCallback(
     (event: LayoutChangeEvent) => {
       viewportWidth.value = event.nativeEvent.layout.width;
-      stripRef.current?.measureInWindow((x: number) => {
-        stripWindowLeft.value = x;
-      });
+      publishStripRect();
     },
-    [stripWindowLeft, viewportWidth],
+    [publishStripRect, viewportWidth],
   );
 
   useEffect(() => {
@@ -226,6 +250,64 @@ export function TabStrip({
     }
   });
 
+  // Layout runs long before a drag does, and a screen that has been pushed,
+  // rotated or scrolled since then has moved the strip. Measuring again as the
+  // pane is picked up is what keeps the drop target where it is drawn.
+  useAnimatedReaction(
+    () => paneDrag?.active.value ?? 0,
+    (carrying, previous) => {
+      if (carrying === 1 && previous !== 1) scheduleOnRN(publishStripRect);
+    },
+    [paneDrag, publishStripRect],
+  );
+
+  /*
+   * Which tab a pane carried up from the list is over. The reaction runs on the
+   * UI thread against geometry the strip published for it, so the highlight
+   * follows the finger without a single render — and the row that started the
+   * drag never has to know where the tabs are.
+   */
+  useAnimatedReaction(
+    () =>
+      paneDrag
+        ? {
+            carrying: paneDrag.active.value,
+            x: paneDrag.pointerX.value,
+            y: paneDrag.pointerY.value,
+          }
+        : null,
+    (current) => {
+      if (!paneDrag || !current) return;
+      const next =
+        current.carrying === 1
+          ? tabIndexAtPoint(current.x, current.y, {
+              stripLeft: paneDrag.stripLeft.value,
+              stripTop: paneDrag.stripTop.value,
+              stripWidth: paneDrag.stripWidth.value,
+              stripHeight: paneDrag.stripHeight.value,
+              scrollX: paneDrag.stripScrollX.value,
+              contentInset: TAB_CONTENT_INSET,
+              tabWidth: TAB_WIDTH,
+              tabGap: TAB_GAP,
+              tabCount: tabs.length,
+            })
+          : -1;
+      if (next === paneDrag.hovered.value) return;
+      paneDrag.hovered.value = next;
+      const name = tabs[next]?.name;
+      if (name) scheduleOnRN(paneHoverFeedback, name);
+    },
+    [paneDrag, tabs],
+  );
+
+  const paneDropStyle = useAnimatedStyle(() => {
+    const index = paneDrag?.hovered.value ?? -1;
+    return {
+      opacity: index >= 0 ? opacity.opaque : opacity.hidden,
+      transform: [{ translateX: Math.max(0, index) * TAB_STEP }],
+    };
+  });
+
   const indicatorStyle = useAnimatedStyle(() => ({
     opacity:
       activeFrom.value >= 0 && activeFrom.value !== activeTo.value
@@ -296,6 +378,17 @@ export function TabStrip({
             style={[styles.dropIndicator, { backgroundColor: theme.colors.ring }, indicatorStyle]}
             testID="tab-drop-indicator"
           />
+          {paneDrag ? (
+            <Animated.View
+              pointerEvents="none"
+              style={[
+                styles.paneDropTarget,
+                { borderColor: theme.colors.ring, borderRadius: theme.radii.md },
+                paneDropStyle,
+              ]}
+              testID="tab-pane-drop-target"
+            />
+          ) : null}
         </View>
         <Pressable
           accessibilityHint={canAdd ? undefined : "A workspace can have up to 8 tabs"}
@@ -346,6 +439,15 @@ const styles = StyleSheet.create({
     position: "absolute",
     top: (sizing.tab.visualHeight - TAB_DROP_INDICATOR_HEIGHT) / 2,
     width: borderWidth.emphasis,
+    zIndex: layer.launcherDropPreview,
+  },
+  paneDropTarget: {
+    borderWidth: borderWidth.emphasis,
+    height: sizing.tab.visualHeight,
+    left: 0,
+    position: "absolute",
+    top: 0,
+    width: TAB_WIDTH,
     zIndex: layer.launcherDropPreview,
   },
   frame: {

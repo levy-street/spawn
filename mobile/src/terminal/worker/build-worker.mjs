@@ -47,7 +47,15 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
 .xterm{height:100%;padding:0 8px}
 /* Scrolling is driven from the worker, not the browser: nothing here may pan
    on its own or the two would fight. */
-.xterm-viewport{touch-action:none;overscroll-behavior:contain}</style>
+.xterm-viewport{touch-action:none;overscroll-behavior:contain}
+/* Selection belongs to the system, not to us. xterm ships \`user-select: none\`
+   because on a desktop it draws its own selection over a canvas; the DOM renderer
+   puts real text in the document instead, so iOS can put its own handles,
+   magnifier and Copy/Look Up callout on it — which is what holding text is
+   supposed to do. Only the rows opt in: the helper textarea and the cursor layer
+   must stay untouchable, or a hold would catch those instead of the output. */
+.xterm .xterm-screen,.xterm .xterm-rows,.xterm .xterm-rows *{user-select:text;-webkit-user-select:text;-ms-user-select:text;-webkit-touch-callout:default}
+.xterm .xterm-helpers,.xterm .xterm-helper-textarea,.xterm .xterm-cursor-layer{user-select:none;-webkit-user-select:none}</style>
 </head>
 <body><div id="terminal" role="application" aria-label="Terminal"></div><script>${scripts}</script></body>
 </html>`;

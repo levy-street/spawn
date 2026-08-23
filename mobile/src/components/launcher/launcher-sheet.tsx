@@ -1,42 +1,58 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 
-import { DetailsStep } from "@/components/launcher/details-step";
 import { FolderPicker } from "@/components/launcher/folder-picker";
+import { pathBasename } from "@/components/launcher/folder-picker-logic";
 import { HostStep } from "@/components/launcher/host-step";
-import {
-  firstAvailableTabId,
-  resolveInitialDirectory,
-} from "@/components/launcher/launcher-selection";
-import { type RunChoice, RunStep } from "@/components/launcher/run-step";
+import { type LaunchHome, resolveLaunchHome } from "@/components/launcher/launcher-selection";
 import { Button } from "@/components/ui/button";
+import { DrawerRow, DrawerSeparator } from "@/components/ui/drawer-row";
+import { Icon } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
-import { Sheet } from "@/components/ui/sheet";
+import { Sheet, SheetHeader, SheetScrollView } from "@/components/ui/sheet";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
+import { AgentIcon } from "@/components/workspace-detail/agent-icon";
+import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import {
   discardLaunchedSession,
   keepLaunchedShell,
+  useAddFilesWidget,
   useLauncherData,
   useLaunchSession,
   useRecentDirectories,
 } from "@/data/queries/launcher";
+import { identifyAgent, sortAgents } from "@/data/selectors/agent";
 import { haptics } from "@/lib/haptics";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import type { HostTransport, TransportState } from "@/terminal/transport/types";
 import { borderWidth, spacing, useTheme } from "@/theme";
+import { sizing } from "@/theme/sizing";
 
-type LauncherStep = "host" | "folder" | "run" | "details" | "recovery";
+/** What the drawer is about to add: a shell, an agent in a shell, or a widget. */
+type Choice = { kind: "shell" } | { kind: "agent"; agent: AgentOut } | { kind: "files" };
+
+/**
+ * "choose" is the whole flow whenever the tab has a home to open in. The two
+ * picker steps exist for the workspace that has none, and for the explicit
+ * "somewhere else" choice.
+ */
+type LauncherStep = "choose" | "host" | "folder" | "recovery";
+
+/** Past this many rows the menu scrolls, so the panel claims the tall shape. */
+const COMPACT_ROW_LIMIT = 7;
 
 export interface LauncherCompletion {
-  session: SessionOut;
+  /** Null when a file explorer was added: a widget is layout, not a session. */
+  session: SessionOut | null;
   pendingCommand: boolean;
   warning?: string;
 }
 
 export interface LauncherSheetProps {
+  /** The tab the new window lands in; defaults to the workspace's active tab. */
   initialTabId?: string | null;
   onDismiss(): void;
   onLaunchError?(message: string, sessionId?: string): void;
@@ -45,6 +61,28 @@ export interface LauncherSheetProps {
   workspaceId: string;
 }
 
+/** What the picker steps are finding a place for. */
+function choiceLabel(choice: Choice): string {
+  if (choice.kind === "agent") return choice.agent.name;
+  return choice.kind === "files" ? "File explorer" : "Shell";
+}
+
+function homeDetail(home: LaunchHome | null): string | null {
+  if (!home) return null;
+  if (home.host.status !== "online") return `${home.host.name} is offline — pick somewhere else`;
+  return `Opens in ${pathBasename(home.cwd) || home.cwd} on ${home.host.name}`;
+}
+
+/**
+ * Adding a window: what to run, and nothing else.
+ *
+ * The tab's own home — or the workspace's, chosen when it was created — answers
+ * where, so picking Claude Code *is* the whole flow: the shell is created on that
+ * host, in that folder, in the tab the drawer was opened from, and the terminal
+ * opens on it. The host and folder pickers below are the fallback for a workspace
+ * with no home and for the deliberate "somewhere else", and both can be changed
+ * again from the running window (`terminal-header`).
+ */
 export function LauncherSheet({
   initialTabId,
   onDismiss,
@@ -56,47 +94,39 @@ export function LauncherSheet({
   const theme = useTheme();
   const data = useLauncherData(workspaceId, visible);
   const launch = useLaunchSession();
+  const addWidget = useAddFilesWidget();
   const cancelRequested = useRef(false);
-  const [step, setStep] = useState<LauncherStep>("host");
-  const [selectedHost, setSelectedHost] = useState<HostOut | null>(null);
-  const [folder, setFolder] = useState<string | null>(null);
-  const [runChoice, setRunChoice] = useState<RunChoice | null>(null);
-  const [name, setName] = useState("");
-  const [tabId, setTabId] = useState("");
+  const [step, setStep] = useState<LauncherStep>("choose");
+  /** The choice the pickers are completing; null when they are re-pointing the menu. */
+  const [pendingChoice, setPendingChoice] = useState<Choice | null>(null);
+  /** A location chosen through "somewhere else", standing in for the tab's home. */
+  const [elsewhere, setElsewhere] = useState<LaunchHome | null>(null);
+  const [pickerHost, setPickerHost] = useState<HostOut | null>(null);
   const [hostTransport, setHostTransport] = useState<HostTransport | null>(null);
   const [hostTransportState, setHostTransportState] = useState<TransportState>("idle");
   const [error, setError] = useState<string | null>(null);
-  const [recovery, setRecovery] = useState<{
-    session: SessionOut;
-    message: string;
-  } | null>(null);
-  const recents = useRecentDirectories(selectedHost?.id ?? null, visible && step === "folder");
+  const [recovery, setRecovery] = useState<{ session: SessionOut; message: string } | null>(null);
+  const recents = useRecentDirectories(pickerHost?.id ?? null, visible && step === "folder");
+  const workspace = data.workspace;
+  const busy = launch.isPending || addWidget.isPending;
+
+  const tabId =
+    (initialTabId ?? workspace?.layout.active_tab ?? workspace?.layout.tabs[0]?.id) || "";
+  const home = elsewhere ?? (workspace ? resolveLaunchHome(workspace, tabId, data.hosts) : null);
+  const agents = useMemo(() => sortAgents(data.agents), [data.agents]);
 
   useEffect(() => {
     if (!visible) return;
-    setStep("host");
-    setSelectedHost(null);
-    setFolder(null);
-    setRunChoice(null);
-    setName("");
-    setTabId("");
+    setStep("choose");
+    setPendingChoice(null);
+    setElsewhere(null);
+    setPickerHost(null);
     setHostTransport(null);
     setHostTransportState("idle");
     setError(null);
     setRecovery(null);
     cancelRequested.current = false;
   }, [visible]);
-
-  useEffect(() => {
-    if (!data.workspace || tabId) return;
-    setTabId(firstAvailableTabId(data.workspace, initialTabId) ?? "");
-  }, [data.workspace, initialTabId, tabId]);
-
-  const moveTo = (next: LauncherStep) => {
-    haptics.selection();
-    setError(null);
-    setStep(next);
-  };
 
   const handleCancel = () => {
     // A launch already in flight cannot be recalled, so the drawer leaves and the
@@ -109,17 +139,24 @@ export function LauncherSheet({
     setHostTransport(transport);
   }, []);
 
-  const handleLaunch = async () => {
-    if (!data.workspace || !selectedHost || !folder || !runChoice || !tabId) return;
+  const create = async (host: HostOut, cwd: string, target: Choice) => {
+    if (!tabId || busy) return;
     setError(null);
     try {
+      if (target.kind === "files") {
+        await addWidget.mutateAsync({ workspaceId, tabId, hostId: host.id, path: cwd });
+        haptics.success();
+        onLaunched({ session: null, pendingCommand: false });
+        onDismiss();
+        return;
+      }
+
       const result = await launch.mutateAsync({
         workspaceId,
         tabId,
-        hostId: selectedHost.id,
-        cwd: folder,
-        name,
-        ...(runChoice.kind === "agent" ? { agent: runChoice.agent } : {}),
+        hostId: host.id,
+        cwd,
+        ...(target.kind === "agent" ? { agent: target.agent } : {}),
       });
 
       if (cancelRequested.current) {
@@ -158,35 +195,151 @@ export function LauncherSheet({
     }
   };
 
-  const previousStep: Partial<Record<LauncherStep, LauncherStep>> = {
-    folder: "host",
-    run: "folder",
-    details: "run",
+  /**
+   * Ask where. The folder browser answers that on its own, so there is no menu
+   * of locations to step through — one host opens it straight away, several ask
+   * which machine first.
+   *
+   * `target` is the choice waiting on an answer, and null is the "somewhere
+   * else" row: that one re-points the menu rather than completing anything, so
+   * the folder comes back as the home every choice above it then opens in.
+   */
+  const browse = (target: Choice | null) => {
+    haptics.selection();
+    setError(null);
+    setPendingChoice(target);
+    const only = data.hosts.length === 1 ? data.hosts[0] : null;
+    if (only) {
+      setPickerHost(only);
+      setStep("folder");
+      return;
+    }
+    setPickerHost(null);
+    setStep("host");
   };
-  const initialFolder =
-    data.workspace && selectedHost
-      ? resolveInitialDirectory(data.workspace, tabId, selectedHost.id)
-      : null;
+
+  // What goes in the window; then where it points, unless home answers that.
+  const pick = (target: Choice) => {
+    if (home && home.host.status === "online") {
+      haptics.selection();
+      void create(home.host, home.cwd, target);
+      return;
+    }
+    browse(target);
+  };
+
+  const rows = [
+    {
+      key: "shell",
+      label: "Shell",
+      detail: "A plain login shell",
+      icon: <Icon name="SquareTerminal" />,
+      onPress: () => pick({ kind: "shell" }),
+    },
+    ...agents.map((agent) => ({
+      key: agent.id,
+      label: agent.name,
+      detail: agent.command,
+      icon: (
+        <AgentIcon
+          identity={identifyAgent(agent.command, [agent])}
+          size={sizing.actionSheet.icon}
+        />
+      ),
+      onPress: () => pick({ kind: "agent", agent }),
+    })),
+    {
+      key: "files",
+      label: "File explorer",
+      detail: "Browse a folder in a pane",
+      icon: <Icon name="FolderTree" />,
+      onPress: () => pick({ kind: "files" }),
+    },
+  ];
+
+  const back: Partial<Record<LauncherStep, LauncherStep>> = {
+    host: "choose",
+    folder: data.hosts.length === 1 ? "choose" : "host",
+  };
+  const scrolls = step !== "choose" || rows.length > COMPACT_ROW_LIMIT;
+  // The host step carries its own heading, so the bar only names what is being
+  // placed; the folder browser has none of its own, so the bar is its heading.
+  const placing =
+    step === "host"
+      ? (pendingChoice && choiceLabel(pendingChoice)) || "Somewhere else"
+      : step === "folder"
+        ? pendingChoice
+          ? `Folder for ${choiceLabel(pendingChoice)}`
+          : "Choose a folder"
+        : null;
+
+  const menu = (
+    <>
+      <SheetHeader title="Add a window" />
+      {home ? (
+        <Text
+          color={home.host.status === "online" ? "mutedForeground" : "warning"}
+          style={styles.caption}
+          variant="caption"
+        >
+          {homeDetail(home)}
+        </Text>
+      ) : null}
+      {rows.map((row) => (
+        <DrawerRow
+          detail={row.detail}
+          disabled={busy}
+          icon={row.icon}
+          key={row.key}
+          label={row.label}
+          onPress={row.onPress}
+          testID={`launcher-choice-${row.key}`}
+        />
+      ))}
+      {/* Home answers "where" for everything above, so a workspace with one
+          needs this escape hatch to open on another host — or just another
+          folder — without giving up the one-tap default. */}
+      {home ? (
+        <>
+          <DrawerSeparator />
+          <DrawerRow
+            detail={data.hosts.length > 1 ? "Pick a host and folder first" : "Pick a folder first"}
+            disabled={busy}
+            icon={<Icon name={data.hosts.length > 1 ? "Server" : "FolderOpen"} />}
+            label="Somewhere else"
+            onPress={() => browse(null)}
+            testID="launcher-choice-elsewhere"
+          />
+        </>
+      ) : null}
+    </>
+  );
 
   return (
-    <Sheet onDismiss={handleCancel} size="tall" testID="launcher-sheet" visible={visible}>
-      <View style={[styles.stepBar, { borderBottomColor: theme.colors.border }]}>
-        {previousStep[step] ? (
+    <Sheet
+      onDismiss={handleCancel}
+      size={scrolls ? "tall" : "content"}
+      testID="launcher-sheet"
+      visible={visible}
+    >
+      {placing ? (
+        <View style={[styles.stepBar, { borderBottomColor: theme.colors.border }]}>
           <IconButton
             accessibilityLabel="Go back"
             icon="ChevronLeft"
-            onPress={() => moveTo(previousStep[step] ?? "host")}
+            onPress={() => {
+              haptics.selection();
+              setError(null);
+              setStep(back[step] ?? "choose");
+            }}
             size="sm"
           />
-        ) : (
+          <Text numberOfLines={1} style={styles.stepTitle} variant="label">
+            {placing}
+          </Text>
           <View style={styles.backPlaceholder} />
-        )}
-        <Text color="mutedForeground" variant="caption">
-          {step === "recovery"
-            ? "Action needed"
-            : `Step ${["host", "folder", "run", "details"].indexOf(step) + 1} of 4`}
-        </Text>
-      </View>
+        </View>
+      ) : null}
 
       {error ? (
         <View style={[styles.error, { backgroundColor: theme.colors.destructiveSoft }]}>
@@ -203,58 +356,48 @@ export function LauncherSheet({
             Try again
           </Button>
         </View>
-      ) : data.isLoading || !data.workspace ? (
+      ) : data.isLoading || !workspace ? (
         <View style={styles.centered}>
           <Spinner size={spacing[6]} />
-          <Text color="mutedForeground">Loading launcher…</Text>
+          <Text color="mutedForeground">Loading…</Text>
         </View>
+      ) : step === "choose" ? (
+        scrolls ? (
+          <SheetScrollView contentContainerStyle={styles.menuContent}>{menu}</SheetScrollView>
+        ) : (
+          <View>{menu}</View>
+        )
       ) : step === "host" ? (
         <HostStep
           hosts={data.hosts}
           onSelect={(host) => {
-            setSelectedHost(host);
-            setFolder(null);
+            haptics.selection();
+            setPickerHost(host);
             setHostTransport(null);
             setHostTransportState("idle");
-            moveTo("folder");
+            setStep("folder");
           }}
-          selectedHostId={selectedHost?.id ?? null}
+          selectedHostId={pickerHost?.id ?? null}
         />
       ) : step === "folder" ? (
         <FolderPicker
-          initialPath={folder ?? initialFolder}
+          initialPath={pickerHost && home?.host.id === pickerHost.id ? home.cwd : null}
           onSelect={(path) => {
-            setFolder(path);
-            setHostTransport(null);
-            setHostTransportState("idle");
-            moveTo("run");
+            if (!pickerHost) return;
+            if (pendingChoice) {
+              void create(pickerHost, path, pendingChoice);
+              return;
+            }
+            // "Somewhere else" only answered where; the menu asks what again,
+            // now opening here instead of at the tab's home.
+            haptics.selection();
+            setElsewhere({ host: pickerHost, cwd: path });
+            setStep("choose");
           }}
           recentError={recents.error?.message ?? null}
           recentDirectories={recents.data}
           transport={hostTransport}
           transportState={hostTransportState}
-        />
-      ) : step === "run" ? (
-        <RunStep
-          agents={data.agents}
-          onSelect={(choice) => {
-            setRunChoice(choice);
-            moveTo("details");
-          }}
-          selected={runChoice}
-        />
-      ) : step === "details" ? (
-        <DetailsStep
-          isLaunching={launch.isPending}
-          name={name}
-          onLaunch={() => void handleLaunch()}
-          onNameChange={setName}
-          onSelectTab={(nextTabId) => {
-            haptics.selection();
-            setTabId(nextTabId);
-          }}
-          selectedTabId={tabId}
-          workspace={data.workspace}
         />
       ) : recovery ? (
         <View style={styles.recovery}>
@@ -300,10 +443,10 @@ export function LauncherSheet({
         </View>
       ) : null}
 
-      {visible && step === "folder" && selectedHost?.host_public_key ? (
+      {visible && step === "folder" && pickerHost?.host_public_key ? (
         <HostTransportSurface
-          hostId={selectedHost.id}
-          hostIdentityPublicKey={selectedHost.host_public_key}
+          hostId={pickerHost.id}
+          hostIdentityPublicKey={pickerHost.host_public_key}
           onError={(transportError) => setError(transportError.message)}
           onStateChange={setHostTransportState}
           onTransport={handleTransport}
@@ -322,14 +465,16 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing[4],
     paddingBottom: spacing[2],
   },
+  stepTitle: { flex: 1, textAlign: "center" },
   backPlaceholder: { height: spacing[9], width: spacing[9] },
+  caption: { paddingBottom: spacing[2], paddingHorizontal: spacing[4] },
+  menuContent: { paddingBottom: spacing[2] },
   error: { margin: spacing[4], padding: spacing[3] },
   centered: {
     alignItems: "center",
-    flex: 1,
     gap: spacing[3],
     justifyContent: "center",
     padding: spacing[6],
   },
-  recovery: { flex: 1, gap: spacing[4], justifyContent: "center", padding: spacing[6] },
+  recovery: { gap: spacing[4], justifyContent: "center", padding: spacing[6] },
 });

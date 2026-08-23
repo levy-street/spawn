@@ -14,11 +14,7 @@ export function AdminHomeScreen(): React.JSX.Element {
   const me = useMeQuery();
 
   return (
-    <SettingsScreen
-      description="Deployment invitations, accounts, and email delivery."
-      testID="admin-home"
-      title="Admin"
-    >
+    <SettingsScreen testID="admin-home" title="Admin">
       <View style={styles.identity}>
         <Badge variant="outline">admin</Badge>
         <Text color="mutedForeground" numberOfLines={1} variant="caption">
@@ -27,19 +23,19 @@ export function AdminHomeScreen(): React.JSX.Element {
       </View>
       <SettingsSection>
         <SettingsLinkRow
-          hint="Create one-use signup links and revoke pending invitations"
+          hint="One-use signup links"
           icon="KeyRound"
           label="Invites"
           onPress={() => router.push("/admin/invites")}
         />
         <SettingsLinkRow
-          hint="Read-only account and deployment counts"
+          hint="Accounts on this deployment"
           icon="UserRound"
           label="Users"
           onPress={() => router.push("/admin/users")}
         />
         <SettingsLinkRow
-          hint="Delivery status, test messages, and redacted logs"
+          hint="Delivery status and logs"
           icon="Mail"
           label="Email"
           onPress={() => router.push("/admin/emails")}
@@ -47,11 +43,7 @@ export function AdminHomeScreen(): React.JSX.Element {
       </SettingsSection>
       {/* Admin is pushed from Settings, so leaving it is a pop rather than a jump
         to a hardcoded root — the tab bar is what owns landing on Settings. */}
-      <Button
-        disabled={!router.canGoBack()}
-        onPress={() => router.back()}
-        variant="outline"
-      >
+      <Button disabled={!router.canGoBack()} onPress={() => router.back()} variant="outline">
         Exit admin
       </Button>
     </SettingsScreen>

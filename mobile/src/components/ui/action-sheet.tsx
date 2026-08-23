@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { ActionSheetIOS, Platform, View } from "react-native";
 
 import { DrawerRow, DrawerSeparator } from "@/components/ui/drawer-row";
+import { Icon } from "@/components/ui/icon";
 import { Sheet } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
@@ -12,9 +13,12 @@ export interface ActionSheetAction {
   label: string;
   detail?: string;
   icon?: ReactNode;
+  /** Marks the row that answers a choice, the way a Select's current value does. */
+  selected?: boolean;
   destructive?: boolean;
   disabled?: boolean;
   accessibilityLabel?: string;
+  accessibilityRole?: "button" | "menuitem" | "radio";
   onPress: () => void;
 }
 
@@ -106,7 +110,9 @@ export function ActionSheet({
       <View>
         {actions.map((action, index) => (
           <View key={action.id}>
-            {index > 0 ? <DrawerSeparator /> : null}
+            {/* A drawer's actions read as one group; only the destructive one is
+                set apart, which is the rule menus already followed. */}
+            {index > 0 && action.destructive === true ? <DrawerSeparator /> : null}
             <DrawerRow
               destructive={action.destructive ?? false}
               disabled={action.disabled ?? false}
@@ -115,8 +121,19 @@ export function ActionSheet({
               {...(action.accessibilityLabel === undefined
                 ? {}
                 : { accessibilityLabel: action.accessibilityLabel })}
+              {...(action.accessibilityRole === undefined
+                ? {}
+                : { accessibilityRole: action.accessibilityRole })}
               {...(action.detail === undefined ? {} : { detail: action.detail })}
               {...(action.icon === undefined ? {} : { icon: action.icon })}
+              {...(action.selected === undefined
+                ? {}
+                : {
+                    selected: action.selected,
+                    ...(action.selected
+                      ? { trailing: <Icon color="popoverForeground" name="Check" /> }
+                      : {}),
+                  })}
             />
           </View>
         ))}

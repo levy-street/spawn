@@ -62,7 +62,7 @@ describe("alert content", () => {
   it("builds a concise location without repeating the folder", () => {
     const context = { session: SESSION, agents: [AGENT], workspaceName: "Project" };
     expect(alertBody(alert(), context)).toBe("Project · spawn");
-    expect(alertToastMessage(alert(), context)).toBe("My Helper finished — Project · spawn");
+    expect(alertToastMessage(alert(), context)).toBe("My Helper finished: Project · spawn");
   });
 
   it("adds exit detail and has a safe missing-session fallback", () => {

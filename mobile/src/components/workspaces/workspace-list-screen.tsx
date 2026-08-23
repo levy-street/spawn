@@ -60,11 +60,6 @@ import type { DomainSnapshot, Workspace } from "@/data/types/domain";
 import { haptics } from "@/lib/haptics";
 import { useTheme } from "@/theme";
 
-function WorkspaceListSeparator(): React.JSX.Element {
-  // FlashList accepts a component, so bind the required edge-to-edge configuration once.
-  return <ListSeparator inset={false} />;
-}
-
 export function WorkspaceListScreen() {
   const theme = useTheme();
   const router = useRouter();
@@ -283,8 +278,9 @@ export function WorkspaceListScreen() {
           <WorkspaceListStatusError onRetry={() => void sessionsQuery.refetch()} />
         ) : null}
         <FlashList
+          contentContainerStyle={styles.listContent}
           data={rows}
-          ItemSeparatorComponent={WorkspaceListSeparator}
+          ItemSeparatorComponent={ListSeparator}
           keyExtractor={(item) => item.workspace.id}
           ListEmptyComponent={<WorkspaceListEmpty onCreate={openCreate} query={query} />}
           ListFooterComponent={

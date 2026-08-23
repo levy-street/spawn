@@ -1,14 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { getHost } from "@/data/api/endpoints/hosts";
-import {
-  deleteSession,
-  getSession,
-  patchSession,
-  restartSession,
-} from "@/data/api/endpoints/sessions";
+import { getSession, patchSession, restartSession } from "@/data/api/endpoints/sessions";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
+import { killSession, removeSessionPanes } from "@/data/queries/session-teardown";
 import { qk } from "@/data/queryKeys";
 
 export interface TerminalData {
@@ -71,13 +67,35 @@ export function useRestartTerminalSession(sessionId: string) {
   });
 }
 
+export interface KillTerminalSessionResult {
+  /** True when the server had already dropped the session before we asked. */
+  alreadyGone: boolean;
+  /** Set when the session died but its pane could not be taken out of a layout. */
+  paneError: Error | null;
+}
+
 export function useKillTerminalSession(sessionId: string) {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: () => deleteSession(sessionId),
-    onSuccess: () => {
+  return useMutation<KillTerminalSessionResult, Error, void>({
+    // Everything happens in the mutation rather than in onSuccess: the terminal
+    // closes as soon as the kill is confirmed, and an observer whose component
+    // has gone never runs its callbacks — while the session list and the
+    // layouts pointing at this pane have to be corrected either way.
+    mutationFn: async () => {
+      const { alreadyGone } = await killSession(sessionId);
       queryClient.removeQueries({ queryKey: qk.session(sessionId), exact: true });
       void queryClient.invalidateQueries({ queryKey: qk.sessions() });
+      try {
+        await removeSessionPanes(queryClient, sessionId);
+        return { alreadyGone, paneError: null };
+      } catch (error) {
+        // Reported rather than thrown: the process is dead whatever the
+        // workspace write did, and calling that a failed kill would be a lie.
+        return {
+          alreadyGone,
+          paneError: error instanceof Error ? error : new Error(String(error)),
+        };
+      }
     },
   });
 }

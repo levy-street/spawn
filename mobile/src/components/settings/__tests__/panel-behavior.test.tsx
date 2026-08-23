@@ -133,13 +133,31 @@ describe("settings panel behavior", () => {
     expect(screen.getByTestId("settings-panel-about")).toBeOnTheScreen();
     expect(screen.getAllByTestId(/^settings-panel-/)).toHaveLength(SETTINGS_PANELS.length + 2);
     // Hosts and Settings are bottom-nav roots and are not linked from any header;
-    // Admin is not in the nav, but it only belongs to an account that can use it.
+    // Admin is a row in the list rather than a header icon, and a non-admin
+    // account does not get the row at all.
     expect(screen.queryByRole("button", { name: "Open hosts" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Open settings" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Open admin" })).toBeNull();
+    expect(screen.queryByTestId("settings-panel-admin")).toBeNull();
     expect(screen.queryByText("Terminal")).toBeNull();
     expect(screen.queryByText("Sessions")).toBeNull();
     expect(screen.queryByText("Security")).toBeNull();
+  });
+
+  test("an admin reaches admin from a list row, never from the header", async () => {
+    mockUser.is_admin = true;
+    try {
+      const screen = await render(<SettingsRoot />, { wrapper });
+
+      const row = screen.getByTestId("settings-panel-admin");
+      expect(row).toBeOnTheScreen();
+      expect(screen.queryByRole("button", { name: "Open admin" })).toBeNull();
+
+      await fireEvent.press(row);
+      expect(mockPush).toHaveBeenCalledWith("/admin");
+    } finally {
+      mockUser.is_admin = false;
+    }
   });
 
   test("push-dependent notification preference is explicitly unavailable", async () => {

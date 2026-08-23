@@ -117,6 +117,7 @@ export type WorkerToNativeMessage =
   | (WorkerMessage & { type: "bell" })
   | (WorkerMessage & { type: "scroll-state"; scroll: ScrollState })
   | (WorkerMessage & { type: "selection"; text: string; requestId?: string })
+  | (WorkerMessage & { type: "native-selection"; active: boolean })
   | (WorkerMessage & { type: "link"; url: string })
   | (WorkerMessage & { type: "clipboard-read"; requestId: string })
   | (WorkerMessage & { type: "clipboard-write"; requestId: string; text: string })
@@ -247,6 +248,7 @@ const WORKER_MESSAGE_TYPES = new Set([
   "bell",
   "scroll-state",
   "selection",
+  "native-selection",
   "link",
   "clipboard-read",
   "clipboard-write",
@@ -332,7 +334,8 @@ export class WorkerEventCoalescer {
     if (
       message.type === "state" ||
       message.type === "scroll-state" ||
-      message.type === "selection"
+      message.type === "selection" ||
+      message.type === "native-selection"
     ) {
       this.#latest.set(message.type, message);
     } else {

@@ -56,6 +56,8 @@ export interface TerminalSurfaceProps extends Omit<SessionTransportOptions, "bri
   onDisplayChange?(display: DisplayControlState): void;
   onBell?(): void;
   onLink?(url: string): void;
+  /** The system has, or no longer has, text selected in the terminal. */
+  onNativeSelection?(active: boolean): void;
   onContentProcessTerminated?(): void;
 }
 
@@ -83,6 +85,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       onDisplayChange,
       onBell,
       onLink,
+      onNativeSelection,
       onContentProcessTerminated,
     },
     ref,
@@ -104,6 +107,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       onDisplayChange,
       onBell,
       onLink,
+      onNativeSelection,
       onContentProcessTerminated,
     });
     callbacks.current = {
@@ -115,6 +119,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       onDisplayChange,
       onBell,
       onLink,
+      onNativeSelection,
       onContentProcessTerminated,
     };
 
@@ -249,6 +254,8 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
           clearTimeout(waiter.timer);
           selectionWaiters.current.delete(message.requestId);
           waiter.resolve(message.text.length === 0 ? null : message.text);
+        } else if (message.type === "native-selection") {
+          callbacks.current.onNativeSelection?.(message.active);
         } else if (message.type === "link") {
           callbacks.current.onLink?.(message.url);
         } else if (message.type === "clipboard-read") {

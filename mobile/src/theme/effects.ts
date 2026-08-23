@@ -19,6 +19,8 @@ export const blurRadius = {
 export const opacity = {
   hidden: 0,
   quiet: 0.45,
+  /** The rule that spends a toast's life: present, never loud. */
+  countdown: 0.55,
   disabled: 0.5,
   pulse: 0.6,
   skeleton: 0.7,

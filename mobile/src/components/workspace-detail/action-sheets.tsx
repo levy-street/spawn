@@ -1,9 +1,10 @@
 import { ActionSheet, type ActionSheetAction } from "@/components/ui/action-sheet";
 import { Icon } from "@/components/ui/icon";
+import { StatusDot } from "@/components/ui/status-dot";
 import { canMovePaneToTab, canRemoveTab } from "@/data/layout/tabs";
 import { canAddTile, orderedTiles } from "@/data/layout/tiles";
 import { sessionTitle } from "@/data/selectors/session";
-import type { AgentDef, Session, Workspace } from "@/data/types/domain";
+import type { AgentDef, Host, Session, Workspace } from "@/data/types/domain";
 import { isFilesWidget, type Tile, type WorkspaceTab } from "@/data/types/layout";
 
 export interface PaneActionTarget {
@@ -20,6 +21,8 @@ export interface PaneActionsSheetProps {
   onDismiss: () => void;
   onRename: (session: Session) => void;
   onMove: (tile: Tile) => void;
+  /** Re-point this window at another machine (sessions only — a widget has none). */
+  onMoveToHost: (tile: Tile, session: Session) => void;
   onDuplicate: (tile: Tile, session: Session | null) => void;
   onReorder: (target: PaneActionTarget, offset: -1 | 1) => void;
   onRestart: (session: Session) => void;
@@ -35,6 +38,7 @@ export function PaneActionsSheet({
   onDismiss,
   onRename,
   onMove,
+  onMoveToHost,
   onDuplicate,
   onReorder,
   onRestart,
@@ -103,6 +107,15 @@ export function PaneActionsSheet({
         },
       },
     );
+  }
+  if (session && tile) {
+    actions.push({
+      id: "move-host",
+      label: "Run on another host",
+      detail: `Now on ${session.host_name ?? "this host"}`,
+      icon: <Icon name="Server" />,
+      onPress: () => onMoveToHost(tile, session),
+    });
   }
   if (session) {
     actions.push({
@@ -173,6 +186,56 @@ export function MovePaneSheet({ visible, tile, workspace, onDismiss, onMove }: M
       onDismiss={onDismiss}
       title="Move pane"
       visible={visible && tile !== null}
+    />
+  );
+}
+
+export interface MovePaneHostSheetProps {
+  visible: boolean;
+  session: Session | null;
+  hosts: readonly Host[];
+  onDismiss: () => void;
+  onSelect: (host: Host) => void;
+}
+
+/**
+ * Which machine a window runs on. Its shell cannot follow it across, so the
+ * choice is destructive — the caller confirms before acting on it.
+ */
+export function MovePaneHostSheet({
+  visible,
+  session,
+  hosts,
+  onDismiss,
+  onSelect,
+}: MovePaneHostSheetProps) {
+  const ordered = [...hosts].sort(
+    (left, right) =>
+      Number(right.status === "online") - Number(left.status === "online") ||
+      left.name.localeCompare(right.name, undefined, { sensitivity: "base" }),
+  );
+  const actions = ordered.map((host): ActionSheetAction => {
+    const current = host.id === session?.host_id;
+    const online = host.status === "online";
+    return {
+      id: host.id,
+      label: host.name,
+      icon: <StatusDot pulse={false} tone={online ? "active" : "offline"} />,
+      selected: current,
+      disabled: current || !online,
+      accessibilityRole: "radio",
+      ...(current ? { detail: "Already here" } : online ? {} : { detail: "Offline" }),
+      onPress: () => onSelect(host),
+    };
+  });
+
+  return (
+    <ActionSheet
+      actions={actions}
+      message="The window keeps its place; a fresh shell starts in your home folder there."
+      onDismiss={onDismiss}
+      title="Run on another host"
+      visible={visible && session !== null}
     />
   );
 }

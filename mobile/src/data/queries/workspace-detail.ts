@@ -1,5 +1,5 @@
 import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { listAgents } from "@/data/api/endpoints/agents";
 import { listHosts } from "@/data/api/endpoints/hosts";
@@ -50,14 +50,31 @@ export function useWorkspaceDetail(workspaceId: string) {
   const hosts = useQuery({ queryKey: qk.hosts(), queryFn: listHosts, enabled });
   const agents = useQuery({ queryKey: qk.agents(), queryFn: listAgents, enabled });
 
+  // Only a pull drives the refresh chrome. The five-second session poll sets
+  // `isFetching` constantly, and binding that to the control makes the list
+  // twitch downwards on its own every tick.
+  const [refreshing, setRefreshing] = useState(false);
+  const refetchWorkspace = workspace.refetch;
+  const refetchSessions = sessions.refetch;
+  const refetchHosts = hosts.refetch;
+  const refetchAgents = agents.refetch;
+  const refresh = useCallback(async (): Promise<void> => {
+    setRefreshing(true);
+    try {
+      await Promise.all([refetchWorkspace(), refetchSessions(), refetchHosts(), refetchAgents()]);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refetchAgents, refetchHosts, refetchSessions, refetchWorkspace]);
+
   return {
     workspace,
     sessions,
     hosts,
     agents,
     loading: workspace.isPending || sessions.isPending || hosts.isPending || agents.isPending,
-    refreshing:
-      workspace.isFetching || sessions.isFetching || hosts.isFetching || agents.isFetching,
+    refreshing,
+    refresh,
     error: workspace.error ?? sessions.error ?? hosts.error ?? agents.error,
   };
 }

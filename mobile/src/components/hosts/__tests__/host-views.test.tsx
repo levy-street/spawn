@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react-native";
-import { AccessibilityInfo } from "react-native";
+import { AccessibilityInfo, Text as NativeText } from "react-native";
 import {
   codexAgent,
   offlineHost,
@@ -20,7 +20,6 @@ describe("host list and detail rendering", () => {
   test("renders every documented list field and opens rows", async () => {
     const onOpen = jest.fn();
     const onOpenActions = jest.fn();
-    const onOpenLegion = jest.fn();
     await render(
       <ThemeProvider>
         <HostListView
@@ -28,9 +27,9 @@ describe("host list and detail rendering", () => {
           onConnect={jest.fn()}
           onOpen={onOpen}
           onOpenActions={onOpenActions}
-          onOpenLegion={onOpenLegion}
           onRefresh={jest.fn()}
           refreshing={false}
+          summary={<NativeText>Legion rollup</NativeText>}
         />
       </ThemeProvider>,
     );
@@ -47,7 +46,8 @@ describe("host list and detail rendering", () => {
       screen.getByTestId(`host-status-${onlineHost.id}`, { includeHiddenElements: true }),
     ).toHaveStyle({ position: "absolute" });
     expect(screen.getByTestId(`host-session-count-${onlineHost.id}`)).toBeOnTheScreen();
-    expect(screen.getAllByTestId("list-separator")).toHaveLength(1);
+    // Between the two hosts, and under the last of them to close the list.
+    expect(screen.getAllByTestId("list-separator")).toHaveLength(2);
     expect(screen.getByText("old-laptop")).toBeOnTheScreen();
 
     const officeMacRow = screen.getByRole("button", { name: /office-mac, online · heartbeat/ });
@@ -61,12 +61,44 @@ describe("host list and detail rendering", () => {
     await fireEvent(officeMacRow, "longPress");
     expect(onOpenActions).toHaveBeenCalledTimes(2);
 
-    await fireEvent.press(
-      screen.getByRole("button", {
-        name: "Fleet overview, 1 online · 1 offline · 6 sessions",
-      }),
+    // The legion's numbers sit at the head of the list itself; there is no row
+    // here that opens a page of its own to show them.
+    expect(screen.getByText("Legion rollup")).toBeOnTheScreen();
+    expect(screen.queryByText("Fleet overview")).toBeNull();
+  });
+
+  test("a legion row reads out capacity, spec and what is running", async () => {
+    await render(
+      <ThemeProvider>
+        <HostListView
+          agents={[codexAgent]}
+          hosts={[onlineHost, offlineHost]}
+          onConnect={jest.fn()}
+          onOpen={jest.fn()}
+          onOpenActions={jest.fn()}
+          onRefresh={jest.fn()}
+          refreshing={false}
+          sessions={[runningSession]}
+        />
+      </ThemeProvider>,
     );
-    expect(onOpenLegion).toHaveBeenCalledTimes(1);
+
+    // The heartbeat's five-level reading, in the words the meter uses.
+    expect(screen.getAllByTestId("bucketed-capacity")).toHaveLength(1);
+    expect(screen.getByLabelText("CPU Busy")).toBeOnTheScreen();
+    expect(screen.getByLabelText("MEM Working")).toBeOnTheScreen();
+    // Both fixtures share a spec; the offline one keeps it and loses the meter.
+    expect(screen.getAllByText("12 cores · 24 GiB · Apple M4 Pro")).toHaveLength(2);
+
+    // What is on the machine, not just how many of it.
+    expect(screen.getByTestId(`host-running-${onlineHost.id}`)).toBeOnTheScreen();
+    expect(screen.getByText("Codex")).toBeOnTheScreen();
+    expect(screen.getByTestId(`host-attention-${onlineHost.id}`)).toBeOnTheScreen();
+
+    // An offline machine reports no capacity, and a stale meter is worse than
+    // none — the spec still says what the machine is.
+    expect(screen.queryByTestId(`host-running-${offlineHost.id}`)).toBeNull();
+    expect(screen.getByRole("button", { name: /old-laptop[\s\S]*12 cores/ })).toBeOnTheScreen();
   });
 
   test("renders host facts and session identity while omitting nonexistent daemon actions", async () => {

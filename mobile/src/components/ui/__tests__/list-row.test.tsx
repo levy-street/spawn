@@ -4,7 +4,6 @@ import { StyleSheet, View } from "react-native";
 
 import { ListRow, ListSeparator } from "@/components/ui/list-row";
 import { borderWidth, lightColors, radii, ThemeProvider } from "@/theme";
-import { sizing } from "@/theme/sizing";
 
 function wrapper({ children }: PropsWithChildren): React.JSX.Element {
   return <ThemeProvider>{children}</ThemeProvider>;
@@ -32,21 +31,30 @@ describe("ListRow", () => {
 });
 
 describe("ListSeparator", () => {
-  test.each([
-    [undefined, sizing.listRow.separatorInset],
-    [true, sizing.listRow.separatorInset],
-    [false, sizing.listRow.separatorFullBleed],
-  ] as const)("uses inset %s with the matching leading clearance", async (inset, marginLeft) => {
-    const screen = await render(
-      inset === undefined ? <ListSeparator /> : <ListSeparator inset={inset} />,
-      { wrapper },
-    );
+  test("runs edge to edge, with no horizontal offset on either side", async () => {
+    const screen = await render(<ListSeparator />, { wrapper });
     const style = StyleSheet.flatten(screen.getByTestId("list-separator").props["style"]);
 
     expect(style).toMatchObject({
       backgroundColor: lightColors.border,
       height: borderWidth.hairline,
-      marginLeft,
     });
+    // A divider that clears one edge but not the other reads as a misalignment.
+    for (const offset of [
+      "marginLeft",
+      "marginRight",
+      "marginStart",
+      "marginEnd",
+      "marginHorizontal",
+      "paddingLeft",
+      "paddingRight",
+      "paddingStart",
+      "paddingEnd",
+      "paddingHorizontal",
+      "left",
+      "right",
+    ] as const) {
+      expect(style[offset]).toBeUndefined();
+    }
   });
 });

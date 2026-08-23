@@ -113,25 +113,25 @@ describe("host screen headers", () => {
 
   afterEach(() => jest.restoreAllMocks());
 
-  test("Hosts is a root: one title, its own actions, no back control", async () => {
+  test("Legion is a root: the mark, its own action, no back control", async () => {
     await render(<HostListScreen />, { wrapper: Providers });
 
-    expect(screen.getAllByText("Hosts")).toHaveLength(1);
-    expect(screen.getByRole("header", { name: "Hosts" })).toBeOnTheScreen();
+    // A destination root wears the spawnd mark; the tab bar underneath names it.
+    expect(screen.queryByText("Legion")).toBeNull();
+    expect(screen.getByLabelText("Legion")).toBeOnTheScreen();
 
     // The bottom nav owns Settings now, so the header must not offer it a second
-    // time. Legion and Connect stay: neither is a nav destination.
+    // time. The legion's rollup is on the page itself, so no action opens it.
     expect(screen.queryByTestId("hosts-settings-action")).toBeNull();
+    expect(screen.queryByTestId("hosts-legion-action")).toBeNull();
 
-    // Hosts is a destination root like Workspaces: there is nothing behind it to
+    // Legion is a destination root like Workspaces: there is nothing behind it to
     // go back to, so it carries the profile control rather than a chevron.
     expect(screen.queryByRole("button", { name: "Go back" })).toBeNull();
 
-    await fireEvent.press(screen.getByTestId("hosts-legion-action"));
     await fireEvent.press(screen.getByTestId("hosts-connect-action"));
 
-    expect(mockPush).toHaveBeenNthCalledWith(1, "/legion");
-    expect(mockPush).toHaveBeenNthCalledWith(2, "/onboarding/host");
+    expect(mockPush).toHaveBeenNthCalledWith(1, "/onboarding/host");
     expect(mockBack).not.toHaveBeenCalled();
   });
 

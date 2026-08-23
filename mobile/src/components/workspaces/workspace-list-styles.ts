@@ -4,6 +4,13 @@ import { borderWidth, radii } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
 export const workspaceListStyles = StyleSheet.create({
+  // A handful of workspaces leave the rest of the screen empty, and scrollable
+  // content that stops under the last row takes the pull-to-refresh gesture
+  // with it. Growing the content to the full height keeps every point between
+  // the search field and the archived footer on the refresh surface.
+  listContent: {
+    flexGrow: 1,
+  },
   screen: {
     flex: 1,
   },

@@ -60,7 +60,6 @@ export const SETTINGS_PANELS = [
       "Sound",
       "System notification",
       "Vibration",
-      "Send a test alert",
     ],
   },
   {

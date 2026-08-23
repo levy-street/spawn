@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react-native";
 
 import { JumpToLatest } from "@/components/terminal-ui/jump-to-latest";
 import { SelectionToolbar } from "@/components/terminal-ui/selection-toolbar";
-import { TerminalKeysSheet } from "@/components/terminal-ui/terminal-keys-sheet";
+import { TerminalCommandsSheet } from "@/components/terminal-ui/terminal-commands-sheet";
 import { ThemeProvider } from "@/theme";
 
 jest.mock("@/components/ui/sheet", () => {
@@ -11,7 +11,9 @@ jest.mock("@/components/ui/sheet", () => {
   return {
     Sheet: ({ children, visible }: React.PropsWithChildren<{ visible: boolean }>) =>
       visible ? React.createElement(View, { testID: "mock-sheet" }, children) : null,
-    SheetHeader: ({ title }: { title: string }) => React.createElement(Text, null, title),
+    SheetHeader: ({ title, action }: { title: string; action?: React.ReactNode }) =>
+      React.createElement(View, null, React.createElement(Text, null, title), action),
+    SheetScrollView: View,
   };
 });
 
@@ -52,15 +54,24 @@ describe("terminal chrome", () => {
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
-  test("sends the selected named key from the shared key sheet", async () => {
-    const onKey = jest.fn();
+  test("sends the pressed key from the commands drawer", async () => {
+    const onCommand = jest.fn();
     await render(
       <ThemeProvider>
-        <TerminalKeysSheet onDismiss={jest.fn()} onKey={onKey} visible />
+        <TerminalCommandsSheet
+          kind="shell"
+          onCommand={onCommand}
+          onDismiss={jest.fn()}
+          onTogglePin={jest.fn(() => true)}
+          pinned={[]}
+          visible
+        />
       </ThemeProvider>,
     );
 
     await fireEvent.press(screen.getByRole("button", { name: "Page up" }));
-    expect(onKey).toHaveBeenCalledWith({ kind: "named", key: "PageUp" });
+    expect(onCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "key-PageUp", spec: { kind: "named", key: "PageUp" } }),
+    );
   });
 });

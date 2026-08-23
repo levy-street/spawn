@@ -1,8 +1,8 @@
 import { StyleSheet, View } from "react-native";
 import { Badge } from "@/components/ui/badge";
-import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
-import { ListRow, ListSeparator } from "@/components/ui/list-row";
+import { ListGroup } from "@/components/ui/list-group";
+import { ListRow } from "@/components/ui/list-row";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Text } from "@/components/ui/text";
 import type { SkillOut } from "@/data/api/schemas/skills";
@@ -23,10 +23,9 @@ export function HostSkillsList({ skills }: { skills: readonly SkillOut[] }) {
       {skills.length === 0 ? (
         <EmptyState icon="Wrench" title="No skills yet." />
       ) : (
-        <Card padded={false} style={styles.rows} variant="flat">
-          {skills.map((skill, index) => (
+        <ListGroup testID="host-skill-rows">
+          {skills.map((skill) => (
             <View key={skill.id}>
-              {index > 0 ? <ListSeparator inset={false} /> : null}
               <ListRow
                 height={skill.description ? "tall" : "regular"}
                 shape="fullBleed"
@@ -36,19 +35,15 @@ export function HostSkillsList({ skills }: { skills: readonly SkillOut[] }) {
               />
             </View>
           ))}
-        </Card>
+        </ListGroup>
       )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  rows: {
-    gap: spacing[0],
-    overflow: "hidden",
-  },
   section: {
-    gap: spacing[3],
+    gap: spacing[0],
   },
   sectionHeader: {
     paddingHorizontal: spacing[0],

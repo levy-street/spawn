@@ -1,4 +1,4 @@
-import { type ReactNode, useState } from "react";
+import { useState } from "react";
 import {
   Keyboard,
   Pressable,
@@ -15,8 +15,9 @@ import Animated, {
   withTiming,
 } from "react-native-reanimated";
 import { ActionSheet, type ActionSheetAction } from "@/components/ui/action-sheet";
+import { DrawerRow } from "@/components/ui/drawer-row";
 import { Icon } from "@/components/ui/icon";
-import { Sheet, SheetHeader, SheetScrollView } from "@/components/ui/sheet";
+import { Sheet, SheetScrollView } from "@/components/ui/sheet";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
 import { useTheme } from "@/theme";
@@ -34,16 +35,11 @@ export interface SelectOption<Value extends string = string> {
   accessibilityLabel?: string;
 }
 
-export interface SelectRenderState {
-  selected: boolean;
-}
-
 export interface SelectProps<Value extends string = string> {
   value: Value | null;
   options: readonly SelectOption<Value>[];
   onChange: (value: Value) => void;
   placeholder: string;
-  renderOption?: (option: SelectOption<Value>, state: SelectRenderState) => ReactNode;
   disabled?: boolean;
   error?: boolean;
   accessibilityLabel?: string;
@@ -58,7 +54,6 @@ export function Select<Value extends string>({
   options,
   onChange,
   placeholder,
-  renderOption,
   disabled = false,
   error = false,
   accessibilityLabel,
@@ -71,7 +66,9 @@ export function Select<Value extends string>({
   const focusProgress = useSharedValue(0);
   const [visible, setVisible] = useState(false);
   const selectedOption = options.find((option) => option.value === value);
-  const usesActionSheet = options.length <= ACTION_SHEET_OPTION_LIMIT && renderOption === undefined;
+  // Past a handful the list has to scroll, which a drawer that hugs its content
+  // cannot do; the rows themselves are the same either way.
+  const usesActionSheet = options.length <= ACTION_SHEET_OPTION_LIMIT;
 
   const animatedHaloStyle = useAnimatedStyle(
     () => ({
@@ -103,9 +100,8 @@ export function Select<Value extends string>({
       ? {}
       : { accessibilityLabel: option.accessibilityLabel }),
     ...(option.disabled === undefined ? {} : { disabled: option.disabled }),
-    ...(option.value === value
-      ? { icon: <Icon color="popoverForeground" name="Check" size={spacing[4]} /> }
-      : {}),
+    accessibilityRole: "radio",
+    selected: option.value === value,
     onPress: () => choose(option),
   }));
 
@@ -170,55 +166,28 @@ export function Select<Value extends string>({
         />
       ) : (
         <Sheet onDismiss={() => setVisible(false)} visible={visible}>
-          <SheetHeader title={placeholder} />
           <SheetScrollView bounces={false} keyboardShouldPersistTaps="handled">
-            {options.map((option, index) => {
+            {options.map((option) => {
               const selected = option.value === value;
               return (
-                <View key={option.value}>
-                  {index > 0 ? (
-                    <View
-                      style={[styles.divider, { backgroundColor: theme.colors.popoverBorder }]}
-                    />
-                  ) : null}
-                  <Pressable
-                    accessibilityLabel={option.accessibilityLabel ?? option.label}
-                    accessibilityRole="radio"
-                    accessibilityState={{ checked: selected, disabled: option.disabled === true }}
-                    disabled={option.disabled}
-                    onPress={() => {
-                      haptics.selection();
-                      choose(option);
-                    }}
-                    style={({ pressed }) => [
-                      styles.option,
-                      {
-                        backgroundColor: pressed
-                          ? theme.colors.popoverAccent
-                          : theme.colors.popover,
-                      },
-                      option.disabled === true && styles.disabled,
-                    ]}
-                  >
-                    <View style={styles.optionCopy}>
-                      {renderOption?.(option, { selected }) ?? (
-                        <>
-                          <Text color="popoverForeground" variant="body">
-                            {option.label}
-                          </Text>
-                          {option.detail !== undefined ? (
-                            <Text color="mutedForeground" variant="caption">
-                              {option.detail}
-                            </Text>
-                          ) : null}
-                        </>
-                      )}
-                    </View>
-                    {selected ? (
-                      <Icon color="popoverForeground" name="Check" size={spacing[4]} />
-                    ) : null}
-                  </Pressable>
-                </View>
+                <DrawerRow
+                  accessibilityRole="radio"
+                  key={option.value}
+                  label={option.label}
+                  onPress={() => {
+                    haptics.selection();
+                    choose(option);
+                  }}
+                  selected={selected}
+                  {...(option.accessibilityLabel === undefined
+                    ? {}
+                    : { accessibilityLabel: option.accessibilityLabel })}
+                  {...(option.detail === undefined ? {} : { detail: option.detail })}
+                  {...(option.disabled === undefined ? {} : { disabled: option.disabled })}
+                  {...(selected
+                    ? { trailing: <Icon color="popoverForeground" name="Check" /> }
+                    : {})}
+                />
               );
             })}
           </SheetScrollView>

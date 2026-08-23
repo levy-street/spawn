@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { AgentForm, type AgentFormValue } from "@/components/settings/agent-form";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
@@ -48,7 +48,7 @@ function AgentRow({
   const yoloActive = canYolo && agent.yolo;
   const identity = identifyAgent(agent.command, [agent]);
   return (
-    <Card variant="flat">
+    <SettingsBlock>
       <View style={styles.row}>
         <AgentIcon identity={identity} size={spacing[9]} />
         <View style={styles.rowCopy}>
@@ -98,7 +98,7 @@ function AgentRow({
           </Button>
         </View>
       ) : null}
-    </Card>
+    </SettingsBlock>
   );
 }
 
@@ -148,20 +148,16 @@ export function AgentsPanel(): React.JSX.Element {
   };
 
   return (
-    <SettingsScreen
-      description="Agents are account-level shortcut definitions that type CLI commands into a session shell."
-      testID="agents-panel"
-      title="Agents"
-    >
+    <SettingsScreen testID="agents-panel" title="Agents">
       {editing ? (
-        <Card variant="flat">
+        <SettingsBlock>
           <AgentForm
             {...(editing === "new" ? {} : { agent: editing })}
             busy={busy}
             onCancel={() => setEditing(null)}
             onSubmit={save}
           />
-        </Card>
+        </SettingsBlock>
       ) : (
         <Button onPress={() => setEditing("new")}>Add agent</Button>
       )}
@@ -172,7 +168,7 @@ export function AgentsPanel(): React.JSX.Element {
         </Text>
       ) : null}
 
-      <SettingsSection title="BUILT IN">
+      <SettingsSection title="Built in">
         {builtIn.map((agent) => (
           <AgentRow
             agent={agent}
@@ -190,10 +186,10 @@ export function AgentsPanel(): React.JSX.Element {
         ))}
       </SettingsSection>
 
-      <SettingsSection title="CUSTOM AGENTS">
+      <SettingsSection title="Custom agents">
         {custom.length === 0 && !agents.isPending ? (
           <EmptyState
-            description="Add a shortcut for any CLI tool installed on your hosts."
+            description="Add a shortcut for any CLI tool on your hosts."
             icon="Bot"
             title="No custom agents"
           />
@@ -218,7 +214,7 @@ export function AgentsPanel(): React.JSX.Element {
 
       <Confirm
         confirmLabel="Delete agent"
-        description="This removes the shortcut definition. Running sessions are not affected."
+        description="Running sessions are not affected."
         destructive
         onCancel={() => setDeleteTarget(null)}
         onConfirm={() => {

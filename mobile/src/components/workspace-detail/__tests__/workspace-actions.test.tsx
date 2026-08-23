@@ -3,7 +3,7 @@ import type { PropsWithChildren, ReactNode } from "react";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { WorkspaceDetail } from "@/components/workspace-detail/workspace-detail";
-import type { Session } from "@/data/types/domain";
+import type { AgentIdentity, Session } from "@/data/types/domain";
 import type { Tile, WorkspaceTab } from "@/data/types/layout";
 import { ThemeProvider } from "@/theme";
 
@@ -18,6 +18,7 @@ interface CapturedGroups {
   paneList?: CapturedProps;
   paneActions?: CapturedProps;
   movePane?: CapturedProps;
+  movePaneHost?: CapturedProps;
   tabActions?: CapturedProps;
   workspaceActions?: CapturedProps;
   rename?: CapturedProps;
@@ -25,6 +26,10 @@ interface CapturedGroups {
 }
 
 const mockCaptured: CapturedGroups = {};
+const mockGhost: { title: string; identity: AgentIdentity } = {
+  title: "Implement mobile",
+  identity: { kind: "codex", displayName: "Codex", logoKey: "codex", monogramSeed: "Codex" },
+};
 const mockOpenTerminal = jest.fn();
 let mockWorkspace = makeWorkspace();
 let mockSessions: Session[] = [];
@@ -168,6 +173,10 @@ jest.mock("@/components/workspace-detail/action-sheets", () => ({
     mockCaptured.movePane = props;
     return null;
   },
+  MovePaneHostSheet: (props: CapturedProps) => {
+    mockCaptured.movePaneHost = props;
+    return null;
+  },
   TabActionsSheet: (props: CapturedProps) => {
     mockCaptured.tabActions = props;
     return null;
@@ -199,6 +208,8 @@ jest.mock("@/data/queries/workspace-detail", () => ({
     hosts: { data: [] },
     agents: { data: [] },
     loading: false,
+    refreshing: false,
+    refresh: jest.fn(),
     error: null,
   }),
 }));
@@ -211,6 +222,16 @@ jest.mock("@/data/stores/connection", () => ({
   useConnectionStore: (selector: (state: { sessionTransports: object }) => unknown) =>
     selector({ sessionTransports: {} }),
 }));
+
+const mockToast = {
+  show: jest.fn(),
+  success: jest.fn(),
+  error: jest.fn(),
+  dismiss: jest.fn(),
+  clear: jest.fn(),
+};
+
+jest.mock("@/components/ui/toast", () => ({ useToast: () => mockToast }));
 
 function Providers({ children }: PropsWithChildren) {
   return (
@@ -362,6 +383,36 @@ describe("workspace action wiring", () => {
     );
   });
 
+  it("says what happened when a session pane is closed out from under its row", async () => {
+    const session = makeSession();
+    mockSessions = [session];
+    const tile = { session_id: session.id, x: 0, y: 0, w: 24, h: 24 };
+    mockWorkspace = makeWorkspace([makeTab("main", [tile])]);
+    await render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+
+    await act(async () => {
+      (mockCaptured.paneList?.["onPaneActions"] as ((target: unknown) => void) | undefined)?.(tile);
+    });
+    await act(async () => {
+      (mockCaptured.paneActions?.["onRemove"] as ((target: unknown) => void) | undefined)?.(tile);
+    });
+    expect(mockCaptured.confirm?.["title"]).toBe("Close session?");
+
+    await act(async () => {
+      (mockCaptured.confirm?.["onConfirm"] as (() => void) | undefined)?.();
+    });
+
+    await waitFor(() => expect(mockToast.success).toHaveBeenCalledWith("Session killed"));
+  });
+
   it("closes an empty tab immediately without destructive confirmation", async () => {
     mockWorkspace = makeWorkspace([makeTab("main"), makeTab("tests")]);
     const screen = await render(
@@ -420,7 +471,16 @@ describe("workspace action wiring", () => {
     expectHandlers("tabStrip", ["onSelect", "onActions", "onAdd", "onClose", "onReorder"]);
     // Rename, move and remove reach the pane through its ... sheet only; the row
     // itself no longer takes them, since round 7 removed the swipe shortcut.
-    expectHandlers("paneList", ["onAddPane", "onOpenTerminal", "onOpenFiles", "onPaneActions"]);
+    expectHandlers("paneList", [
+      "onAddPane",
+      "onOpenTerminal",
+      "onOpenFiles",
+      "onPaneActions",
+      // A tab is refetched by pulling its own list, not only by leaving and
+      // coming back to the workspace.
+      "onRefresh",
+    ]);
+    expect(mockCaptured.paneList?.["refreshing"]).toBe(false);
     expectHandlers("paneActions", [
       "onDismiss",
       "onRename",
@@ -436,6 +496,84 @@ describe("workspace action wiring", () => {
     expectHandlers("rename", ["onDismiss", "onSubmit"]);
     expectHandlers("confirm", ["onCancel", "onConfirm"]);
     expectHandlers("launcher", ["onDismiss", "onLaunchError", "onLaunched"]);
+    await screen.unmount();
+  });
+
+  it("moves a carried pane into the tab it was dropped on, and follows it there", async () => {
+    const tile: Tile = { session_id: "session-1", x: 0, y: 0, w: 24, h: 24 };
+    mockWorkspace = makeWorkspace([makeTab("main", [tile]), makeTab("notes")]);
+    mockSessions = [makeSession()];
+    const screen = await render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+
+    const begin = mockCaptured.paneList?.["onPaneDragBegin"] as
+      | ((tile: Tile, ghost: typeof mockGhost) => void)
+      | undefined;
+    const drop = mockCaptured.paneList?.["onPaneDragEnd"] as
+      | ((tabIndex: number) => void)
+      | undefined;
+    expect(begin).toBeDefined();
+
+    await act(async () => begin?.(tile, mockGhost));
+    await act(async () => drop?.(1));
+
+    expect(mockWorkspaceActions.movePane).toHaveBeenCalledWith(mockWorkspace, "session-1", "notes");
+    await waitFor(() => expect(mockCaptured.tabStrip?.["activeIndex"]).toBe(1));
+    await screen.unmount();
+  });
+
+  it("leaves a pane where it is when it is let go over its own tab or over nothing", async () => {
+    const tile: Tile = { session_id: "session-1", x: 0, y: 0, w: 24, h: 24 };
+    mockWorkspace = makeWorkspace([makeTab("main", [tile]), makeTab("notes")]);
+    mockSessions = [makeSession()];
+    const screen = await render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+
+    const begin = mockCaptured.paneList?.["onPaneDragBegin"] as
+      | ((tile: Tile, ghost: typeof mockGhost) => void)
+      | undefined;
+    const drop = mockCaptured.paneList?.["onPaneDragEnd"] as
+      | ((tabIndex: number) => void)
+      | undefined;
+
+    await act(async () => begin?.(tile, mockGhost));
+    await act(async () => drop?.(0));
+    await act(async () => begin?.(tile, mockGhost));
+    await act(async () => drop?.(-1));
+
+    expect(mockWorkspaceActions.movePane).not.toHaveBeenCalled();
+    await screen.unmount();
+  });
+
+  it("offers no pane drag at all while the workspace has a single tab", async () => {
+    mockWorkspace = makeWorkspace([makeTab("main")]);
+    mockSessions = [];
+    const screen = await render(
+      <WorkspaceDetail
+        onBack={jest.fn()}
+        onOpenFiles={jest.fn()}
+        onOpenTerminal={mockOpenTerminal}
+        workspaceId={mockWorkspace.id}
+      />,
+      { wrapper: Providers },
+    );
+
+    expect(mockCaptured.paneList?.["onPaneDragBegin"]).toBeUndefined();
+    expect(mockCaptured.paneList?.["paneDrag"]).toBeUndefined();
     await screen.unmount();
   });
 });

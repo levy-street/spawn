@@ -3,11 +3,11 @@ import { useEffect, useRef, useState } from "react";
 import { RefreshControl, StyleSheet, View } from "react-native";
 
 import { formatLongtailDate } from "@/components/longtail/longtail-format";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Badge, type BadgeVariant } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Field } from "@/components/ui/field";
 import { Icon } from "@/components/ui/icon";
@@ -70,7 +70,7 @@ interface InviteCardProps {
 
 function InviteCard({ invite, revoking, onRevoke }: InviteCardProps): React.JSX.Element {
   return (
-    <Card style={styles.inviteCard} variant="flat">
+    <SettingsBlock>
       <View style={styles.cardHeader}>
         <View style={styles.cardCopy}>
           <Text numberOfLines={1} variant="label">
@@ -90,7 +90,7 @@ function InviteCard({ invite, revoking, onRevoke }: InviteCardProps): React.JSX.
           Revoke
         </Button>
       ) : null}
-    </Card>
+    </SettingsBlock>
   );
 }
 
@@ -162,7 +162,6 @@ export function AdminInvitesScreen(): React.JSX.Element {
 
   return (
     <SettingsScreen
-      description="Signup is closed: an invite admits exactly one account, once, before it expires."
       refreshControl={
         <RefreshControl onRefresh={() => void query.refetch()} refreshing={query.isRefetching} />
       }
@@ -170,7 +169,7 @@ export function AdminInvitesScreen(): React.JSX.Element {
       title="Invites"
     >
       <SettingsSection title="Create invite">
-        <Card style={styles.form} variant="flat">
+        <SettingsBlock>
           <Field
             error={
               inputError?.ok === false && inputError.field === "email" ? inputError.message : null
@@ -204,14 +203,14 @@ export function AdminInvitesScreen(): React.JSX.Element {
           <Button loading={createMutation.isPending} onPress={submit}>
             {createMutation.isPending ? "Creating…" : "Create invite"}
           </Button>
-        </Card>
+        </SettingsBlock>
       </SettingsSection>
 
       {fresh ? (
         <SettingsSection
-          title={fresh.email ? `Invite ready — emailed to ${fresh.email}` : "Invite ready"}
+          title={fresh.email ? `Invite ready, emailed to ${fresh.email}` : "Invite ready"}
         >
-          <Card style={styles.freshCard} variant="flat">
+          <SettingsBlock>
             {fresh.url ? (
               <Text selectable variant="mono">
                 {fresh.url}
@@ -239,7 +238,7 @@ export function AdminInvitesScreen(): React.JSX.Element {
                 Dismiss
               </Button>
             </View>
-          </Card>
+          </SettingsBlock>
         </SettingsSection>
       ) : null}
 
@@ -290,18 +289,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: spacing[2],
   },
-  form: {
-    gap: spacing[3],
-  },
   freshActions: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: spacing[2],
-  },
-  freshCard: {
-    gap: spacing[3],
-  },
-  inviteCard: {
     gap: spacing[2],
   },
   loading: {

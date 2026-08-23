@@ -1,7 +1,7 @@
 import { StyleSheet, View } from "react-native";
-import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
-import { ListRow, ListSeparator } from "@/components/ui/list-row";
+import { ListGroup } from "@/components/ui/list-group";
+import { ListRow } from "@/components/ui/list-row";
 import { SectionHeader } from "@/components/ui/section-header";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
@@ -33,13 +33,12 @@ export function HostSessionList({ agents, sessions, onOpen }: HostSessionListPro
       {sessions.length === 0 ? (
         <EmptyState icon="Terminal" title="No sessions are running on this host." />
       ) : (
-        <Card padded={false} style={styles.rows} variant="flat">
-          {sessions.map((session, index) => {
+        <ListGroup testID="host-session-rows">
+          {sessions.map((session) => {
             const identity = identifyAgent(session.foreground_command, agents);
             const tone = activityTone(session);
             return (
               <View key={session.id}>
-                {index > 0 ? <ListSeparator /> : null}
                 <ListRow
                   height="tall"
                   leading={<AgentIcon identity={identity} size={spacing[8]} />}
@@ -63,19 +62,15 @@ export function HostSessionList({ agents, sessions, onOpen }: HostSessionListPro
               </View>
             );
           })}
-        </Card>
+        </ListGroup>
       )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  rows: {
-    gap: spacing[0],
-    overflow: "hidden",
-  },
   section: {
-    gap: spacing[3],
+    gap: spacing[0],
   },
   sectionHeader: {
     paddingHorizontal: spacing[0],

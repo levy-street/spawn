@@ -64,5 +64,5 @@ export function alertBody(event: AlertEvent, context: AlertContentContext = {}):
 }
 
 export function alertToastMessage(event: AlertEvent, context: AlertContentContext = {}): string {
-  return `${alertTitle(event, context.agents)} — ${alertBody(event, context)}`;
+  return `${alertTitle(event, context.agents)}: ${alertBody(event, context)}`;
 }

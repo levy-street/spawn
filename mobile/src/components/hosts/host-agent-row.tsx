@@ -2,8 +2,8 @@ import { useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { Confirm } from "@/components/ui/confirm";
+import { ListBlock } from "@/components/ui/list-group";
 import { Monogram } from "@/components/ui/monogram";
 import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
@@ -34,7 +34,7 @@ export function HostAgentRow({
   const action = agent.installed ? "Update" : "Install";
   const canInstall = Boolean(agent.install?.trim());
   return (
-    <Card testID={`host-agent-${agent.agent_id}`} variant="flat">
+    <ListBlock bleed={false} testID={`host-agent-${agent.agent_id}`}>
       <View style={styles.heading}>
         <Monogram seed={agent.agent_name} size={spacing[8]} />
         <View style={styles.headingCopy}>
@@ -125,7 +125,7 @@ export function HostAgentRow({
         title={`${action} ${agent.agent_name}?`}
         visible={confirmVisible}
       />
-    </Card>
+    </ListBlock>
   );
 }
 

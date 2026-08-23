@@ -1,17 +1,16 @@
 import * as Clipboard from "expo-clipboard";
-import { useRouter } from "expo-router";
 import { ScrollView, StyleSheet, View } from "react-native";
 import {
   formatProfileDuration,
   formatProfileMemory,
   profileStatsLine,
 } from "@/components/settings/profile-format";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsInfoRow } from "@/components/settings/settings-row";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Monogram } from "@/components/ui/monogram";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -32,7 +31,6 @@ function Metric({ label, value }: { label: string; value: string | number }): Re
 }
 
 export function ProfileScreen(): React.JSX.Element {
-  const router = useRouter();
   const theme = useTheme();
   const profile = useProfileSettingsQuery();
 
@@ -81,8 +79,8 @@ export function ProfileScreen(): React.JSX.Element {
         </View>
       </View>
 
-      <SettingsSection title="THE LEGION">
-        <Card variant="flat">
+      <SettingsSection title="The legion">
+        <SettingsBlock>
           <View style={styles.metrics}>
             <Metric
               label="hosts online"
@@ -102,10 +100,10 @@ export function ProfileScreen(): React.JSX.Element {
           >
             Copy stats
           </Button>
-        </Card>
+        </SettingsBlock>
       </SettingsSection>
 
-      <SettingsSection title="MACHINES">
+      <SettingsSection title="Machines">
         {data.hosts.length === 0 ? (
           <EmptyState icon="Server" title="No hosts possessed yet." />
         ) : (
@@ -137,8 +135,8 @@ export function ProfileScreen(): React.JSX.Element {
         )}
       </SettingsSection>
 
-      <SettingsSection title={`LAST ${data.history_days} DAYS`}>
-        <Card variant="flat">
+      <SettingsSection title={`Last ${data.history_days} days`}>
+        <SettingsBlock>
           <ScrollView horizontal showsHorizontalScrollIndicator={false}>
             <View style={styles.heatmap}>
               {data.days.map((day) => (
@@ -171,13 +169,13 @@ export function ProfileScreen(): React.JSX.Element {
             <Metric label="most hosts at once" value={data.totals.peak_hosts_online} />
             <Metric label="most sessions at once" value={data.totals.peak_sessions} />
           </View>
-        </Card>
+        </SettingsBlock>
       </SettingsSection>
 
       {data.agents.length > 0 ? (
         <SettingsSection
-          description="Only the foreground process basename is counted. No paths, repositories, or hostnames are included."
-          title="AGENTS SUMMONED"
+          description="Command names only. No paths, repositories, or hostnames."
+          title="Agents summoned"
         >
           {data.agents.map((agent) => (
             <View key={agent.command} style={styles.agent}>

@@ -63,8 +63,8 @@ export const transition = {
   sheet: { duration: duration.panel, easing: easing.out },
   dialog: { duration: duration.base, easing: easing.cssEase },
   overlay: { duration: duration.overlay, easing: easing.cssEase },
-  toastEnter: { duration: duration.medium, easing: easing.cssEase },
-  toastExit: { duration: duration.base, easing: easing.cssEase },
+  toastEnter: { duration: duration.medium, easing: easing.swift },
+  toastExit: { duration: duration.base, easing: easing.in },
   statusPulse: { duration: duration.spinner, easing: easing.out },
 } as const;
 
@@ -77,7 +77,8 @@ export const gesture = {
 export const transform = {
   enterScale: 0.95,
   menuSlide: 16,
-  toastSlide: 16,
+  /** How far above its resting place a notice starts and ends. */
+  toastDrop: 24,
   drawerHiddenXPercent: -100,
   sheetHiddenYPercent: 100,
   switchThumbOffX: 2,

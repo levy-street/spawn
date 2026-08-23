@@ -1,6 +1,5 @@
 import { fireEvent, render } from "@testing-library/react-native";
 import type { ComponentProps, PropsWithChildren, ReactNode } from "react";
-import { Text as NativeText } from "react-native";
 
 import { Select } from "@/components/ui/select";
 import { ThemeProvider } from "@/theme";
@@ -92,20 +91,17 @@ describe("Select", () => {
     expect(screen.queryByTestId("action-sheet")).not.toBeOnTheScreen();
   });
 
-  test("uses a sheet for many options and supports custom rows", async () => {
+  test("uses a scrolling sheet for many options and marks the current one", async () => {
     const options = Array.from({ length: 7 }, (_, index) => ({
       label: `Host ${index + 1}`,
       value: `host-${index + 1}`,
     }));
-    const renderOption = jest.fn((option: (typeof options)[number]) => (
-      <NativeText>{`Custom ${option.label}`}</NativeText>
-    ));
+    const onChange = jest.fn();
     const screen = await render(
       <Select
-        onChange={jest.fn()}
+        onChange={onChange}
         options={options}
         placeholder="Choose host"
-        renderOption={renderOption}
         testID="select"
         value="host-1"
       />,
@@ -114,7 +110,18 @@ describe("Select", () => {
 
     await fireEvent.press(screen.getByTestId("select"));
     expect(screen.getByTestId("sheet")).toBeOnTheScreen();
-    expect(screen.getByText("Custom Host 7")).toBeOnTheScreen();
-    expect(renderOption).toHaveBeenCalledWith(options[0], { selected: true });
+    expect(screen.getByText("Host 7")).toBeOnTheScreen();
+
+    // The long list presents the same drawer rows as the short one: a choice
+    // reports itself as a radio and the current value carries the tick.
+    const current = screen.getByLabelText("Host 1");
+    expect(current.props["accessibilityRole"]).toBe("radio");
+    expect(current.props["accessibilityState"]).toMatchObject({ checked: true });
+    expect(screen.getByLabelText("Host 2").props["accessibilityState"]).toMatchObject({
+      checked: false,
+    });
+
+    await fireEvent.press(screen.getByLabelText("Host 7"));
+    expect(onChange).toHaveBeenCalledWith("host-7");
   });
 });

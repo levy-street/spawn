@@ -17,21 +17,15 @@ export function HostsPanel(): React.JSX.Element {
   return (
     <SettingsScreen testID="hosts-settings-panel" title="Hosts">
       <SettingsSection>
+        <SettingsLinkRow icon="Server" label="Open Hosts" onPress={() => router.push("/hosts")} />
         <SettingsLinkRow
-          hint="View details, rename, remove, and manage agent installs."
-          icon="Server"
-          label="Open Hosts"
-          onPress={() => router.push("/hosts")}
-        />
-        <SettingsLinkRow
-          hint="Approve a daemon using its eight-character code."
           icon="Plus"
           label="Connect a host"
           onPress={() => router.push("/onboarding/host")}
         />
       </SettingsSection>
 
-      <SettingsSection title="CONNECTED HOSTS">
+      <SettingsSection title="Connected hosts">
         {hosts.isError ? (
           <EmptyState
             description={`Failed to load hosts: ${hosts.error.message}`}

@@ -1,12 +1,14 @@
-import * as DocumentPicker from "expo-document-picker";
 import { File } from "expo-file-system";
 import { Image } from "expo-image";
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
+import { encodeIconDataUrl } from "@/components/media/icon-image";
+import { type ImageSource, pickImage } from "@/components/media/image-source";
+import { ImageSourceSheet } from "@/components/media/image-source-sheet";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { Confirm } from "@/components/ui/confirm";
 import { Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -18,7 +20,8 @@ import type { WorkspaceTemplateOut } from "@/data/api/schemas/templates";
 import { useTemplateMutations, useTemplatesSettingsQuery } from "@/data/queries/settings";
 import { spacing } from "@/theme";
 
-const MAX_ICON_DATA_URL_LENGTH = 512 * 1024;
+/** What the server accepts for a template icon, identical to a workspace's. */
+const MAX_ICON_DATA_URL_LENGTH = 32 * 1024;
 
 export function formatTemplateSummary(template: WorkspaceTemplateOut): string {
   const tabs = template.spec.tabs.length;
@@ -51,28 +54,28 @@ export function TemplatesPanel(): React.JSX.Element {
   const [renameTarget, setRenameTarget] = useState<WorkspaceTemplateOut | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [iconTarget, setIconTarget] = useState<WorkspaceTemplateOut | null>(null);
+  const [sourceVisible, setSourceVisible] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<WorkspaceTemplateOut | null>(null);
   const [error, setError] = useState<string | null>(null);
   const busy = mutations.patch.isPending || mutations.remove.isPending;
 
-  const chooseImage = async () => {
+  const chooseImage = async (source: ImageSource) => {
     if (!iconTarget) return;
     setError(null);
     try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: "image/*",
-        copyToCacheDirectory: true,
-        multiple: false,
-      });
-      if (result.canceled) return;
-      const asset = result.assets[0];
-      if (!asset) return;
-      const encoded = await new File(asset.uri).base64();
-      const dataUrl = `data:${asset.mimeType ?? "image/png"};base64,${encoded}`;
-      if (dataUrl.length > MAX_ICON_DATA_URL_LENGTH) {
-        setError("That image is too large. Choose a smaller image.");
-        return;
-      }
+      const picked = await pickImage(source, { fileTypes: ["image/png", "image/webp"] });
+      if (!picked) return;
+      // A PNG or WebP already inside the budget is used untouched; anything else,
+      // a camera photo above all, is squared down to one the server accepts.
+      const mime = picked.mimeType?.toLowerCase();
+      const direct =
+        mime === "image/png" || mime === "image/webp"
+          ? `data:${mime};base64,${await new File(picked.uri).base64()}`
+          : null;
+      const dataUrl =
+        direct !== null && direct.length <= MAX_ICON_DATA_URL_LENGTH
+          ? direct
+          : await encodeIconDataUrl(picked.uri, MAX_ICON_DATA_URL_LENGTH);
       await mutations.patch.mutateAsync({
         id: iconTarget.id,
         patch: { icon: dataUrl, icon_source: "custom" },
@@ -84,11 +87,7 @@ export function TemplatesPanel(): React.JSX.Element {
   };
 
   return (
-    <SettingsScreen
-      description="Templates are saved from a workspace and used from New workspace."
-      testID="templates-panel"
-      title="Templates"
-    >
+    <SettingsScreen testID="templates-panel" title="Templates">
       {error || templates.error ? (
         <Text accessibilityRole="alert" color="destructive" variant="body">
           {error ?? templates.error?.message}
@@ -99,7 +98,7 @@ export function TemplatesPanel(): React.JSX.Element {
           <EmptyState icon="LayoutTemplate" title="No templates yet." />
         ) : (
           templates.data?.map((template) => (
-            <Card key={template.id} variant="flat">
+            <SettingsBlock key={template.id}>
               <View style={styles.row}>
                 <TemplateAvatar template={template} />
                 <View style={styles.rowCopy}>
@@ -184,7 +183,7 @@ export function TemplatesPanel(): React.JSX.Element {
                   </Button>
                 </View>
               )}
-            </Card>
+            </SettingsBlock>
           ))
         )}
       </SettingsSection>
@@ -208,7 +207,7 @@ export function TemplatesPanel(): React.JSX.Element {
             >
               Use initials
             </Button>
-            <Button loading={busy} onPress={() => void chooseImage()} variant="outline">
+            <Button loading={busy} onPress={() => setSourceVisible(true)} variant="outline">
               Choose image…
             </Button>
           </View>
@@ -230,6 +229,15 @@ export function TemplatesPanel(): React.JSX.Element {
           </View>
         ) : null}
       </Dialog>
+
+      <ImageSourceSheet
+        onDismiss={() => setSourceVisible(false)}
+        onSelect={(source) => {
+          setSourceVisible(false);
+          void chooseImage(source);
+        }}
+        visible={sourceVisible}
+      />
 
       <Confirm
         confirmLabel="Delete template"

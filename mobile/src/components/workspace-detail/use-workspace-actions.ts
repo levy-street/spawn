@@ -21,6 +21,7 @@ import {
   reorderTab,
 } from "@/data/layout/tabs";
 import { addTile } from "@/data/layout/tiles";
+import { killSession } from "@/data/queries/session-teardown";
 import {
   normalizeWorkspace,
   useWorkspaceLayoutCommit,
@@ -28,7 +29,7 @@ import {
 } from "@/data/queries/workspace-detail";
 import { qk } from "@/data/queryKeys";
 import { agentRunCommand, runningAgent } from "@/data/selectors/agent";
-import type { AgentDef, Session, Workspace } from "@/data/types/domain";
+import type { AgentDef, Host, Session, Workspace } from "@/data/types/domain";
 import type { PaneId, TabId, Tile, WorkspaceLayoutV3 } from "@/data/types/layout";
 
 function replaceTabLayout(
@@ -62,7 +63,7 @@ export function reorderPaneLayout(
 
 export async function deleteSessionsForTab(
   sessionIds: readonly string[],
-  removeSession: (sessionId: string) => Promise<unknown> = deleteSession,
+  removeSession: (sessionId: string) => Promise<unknown> = killSession,
 ): Promise<void> {
   const deletions = await Promise.allSettled(
     sessionIds.map((sessionId) => removeSession(sessionId)),
@@ -131,13 +132,75 @@ export function useWorkspaceActions(onReorderError: (error: unknown) => void) {
       if (!layout) throw new Error("There is no room in that tab.");
       return commit(workspace, layout);
     },
+    /**
+     * Re-point a pane at another machine. The shell cannot be carried across, so
+     * a fresh one is started on the new host — created before anything is torn
+     * down, so a host that has just dropped offline leaves the pane as it was —
+     * the tile keeps its place, and whatever agent was running is queued to run
+     * again over there.
+     */
+    movePaneToHost: async (
+      workspace: Workspace,
+      tile: Tile,
+      host: Host,
+      session: Session | null,
+      agents: readonly AgentDef[],
+    ) => {
+      const sourceTab = workspace.layout.tabs.find((tab) =>
+        tab.layout.tiles.some((candidate) => candidate.session_id === tile.session_id),
+      );
+      if (!sourceTab) throw new Error("That pane is no longer in this workspace.");
+      const created = await createSession({
+        host_id: host.id,
+        cwd: "~",
+        ...(session?.name ? { name: session.name } : {}),
+      });
+      const nextTab = {
+        ...sourceTab,
+        layout: {
+          ...sourceTab.layout,
+          tiles: sourceTab.layout.tiles.map((candidate) =>
+            candidate.session_id === tile.session_id
+              ? { ...candidate, session_id: created.id }
+              : candidate,
+          ),
+        },
+      };
+      let saved: Workspace;
+      try {
+        saved = await commit(workspace, replaceTabLayout(workspace, sourceTab.id, nextTab));
+      } catch (error) {
+        await deleteSession(created.id).catch(() => undefined);
+        throw error;
+      }
+
+      const agent = session ? runningAgent(session.foreground_command, agents) : null;
+      let launchError: Error | null = null;
+      if (agent) {
+        try {
+          await pendingLaunches.persist(created.id, agentRunCommand(agent));
+        } catch {
+          launchError = new Error(
+            `The window moved to ${host.name} as a shell, but ${agent.name} could not be queued.`,
+          );
+        }
+      }
+      await deleteSession(tile.session_id).catch(() => undefined);
+      await invalidateSessions();
+      if (launchError) throw launchError;
+      return { workspace: saved, session: created };
+    },
     reorderPane: (workspace: Workspace, tabId: TabId, paneId: PaneId, offset: -1 | 1) => {
       const layout = reorderPaneLayout(workspace, tabId, paneId, offset);
       reorder.schedule(workspace, layout);
     },
     removePane: async (workspace: Workspace, tile: Tile) => {
       if (!tile.widget) {
-        await deleteSession(tile.session_id);
+        // A pane whose session the server has already dropped is precisely the
+        // dead row this action exists to clear, so a session that is missing is
+        // the goal rather than a failure — treating it as one is what left
+        // "Session unavailable" rows that could not be removed at all.
+        await killSession(tile.session_id);
         await invalidateSessions();
       }
       return commit(workspace, removePane(workspace.layout, tile.session_id));

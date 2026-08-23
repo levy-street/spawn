@@ -26,5 +26,5 @@ export function WorkspaceListHeader({
     [canCreate, onCreate],
   );
 
-  return <AppHeader actions={actions} testID="workspace-list-header" title="Workspaces" />;
+  return <AppHeader actions={actions} branded testID="workspace-list-header" title="Workspaces" />;
 }

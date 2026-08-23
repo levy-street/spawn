@@ -30,6 +30,7 @@ function makeDependencies(overrides: Partial<LaunchDependencies> = {}): LaunchDe
     patchWorkspace: async (_id, patch) => ({ ...workspace, layout: patch.layout }),
     createSession: async () => makeSession(),
     deleteSession: async () => undefined,
+    newId: () => "widget-1",
     pending: makePending(),
     ...overrides,
   };
@@ -165,5 +166,61 @@ describe("two-stage launch orchestration", () => {
     ).toBeNull();
     expect(launchAvailability(tab, makeHost({ status: "offline" }))).toBe("host_offline");
     expect(launchAvailability(fullTab(), makeHost())).toBe("tab_full");
+  });
+
+  test("places a file explorer and saves it in the same patch, creating no session", async () => {
+    const createSession = jest.fn(async () => makeSession());
+    const workspace = makeWorkspace();
+    const patchWorkspace = jest.fn<
+      ReturnType<LaunchDependencies["patchWorkspace"]>,
+      Parameters<LaunchDependencies["patchWorkspace"]>
+    >(async (_id, patch) => ({ ...workspace, layout: patch.layout }));
+    const orchestrator = createLaunchOrchestrator(
+      makeDependencies({
+        getWorkspace: async () => workspace,
+        createSession,
+        patchWorkspace,
+        newId: () => "widget-tile",
+      }),
+    );
+
+    const saved = await orchestrator.addFilesWidget({
+      workspaceId: workspace.id,
+      tabId: "tab-1",
+      hostId: makeHost().id,
+      path: "/Users/ada/spawn",
+    });
+
+    expect(createSession).not.toHaveBeenCalled();
+    const tiles = saved.layout.tabs[0]?.layout.tiles ?? [];
+    expect(tiles).toEqual([
+      expect.objectContaining({
+        session_id: "widget-tile",
+        widget: { kind: "files", host_id: makeHost().id, path: "/Users/ada/spawn" },
+      }),
+    ]);
+  });
+
+  test("refuses a file explorer a full tab has no room for", async () => {
+    const workspace = makeWorkspace({
+      layout: { version: 3, active_tab: "tab-1", tabs: [fullTab()] },
+    });
+    const patchWorkspace = jest.fn<
+      ReturnType<LaunchDependencies["patchWorkspace"]>,
+      Parameters<LaunchDependencies["patchWorkspace"]>
+    >(async (_id, patch) => ({ ...workspace, layout: patch.layout }));
+    const orchestrator = createLaunchOrchestrator(
+      makeDependencies({ getWorkspace: async () => workspace, patchWorkspace }),
+    );
+
+    await expect(
+      orchestrator.addFilesWidget({
+        workspaceId: workspace.id,
+        tabId: "tab-1",
+        hostId: makeHost().id,
+        path: "/Users/ada",
+      }),
+    ).rejects.toEqual(expect.objectContaining<Partial<LauncherError>>({ code: "tab_full" }));
+    expect(patchWorkspace).not.toHaveBeenCalled();
   });
 });

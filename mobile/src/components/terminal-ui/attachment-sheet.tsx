@@ -1,5 +1,6 @@
+import { ImageSourceSheet } from "@/components/media/image-source-sheet";
 import type { AttachmentSource } from "@/components/terminal-ui/use-terminal-transfers";
-import { ActionSheet, type ActionSheetAction } from "@/components/ui/action-sheet";
+import type { ActionSheetAction } from "@/components/ui/action-sheet";
 import { Icon } from "@/components/ui/icon";
 
 export interface AttachmentSheetProps {
@@ -10,9 +11,9 @@ export interface AttachmentSheetProps {
 }
 
 /**
- * Everything that puts content the operator already has into the session:
- * clipboard text at the prompt, and the three ways a phone holds a file.
- * Photos land in the session's attachments; anything else beside the work.
+ * Everything that puts content the operator already has into the session: the
+ * three image sources every input in the app offers, plus the clipboard, which
+ * only a prompt has any use for.
  */
 export function AttachmentSheet({
   visible,
@@ -20,25 +21,7 @@ export function AttachmentSheet({
   onAttach,
   onPaste,
 }: AttachmentSheetProps): React.JSX.Element {
-  const actions: readonly ActionSheetAction[] = [
-    {
-      id: "camera",
-      label: "Take photo",
-      icon: <Icon name="Camera" />,
-      onPress: () => onAttach("camera"),
-    },
-    {
-      id: "photos",
-      label: "Upload from photos",
-      icon: <Icon name="ImagePlus" />,
-      onPress: () => onAttach("photos"),
-    },
-    {
-      id: "files",
-      label: "Upload a file",
-      icon: <Icon name="Upload" />,
-      onPress: () => onAttach("files"),
-    },
+  const paste: readonly ActionSheetAction[] = [
     {
       id: "paste",
       label: "Paste clipboard",
@@ -47,5 +30,12 @@ export function AttachmentSheet({
     },
   ];
 
-  return <ActionSheet actions={actions} onDismiss={onDismiss} visible={visible} />;
+  return (
+    <ImageSourceSheet
+      extraActions={paste}
+      onDismiss={onDismiss}
+      onSelect={onAttach}
+      visible={visible}
+    />
+  );
 }

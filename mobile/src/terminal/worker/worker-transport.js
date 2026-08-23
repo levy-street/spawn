@@ -11,8 +11,21 @@
       : { scopeType: "host", protocol: "spawn.host.ctl", protocolVersion: 1 };
   }
 
+  /** The two signalling channels bind a peer differently, and only the session
+   * channel works the way this file originally assumed. /ws/browser echoes the
+   * browser-proposed `binding_nonce` and a server ownership `binding_generation`
+   * on every frame. /ws/host mints its own nonce, never discloses it, and has no
+   * generation at all: the scope tuple plus `session_id` is the whole binding.
+   * Matching or gating on the session fields in host mode drops every daemon
+   * frame and strands the connection in `connecting`. */
+  function isSessionMode() {
+    return state.mode === "session";
+  }
+
   function outerTuple() {
     const tuple = protocolTuple();
+    // `binding_nonce` is inert on /ws/host — the server substitutes its own
+    // before the frame reaches the daemon — but it still guards teardown.
     return {
       session_id: state.rtcSessionId,
       binding_nonce: state.bindingNonce,
@@ -59,6 +72,7 @@
     state.rtcSessionId = message.rtcSessionId;
     state.bindingNonce = message.bindingNonce;
     state.bindingGeneration = null;
+    state.offerSent = false;
     const pc = new RTCPeerConnection({
       iceServers: message.iceServers,
       iceTransportPolicy: message.forceRelay ? "relay" : "all",
@@ -78,8 +92,12 @@
     pc.onicecandidate = ({ candidate }) => {
       if (!candidate) return;
       const frame = { type: "rtc.candidate", ...outerTuple(), candidate: candidate.toJSON() };
-      if (state.bindingGeneration === null) state.pendingLocalCandidates.push(frame);
-      else emitSignal(frame);
+      // Candidates disclose the session, so neither mode emits one before its
+      // offer is armed: a session waits for the server to accept the binding,
+      // a host — which is never told of a binding — waits for the signed offer.
+      const armed = isSessionMode() ? state.bindingGeneration !== null : state.offerSent;
+      if (armed) emitSignal(frame);
+      else state.pendingLocalCandidates.push(frame);
     };
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "failed") channelFailed("RTCPeerConnection");
@@ -133,13 +151,17 @@
       signature: message.signature,
     };
     emitSignal({ type: "rtc.offer", ...outerTuple(), signed_envelope: JSON.stringify(envelope) });
+    if (!isSessionMode()) {
+      state.offerSent = true;
+      for (const candidate of state.pendingLocalCandidates.splice(0)) emitSignal(candidate);
+    }
   }
 
   function frameMatches(value) {
     const tuple = protocolTuple();
     return (
       value?.session_id === state.rtcSessionId &&
-      value?.binding_nonce === state.bindingNonce &&
+      (!isSessionMode() || value?.binding_nonce === state.bindingNonce) &&
       value?.scope_type === tuple.scopeType &&
       value?.scope_id === state.scopeId &&
       value?.protocol === tuple.protocol &&
@@ -151,14 +173,16 @@
     if (frame?.type === "rtc.config") return;
     if (frame?.type === "rtc.status") {
       if (!frameMatches(frame)) return;
-      if (frame.status === "negotiating" || frame.status === "connected") {
-        if (Number.isSafeInteger(frame.binding_generation) && frame.binding_generation > 0) {
-          state.bindingGeneration = frame.binding_generation;
-          if (state.mode === "session") api.sessionGate?.("bindingAccepted");
-          else api.hostBindingAccepted?.();
-          for (const candidate of state.pendingLocalCandidates.splice(0)) {
-            emitSignal({ ...candidate, binding_generation: frame.binding_generation });
-          }
+      if (
+        isSessionMode() &&
+        (frame.status === "negotiating" || frame.status === "connected") &&
+        Number.isSafeInteger(frame.binding_generation) &&
+        frame.binding_generation > 0
+      ) {
+        state.bindingGeneration = frame.binding_generation;
+        api.sessionGate?.("bindingAccepted");
+        for (const candidate of state.pendingLocalCandidates.splice(0)) {
+          emitSignal({ ...candidate, binding_generation: frame.binding_generation });
         }
       }
       if (["failed", "unavailable", "collision", "disabled"].includes(frame.status)) {
@@ -179,6 +203,9 @@
         throw new Error("Signed RTC answer identity or shape mismatch.");
       }
       await state.pc.setRemoteDescription({ type: "answer", sdp: envelope.sdp });
+      // The host channel has no binding status to wait for: an answer signed by
+      // the pinned host for this exact session and scope is the proof itself.
+      if (!isSessionMode()) api.hostBindingAccepted?.();
       for (const candidate of state.pendingRemoteCandidates.splice(0))
         await state.pc.addIceCandidate(candidate);
       return;
@@ -205,6 +232,7 @@
     state.ctl = null;
     state.pc?.close();
     state.pc = null;
+    state.offerSent = false;
     state.pendingLocalCandidates.splice(0);
     state.pendingRemoteCandidates.splice(0);
     state.pendingSign.clear();

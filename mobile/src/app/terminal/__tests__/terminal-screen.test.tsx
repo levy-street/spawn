@@ -1,8 +1,9 @@
-import { render, screen } from "@testing-library/react-native";
+import { act, render, screen } from "@testing-library/react-native";
 import { StyleSheet } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import TerminalScreen, { TERMINAL_ROUTE_GESTURE_OPTIONS } from "@/app/terminal/[sessionId]";
+import type { KillTerminalSessionResult } from "@/data/queries/terminal";
 import { darkTheme } from "@/theme";
 import { bottomNavHeight } from "@/theme/sizing";
 
@@ -63,20 +64,44 @@ jest.mock("@/components/layout/app-header", () => {
   };
 });
 
+interface MockOverlayProps {
+  onKill?: () => Promise<void>;
+}
+
+let mockOverlayProps: MockOverlayProps = {};
+
 jest.mock("@/components/terminal-ui/terminal-overlay", () => {
   const React = require("react") as typeof import("react");
   const { View } = require("react-native") as typeof import("react-native");
   return {
-    TerminalOverlay: () => React.createElement(View, { testID: "mock-terminal-overlay" }),
+    TerminalOverlay: (props: MockOverlayProps) => {
+      mockOverlayProps = props;
+      return React.createElement(View, { testID: "mock-terminal-overlay" });
+    },
   };
 });
 
+const mockKill = jest.fn<Promise<KillTerminalSessionResult>, []>(async () => ({
+  alreadyGone: false,
+  paneError: null,
+}));
+
 jest.mock("@/data/queries/terminal", () => ({
   useTerminalData: () => mockTerminalData,
-  useKillTerminalSession: () => ({ mutateAsync: jest.fn(async () => undefined) }),
+  useKillTerminalSession: () => ({ mutateAsync: mockKill }),
   useRenameTerminalSession: () => ({ mutateAsync: jest.fn(async () => undefined) }),
   useRestartTerminalSession: () => ({ mutateAsync: jest.fn(async () => undefined) }),
 }));
+
+const mockToast = {
+  show: jest.fn(),
+  success: jest.fn(),
+  error: jest.fn(),
+  dismiss: jest.fn(),
+  clear: jest.fn(),
+};
+
+jest.mock("@/components/ui/toast", () => ({ useToast: () => mockToast }));
 
 jest.mock("@/theme", () => {
   const actual = jest.requireActual<typeof import("@/theme")>("@/theme");
@@ -107,7 +132,7 @@ function dataFor(state: "loading" | "error" | "connected"): MockTerminalData {
     host: { id: "host" },
     isLoading: false,
     refetch: jest.fn(async () => undefined),
-    session: { id: "session" },
+    session: { id: "session", name: "Build" },
   };
 }
 
@@ -135,7 +160,7 @@ describe("TerminalScreen dismissal", () => {
         presentation: "card",
       });
       expect(mockStackScreenOptions["contentStyle"]).toMatchObject({
-        borderRadius: darkTheme.radii.xxl,
+        borderRadius: darkTheme.radii.device,
         overflow: "hidden",
       });
       // An omitted response distance is what lets the native recognizer begin at screen centre.
@@ -156,4 +181,68 @@ describe("TerminalScreen dismissal", () => {
       }
     },
   );
+});
+
+describe("TerminalScreen kill reporting", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockOverlayProps = {};
+    mockTerminalData = dataFor("connected");
+  });
+
+  test("names the killed session in a toast the closing screen cannot swallow", async () => {
+    await renderScreen();
+
+    await act(async () => {
+      await mockOverlayProps.onKill?.();
+    });
+
+    expect(mockKill).toHaveBeenCalledTimes(1);
+    expect(mockToast.success).toHaveBeenCalledWith("Session killed", { detail: "Build" });
+  });
+
+  test("says so when the session was already gone", async () => {
+    mockKill.mockResolvedValueOnce({ alreadyGone: true, paneError: null });
+    await renderScreen();
+
+    await act(async () => {
+      await mockOverlayProps.onKill?.();
+    });
+
+    expect(mockToast.success).toHaveBeenCalledWith("Session removed", {
+      detail: "It had already ended on the host.",
+    });
+  });
+
+  test("separates a pane that stayed behind from a kill that failed", async () => {
+    mockKill.mockResolvedValueOnce({
+      alreadyGone: false,
+      paneError: new Error("workspace patch rejected"),
+    });
+    await renderScreen();
+
+    await act(async () => {
+      await mockOverlayProps.onKill?.();
+    });
+
+    expect(mockToast.error).toHaveBeenCalledWith(
+      "Session killed, but its pane stayed in the workspace",
+      {
+        detail: "workspace patch rejected",
+      },
+    );
+  });
+
+  test("reports a kill the server refused without rethrowing at the closed screen", async () => {
+    mockKill.mockRejectedValueOnce(new Error("host is offline"));
+    await renderScreen();
+
+    await act(async () => {
+      await expect(mockOverlayProps.onKill?.()).resolves.toBeUndefined();
+    });
+
+    expect(mockToast.error).toHaveBeenCalledWith("Session could not be killed", {
+      detail: "host is offline",
+    });
+  });
 });

@@ -44,7 +44,8 @@ jest.mock("@/lib/auth-gate", () => ({
 }));
 
 jest.mock("@/lib/haptics", () => ({
-  haptics: { overlayOpen: jest.fn(), selection: jest.fn() },
+  // The drawer warns on a destructive row — logging out is one.
+  haptics: { overlayOpen: jest.fn(), selection: jest.fn(), warning: jest.fn() },
 }));
 
 async function renderMenu() {

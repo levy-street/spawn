@@ -10,6 +10,8 @@ import { TERMINAL_BRIDGE_VERSION, type WorkerToNativeMessage } from "@/terminal/
 import {
   assertHostFileSize,
   collectHostStream,
+  HOST_CONTROL_PROTOCOL,
+  HOST_CONTROL_VERSION,
   HOST_FILE_MAX_BYTES,
   HOST_RANGE_MAX_BYTES,
   HOST_STREAM_CHUNK_BYTES,
@@ -70,7 +72,10 @@ interface FrameRecord extends Record<string, unknown> {
   type?: unknown;
   enabled?: unknown;
   ice_servers?: unknown;
-  binding_nonce_required?: unknown;
+  scope_type?: unknown;
+  scope_id?: unknown;
+  protocol?: unknown;
+  protocol_version?: unknown;
 }
 
 interface PendingRequest {
@@ -599,10 +604,15 @@ class WebViewHostTransport implements StreamingHostTransport {
     const frame = record(value);
     if (!frame) return;
     if (frame.type === "rtc.config") {
+      // /ws/host binds every frame to the host tuple instead of advertising
+      // `binding_nonce_required`; that flag only exists on the session channel.
       if (
         frame.enabled !== true ||
-        frame.binding_nonce_required !== true ||
-        !Array.isArray(frame.ice_servers)
+        !Array.isArray(frame.ice_servers) ||
+        frame.scope_type !== "host" ||
+        frame.scope_id !== this.hostId ||
+        frame.protocol !== HOST_CONTROL_PROTOCOL ||
+        frame.protocol_version !== HOST_CONTROL_VERSION
       ) {
         this.#fail("rtc_config", "Host RTC configuration is disabled or weakly bound.");
         return;

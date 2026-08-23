@@ -248,6 +248,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     height: sizing.listRow.trailingTarget,
     justifyContent: "center",
+    // Pulled out of the row's gutter so the glyph sits where a row's trailing
+    // control belongs — near the edge — rather than a full gutter inside it.
+    marginRight: -(sizing.listRow.horizontalPadding - sizing.listRow.trailingActionInset),
     width: sizing.listRow.trailingTarget,
   },
   rowContainer: {

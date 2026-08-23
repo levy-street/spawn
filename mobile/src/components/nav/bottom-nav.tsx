@@ -1,7 +1,8 @@
 import { type Href, usePathname, useRouter } from "expo-router";
-import { useEffect } from "react";
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
+import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
+import Animated, { useAnimatedStyle, useSharedValue } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { FullWindowOverlay } from "react-native-screens";
 import { dismissNavigationOverlays } from "@/components/nav/overlay-dismiss";
@@ -15,7 +16,7 @@ import { sizing } from "@/theme/sizing";
 
 const DESTINATIONS = [
   { href: "/workspaces", icon: "Shapes", label: "Workspaces", rootRoute: "workspaces" },
-  { href: "/hosts", icon: "Server", label: "Hosts", rootRoute: "hosts" },
+  { href: "/hosts", icon: "Server", label: "Legion", rootRoute: "hosts" },
   { href: "/settings", icon: "Settings", label: "Settings", rootRoute: "settings" },
 ] as const satisfies readonly {
   href: Href;
@@ -65,10 +66,27 @@ export function BottomNav(): React.JSX.Element {
   const lastDestination = useRef<BottomNavRoute>(DESTINATIONS[0].href);
   if (destinationForPath !== null) lastDestination.current = destinationForPath;
   const activeDestination = destinationForPath ?? lastDestination.current;
+
+  // A raised keyboard takes the bar with it. The bar is portalled to window
+  // level and the system keyboard is translucent, so leaving it where it is
+  // shows the tab labels ghosted through the key rows — and there is nothing to
+  // tap there anyway while the keyboard covers it. Driven off the keyboard's own
+  // progress rather than a visibility flag, so it leaves and comes back on the
+  // keyboard's curve, an interactive drag-to-dismiss included.
+  const keyboard = useReanimatedKeyboardAnimation();
+  const barHeight = useSharedValue(0);
+  const keyboardSlide = useAnimatedStyle(
+    () => ({ transform: [{ translateY: keyboard.progress.value * barHeight.value }] }),
+    [barHeight, keyboard.progress],
+  );
+
   return (
-    <View
+    <Animated.View
       accessibilityLabel="Primary navigation"
       accessibilityRole="tablist"
+      onLayout={(event) => {
+        barHeight.value = event.nativeEvent.layout.height;
+      }}
       style={[
         styles.root,
         {
@@ -79,6 +97,7 @@ export function BottomNav(): React.JSX.Element {
           paddingRight: insets.right + sizing.bottomNav.horizontalPadding,
           paddingTop: sizing.bottomNav.verticalPadding,
         },
+        keyboardSlide,
       ]}
       testID="bottom-nav"
     >
@@ -120,7 +139,7 @@ export function BottomNav(): React.JSX.Element {
           </Pressable>
         );
       })}
-    </View>
+    </Animated.View>
   );
 }
 

@@ -2,13 +2,18 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, renderHook, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
 
+import { listAgents } from "@/data/api/endpoints/agents";
+import { listHosts } from "@/data/api/endpoints/hosts";
+import { listSessions } from "@/data/api/endpoints/sessions";
 import {
   archiveWorkspace,
   createWorkspace,
+  getWorkspace,
   listWorkspaces,
   patchWorkspace,
 } from "@/data/api/endpoints/workspaces";
 import type { WorkspaceOut } from "@/data/api/schemas/workspaces";
+import { useWorkspaceDetail } from "@/data/queries/workspace-detail";
 import {
   useArchiveWorkspaceMutation,
   useCreateWorkspaceMutation,
@@ -18,12 +23,14 @@ import {
 import { qk } from "@/data/queryKeys";
 
 jest.mock("@/data/api/endpoints/agents", () => ({ listAgents: jest.fn() }));
+jest.mock("@/data/api/endpoints/hosts", () => ({ listHosts: jest.fn() }));
 jest.mock("@/data/api/endpoints/sessions", () => ({ listSessions: jest.fn() }));
 jest.mock("@/data/api/endpoints/templates", () => ({ listWorkspaceTemplates: jest.fn() }));
 jest.mock("@/data/api/endpoints/workspaces", () => ({
   archiveWorkspace: jest.fn(),
   createWorkspace: jest.fn(),
   deleteWorkspace: jest.fn(),
+  getWorkspace: jest.fn(),
   listWorkspaces: jest.fn(),
   patchWorkspace: jest.fn(),
   unarchiveWorkspace: jest.fn(),
@@ -143,6 +150,45 @@ describe("workspace query hooks", () => {
     expect(queryClient.getQueryData(qk.archivedWorkspaces())).toEqual([archived]);
     expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.sessions() });
     await mutation.unmount();
+    queryClient.clear();
+  });
+
+  test("a pull refetches every workspace resource and spins only while it runs", async () => {
+    const detailWorkspace = workspace();
+    jest.mocked(getWorkspace).mockResolvedValue(detailWorkspace);
+    jest.mocked(listSessions).mockResolvedValue([]);
+    jest.mocked(listHosts).mockResolvedValue([]);
+    jest.mocked(listAgents).mockResolvedValue([]);
+    const { queryClient, wrapper } = harness();
+    const detail = await renderHook(() => useWorkspaceDetail(detailWorkspace.id), { wrapper });
+    await waitFor(() => expect(detail.result.current.loading).toBe(false));
+
+    // The session poll runs every five seconds. Only the pull may spin the
+    // control, or the list twitches downwards on its own.
+    expect(detail.result.current.refreshing).toBe(false);
+    let finishWorkspace: (() => void) | undefined;
+    jest.mocked(getWorkspace).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishWorkspace = () => resolve(detailWorkspace);
+      }),
+    );
+
+    let pull: Promise<void> | undefined;
+    await act(() => {
+      pull = detail.result.current.refresh();
+    });
+    expect(detail.result.current.refreshing).toBe(true);
+
+    await act(async () => {
+      finishWorkspace?.();
+      await pull;
+    });
+    expect(detail.result.current.refreshing).toBe(false);
+    expect(getWorkspace).toHaveBeenCalledTimes(2);
+    expect(listSessions).toHaveBeenCalledTimes(2);
+    expect(listHosts).toHaveBeenCalledTimes(2);
+    expect(listAgents).toHaveBeenCalledTimes(2);
+    await detail.unmount();
     queryClient.clear();
   });
 });

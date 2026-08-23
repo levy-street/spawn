@@ -2,15 +2,27 @@ import { fireEvent, render, screen } from "@testing-library/react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { TerminalAccessoryBar } from "@/components/terminal-ui/accessory-bar";
-import { ThemeProvider } from "@/theme";
+import { resolvePinnedCommands } from "@/components/terminal-ui/terminal-commands";
+import { spacing, ThemeProvider } from "@/theme";
 import { sizing } from "@/theme/sizing";
+
+const mockKeyboard = { visible: true };
 
 jest.mock("react-native-keyboard-controller", () => ({
   KeyboardController: { dismiss: jest.fn(async () => undefined) },
+  useKeyboardState: (selector: (state: { isVisible: boolean }) => unknown) =>
+    selector({ isVisible: mockKeyboard.visible }),
 }));
+
+const claudeCommands = resolvePinnedCommands("claude-code", [
+  "key-Escape",
+  "key-BackTab",
+  "text-/",
+]);
 
 async function renderBar(props?: Partial<React.ComponentProps<typeof TerminalAccessoryBar>>) {
   const onSend = jest.fn();
+  const onCommand = jest.fn();
   const onAttach = jest.fn();
   const onMore = jest.fn();
   const onDismissKeyboard = jest.fn();
@@ -26,6 +38,7 @@ async function renderBar(props?: Partial<React.ComponentProps<typeof TerminalAcc
         <TerminalAccessoryBar
           encode={encode}
           onAttach={onAttach}
+          onCommand={onCommand}
           onDismissKeyboard={onDismissKeyboard}
           onMore={onMore}
           onSend={onSend}
@@ -34,46 +47,34 @@ async function renderBar(props?: Partial<React.ComponentProps<typeof TerminalAcc
       </ThemeProvider>
     </SafeAreaProvider>,
   );
-  return { encode, onAttach, onDismissKeyboard, onMore, onSend };
+  return { encode, onAttach, onCommand, onDismissKeyboard, onMore, onSend };
 }
 
 describe("terminal accessory bar", () => {
-  test("carries only the keys an agent reaches for, plus a way to the rest", async () => {
+  beforeEach(() => {
+    mockKeyboard.visible = true;
+  });
+
+  test("carries no key caps of its own — only the ones pinned for this agent", async () => {
     await renderBar();
 
-    for (const name of ["Esc", /^Tab/, "Control C", "More"]) {
-      expect(screen.getByRole("button", { name })).toBeTruthy();
-    }
-    // Modifiers, control codes, symbols, arrows and function keys all moved
-    // into More; paste and the upload paths into the attach drawer.
-    for (const name of [/^Control,/, /^Alt,/, "Paste", "^D", "|", "Arrow up"]) {
+    // The strip used to be a fixed, partial keyboard above the real one, the same
+    // rank whether a shell or Claude Code was running. With nothing pinned it is
+    // four round controls, and every key is behind the shortcuts button.
+    for (const name of ["Esc", /^Tab/, "Control C", "More", "^D", "|", "Arrow up"]) {
       expect(screen.queryByRole("button", { name })).toBeNull();
     }
-  });
-
-  test("encodes a key and forwards both the sequence and the spec", async () => {
-    const { encode, onSend } = await renderBar();
-    await fireEvent.press(screen.getByRole("button", { name: "Esc" }));
-
-    expect(encode).toHaveBeenCalledWith({ kind: "named", key: "Escape" });
-    expect(onSend).toHaveBeenCalledWith("encoded", { kind: "named", key: "Escape" });
-  });
-
-  test("holding Tab sends Shift Tab instead", async () => {
-    const { encode } = await renderBar();
-    await fireEvent(screen.getByRole("button", { name: "Tab, hold for Shift Tab" }), "longPress");
-
-    expect(encode).toHaveBeenCalledWith({ kind: "named", key: "BackTab" });
+    expect(screen.getByTestId("accessory-shortcuts")).toBeOnTheScreen();
   });
 
   test("hands every drawer up to the screen, which owns the keyboard", async () => {
     const { onMore } = await renderBar();
-    await fireEvent.press(screen.getByRole("button", { name: "More" }));
+    await fireEvent.press(screen.getByRole("button", { name: "Keyboard shortcuts" }));
 
     expect(onMore).toHaveBeenCalledTimes(1);
   });
 
-  test("pins attach and send either side of the key row", async () => {
+  test("pins attach and send either side of the strip", async () => {
     const { onAttach, onSend } = await renderBar();
     expect(screen.getByTestId("terminal-accessory-bar")).toBeOnTheScreen();
 
@@ -82,6 +83,41 @@ describe("terminal accessory bar", () => {
 
     await fireEvent.press(screen.getByTestId("accessory-send"));
     expect(onSend).toHaveBeenCalledWith("encoded", { kind: "named", key: "Enter" });
+  });
+
+  test("shows the keys pinned for the running agent and hands back the one pressed", async () => {
+    const { onCommand } = await renderBar({ commands: claudeCommands });
+
+    expect(screen.getByTestId("accessory-command-key-Escape")).toBeOnTheScreen();
+    expect(screen.getByTestId("accessory-command-key-BackTab")).toBeOnTheScreen();
+
+    await fireEvent.press(screen.getByRole("button", { name: "Cycle mode" }));
+    expect(onCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "key-BackTab", cap: "⇧⇥" }),
+    );
+  });
+
+  test("offers the keyboard dismissal, drawn large, while a keyboard is up", async () => {
+    await renderBar();
+    expect(screen.getByTestId("accessory-dismiss-keyboard")).toBeOnTheScreen();
+
+    // It is the one control here aimed at while the keyboard is in the way, so
+    // its chevron is drawn above the size the rest of the strip's glyphs share.
+    // The glyph itself is hidden from assistive tech — its button carries the
+    // label — so the query has to reach past that to measure it.
+    const chevron = screen.getByTestId("accessory-dismiss-keyboard-icon", {
+      includeHiddenElements: true,
+    });
+    expect(chevron).toHaveStyle({ height: sizing.terminalAccessory.dismissIcon });
+    expect(sizing.terminalAccessory.dismissIcon).toBeGreaterThan(spacing[4]);
+  });
+
+  test("drops the dismissal once there is no keyboard to dismiss", async () => {
+    mockKeyboard.visible = false;
+    await renderBar();
+
+    expect(screen.queryByTestId("accessory-dismiss-keyboard")).toBeNull();
+    expect(screen.getByTestId("accessory-send")).toBeOnTheScreen();
   });
 
   test("keeps its plates below a standard control so the strip stays thin", async () => {
@@ -97,11 +133,19 @@ describe("terminal accessory bar", () => {
   });
 
   test("disables everything that would reach a terminal that is not ready", async () => {
-    const { onSend } = await renderBar({ disabled: true });
+    const { onAttach, onCommand, onMore, onSend } = await renderBar({
+      commands: claudeCommands,
+      disabled: true,
+    });
     await fireEvent.press(screen.getByTestId("accessory-send"));
-    await fireEvent.press(screen.getByRole("button", { name: "Esc" }));
+    await fireEvent.press(screen.getByTestId("accessory-shortcuts"));
+    await fireEvent.press(screen.getByTestId("accessory-attach"));
+    await fireEvent.press(screen.getByTestId("accessory-command-key-Escape"));
 
     expect(onSend).not.toHaveBeenCalled();
+    expect(onMore).not.toHaveBeenCalled();
+    expect(onAttach).not.toHaveBeenCalled();
+    expect(onCommand).not.toHaveBeenCalled();
     // Dismissing the keyboard is always allowed; it touches nothing remote.
     expect(screen.getByRole("button", { name: "Dismiss keyboard" })).toBeTruthy();
   });

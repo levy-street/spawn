@@ -1,11 +1,11 @@
 import { RefreshControl, StyleSheet, View } from "react-native";
 
 import { formatLongtailDate } from "@/components/longtail/longtail-format";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
@@ -36,7 +36,7 @@ interface AdminUserCardProps {
 
 function AdminUserCard({ user }: AdminUserCardProps): React.JSX.Element {
   return (
-    <Card style={styles.userCard} testID={`admin-user-${user.id}`} variant="flat">
+    <SettingsBlock testID={`admin-user-${user.id}`}>
       <View style={styles.header}>
         <View style={styles.identity}>
           <Text numberOfLines={1} variant="label">
@@ -65,7 +65,7 @@ function AdminUserCard({ user }: AdminUserCardProps): React.JSX.Element {
         <CountCell label="Sessions" value={user.session_count} />
         <CountCell label="Devices" value={user.browser_device_count} />
       </View>
-    </Card>
+    </SettingsBlock>
   );
 }
 
@@ -160,8 +160,5 @@ const styles = StyleSheet.create({
   timestamps: {
     alignItems: "flex-start",
     gap: spacing[1],
-  },
-  userCard: {
-    gap: spacing[3],
   },
 });

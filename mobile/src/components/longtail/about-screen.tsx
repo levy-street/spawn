@@ -9,12 +9,12 @@ import {
   SECURITY_URL,
   SOURCE_URL,
 } from "@/components/longtail/public-content";
+import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsLinkRow } from "@/components/settings/settings-row";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
@@ -101,43 +101,41 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
   };
 
   return (
-    <SettingsScreen
-      description="Version, host installation, security, source, and legal information."
-      testID="about-screen"
-      title="About & security"
-    >
+    <SettingsScreen testID="about-screen" title="About & security">
       <SettingsSection>
-        <Card style={styles.identity} variant="flat">
-          <View style={[styles.mark, { backgroundColor: theme.colors.brandAccentSoft }]}>
-            <Icon color="brandAccent" name="Terminal" size={spacing[6]} />
+        <SettingsBlock>
+          <View style={styles.identity}>
+            <View style={[styles.mark, { backgroundColor: theme.colors.brandAccentSoft }]}>
+              <Icon color="brandAccent" name="Terminal" size={spacing[6]} />
+            </View>
+            <View style={styles.identityCopy}>
+              <Text variant="title">spawn</Text>
+              <Text color="mutedForeground" variant="caption">
+                Version {appVersion}
+              </Text>
+            </View>
+            <Badge variant="outline">MIT / Apache-2.0</Badge>
           </View>
-          <View style={styles.identityCopy}>
-            <Text variant="title">spawn</Text>
-            <Text color="mutedForeground" variant="caption">
-              Version {appVersion}
-            </Text>
-          </View>
-          <Badge variant="outline">MIT / Apache-2.0</Badge>
-        </Card>
+        </SettingsBlock>
       </SettingsSection>
 
       <SettingsSection title="Security">
-        <Card style={styles.cardCopy} variant="flat">
-          <Text variant="label">Security — the server that can&apos;t read your terminal</Text>
+        <SettingsBlock>
+          <Text variant="label">The server cannot read your terminal</Text>
           <Text color="mutedForeground">We introduce. We never listen.</Text>
           <Text color="mutedForeground" variant="caption">
             Terminal traffic is encrypted directly between this device and your host. The control
             plane carries signaling, while visible fingerprints, explicit pairing, revocation, and
             encrypted TURN fallback preserve the server-as-adversary threat model.
           </Text>
-        </Card>
+        </SettingsBlock>
       </SettingsSection>
 
       <SettingsSection
-        description="An iPhone cannot run spawnd. Install it on a Mac or Linux machine you control. Windows hosting is not available."
+        description="Install spawnd on a Mac or Linux machine you control."
         title="Install a host"
       >
-        <Card style={styles.commandCard} variant="flat">
+        <SettingsBlock>
           <Text variant="label">Install command</Text>
           <View
             style={[
@@ -172,9 +170,9 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
               Share
             </Button>
           </View>
-        </Card>
+        </SettingsBlock>
 
-        <Card style={styles.commandCard} variant="flat">
+        <SettingsBlock>
           <Text variant="label">Prebuilt-only smoke test</Text>
           <View
             style={[
@@ -203,7 +201,7 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
             />
             {copied === "prebuilt" ? "Copied" : "Copy command"}
           </Button>
-        </Card>
+        </SettingsBlock>
       </SettingsSection>
 
       <SettingsSection title="Links">
@@ -231,16 +229,10 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
 }
 
 const styles = StyleSheet.create({
-  cardCopy: {
-    gap: spacing[3],
-  },
   commandActions: {
     flexDirection: "row",
     flexWrap: "wrap",
     gap: spacing[2],
-  },
-  commandCard: {
-    gap: spacing[3],
   },
   commandWell: {
     borderWidth: borderWidth.hairline,

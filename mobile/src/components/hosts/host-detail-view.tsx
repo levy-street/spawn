@@ -2,9 +2,9 @@ import { StyleSheet, View } from "react-native";
 import { HostFacts } from "@/components/hosts/host-facts";
 import { hostConnectionLabel } from "@/components/hosts/host-model";
 import { HostSessionList } from "@/components/hosts/host-session-list";
-import { Card } from "@/components/ui/card";
 import { Icon, type IconName } from "@/components/ui/icon";
-import { ListRow, ListSeparator } from "@/components/ui/list-row";
+import { ListGroup } from "@/components/ui/list-group";
+import { ListRow } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import type { AgentOut } from "@/data/api/schemas/agents";
@@ -86,7 +86,7 @@ export function HostDetailView({
           {host.os ?? "unknown"} · {host.arch ?? "unknown"} · daemon {host.version ?? "unknown"}
         </Text>
       </View>
-      <Card padded={false} style={styles.destinations} variant="flat">
+      <ListGroup testID="host-destinations">
         <DestinationRow
           detail={online ? "Browse this machine" : "Unavailable while the daemon is offline"}
           disabled={!online}
@@ -94,14 +94,13 @@ export function HostDetailView({
           label="Files"
           onPress={onOpenFiles}
         />
-        <ListSeparator />
         <DestinationRow
           detail={online ? "Availability, installs, updates and skills" : "Availability is offline"}
           icon="Bot"
           label="Agents & skills"
           onPress={onOpenAgents}
         />
-      </Card>
+      </ListGroup>
       <HostFacts host={host} />
       <HostSessionList agents={agents} onOpen={onOpenSession} sessions={sessions} />
     </View>
@@ -112,10 +111,6 @@ const styles = StyleSheet.create({
   content: {
     gap: spacing[8],
     padding: spacing[4],
-  },
-  destinations: {
-    gap: spacing[0],
-    overflow: "hidden",
   },
   hero: {
     gap: spacing[2],

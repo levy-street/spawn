@@ -10,6 +10,13 @@ export interface ListRowProps {
   title: string;
   subtitle?: string;
   trailing?: ReactNode;
+  /**
+   * Content under the row's copy and inside the same press target — meters,
+   * chips, anything the two text lines cannot carry.
+   */
+  body?: ReactNode;
+  /** Named for assistive tech, since `body` itself is merged into the row. */
+  bodyLabel?: string;
   onPress?: () => void;
   onLongPress?: () => void;
   height?: "regular" | "tall";
@@ -19,12 +26,9 @@ export interface ListRowProps {
   titleWeight?: TextWeight;
 }
 
-export interface ListSeparatorProps {
-  /** Clear the row's leading slot. Set false for an edge-to-edge divider. Default true. */
-  inset?: boolean;
-}
-
 export function ListRow({
+  body,
+  bodyLabel,
   height = "regular",
   leading,
   onLongPress,
@@ -40,13 +44,13 @@ export function ListRow({
 
   return (
     <Pressable
-      accessibilityLabel={subtitle === undefined ? title : `${title}, ${subtitle}`}
+      accessibilityLabel={[title, subtitle, bodyLabel].filter(Boolean).join(", ")}
       accessibilityRole={interactive ? "button" : undefined}
       accessible
       onLongPress={onLongPress}
       onPress={onPress}
       style={({ pressed }) => [
-        styles.container,
+        styles.frame,
         height === "tall" ? styles.tall : styles.regular,
         {
           backgroundColor: pressed ? theme.colors.accent : "transparent",
@@ -54,56 +58,73 @@ export function ListRow({
         },
       ]}
     >
-      {leading !== undefined ? (
-        <View accessibilityElementsHidden style={styles.leading}>
-          {leading}
-        </View>
-      ) : null}
-      <View style={styles.copy}>
-        <Text numberOfLines={1} style={styles.title} variant="label" weight={titleWeight}>
-          {title}
-        </Text>
-        {subtitle !== undefined ? (
-          <Text color="mutedForeground" numberOfLines={2} style={styles.subtitle} variant="caption">
-            {subtitle}
-          </Text>
+      <View style={styles.container}>
+        {leading !== undefined ? (
+          <View accessibilityElementsHidden style={styles.leading}>
+            {leading}
+          </View>
         ) : null}
+        <View style={styles.copy}>
+          <Text numberOfLines={1} style={styles.title} variant="label" weight={titleWeight}>
+            {title}
+          </Text>
+          {subtitle !== undefined ? (
+            <Text
+              color="mutedForeground"
+              numberOfLines={2}
+              style={styles.subtitle}
+              variant="caption"
+            >
+              {subtitle}
+            </Text>
+          ) : null}
+        </View>
+        {trailing !== undefined ? <View style={styles.trailing}>{trailing}</View> : null}
       </View>
-      {trailing !== undefined ? <View style={styles.trailing}>{trailing}</View> : null}
+      {body === undefined ? null : <View style={styles.body}>{body}</View>}
     </Pressable>
   );
 }
 
-export function ListSeparator({ inset = true }: ListSeparatorProps): React.JSX.Element {
+/**
+ * The divider between separator-joined rows. It runs edge to edge on purpose:
+ * a one-sided inset reads as a misalignment rather than as a style, and every
+ * list in the app that offered the choice had already opted out of it.
+ */
+export function ListSeparator(): React.JSX.Element {
   const theme = useTheme();
 
   return (
     <View
-      style={[
-        styles.separator,
-        {
-          backgroundColor: theme.colors.border,
-          marginLeft: inset ? sizing.listRow.separatorInset : sizing.listRow.separatorFullBleed,
-        },
-      ]}
+      style={[styles.separator, { backgroundColor: theme.colors.border }]}
       testID="list-separator"
     />
   );
 }
 
 const styles = StyleSheet.create({
+  body: {
+    gap: sizing.listRow.bodyGap,
+    paddingTop: sizing.listRow.bodyGap,
+  },
   container: {
     alignItems: "center",
     flexDirection: "row",
     gap: sizing.listRow.contentGap,
-    paddingHorizontal: sizing.listRow.horizontalPadding,
-    paddingVertical: sizing.listRow.verticalPadding,
     width: "100%",
   },
   copy: {
     flex: 1,
     gap: sizing.listRow.textGap,
     minWidth: 0,
+  },
+  frame: {
+    // The row's own padding lives here rather than on the content row, so a
+    // body drawn under it sits inside the same frame instead of alongside it.
+    justifyContent: "center",
+    paddingHorizontal: sizing.listRow.horizontalPadding,
+    paddingVertical: sizing.listRow.verticalPadding,
+    width: "100%",
   },
   leading: {
     alignItems: "center",

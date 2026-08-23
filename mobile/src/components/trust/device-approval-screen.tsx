@@ -9,8 +9,8 @@ import { Screen } from "@/components/layout/screen";
 import { EndorsementOption } from "@/components/onboarding/endorsement-option";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
+import { ListBlock } from "@/components/ui/list-group";
 import { ListRow } from "@/components/ui/list-row";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Spinner } from "@/components/ui/spinner";
@@ -145,7 +145,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
 
   return (
     <View style={styles.body} testID="device-approval-screen">
-      <Card variant="flat">
+      <ListBlock>
         <View style={styles.status}>
           {settled && !waiting ? (
             <Icon
@@ -172,12 +172,12 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
               {done
                 ? "You can go back and open a terminal. This screen keeps watching in case that changes."
                 : waiting
-                  ? "Open spawn on a device that already works — a prompt is waiting for you there. This screen notices the moment you approve."
+                  ? "Open spawn on a device that already works. A prompt is waiting there."
                   : "A host only answers devices whose key it has pinned, and no other device is registered to vouch for this one. Use a pairing code below."}
             </Text>
           </View>
         </View>
-      </Card>
+      </ListBlock>
 
       {error ? (
         <Text accessibilityRole="alert" color="destructive" variant="body">
@@ -186,8 +186,8 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
       ) : null}
 
       <View style={styles.section}>
-        <SectionHeader title="THIS DEVICE" />
-        <Card variant="flat">
+        <SectionHeader title="This device" />
+        <ListBlock>
           <View style={styles.identity}>
             <Text color="mutedForeground" variant="caption">
               {phone?.label ?? "This device"}
@@ -208,13 +208,13 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
               {copied ? "Copied" : "Copy fingerprint"}
             </Button>
           </View>
-        </Card>
+        </ListBlock>
       </View>
 
       {waiting ? (
         <View style={styles.section}>
-          <SectionHeader title="ON YOUR OTHER DEVICE" />
-          <Card variant="flat">
+          <SectionHeader title="On your other device" />
+          <ListBlock>
             <View style={styles.steps}>
               <Text color="mutedForeground" variant="body">
                 1. Open spawn there, signed in to this same account.
@@ -237,13 +237,13 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
                 Ask again
               </Button>
             </View>
-          </Card>
+          </ListBlock>
         </View>
       ) : null}
 
       {phone && (endorsements.data ?? []).length > 0 ? (
         <View style={styles.section}>
-          <SectionHeader title="WAITING FOR YOU" />
+          <SectionHeader title="Waiting for you" />
           <EndorsementOption
             acceptingKey={
               accept.variables
@@ -264,8 +264,8 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
 
       {settled && !done ? (
         <View style={styles.section}>
-          <SectionHeader title="OR PAIR FROM THIS DEVICE" />
-          <Card variant="flat">
+          <SectionHeader title="Or pair from this device" />
+          <ListBlock>
             <View style={styles.steps}>
               <Text color="mutedForeground" variant="body">
                 Run <Text variant="mono">spawnd login</Text> on the host and enter the code it
@@ -275,14 +275,14 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
                 Enter a pairing code
               </Button>
             </View>
-          </Card>
+          </ListBlock>
         </View>
       ) : null}
 
       {approvals.approvals.length > 0 ? (
         <View style={styles.section}>
-          <SectionHeader title="HOSTS" />
-          <Card variant="flat">
+          <SectionHeader title="Hosts" />
+          <ListBlock>
             {approvals.approvals.map((entry) => (
               <ListRow
                 key={entry.host.id}
@@ -313,7 +313,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
                 }
               />
             ))}
-          </Card>
+          </ListBlock>
         </View>
       ) : null}
     </View>

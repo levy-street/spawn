@@ -196,7 +196,7 @@ export function SignupScreen({ invite }: { invite?: string }) {
     >
       <View style={styles.content}>
         {invite !== undefined ? (
-          <AuthMessage>You have an invite — finish creating your account below.</AuthMessage>
+          <AuthMessage>You have an invite. Finish creating your account below.</AuthMessage>
         ) : null}
         <SignupForm
           config={configQuery.data}

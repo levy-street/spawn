@@ -104,7 +104,7 @@ export function AccountPanel(): React.JSX.Element {
               onPress={() => {
                 setResending(true);
                 void requestEmailVerification()
-                  .then(() => setResendNote("Sent — check your inbox."))
+                  .then(() => setResendNote("Sent. Check your inbox."))
                   .catch(() => setResendNote("Could not send right now."))
                   .finally(() => setResending(false));
               }}

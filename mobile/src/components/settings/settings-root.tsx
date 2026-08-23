@@ -1,109 +1,89 @@
 import { useRouter } from "expo-router";
 import { StyleSheet, View } from "react-native";
-import { headerDestinationActions } from "@/components/nav/header-destinations";
-import { SETTINGS_PANELS } from "@/components/settings/settings-inventory";
+import { SETTINGS_PANELS, type SettingsPanelKey } from "@/components/settings/settings-inventory";
 import { SettingsLinkRow } from "@/components/settings/settings-row";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Monogram } from "@/components/ui/monogram";
-import { Text } from "@/components/ui/text";
 import { useMeSettingsQuery } from "@/data/queries/settings";
-import { borderWidth, spacing, useTheme } from "@/theme";
+import { spacing } from "@/theme";
+
+/**
+ * How the inventory reads as a list. The panels keep their inventory order; the
+ * groups only say where one subject ends and the next begins, so a reader scans
+ * headings rather than nine identical rows.
+ */
+const PANEL_GROUPS = [
+  { title: "General", keys: ["account", "appearance", "notifications"] },
+  { title: "Hosts & agents", keys: ["hosts", "agents", "skills", "templates"] },
+  { title: "Devices & trust", keys: ["devices", "trust"] },
+] as const satisfies readonly { title: string; keys: readonly SettingsPanelKey[] }[];
+
+const PANELS_BY_KEY = new Map(SETTINGS_PANELS.map((panel) => [panel.key, panel]));
 
 export function SettingsRoot(): React.JSX.Element {
   const router = useRouter();
-  const theme = useTheme();
   const me = useMeSettingsQuery();
   const user = me.data?.user;
 
   return (
-    <SettingsScreen
-      actions={headerDestinationActions(user?.is_admin ? ["admin"] : [])}
-      description="Manage your account, appearance, notifications, hosts, agents, skills, browser devices, and device trust."
-      root
-      testID="settings-root"
-      title="Settings"
-    >
-      {user ? (
-        <View
-          style={[
-            styles.profile,
-            { backgroundColor: theme.colors.card, borderColor: theme.colors.border },
-          ]}
-        >
-          <Monogram seed={user.email} />
-          <View style={styles.profileCopy}>
-            <Text numberOfLines={1} variant="label">
-              {user.email}
-            </Text>
-            <View style={styles.badges}>
-              <Badge variant={user.email_verified_at ? "success" : "warning"}>
-                {user.email_verified_at ? "verified" : "unverified"}
-              </Badge>
-              {user.is_admin ? <Badge variant="outline">admin</Badge> : null}
-            </View>
-          </View>
-          <Button
-            accessibilityLabel="Open profile"
-            onPress={() => router.push("/profile")}
-            size="sm"
-            variant="outline"
+    <SettingsScreen root testID="settings-root" title="Settings">
+      <View style={styles.groups}>
+        {PANEL_GROUPS.map((group) => (
+          <SettingsSection
+            key={group.title}
+            testID={`settings-group-${group.title.toLowerCase()}`}
+            title={group.title}
           >
-            Profile
-          </Button>
-        </View>
-      ) : null}
-
-      <SettingsSection>
-        {SETTINGS_PANELS.map((panel) => (
-          <SettingsLinkRow
-            icon={panel.icon}
-            key={panel.key}
-            label={panel.label}
-            onPress={() => router.push(panel.route)}
-            testID={`settings-panel-${panel.key}`}
-          />
+            {group.keys.map((key) => {
+              const panel = PANELS_BY_KEY.get(key);
+              if (panel === undefined) return null;
+              return (
+                <SettingsLinkRow
+                  icon={panel.icon}
+                  key={panel.key}
+                  label={panel.label}
+                  onPress={() => router.push(panel.route)}
+                  testID={`settings-panel-${panel.key}`}
+                />
+              );
+            })}
+          </SettingsSection>
         ))}
-      </SettingsSection>
 
-      <SettingsSection title="Connectivity & support">
-        <SettingsLinkRow
-          hint="Connection URL and health check"
-          icon="Network"
-          label="Server"
-          onPress={() => router.push("/settings/server")}
-          testID="settings-panel-server"
-        />
-        <SettingsLinkRow
-          hint="Version, installation, security, source, and legal information"
-          icon="ShieldCheck"
-          label="About & security"
-          onPress={() => router.push("/settings/about")}
-          testID="settings-panel-about"
-        />
-      </SettingsSection>
+        <SettingsSection testID="settings-group-support" title="Connection & support">
+          <SettingsLinkRow
+            icon="Network"
+            label="Server"
+            onPress={() => router.push("/settings/server")}
+            testID="settings-panel-server"
+          />
+          <SettingsLinkRow
+            icon="ShieldCheck"
+            label="About & security"
+            onPress={() => router.push("/settings/about")}
+            testID="settings-panel-about"
+          />
+        </SettingsSection>
+
+        {/* Admin is an ordinary row rather than a header icon: it is a place you
+            go, not an action on this screen, and only an admin account has it. */}
+        {user?.is_admin ? (
+          <SettingsSection testID="settings-group-admin" title="Administration">
+            <SettingsLinkRow
+              icon="Settings2"
+              label="Admin"
+              onPress={() => router.push("/admin")}
+              testID="settings-panel-admin"
+            />
+          </SettingsSection>
+        ) : null}
+      </View>
     </SettingsScreen>
   );
 }
 
 const styles = StyleSheet.create({
-  badges: {
-    flexDirection: "row",
-    gap: spacing[1],
-  },
-  profile: {
-    alignItems: "center",
-    borderRadius: spacing[2.5],
-    borderWidth: borderWidth.hairline,
-    flexDirection: "row",
-    gap: spacing[3],
-    padding: spacing[3],
-  },
-  profileCopy: {
-    flex: 1,
-    gap: spacing[1],
-    minWidth: 0,
+  groups: {
+    gap: spacing[6],
   },
 });

@@ -110,14 +110,14 @@ describe("onboarding security states", () => {
       { wrapper },
     );
 
-    await fireEvent.press(screen.getByRole("button", { name: "Fingerprint matches — approve" }));
+    await fireEvent.press(screen.getByRole("button", { name: "Fingerprint matches, approve" }));
     expect(onApprove).not.toHaveBeenCalled();
     await fireEvent.press(
       screen.getByRole("checkbox", {
         name: "I compared the host fingerprint and it matches",
       }),
     );
-    await fireEvent.press(screen.getByRole("button", { name: "Fingerprint matches — approve" }));
+    await fireEvent.press(screen.getByRole("button", { name: "Fingerprint matches, approve" }));
     expect(onApprove).toHaveBeenCalledTimes(1);
     await screen.unmount();
   });

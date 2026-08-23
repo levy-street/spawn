@@ -11,7 +11,6 @@ import { Collapse } from "@/components/ui/collapse";
 import { Confirm, ConfirmHost, confirm } from "@/components/ui/confirm";
 import { Dialog } from "@/components/ui/dialog";
 import { Menu } from "@/components/ui/menu";
-import { NativePopover } from "@/components/ui/native-popover";
 import { Popover } from "@/components/ui/popover";
 import { Sheet, SheetHeader } from "@/components/ui/sheet";
 import { SwipeDismissOverlay } from "@/components/ui/swipe-dismiss-overlay";
@@ -164,31 +163,6 @@ describe("overlay rendering and dismissal", () => {
     });
   });
 
-  test("NativePopover renders and selects from a solid themed surface", async () => {
-    const action = jest.fn();
-    const onDismiss = jest.fn();
-    const screen = await render(
-      <NativePopover
-        anchor={{ x: 40, y: 80, width: 44, height: 44 }}
-        items={[{ key: "rename", label: "Rename", onPress: action }]}
-        onDismiss={onDismiss}
-        visible
-      />,
-      { wrapper: Providers },
-    );
-
-    await waitFor(() => expect(screen.getByTestId("native-popover-surface")).toBeTruthy());
-    expect(
-      StyleSheet.flatten(screen.getByTestId("native-popover-surface").props["style"]),
-    ).toMatchObject({
-      backgroundColor: lightColors.popover,
-      borderWidth: borderWidth.none,
-    });
-    await fireEvent.press(screen.getByTestId("native-popover-item-rename"));
-    expect(action).toHaveBeenCalledTimes(1);
-    expect(onDismiss).toHaveBeenCalledTimes(1);
-  });
-
   test("Sheet mounts content and ActionSheet carries only its actions", async () => {
     const sheet = await render(
       <Sheet onDismiss={jest.fn()} visible>
@@ -215,6 +189,26 @@ describe("overlay rendering and dismissal", () => {
     expect(actionSheet.queryByText("Cancel")).toBeNull();
     await fireEvent.press(actionSheet.getByText("Archive"));
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  test("a drawer groups its actions and sets only the destructive one apart", async () => {
+    const screen = await render(
+      <ActionSheet
+        actions={[
+          { id: "rename", label: "Rename", onPress: jest.fn() },
+          { id: "duplicate", label: "Duplicate", onPress: jest.fn() },
+          { id: "delete", label: "Delete", destructive: true, onPress: jest.fn() },
+        ]}
+        onDismiss={jest.fn()}
+        visible
+      />,
+      { wrapper: Providers },
+    );
+
+    // Menus already read this way, and a drawer is the same list of actions: one
+    // group, with the irreversible one fenced off.
+    await waitFor(() => expect(screen.getByText("Rename")).toBeTruthy());
+    expect(screen.getAllByTestId("drawer-separator")).toHaveLength(1);
   });
 
   test("Collapse keeps dynamic content mounted", async () => {

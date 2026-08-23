@@ -92,6 +92,14 @@ export function TabPager<Page>({
   const lastRequestedPage = useRef(startingPage);
   const progress = useSharedValue(startingPage);
   const onPageScroll = usePageScrollHandler(progress, onDragProgress);
+  // `scrollEnabled: false` cannot be the pager's first answer. Fabric applies a
+  // view's props before inserting it into its superview, and the pager only
+  // builds its UIPageViewController once it *has* one, so the flag lands on a
+  // scroll view that does not exist yet and is silently dropped — leaving the
+  // pager with a live horizontal pan that outranks the card's own full-screen
+  // back gesture. The first page selection is proof the native side is up, and
+  // turning the pan off then reaches it as a change of value.
+  const [nativePagerReady, setNativePagerReady] = useState(false);
   const normalizedLazyWindow = Math.max(0, Math.trunc(lazyWindow));
 
   useEffect(() => {
@@ -126,6 +134,7 @@ export function TabPager<Page>({
   const handlePageSelected = useCallback(
     (event: PagerViewOnPageSelectedEvent) => {
       const nextPage = clampPage(event.nativeEvent.position, pages.length);
+      setNativePagerReady(true);
       setSettledPage(nextPage);
       lastRequestedPage.current = nextPage;
       progress.value = nextPage;
@@ -174,7 +183,11 @@ export function TabPager<Page>({
       onPageScroll={onPageScroll}
       onPageSelected={handlePageSelected}
       orientation="horizontal"
-      overdrag={!reducedMotion}
+      overdrag={false}
+      // Paging is driven by the tab strip alone. A horizontal swipe on the page
+      // itself sat on top of the card's own back gesture, so the same drag meant
+      // two things depending on how far across the screen it started.
+      scrollEnabled={!nativePagerReady}
       style={[styles.pager, style]}
       testID={testID}
     >

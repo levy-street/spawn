@@ -15,6 +15,9 @@ export interface IconButtonProps
   accessibilityLabel: string;
   icon: IconName;
   size?: IconButtonSize;
+  /** Overrides the glyph without changing the plate, for a control that has to
+   *  read larger than its neighbours. */
+  iconSize?: number;
 }
 
 const ICON_SIZE = {
@@ -32,6 +35,7 @@ const CONTROL_SIZE = {
 export function IconButton({
   accessibilityLabel,
   icon,
+  iconSize,
   size = "default",
   style,
   variant = "ghost",
@@ -45,7 +49,12 @@ export function IconButton({
       style={[styles.square, { height: CONTROL_SIZE[size], width: CONTROL_SIZE[size] }, style]}
       variant={variant}
     >
-      <Icon color={buttonContentColor(variant)} name={icon} size={ICON_SIZE[size]} />
+      <Icon
+        color={buttonContentColor(variant)}
+        name={icon}
+        size={iconSize ?? ICON_SIZE[size]}
+        {...(props.testID === undefined ? {} : { testID: `${props.testID}-icon` })}
+      />
     </Button>
   );
 }
