@@ -272,7 +272,7 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
                 text("select name, command, install from agents where owner_user_id is null")
             ).mappings()
             agents = {row["name"]: row for row in agent_rows}
-            # The 0001 seed carried a `shell` builtin; 0030 deletes it —
+            # The 0001 seed carried a `shell` builtin; 0043 deletes it —
             # sessions ARE shells now.
             assert set(agents) == {"claude-code", "codex", "opencode", "aider-sonnet"}
             assert agents["codex"]["command"] == "codex"
