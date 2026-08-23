@@ -146,6 +146,8 @@ export const displayClamp = {
   c26_5_9_32: [26, 5.9, 32],
   c28_3_7_48: [28, 3.7, 48],
   c30_4_5_48: [30, 4.5, 48],
+  /** The account masthead: a phone-width poster line, not a card heading. */
+  c30_10_2_42: [30, 10.2, 42],
   c30_4_8_52: [30, 4.8, 52],
   c30_5_4_48: [30, 5.4, 48],
   c32_4_3_63: [32, 4.3, 63],

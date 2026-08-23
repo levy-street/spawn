@@ -1,12 +1,11 @@
 import { useRouter } from "expo-router";
 import { useRef, useState } from "react";
 import { StyleSheet, type TextInput, View } from "react-native";
+import { AuthAction, AuthLink, authFooterRow } from "@/components/auth/auth-actions";
+import { AuthField, AuthInput, authFormGap } from "@/components/auth/auth-field";
 import { AuthMessage } from "@/components/auth/auth-message";
-import { AuthShell } from "@/components/auth/auth-shell";
+import { AuthBlock, AuthShell, authGutter } from "@/components/auth/auth-shell";
 import { OAuthButtons } from "@/components/auth/oauth-buttons";
-import { Button } from "@/components/ui/button";
-import { Field } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
 import { Text } from "@/components/ui/text";
 import { ApiError } from "@/data/api/client";
 import { useAuthConfigQuery, useLoginMutation } from "@/data/queries/auth";
@@ -52,111 +51,101 @@ export function LoginScreen() {
   return (
     <AuthShell
       description="Sign in to reach the shells running across your machines."
+      footer={
+        <View style={styles.colophon}>
+          <View style={authFooterRow}>
+            <Text color="mutedForeground" variant="sigilLabel">
+              No account?
+            </Text>
+            <AuthLink emphasis label="Create one" onPress={() => router.push("/signup")} />
+          </View>
+          <View style={authFooterRow}>
+            <AuthLink
+              accessibilityLabel="Server settings"
+              label="Server"
+              onPress={() => router.push("/server")}
+              testID="login-server"
+            />
+          </View>
+        </View>
+      }
       title="Welcome back"
     >
-      <View style={styles.content}>
-        <OAuthButtons
-          loading={configQuery.isPending}
-          providers={configQuery.data?.providers ?? []}
-        />
-        {configQuery.isError ? (
-          <Text accessibilityRole="alert" color="mutedForeground">
-            Social sign-in is temporarily unavailable. Email sign-in still works.
-          </Text>
-        ) : null}
-        <View style={styles.form}>
-          <Field error={errors.email} label="Email" required>
-            <Input
-              autoFocus
+      <View style={styles.form}>
+        <AuthField error={errors.email} label="Email" required>
+          <AuthInput
+            editable={!login.isPending}
+            error={errors.email !== null}
+            nextRef={passwordRef}
+            onChangeText={(value) => {
+              setEmail(value);
+              setRequestError(null);
+            }}
+            placeholder="you@example.com"
+            purpose="email"
+            returnKeyType="next"
+            testID="login-email"
+            value={email}
+          />
+        </AuthField>
+        <View style={styles.passwordGroup}>
+          <AuthField error={errors.password} label="Password" required>
+            <AuthInput
               editable={!login.isPending}
-              error={errors.email !== null}
-              nextRef={passwordRef}
+              error={errors.password !== null}
               onChangeText={(value) => {
-                setEmail(value);
+                setPassword(value);
                 setRequestError(null);
               }}
-              purpose="email"
-              returnKeyType="next"
-              testID="login-email"
-              value={email}
+              onSubmitEditing={() => {
+                void submit();
+              }}
+              purpose="password"
+              ref={passwordRef}
+              returnKeyType="go"
+              testID="login-password"
+              value={password}
             />
-          </Field>
-          <View style={styles.passwordGroup}>
-            <Field error={errors.password} label="Password" required>
-              <Input
-                editable={!login.isPending}
-                error={errors.password !== null}
-                onChangeText={(value) => {
-                  setPassword(value);
-                  setRequestError(null);
-                }}
-                onSubmitEditing={() => {
-                  void submit();
-                }}
-                purpose="password"
-                ref={passwordRef}
-                returnKeyType="go"
-                testID="login-password"
-                value={password}
-              />
-            </Field>
-            <Button
-              accessibilityLabel="Forgot password?"
-              onPress={() => router.push("/forgot-password")}
-              variant="link"
-            >
-              Forgot password?
-            </Button>
+          </AuthField>
+          <View style={styles.forgotRow}>
+            <AuthLink label="Forgot password?" onPress={() => router.push("/forgot-password")} />
           </View>
-          {requestError !== null ? <AuthMessage tone="error">{requestError}</AuthMessage> : null}
-          <Button
-            accessibilityLabel={login.isPending ? "Signing in…" : "Sign in"}
-            loading={login.isPending}
-            onPress={() => {
-              void submit();
-            }}
-            size="lg"
-          >
-            {login.isPending ? "Signing in…" : "Sign in"}
-          </Button>
-        </View>
-        <View style={styles.accountLink}>
-          <Button
-            accessibilityLabel="Server settings"
-            onPress={() => router.push("/server")}
-            variant="link"
-          >
-            Server
-          </Button>
-        </View>
-        <View style={styles.accountLink}>
-          <Text color="mutedForeground">No account?</Text>
-          <Button
-            accessibilityLabel="Create one"
-            onPress={() => router.push("/signup")}
-            variant="link"
-          >
-            Create one
-          </Button>
         </View>
       </View>
+      {requestError !== null ? <AuthMessage tone="error">{requestError}</AuthMessage> : null}
+      <AuthBlock>
+        <AuthAction
+          label={login.isPending ? "Signing in…" : "Sign in"}
+          loading={login.isPending}
+          onPress={() => {
+            void submit();
+          }}
+        />
+      </AuthBlock>
+      {configQuery.isError ? (
+        <AuthBlock>
+          <Text accessibilityRole="alert" color="mutedForeground" variant="caption">
+            Social sign-in is temporarily unavailable. Email sign-in still works.
+          </Text>
+        </AuthBlock>
+      ) : null}
+      <OAuthButtons loading={configQuery.isPending} providers={configQuery.data?.providers ?? []} />
     </AuthShell>
   );
 }
 
 const styles = StyleSheet.create({
-  accountLink: {
-    alignItems: "center",
-    flexDirection: "row",
-    justifyContent: "center",
+  colophon: {
+    gap: spacing[1],
   },
-  content: {
-    gap: spacing[5],
+  forgotRow: {
+    alignItems: "flex-end",
+    paddingHorizontal: authGutter,
   },
   form: {
-    gap: spacing[4],
+    gap: authFormGap,
   },
   passwordGroup: {
-    alignItems: "flex-end",
+    gap: spacing[1],
   },
 });

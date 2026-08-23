@@ -3,7 +3,7 @@ import { type StyleProp, StyleSheet, type ViewStyle } from "react-native";
 import Animated, { FadeIn, FadeOut, LinearTransition, ReduceMotion } from "react-native-reanimated";
 import { Label } from "@/components/ui/label";
 import { Text } from "@/components/ui/text";
-import { pressroomColors, useTheme } from "@/theme";
+import { useTheme } from "@/theme";
 import { spacing } from "@/theme/spacing";
 import { lineHeight, typeStyles } from "@/theme/typography";
 
@@ -92,13 +92,7 @@ export function Field({
             accessibilityLiveRegion={hasError ? "assertive" : "none"}
             accessibilityRole={hasError ? "alert" : "text"}
             color={hasError ? "destructive" : "mutedForeground"}
-            style={[
-              styles.helper,
-              variant === "auth" && styles.authHelper,
-              variant === "auth" && {
-                color: hasError ? pressroomColors.ember : pressroomColors.ash,
-              },
-            ]}
+            style={[styles.helper, variant === "auth" && styles.authHelper]}
           >
             {helperCopy}
           </Text>

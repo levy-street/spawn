@@ -364,6 +364,11 @@ exports[`assembled themes matches the dark token snapshot 1`] = `
         3.7,
         48,
       ],
+      "c30_10_2_42": [
+        30,
+        10.2,
+        42,
+      ],
       "c30_4_5_48": [
         30,
         4.5,
@@ -934,6 +939,11 @@ exports[`assembled themes matches the light token snapshot 1`] = `
         28,
         3.7,
         48,
+      ],
+      "c30_10_2_42": [
+        30,
+        10.2,
+        42,
       ],
       "c30_4_5_48": [
         30,

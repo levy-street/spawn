@@ -3,6 +3,7 @@ import { fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import SettingsIndexRoute from "@/app/(drawer)/(tabs)/settings/index";
+import { SignedOutServerScreen } from "@/components/auth/server-form";
 import { ServerPanel, testServerConnection } from "@/components/settings/server-panel";
 import { authToken } from "@/data/api/auth-token";
 import { getBaseUrlResolution, setBaseUrl } from "@/data/api/config";
@@ -11,9 +12,15 @@ import { ThemeProvider } from "@/theme";
 const mockPush = jest.fn();
 const mockReplace = jest.fn();
 const mockConnectionReset = jest.fn();
+const mockBack = jest.fn();
 
 jest.mock("expo-router", () => ({
-  useRouter: () => ({ push: mockPush, replace: mockReplace }),
+  useRouter: () => ({
+    back: mockBack,
+    canGoBack: () => true,
+    push: mockPush,
+    replace: mockReplace,
+  }),
 }));
 
 jest.mock("@/data/api/auth-token", () => ({
@@ -159,6 +166,46 @@ describe("ServerPanel", () => {
     expect(jest.mocked(authToken.clear).mock.invocationCallOrder[0]).toBeLessThan(
       jest.mocked(setBaseUrl).mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
     );
+  });
+});
+
+describe("SignedOutServerScreen", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.mocked(getBaseUrlResolution).mockResolvedValue({
+      url: "https://current.spawn.test",
+      source: "expo.extra",
+    });
+  });
+
+  test("puts the signed-out server switch on the account sheet, not in app chrome", async () => {
+    const screen = await render(<SignedOutServerScreen />, { wrapper });
+
+    expect(screen.getByTestId("auth-sheet")).toBeTruthy();
+    expect(screen.queryByTestId("server-panel")).toBeNull();
+    await waitFor(() =>
+      expect(screen.getByTestId("effective-server-url")).toHaveTextContent(
+        "https://current.spawn.test",
+      ),
+    );
+  });
+
+  test("changes servers and returns to sign-in", async () => {
+    const screen = await render(<SignedOutServerScreen />, { wrapper });
+    await waitFor(() =>
+      expect(screen.getByTestId("server-url-input")).toHaveDisplayValue(
+        "https://current.spawn.test",
+      ),
+    );
+
+    await fireEvent.changeText(screen.getByTestId("server-url-input"), " new.spawn.test/// ");
+    await fireEvent.press(screen.getByRole("button", { name: "Save server" }));
+
+    await waitFor(() => {
+      expect(authToken.clear).toHaveBeenCalledTimes(1);
+      expect(setBaseUrl).toHaveBeenCalledWith("https://new.spawn.test");
+      expect(mockReplace).toHaveBeenCalledWith("/login");
+    });
   });
 });
 

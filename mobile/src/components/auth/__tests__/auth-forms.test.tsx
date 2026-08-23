@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren, ReactElement } from "react";
+import { StyleSheet } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { LoginScreen } from "@/components/auth/login-form";
 import { OAuthButtons } from "@/components/auth/oauth-buttons";
@@ -11,13 +12,20 @@ import {
 import { validateSignupForm } from "@/components/auth/signup-form";
 import { ApiError } from "@/data/api/client";
 import { confirmPasswordReset, getAuthConfig, logIn } from "@/data/api/endpoints/auth";
-import { ThemeProvider } from "@/theme";
+import { fontFamily, ThemeProvider } from "@/theme";
 
 const mockReplace = jest.fn();
 const mockPush = jest.fn();
+const mockBack = jest.fn();
+const mockCanGoBack = jest.fn(() => true);
 
 jest.mock("expo-router", () => ({
-  useRouter: () => ({ push: mockPush, replace: mockReplace }),
+  useRouter: () => ({
+    back: mockBack,
+    canGoBack: mockCanGoBack,
+    push: mockPush,
+    replace: mockReplace,
+  }),
 }));
 
 jest.mock("@/data/api/endpoints/account", () => ({ getMe: jest.fn() }));
@@ -76,6 +84,37 @@ describe("auth form wiring", () => {
 
     expect(await screen.findByText("Enter a valid email address.")).toBeTruthy();
     expect(logIn).not.toHaveBeenCalled();
+  });
+
+  it("prints the sign-in form on the sheet: ruled fields, no plate, no boxes", async () => {
+    const screen = await renderAuth(<LoginScreen />);
+    await screen.findByText("Available in installed builds");
+
+    // The rule *is* the field. A halo belongs to the app's plated input, and a
+    // plate belongs to the web layout this screen used to be a port of.
+    expect(screen.getByTestId("login-email-rule")).toBeTruthy();
+    expect(screen.queryByTestId("login-email-focus-halo")).toBeNull();
+    expect(screen.queryByTestId("auth-plate")).toBeNull();
+    // The server escape hatch is marginalia at the foot — no icon, but still
+    // reachable, or a wrong address is a deadlock you cannot sign in to fix.
+    await fireEvent.press(screen.getByTestId("login-server"));
+    expect(mockPush).toHaveBeenCalledWith("/server");
+  });
+
+  it("sets the masthead as a poster line, not a card heading", async () => {
+    const screen = await renderAuth(<LoginScreen />);
+    const heading = await screen.findByRole("header", { name: "Welcome back" });
+    const style = StyleSheet.flatten(heading.props["style"]) as {
+      fontFamily?: string;
+      fontSize?: number;
+      textTransform?: string;
+    };
+
+    // 390pt-wide test viewport: the clamp has to be resolving, not falling back
+    // to the body scale the shared Text variant starts from.
+    expect(style.fontSize).toBeGreaterThanOrEqual(36);
+    expect(style.fontFamily).toBe(fontFamily.posterLight);
+    expect(style.textTransform).toBe("uppercase");
   });
 
   it("keeps signup and reset password boundaries distinct", () => {

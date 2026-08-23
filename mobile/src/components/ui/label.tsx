@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
 import { StyleSheet, type TextProps } from "react-native";
 import { Text } from "@/components/ui/text";
-import { pressroomColors } from "@/theme/colors";
 import { fontSize, fontWeight, lineHeight, typeStyles } from "@/theme/typography";
 
 export interface LabelProps extends Omit<TextProps, "children"> {
@@ -21,7 +20,11 @@ export function Label({
 }: LabelProps) {
   const isAuth = variant === "auth";
   return (
-    <Text {...props} color="foreground" style={[styles.label, isAuth && styles.authLabel, style]}>
+    <Text
+      {...props}
+      color={isAuth ? "mutedForeground" : "foreground"}
+      style={[styles.label, isAuth && styles.authLabel, style]}
+    >
       {children}
       {required && showRequiredIndicator ? (
         <Text
@@ -47,12 +50,6 @@ const styles = StyleSheet.create({
     fontWeight: fontWeight.medium,
     lineHeight: lineHeight.compact,
   },
-  authLabel: {
-    ...typeStyles.sigilLabel,
-    color: pressroomColors.ash,
-  },
-  authRequired: {
-    ...typeStyles.sigilLabel,
-    color: pressroomColors.ember,
-  },
+  authLabel: typeStyles.sigilLabel,
+  authRequired: typeStyles.sigilLabel,
 });

@@ -1,12 +1,12 @@
 import { useRouter } from "expo-router";
 import { useRef, useState } from "react";
 import { StyleSheet, type TextInput, View } from "react-native";
+import { AuthAction, AuthLink, authFooterRow } from "@/components/auth/auth-actions";
+import { AuthField, AuthInput, authFormGap } from "@/components/auth/auth-field";
 import { AuthMessage } from "@/components/auth/auth-message";
-import { AuthShell } from "@/components/auth/auth-shell";
+import { useAuthBack } from "@/components/auth/auth-navigation";
+import { AuthBlock, AuthShell } from "@/components/auth/auth-shell";
 import { OAuthButtons } from "@/components/auth/oauth-buttons";
-import { Button } from "@/components/ui/button";
-import { Field } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import { ApiError } from "@/data/api/client";
@@ -19,7 +19,7 @@ import {
   validateRequired,
   validateSignupPassword,
 } from "@/lib/validation";
-import { fontFamily, spacing } from "@/theme";
+import { fontFamily, fontSize, letterSpacing, spacing } from "@/theme";
 
 interface SignupErrors {
   email: string | null;
@@ -78,12 +78,10 @@ function SignupForm({ config, initialInvite }: { config: AuthConfigOut; initialI
   };
 
   return (
-    <View style={styles.content}>
-      <OAuthButtons providers={config.providers} />
+    <>
       <View style={styles.form}>
-        <Field error={errors.email} label="Email" required>
-          <Input
-            autoFocus
+        <AuthField error={errors.email} label="Email" required>
+          <AuthInput
             editable={!signup.isPending}
             error={errors.email !== null}
             nextRef={passwordRef}
@@ -91,13 +89,20 @@ function SignupForm({ config, initialInvite }: { config: AuthConfigOut; initialI
               setEmail(value);
               setRequestError(null);
             }}
+            placeholder="you@example.com"
             purpose="email"
             returnKeyType="next"
+            testID="signup-email"
             value={email}
           />
-        </Field>
-        <Field error={errors.password} hint="Use at least 8 characters." label="Password" required>
-          <Input
+        </AuthField>
+        <AuthField
+          error={errors.password}
+          hint="Use at least 8 characters."
+          label="Password"
+          required
+        >
+          <AuthInput
             editable={!signup.isPending}
             error={errors.password !== null}
             {...(config.invite_only ? { nextRef: inviteRef } : {})}
@@ -115,12 +120,13 @@ function SignupForm({ config, initialInvite }: { config: AuthConfigOut; initialI
             purpose="newPassword"
             ref={passwordRef}
             returnKeyType={config.invite_only ? "next" : "go"}
+            testID="signup-password"
             value={password}
           />
-        </Field>
+        </AuthField>
         {config.invite_only ? (
-          <Field error={errors.invite} label="Invite code" required>
-            <Input
+          <AuthField error={errors.invite} label="Invite code" required>
+            <AuthInput
               editable={!signup.isPending}
               error={errors.invite !== null}
               maxLength={PASSWORD_MAX_LENGTH}
@@ -131,33 +137,35 @@ function SignupForm({ config, initialInvite }: { config: AuthConfigOut; initialI
               onSubmitEditing={() => {
                 void submit();
               }}
+              placeholder="————————"
               purpose="plain"
               ref={inviteRef}
               returnKeyType="go"
               style={styles.inviteInput}
+              testID="signup-invite"
               value={invite}
             />
-          </Field>
+          </AuthField>
         ) : null}
-        {requestError !== null ? <AuthMessage tone="error">{requestError}</AuthMessage> : null}
-        <Button
-          accessibilityLabel={signup.isPending ? "Creating account…" : "Create account"}
+      </View>
+      {requestError !== null ? <AuthMessage tone="error">{requestError}</AuthMessage> : null}
+      <AuthBlock>
+        <AuthAction
+          label={signup.isPending ? "Creating account…" : "Create account"}
           loading={signup.isPending}
           onPress={() => {
             void submit();
           }}
-          size="lg"
-        >
-          {signup.isPending ? "Creating account…" : "Create account"}
-        </Button>
-      </View>
-    </View>
+        />
+      </AuthBlock>
+      <OAuthButtons providers={config.providers} />
+    </>
   );
 }
 
-function SignupLoading() {
+function SignupLoading({ onBack }: { onBack: () => void }) {
   return (
-    <AuthShell title="Create your account">
+    <AuthShell onBack={onBack} title="Create your account">
       <View style={styles.loading}>
         <Spinner label="Loading signup" size={spacing[5]} />
       </View>
@@ -167,24 +175,25 @@ function SignupLoading() {
 
 export function SignupScreen({ invite }: { invite?: string }) {
   const router = useRouter();
+  const goBack = useAuthBack();
   const configQuery = useAuthConfigQuery();
 
-  if (configQuery.isPending) return <SignupLoading />;
+  if (configQuery.isPending) return <SignupLoading onBack={goBack} />;
   if (configQuery.isError || configQuery.data === undefined) {
     return (
       <AuthShell
         description="The server’s signup settings are unavailable."
+        onBack={goBack}
         title="Couldn’t load signup"
       >
-        <Button
-          accessibilityLabel="Try again"
-          onPress={() => {
-            void configQuery.refetch();
-          }}
-          size="lg"
-        >
-          Try again
-        </Button>
+        <AuthBlock>
+          <AuthAction
+            label="Try again"
+            onPress={() => {
+              void configQuery.refetch();
+            }}
+          />
+        </AuthBlock>
       </AuthShell>
     );
   }
@@ -192,50 +201,40 @@ export function SignupScreen({ invite }: { invite?: string }) {
   return (
     <AuthShell
       description="Start with an account, then connect the machine where your agents work."
+      footer={
+        <View style={authFooterRow}>
+          <Text color="mutedForeground" variant="sigilLabel">
+            Already registered?
+          </Text>
+          <AuthLink emphasis label="Log in" onPress={() => router.replace("/login")} />
+        </View>
+      }
+      onBack={goBack}
       title="Create your account"
     >
-      <View style={styles.content}>
-        {invite !== undefined ? (
-          <AuthMessage>You have an invite. Finish creating your account below.</AuthMessage>
-        ) : null}
-        <SignupForm
-          config={configQuery.data}
-          {...(invite === undefined ? {} : { initialInvite: invite })}
-        />
-        <View style={styles.accountLink}>
-          <Text color="mutedForeground">Already have an account?</Text>
-          <Button
-            accessibilityLabel="Log in"
-            onPress={() => router.replace("/login")}
-            variant="link"
-          >
-            Log in
-          </Button>
-        </View>
-      </View>
+      {invite !== undefined ? (
+        <AuthMessage>You have an invite. Finish creating your account below.</AuthMessage>
+      ) : null}
+      <SignupForm
+        config={configQuery.data}
+        {...(invite === undefined ? {} : { initialInvite: invite })}
+      />
     </AuthShell>
   );
 }
 
 const styles = StyleSheet.create({
-  accountLink: {
-    alignItems: "center",
-    flexDirection: "row",
-    justifyContent: "center",
-  },
-  content: {
-    gap: spacing[5],
-  },
   form: {
-    gap: spacing[4],
+    gap: authFormGap,
   },
   inviteInput: {
     fontFamily: fontFamily.mono,
+    letterSpacing: letterSpacing.sigil10Em * fontSize.seventeen,
     textTransform: "uppercase",
   },
   loading: {
     alignItems: "center",
     justifyContent: "center",
-    minHeight: spacing[24] + spacing[8],
+    minHeight: spacing[24],
   },
 });

@@ -23,6 +23,9 @@ export const sizing = {
     /** A search field stands taller than a plain control: it is the primary
      *  target on the screens it heads, and its text needs room to sit centred. */
     searchField: 48,
+    /** A ruled field carries a larger value than a plated one and has no border
+     *  to sit inside, so its height is what gives the line room to breathe. */
+    ruledField: 48,
     button: {
       sm: 44,
       default: 48,

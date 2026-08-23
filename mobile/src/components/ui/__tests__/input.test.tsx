@@ -89,3 +89,20 @@ describe("Input", () => {
     expect(focus).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("Input rule variant", () => {
+  test("swaps the plate for a rule and keeps the value on the sheet's own margin", async () => {
+    const screen = await render(<Input testID="input" variant="rule" />, { wrapper });
+
+    expect(screen.getByTestId("input-rule")).toBeTruthy();
+    expect(screen.queryByTestId("input-focus-halo")).toBeNull();
+    expect(screen.getByTestId("input")).toHaveStyle({ paddingHorizontal: 0 });
+  });
+
+  test("keeps the plated field's halo when no rule was asked for", async () => {
+    const screen = await render(<Input testID="input" />, { wrapper });
+
+    expect(screen.getByTestId("input-focus-halo")).toBeTruthy();
+    expect(screen.queryByTestId("input-rule")).toBeNull();
+  });
+});

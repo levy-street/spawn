@@ -12,7 +12,7 @@ export const DEFAULT_SEARCH_DEBOUNCE_MS = 250;
 export type SearchFieldVariant = "default" | "sidebar" | "inline";
 
 export interface SearchFieldProps
-  extends Omit<InputProps, "leading" | "purpose" | "showFocusHalo" | "trailing"> {
+  extends Omit<InputProps, "leading" | "purpose" | "showFocusHalo" | "trailing" | "variant"> {
   debounceMs?: number;
   onDebouncedChange?: (value: string) => void;
   variant?: SearchFieldVariant;

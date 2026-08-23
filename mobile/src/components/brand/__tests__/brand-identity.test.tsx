@@ -1,11 +1,12 @@
 import { render, screen } from "@testing-library/react-native";
 import { View } from "react-native";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 
 import { AuthShell } from "@/components/auth/auth-shell";
 import { BrandMark, Wordmark } from "@/components/brand/brand-mark";
 import { AgentIcon } from "@/components/workspace-detail/agent-icon";
 import type { AgentIdentity, AgentLogoKey } from "@/data/types/domain";
-import { lightColors, pressroomColors, ThemeProvider } from "@/theme";
+import { darkColors, FixedThemeProvider, lightColors, ThemeProvider } from "@/theme";
 
 const IDENTITIES: readonly AgentIdentity[] = [
   {
@@ -127,35 +128,62 @@ describe("agent brand plates", () => {
   });
 });
 
-describe("auth Pressroom surface", () => {
-  test("uses fixed Pressroom inks and canonical artwork instead of theme surfaces", async () => {
-    await render(
-      <ThemeProvider>
-        <AuthShell description="Continue to your machines." title="Welcome back">
-          <View />
-        </AuthShell>
-      </ThemeProvider>,
-    );
+const METRICS = {
+  frame: { x: 0, y: 0, width: 390, height: 844 },
+  insets: { top: 47, left: 0, right: 0, bottom: 34 },
+};
 
-    expect(screen.getByTestId("auth-pressroom")).toHaveStyle({
-      backgroundColor: pressroomColors.void,
+describe("auth surface", () => {
+  function renderSheet(mode: "light" | "dark") {
+    return render(
+      <SafeAreaProvider initialMetrics={METRICS}>
+        <FixedThemeProvider mode={mode}>
+          <AuthShell description="Continue to your machines." title="Welcome back">
+            <View />
+          </AuthShell>
+        </FixedThemeProvider>
+      </SafeAreaProvider>,
+    );
+  }
+
+  test("prints on the sheet itself rather than a plate laid on it", async () => {
+    const view = await renderSheet("dark");
+
+    // The account surface is the sheet. Nothing may reintroduce a card between
+    // the ground and the form printed on it.
+    expect(view.queryByTestId("auth-plate")).toBeNull();
+    expect(view.getByTestId("auth-brand-mark-path")).toHaveProp(
+      "fill",
+      svgBrush(darkColors.brandAccent),
+    );
+    expect(view.getByTestId("auth-wordmark-path-0")).toHaveProp(
+      "fill",
+      svgBrush(darkColors.brandAccent),
+    );
+    expect(view.queryByText("SPAWN")).not.toBeOnTheScreen();
+    // The press bed's corner crosses are gone; nothing decorative frames the sheet.
+    expect(view.queryAllByText("+")).toHaveLength(0);
+  });
+
+  test("follows the appearance setting instead of pinning itself dark", async () => {
+    const dark = await renderSheet("dark");
+
+    expect(dark.getByTestId("auth-sheet")).toHaveStyle({
+      backgroundColor: darkColors.background,
     });
-    expect(screen.getByTestId("auth-pressroom")).not.toHaveStyle({
+    expect(dark.getByTestId("auth-altar", { includeHiddenElements: true })).toBeOnTheScreen();
+    dark.unmount();
+
+    const light = await renderSheet("light");
+
+    expect(light.getByTestId("auth-sheet")).toHaveStyle({
       backgroundColor: lightColors.background,
     });
-    expect(screen.getByTestId("auth-plate")).toHaveStyle({
-      backgroundColor: pressroomColors.char,
-      borderColor: pressroomColors.lineG,
-    });
-    expect(screen.getByTestId("auth-brand-mark-path")).toHaveProp(
+    expect(light.getByTestId("auth-brand-mark-path")).toHaveProp(
       "fill",
-      svgBrush(pressroomColors.hellfire),
+      svgBrush(lightColors.brandAccent),
     );
-    expect(screen.getByTestId("auth-wordmark-path-0")).toHaveProp(
-      "fill",
-      svgBrush(pressroomColors.hellfire),
-    );
-    expect(screen.getByTestId("auth-altar", { includeHiddenElements: true })).toBeOnTheScreen();
-    expect(screen.queryByText("SPAWN")).not.toBeOnTheScreen();
+    // Ink on paper is a grey smudge: the plate stays off a light sheet.
+    expect(light.queryByTestId("auth-altar", { includeHiddenElements: true })).toBeNull();
   });
 });

@@ -31,6 +31,8 @@ const ThemeContext = createContext<ThemeProviderValue | null>(null);
  * Pins a subtree to one palette regardless of the device appearance. The auth
  * surface paints a fixed dark brand ground, so its controls must not follow the
  * OS into light mode — that renders near-black labels on a near-black card.
+ * `grimoire` goes further and hands that subtree the press palette itself, so a
+ * borrowed button or field arrives already inked rather than restyled in place.
  */
 export function FixedThemeProvider({
   mode,

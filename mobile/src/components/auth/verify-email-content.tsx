@@ -2,9 +2,9 @@ import { useRouter } from "expo-router";
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
+import { AuthAction } from "@/components/auth/auth-actions";
 import { AuthMessage } from "@/components/auth/auth-message";
-import { AuthShell } from "@/components/auth/auth-shell";
-import { Button } from "@/components/ui/button";
+import { AuthBlock, AuthShell } from "@/components/auth/auth-shell";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import { authToken } from "@/data/api/auth-token";
@@ -15,7 +15,7 @@ import {
   useMeQuery,
 } from "@/data/queries/auth";
 import { haptics } from "@/lib/haptics";
-import { duration, spacing } from "@/theme";
+import { duration, fontFamily, fontSize, spacing } from "@/theme";
 
 type SessionState = "checking" | "signed-in" | "signed-out";
 type LinkState =
@@ -26,15 +26,23 @@ type LinkState =
 function VerifySuccess({ signedIn }: { signedIn: boolean }) {
   const router = useRouter();
   return (
-    <View style={styles.content}>
+    <>
       <AuthMessage tone="success">Your email address is verified.</AuthMessage>
-      <Button
-        accessibilityLabel={signedIn ? "Continue to spawn" : "Sign in to continue"}
-        onPress={() => router.replace(signedIn ? "/" : "/login")}
-        size="lg"
-      >
-        {signedIn ? "Continue to spawn" : "Sign in to continue"}
-      </Button>
+      <AuthBlock>
+        <AuthAction
+          label={signedIn ? "Continue to spawn" : "Sign in to continue"}
+          onPress={() => router.replace(signedIn ? "/" : "/login")}
+        />
+      </AuthBlock>
+    </>
+  );
+}
+
+function Working({ label, message }: { label: string; message?: string }) {
+  return (
+    <View accessibilityLabel={message ?? label} style={styles.working}>
+      <Spinner label={label} />
+      {message === undefined ? null : <Text color="mutedForeground">{message}</Text>}
     </View>
   );
 }
@@ -67,12 +75,7 @@ function VerificationLink({ token }: { token: string }) {
   }, [token, verifyEmail]);
 
   if (state.status === "working") {
-    return (
-      <View accessibilityLabel="Verifying your email…" style={styles.working}>
-        <Spinner label="Verifying email" />
-        <Text color="mutedForeground">Verifying your email…</Text>
-      </View>
-    );
+    return <Working label="Verifying email" message="Verifying your email…" />;
   }
   if (state.status === "done") return <VerifySuccess signedIn={state.signedIn} />;
 
@@ -82,21 +85,18 @@ function VerificationLink({ token }: { token: string }) {
 function VerificationFailure({ message }: { message: string }) {
   const router = useRouter();
   return (
-    <View style={styles.content}>
+    <>
       <AuthMessage tone="error">{message}</AuthMessage>
-      <Text color="mutedForeground" style={styles.longCopy}>
-        Verification links work once and expire after two days. Sign in and request a fresh one from
-        Settings.
-      </Text>
-      <Button
-        accessibilityLabel="Go to sign in"
-        onPress={() => router.replace("/login")}
-        size="lg"
-        variant="secondary"
-      >
-        Go to sign in
-      </Button>
-    </View>
+      <AuthBlock>
+        <Text color="mutedForeground" style={styles.copy}>
+          Verification links work once and expire after two days. Sign in and request a fresh one
+          from Settings.
+        </Text>
+      </AuthBlock>
+      <AuthBlock>
+        <AuthAction label="Go to sign in" onPress={() => router.replace("/login")} tone="quiet" />
+      </AuthBlock>
+    </>
   );
 }
 
@@ -128,50 +128,45 @@ function VerificationWaiting() {
     }
   };
 
-  if (meQuery.isPending) {
-    return (
-      <View style={styles.working}>
-        <Spinner label="Checking verification" />
-      </View>
-    );
-  }
+  if (meQuery.isPending) return <Working label="Checking verification" />;
   if (meQuery.isError || meQuery.data === undefined) {
     return (
-      <View style={styles.content}>
+      <>
         <AuthMessage tone="error">Couldn’t load your account</AuthMessage>
-        <Button
-          accessibilityLabel="Go to sign in"
-          onPress={() => router.replace("/login")}
-          size="lg"
-        >
-          Go to sign in
-        </Button>
-      </View>
+        <AuthBlock>
+          <AuthAction label="Go to sign in" onPress={() => router.replace("/login")} />
+        </AuthBlock>
+      </>
     );
   }
 
   return (
-    <View style={styles.content}>
-      <Text>
-        We sent a link to <Text weight="medium">{meQuery.data.user.email}</Text>.
-      </Text>
-      <Text color="mutedForeground" style={styles.longCopy}>
-        Open it in any tab. This page checks every five seconds and will continue automatically.
-      </Text>
+    <>
+      <AuthBlock>
+        <Text style={styles.copy}>
+          We sent a link to{" "}
+          <Text style={styles.address} testID="verify-address">
+            {meQuery.data.user.email}
+          </Text>
+          .
+        </Text>
+        <Text color="mutedForeground" style={[styles.copy, styles.secondLine]}>
+          Open it anywhere. This screen checks every few seconds and continues on its own.
+        </Text>
+      </AuthBlock>
       {message !== null ? <AuthMessage tone="success">{message}</AuthMessage> : null}
       {error !== null ? <AuthMessage tone="error">{error}</AuthMessage> : null}
-      <Button
-        accessibilityLabel={resend.isPending ? "Sending…" : "Resend email"}
-        loading={resend.isPending}
-        onPress={() => {
-          void sendAgain();
-        }}
-        size="lg"
-        variant="secondary"
-      >
-        {resend.isPending ? "Sending…" : "Resend email"}
-      </Button>
-    </View>
+      <AuthBlock>
+        <AuthAction
+          label={resend.isPending ? "Sending…" : "Resend email"}
+          loading={resend.isPending}
+          onPress={() => {
+            void sendAgain();
+          }}
+          tone="quiet"
+        />
+      </AuthBlock>
+    </>
   );
 }
 
@@ -202,11 +197,7 @@ export function VerifyEmailScreen({ token }: { token?: string }) {
   if (token !== undefined) {
     content = <VerificationLink token={token} />;
   } else if (sessionState === "checking") {
-    content = (
-      <View style={styles.working}>
-        <Spinner label="Loading verification" />
-      </View>
-    );
+    content = <Working label="Loading verification" />;
   } else if (sessionState === "signed-in") {
     content = <VerificationWaiting />;
   } else {
@@ -224,17 +215,22 @@ export function VerifyEmailScreen({ token }: { token?: string }) {
 }
 
 const styles = StyleSheet.create({
-  content: {
-    gap: spacing[5],
+  address: {
+    fontFamily: fontFamily.mono,
   },
-  longCopy: {
+  copy: {
+    fontFamily: fontFamily.grimoireRegular,
+    fontSize: fontSize.fifteen,
     lineHeight: spacing[6],
+  },
+  secondLine: {
+    marginTop: spacing[3],
   },
   working: {
     alignItems: "center",
     flexDirection: "row",
     gap: spacing[3],
     justifyContent: "center",
-    minHeight: spacing[24] + spacing[8],
+    minHeight: spacing[24],
   },
 });
