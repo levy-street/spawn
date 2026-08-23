@@ -15,10 +15,10 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, schemas
+from .. import auth, rate_limit, schemas
 from ..config import Settings, get_settings
 from ..db import get_session
-from ..models import AuthIdentity, AuthProviderState, User
+from ..models import AuthIdentity, AuthProviderExchange, AuthProviderState, User
 
 ProviderId = Literal["google", "microsoft", "github"]
 
@@ -151,6 +151,43 @@ def _clean_return_to(return_to: str | None) -> str:
 
 def _provider_redirect_uri(provider: ProviderId) -> str:
     return _public_url(f"/api/auth/oauth/{provider}/callback")
+
+
+def _native_redirect_uri(redirect_uri: str | None) -> str | None:
+    """The app's own redirect target, or None when this is an ordinary web flow.
+
+    Matching is exact against the configured allow-list. A prefix or host rule
+    would let anything that claims the scheme collect codes meant for the real
+    app, which is the whole reason the code is single-use and short-lived.
+    """
+    if not redirect_uri:
+        return None
+    allowed = get_settings().oauth_native_redirect_uri_list
+    if redirect_uri not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="redirect_uri is not an allowed native redirect",
+        )
+    return redirect_uri
+
+
+def _is_native_redirect(return_to: str) -> bool:
+    return return_to in get_settings().oauth_native_redirect_uri_list
+
+
+async def _issue_exchange_code(*, session: AsyncSession, user: User) -> str:
+    code = secrets.token_urlsafe(32)
+    settings = get_settings()
+    session.add(
+        AuthProviderExchange(
+            code_hash=_hash_state(code),
+            user_id=user.id,
+            expires_at=_now() + timedelta(seconds=settings.oauth_exchange_ttl_seconds),
+            created_at=_now(),
+        )
+    )
+    await session.commit()
+    return code
 
 
 def _email_from_body(body: dict[str, Any], *keys: str) -> str:
@@ -372,17 +409,19 @@ async def _user_for_profile(
 async def provider_start(
     provider: ProviderId,
     return_to: str | None = Query(default="/"),
+    redirect_uri: str | None = Query(default=None),
     session: AsyncSession = Depends(get_session),
     user: User | None = Depends(auth.current_user_optional),
 ) -> RedirectResponse:
     config = _enabled_config(provider)
     state = secrets.token_urlsafe(32)
     settings = get_settings()
+    native = _native_redirect_uri(redirect_uri)
     session.add(
         AuthProviderState(
             state_hash=_hash_state(state),
             provider=config.definition.id,
-            return_to=_clean_return_to(return_to),
+            return_to=native or _clean_return_to(return_to),
             user_id=user.id if user else None,
             expires_at=_now() + timedelta(minutes=settings.oauth_provider_state_ttl_minutes),
             created_at=_now(),
@@ -435,8 +474,54 @@ async def provider_callback(
         profile=profile,
         linked_user_id=state_row.user_id,
     )
+    if _is_native_redirect(state_row.return_to):
+        # The app cannot read the cookie this would otherwise set: its sign-in
+        # ran in a system web view with its own jar. Hand back a single-use code
+        # instead and let it trade that for a token over the API, and set no
+        # cookie at all — nothing here is a browser session.
+        code = await _issue_exchange_code(session=session, user=user)
+        return RedirectResponse(
+            f"{state_row.return_to}?{urlencode({'code': code})}",
+            status_code=status.HTTP_302_FOUND,
+        )
     auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     redirect = RedirectResponse(state_row.return_to, status_code=status.HTTP_302_FOUND)
     if "set-cookie" in response.headers:
         redirect.headers.append("set-cookie", response.headers["set-cookie"])
     return redirect
+
+
+@router.post(
+    "/oauth/exchange",
+    response_model=schemas.TokenResponse,
+    dependencies=[Depends(rate_limit.limiter(rate_limit.LOGIN))],
+)
+async def provider_exchange(
+    body: schemas.OAuthExchangeRequest,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+) -> schemas.TokenResponse:
+    """Trade a native callback's one-time code for the same token a login returns."""
+    row = (
+        await session.execute(
+            select(AuthProviderExchange).where(
+                AuthProviderExchange.code_hash == _hash_state(body.code)
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None or row.used_at is not None or _aware(row.expires_at) <= _now():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="this sign-in code is invalid or has expired",
+        )
+    row.used_at = _now()
+    await session.commit()
+
+    user = await session.get(User, row.user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user gone")
+    auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
+    return schemas.TokenResponse(
+        access_token=auth.issue_access_token(user.id, user.session_epoch),
+        user=schemas.UserOut.model_validate(user),
+    )

@@ -2,10 +2,11 @@ import { useRouter } from "expo-router";
 import { useRef, useState } from "react";
 import { StyleSheet, type TextInput, View } from "react-native";
 import { AuthAction, AuthLink, authFooterRow } from "@/components/auth/auth-actions";
-import { AuthField, AuthInput, authFormGap } from "@/components/auth/auth-field";
+import { AuthField, authFormGap } from "@/components/auth/auth-field";
 import { AuthMessage } from "@/components/auth/auth-message";
 import { AuthBlock, AuthShell, authGutter } from "@/components/auth/auth-shell";
 import { OAuthButtons } from "@/components/auth/oauth-buttons";
+import { Input } from "@/components/ui/input";
 import { Text } from "@/components/ui/text";
 import { ApiError } from "@/data/api/client";
 import { useAuthConfigQuery, useLoginMutation } from "@/data/queries/auth";
@@ -44,36 +45,27 @@ export function LoginScreen() {
       await login.mutateAsync({ email, password });
       router.replace("/");
     } catch (error) {
-      setRequestError(error instanceof ApiError ? error.message : "Login failed");
+      setRequestError(error instanceof ApiError ? error.message : "Sign-in failed");
     }
   };
 
   return (
     <AuthShell
-      description="Sign in to reach the shells running across your machines."
+      brand
+      description="Host your daemons, reach them from anywhere."
       footer={
-        <View style={styles.colophon}>
-          <View style={authFooterRow}>
-            <Text color="mutedForeground" variant="sigilLabel">
-              No account?
-            </Text>
-            <AuthLink emphasis label="Create one" onPress={() => router.push("/signup")} />
-          </View>
-          <View style={authFooterRow}>
-            <AuthLink
-              accessibilityLabel="Server settings"
-              label="Server"
-              onPress={() => router.push("/server")}
-              testID="login-server"
-            />
-          </View>
+        <View style={authFooterRow}>
+          <Text color="mutedForeground" variant="sigilLabel">
+            Don’t have an account?
+          </Text>
+          <AuthLink emphasis label="Create one" onPress={() => router.push("/signup")} />
         </View>
       }
-      title="Welcome back"
+      title="Enter the circle"
     >
       <View style={styles.form}>
         <AuthField error={errors.email} label="Email" required>
-          <AuthInput
+          <Input
             editable={!login.isPending}
             error={errors.email !== null}
             nextRef={passwordRef}
@@ -90,7 +82,7 @@ export function LoginScreen() {
         </AuthField>
         <View style={styles.passwordGroup}>
           <AuthField error={errors.password} label="Password" required>
-            <AuthInput
+            <Input
               editable={!login.isPending}
               error={errors.password !== null}
               onChangeText={(value) => {
@@ -135,9 +127,6 @@ export function LoginScreen() {
 }
 
 const styles = StyleSheet.create({
-  colophon: {
-    gap: spacing[1],
-  },
   forgotRow: {
     alignItems: "flex-end",
     paddingHorizontal: authGutter,

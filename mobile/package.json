@@ -15,6 +15,8 @@
     "lint:fix": "biome check --write .",
     "test": "jest",
     "test:ci": "jest --ci --coverage",
+    "brand:assets": "node scripts/generate-brand-assets.mjs",
+    "brand:assets:check": "node scripts/generate-brand-assets.mjs --check",
     "ci": "npm run typecheck && npm run lint && npm run test:ci"
   },
   "dependencies": {

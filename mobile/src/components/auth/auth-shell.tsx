@@ -2,16 +2,14 @@ import { Image } from "expo-image";
 import { LinearGradient } from "expo-linear-gradient";
 import type { ReactNode } from "react";
 import {
-  KeyboardAvoidingView,
-  Platform,
   Pressable,
-  ScrollView,
   type StyleProp,
   StyleSheet,
   useWindowDimensions,
   View,
   type ViewStyle,
 } from "react-native";
+import { KeyboardAwareScrollView } from "react-native-keyboard-controller";
 import Animated, { FadeInDown, ReduceMotion } from "react-native-reanimated";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { BrandMark, Wordmark } from "@/components/brand/brand-mark";
@@ -59,6 +57,12 @@ const SCRIM_STOPS = [
 const SCRIM_LOCATIONS = [0, 0.28, 0.6, 1] as const;
 
 export interface AuthShellProps {
+  /**
+   * Whether the sheet wears the lockup. Only the screen you arrive on does: a
+   * pushed screen already sits inside the flow the mark introduced, and
+   * repeating it there is a masthead on every page of the same document.
+   */
+  brand?: boolean;
   children: ReactNode;
   description?: ReactNode;
   /** Marginalia set below the sheet's foot rule — the account switch, mostly. */
@@ -116,43 +120,44 @@ function AuthRailAction({
   );
 }
 
+/**
+ * The lockup is masthead, not chrome: ranged with the title it introduces and
+ * set close enough to read as one block with it, rather than floating in a
+ * navigation bar of its own. The mark stands a shade above the wordmark's cap
+ * height, which is the proportion the web lockup is drawn at.
+ */
 function BrandLockup() {
   const theme = useTheme();
   return (
     <View accessibilityLabel="spawnd" accessible style={styles.brandLockup}>
-      <BrandMark color={theme.colors.brandAccent} size={spacing[5]} testID="auth-brand-mark" />
-      <Wordmark color={theme.colors.brandAccent} height={spacing[4]} testID="auth-wordmark" />
+      <BrandMark color={theme.colors.brandAccent} size={spacing[9]} testID="auth-brand-mark" />
+      <Wordmark color={theme.colors.brandAccent} height={spacing[7]} testID="auth-wordmark" />
     </View>
   );
 }
 
-/**
- * The rail every account screen wears: the lockup centred like a masthead, with
- * the screen's escape hatches hung either side of it. It is a navigation bar in
- * everything but name, which is the point — the account surface should read as
- * part of the app it opens onto, not as a page loaded inside it.
- */
-function AuthRail({ onBack }: { onBack?: () => void }) {
+/** Only the way back out. The brand belongs to the masthead below it. */
+function AuthRail({ onBack }: { onBack: () => void }) {
   return (
     <View style={styles.rail}>
-      <View style={styles.railSlot}>
-        {onBack === undefined ? null : (
-          <AuthRailAction
-            accessibilityLabel="Back"
-            name="ChevronLeft"
-            onPress={onBack}
-            testID="auth-back"
-          />
-        )}
-      </View>
-      <BrandLockup />
-      {/* Balances the leading slot so the lockup stays optically centred. */}
-      <View style={styles.railSlot} />
+      <AuthRailAction
+        accessibilityLabel="Back"
+        name="ChevronLeft"
+        onPress={onBack}
+        testID="auth-back"
+      />
     </View>
   );
 }
 
-export function AuthShell({ children, description, footer, onBack, title }: AuthShellProps) {
+export function AuthShell({
+  brand = false,
+  children,
+  description,
+  footer,
+  onBack,
+  title,
+}: AuthShellProps) {
   const theme = useTheme();
   const { width } = useWindowDimensions();
   const insets = useSafeAreaInsets();
@@ -189,59 +194,62 @@ export function AuthShell({ children, description, footer, onBack, title }: Auth
         </>
       ) : null}
       <SafeAreaView edges={SAFE_EDGES} style={styles.safeArea}>
-        <AuthRail {...(onBack === undefined ? {} : { onBack })} />
-        <KeyboardAvoidingView
-          behavior={Platform.OS === "ios" ? "padding" : undefined}
-          style={styles.keyboardAvoider}
+        {onBack === undefined ? null : <AuthRail onBack={onBack} />}
+        {/* The same scroller every other form screen in the app uses: it lifts
+            the focused field clear of the keys on its own, where a
+            KeyboardAvoidingView stacked on the scroll view's own keyboard
+            insets was compensating twice and overshooting the lower fields. */}
+        <KeyboardAwareScrollView
+          bottomOffset={spacing[3]}
+          contentContainerStyle={[
+            styles.scrollContent,
+            { paddingBottom: Math.max(insets.bottom, spacing[4]) },
+          ]}
+          contentInsetAdjustmentBehavior="never"
+          keyboardDismissMode="interactive"
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
         >
-          <ScrollView
-            automaticallyAdjustKeyboardInsets
-            contentContainerStyle={[
-              styles.scrollContent,
-              { paddingBottom: Math.max(insets.bottom, spacing[4]) },
-            ]}
-            contentInsetAdjustmentBehavior="never"
-            keyboardDismissMode="interactive"
-            keyboardShouldPersistTaps="handled"
-            showsVerticalScrollIndicator={false}
+          <Animated.View
+            entering={enter(0)}
+            style={[styles.masthead, !brand && styles.mastheadPlain]}
           >
-            <Animated.View entering={enter(0)} style={styles.masthead}>
-              <Text
-                accessibilityRole="header"
-                style={[
-                  styles.title,
-                  {
-                    color: theme.colors.foreground,
-                    fontSize: titleSize,
-                    lineHeight: titleSize * displayLineHeightRatio.r102,
-                  },
-                ]}
-              >
-                {title}
-              </Text>
-              {description !== undefined ? (
-                typeof description === "string" || typeof description === "number" ? (
-                  <Text style={[styles.description, { color: theme.colors.mutedForeground }]}>
-                    {description}
-                  </Text>
-                ) : (
-                  description
-                )
-              ) : null}
+            {brand ? <BrandLockup /> : null}
+            <Text
+              accessibilityRole="header"
+              style={[
+                styles.title,
+                {
+                  color: theme.colors.foreground,
+                  fontSize: titleSize,
+                  lineHeight: titleSize * displayLineHeightRatio.r102,
+                },
+              ]}
+            >
+              {title}
+            </Text>
+            {description !== undefined ? (
+              typeof description === "string" || typeof description === "number" ? (
+                <Text style={[styles.description, { color: theme.colors.mutedForeground }]}>
+                  {description}
+                </Text>
+              ) : (
+                description
+              )
+            ) : null}
+          </Animated.View>
+          <AuthRule />
+          <Animated.View entering={enter(1)} style={styles.content}>
+            {children}
+          </Animated.View>
+          <View style={styles.gap} />
+          {footer === undefined ? null : (
+            <Animated.View entering={enter(2)} testID="auth-footer">
+              <AuthRule />
+              <View style={styles.footer}>{footer}</View>
             </Animated.View>
-            <AuthRule />
-            <Animated.View entering={enter(1)} style={styles.content}>
-              {children}
-            </Animated.View>
-            <View style={styles.gap} />
-            {footer === undefined ? null : (
-              <Animated.View entering={enter(2)}>
-                <AuthRule />
-                <View style={styles.footer}>{footer}</View>
-              </Animated.View>
-            )}
-          </ScrollView>
-        </KeyboardAvoidingView>
+          )}
+        </KeyboardAwareScrollView>
       </SafeAreaView>
     </View>
   );
@@ -256,8 +264,10 @@ const styles = StyleSheet.create({
   },
   brandLockup: {
     alignItems: "center",
+    alignSelf: "flex-start",
     flexDirection: "row",
-    gap: spacing[2],
+    gap: spacing[3],
+    marginBottom: spacing[8],
   },
   content: {
     gap: spacing[6],
@@ -284,19 +294,19 @@ const styles = StyleSheet.create({
   ground: {
     flex: 1,
   },
-  keyboardAvoider: {
-    flex: 1,
-  },
   masthead: {
     paddingBottom: spacing[7],
     paddingHorizontal: authGutter,
     paddingTop: spacing[10],
   },
+  // Without the lockup above it the title needs less lead-in, and a pushed
+  // screen already spent height on the control that got you here.
+  mastheadPlain: {
+    paddingTop: spacing[6],
+  },
   rail: {
-    alignItems: "center",
     flexDirection: "row",
     height: sizing.appHeader.minHeight,
-    justifyContent: "space-between",
     paddingHorizontal: spacing[3],
   },
   railAction: {
@@ -307,9 +317,6 @@ const styles = StyleSheet.create({
   },
   railActionPressed: {
     opacity: opacity.pressedContent,
-  },
-  railSlot: {
-    minWidth: sizing.appHeader.sideSlot,
   },
   safeArea: {
     flex: 1,

@@ -138,7 +138,7 @@ describe("auth surface", () => {
     return render(
       <SafeAreaProvider initialMetrics={METRICS}>
         <FixedThemeProvider mode={mode}>
-          <AuthShell description="Continue to your machines." title="Welcome back">
+          <AuthShell brand description="Continue to your machines." title="Welcome back">
             <View />
           </AuthShell>
         </FixedThemeProvider>
