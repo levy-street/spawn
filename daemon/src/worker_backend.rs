@@ -1004,11 +1004,12 @@ mod tests {
 
     /// Wait for `needle` on the direct sink.
     ///
-    /// KNOWN FLAKE: in a full-suite run this wait is bimodal — the first bytes
-    /// either arrive in milliseconds or never (the accumulator is empty at the
-    /// deadline), so the failure is a race with another test, not slowness.
-    /// Raising the budget to 60s did not convert a single failure into a pass.
-    /// Reproduces without any signed-signaling change, and never in isolation.
+    /// Callers must register the sink BEFORE taking the replay whose absence
+    /// of `needle` justifies this wait: a direct sink's origin is the
+    /// forwarder offset at registration, so a byte routed between a replay
+    /// snapshot and a later registration reaches neither and the wait starves.
+    /// Sink-then-replay closes that gap — origins only grow, so every byte is
+    /// ≤ the watermark (in the replay) or > the origin (on the sink).
     async fn collect_direct_until(
         rx: &mut mpsc::Receiver<pty::DirectPayload>,
         needle: &[u8],
@@ -1106,6 +1107,15 @@ mod tests {
         launched.handle.control.set_sink(ws_tx).await;
         tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
 
+        // Sink first, replay second (see collect_direct_until): the shell's
+        // startup output races the attach, and this order guarantees it lands
+        // in the replay, on the sink, or both — never in the gap between.
+        let mut direct = launched
+            .handle
+            .control
+            .add_direct_sink("test-dc".into())
+            .await;
+
         // Establish the same replay barrier used before a real DataChannel is
         // registered. Historical worker watermarks may predate this spawnd.
         let initial_replay_rx = launched.handle.replay(1 << 20).expect("replay req");
@@ -1123,12 +1133,6 @@ mod tests {
             String::from_utf8_lossy(initial_replay.bytes()).contains("wb-hello");
         drop(initial_replay);
 
-        // DataChannel-style direct sink sees output after its exact origin.
-        let mut direct = launched
-            .handle
-            .control
-            .add_direct_sink("test-dc".into())
-            .await;
         if !initial_replay_has_hello {
             collect_direct_until(&mut direct.receiver, b"wb-hello").await;
         }

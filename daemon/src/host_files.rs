@@ -2247,6 +2247,11 @@ fn read_fully(file: &mut std::fs::File, buffer: &mut [u8]) -> FsResult<usize> {
 /// one-second granularity, which misses an edit made in the same second as the
 /// read, and inode identity catches the replace-by-rename that leaves mtime
 /// looking plausible.
+///
+/// The kernel stamps mtimes from its coarse clock (one tick, typically 1–4ms),
+/// so two same-size in-place rewrites inside a single tick are still
+/// indistinguishable. That window is accepted: it closes on the next change to
+/// the file, and closing it entirely would mean hashing content on every read.
 fn file_version(metadata: &std::fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
     let mut hasher = Sha256::new();
@@ -2473,9 +2478,23 @@ mod tests {
         // rather than the second-granularity mtime the wire already carries: an
         // edit made in the same second as the read would otherwise look
         // unchanged and serve a stale preview forever.
+        //
+        // The mtimes are pinned rather than taken from the clock: the kernel
+        // stamps writes from its coarse clock, so two natural rewrites can land
+        // in one tick and carry identical nanoseconds — the exact same-second
+        // rewrite this test exists to distinguish would then be invisible for a
+        // reason outside the claim under test.
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("data.bin");
+        let pin_mtime = |nanos: u32| {
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            let modified =
+                std::time::UNIX_EPOCH + std::time::Duration::new(1_755_000_000, nanos);
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        };
         std::fs::write(&path, b"aaaa").unwrap();
+        pin_mtime(111_111_111);
         let service = HostFileService::rooted_at(temp.path()).await.unwrap();
 
         let first = service
@@ -2483,6 +2502,7 @@ mod tests {
             .await
             .unwrap();
         std::fs::write(&path, b"bbbb").unwrap();
+        pin_mtime(222_222_222);
         let second = service
             .open_range_read("data.bin", 0, 4, None)
             .await
