@@ -4389,7 +4389,7 @@ mod tests {
                  mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
                     response.headers_mut().insert(
                         SEC_WEBSOCKET_PROTOCOL,
-                        HeaderValue::from_static("spawn.control.v2"),
+                        HeaderValue::from_static("spawn.control.v3"),
                     );
                     Ok(response)
                 },
