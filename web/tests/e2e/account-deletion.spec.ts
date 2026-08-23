@@ -37,7 +37,8 @@ test("deletion is gated on the typed email and a correct password", async ({ pag
 
   await page.locator("#delete-confirm-password").fill("correct horse battery");
   await submit.click();
-  await page.waitForURL(/\/login/, { timeout: 15_000 });
+  // logout() hands back to the lander, which owns "/" after the overhaul.
+  await page.waitForURL(/\/$/, { timeout: 15_000 });
   expect(deleteCalls).toHaveLength(2);
   expect(deleteCalls[1]).toMatchObject({
     confirm_email: "Tester@Example.com",

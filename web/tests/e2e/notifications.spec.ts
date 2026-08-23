@@ -318,6 +318,10 @@ test("clicking an alert opens its session's tab and focuses the terminal", async
   await page.routeWebSocket(/\/ws\/browser/, () => {});
   const push = await mockAlertSocket(page);
   await page.goto(`/w/${WORKSPACE_ID}`);
+  // The alert resolves its destination from the cached workspace list, so let
+  // the workspace finish loading before pushing — otherwise the toast is built
+  // against an empty cache and can only offer the standalone session page.
+  await expect(page.getByRole("tab", { name: "Tab 2" })).toBeVisible();
 
   await push(finishedFrame());
   await page
