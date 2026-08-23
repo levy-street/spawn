@@ -15,6 +15,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { SessionFilesAside, SessionFilesPanel } from "@/components/files/session-files-aside";
+import { ConnectionChip } from "@/components/terminal/ConnectionChip";
 import { useLiveTerminal } from "@/components/terminal/LiveTerminalProvider";
 import { ModifierBar } from "@/components/terminal/ModifierBar";
 import { Button } from "@/components/ui/button";
@@ -58,7 +59,7 @@ export function SessionView({ sessionId }: { sessionId: string }) {
   const [draftName, setDraftName] = useState("");
   const [filesOpen, setFilesOpen] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const { attach, getHandle } = useLiveTerminal(sessionId);
+  const { attach, getHandle, connInfo, displayState } = useLiveTerminal(sessionId);
   const sessionQ = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => sessions.get(sessionId),
@@ -243,6 +244,17 @@ export function SessionView({ sessionId }: { sessionId: string }) {
             </p>
           </div>
         )}
+        {/* Owner-side viewer count and the transport/trust chip: the surface
+            header carried both before this view replaced it, and the chip is
+            the one place the endpoint-to-endpoint story is told (viewer mode's
+            dimmed overlay handles the non-owner side inside the terminal). */}
+        {displayState?.owner && displayState.viewers > 1 && (
+          <span className="hidden whitespace-nowrap px-2 text-xs text-muted-foreground sm:inline">
+            {displayState.viewers - 1} viewer{displayState.viewers - 1 === 1 ? "" : "s"}
+          </span>
+        )}
+        <ConnectionChip info={connInfo} compact className="sm:hidden" />
+        <ConnectionChip info={connInfo} className="hidden sm:block" />
         <Button
           type="button"
           variant={filesOpen ? "secondary" : "ghost"}
