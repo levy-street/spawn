@@ -788,3 +788,40 @@ async def test_auto_update_shutdown_cancels_after_drain_and_clears_inflight(
     assert cancelled.is_set()
     assert key not in hosts_routes._AUTO_UPDATE_IN_FLIGHT
     assert not hosts_routes._AUTO_UPDATE_TASKS
+
+
+async def test_daemon_deregisters_its_own_host(client):
+    # `spawnd exorcise` / the possess dedup revoke via DELETE /api/hosts/self,
+    # authenticated by the daemon token — a host can only remove itself.
+    from sqlalchemy import select
+
+    from spawn_server import auth
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+
+    await _signup(client, "deregister-self@example.com")
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "deregister-self@example.com"))
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="self-box", status="offline")
+        session.add(host)
+        await session.commit()
+        host_id, user_id = host.id, user.id
+
+    daemon_token = auth.issue_daemon_token(host_id, user_id)
+    headers = {"Authorization": f"Bearer {daemon_token}"}
+
+    r = await client.delete("/api/hosts/self", headers=headers)
+    assert r.status_code == 204, r.text
+
+    async with sm() as session:
+        gone = (
+            await session.execute(select(Host).where(Host.id == host_id))
+        ).scalar_one_or_none()
+    assert gone is None
+
+    # The token now resolves to no host — a second call is unauthorized.
+    r2 = await client.delete("/api/hosts/self", headers=headers)
+    assert r2.status_code == 401

@@ -17,10 +17,12 @@
  * unlock — it cannot read the data key or forge a bundle.
  */
 
+import type { AccountRootMaterial } from "./account-root";
 import { encodeBase64Url } from "./signed-signal";
 import {
   canonicalBundle,
   decodeVariableBase64Url,
+  MAX_RETIRED_ROOTS,
   requireRevision,
   TRUST_IV_BYTES,
   type TrustBundle,
@@ -179,12 +181,14 @@ export async function sealTrustEnvelope(
   hosts: readonly TrustBundleHost[],
   passkeys: readonly PasskeyWrapInput[],
   revision: number,
+  root: AccountRootMaterial | null = null,
+  retiredRoots: readonly AccountRootMaterial[] = [],
 ): Promise<string> {
   requireAccountId(accountId);
   if (passkeys.length === 0) {
     throw new TrustBundleError("invalid_bundle", "an envelope needs at least one passkey wrap");
   }
-  const bundle = await canonicalBundle(accountId, hosts, revision);
+  const bundle = await canonicalBundle(accountId, hosts, revision, root, retiredRoots);
   const dataKey = crypto.getRandomValues(new Uint8Array(DATA_KEY_BYTES));
   const sealed = await sealBytes(
     await importDataKey(dataKey),
@@ -283,7 +287,13 @@ async function openSealedBundle(
   // authenticated with the rest of the plaintext; legacy bundles without one
   // open as 0. The caller enforces monotonicity against a local floor.
   const revision = candidate.revision === undefined ? 0 : requireRevision(candidate.revision);
-  return canonicalBundle(accountId, candidate.hosts, revision);
+  return canonicalBundle(
+    accountId,
+    candidate.hosts,
+    revision,
+    candidate.root ?? null,
+    candidate.retiredRoots ?? [],
+  );
 }
 
 /** Open the envelope with one enrolled passkey and return the trust bundle. */
@@ -296,6 +306,130 @@ export async function openTrustEnvelope(
   const envelope = parseEnvelope(accountId, wire);
   const dataKey = await recoverDataKey(envelope, accountId, passkey);
   return openSealedBundle(dataKey, accountId, envelope.sealed);
+}
+
+/**
+ * Retrofit an account root into a pre-root bundle (mesh stage 5c).
+ *
+ * Reseals the bundle's content — same hosts, plus the root, at an advanced
+ * revision — under the SAME data key, so every enrolled passkey's wrap keeps
+ * working without gathering the other passkeys' PRF secrets. Refuses to touch a
+ * bundle that already holds a root: an existing `sk_R` is the account's anchor
+ * and is never silently replaced.
+ *
+ * With `replace` (root ROTATION), the outgoing root is RETIRED into the
+ * bundle rather than destroyed (hardening B2): rotation was triggered by a
+ * server-claimed revocation, and however well corroborated, a server claim
+ * must never be able to erase the operator's only copy of firsthand key
+ * material. The retired archive is bounded; AT the cap the OLDEST retired
+ * seed is evicted to admit the newest. Refusing instead (the previous
+ * behavior) threw out of the unlock itself, so the 9th rotation permanently
+ * broke recovery — pins imported but every unlock errored forever after.
+ * Rotation is the compromise response and must keep working unboundedly; the
+ * evicted seed is the least valuable one (its key has been revoked longest,
+ * every anchor on it long severed), while the newest MAX_RETIRED_ROOTS seeds
+ * — the only ones plausibly still referenced anywhere — all survive.
+ */
+export async function setEnvelopeRoot(
+  accountId: string,
+  wire: string,
+  unlockWith: PasskeyWrapInput,
+  root: AccountRootMaterial,
+  revision: number,
+  replace = false,
+): Promise<string> {
+  requireAccountId(accountId);
+  const envelope = parseEnvelope(accountId, wire);
+  const dataKey = await recoverDataKey(envelope, accountId, unlockWith);
+  const bundle = await openSealedBundle(dataKey, accountId, envelope.sealed);
+  if (bundle.root !== null && !replace) {
+    throw new TrustBundleError("invalid_bundle", "the trust bundle already holds an account root");
+  }
+  if (revision <= bundle.revision) {
+    throw new TrustBundleError(
+      "invalid_bundle",
+      "a root retrofit must advance the bundle revision",
+    );
+  }
+  const retiredRoots =
+    replace && bundle.root !== null
+      ? [...bundle.retiredRoots, bundle.root]
+      : [...bundle.retiredRoots];
+  // Fail-soft at the archive cap: evict the OLDEST retired seed rather than
+  // throwing out of the caller's unlock (see the rotation note above).
+  while (retiredRoots.length > MAX_RETIRED_ROOTS) retiredRoots.shift();
+  const amended = await canonicalBundle(accountId, bundle.hosts, revision, root, retiredRoots);
+  const sealed = await sealBytes(
+    await importDataKey(dataKey),
+    aad(BUNDLE_AAD_MAGIC, accountId),
+    new TextEncoder().encode(JSON.stringify(amended)),
+  );
+  const next: EnvelopeWire = { ...envelope, sealed };
+  return encodeBase64Url(new TextEncoder().encode(JSON.stringify(next)));
+}
+
+/**
+ * Merge additional verified hosts into the sealed bundle — the reseal half of
+ * "the bundle tracks the fleet" (review P-C1).
+ *
+ * Reseals the bundle's content — the union of its hosts and `hosts`, same
+ * root and retired-root archive, at an advanced revision — under the SAME
+ * data key, so every enrolled passkey's wrap keeps working without gathering
+ * the other passkeys' PRF secrets (exactly the `setEnvelopeRoot` discipline).
+ * `hosts` must be firsthand-verified by the caller (this device's own active
+ * pin store): what goes in here is what every future passkey unlock will pin.
+ *
+ * Returns null when the union adds nothing — the caller skips the write.
+ */
+export async function mergeEnvelopeHosts(
+  accountId: string,
+  wire: string,
+  unlockWith: PasskeyWrapInput,
+  hosts: readonly TrustBundleHost[],
+  revision: number,
+): Promise<{ readonly sealed: string; readonly addedHostKeys: readonly string[] } | null> {
+  requireAccountId(accountId);
+  const envelope = parseEnvelope(accountId, wire);
+  const dataKey = await recoverDataKey(envelope, accountId, unlockWith);
+  const bundle = await openSealedBundle(dataKey, accountId, envelope.sealed);
+  const byKey = new Map(bundle.hosts.map((host) => [host.hostPublicKey, host]));
+  const addedHostKeys: string[] = [];
+  for (const host of hosts) {
+    const existing = byKey.get(host.hostPublicKey);
+    if (existing === undefined) {
+      byKey.set(host.hostPublicKey, host);
+      addedHostKeys.push(host.hostPublicKey);
+      continue;
+    }
+    // Same key, possibly new host-id bindings (an id learned since the seal
+    // keeps the signed-RTC downgrade check working right after an import).
+    const hostIds = [...new Set([...existing.hostIds, ...host.hostIds])].sort();
+    if (hostIds.length !== existing.hostIds.length) {
+      byKey.set(host.hostPublicKey, { ...existing, hostIds });
+      addedHostKeys.push(host.hostPublicKey);
+    }
+  }
+  if (addedHostKeys.length === 0) return null;
+  if (revision <= bundle.revision) {
+    throw new TrustBundleError("invalid_bundle", "a host merge must advance the bundle revision");
+  }
+  const amended = await canonicalBundle(
+    accountId,
+    [...byKey.values()],
+    revision,
+    bundle.root,
+    bundle.retiredRoots,
+  );
+  const sealed = await sealBytes(
+    await importDataKey(dataKey),
+    aad(BUNDLE_AAD_MAGIC, accountId),
+    new TextEncoder().encode(JSON.stringify(amended)),
+  );
+  const next: EnvelopeWire = { ...envelope, sealed };
+  return {
+    sealed: encodeBase64Url(new TextEncoder().encode(JSON.stringify(next))),
+    addedHostKeys,
+  };
 }
 
 /**
@@ -389,5 +523,15 @@ export async function revokePasskeyFromEnvelope(
   if (revision <= bundle.revision) {
     throw new TrustBundleError("invalid_bundle", "revocation must advance the bundle revision");
   }
-  return sealTrustEnvelope(accountId, bundle.hosts, keep, revision);
+  // Reseal with the root AND retired-root archive the bundle already carried —
+  // dropping either here would silently destroy the account's only copy of
+  // firsthand root material.
+  return sealTrustEnvelope(
+    accountId,
+    bundle.hosts,
+    keep,
+    revision,
+    bundle.root,
+    bundle.retiredRoots,
+  );
 }

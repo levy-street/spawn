@@ -60,3 +60,6 @@ spawn.log
 # Downloaded credential files: never let `git add -A` publish one.
 *credentials.csv
 *.pem
+
+# Reference screenshots dropped in the repo root
+Screenshot *.png

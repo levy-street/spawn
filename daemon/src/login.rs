@@ -1,15 +1,17 @@
 //! `spawnd login` — interactive device-code flow.
 //!
 //! Flow per `proto/README.md`:
-//!   1. POST /api/auth/device/start  -> { device_code, user_code, verification_uri, interval, expires_in }
+//!   1. POST /api/auth/device/start  -> { device_code, approval_ref, verification_uri, … }
 //!   2. Sign and POST /api/auth/device/possession for that exact ceremony.
-//!   3. Only after proof succeeds, print the verification URI and user code.
+//!   3. Only after proof succeeds, open/print the approval URL — with this
+//!      host's public key appended LOCALLY as a `#k=` URL fragment, the
+//!      out-of-band value the browser checks the server's claimed key against.
 //!   4. Poll /api/auth/device/poll until success / expiry / denial.
 //!   5. On success store {access_token, host_id, server_url}.
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::StatusCode;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -25,7 +27,13 @@ use crate::proto::{
     DeviceStartRequest, DeviceStartResponse,
 };
 
-pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
+/// What a successful login learned — enough for `possess` to place this
+/// registration in the authenticated account's config dir.
+pub struct LoginOutcome {
+    pub account_id: Option<String>,
+}
+
+pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOutcome> {
     let server = config::server_url(server_cli)?;
 
     // Persist before starting the ceremony so retries and interrupted logins
@@ -46,16 +54,17 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
 
     // 1. start
     let start_url = config::api_url(&server, "/api/auth/device/start")?;
+    let start_req = DeviceStartRequest {
+        host_name: &host_name,
+        os: &os,
+        arch: &arch,
+        version: &version,
+        host_key_algorithm: identity.algorithm,
+        host_public_key: &identity.public_key,
+    };
     let start: DeviceStartResponse = client
         .post(start_url.as_str())
-        .json(&DeviceStartRequest {
-            host_name: &host_name,
-            os: &os,
-            arch: &arch,
-            version: &version,
-            host_key_algorithm: identity.algorithm,
-            host_public_key: &identity.public_key,
-        })
+        .json(&start_req)
         .send()
         .await
         .context("POST /api/auth/device/start")?
@@ -91,11 +100,32 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
         ));
     }
 
-    println!(
-        "spawn: open {} and enter code:  {}",
-        start.verification_uri, start.user_code
-    );
-    println!("spawn: verify host fingerprint: {}", identity.fingerprint);
+    // Match a browser login's ease: open the approval page directly, carrying a
+    // handle so it lands on the approval with nothing to type, and poll to
+    // completion ourselves. We bake the opaque approval_ref into the URL (the
+    // short user_code never appears in a link); a pre-0029 server without a ref
+    // falls back to the user_code. The URL additionally carries this host's
+    // public key as a `#k=` fragment appended LOCALLY — see `approval_url` for
+    // why that is the ceremony's out-of-band host-key check.
+    let approve_url = approval_url(&server, &start, &identity.public_key)?;
+    if open_browser(&approve_url) {
+        println!("spawn: opened your browser to approve this host.");
+        println!("spawn:   didn't open? use this link on any device:");
+    } else {
+        println!("spawn: approve this host in your browser — open this link on any device:");
+    }
+    println!("spawn:   {approve_url}");
+    println!();
+
+    // The link's fragment carries the key check; the fingerprint stays printed
+    // for the fallback (a browser that never received the fragment — retyped
+    // URL, older page — falls back to comparing exactly this value).
+    println!("spawn:   the link carries this host's identity key (the part after '#');");
+    println!("spawn:   your browser checks it automatically before asking you to approve.");
+    println!("spawn:   asked to compare a fingerprint instead? it must be exactly:");
+    println!("spawn:     {}", identity.fingerprint);
+    println!();
+    println!("spawn: waiting for approval…");
 
     // 2. poll
     let poll_url = config::api_url(&server, "/api/auth/device/poll")?;
@@ -130,6 +160,7 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
             resp.json().await.context("decoding device/poll response")?;
 
         if poll_has_success_fields(&body) {
+            let account_id = body.account_id.clone();
             let host_id = commit_poll_success(
                 &mut stored,
                 body,
@@ -139,7 +170,7 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
                 creds::save,
             )?;
             println!("spawn: logged in. host_id = {host_id}");
-            return Ok(());
+            return Ok(LoginOutcome { account_id });
         }
 
         match body.error.as_deref() {
@@ -160,6 +191,81 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<()> {
                 return Err(anyhow!("device/poll returned error: {other}"));
             }
         }
+    }
+}
+
+/// Build the browser approval URL for this ceremony.
+///
+/// This URL is the possession ceremony's out-of-band channel (it travels
+/// terminal→browser without passing through the server again), so two rules
+/// are load-bearing:
+///
+/// 1. **The fragment is ours.** `#k=<host_public_key_wire>` is appended
+///    locally from the key this daemon holds; `set_fragment` also overwrites
+///    anything the server smuggled into `verification_uri`. Fragments are
+///    never sent in HTTP requests, so the server cannot observe or rewrite
+///    this value in flight — the browser compares the server's claimed host
+///    key against it and refuses to pin on any difference.
+/// 2. **Same origin or nothing.** A hostile server could otherwise point
+///    `verification_uri` at a page it controls, read or replace the fragment
+///    there, and bounce the human into the real approval page with a key of
+///    its choosing. The approval page must live on the origin the operator
+///    pointed this daemon at, or we refuse to continue.
+fn approval_url(
+    server: &url::Url,
+    start: &DeviceStartResponse,
+    host_public_key: &str,
+) -> Result<String> {
+    let mut parsed = url::Url::parse(&start.verification_uri).with_context(|| {
+        format!(
+            "the server sent an unusable approval page URL {:?}",
+            start.verification_uri
+        )
+    })?;
+    if parsed.origin() != server.origin() {
+        bail!(
+            "the server's approval page ({}) is not on the server this daemon was pointed at ({}); \
+             refusing — a relay that redirects approval elsewhere could substitute the host key",
+            parsed.origin().ascii_serialization(),
+            server.origin().ascii_serialization(),
+        );
+    }
+    match start.approval_ref.as_deref() {
+        Some(reference) => parsed.query_pairs_mut().append_pair("ref", reference),
+        None => parsed
+            .query_pairs_mut()
+            .append_pair("code", &start.user_code),
+    };
+    parsed.set_fragment(Some(&format!("k={host_public_key}")));
+    Ok(parsed.to_string())
+}
+
+/// Best-effort: open `url` in the operator's default browser. Returns whether a
+/// launcher was started. Never blocks and never fails login — on a headless host
+/// (no display) or where no opener exists, the caller prints the URL instead.
+fn open_browser(url: &str) -> bool {
+    use std::process::{Command, Stdio};
+    let mut _cmd: Option<Command> = None;
+    #[cfg(target_os = "macos")]
+    {
+        _cmd = Some(Command::new("open"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // No display ⇒ headless (SSH/server): don't try; the caller prints it.
+        if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            _cmd = Some(Command::new("xdg-open"));
+        }
+    }
+    match _cmd {
+        Some(mut cmd) => cmd
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok(),
+        None => false,
     }
 }
 
@@ -406,6 +512,84 @@ mod tests {
         body.browser_public_key = Some(BROWSER_KEY.into());
         body.browser_key_fingerprint = Some(creds::browser_key_fingerprint(BROWSER_KEY).unwrap());
         body
+    }
+
+    fn start_response(verification_uri: &str, approval_ref: Option<&str>) -> DeviceStartResponse {
+        DeviceStartResponse {
+            device_code: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into(),
+            user_code: "ABCD-EFGH".into(),
+            approval_ref: approval_ref.map(str::to_string),
+            approval_nonce: TEST_APPROVAL_NONCE.into(),
+            verification_uri: verification_uri.into(),
+            interval: 5,
+            expires_in: 600,
+        }
+    }
+
+    #[test]
+    fn approval_url_bakes_the_ref_and_appends_our_key_as_the_fragment() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let url = approval_url(
+            &server,
+            &start_response("https://spawn.example/device", Some("REFxyz")),
+            BROWSER_KEY, // any wire-encoded key literal works here
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            format!("https://spawn.example/device?ref=REFxyz#k={BROWSER_KEY}")
+        );
+    }
+
+    #[test]
+    fn approval_url_overwrites_any_server_supplied_fragment() {
+        // A hostile server pre-baking `#k=<its key>` into verification_uri must
+        // not survive: the fragment is this daemon's channel, set locally.
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let url = approval_url(
+            &server,
+            &start_response("https://spawn.example/device#k=EVILKEY", Some("REFxyz")),
+            BROWSER_KEY,
+        )
+        .unwrap();
+        assert!(!url.contains("EVILKEY"), "server fragment survived: {url}");
+        assert!(url.ends_with(&format!("#k={BROWSER_KEY}")));
+    }
+
+    #[test]
+    fn approval_url_refuses_a_cross_origin_approval_page() {
+        // Same host, different scheme/port/host each count as a different
+        // origin — a page the server chose, not the one the operator trusts.
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        for evil in [
+            "https://evil.example/device",
+            "http://spawn.example/device",
+            "https://spawn.example:8443/device",
+        ] {
+            let error = approval_url(&server, &start_response(evil, Some("REFxyz")), BROWSER_KEY)
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("refusing"),
+                "unexpected error for {evil}: {error:#}"
+            );
+        }
+        // Unparseable is refused too — an origin we cannot check is unchecked.
+        assert!(approval_url(&server, &start_response("not a url", None), BROWSER_KEY).is_err());
+    }
+
+    #[test]
+    fn approval_url_falls_back_to_the_user_code_without_a_ref() {
+        let server = url::Url::parse("https://spawn.example/").unwrap();
+        let url = approval_url(
+            &server,
+            &start_response("https://spawn.example/device", None),
+            BROWSER_KEY,
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            format!("https://spawn.example/device?code=ABCD-EFGH#k={BROWSER_KEY}")
+        );
     }
 
     #[test]

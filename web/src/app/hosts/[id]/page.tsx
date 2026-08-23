@@ -35,6 +35,8 @@ import {
   revokeBrowserHostPin,
 } from "@/lib/browser-host-pins";
 import { relativeTime, sessionActivityDetail, sessionTitle } from "@/lib/sessions";
+import { SIGNED_RTC_REFUSAL_DETAIL, SIGNED_RTC_REFUSAL_NEXT_STEP } from "@/lib/signed-rtc-trust";
+import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
 class HostDeletionFlowError extends Error {
   constructor(
@@ -71,6 +73,7 @@ function HostDetail() {
   const [draftName, setDraftName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [localDeletionPending, setLocalDeletionPending] = useState(false);
+  const [identityConflict, setIdentityConflict] = useState(false);
 
   const hostQ = useQuery({
     queryKey: ["host", id],
@@ -85,6 +88,14 @@ function HostDetail() {
     refetchInterval: 5_000,
   });
   const host = hostQ.data;
+  // Displayed fingerprint, derived LOCALLY from the served key (mesh B5): the
+  // server no longer serves one, and this page would not show it if it did.
+  const hostFingerprintQ = useQuery({
+    queryKey: ["host-key-fingerprint", hostQ.data?.host_public_key ?? null],
+    queryFn: () => ed25519PublicKeyFingerprint(hostQ.data?.host_public_key as string),
+    enabled: Boolean(hostQ.data?.host_public_key),
+    staleTime: Number.POSITIVE_INFINITY,
+  });
 
   const renameM = useMutation({
     mutationFn: (name: string) => hosts.rename(id as string, name),
@@ -113,7 +124,13 @@ function HostDetail() {
       }
       let localTombstoneWritten = false;
       try {
-        if (host.host_public_key && host.host_key_fingerprint) {
+        // Revoking the local pin is best-effort cleanup and must never block the
+        // server delete. There is nothing active to revoke when the host has no
+        // key (never pinnable — legacy/orphaned), no local pin is bound in this
+        // browser (missing_pin), or the pin is already a tombstone. In all those
+        // cases proceed straight to the server delete instead of failing "before
+        // any server DELETE"; only a genuine local-storage fault still blocks.
+        if (host.host_public_key) {
           try {
             await revokeBrowserHostPin({
               accountId: user.id,
@@ -121,13 +138,12 @@ function HostDetail() {
               targetHostId,
               claimedHostId: host.id,
               claimedHostPublicKey: host.host_public_key,
-              claimedHostFingerprint: host.host_key_fingerprint,
             });
             localTombstoneWritten = true;
           } catch (caught) {
             const nothingToRevoke =
               caught instanceof BrowserHostPinError &&
-              ["revoked_pin", "missing_pin", "null_key", "null_fingerprint"].includes(caught.code);
+              ["revoked_pin", "missing_pin", "null_key"].includes(caught.code);
             if (!nothingToRevoke) throw caught;
           }
         }
@@ -162,21 +178,34 @@ function HostDetail() {
 
   useEffect(() => {
     const hostPublicKey = host?.host_public_key;
-    const hostFingerprint = host?.host_key_fingerprint;
-    if (!host || !user || !id || !hostPublicKey || !hostFingerprint) return;
+    if (!host || !user || !id || !hostPublicKey) return;
     let cancelled = false;
     void (async () => {
       try {
         if (host.id !== id) throw new Error("Host API response ID does not match this route");
+        // Locally derived (mesh B5) — the pin store never sees a served label.
+        const hostFingerprint = await ed25519PublicKeyFingerprint(hostPublicKey);
         try {
           await resolveActiveBrowserHostPin({
             accountId: user.id,
             origin: browserHostPinServerOrigin(),
             hostId: id,
             claimedHostPublicKey: hostPublicKey,
-            claimedHostFingerprint: hostFingerprint,
           });
+          if (!cancelled) setIdentityConflict(false);
         } catch (caught) {
+          // The served key is not the one this browser approved for this Host
+          // ID: reinstall/re-key or substitution. Show the guided panel (with
+          // the safe exit) instead of a generic storage error.
+          if (caught instanceof BrowserHostPinError && caught.code === "host_id_key_conflict") {
+            if (!cancelled) {
+              setIdentityConflict(true);
+              setLocalDeletionPending(false);
+            }
+            return;
+          }
+          // An already-bound tombstone is expected after a failed server
+          // DELETE. Confirm its exact binding below without reactivating it.
           if (!(caught instanceof BrowserHostPinError) || caught.code !== "revoked_pin") {
             throw caught;
           }
@@ -343,6 +372,44 @@ function HostDetail() {
             {error}
           </p>
         )}
+        {identityConflict && (
+          <div
+            className="mb-4 rounded-xl border border-amber-500/40 bg-amber-500/5 p-4"
+            data-testid="host-identity-conflict"
+            role="alert"
+          >
+            <p className="text-sm font-medium text-foreground">
+              This host&apos;s identity changed — connections are blocked
+            </p>
+            <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+              {SIGNED_RTC_REFUSAL_DETAIL.host_key_substituted}
+            </p>
+            <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+              {SIGNED_RTC_REFUSAL_NEXT_STEP.host_key_substituted}
+            </p>
+            <div className="mt-3">
+              {/* The safe exit and nothing else: removal, then a fresh possession
+                  ceremony from the host's own terminal. There is deliberately no
+                  "trust the new identity" control here. */}
+              <Button
+                variant="destructive"
+                size="sm"
+                data-testid="conflict-remove-host"
+                disabled={removeM.isPending}
+                onClick={() => void requestRemove()}
+              >
+                <Trash2 className="size-4" aria-hidden />
+                Remove this host
+              </Button>
+            </div>
+          </div>
+        )}
+        {localDeletionPending && (
+          <p className="mb-3 text-sm text-foreground" role="status">
+            This browser retains a revoked host/key tombstone. Server deletion is retryable and
+            server disappearance will not clear local trust state.
+          </p>
+        )}
         {hostQ.error && (
           <p className="text-sm text-destructive" role="alert">
             Failed to load host: {String(hostQ.error)}
@@ -370,7 +437,12 @@ function HostDetail() {
                 }
               />
               <Fact label="Host identity" value={host.host_key_algorithm ?? "legacy unpaired"} />
-              <Fact label="Fingerprint" value={host.host_key_fingerprint ?? "not pinned"} mono />
+              <Fact
+                label="Fingerprint"
+                // Derived locally from the served key (mesh B5), never served.
+                value={host.host_public_key ? (hostFingerprintQ.data ?? "…") : "not pinned"}
+                mono
+              />
             </dl>
 
             <HostAgentsPanel host={host} />

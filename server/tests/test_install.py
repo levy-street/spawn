@@ -533,39 +533,26 @@ async def test_installer_without_rustup_stops_on_too_old_cargo(client, tmp_path:
     assert not (install_root / "bin" / "spawnd").is_file()
 
 
-async def test_installer_writes_and_starts_macos_launchagent(client, tmp_path: Path):
+async def test_installer_default_runs_possess_on_linux(client, tmp_path: Path):
+    # The default install hands off to `spawnd possess`, which owns login + the
+    # supervised background service. That systemd/launchd setup lives in the
+    # daemon now (tested in daemon/src/service.rs), so the installer no longer
+    # drives the service manager itself.
     script = await _install_script_file(client, tmp_path)
-    server = 'http://spawn.test/?a=1&b="<tag>'
 
-    result, logs, home, install_root = _run_installer(
+    result, logs, _home, _install_root = _run_installer(
         script,
         tmp_path,
-        os_name="Darwin",
-        arch="arm64",
-        server=server,
-        install_root_name="install & root",
+        os_name="Linux",
+        arch="x86_64",
     )
 
     assert result.returncode == 0, result.stderr
-    plist = home / "Library" / "LaunchAgents" / "app.spawn.spawnd.plist"
-    assert plist.is_file()
-    text = plist.read_text()
-    assert "<key>ProgramArguments</key>" in text
-    assert f"<string>{install_root}/bin/spawnd</string>".replace("&", "&amp;") in text
-    assert "<string>--server</string>" in text
-    assert "<string>http://spawn.test/?a=1&amp;b=&quot;&lt;tag&gt;</string>" in text
-    assert "<key>RunAtLoad</key>" in text
-    assert "<key>KeepAlive</key>" in text
-    assert "<true/>" in text
-    assert "bootstrap" in _log(logs, "launchctl.log")
-    assert "kickstart -k" in _log(logs, "launchctl.log")
-    assert "--server" in _log(logs, "spawnd.log")
-    assert "login --no-run" in _log(logs, "spawnd.log")
+    assert "--server http://spawn.test possess" in _log(logs, "spawnd.log")
+    assert _log(logs, "systemctl.log") == ""
 
 
-async def test_installer_launchd_falls_back_to_load_when_bootstrap_fails(
-    client, tmp_path: Path
-):
+async def test_installer_default_runs_possess_on_macos(client, tmp_path: Path):
     script = await _install_script_file(client, tmp_path)
 
     result, logs, _home, _install_root = _run_installer(
@@ -573,99 +560,11 @@ async def test_installer_launchd_falls_back_to_load_when_bootstrap_fails(
         tmp_path,
         os_name="Darwin",
         arch="arm64",
-        extra_env={"SPAWN_FAKE_LAUNCHCTL_MODE": "bootstrap_fail"},
     )
 
     assert result.returncode == 0, result.stderr
-    launchctl_log = _log(logs, "launchctl.log")
-    assert "bootstrap" in launchctl_log
-    assert "load" in launchctl_log
-    assert "kickstart -k" in launchctl_log
-    assert "started LaunchAgent app.spawn.spawnd" in result.stdout
-
-
-async def test_installer_writes_and_starts_linux_systemd_user_service(client, tmp_path: Path):
-    script = await _install_script_file(client, tmp_path)
-
-    result, logs, home, install_root = _run_installer(
-        script,
-        tmp_path,
-        os_name="Linux",
-        arch="x86_64",
-        install_root_name="install root",
-    )
-
-    assert result.returncode == 0, result.stderr
-    unit = home / ".config" / "systemd" / "user" / "spawnd.service"
-    assert unit.is_file()
-    text = unit.read_text()
-    assert (
-        'ExecStart="' + str(install_root / "bin" / "spawnd") + '" --server "http://spawn.test" run'
-        in text
-    )
-    assert "Restart=always" in text
-    assert "RestartSec=2" in text
-    assert 'Environment="PATH=' in text
-    systemctl_log = _log(logs, "systemctl.log")
-    assert "--user show-environment" in systemctl_log
-    assert "--user daemon-reload" in systemctl_log
-    assert "--user enable --now spawnd.service" in systemctl_log
-    assert "show-user" in _log(logs, "loginctl.log")
-    assert "enable-linger" in _log(logs, "loginctl.log")
-    assert "enabled systemd linger" in result.stdout
-
-
-async def test_installer_does_not_reenable_existing_systemd_linger(client, tmp_path: Path):
-    script = await _install_script_file(client, tmp_path)
-
-    result, logs, _home, _install_root = _run_installer(
-        script,
-        tmp_path,
-        os_name="Linux",
-        arch="x86_64",
-        extra_env={"SPAWN_FAKE_LINGER": "yes"},
-    )
-
-    assert result.returncode == 0, result.stderr
-    loginctl_log = _log(logs, "loginctl.log")
-    assert "show-user" in loginctl_log
-    assert "enable-linger" not in loginctl_log
-
-
-async def test_installer_warns_when_systemd_linger_cannot_be_enabled(client, tmp_path: Path):
-    script = await _install_script_file(client, tmp_path)
-
-    result, logs, _home, _install_root = _run_installer(
-        script,
-        tmp_path,
-        os_name="Linux",
-        arch="x86_64",
-        extra_env={"SPAWN_FAKE_LINGER_ENABLE": "fail"},
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "enable-linger" in _log(logs, "loginctl.log")
-    assert "systemd linger is not enabled" in result.stdout
-
-
-async def test_installer_falls_back_to_background_when_user_systemd_unavailable(
-    client, tmp_path: Path
-):
-    script = await _install_script_file(client, tmp_path)
-
-    result, logs, home, _install_root = _run_installer(
-        script,
-        tmp_path,
-        os_name="Linux",
-        arch="x86_64",
-        extra_env={"SPAWN_FAKE_SYSTEMCTL_MODE": "fail_show"},
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "started spawnd in the background" in result.stdout
-    assert "--user show-environment" in _log(logs, "systemctl.log")
-    assert "--user daemon-reload" not in _log(logs, "systemctl.log")
-    assert not (home / ".config" / "systemd" / "user" / "spawnd.service").exists()
+    assert "--server http://spawn.test possess" in _log(logs, "spawnd.log")
+    assert _log(logs, "launchctl.log") == ""
 
 
 async def test_installer_replaces_existing_binary_on_reinstall(client, tmp_path: Path):

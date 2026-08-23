@@ -1,6 +1,6 @@
-"""Overhaul migration chain (0029–0032) against representative pre-overhaul data.
+"""Overhaul migration chain (0042–0045) against representative pre-overhaul data.
 
-Seeds a 0028-shaped database the way internal users actually had it —
+Seeds a 0041-shaped database the way internal users actually had it —
 split-tree layouts (deep and ratio-heavy ones), archived agents, built-in and
 custom presets, host_tool_policies — then proves the chain is data-preserving
 in both directions.
@@ -246,7 +246,7 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
     sync_url = f"sqlite:///{db_path}"
     env = _migration_env(async_url)
 
-    _alembic(["upgrade", "0028"], env=env)
+    _alembic(["upgrade", "0041"], env=env)
     engine = create_engine(sync_url, future=True)
     try:
         with engine.begin() as conn:
@@ -275,7 +275,7 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
         assert {"ephemeral", "pinned_at"}.isdisjoint(workspace_columns)
 
         with engine.begin() as conn:
-            # 0029: archived agents (and their grants) are the one deletion.
+            # 0042: archived agents (and their grants) are the one deletion.
             session_ids = set(conn.execute(text("select id from sessions")).scalars())
             assert ids["a_archived"] not in session_ids
             assert {ids["a1"], ids["a2"], ids["a_pinned"]} <= session_ids
@@ -290,7 +290,7 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
             ).scalars().all()
             assert grants == [ids["a1"]]
 
-            # 0030: presets became agent definitions; shell is gone; argv
+            # 0043: presets became agent definitions; shell is gone; argv
             # shell-joined into a single command with quoting.
             agents = {
                 row.name: row
@@ -313,7 +313,7 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
                 (ids["codex_preset"], 1)
             ]
 
-            # 0031: split trees became valid v2 grids; positions follow name
+            # 0044: split trees became valid v2 grids; positions follow name
             # order; retired flags are gone with their columns.
             workspaces = {
                 row.name: row
@@ -329,7 +329,7 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
                 "e empty": 4,
             }
 
-            # 0033 wraps every v2 grid into a single-tab v3 envelope.
+            # 0046 wraps every v2 grid into a single-tab v3 envelope.
             def first_tab_grid(row) -> dict:
                 envelope = json.loads(row.layout)
                 assert envelope["version"] == 3
@@ -360,7 +360,7 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
 
             assert first_tab_grid(workspaces["e empty"]) == {"version": 3, "tiles": []}
 
-            # 0032: recent dirs backfilled newest-first, capped at 8 per host,
+            # 0045: recent dirs backfilled newest-first, capped at 8 per host,
             # and never from the deleted archived session.
             host1_dirs = conn.execute(
                 text(
@@ -381,7 +381,7 @@ def test_overhaul_chain_preserves_data_and_downgrades(tmp_path: Path):
         engine.dispose()
 
     # The whole chain downgrades and re-upgrades without wedging.
-    _alembic(["downgrade", "0028"], env=env)
+    _alembic(["downgrade", "0041"], env=env)
     engine = create_engine(sync_url, future=True)
     try:
         inspector = inspect(engine)

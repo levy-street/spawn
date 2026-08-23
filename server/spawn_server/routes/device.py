@@ -53,6 +53,10 @@ def _gen_device_code() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _gen_approval_ref() -> str:
+    return secrets.token_urlsafe(32)
+
+
 def _gen_approval_nonce() -> str:
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
 
@@ -121,6 +125,8 @@ async def device_start(
     dc = DeviceCode(
         device_code=_gen_device_code(),
         user_code=user_code,
+        approval_ref=_gen_approval_ref(),
+        sas_commit=body.sas_commit,
         host_name=body.host_name,
         os=body.os,
         arch=body.arch,
@@ -136,12 +142,16 @@ async def device_start(
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise HTTPException(status_code=409, detail="could not allocate device code; retry") from exc
+        raise HTTPException(
+            status_code=409, detail="could not allocate device code; retry"
+        ) from exc
 
     assert dc.approval_nonce is not None
+    assert dc.approval_ref is not None
     return schemas.DeviceStartResponse(
         device_code=dc.device_code,
         user_code=dc.user_code,
+        approval_ref=dc.approval_ref,
         approval_nonce=dc.approval_nonce,
         verification_uri=f"{get_settings().public_url.rstrip('/')}/device",
         interval=POLL_INTERVAL_SECONDS,
@@ -201,18 +211,22 @@ async def device_possession(
     # An exact already-verified tuple is the sole idempotent retry case.
     await session.rollback()
     snapshot = (
-        await session.execute(
-            select(
-                DeviceCode.approval_nonce,
-                DeviceCode.host_key_algorithm,
-                DeviceCode.host_public_key,
-                DeviceCode.host_possession_version,
-                DeviceCode.host_possession_verified_at,
-                DeviceCode.status,
-                DeviceCode.expires_at,
-            ).where(DeviceCode.device_code == body.device_code)
+        (
+            await session.execute(
+                select(
+                    DeviceCode.approval_nonce,
+                    DeviceCode.host_key_algorithm,
+                    DeviceCode.host_public_key,
+                    DeviceCode.host_possession_version,
+                    DeviceCode.host_possession_verified_at,
+                    DeviceCode.status,
+                    DeviceCode.expires_at,
+                ).where(DeviceCode.device_code == body.device_code)
+            )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     if snapshot is None:
         raise HTTPException(status_code=404, detail="unknown device code")
     if (
@@ -542,9 +556,7 @@ async def device_poll(
         host.arch = claimed["arch"]
         host.version = claimed["version"]
 
-    existing_pin = await session.get(
-        HostBrowserPin, (host.id, claimed["browser_device_id"])
-    )
+    existing_pin = await session.get(HostBrowserPin, (host.id, claimed["browser_device_id"]))
     pin_values = (
         claimed["browser_key_algorithm"],
         claimed["browser_public_key"],
@@ -634,16 +646,28 @@ def _pending_response(dc: DeviceCode) -> schemas.DevicePendingResponse:
         host_key_algorithm=dc.host_key_algorithm,
         host_public_key=dc.host_public_key,
         host_key_fingerprint=host_key_fingerprint(dc.host_key_algorithm, dc.host_public_key),
+        sas_commit=dc.sas_commit,
+        sas_host_nonce=dc.sas_host_nonce,
     )
 
 
-async def _pending_device_code(session: AsyncSession, user_code: str) -> DeviceCode:
-    code = user_code.strip().upper()
-    dc = (
-        await session.execute(select(DeviceCode).where(DeviceCode.user_code == code))
-    ).scalar_one_or_none()
+async def _pending_device_code(
+    session: AsyncSession,
+    *,
+    user_code: str | None = None,
+    approval_ref: str | None = None,
+) -> DeviceCode:
+    # Identify by exactly one of the two handles (the schema guarantees this):
+    # the opaque URL ref the browser normally sends, or the short user_code from
+    # the manual-entry form.
+    if approval_ref:
+        where = DeviceCode.approval_ref == approval_ref.strip()
+    else:
+        assert user_code is not None
+        where = DeviceCode.user_code == user_code.strip().upper()
+    dc = (await session.execute(select(DeviceCode).where(where))).scalar_one_or_none()
     if dc is None:
-        raise HTTPException(status_code=404, detail="unknown user code")
+        raise HTTPException(status_code=404, detail="unknown device code")
     expires = _aware(dc.expires_at)
     if expires is not None and expires <= _utcnow():
         raise HTTPException(status_code=400, detail="user code expired")
@@ -663,8 +687,107 @@ async def device_pending(
 ) -> schemas.DevicePendingResponse:
     """Inspect the server-derived identity before the user confirms approval."""
 
-    dc = await _pending_device_code(session, body.user_code)
+    dc = await _pending_device_code(
+        session, user_code=body.user_code, approval_ref=body.approval_ref
+    )
     return _pending_response(dc)
+
+
+@router.post("/sas", response_model=schemas.DeviceSasResponse)
+async def device_sas(
+    body: schemas.DeviceSasRequest,
+    session: AsyncSession = Depends(get_session),
+    _user: User = Depends(auth.current_user),
+) -> schemas.DeviceSasResponse:
+    """LEGACY (pre-fragment daemons only). Browser's committed-ephemeral SAS
+    contribution: its nonce Nb and key B. The server only stores/forwards them
+    (it is a dumb relay); the daemon reads them on its next poll and reveals its
+    own Nd. Set-once, and only while the ceremony is still pending with a daemon
+    commitment present.
+
+    Since 2026-08-21 possession verifies the host key via the out-of-band URL
+    fragment instead (docs/TRUST_DEVICE_MESH.md Appendix A note): new daemons
+    send no sas_commit and new web builds never call this. It remains so that
+    an old daemon paired against an old cached web build keeps working."""
+
+    dc = await _pending_device_code(
+        session, user_code=body.user_code, approval_ref=body.approval_ref
+    )
+    if dc.sas_commit is None:
+        # No daemon commitment ⇒ this daemon doesn't speak SAS; nothing to relay.
+        raise HTTPException(status_code=409, detail="host did not offer a SAS commitment")
+    if dc.sas_browser_nonce is not None or dc.sas_browser_key is not None:
+        # Set-once: a second contribution would let a relay swap Nb after seeing Nd.
+        raise HTTPException(status_code=409, detail="SAS contribution already recorded")
+    await session.execute(
+        update(DeviceCode)
+        .where(
+            DeviceCode.device_code == dc.device_code,
+            DeviceCode.sas_browser_nonce.is_(None),
+        )
+        .values(
+            sas_browser_nonce=body.sas_browser_nonce,
+            sas_browser_key=body.browser_public_key,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    return schemas.DeviceSasResponse(ok=True)
+
+
+@router.post("/sas-host", response_model=schemas.DeviceSasHostResponse)
+async def device_sas_host(
+    body: schemas.DeviceSasHostRequest,
+    session: AsyncSession = Depends(get_session),
+) -> schemas.DeviceSasHostResponse:
+    """Daemon's SAS handshake, authenticated by the device_code (no user
+    session, like poll). Returns the browser's Nb/B once present, and — when the
+    daemon supplies its opened Nd (only after it has seen Nb) — records it once.
+    Deliberately independent of the approval CAS so the pairing race is untouched.
+
+    Commit-reveal ordering is enforced here: Nd is accepted only while Nb is
+    already present, and set-once, so a relay cannot make the daemon reveal Nd
+    before the browser has committed to Nb."""
+    dc = (
+        await session.execute(select(DeviceCode).where(DeviceCode.device_code == body.device_code))
+    ).scalar_one_or_none()
+    # Match on the daemon's own key; never echo which check failed.
+    if (
+        dc is None
+        or dc.host_key_algorithm != body.host_key_algorithm
+        or dc.host_public_key != body.host_public_key
+    ):
+        raise HTTPException(status_code=404, detail="unknown device code")
+    expires = _aware(dc.expires_at)
+    if expires is not None and expires <= _utcnow():
+        raise HTTPException(status_code=400, detail="device code expired")
+
+    if (
+        body.sas_host_nonce is not None
+        and dc.sas_browser_nonce is not None
+        and dc.sas_host_nonce is None
+    ):
+        await session.execute(
+            update(DeviceCode)
+            .where(
+                DeviceCode.device_code == dc.device_code,
+                DeviceCode.sas_browser_nonce.is_not(None),
+                DeviceCode.sas_host_nonce.is_(None),
+            )
+            .values(sas_host_nonce=body.sas_host_nonce)
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+        return schemas.DeviceSasHostResponse(
+            sas_browser_nonce=dc.sas_browser_nonce,
+            sas_browser_key=dc.sas_browser_key,
+            sas_host_nonce=body.sas_host_nonce,
+        )
+    return schemas.DeviceSasHostResponse(
+        sas_browser_nonce=dc.sas_browser_nonce,
+        sas_browser_key=dc.sas_browser_key,
+        sas_host_nonce=dc.sas_host_nonce,
+    )
 
 
 @router.post("/approve", response_model=schemas.DeviceApproveResponse)
@@ -673,7 +796,9 @@ async def device_approve(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.verified_user),
 ) -> schemas.DeviceApproveResponse:
-    dc = await _pending_device_code(session, body.user_code)
+    dc = await _pending_device_code(
+        session, user_code=body.user_code, approval_ref=body.approval_ref
+    )
     assert dc.host_key_algorithm is not None
     assert dc.host_public_key is not None
     reviewed = _pending_response(dc)
@@ -778,11 +903,15 @@ async def device_approve(
             detail="host identity or approval state changed; review the device code again",
         )
     await session.commit()
+    # Echo the reviewed identity minus the SAS relay fields (pending-only) and
+    # minus the fingerprint (mesh B5: the response carries the keys themselves,
+    # so the client derives any fingerprint it needs locally).
     return schemas.DeviceApproveResponse(
-        **reviewed.model_dump(),
+        **reviewed.model_dump(
+            exclude={"host_key_fingerprint", "sas_commit", "sas_host_nonce"}
+        ),
         browser_device_id=body.browser_device_id,
         browser_key_algorithm=body.browser_key_algorithm,
         browser_public_key=body.browser_public_key,
-        browser_key_fingerprint=body.browser_key_fingerprint,
         host_id=pinned_host.id if pinned_host is not None else None,
     )

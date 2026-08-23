@@ -4,6 +4,8 @@ import { agent, host, mockApp, openSettings, USER_ID, user } from "./app-mocks";
 test("all eight settings tabs open", async ({ page }) => {
   await mockApp(page);
   await openSettings(page);
+  // "Browser devices" and "Device trust" were two tabs before the mesh; both
+  // now live on the single Access tab (docs/TRUST_UX.md).
   const cases = [
     ["Account", "Account"],
     ["Appearance", "Appearance"],
@@ -11,8 +13,8 @@ test("all eight settings tabs open", async ({ page }) => {
     ["Hosts", "Hosts"],
     ["Agents", "Agents"],
     ["Skills", "Skills"],
-    ["Browser devices", "Browser devices"],
-    ["Device trust", "Device trust"],
+    ["Templates", "Workspace templates"],
+    ["Access", "Access"],
   ] as const;
   for (const [tab, heading] of cases) {
     await page.getByRole("button", { name: tab, exact: true }).click();
@@ -20,23 +22,21 @@ test("all eight settings tabs open", async ({ page }) => {
   }
 });
 
-test("module-level openSettings links change tabs without navigating", async ({ page }) => {
+test("switching tabs changes the panel without navigating", async ({ page }) => {
+  // The dialog is a module singleton, not URL state: opening and switching
+  // tabs must never push a history entry.
   await mockApp(page);
-  await openSettings(page, "devices");
+  await openSettings(page, "access");
   const url = page.url();
-  await page
-    .getByRole("heading", { name: "Browser devices" })
-    .locator("xpath=ancestor::section")
-    .getByRole("button", { name: "Device trust" })
-    .click();
-  await expect(page.getByRole("heading", { name: "Device trust" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Access", exact: true }).last()).toBeVisible();
+
+  await page.getByRole("button", { name: "Account", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Account", exact: true }).last()).toBeVisible();
   expect(page.url()).toBe(url);
-  await page
-    .getByRole("heading", { name: "Device trust" })
-    .locator("xpath=ancestor::section")
-    .getByRole("button", { name: "Browser devices" })
-    .click();
-  await expect(page.getByRole("heading", { name: "Browser devices" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Access", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Access", exact: true }).last()).toBeVisible();
+  expect(page.url()).toBe(url);
 });
 
 test("Hosts lists connected machines and offers the connect flow", async ({ page }) => {

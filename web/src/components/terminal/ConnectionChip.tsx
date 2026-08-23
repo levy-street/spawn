@@ -1,13 +1,18 @@
 "use client";
 
 import { ShieldAlert, ShieldCheck, ShieldOff } from "lucide-react";
+import Link from "next/link";
 import type {
   ConnInfo,
   SignalingTrustLevel,
   SocketState,
 } from "@/components/terminal/useSessionSocket";
 import { DropdownMenu, DropdownMenuLabel } from "@/components/ui/dropdown-menu";
-import type { SignedRtcRefusalReason } from "@/lib/signed-rtc-trust";
+import {
+  SIGNED_RTC_REFUSAL_DETAIL,
+  SIGNED_RTC_REFUSAL_NEXT_STEP,
+  type SignedRtcRefusalReason,
+} from "@/lib/signed-rtc-trust";
 import { cn } from "@/lib/utils";
 
 /** Snapshot of a session terminal's transport, surfaced by <Terminal>. */
@@ -20,6 +25,9 @@ export interface SessionConnectionInfo extends ConnInfo {
   signedRtcRefusal?: SignedRtcRefusalReason | null;
   /** How this connection's signaling was authenticated, once decided. */
   signalingTrust?: SignalingTrustLevel | null;
+  /** The agent's host, once known — lets a refusal deep-link the safe next
+   * step (the host page, where removal + re-possession live). */
+  hostId?: string | null;
 }
 
 const TRUST_VIEW: Record<
@@ -38,7 +46,7 @@ const TRUST_VIEW: Record<
     tint: "text-warning",
     label: "first contact",
     detail:
-      "Signed, but this browser has not verified this host before — the host key came from the server on first contact. Approve the host or unlock your saved trust for full verification.",
+      "Signed, but this device is meeting this host for the first time — it took the server's word for the host's identity. Signing in with your passkey verifies it fully; approving this device again from one that already reaches the host also hands it over.",
   },
   raw: {
     icon: ShieldOff,
@@ -49,16 +57,10 @@ const TRUST_VIEW: Record<
   },
 };
 
-export const REFUSAL_DETAIL: Record<SignedRtcRefusalReason, string> = {
-  host_key_substituted:
-    "This host presented a different identity key than the one you approved. Connection blocked to prevent interception — re-verify and re-approve the host to reconnect.",
-  host_key_revoked: "You revoked this host's approved key. Re-approve it to reconnect.",
-  host_key_withheld:
-    "This host's identity key is absent from the server response, but you hold a saved pin for it. Connection blocked.",
-  browser_identity_unavailable:
-    "This browser has no signing identity for your account, so it cannot make a verified connection to this pinned host.",
-  pin_storage_error: "Your saved host pins could not be read; connection blocked to stay safe.",
-};
+// The refusal copy is shared with the host page and the file explorer so the
+// story never forks between surfaces (docs/TRUST_UX.md voice; review R-b).
+// Re-exported because ConnectingOverlay reads it from here.
+export const REFUSAL_DETAIL = SIGNED_RTC_REFUSAL_DETAIL;
 
 interface ChipView {
   dot: string;
@@ -136,8 +138,14 @@ export function ConnectionChip({
     .filter(Boolean)
     .join(" · ");
 
+  const refusalNextStep = info.signedRtcRefusal
+    ? (SIGNED_RTC_REFUSAL_NEXT_STEP[info.signedRtcRefusal] ?? null)
+    : null;
   const details: Array<[string, string]> = info.signedRtcRefusal
-    ? [["Security", REFUSAL_DETAIL[info.signedRtcRefusal]]]
+    ? [
+        ["Security", REFUSAL_DETAIL[info.signedRtcRefusal]],
+        ...(refusalNextStep ? ([["Next step", refusalNextStep]] as Array<[string, string]>) : []),
+      ]
     : [
         ...(trust ? ([["Security", trust.detail]] as Array<[string, string]>) : []),
         ["Path", view.detail],
@@ -216,6 +224,23 @@ export function ConnectionChip({
           <span className="min-w-0 text-right">{value}</span>
         </div>
       ))}
+      {info.signedRtcRefusal &&
+        (info.signedRtcRefusal === "host_key_substituted" ||
+          info.signedRtcRefusal === "host_key_revoked") &&
+        info.hostId && (
+          // The safe path forward, one click away: the host page carries the
+          // removal (and, for a re-keyed host, the full explanation). Never an
+          // "accept the new identity" control — that button cannot exist.
+          <div className="px-2 py-1.5">
+            <Link
+              href={`/hosts/${info.hostId}`}
+              data-testid="refusal-review-host"
+              className="text-xs font-medium text-foreground underline underline-offset-2 hover:text-primary"
+            >
+              Review this host
+            </Link>
+          </div>
+        )}
     </DropdownMenu>
   );
 }

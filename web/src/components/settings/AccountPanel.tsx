@@ -5,8 +5,163 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ApiError, account, auth } from "@/lib/api";
+import { ApiError, account, auth, type PasskeyCredential } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
+import { UnreadableTrustStateError } from "@/lib/passkey-flows";
+import { usePasskeyTrust } from "@/lib/trust-passkeys";
+
+/**
+ * Passkeys live in account settings, next to email and password — sign-in
+ * furniture, not trust machinery (docs/TRUST_UX.md). The one taught promise:
+ * if you lose every device, a passkey brings everything back.
+ */
+function PasskeysSection() {
+  const passkey = usePasskeyTrust();
+  const rows = passkey.passkeys.data;
+  const count = rows?.length ?? null;
+
+  // A GHOST is a listed credential holding no wrap in the current saved
+  // protection (a partial enrollment's leftover): it opens nothing, so it can
+  // always be removed as cleanup — and it must not count toward the
+  // two-passkey reseal rule. Unknown wraps (no bundle / unreadable) treat
+  // every row conservatively as real.
+  const wrapIds = passkey.wrapCredentialIds;
+  const isGhost = (row: PasskeyCredential) =>
+    passkey.hasBundle && wrapIds !== null && !wrapIds.includes(row.credential_id);
+  const realCount = rows === undefined ? null : rows.filter((row) => !isGhost(row)).length;
+
+  const removeRow = async (row: PasskeyCredential) => {
+    if (count === 1) {
+      if (
+        !confirm(
+          "Remove your only passkey?\n\nYour devices keep working, but the " +
+            "protection it provides ends: if you ever lose every device, nothing " +
+            "will bring this account's hosts back.",
+        )
+      ) {
+        return;
+      }
+      try {
+        await passkey.removeLastPasskey.mutateAsync({ target: row });
+      } catch (cause) {
+        // The one state that re-asks (P-C6): the saved protection exists but
+        // can't be read here, so removing the passkey abandons it while the
+        // trust it granted lives on. Named exactly, decided explicitly.
+        if (
+          cause instanceof UnreadableTrustStateError &&
+          confirm(
+            "Your saved protection can't be read from here.\n\nRemoving this passkey " +
+              "abandons it: your devices and hosts keep trusting the old setup, and if " +
+              "you lose every device, nothing brings this account's hosts back.\n\n" +
+              "Remove it anyway?",
+          )
+        ) {
+          passkey.removeLastPasskey.mutate({ target: row, acknowledgeUnreadable: true });
+        }
+      }
+      return;
+    }
+    if (isGhost(row)) {
+      if (
+        confirm(
+          "Remove this passkey?\n\nIt can't open your saved protection, so it isn't " +
+            "protecting anything. Removing it changes nothing else.",
+        )
+      ) {
+        passkey.revokePasskey.mutate(row);
+      }
+      return;
+    }
+    passkey.revokePasskey.mutate(row);
+  };
+
+  return (
+    <div className="space-y-3 rounded-md border border-border p-3" data-testid="passkey-list">
+      <div>
+        <p className="text-sm font-medium">Passkeys</p>
+        <p className="text-sm text-muted-foreground">
+          A passkey signs in and approves a device in one step — and if you lose every device, it
+          brings everything back.
+        </p>
+      </div>
+      {!passkey.supported && (
+        <p className="text-sm text-muted-foreground">
+          This browser cannot use passkeys here. Passkeys need a secure context (HTTPS).
+        </p>
+      )}
+      {count !== null && count > 0 && (
+        <ul className="flex flex-col gap-2">
+          {rows?.map((row) => (
+            <li key={row.id} className="flex items-center justify-between gap-2 text-sm">
+              <span className="min-w-0 truncate">
+                {row.label ?? "passkey"}
+                <span className="ml-2 text-xs text-muted-foreground">
+                  added {new Date(row.created_at).toLocaleDateString()}
+                </span>
+                {isGhost(row) && (
+                  <span className="ml-2 text-xs text-muted-foreground" data-testid="ghost-passkey">
+                    not protecting anything
+                  </span>
+                )}
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                className="shrink-0"
+                // A ghost is always removable (it opens nothing); a real one
+                // needs the honest reseal rules: it is the last passkey, or
+                // exactly one other REAL passkey survives to reseal for.
+                disabled={
+                  passkey.busy ||
+                  (!isGhost(row) && count !== 1 && (realCount === null || realCount !== 2))
+                }
+                data-testid="revoke-passkey"
+                onClick={() => void removeRow(row)}
+              >
+                {passkey.revokePasskey.isPending || passkey.removeLastPasskey.isPending
+                  ? "Removing…"
+                  : "Remove"}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {realCount !== null && realCount > 2 && (
+        <p className="text-xs text-muted-foreground">
+          Removing needs at most two passkeys enrolled. With more, this device cannot reseal for
+          every survivor — remove from each surviving device instead.
+        </p>
+      )}
+      <div className="flex items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          disabled={!passkey.supported || passkey.busy}
+          data-testid={passkey.hasBundle ? "add-backup-passkey" : "setup-passkey"}
+          onClick={() => (passkey.hasBundle ? passkey.addBackup.mutate() : passkey.setUp.mutate())}
+        >
+          {passkey.setUp.isPending || passkey.addBackup.isPending ? "Adding…" : "Add passkey"}
+        </Button>
+        {count === 1 && (
+          <p className="text-xs text-muted-foreground">
+            A second passkey (another phone, a security key) survives losing this one.
+          </p>
+        )}
+      </div>
+      {passkey.status !== null && (
+        <p className="text-sm font-medium" role="status" data-testid="trust-status">
+          {passkey.status}
+        </p>
+      )}
+      {passkey.error !== null && (
+        <p className="text-sm text-destructive" role="alert" data-testid="trust-error">
+          {passkey.error}
+        </p>
+      )}
+    </div>
+  );
+}
 
 export function AccountPanel() {
   const { user } = useAuth();
@@ -72,6 +227,8 @@ export function AccountPanel() {
           </Button>
         </div>
       )}
+      <PasskeysSection />
+
       <Button
         variant="secondary"
         onClick={() => {

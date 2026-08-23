@@ -42,8 +42,9 @@ import {
   terminalTheme,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
-import { hosts, sessions } from "@/lib/api";
+import { hosts, sessions, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import type { CarriedEndorsement } from "@/lib/hostControl";
 import { DirectSessionUploadError } from "@/lib/session-ctl";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
@@ -1045,7 +1046,6 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const liveAccountIdRef = useRef<string | null>(signalingAccountId);
   liveAccountIdRef.current = signalingAccountId;
   const claimedHostPublicKey = hostIdentityQuery.data?.host_public_key ?? null;
-  const claimedHostFingerprint = hostIdentityQuery.data?.host_key_fingerprint ?? null;
   // Trust can only be evaluated once the account and hostId are known, and the
   // first connection must not race the host record: until the claimed key
   // query settles (success or error — a keyless host legitimately resolves to
@@ -1062,16 +1062,28 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         accountId: signalingAccountId as string,
         hostId: signalingHostId as string,
         claimedHostPublicKey,
-        claimedHostFingerprint,
         isActive: () => liveAccountIdRef.current === signalingAccountId,
       }),
-    [signalingAccountId, signalingHostId, claimedHostPublicKey, claimedHostFingerprint],
+    [signalingAccountId, signalingHostId, claimedHostPublicKey],
   );
+  const loadCarriedEndorsements = useCallback(async (): Promise<CarriedEndorsement[]> => {
+    const accountId = signalingAccountId;
+    if (!accountId) return [];
+    const edges = await trust.accountEndorsements();
+    return edges.map((edge) => ({
+      account_id: accountId,
+      endorser_public_key: edge.endorser_public_key,
+      endorsed_public_key: edge.endorsed_public_key,
+      endorsed_device_id: edge.endorsed_device_id,
+      signature: edge.signature,
+    }));
+  }, [signalingAccountId]);
 
   const socket = useSessionSocket({
     sessionId,
     enabled: socketInitialSize !== null && signalingIdentityKnown,
     resolveSignedRtcTrust: signalingIdentityKnown ? resolveTrust : undefined,
+    loadCarriedEndorsements: signalingIdentityKnown ? loadCarriedEndorsements : undefined,
     initialSize: socketInitialSize,
     onData: (bytes, dcOffsetAfter) => {
       if (typeof dcOffsetAfter === "number") {
@@ -1324,6 +1336,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       dcOpen: socket.dcOpen,
       signedRtcRefusal: socket.signedRtcRefusal,
       signalingTrust: socket.signalingTrust,
+      // Lets a refusal surface deep-link its safe next step (the host page).
+      hostId: signalingHostId,
       ...socket.connInfo,
     });
   }, [
@@ -1333,6 +1347,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     socket.signedRtcRefusal,
     socket.signalingTrust,
     socket.connInfo,
+    signalingHostId,
   ]);
 
   // Only surface "waiting for the direct channel" after a grace period —

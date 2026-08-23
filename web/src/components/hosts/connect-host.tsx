@@ -21,11 +21,43 @@ import {
   browserHostPinServerOrigin,
   loadBrowserHostPin,
 } from "@/lib/browser-host-pins";
+import { publishHostIntroductionBroadcast } from "@/lib/host-gossip";
 import { detectPlatform, UNDETECTED_PLATFORM } from "@/lib/platform";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { cn } from "@/lib/utils";
 
 class ApprovalIdentityError extends Error {}
+
+/**
+ * The `#k=` URL fragment is the possession ceremony's out-of-band channel:
+ * the daemon appends its OWN public key to the approval URL locally, after
+ * receiving `verification_uri`, and the fragment travels terminal→browser
+ * without ever appearing in an HTTP request — the server cannot see, strip,
+ * or rewrite it in flight. Its value is what the server-claimed host key
+ * must equal EXACTLY; on any difference nothing is pinned or approved.
+ *
+ * Returns the wire-encoded key, `null` when the URL carries no `k` fragment
+ * (an older daemon, a retyped URL — the fingerprint-compare fallback), or
+ * `"malformed"` when a `k` value is present but is not a canonical ed25519
+ * wire key — a damaged or truncated link is refused, never downgraded.
+ */
+function readFragmentHostKey(hash: string): string | null | "malformed" {
+  const raw = hash.startsWith("#") ? hash.slice(1) : hash;
+  if (!raw) return null;
+  const value = new URLSearchParams(raw).get("k");
+  if (value === null) return null;
+  return /^[A-Za-z0-9_-]{43}$/u.test(value) ? value : "malformed";
+}
+
+const REFUSAL_MISMATCH =
+  "This host's identity could not be verified: the server presented a different identity " +
+  "key than the one in your host's link. Nothing was trusted and no access was granted. " +
+  "This can mean the connection is being tampered with — start over from the host's " +
+  "terminal, on a network you trust.";
+const REFUSAL_MALFORMED =
+  "The identity check in this link (the part after '#') is damaged or cut off, so this " +
+  "host could not be verified. Nothing was trusted. Copy the entire link from the host's " +
+  "terminal and open it again.";
 
 async function seedApprovedHostBinding(input: {
   accountId: string;
@@ -65,8 +97,11 @@ export function ConnectHostSection(props: {
   /** Drop the card chrome and its heading: the host is already inside a framed,
    * titled surface (the onboarding sheet) and a second frame just doubles it. */
   frameless?: boolean;
+  /** Forwarded to {@link PairingCodeForm}: read the possession handle and the
+   * `#k=` identity fragment from the URL. Only `/device` sets this. */
+  autoLoadFromUrl?: boolean;
 }): JSX.Element {
-  const { onHostOnline, frameless = false } = props;
+  const { onHostOnline, frameless = false, autoLoadFromUrl = false } = props;
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
   const [copied, setCopied] = useState(false);
   const notifiedRef = useRef(false);
@@ -152,7 +187,7 @@ export function ConnectHostSection(props: {
               Enter a pairing code
             </h3>
           </div>
-          <PairingCodeForm />
+          <PairingCodeForm autoLoadFromUrl={autoLoadFromUrl} />
         </section>
 
         <div className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2.5 text-xs text-muted-foreground">
@@ -168,7 +203,19 @@ export function ConnectHostSection(props: {
   );
 }
 
-export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string) => void } = {}) {
+export function PairingCodeForm({
+  onApproved,
+  autoLoadFromUrl = false,
+}: {
+  onApproved?: (hostName: string) => void;
+  /**
+   * Read `?ref=`/`?code=` and the `#k=` identity fragment from the URL and
+   * load the pending approval on mount. Only the possession route (`/device`,
+   * which the daemon's own link opens) arrives with those; the Settings and
+   * onboarding embeddings type a code by hand and leave this off.
+   */
+  autoLoadFromUrl?: boolean;
+} = {}) {
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const registration = useBrowserDeviceRegistration(user?.id);
@@ -179,18 +226,47 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
   const [localPinCommitted, setLocalPinCommitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // The identifier a successful review was loaded with, reused verbatim by
+  // approve: the opaque URL ref (auto-open path) or the typed user_code.
+  const [identifier, setIdentifier] = useState<{
+    user_code?: string;
+    approval_ref?: string;
+  } | null>(null);
+  // The out-of-band host key from the URL fragment; null → fingerprint fallback.
+  const fragmentKeyRef = useRef<string | null>(null);
+  // Terminal refusal (fragment mismatch / damaged link). Nothing was trusted.
+  const [refusal, setRefusal] = useState<string | null>(null);
+  // True once the pending host key equaled the fragment key exactly — the
+  // invisible check passed, so the screen is a plain Approve confirmation.
+  const [fragmentVerified, setFragmentVerified] = useState(false);
 
-  const onReview = async (event: FormEvent) => {
-    event.preventDefault();
+  // Load the pending approval. Takes the opaque URL ref the terminal
+  // opened/printed or the typed user_code, and remembers which, so approve
+  // reuses the exact same identifier. The fragment check happens here, before
+  // anything is shown or stored: the server-claimed key either exactly equals
+  // the out-of-band key or the ceremony is refused.
+  const review = async (id: { user_code?: string; approval_ref?: string }) => {
+    const lookup = id.approval_ref
+      ? { approval_ref: id.approval_ref }
+      : { user_code: (id.user_code ?? "").trim().toUpperCase() };
+    if (!lookup.approval_ref && !lookup.user_code) return;
     setError(null);
     setSubmitting(true);
     try {
-      const response = await auth.pendingDevice({ user_code: code.trim().toUpperCase() });
+      const response = await auth.pendingDevice(lookup);
       const expectedFingerprint = await ed25519PublicKeyFingerprint(response.host_public_key);
       if (response.host_key_fingerprint !== expectedFingerprint) {
         throw new ApprovalIdentityError(
           "Daemon fingerprint did not match its public key; approval was blocked",
         );
+      }
+      // THE substitution check (docs/TRUST_DEVICE_MESH.md): the server's
+      // claimed key against the key the host's own link carried out-of-band.
+      // A hostile relay cannot pass this without controlling the terminal.
+      const fragmentKey = fragmentKeyRef.current;
+      if (fragmentKey !== null && response.host_public_key !== fragmentKey) {
+        setRefusal(REFUSAL_MISMATCH);
+        return;
       }
       if (!user) throw new ApprovalIdentityError("The authenticated account is unavailable");
       const existing = await loadBrowserHostPin({
@@ -199,6 +275,8 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
         hostPublicKey: response.host_public_key,
         hostFingerprint: expectedFingerprint,
       });
+      setFragmentVerified(fragmentKey !== null);
+      setIdentifier(lookup);
       setPending(response);
       setLocalPinState(existing?.state ?? "new");
       setLocalPinCommitted(existing?.state === "active");
@@ -215,6 +293,34 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
     }
   };
 
+  const onReview = async (event: FormEvent) => {
+    event.preventDefault();
+    await review({ user_code: code });
+  };
+
+  // The daemon opens the possession page with an opaque handle baked into the
+  // URL (`/device?ref=…`, or `?code=…` from an older server) and its own host
+  // key in the `#k=` fragment. Read both, then load once the account is known.
+  const autoTriedRef = useRef(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: one-shot guarded by a ref; review intentionally omitted
+  useEffect(() => {
+    if (!autoLoadFromUrl) return;
+    const params = new URLSearchParams(window.location.search);
+    const ref = params.get("ref");
+    const urlCode = params.get("code");
+    if (!(ref || urlCode) || !user || autoTriedRef.current) return;
+    autoTriedRef.current = true;
+    const fragment = readFragmentHostKey(window.location.hash);
+    if (fragment === "malformed") {
+      // A present-but-broken identity check is refused, never downgraded to
+      // the fingerprint fallback: the link was damaged, not merely old.
+      setRefusal(REFUSAL_MALFORMED);
+      return;
+    }
+    fragmentKeyRef.current = fragment;
+    void review(ref ? { approval_ref: ref } : { user_code: urlCode ?? undefined });
+  }, [user, autoLoadFromUrl]);
+
   const onApprove = async () => {
     if (!pending || !user || registration.data?.status !== "ready") return;
     setError(null);
@@ -228,6 +334,14 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
       ) {
         throw new ApprovalIdentityError(
           "Local browser identity changed; refresh and review the daemon again",
+        );
+      }
+      // Defense in depth: re-assert the out-of-band binding at the moment of
+      // signing, so no state shuffle can approve a key the fragment never
+      // vouched for.
+      if (fragmentKeyRef.current !== null && pending.host_public_key !== fragmentKeyRef.current) {
+        throw new ApprovalIdentityError(
+          "The host's identity no longer matches its link; nothing was trusted",
         );
       }
       const expectedFingerprint = await ed25519PublicKeyFingerprint(pending.host_public_key);
@@ -252,7 +366,7 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
         pending.host_public_key,
       );
       const response = await auth.approveDevice({
-        user_code: code.trim().toUpperCase(),
+        ...(identifier ?? { user_code: code.trim().toUpperCase() }),
         approval_nonce: pending.approval_nonce,
         host_key_algorithm: pending.host_key_algorithm,
         host_public_key: pending.host_public_key,
@@ -260,19 +374,24 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
         browser_device_id: registration.data.device.id,
         browser_key_algorithm: registration.data.device.key_algorithm,
         browser_public_key: registration.data.device.public_key,
-        browser_key_fingerprint: registration.data.device.fingerprint,
+        // Derived locally from this browser's own key (mesh B5): the server
+        // serves no fingerprint next to a key, so the wire copy the daemon
+        // stores originates here, from the key holder.
+        browser_key_fingerprint: await ed25519PublicKeyFingerprint(
+          registration.data.device.public_key,
+        ),
         signature,
       });
+      // The approve echo carries the keys alone (mesh B5); comparing them
+      // byte-for-byte subsumes any fingerprint comparison.
       if (
         response.host_name !== pending.host_name ||
         response.approval_nonce !== pending.approval_nonce ||
         response.host_key_algorithm !== pending.host_key_algorithm ||
         response.host_public_key !== pending.host_public_key ||
-        response.host_key_fingerprint !== pending.host_key_fingerprint ||
         response.browser_device_id !== registration.data.device.id ||
         response.browser_key_algorithm !== registration.data.device.key_algorithm ||
-        response.browser_public_key !== registration.data.device.public_key ||
-        response.browser_key_fingerprint !== registration.data.device.fingerprint
+        response.browser_public_key !== registration.data.device.public_key
       ) {
         throw new ApprovalIdentityError(
           "Approval response changed the reviewed host or browser identity",
@@ -286,10 +405,36 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
         hostFingerprint: expectedFingerprint,
         knownHostId: response.host_id,
       });
+      // Continuous gossip (mesh R7): the moment this device verifies a host,
+      // it vouches the key to the account so its firsthand-known peers pin it
+      // too. Best-effort — the background reconcile sweep republishes anything
+      // this misses (e.g. a first pairing whose Host row is not created yet).
+      if (response.host_id) {
+        const publishTarget = {
+          hostId: response.host_id,
+          hostName: response.host_name,
+          hostPublicKey: pending.host_public_key,
+        };
+        void (async () => {
+          try {
+            const signer = await loadBrowserDeviceIdentity(user.id);
+            if (signer === null || registration.data?.status !== "ready") return;
+            await publishHostIntroductionBroadcast({
+              accountId: user.id,
+              deviceId: registration.data.device.id,
+              identity: signer,
+              target: publishTarget,
+            });
+          } catch {
+            // The sweep is the durable path.
+          }
+        })();
+      }
       queryClient.invalidateQueries({ queryKey: ["hosts"] });
       setPending(null);
       setLocalPinState(null);
       setLocalPinCommitted(false);
+      setIdentifier(null);
       setCode("");
     } catch (caught) {
       const message =
@@ -310,6 +455,44 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
 
   const deviceLabel =
     registration.data?.status === "ready" ? (registration.data.device.label ?? null) : null;
+  // Displayed fingerprint for this browser's own key, derived locally (mesh
+  // B5) — the registration response carries the key alone.
+  const readyBrowserKey =
+    registration.data?.status === "ready" ? registration.data.device.public_key : null;
+  const browserFingerprintQ = useQuery({
+    queryKey: ["browser-key-fingerprint", readyBrowserKey],
+    queryFn: () => ed25519PublicKeyFingerprint(readyBrowserKey as string),
+    enabled: readyBrowserKey !== null,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const browserFingerprint = readyBrowserKey === null ? null : (browserFingerprintQ.data ?? "…");
+
+  // A refusal is terminal: the identity check failed, nothing was trusted, and
+  // there is deliberately no control here that proceeds anyway.
+  if (refusal) {
+    return (
+      <div className="space-y-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
+        <p className="text-sm font-medium text-foreground">This host could not be verified</p>
+        <p className="text-sm leading-relaxed text-muted-foreground" role="alert">
+          {refusal}
+        </p>
+        <Button
+          type="button"
+          variant="secondary"
+          onClick={() => {
+            setRefusal(null);
+            setFragmentVerified(false);
+            fragmentKeyRef.current = null;
+            setPending(null);
+            setIdentifier(null);
+            setCode("");
+          }}
+        >
+          Start over
+        </Button>
+      </div>
+    );
+  }
 
   return (
     <form className="space-y-3" onSubmit={onReview}>
@@ -359,21 +542,36 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
 
       {pending ? (
         <div className="space-y-3 rounded-lg border border-border p-3">
-          <div className="space-y-1">
-            <p className="text-sm font-medium">
-              Check the fingerprint for <code>{pending.host_name}</code>
-            </p>
-            <p
-              className="break-all rounded-md bg-muted px-2 py-1.5 font-mono text-sm font-semibold"
-              data-testid="host-key-fingerprint"
-            >
-              {pending.host_key_fingerprint}
-            </p>
-            <p className="text-xs leading-5 text-muted-foreground">
-              Confirm the terminal shows this exact value. If it differs, stop—the connection may be
-              intercepted.
-            </p>
-          </div>
+          {fragmentVerified ? (
+            // The link from the host's own terminal carried its identity key,
+            // and it matched exactly. The human check is already done, so
+            // asking for a fingerprint comparison here would be theatre.
+            <div className="space-y-1" data-testid="possess-approve-screen">
+              <p className="text-sm font-medium">
+                Approve <code>{pending.host_name}</code>
+              </p>
+              <p className="text-xs leading-5 text-muted-foreground">
+                This browser verified the host&apos;s identity against the link from its terminal.
+                Approving grants all your devices access to it.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-1">
+              <p className="text-sm font-medium">
+                Check the fingerprint for <code>{pending.host_name}</code>
+              </p>
+              <p
+                className="break-all rounded-md bg-muted px-2 py-1.5 font-mono text-sm font-semibold"
+                data-testid="host-key-fingerprint"
+              >
+                {pending.host_key_fingerprint}
+              </p>
+              <p className="text-xs leading-5 text-muted-foreground">
+                Confirm the terminal shows this exact value. If it differs, stop—the connection may
+                be intercepted.
+              </p>
+            </div>
+          )}
           {localPinState === "active" && (
             <p className="text-xs text-muted-foreground" data-testid="local-pin-state">
               This exact host key is already active in this browser. Approving again only completes
@@ -404,9 +602,8 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
               className="break-all font-mono text-xs text-muted-foreground"
               data-testid="browser-key-fingerprint"
             >
-              {registration.data?.status === "ready"
-                ? registration.data.device.fingerprint
-                : "unavailable"}
+              {/* Derived locally from the key this browser holds (mesh B5). */}
+              {browserFingerprint ?? "unavailable"}
             </p>
           </div>
           <div className="flex flex-col-reverse gap-2 @sm/settings:flex-row">
@@ -434,7 +631,9 @@ export function PairingCodeForm({ onApproved }: { onApproved?: (hostName: string
                   ? "Retry server approval"
                   : localPinState === "revoked"
                     ? "Approve this host again"
-                    : "Fingerprint matches — approve"}
+                    : fragmentVerified
+                      ? `Approve ${pending.host_name}`
+                      : "Fingerprint matches — approve"}
             </Button>
           </div>
         </div>

@@ -1,6 +1,13 @@
 // @ts-nocheck -- focused browser API fakes; production code remains fully type-checked.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
+/** Poll until `cond` holds (deadline-bounded) — fixed sleeps flake on loaded
+ * CI runners when a 5ms client timeout races an 8ms wall-clock nap. */
+async function waitFor(cond: () => boolean, deadlineMs = 500): Promise<void> {
+  const deadline = Date.now() + deadlineMs;
+  while (!cond() && Date.now() < deadline) await Bun.sleep(2);
+}
+
 import { HOST_CONTROL_PROTOCOL, HostControlClient } from "./hostControl";
 import {
   decodeEd25519PublicKeyWire,
@@ -555,7 +562,9 @@ describe("HostControlClient", () => {
       ice_transport_policy: "all",
       ...metadata,
     });
-    await Bun.sleep(8);
+    await waitFor(
+      () => FakePeerConnection.instances[0].channel.closed && FakeWebSocket.instances.length === 2,
+    );
 
     expect(FakePeerConnection.instances[0].channel.closed).toBe(true);
     expect(FakeWebSocket.instances).toHaveLength(2);
@@ -589,7 +598,7 @@ describe("HostControlClient", () => {
       ...metadata,
     });
     noHelloPc.channel.onopen?.();
-    await Bun.sleep(8);
+    await waitFor(() => noHelloPc.channel.closed && FakeWebSocket.instances.length === 2);
     expect(noHelloPc.channel.closed).toBe(true);
     expect(FakeWebSocket.instances).toHaveLength(2);
     noHelloClient.close();
@@ -601,7 +610,7 @@ describe("HostControlClient", () => {
       reconnectBaseDelayMs: 1,
     });
     neverOpen.connect();
-    await Bun.sleep(8);
+    await waitFor(() => FakeWebSocket.instances.length === 2);
     expect(FakeWebSocket.instances).toHaveLength(2);
     neverOpen.close();
 
@@ -613,7 +622,7 @@ describe("HostControlClient", () => {
     });
     noConfig.connect();
     FakeWebSocket.instances[0].onopen?.();
-    await Bun.sleep(8);
+    await waitFor(() => FakeWebSocket.instances.length === 2);
     expect(FakeWebSocket.instances).toHaveLength(2);
     noConfig.close();
   });

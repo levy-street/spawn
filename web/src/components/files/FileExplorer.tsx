@@ -21,6 +21,7 @@ import {
   Trash2,
   Upload,
 } from "lucide-react";
+import Link from "next/link";
 import {
   type DragEvent,
   forwardRef,
@@ -60,7 +61,7 @@ import { HostControlClient, type HostDirEntry, type HostDirList } from "@/lib/ho
 import { deriveFileCapabilities } from "@/lib/preview/capabilities";
 import { classifyFile } from "@/lib/preview/file-kinds";
 import { previewCache } from "@/lib/preview/preview-cache";
-import { resolveSignedRtcTrust } from "@/lib/signed-rtc-trust";
+import { resolveSignedRtcTrust, SIGNED_RTC_REFUSAL_DETAIL } from "@/lib/signed-rtc-trust";
 import { cn } from "@/lib/utils";
 import { FILE_EXPLORER_RETAINED_PAGE_LIMIT, retainDirectoryPages } from "./fileExplorerPaging";
 
@@ -183,6 +184,7 @@ export const FileExplorer = forwardRef<
     state: hostControlState,
     capabilities,
     os: hostOs,
+    signedRtcRefusal,
   } = useHostControl(hostId);
   const controlReady = hostControlState === "ready" && hostControl !== null;
   // Actions are gated on what the daemon advertised, never on the platform it
@@ -676,7 +678,6 @@ export const FileExplorer = forwardRef<
               accountId,
               hostId: destHostId,
               claimedHostPublicKey: destHost.host_public_key ?? null,
-              claimedHostFingerprint: destHost.host_key_fingerprint ?? null,
               isActive: () => liveAccountIdRef.current === accountId,
             }),
         });
@@ -1079,6 +1080,24 @@ export const FileExplorer = forwardRef<
                 <div className={cn("h-2.5 rounded bg-muted", width)} />
               </div>
             ))}
+          </div>
+        )}
+        {signedRtcRefusal && (
+          // A trust refusal is not a transport hiccup: say why the channel is
+          // blocked and point at the page that carries the safe next step
+          // (remove + possess again for a re-keyed host). Never an override.
+          <div
+            className="px-3 py-2 text-xs leading-relaxed text-destructive"
+            role="alert"
+            data-testid="files-trust-refusal"
+          >
+            {SIGNED_RTC_REFUSAL_DETAIL[signedRtcRefusal]}{" "}
+            <Link
+              href={`/hosts/${hostId}`}
+              className="font-medium underline underline-offset-2 text-foreground"
+            >
+              Review this host
+            </Link>
           </div>
         )}
         {rootQ.error && (

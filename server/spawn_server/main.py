@@ -23,9 +23,12 @@ from .routes import auth_providers as auth_providers_routes
 from .routes import browser_devices as browser_devices_routes
 from .routes import capabilities as capabilities_routes
 from .routes import device as device_routes
+from .routes import device_pairing as device_pairing_routes
+from .routes import host_introductions as host_introductions_routes
 from .routes import hosts as hosts_routes
 from .routes import install as install_routes
 from .routes import profile as profile_routes
+from .routes import root_introductions as root_introductions_routes
 from .routes import sessions as sessions_routes
 from .routes import trust_bundle as trust_bundle_routes
 from .routes import workspace_templates as workspace_templates_routes
@@ -85,6 +88,9 @@ def create_app() -> FastAPI:
     app.include_router(browser_devices_routes.router)
     app.include_router(capabilities_routes.router)
     app.include_router(device_routes.router)
+    app.include_router(device_pairing_routes.router)
+    app.include_router(host_introductions_routes.router)
+    app.include_router(root_introductions_routes.router)
     app.include_router(hosts_routes.router)
     app.include_router(profile_routes.router)
     app.include_router(sessions_routes.router)

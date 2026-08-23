@@ -9,19 +9,31 @@ serve at all.
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select, update
+from pydantic import BaseModel
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from .. import auth, schemas
+from ..acct_endorsement import verify_acct_endorsement_proof
 from ..browser_endorsement import verify_browser_endorsement_proof
 from ..db import get_session
 from ..host_identity import ed25519_key_fingerprint
-from ..models import BrowserDevice, Host, HostBrowserPin, PasskeyCredential, TrustBundle, User
+from ..models import (
+    BrowserDevice,
+    DeviceEndorsement,
+    Host,
+    HostBrowserPin,
+    PasskeyCredential,
+    TrustBundle,
+    User,
+)
+from ..pin_liveness import live_browser_device_id_set
 from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/trust", tags=["trust"])
@@ -105,6 +117,43 @@ async def put_trust_bundle(
         )
     await session.commit()
     return schemas.TrustBundleOut(sealed=body.sealed, revision=next_revision, updated_at=now)
+
+
+@router.delete("/bundle", status_code=204)
+async def delete_trust_bundle(
+    expected_revision: int | None = None,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    """Delete the account's sealed bundle (removing the last passkey abandons it).
+
+    Deleting only forgets recovery material the account owner sealed — it never
+    grants or restores anything, so no pin push is needed. Idempotent: an
+    account with no bundle is the normal pre-bootstrap state.
+
+    ``expected_revision`` is a compare-and-set guard, mirroring PUT: without it,
+    a delete interleaving between another device's putBundle and addPasskey
+    (backup enrollment) silently destroyed the bundle that credential had just
+    been wrapped into, stranding an enrolled passkey that opens nothing. A
+    mismatch is a 409 — the client re-reads and re-confirms. The parameter is
+    optional only for wire compatibility; the web client always sends it.
+    """
+    user_id = user.id
+    row = await session.get(TrustBundle, user_id)
+    if row is None:
+        # Idempotent: nothing to delete, whatever revision the caller expected.
+        return
+    stmt = delete(TrustBundle).where(TrustBundle.owner_user_id == user_id)
+    if expected_revision is not None:
+        stmt = stmt.where(TrustBundle.revision == expected_revision)
+    result = await session.execute(stmt)
+    if result.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="trust bundle changed since it was read; re-read and confirm before deleting",
+        )
+    await session.commit()
 
 
 @router.get("/passkeys", response_model=list[schemas.PasskeyCredentialOut])
@@ -211,6 +260,10 @@ async def delete_passkey(
 
 MAX_BROWSER_PINS_PER_HOST = 32
 
+# Bounds a hostile client's storage of account-scoped endorsement edges. The
+# real device graph is tiny; this leaves generous headroom.
+MAX_ACCOUNT_ENDORSEMENTS = 256
+
 
 @router.get("/endorsements", response_model=list[schemas.BrowserEndorsementRecord])
 async def list_endorsements_for_device(
@@ -308,6 +361,20 @@ async def create_browser_endorsement(
                 status_code=409, detail="revoked browser devices cannot endorse or be endorsed"
             )
 
+    # Mesh R9: once this host's daemon validates account-scoped chains, the
+    # legacy per-host path is retired for DEVICE admission — otherwise both
+    # rails stay live and a hostile server steers admission onto the weaker
+    # one. The single remaining per-host use is anchoring the account ROOT
+    # (the 5c anchor upgrade), which is precisely a statement about this host.
+    if host.supports_account_chains and not endorsed.is_root:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "this host accepts account-wide trust; approve the device once with the "
+                "add-device ceremony instead of per-host endorsement"
+            ),
+        )
+
     # The endorser must already be pinned to this host. An endorsement from a
     # device the host does not trust carries no authority, and accepting it here
     # would invite the daemon to reject rows this table had blessed.
@@ -341,7 +408,6 @@ async def create_browser_endorsement(
         return schemas.BrowserEndorsementOut(
             host_id=host.id,
             endorsed_device_id=endorsed.id,
-            endorsed_key_fingerprint=existing.browser_key_fingerprint,
             endorser_device_id=body.endorser_device_id,
             created_at=existing.created_at,
         )
@@ -383,10 +449,243 @@ async def create_browser_endorsement(
     return schemas.BrowserEndorsementOut(
         host_id=host.id,
         endorsed_device_id=body.endorsed_device_id,
-        endorsed_key_fingerprint=fingerprint,
         endorser_device_id=body.endorser_device_id,
         created_at=created_at,
     )
+
+
+@router.post("/account-endorsements", response_model=schemas.AccountEndorsementOut)
+async def create_account_endorsement(
+    body: schemas.AccountEndorsementCreate,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.AccountEndorsementOut:
+    """Record one device account-endorsing another (docs §3, no host binding).
+
+    Unlike the per-host endorsement this does NOT require the endorser to be
+    trusted by anything: account trust is decided by the daemon when it validates
+    a carried chain against its own anchors, never by this table. A stored edge
+    from a device that chains to no anchor is inert. The server verifies the
+    signature only to keep malformed rows out; the daemon re-verifies it.
+    """
+
+    user_id = user.id
+    if body.endorser_device_id == body.endorsed_device_id:
+        raise HTTPException(status_code=422, detail="a device may not endorse itself")
+
+    devices = {
+        row.id: row
+        for row in (
+            await session.execute(
+                select(BrowserDevice).where(
+                    BrowserDevice.owner_user_id == user_id,
+                    BrowserDevice.id.in_([body.endorser_device_id, body.endorsed_device_id]),
+                )
+            )
+        ).scalars()
+    }
+    endorser = devices.get(body.endorser_device_id)
+    endorsed = devices.get(body.endorsed_device_id)
+    if endorser is None or endorsed is None:
+        raise HTTPException(status_code=404, detail="browser device not found")
+    for device in (endorser, endorsed):
+        if device.revoked_at is not None:
+            raise HTTPException(
+                status_code=409, detail="revoked browser devices cannot endorse or be endorsed"
+            )
+    if endorsed.is_root:
+        # The root anchors trust; nothing endorses it. R only ever appears as the
+        # ENDORSER (R→d). Endorsing the root would be meaningless and confuse the
+        # graph, so refuse it.
+        raise HTTPException(status_code=422, detail="the account root cannot be endorsed")
+
+    verify_acct_endorsement_proof(
+        account_id=user_id,
+        endorser_public_key_wire=endorser.public_key,
+        endorsed_public_key_wire=endorsed.public_key,
+        endorsed_device_id=endorsed.id,
+        signature_wire=body.signature,
+    )
+
+    # Idempotent: re-recording the same directed edge is a retry.
+    existing = (
+        await session.execute(
+            select(DeviceEndorsement).where(
+                DeviceEndorsement.endorser_device_id == endorser.id,
+                DeviceEndorsement.endorsed_device_id == endorsed.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return schemas.AccountEndorsementOut(
+            id=existing.id,
+            endorser_device_id=existing.endorser_device_id,
+            endorsed_device_id=existing.endorsed_device_id,
+            created_at=existing.created_at,
+        )
+
+    count = (
+        await session.execute(
+            select(func.count())
+            .select_from(DeviceEndorsement)
+            .where(DeviceEndorsement.owner_user_id == user_id)
+        )
+    ).scalar_one()
+    if count >= MAX_ACCOUNT_ENDORSEMENTS:
+        raise HTTPException(status_code=409, detail="account endorsement capacity is exhausted")
+
+    record_id = str(uuid.uuid4())
+    created_at = datetime.now(UTC)
+    session.add(
+        DeviceEndorsement(
+            id=record_id,
+            owner_user_id=user_id,
+            endorser_device_id=endorser.id,
+            endorsed_device_id=endorsed.id,
+            signature=body.signature,
+            created_at=created_at,
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        # A concurrent insert of the same pair won the race: return theirs.
+        await session.rollback()
+        winner = (
+            await session.execute(
+                select(DeviceEndorsement).where(
+                    DeviceEndorsement.endorser_device_id == endorser.id,
+                    DeviceEndorsement.endorsed_device_id == endorsed.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if winner is None:
+            raise HTTPException(status_code=409, detail="endorsement could not be stored") from None
+        return schemas.AccountEndorsementOut(
+            id=winner.id,
+            endorser_device_id=winner.endorser_device_id,
+            endorsed_device_id=winner.endorsed_device_id,
+            created_at=winner.created_at,
+        )
+
+    # Nudge every host of the account so their pin/deny state reconciles NOW,
+    # not at the next daemon reconnect. Admission itself needs no push (the
+    # device carries its chain), but a daemon's deny-list REPLACES on push and
+    # can otherwise sit stale — seen live: a key revoked, pruned, re-registered,
+    # and re-approved stayed refused indefinitely because nothing pushed after
+    # the revoke. Best effort: a failed push must never fail the approval.
+    host_ids = (
+        (await session.execute(select(Host.id).where(Host.owner_user_id == user_id)))
+        .scalars()
+        .all()
+    )
+    for host_id in host_ids:
+        try:
+            await push_browser_pins(host_id)
+        except Exception:
+            pass
+
+    return schemas.AccountEndorsementOut(
+        id=record_id,
+        endorser_device_id=body.endorser_device_id,
+        endorsed_device_id=body.endorsed_device_id,
+        created_at=created_at,
+    )
+
+
+@router.get("/account-endorsements", response_model=list[schemas.AccountEndorsementRecord])
+async def list_account_endorsements(
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[schemas.AccountEndorsementRecord]:
+    """Every account-scoped endorsement edge whose endpoints are both live, so a
+    device can assemble a carried chain from a host's anchor down to itself.
+
+    Edges touching a revoked device are omitted (the daemon would reject a chain
+    through a revoked key anyway). Nothing here is trusted as served — each edge
+    carries a signature the consumer re-verifies against the endorser key.
+    """
+
+    endorser = aliased(BrowserDevice)
+    endorsed = aliased(BrowserDevice)
+    rows = await session.execute(
+        select(
+            DeviceEndorsement.endorser_device_id,
+            endorser.public_key.label("endorser_public_key"),
+            DeviceEndorsement.endorsed_device_id,
+            endorsed.public_key.label("endorsed_public_key"),
+            DeviceEndorsement.signature,
+            DeviceEndorsement.created_at,
+        )
+        .join(endorser, endorser.id == DeviceEndorsement.endorser_device_id)
+        .join(endorsed, endorsed.id == DeviceEndorsement.endorsed_device_id)
+        .where(
+            DeviceEndorsement.owner_user_id == user.id,
+            endorser.revoked_at.is_(None),
+            endorsed.revoked_at.is_(None),
+        )
+        .order_by(DeviceEndorsement.created_at)
+    )
+    return [
+        schemas.AccountEndorsementRecord(
+            endorser_device_id=row.endorser_device_id,
+            endorser_public_key=row.endorser_public_key,
+            endorsed_device_id=row.endorsed_device_id,
+            endorsed_public_key=row.endorsed_public_key,
+            signature=row.signature,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+class HostPinDetail(BaseModel):
+    device_id: str
+    # True when the pin came from the possess ceremony itself (no endorser) —
+    # the "Possessed by" provenance on the Access screen.
+    direct: bool
+    created_at: datetime
+
+
+@router.get("/hosts/{host_id}/pin-details", response_model=list[HostPinDetail])
+async def list_host_browser_pin_details(
+    host_id: str,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> list[HostPinDetail]:
+    """Pin records with provenance, for the Access screen's host rows
+    (docs/TRUST_UX.md). Display data only — admission stays daemon-side.
+
+    Filtered through the same transitive-liveness computation the daemon pin
+    push uses: a raw row whose device (or whole endorsement subtree) is revoked
+    must not read as approved here — that is exactly the state the R5 sole-trust
+    warning has to see through (a host "pinned" by a live device plus a revoked
+    root is sole-trust, not doubly covered)."""
+
+    host = await session.get(Host, host_id)
+    if host is None or host.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="host not found")
+    live_ids = await live_browser_device_id_set(session, host_id)
+    rows = (
+        await session.execute(
+            select(
+                HostBrowserPin.browser_device_id,
+                HostBrowserPin.endorser_device_id,
+                HostBrowserPin.created_at,
+            )
+            .where(HostBrowserPin.host_id == host_id)
+            .order_by(HostBrowserPin.created_at)
+        )
+    ).all()
+    return [
+        HostPinDetail(
+            device_id=row.browser_device_id,
+            direct=row.endorser_device_id is None,
+            created_at=row.created_at,
+        )
+        for row in rows
+        if row.browser_device_id in live_ids
+    ]
 
 
 @router.get("/hosts/{host_id}/pins", response_model=list[str])
@@ -395,16 +694,13 @@ async def list_host_browser_pins(
     user: User = Depends(auth.current_user),
     session: AsyncSession = Depends(get_session),
 ) -> list[str]:
-    """Browser device IDs this host trusts, so the UI can offer to endorse the rest."""
+    """Browser device IDs this host trusts, so the UI can offer to endorse the rest.
+
+    Transitively-live pins only (the daemon's own computation): revoked devices
+    and dead endorsement subtrees are omitted, so the roster's advisory anchors
+    and the R5 sole-trust warning see what the daemon would actually admit."""
 
     host = await session.get(Host, host_id)
     if host is None or host.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="host not found")
-    rows = (
-        await session.execute(
-            select(HostBrowserPin.browser_device_id)
-            .where(HostBrowserPin.host_id == host_id)
-            .order_by(HostBrowserPin.browser_device_id)
-        )
-    ).scalars()
-    return list(rows)
+    return sorted(await live_browser_device_id_set(session, host_id))

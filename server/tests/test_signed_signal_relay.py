@@ -244,3 +244,109 @@ def test_redis_offer_and_answer_wrappers_preserve_exact_unicode_and_escapes():
     decoded_dispatch = decode_rtc_signal_dispatch(encode_rtc_signal_dispatch(dispatch))
     assert decoded_dispatch is not None
     assert decoded_dispatch.signal["signed_envelope"] == wire
+
+
+# ---------------------------------------------------------------------------
+# Carried endorsements (hardening B4): sanitizer alphabet + worst-case fit.
+# ---------------------------------------------------------------------------
+
+from spawn_server.ws.signed_signal_relay import (  # noqa: E402
+    _WORST_CARRIED_ENDORSEMENTS_BYTES,
+    CARRIED_ENDORSEMENTS_FIELD,
+    MAX_RELAYED_ENDORSEMENTS,
+    sanitize_carried_endorsements,
+)
+
+
+def _edge(**overrides: str) -> dict[str, str]:
+    edge = {
+        "account_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+        "endorser_public_key": "A" * 43,
+        "endorsed_public_key": "B" * 43,
+        "endorsed_device_id": "11111111-2222-4333-8444-555555555555",
+        "signature": "C" * 86,
+    }
+    edge.update(overrides)
+    return edge
+
+
+def test_sanitize_accepts_realistic_edges_and_bounds_count():
+    edges = [_edge() for _ in range(MAX_RELAYED_ENDORSEMENTS)]
+    assert sanitize_carried_endorsements(edges) == edges
+    assert sanitize_carried_endorsements(edges + [_edge()]) is None
+    assert sanitize_carried_endorsements([]) is None
+    assert sanitize_carried_endorsements("edges") is None
+    assert sanitize_carried_endorsements([_edge(), "edge"]) is None
+
+
+def test_sanitize_rejects_fields_outside_the_token_alphabet():
+    # The token alphabet is what makes the fit arithmetic honest: any character
+    # that JSON-escapes or encodes to more than one UTF-8 byte must be refused.
+    for bad in ['"', "\\", "\n", " ", "é", "\U0001f600", "a b", "="]:
+        assert sanitize_carried_endorsements([_edge(signature="C" * 10 + bad)]) is None
+    assert sanitize_carried_endorsements([_edge(signature="")]) is None
+    assert sanitize_carried_endorsements([_edge(signature="C" * 129)]) is None
+    assert sanitize_carried_endorsements([_edge(signature=42)]) is None  # type: ignore[arg-type]
+    missing = _edge()
+    del missing["signature"]
+    assert sanitize_carried_endorsements([missing]) is None
+
+
+def test_worst_case_carried_endorsements_arithmetic_is_exact_and_fits():
+    # Build the literal worst case the sanitizer can accept and measure it the
+    # way validate_signed_relay_container does. The module-load constant must
+    # be EXACTLY that measurement -- an overclaim wastes budget, an underclaim
+    # voids the fit proof.
+    worst_edges = [
+        {
+            "account_id": "a" * 128,
+            "endorser_public_key": "b" * 128,
+            "endorsed_public_key": "c" * 128,
+            "endorsed_device_id": "d" * 128,
+            "signature": "e" * 128,
+        }
+        for _ in range(MAX_RELAYED_ENDORSEMENTS)
+    ]
+    assert sanitize_carried_endorsements(worst_edges) == worst_edges
+    serialized = json.dumps(
+        {CARRIED_ENDORSEMENTS_FIELD: worst_edges},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    # The container serializes the whole routing dict; the module constant
+    # counts this field's contribution inside a larger object, i.e. a leading
+    # comma instead of the surrounding braces.
+    field_contribution = len(serialized) - 2 + 1
+    assert field_contribution == _WORST_CARRIED_ENDORSEMENTS_BYTES
+    assert _WORST_CARRIED_ENDORSEMENTS_BYTES + 8 * 1024 <= MAX_RTC_ROUTING_METADATA_BYTES
+
+
+def test_container_bound_admits_a_maximal_sanitized_offer():
+    envelope = _vector()
+    worst_edges = [
+        {
+            "account_id": "a" * 128,
+            "endorser_public_key": "b" * 128,
+            "endorsed_public_key": "c" * 128,
+            "endorsed_device_id": "d" * 128,
+            "signature": "e" * 128,
+        }
+        for _ in range(MAX_RELAYED_ENDORSEMENTS)
+    ]
+    frame = {
+        "type": "rtc.offer",
+        "session_id": envelope["session_id"],
+        "agent_id": envelope["scope_id"],
+        "binding_nonce": "b" * 32,
+        "binding_generation": 7,
+        "scope_type": "agent",
+        "scope_id": envelope["scope_id"],
+        "protocol": "spawn.pty",
+        "protocol_version": 2,
+        "signed_envelope": _wire(envelope),
+        CARRIED_ENDORSEMENTS_FIELD: worst_edges,
+    }
+    assert sanitize_carried_endorsements(worst_edges) == worst_edges
+    # Must not raise: the maximal sanitizer-accepted set fits the container
+    # bound with room for the rest of the routing metadata.
+    validate_signed_relay_container(frame)

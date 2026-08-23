@@ -1,5 +1,7 @@
 //! Clap derive structs for the `spawnd` CLI.
 
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -9,6 +11,13 @@ pub struct Cli {
     /// https://localhost:8000).
     #[arg(long, global = true, env = "SPAWN_SERVER_URL")]
     pub server: Option<String>,
+
+    /// Root directory for this instance's credentials and state (default: env
+    /// SPAWN_CONFIG_DIR or the platform config dir). Give each spawn user or
+    /// registration its own root to run fully isolated daemons side by side on
+    /// one host.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config_dir: Option<PathBuf>,
 
     /// Increase log verbosity (-v, -vv).
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
@@ -20,6 +29,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Register this host and run it in the background (idempotent). Runs the
+    /// login flow if needed, installs a supervised service, then detaches;
+    /// re-running an already-registered host just resumes it.
+    Possess(PossessArgs),
+    /// Authenticate, then stop and remove this host's spawn daemon.
+    Exorcise(ExorciseArgs),
     /// Interactive device-code flow; stores a long-lived daemon token.
     Login(LoginArgs),
     /// Foreground; connects WSS and services frames.
@@ -28,6 +43,21 @@ pub enum Command {
     Logout,
     /// Print credential state and redacted host/browser fingerprints.
     Status,
+}
+
+#[derive(Debug, Args)]
+pub struct PossessArgs {
+    /// Override the host name reported to the server (defaults to system
+    /// hostname).
+    #[arg(long)]
+    pub host_name: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ExorciseArgs {
+    /// Remove every spawn instance on this host, not just the selected one.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]

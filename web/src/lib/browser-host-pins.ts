@@ -93,14 +93,24 @@ export interface ApproveBrowserHostPinInput {
    * simply never presenting the key. Omit for a pure key approval.
    */
   readonly hostIds?: readonly string[];
+  /**
+   * Whether this approval may resurrect an exact revoked tombstone (default
+   * true — the hand-run possession ceremony's documented power). Introduction-
+   * driven callers (ceremony handover, continuous gossip) MUST pass false: a
+   * tombstone is the operator's targeted "removed here" statement, and a peer's
+   * broadcast row re-vouching the dead key must not quietly undo it — which
+   * would also re-wedge the re-key path by re-activating the stale binding.
+   */
+  readonly reactivateRevoked?: boolean;
 }
 
 export interface ResolveBrowserHostPinInput {
   readonly accountId: string;
   readonly origin: string;
   readonly hostId: string;
+  /** As claimed by the (untrusted) server Host API. Its fingerprint is always
+   * derived locally from this key (mesh B5) — never accepted as input. */
   readonly claimedHostPublicKey: string | null;
-  readonly claimedHostFingerprint: string | null;
 }
 
 export interface RevokeBrowserHostPinInput {
@@ -109,8 +119,9 @@ export interface RevokeBrowserHostPinInput {
   readonly targetHostId: string;
   /** Host ID returned by the Host API response for the route. */
   readonly claimedHostId: string;
+  /** As claimed by the (untrusted) server Host API. Its fingerprint is always
+   * derived locally from this key (mesh B5) — never accepted as input. */
   readonly claimedHostPublicKey: string | null;
-  readonly claimedHostFingerprint: string | null;
   readonly origin: string;
 }
 
@@ -328,6 +339,26 @@ function recordId(accountId: string, origin: string, hostPublicKey: string): str
   return JSON.stringify([accountId, origin, hostPublicKey]);
 }
 
+/**
+ * The identity a server-CLAIMED key resolves to. The fingerprint is always
+ * derived locally from the key (mesh B5): the server no longer serves one next
+ * to a key, and this module would not accept it as input if it did — a claimed
+ * fingerprint could otherwise become the comparison value a substituted key
+ * hides behind.
+ */
+async function claimedIdentity(hostPublicKey: string | null): Promise<StrictIdentity> {
+  if (hostPublicKey === null) {
+    throw new BrowserHostPinError("null_key", "the Host API did not provide a host public key");
+  }
+  let derived: string;
+  try {
+    derived = await ed25519PublicKeyFingerprint(hostPublicKey);
+  } catch {
+    throw new BrowserHostPinError("invalid_key", "the host public key is not strict Ed25519");
+  }
+  return { hostFingerprint: derived, hostPublicKey };
+}
+
 async function strictIdentity(
   hostPublicKey: string | null,
   hostFingerprint: string | null,
@@ -520,6 +551,11 @@ async function compareAndWrite<T>(
   database: IDBDatabase,
   mutate: (records: readonly StoredBrowserHostPinV1[]) => {
     readonly nextRecord?: StoredBrowserHostPinV1;
+    /** Additional records written in the SAME transaction (e.g. a routing
+     * binding migrating between two records must move atomically). */
+    readonly nextRecords?: readonly StoredBrowserHostPinV1[];
+    /** Records to DELETE outright (device-local forget). Applied before any put. */
+    readonly removeRecordIds?: readonly string[];
     readonly result: T;
   },
 ): Promise<T> {
@@ -553,8 +589,14 @@ async function compareAndWrite<T>(
         throw RETRY_COMPARE_WRITE;
       }
       const transition = mutate(validated);
+      for (const id of transition.removeRecordIds ?? []) {
+        await requestResult(store.delete(id));
+      }
       if (transition.nextRecord !== undefined) {
         await requestResult(store.put(transition.nextRecord));
+      }
+      for (const record of transition.nextRecords ?? []) {
+        await requestResult(store.put(record));
       }
       await completion;
       return transition.result;
@@ -656,6 +698,12 @@ export async function approveBrowserHostPin(
 
       const now = checkedNow(options);
       if (existing !== undefined) {
+        if (input.reactivateRevoked === false) {
+          throw new BrowserHostPinError(
+            "revoked_pin",
+            "this host key was removed on this device; only a fresh explicit ceremony reactivates it",
+          );
+        }
         const reactivated: StoredBrowserHostPinV1 = {
           ...existing,
           approvedAtMs: Math.max(now, existing.approvedAtMs, existing.revokedAtMs ?? 0),
@@ -693,8 +741,8 @@ export async function approveBrowserHostPin(
 
 /**
  * Resolve and bind routing metadata only after an exact active local key pin
- * matches. This never creates key trust, never reactivates, and never accepts a
- * Host API fingerprint as authority.
+ * matches. This never creates key trust, never reactivates, and never consults
+ * a Host API fingerprint — identity is the claimed key, locally fingerprinted.
  */
 export async function resolveActiveBrowserHostPin(
   input: ResolveBrowserHostPinInput,
@@ -702,7 +750,7 @@ export async function resolveActiveBrowserHostPin(
 ): Promise<string> {
   assertScope(input.accountId, input.origin);
   assertCanonicalUuid(input.hostId, "hostId");
-  const identity = await strictIdentity(input.claimedHostPublicKey, input.claimedHostFingerprint);
+  const identity = await claimedIdentity(input.claimedHostPublicKey);
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
@@ -710,6 +758,30 @@ export async function resolveActiveBrowserHostPin(
       const scoped = recordsInScope(records, input.accountId, input.origin);
       const bound = scoped.find((record) => record.hostIds.includes(input.hostId));
       if (bound !== undefined && bound.hostPublicKey !== identity.hostPublicKey) {
+        // Re-key un-wedge (review R-b): a binding held by a REVOKED record is
+        // routing metadata on trust the operator already withdrew here. When
+        // the claimed key is separately held as an ACTIVE pin — which only an
+        // explicit fresh ceremony or a firsthand-verified introduction can
+        // create — the legitimate remove-then-possess-again cycle is exactly
+        // what happened, and the binding migrates atomically to the approved
+        // key instead of conflicting forever. Deny-only is preserved: an
+        // ACTIVE old binding still hard-conflicts (the substitution signal),
+        // and a claimed key with no active pin still conflicts (a tombstoned
+        // hostId never re-binds on the server's say-so alone).
+        const activeExact = scoped.find(
+          (record) => record.hostPublicKey === identity.hostPublicKey && record.state === "active",
+        );
+        if (bound.state === "revoked" && activeExact !== undefined) {
+          const unbound: StoredBrowserHostPinV1 = {
+            ...bound,
+            hostIds: bound.hostIds.filter((id) => id !== input.hostId),
+          };
+          const rebound: StoredBrowserHostPinV1 = {
+            ...activeExact,
+            hostIds: mergeHostIds(activeExact.hostIds, [input.hostId]),
+          };
+          return { nextRecords: [unbound, rebound], result: rebound.hostPublicKey };
+        }
         throw new BrowserHostPinError(
           "host_id_key_conflict",
           "this Host ID is already bound to a different local key; explicit re-pair/rotation is required",
@@ -751,6 +823,14 @@ export async function resolveActiveBrowserHostPin(
  * target, Host response, and a binding established by an earlier explicit
  * resolver call must already agree exactly. A revoked exact binding remains
  * idempotently retryable after a server DELETE failure.
+ *
+ * The record revoked is the BOUND one — the local truth for this Host ID —
+ * even when the server now claims a different key (review R-b): removal is
+ * the explicit user intent to withdraw trust for exactly this host, it is
+ * deny-only (a tombstone can grant nothing), and blocking it would wedge the
+ * legitimate re-keyed-host cycle at its only safe exit (remove here, possess
+ * again from the terminal). The claimed key is still strictly validated, but
+ * it decides nothing about WHICH trust dies.
  */
 export async function revokeBrowserHostPin(
   input: RevokeBrowserHostPinInput,
@@ -765,7 +845,10 @@ export async function revokeBrowserHostPin(
       "the Host API response ID does not exactly match the route and DELETE target",
     );
   }
-  const identity = await strictIdentity(input.claimedHostPublicKey, input.claimedHostFingerprint);
+  // The claimed key is still strictly validated (a keyless or malformed Host
+  // API response never drives a deletion flow), but its VALUE no longer gates
+  // the tombstone — see the docstring.
+  await claimedIdentity(input.claimedHostPublicKey);
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
@@ -778,12 +861,10 @@ export async function revokeBrowserHostPin(
           "server deletion requires an existing exact local Host-ID-to-key binding",
         );
       }
-      if (bound.hostPublicKey !== identity.hostPublicKey) {
-        throw new BrowserHostPinError(
-          "host_id_key_conflict",
-          "this Host ID is bound to a different local key; deletion was blocked",
-        );
-      }
+      // A claimed key differing from the bound one is NOT a block: the server
+      // cannot veto a local trust withdrawal, and a re-keyed host would
+      // otherwise be unremovable from this browser forever. The bound record
+      // (the key this device actually approved for this Host ID) is what dies.
       if (bound.state === "revoked") return { result: publicPin(bound) };
       const now = checkedNow(options);
       const revoked: StoredBrowserHostPinV1 = {
@@ -792,6 +873,43 @@ export async function revokeBrowserHostPin(
         state: "revoked",
       };
       return { nextRecord: revoked, result: publicPin(revoked) };
+    });
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * Forget every ACTIVE pin in scope by DELETING the records outright — the
+ * device-local reset behind "Forget hosts on this device".
+ *
+ * Deletion (not tombstoning) is deliberate tombstone PROVENANCE (review P-C6):
+ * a retained `state: "revoked"` record means an operator's TARGETED host
+ * revocation — a statement about the HOST — which a bundle import must never
+ * resurrect and the signed-RTC gate must keep refusing. A forget is the
+ * opposite statement — "this DEVICE should remember nothing" — so the record
+ * disappears entirely and a later passkey import may re-pin the host as if
+ * first seen, instead of skipping it forever while the unlock claims the
+ * device "already knows" hosts it cannot reach. Targeted-revocation
+ * tombstones already in scope are retained untouched: a forget is a reset,
+ * not an amnesty for hosts the operator deliberately removed here.
+ */
+export async function forgetActiveBrowserHostPins(
+  input: { readonly accountId: string; readonly origin: string },
+  options: BrowserHostPinStorageOptions = {},
+): Promise<{ readonly forgotten: number }> {
+  assertScope(input.accountId, input.origin);
+  const factory = resolveIndexedDB(options);
+  const database = await openDatabase(factory);
+  try {
+    return await compareAndWrite(database, (records) => {
+      const active = recordsInScope(records, input.accountId, input.origin).filter(
+        (record) => record.state === "active",
+      );
+      return {
+        removeRecordIds: active.map((record) => record.recordId),
+        result: { forgotten: active.length },
+      };
     });
   } finally {
     database.close();

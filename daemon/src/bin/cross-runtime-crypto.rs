@@ -19,10 +19,14 @@ use spawnd::signed_signal_wire::{sign_rtc_signal_wire, verify_rtc_signal_wire, R
 use std::io::{self, Read};
 use uuid::Uuid;
 
-const BROWSER_REGISTRATION_MAGIC: &[u8] = b"SPAWN-BROWSER-REGISTER-V1";
+const BROWSER_REGISTRATION_MAGIC: &[u8] = b"SPAWN-BROWSER-REGISTER-V2";
+const BROWSER_REGISTRATION_VERSION: u8 = 2;
+// V2 flags byte, bit 0: the account-root claim, bound inside the signed
+// transcript so the server-stored `is_root` column is attested by the key
+// holder (security hardening B1).
+const BROWSER_REGISTRATION_FLAG_ROOT: u8 = 0x01;
 // The host-pair approval magic and layout now live in spawnd::host_pair_approval,
 // so this check exercises the production encoder instead of a private copy.
-const CONTRACT_VERSION: u8 = 1;
 const APPROVAL_NONCE_BYTES: usize = 32;
 const MAX_INPUT_BYTES: u64 = 4 * 1024 * 1024;
 const DTLS_FINGERPRINT: &str =
@@ -75,6 +79,7 @@ struct WireArtifact {
 struct RegistrationArtifact {
     user_id: String,
     browser_public_key: String,
+    is_root: bool,
     canonical_bytes: String,
     canonical_sha256: String,
     signature: String,
@@ -169,10 +174,16 @@ fn produce() -> Result<ExchangeArtifact> {
         .context("signing Rust live answer envelope")?;
 
     let user_id = Uuid::new_v4().to_string();
-    let registration_bytes = encode_browser_registration(&user_id, &browser_public_key)?;
+    // Rust produces the ordinary-device (is_root = false) variant; the WebCrypto
+    // producer emits the root-flagged one, so the exchange covers both flag
+    // values in both directions.
+    let registration_is_root = false;
+    let registration_bytes =
+        encode_browser_registration(&user_id, &browser_public_key, registration_is_root)?;
     let registration = RegistrationArtifact {
         user_id: user_id.clone(),
         browser_public_key: browser_public_key.clone(),
+        is_root: registration_is_root,
         canonical_bytes: canonical_wire(&registration_bytes),
         canonical_sha256: sha256_wire(&registration_bytes),
         signature: raw_signature_wire(&browser_key, &registration_bytes),
@@ -394,6 +405,7 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
     let registration_bytes = encode_browser_registration(
         &artifact.registration.user_id,
         &artifact.registration.browser_public_key,
+        artifact.registration.is_root,
     )?;
     verify_canonical(
         "browser registration",
@@ -407,6 +419,25 @@ fn verify(artifact: &ExchangeArtifact) -> Result<()> {
         &artifact.registration.signature,
         "browser registration",
     )?;
+    // B1: flipping the root flag must change the transcript and break the proof.
+    let flipped_bytes = encode_browser_registration(
+        &artifact.registration.user_id,
+        &artifact.registration.browser_public_key,
+        !artifact.registration.is_root,
+    )?;
+    if flipped_bytes == registration_bytes {
+        bail!("browser registration transcript ignores the root flag");
+    }
+    if verify_raw_signature(
+        &browser_key,
+        &flipped_bytes,
+        &artifact.registration.signature,
+        "browser registration",
+    )
+    .is_ok()
+    {
+        bail!("browser registration proof verified with a flipped root flag");
+    }
 
     require_equal(
         "host-pair user",
@@ -466,14 +497,19 @@ fn signal_transcript(
     .context("constructing WebCrypto signed-signal transcript in Rust")
 }
 
-fn encode_browser_registration(user_id: &str, browser_public_key: &str) -> Result<Vec<u8>> {
+fn encode_browser_registration(
+    user_id: &str,
+    browser_public_key: &str,
+    is_root: bool,
+) -> Result<Vec<u8>> {
     let user_id = canonical_uuid_bytes(user_id)?;
     let browser_key = public_key_from_wire(browser_public_key)
         .context("validating browser registration public key")?;
-    let mut output = Vec::with_capacity(BROWSER_REGISTRATION_MAGIC.len() + 1 + 16 + 32);
+    let mut output = Vec::with_capacity(BROWSER_REGISTRATION_MAGIC.len() + 1 + 16 + 1 + 32);
     output.extend_from_slice(BROWSER_REGISTRATION_MAGIC);
-    output.push(CONTRACT_VERSION);
+    output.push(BROWSER_REGISTRATION_VERSION);
     output.extend_from_slice(&user_id);
+    output.push(if is_root { BROWSER_REGISTRATION_FLAG_ROOT } else { 0 });
     output.extend_from_slice(browser_key.as_bytes());
     Ok(output)
 }

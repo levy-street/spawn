@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { CarriedEndorsement } from "@/lib/hostControl";
 import {
   DirectSessionUploadError,
   decodeSessionCtlChunk,
@@ -52,6 +53,9 @@ export interface UseSessionSocketOptions {
    * signaling, may use raw (unpinned TOFU first-contact), or must be refused.
    * Absence keeps every generation unsigned. */
   resolveSignedRtcTrust?: () => Promise<SignedRtcTrustDecision>;
+  /** Account endorsement edges to carry on the offer so a daemon that does not
+   * directly pin this browser can admit it via a chain to an anchor (§3). */
+  loadCarriedEndorsements?: () => Promise<CarriedEndorsement[]>;
   initialSize?: { cols: number; rows: number } | null;
   /** dcOffsetAfter is the cumulative DataChannel byte count including this
    *  chunk; every terminal byte arrives over the DataChannel. */
@@ -178,6 +182,7 @@ export function useSessionSocket({
   sessionId,
   enabled = true,
   resolveSignedRtcTrust,
+  loadCarriedEndorsements,
   initialSize = null,
   onData,
   onHistory,
@@ -253,6 +258,8 @@ export function useSessionSocket({
   // must inform the NEXT offer, not tear down a live connection.
   const resolveSignedRtcTrustRef = useRef(resolveSignedRtcTrust);
   resolveSignedRtcTrustRef.current = resolveSignedRtcTrust;
+  const loadCarriedEndorsementsRef = useRef(loadCarriedEndorsements);
+  loadCarriedEndorsementsRef.current = loadCarriedEndorsements;
   const initialSizeRef = useRef(initialSize);
   const handlersRef = useRef({
     sessionId,
@@ -1220,16 +1227,30 @@ export function useSessionSocket({
           ? await nextSignedRtcSession.createOffer(offer.sdp ?? "")
           : { sdp: offer.sdp };
         if (!isCurrentRtcGeneration()) return;
+        // A device the host does not directly pin carries its account endorsement
+        // edges so the daemon can admit it via a chain to an anchor (§3).
+        // Best-effort: on failure the offer still goes and a directly-pinned
+        // device is admitted exactly as before.
+        let carried: CarriedEndorsement[] = [];
+        const loadCarried = loadCarriedEndorsementsRef.current;
+        if (nextSignedRtcSession && loadCarried) {
+          try {
+            carried = await loadCarried();
+          } catch {
+            carried = [];
+          }
+          if (!isCurrentRtcGeneration()) return;
+        }
         signedRtcSession = nextSignedRtcSession;
-        if (
-          !sendJsonOverWs({
-            type: "rtc.offer",
-            session_id: rtcSessionId,
-            binding_nonce: bindingNonce,
-            ...boundSessionRtcTuple,
-            ...carrier,
-          })
-        ) {
+        const offerFrame: Record<string, unknown> = {
+          type: "rtc.offer",
+          session_id: rtcSessionId,
+          binding_nonce: bindingNonce,
+          ...boundSessionRtcTuple,
+          ...carrier,
+        };
+        if (carried.length > 0) offerFrame.carried_endorsements = carried;
+        if (!sendJsonOverWs(offerFrame)) {
           cleanupRtc(false, false, rtcGeneration);
           return;
         }

@@ -337,6 +337,15 @@ at L1+.
 `spawnd login` terminal ceremony is the only root of trust — which was never
 argued for, it was simply the first thing built.
 
+> **Update 2026-08-20:** the device trust mesh
+> ([TRUST_DEVICE_MESH.md](./TRUST_DEVICE_MESH.md)) supersedes the mechanics
+> below in part. "Both required" no longer means two user actions: a passkey
+> unlock now *produces* the endorsement automatically (the account root
+> endorses the device during the heal), so unlocking the bundle is sufficient
+> on its own — the failure mode this ADR observed (a bundle-holding device the
+> daemon rejects) can no longer occur on chain-capable hosts. The two-direction
+> analysis and the reasons TOFU/enforcement are gated remain correct.
+
 ### The constraint
 
 Exactly one combination is impossible, and it is impossible for an
@@ -793,6 +802,14 @@ on the control plane. Signaling remains vulnerable to active MITM until Phase
   if real-world failure rates justify it.
 
 ## Bidirectional device approval (2026-08-06)
+
+> **Update 2026-08-20:** superseded for chain-capable hosts by the device
+> trust mesh ([TRUST_DEVICE_MESH.md](./TRUST_DEVICE_MESH.md)): device
+> admission is account-scoped (one SAS ceremony, every host) and the per-host
+> endorsement below is refused by such hosts (mesh R9), surviving only as the
+> root anchor-upgrade statement and for legacy hosts. The introduction
+> mechanism below remains the no-passkey path for host-key delivery on legacy
+> fleets (mesh R7 covers its future).
 
 Endorsement admits a new browser to a host: a trusted browser signs a
 transcript covering (account, host key, endorser key, endorsed key, endorsed

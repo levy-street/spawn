@@ -180,41 +180,59 @@ done
 printf 'remote deploy: complete\n'
 REMOTE
 
-# Publish macOS prebuilt daemon binaries to the host. This Linux host can't
-# build Darwin, so CI builds them; we pull the checksummed `prebuilt-latest`
-# release HERE — the deploy invoker is already GitHub-authed, so prod needs no
-# gh/token — and scp them into the server's prebuilt dir. Best-effort: a miss
-# leaves the from-source fallback intact (and the server reads prebuilts live,
-# so no restart is needed).
-publish_darwin_prebuilts() {
+# Publish CI-built prebuilt daemon binaries to the host. Every supported target
+# is built + checksummed by CI (.github/workflows/prebuilt.yml) into the rolling
+# `prebuilt-latest` release; we pull it HERE — the deploy invoker is already
+# GitHub-authed, so prod needs no gh/token — verify it against SHA256SUMS, and
+# scp the bytes into the server's prebuilt dir. The server serves prebuilts over
+# the source-build fallback, so what CI built is exactly what prod hands out
+# (verify with scripts/verify-prebuilts.sh). Best-effort: a miss leaves the
+# from-source fallback intact, and the server reads prebuilts live (no restart).
+#
+# Map of install.py's friendly target name -> release-asset triple. The prebuilt
+# dir uses the friendly name; the release assets use the triple.
+PREBUILT_TARGETS=(
+  "darwin-aarch64:aarch64-apple-darwin"
+  "darwin-x86_64:x86_64-apple-darwin"
+  "linux-x86_64:x86_64-unknown-linux-gnu"
+  "linux-aarch64:aarch64-unknown-linux-gnu"
+)
+publish_prebuilts() {
+  if [[ "${SPAWN_DEPLOY_PREBUILTS:-1}" != "1" ]]; then
+    printf 'deploy-prod: prebuilt publish disabled (SPAWN_DEPLOY_PREBUILTS=0)\n'
+    return 0
+  fi
   command -v gh >/dev/null 2>&1 || {
-    printf 'deploy-prod: gh not found locally; skipping darwin prebuilt publish\n'
+    printf 'deploy-prod: gh not found locally; skipping prebuilt publish\n'
     return 0
   }
   local tmp
   tmp="$(mktemp -d)"
   if ! gh release download prebuilt-latest --repo levy-street/spawn --dir "$tmp" --clobber >/dev/null 2>&1; then
-    printf 'deploy-prod: no prebuilt-latest release; skipping darwin prebuilt publish\n'
+    printf 'deploy-prod: no prebuilt-latest release; skipping prebuilt publish\n'
     rm -rf "$tmp"
     return 0
   fi
   if ! (cd "$tmp" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
-    printf 'deploy-prod: darwin prebuilt checksum verification failed; not publishing\n' >&2
+    printf 'deploy-prod: prebuilt checksum verification failed; not publishing\n' >&2
     rm -rf "$tmp"
     return 0
   fi
-  local arch triple dest
-  for arch in aarch64 x86_64; do
-    triple="$arch-apple-darwin"
-    dest="$remote_path/daemon/target/prebuilt/darwin-$arch"
+  local pair target triple dest
+  for pair in "${PREBUILT_TARGETS[@]}"; do
+    target="${pair%%:*}"
+    triple="${pair##*:}"
+    dest="$remote_path/daemon/target/prebuilt/$target"
     if [[ -f "$tmp/spawnd-$triple" && -f "$tmp/spawn-worker-$triple" ]]; then
       ssh "$host" "mkdir -p '$dest'"
       scp -q "$tmp/spawnd-$triple" "$host:$dest/spawnd"
       scp -q "$tmp/spawn-worker-$triple" "$host:$dest/spawn-worker"
       ssh "$host" "chmod 755 '$dest/spawnd' '$dest/spawn-worker'"
-      printf 'deploy-prod: published darwin-%s prebuilt to %s\n' "$arch" "$host"
+      printf 'deploy-prod: published %s prebuilt to %s\n' "$target" "$host"
+    else
+      printf 'deploy-prod: no %s binaries in prebuilt-latest; skipping\n' "$target"
     fi
   done
   rm -rf "$tmp"
 }
-publish_darwin_prebuilts || true
+publish_prebuilts || true

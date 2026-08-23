@@ -1,0 +1,545 @@
+import { beforeAll, describe, expect, test } from "bun:test";
+import {
+  AccountHealError,
+  assessSealedRootRevocation,
+  planAccountHeal,
+  selectSealedRootRowForRevocation,
+} from "./account-heal";
+import { encodeAcctEndorsementTranscript } from "./acct-endorsement-transcript";
+import { encodeBase64Url } from "./signed-signal";
+
+const ACCOUNT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const uuid = (n: number) => `00000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
+
+const ROOT_ID = uuid(1);
+const SELF_ID = uuid(2);
+const LAPTOP_ID = uuid(3);
+const PHONE_ID = uuid(4);
+const ROGUE_ID = uuid(5);
+const DEAD_ID = uuid(6);
+const ORPHAN_ID = uuid(7);
+
+/** A device identity that can sign real endorsement transcripts. */
+interface Signer {
+  pk: string;
+  key: CryptoKey;
+}
+
+async function makeSigner(): Promise<Signer> {
+  const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  return { pk: encodeBase64Url(raw), key: pair.privateKey };
+}
+
+/** A GENUINE edge: the endorser really signed the daemon's admission transcript. */
+async function signedEdge(
+  endorser: Signer,
+  endorserDeviceId: string,
+  endorsedPk: string,
+  endorsedDeviceId: string,
+) {
+  const transcript = encodeAcctEndorsementTranscript(
+    ACCOUNT_ID,
+    endorser.pk,
+    endorsedPk,
+    endorsedDeviceId,
+  );
+  const owned = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(owned).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, endorser.key, owned),
+  );
+  return {
+    endorser_device_id: endorserDeviceId,
+    endorser_public_key: endorser.pk,
+    endorsed_device_id: endorsedDeviceId,
+    endorsed_public_key: endorsedPk,
+    signature: encodeBase64Url(signature),
+  };
+}
+
+/** A FORGED edge: well-formed fields, but a signature nobody produced. */
+function forgedEdge(
+  endorserPk: string,
+  endorserDeviceId: string,
+  endorsedPk: string,
+  endorsedDeviceId: string,
+) {
+  return {
+    endorser_device_id: endorserDeviceId,
+    endorser_public_key: endorserPk,
+    endorsed_device_id: endorsedDeviceId,
+    endorsed_public_key: endorsedPk,
+    signature: encodeBase64Url(new Uint8Array(64)),
+  };
+}
+
+function device(id: string, publicKey: string, opts: { revoked?: boolean; isRoot?: boolean } = {}) {
+  return {
+    id,
+    public_key: publicKey,
+    revoked_at: opts.revoked ? "2026-08-20T00:00:00Z" : null,
+    is_root: opts.isRoot ?? false,
+  };
+}
+
+let root: Signer;
+let self: Signer;
+let laptop: Signer;
+let phone: Signer;
+let rogue: Signer;
+let dead: Signer;
+let orphan: Signer;
+let attacker: Signer;
+
+beforeAll(async () => {
+  [root, self, laptop, phone, rogue, dead, orphan, attacker] = await Promise.all([
+    makeSigner(),
+    makeSigner(),
+    makeSigner(),
+    makeSigner(),
+    makeSigner(),
+    makeSigner(),
+    makeSigner(),
+    makeSigner(),
+  ]);
+});
+
+describe("planAccountHeal", () => {
+  test("plans R→d along the verified chain; skips endorsed, revoked, and the root", async () => {
+    const devices = [
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(LAPTOP_ID, laptop.pk),
+      device(PHONE_ID, phone.pk),
+      device(DEAD_ID, dead.pk, { revoked: true }),
+    ];
+    const edges = [
+      await signedEdge(root, ROOT_ID, laptop.pk, LAPTOP_ID), // laptop already root-endorsed
+      await signedEdge(laptop, LAPTOP_ID, phone.pk, PHONE_ID), // phone ceremony-admitted
+    ];
+    const plan = await planAccountHeal(ACCOUNT_ID, root.pk, null, devices, edges);
+    expect(plan.rootDevice?.id).toBe(ROOT_ID);
+    expect(plan.devicesToEndorse.map((d) => d.id)).toEqual([PHONE_ID]);
+  });
+
+  test("C1 regression: a waiting/injected device (no verified edges) is never endorsed", async () => {
+    // The original attack: the server fabricates a device row (or a real
+    // sign-in sits unapproved) and waits for the victim's next passkey moment.
+    // The heal must not sign R→that_device — full-mesh access with no ceremony.
+    const devices = [
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(SELF_ID, self.pk), // the device performing this heal
+      device(LAPTOP_ID, laptop.pk), // ceremony-admitted: self endorsed it
+      device(ROGUE_ID, rogue.pk), // server-claimed row, nothing behind it
+    ];
+    const edges = [await signedEdge(self, SELF_ID, laptop.pk, LAPTOP_ID)];
+    const plan = await planAccountHeal(ACCOUNT_ID, root.pk, self.pk, devices, edges);
+    expect(plan.devicesToEndorse.map((d) => d.id).sort()).toEqual([SELF_ID, LAPTOP_ID].sort());
+  });
+
+  test("VECTOR A regression: forged or attacker-signed edges create no reachability", async () => {
+    // (a1) a fabricated edge claiming the real root key with a bogus signature;
+    // (a2) an edge with a VALID signature under the attacker's own key that
+    //      name-drops a genuinely trusted device's id as endorser. The walk is
+    //      over keys, so neither fires: a1 fails verification, a2 verifies but
+    //      the attacker's key is outside the trusted graph.
+    const devices = [
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(LAPTOP_ID, laptop.pk),
+      device(ROGUE_ID, rogue.pk),
+    ];
+    const edges = [
+      await signedEdge(root, ROOT_ID, laptop.pk, LAPTOP_ID), // laptop genuinely trusted
+      forgedEdge(root.pk, ROOT_ID, rogue.pk, ROGUE_ID), // a1
+      await signedEdge(attacker, LAPTOP_ID, rogue.pk, ROGUE_ID), // a2: claims laptop's id
+    ];
+    const plan = await planAccountHeal(ACCOUNT_ID, root.pk, null, devices, edges);
+    expect(plan.devicesToEndorse.map((d) => d.id)).not.toContain(ROGUE_ID);
+    expect(plan.devicesToEndorse).toEqual([]); // laptop is already root-endorsed
+  });
+
+  test("VECTOR B regression: server pin-membership claims are not an anchor", async () => {
+    // Pin membership is no longer an input to selection AT ALL: the planner's
+    // only anchors are the sealed root and this device's own key. A rogue row
+    // the server claims is "pinned somewhere" stays out; so does a legitimate
+    // pin-only sibling with no edges — it heals itself at its own passkey
+    // unlock (TRUST_UX "additional device, passkey"), never via server say-so.
+    const devices = [
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(SELF_ID, self.pk),
+      device(LAPTOP_ID, laptop.pk), // pin-only sibling, no edges
+      device(ROGUE_ID, rogue.pk), // rogue "pinned" per the server
+    ];
+    const plan = await planAccountHeal(ACCOUNT_ID, root.pk, self.pk, devices, []);
+    expect(plan.devicesToEndorse.map((d) => d.id)).toEqual([SELF_ID]);
+  });
+
+  test("a verified edge from a revoked device grants no reachability", async () => {
+    // dead was even root-endorsed once; revocation removes its key from the
+    // walk, so its (genuine) endorsement of orphan no longer carries.
+    const devices = [
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(DEAD_ID, dead.pk, { revoked: true }),
+      device(ORPHAN_ID, orphan.pk),
+    ];
+    const edges = [
+      await signedEdge(root, ROOT_ID, dead.pk, DEAD_ID),
+      await signedEdge(dead, DEAD_ID, orphan.pk, ORPHAN_ID),
+    ];
+    const plan = await planAccountHeal(ACCOUNT_ID, root.pk, null, devices, edges);
+    expect(plan.devicesToEndorse).toEqual([]);
+  });
+
+  test("the device performing the heal is endorsed with no edges at all (passkey recovery)", async () => {
+    // TRUST_UX "additional device, passkey" / recovery after total loss: the
+    // fresh device that just proved the passkey is the one seed known
+    // firsthand besides the root, so the heal may re-admit it — and only it.
+    const devices = [
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(SELF_ID, self.pk),
+      device(ROGUE_ID, rogue.pk),
+    ];
+    const plan = await planAccountHeal(ACCOUNT_ID, root.pk, self.pk, devices, []);
+    expect(plan.currentDevice?.id).toBe(SELF_ID);
+    expect(plan.devicesToEndorse.map((d) => d.id)).toEqual([SELF_ID]);
+  });
+
+  test("a revoked row matching this device's key is not resurrected as self", async () => {
+    const devices = [
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(SELF_ID, self.pk, { revoked: true }),
+    ];
+    const plan = await planAccountHeal(ACCOUNT_ID, root.pk, self.pk, devices, []);
+    expect(plan.currentDevice).toBeNull();
+    expect(plan.devicesToEndorse).toEqual([]);
+  });
+
+  test("a server root that differs from the sealed root aborts the heal", async () => {
+    // The bundle is the authority on pk_R: a substituted is_root row must never
+    // be endorsed or anchored.
+    const devices = [device(ROGUE_ID, rogue.pk, { isRoot: true })];
+    expect(planAccountHeal(ACCOUNT_ID, root.pk, null, devices, [])).rejects.toThrow(
+      AccountHealError,
+    );
+    try {
+      await planAccountHeal(ACCOUNT_ID, root.pk, null, devices, []);
+      throw new Error("expected root_conflict");
+    } catch (error) {
+      expect((error as AccountHealError).code).toBe("root_conflict");
+    }
+  });
+
+  test("a SECOND live is_root row with a different key also aborts", async () => {
+    // Any live is_root row is an authority claim; one matching row must not
+    // launder an additional, never-minted root past the provenance check.
+    const devices = [
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(ROGUE_ID, rogue.pk, { isRoot: true }),
+      device(LAPTOP_ID, laptop.pk),
+    ];
+    expect(
+      planAccountHeal(ACCOUNT_ID, root.pk, null, devices, [
+        await signedEdge(rogue, ROGUE_ID, laptop.pk, LAPTOP_ID),
+      ]),
+    ).rejects.toThrow(AccountHealError);
+  });
+
+  test("a REVOKED conflicting root does not block a fresh one", async () => {
+    // Root rotation: the old root's tombstone stays; the new root heals.
+    const devices = [
+      device(uuid(8), rogue.pk, { isRoot: true, revoked: true }),
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(SELF_ID, self.pk),
+    ];
+    const plan = await planAccountHeal(ACCOUNT_ID, root.pk, self.pk, devices, []);
+    expect(plan.rootDevice?.id).toBe(ROOT_ID);
+    expect(plan.devicesToEndorse.map((d) => d.id)).toEqual([SELF_ID]);
+  });
+
+  test("no registered root yields an empty plan, not an error", async () => {
+    const plan = await planAccountHeal(
+      ACCOUNT_ID,
+      root.pk,
+      self.pk,
+      [device(SELF_ID, self.pk)],
+      [],
+    );
+    expect(plan.rootDevice).toBeNull();
+    expect(plan.devicesToEndorse).toEqual([]);
+  });
+
+  test("edges from other endorsers do not count as root endorsements", async () => {
+    // A verified self→laptop edge makes laptop reachable, but only a VERIFIED
+    // root edge marks a device as already covered — so both still get R→d.
+    const devices = [
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(SELF_ID, self.pk),
+      device(LAPTOP_ID, laptop.pk),
+    ];
+    const edges = [await signedEdge(self, SELF_ID, laptop.pk, LAPTOP_ID)];
+    const plan = await planAccountHeal(ACCOUNT_ID, root.pk, self.pk, devices, edges);
+    expect(plan.devicesToEndorse.map((d) => d.id).sort()).toEqual([SELF_ID, LAPTOP_ID].sort());
+  });
+
+  test("a forged R→d row cannot suppress a legitimate re-endorsement", async () => {
+    // Availability twin of vector A: the server plants a bogus "root already
+    // endorsed laptop" row to keep laptop off the star. Only verified root
+    // edges count as coverage, so laptop is healed anyway.
+    const devices = [
+      device(ROOT_ID, root.pk, { isRoot: true }),
+      device(SELF_ID, self.pk),
+      device(LAPTOP_ID, laptop.pk),
+    ];
+    const edges = [
+      await signedEdge(self, SELF_ID, laptop.pk, LAPTOP_ID),
+      forgedEdge(root.pk, ROOT_ID, laptop.pk, LAPTOP_ID),
+    ];
+    const plan = await planAccountHeal(ACCOUNT_ID, root.pk, self.pk, devices, edges);
+    expect(plan.devicesToEndorse.map((d) => d.id).sort()).toEqual([SELF_ID, LAPTOP_ID].sort());
+  });
+});
+
+describe("assessSealedRootRevocation (hardening B2): rotation needs corroboration", () => {
+  const SEALED_PK = "R".repeat(43);
+  const OTHER_PK = "X".repeat(43);
+
+  test("a bare roster claim — the fabricated-rotation server response — is uncorroborated", () => {
+    const devices = [device(ROOT_ID, SEALED_PK, { isRoot: true, revoked: true })];
+    expect(assessSealedRootRevocation(SEALED_PK, devices, [])).toBe("uncorroborated");
+  });
+
+  test("a bare tombstone with no roster row is equally insufficient", () => {
+    expect(assessSealedRootRevocation(SEALED_PK, [], [SEALED_PK])).toBe("uncorroborated");
+  });
+
+  test("roster row AND permanent tombstone together corroborate the revocation", () => {
+    const devices = [device(ROOT_ID, SEALED_PK, { isRoot: true, revoked: true })];
+    expect(assessSealedRootRevocation(SEALED_PK, devices, [SEALED_PK])).toBe("revoked");
+  });
+
+  test("no claim anywhere means the sealed root is live", () => {
+    const devices = [device(ROOT_ID, SEALED_PK, { isRoot: true })];
+    expect(assessSealedRootRevocation(SEALED_PK, devices, [])).toBe("live");
+  });
+
+  test("claims about OTHER keys never implicate the sealed root", () => {
+    // A revoked sibling device and its tombstone are normal account history;
+    // the revoked_at-bearing row must carry the sealed root's exact key.
+    const devices = [
+      device(ROOT_ID, SEALED_PK, { isRoot: true }),
+      device(LAPTOP_ID, OTHER_PK, { revoked: true }),
+    ];
+    expect(assessSealedRootRevocation(SEALED_PK, devices, [OTHER_PK])).toBe("live");
+  });
+
+  test("the roster row corroborates by KEY, not by is_root labeling", () => {
+    // Even a non-root row wearing the sealed key counts as the roster half —
+    // the key is the identity; the label is server-editable display data.
+    const devices = [device(LAPTOP_ID, SEALED_PK, { revoked: true })];
+    expect(assessSealedRootRevocation(SEALED_PK, devices, [SEALED_PK])).toBe("revoked");
+  });
+});
+
+describe("selectSealedRootRowForRevocation (hardening B3): firsthand pk_R chooses", () => {
+  const SEALED_PK = "R".repeat(43);
+  const IMPOSTOR_PK = "X".repeat(43);
+
+  test("revokes exactly the live row carrying the sealed root's key", () => {
+    const devices = [device(LAPTOP_ID, IMPOSTOR_PK), device(ROOT_ID, SEALED_PK, { isRoot: true })];
+    expect(selectSealedRootRowForRevocation(SEALED_PK, devices)).toEqual({
+      row: { id: ROOT_ID, public_key: SEALED_PK },
+      reason: null,
+    });
+  });
+
+  test("a mismatched server-labeled root is skipped loudly, never revoked on its word", () => {
+    const devices = [device(ROOT_ID, IMPOSTOR_PK, { isRoot: true })];
+    const result = selectSealedRootRowForRevocation(SEALED_PK, devices);
+    expect(result.row).toBeNull();
+    expect(result.reason).toContain("does not match");
+  });
+
+  test("no live root row means nothing to revoke, quietly", () => {
+    expect(selectSealedRootRowForRevocation(SEALED_PK, [device(LAPTOP_ID, IMPOSTOR_PK)])).toEqual({
+      row: null,
+      reason: null,
+    });
+    // An already-revoked root row is history, not a live endorser.
+    expect(
+      selectSealedRootRowForRevocation(SEALED_PK, [
+        device(ROOT_ID, SEALED_PK, { isRoot: true, revoked: true }),
+      ]),
+    ).toEqual({ row: null, reason: null });
+  });
+
+  test("with no firsthand pk_R, a server-listed root is skipped loudly", () => {
+    const result = selectSealedRootRowForRevocation(null, [
+      device(ROOT_ID, IMPOSTOR_PK, { isRoot: true }),
+    ]);
+    expect(result.row).toBeNull();
+    expect(result.reason).toContain("holds none");
+  });
+
+  test("with no firsthand pk_R and no server root, there is nothing to do", () => {
+    expect(selectSealedRootRowForRevocation(null, [])).toEqual({ row: null, reason: null });
+  });
+
+  test("the sealed key must match a row marked live AND root — plain devices stay untouched", () => {
+    // A live NON-root row wearing pk_R would be server mischief; this flow only
+    // ever revokes a row the server itself presents as the live root.
+    const result = selectSealedRootRowForRevocation(SEALED_PK, [device(LAPTOP_ID, SEALED_PK)]);
+    expect(result).toEqual({ row: null, reason: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// healAccount execution: per-statement isolation and the per-id report (P-C2/3)
+// ---------------------------------------------------------------------------
+
+import { IDBFactory } from "fake-indexeddb";
+import { type AccountHealIo, healAccount, unionHealHosts } from "./account-heal";
+import { generateAccountRoot } from "./account-root";
+import { loadOrCreateBrowserDeviceIdentity } from "./browser-device-identity";
+
+const HOST_1 = uuid(0x11);
+const HOST_2 = uuid(0x12);
+const HOST_KEY_1 = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
+const HOST_KEY_2 = "11qYAYdk9Jt0uvL7Tp_5eQK8heP0LOEYVVt4dSK3M3A";
+
+/**
+ * A fake heal I/O: a roster of {root, self, laptop, phone}, no prior edges,
+ * per-call failure injection, and a second listEdges() that serves back the
+ * genuinely-signed R→d edges the heal stored — so the post-heal R→SELF check
+ * verifies real signatures, not bookkeeping.
+ */
+function makeHealIo(input: {
+  rootPk: string;
+  selfPk: string;
+  devices: { id: string; public_key: string; revoked_at: string | null; is_root: boolean }[];
+  failEndorsementFor?: string[];
+  failEndorseHostIds?: string[];
+}) {
+  const stored: { endorsed_device_id: string; signature: string }[] = [];
+  const endorseCalls: { host_id: string; endorsed_device_id: string }[] = [];
+  const pkById = new Map(input.devices.map((d) => [d.id, d.public_key]));
+  const io: AccountHealIo = {
+    listDevices: async () => input.devices,
+    listEdges: async () =>
+      stored.map((row) => ({
+        endorser_device_id: uuid(1),
+        endorser_public_key: input.rootPk,
+        endorsed_device_id: row.endorsed_device_id,
+        endorsed_public_key: pkById.get(row.endorsed_device_id) as string,
+        signature: row.signature,
+      })),
+    createAccountEndorsement: async (body) => {
+      if (input.failEndorsementFor?.includes(body.endorsed_device_id)) {
+        throw new Error("injected endorsement failure");
+      }
+      stored.push({ endorsed_device_id: body.endorsed_device_id, signature: body.signature });
+      return {};
+    },
+    endorse: async (body) => {
+      if (input.failEndorseHostIds?.includes(body.host_id)) {
+        throw new Error("the endorsing device is not trusted by this host");
+      }
+      endorseCalls.push({ host_id: body.host_id, endorsed_device_id: body.endorsed_device_id });
+      return {};
+    },
+  };
+  return { io, stored, endorseCalls };
+}
+
+describe("healAccount (execution half, injected I/O)", () => {
+  async function fixture(opts: { failEndorsementFor?: string[]; failEndorseHostIds?: string[] }) {
+    const accountRoot = await generateAccountRoot();
+    const identity = await loadOrCreateBrowserDeviceIdentity(ACCOUNT_ID, {
+      indexedDBFactory: new IDBFactory(),
+    });
+    const devices = [
+      device(ROOT_ID, accountRoot.publicKeyWire, { isRoot: true }),
+      device(SELF_ID, identity.publicKeyWire),
+      device(LAPTOP_ID, laptop.pk),
+    ];
+    const made = makeHealIo({
+      rootPk: accountRoot.publicKeyWire,
+      selfPk: identity.publicKeyWire,
+      devices,
+      ...opts,
+    });
+    return { accountRoot, identity, ...made };
+  }
+
+  const hosts = [
+    { hostPublicKey: HOST_KEY_1, hostFingerprint: "f1", hostIds: [HOST_1] },
+    { hostPublicKey: HOST_KEY_2, hostFingerprint: "f2", hostIds: [HOST_2] },
+  ];
+
+  test("one failed R→d endorsement neither stops the loop nor skips the anchors", async () => {
+    // LAPTOP has no verified chain in this fixture, so only SELF is planned;
+    // fail SELF's endorsement and prove the anchor half still ran in full.
+    const { accountRoot, identity, io, endorseCalls } = await fixture({
+      failEndorsementFor: [SELF_ID],
+    });
+    const report = await healAccount(accountRoot, ACCOUNT_ID, identity, hosts, io);
+    expect(report.failedEndorsementDeviceIds).toEqual([SELF_ID]);
+    expect(report.endorsedDeviceIds).toEqual([]);
+    // The anchor loop ALWAYS runs (P-C2): both hosts were attempted.
+    expect(endorseCalls.map((c) => c.host_id).sort()).toEqual([HOST_1, HOST_2].sort());
+    expect([...report.upgradedHostIds].sort()).toEqual([HOST_1, HOST_2].sort());
+    // And the honesty flag reflects the failure: no verified R→self edge.
+    expect(report.rootEndorsedSelf).toBe(false);
+  });
+
+  test("per-host report: refused hosts carry their reason; upgraded carry their id", async () => {
+    const { accountRoot, identity, io } = await fixture({ failEndorseHostIds: [HOST_2] });
+    const report = await healAccount(accountRoot, ACCOUNT_ID, identity, hosts, io);
+    expect(report.upgradedHostIds).toEqual([HOST_1]);
+    expect(report.refusedHosts).toEqual([
+      { hostId: HOST_2, reason: "the endorsing device is not trusted by this host" },
+    ]);
+    // The endorsement half succeeded, so this device is verifiably approved.
+    expect(report.endorsedDeviceIds).toEqual([SELF_ID]);
+    expect(report.rootEndorsedSelf).toBe(true);
+  });
+
+  test("rootEndorsedSelf verifies the FETCHED edge's signature, not bookkeeping", async () => {
+    // A server that answers 200 but stores a corrupted edge must read false.
+    const { accountRoot, identity, io, stored } = await fixture({});
+    const originalCreate = io.createAccountEndorsement;
+    io.createAccountEndorsement = async (body) => {
+      await originalCreate(body);
+      stored[stored.length - 1] = {
+        ...stored[stored.length - 1],
+        signature: encodeBase64Url(new Uint8Array(64)),
+      };
+      return {};
+    };
+    const report = await healAccount(accountRoot, ACCOUNT_ID, identity, hosts, io);
+    expect(report.endorsedDeviceIds).toEqual([SELF_ID]);
+    expect(report.rootEndorsedSelf).toBe(false);
+  });
+});
+
+describe("unionHealHosts (P-C1c)", () => {
+  test("bundle hosts and local pins merge by key, union their host ids", () => {
+    const union = unionHealHosts(
+      [{ hostPublicKey: HOST_KEY_1, hostFingerprint: "f1", hostIds: [HOST_1] }],
+      [
+        { hostPublicKey: HOST_KEY_1, hostFingerprint: "f1", hostIds: [HOST_2] },
+        { hostPublicKey: HOST_KEY_2, hostFingerprint: "f2", hostIds: [] },
+      ],
+    );
+    expect(union).toHaveLength(2);
+    expect(
+      union
+        .find((h) => h.hostPublicKey === HOST_KEY_1)
+        ?.hostIds.slice()
+        .sort(),
+    ).toEqual([HOST_1, HOST_2].sort());
+    expect(union.find((h) => h.hostPublicKey === HOST_KEY_2)).toBeDefined();
+  });
+});

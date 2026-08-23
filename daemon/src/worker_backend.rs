@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -76,15 +77,44 @@ pub fn worker_dir() -> Result<PathBuf> {
         // operator's to answer for and surfaces loudly at bind time.
         PathBuf::from(dir)
     } else {
+        let tag = config_root_tag();
         choose_worker_dir(
             dirs::runtime_dir(),
+            &tag,
             || Ok(config::config_dir()?.join("workers")),
             socket_dir_fits,
-            short_worker_dir,
+            || short_worker_dir(&tag),
         )?
     };
     endpoint::ensure_private_dir(&dir)?;
     Ok(dir)
+}
+
+/// Per-config-root suffix that isolates the worker runtime directory when an
+/// explicit `SPAWN_CONFIG_DIR` is in use. Two instances under one OS user share
+/// `$XDG_RUNTIME_DIR` and `/tmp`, so without this they would land in the same
+/// worker dir and adopt each other's workers on restart. Empty for the default
+/// single instance, which keeps its path byte-for-byte unchanged.
+fn config_root_tag() -> String {
+    root_tag_for(
+        std::env::var_os("SPAWN_CONFIG_DIR")
+            .filter(|v| !v.is_empty())
+            .as_deref(),
+    )
+}
+
+fn root_tag_for(root: Option<&std::ffi::OsStr>) -> String {
+    match root {
+        None => String::new(),
+        Some(root) => {
+            let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
+            let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
+            format!(
+                "-{:02x}{:02x}{:02x}{:02x}",
+                digest[0], digest[1], digest[2], digest[3]
+            )
+        }
+    }
 }
 
 /// Prefer the runtime dir, fall back to the config dir — but only while the
@@ -95,12 +125,15 @@ pub fn worker_dir() -> Result<PathBuf> {
 /// host whose real `sun_path` limit wouldn't trip it.
 fn choose_worker_dir(
     runtime_dir: Option<PathBuf>,
+    tag: &str,
     config_workers: impl FnOnce() -> Result<PathBuf>,
     fits: impl Fn(&std::path::Path) -> bool,
     short: impl FnOnce() -> Result<PathBuf>,
 ) -> Result<PathBuf> {
     let preferred = match runtime_dir {
-        Some(run) => run.join("spawn").join("workers"),
+        // The config-dir fallback is already per-root (it *is* SPAWN_CONFIG_DIR);
+        // only the shared runtime dir needs the tag to stay per-instance.
+        Some(run) => run.join(format!("spawn{tag}")).join("workers"),
         None => config_workers()?,
     };
     if fits(&preferred) {
@@ -141,9 +174,9 @@ fn socket_dir_fits(dir: &std::path::Path) -> bool {
 /// node we don't own — so a hostile `/tmp` entry can't redirect the daemon.
 /// (`std::env::temp_dir()` is deliberately avoided: `$TMPDIR` on macOS is a
 /// ~50-char path that would defeat the whole point.)
-fn short_worker_dir() -> Result<PathBuf> {
+fn short_worker_dir(tag: &str) -> Result<PathBuf> {
     let uid = nix::unistd::Uid::effective().as_raw();
-    let base = PathBuf::from("/tmp").join(format!("spawn-{uid}"));
+    let base = PathBuf::from("/tmp").join(format!("spawn-{uid}{tag}"));
     // Harden the per-uid parent too; ensure_private_dir only secures the leaf.
     endpoint::ensure_private_dir(&base)?;
     Ok(base.join("workers"))
@@ -747,6 +780,7 @@ mod tests {
         let short = PathBuf::from("/tmp/spawn-1/workers");
         let picked = choose_worker_dir(
             None,
+            "",
             || {
                 Ok(PathBuf::from(
                     "/Users/who/Library/Application Support/spawn/workers",
@@ -761,12 +795,37 @@ mod tests {
         // Runtime dir present and fits → keep it; neither fallback is touched.
         let picked = choose_worker_dir(
             Some(PathBuf::from("/run/user/1000")),
+            "",
             || unreachable!("config dir must not be consulted when runtime dir is present"),
             |_| true,
             || unreachable!("short dir must not be built when the preferred base fits"),
         )
         .unwrap();
         assert_eq!(picked, PathBuf::from("/run/user/1000/spawn/workers"));
+
+        // A per-root tag namespaces the shared runtime dir so two instances
+        // under one OS user don't collide (and adopt each other's workers).
+        let alice = choose_worker_dir(
+            Some(PathBuf::from("/run/user/1000")),
+            "-aabbccdd",
+            || unreachable!(),
+            |_| true,
+            || unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(
+            alice,
+            PathBuf::from("/run/user/1000/spawn-aabbccdd/workers")
+        );
+    }
+
+    #[test]
+    fn config_root_tag_isolates_distinct_roots_and_is_empty_by_default() {
+        assert_eq!(root_tag_for(None), "");
+        let alice = root_tag_for(Some(std::ffi::OsStr::new("/srv/spawn/alice")));
+        let bob = root_tag_for(Some(std::ffi::OsStr::new("/srv/spawn/bob")));
+        assert_ne!(alice, bob);
+        assert!(alice.starts_with('-') && alice.len() == 9); // '-' + 8 hex
     }
 
     #[tokio::test]
