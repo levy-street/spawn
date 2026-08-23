@@ -2,9 +2,10 @@ import { useRouter } from "expo-router";
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { AuthAction, AuthLink } from "@/components/auth/auth-actions";
-import { AuthField, AuthInput } from "@/components/auth/auth-field";
+import { AuthField } from "@/components/auth/auth-field";
 import { useAuthBack } from "@/components/auth/auth-navigation";
 import { AuthBlock, AuthShell } from "@/components/auth/auth-shell";
+import { Input } from "@/components/ui/input";
 import { Text } from "@/components/ui/text";
 import { usePasswordResetRequestMutation } from "@/data/queries/auth";
 import { validateEmail, validateRequired } from "@/lib/validation";
@@ -35,7 +36,7 @@ export function ForgotPasswordScreen() {
   if (sent) {
     return (
       <AuthShell
-        description="It works once and expires in an hour. Your password stays as it is until you use it."
+        description="It burns out in an hour and works only once. Your old word stands until you use it."
         onBack={goBack}
         title="Check your inbox"
       >
@@ -61,17 +62,17 @@ export function ForgotPasswordScreen() {
 
   return (
     <AuthShell
-      description="Give us the address on the account and we’ll send a one-time reset link."
+      description="Give the address bound to the account. We’ll send a link that works once."
       footer={
         <View style={styles.footer}>
           <AuthLink label="Back to sign in" onPress={() => router.replace("/login")} />
         </View>
       }
       onBack={goBack}
-      title="Reset your password"
+      title="Lost the word"
     >
       <AuthField error={emailError} label="Email" required>
-        <AuthInput
+        <Input
           editable={!requestReset.isPending}
           error={emailError !== null}
           onChangeText={(value) => {

@@ -253,6 +253,12 @@ class AuthProviderOut(BaseModel):
     name: str
 
 
+class OAuthExchangeRequest(BaseModel):
+    """The one-time code a native app carries back from the provider callback."""
+
+    code: str = Field(min_length=16, max_length=256)
+
+
 class AuthConfigOut(BaseModel):
     """Everything the login/signup/onboarding surfaces need in one request.
 

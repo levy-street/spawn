@@ -2,11 +2,12 @@ import { useRouter } from "expo-router";
 import { useRef, useState } from "react";
 import { StyleSheet, type TextInput, View } from "react-native";
 import { AuthAction, AuthLink, authFooterRow } from "@/components/auth/auth-actions";
-import { AuthField, AuthInput, authFormGap } from "@/components/auth/auth-field";
+import { AuthField, authFormGap } from "@/components/auth/auth-field";
 import { AuthMessage } from "@/components/auth/auth-message";
 import { useAuthBack } from "@/components/auth/auth-navigation";
 import { AuthBlock, AuthShell } from "@/components/auth/auth-shell";
 import { OAuthButtons } from "@/components/auth/oauth-buttons";
+import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import { ApiError } from "@/data/api/client";
@@ -81,7 +82,7 @@ function SignupForm({ config, initialInvite }: { config: AuthConfigOut; initialI
     <>
       <View style={styles.form}>
         <AuthField error={errors.email} label="Email" required>
-          <AuthInput
+          <Input
             editable={!signup.isPending}
             error={errors.email !== null}
             nextRef={passwordRef}
@@ -102,7 +103,7 @@ function SignupForm({ config, initialInvite }: { config: AuthConfigOut; initialI
           label="Password"
           required
         >
-          <AuthInput
+          <Input
             editable={!signup.isPending}
             error={errors.password !== null}
             {...(config.invite_only ? { nextRef: inviteRef } : {})}
@@ -126,7 +127,7 @@ function SignupForm({ config, initialInvite }: { config: AuthConfigOut; initialI
         </AuthField>
         {config.invite_only ? (
           <AuthField error={errors.invite} label="Invite code" required>
-            <AuthInput
+            <Input
               editable={!signup.isPending}
               error={errors.invite !== null}
               maxLength={PASSWORD_MAX_LENGTH}
@@ -165,7 +166,7 @@ function SignupForm({ config, initialInvite }: { config: AuthConfigOut; initialI
 
 function SignupLoading({ onBack }: { onBack: () => void }) {
   return (
-    <AuthShell onBack={onBack} title="Create your account">
+    <AuthShell onBack={onBack} title="Sign the pact">
       <View style={styles.loading}>
         <Spinner label="Loading signup" size={spacing[5]} />
       </View>
@@ -182,9 +183,9 @@ export function SignupScreen({ invite }: { invite?: string }) {
   if (configQuery.isError || configQuery.data === undefined) {
     return (
       <AuthShell
-        description="The server’s signup settings are unavailable."
+        description="The server never answered with its signup terms."
         onBack={goBack}
-        title="Couldn’t load signup"
+        title="No answer"
       >
         <AuthBlock>
           <AuthAction
@@ -200,20 +201,20 @@ export function SignupScreen({ invite }: { invite?: string }) {
 
   return (
     <AuthShell
-      description="Start with an account, then connect the machine where your agents work."
+      description="An account first. Then you bind the machine your daemons will run on."
       footer={
         <View style={authFooterRow}>
           <Text color="mutedForeground" variant="sigilLabel">
-            Already registered?
+            Already have an account?
           </Text>
           <AuthLink emphasis label="Log in" onPress={() => router.replace("/login")} />
         </View>
       }
       onBack={goBack}
-      title="Create your account"
+      title="Sign the pact"
     >
       {invite !== undefined ? (
-        <AuthMessage>You have an invite. Finish creating your account below.</AuthMessage>
+        <AuthMessage>Your invite holds. Sign below to finish.</AuthMessage>
       ) : null}
       <SignupForm
         config={configQuery.data}

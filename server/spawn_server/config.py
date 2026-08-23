@@ -30,6 +30,18 @@ class Settings(BaseSettings):
     jwt_daemon_ttl_days: int = 365
     oauth_provider_state_ttl_minutes: int = 10
 
+    # A native OAuth callback cannot hand a browser cookie to an app, so it
+    # returns a one-time code on a custom scheme instead. Matching is exact:
+    # a prefix or host rule here would let anything claiming the scheme collect
+    # codes on the real app's behalf.
+    oauth_native_redirect_uris: str = Field(
+        default="spawn://auth/oauth",
+        description="Comma-separated exact redirect URIs the native app may hand back to.",
+    )
+    # Long enough to survive a slow provider handoff, short enough that a code
+    # left in a log is worthless by the time anyone reads it.
+    oauth_exchange_ttl_seconds: int = 120
+
     google_client_id: str | None = None
     google_client_secret: str | None = None
     microsoft_client_id: str | None = None
@@ -105,6 +117,10 @@ class Settings(BaseSettings):
     )
     turn_secret: str | None = Field(default=None)
     turn_ttl_seconds: int = Field(default=24 * 3600)
+
+    @property
+    def oauth_native_redirect_uri_list(self) -> list[str]:
+        return [u.strip() for u in self.oauth_native_redirect_uris.split(",") if u.strip()]
 
     @property
     def cors_origin_list(self) -> list[str]:

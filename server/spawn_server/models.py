@@ -203,6 +203,31 @@ class AuthProviderState(Base):
     user: Mapped[User | None] = relationship(back_populates="auth_provider_states")
 
 
+class AuthProviderExchange(Base):
+    """A one-time code standing in for the session cookie a native app cannot take.
+
+    The web callback finishes by setting a cookie on the browser that started
+    the flow. An app has no such browser: the sign-in runs in a system web view
+    whose cookie jar it cannot read. So the callback mints one of these instead
+    and hands the app the code on a custom scheme, and the app trades it for the
+    same token pair `/auth/login` returns. The row is single-use and expires in
+    minutes, so a code captured from a log or a URL is already spent or stale.
+    """
+
+    __tablename__ = "auth_provider_exchanges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
 class TrustBundle(Base):
     """The operator's sealed trust bundle: ciphertext the server cannot read.
 
