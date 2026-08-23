@@ -2,10 +2,11 @@ import { useRouter } from "expo-router";
 import { useRef, useState } from "react";
 import { StyleSheet, type TextInput, View } from "react-native";
 import { AuthAction } from "@/components/auth/auth-actions";
-import { AuthField, AuthInput, authFormGap } from "@/components/auth/auth-field";
+import { AuthField, authFormGap } from "@/components/auth/auth-field";
 import { AuthMessage } from "@/components/auth/auth-message";
 import { useAuthBack } from "@/components/auth/auth-navigation";
 import { AuthBlock, AuthShell } from "@/components/auth/auth-shell";
+import { Input } from "@/components/ui/input";
 import { Text } from "@/components/ui/text";
 import { ApiError } from "@/data/api/client";
 import { usePasswordResetConfirmMutation } from "@/data/queries/auth";
@@ -54,11 +55,13 @@ export function ResetPasswordScreen({ token }: { token?: string }) {
   if (token === undefined) {
     return (
       <AuthShell
-        description="Reset links carry a one-time token. This one arrived without it."
+        description="A reset link carries a one-time sigil. This one arrived without it."
         onBack={goBack}
-        title="This link is incomplete"
+        title="This sigil is broken"
       >
-        <AuthMessage tone="error">This link is missing its token. Request a new one.</AuthMessage>
+        <AuthMessage tone="error">
+          This link arrived without its token. Ask for a fresh one.
+        </AuthMessage>
         <AuthBlock>
           <AuthAction
             label="Request a reset link"
@@ -71,9 +74,9 @@ export function ResetPasswordScreen({ token }: { token?: string }) {
 
   return (
     <AuthShell
-      description="Use a unique password with at least 12 characters."
+      description="Twelve characters at least, and one you’ve used nowhere else."
       onBack={goBack}
-      title="Choose a new password"
+      title="Set a new word"
     >
       <View style={styles.form}>
         <AuthField
@@ -82,7 +85,7 @@ export function ResetPasswordScreen({ token }: { token?: string }) {
           label="New password"
           required
         >
-          <AuthInput
+          <Input
             editable={!resetPassword.isPending}
             error={passwordError !== null}
             maxLength={PASSWORD_MAX_LENGTH}
@@ -98,7 +101,7 @@ export function ResetPasswordScreen({ token }: { token?: string }) {
           />
         </AuthField>
         <AuthField error={confirmationError} label="Confirm new password" required>
-          <AuthInput
+          <Input
             editable={!resetPassword.isPending}
             error={confirmationError !== null}
             maxLength={PASSWORD_MAX_LENGTH}
@@ -128,7 +131,7 @@ export function ResetPasswordScreen({ token }: { token?: string }) {
           }}
         />
         <Text color="mutedForeground" style={styles.note} variant="caption">
-          Every device currently signed in to this account will be signed out.
+          Every device signed in to this account is cast out.
         </Text>
       </AuthBlock>
     </AuthShell>
