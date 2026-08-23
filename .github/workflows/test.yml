@@ -13,7 +13,10 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The matrix outgrew 30 minutes when the mesh and workspaces work grew the
+    # suites (server pytest ~8m, daemon tests, ten smokes, 220+ Playwright
+    # specs, production build); 30 was cancelling runs mid-e2e.
+    timeout-minutes: 60
     env:
       CI: "1"
       NEXT_TELEMETRY_DISABLED: "1"
