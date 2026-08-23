@@ -1078,6 +1078,18 @@ impl UploadHub {
     }
 
     fn release_entry(&self, key: &UploadKey, entry: &Arc<ActiveEntry>) {
+        // A retired entry must not own descriptors: the releasing operation's
+        // permit signals idle before the entry's last Arc drops, so anything
+        // still in the slot (the directory fd) would outlive the drain the
+        // permit vouches for. Taken before the state lock — record_published
+        // establishes the upload→state lock order and this must not invert it.
+        drop(
+            entry
+                .upload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
         let mut state = self
             .inner
             .state
