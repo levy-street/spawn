@@ -1984,7 +1984,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
             task.cancel()
         if pending_expiry_tasks:
             await asyncio.gather(*pending_expiry_tasks, return_exceptions=True)
-        quiet_watch.shutdown()
+        await quiet_watch.shutdown()
         signal_task.cancel()
         try:
             await signal_task

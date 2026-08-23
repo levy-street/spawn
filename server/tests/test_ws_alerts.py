@@ -511,7 +511,7 @@ async def test_quiet_watch_is_rearmed_by_activity():
     assert fired == []
     await asyncio.sleep(0.30)
     assert fired == ["s-1"]
-    watch.shutdown()
+    await watch.shutdown()
 
 
 async def test_quiet_watch_cancel_and_shutdown_silence_it():
@@ -524,7 +524,7 @@ async def test_quiet_watch_cancel_and_shutdown_silence_it():
     watch.touch("s-1")
     watch.cancel("s-1")
     watch.touch("s-2")
-    watch.shutdown()
+    await watch.shutdown()
     await asyncio.sleep(0.08)
     assert fired == []
     assert watch.pending == 0
