@@ -343,8 +343,11 @@ test("a failed layout PATCH rolls the optimistic drag back", async ({ page }) =>
   const area = tile.locator("..");
   store.failNextWorkspacePatch(503, "layout unavailable");
   await dragTile(page, SESSION_ID, 0, 12);
-  await expect(page.locator("p[role='alert']")).toContainText("layout unavailable");
-  // Measured against the grid area: the error banner shifts the whole page.
+  // A failed save is a toast now, not an inline banner (w/[id]/page.tsx:
+  // "Errors surface as toasts"); error toasts carry role="alert".
+  await expect(page.getByRole("alert")).toContainText("layout unavailable");
+  // Measured against the grid area rather than the viewport, so the assertion
+  // holds regardless of anything the failure adds above the grid.
   await expect
     .poll(async () => {
       const tileBox = await tile.boundingBox();

@@ -186,7 +186,7 @@ export function AccountPanel() {
       }),
     onSuccess: () => {
       // The server already deleted the session cookie with the account; this
-      // clears local auth state and lands on the login page.
+      // clears local auth state and hands back to the lander.
       void logout();
     },
     onError: (cause) => setError(cause instanceof ApiError ? cause.message : String(cause)),

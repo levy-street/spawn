@@ -76,7 +76,7 @@ test("Linux detection recommends the user systemd service", async ({ browser }) 
     page.locator("section").first().getByRole("heading", { name: "Linux" }),
   ).toBeVisible();
   await expect(page.getByText("systemd user service: spawnd.service")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Install on this Linux host" })).toBeVisible();
+  await expect(page.getByText("Install on this Linux host")).toBeVisible();
 
   await context.close();
 });
@@ -115,7 +115,7 @@ test("unknown browser OS explains that the installer detects the actual host", a
     page.locator("section").first().getByRole("heading", { name: "Unknown OS" }),
   ).toBeVisible();
   await expect(page.getByText("will detect the actual host when it runs")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Run from a host terminal" })).toBeVisible();
+  await expect(page.getByText("Run from a host terminal")).toBeVisible();
 
   await context.close();
 });

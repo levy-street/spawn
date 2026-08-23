@@ -20,15 +20,15 @@ test("login and signup render enabled provider buttons", async ({ page }) => {
   await page.goto("/login");
   await expect(page.getByRole("link", { name: "Continue with Google" })).toHaveAttribute(
     "href",
-    "/api/auth/oauth/google/start?return_to=%2F",
+    "/api/auth/oauth/google/start?return_to=%2Fapp",
   );
   await expect(page.getByRole("link", { name: "Continue with Microsoft" })).toHaveAttribute(
     "href",
-    "/api/auth/oauth/microsoft/start?return_to=%2F",
+    "/api/auth/oauth/microsoft/start?return_to=%2Fapp",
   );
   await expect(page.getByRole("link", { name: "Continue with GitHub" })).toHaveAttribute(
     "href",
-    "/api/auth/oauth/github/start?return_to=%2F",
+    "/api/auth/oauth/github/start?return_to=%2Fapp",
   );
 
   await page.goto("/signup");
