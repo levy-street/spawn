@@ -216,8 +216,12 @@ test("the bare page instructs — one command, no code to type", async ({ page }
   await expect(instructions).toBeVisible();
   await expect(instructions).toContainText("spawnd possess");
   await expect(instructions).toContainText("single click");
-  // The terminal's link is the entry — there is nothing to type here.
-  await expect(page.locator("input")).toHaveCount(0);
+  // The terminal's link is still the intended entry, but /device is the shared
+  // connect surface after the workspaces overhaul, so code entry stays on the
+  // page as the stated fallback for a host whose link you cannot open. Typing a
+  // code is not a weaker path: it runs the same fingerprint-compare ceremony.
+  await expect(instructions).toContainText("fallback");
+  await expect(page.getByLabel("Code from the terminal")).toBeVisible();
 });
 
 test("blocks first contact when the server fingerprint disagrees with the host key", async ({

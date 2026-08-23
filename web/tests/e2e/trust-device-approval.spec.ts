@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { expect, test } from "@playwright/test";
-import { BROWSER_DEVICE_ID, HOST_ID, host, mockApp, openSettings } from "./app-mocks";
+import { BROWSER_DEVICE_ID, HOST_ID, host, mockApp, openSettings, WORKSPACE_ID } from "./app-mocks";
 
 // Device approval lives on Settings → Access: unapproved sign-ins are waiting
 // rows, an untrusted device gets a guided callout, and toward LEGACY hosts
@@ -45,7 +45,7 @@ const secondDevice = {
 
 test("an untrusted browser gets a guided callout, not a dead end", async ({ page }) => {
   await mockApp(page, { hosts: [KEYED_HOST], hostPins: {} });
-  await openSettings(page, "access");
+  await openSettings(page, "access", WORKSPACE_ID, `/hosts/${HOST_ID}`);
 
   const callout = page.getByTestId("untrusted-callout");
   await expect(callout).toBeVisible();
@@ -64,7 +64,7 @@ test("a trusted browser approves a waiting device through the fingerprint ceremo
     extraBrowserDevices: [secondDevice],
     hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] },
   });
-  await openSettings(page, "access");
+  await openSettings(page, "access", WORKSPACE_ID, `/hosts/${HOST_ID}`);
 
   // This device is trusted; the fixture device is waiting.
   const pixelRow = page.getByTestId("device-row").filter({ hasText: "Pixel phone" });

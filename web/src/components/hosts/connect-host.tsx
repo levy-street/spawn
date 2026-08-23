@@ -3,6 +3,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, KeyRound, Terminal } from "lucide-react";
 import { type FormEvent, type JSX, useEffect, useRef, useState } from "react";
+import { NumberCheck } from "@/components/access/number-check";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -174,7 +175,7 @@ export function ConnectHostSection(props: {
             </Button>
           </div>
           <p className="text-xs leading-5 text-muted-foreground">
-            After installation, run <code>spawnd login</code> on that machine.
+            After installation, run <code>spawnd possess</code> on that machine.
           </p>
         </section>
 
@@ -239,6 +240,22 @@ export function PairingCodeForm({
   // True once the pending host key equaled the fragment key exactly — the
   // invisible check passed, so the screen is a plain Approve confirmation.
   const [fragmentVerified, setFragmentVerified] = useState(false);
+  // The operator said the fingerprints do not match. Terminal, like a refusal.
+  const [stopped, setStopped] = useState(false);
+
+  const resetCeremony = () => {
+    setPending(null);
+    setFragmentVerified(false);
+    setRefusal(null);
+    fragmentKeyRef.current = null;
+    setLocalPinState(null);
+    setLocalPinCommitted(false);
+    setStopped(false);
+    setError(null);
+    setIdentifier(null);
+    setHostName(null);
+    setCode("");
+  };
 
   // Load the pending approval. Takes the opaque URL ref the terminal
   // opened/printed or the typed user_code, and remembers which, so approve
@@ -257,7 +274,7 @@ export function PairingCodeForm({
       const expectedFingerprint = await ed25519PublicKeyFingerprint(response.host_public_key);
       if (response.host_key_fingerprint !== expectedFingerprint) {
         throw new ApprovalIdentityError(
-          "Daemon fingerprint did not match its public key; approval was blocked",
+          "The host's identity did not check out; nothing was trusted",
         );
       }
       // THE substitution check (docs/TRUST_DEVICE_MESH.md): the server's
@@ -333,7 +350,7 @@ export function PairingCodeForm({
         localIdentity.publicKeyWire !== registration.data.device.public_key
       ) {
         throw new ApprovalIdentityError(
-          "Local browser identity changed; refresh and review the daemon again",
+          "This browser's identity changed; refresh and start over on the host",
         );
       }
       // Defense in depth: re-assert the out-of-band binding at the moment of
@@ -347,7 +364,7 @@ export function PairingCodeForm({
       const expectedFingerprint = await ed25519PublicKeyFingerprint(pending.host_public_key);
       if (pending.host_key_fingerprint !== expectedFingerprint) {
         throw new ApprovalIdentityError(
-          "Daemon fingerprint changed after review; approval was blocked",
+          "The host's identity changed mid-check; nothing was trusted",
         );
       }
       await approveBrowserHostPin({
@@ -394,7 +411,7 @@ export function PairingCodeForm({
         response.browser_public_key !== registration.data.device.public_key
       ) {
         throw new ApprovalIdentityError(
-          "Approval response changed the reviewed host or browser identity",
+          "The approval response changed the reviewed host or browser identity",
         );
       }
       setHostName(response.host_name);
@@ -445,7 +462,7 @@ export function PairingCodeForm({
             : "Approval failed";
       setError(
         localPinPersisted
-          ? `The exact host fingerprint is saved locally, but server approval did not complete: ${message}. Retry server approval or review the code again; the local pin will remain.`
+          ? `The host's exact identity is saved in this browser, but the server step did not complete: ${message}. Retrying is safe.`
           : message,
       );
     } finally {
@@ -471,28 +488,36 @@ export function PairingCodeForm({
   // there is deliberately no control here that proceeds anyway.
   if (refusal) {
     return (
-      <div className="space-y-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
+      <div
+        className="space-y-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3"
+        data-testid="possess-refusal"
+      >
         <p className="text-sm font-medium text-foreground">This host could not be verified</p>
         <p className="text-sm leading-relaxed text-muted-foreground" role="alert">
           {refusal}
         </p>
-        <Button
-          type="button"
-          variant="secondary"
-          onClick={() => {
-            setRefusal(null);
-            setFragmentVerified(false);
-            fragmentKeyRef.current = null;
-            setPending(null);
-            setIdentifier(null);
-            setCode("");
-          }}
-        >
+        <Button type="button" variant="secondary" onClick={resetCeremony}>
           Start over
         </Button>
       </div>
     );
   }
+
+  // Mirrors the app-wide ceremony vocabulary (docs/TRUST_UX.md): the shared
+  // NumberCheck owns the compare/waiting/done/stopped screens, so the possess
+  // fallback reads exactly like every other identity check in the product.
+  const checkPhase = stopped
+    ? ("stopped" as const)
+    : hostName
+      ? ("done" as const)
+      : submitting && pending
+        ? ("waiting" as const)
+        : pending
+          ? ("compare" as const)
+          : ("connecting" as const);
+  // A server approval that failed AFTER the local pin landed needs a retry
+  // surface, not the identity check again — that part already passed.
+  const retryable = Boolean(error && localPinCommitted && pending);
 
   return (
     <form className="space-y-3" onSubmit={onReview}>
@@ -517,7 +542,7 @@ export function PairingCodeForm({
         />
       </div>
 
-      {error && (
+      {error && !retryable && (
         <p className="text-sm text-destructive" role="alert">
           {error}
         </p>
@@ -534,44 +559,42 @@ export function PairingCodeForm({
           approve hosts.
         </p>
       )}
-      {hostName && (
-        <p className="text-sm text-success" role="status">
-          {hostName} is connected. It will appear as soon as its daemon comes online.
-        </p>
-      )}
-
-      {pending ? (
+      {retryable ? (
+        // The local pin already landed and only the server step failed. The
+        // identity check has passed, so re-running it would be theatre — offer
+        // the retry directly instead of sending the operator round again.
+        <div className="space-y-3">
+          <p className="text-sm text-destructive" role="alert">
+            {error}
+          </p>
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              className="flex-1"
+              disabled={submitting}
+              onClick={() => void onApprove()}
+            >
+              {submitting ? "Retrying…" : "Retry"}
+            </Button>
+            <Button type="button" variant="outline" disabled={submitting} onClick={resetCeremony}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      ) : pending && fragmentVerified && !hostName ? (
+        // The link from the host's own terminal carried its identity key, and
+        // it matched exactly. The human check is already done, so asking for a
+        // fingerprint comparison here would be theatre.
         <div className="space-y-3 rounded-lg border border-border p-3">
-          {fragmentVerified ? (
-            // The link from the host's own terminal carried its identity key,
-            // and it matched exactly. The human check is already done, so
-            // asking for a fingerprint comparison here would be theatre.
-            <div className="space-y-1" data-testid="possess-approve-screen">
-              <p className="text-sm font-medium">
-                Approve <code>{pending.host_name}</code>
-              </p>
-              <p className="text-xs leading-5 text-muted-foreground">
-                This browser verified the host&apos;s identity against the link from its terminal.
-                Approving grants all your devices access to it.
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-1">
-              <p className="text-sm font-medium">
-                Check the fingerprint for <code>{pending.host_name}</code>
-              </p>
-              <p
-                className="break-all rounded-md bg-muted px-2 py-1.5 font-mono text-sm font-semibold"
-                data-testid="host-key-fingerprint"
-              >
-                {pending.host_key_fingerprint}
-              </p>
-              <p className="text-xs leading-5 text-muted-foreground">
-                Confirm the terminal shows this exact value. If it differs, stop—the connection may
-                be intercepted.
-              </p>
-            </div>
-          )}
+          <div className="space-y-1" data-testid="possess-approve-screen">
+            <p className="text-sm font-medium">
+              Approve <code>{pending.host_name}</code>
+            </p>
+            <p className="text-xs leading-5 text-muted-foreground">
+              This browser verified the host&apos;s identity against the link from its terminal.
+              Approving grants all your devices access to it.
+            </p>
+          </div>
           {localPinState === "active" && (
             <p className="text-xs text-muted-foreground" data-testid="local-pin-state">
               This exact host key is already active in this browser. Approving again only completes
@@ -607,21 +630,13 @@ export function PairingCodeForm({
             </p>
           </div>
           <div className="flex flex-col-reverse gap-2 @sm/settings:flex-row">
-            <Button
-              type="button"
-              variant="outline"
-              disabled={submitting}
-              onClick={() => {
-                setPending(null);
-                setLocalPinState(null);
-                setLocalPinCommitted(false);
-              }}
-            >
-              Back
+            <Button type="button" variant="outline" disabled={submitting} onClick={resetCeremony}>
+              Cancel
             </Button>
             <Button
               type="button"
               className="flex-1"
+              data-testid="possess-approve"
               disabled={submitting || registration.data?.status !== "ready"}
               onClick={onApprove}
             >
@@ -631,16 +646,53 @@ export function PairingCodeForm({
                   ? "Retry server approval"
                   : localPinState === "revoked"
                     ? "Approve this host again"
-                    : fragmentVerified
-                      ? `Approve ${pending.host_name}`
-                      : "Fingerprint matches — approve"}
+                    : `Approve ${pending.host_name}`}
             </Button>
           </div>
         </div>
+      ) : pending || hostName ? (
+        // No fragment (an older daemon, or a retyped link): the human compares
+        // the full fingerprint. Also owns the done/stopped screens, so a
+        // fragment-verified approval lands here once hostName is set.
+        <>
+          {/* NumberCheck deliberately shows no host name — it is one shared
+              ceremony surface. Name the host above it so the operator knows
+              what they are vouching for. Not rendered on the fragment path,
+              where the approve screen already names it. */}
+          {pending && !hostName && !stopped && (
+            <div className="text-center">
+              <p className="text-sm text-muted-foreground">Possess a host</p>
+              <p className="text-xl font-semibold text-foreground">{pending.host_name}</p>
+            </div>
+          )}
+          <NumberCheck
+            phase={checkPhase}
+            mode="enter"
+            fingerprint={pending?.host_key_fingerprint}
+            otherScreen="in the host's terminal"
+            doneText={`${hostName} is possessed. All your devices can reach it.`}
+            stoppedText="The fingerprints don't match, so nothing was trusted. Start over from the host's terminal."
+            onMatch={() => void onApprove()}
+            onNoMatch={() => {
+              // A fingerprint mismatch is terminal — never a retry loop.
+              setStopped(true);
+            }}
+            onDone={resetCeremony}
+            onClose={resetCeremony}
+          />
+        </>
       ) : (
-        <Button type="submit" className="w-full" disabled={submitting || !code.trim()}>
-          {submitting ? "Checking…" : "Look up host"}
-        </Button>
+        <div className="space-y-3" data-testid="possess-instructions">
+          <p className="text-xs leading-5 text-muted-foreground">
+            Run <code>spawnd possess</code> on that machine. Its terminal opens this approval in
+            your browser, and the link carries the host&apos;s identity — so finishing is a single
+            click. Typing a code is the fallback for when you cannot open that link (a remote host,
+            or a browser on another device).
+          </p>
+          <Button type="submit" className="w-full" disabled={submitting || !code.trim()}>
+            {submitting ? "Checking…" : "Look up host"}
+          </Button>
+        </div>
       )}
     </form>
   );
