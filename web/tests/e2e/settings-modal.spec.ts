@@ -42,8 +42,10 @@ test("switching tabs changes the panel without navigating", async ({ page }) => 
 test("Hosts lists connected machines and offers the connect flow", async ({ page }) => {
   await mockApp(page, { hosts: [host] });
   await openSettings(page, "hosts");
-  await expect(page.getByText("Mac", { exact: true })).toBeVisible();
-  await expect(page.getByText("macos/aarch64 · daemon 0.1.0")).toBeVisible();
+  // The sidebar names the host too; assert the panel's own row.
+  const panel = page.getByTestId("settings-dialog");
+  await expect(panel.getByText("Mac", { exact: true })).toBeVisible();
+  await expect(panel.getByText("macos/aarch64 · daemon 0.1.0")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Connect a host" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Copy install command" })).toBeVisible();
   await expect(page.getByLabel("Code from the terminal")).toBeVisible();
@@ -72,7 +74,7 @@ test("Agents keeps built-ins read-only and round-trips a custom definition", asy
   const add = page.getByRole("dialog", { name: "Add an agent" });
   await add.getByLabel("Name").fill("Deploy bot");
   await add.getByLabel("Kind").fill("custom");
-  await add.getByLabel("Command").fill("deploy --watch");
+  await add.getByLabel("Command", { exact: true }).fill("deploy --watch");
   await add.getByLabel("Install command (optional)").fill("npm i -g deploy");
   await add.getByRole("button", { name: "Add variable" }).click();
   await add.getByLabel("Environment variable name").fill("REGION");
@@ -84,7 +86,7 @@ test("Agents keeps built-ins read-only and round-trips a custom definition", asy
   await page.getByRole("button", { name: "Deploy bot actions" }).click();
   await page.getByRole("menuitem", { name: "Edit" }).click();
   const edit = page.getByRole("dialog", { name: "Edit Deploy bot" });
-  await edit.getByLabel("Command").fill("deploy --safe");
+  await edit.getByLabel("Command", { exact: true }).fill("deploy --safe");
   await edit.getByRole("button", { name: "Save changes" }).click();
   await expect
     .poll(() => store.agents.find((item) => item.name === "Deploy bot")?.command)

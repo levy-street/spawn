@@ -22,9 +22,14 @@ const CardHeader = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDiv
 );
 CardHeader.displayName = "CardHeader";
 
-const CardTitle = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
+/**
+ * A real heading, not a styled div: a card title reads as a heading to the
+ * eye, so it has to read as one to a screen reader walking the page by
+ * headings. `h3` because cards sit under a page `h1` and a section `h2`.
+ */
+const CardTitle = React.forwardRef<HTMLHeadingElement, React.HTMLAttributes<HTMLHeadingElement>>(
   ({ className, ...props }, ref) => (
-    <div ref={ref} className={cn("text-base font-semibold leading-tight", className)} {...props} />
+    <h3 ref={ref} className={cn("text-base font-semibold leading-tight", className)} {...props} />
   ),
 );
 CardTitle.displayName = "CardTitle";

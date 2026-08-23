@@ -491,7 +491,6 @@ export async function installSessionRtcMock(
             sendHistoryDelta: (epoch: string, offset: number, text: string) => void;
             sendHistoryWipe: (epoch: string) => void;
             sendHistoryGap: () => void;
-            browserHandshakes: () => Array<{ path: string; protocols: string[] }>;
           };
         }
       ).__spawnRtcTest = {
@@ -596,9 +595,6 @@ export async function installSessionRtcMock(
           state.channels
             .get("spawn.ctl")
             ?.receive(JSON.stringify({ version: 1, kind: "event", event: "history_gap" }));
-        },
-        browserHandshakes() {
-          return state.websocketHandshakes.filter((entry) => entry.path === "/ws/browser");
         },
       };
     },

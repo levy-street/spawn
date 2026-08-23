@@ -353,9 +353,13 @@ function AgentEditorDialog({
               <Input
                 id="agent-name"
                 value={draft.name}
-                onChange={(event) =>
-                  setDraft((current) => ({ ...current, name: event.currentTarget.value }))
-                }
+                onChange={(event) => {
+                  // Read the value BEFORE the updater runs: React nulls
+                  // `currentTarget` once the handler returns, so touching it
+                  // inside the updater throws.
+                  const value = event.currentTarget.value;
+                  setDraft((current) => ({ ...current, name: value }));
+                }}
                 placeholder="My agent"
               />
             </div>
@@ -364,9 +368,13 @@ function AgentEditorDialog({
               <Input
                 id="agent-kind"
                 value={draft.kind}
-                onChange={(event) =>
-                  setDraft((current) => ({ ...current, kind: event.currentTarget.value }))
-                }
+                onChange={(event) => {
+                  // Read the value BEFORE the updater runs: React nulls
+                  // `currentTarget` once the handler returns, so touching it
+                  // inside the updater throws.
+                  const value = event.currentTarget.value;
+                  setDraft((current) => ({ ...current, kind: value }));
+                }}
                 placeholder="custom"
               />
             </div>
@@ -375,9 +383,13 @@ function AgentEditorDialog({
               <Input
                 id="agent-command"
                 value={draft.command}
-                onChange={(event) =>
-                  setDraft((current) => ({ ...current, command: event.currentTarget.value }))
-                }
+                onChange={(event) => {
+                  // Read the value BEFORE the updater runs: React nulls
+                  // `currentTarget` once the handler returns, so touching it
+                  // inside the updater throws.
+                  const value = event.currentTarget.value;
+                  setDraft((current) => ({ ...current, command: value }));
+                }}
                 placeholder="my-agent --interactive"
               />
               <p className="text-xs text-muted-foreground">
@@ -389,9 +401,13 @@ function AgentEditorDialog({
               <Input
                 id="agent-install"
                 value={draft.install}
-                onChange={(event) =>
-                  setDraft((current) => ({ ...current, install: event.currentTarget.value }))
-                }
+                onChange={(event) => {
+                  // Read the value BEFORE the updater runs: React nulls
+                  // `currentTarget` once the handler returns, so touching it
+                  // inside the updater throws.
+                  const value = event.currentTarget.value;
+                  setDraft((current) => ({ ...current, install: value }));
+                }}
                 placeholder="npm install -g my-agent"
               />
             </div>
@@ -400,9 +416,13 @@ function AgentEditorDialog({
               <Input
                 id="agent-yolo"
                 value={draft.yoloArgs}
-                onChange={(event) =>
-                  setDraft((current) => ({ ...current, yoloArgs: event.currentTarget.value }))
-                }
+                onChange={(event) => {
+                  // Read the value BEFORE the updater runs: React nulls
+                  // `currentTarget` once the handler returns, so touching it
+                  // inside the updater throws.
+                  const value = event.currentTarget.value;
+                  setDraft((current) => ({ ...current, yoloArgs: value }));
+                }}
                 placeholder="--dangerously-skip-permissions"
               />
               <p className="text-xs text-muted-foreground">

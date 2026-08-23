@@ -148,9 +148,14 @@ test("archiving a busy workspace warns first, then moves it into the drawer", as
   await expect(nav.getByRole("link", { name: /Zeta desk/ })).toHaveCount(0);
   const disclosure = page.getByRole("button", { name: /^Archived/ });
   await expect(disclosure).toHaveAttribute("aria-expanded", "false");
-  await expect(page.getByRole("button", { name: "Zeta desk archived actions" })).toHaveCount(0);
+  // Collapse clips the drawer to zero height and marks the subtree `inert`.
+  // The row keeps its own box inside that clip, so Playwright still calls it
+  // "visible" — the contract worth asserting is that it is unreachable.
+  const archivedActions = '[aria-label="Zeta desk archived actions"]';
+  await expect(page.locator(`[inert] ${archivedActions}`)).toHaveCount(1);
   await disclosure.click();
   await expect(disclosure).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator(`[inert] ${archivedActions}`)).toHaveCount(0);
   await expect(page.getByText("Zeta desk", { exact: true })).toBeVisible();
 });
 
