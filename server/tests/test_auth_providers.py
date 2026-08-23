@@ -58,16 +58,24 @@ async def _identity_count() -> int:
         return await session.scalar(select(func.count()).select_from(AuthIdentity)) or 0
 
 
-async def test_provider_list_and_start_urls_require_enabled_credentials(client, configured_providers):
-    providers = await client.get("/api/auth/providers")
-    assert providers.status_code == 200
-    assert providers.json() == {
-        "providers": [
-            {"id": "google", "name": "Google"},
-            {"id": "microsoft", "name": "Microsoft"},
-            {"id": "github", "name": "GitHub"},
-        ]
-    }
+async def test_auth_config_lists_providers_and_start_urls_require_credentials(
+    client, configured_providers
+):
+    config = await client.get("/api/auth/config")
+    assert config.status_code == 200
+    body = config.json()
+    assert body["providers"] == [
+        {"id": "google", "name": "Google"},
+        {"id": "microsoft", "name": "Microsoft"},
+        {"id": "github", "name": "GitHub"},
+    ]
+    # No SMTP is configured in tests, so the server would never enforce the
+    # email gate — config must say so.
+    assert body["email_verification_required"] is False
+    assert body["invite_only"] is False
+
+    # The old providers endpoint is deleted, not aliased.
+    assert (await client.get("/api/auth/providers")).status_code == 404
 
     google = await client.get("/api/auth/oauth/google/start", follow_redirects=False)
     assert google.status_code == 302
@@ -95,9 +103,9 @@ async def test_provider_list_and_start_urls_require_enabled_credentials(client, 
 
 async def test_provider_start_is_hidden_when_provider_is_not_configured(client):
     get_settings.cache_clear()  # type: ignore[attr-defined]
-    providers = await client.get("/api/auth/providers")
-    assert providers.status_code == 200
-    assert providers.json() == {"providers": []}
+    config = await client.get("/api/auth/config")
+    assert config.status_code == 200
+    assert config.json()["providers"] == []
 
     start = await client.get("/api/auth/oauth/google/start", follow_redirects=False)
     assert start.status_code == 404

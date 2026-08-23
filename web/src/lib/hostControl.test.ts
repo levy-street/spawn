@@ -127,7 +127,7 @@ const metadata = {
   protocol_version: 1,
 };
 
-async function readyClient(options = {}, clientHostId = hostId) {
+async function readyClient(options = {}, clientHostId = hostId, capabilities = ["ping"]) {
   const clientMetadata = { ...metadata, scope_id: clientHostId };
   const client = new HostControlClient(clientHostId, options);
   client.connect();
@@ -150,7 +150,7 @@ async function readyClient(options = {}, clientHostId = hostId) {
       version: 1,
       type: "hello",
       protocol: HOST_CONTROL_PROTOCOL,
-      capabilities: ["ping"],
+      capabilities,
     }),
   );
   return { client, ws, pc, offer };
@@ -1506,5 +1506,243 @@ describe("HostControlClient", () => {
     expect(framesOf(destination.pc.channel, "stream.chunk")).toHaveLength(0);
     source.client.close();
     destination.client.close();
+  });
+});
+
+describe("HostControlClient capabilities", () => {
+  const FULL = [
+    "ping",
+    "fs.list",
+    "fs.read",
+    "fs.read.range",
+    "fs.preview",
+    "desktop.reveal",
+    "desktop.open",
+  ];
+
+  test("a hello's capabilities are readable as soon as the client is ready", async () => {
+    // Parsed before the ready transition, so no subscriber can see a ready
+    // client that appears to support nothing and latch that conclusion.
+    const seen: Array<ReadonlySet<string>> = [];
+    const client = new HostControlClient(hostId, {});
+    client.subscribe((state) => {
+      if (state === "ready") seen.push(client.getCapabilities());
+    });
+    client.connect();
+    const ws = FakeWebSocket.instances.at(-1);
+    ws.onopen?.();
+    ws.receive({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [{ urls: ["turn:relay.example"] }],
+      ice_transport_policy: "relay",
+      ...metadata,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const pc = FakePeerConnection.instances.at(-1);
+    pc.channel.onopen?.();
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "hello",
+        protocol: HOST_CONTROL_PROTOCOL,
+        capabilities: FULL,
+      }),
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0].has("desktop.reveal")).toBe(true);
+    expect(client.hasCapability("fs.read.range")).toBe(true);
+    client.close();
+  });
+
+  test("a malformed capability list degrades to empty without dropping the channel", async () => {
+    // An odd hello from a future daemon means "we cannot read its menu", not
+    // "this connection is broken".
+    const { client, pc } = await readyClient({}, hostId, ["fs.list", 42]);
+    expect(client.state).toBe("ready");
+    expect(client.getCapabilities().size).toBe(0);
+    expect(pc.channel.closed).toBe(false);
+    client.close();
+  });
+
+  test("a hello without a capability list is simply no capabilities", async () => {
+    const { client } = await readyClient({}, hostId, null);
+    expect(client.state).toBe("ready");
+    expect(client.getCapabilities().size).toBe(0);
+    client.close();
+  });
+
+  test("capabilities are dropped on teardown", async () => {
+    // A reconnect onto a downgraded daemon must not inherit the old menu.
+    const { client } = await readyClient({}, hostId, FULL);
+    expect(client.hasCapability("desktop.open")).toBe(true);
+    client.close();
+    expect(client.getCapabilities().size).toBe(0);
+  });
+});
+
+describe("HostControlClient desktop actions", () => {
+  const FULL = ["ping", "fs.read.range", "fs.preview", "desktop.reveal", "desktop.open"];
+
+  test("reveal and open send a path and nothing else", async () => {
+    // The wire has no field for an application, arguments or flags, so no
+    // caller can steer what the host launches.
+    const { client, pc } = await readyClient({}, hostId, FULL);
+    client.reveal("~/Desktop/report.pdf").catch(() => {});
+    client.openDefault("~/Desktop/report.pdf").catch(() => {});
+    await Promise.resolve();
+    const requests = framesOf(pc.channel, "request");
+    const reveal = requests.find((frame) => frame.operation === "desktop.reveal");
+    const open = requests.find((frame) => frame.operation === "desktop.open");
+    expect(reveal.payload).toEqual({ path: "~/Desktop/report.pdf" });
+    expect(open.payload).toEqual({ path: "~/Desktop/report.pdf" });
+    expect(Object.keys(open.payload)).toEqual(["path"]);
+    client.close();
+  });
+
+  test("stat rejects a malformed response rather than trusting it", async () => {
+    const { client, pc } = await readyClient({}, hostId, FULL);
+    const pending = client.stat("~/notes.txt");
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: { path: 42, name: "notes.txt", kind: "file" },
+      }),
+    );
+    await expect(pending).rejects.toThrow(/invalid file stat/i);
+    client.close();
+  });
+
+  test("stat returns a well-formed result", async () => {
+    const { client, pc } = await readyClient({}, hostId, FULL);
+    const pending = client.stat("~/notes.txt");
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    expect(request.operation).toBe("fs.stat");
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: { path: "/home/me/notes.txt", name: "notes.txt", kind: "file", size: 12 },
+      }),
+    );
+    expect((await pending).size).toBe(12);
+    client.close();
+  });
+});
+
+describe("HostControlClient ranged reads", () => {
+  const FULL = ["ping", "fs.read", "fs.read.range", "fs.preview"];
+
+  test("rejects nonsensical ranges before they reach the wire", async () => {
+    const { client, pc } = await readyClient({}, hostId, FULL);
+    const before = framesOf(pc.channel, "request").length;
+    await expect(client.readRange("~/a", -1, 10)).rejects.toThrow(/non-negative/i);
+    await expect(client.readRange("~/a", 0, 0)).rejects.toThrow(/between 1 and 16 MiB/i);
+    await expect(client.readRange("~/a", 0, 64 * 1024 * 1024)).rejects.toThrow(
+      /between 1 and 16 MiB/i,
+    );
+    expect(framesOf(pc.channel, "request")).toHaveLength(before);
+    client.close();
+  });
+
+  test("sends offset and length as its own operation", async () => {
+    // Never as extra keys on fs.read: an older daemon ignores unknown keys and
+    // would whole-file hash a 512 MiB video to answer a 4 KiB question.
+    const { client, pc } = await readyClient({}, hostId, FULL);
+    client.readRange("~/video.mp4", 0, 4096).catch(() => {});
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    expect(request.operation).toBe("fs.read.range");
+    expect(request.payload).toEqual({ path: "~/video.mp4", offset: 0, length: 4096 });
+    client.close();
+  });
+
+  test("refuses a host that returns more bytes than were asked for", async () => {
+    const { client, pc } = await readyClient({}, hostId, FULL);
+    const pending = client.readRange("~/video.mp4", 0, 16);
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    pc.channel.receive(
+      JSON.stringify({
+        version: 1,
+        type: "response",
+        request_id: request.request_id,
+        ok: true,
+        result: {
+          stream_id: "range-1",
+          path: "/home/me/video.mp4",
+          name: "video.mp4",
+          offset: 0,
+          length: 999,
+          file_size: 999,
+          sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        },
+      }),
+    );
+    await expect(pending).rejects.toThrow(/more bytes than requested/i);
+    client.close();
+  });
+
+  test("previewImage only accepts allowlisted render sizes", async () => {
+    // A free integer would let a caller ask a third-party QuickLook generator
+    // for a 16384px render and allocate a gigabyte on someone's laptop.
+    const { client, pc } = await readyClient({}, hostId, FULL);
+    const before = framesOf(pc.channel, "request").length;
+    await expect(client.previewImage("~/deck.key", 16384)).rejects.toThrow(/unsupported/i);
+    await expect(client.previewImage("~/deck.key", 300)).rejects.toThrow(/unsupported/i);
+    expect(framesOf(pc.channel, "request")).toHaveLength(before);
+
+    client.previewImage("~/deck.key", 256).catch(() => {});
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    expect(request.operation).toBe("fs.preview");
+    expect(request.payload).toEqual({ path: "~/deck.key", max_pixels: 256 });
+    client.close();
+  });
+});
+
+describe("HostControlClient readHead", () => {
+  test("reads a small file whole rather than cancelling a stream", async () => {
+    // Cancelling leaves a tombstone, and enough live tombstones tear the
+    // control channel down. A file already under the limit needs no range.
+    const { client, pc } = await readyClient({}, hostId, ["fs.read", "fs.read.range"]);
+    client.readHead("~/notes.txt", 96 * 1024, { size: 12 }).catch(() => {});
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    expect(request.operation).toBe("fs.read");
+    expect(framesOf(pc.channel, "request").some((f) => f.operation === "fs.read.range")).toBe(
+      false,
+    );
+    client.close();
+  });
+
+  test("uses a real ranged read for a large file", async () => {
+    const { client, pc } = await readyClient({}, hostId, ["fs.read", "fs.read.range"]);
+    client.readHead("~/huge.log", 4096, { size: 50_000_000 }).catch(() => {});
+    await Promise.resolve();
+    const request = framesOf(pc.channel, "request").at(-1);
+    expect(request.operation).toBe("fs.read.range");
+    expect(request.payload.length).toBe(4096);
+    client.close();
+  });
+
+  test("declines rather than cancelling when the host has no ranged read", async () => {
+    const { client, pc } = await readyClient({}, hostId, ["fs.read"]);
+    const before = framesOf(pc.channel, "request").length;
+    await expect(client.readHead("~/huge.log", 4096, { size: 50_000_000 })).rejects.toThrow(
+      /cannot read part of a file/i,
+    );
+    // Nothing was started, so nothing needs cancelling.
+    expect(framesOf(pc.channel, "request")).toHaveLength(before);
+    client.close();
   });
 });

@@ -29,11 +29,11 @@ use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
-use crate::agent_ctl::{
-    self, AgentControlHub, ControlOperation, ControlOutbound, ControlRequest, ControlSender,
+use crate::session_ctl::{
+    self, SessionControlHub, ControlOperation, ControlOutbound, ControlRequest, ControlSender,
     ProtocolError,
 };
-use crate::agents::{AgentBinding, AgentRegistry};
+use crate::sessions::{SessionBinding, SessionRegistry};
 use crate::host_files::HostFileService;
 use crate::host_signal::HostConnectedSignal;
 use crate::proto::{Outbound, RtcIceServerConfig};
@@ -50,7 +50,7 @@ pub type RtcAnswerSigner = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
 
 const PTY_DATA_CHANNEL_LABEL: &str = "spawn.pty";
 const CONTROL_DATA_CHANNEL_LABEL: &str = "spawn.ctl";
-const AGENT_RTC_PROTOCOL_VERSION: u16 = 2;
+const SESSION_RTC_PROTOCOL_VERSION: u16 = 2;
 const HOST_CONTROL_LABEL: &str = "spawn.host.ctl";
 const RTC_PROTOCOL_VERSION: u16 = 1;
 #[cfg(test)]
@@ -81,16 +81,16 @@ const RTC_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// network blips) before the daemon closes it.
 const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
 #[cfg(not(test))]
-const REQUIRED_AGENT_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUIRED_SESSION_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
-const REQUIRED_AGENT_CHANNEL_TIMEOUT: Duration = Duration::from_secs(3);
+const REQUIRED_SESSION_CHANNEL_TIMEOUT: Duration = Duration::from_secs(3);
 const DATA_CHANNEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
-type AgentCloserMap = HashMap<(Uuid, u64), Weak<Mutex<()>>>;
+type SessionCloserMap = HashMap<(Uuid, u64), Weak<Mutex<()>>>;
 #[cfg(test)]
 type TestEffectGateMap = HashMap<(String, TestEffectPoint), Arc<TestEffectGate>>;
 #[cfg(test)]
-type TestSenderCloseGateMap = HashMap<(String, AgentChannel), Arc<TestSenderCloseGate>>;
+type TestSenderCloseGateMap = HashMap<(String, SessionChannel), Arc<TestSenderCloseGate>>;
 
 #[derive(Clone, Default)]
 pub struct RtcSessions {
@@ -101,8 +101,8 @@ pub struct RtcSessions {
     /// RTC construction and must still match while admission is serialized.
     trust_epoch: Arc<AtomicU64>,
     registered_host_id: Arc<Mutex<Option<Uuid>>>,
-    agent_closers: Arc<Mutex<AgentCloserMap>>,
-    controls: AgentControlHub,
+    session_closers: Arc<Mutex<SessionCloserMap>>,
+    controls: SessionControlHub,
     uploads: UploadHub,
     peer_cleanup_tasks: Arc<Mutex<tokio::task::JoinSet<()>>>,
     closing_peers: Arc<Mutex<HashMap<(String, String), RtcPeer>>>,
@@ -247,7 +247,7 @@ pub(crate) struct HostRtcBinding {
 /// Immutable host-scope identity supplied on offer/candidate/close frames.
 #[derive(Clone)]
 pub struct HostRtcSignal {
-    pub session_id: String,
+    pub signal_id: String,
     pub binding_nonce: Option<String>,
     pub scope_type: Option<String>,
     pub scope_id: Option<Uuid>,
@@ -280,16 +280,16 @@ impl HostRtcSignal {
 #[derive(Clone)]
 struct RtcPeer {
     pc: Arc<RTCPeerConnection>,
-    agent: AgentBinding,
+    session: SessionBinding,
     generation: String,
     active: Arc<AtomicBool>,
     control: ForwarderControl,
-    channels: Arc<RequiredAgentChannels>,
+    channels: Arc<RequiredSessionChannels>,
     close: Arc<PeerCloseCoordinator>,
     _admission_permit: Arc<RtcPeerAdmissionPermit>,
     /// Replacement sets `active` false, closes the PC, then takes this write
     /// lock. Every callback holds a read lock while touching its backend, so
-    /// `close_for_agent` does not return until old-generation work has drained.
+    /// `close_for_session` does not return until old-generation work has drained.
     fence: Arc<tokio::sync::RwLock<()>>,
 }
 
@@ -297,35 +297,35 @@ struct RtcPeer {
 ///
 /// Keeping the three binding fields together makes it difficult to
 /// accidentally validate a session ID while forwarding a stale generation or
-/// a different agent ID.
+/// a different session ID.
 #[derive(Clone)]
-pub struct RtcSessionBinding {
-    session_id: String,
+pub struct RtcSignalBinding {
+    signal_id: String,
     binding_nonce: String,
     generation: String,
-    agent_id: Uuid,
+    session_id: Uuid,
 }
 
-impl RtcSessionBinding {
+impl RtcSignalBinding {
     #[cfg(test)]
-    pub fn new(session_id: String, generation: String, agent_id: Uuid) -> Self {
+    pub fn new(signal_id: String, generation: String, session_id: Uuid) -> Self {
         Self {
-            session_id,
+            signal_id,
             binding_nonce: "a".repeat(32),
             generation,
-            agent_id,
+            session_id,
         }
     }
 
-    /// Bind an agent RTC attempt to both the browser nonce and the durable
+    /// Bind a session RTC attempt to both the browser nonce and the durable
     /// daemon-owner generation selected by the signaling server. The
     /// composite key is daemon-local only; signaling responses echo the nonce
     /// and the server restores its own generation token.
     pub fn from_server(
-        session_id: String,
+        signal_id: String,
         binding_nonce: String,
         binding_generation: u64,
-        agent_id: Uuid,
+        session_id: Uuid,
     ) -> Option<Self> {
         if !valid_binding_nonce(&binding_nonce)
             || binding_generation == 0
@@ -334,15 +334,15 @@ impl RtcSessionBinding {
             return None;
         }
         Some(Self {
-            session_id,
+            signal_id,
             generation: format!("{binding_generation}:{binding_nonce}"),
             binding_nonce,
-            agent_id,
+            session_id,
         })
     }
 
     pub fn into_routing_parts(self) -> (String, String, Uuid) {
-        (self.session_id, self.generation, self.agent_id)
+        (self.signal_id, self.generation, self.session_id)
     }
 }
 
@@ -355,8 +355,8 @@ fn valid_binding_nonce(nonce: &str) -> bool {
 
 #[derive(Clone)]
 struct BoundRtcSession {
-    signaling: RtcSessionBinding,
-    agent: AgentBinding,
+    signaling: RtcSignalBinding,
+    session: SessionBinding,
     control: ForwarderControl,
     trust_epoch: u64,
 }
@@ -373,13 +373,13 @@ struct RtcCallbackGuard {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum AgentChannel {
+enum SessionChannel {
     Pty,
     Control,
 }
 
 #[derive(Default)]
-struct AgentChannelState {
+struct SessionChannelState {
     pty_seen: bool,
     control_seen: bool,
     pty_open: bool,
@@ -388,30 +388,30 @@ struct AgentChannelState {
 }
 
 #[derive(Default)]
-struct RequiredAgentChannels {
-    state: Mutex<AgentChannelState>,
+struct RequiredSessionChannels {
+    state: Mutex<SessionChannelState>,
     changed: Notify,
     ready: AtomicBool,
     failed: AtomicBool,
     effects: Arc<tokio::sync::RwLock<()>>,
 }
 
-struct AgentEffectPermit {
-    channels: Arc<RequiredAgentChannels>,
+struct SessionEffectPermit {
+    channels: Arc<RequiredSessionChannels>,
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
-impl AgentEffectPermit {
+impl SessionEffectPermit {
     fn valid(&self) -> bool {
         self.channels.ready.load(Ordering::SeqCst) && !self.channels.failed.load(Ordering::SeqCst)
     }
 }
 
-struct AgentFailurePermit {
+struct SessionFailurePermit {
     _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
 }
 
-impl RequiredAgentChannels {
+impl RequiredSessionChannels {
     fn ready(&self) -> bool {
         self.ready.load(Ordering::SeqCst) && !self.failed.load(Ordering::SeqCst)
     }
@@ -422,7 +422,7 @@ impl RequiredAgentChannels {
         self.changed.notify_waiters();
     }
 
-    async fn permit(self: &Arc<Self>) -> Option<AgentEffectPermit> {
+    async fn permit(self: &Arc<Self>) -> Option<SessionEffectPermit> {
         if !self.ready() {
             return None;
         }
@@ -430,17 +430,17 @@ impl RequiredAgentChannels {
         if !self.ready() {
             return None;
         }
-        Some(AgentEffectPermit {
+        Some(SessionEffectPermit {
             channels: Arc::clone(self),
             _guard: guard,
         })
     }
 
-    async fn register(&self, channel: AgentChannel) -> bool {
+    async fn register(&self, channel: SessionChannel) -> bool {
         let mut state = self.state.lock().await;
         let seen = match channel {
-            AgentChannel::Pty => &mut state.pty_seen,
-            AgentChannel::Control => &mut state.control_seen,
+            SessionChannel::Pty => &mut state.pty_seen,
+            SessionChannel::Control => &mut state.control_seen,
         };
         if *seen {
             state.failed = true;
@@ -451,11 +451,11 @@ impl RequiredAgentChannels {
         true
     }
 
-    async fn mark_open(&self, channel: AgentChannel) {
+    async fn mark_open(&self, channel: SessionChannel) {
         let mut state = self.state.lock().await;
         match channel {
-            AgentChannel::Pty => state.pty_open = true,
-            AgentChannel::Control => state.control_open = true,
+            SessionChannel::Pty => state.pty_open = true,
+            SessionChannel::Control => state.control_open = true,
         }
         if !state.failed
             && !self.failed.load(Ordering::SeqCst)
@@ -470,14 +470,14 @@ impl RequiredAgentChannels {
         self.changed.notify_waiters();
     }
 
-    async fn fail(self: &Arc<Self>) -> AgentFailurePermit {
+    async fn fail(self: &Arc<Self>) -> SessionFailurePermit {
         self.stop();
         let mut state = self.state.lock().await;
         state.failed = true;
         self.ready.store(false, Ordering::SeqCst);
         self.changed.notify_waiters();
         drop(state);
-        AgentFailurePermit {
+        SessionFailurePermit {
             _guard: Arc::clone(&self.effects).write_owned().await,
         }
     }
@@ -499,8 +499,8 @@ impl RequiredAgentChannels {
     }
 }
 
-fn viewer_id(session_id: &str, generation: &str) -> String {
-    format!("{session_id}:{generation}")
+fn viewer_id(signal_id: &str, generation: &str) -> String {
+    format!("{signal_id}:{generation}")
 }
 
 impl RtcSessions {
@@ -517,12 +517,12 @@ impl RtcSessions {
     }
 
     #[cfg(test)]
-    async fn stall_effect(&self, session_id: &str, point: TestEffectPoint) -> Arc<TestEffectGate> {
+    async fn stall_effect(&self, signal_id: &str, point: TestEffectPoint) -> Arc<TestEffectGate> {
         let gate = Arc::new(TestEffectGate::default());
         self.effect_gates
             .lock()
             .await
-            .insert((session_id.to_string(), point), Arc::clone(&gate));
+            .insert((signal_id.to_string(), point), Arc::clone(&gate));
         gate
     }
 
@@ -534,12 +534,12 @@ impl RtcSessions {
     }
 
     #[cfg(test)]
-    async fn pause_effect(&self, session_id: &str, point: TestEffectPoint) {
+    async fn pause_effect(&self, signal_id: &str, point: TestEffectPoint) {
         let gate = self
             .effect_gates
             .lock()
             .await
-            .remove(&(session_id.to_string(), point));
+            .remove(&(signal_id.to_string(), point));
         if let Some(gate) = gate {
             gate.entered.notify_one();
             gate.release.notified().await;
@@ -549,14 +549,14 @@ impl RtcSessions {
     #[cfg(test)]
     async fn stall_sender_close(
         &self,
-        session_id: &str,
-        channel: AgentChannel,
+        signal_id: &str,
+        channel: SessionChannel,
     ) -> Arc<TestSenderCloseGate> {
         let gate = Arc::new(TestSenderCloseGate::default());
         self.sender_close_gates
             .lock()
             .await
-            .insert((session_id.to_string(), channel), Arc::clone(&gate));
+            .insert((signal_id.to_string(), channel), Arc::clone(&gate));
         gate
     }
 
@@ -571,41 +571,41 @@ impl RtcSessions {
 
     pub async fn handle_offer(
         &self,
-        binding: RtcSessionBinding,
+        binding: RtcSignalBinding,
         sdp: String,
         ice_servers: Vec<RtcIceServerConfig>,
-        registry: AgentRegistry,
+        registry: SessionRegistry,
         out_tx: mpsc::Sender<WsOutbound>,
         answer_signer: Option<RtcAnswerSigner>,
     ) {
         let trust_epoch = self.capture_trust_epoch();
-        let Some(agent) = registry.binding_for(binding.agent_id) else {
+        let Some(session) = registry.binding_for(binding.session_id) else {
             send_status(
                 &out_tx,
-                binding.session_id,
+                binding.signal_id,
                 binding.binding_nonce,
-                binding.agent_id,
+                binding.session_id,
                 "failed",
-                Some("agent is not running on this daemon"),
+                Some("session is not running on this daemon"),
             )
             .await;
             return;
         };
-        let Some(control) = registry.control_for_binding(agent) else {
+        let Some(control) = registry.control_for_binding(session) else {
             send_status(
                 &out_tx,
-                binding.session_id,
+                binding.signal_id,
                 binding.binding_nonce,
-                binding.agent_id,
+                binding.session_id,
                 "failed",
-                Some("agent backend was replaced while binding RTC"),
+                Some("session backend was replaced while binding RTC"),
             )
             .await;
             return;
         };
         let bound = BoundRtcSession {
             signaling: binding,
-            agent,
+            session,
             control,
             trust_epoch,
         };
@@ -622,16 +622,16 @@ impl RtcSessions {
             .await
         {
             tracing::warn!(
-                agent_id = %bound.signaling.agent_id,
                 session_id = %bound.signaling.session_id,
+                signal_id = %bound.signaling.signal_id,
                 error = %e,
                 "rtc offer failed"
             );
             send_status(
                 &out_tx,
-                bound.signaling.session_id,
+                bound.signaling.signal_id,
                 bound.signaling.binding_nonce,
-                bound.signaling.agent_id,
+                bound.signaling.session_id,
                 "failed",
                 Some(&format!("{e:#}")),
             )
@@ -644,7 +644,7 @@ impl RtcSessions {
         binding: BoundRtcSession,
         sdp: String,
         ice_servers: Vec<RtcIceServerConfig>,
-        registry: AgentRegistry,
+        registry: SessionRegistry,
         out_tx: mpsc::Sender<WsOutbound>,
         answer_signer: Option<RtcAnswerSigner>,
     ) -> Result<()> {
@@ -687,12 +687,12 @@ impl RtcSessions {
         );
         let active = Arc::new(AtomicBool::new(true));
         let fence = Arc::new(tokio::sync::RwLock::new(()));
-        let channels = Arc::new(RequiredAgentChannels::default());
+        let channels = Arc::new(RequiredSessionChannels::default());
         let close = Arc::new(PeerCloseCoordinator::default());
 
         // Linearize peer insertion with backend replacement. Construction and
         // SDP work stay outside this guard, but the captured binding is
-        // revalidated while insertion is protected by the same per-agent lock
+        // revalidated while insertion is protected by the same per-session lock
         // used to invalidate the registry entry and scan old peers.
         #[cfg(test)]
         self.peer_insert_attempted.notify_waiters();
@@ -702,12 +702,12 @@ impl RtcSessions {
             anyhow::bail!("credential trust changed during RTC negotiation");
         }
         let transition = registry
-            .lock_generation_transition(binding.signaling.agent_id)
+            .lock_generation_transition(binding.signaling.session_id)
             .await;
-        if !registry.is_current(binding.agent) {
+        if !registry.is_current(binding.session) {
             drop(transition);
             let _ = pc.close().await;
-            anyhow::bail!("agent backend was replaced during RTC negotiation");
+            anyhow::bail!("session backend was replaced during RTC negotiation");
         }
 
         // Track the peer connection BEFORE SDP negotiation so every exit path
@@ -716,24 +716,24 @@ impl RtcSessions {
             .host_peers
             .lock()
             .await
-            .contains_key(&binding.signaling.session_id);
+            .contains_key(&binding.signaling.signal_id);
         let cleanup_collision = self.closing_peers.lock().await.contains_key(&(
-            binding.signaling.session_id.clone(),
+            binding.signaling.signal_id.clone(),
             binding.signaling.generation.clone(),
         ));
         let collision_or_capacity = {
             let mut peers = self.peers.lock().await;
             if host_collision
                 || cleanup_collision
-                || peers.contains_key(&binding.signaling.session_id)
+                || peers.contains_key(&binding.signaling.signal_id)
             {
                 true
             } else {
                 peers.insert(
-                    binding.signaling.session_id.clone(),
+                    binding.signaling.signal_id.clone(),
                     RtcPeer {
                         pc: Arc::clone(&pc),
-                        agent: binding.agent,
+                        session: binding.session,
                         generation: binding.signaling.generation.clone(),
                         active: Arc::clone(&active),
                         control: binding.control.clone(),
@@ -759,19 +759,19 @@ impl RtcSessions {
             .pty_send_gates
             .lock()
             .await
-            .remove(&binding.signaling.session_id);
+            .remove(&binding.signaling.signal_id);
         #[cfg(test)]
         let pty_sender_close_gate = self
             .sender_close_gates
             .lock()
             .await
-            .remove(&(binding.signaling.session_id.clone(), AgentChannel::Pty));
+            .remove(&(binding.signaling.signal_id.clone(), SessionChannel::Pty));
         #[cfg(test)]
         let control_sender_close_gate = self
             .sender_close_gates
             .lock()
             .await
-            .remove(&(binding.signaling.session_id.clone(), AgentChannel::Control));
+            .remove(&(binding.signaling.signal_id.clone(), SessionChannel::Control));
         install_data_channel_handler(
             &pc,
             self.clone(),
@@ -798,7 +798,7 @@ impl RtcSessions {
             Ok(local_sdp) => local_sdp,
             Err(e) => {
                 self.close_if_same(
-                    &binding.signaling.session_id,
+                    &binding.signaling.signal_id,
                     &binding.signaling.generation,
                     &pc,
                 )
@@ -815,12 +815,12 @@ impl RtcSessions {
                 Ok(wire) => (None, Some(wire)),
                 Err(e) => {
                     self.close_if_same(
-                        &binding.signaling.session_id,
+                        &binding.signaling.signal_id,
                         &binding.signaling.generation,
                         &pc,
                     )
                     .await;
-                    return Err(e.context("signing agent RTC answer"));
+                    return Err(e.context("signing session RTC answer"));
                 }
             },
             None => (Some(local_sdp), None),
@@ -829,13 +829,12 @@ impl RtcSessions {
         send_json(
             &out_tx,
             Outbound::RtcAnswer {
-                session_id: binding.signaling.session_id,
+                session_id: binding.signaling.signal_id,
                 binding_nonce: Some(binding.signaling.binding_nonce),
-                agent_id: Some(binding.signaling.agent_id),
-                scope_type: Some("agent".to_string()),
-                scope_id: Some(binding.signaling.agent_id),
+                scope_type: Some("session".to_string()),
+                scope_id: Some(binding.signaling.session_id),
                 protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
-                protocol_version: Some(AGENT_RTC_PROTOCOL_VERSION),
+                protocol_version: Some(SESSION_RTC_PROTOCOL_VERSION),
                 sdp: answer_sdp,
                 signed_envelope: answer_signed_envelope,
             },
@@ -855,16 +854,16 @@ impl RtcSessions {
     ) {
         let trust_epoch = self.capture_trust_epoch();
         let Some(binding) = signal.binding() else {
-            tracing::warn!(session_id = %signal.session_id, "rejecting invalid host rtc offer binding");
+            tracing::warn!(signal_id = %signal.signal_id, "rejecting invalid host rtc offer binding");
             return;
         };
         if *self.registered_host_id.lock().await != Some(binding.host_id) {
-            tracing::warn!(session_id = %signal.session_id, "rejecting host rtc offer for another daemon");
+            tracing::warn!(signal_id = %signal.signal_id, "rejecting host rtc offer for another daemon");
             return;
         }
         if let Err(error) = self
             .create_host_answer(
-                signal.session_id.clone(),
+                signal.signal_id.clone(),
                 binding.clone(),
                 sdp,
                 ice_servers,
@@ -877,14 +876,14 @@ impl RtcSessions {
             )
             .await
         {
-            tracing::warn!(session_id = %signal.session_id, %error, "host rtc offer failed");
-            send_host_status(&out_tx, signal.session_id, &binding, "failed").await;
+            tracing::warn!(signal_id = %signal.signal_id, %error, "host rtc offer failed");
+            send_host_status(&out_tx, signal.signal_id, &binding, "failed").await;
         }
     }
 
     async fn create_host_answer(
         &self,
-        session_id: String,
+        signal_id: String,
         binding: HostRtcBinding,
         sdp: String,
         ice_servers: Vec<RtcIceServerConfig>,
@@ -929,14 +928,14 @@ impl RtcSessions {
         }
         let admitted = {
             let mut hosts = self.host_peers.lock().await;
-            if hosts.contains_key(&session_id)
+            if hosts.contains_key(&signal_id)
                 || hosts.len() >= MAX_HOST_RTC_PEERS
-                || self.peers.lock().await.contains_key(&session_id)
+                || self.peers.lock().await.contains_key(&signal_id)
             {
                 false
             } else {
                 hosts.insert(
-                    session_id.clone(),
+                    signal_id.clone(),
                     HostRtcPeer {
                         pc: Arc::clone(&pc),
                         binding: binding.clone(),
@@ -954,23 +953,23 @@ impl RtcSessions {
 
         install_host_ice_handler(
             &pc,
-            session_id.clone(),
+            signal_id.clone(),
             binding.clone(),
             admission.out_tx.clone(),
         );
         install_host_data_channel_handler(
             &pc,
-            session_id.clone(),
+            signal_id.clone(),
             binding.clone(),
             admission.out_tx.clone(),
             None,
         );
-        self.install_host_reaper(&pc, session_id.clone());
+        self.install_host_reaper(&pc, signal_id.clone());
 
         let local_sdp = match negotiate(&pc, sdp).await {
             Ok(sdp) => sdp,
             Err(error) => {
-                self.close_host_if_same(&session_id, &pc).await;
+                self.close_host_if_same(&signal_id, &pc).await;
                 return Err(error);
             }
         };
@@ -980,7 +979,7 @@ impl RtcSessions {
             Some(sign) => match sign(&local_sdp) {
                 Ok(wire) => (None, Some(wire)),
                 Err(e) => {
-                    self.close_host_if_same(&session_id, &pc).await;
+                    self.close_host_if_same(&signal_id, &pc).await;
                     return Err(e.context("signing host RTC answer"));
                 }
             },
@@ -989,9 +988,8 @@ impl RtcSessions {
         send_json(
             &admission.out_tx,
             Outbound::RtcAnswer {
-                session_id,
+                session_id: signal_id,
                 binding_nonce: Some(binding.binding_nonce),
-                agent_id: None,
                 scope_type: Some("host".to_string()),
                 scope_id: Some(binding.host_id),
                 protocol: Some(binding.protocol),
@@ -1004,24 +1002,24 @@ impl RtcSessions {
         Ok(())
     }
 
-    fn install_host_reaper(&self, pc: &Arc<RTCPeerConnection>, session_id: String) {
+    fn install_host_reaper(&self, pc: &Arc<RTCPeerConnection>, signal_id: String) {
         let weak = Arc::downgrade(pc);
         {
             let sessions = self.clone();
-            let session_id = session_id.clone();
+            let signal_id = signal_id.clone();
             let weak = weak.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(RTC_CONNECT_TIMEOUT).await;
                 let Some(pc) = weak.upgrade() else { return };
                 if pc.connection_state() != RTCPeerConnectionState::Connected {
-                    sessions.close_host_if_same(&session_id, &pc).await;
+                    sessions.close_host_if_same(&signal_id, &pc).await;
                 }
             });
         }
         let sessions = self.clone();
         pc.on_peer_connection_state_change(Box::new(move |state| {
             let sessions = sessions.clone();
-            let session_id = session_id.clone();
+            let signal_id = signal_id.clone();
             let weak = weak.clone();
             Box::pin(async move {
                 let delay = match state {
@@ -1036,21 +1034,21 @@ impl RtcSessions {
                     if delay.is_zero()
                         || pc.connection_state() == RTCPeerConnectionState::Disconnected
                     {
-                        sessions.close_host_if_same(&session_id, &pc).await;
+                        sessions.close_host_if_same(&signal_id, &pc).await;
                     }
                 });
             })
         }));
     }
 
-    async fn close_host_if_same(&self, session_id: &str, pc: &Arc<RTCPeerConnection>) {
+    async fn close_host_if_same(&self, signal_id: &str, pc: &Arc<RTCPeerConnection>) {
         let removed = {
             let mut peers = self.host_peers.lock().await;
             if peers
-                .get(session_id)
+                .get(signal_id)
                 .is_some_and(|peer| Arc::ptr_eq(&peer.pc, pc))
             {
-                peers.remove(session_id)
+                peers.remove(signal_id)
             } else {
                 None
             }
@@ -1070,18 +1068,18 @@ impl RtcSessions {
             .host_peers
             .lock()
             .await
-            .get(&signal.session_id)
+            .get(&signal.signal_id)
             .cloned()
         else {
             return;
         };
         if peer.binding != binding {
-            tracing::warn!(session_id = %signal.session_id, "ignoring stale host rtc candidate binding");
+            tracing::warn!(signal_id = %signal.signal_id, "ignoring stale host rtc candidate binding");
             return;
         }
         if let Ok(candidate) = serde_json::from_value::<RTCIceCandidateInit>(candidate) {
             if let Err(error) = peer.pc.add_ice_candidate(candidate).await {
-                tracing::debug!(session_id = %signal.session_id, %error, "adding host rtc candidate failed");
+                tracing::debug!(signal_id = %signal.signal_id, %error, "adding host rtc candidate failed");
             }
         }
     }
@@ -1093,10 +1091,10 @@ impl RtcSessions {
         let peer = {
             let mut peers = self.host_peers.lock().await;
             if peers
-                .get(&signal.session_id)
+                .get(&signal.signal_id)
                 .is_some_and(|peer| peer.binding == binding)
             {
-                peers.remove(&signal.session_id)
+                peers.remove(&signal.signal_id)
             } else {
                 None
             }
@@ -1113,7 +1111,7 @@ impl RtcSessions {
     fn install_reaper(
         &self,
         pc: &Arc<RTCPeerConnection>,
-        binding: RtcSessionBinding,
+        binding: RtcSignalBinding,
         close: Arc<PeerCloseCoordinator>,
     ) {
         let weak = Arc::downgrade(pc);
@@ -1128,14 +1126,14 @@ impl RtcSessions {
                 let Some(pc) = weak.upgrade() else { return };
                 if pc.connection_state() != RTCPeerConnectionState::Connected {
                     tracing::debug!(
-                        agent_id = %binding.agent_id,
                         session_id = %binding.session_id,
+                        signal_id = %binding.signal_id,
                         "rtc peer never connected; reaping"
                     );
                     let deadline = close.initiate();
                     sessions
                         .close_if_same_until(
-                            &binding.session_id,
+                            &binding.signal_id,
                             &binding.generation,
                             &pc,
                             deadline,
@@ -1162,13 +1160,13 @@ impl RtcSessions {
                         // inside its own event handler can deadlock.
                         tokio::spawn(async move {
                             tracing::debug!(
-                                agent_id = %binding.agent_id,
                                 session_id = %binding.session_id,
+                                signal_id = %binding.signal_id,
                                 "rtc peer failed; reaping"
                             );
                             sessions
                                 .close_if_same_until(
-                                    &binding.session_id,
+                                    &binding.signal_id,
                                     &binding.generation,
                                     &pc,
                                     deadline,
@@ -1183,13 +1181,13 @@ impl RtcSessions {
                             if pc.connection_state() == RTCPeerConnectionState::Disconnected {
                                 let deadline = close.initiate();
                                 tracing::debug!(
-                                    agent_id = %binding.agent_id,
                                     session_id = %binding.session_id,
+                                    signal_id = %binding.signal_id,
                                     "rtc peer stayed disconnected; reaping"
                                 );
                                 sessions
                                     .close_if_same_until(
-                                        &binding.session_id,
+                                        &binding.signal_id,
                                         &binding.generation,
                                         &pc,
                                         deadline,
@@ -1208,28 +1206,28 @@ impl RtcSessions {
     /// this same instance (a newer offer may have replaced it).
     fn schedule_close_if_same(
         &self,
-        session_id: &str,
+        signal_id: &str,
         generation: &str,
         pc: &Arc<RTCPeerConnection>,
         close: &Arc<PeerCloseCoordinator>,
     ) {
         let upload_deadline = close.initiate();
         let sessions = self.clone();
-        let session_id = session_id.to_string();
+        let signal_id = signal_id.to_string();
         let generation = generation.to_string();
         let pc = Arc::clone(pc);
         tokio::spawn(async move {
             sessions
-                .close_if_same_until(&session_id, &generation, &pc, upload_deadline)
+                .close_if_same_until(&signal_id, &generation, &pc, upload_deadline)
                 .await;
         });
     }
 
-    async fn close_if_same(&self, session_id: &str, generation: &str, pc: &Arc<RTCPeerConnection>) {
+    async fn close_if_same(&self, signal_id: &str, generation: &str, pc: &Arc<RTCPeerConnection>) {
         let active_deadline = {
             let peers = self.peers.lock().await;
             peers
-                .get(session_id)
+                .get(signal_id)
                 .filter(|current| current.generation == generation && Arc::ptr_eq(&current.pc, pc))
                 .map(|peer| peer.close.initiate())
         };
@@ -1238,12 +1236,12 @@ impl RtcSessions {
         } else {
             let closing = self.closing_peers.lock().await;
             closing
-                .get(&(session_id.to_string(), generation.to_string()))
+                .get(&(signal_id.to_string(), generation.to_string()))
                 .filter(|current| Arc::ptr_eq(&current.pc, pc))
                 .map(|peer| peer.close.initiate())
         };
         if let Some(deadline) = deadline {
-            self.close_if_same_until(session_id, generation, pc, deadline)
+            self.close_if_same_until(signal_id, generation, pc, deadline)
                 .await;
         } else {
             let _ = pc.close().await;
@@ -1252,29 +1250,29 @@ impl RtcSessions {
 
     async fn close_if_same_until(
         &self,
-        session_id: &str,
+        signal_id: &str,
         generation: &str,
         pc: &Arc<RTCPeerConnection>,
         upload_deadline: tokio::time::Instant,
     ) {
-        let active_agent = {
+        let active_session = {
             let peers = self.peers.lock().await;
             peers
-                .get(session_id)
+                .get(signal_id)
                 .filter(|current| current.generation == generation && Arc::ptr_eq(&current.pc, pc))
-                .map(|peer| peer.agent)
+                .map(|peer| peer.session)
         };
-        let closing_peer = if active_agent.is_none() {
+        let closing_peer = if active_session.is_none() {
             self.closing_peers
                 .lock()
                 .await
-                .get(&(session_id.to_string(), generation.to_string()))
+                .get(&(signal_id.to_string(), generation.to_string()))
                 .filter(|current| Arc::ptr_eq(&current.pc, pc))
                 .cloned()
         } else {
             None
         };
-        let Some(agent) = active_agent.or_else(|| closing_peer.as_ref().map(|peer| peer.agent))
+        let Some(session) = active_session.or_else(|| closing_peer.as_ref().map(|peer| peer.session))
         else {
             let _ = tokio::time::timeout_at(upload_deadline, pc.close()).await;
             return;
@@ -1282,27 +1280,27 @@ impl RtcSessions {
         if let Some(peer) = closing_peer {
             debug_assert_eq!(peer.close.initiate(), upload_deadline);
             self.uploads
-                .cancel_session_now(peer.agent, &viewer_id(session_id, &peer.generation));
+                .cancel_viewer_now(peer.session, &viewer_id(signal_id, &peer.generation));
             let _ = tokio::time::timeout_at(upload_deadline, pc.close()).await;
             return;
         }
-        let closer = self.agent_closer(agent).await;
+        let closer = self.session_closer(session).await;
         let _closing = closer.lock().await;
         let peer = {
             let peers = self.peers.lock().await;
             peers
-                .get(session_id)
+                .get(signal_id)
                 .filter(|current| current.generation == generation && Arc::ptr_eq(&current.pc, pc))
                 .cloned()
         };
         if let Some(peer) = peer {
-            self.deactivate_peer_until(session_id, peer, upload_deadline)
+            self.deactivate_peer_until(signal_id, peer, upload_deadline)
                 .await;
             let mut peers = self.peers.lock().await;
-            if peers.get(session_id).is_some_and(|current| {
+            if peers.get(signal_id).is_some_and(|current| {
                 current.generation == generation && Arc::ptr_eq(&current.pc, pc)
             }) {
-                peers.remove(session_id);
+                peers.remove(signal_id);
             }
             return;
         }
@@ -1310,33 +1308,33 @@ impl RtcSessions {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn send_agent_peer_status(
+    async fn send_session_peer_status(
         &self,
         out_tx: &mpsc::Sender<WsOutbound>,
-        session_id: &str,
+        signal_id: &str,
         generation: &str,
         pc: &Arc<RTCPeerConnection>,
         active: &Arc<AtomicBool>,
-        channels: &Arc<RequiredAgentChannels>,
+        channels: &Arc<RequiredSessionChannels>,
         binding_nonce: &str,
-        agent_id: Uuid,
+        session_id: Uuid,
         status: &str,
         message: Option<&str>,
     ) -> bool {
         let (sent, close) = {
             let peers = self.peers.lock().await;
-            let current = peers.get(session_id).filter(|current| {
+            let current = peers.get(signal_id).filter(|current| {
                 current.generation == generation
                     && Arc::ptr_eq(&current.pc, pc)
-                    && current.agent.agent_id() == agent_id
+                    && current.session.session_id() == session_id
             });
             (
                 current.is_some()
                     && try_send_status(
                         out_tx,
-                        session_id,
+                        signal_id,
                         binding_nonce,
-                        agent_id,
+                        session_id,
                         status,
                         message,
                     ),
@@ -1347,7 +1345,7 @@ impl RtcSessions {
             channels.stop();
             active.store(false, Ordering::Release);
             if let Some(close) = close {
-                self.schedule_close_if_same(session_id, generation, pc, &close);
+                self.schedule_close_if_same(signal_id, generation, pc, &close);
             } else {
                 let _ = pc.close().await;
             }
@@ -1357,46 +1355,46 @@ impl RtcSessions {
 
     pub async fn handle_candidate(
         &self,
-        session_id: String,
+        signal_id: String,
         generation: String,
-        agent_id: Uuid,
+        session_id: Uuid,
         candidate: serde_json::Value,
     ) {
-        let Some(peer) = self.peers.lock().await.get(&session_id).cloned() else {
-            tracing::debug!(%session_id, "ignoring rtc candidate for unknown session");
+        let Some(peer) = self.peers.lock().await.get(&signal_id).cloned() else {
+            tracing::debug!(%signal_id, "ignoring rtc candidate for unknown session");
             return;
         };
-        if peer.agent.agent_id() != agent_id || peer.generation != generation {
-            tracing::warn!(%session_id, %agent_id, "ignoring rtc candidate with stale binding");
+        if peer.session.session_id() != session_id || peer.generation != generation {
+            tracing::warn!(%signal_id, %session_id, "ignoring rtc candidate with stale binding");
             return;
         }
         let pc = peer.pc;
         match serde_json::from_value::<RTCIceCandidateInit>(candidate) {
             Ok(candidate) => {
                 if let Err(e) = pc.add_ice_candidate(candidate).await {
-                    tracing::debug!(%session_id, error = %e, "adding rtc candidate failed");
+                    tracing::debug!(%signal_id, error = %e, "adding rtc candidate failed");
                 }
             }
             Err(e) => {
-                tracing::debug!(%session_id, error = %e, "decoding rtc candidate failed");
+                tracing::debug!(%signal_id, error = %e, "decoding rtc candidate failed");
             }
         }
     }
 
-    pub async fn close(&self, session_id: &str, generation: &str, agent_id: Uuid) {
+    pub async fn close(&self, signal_id: &str, generation: &str, session_id: Uuid) {
         let active = {
             let peers = self.peers.lock().await;
             peers
-                .get(session_id)
-                .filter(|peer| peer.agent.agent_id() == agent_id && peer.generation == generation)
+                .get(signal_id)
+                .filter(|peer| peer.session.session_id() == session_id && peer.generation == generation)
                 .cloned()
         };
         let closing = if active.is_none() {
             self.closing_peers
                 .lock()
                 .await
-                .get(&(session_id.to_string(), generation.to_string()))
-                .filter(|peer| peer.agent.agent_id() == agent_id)
+                .get(&(signal_id.to_string(), generation.to_string()))
+                .filter(|peer| peer.session.session_id() == session_id)
                 .cloned()
         } else {
             None
@@ -1404,47 +1402,47 @@ impl RtcSessions {
         let Some(initial) = active.or_else(|| closing.clone()) else {
             return;
         };
-        let agent = initial.agent;
+        let session = initial.session;
         let upload_deadline = initial.close.initiate();
         if let Some(peer) = closing {
             self.uploads
-                .cancel_session_now(peer.agent, &viewer_id(session_id, &peer.generation));
+                .cancel_viewer_now(peer.session, &viewer_id(signal_id, &peer.generation));
             let _ = tokio::time::timeout_at(upload_deadline, peer.pc.close()).await;
             return;
         }
-        let closer = self.agent_closer(agent).await;
+        let closer = self.session_closer(session).await;
         let _closing = closer.lock().await;
         let peer = {
             let peers = self.peers.lock().await;
             peers
-                .get(session_id)
-                .filter(|peer| peer.agent.agent_id() == agent_id && peer.generation == generation)
+                .get(signal_id)
+                .filter(|peer| peer.session.session_id() == session_id && peer.generation == generation)
                 .cloned()
         };
         if let Some(peer) = peer {
-            self.deactivate_peer_until(session_id, peer, upload_deadline)
+            self.deactivate_peer_until(signal_id, peer, upload_deadline)
                 .await;
             let mut peers = self.peers.lock().await;
-            if peers.get(session_id).is_some_and(|peer| {
-                peer.agent.agent_id() == agent_id && peer.generation == generation
+            if peers.get(signal_id).is_some_and(|peer| {
+                peer.session.session_id() == session_id && peer.generation == generation
             }) {
-                peers.remove(session_id);
+                peers.remove(signal_id);
             }
         }
     }
 
     /// Close peers attached to one concrete backend generation. A replacement
     /// using the same UUID is deliberately not matched.
-    pub async fn close_for_agent(&self, agent_id: Uuid, agent_generation: u64) {
-        let agent = AgentBinding::new(agent_id, agent_generation);
+    pub async fn close_for_session(&self, session_id: Uuid, generation: u64) {
+        let session = SessionBinding::new(session_id, generation);
         let closing = {
             let peers = self.peers.lock().await;
             peers
                 .iter()
-                .filter(|(_, peer)| peer.agent == agent)
-                .map(|(session_id, peer)| {
+                .filter(|(_, peer)| peer.session == session)
+                .map(|(signal_id, peer)| {
                     let deadline = peer.close.initiate();
-                    (session_id.clone(), peer.clone(), deadline)
+                    (signal_id.clone(), peer.clone(), deadline)
                 })
                 .collect::<Vec<_>>()
         };
@@ -1452,7 +1450,7 @@ impl RtcSessions {
             let closing_peers = self.closing_peers.lock().await;
             closing_peers
                 .values()
-                .filter(|peer| peer.agent == agent)
+                .filter(|peer| peer.session == session)
                 .map(|peer| peer.close.initiate())
                 .min()
         };
@@ -1464,19 +1462,19 @@ impl RtcSessions {
             .unwrap_or_else(upload_teardown_deadline);
         // Publish cancellation before transport/fence draining. Every later
         // upload cleanup wait for this generation shares this one deadline.
-        self.uploads.remove_generation_now(agent);
-        let closer = self.agent_closer(agent).await;
+        self.uploads.remove_generation_now(session);
+        let closer = self.session_closer(session).await;
         let _closing = closer.lock().await;
-        for (session_id, peer, peer_deadline) in closing {
+        for (signal_id, peer, peer_deadline) in closing {
             let pc = Arc::clone(&peer.pc);
-            self.deactivate_peer_until(&session_id, peer, peer_deadline)
+            self.deactivate_peer_until(&signal_id, peer, peer_deadline)
                 .await;
             let mut peers = self.peers.lock().await;
             if peers
-                .get(&session_id)
-                .is_some_and(|current| current.agent == agent && Arc::ptr_eq(&current.pc, &pc))
+                .get(&signal_id)
+                .is_some_and(|current| current.session == session && Arc::ptr_eq(&current.pc, &pc))
             {
-                peers.remove(&session_id);
+                peers.remove(&signal_id);
             }
         }
         // An old exit task can race a replacement using the same UUID. Keep
@@ -1484,33 +1482,33 @@ impl RtcSessions {
         // state so a new generation either prevents cleanup or registers only
         // after cleanup has completed.
         let peers = self.peers.lock().await;
-        if !peers.values().any(|peer| peer.agent.agent_id() == agent_id) {
-            self.controls.remove_agent(agent_id).await;
+        if !peers.values().any(|peer| peer.session.session_id() == session_id) {
+            self.controls.remove_session(session_id).await;
         }
         drop(peers);
         self.uploads
-            .remove_generation_until(agent, upload_deadline)
+            .remove_generation_until(session, upload_deadline)
             .await;
     }
 
     async fn deactivate_peer_until(
         &self,
-        session_id: &str,
+        signal_id: &str,
         peer: RtcPeer,
         upload_deadline: tokio::time::Instant,
     ) {
         peer.channels.stop();
         peer.active.store(false, Ordering::Release);
-        let upload_session_id = viewer_id(session_id, &peer.generation);
+        let upload_viewer_id = viewer_id(signal_id, &peer.generation);
         self.uploads
-            .cancel_session_now(peer.agent, &upload_session_id);
+            .cancel_viewer_now(peer.session, &upload_viewer_id);
         // Publish removal from the viewer/control registries immediately as
         // well. The fenced late-cleanup task repeats both operations after all
         // already-admitted callbacks drain, closing the narrow race where an
         // on-open callback passed its final active check just before teardown.
         let _ = tokio::time::timeout_at(upload_deadline, async {
-            peer.control.remove_direct_sink(&upload_session_id).await;
-            self.controls.unregister_session(&upload_session_id).await;
+            peer.control.remove_direct_sink(&upload_viewer_id).await;
+            self.controls.unregister_viewer(&upload_viewer_id).await;
         })
         .await;
         // Closing transports wakes bounded WebRTC sends and control replies.
@@ -1523,11 +1521,11 @@ impl RtcSessions {
         let controls = self.controls.clone();
         let uploads = self.uploads.clone();
         self.closing_peers.lock().await.insert(
-            (session_id.to_string(), peer.generation.clone()),
+            (signal_id.to_string(), peer.generation.clone()),
             peer.clone(),
         );
         let closing_peers = Arc::clone(&self.closing_peers);
-        let closing_key = (session_id.to_string(), peer.generation.clone());
+        let closing_key = (signal_id.to_string(), peer.generation.clone());
         {
             let mut tasks = self.peer_cleanup_tasks.lock().await;
             while tasks.try_join_next().is_some() {}
@@ -1538,10 +1536,10 @@ impl RtcSessions {
                 let cleanup = async move {
                     let _lifecycle = peer.channels.fail().await;
                     let _drained = peer.fence.write().await;
-                    peer.control.remove_direct_sink(&upload_session_id).await;
-                    controls.unregister_session(&upload_session_id).await;
+                    peer.control.remove_direct_sink(&upload_viewer_id).await;
+                    controls.unregister_viewer(&upload_viewer_id).await;
                     uploads
-                        .cancel_session_and_wait(peer.agent, &upload_session_id)
+                        .cancel_viewer_and_wait(peer.session, &upload_viewer_id)
                         .await;
                 };
                 let (_closed, ()) = tokio::join!(pc.close(), cleanup);
@@ -1565,9 +1563,9 @@ impl RtcSessions {
         tasks.len()
     }
 
-    async fn agent_closer(&self, agent: AgentBinding) -> Arc<Mutex<()>> {
-        let key = (agent.agent_id(), agent.generation());
-        let mut closers = self.agent_closers.lock().await;
+    async fn session_closer(&self, session: SessionBinding) -> Arc<Mutex<()>> {
+        let key = (session.session_id(), session.generation());
+        let mut closers = self.session_closers.lock().await;
         closers.retain(|_, closer| closer.strong_count() > 0);
         if let Some(closer) = closers.get(&key).and_then(Weak::upgrade) {
             closer
@@ -1593,28 +1591,28 @@ impl RtcSessions {
             .lock()
             .await
             .iter()
-            .map(|((session_id, _), peer)| (session_id.clone(), peer.clone()))
+            .map(|((signal_id, _), peer)| (signal_id.clone(), peer.clone()))
             .collect::<Vec<_>>();
-        for (session_id, peer) in retained_cleanup {
+        for (signal_id, peer) in retained_cleanup {
             let _ = peer.close.initiate();
             self.uploads
-                .cancel_session_now(peer.agent, &viewer_id(&session_id, &peer.generation));
+                .cancel_viewer_now(peer.session, &viewer_id(&signal_id, &peer.generation));
         }
         #[cfg(test)]
-        for session_id in peers.keys() {
-            self.pause_effect(session_id, TestEffectPoint::CloseAllSnapshot)
+        for signal_id in peers.keys() {
+            self.pause_effect(signal_id, TestEffectPoint::CloseAllSnapshot)
                 .await;
         }
-        for (session_id, peer) in peers {
-            let closer = self.agent_closer(peer.agent).await;
+        for (signal_id, peer) in peers {
+            let closer = self.session_closer(peer.session).await;
             let _closing = closer.lock().await;
             let current = {
                 let peers = self.peers.lock().await;
                 peers
-                    .get(&session_id)
+                    .get(&signal_id)
                     .filter(|current| {
                         current.generation == peer.generation
-                            && current.agent == peer.agent
+                            && current.session == peer.session
                             && Arc::ptr_eq(&current.pc, &peer.pc)
                     })
                     .cloned()
@@ -1623,13 +1621,13 @@ impl RtcSessions {
             let pc = Arc::clone(&current.pc);
             let generation = current.generation.clone();
             let upload_deadline = current.close.initiate();
-            self.deactivate_peer_until(&session_id, current, upload_deadline)
+            self.deactivate_peer_until(&signal_id, current, upload_deadline)
                 .await;
             let mut peers = self.peers.lock().await;
-            if peers.get(&session_id).is_some_and(|current| {
+            if peers.get(&signal_id).is_some_and(|current| {
                 current.generation == generation && Arc::ptr_eq(&current.pc, &pc)
             }) {
-                peers.remove(&session_id);
+                peers.remove(&signal_id);
             }
         }
         let host_peers = std::mem::take(&mut *self.host_peers.lock().await);
@@ -1638,7 +1636,7 @@ impl RtcSessions {
         }
     }
 
-    /// Linearize credential invalidation against both agent and host RTC
+    /// Linearize credential invalidation against both session and host RTC
     /// insertion. Once this returns, every peer admitted under the prior
     /// whole-record credential revision is closed, and any offer that began
     /// before the revision change will fail its epoch check at admission.
@@ -1646,21 +1644,21 @@ impl RtcSessions {
         let _admission = self.admission.lock().await;
         self.trust_epoch.fetch_add(1, Ordering::SeqCst);
 
-        // Publish fail-closed state to every agent callback before awaiting
+        // Publish fail-closed state to every session callback before awaiting
         // any transport/fence cleanup. `close_all` has intentionally careful
         // bounded per-peer teardown, but a slow first peer must not leave a
         // later stale peer authorized after credential revocation.
         let peers = self.peers.lock().await.clone();
-        for (session_id, peer) in &peers {
+        for (signal_id, peer) in &peers {
             peer.channels.stop();
             peer.active.store(false, Ordering::Release);
             let _ = peer.close.initiate();
             self.uploads
-                .cancel_session_now(peer.agent, &viewer_id(session_id, &peer.generation));
+                .cancel_viewer_now(peer.session, &viewer_id(signal_id, &peer.generation));
         }
 
         // Remove host peers from admission immediately as well. Close their
-        // transports alongside the more involved agent cleanup so neither
+        // transports alongside the more involved session cleanup so neither
         // class delays fail-closed publication for the other.
         let host_peers = std::mem::take(&mut *self.host_peers.lock().await);
         let close_hosts = async move {
@@ -1682,12 +1680,12 @@ impl RtcSessions {
     }
 
     #[cfg(test)]
-    async fn stall_first_pty_send(&self, session_id: &str) -> Arc<tokio::sync::Notify> {
+    async fn stall_first_pty_send(&self, signal_id: &str) -> Arc<tokio::sync::Notify> {
         let gate = Arc::new(tokio::sync::Notify::new());
         self.pty_send_gates
             .lock()
             .await
-            .insert(session_id.to_string(), Arc::clone(&gate));
+            .insert(signal_id.to_string(), Arc::clone(&gate));
         gate
     }
 }
@@ -1710,7 +1708,7 @@ async fn negotiate(pc: &Arc<RTCPeerConnection>, sdp: String) -> Result<String> {
 
 fn install_ice_handler(
     pc: &Arc<RTCPeerConnection>,
-    binding: RtcSessionBinding,
+    binding: RtcSignalBinding,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
     pc.on_ice_candidate(Box::new(move |candidate| {
@@ -1723,7 +1721,7 @@ fn install_ice_handler(
             let candidate = match candidate.to_json() {
                 Ok(candidate) => candidate,
                 Err(e) => {
-                    tracing::debug!(agent_id = %binding.agent_id, error = %e, "encoding rtc candidate failed");
+                    tracing::debug!(session_id = %binding.session_id, error = %e, "encoding rtc candidate failed");
                     return;
                 }
             };
@@ -1732,20 +1730,19 @@ fn install_ice_handler(
                     send_json(
                         &out_tx,
                         Outbound::RtcCandidate {
-                            session_id: binding.session_id,
+                            session_id: binding.signal_id,
                             binding_nonce: Some(binding.binding_nonce),
-                            agent_id: Some(binding.agent_id),
-                            scope_type: Some("agent".to_string()),
-                            scope_id: Some(binding.agent_id),
+                            scope_type: Some("session".to_string()),
+                            scope_id: Some(binding.session_id),
                             protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
-                            protocol_version: Some(AGENT_RTC_PROTOCOL_VERSION),
+                            protocol_version: Some(SESSION_RTC_PROTOCOL_VERSION),
                             candidate,
                         },
                     )
                     .await;
                 }
                 Err(e) => {
-                    tracing::debug!(agent_id = %binding.agent_id, error = %e, "serializing rtc candidate failed");
+                    tracing::debug!(session_id = %binding.session_id, error = %e, "serializing rtc candidate failed");
                 }
             }
         })
@@ -1757,10 +1754,10 @@ fn install_data_channel_handler(
     pc: &Arc<RTCPeerConnection>,
     sessions: RtcSessions,
     binding: BoundRtcSession,
-    registry: AgentRegistry,
-    controls: AgentControlHub,
+    registry: SessionRegistry,
+    controls: SessionControlHub,
     guard: RtcCallbackGuard,
-    channels: Arc<RequiredAgentChannels>,
+    channels: Arc<RequiredSessionChannels>,
     close: Arc<PeerCloseCoordinator>,
     #[cfg(test)] pty_send_gate: Option<Arc<tokio::sync::Notify>>,
     #[cfg(test)] pty_sender_close_gate: Option<Arc<TestSenderCloseGate>>,
@@ -1774,33 +1771,33 @@ fn install_data_channel_handler(
         let pc = Arc::clone(pc);
         let sessions = sessions.clone();
         let out_tx = out_tx.clone();
-        let session_id = binding.signaling.session_id.clone();
+        let signal_id = binding.signaling.signal_id.clone();
         let generation = binding.signaling.generation.clone();
         let binding_nonce = binding.signaling.binding_nonce.clone();
-        let agent_id = binding.signaling.agent_id;
+        let session_id = binding.signaling.session_id;
         tokio::spawn(async move {
             if !matches!(
-                tokio::time::timeout(REQUIRED_AGENT_CHANNEL_TIMEOUT, channels.wait_ready()).await,
+                tokio::time::timeout(REQUIRED_SESSION_CHANNEL_TIMEOUT, channels.wait_ready()).await,
                 Ok(true)
             ) {
                 channels.fail().await;
                 let _ = sessions
-                    .send_agent_peer_status(
+                    .send_session_peer_status(
                         &out_tx,
-                        &session_id,
+                        &signal_id,
                         &generation,
                         &pc,
                         &active,
                         &channels,
                         &binding_nonce,
-                        agent_id,
+                        session_id,
                         "failed",
                         Some("spawn.pty and spawn.ctl are both required"),
                     )
                     .await;
                 let deadline = close.initiate();
                 sessions
-                    .close_if_same_until(&session_id, &generation, &pc, deadline)
+                    .close_if_same_until(&signal_id, &generation, &pc, deadline)
                     .await;
             }
         });
@@ -1832,14 +1829,14 @@ fn install_data_channel_handler(
         }
         Box::pin(async move {
             let viewer_id = viewer_id(
-                &binding.signaling.session_id,
+                &binding.signaling.signal_id,
                 &binding.signaling.generation,
             );
             if !reliable {
-                tracing::warn!(agent_id = %binding.signaling.agent_id, label = %dc.label(), "rejecting unreliable rtc data channel");
+                tracing::warn!(session_id = %binding.signaling.session_id, label = %dc.label(), "rejecting unreliable rtc data channel");
                 channels.fail().await;
                 sessions.schedule_close_if_same(
-                    &binding.signaling.session_id,
+                    &binding.signaling.signal_id,
                     &binding.signaling.generation,
                     &pc,
                     &close,
@@ -1847,9 +1844,9 @@ fn install_data_channel_handler(
                 return;
             }
             if dc.label() == CONTROL_DATA_CHANNEL_LABEL {
-                if !channels.register(AgentChannel::Control).await {
+                if !channels.register(SessionChannel::Control).await {
                     sessions.schedule_close_if_same(
-                        &binding.signaling.session_id,
+                        &binding.signaling.signal_id,
                         &binding.signaling.generation,
                         &pc,
                         &close,
@@ -1859,8 +1856,8 @@ fn install_data_channel_handler(
                 install_control_data_channel(
                     dc,
                     viewer_id,
-                    binding.signaling.session_id.clone(),
-                    binding.agent,
+                    binding.signaling.signal_id.clone(),
+                    binding.session,
                     registry,
                     controls,
                     active,
@@ -1876,19 +1873,19 @@ fn install_data_channel_handler(
                 return;
             }
             if dc.label() != PTY_DATA_CHANNEL_LABEL {
-                tracing::warn!(agent_id = %binding.signaling.agent_id, label = %dc.label(), "rejecting unknown rtc data channel");
+                tracing::warn!(session_id = %binding.signaling.session_id, label = %dc.label(), "rejecting unknown rtc data channel");
                 channels.fail().await;
                 sessions.schedule_close_if_same(
-                    &binding.signaling.session_id,
+                    &binding.signaling.signal_id,
                     &binding.signaling.generation,
                     &pc,
                     &close,
                 );
                 return;
             }
-            if !channels.register(AgentChannel::Pty).await {
+            if !channels.register(SessionChannel::Pty).await {
                 sessions.schedule_close_if_same(
-                    &binding.signaling.session_id,
+                    &binding.signaling.signal_id,
                     &binding.signaling.generation,
                     &pc,
                     &close,
@@ -1896,8 +1893,8 @@ fn install_data_channel_handler(
                 return;
             }
 
-            let agent = binding.agent;
-            let agent_id = agent.agent_id();
+            let session = binding.session;
+            let session_id = session.session_id();
 
             let input_registry = registry.clone();
             let input_out_tx = out_tx.clone();
@@ -1907,7 +1904,7 @@ fn install_data_channel_handler(
             #[cfg(test)]
             let input_sessions = sessions.clone();
             #[cfg(test)]
-            let input_session_id = binding.signaling.session_id.clone();
+            let input_session_id = binding.signaling.signal_id.clone();
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let registry = input_registry.clone();
                 let out_tx = input_out_tx.clone();
@@ -1917,7 +1914,7 @@ fn install_data_channel_handler(
                 #[cfg(test)]
                 let sessions = input_sessions.clone();
                 #[cfg(test)]
-                let session_id = input_session_id.clone();
+                let signal_id = input_session_id.clone();
                 Box::pin(async move {
                     let Some(effect) = channels.permit().await else {
                         return;
@@ -1925,25 +1922,25 @@ fn install_data_channel_handler(
                     let _callback = fence.read().await;
                     #[cfg(test)]
                     sessions
-                        .pause_effect(&session_id, TestEffectPoint::PtyInput)
+                        .pause_effect(&signal_id, TestEffectPoint::PtyInput)
                         .await;
                     if !effect.valid()
                         || !active.load(Ordering::Acquire)
-                        || !registry.is_current(agent)
+                        || !registry.is_current(session)
                     {
                         return;
                     }
                     let result = forward_bound_data_channel_input(
-                        agent,
+                        session,
                         msg.is_string,
                         &msg.data,
                         &registry,
                         &out_tx,
                     );
                     if result.is_none() {
-                        tracing::debug!(%agent_id, "ignoring rtc stdin for unknown agent");
+                        tracing::debug!(%session_id, "ignoring rtc stdin for unknown session");
                     } else if let Some(Err(e)) = result {
-                        tracing::warn!(%agent_id, error = %e, "rtc PTY stdin write failed");
+                        tracing::warn!(%session_id, error = %e, "rtc PTY stdin write failed");
                     }
                 })
             }));
@@ -1960,7 +1957,7 @@ fn install_data_channel_handler(
             let open_pc = Arc::clone(&pc);
             let open_sessions = sessions.clone();
             let open_close = Arc::clone(&close);
-            let open_rtc_session_id = binding.signaling.session_id.clone();
+            let open_signal_id = binding.signaling.signal_id.clone();
             let open_generation = binding.signaling.generation.clone();
             dc.on_open(Box::new(move || {
                 let registry = open_registry.clone();
@@ -1975,17 +1972,17 @@ fn install_data_channel_handler(
                 let pc = Arc::clone(&open_pc);
                 let sessions = open_sessions.clone();
                 let close = Arc::clone(&open_close);
-                let rtc_session_id = open_rtc_session_id.clone();
+                let signal_id = open_signal_id.clone();
                 let generation = open_generation.clone();
                 Box::pin(async move {
-                    if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+                    if !active.load(Ordering::Acquire) || !registry.is_current(session) {
                         let _ = dc.close().await;
                         return;
                     }
-                    channels.mark_open(AgentChannel::Pty).await;
+                    channels.mark_open(SessionChannel::Pty).await;
                     if !channels.wait_ready().await {
                         sessions.schedule_close_if_same(
-                            &rtc_session_id,
+                            &signal_id,
                             &generation,
                             &pc,
                             &close,
@@ -1994,7 +1991,7 @@ fn install_data_channel_handler(
                     }
                     let Some(effect) = channels.permit().await else {
                         sessions.schedule_close_if_same(
-                            &rtc_session_id,
+                            &signal_id,
                             &generation,
                             &pc,
                             &close,
@@ -2004,25 +2001,25 @@ fn install_data_channel_handler(
                     let _callback = fence.read().await;
                     if !effect.valid()
                         || !active.load(Ordering::Acquire)
-                        || !registry.is_current(agent)
+                        || !registry.is_current(session)
                     {
                         return;
                     }
                     let mut replay_rx = None;
-                    registry.with_bound_handle(agent, |handle| {
+                    registry.with_bound_handle(session, |handle| {
                         replay_rx = handle.replay(64 * 1024);
                     });
                     let Some(replay_rx) = replay_rx else {
                         let _ = sessions
-                            .send_agent_peer_status(
+                            .send_session_peer_status(
                                 &out_tx,
-                                &rtc_session_id,
+                                &signal_id,
                                 &generation,
                                 &pc,
                                 &active,
                                 &channels,
                                 &binding_nonce,
-                                agent_id,
+                                session_id,
                                 "failed",
                                 Some("worker replay is unavailable"),
                             )
@@ -2030,7 +2027,7 @@ fn install_data_channel_handler(
                         channels.stop();
                         active.store(false, Ordering::Release);
                         sessions.schedule_close_if_same(
-                            &rtc_session_id,
+                            &signal_id,
                             &generation,
                             &pc,
                             &close,
@@ -2041,15 +2038,15 @@ fn install_data_channel_handler(
                         tokio::time::timeout(Duration::from_secs(3), replay_rx).await
                     else {
                         let _ = sessions
-                            .send_agent_peer_status(
+                            .send_session_peer_status(
                                 &out_tx,
-                                &rtc_session_id,
+                                &signal_id,
                                 &generation,
                                 &pc,
                                 &active,
                                 &channels,
                                 &binding_nonce,
-                                agent_id,
+                                session_id,
                                 "failed",
                                 Some("worker replay barrier failed"),
                             )
@@ -2057,7 +2054,7 @@ fn install_data_channel_handler(
                         channels.stop();
                         active.store(false, Ordering::Release);
                         sessions.schedule_close_if_same(
-                            &rtc_session_id,
+                            &signal_id,
                             &generation,
                             &pc,
                             &close,
@@ -2067,7 +2064,7 @@ fn install_data_channel_handler(
                     let watermark = replay.watermark();
                     if !effect.valid()
                         || !active.load(Ordering::Acquire)
-                        || !registry.is_current(agent)
+                        || !registry.is_current(session)
                     {
                         let _ = dc.close().await;
                         return;
@@ -2080,15 +2077,15 @@ fn install_data_channel_handler(
                     .is_err()
                     {
                         let _ = sessions
-                            .send_agent_peer_status(
+                            .send_session_peer_status(
                                 &out_tx,
-                                &rtc_session_id,
+                                &signal_id,
                                 &generation,
                                 &pc,
                                 &active,
                                 &channels,
                                 &binding_nonce,
-                                agent_id,
+                                session_id,
                                 "failed",
                                 Some("worker live-stream barrier timed out"),
                             )
@@ -2096,7 +2093,7 @@ fn install_data_channel_handler(
                         channels.stop();
                         active.store(false, Ordering::Release);
                         sessions.schedule_close_if_same(
-                            &rtc_session_id,
+                            &signal_id,
                             &generation,
                             &pc,
                             &close,
@@ -2105,7 +2102,7 @@ fn install_data_channel_handler(
                     }
                     if !effect.valid()
                         || !active.load(Ordering::Acquire)
-                        || !registry.is_current(agent)
+                        || !registry.is_current(session)
                     {
                         let _ = dc.close().await;
                         return;
@@ -2113,33 +2110,33 @@ fn install_data_channel_handler(
 
                     #[cfg(test)]
                     sessions
-                        .pause_effect(&rtc_session_id, TestEffectPoint::PtySink)
+                        .pause_effect(&signal_id, TestEffectPoint::PtySink)
                         .await;
                     if !effect.valid()
                         || !active.load(Ordering::Acquire)
-                        || !registry.is_current(agent)
+                        || !registry.is_current(session)
                     {
                         return;
                     }
                     let mut direct = control.add_direct_sink(viewer_id.clone()).await;
                     if !effect.valid()
                         || !active.load(Ordering::Acquire)
-                        || !registry.is_current(agent)
+                        || !registry.is_current(session)
                     {
                         control.remove_direct_sink(&viewer_id).await;
                         let _ = dc.close().await;
                         return;
                     }
                     if !sessions
-                        .send_agent_peer_status(
+                        .send_session_peer_status(
                             &out_tx,
-                            &rtc_session_id,
+                            &signal_id,
                             &generation,
                             &pc,
                             &active,
                             &channels,
                             &binding_nonce,
-                            agent_id,
+                            session_id,
                             "connected",
                             None,
                         )
@@ -2149,7 +2146,7 @@ fn install_data_channel_handler(
                     }
                     if !effect.valid()
                         || !active.load(Ordering::Acquire)
-                        || !registry.is_current(agent)
+                        || !registry.is_current(session)
                     {
                         control.remove_direct_sink(&viewer_id).await;
                         let _ = dc.close().await;
@@ -2162,7 +2159,7 @@ fn install_data_channel_handler(
                     let output_sessions = sessions.clone();
                     let output_close = Arc::clone(&close);
                     let output_pc = Arc::clone(&pc);
-                    let output_session_id = rtc_session_id.clone();
+                    let output_signal_id = signal_id.clone();
                     let output_generation = generation.clone();
                     drop(_callback);
                     drop(effect);
@@ -2194,7 +2191,7 @@ fn install_data_channel_handler(
                             let _callback = output_fence.read().await;
                             if !effect.valid()
                                 || !output_active.load(Ordering::Acquire)
-                                || !rtc_output_allowed(&output_registry, agent)
+                                || !rtc_output_allowed(&output_registry, session)
                             {
                                 break;
                             }
@@ -2206,11 +2203,11 @@ fn install_data_channel_handler(
                             {
                                 Ok(Ok(_)) => {}
                                 Ok(Err(error)) => {
-                                    tracing::debug!(%agent_id, %error, "rtc data channel send failed");
+                                    tracing::debug!(%session_id, %error, "rtc data channel send failed");
                                     break;
                                 }
                                 Err(_) => {
-                                    tracing::debug!(%agent_id, "rtc data channel send timed out");
+                                    tracing::debug!(%session_id, "rtc data channel send timed out");
                                     break;
                                 }
                             }
@@ -2218,7 +2215,7 @@ fn install_data_channel_handler(
                         output_channels.stop();
                         output_active.store(false, Ordering::Release);
                         output_sessions.schedule_close_if_same(
-                            &output_session_id,
+                            &output_signal_id,
                             &output_generation,
                             &output_pc,
                             &output_close,
@@ -2235,7 +2232,7 @@ fn install_data_channel_handler(
             let close_pc = Arc::clone(&pc);
             let close_sessions = sessions;
             let close_coordinator = Arc::clone(&close);
-            let close_session_id = binding.signaling.session_id.clone();
+            let close_session_id = binding.signaling.signal_id.clone();
             let close_generation = binding.signaling.generation.clone();
             dc.on_close(Box::new(move || {
                 let active = Arc::clone(&close_active);
@@ -2243,14 +2240,14 @@ fn install_data_channel_handler(
                 let pc = Arc::clone(&close_pc);
                 let sessions = close_sessions.clone();
                 let close = Arc::clone(&close_coordinator);
-                let session_id = close_session_id.clone();
+                let signal_id = close_session_id.clone();
                 let generation = close_generation.clone();
                 let initiating_deadline = close.initiate();
                 Box::pin(async move {
                     channels.stop();
                     active.store(false, Ordering::Release);
                     debug_assert_eq!(close.initiate(), initiating_deadline);
-                    sessions.schedule_close_if_same(&session_id, &generation, &pc, &close);
+                    sessions.schedule_close_if_same(&signal_id, &generation, &pc, &close);
                 })
             }));
         })
@@ -2260,29 +2257,29 @@ fn install_data_channel_handler(
 #[allow(clippy::too_many_arguments)]
 fn install_control_data_channel(
     dc: Arc<RTCDataChannel>,
-    session_id: String,
-    rtc_session_id: String,
-    agent: AgentBinding,
-    registry: AgentRegistry,
-    controls: AgentControlHub,
+    viewer_id: String,
+    signal_id: String,
+    session: SessionBinding,
+    registry: SessionRegistry,
+    controls: SessionControlHub,
     active: Arc<AtomicBool>,
     fence: Arc<tokio::sync::RwLock<()>>,
-    channels: Arc<RequiredAgentChannels>,
+    channels: Arc<RequiredSessionChannels>,
     pc: Arc<RTCPeerConnection>,
     sessions: RtcSessions,
     close: Arc<PeerCloseCoordinator>,
     generation: String,
     #[cfg(test)] sender_close_gate: Option<Arc<TestSenderCloseGate>>,
 ) {
-    let agent_id = agent.agent_id();
+    let session_id = session.session_id();
     let upload_capability = Uuid::new_v4();
     let uploads = sessions.uploads.clone();
-    let (sender, mut receiver) = mpsc::channel(agent_ctl::OUTBOUND_QUEUE_DEPTH);
+    let (sender, mut receiver) = mpsc::channel(session_ctl::OUTBOUND_QUEUE_DEPTH);
     let (display_sender, mut display_receiver) = tokio::sync::watch::channel(None::<String>);
     let (close_tx, mut close_rx) = oneshot::channel();
     let close_tx = Arc::new(Mutex::new(Some(close_tx)));
     let send_dc = Arc::clone(&dc);
-    let send_session_id = session_id.clone();
+    let send_viewer_id = viewer_id.clone();
     let send_registry = registry.clone();
     let send_active = Arc::clone(&active);
     let send_fence = Arc::clone(&fence);
@@ -2322,7 +2319,7 @@ fn install_control_data_channel(
             let _callback = send_fence.read().await;
             if !effect.valid()
                 || !send_active.load(Ordering::Acquire)
-                || !send_registry.is_current(agent)
+                || !send_registry.is_current(session)
             {
                 break;
             }
@@ -2337,11 +2334,11 @@ fn install_control_data_channel(
             match tokio::time::timeout(DATA_CHANNEL_SEND_TIMEOUT, send).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
-                    tracing::debug!(%agent_id, %send_session_id, %error, "spawn.ctl send failed");
+                    tracing::debug!(%session_id, %send_viewer_id, %error, "spawn.ctl send failed");
                     break;
                 }
                 Err(_) => {
-                    tracing::debug!(%agent_id, %send_session_id, "spawn.ctl send timed out");
+                    tracing::debug!(%session_id, %send_viewer_id, "spawn.ctl send timed out");
                     break;
                 }
             }
@@ -2349,7 +2346,7 @@ fn install_control_data_channel(
         send_channels.stop();
         send_active.store(false, Ordering::Release);
         send_sessions.schedule_close_if_same(
-            &send_session_id,
+            &send_viewer_id,
             &send_generation,
             &send_pc,
             &send_close,
@@ -2367,12 +2364,12 @@ fn install_control_data_channel(
     let message_controls = controls.clone();
     let message_sender = sender.clone();
     let message_display_sender = display_sender.clone();
-    let message_session_id = session_id.clone();
+    let message_viewer_id = viewer_id.clone();
     let message_uploads = uploads.clone();
     #[cfg(test)]
     let message_sessions = sessions.clone();
     #[cfg(test)]
-    let message_rtc_session_id = rtc_session_id.clone();
+    let message_signal_id = signal_id.clone();
     let message_active = Arc::clone(&active);
     let message_fence = Arc::clone(&fence);
     let message_channels = Arc::clone(&channels);
@@ -2381,7 +2378,7 @@ fn install_control_data_channel(
         let controls = message_controls.clone();
         let sender = message_sender.clone();
         let display_sender = message_display_sender.clone();
-        let session_id = message_session_id.clone();
+        let viewer_id = message_viewer_id.clone();
         let uploads = message_uploads.clone();
         let request_lock = request_lock.clone();
         let active = Arc::clone(&message_active);
@@ -2390,32 +2387,32 @@ fn install_control_data_channel(
         #[cfg(test)]
         let sessions = message_sessions.clone();
         #[cfg(test)]
-        let rtc_session_id = message_rtc_session_id.clone();
+        let signal_id = message_signal_id.clone();
         Box::pin(async move {
             let Some(effect) = channels.permit().await else {
                 return;
             };
             let _callback = fence.read().await;
-            if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+            if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(session) {
                 return;
             }
             let _guard = request_lock.lock().await;
             #[cfg(test)]
             sessions
-                .pause_effect(&rtc_session_id, TestEffectPoint::ControlRequest)
+                .pause_effect(&signal_id, TestEffectPoint::ControlRequest)
                 .await;
-            if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+            if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(session) {
                 return;
             }
             if !msg.is_string {
-                match agent_ctl::decode_upload_chunk(&msg.data) {
+                match session_ctl::decode_upload_chunk(&msg.data) {
                     Ok(chunk) => {
                         let upload_id = chunk.upload_id;
                         let outcome = uploads
                             .write_chunk(
-                                agent,
+                                session,
                                 UploadChunkRequest {
-                                    session_id: &session_id,
+                                    viewer_id: &viewer_id,
                                     capability: upload_capability,
                                     upload_id,
                                     sequence: chunk.sequence,
@@ -2426,10 +2423,10 @@ fn install_control_data_channel(
                             .await;
                         if !effect.valid()
                             || !active.load(Ordering::Acquire)
-                            || !registry.is_current(agent)
+                            || !registry.is_current(session)
                         {
                             let _ = uploads
-                                .cancel(agent, &session_id, upload_capability, upload_id)
+                                .cancel(session, &viewer_id, upload_capability, upload_id)
                                 .await;
                             return;
                         }
@@ -2437,14 +2434,14 @@ fn install_control_data_channel(
                             Ok(UploadChunkOutcome::Pending) => {}
                             Ok(UploadChunkOutcome::Complete(result)) => {
                                 if let Err(error) =
-                                    agent_ctl::send_upload_complete(&sender, upload_id, &result)
+                                    session_ctl::send_upload_complete(&sender, upload_id, &result)
                                         .await
                                 {
-                                    agent_ctl::send_error(&sender, &error).await;
+                                    session_ctl::send_error(&sender, &error).await;
                                 }
                             }
                             Err(error) => {
-                                agent_ctl::send_error(
+                                session_ctl::send_error(
                                     &sender,
                                     &ProtocolError::new(Some(upload_id), error.code, &error.detail),
                                 )
@@ -2455,10 +2452,10 @@ fn install_control_data_channel(
                     Err(error) => {
                         if let Some(upload_id) = error.request_id {
                             let _ = uploads
-                                .cancel(agent, &session_id, upload_capability, upload_id)
+                                .cancel(session, &viewer_id, upload_capability, upload_id)
                                 .await;
                         }
-                        agent_ctl::send_error(&sender, &error).await;
+                        session_ctl::send_error(&sender, &error).await;
                     }
                 }
                 return;
@@ -2466,7 +2463,7 @@ fn install_control_data_channel(
             let text = match std::str::from_utf8(&msg.data) {
                 Ok(text) => text,
                 Err(_) => {
-                    agent_ctl::send_error(
+                    session_ctl::send_error(
                         &sender,
                         &ProtocolError::new(None, "malformed_request", "request is not UTF-8"),
                     )
@@ -2476,28 +2473,28 @@ fn install_control_data_channel(
             };
             match ControlRequest::decode(text) {
                 Ok(request) => {
-                    let registered = controls.contains_viewer(agent_id, &session_id).await;
+                    let registered = controls.contains_viewer(session_id, &viewer_id).await;
                     if !effect.valid()
                         || !active.load(Ordering::Acquire)
-                        || !registry.is_current(agent)
+                        || !registry.is_current(session)
                     {
                         return;
                     }
                     if !registered {
                         controls
-                            .register(agent_id, session_id.clone(), display_sender.clone())
+                            .register(session_id, viewer_id.clone(), display_sender.clone())
                             .await;
                         if !effect.valid()
                             || !active.load(Ordering::Acquire)
-                            || !registry.is_current(agent)
+                            || !registry.is_current(session)
                         {
                             return;
                         }
                     }
                     handle_control_request(
                         ControlRequestContext {
-                            agent,
-                            session_id: &session_id,
+                            session,
+                            viewer_id: &viewer_id,
                             registry: &registry,
                             controls: &controls,
                             sender: &sender,
@@ -2509,13 +2506,13 @@ fn install_control_data_channel(
                     )
                     .await;
                 }
-                Err(error) => agent_ctl::send_error(&sender, &error).await,
+                Err(error) => session_ctl::send_error(&sender, &error).await,
             }
         })
     }));
 
     let open_controls = controls.clone();
-    let open_session_id = session_id.clone();
+    let open_viewer_id = viewer_id.clone();
     let open_sender = sender;
     let open_display_sender = display_sender;
     let open_active = Arc::clone(&active);
@@ -2525,11 +2522,11 @@ fn install_control_data_channel(
     let open_pc = Arc::clone(&pc);
     let open_sessions = sessions.clone();
     let open_close = Arc::clone(&close);
-    let open_rtc_session_id = rtc_session_id.clone();
+    let open_signal_id = signal_id.clone();
     let open_generation = generation.clone();
     dc.on_open(Box::new(move || {
         let controls = open_controls.clone();
-        let session_id = open_session_id.clone();
+        let viewer_id = open_viewer_id.clone();
         let sender = open_sender.clone();
         let display_sender = open_display_sender.clone();
         let active = Arc::clone(&open_active);
@@ -2539,42 +2536,42 @@ fn install_control_data_channel(
         let pc = Arc::clone(&open_pc);
         let sessions = open_sessions.clone();
         let close = Arc::clone(&open_close);
-        let rtc_session_id = open_rtc_session_id.clone();
+        let signal_id = open_signal_id.clone();
         let generation = open_generation.clone();
         Box::pin(async move {
-            if !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+            if !active.load(Ordering::Acquire) || !registry.is_current(session) {
                 return;
             }
-            channels.mark_open(AgentChannel::Control).await;
+            channels.mark_open(SessionChannel::Control).await;
             if !channels.wait_ready().await {
-                sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc, &close);
+                sessions.schedule_close_if_same(&signal_id, &generation, &pc, &close);
                 return;
             }
             let Some(effect) = channels.permit().await else {
-                sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc, &close);
+                sessions.schedule_close_if_same(&signal_id, &generation, &pc, &close);
                 return;
             };
             let _callback = fence.read().await;
-            if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+            if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(session) {
                 return;
             }
             controls
-                .register(agent_id, session_id.clone(), display_sender)
+                .register(session_id, viewer_id.clone(), display_sender)
                 .await;
             #[cfg(test)]
             sessions
-                .pause_effect(&rtc_session_id, TestEffectPoint::Ready)
+                .pause_effect(&signal_id, TestEffectPoint::Ready)
                 .await;
-            if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(agent) {
+            if !effect.valid() || !active.load(Ordering::Acquire) || !registry.is_current(session) {
                 return;
             }
-            if agent_ctl::send_ready(&sender, upload_capability, agent.generation())
+            if session_ctl::send_ready(&sender, upload_capability, session.generation())
                 .await
                 .is_err()
             {
                 channels.stop();
                 active.store(false, Ordering::Release);
-                sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc, &close);
+                sessions.schedule_close_if_same(&signal_id, &generation, &pc, &close);
             }
         })
     }));
@@ -2585,48 +2582,48 @@ fn install_control_data_channel(
         let active = Arc::clone(&active);
         let pc = Arc::clone(&pc);
         let sessions = sessions.clone();
-        let rtc_session_id = rtc_session_id.clone();
+        let signal_id = signal_id.clone();
         let generation = generation.clone();
         let close = Arc::clone(&close);
         let uploads = uploads.clone();
-        let session_id = session_id.clone();
+        let viewer_id = viewer_id.clone();
         let upload_deadline = close.initiate();
         Box::pin(async move {
-            uploads.cancel_session_now(agent, &session_id);
+            uploads.cancel_viewer_now(session, &viewer_id);
             if let Some(close_tx) = close_tx.lock().await.take() {
                 let _ = close_tx.send(());
             }
             channels.stop();
             active.store(false, Ordering::Release);
             debug_assert_eq!(close.initiate(), upload_deadline);
-            sessions.schedule_close_if_same(&rtc_session_id, &generation, &pc, &close);
+            sessions.schedule_close_if_same(&signal_id, &generation, &pc, &close);
         })
     }));
 }
 
 #[derive(Clone, Copy)]
 struct ControlRequestContext<'a> {
-    agent: AgentBinding,
-    session_id: &'a str,
-    registry: &'a AgentRegistry,
-    controls: &'a AgentControlHub,
+    session: SessionBinding,
+    viewer_id: &'a str,
+    registry: &'a SessionRegistry,
+    controls: &'a SessionControlHub,
     sender: &'a ControlSender,
-    effect: &'a AgentEffectPermit,
+    effect: &'a SessionEffectPermit,
     uploads: &'a UploadHub,
     upload_capability: Uuid,
 }
 
 async fn handle_control_request(context: ControlRequestContext<'_>, request: ControlRequest) {
     let ControlRequestContext {
-        agent,
+        session,
         controls,
         sender,
         effect,
         ..
     } = context;
-    let agent_id = agent.agent_id();
+    let session_id = session.session_id();
     let request_id = request.request_id;
-    let transaction = controls.transaction(agent_id).await;
+    let transaction = controls.transaction(session_id).await;
     let _guard = transaction.lock().await;
     if !effect.valid() {
         return;
@@ -2635,7 +2632,7 @@ async fn handle_control_request(context: ControlRequestContext<'_>, request: Con
         if error.request_id.is_none() {
             error.request_id = Some(request_id);
         }
-        agent_ctl::send_error(sender, &error).await;
+        session_ctl::send_error(sender, &error).await;
     }
 }
 
@@ -2644,8 +2641,8 @@ async fn execute_control_request(
     request: ControlRequest,
 ) -> Result<(), ProtocolError> {
     let ControlRequestContext {
-        agent,
-        session_id,
+        session,
+        viewer_id,
         registry,
         controls,
         sender,
@@ -2653,12 +2650,12 @@ async fn execute_control_request(
         uploads,
         upload_capability,
     } = context;
-    let agent_id = agent.agent_id();
-    if !effect.valid() || !registry.is_current(agent) {
+    let session_id = session.session_id();
+    if !effect.valid() || !registry.is_current(session) {
         return Err(ProtocolError::new(
             Some(request.request_id),
             "stale_agent_generation",
-            "the RTC session belongs to a replaced agent backend",
+            "the RTC session belongs to a replaced session backend",
         ));
     }
     let request_id = request.request_id;
@@ -2671,24 +2668,24 @@ async fn execute_control_request(
             rows,
         } => {
             if let Some((cols, rows)) = cols.zip(rows) {
-                if controls.is_owner(agent_id, session_id).await {
+                if controls.is_owner(session_id, viewer_id).await {
                     if !effect.valid() {
                         return Ok(());
                     }
-                    resize_agent(agent, cols, rows, registry).await?;
+                    resize_session(session, cols, rows, registry).await?;
                     if !effect.valid() {
                         return Ok(());
                     }
-                    let _ = controls.update_size(agent_id, session_id, cols, rows).await;
+                    let _ = controls.update_size(session_id, viewer_id, cols, rows).await;
                 }
             }
             if !effect.valid() {
                 return Ok(());
             }
-            send_agent_replay(
-                agent,
+            send_session_replay(
+                session,
                 ReplaySpec {
-                    session_id,
+                    viewer_id,
                     request_id,
                     operation: operation_name,
                     lines,
@@ -2703,10 +2700,10 @@ async fn execute_control_request(
             if !effect.valid() {
                 return Ok(());
             }
-            send_agent_replay(
-                agent,
+            send_session_replay(
+                session,
                 ReplaySpec {
-                    session_id,
+                    viewer_id,
                     request_id,
                     operation: operation_name,
                     lines,
@@ -2718,21 +2715,21 @@ async fn execute_control_request(
             .await
         }
         ControlOperation::HistorySubscribe => {
-            let Some(control) = registry.control_for_binding(agent) else {
+            let Some(control) = registry.control_for_binding(session) else {
                 return Err(ProtocolError::new(
                     Some(request_id),
                     "agent_unavailable",
-                    "agent is not attached to this daemon",
+                    "session is not attached to this daemon",
                 ));
             };
             if !effect.valid() {
                 return Ok(());
             }
-            spawn_history_pump(control, sender.clone(), session_id.to_string());
-            agent_ctl::send_ack(sender, request_id, operation_name).await
+            spawn_history_pump(control, sender.clone(), viewer_id.to_string());
+            session_ctl::send_ack(sender, request_id, operation_name).await
         }
         ControlOperation::Resize { cols, rows } => {
-            if !controls.is_owner(agent_id, session_id).await {
+            if !controls.is_owner(session_id, viewer_id).await {
                 return Err(ProtocolError::new(
                     Some(request_id),
                     "not_display_owner",
@@ -2742,19 +2739,19 @@ async fn execute_control_request(
             if !effect.valid() {
                 return Ok(());
             }
-            resize_agent(agent, cols, rows, registry).await?;
+            resize_session(session, cols, rows, registry).await?;
             if !effect.valid() {
                 return Ok(());
             }
-            let _ = controls.update_size(agent_id, session_id, cols, rows).await;
+            let _ = controls.update_size(session_id, viewer_id, cols, rows).await;
             if !effect.valid() {
                 return Ok(());
             }
-            agent_ctl::send_ack(sender, request_id, operation_name).await?;
+            session_ctl::send_ack(sender, request_id, operation_name).await?;
             Ok(())
         }
         ControlOperation::TakeControl { cols, rows } => {
-            if !controls.contains_viewer(agent_id, session_id).await {
+            if !controls.contains_viewer(session_id, viewer_id).await {
                 return Err(ProtocolError::new(
                     Some(request_id),
                     "unknown_viewer",
@@ -2764,43 +2761,43 @@ async fn execute_control_request(
             if !effect.valid() {
                 return Ok(());
             }
-            resize_agent(agent, cols, rows, registry).await?;
+            resize_session(session, cols, rows, registry).await?;
             if !effect.valid() {
                 return Ok(());
             }
             let _ = controls
-                .take_control(agent_id, session_id, cols, rows)
+                .take_control(session_id, viewer_id, cols, rows)
                 .await;
             if !effect.valid() {
                 return Ok(());
             }
-            redraw_agent(agent, registry).await;
+            redraw_session(session, registry).await;
             if !effect.valid() {
                 return Ok(());
             }
-            agent_ctl::send_ack(sender, request_id, operation_name).await?;
+            session_ctl::send_ack(sender, request_id, operation_name).await?;
             Ok(())
         }
         ControlOperation::Scroll { lines } => {
             if !effect.valid() {
                 return Ok(());
             }
-            scroll_agent(agent, lines, registry).await?;
+            scroll_session(session, lines, registry).await?;
             if !effect.valid() {
                 return Ok(());
             }
-            agent_ctl::send_ack(sender, request_id, operation_name).await?;
+            session_ctl::send_ack(sender, request_id, operation_name).await?;
             Ok(())
         }
         ControlOperation::Redraw => {
             if !effect.valid() {
                 return Ok(());
             }
-            redraw_agent(agent, registry).await;
+            redraw_session(session, registry).await;
             if !effect.valid() {
                 return Ok(());
             }
-            agent_ctl::send_ack(sender, request_id, operation_name).await?;
+            session_ctl::send_ack(sender, request_id, operation_name).await?;
             Ok(())
         }
         ControlOperation::UploadStart {
@@ -2813,31 +2810,31 @@ async fn execute_control_request(
             chunks,
             sha256,
         } => {
-            if capability != upload_capability || agent_generation != agent.generation() {
+            if capability != upload_capability || agent_generation != session.generation() {
                 return Err(ProtocolError::new(
                     Some(request_id),
                     "upload_capability_mismatch",
                     "upload capability or backend generation does not match this channel",
                 ));
             }
-            let cwd = registry.cwd_for_binding(agent).ok_or_else(|| {
+            let cwd = registry.cwd_for_binding(session).ok_or_else(|| {
                 ProtocolError::new(
                     Some(request_id),
                     "upload_root_unavailable",
                     "the bound worker did not provide a local cwd capability",
                 )
             })?;
-            if !effect.valid() || !registry.is_current(agent) {
+            if !effect.valid() || !registry.is_current(session) {
                 return Err(ProtocolError::new(
                     Some(request_id),
                     "stale_agent_generation",
-                    "the RTC session belongs to a replaced agent backend",
+                    "the RTC session belongs to a replaced session backend",
                 ));
             }
             let outcome = uploads
                 .start(
-                    agent,
-                    session_id,
+                    session,
+                    viewer_id,
                     upload_capability,
                     request_id,
                     &cwd,
@@ -2852,9 +2849,9 @@ async fn execute_control_request(
                 )
                 .await
                 .map_err(|error| ProtocolError::new(Some(request_id), error.code, &error.detail))?;
-            if !effect.valid() || !registry.is_current(agent) {
+            if !effect.valid() || !registry.is_current(session) {
                 let _ = uploads
-                    .cancel(agent, session_id, upload_capability, request_id)
+                    .cancel(session, viewer_id, upload_capability, request_id)
                     .await;
                 return Ok(());
             }
@@ -2863,11 +2860,11 @@ async fn execute_control_request(
                     next_sequence,
                     received_bytes,
                 } => {
-                    agent_ctl::send_upload_ready(sender, request_id, next_sequence, received_bytes)
+                    session_ctl::send_upload_ready(sender, request_id, next_sequence, received_bytes)
                         .await
                 }
                 UploadStartOutcome::Complete(result) => {
-                    agent_ctl::send_upload_complete(sender, request_id, &result).await
+                    session_ctl::send_upload_complete(sender, request_id, &result).await
                 }
             }
         }
@@ -2876,7 +2873,7 @@ async fn execute_control_request(
             agent_generation,
             upload_id,
         } => {
-            if capability != upload_capability || agent_generation != agent.generation() {
+            if capability != upload_capability || agent_generation != session.generation() {
                 return Err(ProtocolError::new(
                     Some(request_id),
                     "upload_capability_mismatch",
@@ -2884,26 +2881,26 @@ async fn execute_control_request(
                 ));
             }
             uploads
-                .cancel(agent, session_id, upload_capability, upload_id)
+                .cancel(session, viewer_id, upload_capability, upload_id)
                 .await
                 .map_err(|error| ProtocolError::new(Some(request_id), error.code, &error.detail))?;
-            if !effect.valid() || !registry.is_current(agent) {
+            if !effect.valid() || !registry.is_current(session) {
                 return Ok(());
             }
-            agent_ctl::send_ack(sender, request_id, operation_name).await
+            session_ctl::send_ack(sender, request_id, operation_name).await
         }
     }
 }
 
 struct ReplaySpec<'a> {
-    session_id: &'a str,
+    viewer_id: &'a str,
     request_id: Uuid,
     operation: &'a str,
     lines: u16,
     plain: bool,
 }
 
-/// Relay committed-history deltas from the agent's forwarder to one control
+/// Relay committed-history deltas from the session's forwarder to one control
 /// channel as `history_delta`/`history_wipe` events. If the per-viewer queue
 /// overflows (the fan-out drops the sink), the pump re-subscribes and emits a
 /// `history_gap` so the client re-anchors from a fresh snapshot. Ends when the
@@ -2911,17 +2908,17 @@ struct ReplaySpec<'a> {
 fn spawn_history_pump(
     control: crate::pty::ForwarderControl,
     sender: ControlSender,
-    session_id: String,
+    viewer_id: String,
 ) {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
-    let key = format!("{session_id}:{}", Uuid::new_v4());
+    let key = format!("{viewer_id}:{}", Uuid::new_v4());
     tokio::spawn(async move {
         let mut resubscribed = false;
         'outer: loop {
             let mut receiver = control.add_history_sink(key.clone()).await;
             if resubscribed
-                && agent_ctl::send_history_event(&sender, agent_ctl::HistoryEvent::Gap)
+                && session_ctl::send_history_event(&sender, session_ctl::HistoryEvent::Gap)
                     .await
                     .is_err()
             {
@@ -2951,9 +2948,9 @@ fn spawn_history_pump(
                         let mut result = Ok(());
                         for (index, part) in payload.chunks(FRAGMENT_BYTES).enumerate() {
                             let data = BASE64.encode(part);
-                            result = agent_ctl::send_history_event(
+                            result = session_ctl::send_history_event(
                                 &sender,
-                                agent_ctl::HistoryEvent::Delta {
+                                session_ctl::HistoryEvent::Delta {
                                     epoch,
                                     offset: offset + (index * FRAGMENT_BYTES) as u64,
                                     data: &data,
@@ -2967,9 +2964,9 @@ fn spawn_history_pump(
                         result
                     }
                     crate::pty::HistoryUpdate::Wipe { epoch } => {
-                        agent_ctl::send_history_event(
+                        session_ctl::send_history_event(
                             &sender,
-                            agent_ctl::HistoryEvent::Wipe { epoch },
+                            session_ctl::HistoryEvent::Wipe { epoch },
                         )
                         .await
                     }
@@ -2983,10 +2980,10 @@ fn spawn_history_pump(
     });
 }
 
-async fn send_agent_replay(
-    agent: AgentBinding,
+async fn send_session_replay(
+    session: SessionBinding,
     spec: ReplaySpec<'_>,
-    registry: &AgentRegistry,
+    registry: &SessionRegistry,
     sender: &ControlSender,
 ) -> Result<(), ProtocolError> {
     if spec.plain {
@@ -2996,15 +2993,15 @@ async fn send_agent_replay(
             "plain replay is not supported; request styled terminal replay",
         ));
     }
-    let Some(control) = registry.control_for_binding(agent) else {
+    let Some(control) = registry.control_for_binding(session) else {
         return Err(ProtocolError::new(
             Some(spec.request_id),
             "agent_unavailable",
-            "agent is not attached to this daemon",
+            "session is not attached to this daemon",
         ));
     };
     if !control
-        .wait_for_direct_sink(spec.session_id, Duration::from_secs(3))
+        .wait_for_direct_sink(spec.viewer_id, Duration::from_secs(3))
         .await
     {
         return Err(ProtocolError::new(
@@ -3013,7 +3010,7 @@ async fn send_agent_replay(
             "spawn.pty did not become ready for this control session",
         ));
     }
-    let capture = capture_agent_replay(agent, spec.lines, spec.plain, registry, &control);
+    let capture = capture_session_replay(session, spec.lines, spec.plain, registry, &control);
     tokio::pin!(capture);
     let replay = tokio::select! {
         result = &mut capture => result?,
@@ -3034,7 +3031,7 @@ async fn send_agent_replay(
     };
     let source_boundary = replay.watermark();
     let pty_offset = control
-        .direct_sink_anchor(spec.session_id, source_boundary)
+        .direct_sink_anchor(spec.viewer_id, source_boundary)
         .await
         .ok_or_else(|| {
             ProtocolError::new(
@@ -3043,7 +3040,7 @@ async fn send_agent_replay(
                 "spawn.pty disconnected while replay was captured",
             )
         })?;
-    agent_ctl::send_replay(
+    session_ctl::send_replay(
         sender,
         spec.request_id,
         spec.operation,
@@ -3054,14 +3051,14 @@ async fn send_agent_replay(
     .await
 }
 
-async fn capture_agent_replay(
-    agent: AgentBinding,
+async fn capture_session_replay(
+    session: SessionBinding,
     lines: u16,
     _plain: bool,
-    registry: &AgentRegistry,
+    registry: &SessionRegistry,
     control: &crate::pty::ForwarderControl,
 ) -> Result<crate::pty::WorkerReplay, ProtocolError> {
-    let max_bytes = if lines == agent_ctl::MAX_HISTORY_LINES {
+    let max_bytes = if lines == session_ctl::MAX_HISTORY_LINES {
         8 * 1024 * 1024
     } else {
         (lines as u32)
@@ -3069,7 +3066,7 @@ async fn capture_agent_replay(
             .clamp(64 * 1024, 8 * 1024 * 1024)
     };
     let mut replay_rx = None;
-    registry.with_bound_handle(agent, |handle| {
+    registry.with_bound_handle(session, |handle| {
         replay_rx = handle.replay(max_bytes);
     });
     match replay_rx {
@@ -3097,21 +3094,21 @@ async fn capture_agent_replay(
     }
 }
 
-async fn resize_agent(
-    agent: AgentBinding,
+async fn resize_session(
+    session: SessionBinding,
     cols: u16,
     rows: u16,
-    registry: &AgentRegistry,
+    registry: &SessionRegistry,
 ) -> Result<(), ProtocolError> {
     let mut result = None;
-    let found = registry.with_bound_handle(agent, |handle| {
+    let found = registry.with_bound_handle(session, |handle| {
         result = Some(handle.resize(cols, rows));
     });
     if !found {
         return Err(ProtocolError::new(
             None,
             "agent_unavailable",
-            "agent is not running on this daemon",
+            "session is not running on this daemon",
         ));
     }
     result
@@ -3120,40 +3117,40 @@ async fn resize_agent(
     Ok(())
 }
 
-async fn scroll_agent(
-    agent: AgentBinding,
+async fn scroll_session(
+    session: SessionBinding,
     lines: i16,
-    registry: &AgentRegistry,
+    registry: &SessionRegistry,
 ) -> Result<(), ProtocolError> {
-    if !registry.is_current(agent) {
+    if !registry.is_current(session) {
         return Err(ProtocolError::new(
             None,
             "agent_unavailable",
-            "agent is not running on this daemon",
+            "session is not running on this daemon",
         ));
     }
-    tracing::debug!(agent_id = %agent.agent_id(), lines, "ignoring deprecated scroll operation");
+    tracing::debug!(session_id = %session.session_id(), lines, "ignoring deprecated scroll operation");
     Ok(())
 }
 
-async fn redraw_agent(agent: AgentBinding, registry: &AgentRegistry) {
-    tracing::debug!(agent_id = %agent.agent_id(), current = registry.is_current(agent), "ignoring deprecated redraw operation");
+async fn redraw_session(session: SessionBinding, registry: &SessionRegistry) {
+    tracing::debug!(session_id = %session.session_id(), current = registry.is_current(session), "ignoring deprecated redraw operation");
 }
 
 /// Testable core of the `spawn.pty` input callback. Activity is recorded only
 /// after a successful, non-empty binary write, and the helper API exposes no
 /// input bytes to the content-free activity serializer.
 fn forward_bound_data_channel_input(
-    agent: AgentBinding,
+    session: SessionBinding,
     is_string: bool,
     data: &[u8],
-    registry: &AgentRegistry,
+    registry: &SessionRegistry,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) -> Option<Result<bool>> {
     let mut result = None;
-    registry.with_bound_handle(agent, |handle| {
+    registry.with_bound_handle(session, |handle| {
         result = Some(forward_data_channel_input(
-            agent.agent_id(),
+            session.session_id(),
             is_string,
             data,
             &handle.control,
@@ -3164,12 +3161,12 @@ fn forward_bound_data_channel_input(
     result
 }
 
-fn rtc_output_allowed(registry: &AgentRegistry, agent: AgentBinding) -> bool {
-    registry.is_current(agent)
+fn rtc_output_allowed(registry: &SessionRegistry, session: SessionBinding) -> bool {
+    registry.is_current(session)
 }
 
 fn forward_data_channel_input<W>(
-    agent_id: Uuid,
+    session_id: Uuid,
     is_string: bool,
     data: &[u8],
     control: &crate::pty::ForwarderControl,
@@ -3183,11 +3180,11 @@ where
         return Ok(false);
     }
     write_stdin(data)?;
-    // Focus-weighted scheduling: the agent being typed into gets its CPU
+    // Focus-weighted scheduling: the session being typed into gets its CPU
     // scope boosted so its response wins the scheduler under host load.
-    crate::cpu_scopes::note_input(agent_id);
+    crate::cpu_scopes::note_input(session_id);
     if control.note_input(data) {
-        crate::pty::try_emit_activity(out_tx, agent_id, crate::pty::ActivityKind::Input);
+        crate::pty::try_emit_activity(out_tx, session_id, crate::pty::ActivityKind::Input);
     }
     Ok(true)
 }
@@ -3210,12 +3207,12 @@ fn parse_ice_transport_policy(value: Option<&str>) -> Result<RTCIceTransportPoli
 
 fn install_host_ice_handler(
     pc: &Arc<RTCPeerConnection>,
-    session_id: String,
+    signal_id: String,
     binding: HostRtcBinding,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
     pc.on_ice_candidate(Box::new(move |candidate| {
-        let session_id = session_id.clone();
+        let signal_id = signal_id.clone();
         let binding = binding.clone();
         let out_tx = out_tx.clone();
         Box::pin(async move {
@@ -3229,9 +3226,8 @@ fn install_host_ice_handler(
             send_json(
                 &out_tx,
                 Outbound::RtcCandidate {
-                    session_id,
+                    session_id: signal_id,
                     binding_nonce: Some(binding.binding_nonce),
-                    agent_id: None,
                     scope_type: Some("host".to_string()),
                     scope_id: Some(binding.host_id),
                     protocol: Some(binding.protocol),
@@ -3246,7 +3242,7 @@ fn install_host_ice_handler(
 
 fn install_host_data_channel_handler(
     pc: &Arc<RTCPeerConnection>,
-    session_id: String,
+    signal_id: String,
     binding: HostRtcBinding,
     out_tx: mpsc::Sender<WsOutbound>,
     files_override: Option<Arc<HostFileService>>,
@@ -3256,7 +3252,7 @@ fn install_host_data_channel_handler(
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let accepted = Arc::clone(&accepted);
         let pc = Arc::clone(&handler_pc);
-        let session_id = session_id.clone();
+        let signal_id = signal_id.clone();
         let binding = binding.clone();
         let out_tx = out_tx.clone();
         let files = files_override.clone();
@@ -3273,7 +3269,7 @@ fn install_host_data_channel_handler(
                 let _ = dc.close().await;
                 return;
             }
-            install_host_control_channel(dc, session_id, binding, out_tx, files);
+            install_host_control_channel(dc, signal_id, binding, out_tx, files);
         })
     }));
 }
@@ -3335,27 +3331,26 @@ fn host_control_response(data: &[u8], is_string: bool) -> HostControlAction {
 
 fn install_host_control_channel(
     dc: Arc<RTCDataChannel>,
-    session_id: String,
+    signal_id: String,
     binding: HostRtcBinding,
     out_tx: mpsc::Sender<WsOutbound>,
     files_override: Option<Arc<HostFileService>>,
 ) {
-    let connected_signal = HostConnectedSignal::new(out_tx, session_id, binding);
+    let connected_signal = HostConnectedSignal::new(out_tx, signal_id, binding);
     crate::host_control::install(dc, connected_signal, files_override);
 }
 
 pub(crate) async fn send_host_status(
     out_tx: &mpsc::Sender<WsOutbound>,
-    session_id: String,
+    signal_id: String,
     binding: &HostRtcBinding,
     status: &str,
 ) {
     send_json(
         out_tx,
         Outbound::RtcStatus {
-            session_id,
+            session_id: signal_id,
             binding_nonce: Some(binding.binding_nonce.clone()),
-            agent_id: None,
             scope_type: Some("host".to_string()),
             scope_id: Some(binding.host_id),
             protocol: Some(binding.protocol.clone()),
@@ -3369,14 +3364,13 @@ pub(crate) async fn send_host_status(
 
 pub(crate) fn try_send_host_status(
     out_tx: &mpsc::Sender<WsOutbound>,
-    session_id: String,
+    signal_id: String,
     binding: &HostRtcBinding,
     status: &str,
 ) -> bool {
     let frame = Outbound::RtcStatus {
-        session_id,
+        session_id: signal_id,
         binding_nonce: Some(binding.binding_nonce.clone()),
-        agent_id: None,
         scope_type: Some("host".to_string()),
         scope_id: Some(binding.host_id),
         protocol: Some(binding.protocol.clone()),
@@ -3392,20 +3386,19 @@ pub(crate) fn try_send_host_status(
 
 fn try_send_status(
     out_tx: &mpsc::Sender<WsOutbound>,
-    session_id: &str,
+    signal_id: &str,
     binding_nonce: &str,
-    agent_id: Uuid,
+    session_id: Uuid,
     status: &str,
     message: Option<&str>,
 ) -> bool {
     let frame = Outbound::RtcStatus {
-        session_id: session_id.to_string(),
+        session_id: signal_id.to_string(),
         binding_nonce: Some(binding_nonce.to_string()),
-        agent_id: Some(agent_id),
-        scope_type: Some("agent".to_string()),
-        scope_id: Some(agent_id),
+        scope_type: Some("session".to_string()),
+        scope_id: Some(session_id),
         protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
-        protocol_version: Some(AGENT_RTC_PROTOCOL_VERSION),
+        protocol_version: Some(SESSION_RTC_PROTOCOL_VERSION),
         status: status.to_string(),
         message: message.map(str::to_string),
     };
@@ -3417,22 +3410,21 @@ fn try_send_status(
 
 async fn send_status(
     out_tx: &mpsc::Sender<WsOutbound>,
-    session_id: String,
+    signal_id: String,
     binding_nonce: String,
-    agent_id: Uuid,
+    session_id: Uuid,
     status: &str,
     message: Option<&str>,
 ) {
     send_json(
         out_tx,
         Outbound::RtcStatus {
-            session_id,
+            session_id: signal_id,
             binding_nonce: Some(binding_nonce),
-            agent_id: Some(agent_id),
-            scope_type: Some("agent".to_string()),
-            scope_id: Some(agent_id),
+            scope_type: Some("session".to_string()),
+            scope_id: Some(session_id),
             protocol: Some(PTY_DATA_CHANNEL_LABEL.to_string()),
-            protocol_version: Some(AGENT_RTC_PROTOCOL_VERSION),
+            protocol_version: Some(SESSION_RTC_PROTOCOL_VERSION),
             status: status.to_string(),
             message: message.map(str::to_string),
         },
@@ -3476,10 +3468,10 @@ mod tests {
 
     #[tokio::test]
     async fn trust_reload_deactivates_all_stale_peers_before_slow_cleanup() {
-        let registry = AgentRegistry::new();
-        let agent_id = Uuid::new_v4();
-        let (agent, _commands) = insert_test_worker(&registry, agent_id);
-        let control = registry.control_for_binding(agent).expect("worker control");
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (session, _commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).expect("worker control");
         let pc = Arc::new(
             APIBuilder::new()
                 .build()
@@ -3489,16 +3481,16 @@ mod tests {
         );
         let active = Arc::new(AtomicBool::new(true));
         let sessions = RtcSessions::new();
-        let session_id = "trust-reload-stalled-cleanup";
+        let signal_id = "trust-reload-stalled-cleanup";
         sessions.peers.lock().await.insert(
-            session_id.to_owned(),
+            signal_id.to_owned(),
             RtcPeer {
                 pc,
-                agent,
+                session,
                 generation: "old-generation".to_owned(),
                 active: Arc::clone(&active),
                 control,
-                channels: Arc::new(RequiredAgentChannels::default()),
+                channels: Arc::new(RequiredSessionChannels::default()),
                 close: Arc::new(PeerCloseCoordinator::default()),
                 _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::new(tokio::sync::RwLock::new(())),
@@ -3525,7 +3517,7 @@ mod tests {
             },
         );
         let cleanup_gate = sessions
-            .stall_effect(session_id, TestEffectPoint::CloseAllSnapshot)
+            .stall_effect(signal_id, TestEffectPoint::CloseAllSnapshot)
             .await;
         let invalidating = sessions.clone();
         let task = tokio::spawn(async move {
@@ -3539,7 +3531,7 @@ mod tests {
         );
         assert!(
             sessions.host_peers.lock().await.is_empty(),
-            "stale host peer remained admitted until slow agent cleanup"
+            "stale host peer remained admitted until slow session cleanup"
         );
         cleanup_gate.release.notify_one();
         tokio::time::timeout(Duration::from_secs(2), task)
@@ -3585,7 +3577,7 @@ mod tests {
     async fn start_paired_host_endpoint_with_init(
         files: Arc<HostFileService>,
         binding: HostRtcBinding,
-        session_id: &str,
+        signal_id: &str,
         init: Option<webrtc::data_channel::data_channel_init::RTCDataChannelInit>,
     ) -> (
         Arc<RTCPeerConnection>,
@@ -3623,7 +3615,7 @@ mod tests {
         let (out_tx, out_rx) = mpsc::channel(4);
         install_host_data_channel_handler(
             &daemon_pc,
-            session_id.to_string(),
+            signal_id.to_string(),
             binding,
             out_tx,
             Some(files),
@@ -3651,7 +3643,7 @@ mod tests {
     async fn start_paired_host_endpoint(
         files: Arc<HostFileService>,
         binding: HostRtcBinding,
-        session_id: &str,
+        signal_id: &str,
     ) -> (
         Arc<RTCPeerConnection>,
         Arc<RTCPeerConnection>,
@@ -3659,13 +3651,13 @@ mod tests {
         mpsc::Receiver<(usize, String)>,
         mpsc::Receiver<WsOutbound>,
     ) {
-        start_paired_host_endpoint_with_init(files, binding, session_id, None).await
+        start_paired_host_endpoint_with_init(files, binding, signal_id, None).await
     }
 
     async fn paired_host_endpoint(
         files: Arc<HostFileService>,
         binding: HostRtcBinding,
-        session_id: &str,
+        signal_id: &str,
     ) -> (
         Arc<RTCPeerConnection>,
         Arc<RTCPeerConnection>,
@@ -3673,7 +3665,7 @@ mod tests {
         mpsc::Receiver<(usize, String)>,
     ) {
         let (browser_pc, daemon_pc, channel, mut messages_rx, _out_rx) =
-            start_paired_host_endpoint(files, binding, session_id).await;
+            start_paired_host_endpoint(files, binding, signal_id).await;
         let (_, hello) = receive_host_control(&mut messages_rx).await;
         assert_eq!(hello["type"], "hello");
         (browser_pc, daemon_pc, channel, messages_rx)
@@ -3692,24 +3684,24 @@ mod tests {
     }
 
     fn insert_test_worker(
-        registry: &AgentRegistry,
-        agent_id: Uuid,
-    ) -> (AgentBinding, mpsc::Receiver<crate::pty::WorkerCmd>) {
-        insert_test_worker_at(registry, agent_id, Path::new("/"))
+        registry: &SessionRegistry,
+        session_id: Uuid,
+    ) -> (SessionBinding, mpsc::Receiver<crate::pty::WorkerCmd>) {
+        insert_test_worker_at(registry, session_id, Path::new("/"))
     }
 
     fn insert_test_worker_at(
-        registry: &AgentRegistry,
-        agent_id: Uuid,
+        registry: &SessionRegistry,
+        session_id: Uuid,
         cwd: &Path,
-    ) -> (AgentBinding, mpsc::Receiver<crate::pty::WorkerCmd>) {
+    ) -> (SessionBinding, mpsc::Receiver<crate::pty::WorkerCmd>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
         let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
-        let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
-            agent_id,
+        let handle = crate::pty::SessionHandle::new_worker(crate::pty::WorkerHandleParts {
+            session_id,
             cwd: cwd.to_string_lossy().into_owned(),
             cmd_tx,
-            lifecycle: crate::pty::AgentLifecycle::new(
+            lifecycle: crate::pty::SessionLifecycle::new(
                 std::path::PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
                 Uuid::new_v4(),
             ),
@@ -3721,7 +3713,7 @@ mod tests {
         });
         registry.insert(handle);
         (
-            registry.binding_for(agent_id).expect("worker binding"),
+            registry.binding_for(session_id).expect("worker binding"),
             cmd_rx,
         )
     }
@@ -3737,7 +3729,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct TestAgentChannel {
+    struct TestSessionChannel {
         label: &'static str,
         ordered: bool,
         max_packet_life_time: Option<u16>,
@@ -3745,7 +3737,7 @@ mod tests {
         close_on_open: bool,
     }
 
-    impl TestAgentChannel {
+    impl TestSessionChannel {
         const fn ordered(label: &'static str) -> Self {
             Self {
                 label,
@@ -3780,9 +3772,9 @@ mod tests {
 
     async fn connect_rtc_session_inner(
         sessions: &RtcSessions,
-        registry: &AgentRegistry,
-        agent_id: Uuid,
-        session_id: &str,
+        registry: &SessionRegistry,
+        session_id: Uuid,
+        signal_id: &str,
         generation: &str,
         await_ready: bool,
     ) -> RtcTestClient {
@@ -3841,7 +3833,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(64);
         sessions
             .handle_offer(
-                RtcSessionBinding::new(session_id.to_string(), generation.to_string(), agent_id),
+                RtcSignalBinding::new(signal_id.to_string(), generation.to_string(), session_id),
                 offer_sdp,
                 Vec::new(),
                 registry.clone(),
@@ -3910,7 +3902,7 @@ mod tests {
                     }
                     let value: serde_json::Value =
                         serde_json::from_slice(&message.1).expect("spawn.ctl readiness JSON");
-                    if value["version"] == agent_ctl::PROTOCOL_VERSION
+                    if value["version"] == session_ctl::PROTOCOL_VERSION
                         && value["kind"] == "event"
                         && value["event"] == "ready"
                     {
@@ -3925,7 +3917,7 @@ mod tests {
                         ready_agent_generation = Some(
                             value["agent_generation"]
                                 .as_u64()
-                                .expect("readiness agent generation"),
+                                .expect("readiness session generation"),
                         );
                         break;
                     }
@@ -3968,26 +3960,26 @@ mod tests {
 
     async fn connect_rtc_session(
         sessions: &RtcSessions,
-        registry: &AgentRegistry,
-        agent_id: Uuid,
-        session_id: &str,
+        registry: &SessionRegistry,
+        session_id: Uuid,
+        signal_id: &str,
         generation: &str,
     ) -> RtcTestClient {
-        connect_rtc_session_inner(sessions, registry, agent_id, session_id, generation, true).await
+        connect_rtc_session_inner(sessions, registry, session_id, signal_id, generation, true).await
     }
 
-    async fn assert_real_agent_channels_fail_closed(
+    async fn assert_real_session_channels_fail_closed(
         case: &'static str,
-        specs: &[TestAgentChannel],
+        specs: &[TestSessionChannel],
         probe: Option<PartialPeerProbe>,
     ) {
-        let agent_id = Uuid::new_v4();
-        let session_id = format!("invalid-{case}-{}", Uuid::new_v4());
+        let session_id = Uuid::new_v4();
+        let signal_id = format!("invalid-{case}-{}", Uuid::new_v4());
         let generation = "generation";
-        let viewer = viewer_id(&session_id, generation);
-        let registry = AgentRegistry::new();
-        let (agent, mut worker_commands) = insert_test_worker(&registry, agent_id);
-        let control = registry.control_for_binding(agent).expect("worker control");
+        let viewer = viewer_id(&signal_id, generation);
+        let registry = SessionRegistry::new();
+        let (session, mut worker_commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).expect("worker control");
         let sessions = RtcSessions::new();
 
         let mut media_engine = MediaEngine::default();
@@ -4091,7 +4083,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(64);
         sessions
             .handle_offer(
-                RtcSessionBinding::new(session_id.clone(), generation.to_string(), agent_id),
+                RtcSignalBinding::new(signal_id.clone(), generation.to_string(), session_id),
                 offer_sdp,
                 Vec::new(),
                 registry,
@@ -4131,11 +4123,11 @@ mod tests {
                                 "{case}: pre-ready frame produced a channel response"
                             );
                             assert!(
-                                !sessions.controls.contains_viewer(agent_id, &viewer).await,
+                                !sessions.controls.contains_viewer(session_id, &viewer).await,
                                 "{case}: pre-ready control frame registered a viewer"
                             );
                             assert!(
-                                !sessions.controls.is_owner(agent_id, &viewer).await,
+                                !sessions.controls.is_owner(session_id, &viewer).await,
                                 "{case}: pre-ready control frame changed display ownership"
                             );
                             assert_eq!(
@@ -4214,7 +4206,7 @@ mod tests {
         }
 
         assert!(
-            !sessions.controls.contains_viewer(agent_id, &viewer).await,
+            !sessions.controls.contains_viewer(session_id, &viewer).await,
             "{case}: invalid RTC viewer remained registered"
         );
         assert_eq!(
@@ -4270,12 +4262,12 @@ mod tests {
         bytes: &[u8],
     ) -> serde_json::Value {
         let capability = client.upload_capability.expect("RTC upload capability");
-        let agent_generation = client.agent_generation.expect("RTC agent generation");
+        let agent_generation = client.agent_generation.expect("RTC session generation");
         client
             .ctl
             .send_text(
                 json!({
-                    "version": agent_ctl::PROTOCOL_VERSION,
+                    "version": session_ctl::PROTOCOL_VERSION,
                     "kind": "request",
                     "request_id": upload_id,
                     "operation": "upload_start",
@@ -4298,7 +4290,7 @@ mod tests {
     fn real_upload_chunk(upload_id: Uuid, sequence: u32, last: bool, bytes: &[u8]) -> Bytes {
         let mut frame = Vec::with_capacity(28 + bytes.len());
         frame.extend_from_slice(b"SPCT");
-        frame.push(agent_ctl::PROTOCOL_VERSION);
+        frame.push(session_ctl::PROTOCOL_VERSION);
         frame.push(2);
         frame.extend_from_slice(&u16::from(last).to_le_bytes());
         frame.extend_from_slice(upload_id.as_bytes());
@@ -4390,21 +4382,21 @@ mod tests {
     const WORKER_TEST_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
     struct WorkerCleanupGuard {
-        agent_id: Uuid,
-        lifecycle: Option<crate::pty::AgentLifecycle>,
+        session_id: Uuid,
+        lifecycle: Option<crate::pty::SessionLifecycle>,
         supervisor_keepalive: Option<mpsc::Sender<crate::pty::WorkerCmd>>,
     }
 
     impl WorkerCleanupGuard {
-        fn new(agent_id: Uuid, handle: &crate::pty::AgentHandle) -> Self {
+        fn new(session_id: Uuid, handle: &crate::pty::SessionHandle) -> Self {
             Self {
-                agent_id,
+                session_id,
                 lifecycle: Some(handle.lifecycle()),
                 supervisor_keepalive: Some(handle.worker_connection_keepalive()),
             }
         }
 
-        fn refresh(&mut self, handle: &crate::pty::AgentHandle) {
+        fn refresh(&mut self, handle: &crate::pty::SessionHandle) {
             self.lifecycle = Some(handle.lifecycle());
             self.supervisor_keepalive = Some(handle.worker_connection_keepalive());
         }
@@ -4420,7 +4412,7 @@ mod tests {
             let Some(lifecycle) = self.lifecycle.take() else {
                 return;
             };
-            let agent_id = self.agent_id;
+            let session_id = self.session_id;
             let cleanup = std::thread::Builder::new()
                 .name("rtc-worker-test-cleanup".to_string())
                 .spawn(move || {
@@ -4435,7 +4427,7 @@ mod tests {
                         let _ = lifecycle
                             .shutdown(spawnd::sessiond::wire::LifecycleSignal::Kill)
                             .await;
-                        while crate::worker_backend::socket_exists(agent_id)
+                        while crate::worker_backend::socket_exists(session_id)
                             && tokio::time::Instant::now() < deadline
                         {
                             tokio::time::sleep_until(std::cmp::min(
@@ -4508,10 +4500,10 @@ mod tests {
     async fn worker_cleanup_guard_drop_is_bounded_on_a_nonwritable_endpoint() {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
         let env = WorkerTestEnv::install();
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         spawnd::sessiond::endpoint::ensure_private_dir(env.path())
             .expect("secure guard test worker directory");
-        let ordinary_path = env.path().join(format!("{agent_id}.sock"));
+        let ordinary_path = env.path().join(format!("{session_id}.sock"));
         let ordinary = std::os::unix::net::UnixDatagram::bind(&ordinary_path)
             .expect("bind persistent fake worker endpoint");
         let ordinary_identity = spawnd::sessiond::endpoint::secure_bound_socket(&ordinary_path)
@@ -4527,18 +4519,18 @@ mod tests {
         );
         let (cmd_tx, _cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
         let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
-        let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
-            agent_id,
+        let handle = crate::pty::SessionHandle::new_worker(crate::pty::WorkerHandleParts {
+            session_id,
             cwd: "/".into(),
             cmd_tx,
-            lifecycle: crate::pty::AgentLifecycle::new(lifecycle_path, Uuid::new_v4()),
+            lifecycle: crate::pty::SessionLifecycle::new(lifecycle_path, Uuid::new_v4()),
             alive: Arc::new(AtomicBool::new(true)),
             cols: 80,
             rows: 24,
             outbox_tx,
             control: crate::pty::ForwarderControl::new(),
         });
-        let guard = WorkerCleanupGuard::new(agent_id, &handle);
+        let guard = WorkerCleanupGuard::new(session_id, &handle);
         drop(handle);
 
         let started = std::time::Instant::now();
@@ -4548,7 +4540,7 @@ mod tests {
             "worker cleanup guard exceeded its advertised bound"
         );
         assert!(
-            crate::worker_backend::socket_exists(agent_id),
+            crate::worker_backend::socket_exists(session_id),
             "test did not retain the deliberately stuck worker endpoint"
         );
         assert!(
@@ -4606,7 +4598,7 @@ mod tests {
                     for (sequence, chunk) in chunks {
                         assert_eq!(
                             sequence as usize,
-                            replay.len() / agent_ctl::CHUNK_PAYLOAD_BYTES
+                            replay.len() / session_ctl::CHUNK_PAYLOAD_BYTES
                         );
                         replay.extend_from_slice(&chunk);
                     }
@@ -4640,95 +4632,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_agent_channel_gate_rejects_every_invalid_shape_without_residents() {
-        let missing_pty = [TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)];
-        let missing_ctl = [TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)];
+    async fn real_session_channel_gate_rejects_every_invalid_shape_without_residents() {
+        let missing_pty = [TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)];
+        let missing_ctl = [TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL)];
         let duplicate_pty = [
-            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
-            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
-            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
         ];
         let duplicate_ctl = [
-            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
-            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
-            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
         ];
         let unknown = [
-            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
-            TestAgentChannel::ordered("spawn.unknown"),
-            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered("spawn.unknown"),
+            TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
         ];
         let early_close = [
-            TestAgentChannel {
+            TestSessionChannel {
                 close_on_open: true,
-                ..TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)
+                ..TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL)
             },
-            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
         ];
         let unordered_pty = [
-            TestAgentChannel {
+            TestSessionChannel {
                 ordered: false,
-                ..TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)
+                ..TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL)
             },
-            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
         ];
         let unordered_ctl = [
-            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
-            TestAgentChannel {
+            TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestSessionChannel {
                 ordered: false,
-                ..TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)
+                ..TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)
             },
         ];
         let lifetime_pty = [
-            TestAgentChannel {
+            TestSessionChannel {
                 max_packet_life_time: Some(1),
-                ..TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)
+                ..TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL)
             },
-            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
         ];
         let lifetime_ctl = [
-            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
-            TestAgentChannel {
+            TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestSessionChannel {
                 max_packet_life_time: Some(1),
-                ..TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)
+                ..TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)
             },
         ];
         let retransmits_pty = [
-            TestAgentChannel {
+            TestSessionChannel {
                 max_retransmits: Some(1),
-                ..TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL)
+                ..TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL)
             },
-            TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
+            TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL),
         ];
         let retransmits_ctl = [
-            TestAgentChannel::ordered(PTY_DATA_CHANNEL_LABEL),
-            TestAgentChannel {
+            TestSessionChannel::ordered(PTY_DATA_CHANNEL_LABEL),
+            TestSessionChannel {
                 max_retransmits: Some(1),
-                ..TestAgentChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)
+                ..TestSessionChannel::ordered(CONTROL_DATA_CHANNEL_LABEL)
             },
         ];
 
         tokio::join!(
-            assert_real_agent_channels_fail_closed(
+            assert_real_session_channels_fail_closed(
                 "missing-pty",
                 &missing_pty,
                 Some(PartialPeerProbe::ControlRequests),
             ),
-            assert_real_agent_channels_fail_closed(
+            assert_real_session_channels_fail_closed(
                 "missing-ctl",
                 &missing_ctl,
                 Some(PartialPeerProbe::PtyInput),
             ),
-            assert_real_agent_channels_fail_closed("duplicate-pty", &duplicate_pty, None),
-            assert_real_agent_channels_fail_closed("duplicate-ctl", &duplicate_ctl, None),
-            assert_real_agent_channels_fail_closed("unknown", &unknown, None),
-            assert_real_agent_channels_fail_closed("early-close", &early_close, None),
-            assert_real_agent_channels_fail_closed("unordered-pty", &unordered_pty, None),
-            assert_real_agent_channels_fail_closed("unordered-ctl", &unordered_ctl, None),
-            assert_real_agent_channels_fail_closed("lifetime-pty", &lifetime_pty, None),
-            assert_real_agent_channels_fail_closed("lifetime-ctl", &lifetime_ctl, None),
-            assert_real_agent_channels_fail_closed("retransmits-pty", &retransmits_pty, None),
-            assert_real_agent_channels_fail_closed("retransmits-ctl", &retransmits_ctl, None),
+            assert_real_session_channels_fail_closed("duplicate-pty", &duplicate_pty, None),
+            assert_real_session_channels_fail_closed("duplicate-ctl", &duplicate_ctl, None),
+            assert_real_session_channels_fail_closed("unknown", &unknown, None),
+            assert_real_session_channels_fail_closed("early-close", &early_close, None),
+            assert_real_session_channels_fail_closed("unordered-pty", &unordered_pty, None),
+            assert_real_session_channels_fail_closed("unordered-ctl", &unordered_ctl, None),
+            assert_real_session_channels_fail_closed("lifetime-pty", &lifetime_pty, None),
+            assert_real_session_channels_fail_closed("lifetime-ctl", &lifetime_ctl, None),
+            assert_real_session_channels_fail_closed("retransmits-pty", &retransmits_pty, None),
+            assert_real_session_channels_fail_closed("retransmits-ctl", &retransmits_ctl, None),
         );
     }
 
@@ -4738,14 +4730,14 @@ mod tests {
             .expect("effect gate was not reached");
     }
 
-    async fn wait_peer_stopped(sessions: &RtcSessions, session_id: &str) {
+    async fn wait_peer_stopped(sessions: &RtcSessions, signal_id: &str) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let stopped = sessions
                     .peers
                     .lock()
                     .await
-                    .get(session_id)
+                    .get(signal_id)
                     .is_none_or(|peer| peer.channels.failed.load(Ordering::SeqCst));
                 if stopped {
                     break;
@@ -4760,13 +4752,13 @@ mod tests {
     async fn wait_peer_cleanup(
         sessions: &RtcSessions,
         control: &crate::pty::ForwarderControl,
-        agent_id: Uuid,
+        session_id: Uuid,
         viewer: &str,
     ) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if sessions.resident_session_count().await == 0
-                    && !sessions.controls.contains_viewer(agent_id, viewer).await
+                    && !sessions.controls.contains_viewer(session_id, viewer).await
                     && control.direct_sink_offset(viewer).await.is_none()
                 {
                     break;
@@ -4780,9 +4772,9 @@ mod tests {
 
     async fn insert_synthetic_peer(
         sessions: &RtcSessions,
-        session_id: &str,
+        signal_id: &str,
         generation: &str,
-        agent: AgentBinding,
+        session: SessionBinding,
         control: ForwarderControl,
     ) -> (
         Arc<RTCPeerConnection>,
@@ -4802,14 +4794,14 @@ mod tests {
             .try_acquire()
             .expect("synthetic peer admission");
         sessions.peers.lock().await.insert(
-            session_id.to_string(),
+            signal_id.to_string(),
             RtcPeer {
                 pc: Arc::clone(&pc),
-                agent,
+                session,
                 generation: generation.to_string(),
                 active: Arc::new(AtomicBool::new(true)),
                 control,
-                channels: Arc::new(RequiredAgentChannels::default()),
+                channels: Arc::new(RequiredSessionChannels::default()),
                 close: Arc::clone(&close),
                 _admission_permit: admission_permit,
                 fence: Arc::clone(&fence),
@@ -4820,21 +4812,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn first_close_deadline_bounds_delayed_sender_state_and_duplicate_callers() {
-        let registry = AgentRegistry::new();
-        let agent_id = Uuid::new_v4();
-        let (agent, _commands) = insert_test_worker(&registry, agent_id);
-        let control = registry.control_for_binding(agent).unwrap();
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (session, _commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).unwrap();
         let sessions = RtcSessions::new();
-        let session_id = "first-close-deadline";
+        let signal_id = "first-close-deadline";
         let generation = "generation";
         let (pc, close, fence) =
-            insert_synthetic_peer(&sessions, session_id, generation, agent, control).await;
+            insert_synthetic_peer(&sessions, signal_id, generation, session, control).await;
         let blocked_effect = fence.read().await;
 
         let initiated_at = tokio::time::Instant::now();
         // This is the same synchronous entry point used by invalid channels,
         // sender shutdown, and peer-state callbacks.
-        sessions.schedule_close_if_same(session_id, generation, &pc, &close);
+        sessions.schedule_close_if_same(signal_id, generation, &pc, &close);
         assert_eq!(
             close.initiated_deadline(),
             Some(initiated_at + Duration::from_millis(100))
@@ -4847,14 +4839,14 @@ mod tests {
         let duplicate_sessions = sessions.clone();
         let duplicate = tokio::spawn(async move {
             duplicate_sessions
-                .close(session_id, generation, agent_id)
+                .close(signal_id, generation, session_id)
                 .await;
         });
         // Model delayed sender-close and peer-state notifications. Neither is
         // allowed to replace the first event's deadline while waiting for the
-        // per-agent closer.
-        sessions.schedule_close_if_same(session_id, generation, &pc, &close);
-        sessions.schedule_close_if_same(session_id, generation, &pc, &close);
+        // per-session closer.
+        sessions.schedule_close_if_same(signal_id, generation, &pc, &close);
+        sessions.schedule_close_if_same(signal_id, generation, &pc, &close);
         assert_eq!(
             close.initiated_deadline(),
             Some(initiated_at + Duration::from_millis(100))
@@ -4869,7 +4861,7 @@ mod tests {
             "duplicate close received a fresh teardown budget"
         );
         duplicate.await.unwrap();
-        assert!(!sessions.peers.lock().await.contains_key(session_id));
+        assert!(!sessions.peers.lock().await.contains_key(signal_id));
         assert_eq!(
             close.initiated_deadline(),
             Some(initiated_at + Duration::from_millis(100))
@@ -4889,11 +4881,11 @@ mod tests {
 
     #[tokio::test]
     async fn real_sender_exit_starts_one_deadline_before_stalled_data_channel_close() {
-        for channel in [AgentChannel::Pty, AgentChannel::Control] {
-            let registry = AgentRegistry::new();
-            let agent_id = Uuid::new_v4();
-            let (agent, mut commands) = insert_test_worker(&registry, agent_id);
-            let control = registry.control_for_binding(agent).unwrap();
+        for channel in [SessionChannel::Pty, SessionChannel::Control] {
+            let registry = SessionRegistry::new();
+            let session_id = Uuid::new_v4();
+            let (session, mut commands) = insert_test_worker(&registry, session_id);
+            let control = registry.control_for_binding(session).unwrap();
             let worker_control = control.clone();
             let worker = tokio::spawn(async move {
                 while let Some(command) = commands.recv().await {
@@ -4906,12 +4898,12 @@ mod tests {
                 }
             });
             let sessions = RtcSessions::new();
-            let session_id = format!("real-sender-close-{channel:?}-{}", Uuid::new_v4());
+            let signal_id = format!("real-sender-close-{channel:?}-{}", Uuid::new_v4());
             let generation = "generation";
-            let viewer = viewer_id(&session_id, generation);
-            let gate = sessions.stall_sender_close(&session_id, channel).await;
+            let viewer = viewer_id(&signal_id, generation);
+            let gate = sessions.stall_sender_close(&signal_id, channel).await;
             let client =
-                connect_rtc_session(&sessions, &registry, agent_id, &session_id, generation).await;
+                connect_rtc_session(&sessions, &registry, session_id, &signal_id, generation).await;
             tokio::time::timeout(Duration::from_secs(10), async {
                 while control.direct_sink_offset(&viewer).await.is_none() {
                     tokio::task::yield_now().await;
@@ -4921,7 +4913,7 @@ mod tests {
             .expect("PTY output sender was not installed");
             let fence = {
                 let peers = sessions.peers.lock().await;
-                Arc::clone(&peers.get(&session_id).expect("active real peer").fence)
+                Arc::clone(&peers.get(&signal_id).expect("active real peer").fence)
             };
             let blocked_effect = fence.read_owned().await;
 
@@ -4941,10 +4933,10 @@ mod tests {
 
             tokio::time::sleep_until(first_deadline - Duration::from_millis(40)).await;
             let duplicate_sessions = sessions.clone();
-            let duplicate_session_id = session_id.clone();
+            let duplicate_session_id = signal_id.clone();
             let duplicate = tokio::spawn(async move {
                 duplicate_sessions
-                    .close(&duplicate_session_id, generation, agent_id)
+                    .close(&duplicate_session_id, generation, session_id)
                     .await;
             });
             let remote_pc = Arc::clone(&client.pc);
@@ -4962,14 +4954,14 @@ mod tests {
                 "peer state/on-close or duplicate close replaced the sender deadline"
             );
             assert!(
-                !sessions.peers.lock().await.contains_key(&session_id),
+                !sessions.peers.lock().await.contains_key(&signal_id),
                 "peer map outlived the sender deadline"
             );
 
             gate.release.notify_one();
             drop(blocked_effect);
             remote_close.await.expect("remote close task");
-            wait_peer_cleanup(&sessions, &control, agent_id, &viewer).await;
+            wait_peer_cleanup(&sessions, &control, session_id, &viewer).await;
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if sessions.closing_peers.lock().await.is_empty()
@@ -4991,18 +4983,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stalled_peer_cleanup_retains_the_global_admission_slot_until_settlement() {
-        let registry = AgentRegistry::new();
-        let agent_id = Uuid::new_v4();
-        let (agent, _commands) = insert_test_worker(&registry, agent_id);
-        let control = registry.control_for_binding(agent).unwrap();
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (session, _commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).unwrap();
         let sessions = RtcSessions::new();
-        let session_id = "stalled-admission";
+        let signal_id = "stalled-admission";
         let generation = "generation";
         let (pc, close, fence) =
-            insert_synthetic_peer(&sessions, session_id, generation, agent, control).await;
+            insert_synthetic_peer(&sessions, signal_id, generation, session, control).await;
         let blocked_effect = fence.read().await;
 
-        sessions.schedule_close_if_same(session_id, generation, &pc, &close);
+        sessions.schedule_close_if_same(signal_id, generation, &pc, &close);
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
@@ -5010,7 +5002,7 @@ mod tests {
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
-        assert!(!sessions.peers.lock().await.contains_key(session_id));
+        assert!(!sessions.peers.lock().await.contains_key(signal_id));
         assert_eq!(sessions.closing_peers.lock().await.len(), 1);
         assert_eq!(sessions.peer_admission.charged(), 1);
 
@@ -5045,10 +5037,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn admitted_input_and_control_abort_when_counterpart_closes() {
-        let agent_id = Uuid::new_v4();
-        let registry = AgentRegistry::new();
-        let (agent, mut worker_commands) = insert_test_worker(&registry, agent_id);
-        let control = registry.control_for_binding(agent).expect("worker control");
+        let session_id = Uuid::new_v4();
+        let registry = SessionRegistry::new();
+        let (session, mut worker_commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).expect("worker control");
         let worker_control = control.clone();
         let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
         let worker = tokio::spawn(async move {
@@ -5068,17 +5060,17 @@ mod tests {
         });
         let sessions = RtcSessions::new();
 
-        for (session_id, point) in [
+        for (signal_id, point) in [
             ("close-race-control", TestEffectPoint::ControlRequest),
             ("close-race-input", TestEffectPoint::PtyInput),
         ] {
-            let viewer = viewer_id(session_id, "generation");
+            let viewer = viewer_id(signal_id, "generation");
             let client =
-                connect_rtc_session(&sessions, &registry, agent_id, session_id, "generation").await;
-            let gate = sessions.stall_effect(session_id, point).await;
+                connect_rtc_session(&sessions, &registry, session_id, signal_id, "generation").await;
+            let gate = sessions.stall_effect(signal_id, point).await;
             match point {
                 TestEffectPoint::ControlRequest => {
-                    sessions.controls.unregister(agent_id, &viewer).await;
+                    sessions.controls.unregister(session_id, &viewer).await;
                     let request_id = Uuid::new_v4();
                     client
                         .ctl
@@ -5101,15 +5093,15 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            wait_peer_stopped(&sessions, session_id).await;
+            wait_peer_stopped(&sessions, signal_id).await;
             gate.release.notify_one();
-            wait_peer_cleanup(&sessions, &control, agent_id, &viewer).await;
+            wait_peer_cleanup(&sessions, &control, session_id, &viewer).await;
             assert!(
                 matches!(
                     observed_rx.try_recv(),
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty)
                 ),
-                "{session_id}: admitted effect reached worker after counterpart close"
+                "{signal_id}: admitted effect reached worker after counterpart close"
             );
             assert_eq!(sessions.controls.retained_counts().await, (0, 0));
             close_test_peer(&client.pc).await;
@@ -5119,10 +5111,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn admitted_sink_and_ready_abort_when_counterpart_closes() {
-        let agent_id = Uuid::new_v4();
-        let registry = AgentRegistry::new();
-        let (agent, mut worker_commands) = insert_test_worker(&registry, agent_id);
-        let control = registry.control_for_binding(agent).expect("worker control");
+        let session_id = Uuid::new_v4();
+        let registry = SessionRegistry::new();
+        let (session, mut worker_commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).expect("worker control");
         let worker_control = control.clone();
         let worker = tokio::spawn(async move {
             while let Some(command) = worker_commands.recv().await {
@@ -5136,17 +5128,17 @@ mod tests {
         });
         let sessions = RtcSessions::new();
 
-        for (session_id, point) in [
+        for (signal_id, point) in [
             ("close-race-sink", TestEffectPoint::PtySink),
             ("close-race-ready", TestEffectPoint::Ready),
         ] {
-            let viewer = viewer_id(session_id, "generation");
-            let gate = sessions.stall_effect(session_id, point).await;
+            let viewer = viewer_id(signal_id, "generation");
+            let gate = sessions.stall_effect(signal_id, point).await;
             let mut client = connect_rtc_session_inner(
                 &sessions,
                 &registry,
-                agent_id,
                 session_id,
+                signal_id,
                 "generation",
                 false,
             )
@@ -5161,11 +5153,11 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            wait_peer_stopped(&sessions, session_id).await;
+            wait_peer_stopped(&sessions, signal_id).await;
             gate.release.notify_one();
-            wait_peer_cleanup(&sessions, &control, agent_id, &viewer).await;
+            wait_peer_cleanup(&sessions, &control, session_id, &viewer).await;
             assert_eq!(control.direct_sink_offset(&viewer).await, None);
-            assert!(!sessions.controls.contains_viewer(agent_id, &viewer).await);
+            assert!(!sessions.controls.contains_viewer(session_id, &viewer).await);
             if point == TestEffectPoint::Ready {
                 while let Ok((is_string, bytes)) = client.ctl_messages.try_recv() {
                     if is_string {
@@ -5183,10 +5175,10 @@ mod tests {
 
     #[tokio::test]
     async fn full_signaling_outbox_cannot_hold_teardown_or_leak_stale_status() {
-        let registry = AgentRegistry::new();
-        let agent_id = Uuid::new_v4();
-        let (agent, _commands) = insert_test_worker(&registry, agent_id);
-        let control = registry.control_for_binding(agent).expect("worker control");
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (session, _commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).expect("worker control");
         let api = APIBuilder::new().build();
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration::default())
@@ -5194,20 +5186,20 @@ mod tests {
                 .unwrap(),
         );
         let active = Arc::new(AtomicBool::new(true));
-        let channels = Arc::new(RequiredAgentChannels::default());
-        assert!(channels.register(AgentChannel::Pty).await);
-        assert!(channels.register(AgentChannel::Control).await);
-        channels.mark_open(AgentChannel::Pty).await;
-        channels.mark_open(AgentChannel::Control).await;
+        let channels = Arc::new(RequiredSessionChannels::default());
+        assert!(channels.register(SessionChannel::Pty).await);
+        assert!(channels.register(SessionChannel::Control).await);
+        channels.mark_open(SessionChannel::Pty).await;
+        channels.mark_open(SessionChannel::Control).await;
         let fence = Arc::new(tokio::sync::RwLock::new(()));
         let sessions = RtcSessions::new();
-        let session_id = "full-status-outbox";
+        let signal_id = "full-status-outbox";
         let generation = "old-generation";
         sessions.peers.lock().await.insert(
-            session_id.to_string(),
+            signal_id.to_string(),
             RtcPeer {
                 pc: Arc::clone(&pc),
-                agent,
+                session,
                 generation: generation.to_string(),
                 active: Arc::clone(&active),
                 control: control.clone(),
@@ -5227,15 +5219,15 @@ mod tests {
         let old_nonce = "b".repeat(32);
         let sent = tokio::time::timeout(
             Duration::from_millis(100),
-            sessions.send_agent_peer_status(
+            sessions.send_session_peer_status(
                 &out_tx,
-                session_id,
+                signal_id,
                 generation,
                 &pc,
                 &active,
                 &channels,
                 &old_nonce,
-                agent_id,
+                session_id,
                 "connected",
                 None,
             ),
@@ -5271,13 +5263,13 @@ mod tests {
                 .unwrap(),
         );
         let replacement_active = Arc::new(AtomicBool::new(true));
-        let replacement_channels = Arc::new(RequiredAgentChannels::default());
+        let replacement_channels = Arc::new(RequiredSessionChannels::default());
         let replacement_fence = Arc::new(tokio::sync::RwLock::new(()));
         sessions.peers.lock().await.insert(
-            session_id.to_string(),
+            signal_id.to_string(),
             RtcPeer {
                 pc: Arc::clone(&replacement_pc),
-                agent,
+                session,
                 generation: "replacement-generation".to_string(),
                 active: Arc::clone(&replacement_active),
                 control,
@@ -5291,15 +5283,15 @@ mod tests {
         let replacement_nonce = "c".repeat(32);
         assert!(
             sessions
-                .send_agent_peer_status(
+                .send_session_peer_status(
                     &replacement_tx,
-                    session_id,
+                    signal_id,
                     "replacement-generation",
                     &replacement_pc,
                     &replacement_active,
                     &replacement_channels,
                     &replacement_nonce,
-                    agent_id,
+                    session_id,
                     "connected",
                     None,
                 )
@@ -5314,9 +5306,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_all_cannot_remove_a_same_session_replacement() {
-        let registry = AgentRegistry::new();
-        let agent_id = Uuid::new_v4();
-        let (old, _old_commands) = insert_test_worker(&registry, agent_id);
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (old, _old_commands) = insert_test_worker(&registry, session_id);
         let old_control = registry
             .control_for_binding(old)
             .expect("old worker control");
@@ -5328,17 +5320,17 @@ mod tests {
         );
         let old_active = Arc::new(AtomicBool::new(true));
         let sessions = RtcSessions::new();
-        let session_id = "close-all-reinsert";
+        let signal_id = "close-all-reinsert";
         let generation = "old-signal-generation";
         sessions.peers.lock().await.insert(
-            session_id.to_string(),
+            signal_id.to_string(),
             RtcPeer {
                 pc: Arc::clone(&old_pc),
-                agent: old,
+                session: old,
                 generation: generation.to_string(),
                 active: Arc::clone(&old_active),
                 control: old_control,
-                channels: Arc::new(RequiredAgentChannels::default()),
+                channels: Arc::new(RequiredSessionChannels::default()),
                 close: Arc::new(PeerCloseCoordinator::default()),
                 _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::new(tokio::sync::RwLock::new(())),
@@ -5346,7 +5338,7 @@ mod tests {
         );
 
         let snapshot_gate = sessions
-            .stall_effect(session_id, TestEffectPoint::CloseAllSnapshot)
+            .stall_effect(signal_id, TestEffectPoint::CloseAllSnapshot)
             .await;
         let close_all_sessions = sessions.clone();
         let close_all = tokio::spawn(async move {
@@ -5358,16 +5350,16 @@ mod tests {
         let close_same_pc = Arc::clone(&old_pc);
         let close_same = tokio::spawn(async move {
             close_same_sessions
-                .close_if_same(session_id, generation, &close_same_pc)
+                .close_if_same(signal_id, generation, &close_same_pc)
                 .await;
         });
         tokio::time::timeout(Duration::from_secs(3), close_same)
             .await
             .expect("exact close did not remove the old peer")
             .unwrap();
-        assert!(!sessions.peers.lock().await.contains_key(session_id));
+        assert!(!sessions.peers.lock().await.contains_key(signal_id));
 
-        let (replacement, _replacement_commands) = insert_test_worker(&registry, agent_id);
+        let (replacement, _replacement_commands) = insert_test_worker(&registry, session_id);
         let replacement_control = registry
             .control_for_binding(replacement)
             .expect("replacement worker control");
@@ -5378,14 +5370,14 @@ mod tests {
         );
         let replacement_active = Arc::new(AtomicBool::new(true));
         sessions.peers.lock().await.insert(
-            session_id.to_string(),
+            signal_id.to_string(),
             RtcPeer {
                 pc: Arc::clone(&replacement_pc),
-                agent: replacement,
+                session: replacement,
                 generation: "replacement-signal-generation".to_string(),
                 active: Arc::clone(&replacement_active),
                 control: replacement_control,
-                channels: Arc::new(RequiredAgentChannels::default()),
+                channels: Arc::new(RequiredSessionChannels::default()),
                 close: Arc::new(PeerCloseCoordinator::default()),
                 _admission_permit: sessions.peer_admission.try_acquire().unwrap(),
                 fence: Arc::new(tokio::sync::RwLock::new(())),
@@ -5399,9 +5391,9 @@ mod tests {
 
         let peers = sessions.peers.lock().await;
         let tracked = peers
-            .get(session_id)
+            .get(signal_id)
             .expect("replacement was silently removed");
-        assert_eq!(tracked.agent, replacement);
+        assert_eq!(tracked.session, replacement);
         assert!(Arc::ptr_eq(&tracked.pc, &replacement_pc));
         drop(peers);
         assert!(replacement_active.load(Ordering::Acquire));
@@ -5413,12 +5405,12 @@ mod tests {
     #[tokio::test]
     async fn real_spawn_ctl_uploads_multiple_verified_chunks() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent_id = Uuid::new_v4();
-        let registry = AgentRegistry::new();
-        let (_agent, _worker_commands) = insert_test_worker_at(&registry, agent_id, tmp.path());
+        let session_id = Uuid::new_v4();
+        let registry = SessionRegistry::new();
+        let (_session, _worker_commands) = insert_test_worker_at(&registry, session_id, tmp.path());
         let sessions = RtcSessions::new();
         let mut client =
-            connect_rtc_session(&sessions, &registry, agent_id, "rtc-upload", "generation").await;
+            connect_rtc_session(&sessions, &registry, session_id, "rtc-upload", "generation").await;
         let upload_id = Uuid::new_v4();
         let bytes = vec![0x5a; crate::upload::UPLOAD_CHUNK_BYTES * 2 + 17];
 
@@ -5441,7 +5433,7 @@ mod tests {
         );
         assert!(!tmp.path().join("verified-2.bin").exists());
 
-        sessions.close("rtc-upload", "generation", agent_id).await;
+        sessions.close("rtc-upload", "generation", session_id).await;
         close_test_peer(&client.pc).await;
         assert_eq!(sessions.resident_session_count().await, 0);
     }
@@ -5449,13 +5441,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_control_close_uses_one_upload_deadline_and_isolates_replacement() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent_id = Uuid::new_v4();
-        let registry = AgentRegistry::new();
-        let (old_agent, _old_worker_commands) =
-            insert_test_worker_at(&registry, agent_id, tmp.path());
+        let session_id = Uuid::new_v4();
+        let registry = SessionRegistry::new();
+        let (old_session, _old_worker_commands) =
+            insert_test_worker_at(&registry, session_id, tmp.path());
         let sessions = RtcSessions::new();
         let mut client =
-            connect_rtc_session(&sessions, &registry, agent_id, "rtc-close-stall", "old").await;
+            connect_rtc_session(&sessions, &registry, session_id, "rtc-close-stall", "old").await;
         let abandoned_id = Uuid::new_v4();
         let abandoned = b"must-not-publish";
         let ready = start_real_upload(&mut client, abandoned_id, "abandoned.bin", abandoned).await;
@@ -5479,12 +5471,12 @@ mod tests {
         assert!(!tmp.path().join("abandoned.bin").exists());
 
         let (replacement, _replacement_worker_commands) =
-            insert_test_worker_at(&registry, agent_id, tmp.path());
-        assert_ne!(old_agent, replacement);
+            insert_test_worker_at(&registry, session_id, tmp.path());
+        assert_ne!(old_session, replacement);
         let mut replacement_client = connect_rtc_session(
             &sessions,
             &registry,
-            agent_id,
+            session_id,
             "rtc-close-stall",
             "replacement",
         )
@@ -5532,7 +5524,7 @@ mod tests {
             .contains("spawn-upload")));
 
         sessions
-            .close("rtc-close-stall", "replacement", agent_id)
+            .close("rtc-close-stall", "replacement", session_id)
             .await;
         close_test_peer(&replacement_client.pc).await;
         close_test_peer(&client.pc).await;
@@ -5541,12 +5533,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_spawn_ctl_lost_final_ack_reconciles_once_after_replacement() {
         let tmp = tempfile::tempdir().unwrap();
-        let agent_id = Uuid::new_v4();
-        let registry = AgentRegistry::new();
-        let (_agent, _worker_commands) = insert_test_worker_at(&registry, agent_id, tmp.path());
+        let session_id = Uuid::new_v4();
+        let registry = SessionRegistry::new();
+        let (_session, _worker_commands) = insert_test_worker_at(&registry, session_id, tmp.path());
         let sessions = RtcSessions::new();
         let mut stale =
-            connect_rtc_session(&sessions, &registry, agent_id, "rtc-lost-ack", "stale").await;
+            connect_rtc_session(&sessions, &registry, session_id, "rtc-lost-ack", "stale").await;
         let upload_id = Uuid::new_v4();
         let bytes = b"published-exactly-once";
         let ready = start_real_upload(&mut stale, upload_id, "once.bin", bytes).await;
@@ -5607,7 +5599,7 @@ mod tests {
         let mut replacement = connect_rtc_session(
             &sessions,
             &registry,
-            agent_id,
+            session_id,
             "rtc-lost-ack",
             "replacement",
         )
@@ -5631,7 +5623,7 @@ mod tests {
         );
 
         sessions
-            .close("rtc-lost-ack", "replacement", agent_id)
+            .close("rtc-lost-ack", "replacement", session_id)
             .await;
         close_test_peer(&replacement.pc).await;
         close_test_peer(&stale.pc).await;
@@ -5639,11 +5631,11 @@ mod tests {
 
     #[tokio::test]
     async fn real_spawn_pty_and_ctl_channels_replay_live_input_and_cleanup() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let viewer = "rtc-real:generation".to_string();
-        let registry = AgentRegistry::new();
-        let (agent, mut worker_commands) = insert_test_worker(&registry, agent_id);
-        let control = registry.control_for_binding(agent).unwrap();
+        let registry = SessionRegistry::new();
+        let (session, mut worker_commands) = insert_test_worker(&registry, session_id);
+        let control = registry.control_for_binding(session).unwrap();
         let worker_control = control.clone();
         let replay_bytes = b"worker-history\r\n".to_vec();
         let worker_replay_bytes = replay_bytes.clone();
@@ -5666,7 +5658,7 @@ mod tests {
         });
         let sessions = RtcSessions::new();
         let mut client =
-            connect_rtc_session(&sessions, &registry, agent_id, "rtc-real", "generation").await;
+            connect_rtc_session(&sessions, &registry, session_id, "rtc-real", "generation").await;
         assert_eq!(sessions.resident_session_count().await, 1);
         client
             .pty
@@ -5716,7 +5708,7 @@ mod tests {
         .await
         .expect("spawn.ctl replay chunk timed out");
         assert_eq!(&replay_chunk[..4], b"SPCT");
-        assert_eq!(replay_chunk[4], agent_ctl::PROTOCOL_VERSION);
+        assert_eq!(replay_chunk[4], session_ctl::PROTOCOL_VERSION);
         assert_eq!(&replay_chunk[28..], replay_bytes);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(10), input_rx.recv())
@@ -5757,7 +5749,7 @@ mod tests {
             live
         );
         let mut second =
-            connect_rtc_session(&sessions, &registry, agent_id, "rtc-second", "generation").await;
+            connect_rtc_session(&sessions, &registry, session_id, "rtc-second", "generation").await;
         assert_eq!(sessions.resident_session_count().await, 2);
         loop {
             let event = next_ctl_json(&mut client.ctl_messages).await;
@@ -5802,15 +5794,15 @@ mod tests {
                 break;
             }
         }
-        sessions.close("rtc-second", "generation", agent_id).await;
+        sessions.close("rtc-second", "generation", session_id).await;
         close_test_peer(&second.pc).await;
         assert_eq!(sessions.resident_session_count().await, 1);
 
-        sessions.close("rtc-real", "generation", agent_id).await;
+        sessions.close("rtc-real", "generation", session_id).await;
         assert_eq!(sessions.resident_session_count().await, 0);
         close_test_peer(&client.pc).await;
         tokio::time::timeout(Duration::from_secs(3), async {
-            while sessions.controls.contains_viewer(agent_id, &viewer).await
+            while sessions.controls.contains_viewer(session_id, &viewer).await
                 || control.direct_sink_offset(&viewer).await.is_some()
             {
                 tokio::task::yield_now().await;
@@ -5821,7 +5813,7 @@ mod tests {
 
         let stall_gate = sessions.stall_first_pty_send("rtc-stalled").await;
         let stalled =
-            connect_rtc_session(&sessions, &registry, agent_id, "rtc-stalled", "generation").await;
+            connect_rtc_session(&sessions, &registry, session_id, "rtc-stalled", "generation").await;
         let stalled_viewer = viewer_id("rtc-stalled", "generation");
         assert!(
             control
@@ -5839,7 +5831,7 @@ mod tests {
         .await
         .expect("stalled RTC PTY viewer was not disconnected");
         stall_gate.notify_one();
-        sessions.close("rtc-stalled", "generation", agent_id).await;
+        sessions.close("rtc-stalled", "generation", session_id).await;
         close_test_peer(&stalled.pc).await;
         assert_eq!(sessions.resident_session_count().await, 0);
         worker.abort();
@@ -5849,7 +5841,7 @@ mod tests {
     async fn real_worker_cleanup_guard_kills_on_unwind() {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
         let _env = WorkerTestEnv::install();
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let argv = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -5863,7 +5855,7 @@ mod tests {
         env.insert("TERM".to_string(), "xterm-256color".to_string());
 
         let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
-            agent_id,
+            session_id,
             cwd: "/",
             cols: 80,
             rows: 24,
@@ -5875,7 +5867,7 @@ mod tests {
         let crate::pty::Launched {
             handle, exit_rx, ..
         } = launched;
-        let cleanup = WorkerCleanupGuard::new(agent_id, &handle);
+        let cleanup = WorkerCleanupGuard::new(session_id, &handle);
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _cleanup = cleanup;
@@ -5889,7 +5881,7 @@ mod tests {
             .expect("cleanup guard worker exit sender dropped");
         assert!(reason.exit_code.is_some() || reason.signal.is_some());
         assert!(
-            !crate::worker_backend::socket_exists(agent_id),
+            !crate::worker_backend::socket_exists(session_id),
             "cleanup guard left its worker endpoint behind"
         );
     }
@@ -5898,7 +5890,7 @@ mod tests {
     async fn real_worker_rtc_launch_adopt_backpressure_catchup_and_exit() {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
         let _env = WorkerTestEnv::install();
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let argv = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -5912,7 +5904,7 @@ mod tests {
         env.insert("TERM".to_string(), "xterm-256color".to_string());
 
         let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
-            agent_id,
+            session_id,
             cwd: "/",
             cols: 80,
             rows: 24,
@@ -5926,19 +5918,19 @@ mod tests {
             exit_rx: initial_exit_rx,
             ..
         } = launched;
-        let mut worker_cleanup = WorkerCleanupGuard::new(agent_id, &handle);
+        let mut worker_cleanup = WorkerCleanupGuard::new(session_id, &handle);
         let initial_control = handle.control.clone();
         let (ws_tx, mut ws_rx) = mpsc::channel(1024);
         initial_control.set_sink(ws_tx).await;
         let ws_drain = tokio::spawn(async move { while ws_rx.recv().await.is_some() {} });
-        let registry = AgentRegistry::new();
+        let registry = SessionRegistry::new();
         let sessions = RtcSessions::new();
-        let transition = registry.lock_generation_transition(agent_id).await;
+        let transition = registry.lock_generation_transition(session_id).await;
         registry.insert(handle);
         drop(transition);
 
         let mut first =
-            connect_rtc_session(&sessions, &registry, agent_id, "worker-first", "launch").await;
+            connect_rtc_session(&sessions, &registry, session_id, "worker-first", "launch").await;
         let history = request_history(&mut first).await;
         assert!(
             history
@@ -5954,7 +5946,7 @@ mod tests {
         collect_pty_until(&mut first.pty_messages, b"rtc-worker-input").await;
 
         let mut second =
-            connect_rtc_session(&sessions, &registry, agent_id, "worker-second", "launch").await;
+            connect_rtc_session(&sessions, &registry, session_id, "worker-second", "launch").await;
         loop {
             let event = next_ctl_json(&mut first.ctl_messages).await;
             if event["event"] == "display_state" && event["viewers"] == 2 {
@@ -5984,26 +5976,26 @@ mod tests {
             }
         }
 
-        sessions.close("worker-second", "launch", agent_id).await;
+        sessions.close("worker-second", "launch", session_id).await;
         close_test_peer(&second.pc).await;
-        sessions.close("worker-first", "launch", agent_id).await;
+        sessions.close("worker-first", "launch", session_id).await;
         close_test_peer(&first.pc).await;
         assert_eq!(sessions.resident_session_count().await, 0);
 
         // Simulate a supervisor restart: invalidate and drain the old RTC
         // generation, drop its worker connection, then adopt the live worker.
-        let old = registry.binding_for(agent_id).expect("launch binding");
-        let transition = registry.lock_generation_transition(agent_id).await;
+        let old = registry.binding_for(session_id).expect("launch binding");
+        let transition = registry.lock_generation_transition(session_id).await;
         let old_handle = registry
-            .remove_if_generation(agent_id, old.generation())
+            .remove_if_generation(session_id, old.generation())
             .expect("remove launch binding");
-        sessions.close_for_agent(agent_id, old.generation()).await;
+        sessions.close_for_session(session_id, old.generation()).await;
         drop(transition);
         drop(old_handle);
         drop(initial_exit_rx);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let adopted = crate::worker_backend::adopt(agent_id)
+        let adopted = crate::worker_backend::adopt(session_id)
             .await
             .expect("adopt worker")
             .expect("live worker socket");
@@ -6018,12 +6010,12 @@ mod tests {
         adopted_control.set_sink(adopted_ws_tx).await;
         let adopted_ws_drain =
             tokio::spawn(async move { while adopted_ws_rx.recv().await.is_some() {} });
-        let transition = registry.lock_generation_transition(agent_id).await;
+        let transition = registry.lock_generation_transition(session_id).await;
         registry.insert(handle);
         drop(transition);
 
         let mut reconnected =
-            connect_rtc_session(&sessions, &registry, agent_id, "worker-adopted", "adopt").await;
+            connect_rtc_session(&sessions, &registry, session_id, "worker-adopted", "adopt").await;
         let adopted_history = request_history(&mut reconnected).await;
         assert!(
             adopted_history
@@ -6031,7 +6023,7 @@ mod tests {
                 .any(|window| window == b"rtc-worker-input"),
             "adopted replay lost pre-adoption output"
         );
-        sessions.close("worker-adopted", "adopt", agent_id).await;
+        sessions.close("worker-adopted", "adopt", session_id).await;
         close_test_peer(&reconnected.pc).await;
 
         // Stall the first outbound PTY send, then drive real worker output
@@ -6040,20 +6032,20 @@ mod tests {
         // worker injection here makes output volume deterministic.
         let stall_gate = sessions.stall_first_pty_send("worker-stalled").await;
         let stalled =
-            connect_rtc_session(&sessions, &registry, agent_id, "worker-stalled", "adopt").await;
+            connect_rtc_session(&sessions, &registry, session_id, "worker-stalled", "adopt").await;
         let stalled_viewer = viewer_id("worker-stalled", "adopt");
         assert!(
             adopted_control
                 .wait_for_direct_sink(&stalled_viewer, Duration::from_secs(3))
                 .await
         );
-        let tail_marker = format!("rtc-catchup-tail-{agent_id}");
+        let tail_marker = format!("rtc-catchup-tail-{session_id}");
         // Wait for each one-byte TTY echo to traverse the real worker before
         // sending the next. This deterministically creates more queue entries
         // than the stalled sink can hold without a multi-megabyte flood.
         for _ in 0..(crate::pty::DIRECT_SINK_QUEUE_DEPTH + 12) {
             let expected = adopted_control.source_offset() + 1;
-            assert!(registry.with_handle(agent_id, |handle| {
+            assert!(registry.with_handle(session_id, |handle| {
                 handle.write_stdin(b"x").expect("flood input");
             }));
             tokio::time::timeout(
@@ -6064,7 +6056,7 @@ mod tests {
             .expect("worker echo did not reach the forwarder");
         }
         let expected_tail = adopted_control.source_offset() + tail_marker.len() as u64;
-        assert!(registry.with_handle(agent_id, |handle| {
+        assert!(registry.with_handle(session_id, |handle| {
             handle
                 .write_stdin(tail_marker.as_bytes())
                 .expect("tail input");
@@ -6087,11 +6079,11 @@ mod tests {
         .await
         .expect("real worker stalled viewer was not evicted");
         stall_gate.notify_one();
-        sessions.close("worker-stalled", "adopt", agent_id).await;
+        sessions.close("worker-stalled", "adopt", session_id).await;
         close_test_peer(&stalled.pc).await;
 
         let mut catchup =
-            connect_rtc_session(&sessions, &registry, agent_id, "worker-catchup", "adopt").await;
+            connect_rtc_session(&sessions, &registry, session_id, "worker-catchup", "adopt").await;
         let mut caught_up = false;
         for _ in 0..10 {
             let replay = request_history(&mut catchup).await;
@@ -6107,8 +6099,8 @@ mod tests {
         assert!(caught_up, "replay did not catch up the evicted viewer");
 
         let lifecycle = registry
-            .lifecycle_snapshot(agent_id)
-            .expect("agent lifecycle");
+            .lifecycle_snapshot(session_id)
+            .expect("session lifecycle");
         registry
             .shutdown_if_current(&lifecycle, spawnd::sessiond::wire::LifecycleSignal::Kill)
             .await
@@ -6118,13 +6110,13 @@ mod tests {
             .expect("worker exit timed out")
             .expect("worker exit sender dropped");
         assert!(reason.exit_code.is_some() || reason.signal.is_some());
-        let current = registry.binding_for(agent_id).expect("adopted binding");
-        let transition = registry.lock_generation_transition(agent_id).await;
+        let current = registry.binding_for(session_id).expect("adopted binding");
+        let transition = registry.lock_generation_transition(session_id).await;
         let exited_handle = registry
-            .remove_if_generation(agent_id, current.generation())
+            .remove_if_generation(session_id, current.generation())
             .expect("remove exited worker");
         sessions
-            .close_for_agent(agent_id, current.generation())
+            .close_for_session(session_id, current.generation())
             .await;
         drop(transition);
         if let Some(replay_after_exit) = exited_handle.replay(1 << 20) {
@@ -6141,10 +6133,10 @@ mod tests {
         let (status_tx, mut status_rx) = mpsc::channel(4);
         sessions
             .handle_offer(
-                RtcSessionBinding::new(
+                RtcSignalBinding::new(
                     "worker-after-exit".to_string(),
                     "after-exit".to_string(),
-                    agent_id,
+                    session_id,
                 ),
                 String::new(),
                 Vec::new(),
@@ -6161,7 +6153,7 @@ mod tests {
         assert_eq!(sessions.resident_session_count().await, 0);
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        while crate::worker_backend::socket_exists(agent_id) {
+        while crate::worker_backend::socket_exists(session_id) {
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -6173,10 +6165,10 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_fences_stale_peer_input_control_and_output() {
-        let registry = AgentRegistry::new();
-        let agent_id = Uuid::new_v4();
-        let (old, _old_commands) = insert_test_worker(&registry, agent_id);
-        let (current, mut current_commands) = insert_test_worker(&registry, agent_id);
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (old, _old_commands) = insert_test_worker(&registry, session_id);
+        let (current, mut current_commands) = insert_test_worker(&registry, session_id);
         assert_ne!(old, current);
 
         let (out_tx, _out_rx) = mpsc::channel(4);
@@ -6205,19 +6197,19 @@ mod tests {
             r#"{{"version":1,"kind":"request","request_id":"{request_id}","operation":"resize","cols":100,"rows":30}}"#
         ))
         .expect("valid resize request");
-        let controls = AgentControlHub::default();
+        let controls = SessionControlHub::default();
         let (sender, _receiver) = mpsc::channel(4);
-        let channels = Arc::new(RequiredAgentChannels::default());
-        assert!(channels.register(AgentChannel::Pty).await);
-        assert!(channels.register(AgentChannel::Control).await);
-        channels.mark_open(AgentChannel::Pty).await;
-        channels.mark_open(AgentChannel::Control).await;
+        let channels = Arc::new(RequiredSessionChannels::default());
+        assert!(channels.register(SessionChannel::Pty).await);
+        assert!(channels.register(SessionChannel::Control).await);
+        channels.mark_open(SessionChannel::Pty).await;
+        channels.mark_open(SessionChannel::Control).await;
         let effect = channels.permit().await.expect("ready effect permit");
         let uploads = UploadHub::default();
         let error = execute_control_request(
             ControlRequestContext {
-                agent: old,
-                session_id: "stale-viewer",
+                session: old,
+                viewer_id: "stale-viewer",
                 registry: &registry,
                 controls: &controls,
                 sender: &sender,
@@ -6243,8 +6235,8 @@ mod tests {
         .expect("valid upload request");
         let error = execute_control_request(
             ControlRequestContext {
-                agent: current,
-                session_id: "current-viewer",
+                session: current,
+                viewer_id: "current-viewer",
                 registry: &registry,
                 controls: &controls,
                 sender: &sender,
@@ -6283,11 +6275,11 @@ mod tests {
         let _ = gathered.recv().await;
         let offer_sdp = offer_pc.local_description().await.unwrap().sdp;
 
-        let registry = AgentRegistry::new();
-        let agent_id = Uuid::new_v4();
-        let (old, _old_commands) = insert_test_worker(&registry, agent_id);
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (old, _old_commands) = insert_test_worker(&registry, session_id);
         let sessions = RtcSessions::new();
-        let transition = registry.lock_generation_transition(agent_id).await;
+        let transition = registry.lock_generation_transition(session_id).await;
         let insert_attempted = sessions.peer_insert_attempted.notified();
         let (out_tx, mut out_rx) = mpsc::channel(16);
         let offer_sessions = sessions.clone();
@@ -6295,10 +6287,10 @@ mod tests {
         let offer_task = tokio::spawn(async move {
             offer_sessions
                 .handle_offer(
-                    RtcSessionBinding::new(
+                    RtcSignalBinding::new(
                         "racing-offer".to_string(),
                         "offer-generation".to_string(),
-                        agent_id,
+                        session_id,
                     ),
                     offer_sdp,
                     Vec::new(),
@@ -6313,10 +6305,10 @@ mod tests {
             .expect("offer did not reach guarded peer insertion");
 
         assert!(registry
-            .remove_if_generation(agent_id, old.generation())
+            .remove_if_generation(session_id, old.generation())
             .is_some());
-        sessions.close_for_agent(agent_id, old.generation()).await;
-        let (current, _current_commands) = insert_test_worker(&registry, agent_id);
+        sessions.close_for_session(session_id, old.generation()).await;
+        let (current, _current_commands) = insert_test_worker(&registry, session_id);
         drop(transition);
         offer_task.await.unwrap();
 
@@ -6337,7 +6329,7 @@ mod tests {
         .expect("failed status timed out");
         assert_eq!(status["session_id"], "racing-offer");
         assert_eq!(status["binding_nonce"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert_eq!(status["scope_type"], "agent");
+        assert_eq!(status["scope_type"], "session");
         assert_eq!(status["protocol"], "spawn.pty");
         assert_eq!(status["protocol_version"], 2);
         assert_eq!(status["status"], "failed");
@@ -6365,17 +6357,17 @@ mod tests {
         let _ = gathered.recv().await;
         let offer_sdp = offer_pc.local_description().await.unwrap().sdp;
 
-        let registry = AgentRegistry::new();
-        let agent_id = Uuid::new_v4();
-        let (old, _old_commands) = insert_test_worker(&registry, agent_id);
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (old, _old_commands) = insert_test_worker(&registry, session_id);
         let sessions = RtcSessions::new();
         let (out_tx, _out_rx) = mpsc::channel(16);
         sessions
             .handle_offer(
-                RtcSessionBinding::new(
+                RtcSignalBinding::new(
                     "inserted-offer".to_string(),
                     "offer-generation".to_string(),
-                    agent_id,
+                    session_id,
                 ),
                 offer_sdp,
                 Vec::new(),
@@ -6386,12 +6378,12 @@ mod tests {
             .await;
         assert_eq!(sessions.resident_session_count().await, 1);
 
-        let transition = registry.lock_generation_transition(agent_id).await;
+        let transition = registry.lock_generation_transition(session_id).await;
         assert!(registry
-            .remove_if_generation(agent_id, old.generation())
+            .remove_if_generation(session_id, old.generation())
             .is_some());
-        sessions.close_for_agent(agent_id, old.generation()).await;
-        let (current, _current_commands) = insert_test_worker(&registry, agent_id);
+        sessions.close_for_session(session_id, old.generation()).await;
+        let (current, _current_commands) = insert_test_worker(&registry, session_id);
         drop(transition);
 
         assert!(registry.is_current(current));
@@ -6400,12 +6392,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_for_agent_drains_only_the_matching_backend_generation() {
-        let registry = AgentRegistry::new();
-        let agent_id = Uuid::new_v4();
-        let (old, _old_commands) = insert_test_worker(&registry, agent_id);
+    async fn close_for_session_drains_only_the_matching_backend_generation() {
+        let registry = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        let (old, _old_commands) = insert_test_worker(&registry, session_id);
         let old_control = registry.control_for_binding(old).unwrap();
-        let (current, _current_commands) = insert_test_worker(&registry, agent_id);
+        let (current, _current_commands) = insert_test_worker(&registry, session_id);
         let current_control = registry.control_for_binding(current).unwrap();
         let api = APIBuilder::new().build();
         let old_pc = Arc::new(
@@ -6422,8 +6414,8 @@ mod tests {
         let current_active = Arc::new(AtomicBool::new(true));
         let old_fence = Arc::new(tokio::sync::RwLock::new(()));
         let current_fence = Arc::new(tokio::sync::RwLock::new(()));
-        let old_channels = Arc::new(RequiredAgentChannels::default());
-        let current_channels = Arc::new(RequiredAgentChannels::default());
+        let old_channels = Arc::new(RequiredSessionChannels::default());
+        let current_channels = Arc::new(RequiredSessionChannels::default());
         let sessions = RtcSessions::new();
         let old_viewer = viewer_id("old-session", "old-signal");
         let current_viewer = viewer_id("current-session", "current-signal");
@@ -6436,7 +6428,7 @@ mod tests {
                 "old-session".to_string(),
                 RtcPeer {
                     pc: old_pc,
-                    agent: old,
+                    session: old,
                     generation: "old-signal".to_string(),
                     active: Arc::clone(&old_active),
                     control: old_control,
@@ -6450,7 +6442,7 @@ mod tests {
                 "current-session".to_string(),
                 RtcPeer {
                     pc: current_pc,
-                    agent: current,
+                    session: current,
                     generation: "current-signal".to_string(),
                     active: Arc::clone(&current_active),
                     control: current_control,
@@ -6465,18 +6457,18 @@ mod tests {
         let (current_display, _current_display_rx) = tokio::sync::watch::channel(None);
         sessions
             .controls
-            .register(agent_id, old_viewer.clone(), old_display)
+            .register(session_id, old_viewer.clone(), old_display)
             .await;
         sessions
             .controls
-            .register(agent_id, current_viewer.clone(), current_display)
+            .register(session_id, current_viewer.clone(), current_display)
             .await;
 
         let in_flight = old_fence.read().await;
         let closing_sessions = sessions.clone();
         let close = tokio::spawn(async move {
             closing_sessions
-                .close_for_agent(agent_id, old.generation())
+                .close_for_session(session_id, old.generation())
                 .await;
         });
         tokio::task::yield_now().await;
@@ -6495,13 +6487,13 @@ mod tests {
         assert!(
             !sessions
                 .controls
-                .contains_viewer(agent_id, &old_viewer)
+                .contains_viewer(session_id, &old_viewer)
                 .await
         );
         assert!(
             sessions
                 .controls
-                .contains_viewer(agent_id, &current_viewer)
+                .contains_viewer(session_id, &current_viewer)
                 .await
         );
         sessions.close_all().await;
@@ -6509,14 +6501,14 @@ mod tests {
 
     #[test]
     fn rtc_binary_input_writes_and_emits_one_throttled_content_free_signal() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = crate::pty::ForwarderControl::new();
         let (out_tx, mut out_rx) = mpsc::channel(4);
         let writes = std::sync::Mutex::new(Vec::<Vec<u8>>::new());
 
         for data in [b"first secret".as_slice(), b"second secret".as_slice()] {
             assert!(forward_data_channel_input(
-                agent_id,
+                session_id,
                 false,
                 data,
                 &control,
@@ -6537,7 +6529,7 @@ mod tests {
         let json = activity_message.as_str();
         assert_eq!(
             json,
-            &format!(r#"{{"type":"agent.input_activity","agent_id":"{agent_id}"}}"#)
+            &format!(r#"{{"type":"session.input_activity","session_id":"{session_id}"}}"#)
         );
         assert!(!json.contains("secret"));
         assert!(out_rx.try_recv().is_err());
@@ -6545,27 +6537,27 @@ mod tests {
 
     #[test]
     fn rtc_text_empty_and_failed_input_do_not_emit_activity() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = crate::pty::ForwarderControl::new();
         let (out_tx, mut out_rx) = mpsc::channel(4);
         let write_calls = std::sync::atomic::AtomicUsize::new(0);
 
         assert!(
-            !forward_data_channel_input(agent_id, true, b"text", &control, &out_tx, |_| {
+            !forward_data_channel_input(session_id, true, b"text", &control, &out_tx, |_| {
                 write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             },)
             .unwrap()
         );
         assert!(
-            !forward_data_channel_input(agent_id, false, b"", &control, &out_tx, |_| {
+            !forward_data_channel_input(session_id, false, b"", &control, &out_tx, |_| {
                 write_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             },)
             .unwrap()
         );
         assert!(forward_data_channel_input(
-            agent_id,
+            session_id,
             false,
             b"failed secret",
             &control,
@@ -6580,15 +6572,15 @@ mod tests {
 
     #[test]
     fn oversized_rtc_input_is_rejected_before_copy_and_does_not_suppress_output() {
-        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
         let control = crate::pty::ForwarderControl::new();
         let (cmd_tx, _cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
         let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
-        let handle = crate::pty::AgentHandle::new_worker(crate::pty::WorkerHandleParts {
-            agent_id,
+        let handle = crate::pty::SessionHandle::new_worker(crate::pty::WorkerHandleParts {
+            session_id,
             cwd: "/".into(),
             cmd_tx,
-            lifecycle: crate::pty::AgentLifecycle::new(
+            lifecycle: crate::pty::SessionLifecycle::new(
                 std::path::PathBuf::from("/nonexistent/spawn-test-lifecycle.sock"),
                 Uuid::new_v4(),
             ),
@@ -6602,7 +6594,7 @@ mod tests {
         let oversized = vec![b'x'; crate::pty::MAX_WORKER_INPUT_BYTES + 1];
 
         assert!(forward_data_channel_input(
-            agent_id,
+            session_id,
             false,
             &oversized,
             &control,
@@ -6618,33 +6610,33 @@ mod tests {
     }
 
     #[test]
-    fn server_agent_binding_requires_nonce_and_safe_owner_generation() {
-        let agent_id = Uuid::new_v4();
+    fn server_session_binding_requires_nonce_and_safe_owner_generation() {
+        let session_id = Uuid::new_v4();
         let nonce = "a".repeat(32);
         let first =
-            RtcSessionBinding::from_server("session".to_string(), nonce.clone(), 1, agent_id)
+            RtcSignalBinding::from_server("session".to_string(), nonce.clone(), 1, session_id)
                 .unwrap();
         let second =
-            RtcSessionBinding::from_server("session".to_string(), nonce.clone(), 2, agent_id)
+            RtcSignalBinding::from_server("session".to_string(), nonce.clone(), 2, session_id)
                 .unwrap();
         assert_eq!(first.binding_nonce, nonce);
         assert_ne!(first.generation, second.generation);
-        assert!(RtcSessionBinding::from_server(
+        assert!(RtcSignalBinding::from_server(
             "session".to_string(),
             "not-a-nonce".to_string(),
             1,
-            agent_id,
+            session_id,
         )
         .is_none());
         assert!(
-            RtcSessionBinding::from_server("session".to_string(), "b".repeat(32), 0, agent_id,)
+            RtcSignalBinding::from_server("session".to_string(), "b".repeat(32), 0, session_id,)
                 .is_none()
         );
-        assert!(RtcSessionBinding::from_server(
+        assert!(RtcSignalBinding::from_server(
             "session".to_string(),
             "b".repeat(32),
             MAX_SAFE_SIGNAL_GENERATION + 1,
-            agent_id,
+            session_id,
         )
         .is_none());
     }
@@ -6653,7 +6645,7 @@ mod tests {
     fn host_binding_requires_exact_identity_protocol_and_nonce() {
         let host_id = Uuid::new_v4();
         let valid = HostRtcSignal {
-            session_id: "host-session".to_string(),
+            signal_id: "host-session".to_string(),
             binding_nonce: Some("c".repeat(32)),
             scope_type: Some("host".to_string()),
             scope_id: Some(host_id),
@@ -6663,7 +6655,7 @@ mod tests {
         assert_eq!(valid.binding().unwrap().host_id, host_id);
 
         let mut invalid = valid.clone();
-        invalid.scope_type = Some("agent".to_string());
+        invalid.scope_type = Some("session".to_string());
         assert!(invalid.binding().is_none());
         let mut invalid = valid.clone();
         invalid.protocol = Some(CONTROL_DATA_CHANNEL_LABEL.to_string());
@@ -6727,7 +6719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_host_identity_binds_without_an_agent_and_cannot_be_rebound() {
+    async fn daemon_host_identity_binds_without_a_session_and_cannot_be_rebound() {
         let sessions = RtcSessions::new();
         let host_id = Uuid::new_v4();
         assert!(sessions.bind_registered_host_id(host_id).await);
@@ -7911,7 +7903,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_agent_host_files_round_trip_over_paired_data_channel() {
+    async fn zero_session_host_files_round_trip_over_paired_data_channel() {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs().unwrap();
         let api = APIBuilder::new().with_media_engine(media_engine).build();

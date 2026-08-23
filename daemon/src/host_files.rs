@@ -30,6 +30,13 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 pub const STREAM_CHUNK_BYTES: usize = 8 * 1024;
 pub const MAX_LIST_ENTRIES_PER_PAGE: usize = 96;
 pub const MAX_DIRECTORY_ENTRIES: usize = 1024;
+/// Largest slice `fs.read.range` will hash and stream in one request.
+///
+/// Bounded so a hover preview costs a bounded hash. `fs.read` still hashes the
+/// whole file, which is the point of keeping the two operations apart.
+pub const MAX_RANGE_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest file the host will hand to a QuickLook generator.
+pub const PREVIEW_MAX_INPUT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_REGISTERED_TEMPORARIES: usize = 16;
 
 #[derive(Debug)]
@@ -39,7 +46,7 @@ pub struct FsError {
 }
 
 impl FsError {
-    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, detail: impl Into<String>) -> Self {
         Self {
             code,
             detail: detail.into(),
@@ -102,6 +109,27 @@ pub struct FileStat {
 pub struct ReadStream {
     pub stat: FileStat,
     pub sha256: String,
+    pub file: File,
+}
+
+/// A bounded slice of a file, positioned and ready to stream.
+///
+/// `sha256` covers exactly the `length` bytes that will be sent, not the whole
+/// file — the contract that lets a preview of a 512 MiB video cost a 4 KiB hash
+/// instead of a 512 MiB one.
+pub struct RangeReadStream {
+    pub stat: FileStat,
+    /// Opaque validator over identity, size and mtime; changes whenever the
+    /// file does, including a same-second rewrite or a replace-by-rename.
+    pub version: String,
+    pub offset: u64,
+    pub length: u64,
+    pub sha256: String,
+    pub content_type: &'static str,
+    pub content_type_source: &'static str,
+    pub preview_kind: &'static str,
+    pub open_allowed: bool,
+    pub eof: bool,
     pub file: File,
 }
 
@@ -486,6 +514,9 @@ pub(crate) enum HostOperationKind {
     Remove,
     WriteBegin,
     WriteCommit,
+    ReadRange,
+    Preview,
+    Desktop,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -586,8 +617,8 @@ pub(crate) struct WriteLifecycleTestHooks {
     publication_send_finished: Notify,
     shutdown_started: Notify,
     shutdown_returned: Notify,
-    blocking: [BlockingPause; 8],
-    effect_boundary: [BlockingPause; 8],
+    blocking: [BlockingPause; 11],
+    effect_boundary: [BlockingPause; 11],
     temporary_cleanup: BlockingPause,
 }
 
@@ -1029,6 +1060,49 @@ impl HostFileService {
     }
 
     #[cfg(test)]
+    pub async fn open_range_read(
+        &self,
+        input: &str,
+        offset: u64,
+        length: u64,
+        if_version: Option<String>,
+    ) -> FsResult<RangeReadStream> {
+        self.open_range_read_in_session(
+            input,
+            offset,
+            length,
+            if_version,
+            Arc::new(AtomicBool::new(false)),
+            HostFileOperations::new(Arc::new(AtomicBool::new(false))),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn open_preview_source(&self, input: &str) -> FsResult<PreviewSource> {
+        self.open_preview_source_in_session(
+            input,
+            None,
+            HostFileOperations::new(Arc::new(AtomicBool::new(false))),
+        )
+        .await
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub async fn open_launch_target(
+        &self,
+        input: &str,
+        require_file: bool,
+    ) -> FsResult<LaunchTarget> {
+        self.open_launch_target_in_session(
+            input,
+            require_file,
+            HostFileOperations::new(Arc::new(AtomicBool::new(false))),
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub async fn open_read(&self, input: &str) -> FsResult<ReadStream> {
         self.open_read_in_session(
             input,
@@ -1122,6 +1196,366 @@ impl HostFileService {
             },
             sha256: format!("{:x}", hasher.finalize()),
             file: File::from_std(file),
+        })
+    }
+
+    pub(crate) async fn open_range_read_in_session(
+        &self,
+        input: &str,
+        offset: u64,
+        length: u64,
+        if_version: Option<String>,
+        cancelled: Arc<AtomicBool>,
+        operations: Arc<HostFileOperations>,
+    ) -> FsResult<RangeReadStream> {
+        let service = self.clone();
+        let input = input.to_string();
+        self.run_blocking(operations, HostOperationKind::ReadRange, move |operations| {
+            service.open_range_read_sync(&input, offset, length, if_version, &cancelled, operations)
+        })
+        .await
+    }
+
+    /// Hash and position a bounded slice of a file.
+    ///
+    /// Unlike `open_read_sync` this never touches more than `length` bytes, so
+    /// the cost of answering a preview does not scale with the size of the
+    /// file. The digest it returns covers exactly the slice that will be
+    /// streamed, which keeps the client's existing verification loop honest.
+    fn open_range_read_sync(
+        &self,
+        input: &str,
+        offset: u64,
+        length: u64,
+        if_version: Option<String>,
+        cancelled: &AtomicBool,
+        operations: &HostFileOperations,
+    ) -> FsResult<RangeReadStream> {
+        if operations.cancelled() {
+            return Err(cancelled_error());
+        }
+        if length == 0 || length > MAX_RANGE_BYTES {
+            return Err(FsError::new(
+                "range_too_large",
+                "range length must be between 1 byte and 16 MiB",
+            ));
+        }
+        let components = self.relative_components(input)?;
+        let (parent, name) = self.open_parent(&components)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = parent
+            .open_with(&name, &options)
+            .map_err(nofollow_error)?
+            .into_std();
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(FsError::new("not_file", "path is not a regular file"));
+        }
+        let size = metadata.len();
+        let version = file_version(&metadata);
+        if let Some(expected) = if_version {
+            if expected != version {
+                return Err(FsError::new(
+                    "version_changed",
+                    "file changed since the cached preview",
+                ));
+            }
+        }
+        if offset > size {
+            return Err(FsError::new(
+                "range_not_satisfiable",
+                "range offset is past the end of the file",
+            ));
+        }
+
+        // Classification wants the head of the file, which is rarely the slice
+        // being asked for; read it first, then position for the real work.
+        let mut head = vec![0_u8; crate::host_mime::SNIFF_BYTES.min(size as usize)];
+        if !head.is_empty() {
+            let filled = read_fully(&mut file, &mut head)?;
+            head.truncate(filled);
+        }
+
+        let effective = length.min(size - offset);
+        file.seek(SeekFrom::Start(offset))?;
+        let mut hasher = Sha256::new();
+        let mut remaining = effective;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        while remaining > 0 {
+            if cancelled.load(Ordering::Acquire) || operations.cancelled() {
+                return Err(FsError::new("cancelled", "file read was cancelled"));
+            }
+            let want = buffer.len().min(remaining as usize);
+            let read = file.read(&mut buffer[..want])?;
+            if read == 0 {
+                return Err(FsError::new("file_changed", "file changed while hashing"));
+            }
+            hasher.update(&buffer[..read]);
+            remaining -= read as u64;
+            #[cfg(test)]
+            std::thread::yield_now();
+        }
+        // A file swapped underneath us between the stat and the hash would
+        // otherwise be streamed with a digest describing different bytes.
+        if file_version(&file.metadata()?) != version {
+            return Err(FsError::new("file_changed", "file changed while hashing"));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        if operations.cancelled() {
+            return Err(cancelled_error());
+        }
+
+        let classification = crate::host_mime::classify(&name, &head);
+        Ok(RangeReadStream {
+            stat: FileStat {
+                path: self
+                    .display_path(&components)
+                    .to_string_lossy()
+                    .into_owned(),
+                name: name.to_string_lossy().into_owned(),
+                kind: "file",
+                size,
+                modified_at: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .and_then(|duration| i64::try_from(duration.as_secs()).ok()),
+            },
+            version,
+            offset,
+            length: effective,
+            sha256: format!("{:x}", hasher.finalize()),
+            content_type: classification.content_type,
+            content_type_source: classification.source,
+            preview_kind: classification.preview.as_wire(),
+            open_allowed: classification.open_allowed,
+            eof: offset + effective >= size,
+            file: File::from_std(file),
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn open_launch_target_in_session(
+        &self,
+        input: &str,
+        require_file: bool,
+        operations: Arc<HostFileOperations>,
+    ) -> FsResult<LaunchTarget> {
+        let service = self.clone();
+        let input = input.to_string();
+        self.run_blocking(operations, HostOperationKind::Desktop, move |operations| {
+            service.open_launch_target_sync(&input, require_file, operations)
+        })
+        .await
+    }
+
+    /// Resolve a path the desktop can be told about, with two independent gates.
+    ///
+    /// The capability walk proves the target is inside the root and that no
+    /// component was a symlink. `F_GETPATH` on the resulting descriptor then
+    /// proves the *string* we are about to hand to another process names the
+    /// exact vnode we just validated — reconstructing the path from components
+    /// would produce a string the kernel never resolved, which a symlink swap
+    /// between validation and the child's `open()` could redirect.
+    #[cfg(target_os = "macos")]
+    fn open_launch_target_sync(
+        &self,
+        input: &str,
+        require_file: bool,
+        operations: &HostFileOperations,
+    ) -> FsResult<LaunchTarget> {
+        use std::os::fd::AsFd;
+
+        if operations.cancelled() {
+            return Err(cancelled_error());
+        }
+        let components = self.relative_components(input)?;
+
+        // The home root itself is a legitimate reveal target; it is never an
+        // open target because it is not a regular file.
+        if components.is_empty() {
+            if require_file {
+                return Err(FsError::new("not_file", "path is not a regular file"));
+            }
+            let display = real_path_of(self.root.as_ref().as_fd())?;
+            self.assert_within_root(&display)?;
+            return Ok(LaunchTarget {
+                display,
+                is_dir: true,
+                mode: 0,
+                name: OsString::from(""),
+                head: Vec::new(),
+            });
+        }
+
+        let (parent, name) = self.open_parent(&components)?;
+        let entry = parent.symlink_metadata(&name)?;
+        if entry.file_type().is_symlink() {
+            return Err(symlink_error());
+        }
+        if entry.is_dir() {
+            if require_file {
+                return Err(FsError::new("not_file", "path is not a regular file"));
+            }
+            let dir = parent.open_dir_nofollow(&name).map_err(nofollow_error)?;
+            let before = rustix::fs::fstat(dir.as_fd())
+                .map_err(|_| FsError::new("io_error", "could not stat the directory"))?;
+            let display = real_path_of(dir.as_fd())?;
+            self.assert_within_root(&display)?;
+            let after = rustix::fs::fstat(dir.as_fd())
+                .map_err(|_| FsError::new("io_error", "could not stat the directory"))?;
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) {
+                return Err(FsError::new("file_changed", "target changed during resolution"));
+            }
+            return Ok(LaunchTarget {
+                display,
+                is_dir: true,
+                mode: u32::from(before.st_mode),
+                name,
+                head: Vec::new(),
+            });
+        }
+        if !entry.is_file() {
+            return Err(FsError::new("not_file", "path is not a regular file"));
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = parent
+            .open_with(&name, &options)
+            .map_err(nofollow_error)?
+            .into_std();
+        let before = rustix::fs::fstat(file.as_fd())
+            .map_err(|_| FsError::new("io_error", "could not stat the file"))?;
+        // Re-checked on the descriptor itself, not on the directory entry we
+        // looked at a moment ago.
+        if !file.metadata()?.is_file() {
+            return Err(FsError::new("not_file", "path is not a regular file"));
+        }
+        let display = real_path_of(file.as_fd())?;
+        self.assert_within_root(&display)?;
+        let after = rustix::fs::fstat(file.as_fd())
+            .map_err(|_| FsError::new("io_error", "could not stat the file"))?;
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) {
+            return Err(FsError::new("file_changed", "target changed during resolution"));
+        }
+
+        let size = before.st_size.max(0) as u64;
+        let mut head = vec![0_u8; crate::host_mime::SNIFF_BYTES.min(size as usize)];
+        if !head.is_empty() {
+            let filled = read_fully(&mut file, &mut head)?;
+            head.truncate(filled);
+        }
+
+        Ok(LaunchTarget {
+            display,
+            is_dir: false,
+            mode: u32::from(before.st_mode),
+            name,
+            head,
+        })
+    }
+
+    /// Refuse any resolved path that is not the root or beneath it.
+    #[cfg(target_os = "macos")]
+    fn assert_within_root(&self, candidate: &Path) -> FsResult<()> {
+        if is_within_root(self.root_display.as_ref(), candidate) {
+            return Ok(());
+        }
+        // macOS firmlinks can render the same directory under two spellings, so
+        // give the kernel a second chance to agree before refusing. The path is
+        // already pinned by a descriptor we hold, so this re-resolution cannot
+        // change which object we act on.
+        if let Ok(resolved) = std::fs::canonicalize(candidate) {
+            if is_within_root(self.root_display.as_ref(), &resolved) {
+                return Ok(());
+            }
+        }
+        Err(FsError::new(
+            "outside_root",
+            "path is outside the home root",
+        ))
+    }
+
+    pub(crate) async fn open_preview_source_in_session(
+        &self,
+        input: &str,
+        if_version: Option<String>,
+        operations: Arc<HostFileOperations>,
+    ) -> FsResult<PreviewSource> {
+        let service = self.clone();
+        let input = input.to_string();
+        self.run_blocking(operations, HostOperationKind::Preview, move |operations| {
+            service.open_preview_source_sync(&input, if_version, operations)
+        })
+        .await
+    }
+
+    /// Open a file for rendering, keeping hold of everything needed to place it
+    /// somewhere a renderer can reach without ever naming it by path.
+    ///
+    /// The parent directory handle comes back with the file because staging is
+    /// done with `linkat` from that handle — the renderer needs a real path, and
+    /// the only safe way to give it one is to make a new name for the exact
+    /// inode we already validated.
+    fn open_preview_source_sync(
+        &self,
+        input: &str,
+        if_version: Option<String>,
+        operations: &HostFileOperations,
+    ) -> FsResult<PreviewSource> {
+        if operations.cancelled() {
+            return Err(cancelled_error());
+        }
+        let components = self.relative_components(input)?;
+        let (parent, name) = self.open_parent(&components)?;
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let mut file = parent
+            .open_with(&name, &options)
+            .map_err(nofollow_error)?
+            .into_std();
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(FsError::new("not_file", "path is not a regular file"));
+        }
+        let size = metadata.len();
+        if size > PREVIEW_MAX_INPUT_BYTES {
+            return Err(FsError::new(
+                "preview_too_large",
+                "file is too large to render a preview for",
+            ));
+        }
+        let version = file_version(&metadata);
+        if let Some(expected) = if_version {
+            if expected != version {
+                return Err(FsError::new(
+                    "version_changed",
+                    "file changed since the cached preview",
+                ));
+            }
+        }
+        let mut head = vec![0_u8; crate::host_mime::SNIFF_BYTES.min(size as usize)];
+        if !head.is_empty() {
+            let filled = read_fully(&mut file, &mut head)?;
+            head.truncate(filled);
+        }
+        use std::os::unix::fs::MetadataExt;
+        Ok(PreviewSource {
+            parent,
+            name: name.clone(),
+            file,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size,
+            head,
+            version,
+            display: self
+                .display_path(&components)
+                .to_string_lossy()
+                .into_owned(),
+            leaf: name.to_string_lossy().into_owned(),
         })
     }
 
@@ -1723,6 +2157,113 @@ fn outcome_unknown_error() -> FsError {
     )
 }
 
+/// A file opened for rendering, plus the handle needed to stage it safely.
+pub struct PreviewSource {
+    /// Directory handle the file lives in, for `linkat`.
+    pub parent: Dir,
+    pub name: OsString,
+    pub file: std::fs::File,
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub head: Vec<u8>,
+    pub version: String,
+    pub display: String,
+    pub leaf: String,
+}
+
+/// A validated desktop target: a real path plus what the daemon needs to
+/// decide whether handing it to LaunchServices is acceptable.
+#[cfg(target_os = "macos")]
+pub struct LaunchTarget {
+    pub display: PathBuf,
+    pub is_dir: bool,
+    pub mode: u32,
+    pub name: OsString,
+    pub head: Vec<u8>,
+}
+
+/// The kernel's own name for the object behind a descriptor.
+#[cfg(target_os = "macos")]
+fn real_path_of(handle: std::os::fd::BorrowedFd<'_>) -> FsResult<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut buffer = vec![0_u8; nix::libc::PATH_MAX as usize];
+    // SAFETY: the descriptor is live for the call and the buffer is PATH_MAX,
+    // which is what F_GETPATH documents it writes into.
+    let result = unsafe {
+        nix::libc::fcntl(
+            handle.as_raw_fd(),
+            nix::libc::F_GETPATH,
+            buffer.as_mut_ptr().cast::<nix::libc::c_char>(),
+        )
+    };
+    if result == -1 {
+        return Err(FsError::new("io_error", "could not resolve the target path"));
+    }
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    buffer.truncate(end);
+    Ok(PathBuf::from(OsString::from_vec(buffer)))
+}
+
+/// Component-wise containment. Deliberately not a string prefix test, which
+/// would let `/Users/mel` pass as inside `/Users/me`.
+#[cfg(target_os = "macos")]
+fn is_within_root(root: &Path, candidate: &Path) -> bool {
+    let mut root_parts = root.components();
+    let mut candidate_parts = candidate.components();
+    loop {
+        match (root_parts.next(), candidate_parts.next()) {
+            (Some(left), Some(right)) if left == right => continue,
+            (None, _) => return true,
+            _ => return false,
+        }
+    }
+}
+
+/// Read until the buffer is full or the file ends; returns bytes filled.
+///
+/// `Read::read` is free to return a short count for any reason, so a single
+/// call is not a sniff window.
+fn read_fully(file: &mut std::fs::File, buffer: &mut [u8]) -> FsResult<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let read = file.read(&mut buffer[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
+}
+
+/// A validator that changes whenever the file's content could have.
+///
+/// Identity and nanosecond mtime are both load-bearing: `modified_at` has
+/// one-second granularity, which misses an edit made in the same second as the
+/// read, and inode identity catches the replace-by-rename that leaves mtime
+/// looking plausible.
+///
+/// The kernel stamps mtimes from its coarse clock (one tick, typically 1–4ms),
+/// so two same-size in-place rewrites inside a single tick are still
+/// indistinguishable. That window is accepted: it closes on the next change to
+/// the file, and closing it entirely would mean hashing content on every read.
+fn file_version(metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let mut hasher = Sha256::new();
+    hasher.update(metadata.dev().to_le_bytes());
+    hasher.update(metadata.ino().to_le_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(metadata.mtime().to_le_bytes());
+    hasher.update(metadata.mtime_nsec().to_le_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..16].to_string()
+}
+
 fn modified_seconds(metadata: &fs::Metadata) -> Option<i64> {
     metadata
         .modified()
@@ -1840,6 +2381,185 @@ mod tests {
             .unwrap();
         drop(write);
         assert!(!temp.path().join("pending.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn range_read_declares_and_streams_exactly_the_requested_slice() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("data.bin"), b"0123456789").unwrap();
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+
+        let mut range = service
+            .open_range_read("data.bin", 3, 4, None)
+            .await
+            .unwrap();
+        assert_eq!(range.offset, 3);
+        assert_eq!(range.length, 4);
+        assert_eq!(range.stat.size, 10);
+        assert!(!range.eof);
+        // The digest covers the slice, not the file — that is the contract that
+        // makes a preview of a huge file cost a small hash.
+        assert_eq!(range.sha256, format!("{:x}", Sha256::digest(b"3456")));
+
+        let mut bytes = Vec::new();
+        range.file.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..4], b"3456");
+    }
+
+    #[tokio::test]
+    async fn range_read_clamps_a_short_tail_and_reports_eof() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("data.bin"), b"0123456789").unwrap();
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+
+        let range = service
+            .open_range_read("data.bin", 8, 4096, None)
+            .await
+            .unwrap();
+        assert_eq!(range.length, 2);
+        assert!(range.eof);
+        assert_eq!(range.sha256, format!("{:x}", Sha256::digest(b"89")));
+    }
+
+    #[tokio::test]
+    async fn range_read_refuses_offsets_past_the_end_and_oversized_lengths() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("data.bin"), b"0123456789").unwrap();
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+
+        assert_eq!(
+            service
+                .open_range_read("data.bin", 11, 1, None)
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            "range_not_satisfiable"
+        );
+        assert_eq!(
+            service
+                .open_range_read("data.bin", 0, MAX_RANGE_BYTES + 1, None)
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            "range_too_large"
+        );
+        assert_eq!(
+            service
+                .open_range_read("data.bin", 0, 0, None)
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            "range_too_large"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_read_refuses_a_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("folder")).unwrap();
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+        assert_eq!(
+            service
+                .open_range_read("folder", 0, 16, None)
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            "not_file"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_version_changes_on_a_same_second_rewrite() {
+        // This is the test that justifies hashing nanoseconds and inode identity
+        // rather than the second-granularity mtime the wire already carries: an
+        // edit made in the same second as the read would otherwise look
+        // unchanged and serve a stale preview forever.
+        //
+        // The mtimes are pinned rather than taken from the clock: the kernel
+        // stamps writes from its coarse clock, so two natural rewrites can land
+        // in one tick and carry identical nanoseconds — the exact same-second
+        // rewrite this test exists to distinguish would then be invisible for a
+        // reason outside the claim under test.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("data.bin");
+        let pin_mtime = |nanos: u32| {
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            let modified =
+                std::time::UNIX_EPOCH + std::time::Duration::new(1_755_000_000, nanos);
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        };
+        std::fs::write(&path, b"aaaa").unwrap();
+        pin_mtime(111_111_111);
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+
+        let first = service
+            .open_range_read("data.bin", 0, 4, None)
+            .await
+            .unwrap();
+        std::fs::write(&path, b"bbbb").unwrap();
+        pin_mtime(222_222_222);
+        let second = service
+            .open_range_read("data.bin", 0, 4, None)
+            .await
+            .unwrap();
+        assert_ne!(first.version, second.version);
+
+        // And the validator is enforced, not merely reported.
+        assert_eq!(
+            service
+                .open_range_read("data.bin", 0, 4, Some(first.version.clone()))
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            "version_changed"
+        );
+        service
+            .open_range_read("data.bin", 0, 4, Some(second.version.clone()))
+            .await
+            .expect("the current version still matches");
+    }
+
+    #[tokio::test]
+    async fn range_read_classifies_from_the_head_not_the_requested_slice() {
+        // Classification needs the start of the file even when the slice asked
+        // for is somewhere in the middle.
+        let temp = tempfile::tempdir().unwrap();
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0_u8; 64]);
+        std::fs::write(temp.path().join("image.png"), &png).unwrap();
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+
+        let range = service
+            .open_range_read("image.png", 32, 8, None)
+            .await
+            .unwrap();
+        assert_eq!(range.content_type, "image/png");
+        assert_eq!(range.content_type_source, "magic");
+        assert!(range.open_allowed);
+    }
+
+    #[tokio::test]
+    async fn preview_source_refuses_a_file_beyond_the_render_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("huge.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(PREVIEW_MAX_INPUT_BYTES + 1).unwrap();
+        drop(file);
+        let service = HostFileService::rooted_at(temp.path()).await.unwrap();
+        assert_eq!(
+            service.open_preview_source("huge.bin")
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            "preview_too_large"
+        );
     }
 
     #[tokio::test]
@@ -2022,6 +2742,27 @@ mod tests {
                 let mut bytes = Vec::new();
                 read.file.read_to_end(&mut bytes).await.unwrap();
                 assert_eq!(bytes, b"inside");
+            }
+            // Every operation that resolves a path belongs in this loop; one
+            // that is missing from it is untested against the only attack that
+            // matters here.
+            if let Ok(mut range) = service.open_range_read("swap/read.txt", 0, 6, None).await {
+                let mut bytes = Vec::new();
+                range.file.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, b"inside");
+                assert_eq!(range.stat.size, 6);
+            }
+            if let Ok(source) = service.open_preview_source("swap/read.txt").await {
+                assert_eq!(source.head, b"inside");
+                assert_eq!(source.size, 6);
+            }
+            #[cfg(target_os = "macos")]
+            if let Ok(target) = service.open_launch_target("swap/read.txt", true).await {
+                assert!(
+                    !target.display.starts_with(&outside),
+                    "a launch target must never resolve outside the root"
+                );
+                assert_eq!(target.head, b"inside");
             }
             let _ = service.mkdir(&format!("swap/mkdir-{index}")).await;
             let _ = service

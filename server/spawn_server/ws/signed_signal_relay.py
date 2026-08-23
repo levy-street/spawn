@@ -246,12 +246,12 @@ def validate_signed_rtc_relay_envelope(
         ("rtc.answer", "daemon"),
     }:
         raise SignedRtcRelayError("signed RTC type does not match sender role")
-    if value["scope_type"] not in {"agent", "host"}:
+    if value["scope_type"] not in {"session", "host"}:
         raise SignedRtcRelayError("invalid signed RTC scope type")
     if value["protocol"] not in {"spawn.pty", "spawn.host.ctl"}:
         raise SignedRtcRelayError("invalid signed RTC protocol")
     expected_topology = {
-        "agent": ("spawn.pty", 2),
+        "session": ("spawn.pty", 2),
         "host": ("spawn.host.ctl", 1),
     }[value["scope_type"]]
     if (value["protocol"], protocol_version) != expected_topology:

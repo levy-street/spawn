@@ -1,12 +1,5 @@
 import { expect, test } from "@playwright/test";
-import {
-  AGENT_ID,
-  agent,
-  BROWSER_DEVICE_ID,
-  HOST_ID,
-  host,
-  mockAuthenticatedApi,
-} from "./app-mocks";
+import { BROWSER_DEVICE_ID, HOST_ID, host, mockApp, SESSION_ID, session } from "./app-mocks";
 
 // Opening an agent session on an unapproved device cannot connect — the daemon
 // refuses the offer. The session approval gate (docs/TRUST_UX.md §3, §7) turns
@@ -23,7 +16,7 @@ const KEYED_HOST = {
 test("an unapproved device opening an agent session gets the approval card and asks out loud", async ({
   page,
 }) => {
-  await mockAuthenticatedApi(page, { hosts: [KEYED_HOST], agents: [agent()], hostPins: {} });
+  await mockApp(page, { hosts: [KEYED_HOST], sessions: [session()], hostPins: {} });
 
   const asked = page.waitForRequest(
     (request) =>
@@ -31,7 +24,7 @@ test("an unapproved device opening an agent session gets the approval card and a
       request.url().endsWith("/request-approval") &&
       request.method() === "POST",
   );
-  await page.goto(`/agents/${AGENT_ID}`);
+  await page.goto(`/sessions/${SESSION_ID}`);
 
   const gate = page.getByTestId("session-approval-gate");
   await expect(gate).toBeVisible();
@@ -55,12 +48,12 @@ test("an unapproved device opening an agent session gets the approval card and a
 });
 
 test("a trusted device never sees the gate", async ({ page }) => {
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     hosts: [KEYED_HOST],
-    agents: [agent()],
+    sessions: [session()],
     hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] },
   });
-  await page.goto(`/agents/${AGENT_ID}`);
+  await page.goto(`/sessions/${SESSION_ID}`);
 
   // The session surface renders normally (header shows the agent) and the
   // gate stays away through a couple of poll cycles.
@@ -70,8 +63,8 @@ test("a trusted device never sees the gate", async ({ page }) => {
 });
 
 test("the card yields to the number check when an approver starts", async ({ page }) => {
-  await mockAuthenticatedApi(page, { hosts: [KEYED_HOST], agents: [agent()], hostPins: {} });
-  await page.goto(`/agents/${AGENT_ID}`);
+  await mockApp(page, { hosts: [KEYED_HOST], sessions: [session()], hostPins: {} });
+  await page.goto(`/sessions/${SESSION_ID}`);
   await expect(page.getByTestId("session-approval-gate")).toBeVisible();
 
   // An approver started a ceremony naming this device as the joiner: the
@@ -107,7 +100,7 @@ test("the card yields to the number check when an approver starts", async ({ pag
 });
 
 test("a device actively asking re-labels the approval toast for the approver", async ({ page }) => {
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     hosts: [KEYED_HOST],
     hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] },
     extraBrowserDevices: [
@@ -122,7 +115,7 @@ test("a device actively asking re-labels the approval toast for the approver", a
       },
     ],
   });
-  await page.goto("/hosts");
+  await page.goto("/app");
 
   const toast = page.getByTestId("approve-toast");
   await expect(toast).toBeVisible({ timeout: 20_000 });

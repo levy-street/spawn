@@ -18,13 +18,13 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::agents::AgentRegistry;
+use crate::sessions::SessionRegistry;
 use crate::cli::RunArgs;
 use crate::config;
 use crate::creds::{self, CredentialRevision, StoredCreds};
 use crate::proto::{
-    AgentCreate, CarriedEndorsement, HostToolInstallResult, HostToolStatus, HostToolTarget,
-    Inbound, Outbound,
+    CarriedEndorsement, HostAgentInstallResult, HostAgentStatus, HostAgentTarget, Inbound,
+    Outbound, SessionCreate,
 };
 use crate::pty::{self, WsOutbound};
 use crate::rtc::{HostRtcSignal, RtcAnswerSigner, RtcSessions};
@@ -47,8 +47,8 @@ const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 const TOOL_OUTPUT_LIMIT: usize = 16 * 1024;
 const SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const DEFAULT_AGENT_COLS: u16 = 120;
-const DEFAULT_AGENT_ROWS: u16 = 32;
+const DEFAULT_SESSION_COLS: u16 = 120;
+const DEFAULT_SESSION_ROWS: u16 = 32;
 /// Credential storage has no portable cross-process notification primitive.
 /// One daemon-wide poll schedules detection within 500 ms while keeping
 /// keyring/file reads serial and avoiding one watcher per connection. The
@@ -470,7 +470,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let ws_url = config::ws_url(&server_url)?;
     let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
-    let registry = AgentRegistry::new();
+    let registry = SessionRegistry::new();
     let rtc_sessions = RtcSessions::new();
     // Process-lifetime monotonic floor for the account deny-list (device mesh
     // §3). Owned here — above the per-connection loop — so a reconnect cannot
@@ -596,7 +596,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
 async fn serve_one_connection(
     live_credentials: &LiveCredentialSnapshot,
     ws_url: &url::Url,
-    registry: &AgentRegistry,
+    registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     loader: &mut CredentialLoader,
     daemon_revoked: &mut RevocationSet,
@@ -617,7 +617,7 @@ async fn serve_one_connection(
 async fn serve_one_connection_with_loader(
     live_credentials: &LiveCredentialSnapshot,
     ws_url: &url::Url,
-    registry: &AgentRegistry,
+    registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     poll_interval: Duration,
     loader: &mut CredentialLoader,
@@ -695,8 +695,8 @@ async fn serve_one_connection_with_loader(
     let (write_half, read_half) = stream.split();
 
     // mpsc that the dispatch loop and heartbeat task push outbound frames
-    // into. Per-agent forwarder tasks ALSO ship into here, but indirectly:
-    // each agent owns its own outbox and a long-lived forwarder task; we
+    // into. Per-session forwarder tasks ALSO ship into here, but indirectly:
+    // each session owns its own outbox and a long-lived forwarder task; we
     // install/clear this session's `out_tx` as the forwarder's "sink" on
     // connect/disconnect so reader threads survive WS reconnects.
     let (out_tx, out_rx) = mpsc::channel::<WsOutbound>(OUTBOUND_CHANNEL_DEPTH);
@@ -709,14 +709,14 @@ async fn serve_one_connection_with_loader(
 
     // First WS session of this daemon process: scan for live session workers
     // left behind by a previous instance, adopt each, and surface them in
-    // `existing_agents`. This makes daemon restart non-destructive.
+    // `existing_sessions`. This makes daemon restart non-destructive.
     if registry.claim_discovery() {
-        rediscover_existing_agents(registry, rtc_sessions, &out_tx).await;
+        rediscover_existing_sessions(registry, rtc_sessions, &out_tx).await;
     }
 
-    // Install this session's sink for every agent's forwarder so PTY bytes
-    // route here. (Reattach-discovered agents don't have a sink yet; agents
-    // from prior WS sessions had a stale sink we need to overwrite.)
+    // Install this connection's sink for every session's forwarder so PTY
+    // bytes route here. (Reattach-discovered sessions don't have a sink yet;
+    // sessions from prior WS connections had a stale sink to overwrite.)
     install_session_sinks(registry, &out_tx).await;
 
     // Send `register`.
@@ -725,12 +725,19 @@ async fn serve_one_connection_with_loader(
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown-host".into());
 
+    // The GPU name is the one part of the spec that needs a subprocess, so it
+    // is probed off to the side and folded in whenever it lands. Registering
+    // without it costs a host its GPU label until the next reconnect, which is
+    // strictly better than making the connection wait on `nvidia-smi`.
+    crate::host_metrics::sampler().probe_gpu();
+
     let register = Outbound::Register {
         host_name,
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        existing_agents: registry.ids(),
+        existing_sessions: registry.ids(),
+        spec: crate::host_metrics::sampler().spec(),
         supports_account_chains: true,
     };
     let register_json = serde_json::to_string(&register)?;
@@ -747,7 +754,11 @@ async fn serve_one_connection_with_loader(
         tick.tick().await; // consume the immediate first tick
         loop {
             tick.tick().await;
-            let frame = match serde_json::to_string(&Outbound::HostHeartbeat) {
+            let (cpu_bucket, mem_bucket) = crate::host_metrics::sampler().heartbeat_buckets();
+            let frame = match serde_json::to_string(&Outbound::HostHeartbeat {
+                cpu_bucket,
+                mem_bucket,
+            }) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
@@ -795,7 +806,7 @@ async fn serve_one_connection_with_loader(
 
     // Tear down this session. A trust reload drops and joins the WebSocket I/O
     // tasks before peer/sink cleanup so a hard loader failure cannot retain a
-    // stale control transport. Ordinary socket endings clear per-agent sinks
+    // stale control transport. Ordinary socket endings clear per-session sinks
     // first; forwarders keep draining bounded worker output into direct
     // viewers and reconnect catches up from worker replay. We abort rather
     // than attempting a graceful WebSocket close because the final TCP write
@@ -831,18 +842,21 @@ async fn serve_one_connection_with_loader(
     }
 }
 
-/// Install this WS session's outbound sender as the forwarder sink for every
-/// agent currently in the registry. Browser reconnects request a checkpoint
-/// replay from the owning worker, so no daemon-side repaint is needed.
-async fn install_session_sinks(registry: &AgentRegistry, out_tx: &mpsc::Sender<WsOutbound>) {
-    for (_, control) in registry.snapshot_controls() {
+/// Install this WS connection's outbound sender as the forwarder sink for
+/// every session currently in the registry. Browser reconnects request a
+/// checkpoint replay from the owning worker, so no daemon-side repaint is
+/// needed; foreground reports emitted while no connection existed are
+/// re-announced so the server converges without waiting for a change.
+async fn install_session_sinks(registry: &SessionRegistry, out_tx: &mpsc::Sender<WsOutbound>) {
+    for (session_id, control) in registry.snapshot_controls() {
         control.set_sink(out_tx.clone()).await;
+        control.resend_foreground(session_id).await;
     }
 }
 
 /// Clear all forwarder sinks. Called when the session ends. Forwarders park
 /// on `notified()` until a new session runs `install_session_sinks`.
-async fn clear_session_sinks(registry: &AgentRegistry) {
+async fn clear_session_sinks(registry: &SessionRegistry) {
     for (_, control) in registry.snapshot_controls() {
         control.clear_sink().await;
     }
@@ -1230,7 +1244,7 @@ fn build_rtc_answer_signer(
 
 async fn dispatch_loop(
     in_rx: &mut mpsc::Receiver<WsInbound>,
-    registry: &AgentRegistry,
+    registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
     live_credentials: &LiveCredentialSnapshot,
@@ -1335,29 +1349,28 @@ async fn dispatch_loop(
                         let _ = out_tx.send(WsOutbound::json(frame)).await;
                     }
                 }
-                Inbound::HostToolsCheck {
+                Inbound::HostAgentsCheck {
                     request_id,
                     targets,
                 } => {
-                    handle_host_tools_check(request_id, targets, out_tx).await;
+                    handle_host_agents_check(request_id, targets, out_tx).await;
                 }
-                Inbound::HostToolsInstall { request_id, target } => {
-                    handle_host_tools_install(request_id, target, out_tx).await;
+                Inbound::HostAgentsInstall { request_id, target } => {
+                    handle_host_agents_install(request_id, target, out_tx).await;
                 }
-                Inbound::AgentCreate(create) => {
-                    handle_agent_create(create, registry, rtc_sessions, out_tx).await;
+                Inbound::SessionCreate(create) => {
+                    handle_session_create(create, registry, rtc_sessions, out_tx).await;
                 }
-                Inbound::AgentRestart(create) => {
-                    handle_agent_restart(create, registry, rtc_sessions, out_tx).await;
+                Inbound::SessionRestart(create) => {
+                    handle_session_restart(create, registry, rtc_sessions, out_tx).await;
                 }
-                Inbound::AgentKill { agent_id, signal } => {
-                    handle_agent_kill(agent_id, signal, registry, rtc_sessions, out_tx).await;
+                Inbound::SessionKill { session_id, signal } => {
+                    handle_session_kill(session_id, signal, registry, rtc_sessions, out_tx).await;
                 }
                 Inbound::RtcOffer {
-                    session_id,
+                    session_id: signal_id,
                     binding_nonce,
                     binding_generation,
-                    agent_id,
                     scope_type,
                     scope_id,
                     protocol,
@@ -1387,7 +1400,7 @@ async fn dispatch_loop(
                             ) {
                                 Some(verified)
                                     if verified.transcript().session_id()
-                                        == session_id.as_str() =>
+                                        == signal_id.as_str() =>
                                 {
                                     tracing::info!(
                                         scope_type = ?verified.transcript().scope_type(),
@@ -1451,7 +1464,6 @@ async fn dispatch_loop(
                     match (
                         binding_nonce,
                         binding_generation,
-                        agent_id,
                         scope_type,
                         scope_id,
                         protocol,
@@ -1460,36 +1472,34 @@ async fn dispatch_loop(
                         (
                             Some(nonce),
                             Some(owner_generation),
-                            Some(agent_id),
                             Some(scope_type),
                             Some(scope_id),
                             Some(protocol),
                             Some(protocol_version),
-                        ) if scope_type == "agent"
-                            && scope_id == agent_id
+                        ) if scope_type == "session"
                             && protocol == "spawn.pty"
                             && protocol_version == 2 =>
                         {
                             // A signed offer's verified scope must match this
-                            // agent routing, so a relay cannot redirect a signed
-                            // offer to a different agent.
+                            // session routing, so a relay cannot redirect a
+                            // signed offer to a different session.
                             if let Some(verified) = &verified_offer {
                                 let t = verified.transcript();
-                                if t.scope_type() != ScopeType::Agent
-                                    || t.scope_id() != agent_id.to_string().as_str()
+                                if t.scope_type() != ScopeType::Session
+                                    || t.scope_id() != scope_id.to_string().as_str()
                                 {
                                     tracing::warn!(
-                                        "signed RTC offer scope does not match agent routing"
+                                        "signed RTC offer scope does not match session routing"
                                     );
                                     continue;
                                 }
                             }
                             if ice_transport_policy.is_none() {
-                                if let Some(binding) = crate::rtc::RtcSessionBinding::from_server(
-                                    session_id,
+                                if let Some(binding) = crate::rtc::RtcSignalBinding::from_server(
+                                    signal_id,
                                     nonce,
                                     owner_generation,
-                                    agent_id,
+                                    scope_id,
                                 ) {
                                     rtc_sessions
                                         .handle_offer(
@@ -1506,7 +1516,6 @@ async fn dispatch_loop(
                         }
                         (
                             Some(binding_nonce),
-                            None,
                             None,
                             scope_type,
                             scope_id,
@@ -1531,7 +1540,7 @@ async fn dispatch_loop(
                             rtc_sessions
                                 .handle_host_offer(
                                     HostRtcSignal {
-                                        session_id,
+                                        signal_id,
                                         binding_nonce: Some(binding_nonce),
                                         scope_type,
                                         scope_id,
@@ -1550,10 +1559,9 @@ async fn dispatch_loop(
                     }
                 }
                 Inbound::RtcCandidate {
-                    session_id,
+                    session_id: signal_id,
                     binding_nonce,
                     binding_generation,
-                    agent_id,
                     scope_type,
                     scope_id,
                     protocol,
@@ -1563,7 +1571,6 @@ async fn dispatch_loop(
                     match (
                         binding_nonce,
                         binding_generation,
-                        agent_id,
                         scope_type,
                         scope_id,
                         protocol,
@@ -1572,32 +1579,29 @@ async fn dispatch_loop(
                         (
                             Some(nonce),
                             Some(owner_generation),
-                            Some(agent_id),
                             Some(scope_type),
                             Some(scope_id),
                             Some(protocol),
                             Some(protocol_version),
-                        ) if scope_type == "agent"
-                            && scope_id == agent_id
+                        ) if scope_type == "session"
                             && protocol == "spawn.pty"
                             && protocol_version == 2 =>
                         {
-                            if let Some(binding) = crate::rtc::RtcSessionBinding::from_server(
-                                session_id,
+                            if let Some(binding) = crate::rtc::RtcSignalBinding::from_server(
+                                signal_id,
                                 nonce,
                                 owner_generation,
-                                agent_id,
+                                scope_id,
                             ) {
-                                let (session_id, generation, agent_id) =
+                                let (signal_id, generation, session_id) =
                                     binding.into_routing_parts();
                                 rtc_sessions
-                                    .handle_candidate(session_id, generation, agent_id, candidate)
+                                    .handle_candidate(signal_id, generation, session_id, candidate)
                                     .await;
                             }
                         }
                         (
                             Some(binding_nonce),
-                            None,
                             None,
                             scope_type,
                             scope_id,
@@ -1607,7 +1611,7 @@ async fn dispatch_loop(
                             rtc_sessions
                                 .handle_host_candidate(
                                     HostRtcSignal {
-                                        session_id,
+                                        signal_id,
                                         binding_nonce: Some(binding_nonce),
                                         scope_type,
                                         scope_id,
@@ -1622,10 +1626,9 @@ async fn dispatch_loop(
                     }
                 }
                 Inbound::RtcClose {
-                    session_id,
+                    session_id: signal_id,
                     binding_nonce,
                     binding_generation,
-                    agent_id,
                     scope_type,
                     scope_id,
                     protocol,
@@ -1634,7 +1637,6 @@ async fn dispatch_loop(
                     match (
                         binding_nonce,
                         binding_generation,
-                        agent_id,
                         scope_type,
                         scope_id,
                         protocol,
@@ -1643,30 +1645,27 @@ async fn dispatch_loop(
                         (
                             Some(nonce),
                             Some(owner_generation),
-                            Some(agent_id),
                             Some(scope_type),
                             Some(scope_id),
                             Some(protocol),
                             Some(protocol_version),
-                        ) if scope_type == "agent"
-                            && scope_id == agent_id
+                        ) if scope_type == "session"
                             && protocol == "spawn.pty"
                             && protocol_version == 2 =>
                         {
-                            if let Some(binding) = crate::rtc::RtcSessionBinding::from_server(
-                                session_id,
+                            if let Some(binding) = crate::rtc::RtcSignalBinding::from_server(
+                                signal_id,
                                 nonce,
                                 owner_generation,
-                                agent_id,
+                                scope_id,
                             ) {
-                                let (session_id, generation, agent_id) =
+                                let (signal_id, generation, session_id) =
                                     binding.into_routing_parts();
-                                rtc_sessions.close(&session_id, &generation, agent_id).await;
+                                rtc_sessions.close(&signal_id, &generation, session_id).await;
                             }
                         }
                         (
                             Some(binding_nonce),
-                            None,
                             None,
                             scope_type,
                             scope_id,
@@ -1675,7 +1674,7 @@ async fn dispatch_loop(
                         ) => {
                             rtc_sessions
                                 .close_host(HostRtcSignal {
-                                    session_id,
+                                    signal_id,
                                     binding_nonce: Some(binding_nonce),
                                     scope_type,
                                     scope_id,
@@ -1693,50 +1692,50 @@ async fn dispatch_loop(
     Ok(())
 }
 
-async fn handle_host_tools_check(
+async fn handle_host_agents_check(
     request_id: String,
-    targets: Vec<HostToolTarget>,
+    targets: Vec<HostAgentTarget>,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     let mut checks = FuturesUnordered::new();
     let target_count = targets.len();
     for (index, target) in targets.into_iter().enumerate() {
-        checks.push(async move { (index, check_host_tool(target).await) });
+        checks.push(async move { (index, check_host_agent(target).await) });
     }
 
-    let mut indexed_tools: Vec<Option<HostToolStatus>> =
+    let mut indexed_agents: Vec<Option<HostAgentStatus>> =
         std::iter::repeat_with(|| None).take(target_count).collect();
-    while let Some((index, tool)) = checks.next().await {
-        if let Some(slot) = indexed_tools.get_mut(index) {
-            *slot = Some(tool);
+    while let Some((index, agent)) = checks.next().await {
+        if let Some(slot) = indexed_agents.get_mut(index) {
+            *slot = Some(agent);
         }
     }
-    let tools = indexed_tools.into_iter().flatten().collect();
+    let agents = indexed_agents.into_iter().flatten().collect();
 
-    let frame = Outbound::HostToolsCheckResult { request_id, tools };
+    let frame = Outbound::HostAgentsCheckResult { request_id, agents };
     if let Ok(s) = serde_json::to_string(&frame) {
         let _ = out_tx.send(WsOutbound::json(s)).await;
     }
 }
 
-async fn handle_host_tools_install(
+async fn handle_host_agents_install(
     request_id: String,
-    target: HostToolTarget,
+    target: HostAgentTarget,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    let result = install_host_tool(target).await;
-    let frame = Outbound::HostToolsInstallResult { request_id, result };
+    let result = install_host_agent(target).await;
+    let frame = Outbound::HostAgentsInstallResult { request_id, result };
     if let Ok(s) = serde_json::to_string(&frame) {
         let _ = out_tx.send(WsOutbound::json(s)).await;
     }
 }
 
-async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
+async fn check_host_agent(target: HostAgentTarget) -> HostAgentStatus {
     let command = target.command.trim().to_string();
     if command.is_empty() {
-        return HostToolStatus {
-            preset_id: target.preset_id,
-            preset_name: target.preset_name,
+        return HostAgentStatus {
+            agent_id: target.agent_id,
+            agent_name: target.agent_name,
             agent_kind: target.agent_kind,
             command,
             install: target.install,
@@ -1745,16 +1744,16 @@ async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
             version: None,
             latest_version: None,
             update_available: None,
-            error: Some("preset argv has no executable".into()),
+            error: Some("agent has no executable command".into()),
         };
     }
 
     let env = resolved_command_env().await;
     let path = binary_path(&command, &env).await;
     let Some(path) = path else {
-        return HostToolStatus {
-            preset_id: target.preset_id,
-            preset_name: target.preset_name,
+        return HostAgentStatus {
+            agent_id: target.agent_id,
+            agent_name: target.agent_name,
             agent_kind: target.agent_kind,
             command,
             install: target.install,
@@ -1777,9 +1776,9 @@ async fn check_host_tool(target: HostToolTarget) -> HostToolStatus {
         _ => None,
     };
 
-    HostToolStatus {
-        preset_id: target.preset_id,
-        preset_name: target.preset_name,
+    HostAgentStatus {
+        agent_id: target.agent_id,
+        agent_name: target.agent_name,
         agent_kind: target.agent_kind,
         command,
         install: target.install,
@@ -1809,7 +1808,7 @@ fn self_update_args(agent_kind: &str) -> Option<&'static [&'static str]> {
 /// silently retrying forever.
 fn update_outcome(
     version_before: Option<&str>,
-    status: Option<&HostToolStatus>,
+    status: Option<&HostAgentStatus>,
     script_success: bool,
     script_error: Option<String>,
 ) -> (bool, Option<String>) {
@@ -1838,19 +1837,19 @@ fn update_outcome(
     (true, script_error)
 }
 
-async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
+async fn install_host_agent(target: HostAgentTarget) -> HostAgentInstallResult {
     let install = target.install.as_deref().unwrap_or("").trim().to_string();
     if install.is_empty() {
-        return HostToolInstallResult {
-            preset_id: target.preset_id,
-            preset_name: target.preset_name,
+        return HostAgentInstallResult {
+            agent_id: target.agent_id,
+            agent_name: target.agent_name,
             agent_kind: target.agent_kind,
             command: target.command,
             install: target.install,
             success: false,
             exit_code: None,
             output: String::new(),
-            error: Some("preset has no install command".into()),
+            error: Some("agent has no install command".into()),
             status: None,
         };
     }
@@ -1896,16 +1895,16 @@ async fn install_host_tool(target: HostToolTarget) -> HostToolInstallResult {
         }
     };
 
-    let status = Some(check_host_tool(target.clone()).await);
+    let status = Some(check_host_agent(target.clone()).await);
     let (success, error) = update_outcome(
         version_before.as_deref(),
         status.as_ref(),
         capture.success,
         capture.error,
     );
-    HostToolInstallResult {
-        preset_id: target.preset_id,
-        preset_name: target.preset_name,
+    HostAgentInstallResult {
+        agent_id: target.agent_id,
+        agent_name: target.agent_name,
         agent_kind: target.agent_kind,
         command: target.command,
         install: target.install,
@@ -2292,12 +2291,12 @@ fn first_meaningful_line(output: &str) -> Option<String> {
         .map(|line| line.chars().take(240).collect())
 }
 
-async fn ensure_agent_cwd(cwd: &str) -> Option<PathBuf> {
+async fn ensure_session_cwd(cwd: &str) -> Option<PathBuf> {
     let path = expand_host_path(cwd);
     match tokio::fs::create_dir_all(&path).await {
         Ok(()) => Some(path),
         Err(error) => {
-            tracing::warn!(error = %error, "agent cwd creation failed");
+            tracing::warn!(error = %error, "session cwd creation failed");
             None
         }
     }
@@ -2350,62 +2349,37 @@ fn lexical_normalize(path: PathBuf) -> PathBuf {
     }
 }
 
-async fn handle_agent_create(
-    create: AgentCreate,
-    registry: &AgentRegistry,
+async fn handle_session_create(
+    create: SessionCreate,
+    registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    let agent_id = create.agent_id;
-    tracing::info!(%agent_id, argv = ?create.argv, "agent.create");
+    let session_id = create.session_id;
+    tracing::info!(%session_id, "session.create");
 
-    // Build the env for the launched agent: the daemon's process env (so
-    // HOME, XDG_CONFIG_HOME, PATH, etc. flow through naturally and the
-    // agent CLI finds its own credentials), overlaid with any per-agent
-    // env from the create frame. spawn does not inject credentials.
+    // Build the env for the session's login shell: the daemon's process env
+    // (so HOME, XDG_CONFIG_HOME, PATH, etc. flow through naturally and agent
+    // CLIs launched from the shell find their own credentials), normalized
+    // and PATH-enriched. spawn does not inject credentials.
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
-    normalize_agent_env(&mut env).await;
-    for (k, v) in &create.env {
-        env.insert(k.clone(), v.clone());
-    }
-    if let Err(error) = materialize_agent_capabilities(&create, &mut env) {
-        tracing::warn!(%agent_id, %error, "agent capability setup failed");
-        send_spawn_failed_exit(agent_id, out_tx, "capability setup failed").await;
+    normalize_session_env(&mut env).await;
+    if let Err(error) = materialize_session_capabilities(&create, &mut env) {
+        tracing::warn!(%session_id, %error, "session capability setup failed");
+        send_spawn_failed_exit(session_id, out_tx, "capability setup failed").await;
         return;
     }
 
-    // Pre-flight install output is endpoint-local and deliberately discarded.
-    // It must never be mirrored over the control websocket.
-    let bin = create.argv.first().cloned().unwrap_or_default();
-    if bin.is_empty() {
-        send_spawn_failed_exit(agent_id, out_tx, "empty argv").await;
-        return;
-    }
-    if !binary_exists(&bin, &env).await {
-        match create.install.as_deref() {
-            Some(install_cmd) if !install_cmd.trim().is_empty() => {
-                let installed = run_install(install_cmd, &env).await;
-                if !installed {
-                    send_spawn_failed_exit(agent_id, out_tx, "install failed").await;
-                    return;
-                }
-                if !binary_exists(&bin, &env).await {
-                    send_spawn_failed_exit(agent_id, out_tx, "binary still missing").await;
-                    return;
-                }
-            }
-            _ => {
-                send_spawn_failed_exit(agent_id, out_tx, "binary not found, no install").await;
-                return;
-            }
-        }
-    }
+    // A session is always the user's login shell; agents are commands typed
+    // into it. The frame carries no argv, env, or install command.
+    let shell = resolve_login_shell(&env);
+    let argv = vec![shell, "-l".to_string()];
 
     let launch_cwd = if create.create_cwd {
-        match ensure_agent_cwd(&create.cwd).await {
+        match ensure_session_cwd(&create.cwd).await {
             Some(path) => path,
             None => {
-                send_spawn_failed_exit(agent_id, out_tx, "cwd create failed").await;
+                send_spawn_failed_exit(session_id, out_tx, "cwd create failed").await;
                 return;
             }
         }
@@ -2414,31 +2388,31 @@ async fn handle_agent_create(
     };
     let launch_cwd_str = launch_cwd.to_string_lossy().into_owned();
 
-    // Launch through the mandatory per-agent worker. There is no backend
-    // selector or per-agent escape hatch: failing to start the worker is a
-    // fail-closed agent.create error.
+    // Launch through the mandatory per-session worker. There is no backend
+    // selector or per-session escape hatch: failing to start the worker is a
+    // fail-closed session.create error.
     let spec = pty::LaunchSpec {
-        agent_id,
+        session_id,
         cwd: &launch_cwd_str,
-        cols: DEFAULT_AGENT_COLS,
-        rows: DEFAULT_AGENT_ROWS,
-        argv: &create.argv,
+        cols: DEFAULT_SESSION_COLS,
+        rows: DEFAULT_SESSION_ROWS,
+        argv: &argv,
         env: &env,
     };
     let launched = match worker_backend::launch(spec).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::warn!(%agent_id, error = %e, "agent failed to start");
+            tracing::warn!(%session_id, error = %e, "session failed to start");
             send_error_code(
                 out_tx,
-                Some(agent_id),
+                Some(session_id),
                 "spawn_failed",
-                "agent failed to start",
+                "session failed to start",
             )
             .await;
             // Update UI status: starting → exited.
-            let exit = Outbound::AgentExit {
-                agent_id,
+            let exit = Outbound::SessionExit {
+                session_id,
                 exit_code: None,
                 signal: Some("spawn_failed".into()),
             };
@@ -2449,65 +2423,43 @@ async fn handle_agent_create(
         }
     };
 
-    let pid = launched.pid;
-    let exit_rx = launched.exit_rx;
-    // Wire the new agent's forwarder to this server session before inserting
-    // into the registry so early worker output routes immediately.
-    launched.handle.control.set_sink(out_tx.clone()).await;
-    let transition = registry.lock_generation_transition(agent_id).await;
-    if let Some(previous) = registry.binding_for(agent_id) {
-        // Invalidate first. Any offer that captured `previous` must acquire
-        // this same transition lock before peer insertion and will fail its
-        // generation recheck after the guard is released.
-        let _ = registry.remove_if_generation(agent_id, previous.generation());
-        rtc_sessions
-            .close_for_agent(agent_id, previous.generation())
-            .await;
+    register_attached(session_id, launched, registry, rtc_sessions, out_tx, true).await;
+}
+
+/// The user's login shell: `$SHELL` from the daemon's environment when it
+/// names an executable file, else the platform default.
+fn resolve_login_shell(env: &BTreeMap<String, String>) -> String {
+    if let Some(shell) = env.get("SHELL").map(|value| value.trim()) {
+        if is_executable_file(Path::new(shell)) {
+            return shell.to_string();
+        }
     }
-    let generation = registry.insert(launched.handle);
-    drop(transition);
+    default_login_shell().to_string()
+}
 
-    // Tell server it's up.
-    let started = Outbound::AgentStarted { agent_id, pid };
-    let _ = out_tx
-        .send(WsOutbound::json(serde_json::to_string(&started).unwrap()))
-        .await;
+fn default_login_shell() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "/bin/zsh"
+    } else {
+        "/bin/bash"
+    }
+}
 
-    // Await PTY exit and forward `agent.exit`.
-    let registry = registry.clone();
-    let rtc_sessions = rtc_sessions.clone();
-    let out_tx = out_tx.clone();
-    tokio::spawn(async move {
-        let reason = exit_rx.await.unwrap_or(pty::ExitReason {
-            exit_code: None,
-            signal: None,
-        });
-        let transition = registry.lock_generation_transition(agent_id).await;
-        let removed = registry.remove_if_generation(agent_id, generation);
-        rtc_sessions.close_for_agent(agent_id, generation).await;
-        drop(transition);
-        if removed.is_none() {
-            tracing::debug!(%agent_id, generation, "ignoring stale agent exit");
-            return;
-        }
-        let exit = Outbound::AgentExit {
-            agent_id,
-            exit_code: reason.exit_code,
-            signal: reason.signal,
-        };
-        if let Ok(s) = serde_json::to_string(&exit) {
-            let _ = out_tx.send(WsOutbound::json(s)).await;
-        }
-    });
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_absolute()
+        && std::fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
 }
 
 async fn resolved_command_env() -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
-    normalize_agent_env(&mut env).await;
+    normalize_session_env(&mut env).await;
     env
 }
 
-async fn normalize_agent_env(env: &mut BTreeMap<String, String>) {
+async fn normalize_session_env(env: &mut BTreeMap<String, String>) {
     env.remove("NO_COLOR");
     env.insert("TERM".into(), "xterm-256color".into());
     env.insert("COLORTERM".into(), "truecolor".into());
@@ -2631,8 +2583,8 @@ fn prepend_path_entries(env: &mut BTreeMap<String, String>, preferred: Vec<PathB
     }
 }
 
-fn materialize_agent_capabilities(
-    create: &AgentCreate,
+fn materialize_session_capabilities(
+    create: &SessionCreate,
     env: &mut BTreeMap<String, String>,
 ) -> Result<()> {
     if create.skills.is_empty() {
@@ -2640,8 +2592,8 @@ fn materialize_agent_capabilities(
     }
 
     let root = config::config_dir()?
-        .join("agents")
-        .join(create.agent_id.to_string());
+        .join("sessions")
+        .join(create.session_id.to_string());
     if root.exists() {
         fs::remove_dir_all(&root).with_context(|| format!("clearing {}", root.display()))?;
     }
@@ -2679,34 +2631,28 @@ fn materialize_agent_capabilities(
         skills_dir.to_string_lossy().into_owned(),
     );
 
-    if is_codex_argv(&create.argv) {
-        let codex_home = root.join("codex-home");
-        fs::create_dir_all(&codex_home)
-            .with_context(|| format!("creating {}", codex_home.display()))?;
-        write_codex_projection(&codex_home, &skills_dir, create)?;
-        link_codex_auth_state(&codex_home)?;
-        env.insert(
-            "CODEX_HOME".into(),
-            codex_home.to_string_lossy().into_owned(),
-        );
-    }
+    // Shell-first sessions no longer know which agent will run, so the Codex
+    // projection is materialized for every skilled session: if the user types
+    // (or clicks) `codex`, it inherits this CODEX_HOME and sees the skills.
+    let codex_home = root.join("codex-home");
+    fs::create_dir_all(&codex_home)
+        .with_context(|| format!("creating {}", codex_home.display()))?;
+    write_codex_projection(&codex_home, &skills_dir, create)?;
+    link_codex_auth_state(&codex_home)?;
+    env.insert(
+        "CODEX_HOME".into(),
+        codex_home.to_string_lossy().into_owned(),
+    );
 
     Ok(())
-}
-
-fn is_codex_argv(argv: &[String]) -> bool {
-    argv.first()
-        .and_then(|bin| Path::new(bin).file_name())
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.to_ascii_lowercase().contains("codex"))
 }
 
 fn write_codex_projection(
     codex_home: &Path,
     skills_dir: &Path,
-    create: &AgentCreate,
+    create: &SessionCreate,
 ) -> Result<()> {
-    let mut config = String::from("# Generated by spawnd for this Spawn agent.\n");
+    let mut config = String::from("# Generated by spawnd for this Spawn session.\n");
     for skill in &create.skills {
         let path = skills_dir
             .join(safe_file_component(&skill.name))
@@ -2833,7 +2779,7 @@ fn toml_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::AgentSkillConfig;
+    use crate::proto::{SessionCreate, SkillConfig};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use futures_util::SinkExt;
@@ -2961,19 +2907,19 @@ mod tests {
         let session_id = Uuid::from_u128(2).to_string();
         let scope_id = Uuid::from_u128(3).to_string();
 
-        // The browser signs an agent offer intended for this host.
+        // The browser signs a session offer intended for this host.
         let offer = SignedSignalTranscript::new(
             SignalKind::Offer,
             2,
             session_id.clone(),
-            ScopeType::Agent,
+            ScopeType::Session,
             scope_id.clone(),
             SenderRole::Browser,
             host_peer.to_bytes(),
             "v=0\r\no=browser\r\n",
         )
         .unwrap();
-        let offer_wire = sign_rtc_signal_wire(&browser_key, RtcProtocol::Agent, &offer).unwrap();
+        let offer_wire = sign_rtc_signal_wire(&browser_key, RtcProtocol::Session, &offer).unwrap();
 
         // The daemon verifies the offer against its host identity + pins.
         let verified = verify_signed_rtc_offer(&offer_wire, &record).expect("offer verifies");
@@ -2999,7 +2945,7 @@ mod tests {
             SignalKind::Offer,
             2,
             session_id,
-            ScopeType::Agent,
+            ScopeType::Session,
             scope_id,
             SenderRole::Browser,
             host_peer.to_bytes(),
@@ -3007,7 +2953,7 @@ mod tests {
         )
         .unwrap();
         let stranger_wire =
-            sign_rtc_signal_wire(&stranger, RtcProtocol::Agent, &stranger_offer).unwrap();
+            sign_rtc_signal_wire(&stranger, RtcProtocol::Session, &stranger_offer).unwrap();
         assert!(verify_signed_rtc_offer(&stranger_wire, &record).is_none());
     }
 
@@ -3629,7 +3575,7 @@ mod tests {
                  mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
                     response.headers_mut().insert(
                         SEC_WEBSOCKET_PROTOCOL,
-                        HeaderValue::from_static("spawn.control.v2"),
+                        HeaderValue::from_static("spawn.control.v3"),
                     );
                     Ok(response)
                 },
@@ -3669,7 +3615,7 @@ mod tests {
             Ok(record.clone())
         })
         .expect("credential loader");
-        let registry = AgentRegistry::new();
+        let registry = SessionRegistry::new();
         assert!(registry.claim_discovery());
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
@@ -4015,7 +3961,7 @@ mod tests {
                         auth_tx.send(authorization).expect("auth observation");
                         response.headers_mut().insert(
                             SEC_WEBSOCKET_PROTOCOL,
-                            HeaderValue::from_static("spawn.control.v2"),
+                            HeaderValue::from_static("spawn.control.v3"),
                         );
                         Ok(response)
                     },
@@ -4057,7 +4003,7 @@ mod tests {
         };
         let mut loader =
             CredentialLoader::start(Duration::from_secs(1), load).expect("credential loader");
-        let registry = AgentRegistry::new();
+        let registry = SessionRegistry::new();
         assert!(
             registry.claim_discovery(),
             "disable ambient worker discovery"
@@ -4140,7 +4086,7 @@ mod tests {
                  mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
                     response.headers_mut().insert(
                         SEC_WEBSOCKET_PROTOCOL,
-                        HeaderValue::from_static("spawn.control.v2"),
+                        HeaderValue::from_static("spawn.control.v3"),
                     );
                     Ok(response)
                 },
@@ -4159,17 +4105,16 @@ mod tests {
                 "register"
             );
 
-            let session_id = "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1";
-            let agent_id = "11111111-2222-4333-8444-555555555555";
+            let signal_id = "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1";
+            let session_id = "11111111-2222-4333-8444-555555555555";
             let frames = [
                 serde_json::json!({
                     "type": "rtc.offer",
-                    "session_id": session_id,
+                    "session_id": signal_id,
                     "binding_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "binding_generation": 7,
-                    "agent_id": agent_id,
-                    "scope_type": "agent",
-                    "scope_id": agent_id,
+                    "scope_type": "session",
+                    "scope_id": session_id,
                     "protocol": "spawn.pty",
                     "protocol_version": 2,
                     "signed_envelope": null,
@@ -4262,7 +4207,7 @@ mod tests {
         let mut loader =
             CredentialLoader::start(Duration::from_secs(1), move || Ok(stable_record.clone()))
                 .expect("credential loader");
-        let registry = AgentRegistry::new();
+        let registry = SessionRegistry::new();
         assert!(registry.claim_discovery());
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
@@ -4340,14 +4285,14 @@ mod tests {
             SignalKind::Offer,
             2,
             Uuid::from_u128(2).to_string(),
-            ScopeType::Agent,
+            ScopeType::Session,
             Uuid::from_u128(3).to_string(),
             SenderRole::Browser,
             host_peer.to_bytes(),
             "v=0\r\no=browser\r\n",
         )
         .unwrap();
-        let envelope = sign_rtc_signal_wire(&browser_key, RtcProtocol::Agent, &offer).unwrap();
+        let envelope = sign_rtc_signal_wire(&browser_key, RtcProtocol::Session, &offer).unwrap();
 
         // One genuine X→B edge, presented as duplicate copies up to the cap —
         // the honest relay's own maximum. Duplicates collapse before the
@@ -4444,7 +4389,7 @@ mod tests {
                  mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
                     response.headers_mut().insert(
                         SEC_WEBSOCKET_PROTOCOL,
-                        HeaderValue::from_static("spawn.control.v2"),
+                        HeaderValue::from_static("spawn.control.v3"),
                     );
                     Ok(response)
                 },
@@ -4551,7 +4496,7 @@ mod tests {
         let mut loader =
             CredentialLoader::start(Duration::from_secs(1), move || Ok(stable_record.clone()))
                 .expect("credential loader");
-        let registry = AgentRegistry::new();
+        let registry = SessionRegistry::new();
         assert!(registry.claim_discovery());
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
@@ -4625,7 +4570,7 @@ mod tests {
                     );
                     response.headers_mut().insert(
                         SEC_WEBSOCKET_PROTOCOL,
-                        HeaderValue::from_static("spawn.control.v2"),
+                        HeaderValue::from_static("spawn.control.v3"),
                     );
                     Ok(response)
                 },
@@ -4680,7 +4625,7 @@ mod tests {
             exit_tx,
         )
         .expect("credential loader");
-        let registry = AgentRegistry::new();
+        let registry = SessionRegistry::new();
         assert!(registry.claim_discovery());
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
@@ -4789,7 +4734,7 @@ mod tests {
                     );
                     response.headers_mut().insert(
                         SEC_WEBSOCKET_PROTOCOL,
-                        HeaderValue::from_static("spawn.control.v2"),
+                        HeaderValue::from_static("spawn.control.v3"),
                     );
                     Ok(response)
                 },
@@ -4846,7 +4791,7 @@ mod tests {
             reply_tx,
         )
         .expect("credential loader");
-        let registry = AgentRegistry::new();
+        let registry = SessionRegistry::new();
         assert!(registry.claim_discovery());
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
@@ -4941,10 +4886,10 @@ mod tests {
         version: Option<&str>,
         latest: Option<&str>,
         update_available: Option<bool>,
-    ) -> HostToolStatus {
-        HostToolStatus {
-            preset_id: "p".into(),
-            preset_name: "claude".into(),
+    ) -> HostAgentStatus {
+        HostAgentStatus {
+            agent_id: "p".into(),
+            agent_name: "claude".into(),
             agent_kind: "claude-code".into(),
             command: "claude".into(),
             install: None,
@@ -5022,20 +4967,17 @@ mod tests {
         fs::create_dir_all(skills_dir.join("spawn-control")).expect("spawn skill dir");
         fs::create_dir_all(skills_dir.join("repo-notes")).expect("notes skill dir");
 
-        let create = AgentCreate {
-            agent_id: Uuid::new_v4(),
+        let create = SessionCreate {
+            session_id: Uuid::new_v4(),
             cwd: "/work/repo".to_string(),
-            argv: vec!["/opt/homebrew/bin/codex".to_string()],
-            env: BTreeMap::new(),
-            install: None,
             skills: vec![
-                AgentSkillConfig {
+                SkillConfig {
                     id: "skill-1".to_string(),
                     name: "spawn control".to_string(),
                     description: "Operate spawn".to_string(),
                     content: "Use spawn carefully.".to_string(),
                 },
-                AgentSkillConfig {
+                SkillConfig {
                     id: "skill-2".to_string(),
                     name: "repo/notes".to_string(),
                     description: "Repo notes".to_string(),
@@ -5124,7 +5066,7 @@ mod tests {
         env.insert("SHELL".to_string(), bash.to_string_lossy().into_owned());
         env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
 
-        normalize_agent_env(&mut env).await;
+        normalize_session_env(&mut env).await;
 
         let path = env.get("PATH").expect("path");
         let entries = std::env::split_paths(path).collect::<Vec<_>>();
@@ -5140,25 +5082,25 @@ mod tests {
     }
 }
 
-async fn handle_agent_restart(
-    create: AgentCreate,
-    registry: &AgentRegistry,
+async fn handle_session_restart(
+    create: SessionCreate,
+    registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    let agent_id = create.agent_id;
-    tracing::info!(%agent_id, argv = ?create.argv, "agent.restart");
+    let session_id = create.session_id;
+    tracing::info!(%session_id, "session.restart");
 
     // Hold the generation transition across every lifecycle delivery. This
     // lets each TERM/KILL revalidate the exact atomic lifecycle snapshot and
     // prevents replacement from linearizing between validation and the
     // worker-owned signal syscall.
-    let transition = registry.lock_generation_transition(agent_id).await;
-    let current = registry.lifecycle_snapshot(agent_id);
+    let transition = registry.lock_generation_transition(session_id).await;
+    let current = registry.lifecycle_snapshot(session_id);
     if let Some(snapshot) = &current {
         let binding = snapshot.binding();
         rtc_sessions
-            .close_for_agent(agent_id, binding.generation())
+            .close_for_session(session_id, binding.generation())
             .await;
         if let Some(control) = registry.control_for_binding(binding) {
             control.clear_sink().await;
@@ -5171,14 +5113,14 @@ async fn handle_agent_restart(
                 .shutdown(spawnd::sessiond::wire::LifecycleSignal::Term)
                 .await
         } else {
-            Err(anyhow!("stale agent lifecycle generation"))
+            Err(anyhow!("stale session lifecycle generation"))
         };
         if let Err(error) = &term_result {
-            tracing::warn!(%agent_id, %error, "restart TERM delivery failed; escalating now");
+            tracing::warn!(%session_id, %error, "restart TERM delivery failed; escalating now");
         }
         let mut kill_attempted = false;
         for attempt in 0..30u32 {
-            if !worker_backend::socket_exists(agent_id) {
+            if !worker_backend::socket_exists(session_id) {
                 break;
             }
             if !kill_attempted && (attempt == 15 || term_result.is_err()) {
@@ -5189,50 +5131,50 @@ async fn handle_agent_restart(
                         .shutdown(spawnd::sessiond::wire::LifecycleSignal::Kill)
                         .await
                 } else {
-                    Err(anyhow!("stale agent lifecycle generation"))
+                    Err(anyhow!("stale session lifecycle generation"))
                 };
                 if let Err(error) = kill_result {
-                    tracing::error!(%agent_id, %error, "restart KILL delivery failed");
+                    tracing::error!(%session_id, %error, "restart KILL delivery failed");
                 }
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let _ = registry.remove_if_generation(agent_id, binding.generation());
+        let _ = registry.remove_if_generation(session_id, binding.generation());
     }
     drop(transition);
 
-    if worker_backend::socket_exists(agent_id) {
-        send_spawn_failed_exit(agent_id, out_tx, "restart timeout").await;
+    if worker_backend::socket_exists(session_id) {
+        send_spawn_failed_exit(session_id, out_tx, "restart timeout").await;
         return;
     }
-    handle_agent_create(create, registry, rtc_sessions, out_tx).await;
+    handle_session_create(create, registry, rtc_sessions, out_tx).await;
 }
 
-async fn handle_agent_kill(
-    agent_id: Uuid,
+async fn handle_session_kill(
+    session_id: Uuid,
     signal: Option<spawnd::sessiond::wire::LifecycleSignal>,
-    registry: &AgentRegistry,
+    registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     // Signal through the worker, adopting first if this daemon process has
-    // not attached yet. The worker Exit frame drives agent.exit.
-    if !registry.contains(agent_id) {
-        let _ = ensure_agent_attached(agent_id, registry, rtc_sessions, out_tx).await;
+    // not attached yet. The worker Exit frame drives session.exit.
+    if !registry.contains(session_id) {
+        let _ = ensure_session_attached(session_id, registry, rtc_sessions, out_tx).await;
     }
-    let Some(snapshot) = registry.lifecycle_snapshot(agent_id) else {
+    let Some(snapshot) = registry.lifecycle_snapshot(session_id) else {
         send_error(
             out_tx,
-            Some(agent_id),
+            Some(session_id),
             "kill_failed",
-            &anyhow!("agent lifecycle is unavailable"),
+            &anyhow!("session lifecycle is unavailable"),
         )
         .await;
         return;
     };
     let requested = signal.unwrap_or(spawnd::sessiond::wire::LifecycleSignal::Term);
     if let Err(error) = registry.shutdown_if_current(&snapshot, requested).await {
-        tracing::warn!(%agent_id, %error, "agent signal delivery failed");
+        tracing::warn!(%session_id, %error, "session signal delivery failed");
         let final_error = if requested == spawnd::sessiond::wire::LifecycleSignal::Kill {
             error
         } else {
@@ -5246,7 +5188,7 @@ async fn handle_agent_kill(
         };
         send_error(
             out_tx,
-            Some(agent_id),
+            Some(session_id),
             "kill_failed",
             &final_error.context("lifecycle delivery failed after escalation"),
         )
@@ -5261,23 +5203,23 @@ async fn handle_agent_kill(
                 .shutdown_if_current(&snapshot, spawnd::sessiond::wire::LifecycleSignal::Kill)
                 .await
             {
-                tracing::warn!(%agent_id, %error, "delayed agent KILL delivery failed");
+                tracing::warn!(%session_id, %error, "delayed session KILL delivery failed");
             }
         });
     }
-    // The worker reports exit and emits `agent.exit`. We do not
+    // The worker reports exit and emits `session.exit`. We do not
     // remove from the registry here — let the exit handler do it once it has
     // the exit code.
 }
 
 async fn send_error(
     out_tx: &mpsc::Sender<WsOutbound>,
-    agent_id: Option<Uuid>,
+    session_id: Option<Uuid>,
     code: &str,
     err: &anyhow::Error,
 ) {
     let frame = Outbound::Error {
-        agent_id,
+        session_id,
         code: code.into(),
         message: format!("{err:#}"),
         request_id: None,
@@ -5286,17 +5228,17 @@ async fn send_error(
     if let Ok(s) = serde_json::to_string(&frame) {
         let _ = out_tx.send(WsOutbound::json(s)).await;
     }
-    tracing::warn!(?agent_id, code, error = %err, "sent error frame");
+    tracing::warn!(?session_id, code, error = %err, "sent error frame");
 }
 
 async fn send_error_code(
     out_tx: &mpsc::Sender<WsOutbound>,
-    agent_id: Option<Uuid>,
+    session_id: Option<Uuid>,
     code: &str,
     message: &str,
 ) {
     let frame = Outbound::Error {
-        agent_id,
+        session_id,
         code: code.into(),
         message: message.into(),
         request_id: None,
@@ -5307,9 +5249,9 @@ async fn send_error_code(
     }
 }
 
-async fn send_spawn_failed_exit(agent_id: Uuid, out_tx: &mpsc::Sender<WsOutbound>, reason: &str) {
-    let exit = Outbound::AgentExit {
-        agent_id,
+async fn send_spawn_failed_exit(session_id: Uuid, out_tx: &mpsc::Sender<WsOutbound>, reason: &str) {
+    let exit = Outbound::SessionExit {
+        session_id,
         exit_code: None,
         signal: Some(format!("spawn_failed: {reason}")),
     };
@@ -5319,10 +5261,10 @@ async fn send_spawn_failed_exit(agent_id: Uuid, out_tx: &mpsc::Sender<WsOutbound
 }
 
 async fn spawn_exit_forwarder(
-    agent_id: Uuid,
+    session_id: Uuid,
     generation: u64,
     exit_rx: tokio::sync::oneshot::Receiver<pty::ExitReason>,
-    registry: AgentRegistry,
+    registry: SessionRegistry,
     rtc_sessions: RtcSessions,
     out_tx: mpsc::Sender<WsOutbound>,
 ) {
@@ -5330,16 +5272,16 @@ async fn spawn_exit_forwarder(
         exit_code: None,
         signal: None,
     });
-    let transition = registry.lock_generation_transition(agent_id).await;
-    let removed = registry.remove_if_generation(agent_id, generation);
-    rtc_sessions.close_for_agent(agent_id, generation).await;
+    let transition = registry.lock_generation_transition(session_id).await;
+    let removed = registry.remove_if_generation(session_id, generation);
+    rtc_sessions.close_for_session(session_id, generation).await;
     drop(transition);
     if removed.is_none() {
-        tracing::debug!(%agent_id, generation, "ignoring stale agent exit");
+        tracing::debug!(%session_id, generation, "ignoring stale session exit");
         return;
     }
-    let exit = Outbound::AgentExit {
-        agent_id,
+    let exit = Outbound::SessionExit {
+        session_id,
         exit_code: reason.exit_code,
         signal: reason.signal,
     };
@@ -5348,23 +5290,23 @@ async fn spawn_exit_forwarder(
     }
 }
 
-/// Adopt a running session worker for this agent (spawnd restart / lazy
+/// Adopt a running session worker for this session (spawnd restart / lazy
 /// attach). Returns false when no live worker exists.
-async fn adopt_worker_agent(
-    agent_id: Uuid,
-    registry: &AgentRegistry,
+async fn adopt_worker_session(
+    session_id: Uuid,
+    registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
     notify_started: bool,
 ) -> Result<bool> {
-    if registry.contains(agent_id) {
+    if registry.contains(session_id) {
         return Ok(true);
     }
-    let Some(launched) = worker_backend::adopt(agent_id).await? else {
+    let Some(launched) = worker_backend::adopt(session_id).await? else {
         return Ok(false);
     };
     register_attached(
-        agent_id,
+        session_id,
         launched,
         registry,
         rtc_sessions,
@@ -5376,11 +5318,11 @@ async fn adopt_worker_agent(
 }
 
 /// Shared tail of launch/adopt: wire the sink, insert into the
-/// registry, optionally announce agent.started, and spawn the exit forwarder.
+/// registry, optionally announce session.started, and spawn the exit forwarder.
 async fn register_attached(
-    agent_id: Uuid,
+    session_id: Uuid,
     launched: pty::Launched,
-    registry: &AgentRegistry,
+    registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
     notify_started: bool,
@@ -5389,25 +5331,25 @@ async fn register_attached(
     let exit_rx = launched.exit_rx;
 
     launched.handle.control.set_sink(out_tx.clone()).await;
-    let transition = registry.lock_generation_transition(agent_id).await;
-    if let Some(previous) = registry.binding_for(agent_id) {
-        let _ = registry.remove_if_generation(agent_id, previous.generation());
+    let transition = registry.lock_generation_transition(session_id).await;
+    if let Some(previous) = registry.binding_for(session_id) {
+        let _ = registry.remove_if_generation(session_id, previous.generation());
         rtc_sessions
-            .close_for_agent(agent_id, previous.generation())
+            .close_for_session(session_id, previous.generation())
             .await;
     }
     let generation = registry.insert(launched.handle);
     drop(transition);
 
     if notify_started {
-        let started = Outbound::AgentStarted { agent_id, pid };
+        let started = Outbound::SessionStarted { session_id, pid };
         let _ = out_tx
             .send(WsOutbound::json(serde_json::to_string(&started).unwrap()))
             .await;
     }
 
     tokio::spawn(spawn_exit_forwarder(
-        agent_id,
+        session_id,
         generation,
         exit_rx,
         registry.clone(),
@@ -5427,32 +5369,32 @@ enum AttachOutcome {
     Unknown,
 }
 
-async fn ensure_agent_attached(
-    agent_id: Uuid,
-    registry: &AgentRegistry,
+async fn ensure_session_attached(
+    session_id: Uuid,
+    registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) -> AttachOutcome {
-    if registry.contains(agent_id) {
+    if registry.contains(session_id) {
         return AttachOutcome::Attached;
     }
     // Serialize lazy adoption: snapshot bursts and stdin dispatch racing here
     // would double-connect and displace each other's worker connections.
     let _guard = registry.lock_attach().await;
-    if registry.contains(agent_id) {
+    if registry.contains(session_id) {
         return AttachOutcome::Attached;
     }
-    match adopt_worker_agent(agent_id, registry, rtc_sessions, out_tx, true).await {
+    match adopt_worker_session(session_id, registry, rtc_sessions, out_tx, true).await {
         Ok(true) => {
-            tracing::info!(%agent_id, "lazily adopted session worker");
+            tracing::info!(%session_id, "lazily adopted session worker");
             AttachOutcome::Attached
         }
         Ok(false) => {
-            tracing::debug!(%agent_id, "no session worker found for unknown agent");
+            tracing::debug!(%session_id, "no session worker found for unknown session");
             AttachOutcome::Unavailable
         }
         Err(e) => {
-            tracing::warn!(%agent_id, error = %e, "worker adoption failed");
+            tracing::warn!(%session_id, error = %e, "worker adoption failed");
             AttachOutcome::Unknown
         }
     }
@@ -5460,61 +5402,22 @@ async fn ensure_agent_attached(
 
 /// On daemon startup, discover worker sockets left behind by a previous
 /// instance and adopt each live session.
-async fn rediscover_existing_agents(
-    registry: &AgentRegistry,
+async fn rediscover_existing_sessions(
+    registry: &SessionRegistry,
     rtc_sessions: &RtcSessions,
     out_tx: &mpsc::Sender<WsOutbound>,
 ) {
-    for agent_id in worker_backend::discover_ids() {
-        if registry.contains(agent_id) {
+    for session_id in worker_backend::discover_ids() {
+        if registry.contains(session_id) {
             continue;
         }
-        match adopt_worker_agent(agent_id, registry, rtc_sessions, out_tx, false).await {
-            Ok(true) => tracing::info!(%agent_id, "rediscovered worker-backed agent"),
+        match adopt_worker_session(session_id, registry, rtc_sessions, out_tx, false).await {
+            Ok(true) => tracing::info!(%session_id, "rediscovered worker-backed session"),
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(%agent_id, error = %e, "failed to adopt session worker");
+                tracing::warn!(%session_id, error = %e, "failed to adopt session worker");
             }
         }
     }
 }
 
-/// Returns true if `bin` resolves to something on PATH.
-async fn binary_exists(bin: &str, env: &BTreeMap<String, String>) -> bool {
-    binary_path(bin, env).await.is_some()
-}
-
-/// Run an endpoint-local install command. Output is discarded because the
-/// server control socket is signaling/metadata-only; interactive tool output
-/// moves to the host DataChannel in P2-HOST-03A.
-async fn run_install(install_cmd: &str, env: &BTreeMap<String, String>) -> bool {
-    let mut shell = tokio::process::Command::new("bash");
-    shell
-        .arg("-c")
-        .arg(format!("exec 2>&1; {install_cmd}"))
-        .envs(env)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-
-    let mut child = match shell.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            tracing::warn!(%error, "failed to start endpoint-local install");
-            return false;
-        }
-    };
-
-    match child.wait().await {
-        Ok(s) if s.success() => true,
-        Ok(status) => {
-            tracing::warn!(exit_code = ?status.code(), "endpoint-local install failed");
-            false
-        }
-        Err(error) => {
-            tracing::warn!(%error, "waiting for endpoint-local install failed");
-            false
-        }
-    }
-}

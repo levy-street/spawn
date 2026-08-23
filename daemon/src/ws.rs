@@ -2,7 +2,7 @@
 //!
 //! Owns the WS connection lifecycle: connect, register, fan inbound frames
 //! to the dispatch loop, and a single sender task that owns the write half
-//! and is fed by an mpsc channel from any number of per-agent reader tasks.
+//! and is fed by an mpsc channel from any number of per-session reader tasks.
 
 use std::time::Duration;
 
@@ -21,10 +21,10 @@ use url::Url;
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-const SUBPROTOCOL: &str = "spawn.control.v2";
+const SUBPROTOCOL: &str = "spawn.control.v3";
 
 /// Open a WS/WSS connection with `Authorization: Bearer <token>` and
-/// `Sec-WebSocket-Protocol: spawn.control.v2`. We TCP-connect manually first so we
+/// `Sec-WebSocket-Protocol: spawn.control.v3`. We TCP-connect manually first so we
 /// can enable TCP keepalive on the socket — without it, a half-dead remote
 /// (e.g. `uvicorn` shut down without a clean WS close) leaves the daemon's
 /// socket in `CLOSE-WAIT` indefinitely with no way for tungstenite to
@@ -395,16 +395,15 @@ mod tests {
             .await
             .expect("websocket log test handshake");
 
-            let agent_id = "11111111-2222-4333-8444-555555555555";
+            let session_id = "11111111-2222-4333-8444-555555555555";
             let rejected = [
                 serde_json::json!({
                     "type": "rtc.offer",
                     "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
                     "binding_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "binding_generation": 7,
-                    "agent_id": agent_id,
-                    "scope_type": "agent",
-                    "scope_id": agent_id,
+                    "scope_type": "session",
+                    "scope_id": session_id,
                     "protocol": "spawn.pty",
                     "protocol_version": 2,
                     "signed_envelope": null,

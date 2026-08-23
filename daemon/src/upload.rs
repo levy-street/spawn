@@ -22,11 +22,11 @@ use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::agents::AgentBinding;
+use crate::sessions::SessionBinding;
 
 pub const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
 pub const UPLOAD_CHUNK_BYTES: usize = 48 * 1024;
-pub const MAX_ACTIVE_UPLOADS_PER_SESSION: usize = 4;
+pub const MAX_ACTIVE_UPLOADS_PER_VIEWER: usize = 4;
 pub const MAX_ACTIVE_UPLOADS_TOTAL: usize = 64;
 pub const MAX_COMPLETED_UPLOADS: usize = 128;
 pub const MAX_RETIRED_UPLOAD_GENERATIONS: usize = 1024;
@@ -150,7 +150,7 @@ pub enum UploadChunkOutcome {
 }
 
 pub struct UploadChunkRequest<'a> {
-    pub session_id: &'a str,
+    pub viewer_id: &'a str,
     pub capability: Uuid,
     pub upload_id: Uuid,
     pub sequence: u32,
@@ -202,15 +202,15 @@ pub type UploadOpResult<T> = std::result::Result<T, UploadError>;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct UploadKey {
-    agent_id: Uuid,
-    agent_generation: u64,
+    session_id: Uuid,
+    session_generation: u64,
     upload_id: Uuid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UploadOwner {
     capability: Uuid,
-    session_id: String,
+    viewer_id: String,
 }
 
 struct ActiveUpload {
@@ -481,18 +481,18 @@ impl UploadHub {
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
-        agent: AgentBinding,
-        session_id: &str,
+        session: SessionBinding,
+        viewer_id: &str,
         capability: Uuid,
         upload_id: Uuid,
         cwd: &str,
         manifest: UploadManifest,
     ) -> UploadOpResult<UploadStartOutcome> {
         manifest.validate().map_err(UploadError::failed)?;
-        let key = upload_key(agent, upload_id);
+        let key = upload_key(session, upload_id);
         let owner = UploadOwner {
             capability,
-            session_id: session_id.to_string(),
+            viewer_id: viewer_id.to_string(),
         };
         let entry = match self.admit(key.clone(), owner.clone(), manifest.clone())? {
             UploadAdmission::Inserted(entry) => entry,
@@ -615,18 +615,18 @@ impl UploadHub {
 
     pub async fn write_chunk(
         &self,
-        agent: AgentBinding,
+        session: SessionBinding,
         request: UploadChunkRequest<'_>,
     ) -> UploadOpResult<UploadChunkOutcome> {
         let UploadChunkRequest {
-            session_id,
+            viewer_id,
             capability,
             upload_id,
             sequence,
             last,
             bytes,
         } = request;
-        let key = upload_key(agent, upload_id);
+        let key = upload_key(session, upload_id);
         let entry = {
             let state = self
                 .inner
@@ -648,7 +648,7 @@ impl UploadHub {
         };
         let owner = UploadOwner {
             capability,
-            session_id: session_id.to_string(),
+            viewer_id: viewer_id.to_string(),
         };
         if entry.owner != owner {
             return Err(UploadError::failed(
@@ -713,12 +713,12 @@ impl UploadHub {
 
     pub async fn cancel(
         &self,
-        agent: AgentBinding,
-        session_id: &str,
+        session: SessionBinding,
+        viewer_id: &str,
         capability: Uuid,
         upload_id: Uuid,
     ) -> UploadOpResult<bool> {
-        let key = upload_key(agent, upload_id);
+        let key = upload_key(session, upload_id);
         let entry = {
             let state = self
                 .inner
@@ -731,7 +731,7 @@ impl UploadHub {
             if entry.owner
                 != (UploadOwner {
                     capability,
-                    session_id: session_id.to_string(),
+                    viewer_id: viewer_id.to_string(),
                 })
             {
                 return Err(UploadError::failed(
@@ -752,19 +752,19 @@ impl UploadHub {
     }
 
     #[cfg(test)]
-    async fn cancel_session(&self, agent: AgentBinding, session_id: &str) {
+    async fn cancel_viewer(&self, session: SessionBinding, viewer_id: &str) {
         let deadline = TokioInstant::now() + upload_close_timeout();
-        self.cancel_session_until(agent, session_id, deadline).await;
+        self.cancel_viewer_until(session, viewer_id, deadline).await;
     }
 
     #[cfg(test)]
-    pub async fn cancel_session_until(
+    pub async fn cancel_viewer_until(
         &self,
-        agent: AgentBinding,
-        session_id: &str,
+        session: SessionBinding,
+        viewer_id: &str,
         deadline: TokioInstant,
     ) {
-        let active = self.session_entries(agent, session_id);
+        let active = self.viewer_entries(session, viewer_id);
         for (key, entry) in &active {
             self.cancel_entry(key.clone(), Arc::clone(entry));
         }
@@ -776,8 +776,8 @@ impl UploadHub {
     /// drained. Peer cleanup owns this wait after its externally visible
     /// deadline has expired; a later teardown can safely schedule another
     /// retry for a retained published entry.
-    pub async fn cancel_session_and_wait(&self, agent: AgentBinding, session_id: &str) {
-        let active = self.session_entries(agent, session_id);
+    pub async fn cancel_viewer_and_wait(&self, session: SessionBinding, viewer_id: &str) {
+        let active = self.viewer_entries(session, viewer_id);
         for (key, entry) in &active {
             self.cancel_entry(key.clone(), Arc::clone(entry));
         }
@@ -792,27 +792,27 @@ impl UploadHub {
         }
     }
 
-    pub fn cancel_session_now(&self, agent: AgentBinding, session_id: &str) {
-        for (key, entry) in self.session_entries(agent, session_id) {
+    pub fn cancel_viewer_now(&self, session: SessionBinding, viewer_id: &str) {
+        for (key, entry) in self.viewer_entries(session, viewer_id) {
             self.cancel_entry(key, entry);
         }
     }
 
-    fn session_entries(
+    fn viewer_entries(
         &self,
-        agent: AgentBinding,
-        session_id: &str,
+        session: SessionBinding,
+        viewer_id: &str,
     ) -> Vec<(UploadKey, Arc<ActiveEntry>)> {
         self.matching_entries(|key, entry| {
-            key.agent_id == agent.agent_id()
-                && key.agent_generation == agent.generation()
-                && entry.owner.session_id == session_id
+            key.session_id == session.session_id()
+                && key.session_generation == session.generation()
+                && entry.owner.viewer_id == viewer_id
         })
     }
 
-    pub async fn remove_generation_until(&self, agent: AgentBinding, deadline: TokioInstant) {
-        self.retire_generation(agent);
-        let active = self.generation_entries(agent);
+    pub async fn remove_generation_until(&self, session: SessionBinding, deadline: TokioInstant) {
+        self.retire_generation(session);
+        let active = self.generation_entries(session);
         for (key, entry) in &active {
             self.cancel_entry(key.clone(), Arc::clone(entry));
         }
@@ -823,33 +823,33 @@ impl UploadHub {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.completed.retain(|key, _| {
-            key.agent_id != agent.agent_id() || key.agent_generation != agent.generation()
+            key.session_id != session.session_id() || key.session_generation != session.generation()
         });
         state.completed_order.retain(|key| {
-            key.agent_id != agent.agent_id() || key.agent_generation != agent.generation()
+            key.session_id != session.session_id() || key.session_generation != session.generation()
         });
     }
 
-    pub fn remove_generation_now(&self, agent: AgentBinding) {
-        self.retire_generation(agent);
-        for (key, entry) in self.generation_entries(agent) {
+    pub fn remove_generation_now(&self, session: SessionBinding) {
+        self.retire_generation(session);
+        for (key, entry) in self.generation_entries(session) {
             self.cancel_entry(key, entry);
         }
     }
 
-    fn generation_entries(&self, agent: AgentBinding) -> Vec<(UploadKey, Arc<ActiveEntry>)> {
+    fn generation_entries(&self, session: SessionBinding) -> Vec<(UploadKey, Arc<ActiveEntry>)> {
         self.matching_entries(|key, _| {
-            key.agent_id == agent.agent_id() && key.agent_generation == agent.generation()
+            key.session_id == session.session_id() && key.session_generation == session.generation()
         })
     }
 
-    fn retire_generation(&self, agent: AgentBinding) {
+    fn retire_generation(&self, session: SessionBinding) {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let retired = (agent.agent_id(), agent.generation());
+        let retired = (session.session_id(), session.generation());
         if state.retired_generations.insert(retired) {
             state.retired_generation_order.push_back(retired);
         }
@@ -945,11 +945,11 @@ impl UploadHub {
         prune_completed(&mut state);
         if state
             .retired_generations
-            .contains(&(key.agent_id, key.agent_generation))
+            .contains(&(key.session_id, key.session_generation))
         {
             return Err(UploadError::new(
                 "stale_agent_generation",
-                "the upload belongs to a replaced agent backend",
+                "the upload belongs to a replaced session backend",
             ));
         }
         if let Some(completed) = state.completed.get(&key) {
@@ -963,12 +963,12 @@ impl UploadHub {
         if let Some(entry) = state.active.get(&key) {
             return Ok(UploadAdmission::Existing(Arc::clone(entry)));
         }
-        let session_active = state
+        let viewer_active = state
             .active
             .values()
-            .filter(|entry| entry.owner.session_id == owner.session_id)
+            .filter(|entry| entry.owner.viewer_id == owner.viewer_id)
             .count();
-        if session_active >= MAX_ACTIVE_UPLOADS_PER_SESSION
+        if viewer_active >= MAX_ACTIVE_UPLOADS_PER_VIEWER
             || state.active.len() >= MAX_ACTIVE_UPLOADS_TOTAL
         {
             return Err(UploadError::failed("too many active uploads"));
@@ -1078,6 +1078,18 @@ impl UploadHub {
     }
 
     fn release_entry(&self, key: &UploadKey, entry: &Arc<ActiveEntry>) {
+        // A retired entry must not own descriptors: the releasing operation's
+        // permit signals idle before the entry's last Arc drops, so anything
+        // still in the slot (the directory fd) would outlive the drain the
+        // permit vouches for. Taken before the state lock — record_published
+        // establishes the upload→state lock order and this must not invert it.
+        drop(
+            entry
+                .upload
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
         let mut state = self
             .inner
             .state
@@ -1120,7 +1132,7 @@ impl UploadHub {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state
             .retired_generations
-            .contains(&(key.agent_id, key.agent_generation))
+            .contains(&(key.session_id, key.session_generation))
         {
             return;
         }
@@ -1214,10 +1226,10 @@ impl UploadHub {
     }
 }
 
-fn upload_key(agent: AgentBinding, upload_id: Uuid) -> UploadKey {
+fn upload_key(session: SessionBinding, upload_id: Uuid) -> UploadKey {
     UploadKey {
-        agent_id: agent.agent_id(),
-        agent_generation: agent.generation(),
+        session_id: session.session_id(),
+        session_generation: session.generation(),
         upload_id,
     }
 }
@@ -1420,11 +1432,11 @@ fn upload_close_timeout() -> Duration {
 
 fn open_capability_root(cwd: &str) -> Result<(PathBuf, OwnedFd)> {
     if cwd.is_empty() || cwd.len() > MAX_UPLOAD_PATH_BYTES {
-        anyhow::bail!("agent cwd is outside upload path limits");
+        anyhow::bail!("session cwd is outside upload path limits");
     }
     let path = Path::new(cwd);
     if !path.is_absolute() {
-        anyhow::bail!("agent cwd is not an absolute capability root");
+        anyhow::bail!("session cwd is not an absolute capability root");
     }
     let mut current = owned_fd(open(
         Path::new("/"),
@@ -1443,11 +1455,11 @@ fn open_capability_root(cwd: &str) -> Result<(PathBuf, OwnedFd)> {
                         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
                         Mode::empty(),
                     )
-                    .context("opening agent cwd capability component")?,
+                    .context("opening session cwd capability component")?,
                 );
                 normalized.push(name);
             }
-            _ => anyhow::bail!("agent cwd contains an ambiguous component"),
+            _ => anyhow::bail!("session cwd contains an ambiguous component"),
         }
     }
     Ok((normalized, current))
@@ -1618,8 +1630,8 @@ mod tests {
     }
 
     struct CompleteUpload<'a> {
-        agent: AgentBinding,
-        session: &'a str,
+        session: SessionBinding,
+        viewer: &'a str,
         capability: Uuid,
         upload_id: Uuid,
         cwd: &'a str,
@@ -1629,8 +1641,8 @@ mod tests {
 
     async fn complete(hub: &UploadHub, spec: CompleteUpload<'_>) -> UploadResult {
         let CompleteUpload {
-            agent,
             session,
+            viewer,
             capability,
             upload_id,
             cwd,
@@ -1639,8 +1651,8 @@ mod tests {
         } = spec;
         assert!(matches!(
             hub.start(
-                agent,
                 session,
+                viewer,
                 capability,
                 upload_id,
                 cwd,
@@ -1657,9 +1669,9 @@ mod tests {
         for (sequence, chunk) in bytes.chunks(UPLOAD_CHUNK_BYTES).enumerate() {
             let outcome = hub
                 .write_chunk(
-                    agent,
+                    session,
                     UploadChunkRequest {
-                        session_id: session,
+                        viewer_id: viewer,
                         capability,
                         upload_id,
                         sequence: sequence as u32,
@@ -1717,14 +1729,14 @@ mod tests {
         let bytes = vec![7; UPLOAD_CHUNK_BYTES + 5];
         let upload_manifest = manifest(&bytes, "shot.png", UploadDestination::Attachments);
         let hub = UploadHub::default();
-        let agent = AgentBinding::new(Uuid::new_v4(), 7);
+        let session = SessionBinding::new(Uuid::new_v4(), 7);
         let capability = Uuid::new_v4();
         let upload_id = Uuid::new_v4();
         let result = complete(
             &hub,
             CompleteUpload {
-                agent,
-                session: "viewer",
+                session,
+                viewer: "viewer",
                 capability,
                 upload_id,
                 cwd: tmp.path().to_str().unwrap(),
@@ -1742,7 +1754,7 @@ mod tests {
         }
         assert!(matches!(
             hub.start(
-                agent,
+                session,
                 "replacement-viewer",
                 Uuid::new_v4(),
                 upload_id,
@@ -1762,11 +1774,11 @@ mod tests {
         let bytes = vec![3; UPLOAD_CHUNK_BYTES + 7];
         let upload_manifest = manifest(&bytes, "resume.bin", UploadDestination::Cwd);
         let hub = UploadHub::default();
-        let agent = AgentBinding::new(Uuid::new_v4(), 8);
+        let session = SessionBinding::new(Uuid::new_v4(), 8);
         let capability = Uuid::new_v4();
         let upload_id = Uuid::new_v4();
         hub.start(
-            agent,
+            session,
             "viewer",
             capability,
             upload_id,
@@ -1777,9 +1789,9 @@ mod tests {
         .unwrap();
         assert!(matches!(
             hub.write_chunk(
-                agent,
+                session,
                 UploadChunkRequest {
-                    session_id: "viewer",
+                    viewer_id: "viewer",
                     capability,
                     upload_id,
                     sequence: 0,
@@ -1793,7 +1805,7 @@ mod tests {
         ));
         assert!(matches!(
             hub.start(
-                agent,
+                session,
                 "viewer",
                 capability,
                 upload_id,
@@ -1809,7 +1821,7 @@ mod tests {
         ));
         assert!(hub
             .start(
-                agent,
+                session,
                 "other-viewer",
                 Uuid::new_v4(),
                 upload_id,
@@ -1820,7 +1832,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("capability"));
-        hub.cancel(agent, "viewer", capability, upload_id)
+        hub.cancel(session, "viewer", capability, upload_id)
             .await
             .unwrap();
         assert_eq!(hub.retained_counts().await, (0, 0));
@@ -1834,7 +1846,7 @@ mod tests {
         hooks.arm_admit_barrier(2);
         hooks.prepare.arm();
         hooks.ready_return.arm();
-        let agent = AgentBinding::new(Uuid::new_v4(), 81);
+        let session = SessionBinding::new(Uuid::new_v4(), 81);
         let capability = Uuid::new_v4();
         let upload_id = Uuid::new_v4();
         let cwd = tmp.path().to_string_lossy().into_owned();
@@ -1846,7 +1858,7 @@ mod tests {
         let first = tokio::spawn(async move {
             first_hub
                 .start(
-                    agent,
+                    session,
                     "viewer",
                     capability,
                     upload_id,
@@ -1860,7 +1872,7 @@ mod tests {
         let second = tokio::spawn(async move {
             second_hub
                 .start(
-                    agent,
+                    session,
                     "viewer",
                     capability,
                     upload_id,
@@ -1908,7 +1920,7 @@ mod tests {
         assert_eq!(private_temps, 1);
 
         assert!(hub
-            .cancel(agent, "viewer", capability, upload_id)
+            .cancel(session, "viewer", capability, upload_id)
             .await
             .unwrap());
         wait_for_upload_drain(&hub).await;
@@ -1924,7 +1936,7 @@ mod tests {
     async fn repeated_same_owner_start_never_exposes_active_before_the_prepared_slot() {
         let tmp = tempfile::tempdir().unwrap();
         let hub = UploadHub::default();
-        let agent = AgentBinding::new(Uuid::new_v4(), 83);
+        let session = SessionBinding::new(Uuid::new_v4(), 83);
         let capability = Uuid::new_v4();
         let cwd = tmp.path().to_string_lossy().into_owned();
 
@@ -1941,7 +1953,7 @@ mod tests {
             let first = tokio::spawn(async move {
                 first_hub
                     .start(
-                        agent,
+                        session,
                         "viewer",
                         capability,
                         upload_id,
@@ -1956,7 +1968,7 @@ mod tests {
             let second = tokio::spawn(async move {
                 second_hub
                     .start(
-                        agent,
+                        session,
                         "viewer",
                         capability,
                         upload_id,
@@ -1976,7 +1988,7 @@ mod tests {
                 ));
             }
             assert!(hub
-                .cancel(agent, "viewer", capability, upload_id)
+                .cancel(session, "viewer", capability, upload_id)
                 .await
                 .unwrap());
         }
@@ -1992,7 +2004,7 @@ mod tests {
         let hooks = hub.lifecycle_hooks();
         hooks.arm_admit_barrier(2);
         hooks.prepare.arm();
-        let agent = AgentBinding::new(Uuid::new_v4(), 82);
+        let session = SessionBinding::new(Uuid::new_v4(), 82);
         let capability = Uuid::new_v4();
         let other_capability = Uuid::new_v4();
         let upload_id = Uuid::new_v4();
@@ -2005,7 +2017,7 @@ mod tests {
         let first = tokio::spawn(async move {
             first_hub
                 .start(
-                    agent,
+                    session,
                     "viewer-a",
                     capability,
                     upload_id,
@@ -2020,7 +2032,7 @@ mod tests {
         let second = tokio::spawn(async move {
             second_hub
                 .start(
-                    agent,
+                    session,
                     "viewer-b",
                     other_capability,
                     upload_id,
@@ -2067,7 +2079,7 @@ mod tests {
         };
         assert!(matches!(
             hub.start(
-                agent,
+                session,
                 winner_session,
                 winner_capability,
                 upload_id,
@@ -2090,7 +2102,7 @@ mod tests {
         assert_eq!(private_temps, 1);
 
         assert!(hub
-            .cancel(agent, winner_session, winner_capability, upload_id)
+            .cancel(session, winner_session, winner_capability, upload_id)
             .await
             .unwrap());
         wait_for_upload_drain(&hub).await;
@@ -2106,11 +2118,11 @@ mod tests {
     async fn global_admission_cap_stays_charged_until_all_cleanup_drains() {
         let tmp = tempfile::tempdir().unwrap();
         let hub = UploadHub::default();
-        let agent = AgentBinding::new(Uuid::new_v4(), 9);
+        let session = SessionBinding::new(Uuid::new_v4(), 9);
         for index in 0..MAX_ACTIVE_UPLOADS_TOTAL {
             hub.start(
-                agent,
-                &format!("viewer-{}", index / MAX_ACTIVE_UPLOADS_PER_SESSION),
+                session,
+                &format!("viewer-{}", index / MAX_ACTIVE_UPLOADS_PER_VIEWER),
                 Uuid::new_v4(),
                 Uuid::new_v4(),
                 tmp.path().to_str().unwrap(),
@@ -2126,7 +2138,7 @@ mod tests {
         assert_eq!(hub.retained_counts().await.0, MAX_ACTIVE_UPLOADS_TOTAL);
         assert!(hub
             .start(
-                agent,
+                session,
                 "overflow-viewer",
                 Uuid::new_v4(),
                 Uuid::new_v4(),
@@ -2137,7 +2149,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("too many"));
-        hub.remove_generation_until(agent, TokioInstant::now() + Duration::from_secs(5))
+        hub.remove_generation_until(session, TokioInstant::now() + Duration::from_secs(5))
             .await;
         wait_for_upload_drain(&hub).await;
         assert_eq!(hub.retained_counts().await, (0, 0));
@@ -2147,7 +2159,7 @@ mod tests {
     async fn completed_cache_is_bounded_and_ttl_pruned() {
         let tmp = tempfile::tempdir().unwrap();
         let hub = UploadHub::default();
-        let agent = AgentBinding::new(Uuid::new_v4(), 10);
+        let session = SessionBinding::new(Uuid::new_v4(), 10);
         let mut completed = Vec::new();
         for index in 0..=MAX_COMPLETED_UPLOADS {
             let upload_id = Uuid::new_v4();
@@ -2156,8 +2168,8 @@ mod tests {
             complete(
                 &hub,
                 CompleteUpload {
-                    agent,
-                    session: "viewer",
+                    session,
+                    viewer: "viewer",
                     capability: Uuid::new_v4(),
                     upload_id,
                     cwd: tmp.path().to_str().unwrap(),
@@ -2172,7 +2184,7 @@ mod tests {
         let (first_id, first_manifest) = completed.first().unwrap();
         assert!(matches!(
             hub.start(
-                agent,
+                session,
                 "viewer",
                 Uuid::new_v4(),
                 *first_id,
@@ -2183,18 +2195,18 @@ mod tests {
             .unwrap(),
             UploadStartOutcome::Ready { .. }
         ));
-        hub.remove_generation_until(agent, TokioInstant::now() + Duration::from_secs(5))
+        hub.remove_generation_until(session, TokioInstant::now() + Duration::from_secs(5))
             .await;
         assert_eq!(hub.retained_counts().await, (0, 0));
 
-        let agent = AgentBinding::new(Uuid::new_v4(), 11);
+        let session = SessionBinding::new(Uuid::new_v4(), 11);
         let ttl_id = Uuid::new_v4();
         let ttl_manifest = manifest(b"ttl", "ttl.bin", UploadDestination::Cwd);
         complete(
             &hub,
             CompleteUpload {
-                agent,
-                session: "viewer",
+                session,
+                viewer: "viewer",
                 capability: Uuid::new_v4(),
                 upload_id: ttl_id,
                 cwd: tmp.path().to_str().unwrap(),
@@ -2206,7 +2218,7 @@ mod tests {
         hub.age_completed(COMPLETED_UPLOAD_TTL + Duration::from_secs(1));
         assert!(matches!(
             hub.start(
-                agent,
+                session,
                 "viewer",
                 Uuid::new_v4(),
                 ttl_id,
@@ -2217,7 +2229,7 @@ mod tests {
             .unwrap(),
             UploadStartOutcome::Ready { .. }
         ));
-        hub.remove_generation_until(agent, TokioInstant::now() + Duration::from_secs(5))
+        hub.remove_generation_until(session, TokioInstant::now() + Duration::from_secs(5))
             .await;
         wait_for_upload_drain(&hub).await;
     }
@@ -2227,12 +2239,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("note.txt"), b"old").unwrap();
         let hub = UploadHub::default();
-        let agent = AgentBinding::new(Uuid::new_v4(), 1);
+        let session = SessionBinding::new(Uuid::new_v4(), 1);
         let first = complete(
             &hub,
             CompleteUpload {
-                agent,
-                session: "first",
+                session,
+                viewer: "first",
                 capability: Uuid::new_v4(),
                 upload_id: Uuid::new_v4(),
                 cwd: tmp.path().to_str().unwrap(),
@@ -2244,8 +2256,8 @@ mod tests {
         let second = complete(
             &hub,
             CompleteUpload {
-                agent,
-                session: "second",
+                session,
+                viewer: "second",
                 capability: Uuid::new_v4(),
                 upload_id: Uuid::new_v4(),
                 cwd: tmp.path().to_str().unwrap(),
@@ -2264,13 +2276,13 @@ mod tests {
     async fn conflicts_bad_chunks_and_cancellation_remove_temporary_files() {
         let tmp = tempfile::tempdir().unwrap();
         let hub = UploadHub::default();
-        let agent = AgentBinding::new(Uuid::new_v4(), 2);
+        let session = SessionBinding::new(Uuid::new_v4(), 2);
         let capability = Uuid::new_v4();
         let upload_id = Uuid::new_v4();
         let bytes = vec![9; UPLOAD_CHUNK_BYTES + 1];
         let upload_manifest = manifest(&bytes, "file.bin", UploadDestination::Cwd);
         hub.start(
-            agent,
+            session,
             "viewer",
             capability,
             upload_id,
@@ -2283,7 +2295,7 @@ mod tests {
         conflict.name = "other.bin".into();
         assert!(hub
             .start(
-                agent,
+                session,
                 "viewer",
                 capability,
                 upload_id,
@@ -2296,9 +2308,9 @@ mod tests {
             .contains("manifest"));
         assert!(hub
             .write_chunk(
-                agent,
+                session,
                 UploadChunkRequest {
-                    session_id: "viewer",
+                    viewer_id: "viewer",
                     capability,
                     upload_id,
                     sequence: 1,
@@ -2319,7 +2331,7 @@ mod tests {
 
         let second_id = Uuid::new_v4();
         hub.start(
-            agent,
+            session,
             "viewer",
             capability,
             second_id,
@@ -2329,7 +2341,7 @@ mod tests {
         .await
         .unwrap();
         assert!(hub
-            .cancel(agent, "viewer", capability, second_id)
+            .cancel(session, "viewer", capability, second_id)
             .await
             .unwrap());
         assert_eq!(hub.retained_counts().await, (0, 0));
@@ -2339,13 +2351,13 @@ mod tests {
     async fn checksum_failure_and_session_teardown_leave_no_files() {
         let tmp = tempfile::tempdir().unwrap();
         let hub = UploadHub::default();
-        let agent = AgentBinding::new(Uuid::new_v4(), 3);
+        let session = SessionBinding::new(Uuid::new_v4(), 3);
         let capability = Uuid::new_v4();
         let upload_id = Uuid::new_v4();
         let mut bad_hash = manifest(b"actual", "note.txt", UploadDestination::Cwd);
         bad_hash.sha256 = "00".repeat(32);
         hub.start(
-            agent,
+            session,
             "viewer",
             capability,
             upload_id,
@@ -2356,9 +2368,9 @@ mod tests {
         .unwrap();
         assert!(hub
             .write_chunk(
-                agent,
+                session,
                 UploadChunkRequest {
-                    session_id: "viewer",
+                    viewer_id: "viewer",
                     capability,
                     upload_id,
                     sequence: 0,
@@ -2372,9 +2384,9 @@ mod tests {
             .contains("checksum"));
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 
-        for index in 0..MAX_ACTIVE_UPLOADS_PER_SESSION {
+        for index in 0..MAX_ACTIVE_UPLOADS_PER_VIEWER {
             hub.start(
-                agent,
+                session,
                 "viewer",
                 capability,
                 Uuid::new_v4(),
@@ -2390,7 +2402,7 @@ mod tests {
         }
         assert!(hub
             .start(
-                agent,
+                session,
                 "viewer",
                 capability,
                 Uuid::new_v4(),
@@ -2401,7 +2413,7 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("too many"));
-        hub.cancel_session(agent, "viewer").await;
+        hub.cancel_viewer(session, "viewer").await;
         assert_eq!(hub.retained_counts().await, (0, 0));
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
@@ -2410,13 +2422,13 @@ mod tests {
     async fn cancellation_and_final_commit_have_one_fail_closed_linearization() {
         let tmp = tempfile::tempdir().unwrap();
         let hub = UploadHub::default();
-        let agent = AgentBinding::new(Uuid::new_v4(), 5);
+        let session = SessionBinding::new(Uuid::new_v4(), 5);
         let capability = Uuid::new_v4();
         for index in 0..32 {
             let upload_id = Uuid::new_v4();
             let name = format!("race-{index}.txt");
             hub.start(
-                agent,
+                session,
                 "viewer",
                 capability,
                 upload_id,
@@ -2426,9 +2438,9 @@ mod tests {
             .await
             .unwrap();
             let write = hub.write_chunk(
-                agent,
+                session,
                 UploadChunkRequest {
-                    session_id: "viewer",
+                    viewer_id: "viewer",
                     capability,
                     upload_id,
                     sequence: 0,
@@ -2436,7 +2448,7 @@ mod tests {
                     bytes: b"x",
                 },
             );
-            let cancel = hub.cancel(agent, "viewer", capability, upload_id);
+            let cancel = hub.cancel(session, "viewer", capability, upload_id);
             let (write, cancel) = tokio::join!(write, cancel);
             match (write, cancel.unwrap()) {
                 (Ok(UploadChunkOutcome::Complete(result)), false) => {
@@ -2476,7 +2488,7 @@ mod tests {
         let hub = UploadHub::default();
         let hooks = hub.lifecycle_hooks();
         hooks.prepare.arm();
-        let agent = AgentBinding::new(Uuid::new_v4(), 41);
+        let session = SessionBinding::new(Uuid::new_v4(), 41);
         let capability = Uuid::new_v4();
         let upload_id = Uuid::new_v4();
         let cwd = tmp.path().to_string_lossy().into_owned();
@@ -2484,7 +2496,7 @@ mod tests {
         let start = tokio::spawn(async move {
             start_hub
                 .start(
-                    agent,
+                    session,
                     "viewer",
                     capability,
                     upload_id,
@@ -2494,8 +2506,8 @@ mod tests {
                 .await
         });
         hooks.prepare.wait_until_entered().await;
-        hub.cancel_session_until(
-            agent,
+        hub.cancel_viewer_until(
+            session,
             "viewer",
             TokioInstant::now() + Duration::from_millis(20),
         )
@@ -2525,11 +2537,11 @@ mod tests {
                 &hooks.write_sync
             };
             pause.arm();
-            let agent = AgentBinding::new(Uuid::new_v4(), 42);
+            let session = SessionBinding::new(Uuid::new_v4(), 42);
             let capability = Uuid::new_v4();
             let upload_id = Uuid::new_v4();
             hub.start(
-                agent,
+                session,
                 "viewer",
                 capability,
                 upload_id,
@@ -2542,9 +2554,9 @@ mod tests {
             let write = tokio::spawn(async move {
                 write_hub
                     .write_chunk(
-                        agent,
+                        session,
                         UploadChunkRequest {
-                            session_id: "viewer",
+                            viewer_id: "viewer",
                             capability,
                             upload_id,
                             sequence: 0,
@@ -2555,8 +2567,8 @@ mod tests {
                     .await
             });
             pause.wait_until_entered().await;
-            hub.cancel_session_until(
-                agent,
+            hub.cancel_viewer_until(
+                session,
                 "viewer",
                 TokioInstant::now() + Duration::from_millis(20),
             )
@@ -2585,12 +2597,12 @@ mod tests {
         let hub = UploadHub::default();
         let hooks = hub.lifecycle_hooks();
         hooks.commit.arm();
-        let agent = AgentBinding::new(Uuid::new_v4(), 45);
+        let session = SessionBinding::new(Uuid::new_v4(), 45);
         let capability = Uuid::new_v4();
         let upload_id = Uuid::new_v4();
         let upload_manifest = manifest(b"linearized", "linearized.txt", UploadDestination::Cwd);
         hub.start(
-            agent,
+            session,
             "viewer",
             capability,
             upload_id,
@@ -2603,9 +2615,9 @@ mod tests {
         let write = tokio::spawn(async move {
             write_hub
                 .write_chunk(
-                    agent,
+                    session,
                     UploadChunkRequest {
-                        session_id: "viewer",
+                        viewer_id: "viewer",
                         capability,
                         upload_id,
                         sequence: 0,
@@ -2616,8 +2628,8 @@ mod tests {
                 .await
         });
         hooks.commit.wait_until_entered().await;
-        hub.remove_generation_now(agent);
-        hub.remove_generation_until(agent, TokioInstant::now() + Duration::from_millis(20))
+        hub.remove_generation_now(session);
+        hub.remove_generation_until(session, TokioInstant::now() + Duration::from_millis(20))
             .await;
         assert_eq!(hub.retained_counts().await, (1, 0));
         hooks.commit.release();
@@ -2629,7 +2641,7 @@ mod tests {
         assert_eq!(hub.retained_counts().await, (0, 0));
         assert_eq!(
             hub.start(
-                agent,
+                session,
                 "viewer",
                 capability,
                 upload_id,
@@ -2653,12 +2665,12 @@ mod tests {
         let hub = UploadHub::default();
         let hooks = hub.lifecycle_hooks();
         hooks.cleanup.arm();
-        let agent = AgentBinding::new(Uuid::new_v4(), 43);
+        let session = SessionBinding::new(Uuid::new_v4(), 43);
         let capability = Uuid::new_v4();
         let upload_id = Uuid::new_v4();
         let upload_manifest = manifest(b"published", "published.txt", UploadDestination::Cwd);
         hub.start(
-            agent,
+            session,
             "viewer",
             capability,
             upload_id,
@@ -2671,9 +2683,9 @@ mod tests {
         let write = tokio::spawn(async move {
             write_hub
                 .write_chunk(
-                    agent,
+                    session,
                     UploadChunkRequest {
-                        session_id: "viewer",
+                        viewer_id: "viewer",
                         capability,
                         upload_id,
                         sequence: 0,
@@ -2686,7 +2698,7 @@ mod tests {
         hooks.cleanup.wait_until_entered().await;
         assert_eq!(hub.retained_counts().await, (1, 1));
         assert!(!hub
-            .cancel(agent, "viewer", capability, upload_id)
+            .cancel(session, "viewer", capability, upload_id)
             .await
             .unwrap());
         assert_eq!(hub.retained_counts().await.0, 1);
@@ -2698,7 +2710,7 @@ mod tests {
         wait_for_upload_drain(&hub).await;
         assert!(matches!(
             hub.start(
-                agent,
+                session,
                 "replacement-viewer",
                 Uuid::new_v4(),
                 upload_id,
@@ -2722,12 +2734,12 @@ mod tests {
             } else {
                 hooks.fail_fsync_count.store(1, Ordering::Release);
             }
-            let agent = AgentBinding::new(Uuid::new_v4(), 44);
+            let session = SessionBinding::new(Uuid::new_v4(), 44);
             let capability = Uuid::new_v4();
             let upload_id = Uuid::new_v4();
             let upload_manifest = manifest(b"once", "once.txt", UploadDestination::Cwd);
             hub.start(
-                agent,
+                session,
                 "viewer",
                 capability,
                 upload_id,
@@ -2738,9 +2750,9 @@ mod tests {
             .unwrap();
             let error = hub
                 .write_chunk(
-                    agent,
+                    session,
                     UploadChunkRequest {
-                        session_id: "viewer",
+                        viewer_id: "viewer",
                         capability,
                         upload_id,
                         sequence: 0,
@@ -2754,7 +2766,7 @@ mod tests {
             wait_for_upload_drain(&hub).await;
             let reconciled = hub
                 .start(
-                    agent,
+                    session,
                     "replacement-viewer",
                     Uuid::new_v4(),
                     upload_id,
@@ -2789,12 +2801,12 @@ mod tests {
             } else {
                 hooks.fail_fsync_count.store(2, Ordering::Release);
             }
-            let agent = AgentBinding::new(Uuid::new_v4(), 45);
+            let session = SessionBinding::new(Uuid::new_v4(), 45);
             let capability = Uuid::new_v4();
             let upload_id = Uuid::new_v4();
             let upload_manifest = manifest(b"retry", "retry.txt", UploadDestination::Cwd);
             hub.start(
-                agent,
+                session,
                 "viewer",
                 capability,
                 upload_id,
@@ -2806,9 +2818,9 @@ mod tests {
 
             let error = hub
                 .write_chunk(
-                    agent,
+                    session,
                     UploadChunkRequest {
-                        session_id: "viewer",
+                        viewer_id: "viewer",
                         capability,
                         upload_id,
                         sequence: 0,
@@ -2828,11 +2840,11 @@ mod tests {
 
             let deadline = TokioInstant::now() + Duration::from_secs(2);
             if remove_generation {
-                hub.remove_generation_now(agent);
-                hub.remove_generation_until(agent, deadline).await;
+                hub.remove_generation_now(session);
+                hub.remove_generation_until(session, deadline).await;
             } else {
-                hub.cancel_session_now(agent, "viewer");
-                hub.cancel_session_until(agent, "viewer", deadline).await;
+                hub.cancel_viewer_now(session, "viewer");
+                hub.cancel_viewer_until(session, "viewer", deadline).await;
             }
             assert!(hub.wait_for_operations(deadline).await);
             assert_eq!(hub.retained_counts().await.0, 0);
@@ -2870,7 +2882,7 @@ mod tests {
 
             let reconciled = hub
                 .start(
-                    agent,
+                    session,
                     "replacement-viewer",
                     Uuid::new_v4(),
                     upload_id,
@@ -2902,8 +2914,8 @@ mod tests {
         let result = complete(
             &UploadHub::default(),
             CompleteUpload {
-                agent: AgentBinding::new(Uuid::new_v4(), 1),
-                session: "viewer",
+                session: SessionBinding::new(Uuid::new_v4(), 1),
+                viewer: "viewer",
                 capability: Uuid::new_v4(),
                 upload_id: Uuid::new_v4(),
                 cwd: tmp.path().to_str().unwrap(),
@@ -2926,10 +2938,10 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         symlink(outside.path(), tmp.path().join("escape")).unwrap();
         let hub = UploadHub::default();
-        let agent = AgentBinding::new(Uuid::new_v4(), 1);
+        let session = SessionBinding::new(Uuid::new_v4(), 1);
         assert!(hub
             .start(
-                agent,
+                session,
                 "viewer",
                 Uuid::new_v4(),
                 Uuid::new_v4(),
@@ -2960,7 +2972,7 @@ mod tests {
         let hub = UploadHub::default();
         let error = hub
             .start(
-                AgentBinding::new(Uuid::new_v4(), 1),
+                SessionBinding::new(Uuid::new_v4(), 1),
                 "viewer",
                 Uuid::new_v4(),
                 Uuid::new_v4(),

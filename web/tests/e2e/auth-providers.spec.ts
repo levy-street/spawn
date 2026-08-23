@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 test("login and signup render enabled provider buttons", async ({ page }) => {
-  await page.route("**/api/auth/providers", async (route) => {
+  await page.route("**/api/auth/config", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -11,6 +11,8 @@ test("login and signup render enabled provider buttons", async ({ page }) => {
           { id: "microsoft", name: "Microsoft" },
           { id: "github", name: "GitHub" },
         ],
+        email_verification_required: false,
+        invite_only: false,
       },
     });
   });
@@ -18,15 +20,15 @@ test("login and signup render enabled provider buttons", async ({ page }) => {
   await page.goto("/login");
   await expect(page.getByRole("link", { name: "Continue with Google" })).toHaveAttribute(
     "href",
-    "/api/auth/oauth/google/start?return_to=%2F",
+    "/api/auth/oauth/google/start?return_to=%2Fapp",
   );
   await expect(page.getByRole("link", { name: "Continue with Microsoft" })).toHaveAttribute(
     "href",
-    "/api/auth/oauth/microsoft/start?return_to=%2F",
+    "/api/auth/oauth/microsoft/start?return_to=%2Fapp",
   );
   await expect(page.getByRole("link", { name: "Continue with GitHub" })).toHaveAttribute(
     "href",
-    "/api/auth/oauth/github/start?return_to=%2F",
+    "/api/auth/oauth/github/start?return_to=%2Fapp",
   );
 
   await page.goto("/signup");
@@ -35,11 +37,11 @@ test("login and signup render enabled provider buttons", async ({ page }) => {
 });
 
 test("provider section stays hidden when no providers are enabled", async ({ page }) => {
-  await page.route("**/api/auth/providers", async (route) => {
+  await page.route("**/api/auth/config", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      json: { providers: [] },
+      json: { providers: [], email_verification_required: false, invite_only: false },
     });
   });
 

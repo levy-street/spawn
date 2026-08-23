@@ -47,7 +47,7 @@ check_tree() {
   local root="$1"
   require_rg || return 1
   local adapter=web/src/lib/signed-rtc-live.ts
-  local agent=web/src/components/terminal/useAgentSocket.ts
+  local session=web/src/components/terminal/useSessionSocket.ts
   local host=web/src/lib/hostControl.ts
   # Known test files that legitimately exercise the RemoteDescription capability.
   # They are allowlisted explicitly rather than excluded by a `*.test.*` glob, so
@@ -57,7 +57,7 @@ check_tree() {
   local host_test=web/src/lib/hostControl.test.ts
   local source
 
-  for source in "$adapter" "$agent" "$host" "$adapter_test" "$host_test"; do
+  for source in "$adapter" "$session" "$host" "$adapter_test" "$host_test"; do
     [[ -f "$root/$source" ]] || { fail "missing production source $source"; return 1; }
   done
 
@@ -76,7 +76,7 @@ check_tree() {
     return 1
   fi
   expected_files="$(printf '%s\n' \
-    "$agent" "$host" "$adapter" "$adapter_test" "$host_test" | sort)"
+    "$session" "$host" "$adapter" "$adapter_test" "$host_test" | sort)"
   [[ "$actual_files" == "$expected_files" ]] \
     || { fail 'production RemoteDescription capability file inventory changed'; return 1; }
 
@@ -92,24 +92,24 @@ check_tree() {
     fail "RTCPeerConnection inventory scan failed (rg exit $pc_status)"
     return 1
   fi
-  expected_pc="$(printf '%s\n' "$agent" "$host" | sort)"
+  expected_pc="$(printf '%s\n' "$session" "$host" | sort)"
   [[ "$actual_pc" == "$expected_pc" ]] \
     || { fail 'production RTCPeerConnection construction inventory changed'; return 1; }
 
   require_count "$root" "$adapter" 'setRemote' 2 || return 1
   require_count "$root" "$adapter" 'RemoteDescription' 2 || return 1
-  require_count "$root" "$agent" 'setRemote' 1 || return 1
-  require_count "$root" "$agent" 'RemoteDescription' 1 || return 1
+  require_count "$root" "$session" 'setRemote' 1 || return 1
+  require_count "$root" "$session" 'RemoteDescription' 1 || return 1
   require_count "$root" "$host" 'setRemote' 1 || return 1
   require_count "$root" "$host" 'RemoteDescription' 1 || return 1
-  require_count "$root" "$agent" 'new RTCPeerConnection' 1 || return 1
+  require_count "$root" "$session" 'new RTCPeerConnection' 1 || return 1
   require_count "$root" "$host" 'new RTCPeerConnection' 1 || return 1
 
   require_count "$root" "$adapter" \
     'Pick<RTCPeerConnection, "close" | "setRemoteDescription">' 1 || return 1
   require_count "$root" "$adapter" 'await peer.setRemoteDescription({' 1 || return 1
   require_count "$root" "$adapter" 'sdp: verified.transcript.sdp' 1 || return 1
-  require_count "$root" "$agent" \
+  require_count "$root" "$session" \
     '.setRemoteDescription({ type: "answer", sdp: msg.sdp })' 1 || return 1
   require_count "$root" "$host" \
     '.setRemoteDescription({ type: "answer", sdp: message.sdp })' 1 || return 1
@@ -128,9 +128,9 @@ check_tree() {
   fi
 
   require_count "$root" "$adapter" 'const verified = await verifyRtcSignalWire(' 2 || return 1
-  require_count "$root" "$agent" '.verifyAndApplyAnswer(' 1 || return 1
+  require_count "$root" "$session" '.verifyAndApplyAnswer(' 1 || return 1
   require_count "$root" "$host" '.verifyAndApplyAnswer(' 1 || return 1
-  require_count "$root" "$agent" 'new SignedRtcLiveSession(' 1 || return 1
+  require_count "$root" "$session" 'new SignedRtcLiveSession(' 1 || return 1
   require_count "$root" "$host" 'new SignedRtcLiveSession(' 1 || return 1
 
   if grep -Fq 'sdp: frame.sdp' "$root/$adapter"; then
@@ -153,7 +153,7 @@ run_self_test() {
   # known-good fixture must contain them.
   cp "$repo_root/web/src/lib/signed-rtc-live.test.ts" "$fixture/web/src/lib/"
   cp "$repo_root/web/src/lib/hostControl.test.ts" "$fixture/web/src/lib/"
-  cp "$repo_root/web/src/components/terminal/useAgentSocket.ts" \
+  cp "$repo_root/web/src/components/terminal/useSessionSocket.ts" \
     "$fixture/web/src/components/terminal/"
   check_tree "$fixture" >/dev/null \
     || { fail 'known-good inventory failed its self-test'; return 1; }

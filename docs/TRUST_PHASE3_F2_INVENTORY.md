@@ -1,5 +1,12 @@
 # Trust Phase 3 F2 — live verified-SDP inventory
 
+> **Historical candidate inventory:** paths and staged unsigned fallbacks below
+> describe the review-pending F2 branch at the time. The terminal consumer is
+> now `useSessionSocket.ts`, session RTC scopes use `scope_type:"session"`, and
+> the current live protocol contract is documented in `proto/README.md` and
+> `INTERFACE_MATRIX.md`. This file is retained to preserve the review record,
+> not as a current caller inventory.
+
 This inventory describes the review-pending browser endpoint prerequisite. It
 does not claim that F2, the signed-only cutover, or L1 is complete.
 

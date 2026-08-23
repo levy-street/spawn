@@ -1,6 +1,6 @@
 //! sessiond — the purpose-built session layer (docs/SESSIOND.md).
 //!
-//! A *session worker* is one process per agent that owns the agent's PTY,
+//! A *session worker* is one process per session that owns the session's PTY,
 //! keeps an encrypted-at-rest scrollback log plus a plaintext, geometry-bounded
 //! headless checkpoint grid, and speaks a small framed protocol over a unix
 //! domain socket to the supervising `spawnd`. The modules here are deliberately
@@ -9,6 +9,7 @@
 
 pub mod emulator;
 pub mod endpoint;
+pub mod foreground;
 pub mod scrollback;
 pub mod secret;
 pub mod wire;

@@ -5,9 +5,9 @@ server-centric data plane to an **operator model**: the control plane
 negotiates identity, authorization, and connections, but is structurally
 unable to read the content that flows between a user and their machines.
 
-It is the governing document for the data-plane redesign. Where DESIGN.md
-and this document disagree, this document describes the target and
-DESIGN.md describes the mechanics.
+It is the governing document for the data-plane redesign. UI rules live in
+`DESIGN.md`; current product and protocol mechanics live in `README.md`,
+`INTERFACE_MATRIX.md`, `SESSIOND.md`, and `proto/README.md`.
 
 ## The principle
 
@@ -17,14 +17,20 @@ DESIGN.md describes the mechanics.
 > parties; it never sees the conversation.
 
 "Protected content" in this document means: PTY input/output,
-scrollback/history, terminal snapshots and viewport controls; agent and host
+scrollback/history, terminal snapshots and viewport controls; session and host
 file names and contents; directory paths, entry sizes/mtimes, and operation
 errors; uploads, downloads, and cross-host transfers; tool check/install
 commands, executable paths, installed/latest versions, stdout/stderr, and
-detailed errors; agent and preset environment values; launch working
-directories/arguments; skill bodies; MCP credentials; and any label or error
+detailed errors; agent-definition command/environment/install values; session
+working directories; skill bodies; MCP credentials; and any label or error
 string derived from those values. Everything on that list either already has an
 end-to-end path today or gets one in a migration phase below.
+
+The current guarantee is narrower than the target: PTY content, replay,
+viewport actions, session uploads, and host-file operations have direct
+browser↔endpoint paths. Session working directories, agent definitions, skill
+bodies, agent availability/install results, and some detailed errors remain
+server-readable. Phase 2 is therefore not complete.
 
 The precise claim we are building toward is **"the server cannot see your
 protected content"** (cryptographic), not merely **"the server does not look"**
@@ -37,9 +43,9 @@ states which guarantee it delivers.
 | Party | Holds | Sees |
 |-------|-------|------|
 | **Host endpoint** (`spawnd` + workers) | session workers, PTYs, encrypted bounded replay state, host identity key | everything on its own host (it is the user's machine) |
-| **Browser client(s)** | rendered terminal, device identity key | protected content for hosts and agents it connects to |
+| **Browser client(s)** | rendered terminal, device identity key | protected content for hosts and sessions it connects to |
 | **TURN relay** | nothing durable | ciphertext, peer IPs, traffic volume/timing |
-| **Control plane** (`spawn-server`) | accounts, host/agent registry, public keys, signaling | disclosed metadata only, including coarse activity and unattended-update state; it also observes endpoint connection and traffic timing (see "What the server still sees") |
+| **Control plane** (`spawn-server`) | accounts; host, session, workspace, agent-definition and skill records; public keys; signaling | the disclosed metadata and remaining server-readable values inventoried below; it also observes endpoint connection and traffic timing |
 
 ## Why the cryptography already works in our favor
 
@@ -55,12 +61,12 @@ direct P2P  →  STUN-assisted P2P  →  TURN relay
 preserves end-to-end confidentiality at every rung. The parts that do
 not come for free:
 
-1. **Signaling integrity.** DTLS authenticates the peers against
-   certificate fingerprints exchanged in the SDP — which today flows
-   through the server as `rtc.offer` / `rtc.answer` frames. A malicious
-   control plane could substitute fingerprints and man-in-the-middle a
-   session. Fixing this requires endpoint identity keys that sign the
-   SDP (Phase 3).
+1. **Signaling integrity.** DTLS authenticates the peers against certificate
+   fingerprints exchanged in the SDP. Current signed RTC envelopes bind that
+   SDP to endpoint identity keys and the exact session/host scope; `spawnd`
+   refuses unsigned offers by default. This is meaningful only when endpoint
+   code and its expected peer pins are trusted. First contact and a hostile
+   operator-supplied web client remain explicit limits.
 2. **Historical relay data and the remaining content surfaces.** The reviewed
    P2-AGENT-02/P2-TERM-02 cut at `5722288` removes `spawn.v1`, daemon WS PTY
    binary frames, transcripts, content pubsub, snapshots/history, and viewport
@@ -76,15 +82,16 @@ not come for free:
 
 ## Threat model
 
-Adversaries and what they get, once the migration is complete:
+Adversaries and what they get today (the endpoint-local store remains a future
+design, not part of these guarantees):
 
 | Adversary | Can | Cannot |
 |-----------|-----|--------|
-| **Curious/compelled control-plane operator** | see account + host/agent metadata, presence, connection/signaling timing and volume, user-input/meaningful-output times, and unattended-update metadata; refuse service; delete accounts | read PTY data, transcripts, host or agent file data, viewport controls, tool details, env vars, skill bodies, MCP credentials |
-| **Malicious control-plane operator** (or compromised server) | everything above; record DTLS/TURN traffic; alter signaling or operator-hosted client code; attempt key-substitution MITM at pairing or signaling time | passively decrypt recorded DTLS traffic when the negotiated suite provides forward secrecy and endpoint/session keys remain uncompromised; obtain the endpoint-local protected-store keys from server persistence. Phase 3 makes signaling substitution detectable only to trusted/verifiable endpoint code; it does not constrain hostile hosted JavaScript |
+| **Curious/compelled control-plane operator** | see account, host, session, workspace, agent-definition and skill records; presence; foreground executable basenames; connection/signaling timing and volume; activity times; and host-agent check/install data; refuse service; delete accounts | read PTY bytes, worker replay, direct session-upload bytes, or host-file channel contents |
+| **Malicious control-plane operator** (or compromised server) | everything above; record DTLS/TURN traffic; alter signaling or operator-hosted client code; attempt key-substitution MITM at pairing or signaling time | passively decrypt recorded DTLS traffic when the negotiated suite provides forward secrecy and endpoint/session keys remain uncompromised. Signed signaling makes substitution detectable only to trusted/verifiable endpoint code; it does not constrain hostile hosted JavaScript |
 | **Network attacker (on-path)** | observe/black-hole encrypted flows, learn peer IPs | read or modify session content (DTLS), impersonate either peer |
 | **TURN operator** | observe ciphertext volume/timing and peer IPs | decrypt anything |
-| **Malicious co-tenant** | attack the API surface | reach another user's daemons or agents (all REST + WS paths filter by `owner_user_id`; daemon tokens are host-scoped) |
+| **Malicious co-tenant** | attack the API surface | reach another user's daemons or sessions (all REST + WS paths filter by `owner_user_id`; daemon tokens are host-scoped) |
 | **Attacker with the user's browser device** | full access as that user | — out of scope; this is device security |
 | **Compromised host daemon** | everything on that host | other hosts' sessions (per-host tokens and keys) |
 
@@ -92,11 +99,11 @@ Past-session confidentiality is not based on ciphertext being absent. A control
 plane, TURN operator, or network observer can record ephemeral-session DTLS
 ciphertext. Its resistance to later decryption depends on the negotiated cipher
 suite's forward-secrecy properties and on endpoint/session key material not
-being compromised. Phase 2 does not add a durable server-side ciphertext
-archive: restart manifests, preset operational values, and skill bodies are
-canonical on the host endpoint under `docs/DURABLE_SENSITIVE_DATA.md`, while
-the live worker replay remains separately bounded and ephemeral-keyed. A later
-optional opaque backup would need its own reviewed key/recovery threat model.
+being compromised. There is no durable server-side transcript archive; live
+worker replay is bounded and ephemeral-keyed. The endpoint-local store in
+`docs/DURABLE_SENSITIVE_DATA.md` is a review-pending, unimplemented proposal
+whose object model predates the workspace/session overhaul. A later optional
+opaque backup would need its own reviewed key/recovery threat model.
 
 Explicitly **in scope**: protecting user content from spawn's own
 infrastructure and anyone who compromises or compels it.
@@ -110,55 +117,171 @@ always refuse service).
 
 Honest inventory, from the current wire protocol:
 
-**Metadata the server keeps seeing by design** — accounts and password hashes;
-host names/OS/arch/version/last-seen; explicit or neutral agent names and
-lifecycle status; preset and skill names/descriptions; exit codes; presence;
-connection and signaling timing; IP addresses; and per-agent timestamps for
-meaningful output and user input. For unattended tool updates it may also keep
-the enabled policy, host/preset identifiers, check/update/result timestamps,
-and content-free success/failure/exit-code status. The proposed endpoint-local
-durable store does not expose its object sizes, revisions, or store-access log
-to the server, although signaling/TURN and metadata API traffic still disclose
-connection timing and approximate transfer volume. Activity frames
-contain no terminal bytes and are throttled, but their timing is behavioral
-metadata and can reveal when a person or agent is active. Self-hosting is the
-answer for users for whom this metadata is itself sensitive.
+**Metadata and values the server currently keeps seeing** — accounts and
+password hashes; host names/OS/arch/version/last-seen; workspace names,
+positions, and layouts; session names, host relationships, working directories,
+lifecycle state, exit codes, foreground executable basenames, and activity
+timestamps; agent-definition names, kinds, commands, environment prefixes, and
+install commands; skill names, descriptions, bodies, defaults, and session
+grants; public trust material; connection/signaling timing; and IP addresses.
+Host-agent availability/install flows also expose the definition target,
+installed path/version data, result output/errors, policy, and update
+timestamps. Since 2026-08-21 the server additionally holds a host's static
+hardware spec, a five-level CPU/memory reading refreshed per heartbeat, and a
+per-owner daily activity rollup — see "Host capacity" below for why those are
+bucketed and coarse rather than exact, and for the switch that turns them off. Activity frames contain no terminal bytes and are throttled, but
+their timing is behavioral metadata. Self-host when any of this metadata or
+remaining server-readable configuration is itself sensitive.
+
+**Foreground process basename (deliberate content-free exception).** With
+shell-first sessions the daemon reports, per session, the basename of the
+executable whose process group owns the PTY foreground (`session.foreground`,
+stored as `sessions.foreground_command`). This is a knowing, documented
+exception to the content-free activity design, scoped as narrowly as it can
+be: a bare executable basename, truncated to 64 characters — never arguments,
+paths, environment, window titles, or output — emitted only when the value
+changes, at most once per second. Its sole purpose is UI labeling: pane
+headers and sidebar icons show what is running, and the agent shortcut bar
+appears only while the shell itself is in the foreground. The server thereby
+learns *which program* is running in a session (e.g. `claude`, `vim`,
+`sleep`) and when that changes; users for whom even program names are
+sensitive should self-host, exactly as with the activity-timing metadata
+above.
+
+The same basename is the only session-derived string on the owner alert
+stream (`/ws/alerts`). Detecting "an agent finished" means comparing the
+previous foreground basename against the new one at the moment the server
+writes it, so the alert reuses a fact the server already holds and already
+returns from `GET /api/sessions` rather than disclosing a new one. Alert
+payloads carry a session id, an event class, the basename, and an exit
+code or signal — never terminal text, and never anything the pane header was
+not already showing. Alerts are published on an owner-scoped channel
+(`spawn:user:{user_id}:alerts`) under the same host-owner fencing as every
+other publish from `/ws/daemon`, so a superseded daemon cannot raise alerts
+on a host it no longer owns.
 
 **Protected-content migration inventory:**
 
 | Content class | Current or historical path | Migration state |
 |---------------|----------------------------|-----------------|
 | PTY bytes (retired live relay) | former binary frames on `/ws/browser`, `/ws/daemon` | removed in P2-AGENT-02/P2-TERM-02, reviewed and merged at `5722288`; deployment/purge pending |
-| Transcripts (~64 MB/agent historically on server disk) | retired `transcript.py`; historical files/Redis/backups may remain | code path deleted; bounded endpoint replay; historical copies still require P2-PURGE-01 |
+| Transcripts (~64 MB/process historically on server disk) | retired `transcript.py`; historical files/Redis/backups may remain | code path deleted; bounded endpoint replay; historical copies still require P2-PURGE-01 |
 | History replay | former `{"type":"history"}` on `/ws/browser` | removed from server; `spawn.ctl` endpoint stream |
-| Agent file uploads | retired `upload`/`agent.upload` frames and REST `bytes_b64`; historical logs/backups may remain | bounded, hash-checked per-agent `spawn.ctl` file stream reviewed and merged in P2-TERM-01 at `5d99ebb4`; deployment/purge pending |
-| Terminal snapshots / card previews | retired `agent.snapshot` frames | removed from server; rendered from endpoint replay/output |
+| Session file uploads | retired process-upload frames and REST `bytes_b64`; historical logs/backups may remain | bounded, hash-checked per-session `spawn.ctl` file stream; the locked v1 wire retains its historical generation field name |
+| Terminal snapshots / card previews | retired process-snapshot frames | removed from server; rendered from endpoint replay/output |
 | REST terminal input and snapshots | retired `/api/agents/{id}/input`, `/snapshot` | removed; browser uses `spawn.pty` / `spawn.ctl` directly |
-| Terminal geometry and viewport actions | retired REST/WS resize/scroll/redraw/display-control paths | removed from server; per-agent `spawn.ctl` only |
-| Agent `env` (may contain real secrets) | current master: `agent.create`, persisted in `agents.env` | DATA-02 target: E2E and endpoint-local only; not implemented |
-| Preset environment templates | current master: `presets.env_template`, merged into agent `env` | DATA-02 proposed target: canonical in a per-host endpoint store; review pending and not implemented |
-| Launch paths/arguments and preset commands | current master: `agents.cwd`/`argv`, `presets.default_argv`/`install`, `agent.create` | DATA-02 target: canonical per-host launch manifest over `spawn.host.ctl`; not implemented |
-| Default agent names derived from `cwd` | current master: `_default_agent_name` copies the cwd basename into `agents.name` | DATA-02 target: explicit/neutral metadata and scrubbed legacy names; not implemented |
-| Skill bodies | current master: `agent.create`, `skills` table | DATA-02 target: endpoint-local and E2E only; not implemented |
+| Terminal geometry and viewport actions | retired REST/WS resize/scroll/redraw/display-control paths | removed from server; per-session `spawn.ctl` only |
+| Agent-definition command/env/install/yolo | current: persisted in `agents`; read through `/api/agents`; shortcut command constructed in the browser | endpoint-local replacement is not implemented |
+| Which agents an account runs without permission prompts | current: one boolean per (owner, agent) in `agent_preferences`, written through `PATCH /api/agents/{id}/preferences` | the flag is applied browser-side when the command is typed; the server learns the preference but never the launch |
+| Session working directory | current: persisted in `sessions.cwd`; carried by `session.create` / `session.restart` | endpoint-local replacement is not implemented |
+| Default session names derived from `cwd` | current: `_default_session_name` includes the directory basename | neutral-name/scrub proposal is not implemented |
+| Skill bodies | current: persisted in `skills`; carried in `session.create` / `session.restart` | endpoint-local replacement is not implemented |
 | ~~MCP server registry (headers incl. bearer tokens), `/mcp` endpoint~~ | — | **removed entirely, 2026-07-09** — see below |
 | Host paths, directory entry names/sizes/mtimes, reads, writes, and detailed operation errors | former REST host-file routes plus `host.fs.*` frames | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source uses `spawn.host.ctl` only |
+| Host file previews (rendered thumbnails, decoded head slices) | current: `spawn.host.ctl` `fs.preview` / `fs.read.range` only | never server-visible; held in memory for the session, never written to disk, never logged |
+| Host desktop launches (`desktop.reveal`, `desktop.open`) | current: `spawn.host.ctl` only; the daemon records the operation name locally in `activity.rs` and never the path | never server-visible |
 | Cross-host file transfer | former server source-read/forward path | removed in reviewed/merged P2-HOST-02 at `4e7c89b`; current source is browser-mediated across two host channels |
-| Tool check/install commands, paths, installed/latest versions, output, and detailed errors | current master: `host.tools.*`; policy errors can persist in Postgres | P2-HOST-03A E2E candidate implemented, independent review pending; legacy server route remains until HOST-03B |
+| Agent check/install commands, paths, installed/latest versions, output, and detailed errors | current: REST plus `host.agents.*`; policy errors can persist in Postgres | server-readable path remains; endpoint-only replacement is not implemented |
 | Free-form daemon errors | current master: `Outbound::Error.message` and other detailed status strings are forwarded and logged by `ws/daemon.py` | P2-ERROR-01 target: stable content-free server code plus E2E detail; not implemented |
 
-Preset names, skill names/descriptions, and explicitly chosen or neutral agent
-names remain server-visible metadata; users must not place secrets in those
-labels. The current default agent name is not valid metadata because it embeds
-the `cwd` basename. `cwd`/`argv` and any derived label are protected content:
-they move E2E with the rest of the launch manifest in Phase 2, and existing
-derived names are scrubbed before their source columns disappear.
+### Host capacity (2026-08-21)
+
+Showing a fleet means showing how hard each machine is working, and utilization
+is a far more sensitive signal than it first looks. A per-second CPU/memory
+trace of somebody's machines is a behavioural fingerprint: when they work, when
+they sleep, when a build runs, when the GPU rig is training, when they went on
+holiday. Putting that on the control plane would be a real regression against
+the principle this document opens with, and it would be one bought for a
+progress bar.
+
+So capacity is split by resolution, and the split is enforced by which
+transport carries it.
+
+**The server is given a bucket.** `host.heartbeat` may carry `cpu_bucket` and
+`mem_bucket`: a meter segment count in `0..=5`, once every thirty seconds. That
+is enough to draw the sidebar's capacity meter and to sort a fleet by which
+machine is pinned, and it is close to useless as a trace — five levels at
+2 samples/minute cannot distinguish a compile from a video call. `register`
+additionally carries a static spec (cores, memory, CPU model, GPU name), which
+is inert: it describes hardware, it does not change while the daemon runs, and
+it is the figure the product actually wants to show off.
+
+**The browser is given the truth.** Exact CPU percentage, memory bytes, load
+average and uptime are served by `host.metrics` on the `spawn.host.ctl`
+DataChannel — browser to daemon, at whatever rate the browser is drawing at,
+with no server code path in between. This is the same posture as `fs.read`:
+precision lives on the connection the control plane cannot read.
+
+**And a host can decline both.** `SPAWND_NO_TELEMETRY=1` stops the daemon
+reporting capacity anywhere: no spec on `register`, no buckets on the
+heartbeat, and `host.metrics` never advertised in the channel's `hello`. That
+last part matters — an opted-out host is indistinguishable from a daemon too
+old to have the operation, so opting out is not itself a signal. It follows the
+shape of the existing `SPAWND_NO_CPU_SCOPES` switch: one variable, checked
+once, no partial modes.
+
+Two consequences worth stating plainly rather than leaving to be found. The
+buckets are *new metadata the server did not previously hold* — small, coarse,
+and rate-limited, but new, and the inventory above is updated accordingly. And
+the daily activity rollup (`legion_days`) that backs the profile is likewise
+new server-side retention: per-owner, per-UTC-day counters — sessions started,
+seconds run, peak concurrent sessions and online hosts, and a bounded tally of
+the already-disclosed `session.foreground` basenames. It holds no per-session
+rows, nothing that outlives its day bucket in identifiable form, and no paths,
+arguments, or terminal bytes. It exists because sessions are hard-deleted with
+their workspace, so anything computed from the `sessions` table would show a
+person's history shrinking as they tidy up.
+
+### Host previews and desktop launches
+
+The preview and desktop operations added alongside the file viewer do not
+change what the control plane can see: rendered pixels and file slices travel
+the same encrypted DataChannel that already carried `fs.read`, and signaling
+stays signaling. Three things about the *host's* exposure do change, and are
+recorded here rather than left to be discovered.
+
+**The daemon now spawns GUI-session processes on behalf of a remote request.**
+This is not a new privilege for an authenticated browser — it can already open a
+PTY session and type `open ~/anything`, and the daemon already spawns login
+shells and install commands. But it is a new *surface*, in three ways. It is
+reachable without creating a session, so it leaves no `sessions` row and no
+visible pane; the daemon therefore records each launch locally by operation name
+only, never by path. It shortens the exploit chain from "drive an interactive
+shell" to "send one frame", which matters because the same channel offers
+`fs.write.begin`: write-then-open would be a code-execution primitive if the
+gates on `desktop.open` (regular files only, magic-sniffed allowlist, no execute
+bit, no executable magic, explicit refusal of URL-indirection types, and a rate
+limit) were ever relaxed. And it runs third-party native code — QuickLook
+generators are arbitrary binaries parsing untrusted documents — which is why
+they are executed out of process via `qlmanage` rather than in-process through
+the framework, so a crash costs one failed preview rather than the daemon that
+holds the host's identity key. `scripts/check-host-desktop-launch.sh` pins these
+properties in the source.
+
+**Ambient authority is now consumed at exactly two roots, not one.** The
+previous invariant — consumed once, for the home directory — is restated rather
+than quietly broken: it is consumed at startup for the user's home directory
+(client-reachable and client-named) and for a daemon-private preview staging
+directory (never client-reachable, never client-named, and never containing a
+client-supplied path component). Request-time operations continue to resolve
+only through held handles. A renderer needs a real path, and the only safe way
+to give it one is to hard-link the already-validated inode under a name the
+daemon chose and then verify the link points at that same inode; reconstructing
+a path from components would hand another process a string the kernel never
+resolved through our handles.
+
+Workspace, session, agent-definition, and skill names remain server-visible;
+users must not place secrets in labels. A default session name includes the
+working-directory basename, and `sessions.cwd` is server-readable today. The
+endpoint-local proposal must be redesigned for shell sessions before either
+can move out of the control plane.
 
 ## Identity and pairing
 
-The device-code flow now binds the host and approving browser keys described
-below. Browser identity registration and bounded first-contact pins are Phase 3
-foundations; live signaling remains unsigned at L0 until the separately gated
-signed-WebSocket and TOFU integration is implemented and reviewed:
+The device-code flow binds the host and approving browser keys described below.
+Live session- and host-scoped signaling supports signed envelopes, and the
+daemon refuses unsigned offers by default. The guarantee still depends on a
+trusted/verifiable endpoint build and locally established expected-peer pins:
 
 - **Host identity**: `spawnd login` generates an Ed25519 keypair, stored
   beside the daemon token in the OS keyring (or the existing mode-0600 Unix
@@ -170,31 +293,29 @@ signed-WebSocket and TOFU integration is implemented and reviewed:
   approval, and token issue remain unavailable until the server verifies that
   proof against the submitted host key. Same-owner re-login reuses the pinned
   Host; host deletion revokes its token authority and removes the server-side
-  Host/browser pins while retaining the original account's key claim. It does
-  not silently erase a daemon-local browser pin. Private key material never
-  enters a request, log, or status/API response.
+  Host/browser pins while retaining the original account's key claim. Private
+  key material never enters a request, log, or status/API response.
 - **Browser device identity**: on first login, the browser generates a
   non-extractable WebCrypto keypair (IndexedDB). The public key is
   registered with the account.
-- **Signed signaling target (not live yet)**: after P3-IDENTITY-02 is
-  implemented and independently reviewed, every `rtc.offer` / `rtc.answer`
-  will carry a signature by the sender's identity key over an unambiguous,
+- **Signed signaling**: a signed `rtc.offer` / `rtc.answer` carries a signature
+  by the sender's identity key over an unambiguous,
   versioned canonical transcript: `(protocol_version, session_id, scope_type,
-  scope_id, sender_role, peer_identity_public_key, SDP)`. `scope_type` will be
-  `agent` or `host`, and `scope_id` the corresponding agent or host UUID; the
+  scope_id, sender_role, peer_identity_public_key, SDP)`. `scope_type` is
+  `session` or `host`, and `scope_id` is the corresponding session or host UUID; the
   role will distinguish browser from daemon. Binding all of these fields is
   intended to prevent a valid offer or answer from being replayed across
-  sessions, agents, hosts, protocol versions, roles, or intended peers. Each
+  RTC generations, sessions, hosts, protocol versions, roles, or intended peers. Each
   ingress must verify through the live adapter against an independently pinned
-  expected peer key before L1 can be claimed. Only then will the DTLS
+  expected peer key before L1 can be claimed. Only then do the DTLS
   fingerprints inside the signed SDP inherit endpoint identity and server
   transcript changes be detectable, **provided the endpoint verifier and its
   delivered build are themselves trusted/verifiable**.
 - **Assurance levels** (mirror how Tailscale layers tailnet lock):
-  - **L0 (today)** — trust the server for introductions. No content
-    visibility once Phases 1–2 land, but a malicious server could MITM
-    at session setup.
-  - **L1 (Phase 3)** — signed signaling + TOFU pinning. For a trusted or
+  - **L0 (explicit compatibility opt-out)** — unsigned signaling is possible
+    only when daemon enforcement is explicitly disabled; it trusts the server
+    for introductions.
+  - **L1 (current signed mode)** — signed signaling + pinning. For a trusted or
     independently verifiable endpoint build, server key substitution is
     detectable except at first contact. Operator-hosted, unverified JavaScript
     does not receive this assurance from protocol signatures alone.
@@ -392,7 +513,7 @@ What moves where, and the regressions we accept:
   stores ciphertext blobs it cannot read).
 - **Live card previews** → rendered client-side from per-host
   DataChannel output. Offline hosts show status metadata only.
-- **Resize, scroll, redraw, and display ownership** → per-agent `spawn.ctl`.
+- **Resize, scroll, redraw, and display ownership** → per-session `spawn.ctl`.
   The daemon arbitrates multi-viewer display state; the REST and browser/server
   control-plane paths are removed so dimensions, scroll deltas, and viewport
   event timing do not become operator metadata.
@@ -400,41 +521,35 @@ What moves where, and the regressions we accept:
   directly. Cost: upstream bandwidth from residential hosts; realistic N
   is small.
 - **File upload** → a bounded/chunked/cancellable `spawn.ctl` stream, bound to
-  a fresh channel capability and exact agent-backend generation. Stable upload
+  a fresh channel capability and exact session-worker generation. Stable upload
   UUIDs make bounded retries resumable/idempotent; exact length and SHA-256 are
   checked before an atomic no-clobber commit beneath the worker-retained cwd.
   Paths and detailed results remain endpoint-to-browser only. This also removes
   base64-over-JSON overhead and the server memory spike.
 - **Host filesystem operations** → a host-scoped browser↔daemon WebRTC
   connection with a `spawn.host.ctl` DataChannel. It exists independently of
-  any agent, because the file browser must work on a host with no running
-  agent. The server authorizes the browser for the host and relays only
+  any session, because the file browser must work on a host with no running
+  session. The server authorizes the browser for the host and relays only
   signaling/ICE; paths, entry names/sizes/mtimes, file bytes, and operation
   errors stay on the DataChannel. Cross-host transfer is browser-mediated
   between two such channels, so the control plane never buffers the file.
-- **Tool installation** → user-initiated requests and stdout/stderr use
-  `spawn.host.ctl`. Installer output is not treated as low-sensitivity: it can
-  contain paths, commands, versions, and secrets. Unattended update checks may
-  report only preset/host identifiers, schedule timestamps, and content-free
-  success/failure/exit-code metadata to the control plane; stdout/stderr and
-  detailed errors remain daemon-local until an endpoint fetches them E2E.
-- **Detailed operational errors** → the server receives only stable codes needed
-  for lifecycle metadata. Human-readable spawn, snapshot, upload, filesystem,
-  and tool errors travel on `spawn.ctl` or `spawn.host.ctl`; the server neither
-  forwards nor logs them.
+- **Agent-definition checks and installation** → currently use REST plus the
+  `host.agents.*` daemon frames. Their target, versions, output, and detailed
+  error can reach the control plane. Moving the interactive result and policy
+  target to `spawn.host.ctl` remains Phase 2 work.
+- **Detailed operational errors** → upload and filesystem detail stays on
+  `spawn.ctl` / `spawn.host.ctl`, but free-form daemon errors and host-agent
+  check/install results still have server-readable paths. P2-ERROR-01 and the
+  host-agent cut remain incomplete.
 - **REST terminal surfaces** → removed once direct replacements ship. Terminal
-  input uses `spawn.pty`; history/snapshot uses per-agent `spawn.ctl`. The
+  input uses `spawn.pty`; history/snapshot uses per-session `spawn.ctl`. The
   server cannot implement a content-returning compatibility REST proxy without
   violating the model.
-- **Launch manifests, preset environment values, and skill bodies** → delivered
-  over `spawn.host.ctl` and retained in a per-host endpoint-local canonical
-  store. The store/key/recovery/conflict/migration decision is normative in
-  `docs/DURABLE_SENSITIVE_DATA.md`. The browser copies values directly between
-  online hosts; the server is not a sync queue. The migration must establish
-  and restart-test a working endpoint copy before clearing the current
-  plaintext database fields.
-  Default agent names become neutral and ID-based unless the user supplies an
-  explicit metadata label; cwd-derived legacy names are scrubbed.
+- **Session launch configuration, agent-definition values, and skill bodies**
+  → still use server-readable database/API/control-frame paths. The proposed
+  endpoint-local store in `docs/DURABLE_SENSITIVE_DATA.md` was not implemented
+  and predates shell-first sessions; it requires a new mapping before runtime
+  work. No endpoint-store guarantee is claimed here.
 - **The spawn MCP surface** — *resolved: cut entirely (2026-07-09).* The
   `/mcp` endpoint sent terminal input and captured snapshots *through
   the server* by design, the managed MCP-server registry stored bearer
@@ -442,11 +557,11 @@ What moves where, and the regressions we accept:
   existed only to authenticate remote MCP clients. All three were
   removed (endpoint, registry + grants + their tables, OAuth AS +
   well-known metadata) rather than kept as an exception that falsifies
-  the headline claim. Skills remain: their bodies are the only
-  content-adjacent payload left in `agent.create`, tracked in the table
+  the headline claim. Skills remain: their bodies are carried in
+  `session.create` / `session.restart`, tracked in the table
   above. If spawn-as-MCP-tool ever returns, it must terminate E2E on
   the daemon/client side.
-- **Notifications** (future) → opaque "activity on agent X" signals or
+- **Notifications** (future) → opaque "activity on session X" signals or
   client-decryptable payloads only.
 
 ## Residual risks
@@ -466,21 +581,17 @@ worthless:
    eventually a packaged client (PWA store build / Tauri) whose update
    channel is independently signed.
 2. **First-contact key substitution** until L2 verification lands.
-3. **Metadata.** The control plane necessarily learns who owns which hosts,
-   when they connect, coarse meaningful-output/user-input times, and the
-   unattended-update metadata listed above. The proposed endpoint-local store
-   avoids durable server-side object/version/access metadata, but its E2E
-   transfers still reveal timing and approximate volume. TURN learns IP pairs
-   and volumes. We do not claim metadata privacy; self-host if that matters.
-4. **Endpoint durable-store keys.** Confidentiality and availability depend on
-   the per-host key, recovery export, rotation, and destruction design in
-   `DURABLE_SENSITIVE_DATA.md`. Key compromise can expose retained local
-   versions; key loss without an export makes them unrecoverable. A fallback
-   key file stored beside the database does not protect a stolen full-disk
-   image. Rotation does not erase old ciphertext unless old wrappers, backups,
-   and keys are also destroyed.
-5. **Endpoint compromise** is out of scope and undiminished: an agent
-   with your credentials running on your machine is exactly as dangerous
+3. **Metadata and remaining server-readable configuration.** The control plane
+   learns the inventory above, including session directories, agent-definition
+   values, skill bodies, foreground basenames, and host-agent results. TURN
+   learns IP pairs and volumes. We do not claim metadata privacy or Phase 2
+   completion; self-host if that matters.
+4. **Proposed endpoint durable-store keys.** If the unimplemented
+   `DURABLE_SENSITIVE_DATA.md` design is revived, its key loss, recovery,
+   rotation, full-disk compromise, and old-ciphertext destruction risks still
+   need implementation evidence after the object model is redesigned.
+5. **Endpoint compromise** is out of scope and undiminished: a CLI agent
+   with your credentials running inside a session shell is exactly as dangerous
    as it is without spawn.
 
 ## Open source
@@ -512,7 +623,14 @@ otherwise.
 
 ## Migration phases
 
-Each phase ships independently; the product works throughout.
+> **Historical plan:** this section records the staged trust work in its
+> original vocabulary. Its v2 subprotocol names and old process/definition
+> terms describe completed checkpoints, not the current interface. The live
+> browser and daemon control subprotocols are `spawn.v3` and
+> `spawn.control.v3`; current lifecycle frames are `session.*`. See
+> `INTERFACE_MATRIX.md` and `proto/README.md`.
+
+Each phase was designed to ship independently while the product kept working.
 
 ### Phase 1 — TURN + WebRTC as the only terminal path
 

@@ -1,4 +1,4 @@
-"""Managed skill access for agents."""
+"""Managed skills and per-session skill access."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
 from ..db import get_session
-from ..models import Agent, AgentSkillGrant, Skill, User
+from ..models import Session, SessionSkillGrant, Skill, User
 
 router = APIRouter(prefix="/api", tags=["capabilities"])
 
@@ -30,11 +30,11 @@ async def _get_owned_skill(session: AsyncSession, skill_id: str, user: User) -> 
     return skill
 
 
-async def _get_owned_agent(session: AsyncSession, agent_id: str, user: User) -> Agent:
-    agent = await session.get(Agent, agent_id)
-    if agent is None or agent.owner_user_id != user.id:
-        raise HTTPException(status_code=404, detail="agent not found")
-    return agent
+async def _get_owned_session(db: AsyncSession, session_id: str, user: User) -> Session:
+    session_row = await db.get(Session, session_id)
+    if session_row is None or session_row.owner_user_id != user.id:
+        raise HTTPException(status_code=404, detail="session not found")
+    return session_row
 
 
 async def _owned_skills_by_ids(session: AsyncSession, user: User, ids: Sequence[str]) -> list[Skill]:
@@ -61,50 +61,55 @@ async def default_skill_ids(session: AsyncSession, user: User) -> list[str]:
     return list(rows)
 
 
-async def set_agent_access(
-    session: AsyncSession,
+async def set_session_access(
+    db: AsyncSession,
     *,
     user: User,
-    agent: Agent,
+    session_row: Session,
     skill_ids: Sequence[str],
 ) -> None:
-    await _owned_skills_by_ids(session, user, skill_ids)
+    await _owned_skills_by_ids(db, user, skill_ids)
 
-    await session.execute(delete(AgentSkillGrant).where(AgentSkillGrant.agent_id == agent.id))
+    await db.execute(
+        delete(SessionSkillGrant).where(SessionSkillGrant.session_id == session_row.id)
+    )
     for skill_id in dict.fromkeys(skill_ids):
-        session.add(
-            AgentSkillGrant(
+        db.add(
+            SessionSkillGrant(
                 owner_user_id=user.id,
-                agent_id=agent.id,
+                session_id=session_row.id,
                 skill_id=skill_id,
             )
         )
 
 
-async def get_agent_access_payload(
-    session: AsyncSession, *, user: User, agent_id: str
-) -> schemas.AgentAccessOut:
-    agent = await _get_owned_agent(session, agent_id, user)
+async def get_session_access_payload(
+    db: AsyncSession, *, user: User, session_id: str
+) -> schemas.SessionAccessOut:
+    session_row = await _get_owned_session(db, session_id, user)
     skills = (
-        await session.execute(
+        await db.execute(
             select(Skill)
-            .join(AgentSkillGrant, AgentSkillGrant.skill_id == Skill.id)
-            .where(AgentSkillGrant.agent_id == agent.id, AgentSkillGrant.owner_user_id == user.id)
+            .join(SessionSkillGrant, SessionSkillGrant.skill_id == Skill.id)
+            .where(
+                SessionSkillGrant.session_id == session_row.id,
+                SessionSkillGrant.owner_user_id == user.id,
+            )
             .order_by(Skill.name)
         )
     ).scalars().all()
-    return schemas.AgentAccessOut(
-        agent_id=agent.id,
+    return schemas.SessionAccessOut(
+        session_id=session_row.id,
         skills=[schemas.SkillOut.model_validate(row) for row in skills],
     )
 
 
-async def get_agent_launch_capabilities(
-    session: AsyncSession, *, user: User, agent_id: str
+async def get_session_launch_capabilities(
+    db: AsyncSession, *, user: User, session_id: str
 ) -> list[dict]:
-    access = await get_agent_access_payload(session, user=user, agent_id=agent_id)
+    access = await get_session_access_payload(db, user=user, session_id=session_id)
     return [
-        schemas.AgentSkillConfig(
+        schemas.SkillLaunchConfig(
             id=skill.id,
             name=skill.name,
             description=skill.description,
@@ -184,32 +189,32 @@ async def delete_skill(
     await session.commit()
 
 
-@router.get("/agents/{agent_id}/access", response_model=schemas.AgentAccessOut)
-async def get_agent_access(
-    agent_id: str,
+@router.get("/sessions/{session_id}/access", response_model=schemas.SessionAccessOut)
+async def get_session_access(
+    session_id: str,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
-) -> schemas.AgentAccessOut:
-    return await get_agent_access_payload(session, user=user, agent_id=agent_id)
+) -> schemas.SessionAccessOut:
+    return await get_session_access_payload(session, user=user, session_id=session_id)
 
 
-@router.patch("/agents/{agent_id}/access", response_model=schemas.AgentAccessOut)
-async def update_agent_access(
-    agent_id: str,
-    body: schemas.AgentAccessPatch,
+@router.patch("/sessions/{session_id}/access", response_model=schemas.SessionAccessOut)
+async def update_session_access(
+    session_id: str,
+    body: schemas.SessionAccessPatch,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
-) -> schemas.AgentAccessOut:
-    agent = await _get_owned_agent(session, agent_id, user)
-    current = await get_agent_access_payload(session, user=user, agent_id=agent.id)
+) -> schemas.SessionAccessOut:
+    session_row = await _get_owned_session(session, session_id, user)
+    current = await get_session_access_payload(session, user=user, session_id=session_row.id)
     skill_ids = body.skill_ids
     if skill_ids is None:
         skill_ids = [skill.id for skill in current.skills]
-    await set_agent_access(
+    await set_session_access(
         session,
         user=user,
-        agent=agent,
+        session_row=session_row,
         skill_ids=skill_ids,
     )
     await session.commit()
-    return await get_agent_access_payload(session, user=user, agent_id=agent.id)
+    return await get_session_access_payload(session, user=user, session_id=session_row.id)

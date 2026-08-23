@@ -55,7 +55,7 @@ class User(Base):
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     hosts: Mapped[list[Host]] = relationship(back_populates="owner")
-    agents: Mapped[list[Agent]] = relationship(back_populates="owner")
+    sessions: Mapped[list[Session]] = relationship(back_populates="owner")
     skills: Mapped[list[Skill]] = relationship(back_populates="owner")
     auth_identities: Mapped[list[AuthIdentity]] = relationship(back_populates="user")
     auth_provider_states: Mapped[list[AuthProviderState]] = relationship(back_populates="user")
@@ -348,12 +348,28 @@ class Host(Base):
         nullable=True,
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # What the machine is. Written once from `register` and stable after that,
+    # so nothing here is refreshed per heartbeat. All nullable: a daemon older
+    # than the field, or one running with SPAWND_NO_TELEMETRY, reports none of
+    # it and must keep working exactly as before.
+    cpu_cores: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cpu_physical_cores: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cpu_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    memory_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    gpu: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # How hard it is working — as a meter segment count in 0..=5, never a
+    # percentage. See migration 0042 and daemon/src/host_metrics.rs: the exact
+    # figures exist, and deliberately never travel through this server.
+    cpu_bucket: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    mem_bucket: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Distinguishes "idle" from "never reported": both leave the buckets NULL.
+    capacity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
 
     owner: Mapped[User] = relationship(back_populates="hosts")
-    agents: Mapped[list[Agent]] = relationship(back_populates="host")
+    sessions: Mapped[list[Session]] = relationship(back_populates="host")
     browser_pins: Mapped[list[HostBrowserPin]] = relationship(
         back_populates="host", passive_deletes=True
     )
@@ -623,26 +639,61 @@ class RootIntroduction(Base):
     )
 
 
-class Preset(Base):
-    __tablename__ = "presets"
+class Agent(Base):
+    """A launchable CLI tool definition — a shortcut, not a process."""
+
+    __tablename__ = "agents"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    # NULL owner marks a built-in: visible to everyone, immutable via the API.
     owner_user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    agent_kind: Mapped[str] = mapped_column(String(64), nullable=False)
-    default_argv: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
-    env_template: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
-    # Optional shell command run by the daemon when `default_argv[0]` is not
-    # on PATH at agent.create time. Output streams into the agent's PTY.
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The full shell command the shortcut bar types into a session's PTY.
+    command: Mapped[str] = mapped_column(String(1024), nullable=False)
+    env: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
+    # Optional shell command offered when the command's binary is missing on a
+    # host ("install & run"); typed visibly into the PTY, never run silently.
     install: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # How this CLI is told to stop asking for permission ("yolo mode"). Every
+    # tool spells it differently, so the definition carries the spelling and
+    # the per-user AgentPreference below carries the on/off. Both empty means
+    # the tool has no such mode and the toggle is not offered.
+    yolo_args: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    yolo_env: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
 
-    __table_args__ = (UniqueConstraint("owner_user_id", "name", name="uq_presets_owner_name"),)
+    __table_args__ = (UniqueConstraint("owner_user_id", "name", name="uq_agents_owner_name"),)
 
 
-class HostToolPolicy(Base):
-    __tablename__ = "host_tool_policies"
+class AgentPreference(Base):
+    """One user's settings for one agent definition — including built-ins.
+
+    Built-ins are shared rows nobody may edit, so a preference on one cannot
+    live on ``agents``. Rows are created lazily on first write; a missing row
+    reads as every default.
+    """
+
+    __tablename__ = "agent_preferences"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agent_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Launch this agent with its permission prompts turned off.
+    yolo: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "agent_id", name="uq_agent_preferences_owner_agent"),
+    )
+
+
+class HostAgentPolicy(Base):
+    __tablename__ = "host_agent_policies"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     owner_user_id: Mapped[str] = mapped_column(
@@ -651,8 +702,8 @@ class HostToolPolicy(Base):
     host_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    preset_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("presets.id", ondelete="CASCADE"), nullable=False, index=True
+    agent_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
     )
     auto_update: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -665,14 +716,16 @@ class HostToolPolicy(Base):
         UniqueConstraint(
             "owner_user_id",
             "host_id",
-            "preset_id",
-            name="uq_host_tool_policies_owner_host_preset",
+            "agent_id",
+            name="uq_host_agent_policies_owner_host_agent",
         ),
     )
 
 
-class Agent(Base):
-    __tablename__ = "agents"
+class Session(Base):
+    """A PTY on a host. Always starts as the user's login shell in `cwd`."""
+
+    __tablename__ = "sessions"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     owner_user_id: Mapped[str] = mapped_column(
@@ -681,12 +734,7 @@ class Agent(Base):
     host_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    preset_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("presets.id", ondelete="SET NULL"), nullable=True
-    )
     cwd: Mapped[str] = mapped_column(String(1024), nullable=False)
-    argv: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
-    env: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
     name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="starting", nullable=False)
     started_at: Mapped[datetime] = mapped_column(
@@ -696,11 +744,13 @@ class Agent(Base):
     last_output_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_input_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     exit_code: Mapped[int | None] = mapped_column(nullable=True)
-    pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Basename of the foreground process (daemon-reported, <= 64 chars). The
+    # documented content-free exception: a process name, nothing else, so the
+    # UI can label panes. See docs/TRUST.md.
+    foreground_command: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    owner: Mapped[User] = relationship(back_populates="agents")
-    host: Mapped[Host] = relationship(back_populates="agents")
+    owner: Mapped[User] = relationship(back_populates="sessions")
+    host: Mapped[Host] = relationship(back_populates="sessions")
 
 
 class Skill(Base):
@@ -723,15 +773,15 @@ class Skill(Base):
     __table_args__ = (UniqueConstraint("owner_user_id", "name", name="uq_skills_owner_name"),)
 
 
-class AgentSkillGrant(Base):
-    __tablename__ = "agent_skill_grants"
+class SessionSkillGrant(Base):
+    __tablename__ = "session_skill_grants"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     owner_user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    agent_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True
     )
     skill_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("skills.id", ondelete="CASCADE"), nullable=False, index=True
@@ -740,7 +790,7 @@ class AgentSkillGrant(Base):
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
 
-    __table_args__ = (UniqueConstraint("agent_id", "skill_id", name="uq_agent_skill_grants"),)
+    __table_args__ = (UniqueConstraint("session_id", "skill_id", name="uq_session_skill_grants"),)
 
 
 class DeviceCode(Base):
@@ -837,29 +887,111 @@ class DeviceCode(Base):
     )
 
 
-class Screen(Base):
-    __tablename__ = "screens"
+class Workspace(Base):
+    """A named 12x12 grid of session tiles."""
+
+    __tablename__ = "workspaces"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     owner_user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
-    # {"root": <split tree>|null} — a split tree is {"type": "pane",
-    # "agent_id": ...} or {"type": "split", "direction": "row"|"column",
-    # "ratio": ..., "a": <node>, "b": <node>}. Kept as loose JSON so layout
-    # evolution doesn't need migrations.
+    # The workspace's home: the host and folder it was created in. New
+    # sessions default here so the folder is chosen once, at creation.
+    # Nullable: pre-0034 workspaces, or a deleted host (SET NULL).
+    host_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("hosts.id", ondelete="SET NULL"), nullable=True
+    )
+    cwd: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # Layout schema v3 (tabs over grid-schema-v3 grids), validated on every write by
+    # spawn_server.grid + routes/workspaces (docs/OVERHAUL.md §4.4).
     layout: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    # Ad-hoc screens (drag one agent onto another) start ephemeral: they are
-    # auto-deleted when emptied and promoted to permanent on rename or a
-    # third pane. Deliberate "New screen" screens are never ephemeral.
-    ephemeral: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Sidebar ordering, contiguous from 0 per owner. Archived rows leave that
+    # space entirely — they order by `archived_at` and their `position` is
+    # stale until a restore appends them back at the end.
+    position: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    # The workspace's mark: a small square thumbnail as a self-contained
+    # `data:image/(png|webp);base64,...` URL, checked on every write by
+    # `schemas.validate_workspace_icon`. Null -> the sidebar draws the name's
+    # initials, as it always has.
+    icon: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Whether the icon question is settled, which `icon` alone cannot say: a
+    # null icon is both "nobody has looked" and "looked, found nothing". NULL
+    # -> the browser scans this workspace's folder next time it opens; "auto"
+    # (that scan found one), "custom" (the owner chose it, or deliberately
+    # cleared it) and "none" (scanned, nothing worth using) all mean: leave it.
+    icon_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Set -> the workspace is put away: out of the sidebar's list, and every
+    # session in it stopped. Nothing else moves — `layout` still names the same
+    # windows and `position` still holds the slot the row will come back to. A
+    # timestamp rather than a flag so the UI can say "archived 3 days ago".
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class WorkspaceTemplate(Base):
+    """A saved workspace shape: tabs, tile geometry, and what runs in each
+    tile (shell / agent command / files widget). No folder or host — those
+    are chosen when a workspace is created from it."""
+
+    __tablename__ = "workspace_templates"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # The folder the template was saved from: creating from the template goes
+    # straight there, no folder prompt. Nullable — the host may be gone.
+    host_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("hosts.id", ondelete="SET NULL"), nullable=True
+    )
+    cwd: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # {"version": 1, "tabs": [{"name", "tiles": [{x, y, w, h, "run"}]}]},
+    # validated by routes/workspace_templates on every write.
+    spec: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # The mark the saved workspace was wearing, in the same form and under the
+    # same validation as `Workspace.icon`; a workspace created from this
+    # template inherits it instead of scanning its folder.
+    icon: Mapped[str | None] = mapped_column(Text, nullable=True)
+    icon_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class RecentDir(Base):
+    """A directory a session was recently started in, per owner and host."""
+
+    __tablename__ = "recent_dirs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    host_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_user_id", "host_id", "path", name="uq_recent_dirs_owner_host_path"
+        ),
     )
 
 
@@ -911,6 +1043,48 @@ class Invite(Base):
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+
+
+class LegionDay(Base):
+    """One owner's fleet activity for one UTC day. Counters only.
+
+    Why this exists at all: session rows are hard-deleted when a workspace is
+    deleted, so a profile computed from ``sessions`` would show a person's
+    history *shrinking* as they tidy up. This table is the durable record —
+    append-only, one row per owner per day, and nothing in it can be traced
+    back to a particular session once written.
+
+    ``agents`` is a small JSON object of foreground executable basenames to
+    counts (``{"claude": 12, "codex": 3}``). It is drawn from the same
+    ``session.foreground`` vocabulary the pane labels already use — a bare
+    basename, never arguments or paths — and is bounded on write so a host
+    cycling through hundreds of binaries cannot grow the row without limit.
+    """
+
+    __tablename__ = "legion_days"
+
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    # ISO ``YYYY-MM-DD``, always the server's UTC day. A string rather than a
+    # DATE so SQLite and Postgres read back the identical value.
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    sessions_started: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    session_seconds: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0", nullable=False
+    )
+    peak_sessions: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    peak_hosts_online: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    agents: Mapped[str] = mapped_column(Text, default="{}", server_default="{}", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
 

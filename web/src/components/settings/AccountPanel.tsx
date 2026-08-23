@@ -186,7 +186,7 @@ export function AccountPanel() {
       }),
     onSuccess: () => {
       // The server already deleted the session cookie with the account; this
-      // clears local auth state and lands on the login page.
+      // clears local auth state and hands back to the lander.
       void logout();
     },
     onError: (cause) => setError(cause instanceof ApiError ? cause.message : String(cause)),
@@ -204,7 +204,7 @@ export function AccountPanel() {
 
       {user !== null && user.email_verified_at === null && (
         <div
-          className="space-y-2 rounded-md border border-amber-600/50 p-3"
+          className="space-y-2 rounded-md border border-warning/50 p-3"
           data-testid="verify-email-callout"
         >
           <p className="text-sm font-medium">Confirm your email address</p>
@@ -242,7 +242,7 @@ export function AccountPanel() {
         <div>
           <p className="text-sm font-medium">Delete account</p>
           <p className="text-sm text-muted-foreground">
-            Permanently deletes this account: every host pairing, agent, screen, preset, skill,
+            Permanently deletes this account: every host pairing, session, workspace, agent, skill,
             device identity, and saved trust. Daemons on your machines keep running but lose this
             server. This cannot be undone.
           </p>

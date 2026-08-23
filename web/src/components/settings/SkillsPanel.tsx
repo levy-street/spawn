@@ -127,7 +127,7 @@ export function SkillsPanel() {
             onChange={(event) => setEnabledByDefault(event.currentTarget.checked)}
             disabled={busy}
           />
-          Grant to new agents by default
+          Grant to new sessions by default
         </label>
         {(error || q.error) && (
           <p className="text-sm text-destructive @md/settings:col-span-2" role="alert">

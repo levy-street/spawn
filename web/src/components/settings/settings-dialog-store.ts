@@ -5,10 +5,17 @@ import { useSyncExternalStore } from "react";
 /**
  * Which settings tab is open, app-wide. A module singleton (not URL state) so
  * opening settings never navigates — the modal overlays whatever the user is
- * doing, and closing it returns them exactly there. /settings and /trust stay
- * deep-linkable via redirect pages that call `openSettings` on mount.
+ * doing, and closing it returns them exactly there.
  */
-export type SettingsTab = "account" | "appearance" | "access" | "skills";
+export type SettingsTab =
+  | "account"
+  | "appearance"
+  | "notifications"
+  | "hosts"
+  | "agents"
+  | "access"
+  | "skills"
+  | "templates";
 
 /**
  * Old bookmarks and copy said "Browser devices" / "Device trust"; both now
@@ -31,6 +38,31 @@ export function openSettings(tab: SettingsTabRequest = "account") {
 export function closeSettings() {
   openTab = null;
   emit();
+}
+
+/**
+ * The settings tab a full-page navigation came *from*, so that page's back
+ * control can return to it instead of guessing.
+ *
+ * A module value rather than a query parameter, for the same reason the open
+ * tab is one: the dialog is not URL state, so "I got here from the Hosts tab"
+ * is a fact about this session's navigation and not about the address. It is
+ * read once and cleared — arriving any other way, or reloading, leaves it null,
+ * and back then means back.
+ */
+let returnTab: SettingsTab | null = null;
+
+/** Close the dialog on the way to a page that can return to this tab. */
+export function leaveSettingsFor(tab: SettingsTab) {
+  returnTab = tab;
+  closeSettings();
+}
+
+/** The tab to return to, consumed. Null unless the last navigation set one. */
+export function takeSettingsReturn(): SettingsTab | null {
+  const tab = returnTab;
+  returnTab = null;
+  return tab;
 }
 
 export function useSettingsDialog(): SettingsTab | null {

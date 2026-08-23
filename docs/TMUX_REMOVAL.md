@@ -5,8 +5,8 @@ Status: **accepted, independently reviewed, and merged for P2-TMUX-01**
 
 ## Decision
 
-`spawn-worker` is the only production agent-session backend. `spawnd` always
-creates and adopts workers; there is no global selector, per-agent override, or
+`spawn-worker` is the only production session backend. `spawnd` always
+creates and adopts workers; there is no global selector, per-session override, or
 fallback. Failure to launch/connect/adopt a worker fails closed. The daemon no
 longer executes the `tmux` binary or contains creation, attach, discovery,
 adoption, naming, capture, replay, resize, scroll, copy-mode, or repaint logic
@@ -42,16 +42,16 @@ protected content.
 
 Before installing the worker-only daemon, an operator must:
 
-1. close new-agent ingress and announce the drain window;
+1. close new-session ingress and announce the drain window;
 2. inventory old sessions without capturing pane content;
 3. let users finish or explicitly terminate those sessions under the normal
    operator change procedure;
 4. verify no old session remains, then install both new binaries and restart
    `spawnd`;
-5. verify new agents create worker sockets and worker-backed replay; and
+5. verify new sessions create worker sockets and worker-backed replay; and
 6. perform the later P2-PURGE-01 host/process/backups purge checks.
 
-This repository change does not deploy, restart services, signal agents, or
+This repository change does not deploy, restart services, signal sessions, or
 delete external sessions. If an old session is still present after upgrade,
 the new daemon reports it unavailable and does not inspect or adopt it.
 
@@ -62,7 +62,7 @@ the new daemon reports it unavailable and does not inspect or adopt it.
 - Supervisor restart: compatible live workers remain authoritative and are
   adopted from their Unix sockets.
 - Worker restart/crash: its PTY and ephemeral replay key are gone; recovery is
-  a user-driven new agent, not content reconstruction.
+  a user-driven new session, not content reconstruction.
 - Rollback: rolling back the supervisor binary must not restore a tmux content
   path or make old session content reachable. Operational rollback means stop
   the change, retain/drain compatible workers, and roll forward with a corrected
@@ -73,7 +73,7 @@ the new daemon reports it unavailable and does not inspect or adopt it.
 
 The server/API/web `tmux_session` display field and `agent.rename` daemon frame
 are removed in the same checkpoint. Although the field was computed rather
-than persisted, its friendly label could derive from protected agent/cwd naming
+than persisted, its friendly label could derive from protected session/cwd naming
 and therefore was not safe compatibility metadata. No new writes or derived
 values are allowed. P2-PURGE-01 still covers historical logs, caches, backups,
 and other recoverable copies outside the live schema.

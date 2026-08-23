@@ -6,7 +6,7 @@ import type {
   ConnInfo,
   SignalingTrustLevel,
   SocketState,
-} from "@/components/terminal/useAgentSocket";
+} from "@/components/terminal/useSessionSocket";
 import { DropdownMenu, DropdownMenuLabel } from "@/components/ui/dropdown-menu";
 import {
   SIGNED_RTC_REFUSAL_DETAIL,
@@ -15,10 +15,10 @@ import {
 } from "@/lib/signed-rtc-trust";
 import { cn } from "@/lib/utils";
 
-/** Snapshot of an agent terminal's transport, surfaced by <Terminal>. */
-export interface AgentConnectionInfo extends ConnInfo {
+/** Snapshot of a session terminal's transport, surfaced by <Terminal>. */
+export interface SessionConnectionInfo extends ConnInfo {
   socketState: SocketState;
-  v2: boolean;
+  v3: boolean;
   dcOpen: boolean;
   /** Set when the connection was refused because the host identity could not
    * be verified against a local pin. A refusal is terminal, not a retry. */
@@ -36,14 +36,14 @@ const TRUST_VIEW: Record<
 > = {
   verified: {
     icon: ShieldCheck,
-    tint: "text-emerald-500",
+    tint: "text-success",
     label: "verified",
     detail:
       "Verified: offers are signed by this browser and the host's identity matches your approved pin end to end.",
   },
   first_contact: {
     icon: ShieldAlert,
-    tint: "text-amber-500",
+    tint: "text-warning",
     label: "first contact",
     detail:
       "Signed, but this device is meeting this host for the first time — it took the server's word for the host's identity. Signing in with your passkey verifies it fully; approving this device again from one that already reaches the host also hands it over.",
@@ -59,7 +59,8 @@ const TRUST_VIEW: Record<
 
 // The refusal copy is shared with the host page and the file explorer so the
 // story never forks between surfaces (docs/TRUST_UX.md voice; review R-b).
-const REFUSAL_DETAIL = SIGNED_RTC_REFUSAL_DETAIL;
+// Re-exported because ConnectingOverlay reads it from here.
+export const REFUSAL_DETAIL = SIGNED_RTC_REFUSAL_DETAIL;
 
 interface ChipView {
   dot: string;
@@ -80,19 +81,23 @@ const KIND_DETAIL: Record<NonNullable<ConnInfo["kind"]>, string> = {
   relay: "TURN relay (encrypted end-to-end)",
 };
 
-function viewFor(info: AgentConnectionInfo): ChipView {
+function viewFor(info: SessionConnectionInfo): ChipView {
   if (info.signedRtcRefusal) {
-    return { dot: "bg-red-500", label: "blocked", detail: REFUSAL_DETAIL[info.signedRtcRefusal] };
+    return {
+      dot: "bg-destructive",
+      label: "blocked",
+      detail: REFUSAL_DETAIL[info.signedRtcRefusal],
+    };
   }
   if (info.socketState === "closed" || info.socketState === "error") {
-    return { dot: "bg-red-500", label: "offline", detail: "Control connection lost" };
+    return { dot: "bg-destructive", label: "offline", detail: "Control connection lost" };
   }
   if (info.socketState !== "open") {
     return { dot: "bg-muted-foreground", label: "connecting", pulse: true, detail: "Connecting…" };
   }
   if (!info.dcOpen) {
     return {
-      dot: "bg-amber-400",
+      dot: "bg-warning",
       label: "channel…",
       pulse: true,
       detail: "Negotiating the mandatory encrypted terminal channels",
@@ -100,7 +105,7 @@ function viewFor(info: AgentConnectionInfo): ChipView {
   }
   const kind = info.kind ?? "direct";
   return {
-    dot: kind === "relay" ? "bg-amber-400" : kind === "stun" ? "bg-sky-400" : "bg-emerald-500",
+    dot: kind === "relay" ? "bg-warning" : kind === "stun" ? "bg-info" : "bg-success",
     label: info.rttMs != null ? `${KIND_LABEL[kind]} · ${info.rttMs} ms` : KIND_LABEL[kind],
     detail: KIND_DETAIL[kind],
   };
@@ -111,7 +116,7 @@ export function ConnectionChip({
   compact = false,
   className,
 }: {
-  info: AgentConnectionInfo | null;
+  info: SessionConnectionInfo | null;
   compact?: boolean;
   className?: string;
 }) {
@@ -119,16 +124,16 @@ export function ConnectionChip({
   const view = viewFor(info);
   const trust = info.signalingTrust ? TRUST_VIEW[info.signalingTrust] : null;
   const TrustIcon = trust?.icon ?? null;
-  const v2TrustDetail = info.dcOpen
-    ? "spawn.v2 — terminal bytes and history are endpoint-to-endpoint; the server receives signaling and disclosed activity only"
-    : "spawn.v2 — mandatory endpoint-to-endpoint terminal channels are negotiating; there is no server content fallback";
+  const v3TrustDetail = info.dcOpen
+    ? "spawn.v3 — terminal bytes and history are endpoint-to-endpoint; the server receives signaling and disclosed activity only"
+    : "spawn.v3 — mandatory endpoint-to-endpoint terminal channels are negotiating; there is no server content fallback";
   const title = [
     view.detail,
     trust?.detail ?? null,
     info.rttMs != null ? `round trip ${info.rttMs} ms` : null,
     info.protocol ? `via ${info.protocol}` : null,
     info.dcOpen ? "DataChannel open" : null,
-    v2TrustDetail,
+    v3TrustDetail,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -154,7 +159,7 @@ export function ConnectionChip({
               ? "disconnected"
               : "negotiating",
         ],
-        ["Protocol", v2TrustDetail],
+        ["Protocol", v3TrustDetail],
       ];
 
   return (

@@ -9,7 +9,7 @@ import { Label } from "@/components/ui/label";
 import { type AdminEmail, type AdminInvite, ApiError, admin } from "@/lib/api";
 
 const STATE_STYLE: Record<AdminInvite["state"], string> = {
-  pending: "border-emerald-600/50 text-emerald-600 dark:text-emerald-400",
+  pending: "border-success/50 text-success",
   used: "border-border text-muted-foreground",
   expired: "border-border text-muted-foreground",
   revoked: "border-border text-muted-foreground",
@@ -31,9 +31,9 @@ export default function AdminPage() {
 }
 
 const EMAIL_STATUS_STYLE: Record<AdminEmail["status"], string> = {
-  sent: "border-emerald-600/50 text-emerald-600 dark:text-emerald-400",
+  sent: "border-success/50 text-success",
   failed: "border-destructive/60 text-destructive",
-  not_delivered: "border-amber-600/50 text-amber-600 dark:text-amber-400",
+  not_delivered: "border-warning/50 text-warning",
 };
 
 function Emails() {
@@ -71,7 +71,7 @@ function Emails() {
 
       <div
         className={`flex flex-wrap items-center justify-between gap-3 rounded-md border p-3 ${
-          delivering ? "border-border" : "border-amber-600/50"
+          delivering ? "border-border" : "border-warning/50"
         }`}
         data-testid="mail-status"
       >
@@ -202,7 +202,7 @@ function Users() {
               <th className="px-3 py-2 font-medium">Joined</th>
               <th className="px-3 py-2 font-medium">Verified</th>
               <th className="px-3 py-2 text-right font-medium">Hosts</th>
-              <th className="px-3 py-2 text-right font-medium">Agents</th>
+              <th className="px-3 py-2 text-right font-medium">Sessions</th>
               <th className="px-3 py-2 text-right font-medium">Devices</th>
             </tr>
           </thead>
@@ -232,11 +232,11 @@ function Users() {
                   {user.email_verified_at ? (
                     when(user.email_verified_at)
                   ) : (
-                    <span className="text-amber-600 dark:text-amber-400">unverified</span>
+                    <span className="text-warning">unverified</span>
                   )}
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums">{user.host_count}</td>
-                <td className="px-3 py-2 text-right tabular-nums">{user.agent_count}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{user.session_count}</td>
                 <td className="px-3 py-2 text-right tabular-nums">{user.browser_device_count}</td>
               </tr>
             ))}
@@ -345,7 +345,7 @@ function Invites() {
 
       {fresh?.url && (
         <div
-          className="space-y-2 rounded-md border border-emerald-600/50 p-3"
+          className="space-y-2 rounded-md border border-success/50 p-3"
           data-testid="fresh-invite"
         >
           <p className="text-sm font-medium">

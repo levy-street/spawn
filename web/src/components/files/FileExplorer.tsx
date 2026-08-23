@@ -8,10 +8,12 @@ import {
   Copy,
   CornerUpLeft,
   Download,
-  File,
+  ExternalLink,
+  Eye,
   Folder,
   FolderOpen,
   FolderPlus,
+  FolderSearch,
   Loader2,
   MoreHorizontal,
   Pencil,
@@ -22,14 +24,20 @@ import {
 import Link from "next/link";
 import {
   type DragEvent,
+  forwardRef,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
+import { FileIcon } from "@/components/files/file-icon";
+import { FilePreviewCard } from "@/components/files/file-preview-card";
+import { FileViewerDialog } from "@/components/files/file-viewer-dialog";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -37,10 +45,22 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+import { useHoverIntent } from "@/components/ui/hover-intent";
+import {
+  type MenuAnchor,
+  type MenuPlacement,
+  measureMenu,
+  placeMenu,
+  pointAnchor,
+} from "@/components/ui/menu-position";
+import { Popover } from "@/components/ui/popover";
 import { useHostControl } from "@/hooks/useHostControl";
 import { ApiError, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { HostControlClient, type HostDirEntry, type HostDirList } from "@/lib/hostControl";
+import { deriveFileCapabilities } from "@/lib/preview/capabilities";
+import { classifyFile } from "@/lib/preview/file-kinds";
+import { previewCache } from "@/lib/preview/preview-cache";
 import { resolveSignedRtcTrust, SIGNED_RTC_REFUSAL_DETAIL } from "@/lib/signed-rtc-trust";
 import { cn } from "@/lib/utils";
 import { FILE_EXPLORER_RETAINED_PAGE_LIMIT, retainDirectoryPages } from "./fileExplorerPaging";
@@ -107,23 +127,34 @@ export function formatSize(size: number | null | undefined): string {
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
-export function FileExplorer({
-  hostId,
-  rootPath,
-  rootLabel,
-  initialPath,
-  dense = false,
-  className,
-}: {
-  hostId: string;
-  /** Directory the tree is rooted at; defaults to the daemon home dir. */
-  rootPath?: string;
-  rootLabel?: string;
-  /** Deep link: ancestors are expanded and the entry selected once loaded. */
-  initialPath?: string;
-  dense?: boolean;
-  className?: string;
-}) {
+/** Imperative surface for hosts that fold the explorer's actions into their
+ *  own single header row (widget pane, files aside). */
+export type FileExplorerHandle = {
+  newFolder: () => void;
+  upload: () => void;
+  refresh: () => void;
+  collapseAll: () => void;
+};
+
+export const FileExplorer = forwardRef<
+  FileExplorerHandle,
+  {
+    hostId: string;
+    /** Directory the tree is rooted at; defaults to the daemon home dir. */
+    rootPath?: string;
+    rootLabel?: string;
+    /** Deep link: ancestors are expanded and the entry selected once loaded. */
+    initialPath?: string;
+    dense?: boolean;
+    /** The host renders its own single-row header (and reaches the actions
+     *  through the ref); the explorer's built-in header row is dropped. */
+    hideHeader?: boolean;
+    className?: string;
+  }
+>(function FileExplorer(
+  { hostId, rootPath, rootLabel, initialPath, dense = false, hideHeader = false, className },
+  handleRef,
+) {
   const qc = useQueryClient();
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -148,8 +179,31 @@ export function FileExplorer({
   // previous account's pin and signing identity.
   const liveAccountIdRef = useRef<string | null>(user?.id ?? null);
   liveAccountIdRef.current = user?.id ?? null;
-  const { client: hostControl, state: hostControlState, signedRtcRefusal } = useHostControl(hostId);
+  const {
+    client: hostControl,
+    state: hostControlState,
+    capabilities,
+    os: hostOs,
+    signedRtcRefusal,
+  } = useHostControl(hostId);
   const controlReady = hostControlState === "ready" && hostControl !== null;
+  // Actions are gated on what the daemon advertised, never on the platform it
+  // reports: an old agent on a Mac must not be offered what it cannot do, and a
+  // future Linux agent lights them up with no change here.
+  const caps = useMemo(() => deriveFileCapabilities(capabilities, hostOs), [capabilities, hostOs]);
+
+  const [viewing, setViewing] = useState<string | null>(null);
+  const [fineHover, setFineHover] = useState(false);
+  useEffect(() => {
+    // Coarse pointers have no hover to give; the preview would only ever fire
+    // on tap, which is what opening the viewer is for.
+    const query = window.matchMedia("(hover: hover) and (pointer: fine)");
+    const apply = () => setFineHover(query.matches);
+    apply();
+    query.addEventListener("change", apply);
+    return () => query.removeEventListener("change", apply);
+  }, []);
+  const hover = useHoverIntent<{ path: string }>({ enabled: fineHover });
 
   const rootQ = useQuery({
     queryKey: ["host-files", hostId, rootPath ?? ""],
@@ -276,6 +330,129 @@ export function FileExplorer({
     () => rows.filter((row): row is EntryRow => row.kind === "entry"),
     [rows],
   );
+  /** Files only — Prev/Next in the viewer steps past folders, not into them. */
+  const viewableRows = useMemo(() => entryRows.filter((row) => !row.entry.is_dir), [entryRows]);
+  const viewingIndex = useMemo(
+    () => (viewing === null ? -1 : viewableRows.findIndex((r) => r.entry.path === viewing)),
+    [viewing, viewableRows],
+  );
+  const viewingEntry = viewingIndex >= 0 ? (viewableRows[viewingIndex]?.entry ?? null) : null;
+  const hoverEntry = useMemo(() => {
+    const path = hover.value?.path;
+    if (!path) return null;
+    return entryRows.find((row) => row.entry.path === path)?.entry ?? null;
+  }, [hover.value, entryRows]);
+
+  // The anchor deliberately mixes two rects: the row supplies the vertical
+  // extent so the card tracks what it describes, and the panel supplies the
+  // horizontal edges so it does not slide sideways as the pointer moves down.
+  const [hoverAnchor, setHoverAnchor] = useState<MenuAnchor | null>(null);
+  useLayoutEffect(() => {
+    const path = hover.value?.path;
+    const container = containerRef.current;
+    if (!path || !container) {
+      setHoverAnchor(null);
+      return;
+    }
+    const row = container.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`);
+    if (!row) {
+      setHoverAnchor(null);
+      return;
+    }
+    const rowRect = row.getBoundingClientRect();
+    const panel = container.getBoundingClientRect();
+    setHoverAnchor({
+      top: rowRect.top,
+      bottom: rowRect.bottom,
+      left: panel.left,
+      right: panel.right,
+    });
+  }, [hover.value]);
+
+  /**
+   * The card closes on geometry, never on a countdown.
+   *
+   * While one is open the live region is the file panel, the card, and a narrow
+   * bridge across the gap between them — so travelling from a row to the card,
+   * pausing on the way, reading it, or drifting back into the list all keep it
+   * up, and it goes the instant the pointer is somewhere else. A close *timer*
+   * is what makes a hover card unreachable: the deadline runs while the pointer
+   * is still on its way there.
+   */
+  useEffect(() => {
+    if (hover.value === null || hover.pinned) return;
+    /**
+     * Slack on the corridor between the panel and the card — and only there.
+     * Padding the card's far side would keep it alive while the pointer is
+     * heading away from it, which is the opposite of what leniency is for.
+     */
+    const BRIDGE = 20;
+    const within = (
+      box: DOMRect | { left: number; right: number; top: number; bottom: number },
+      x: number,
+      y: number,
+    ) => x >= box.left && x <= box.right && y >= box.top && y <= box.bottom;
+
+    const outside = (x: number, y: number) => {
+      const panel = containerRef.current?.getBoundingClientRect() ?? null;
+      const card = document.getElementById("file-preview-card")?.getBoundingClientRect() ?? null;
+      if (!panel && !card) return true;
+      // Anywhere in the list keeps it up; rows handle swapping between files.
+      if (panel && within(panel, x, y)) return false;
+      if (card) {
+        const cardOnRight = panel
+          ? (card.left + card.right) / 2 >= (panel.left + panel.right) / 2
+          : true;
+        if (
+          within(
+            {
+              left: card.left - (cardOnRight ? BRIDGE : 0),
+              right: card.right + (cardOnRight ? 0 : BRIDGE),
+              top: card.top,
+              bottom: card.bottom,
+            },
+            x,
+            y,
+          )
+        ) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    const onMove = (event: PointerEvent) => {
+      if (outside(event.clientX, event.clientY)) hover.cancel();
+    };
+    // Leaving the window entirely counts as leaving the region.
+    const onWindowOut = (event: PointerEvent) => {
+      if (event.relatedTarget === null) hover.cancel();
+    };
+    window.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerout", onWindowOut);
+    window.addEventListener("blur", hover.cancel);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerout", onWindowOut);
+      window.removeEventListener("blur", hover.cancel);
+    };
+  }, [hover.value, hover.pinned, hover.cancel]);
+
+  // Opening the viewer, losing the channel, or unmounting all close the card;
+  // a disconnect additionally drops every cached preview for this host so a
+  // reconnect cannot show bytes from a session that has ended.
+  useEffect(() => {
+    if (viewing !== null) hover.cancel();
+  }, [viewing, hover.cancel]);
+
+  useEffect(() => {
+    if (hostControlState === "ready") return;
+    hover.cancel();
+    setViewing(null);
+    previewCache.clearHost(hostId);
+  }, [hostControlState, hostId, hover.cancel]);
+
+  useEffect(() => () => previewCache.clearHost(hostId), [hostId]);
 
   // Deep link: expand every ancestor between the root and initialPath.
   useEffect(() => {
@@ -322,6 +499,30 @@ export function FileExplorer({
     setPageCursors({});
     qc.invalidateQueries({ queryKey: ["host-files", hostId] });
   }, [hostId, qc]);
+
+  useImperativeHandle(
+    handleRef,
+    () => ({
+      newFolder: () => {
+        if (resolvedRoot) {
+          setCreatingIn(resolvedRoot);
+          setFolderDraft("");
+        }
+      },
+      upload: () => {
+        uploadDirRef.current = resolvedRoot;
+        fileInputRef.current?.click();
+      },
+      refresh: refreshAll,
+      collapseAll: () => {
+        setExpanded([]);
+        setPageCursors((current) =>
+          resolvedRoot && current[resolvedRoot] ? { [resolvedRoot]: current[resolvedRoot] } : {},
+        );
+      },
+    }),
+    [refreshAll, resolvedRoot],
+  );
 
   const toggleDir = useCallback(
     (path: string) => {
@@ -570,6 +771,38 @@ export function FileExplorer({
     };
   }, [menu]);
 
+  // Placed by the shared menu geometry rather than by hand: the context menu
+  // opens at the cursor, which near a viewport edge is exactly where a
+  // naively-positioned menu runs off the screen.
+  const [menuCoords, setMenuCoords] = useState<MenuPlacement | null>(null);
+  useLayoutEffect(() => {
+    if (!menu) {
+      setMenuCoords(null);
+      return;
+    }
+    const place = () => {
+      const { width, height } = measureMenu(menuRef.current, 176);
+      setMenuCoords(
+        placeMenu({
+          anchor: pointAnchor(menu.x, menu.y),
+          menuWidth: width,
+          menuHeight: height,
+          align: "start",
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+        }),
+      );
+    };
+    place();
+    const observer = new ResizeObserver(place);
+    if (menuRef.current) observer.observe(menuRef.current);
+    window.addEventListener("resize", place);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", place);
+    };
+  }, [menu]);
+
   const onRowKeyDown = (event: ReactKeyboardEvent) => {
     if (renaming || creatingIn !== null) return;
     const index = entryRows.findIndex((r) => r.entry.path === selected);
@@ -594,8 +827,17 @@ export function FileExplorer({
       }
     } else if (event.key === "Enter" && row) {
       event.preventDefault();
+      // Opening is what Enter means everywhere else; Download stays one menu
+      // item away rather than being the only way to look at a file.
       if (row.entry.is_dir) toggleDir(row.entry.path);
-      else void download(row.entry);
+      else setViewing(row.entry.path);
+    } else if (event.key === " " && row && !row.entry.is_dir) {
+      // Space peeks, the way it does in Finder. Pinned, so it survives the
+      // pointer wandering off, and it never waits on the hover delay.
+      event.preventDefault();
+      hover.pin({ path: row.entry.path });
+    } else if (event.key === "Escape") {
+      hover.cancel();
     } else if (event.key === "F2" && row) {
       event.preventDefault();
       startRename(row.entry);
@@ -628,12 +870,48 @@ export function FileExplorer({
 
   const openContextMenu = (event: ReactMouseEvent, entry: HostDirEntry, parentDir: string) => {
     event.preventDefault();
+    // The card is pointer-events-none, so it cannot be clicked through — but a
+    // menu opening behind a floating preview reads as a bug either way.
+    hover.cancel();
     setSelected(entry.path);
     setMenu({ x: event.clientX, y: event.clientY, entry, parentDir });
   };
 
+  const revealM = useMutation({
+    mutationFn: (entry: HostDirEntry) => hostControl!.reveal(entry.path),
+    onMutate: () => setStatus(null),
+    onError: (error) => setStatus(errorMessage(error)),
+  });
+
+  const openExternalM = useMutation({
+    mutationFn: (entry: HostDirEntry) => hostControl!.openDefault(entry.path),
+    onMutate: () => setStatus(null),
+    onError: (error) => setStatus(errorMessage(error)),
+  });
+
   const rowActions = (entry: HostDirEntry, parentDir: string) => (
     <>
+      {!entry.is_dir && (
+        <DropdownMenuItem onSelect={() => setViewing(entry.path)}>
+          <Eye className="size-4" aria-hidden />
+          Open preview
+        </DropdownMenuItem>
+      )}
+      {/* Absent, not disabled, when the host cannot do it: a greyed-out row
+          invites a support question that has no good answer. */}
+      {caps.reveal && (
+        <DropdownMenuItem onSelect={() => revealM.mutate(entry)}>
+          <FolderSearch className="size-4" aria-hidden />
+          {caps.revealLabel}
+        </DropdownMenuItem>
+      )}
+      {caps.open && !entry.is_dir && !classifyFile(entry).executable && (
+        <DropdownMenuItem onSelect={() => openExternalM.mutate(entry)}>
+          <ExternalLink className="size-4" aria-hidden />
+          {caps.openLabel}
+        </DropdownMenuItem>
+      )}
+      {(!entry.is_dir || caps.reveal) && <DropdownMenuSeparator />}
       <DropdownMenuItem onSelect={() => void copyText(entry.path, "path")}>
         <Copy className="size-4" aria-hidden />
         Copy path
@@ -683,84 +961,90 @@ export function FileExplorer({
     </>
   );
 
-  const rootBusy = rootQ.isLoading;
+  // Not `isLoading`: while the host channel is still connecting the query is
+  // disabled, so it is pending but not fetching — and the panel would claim the
+  // directory is empty for the whole of a multi-second connect.
+  const rootBusy = hostControlState !== "error" && (!controlReady || rootQ.isPending);
   const label = rootLabel ?? (resolvedRoot ? baseName(resolvedRoot) : "files");
 
   return (
     <div className={cn("flex min-h-0 flex-col", className)}>
-      {/* Header */}
-      <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1.5">
-        <span
-          className="min-w-0 flex-1 truncate text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"
-          title={resolvedRoot ?? undefined}
-        >
-          {label}
-        </span>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-6"
-          aria-label="New folder"
-          onClick={() => {
-            if (resolvedRoot) {
-              setCreatingIn(resolvedRoot);
-              setFolderDraft("");
-            }
-          }}
-        >
-          <FolderPlus className="size-3.5" />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-6"
-          aria-label="Upload files"
-          onClick={() => {
-            uploadDirRef.current = resolvedRoot;
-            fileInputRef.current?.click();
-          }}
-        >
-          <Upload className="size-3.5" />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-6"
-          aria-label="Refresh files"
-          onClick={refreshAll}
-        >
-          <RefreshCw className={cn("size-3.5", rootQ.isFetching && "animate-spin")} />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-6"
-          aria-label="Collapse all"
-          onClick={() => {
-            setExpanded([]);
-            setPageCursors((current) =>
-              resolvedRoot && current[resolvedRoot]
-                ? { [resolvedRoot]: current[resolvedRoot] }
-                : {},
-            );
-          }}
-        >
-          <ChevronsDownUp className="size-3.5" />
-        </Button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          className="hidden"
-          aria-label="Upload file input"
-          onChange={(e) => {
-            const files = Array.from(e.target.files ?? []);
-            e.target.value = "";
-            const dir = uploadDirRef.current ?? resolvedRoot;
-            if (dir) void uploadFiles(dir, files);
-          }}
-        />
-      </div>
+      {!hideHeader && (
+        <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1.5">
+          <span
+            className="min-w-0 flex-1 truncate text-[11px] font-semibold uppercase tracking-wide text-muted-foreground"
+            title={resolvedRoot ?? undefined}
+          >
+            {label}
+          </span>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            aria-label="New folder"
+            onClick={() => {
+              if (resolvedRoot) {
+                setCreatingIn(resolvedRoot);
+                setFolderDraft("");
+              }
+            }}
+          >
+            <FolderPlus className="size-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            aria-label="Upload files"
+            onClick={() => {
+              uploadDirRef.current = resolvedRoot;
+              fileInputRef.current?.click();
+            }}
+          >
+            <Upload className="size-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            aria-label="Refresh files"
+            onClick={refreshAll}
+          >
+            <RefreshCw className={cn("size-3.5", rootQ.isFetching && "animate-spin")} />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            aria-label="Collapse all"
+            onClick={() => {
+              setExpanded([]);
+              setPageCursors((current) =>
+                resolvedRoot && current[resolvedRoot]
+                  ? { [resolvedRoot]: current[resolvedRoot] }
+                  : {},
+              );
+            }}
+          >
+            <ChevronsDownUp className="size-3.5" />
+          </Button>
+        </div>
+      )}
+      {/* Always mounted: hosts that hide the header still upload via the
+          ref's upload(), which clicks this input. */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        aria-label="Upload file input"
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? []);
+          e.target.value = "";
+          const dir = uploadDirRef.current ?? resolvedRoot;
+          if (dir) void uploadFiles(dir, files);
+        }}
+      />
 
       {/* Tree */}
       <div
@@ -769,6 +1053,7 @@ export function FileExplorer({
         aria-label="Files"
         tabIndex={0}
         onKeyDown={onRowKeyDown}
+        onScroll={() => hover.cancel()}
         className={cn(
           "min-h-0 flex-1 overflow-y-auto py-1 outline-none focus-visible:ring-1 focus-visible:ring-ring",
           dropDir && resolvedRoot === dropDir && "bg-primary/5",
@@ -776,8 +1061,25 @@ export function FileExplorer({
         {...(resolvedRoot ? dropProps(resolvedRoot) : {})}
       >
         {rootBusy && (
-          <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
-            <Loader2 className="size-3.5 animate-spin" aria-hidden /> Loading...
+          // Placeholder rows rather than a spinner: the panel fills with the
+          // shape of what is coming, so the tree does not appear to jump from
+          // empty to full.
+          <div
+            role="status"
+            aria-label="Loading files"
+            aria-busy
+            className="animate-pulse space-y-1 px-2 py-1"
+          >
+            {["w-2/5", "w-3/5", "w-1/2", "w-4/6", "w-1/3", "w-2/4"].map((width) => (
+              <div
+                key={width}
+                className={cn("flex items-center gap-2", dense ? "h-6" : "h-7")}
+                aria-hidden
+              >
+                <div className="size-4 shrink-0 rounded bg-muted" />
+                <div className={cn("h-2.5 rounded bg-muted", width)} />
+              </div>
+            ))}
           </div>
         )}
         {signedRtcRefusal && (
@@ -868,9 +1170,23 @@ export function FileExplorer({
                   dropDir === entry.path && "bg-primary/10 outline outline-1 outline-primary",
                 )}
                 style={{ paddingLeft: 6 + depth * INDENT_PX }}
-                onClick={() => {
+                onClick={(event) => {
+                  // This row's dropdown is portalled to <body>, but React
+                  // events bubble through the React tree rather than the DOM,
+                  // so a click on one of its items arrives here too. Anything
+                  // that did not physically happen inside the row — a menu
+                  // item, a dismissing click — is not a click on the row.
+                  if (!event.currentTarget.contains(event.target as Node)) return;
                   setSelected(entry.path);
-                  if (isDir && !isRenaming) toggleDir(entry.path);
+                  if (isRenaming) return;
+                  if (isDir) toggleDir(entry.path);
+                  else setViewing(entry.path);
+                }}
+                // Enter/leave, never move: they fire once per row, so running
+                // the pointer down a list cannot re-trigger a fetch per pixel.
+                onPointerEnter={() => {
+                  if (isDir || isRenaming || menu || dropDir || viewing) return;
+                  hover.enter({ path: entry.path });
                 }}
                 onContextMenu={(e) => openContextMenu(e, entry, parentDir)}
                 {...(isDir ? dropProps(entry.path) : {})}
@@ -904,12 +1220,16 @@ export function FileExplorer({
                 )}
                 {isDir ? (
                   isExpanded ? (
-                    <FolderOpen className="z-10 size-4 shrink-0 text-sky-400" aria-hidden />
+                    <FolderOpen className="z-10 size-4 shrink-0 text-info" aria-hidden />
                   ) : (
-                    <Folder className="z-10 size-4 shrink-0 text-sky-400" aria-hidden />
+                    <Folder className="z-10 size-4 shrink-0 text-info" aria-hidden />
                   )
                 ) : (
-                  <File className="z-10 size-4 shrink-0 text-muted-foreground" aria-hidden />
+                  <FileIcon
+                    name={entry.name}
+                    kind={entry.kind}
+                    className="z-10 size-4 shrink-0 text-muted-foreground"
+                  />
                 )}
                 {isRenaming ? (
                   <input
@@ -956,7 +1276,18 @@ export function FileExplorer({
                       type="button"
                       onClick={(e) => {
                         e.stopPropagation();
+                        // The menu is about to open where the card is sitting.
+                        hover.cancel();
                         props.onClick();
+                      }}
+                      // The kebab sits at the row's right edge, which is
+                      // directly on the path to the card. So this suppresses a
+                      // preview that has not opened yet — hovering the menu
+                      // button is not a request to look at the file — but never
+                      // dismisses one already open, or the card could not be
+                      // reached at all.
+                      onPointerEnter={() => {
+                        if (hover.value === null) hover.cancel();
                       }}
                       aria-label={`${entry.name} actions`}
                       className="z-10 grid size-5 place-items-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 group-hover/filerow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100"
@@ -983,22 +1314,62 @@ export function FileExplorer({
         })}
       </div>
 
+      {/* Hover preview. Anchored to the panel's edges but the row's vertical
+          extent, so it tracks the row without sliding sideways as the pointer
+          runs down the list. */}
+      <Popover
+        open={hoverEntry !== null}
+        anchor={hoverAnchor}
+        side="right"
+        align="start"
+        interactive
+        id="file-preview-card"
+        ariaLabel={hoverEntry ? `${hoverEntry.name} preview` : undefined}
+      >
+        {hoverEntry && (
+          <FilePreviewCard
+            hostId={hostId}
+            entry={hoverEntry}
+            client={hostControl}
+            caps={caps}
+            onOpen={() => {
+              hover.cancel();
+              setViewing(hoverEntry.path);
+            }}
+          />
+        )}
+      </Popover>
+
+      <FileViewerDialog
+        open={viewing !== null && viewingEntry !== null}
+        hostId={hostId}
+        entry={viewingEntry}
+        client={hostControl}
+        caps={caps}
+        hasPrev={viewingIndex > 0}
+        hasNext={viewingIndex >= 0 && viewingIndex < viewableRows.length - 1}
+        relativePath={viewingEntry ? relativePath(viewingEntry.path) : ""}
+        onNavigate={(delta) => {
+          const next = viewableRows[viewingIndex + delta];
+          if (next) {
+            setViewing(next.entry.path);
+            setSelected(next.entry.path);
+          }
+        }}
+        onClose={() => setViewing(null)}
+        onDownload={() => viewingEntry && void download(viewingEntry)}
+        onReveal={() => viewingEntry && revealM.mutate(viewingEntry)}
+        onOpenExternal={() => viewingEntry && openExternalM.mutate(viewingEntry)}
+        onCopyPath={() => viewingEntry && void copyText(viewingEntry.path, "path")}
+      />
+
       {/* Right-click context menu */}
       {menu && (
         <div
           ref={menuRef}
           role="menu"
-          className="fixed z-50 min-w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg shadow-black/40"
-          style={{
-            left: Math.min(
-              menu.x,
-              typeof window !== "undefined" ? window.innerWidth - 200 : menu.x,
-            ),
-            top: Math.min(
-              menu.y,
-              typeof window !== "undefined" ? window.innerHeight - 240 : menu.y,
-            ),
-          }}
+          className="fixed z-50 min-w-44 overflow-y-auto overscroll-contain rounded-lg border border-popover-border bg-popover p-1 text-popover-foreground shadow-xl shadow-black/50"
+          style={menuCoords ?? { position: "fixed", visibility: "hidden" }}
           onClick={() => setMenu(null)}
         >
           {rowActions(menu.entry, menu.parentDir)}
@@ -1019,7 +1390,7 @@ export function FileExplorer({
       )}
     </div>
   );
-}
+});
 
 function NewFolderRow({
   depth,
@@ -1041,7 +1412,7 @@ function NewFolderRow({
       className="flex h-7 items-center gap-1 pr-2"
       style={{ paddingLeft: 6 + depth * INDENT_PX + 14 }}
     >
-      <Folder className="size-4 shrink-0 text-sky-400" aria-hidden />
+      <Folder className="size-4 shrink-0 text-info" aria-hidden />
       <input
         ref={(el) => el?.focus()}
         aria-label="Folder name"

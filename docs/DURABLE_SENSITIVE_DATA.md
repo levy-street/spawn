@@ -1,5 +1,16 @@
 # ADR P2-DATA-01 — durable protected data lives on each host endpoint
 
+> **Post-overhaul note (2026-08-19):** this is an unimplemented proposal written
+> for the former process-record and CLI-definition model. The shipped product
+> now has login-shell **sessions**, launchable **agent definitions**, and
+> **workspaces**; it has no archive or pin lifecycle for sessions/workspaces.
+> Current server-readable fields include `sessions.cwd`, agent-definition
+> `command`/`env`/`install`, and skill bodies. Do not implement this ADR's
+> process manifest or definition-sync sections unchanged: P2-DATA-01 needs a
+> follow-up design decision mapped to the current objects and v3 interfaces.
+> The text below is retained as the review-pending security design record, not
+> as documentation of current runtime behavior.
+
 Status: **proposed for independent review; runtime not implemented**. This ADR
 becomes the accepted P2-DATA-01 decision only when this commit passes review and
 is merged. It does not approve the P2-DATA-02 migration, remove a server column,

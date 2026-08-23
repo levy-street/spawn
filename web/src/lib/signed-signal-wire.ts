@@ -220,7 +220,7 @@ function parseEnvelope(value: unknown): SignedRtcEnvelope {
   if (record.type !== "rtc.offer" && record.type !== "rtc.answer") {
     throw new SignedRtcWireError("invalid_enum", "invalid type");
   }
-  if (record.scope_type !== "agent" && record.scope_type !== "host") {
+  if (record.scope_type !== "session" && record.scope_type !== "host") {
     throw new SignedRtcWireError("invalid_enum", "invalid scope_type");
   }
   if (record.sender_role !== "browser" && record.sender_role !== "daemon") {
@@ -237,7 +237,7 @@ function validateTuple(protocol: RtcSignalProtocol, transcript: SignedSignalTran
     throw new SignedRtcWireError("invalid_enum", "invalid protocol");
   }
   const protocolMatchesScope =
-    (protocol === "spawn.pty" && transcript.scopeType === "agent") ||
+    (protocol === "spawn.pty" && transcript.scopeType === "session") ||
     (protocol === "spawn.host.ctl" && transcript.scopeType === "host");
   if (!protocolMatchesScope) {
     throw new SignedRtcWireError("inconsistent_tuple", "protocol does not match scope_type");

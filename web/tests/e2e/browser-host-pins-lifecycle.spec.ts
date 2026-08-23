@@ -25,7 +25,7 @@ const host = {
   host_public_key: HOST_PUBLIC_KEY,
   status: "online",
   last_seen_at: "2026-07-17T00:00:00Z",
-  agent_count: 0,
+  session_count: 0,
 };
 
 async function readHostPins(page: Page): Promise<Array<Record<string, unknown>>> {
@@ -135,9 +135,14 @@ async function approveExactHost(page: Page): Promise<void> {
 }
 
 async function requestHostDeletion(page: Page): Promise<void> {
-  page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Host actions" }).click();
   await page.getByText(/^(?:Remove host|Retry server deletion)$/u).click();
+  // The overhaul replaced window.confirm with an in-app dialog, so accepting
+  // is a click inside it rather than a native dialog handler.
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: /^(?:Remove host|Retry deletion)$/u })
+    .click();
 }
 
 async function installRoutes(
@@ -159,6 +164,13 @@ async function installRoutes(
         json: {
           user: { id: USER_ID, email: "owner@example.com", created_at: "2026-07-17T00:00:00Z" },
         },
+      });
+      return;
+    }
+    if (path === "/api/auth/config") {
+      await route.fulfill({
+        status: 200,
+        json: { providers: ["password"], email_verification_required: false, invite_only: false },
       });
       return;
     }
@@ -223,8 +235,16 @@ async function installRoutes(
       await state.onDelete(route);
       return;
     }
-    if (path === `/api/hosts/${HOST_ID}/tools`) {
-      await route.fulfill({ status: 200, json: { tools: [] } });
+    if (path === `/api/hosts/${HOST_ID}/agents`) {
+      await route.fulfill({ status: 200, json: { agents: [] } });
+      return;
+    }
+    if (path === "/api/sessions") {
+      await route.fulfill({ status: 200, json: [] });
+      return;
+    }
+    if (path === "/api/workspaces") {
+      await route.fulfill({ status: 200, json: [] });
       return;
     }
     if (path === "/api/agents") {
@@ -295,9 +315,13 @@ test("key substitution cannot retarget an established Host-ID binding", async ({
   // removal tombstones the BOUND record — the key this device actually
   // approved; the server's claimed key cannot veto a local trust withdrawal —
   // and the server DELETE proceeds, clearing the way for `spawnd possess`.
-  page.once("dialog", (dialog) => dialog.accept());
   await panel.getByTestId("conflict-remove-host").click();
-  await page.waitForURL("**/hosts");
+  await page
+    .getByRole("dialog")
+    .getByRole("button", { name: /^(?:Remove host|Retry deletion)$/u })
+    .click();
+  // The overhaul retired the /hosts index; a removed host lands on /app.
+  await page.waitForURL("**/app");
   expect(state.deleteCalls).toBe(1);
   const pins = await readHostPins(page);
   expect(pins).toHaveLength(1);
@@ -327,7 +351,8 @@ test("deletion never revokes among multiple active unbound host pins", async ({ 
 
   await requestHostDeletion(page);
 
-  await page.waitForURL("**/hosts");
+  // The overhaul retired the /hosts index; a removed host lands on /app.
+  await page.waitForURL("**/app");
   expect(state.deleteCalls).toBe(1);
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 });
@@ -370,7 +395,7 @@ test("host-detail resolution binds before a legitimate tombstone-first DELETE", 
 
   await requestHostDeletion(page);
 
-  await expect(page).toHaveURL(/\/hosts$/u);
+  await expect(page).toHaveURL(/\/app$/u);
   expect(state.deleteCalls).toBe(1);
   expect(pinStateAtDelete).toMatchObject([
     { hostIds: [HOST_ID], hostPublicKey: HOST_PUBLIC_KEY, state: "revoked" },
@@ -400,8 +425,8 @@ test("server delete failure retains tombstone across disappearance, reload, retr
   ]);
 
   state.hostVisible = false;
-  await page.goto("/hosts");
-  await expect(page.getByText("No hosts yet")).toBeVisible();
+  await page.goto("/");
+  await expect(page).toHaveURL(/\/$/u);
   expect(await readHostPins(page)).toMatchObject([{ state: "revoked" }]);
 
   state.hostVisible = true;

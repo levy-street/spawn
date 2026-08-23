@@ -4,10 +4,10 @@ import { cn } from "@/lib/utils";
 const VARIANTS = {
   default: "border-border bg-secondary/60 text-secondary-foreground",
   outline: "border-border bg-transparent text-muted-foreground",
-  success: "border-emerald-500/25 bg-emerald-500/10 text-emerald-400",
-  warning: "border-amber-500/25 bg-amber-500/10 text-amber-400",
-  info: "border-sky-500/25 bg-sky-500/10 text-sky-400",
-  destructive: "border-destructive/25 bg-destructive/10 text-destructive",
+  success: "border-success/25 bg-success-soft text-success",
+  warning: "border-warning/25 bg-warning-soft text-warning",
+  info: "border-info/25 bg-info-soft text-info",
+  destructive: "border-destructive/25 bg-destructive-soft text-destructive",
 } as const;
 
 export type BadgeVariant = keyof typeof VARIANTS;

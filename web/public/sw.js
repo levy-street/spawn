@@ -71,3 +71,36 @@ self.addEventListener("fetch", (event) => {
       .catch(() => caches.match(req).then((hit) => hit || caches.match("/"))),
   );
 });
+
+/*
+ * Notification clicks.
+ *
+ * Alerts are shown through this registration (`registration.showNotification`)
+ * rather than the `Notification` constructor, because that is the only path
+ * Android and installed PWAs honour — and the only one whose click can be
+ * routed. The URL travels on the notification's own data, so the page that
+ * raised it decides where it lands.
+ *
+ * Focus an existing tab where we can rather than opening another one: someone
+ * with spawn already open wants that window brought forward, not a second copy
+ * of it.
+ */
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const target = event.notification.data && event.notification.data.url;
+  const url = typeof target === "string" && target.startsWith("/") ? target : "/app";
+  event.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((windows) => {
+      for (const client of windows) {
+        if (new URL(client.url).origin !== self.location.origin) continue;
+        if ("focus" in client) {
+          return client.focus().then((focused) => {
+            const nav = focused || client;
+            return "navigate" in nav ? nav.navigate(url).catch(() => {}) : undefined;
+          });
+        }
+      }
+      return self.clients.openWindow(url);
+    }),
+  );
+});

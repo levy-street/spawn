@@ -8,7 +8,7 @@ describe("host identity API schemas", () => {
       name: "host",
       status: "offline",
       last_seen_at: null,
-      agent_count: 0,
+      session_count: 0,
       host_key_algorithm: "ed25519",
       host_public_key: "A".repeat(43),
       // A legacy/hostile server may still send one; it must be dropped so no

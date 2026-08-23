@@ -9,11 +9,14 @@
  * admission.
  */
 
-/** Routes that host a live agent terminal: one agent, or a screen of panes. */
+/**
+ * Routes that host a live terminal: one session, or a workspace of panes.
+ * (`/sessions/:id` and `/w/:id` — the post-overhaul spellings of what were
+ * `/agents/:id` and `/screens/:id`.)
+ */
 export function isAgentSessionPath(pathname: string | null): boolean {
   if (!pathname) return false;
-  if (pathname === "/agents/new") return false;
-  return /^\/(?:agents|screens)\/[^/]+\/?$/u.test(pathname);
+  return /^\/(?:sessions|w)\/[^/]+\/?$/u.test(pathname);
 }
 
 /**

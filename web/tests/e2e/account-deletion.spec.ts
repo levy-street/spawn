@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { mockAuthenticatedApi } from "./app-mocks";
+import { mockApp, openSettings } from "./app-mocks";
 
 // Account deletion is double-confirmed: the typed email gates the submit
 // client-side, and the password is verified server-side. Success ends the
@@ -7,7 +7,7 @@ import { mockAuthenticatedApi } from "./app-mocks";
 
 test("deletion is gated on the typed email and a correct password", async ({ page }) => {
   const deleteCalls: Array<Record<string, unknown>> = [];
-  await mockAuthenticatedApi(page);
+  await mockApp(page);
   await page.route("**/api/account/delete", async (route) => {
     const body = (await route.request().postDataJSON()) as Record<string, unknown>;
     deleteCalls.push(body);
@@ -17,7 +17,7 @@ test("deletion is gated on the typed email and a correct password", async ({ pag
     }
     await route.fulfill({ status: 204, body: "" });
   });
-  await page.goto("/settings?tab=account");
+  await openSettings(page, "account");
 
   await page.getByRole("button", { name: "Delete account…" }).click();
   const submit = page.getByRole("button", { name: "Permanently delete" });
@@ -37,7 +37,8 @@ test("deletion is gated on the typed email and a correct password", async ({ pag
 
   await page.locator("#delete-confirm-password").fill("correct horse battery");
   await submit.click();
-  await page.waitForURL(/\/login/, { timeout: 15_000 });
+  // logout() hands back to the lander, which owns "/" after the overhaul.
+  await page.waitForURL(/\/$/, { timeout: 15_000 });
   expect(deleteCalls).toHaveLength(2);
   expect(deleteCalls[1]).toMatchObject({
     confirm_email: "Tester@Example.com",

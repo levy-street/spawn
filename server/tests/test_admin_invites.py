@@ -174,7 +174,7 @@ async def test_admin_user_list_reports_account_details(client):
     assert rows["guest@example.com"]["is_admin"] is False
     for row in rows.values():
         assert row["host_count"] == 0
-        assert row["agent_count"] == 0
+        assert row["session_count"] == 0
         assert row["browser_device_count"] == 0
         assert "email_verified_at" in row
 
@@ -275,3 +275,20 @@ async def test_email_log_is_admin_only(client):
     assert (
         await client.post("/api/admin/emails/test", json={}, headers=guest_headers)
     ).status_code == 404
+
+
+async def test_auth_config_reports_the_first_signup_open_then_closes(client):
+    """The config surface mirrors enforcement, not the static flag: a closed
+    install with no accounts admits its first signup freely, so the form must
+    not demand an invite code that cannot exist yet."""
+
+    fresh = await client.get("/api/auth/config")
+    assert fresh.status_code == 200
+    assert fresh.json()["invite_only"] is False
+
+    first = await _signup(client, "owner@example.com")
+    assert first.status_code == 200, first.text
+
+    populated = await client.get("/api/auth/config")
+    assert populated.status_code == 200
+    assert populated.json()["invite_only"] is True

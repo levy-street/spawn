@@ -7,7 +7,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
@@ -16,11 +16,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from .. import auth as auth_mod
+from .. import host_capacity, legion
 from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
-from ..models import Agent, BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey
+from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, Session
 from ..pin_liveness import live_browser_device_id_set
-from ..redis import agent_event_channel, get_backend
+from ..redis import get_backend, session_event_channel, user_alert_channel
+from .alerts import (
+    ALERT_QUIET_SECONDS,
+    QuietWatch,
+    agent_awaiting_input_payload,
+    agent_finished_payload,
+    is_agent_finish,
+    is_shell_command,
+    session_died_payload,
+)
 from .broker import DaemonConn, RtcSessionBinding, get_broker
 from .host_signal import (
     HOST_CONTROL_PROTOCOL,
@@ -60,13 +70,21 @@ log = logging.getLogger("spawn.ws.daemon")
 HOST_ACTIVATION_DEADLINE_SECONDS = 30
 HOST_EXTERNAL_EFFECT_TIMEOUT_SECONDS = 2.0
 HOST_OWNERSHIP_TRANSACTION_TIMEOUT_SECONDS = 10.0
-DAEMON_WS_PROTOCOL = "spawn.control.v2"
+DAEMON_WS_PROTOCOL = "spawn.control.v3"
 WS_CLOSE_PROTOCOL_REQUIRED = 4003
 WS_CLOSE_CONTENT_FORBIDDEN = 4002
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _aware_utc(value: datetime | None) -> datetime | None:
+    """SQLite hands back naive datetimes; comparing those to an aware `now`
+    raises. Mirrors `_aware` in `routes/sessions.py`."""
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 async def _resolve_daemon_host(websocket: WebSocket, query_token: str | None) -> Host | None:
@@ -192,6 +210,11 @@ async def _prepare_host_activation(
         value = registration.get(field)
         if isinstance(value, str) and value:
             values[field] = value
+    # What the machine is, validated field by field (host_capacity). Written
+    # here rather than on the heartbeat because none of it changes while a
+    # daemon runs, and a daemon that reports none of it leaves the columns
+    # exactly as they were.
+    values.update(host_capacity.spec_values(registration.get("spec")))
     # Ratchet, never lower: once a chain-capable daemon has registered, the
     # legacy per-host endorsement path stays retired for this host (mesh R9)
     # even if an older build reconnects later.
@@ -445,7 +468,11 @@ async def _durable_pending_successor(
 
 
 async def _touch_host(
-    session: AsyncSession, host_id: str, connection_id: str, generation: int
+    session: AsyncSession,
+    host_id: str,
+    connection_id: str,
+    generation: int,
+    capacity: dict[str, object] | None = None,
 ) -> bool:
     await _configure_activation_timeouts(session)
     result = await session.execute(
@@ -455,7 +482,10 @@ async def _touch_host(
             Host.daemon_connection_id == connection_id,
             Host.daemon_generation == generation,
         )
-        .values(last_seen_at=_utcnow())
+        # The keepalive is already a write on this row, so the two meter
+        # readings ride it for free rather than earning a statement of
+        # their own.
+        .values(last_seen_at=_utcnow(), **(capacity or {}))
     )
     if result.rowcount != 1:
         await session.rollback()
@@ -507,13 +537,12 @@ def _valid_rtc_sdp(value: object) -> str | None:
 
 def _rtc_frame_matches_binding(obj: dict, binding: RtcSessionBinding) -> bool:
     """Bind daemon signaling to its registered session, endpoint and scope."""
-    scope_type = binding.scope_type
     if obj.get("session_id") != binding.session_id:
         return False
     if obj.get("binding_nonce") != binding.nonce:
         return False
     expected = {
-        "scope_type": scope_type,
+        "scope_type": binding.scope_type,
         "scope_id": binding.scope_id,
         "protocol": binding.protocol,
         "protocol_version": binding.protocol_version,
@@ -521,10 +550,6 @@ def _rtc_frame_matches_binding(obj: dict, binding: RtcSessionBinding) -> bool:
     for key, value in expected.items():
         if obj.get(key) != value:
             return False
-    if scope_type == "agent" and obj.get("agent_id") != binding.scope_id:
-        return False
-    if scope_type == "host" and obj.get("agent_id") is not None:
-        return False
     return True
 
 
@@ -534,7 +559,6 @@ def _host_rtc_metadata_matches(obj: dict, host_id: str) -> bool:
         and obj.get("scope_id") == host_id
         and obj.get("protocol") == HOST_CONTROL_PROTOCOL
         and obj.get("protocol_version") == HOST_CONTROL_VERSION
-        and obj.get("agent_id") is None
     )
 
 
@@ -629,8 +653,8 @@ async def _daemon_can_mutate(conn: DaemonConn) -> bool:
     )
 
 
-async def _publish_agent_event_if_owner(
-    conn: DaemonConn, agent_id: str, payload: dict[str, object]
+async def _publish_channel_if_owner(
+    conn: DaemonConn, channel: str, payload: dict[str, object]
 ) -> bool:
     owner = _host_presence_value(conn)
     if owner is None:
@@ -643,9 +667,73 @@ async def _publish_agent_event_if_owner(
         host_pending_presence_key(conn.host_id),
         owner,
         generation=generation,
-        channel=agent_event_channel(agent_id),
+        channel=channel,
         payload=json.dumps(payload, separators=(",", ":")).encode(),
     )
+
+
+async def _publish_session_event_if_owner(
+    conn: DaemonConn, session_id: str, payload: dict[str, object]
+) -> bool:
+    return await _publish_channel_if_owner(conn, session_event_channel(session_id), payload)
+
+
+async def _publish_awaiting_input(conn: DaemonConn, session_id: str) -> None:
+    """A session has produced no output for `ALERT_QUIET_SECONDS`.
+
+    The state is re-read rather than carried on the timer: half a minute is
+    long enough for the agent to have exited, been restarted, or handed the
+    foreground back to the shell, and each of those already has its own event.
+    Only a session still running something that is not a shell is genuinely
+    sitting there waiting for its owner.
+    """
+    sm = get_sessionmaker()
+    async with sm() as session:
+        row = await session.get(Session, session_id)
+        if row is None or row.host_id != conn.host_id or row.status != "running":
+            return
+        command = row.foreground_command
+        owner_user_id = row.owner_user_id
+        last_output = _aware_utc(row.last_output_at)
+        last_input = _aware_utc(row.last_input_at)
+    if command is None or is_shell_command(command):
+        return
+    # The timer says "nothing arrived for a while"; these say "and what came
+    # before it was the agent finishing a turn". Without them a reconnect, or
+    # a user who typed and walked away, both read as the agent waiting.
+    if last_output is None:
+        return
+    if last_input is not None and last_input > last_output:
+        # The user spoke last. Whatever this session is doing, it is not
+        # waiting on them — the same call the status dot makes ("input_sent"
+        # in `routes/sessions.py`).
+        return
+    # A hair under the window: the timer's delay and this threshold are the
+    # same number, so a few milliseconds of ordering slop between the write and
+    # the timer would otherwise reject an alert that is genuinely due — and a
+    # rejected alert is silence, which is the failure this whole check exists
+    # to avoid overcorrecting into.
+    if _utcnow() - last_output < timedelta(seconds=ALERT_QUIET_SECONDS * 0.9):
+        return
+    await _publish_user_alert(
+        conn, owner_user_id, agent_awaiting_input_payload(session_id, command)
+    )
+
+
+async def _publish_user_alert(
+    conn: DaemonConn, owner_user_id: str, payload: dict[str, object]
+) -> None:
+    """Fan an attention event out to every browser this owner has open.
+
+    Fenced like every other publish from this socket, so a superseded daemon
+    cannot alert on a host it no longer owns. Unlike the lifecycle publishes,
+    a failure here is not a fencing signal the caller must act on: an alert is
+    a courtesy, and losing one must never tear down a healthy daemon link.
+    """
+    try:
+        await _publish_channel_if_owner(conn, user_alert_channel(owner_user_id), payload)
+    except Exception as e:  # noqa: BLE001
+        log.warning("alert publish failed: %s", e)
 
 
 async def _lock_durable_host_owner(session: AsyncSession, conn: DaemonConn) -> bool:
@@ -673,7 +761,7 @@ async def _validate_durable_host_owner(conn: DaemonConn) -> bool:
         return valid
 
 
-def _agent_owner_exists(conn: DaemonConn) -> Any:
+def _session_owner_exists(conn: DaemonConn) -> Any:
     generation = conn.host_generation
     return (
         select(Host.id)
@@ -942,8 +1030,8 @@ async def _process_host_rtc_signal(
         await _fence_superseded_daemon(conn)
         return False
     signal = envelope.signal
-    agent_id = signal.get("agent_id")
-    if isinstance(agent_id, str):
+    scope_id = signal.get("scope_id")
+    if signal.get("scope_type") == "session" and isinstance(scope_id, str):
         session_id = _valid_rtc_session_id(signal.get("session_id"))
         if session_id is None:
             return True
@@ -952,8 +1040,8 @@ async def _process_host_rtc_signal(
         binding = await broker.rtc_session_for(session_id, daemon=conn)
         if (
             binding is None
-            or binding.scope_type != "agent"
-            or binding.scope_id != agent_id
+            or binding.scope_type != "session"
+            or binding.scope_id != scope_id
             or binding.protocol != "spawn.pty"
             or binding.protocol_version != 2
             or binding.browser.route_id != envelope.browser_channel
@@ -1171,7 +1259,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
     if DAEMON_WS_PROTOCOL not in offered:
         await websocket.accept()
         await websocket.send_json(
-            {"type": "protocol.required", "protocol": DAEMON_WS_PROTOCOL, "version": 2}
+            {"type": "protocol.required", "protocol": DAEMON_WS_PROTOCOL, "version": 3}
         )
         await websocket.close(code=WS_CLOSE_PROTOCOL_REQUIRED, reason="protocol upgrade required")
         return
@@ -1187,6 +1275,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
     signal_ready = asyncio.Event()
     expiry_tasks: set[asyncio.Task[None]] = set()
     signal_task = asyncio.create_task(_pump_host_rtc_signals(conn, signal_ready, expiry_tasks))
+    # "The agent stopped talking" has no write to hang off, so it is a timer
+    # per session, rearmed by every activity ping and owned by this connection.
+    quiet_watch = QuietWatch(lambda sid: _publish_awaiting_input(conn, sid))
 
     registered = False
 
@@ -1280,27 +1371,27 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     ):
                         await _fence_superseded_daemon(conn)
                         break
-                    existing = obj.get("existing_agents") or []
+                    existing = obj.get("existing_sessions") or []
                     valid_existing: list[str] = []
                     durable_owner = False
                     async with _bounded_host_ownership_session() as session:
                         durable_owner = await _lock_durable_host_owner(session, conn)
                         if durable_owner:
-                            for aid in existing:
-                                if not isinstance(aid, str):
+                            for sid in existing:
+                                if not isinstance(sid, str):
                                     continue
-                                agent = await session.get(Agent, aid)
-                                if agent is not None and agent.host_id == host.id:
-                                    valid_existing.append(aid)
+                                session_row = await session.get(Session, sid)
+                                if session_row is not None and session_row.host_id == host.id:
+                                    valid_existing.append(sid)
                         await session.rollback()
 
                     registration_accepted = False
                     if durable_owner and await _redis_owner_is_current(conn):
                         acceptance = await broker.accept_daemon_owner(conn, generation)
                         registration_accepted = bool(acceptance)
-                        for aid in valid_existing if registration_accepted else ():
-                            if not await broker.attach_agent_to_daemon(
-                                aid,
+                        for sid in valid_existing if registration_accepted else ():
+                            if not await broker.attach_session_to_daemon(
+                                sid,
                                 conn,
                                 expected_host_generation=generation,
                             ):
@@ -1356,10 +1447,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         await _fence_superseded_daemon(conn)
                         break
 
-                elif ftype == "host.tools.check_result":
+                elif ftype == "host.agents.check_result":
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
-                        if not await broker.resolve_tool_check(
+                        if not await broker.resolve_agent_check(
                             request_id,
                             obj,
                             daemon=conn,
@@ -1380,10 +1471,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             await _fence_superseded_daemon(conn)
                             break
 
-                elif ftype == "host.tools.install_result":
+                elif ftype == "host.agents.install_result":
                     request_id = obj.get("request_id")
                     if isinstance(request_id, str):
-                        if not await broker.resolve_tool_install(
+                        if not await broker.resolve_agent_install(
                             request_id,
                             obj,
                             daemon=conn,
@@ -1397,16 +1488,19 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     if generation is None:
                         await _fence_superseded_daemon(conn)
                         break
+                    capacity = host_capacity.bucket_values(obj)
                     async with _bounded_host_ownership_session() as session:
-                        touched = await _touch_host(session, host.id, conn.id, generation)
+                        touched = await _touch_host(
+                            session, host.id, conn.id, generation, capacity
+                        )
                     if not touched or not await _refresh_host_signal_presence(conn):
                         await _fence_superseded_daemon(conn)
                         break
                     await _bounded_send_text(conn, {"type": "host.heartbeat"})
 
-                elif ftype == "agent.started":
-                    aid = obj.get("agent_id")
-                    if aid:
+                elif ftype == "session.started":
+                    sid = obj.get("session_id")
+                    if sid:
                         generation = conn.host_generation
                         if generation is None:
                             await _fence_superseded_daemon(conn)
@@ -1416,14 +1510,16 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         rejected_owner = False
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
-                            agent = await session.get(Agent, aid) if durable_owner else None
-                            if agent is not None and agent.host_id == host.id:
+                            session_row = (
+                                await session.get(Session, sid) if durable_owner else None
+                            )
+                            if session_row is not None and session_row.host_id == host.id:
                                 result = await session.execute(
-                                    update(Agent)
+                                    update(Session)
                                     .where(
-                                        Agent.id == aid,
-                                        Agent.host_id == host.id,
-                                        _agent_owner_exists(conn),
+                                        Session.id == sid,
+                                        Session.host_id == host.id,
+                                        _session_owner_exists(conn),
                                     )
                                     .values(status="running")
                                     .execution_options(synchronize_session=False)
@@ -1443,43 +1539,45 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             await _fence_superseded_daemon(conn)
                             break
                         if started:
-                            attached = await broker.attach_agent_to_daemon(
-                                aid,
+                            attached = await broker.attach_session_to_daemon(
+                                sid,
                                 conn,
                                 expected_host_generation=generation,
                             )
-                            published = attached and await _publish_agent_event_if_owner(
+                            published = attached and await _publish_session_event_if_owner(
                                 conn,
-                                aid,
-                                {"type": "agent.status", "status": "running"},
+                                sid,
+                                {"type": "session.status", "status": "running"},
                             )
                             if not published:
                                 await _fence_superseded_daemon(conn)
                                 break
 
-                elif ftype == "agent.activity":
+                elif ftype == "session.activity":
                     # Content-free output-activity ping (trust Phase 2). The
                     # daemon already classified meaningful output and throttled
                     # it, so the server just stamps — it never sees the bytes.
-                    aid = obj.get("agent_id")
-                    if aid:
+                    sid = obj.get("session_id")
+                    if sid:
                         now = _utcnow()
                         durable_owner = False
                         rejected_owner = False
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
-                            agent = await session.get(Agent, aid) if durable_owner else None
-                            if agent is not None and agent.host_id == host.id:
+                            session_row = (
+                                await session.get(Session, sid) if durable_owner else None
+                            )
+                            if session_row is not None and session_row.host_id == host.id:
                                 generation = conn.host_generation
                                 if generation is None:
                                     await session.rollback()
                                 else:
                                     result = await session.execute(
-                                        update(Agent)
+                                        update(Session)
                                         .where(
-                                            Agent.id == aid,
-                                            Agent.host_id == host.id,
-                                            _agent_owner_exists(conn),
+                                            Session.id == sid,
+                                            Session.host_id == host.id,
+                                            _session_owner_exists(conn),
                                         )
                                         .values(last_output_at=now)
                                         .execution_options(synchronize_session=False)
@@ -1497,30 +1595,33 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if rejected_owner:
                             await _fence_superseded_daemon(conn)
                             break
+                        quiet_watch.touch(sid)
 
-                elif ftype == "agent.input_activity":
-                    # `spawn.pty` input bypasses the server on v2. The daemon
+                elif ftype == "session.input_activity":
+                    # `spawn.pty` input bypasses the server. The daemon
                     # throttles this content-free signal so the activity badge
                     # remains accurate without revealing input bytes.
-                    aid = obj.get("agent_id")
-                    if aid:
+                    sid = obj.get("session_id")
+                    if sid:
                         now = _utcnow()
                         durable_owner = False
                         rejected_owner = False
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
-                            agent = await session.get(Agent, aid) if durable_owner else None
-                            if agent is not None and agent.host_id == host.id:
+                            session_row = (
+                                await session.get(Session, sid) if durable_owner else None
+                            )
+                            if session_row is not None and session_row.host_id == host.id:
                                 generation = conn.host_generation
                                 if generation is None:
                                     await session.rollback()
                                 else:
                                     result = await session.execute(
-                                        update(Agent)
+                                        update(Session)
                                         .where(
-                                            Agent.id == aid,
-                                            Agent.host_id == host.id,
-                                            _agent_owner_exists(conn),
+                                            Session.id == sid,
+                                            Session.host_id == host.id,
+                                            _session_owner_exists(conn),
                                         )
                                         .values(last_input_at=now)
                                         .execution_options(synchronize_session=False)
@@ -1538,30 +1639,137 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if rejected_owner:
                             await _fence_superseded_daemon(conn)
                             break
+                        # Cancelled, not rearmed: input means the *user* spoke
+                        # last, so the agent owes them a reply. Its reply is
+                        # what starts a turn, and the end of that reply is what
+                        # this feature is about.
+                        quiet_watch.cancel(sid)
 
-                elif ftype == "agent.exit":
-                    aid = obj.get("agent_id")
+                elif ftype == "session.foreground":
+                    # The one deliberate, documented exception to content-free
+                    # activity: a process basename (nothing else) so the UI
+                    # can label panes. Re-derive the basename and truncate
+                    # server-side rather than trusting the daemon's framing.
+                    sid = obj.get("session_id")
+                    command = obj.get("command")
+                    if sid and (command is None or isinstance(command, str)):
+                        basename: str | None = None
+                        if isinstance(command, str):
+                            basename = (
+                                command.strip().replace("\\", "/").rsplit("/", 1)[-1][:64]
+                                or None
+                            )
+                        durable_owner = False
+                        rejected_owner = False
+                        # Captured before the write: this is the whole reason
+                        # detection lives here rather than in the browser. The
+                        # previous foreground is in hand exactly once, and only
+                        # at this point.
+                        finished_alert: dict[str, object] | None = None
+                        summoned_agent: str | None = None
+                        async with _bounded_host_ownership_session() as session:
+                            durable_owner = await _lock_durable_host_owner(session, conn)
+                            session_row = (
+                                await session.get(Session, sid) if durable_owner else None
+                            )
+                            if session_row is not None and session_row.host_id == host.id:
+                                previous_command = session_row.foreground_command
+                                session_status = session_row.status
+                                alert_owner_id = session_row.owner_user_id
+                                result = await session.execute(
+                                    update(Session)
+                                    .where(
+                                        Session.id == sid,
+                                        Session.host_id == host.id,
+                                        _session_owner_exists(conn),
+                                    )
+                                    .values(foreground_command=basename)
+                                    .execution_options(synchronize_session=False)
+                                )
+                                if result.rowcount == 1:
+                                    await session.commit()
+                                    # One tally per arrival at the front, not
+                                    # per report: the daemon only sends this
+                                    # frame on change, and a shell coming back
+                                    # to the foreground is not an agent run.
+                                    if basename and not is_shell_command(basename):
+                                        summoned_agent = basename
+                                    if is_agent_finish(
+                                        previous_command, basename, session_status
+                                    ):
+                                        finished_alert = agent_finished_payload(
+                                            sid, previous_command or ""
+                                        )
+                                else:
+                                    rejected_owner = True
+                                    await session.rollback()
+                            else:
+                                await session.rollback()
+                        if not durable_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if rejected_owner:
+                            await _fence_superseded_daemon(conn)
+                            break
+                        if summoned_agent is not None:
+                            await legion.record_agent(alert_owner_id, summoned_agent)
+                        if basename is None or is_shell_command(basename):
+                            # Back at a prompt: there is nothing left to go
+                            # quiet, and `agent.finished` already covers this.
+                            quiet_watch.cancel(sid)
+                        # An agent *taking* the foreground deliberately does
+                        # not start the clock. Only output does. A worker
+                        # re-reports its foreground on every reconnect, so
+                        # arming here raised an "is waiting for you" for a
+                        # session that had done nothing at all.
+                        if finished_alert is not None:
+                            await _publish_user_alert(conn, alert_owner_id, finished_alert)
+
+                elif ftype == "session.exit":
+                    sid = obj.get("session_id")
                     code = obj.get("exit_code")
                     sig = obj.get("signal")
-                    if aid:
+                    if sid:
                         durable_owner = False
                         exited = False
                         rejected_owner = False
+                        died_alert: dict[str, object] | None = None
+                        ran_seconds = 0
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
-                            agent = await session.get(Agent, aid) if durable_owner else None
-                            if agent is not None and agent.host_id == host.id:
+                            session_row = (
+                                await session.get(Session, sid) if durable_owner else None
+                            )
+                            if session_row is not None and session_row.host_id == host.id:
+                                # Read before the write, which nulls it. This
+                                # is what lets the alert name the agent that
+                                # went down with the session.
+                                dying_command = session_row.foreground_command
+                                alert_owner_id = session_row.owner_user_id
+                                # How long this circle stayed open. Read here
+                                # for the same reason: after the update the row
+                                # is still present, but this is the one place
+                                # both ends of the interval are certainly in
+                                # hand and certainly this daemon's to report.
+                                started = session_row.started_at
+                                if started is not None:
+                                    if started.tzinfo is None:
+                                        started = started.replace(tzinfo=UTC)
+                                    ran_seconds = max(
+                                        0, int((_utcnow() - started).total_seconds())
+                                    )
                                 result = await session.execute(
-                                    update(Agent)
+                                    update(Session)
                                     .where(
-                                        Agent.id == aid,
-                                        Agent.host_id == host.id,
-                                        _agent_owner_exists(conn),
+                                        Session.id == sid,
+                                        Session.host_id == host.id,
+                                        _session_owner_exists(conn),
                                     )
                                     .values(
                                         status="killed" if sig else "exited",
                                         exit_code=code,
                                         exited_at=_utcnow(),
+                                        foreground_command=None,
                                     )
                                     .execution_options(synchronize_session=False)
                                 )
@@ -1569,6 +1777,16 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 rejected_owner = not exited
                                 if exited:
                                     await session.commit()
+                                    # Exactly one alert for this transition:
+                                    # the same update nulls foreground_command,
+                                    # so `is_agent_finish` sees a status that
+                                    # has left "running" and stays silent.
+                                    died_alert = session_died_payload(
+                                        sid,
+                                        dying_command,
+                                        exit_code=code if isinstance(code, int) else None,
+                                        signal=sig if isinstance(sig, str) else None,
+                                    )
                                 else:
                                     await session.rollback()
                             else:
@@ -1579,17 +1797,22 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         if rejected_owner:
                             await _fence_superseded_daemon(conn)
                             break
-                        published = not exited or await _publish_agent_event_if_owner(
+                        published = not exited or await _publish_session_event_if_owner(
                             conn,
-                            aid,
+                            sid,
                             {
-                                "type": "agent.exit",
+                                "type": "session.exit",
                                 "exit_code": code,
                                 "signal": sig,
                             },
                         )
-                        detached = await broker.detach_agent(
-                            aid,
+                        if exited:
+                            await legion.record_session_seconds(alert_owner_id, ran_seconds)
+                        quiet_watch.cancel(sid)
+                        if died_alert is not None:
+                            await _publish_user_alert(conn, alert_owner_id, died_alert)
+                        detached = await broker.detach_session(
+                            sid,
                             expected_daemon=conn,
                             expected_host_generation=conn.host_generation,
                         )
@@ -1648,8 +1871,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         else:
                             assert sdp is not None
                             payload["sdp"] = sdp
-                        if binding.scope_type == "agent":
-                            payload["agent_id"] = binding.scope_id
                         payload.update(
                             {
                                 "scope_type": binding.scope_type,
@@ -1677,8 +1898,6 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             "binding_generation": binding.daemon_generation,
                             "candidate": candidate,
                         }
-                        if binding.scope_type == "agent":
-                            payload["agent_id"] = binding.scope_id
                         payload.update(
                             {
                                 "scope_type": binding.scope_type,
@@ -1715,8 +1934,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             "binding_generation": binding.daemon_generation,
                             "status": status_value,
                         }
-                        if binding.scope_type == "agent":
-                            payload["agent_id"] = binding.scope_id
+                        if binding.scope_type == "session":
                             message = obj.get("message")
                             if isinstance(message, str):
                                 payload["message"] = message
@@ -1746,9 +1964,9 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         )
                         break
                     log.warning(
-                        "daemon error host=%s agent=%s code=%s msg=%s",
+                        "daemon error host=%s session=%s code=%s msg=%s",
                         host.id,
-                        obj.get("agent_id"),
+                        obj.get("session_id"),
                         obj.get("code"),
                         obj.get("message"),
                     )
@@ -1766,6 +1984,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
             task.cancel()
         if pending_expiry_tasks:
             await asyncio.gather(*pending_expiry_tasks, return_exceptions=True)
+        await quiet_watch.shutdown()
         signal_task.cancel()
         try:
             await signal_task

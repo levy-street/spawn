@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
+import { grimoire } from "@/lib/fonts";
 import { AppProviders } from "@/lib/query";
 import { THEME_BOOTSTRAP_SCRIPT } from "@/lib/theme-bootstrap";
 import "./globals.css";
@@ -7,7 +8,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   metadataBase: new URL("https://spawnd.dev"),
   title: {
-    default: "spawnd — a daemon on every host you own",
+    default: "SPAWN D - Host your daemons",
     template: "%s · spawnd",
   },
   description:
@@ -54,7 +55,7 @@ export const viewport: Viewport = {
   // A single tag rather than a light/dark media pair: an explicit theme choice
   // has to beat the OS preference, and only script can express that. applyTheme
   // rewrites this on load and on every change.
-  themeColor: "#0A0607",
+  themeColor: "#000000",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
@@ -62,7 +63,10 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     // suppressHydrationWarning: the bootstrap script below stamps data-theme
     // and color-scheme onto <html> before React sees it, so the server markup
     // is expected to differ here.
-    <html lang="en" suppressHydrationWarning>
+    // The body face rides along as a CSS variable on <html>: the @theme token
+    // --font-grimoire substitutes var(--font-plex-sans) at :root, so the
+    // variable has to live on the root element itself to resolve.
+    <html lang="en" suppressHydrationWarning className={grimoire.variable}>
       <head>
         {/* Must run before first paint; see lib/theme-bootstrap.ts. */}
         {/* biome-ignore lint/security/noDangerouslySetInnerHtml: fixed, build-time string with no interpolation */}

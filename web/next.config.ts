@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { NextConfig } from "next";
 
 // Where the FastAPI server lives. Used for rewrites so /api/* and /ws/* go
@@ -32,6 +33,9 @@ function buildId(): string {
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  // Keep Next rooted in this workspace even when a parent directory contains
+  // an unrelated npm lockfile.
+  outputFileTracingRoot: path.resolve(process.cwd()),
   generateBuildId: buildId,
   experimental: {
     // Next buffers proxied request bodies (rewrites share the middleware
@@ -59,6 +63,24 @@ const nextConfig: NextConfig = {
       { source: "/ws/:path*", destination: `${API_PROXY_TARGET}/ws/:path*` },
       { source: "/healthz", destination: `${API_PROXY_TARGET}/healthz` },
       { source: "/install.sh", destination: `${API_PROXY_TARGET}/install.sh` },
+    ];
+  },
+  // The overhaul collapsed five nav destinations into one workspace page plus a
+  // settings modal. These keep bookmarks and daemon-printed links from 404ing;
+  // an agent id still resolves because agents became sessions one-for-one.
+  async redirects() {
+    return [
+      // Order matters: the literal /agents/new must precede /agents/:id, or the
+      // dynamic rule swallows it and sends it to a session that cannot exist.
+      { source: "/agents/new", destination: "/", permanent: false },
+      { source: "/agents/:id", destination: "/sessions/:id", permanent: false },
+      { source: "/agents", destination: "/", permanent: false },
+      { source: "/screens", destination: "/", permanent: false },
+      { source: "/screens/:id", destination: "/w/:id", permanent: false },
+      { source: "/presets", destination: "/", permanent: false },
+      { source: "/hosts", destination: "/", permanent: false },
+      { source: "/settings", destination: "/", permanent: false },
+      { source: "/trust", destination: "/", permanent: false },
     ];
   },
 };

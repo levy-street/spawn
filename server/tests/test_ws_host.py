@@ -207,7 +207,7 @@ def _metadata(host_id: str) -> dict[str, object]:
 async def _start_daemon(user_id: str, host_id: str) -> tuple[FakeWebSocket, asyncio.Task[None]]:
     socket = FakeWebSocket(
         authorization=f"Bearer {auth.issue_daemon_token(host_id, user_id)}",
-        subprotocols=["spawn.control.v2"],
+        subprotocols=["spawn.control.v3"],
     )
     task = asyncio.create_task(daemon_ws(socket))  # type: ignore[arg-type]
     socket.queue_text(

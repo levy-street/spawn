@@ -64,7 +64,7 @@ interface SignalArtifact {
   signal_kind: "offer";
   protocol_version: number;
   session_id: string;
-  scope_type: "agent";
+  scope_type: "session";
   scope_id: string;
   sender_role: "browser";
   intended_peer_public_key: string;
@@ -343,7 +343,7 @@ async function verifyRustArtifact(artifact: ExchangeArtifact): Promise<void> {
   let closeCalls = 0;
   const liveSession = new SignedRtcLiveSession(
     {
-      scopeType: "agent",
+      scopeType: "session",
       scopeId: artifact.signal.scope_id,
       protocol: "spawn.pty",
       protocolVersion: 2,
@@ -370,7 +370,7 @@ async function verifyRustArtifact(artifact: ExchangeArtifact): Promise<void> {
     },
     {
       session_id: artifact.signal.session_id,
-      scope_type: "agent",
+      scope_type: "session",
       scope_id: artifact.signal.scope_id,
       protocol: "spawn.pty",
       protocol_version: 2,
@@ -505,7 +505,7 @@ async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
     signalKind: "offer",
     protocolVersion: 2,
     sessionId: crypto.randomUUID(),
-    scopeType: "agent",
+    scopeType: "session",
     scopeId: crypto.randomUUID(),
     senderRole: "browser",
     intendedPeerPublicKey: decodeEd25519PublicKeyWire(hostPublicKey),
@@ -583,7 +583,7 @@ async function produceWebCryptoArtifact(): Promise<ExchangeArtifact> {
       signal_kind: "offer",
       protocol_version: transcript.protocolVersion,
       session_id: transcript.sessionId,
-      scope_type: "agent",
+      scope_type: "session",
       scope_id: transcript.scopeId,
       sender_role: "browser",
       intended_peer_public_key: hostPublicKey,

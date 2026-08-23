@@ -12,7 +12,7 @@ from typing import Any
 from spawn_server import auth
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
-from spawn_server.models import Agent, Host
+from spawn_server.models import Host, Session
 from spawn_server.redis import get_backend
 from spawn_server.ws.broker import DaemonConn, get_broker
 from spawn_server.ws.browser import browser_ws
@@ -26,7 +26,7 @@ from spawn_server.ws.host_signal import (
 )
 
 
-def _signed_agent_wire(signal_type: str, session_id: str, agent_id: str) -> str:
+def _signed_session_wire(signal_type: str, session_id: str, pty_id: str) -> str:
     vectors = json.loads(
         (Path(__file__).parents[2] / "proto" / "signed-signal-wire-v1-vectors.json").read_text()
     )["vectors"]
@@ -35,7 +35,8 @@ def _signed_agent_wire(signal_type: str, session_id: str, agent_id: str) -> str:
         {
             "type": signal_type,
             "session_id": session_id,
-            "scope_id": agent_id,
+            "scope_type": "session",
+            "scope_id": pty_id,
             "sender_role": "browser" if signal_type == "rtc.offer" else "daemon",
         }
     )
@@ -62,7 +63,7 @@ class FakeBrowserWebSocket:
         if authorization is not None:
             self.headers["authorization"] = authorization
         self.cookies = cookies or {}
-        self.scope: dict[str, Any] = {"subprotocols": subprotocols or ["spawn.v2"]}
+        self.scope: dict[str, Any] = {"subprotocols": subprotocols or ["spawn.v3"]}
         self.accepted_subprotocol: str | None = None
         self.sent_text: list[str] = []
         self.sent_bytes: list[bytes] = []
@@ -121,45 +122,43 @@ async def _signup(client, email: str) -> tuple[str, str]:
     return response.json()["user"]["id"], response.json()["access_token"]
 
 
-async def _create_host_and_agent(user_id: str, *, status: str = "running") -> tuple[str, str]:
+async def _create_host_and_session(user_id: str, *, status: str = "running") -> tuple[str, str]:
     sm = get_sessionmaker()
     async with sm() as session:
         host = Host(owner_user_id=user_id, name="browser-host", status="online")
         session.add(host)
         await session.flush()
-        agent = Agent(
+        row = Session(
             owner_user_id=user_id,
             host_id=host.id,
-            name="browser-agent",
+            name="browser-session",
             cwd="/repo",
-            argv=["sh"],
             status=status,
         )
-        session.add(agent)
+        session.add(row)
         await session.commit()
-        return host.id, agent.id
+        return host.id, row.id
 
 
-async def _create_host_with_agents(user_id: str, count: int) -> tuple[str, list[str]]:
+async def _create_host_with_sessions(user_id: str, count: int) -> tuple[str, list[str]]:
     sm = get_sessionmaker()
     async with sm() as session:
         host = Host(owner_user_id=user_id, name="browser-host", status="online")
         session.add(host)
         await session.flush()
-        agents = [
-            Agent(
+        rows = [
+            Session(
                 owner_user_id=user_id,
                 host_id=host.id,
-                name=f"browser-agent-{index}",
+                name=f"browser-session-{index}",
                 cwd=f"/repo/{index}",
-                argv=["sh"],
                 status="running",
             )
             for index in range(count)
         ]
-        session.add_all(agents)
+        session.add_all(rows)
         await session.commit()
-        return host.id, [agent.id for agent in agents]
+        return host.id, [row.id for row in rows]
 
 
 async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) -> None:
@@ -208,48 +207,47 @@ def _daemon_messages_of_type(
     ]
 
 
-def _agent_rtc_frame(agent_id: str, **fields: object) -> dict[str, object]:
+def _session_rtc_frame(pty_id: str, **fields: object) -> dict[str, object]:
     return {
-        "agent_id": agent_id,
-        "scope_type": "agent",
-        "scope_id": agent_id,
+        "scope_type": "session",
+        "scope_id": pty_id,
         "protocol": "spawn.pty",
         "protocol_version": 2,
         **fields,
     }
 
 
-async def test_browser_ws_rejects_missing_wrong_kind_and_cross_user_agents(client):
+async def test_browser_ws_rejects_missing_wrong_kind_and_cross_user_sessions(client):
     user_a, token_a = await _signup(client, "ws-browser-a@example.com")
     _user_b, token_b = await _signup(client, "ws-browser-b@example.com")
-    _host_id, agent_id = await _create_host_and_agent(user_a)
+    _host_id, pty_id = await _create_host_and_session(user_a)
 
     missing = FakeBrowserWebSocket()
-    await browser_ws(missing, agent_id=agent_id, token=None)  # type: ignore[arg-type]
-    assert missing.accepted_subprotocol == "spawn.v2"
+    await browser_ws(missing, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
+    assert missing.accepted_subprotocol == "spawn.v3"
     assert missing.closed == (1008, "not authenticated")
 
     daemon_token = auth.issue_daemon_token("00000000-0000-4000-8000-000000000001", user_a)
     wrong_kind = FakeBrowserWebSocket(authorization=f"Bearer {daemon_token}")
-    await browser_ws(wrong_kind, agent_id=agent_id, token=None)  # type: ignore[arg-type]
+    await browser_ws(wrong_kind, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
     assert wrong_kind.closed == (1008, "wrong token kind")
 
     cross_user = FakeBrowserWebSocket(authorization=f"Bearer {token_b}")
-    await browser_ws(cross_user, agent_id=agent_id, token=None)  # type: ignore[arg-type]
-    assert cross_user.closed == (1008, "agent not found")
+    await browser_ws(cross_user, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
+    assert cross_user.closed == (1008, "session not found")
 
     via_query = FakeBrowserWebSocket()
     via_query.queue_disconnect()
-    await browser_ws(via_query, agent_id=agent_id, token=token_a)  # type: ignore[arg-type]
+    await browser_ws(via_query, pty_session_id=pty_id, token=token_a)  # type: ignore[arg-type]
     assert via_query.closed is None
 
     old = FakeBrowserWebSocket(
         authorization=f"Bearer {token_a}", subprotocols=["spawn.v1"]
     )
-    await browser_ws(old, agent_id=agent_id, token=None)  # type: ignore[arg-type]
+    await browser_ws(old, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
     assert old.accepted_subprotocol is None
     assert _messages_of_type(old, "protocol.required") == [
-        {"type": "protocol.required", "protocol": "spawn.v2", "version": 2}
+        {"type": "protocol.required", "protocol": "spawn.v3", "version": 3}
     ]
     assert old.closed == (4003, "protocol upgrade required")
 
@@ -257,12 +255,12 @@ async def test_browser_ws_rejects_missing_wrong_kind_and_cross_user_agents(clien
 
 async def test_browser_upload_frame_fails_closed_without_forwarding_content(client, caplog):
     user_id, token = await _signup(client, "ws-browser-upload-retired@example.com")
-    _, agent_id = await _create_host_and_agent(user_id)
+    _, pty_id = await _create_host_and_session(user_id)
     ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
     task = asyncio.create_task(
-        browser_ws(ws, agent_id=agent_id, token=None)  # type: ignore[arg-type]
+        browser_ws(ws, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
     )
-    await _wait_until(lambda: bool(_messages_of_type(ws, "agent.status")))
+    await _wait_until(lambda: bool(_messages_of_type(ws, "session.status")))
 
     secret_name = "browser-secret-name.txt"
     secret_body = "YnJvd3Nlci1zZWNyZXQtY29udGVudA=="
@@ -283,23 +281,23 @@ async def test_browser_upload_frame_fails_closed_without_forwarding_content(clie
 
 
 
-async def test_browser_ws_v2_never_relays_pty_bytes(client):
-    """spawn.v2 never exposes a server-side PTY byte path."""
+async def test_browser_ws_v3_never_relays_pty_bytes(client):
+    """spawn.v3 never exposes a server-side PTY byte path."""
 
     user_id, token = await _signup(client, "ws-browser-v2@example.com")
-    host_id, agent_id = await _create_host_and_agent(user_id)
+    host_id, pty_id = await _create_host_and_session(user_id)
     daemon_ws = FakeDaemonWebSocket()
     daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
     broker = get_broker()
     await broker.register_daemon(daemon)
-    await broker.attach_agent_to_daemon(agent_id, daemon)
+    await broker.attach_session_to_daemon(pty_id, daemon)
 
-    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
-    task = asyncio.create_task(browser_ws(ws, agent_id=agent_id, token=None))  # type: ignore[arg-type]
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v3"])
+    task = asyncio.create_task(browser_ws(ws, pty_session_id=pty_id, token=None))  # type: ignore[arg-type]
 
     try:
-        await _wait_until(lambda: len(_messages_of_type(ws, "agent.status")) >= 1)
-        assert ws.accepted_subprotocol == "spawn.v2"
+        await _wait_until(lambda: len(_messages_of_type(ws, "session.status")) >= 1)
+        assert ws.accepted_subprotocol == "spawn.v3"
         # Control frames still flow: signaling config reaches the browser.
         assert len(_messages_of_type(ws, "rtc.config")) == 1
         # History, snapshots, geometry and display ownership are now carried
@@ -317,7 +315,7 @@ async def test_browser_ws_v2_never_relays_pty_bytes(client):
         # There is no terminal-content pubsub channel or binary send path.
         backend = get_backend()
         assert backend.inproc is not None
-        assert f"spawn:agent:{agent_id}" not in backend.inproc._subs
+        assert f"spawn:session:{pty_id}" not in backend.inproc._subs
         assert ws.sent_bytes == []
     finally:
         ws.queue_disconnect()
@@ -325,11 +323,11 @@ async def test_browser_ws_v2_never_relays_pty_bytes(client):
         await broker.unregister_daemon(daemon)
 
 
-async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client, monkeypatch):
+async def test_browser_ws_v3_reused_session_rejects_stale_binding_frames(client, monkeypatch):
     monkeypatch.setenv("SPAWN_WEBRTC_ENABLED", "1")
     get_settings.cache_clear()  # type: ignore[attr-defined]
     user_id, token = await _signup(client, "ws-browser-v2-binding@example.com")
-    host_id, agent_id = await _create_host_and_agent(user_id)
+    host_id, pty_id = await _create_host_and_session(user_id)
 
     daemon_ws = FakeDaemonWebSocket()
     daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
@@ -338,10 +336,10 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
     signal_task: asyncio.Task[None] | None = None
 
     ws = FakeBrowserWebSocket(
-        authorization=f"Bearer {token}", subprotocols=["spawn.v2"]
+        authorization=f"Bearer {token}", subprotocols=["spawn.v3"]
     )
     task = asyncio.create_task(
-        browser_ws(ws, agent_id=agent_id, token=None)  # type: ignore[arg-type]
+        browser_ws(ws, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
     )
     session_id = "reused-v2-session"
     nonce_a = "a" * 32
@@ -353,7 +351,7 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
 
         await broker.register_daemon(daemon)
         await _accept_daemon(daemon)
-        await broker.attach_agent_to_daemon(agent_id, daemon)
+        await broker.attach_session_to_daemon(pty_id, daemon)
         signal_ready = asyncio.Event()
         signal_task = asyncio.create_task(
             _pump_host_rtc_signals(daemon, signal_ready, expiry_tasks)
@@ -362,15 +360,15 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
 
         # v2 offers without a browser-generated binding identity fail closed.
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id, type="rtc.offer", session_id=session_id, sdp="v=0\r\n"
+            _session_rtc_frame(
+                pty_id, type="rtc.offer", session_id=session_id, sdp="v=0\r\n"
             )
         )
         await asyncio.sleep(0.02)
         assert not _daemon_messages_of_type(daemon_ws, "rtc.offer")
 
-        valid_tuple = _agent_rtc_frame(
-            agent_id,
+        valid_tuple = _session_rtc_frame(
+            pty_id,
             type="rtc.offer",
             session_id=session_id,
             binding_nonce=nonce_a,
@@ -378,7 +376,6 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         )
         invalid_tuples = []
         for field in (
-            "agent_id",
             "scope_type",
             "scope_id",
             "protocol",
@@ -388,7 +385,6 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
             missing.pop(field)
             invalid_tuples.append(missing)
         for field, value in (
-            ("agent_id", str(uuid.uuid4())),
             ("scope_type", "host"),
             ("scope_id", str(uuid.uuid4())),
             ("protocol", "spawn.ctl"),
@@ -404,8 +400,8 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         assert await broker.rtc_session_for(session_id) is None
 
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.offer",
                 session_id=session_id,
                 binding_nonce=nonce_a,
@@ -418,14 +414,14 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         first_offer = _daemon_messages_of_type(daemon_ws, "rtc.offer")[-1]
         assert first_offer["binding_nonce"] == nonce_a
         assert first_offer["binding_generation"] == daemon.host_generation
-        assert first_offer["scope_type"] == "agent"
-        assert first_offer["scope_id"] == agent_id
+        assert first_offer["scope_type"] == "session"
+        assert first_offer["scope_id"] == pty_id
         assert first_offer["protocol"] == "spawn.pty"
         assert first_offer["protocol_version"] == 2
 
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.close",
                 session_id=session_id,
                 binding_nonce=nonce_a,
@@ -443,8 +439,8 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
             ]
         )
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.offer",
                 session_id=session_id,
                 binding_nonce=nonce_a,
@@ -472,8 +468,8 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         assert await broker.rtc_session_for(session_id) is None
 
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.offer",
                 session_id=session_id,
                 binding_nonce=nonce_b,
@@ -490,8 +486,8 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         before_close_count = len(_daemon_messages_of_type(daemon_ws, "rtc.close"))
         candidate = {"candidate": "candidate:1 1 udp 1 127.0.0.1 9 typ host"}
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.candidate",
                 session_id=session_id,
                 binding_nonce=nonce_a,
@@ -499,8 +495,8 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
             )
         )
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.close",
                 session_id=session_id,
                 binding_nonce=nonce_a,
@@ -516,8 +512,8 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         assert current is not None
         assert current.nonce == nonce_b
 
-        missing_candidate_tuple = _agent_rtc_frame(
-            agent_id,
+        missing_candidate_tuple = _session_rtc_frame(
+            pty_id,
             type="rtc.candidate",
             session_id=session_id,
             binding_nonce=nonce_b,
@@ -526,8 +522,8 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         missing_candidate_tuple.pop("protocol")
         ws.queue_text(missing_candidate_tuple)
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.candidate",
                 session_id=session_id,
                 binding_nonce=nonce_b,
@@ -535,17 +531,17 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
                 scope_id=str(uuid.uuid4()),
             )
         )
-        missing_close_tuple = _agent_rtc_frame(
-            agent_id,
+        missing_close_tuple = _session_rtc_frame(
+            pty_id,
             type="rtc.close",
             session_id=session_id,
             binding_nonce=nonce_b,
         )
-        missing_close_tuple.pop("agent_id")
+        missing_close_tuple.pop("scope_type")
         ws.queue_text(missing_close_tuple)
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.close",
                 session_id=session_id,
                 binding_nonce=nonce_b,
@@ -563,8 +559,8 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         assert current.nonce == nonce_b
 
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.candidate",
                 session_id=session_id,
                 binding_nonce=nonce_b,
@@ -587,17 +583,17 @@ async def test_browser_ws_v2_reused_session_rejects_stale_binding_frames(client,
         await broker.unregister_daemon(daemon)
 
 
-async def test_agent_signed_offer_and_answer_are_opaque_symmetric_and_no_downgrade(
+async def test_session_signed_offer_and_answer_are_opaque_symmetric_and_no_downgrade(
     client, monkeypatch
 ):
     monkeypatch.setenv("SPAWN_WEBRTC_ENABLED", "1")
     get_settings.cache_clear()  # type: ignore[attr-defined]
     user_id, token = await _signup(client, "ws-browser-signed-relay@example.com")
-    host_id, agent_id = await _create_host_and_agent(user_id)
+    host_id, pty_id = await _create_host_and_session(user_id)
     session_id = str(uuid.uuid4())
     nonce = "c" * 32
-    offer_wire = _signed_agent_wire("rtc.offer", session_id, agent_id)
-    answer_wire = _signed_agent_wire("rtc.answer", session_id, agent_id)
+    offer_wire = _signed_session_wire("rtc.offer", session_id, pty_id)
+    answer_wire = _signed_session_wire("rtc.answer", session_id, pty_id)
 
     daemon_ws = FakeDaemonWebSocket()
     daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=daemon_ws)  # type: ignore[arg-type]
@@ -605,20 +601,20 @@ async def test_agent_signed_offer_and_answer_are_opaque_symmetric_and_no_downgra
     expiry_tasks: set[asyncio.Task[None]] = set()
     signal_task: asyncio.Task[None] | None = None
     ws = FakeBrowserWebSocket(authorization=f"Bearer {token}")
-    task = asyncio.create_task(browser_ws(ws, agent_id=agent_id))  # type: ignore[arg-type]
+    task = asyncio.create_task(browser_ws(ws, pty_session_id=pty_id))  # type: ignore[arg-type]
     try:
         await _wait_until(lambda: bool(_messages_of_type(ws, "rtc.config")))
         await broker.register_daemon(daemon)
         await _accept_daemon(daemon)
-        await broker.attach_agent_to_daemon(agent_id, daemon)
+        await broker.attach_session_to_daemon(pty_id, daemon)
         ready = asyncio.Event()
         signal_task = asyncio.create_task(_pump_host_rtc_signals(daemon, ready, expiry_tasks))
         await wait_for_signal_pump(signal_task, ready)
 
         offers_before = len(_daemon_messages_of_type(daemon_ws, "rtc.offer"))
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.offer",
                 session_id=session_id,
                 binding_nonce=nonce,
@@ -626,8 +622,8 @@ async def test_agent_signed_offer_and_answer_are_opaque_symmetric_and_no_downgra
             )
         )
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.offer",
                 session_id=session_id,
                 binding_nonce=nonce,
@@ -640,8 +636,8 @@ async def test_agent_signed_offer_and_answer_are_opaque_symmetric_and_no_downgra
         assert await broker.rtc_session_for(session_id) is None
 
         ws.queue_text(
-            _agent_rtc_frame(
-                agent_id,
+            _session_rtc_frame(
+                pty_id,
                 type="rtc.offer",
                 session_id=session_id,
                 binding_nonce=nonce,
@@ -661,11 +657,10 @@ async def test_agent_signed_offer_and_answer_are_opaque_symmetric_and_no_downgra
         response = {
             "type": "rtc.answer",
             "session_id": session_id,
-            "agent_id": agent_id,
             "binding_nonce": binding.nonce,
             "binding_generation": binding.daemon_generation,
-            "scope_type": "agent",
-            "scope_id": agent_id,
+            "scope_type": "session",
+            "scope_id": pty_id,
             "protocol": "spawn.pty",
             "protocol_version": 2,
         }
@@ -693,14 +688,14 @@ async def test_agent_signed_offer_and_answer_are_opaque_symmetric_and_no_downgra
         get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
-async def test_browser_ws_v2_rejects_binary_input_as_protocol_error(client):
+async def test_browser_ws_v3_rejects_binary_input_as_protocol_error(client):
     user_id, token = await _signup(client, "ws-browser-v2-input@example.com")
-    _host_id, agent_id = await _create_host_and_agent(user_id)
+    _host_id, pty_id = await _create_host_and_session(user_id)
 
-    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
-    task = asyncio.create_task(browser_ws(ws, agent_id=agent_id, token=None))  # type: ignore[arg-type]
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v3"])
+    task = asyncio.create_task(browser_ws(ws, pty_session_id=pty_id, token=None))  # type: ignore[arg-type]
 
-    await _wait_until(lambda: len(_messages_of_type(ws, "agent.status")) >= 1)
+    await _wait_until(lambda: len(_messages_of_type(ws, "session.status")) >= 1)
     ws.queue_bytes(b"stdin over the relay")
     await asyncio.wait_for(task, timeout=1)
 
@@ -708,16 +703,16 @@ async def test_browser_ws_v2_rejects_binary_input_as_protocol_error(client):
     assert ws.closed[0] == 4002
 
 
-async def test_browser_ws_v2_rejects_server_visible_viewport_control(client):
+async def test_browser_ws_v3_rejects_server_visible_viewport_control(client):
     user_id, token = await _signup(client, "ws-browser-v2-control@example.com")
-    _host_id, agent_id = await _create_host_and_agent(user_id)
+    _host_id, pty_id = await _create_host_and_session(user_id)
 
-    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v2"])
+    ws = FakeBrowserWebSocket(authorization=f"Bearer {token}", subprotocols=["spawn.v3"])
     task = asyncio.create_task(
-        browser_ws(ws, agent_id=agent_id, token=None)  # type: ignore[arg-type]
+        browser_ws(ws, pty_session_id=pty_id, token=None)  # type: ignore[arg-type]
     )
 
-    await _wait_until(lambda: len(_messages_of_type(ws, "agent.status")) >= 1)
+    await _wait_until(lambda: len(_messages_of_type(ws, "session.status")) >= 1)
     ws.queue_text({"type": "resize", "cols": 132, "rows": 40})
     await asyncio.wait_for(task, timeout=1)
 

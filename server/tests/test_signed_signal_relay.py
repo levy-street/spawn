@@ -24,12 +24,19 @@ from spawn_server.ws.signed_signal_relay import (
 )
 
 
-def _vector(vector_id: str = "agent-offer") -> dict[str, object]:
+def _vector(vector_id: str | None = None) -> dict[str, object]:
     path = Path(__file__).parents[2] / "proto" / "signed-signal-wire-v1-vectors.json"
+    wanted = {vector_id} if vector_id is not None else {"session-offer", "agent-offer"}
     for vector in json.loads(path.read_text())["vectors"]:
-        if vector["id"] == vector_id:
-            return dict(vector["envelope"])
-    raise AssertionError(f"missing vector {vector_id}")
+        if vector["id"] in wanted:
+            envelope = dict(vector["envelope"])
+            # Until the daemon workstream regenerates the vectors for the v3
+            # scope rename, normalize the legacy scope label; once the new
+            # vectors land this is a no-op.
+            if envelope.get("scope_type") == "agent":
+                envelope["scope_type"] = "session"
+            return envelope
+    raise AssertionError(f"missing vector {wanted}")
 
 
 def _wire(envelope: dict[str, object]) -> str:
@@ -41,7 +48,7 @@ def _validate(wire: object):
         wire,
         expected_type="rtc.offer",
         expected_session_id="018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
-        expected_scope_type="agent",
+        expected_scope_type="session",
         expected_scope_id="11111111-2222-4333-8444-555555555555",
         expected_protocol="spawn.pty",
         expected_protocol_version=2,
@@ -212,10 +219,9 @@ def test_redis_offer_and_answer_wrappers_preserve_exact_unicode_and_escapes():
     signal = {
         "type": "rtc.offer",
         "session_id": envelope["session_id"],
-        "agent_id": envelope["scope_id"],
         "binding_nonce": "b" * 32,
         "binding_generation": 7,
-        "scope_type": "agent",
+        "scope_type": "session",
         "scope_id": envelope["scope_id"],
         "protocol": "spawn.pty",
         "protocol_version": 2,

@@ -20,9 +20,19 @@ from .config import get_settings
 from .limits import MAX_SAFE_FENCING_GENERATION
 
 
-def agent_event_channel(agent_id: str) -> str:
-    """Cross-worker JSON control events for browsers attached to an agent."""
-    return f"spawn:agent:{agent_id}:events"
+def session_event_channel(session_id: str) -> str:
+    """Cross-worker JSON control events for browsers attached to a session."""
+    return f"spawn:session:{session_id}:events"
+
+
+def user_alert_channel(user_id: str) -> str:
+    """Cross-worker attention events for every browser this owner has open.
+
+    Distinct from ``session_event_channel`` on purpose: that one reaches the
+    browsers attached to one session, and an alert has to reach an owner who
+    has no pane open on the session at all.
+    """
+    return f"spawn:user:{user_id}:alerts"
 
 
 def _lease_generation(value: bytes) -> int | None:

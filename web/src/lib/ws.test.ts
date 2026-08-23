@@ -1,36 +1,40 @@
 import { describe, expect, test } from "bun:test";
 
-import { agentRtcTuple, buildAgentWsUrl, rtcBindingFrameMatches, SPAWN_WS_SUBPROTOCOL } from "./ws";
+import {
+  buildSessionWsUrl,
+  rtcBindingFrameMatches,
+  SPAWN_WS_SUBPROTOCOL,
+  sessionRtcTuple,
+} from "./ws";
 
-const AGENT_ID = "00000000-0000-4000-8000-000000000001";
+const SESSION_ID = "00000000-0000-4000-8000-000000000001";
 
-function boundFrame(sessionId: string, nonce: string, generation: number) {
+function boundFrame(rtcSessionId: string, nonce: string, generation: number) {
   return {
-    session_id: sessionId,
+    session_id: rtcSessionId,
     binding_nonce: nonce,
     binding_generation: generation,
-    agent_id: AGENT_ID,
-    scope_type: "agent",
-    scope_id: AGENT_ID,
+    scope_type: "session",
+    scope_id: SESSION_ID,
     protocol: "spawn.pty",
     protocol_version: 2,
   };
 }
 
-describe("mandatory agent signaling", () => {
-  test("uses only spawn.v2 and never discloses viewport dimensions in the URL", () => {
-    expect(SPAWN_WS_SUBPROTOCOL).toBe("spawn.v2");
-    const url = new URL(buildAgentWsUrl(AGENT_ID));
-    expect(url.searchParams.get("agent_id")).toBe(AGENT_ID);
+describe("mandatory session signaling", () => {
+  test("uses only spawn.v3 and never discloses viewport dimensions in the URL", () => {
+    expect(SPAWN_WS_SUBPROTOCOL).toBe("spawn.v3");
+    const url = new URL(buildSessionWsUrl(SESSION_ID));
+    expect(url.searchParams.get("session_id")).toBe(SESSION_ID);
+    expect(url.searchParams.has("agent_id")).toBe(false);
     expect(url.searchParams.has("cols")).toBe(false);
     expect(url.searchParams.has("rows")).toBe(false);
   });
 
-  test("binds every browser RTC signal to the exact agent PTY tuple", () => {
-    expect(agentRtcTuple(AGENT_ID)).toEqual({
-      agent_id: AGENT_ID,
-      scope_type: "agent",
-      scope_id: AGENT_ID,
+  test("binds every browser RTC signal to the exact session PTY tuple", () => {
+    expect(sessionRtcTuple(SESSION_ID)).toEqual({
+      scope_type: "session",
+      scope_id: SESSION_ID,
       protocol: "spawn.pty",
       protocol_version: 2,
     });
@@ -41,16 +45,16 @@ describe("rtcBindingFrameMatches", () => {
   test("rejects a validated frame after the same session id is rebound", () => {
     const stale = boundFrame("reused-session", "a".repeat(32), 7);
     const first = {
-      sessionId: "reused-session",
+      rtcSessionId: "reused-session",
       bindingNonce: "a".repeat(32),
       bindingGeneration: 7,
-      agentId: AGENT_ID,
+      sessionId: SESSION_ID,
     };
     const replacement = {
-      sessionId: "reused-session",
+      rtcSessionId: "reused-session",
       bindingNonce: "b".repeat(32),
       bindingGeneration: 7,
-      agentId: AGENT_ID,
+      sessionId: SESSION_ID,
     };
 
     expect(rtcBindingFrameMatches(first, stale)).toBe(true);
@@ -64,12 +68,12 @@ describe("rtcBindingFrameMatches", () => {
     ).toBe(false);
   });
 
-  test("fails closed on a nonce-less v2 frame", () => {
+  test("fails closed on a nonce-less frame", () => {
     const current = {
-      sessionId: "current",
+      rtcSessionId: "current",
       bindingNonce: "c".repeat(32),
       bindingGeneration: 3,
-      agentId: AGENT_ID,
+      sessionId: SESSION_ID,
     };
     expect(rtcBindingFrameMatches(current, { session_id: "current" })).toBe(false);
     expect(
@@ -77,17 +81,18 @@ describe("rtcBindingFrameMatches", () => {
     ).toBe(false);
   });
 
-  test("rejects an otherwise valid frame with a missing or mismatched agent tuple", () => {
+  test("rejects an otherwise valid frame with a missing or mismatched scope tuple", () => {
     const current = {
-      sessionId: "current",
+      rtcSessionId: "current",
       bindingNonce: "c".repeat(32),
       bindingGeneration: 3,
-      agentId: AGENT_ID,
+      sessionId: SESSION_ID,
     };
     const frame = boundFrame("current", "c".repeat(32), 3);
     expect(rtcBindingFrameMatches(current, frame)).toBe(true);
     expect(rtcBindingFrameMatches(current, { ...frame, protocol_version: 1 })).toBe(false);
-    expect(rtcBindingFrameMatches(current, { ...frame, scope_id: "other-agent" })).toBe(false);
+    expect(rtcBindingFrameMatches(current, { ...frame, scope_id: "other-session" })).toBe(false);
+    expect(rtcBindingFrameMatches(current, { ...frame, scope_type: "agent" })).toBe(false);
     const { protocol: _protocol, ...missingProtocol } = frame;
     expect(rtcBindingFrameMatches(current, missingProtocol)).toBe(false);
   });

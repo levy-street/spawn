@@ -27,7 +27,7 @@ export default defineConfig({
   webServer: configuredBaseUrl
     ? undefined
     : {
-        command: `SPAWN_API_PROXY_TARGET=http://127.0.0.1:9 bun run dev -- -H 127.0.0.1 -p ${port}`,
+        command: `SPAWN_API_PROXY_TARGET=http://127.0.0.1:9 npx --package=bun bunx bun run dev -- -H 127.0.0.1 -p ${port}`,
         url: baseURL,
         reuseExistingServer: !process.env.CI,
         timeout: 120_000,

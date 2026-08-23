@@ -1,6 +1,14 @@
 import { createHash, generateKeyPairSync, type KeyObject, sign as nodeSign } from "node:crypto";
 import { expect, test } from "@playwright/test";
-import { BROWSER_DEVICE_ID, HOST_ID, host, mockAuthenticatedApi, USER_ID } from "./app-mocks";
+import {
+  BROWSER_DEVICE_ID,
+  HOST_ID,
+  host,
+  mockApp,
+  openSettings,
+  USER_ID,
+  WORKSPACE_ID,
+} from "./app-mocks";
 
 // Bidirectional approval, receiving half: this browser was endorsed, and the
 // endorsement carries the host's key. The panel verifies the signature
@@ -45,7 +53,7 @@ test("an endorsed browser verifies its hosts from the endorsement itself", async
 
   // The endorsed key is this browser's own, minted in-page: capture it from
   // the registration the app performs, then serve a matching endorsement.
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     hosts: [
       {
         ...host,
@@ -98,7 +106,7 @@ test("an endorsed browser verifies its hosts from the endorsement itself", async
     });
   });
 
-  await page.goto("/settings");
+  await openSettings(page, "access", WORKSPACE_ID, `/hosts/${HOST_ID}`);
   // Introductions live under Advanced on the Access tab.
   await page.getByTestId("access-advanced").locator("summary").click();
   const panel = page.getByTestId("introduction-panel");
@@ -137,7 +145,7 @@ test("a server-substituted host key cannot be introduced", async ({ page }) => {
   const attackerRaw = rawPublicKey(attackerPair.publicKey);
   const endorserRaw = rawPublicKey(endorserPair.publicKey);
 
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     hosts: [
       {
         ...host,
@@ -196,7 +204,7 @@ test("a server-substituted host key cannot be introduced", async ({ page }) => {
     });
   });
 
-  await page.goto("/settings");
+  await openSettings(page, "access", WORKSPACE_ID, `/hosts/${HOST_ID}`);
   await page.getByTestId("access-advanced").locator("summary").click();
   await expect(page.getByTestId("browser-fingerprint")).toBeVisible({ timeout: 20_000 });
   await page.waitForTimeout(2_000);
