@@ -1,0 +1,57 @@
+{
+  "format": "spawn-signed-signal-v1",
+  "intended_peer_key": {
+    "public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+    "public_key_wire": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw"
+  },
+  "key_material_source": "RFC 8032 section 7.1 test vectors 1 and 2; test use only",
+  "mutation_fields": [
+    "signal_kind",
+    "protocol_version",
+    "session_id",
+    "scope_type",
+    "scope_id",
+    "sender_role",
+    "intended_peer_public_key",
+    "sdp"
+  ],
+  "signing_key": {
+    "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "public_key_wire": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+  },
+  "vectors": [
+    {
+      "id": "session-offer",
+      "intended_peer_public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "protocol_version": 2,
+      "replay_signature_from": "host-answer",
+      "scope_id": "11111111-2222-4333-8444-555555555555",
+      "scope_type": "session",
+      "sdp": "v=0\r\no=- 461173305954868531 2 IN IP4 127.0.0.1\r\ns=spawn-session\r\nt=0 0\r\na=setup:actpass\r\n",
+      "sender_role": "browser",
+      "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2a1",
+      "sha256_hex": "0497663df7234f1cdcd827c341a06340d27916012a302f5be0cf49ab18cb92d0",
+      "signal_kind": "offer",
+      "signature_hex": "031737c52c3e94be88c539f8e74016f930998690322880ae5b220538f275d17ec0e0955dd59fe4df82349e1784ba86905ac2beac69400920a41253b90d934404",
+      "signature_wire": "Axc3xSw-lL6IxTn450AW-TCZhpAyKICuWyIFOPJ10X7A4JVd1Z_k34I0nheEuoaQWsK-rGlACSCkElO5DZNEBA",
+      "transcript_hex": "535041574e2d5254432d5349474e414c2d5349472d5631020100000002002430313866306637372d383664322d376138652d396231632d31663362383437636132613101002431313131313131312d323232322d343333332d383434342d353535353535353535353535013d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c00000059763d300d0a6f3d2d20343631313733333035393534383638353331203220494e20495034203132372e302e302e310d0a733d737061776e2d73657373696f6e0d0a743d3020300d0a613d73657475703a616374706173730d0a"
+    },
+    {
+      "id": "host-answer",
+      "intended_peer_public_key_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+      "protocol_version": 1,
+      "replay_signature_from": "session-offer",
+      "scope_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "scope_type": "host",
+      "sdp": "v=0\r\no=- 461173305954868532 2 IN IP4 127.0.0.1\r\ns=spawn-host\r\nt=0 0\r\na=setup:active\r\n",
+      "sender_role": "daemon",
+      "session_id": "018f0f77-86d2-7a8e-9b1c-1f3b847ca2b2",
+      "sha256_hex": "92a0156bb584ab071f5113588e3589b7f1c62f36cf01c3dab75a8a600d69a7b2",
+      "signal_kind": "answer",
+      "signature_hex": "007d6dfada92bc13947d86d8bfb408e29b6996c1734b371b610e44744415b88cd77be5ed61ae807fc21bde230ddaaa660d6417c2ee7c1147be7c7ce87af1320c",
+      "signature_wire": "AH1t-tqSvBOUfYbYv7QI4ptplsFzSzcbYQ5EdEQVuIzXe-XtYa6Af8Ib3iMN2qpmDWQXwu58EUe-fHzoevEyDA",
+      "transcript_hex": "535041574e2d5254432d5349474e414c2d5349472d5631020200000001002430313866306637372d383664322d376138652d396231632d31663362383437636132623202002461616161616161612d626262622d346363632d386464642d656565656565656565656565023d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c00000055763d300d0a6f3d2d20343631313733333035393534383638353332203220494e20495034203132372e302e302e310d0a733d737061776e2d686f73740d0a743d3020300d0a613d73657475703a6163746976650d0a"
+    }
+  ]
+}

@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from ..redis import get_backend, user_alert_channel
+from ..trust_events import forwardable_trust_frame
 from .browser import _resolve_user
 
 router = APIRouter()
@@ -281,7 +282,9 @@ async def alerts_ws(websocket: WebSocket, token: str | None = Query(default=None
                         event = json.loads(raw_event)
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         continue
-                    forwardable = _forwardable(event)
+                    # Two families share this channel and are validated apart,
+                    # so the alert whitelist stays exactly as narrow as it was.
+                    forwardable = _forwardable(event) or forwardable_trust_frame(event)
                     if forwardable is None:
                         continue
                     await _send(forwardable)

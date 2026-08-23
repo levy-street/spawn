@@ -389,6 +389,51 @@ class Host(Base):
     )
 
 
+class DeviceApprovalRequest(Base):
+    """A device asking the account's other devices to admit it.
+
+    Approval itself has always been possible — a trusted device endorses an
+    untrusted one — but nothing told the trusted device that somebody was
+    waiting, so the operator had to already know the feature existed and go
+    find it. This row is that missing knock: it is pure notification, carries
+    no authority, and is resolved by an endorsement signed the same way as
+    before.
+    """
+
+    __tablename__ = "device_approval_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    owner_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    browser_device_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("browser_devices.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'denied')",
+            name="ck_device_approval_requests_status",
+        ),
+        # One live knock per device. A device that asks twice refreshes its own
+        # request rather than filling every other device's screen with copies.
+        Index(
+            "uq_device_approval_requests_pending",
+            "browser_device_id",
+            unique=True,
+            sqlite_where=text("status = 'pending'"),
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
+
+
 class HostBrowserPin(Base):
     """Immutable snapshot of one browser identity explicitly approved for a host."""
 

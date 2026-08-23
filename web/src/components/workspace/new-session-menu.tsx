@@ -43,11 +43,35 @@ function choiceKey(choice: Choice): string {
 export type NewSessionProps = {
   mode: "session" | "workspace";
   workspaceId?: string;
-  /** The tab the window lands in — its home answers "where". Defaults to the
-   *  workspace's active tab. */
-  tabId?: string;
+  /**
+   * The tab the window lands in — its home answers "where". Defaults to the
+   * workspace's active tab. Explicitly null for a tab that does not exist
+   * yet (the strip's "+", which makes the tab as part of the create): a fresh
+   * tab inherits the workspace's home, so that is what the menu offers.
+   */
+  tabId?: string | null;
   /** Drop the new window at this exact rect instead of auto-placing it. */
   placement?: Rect;
+  /** Overrides what the menu calls itself — the heading over the root panel,
+   *  and the mobile sheet's title. */
+  heading?: string;
+  /** Drops the heading row over the root panel, for a trigger that already
+   *  says what the menu is. The mobile sheet keeps its title: it opens over
+   *  the whole screen with no trigger left beside it to read. */
+  hideHeading?: boolean;
+  /** Drops the "somewhere other than home" escape hatch. For a surface where
+   *  home is not a guess — a new tab opens at the workspace's folder, and
+   *  "Change tab folder" re-points it afterwards — the extra row is a second
+   *  way to say the same thing and only lengthens the list. */
+  hideElsewhere?: boolean;
+  /**
+   * Run just before the window is created, for a caller that has to make room
+   * for it first — the strip's "+" adds the tab (and makes it active, which is
+   * what puts the window in it) here. Whatever it returns is called if the
+   * create then fails, so a tab added for a window that never opened does not
+   * stay behind.
+   */
+  beforeCreate?: () => Promise<(() => void) | undefined>;
   /** `sessionId` is null when the menu added a widget rather than a session. */
   onCreated?: (r: { workspaceId: string; sessionId: string | null }) => void;
 };
@@ -60,7 +84,17 @@ export type NewSessionProps = {
  * a "Select folder…" opens, and the error a refused create reports).
  */
 function useNewSessionChoices(
-  { mode, workspaceId, tabId, placement, onCreated }: NewSessionProps,
+  {
+    mode,
+    workspaceId,
+    tabId,
+    placement,
+    heading,
+    hideHeading,
+    hideElsewhere,
+    beforeCreate,
+    onCreated,
+  }: NewSessionProps,
   /** What the folder picker hangs off — the cascade has closed by then. */
   anchorRef?: RefObject<HTMLElement | null>,
   /** Reopens the cascade behind the picker; omitted where there is not one. */
@@ -87,9 +121,15 @@ function useNewSessionChoices(
   const agentsQ = useQuery({ queryKey: ["agents"], queryFn: agents.list, staleTime: 60_000 });
   const hostList = hostsQ.data ?? [];
   const agentList = agentsQ.data ?? [];
-  const workspaceHasRoom = workspaceQ.data
-    ? autoPlace(activeTab(workspaceQ.data.layout).layout.tiles).tile !== null
-    : true;
+  /** Undoes what `beforeCreate` did, held for as long as the create it was
+   *  made for is still in flight. */
+  const undoRef = useRef<(() => void) | null>(null);
+  // A tab that does not exist yet is empty by definition, so a full canvas is
+  // no reason to refuse — the strip's own MAX_TABS check is what limits it.
+  const workspaceHasRoom =
+    tabId === null || !workspaceQ.data
+      ? true
+      : autoPlace(activeTab(workspaceQ.data.layout).layout.tiles).tile !== null;
 
   /*
    * Where a window added here opens: the tab's own home when it has one, else
@@ -102,7 +142,11 @@ function useNewSessionChoices(
   const home = (() => {
     if (mode !== "session" || !workspaceQ.data) return null;
     const layout = workspaceQ.data.layout;
-    const resolved = tabHome(layout, tabId ?? activeTab(layout).id, workspaceQ.data);
+    // `tabId: null` names a tab that is about to be made; no id in the
+    // envelope matches "", which is exactly how `tabHome` answers "inherit the
+    // workspace's home" — what the new tab will do.
+    const target = tabId === null ? "" : (tabId ?? activeTab(layout).id);
+    const resolved = tabHome(layout, target, workspaceQ.data);
     const host = resolved ? hostList.find((item) => item.id === resolved.host_id) : undefined;
     return host && resolved ? { host, cwd: resolved.cwd } : null;
   })();
@@ -113,6 +157,9 @@ function useNewSessionChoices(
 
   const createM = useMutation({
     mutationFn: async ({ host, cwd, choice }: { host: Host; cwd: string; choice: Choice }) => {
+      // Whatever this makes room in is what `activeTab` reads below, so it has
+      // to land on the server before anything else is fetched.
+      undoRef.current = (await beforeCreate?.()) ?? null;
       if (choice.kind === "files") {
         if (!workspaceId) throw new Error("A workspace is required to add a file explorer.");
         // Widgets are layout, not sessions: place one in the active tab and
@@ -177,6 +224,7 @@ function useNewSessionChoices(
       return { workspaceId: result.workspace.id, sessionId: result.session.id };
     },
     onSuccess: (result) => {
+      undoRef.current = null;
       setErrorMessage(null);
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
       queryClient.invalidateQueries({ queryKey: ["workspace", result.workspaceId] });
@@ -184,6 +232,8 @@ function useNewSessionChoices(
       onCreated?.(result);
     },
     onError: (error) => {
+      undoRef.current?.();
+      undoRef.current = null;
       if (isWorkspaceFullError(error)) {
         setWorkspaceFull(true);
         setErrorMessage("This workspace is full. Remove a window before adding another session.");
@@ -244,9 +294,10 @@ function useNewSessionChoices(
         }
       : elsewhere(choice);
 
+  const defaultHeading = mode === "workspace" ? "New workspace" : "Add a window";
   const root: CascadePanel = {
     id: "widgets",
-    title: mode === "workspace" ? "New workspace" : "Add a window",
+    title: hideHeading ? undefined : (heading ?? defaultHeading),
     items: [
       {
         key: "shell",
@@ -258,7 +309,7 @@ function useNewSessionChoices(
       // Home answers "where" for everything above, so a workspace with one
       // needs this escape hatch to open a shell on another host (or just
       // another folder) without giving up the one-click default.
-      ...(home
+      ...(home && !hideElsewhere
         ? [
             {
               key: "shell-elsewhere",
@@ -340,9 +391,15 @@ export function NewSessionMenu(
      * half the canvas, so its corner is nowhere near the cursor).
      */
     anchor?: "trigger" | "pointer";
+    /** Goes on the wrapper the trigger sits in, for a trigger whose own
+     *  layout (a flex row's `shrink-0`, say) is set by its parent. */
+    className?: string;
+    /** Goes on the dropdown itself — its width, mostly, where the default is
+     *  too narrow for the labels a surface carries. */
+    menuClassName?: string;
   },
 ): JSX.Element {
-  const { trigger, mode, anchor = "trigger" } = props;
+  const { trigger, mode, heading, anchor = "trigger", className, menuClassName } = props;
   const anchorRef = useRef<HTMLSpanElement>(null);
   const menuRef = useRef<CascadeMenuHandle>(null);
   // The lozenge row has no single cascade to return to, so only this
@@ -352,11 +409,12 @@ export function NewSessionMenu(
   );
 
   return (
-    <span ref={anchorRef} className="relative inline-flex" title={tooltip}>
+    <span ref={anchorRef} className={cn("relative inline-flex", className)} title={tooltip}>
       <CascadeMenu
         ref={menuRef}
         root={root}
-        sheetTitle={mode === "workspace" ? "New workspace" : "Add a window"}
+        sheetTitle={heading ?? (mode === "workspace" ? "New workspace" : "Add a window")}
+        menuClassName={menuClassName}
         renderTrigger={(triggerProps) =>
           isValidElement(trigger) ? (
             <Slot

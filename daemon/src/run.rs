@@ -1046,6 +1046,58 @@ fn require_signed_rtc_offers() -> bool {
         .is_some_and(|value| value == "0" || value == "false")
 }
 
+/// The fingerprint of whoever signed a refused offer, for the console line the
+/// operator is standing in front of. The envelope failed verification, so this
+/// is the sender's own unverified claim about itself — useful only for naming
+/// the device to approve, never for a trust decision.
+fn claimed_offer_fingerprint(envelope: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(envelope).ok()?;
+    let claimed = parsed.get("sender_identity_public_key")?.as_str()?;
+    public_key_from_wire(claimed).ok()?;
+    creds::browser_key_fingerprint(claimed).ok()
+}
+
+/// Answer a refused RTC offer instead of dropping it.
+///
+/// A daemon that simply `continue`s leaves the browser watching an indefinite
+/// "connecting" spinner: the relay has a live binding, no answer ever arrives,
+/// and nothing distinguishes an unapproved device from a host that is asleep.
+/// Echoing the offer's own routing tuple is what lets the relay match this
+/// status to that binding and forward it.
+#[allow(clippy::too_many_arguments)]
+fn refuse_rtc_offer(
+    out_tx: &mpsc::Sender<WsOutbound>,
+    signal_id: &str,
+    binding_nonce: Option<&String>,
+    scope_type: Option<&String>,
+    scope_id: Option<Uuid>,
+    protocol: Option<&String>,
+    protocol_version: Option<u16>,
+    message: &str,
+) {
+    // Without the nonce the relay cannot bind the status to the offer, so
+    // there is nobody to tell.
+    let Some(nonce) = binding_nonce else {
+        return;
+    };
+    let frame = Outbound::RtcStatus {
+        session_id: signal_id.to_string(),
+        binding_nonce: Some(nonce.clone()),
+        scope_type: scope_type.cloned(),
+        scope_id,
+        protocol: protocol.cloned(),
+        protocol_version,
+        status: "failed".to_string(),
+        message: Some(message.to_string()),
+    };
+    if let Ok(text) = serde_json::to_string(&frame) {
+        let _ = out_tx.try_send(WsOutbound::json(text));
+    }
+}
+
+const RTC_REFUSED_UNPINNED_BROWSER: &str =
+    "This host has not approved this device. Approve it from a device this host already trusts, or pair the host again.";
+
 fn verify_signed_rtc_offer(envelope: &str, record: &StoredCreds) -> Option<VerifiedRtcSignal> {
     let host_identity = creds::host_identity(record).ok().flatten()?;
     let host_key = public_key_from_wire(&host_identity.public_key).ok()?;
@@ -1415,11 +1467,40 @@ async fn dispatch_loop(
                                     tracing::warn!(
                                         "rejecting signed RTC offer with mismatched session"
                                     );
+                                    refuse_rtc_offer(
+                                        &out_tx,
+                                        &signal_id,
+                                        binding_nonce.as_ref(),
+                                        scope_type.as_ref(),
+                                        scope_id,
+                                        protocol.as_ref(),
+                                        protocol_version,
+                                        "The offer did not describe the session it was routed to.",
+                                    );
                                     continue;
                                 }
                                 None => {
-                                    tracing::warn!(
-                                        "rejecting signed RTC offer that no local pin verified"
+                                    match claimed_offer_fingerprint(envelope) {
+                                        Some(fingerprint) => tracing::warn!(
+                                            claimed_browser_fingerprint = %fingerprint,
+                                            "refusing an RTC offer from a browser this host has \
+                                             not approved; approve that fingerprint from a \
+                                             device this host already trusts, or re-run \
+                                             `spawnd login` and approve from the new device"
+                                        ),
+                                        None => tracing::warn!(
+                                            "rejecting signed RTC offer that no local pin verified"
+                                        ),
+                                    }
+                                    refuse_rtc_offer(
+                                        &out_tx,
+                                        &signal_id,
+                                        binding_nonce.as_ref(),
+                                        scope_type.as_ref(),
+                                        scope_id,
+                                        protocol.as_ref(),
+                                        protocol_version,
+                                        RTC_REFUSED_UNPINNED_BROWSER,
                                     );
                                     continue;
                                 }
@@ -1434,6 +1515,16 @@ async fn dispatch_loop(
                                 _ => {
                                     tracing::warn!(
                                         "cannot sign RTC answer for verified signed offer"
+                                    );
+                                    refuse_rtc_offer(
+                                        &out_tx,
+                                        &signal_id,
+                                        binding_nonce.as_ref(),
+                                        scope_type.as_ref(),
+                                        scope_id,
+                                        protocol.as_ref(),
+                                        protocol_version,
+                                        "This host cannot sign an RTC answer right now.",
                                     );
                                     continue;
                                 }
@@ -1451,6 +1542,16 @@ async fn dispatch_loop(
                                 // to the PTY without going near the browser.
                                 tracing::warn!(
                                     "rejecting unsigned RTC offer: signed signaling is required"
+                                );
+                                refuse_rtc_offer(
+                                    &out_tx,
+                                    &signal_id,
+                                    binding_nonce.as_ref(),
+                                    scope_type.as_ref(),
+                                    scope_id,
+                                    protocol.as_ref(),
+                                    protocol_version,
+                                    "This host requires signed RTC signalling.",
                                 );
                                 continue;
                             }

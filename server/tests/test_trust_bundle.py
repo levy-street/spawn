@@ -688,3 +688,39 @@ async def test_pins_routes_match_the_daemon_computation(client):
         expected = sorted(await live_browser_device_id_set(session, host_id))
     pins = await client.get(f"/api/trust/hosts/{host_id}/pins", headers=auth)
     assert pins.json() == expected == [x_id]
+
+
+async def test_an_endorsement_closes_the_knock_it_answers(client):
+    """The prompt must stop as soon as it has been answered, on every device."""
+
+    user_id, auth, endorser_key, _, ids = await _endorsement_fixture(
+        client, "knock-answered@example.com"
+    )
+    host_id, host_pub, endorser_id, endorsed_id, endorsed_pub = ids
+
+    knock = await client.post(
+        "/api/trust/device-approvals",
+        json={"browser_device_id": endorsed_id},
+        headers=auth,
+    )
+    assert knock.status_code == 200, knock.text
+    assert len((await client.get("/api/trust/device-approvals", headers=auth)).json()) == 1
+
+    response = await client.post(
+        "/api/trust/endorsements",
+        json={
+            "host_id": host_id,
+            "endorser_device_id": endorser_id,
+            "endorsed_device_id": endorsed_id,
+            "signature": _endorsement_signature(
+                user_id=user_id,
+                host_public_key=host_pub,
+                endorser_private=endorser_key,
+                endorsed_public_key=endorsed_pub,
+                endorsed_device_id=endorsed_id,
+            ),
+        },
+        headers=auth,
+    )
+    assert response.status_code == 200, response.text
+    assert (await client.get("/api/trust/device-approvals", headers=auth)).json() == []
