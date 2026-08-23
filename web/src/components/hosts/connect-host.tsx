@@ -138,8 +138,8 @@ export function ConnectHostSection(props: {
         <CardHeader>
           <CardTitle>Connect a host</CardTitle>
           <CardDescription>
-            Install the daemon on the machine where your sessions should run, then approve its
-            one-time pairing code.
+            Install the daemon on the machine where your sessions should run, then approve it from
+            the link its terminal prints.
           </CardDescription>
         </CardHeader>
       )}

@@ -34,7 +34,8 @@ const STEP_COPY: Record<OnboardingStep, { title: string; description: string }> 
   },
   host: {
     title: "Connect your first host",
-    description: "Install the daemon on a Mac or Linux machine, then approve its pairing code.",
+    description:
+      "Install the daemon on a Mac or Linux machine, then approve it from the link its terminal prints.",
   },
   done: {
     title: "Your workspace is ready",
