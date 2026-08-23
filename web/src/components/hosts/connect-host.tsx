@@ -640,13 +640,14 @@ export function PairingCodeForm({
               disabled={submitting || registration.data?.status !== "ready"}
               onClick={onApprove}
             >
+              {/* One label whatever the pin's history: the line above already
+                  says if this key was removed before, and the possess screen
+                  reads the same every time you land on it. */}
               {submitting
                 ? "Approving…"
                 : localPinCommitted
                   ? "Retry server approval"
-                  : localPinState === "revoked"
-                    ? "Approve this host again"
-                    : `Approve ${pending.host_name}`}
+                  : `Approve ${pending.host_name}`}
             </Button>
           </div>
         </div>
