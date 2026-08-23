@@ -43,6 +43,10 @@ scripts/check-signed-rtc-live.sh
 printf '%s\n' "== host-control pin-gate guard =="
 scripts/check-host-control-gated.sh
 
+printf '%s\n' "== session-epoch enforcement guard =="
+scripts/check-session-epoch-enforced.sh --self-test
+scripts/check-session-epoch-enforced.sh
+
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
 

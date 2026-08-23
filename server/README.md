@@ -15,7 +15,8 @@ uv sync
 
 # copy env template (from repo root)
 cp ../.env.example .env
-# fill in SPAWN_VAULT_KEY (32 random bytes hex) and SPAWN_JWT_SECRET
+# generate a signing key -- the server refuses to boot without a real one
+python -c 'import secrets; print("SPAWN_JWT_SECRET=" + secrets.token_urlsafe(64))' >> .env
 
 # start postgres + redis (use ../infra/ compose if present, or your own)
 # then run migrations

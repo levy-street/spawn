@@ -12,7 +12,8 @@ from typing import Any
 from spawn_server import auth
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
-from spawn_server.models import Host
+from spawn_server.models import Host, User
+from spawn_server.ws import browser as browser_ws_mod
 from spawn_server.ws.broker import HostBrowserConn, get_broker
 from spawn_server.ws.daemon import daemon_ws
 from spawn_server.ws.host import (
@@ -733,3 +734,40 @@ async def test_new_daemon_claim_actively_revokes_established_old_worker_session(
 
     browser_socket.queue_disconnect()
     await asyncio.gather(browser_task, _stop_daemon(new_socket, new_task))
+
+
+async def test_host_ws_refuses_and_evicts_a_session_past_its_epoch(client, monkeypatch):
+    """The host-control socket is the same door as the agent one.
+
+    `/ws/host` carries file browse/read/write and upload signaling for the
+    whole machine, so a session that survives a password reset here is the
+    worst version of the bug, not a lesser one.
+    """
+
+    # The watchdog is shared with /ws/browser and lives in that module.
+    monkeypatch.setattr(browser_ws_mod, "SESSION_EPOCH_RECHECK_SECONDS", 0.01)
+    user_id, token = await _signup(client, "host-rtc-epoch@example.com")
+    host_id = await _create_host(user_id, "epoch-host")
+
+    live = FakeWebSocket(authorization=f"Bearer {token}")
+    task = asyncio.create_task(host_ws(live, host_id=host_id))  # type: ignore[arg-type]
+    await _wait_until(lambda: bool(live.sent_text))
+    assert live.closed is None
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = await session.get(User, user_id)
+        assert user is not None
+        user.session_epoch = user.session_epoch + 1
+        await session.commit()
+
+    await _wait_until(lambda: live.closed is not None, timeout=3.0)
+    assert live.closed == (4001, "session ended; sign in again")
+    live.queue_disconnect()
+    await asyncio.wait_for(task, timeout=2)
+
+    # And a fresh connection with the same token never gets its ICE servers.
+    reconnect = FakeWebSocket(authorization=f"Bearer {token}")
+    await host_ws(reconnect, host_id=host_id)  # type: ignore[arg-type]
+    assert reconnect.closed == (4001, "session ended; sign in again")
+    assert reconnect.sent_text == []

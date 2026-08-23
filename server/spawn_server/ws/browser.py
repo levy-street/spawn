@@ -47,6 +47,13 @@ AGENT_RTC_PROTOCOL_VERSION = 2
 BROWSER_WS_PROTOCOL = "spawn.v2"
 WS_CLOSE_PROTOCOL_REQUIRED = 4003
 WS_CLOSE_CONTENT_FORBIDDEN = 4002
+WS_CLOSE_SESSION_ENDED = 4001
+
+# How often a live socket re-reads the account's session epoch. The
+# connect-time check cannot help a socket that was already open when the
+# password reset landed, and these sockets are long-lived by design -- without
+# this, eviction would wait out the 30-day session cookie.
+SESSION_EPOCH_RECHECK_SECONDS = 30.0
 
 
 def _rtc_config_payload(user_id: str, *, binding_nonce_required: bool = False) -> dict[str, object]:
@@ -156,7 +163,46 @@ async def _resolve_user(websocket: WebSocket, query_token: str | None) -> User |
     if user is None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="user gone")
         return None
+    # Same eviction rule the REST paths enforce. Both sockets authenticate
+    # here, and `issue_session_token` mints KIND_ACCESS, so without this the
+    # 30-day session cookie stays a valid credential on them after a reset.
+    if not auth_mod.session_epoch_matches(payload, user):
+        await websocket.close(code=WS_CLOSE_SESSION_ENDED, reason="session ended; sign in again")
+        return None
     return user
+
+
+async def watch_session_epoch(websocket: WebSocket, user: User) -> None:
+    """Close a socket once the account's session epoch moves past its token.
+
+    Checking only at connect leaves a socket opened one second before a
+    password reset authenticated indefinitely -- so re-read the epoch on a
+    slow interval and hang up when it changes (or the account disappears).
+    """
+
+    minted_epoch = int(user.session_epoch or 0)
+    sm = get_sessionmaker()
+    while True:
+        await asyncio.sleep(SESSION_EPOCH_RECHECK_SECONDS)
+        try:
+            async with sm() as session:
+                current = await session.get(User, user.id)
+                live_epoch = None if current is None else int(current.session_epoch or 0)
+        except Exception as e:  # noqa: BLE001
+            # A transient database blip must not disconnect a healthy session;
+            # the next tick re-checks.
+            log.warning("session epoch recheck failed user=%s: %s", user.id, e)
+            continue
+        if live_epoch == minted_epoch:
+            continue
+        log.info("session evicted mid-connection; closing socket user=%s", user.id)
+        try:
+            await websocket.close(
+                code=WS_CLOSE_SESSION_ENDED, reason="session ended; sign in again"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
 
 
 @router.websocket("/ws/browser")
@@ -325,6 +371,7 @@ async def browser_ws(
 
     event_task = asyncio.create_task(_pump_events())
     rtc_task = asyncio.create_task(_pump_rtc_signals())
+    epoch_task = asyncio.create_task(watch_session_epoch(websocket, user))
     try:
         await asyncio.gather(
             asyncio.wait_for(event_ready.wait(), timeout=1.0),
@@ -626,6 +673,11 @@ async def browser_ws(
     except Exception as e:  # noqa: BLE001
         log.exception("browser ws crashed: %s", e)
     finally:
+        epoch_task.cancel()
+        try:
+            await epoch_task
+        except (asyncio.CancelledError, Exception):
+            pass
         rtc_task.cancel()
         try:
             await rtc_task

@@ -210,6 +210,16 @@ cannot become an implicit cross-account key transfer; only the original account
 may intentionally re-pair that key. Browsers refuse sessions with unpinned keys
 at L1+.
 
+Account session revocation is separate and stateless: every user token carries
+the `session_epoch` it was minted under, and a password reset bumps that epoch
+(`routes/account_recovery.py`). Every path that turns a token into a `User` —
+REST, `/ws/browser`, and `/ws/host` alike — refuses a token minted under an
+older epoch, and the two WebSockets additionally re-read the epoch on a timer
+so a socket opened just before the reset is hung up rather than surviving on
+its original credential. `scripts/check-session-epoch-enforced.sh` fails the
+build on a token-accepting entry point that skips the check, because a path
+that does is unrevocable by construction.
+
 ## ADR: how a new device bootstraps trust
 
 **Status:** accepted 2026-07-20. Supersedes the implicit decision that the

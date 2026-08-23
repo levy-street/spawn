@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .config import get_settings
+from .config import assert_jwt_secret_usable, get_settings
 from .db import dispose_engine, get_sessionmaker, init_engine
 from .presets import seed_builtin_presets
 from .redis import lifespan_shutdown as redis_shutdown
@@ -41,6 +41,10 @@ log = logging.getLogger("spawn.main")
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
+    # Before anything else, and before a single request is served: a
+    # guessable signing key means every token on this deployment is
+    # forgeable, so refuse to come up rather than fail open quietly.
+    assert_jwt_secret_usable(settings)
     log.info("starting spawn-server (db=%s redis=%s)", settings.database_url, settings.redis_url)
 
     init_engine()

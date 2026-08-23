@@ -161,6 +161,14 @@ def _email_from_body(body: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _claim_is_true(value: Any) -> bool:
+    """Whether a provider asserted a boolean claim, tolerating JSON stringly types."""
+
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() == "true"
+
+
 def _str_claim(body: dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = body.get(key)
@@ -175,6 +183,16 @@ class ProviderAuthError(Exception):
     def __init__(self, message: str, status_code: int = status.HTTP_400_BAD_REQUEST) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class ProviderLinkConflictError(Exception):
+    """A provider identity resolved onto an account it has not proven it owns."""
+
+    def __init__(self, email: str) -> None:
+        super().__init__(
+            f"An account already exists for {email}. Sign in with your password to continue."
+        )
+        self.email = email
 
 
 async def _exchange_provider_code(
@@ -233,13 +251,24 @@ async def _oidc_profile(
         raise ProviderAuthError(f"{definition.name} did not return an account id")
 
     if definition.id == "microsoft":
-        email = _email_from_body(body, "email", "preferred_username", "upn")
-        email_verified = bool(email)
+        # Entra ID's `email` claim is backed by mutable directory attributes
+        # (`mail` / `otherMails`) that any tenant admin can set to any string,
+        # and `preferred_username` / `upn` are not identity at all. Microsoft's
+        # own guidance is that none of them may be used for authorization
+        # unless the tenant asserts domain ownership -- which is what
+        # `xms_edov` is. Synthesizing verification from "the string is
+        # non-empty" is the documented nOAuth account-takeover pattern.
+        email = _email_from_body(body, "email")
+        email_verified = _claim_is_true(body.get("xms_edov")) or _claim_is_true(
+            body.get("email_verified")
+        )
     else:
         email = _email_from_body(body, "email")
-        email_verified = body.get("email_verified") is True or body.get("email_verified") == "true"
+        email_verified = _claim_is_true(body.get("email_verified"))
 
-    if not email or not email_verified:
+    if not email:
+        raise ProviderAuthError(f"{definition.name} did not return an email address")
+    if not email_verified:
         raise ProviderAuthError(f"{definition.name} did not return a verified email")
     return ProviderProfile(
         provider=definition.id,
@@ -342,11 +371,22 @@ async def _user_for_profile(
         if user is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user gone")
     if user is None:
-        user = (
+        existing = (
             await session.execute(
                 select(User).where(func.lower(User.email) == profile.email.lower())
             )
         ).scalar_one_or_none()
+        if existing is not None:
+            # Adopting an account because two strings match is account
+            # pre-hijacking: signup enforces only uniqueness, so anyone can
+            # park a row on an address they do not own and wait for its real
+            # owner to arrive through a provider -- and keep password access
+            # to whatever that account later pairs. Requiring spawn's own
+            # out-of-band confirmation of the address means both sides have
+            # independently proven they hold it.
+            if existing.email_verified_at is None:
+                raise ProviderLinkConflictError(profile.email)
+            user = existing
     if user is None:
         user = User(email=profile.email, password_hash=auth.hash_random_password(), created_at=now)
         session.add(user)
@@ -435,11 +475,19 @@ async def provider_callback(
         profile = await _exchange_provider_code(config=config, code=code)
     except ProviderAuthError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e)) from e
-    user = await _user_for_profile(
-        session=session,
-        profile=profile,
-        linked_user_id=state_row.user_id,
-    )
+    try:
+        user = await _user_for_profile(
+            session=session,
+            profile=profile,
+            linked_user_id=state_row.user_id,
+        )
+    except ProviderLinkConflictError as e:
+        # Land on the sign-in page saying what to do instead of a bare JSON
+        # error: this account holder has a password and a way in.
+        return RedirectResponse(
+            f"/login?{urlencode({'error': str(e)})}",
+            status_code=status.HTTP_302_FOUND,
+        )
     auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     redirect = RedirectResponse(state_row.return_to, status_code=status.HTTP_302_FOUND)
     if "set-cookie" in response.headers:
