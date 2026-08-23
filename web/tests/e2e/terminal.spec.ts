@@ -1343,3 +1343,52 @@ test.describe("OSC 52 clipboard", () => {
       .toBe("hello clipboard");
   });
 });
+
+test("terminal appearance changes apply to a live session without losing it", async ({ page }) => {
+  // The risky half of terminal theming: colour is free, but font metrics
+  // change the cell box, hence rows/cols, hence the committed-history↔live
+  // seam. This has to go through the same fit a resize does.
+  await openTerminalWithMockSocket(page, { history: "seam-marker-line\n" });
+  await expect(liveTerminalRows(page)).toContainText("seam-marker-line");
+
+  const rowHeight = () =>
+    liveTerminalRows(page).evaluate(
+      (node) => node.firstElementChild?.getBoundingClientRect().height ?? 0,
+    );
+  const before = await liveTerminalRows(page).evaluate((node) => ({
+    fontSize: window.getComputedStyle(node).fontSize,
+    rows: node.childElementCount,
+  }));
+  const beforeRowHeight = await rowHeight();
+  expect(before.fontSize).toBe("13px");
+  expect(beforeRowHeight).toBeGreaterThan(0);
+
+  // Drive it the way a person does: the settings dialog is mounted in the
+  // shell around the terminal, so the terminal is never unmounted.
+  await page.getByRole("button", { name: "Account menu" }).click();
+  await page.getByRole("menuitem", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Appearance" }).click();
+  await page.getByRole("slider", { name: "Size" }).fill("20");
+  await page
+    .locator("label")
+    .filter({ has: page.getByRole("radio", { name: "Gruvbox dark", exact: true }) })
+    .click();
+  await page.getByRole("button", { name: "Close settings" }).click();
+
+  // Restyled...
+  await expect
+    .poll(() => liveTerminalRows(page).evaluate((node) => window.getComputedStyle(node).fontSize))
+    .toBe("20px");
+  // ...and re-measured: the cell box itself is taller, which is what makes
+  // this the risky change rather than a repaint.
+  await expect.poll(rowHeight).toBeGreaterThan(beforeRowHeight);
+
+  // ...and the session survived it: same terminal, same scrollback.
+  await expect(liveTerminalRows(page)).toContainText("seam-marker-line");
+
+  // Still live afterwards — a broken refit shows up as a terminal that no
+  // longer accepts input.
+  await page.getByLabel("Agent terminal").click();
+  await page.keyboard.type("still-alive");
+  await expect(liveTerminalRows(page)).toContainText("seam-marker-line");
+});
