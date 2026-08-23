@@ -12,7 +12,7 @@ import { type ClipboardEvent, type FormEvent, type ReactNode, useRef } from "rea
 import { cn } from "@/lib/utils";
 
 export interface ModifierBarProps {
-  /** Send raw bytes / strings to the agent stdin. */
+  /** Send raw bytes / strings to the session stdin. */
   onSend: (bytes: Uint8Array | string) => void;
   onPaste?: (data: DataTransfer) => void;
   onPasteText?: (text: string) => void;

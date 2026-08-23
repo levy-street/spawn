@@ -25,6 +25,12 @@
   --color-card-foreground: var(--card-foreground);
   --color-popover: var(--popover);
   --color-popover-foreground: var(--popover-foreground);
+  /* Menu chrome, kept off the shared --border/--accent pair: a popover is a
+     lighter surface than the ground it opens over, so its hairline and its
+     row hover both have to be read against that lighter ground rather than
+     against the panel. */
+  --color-popover-border: var(--popover-border);
+  --color-popover-accent: var(--popover-accent);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
   --color-secondary: var(--secondary);
@@ -33,10 +39,40 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-soft: var(--destructive-soft);
+  /* Semantic status set. `destructive` is the canonical "danger" name (the
+     spec's --danger alias was dropped in its favor). *-soft is a 10–20%
+     translucent tint of the same hue for chips/badges/callout fills. */
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  /* Code highlighting. Its own family, not the status hues: painting a
+     string literal "success green" is exactly the semantic overload the
+     token system exists to prevent. */
+  --color-code-comment: var(--code-comment);
+  --color-code-string: var(--code-string);
+  --color-code-keyword: var(--code-keyword);
+  --color-code-number: var(--code-number);
+  --color-code-punct: var(--code-punct);
+  /* Status-dot tones (sidebar rows, pane headers, host cards). */
+  --color-tone-active: var(--tone-active);
+  --color-tone-waiting: var(--tone-waiting);
+  --color-tone-idle: var(--tone-idle);
+  --color-tone-offline: var(--tone-offline);
   --color-border: var(--border);
+  /* Seam between tiled panes. One step brighter than --border: at 1px against
+     a terminal's near-black ground the plain border reads as nothing. */
+  --color-pane-divider: var(--pane-divider);
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-terminal-bg: var(--terminal-bg);
+  /* The app-shell ground: the sidebar, and the frame the content panel floats
+     in. Sits one step off the content panel in both themes — lighter in dark,
+     darker in light — so chrome and content never read as the same surface. */
+  --color-shell: var(--shell);
   /* Brand surfaces: the landing and download pages are a darker, flatter
      stack than the app chrome, and they need to stay that way relative to
      whichever theme is active. */
@@ -44,6 +80,10 @@
   --color-brand-panel: var(--brand-panel);
   --color-brand-well: var(--brand-well);
   --color-brand-hairline: var(--brand-hairline);
+  /* The one non-status accent in the app palette: the landing page's hellfire,
+     theme-swapped so it stays legible on both grounds. */
+  --color-brand-accent: var(--brand-accent);
+  --color-brand-accent-soft: var(--brand-accent-soft);
 }
 
 @theme {
@@ -52,36 +92,147 @@
   --radius-sm: 0.375rem;
 
   /*
-   * The Grimoire — spawnd's brand palette. Fixed constants (not theme-swapped):
-   * marketing surfaces commit to the dark occult look in every theme. Exposed as
-   * Tailwind utilities: bg-void, text-hellfire, border-line-g, font-grimoire, …
+   * The Pressroom — spawnd's brand palette. Fixed constants (not theme-swapped):
+   * marketing surfaces commit to the hand-pulled screenprint look — pure black
+   * paper, one vivid red ink — in every theme. Exposed as Tailwind utilities:
+   * bg-void, text-hellfire, border-line-g, font-grimoire, …
+   *
+   * hellfire is the brand ink verbatim (#E11E15). At ~4.4:1 on pure black it
+   * clears the 3:1 graphics bar but not 4.5:1 body text — small red text on
+   * void uses ember (the same ink hit twice, still unmistakably the brand red).
    */
-  --color-void: #0a0607;
-  --color-char: #151011;
-  --color-panelg: #1b1414;
-  --color-line-g: rgba(233, 225, 211, 0.13);
-  --color-line-strong: rgba(233, 225, 211, 0.25);
-  --color-bone: #e9e1d3;
-  --color-ash: #a89b8e;
-  --color-hellfire: #ff4930;
-  --color-blood: #8e1f16;
-  --color-ember: #ffa46b;
+  --color-void: #000000;
+  --color-char: #120f0e;
+  --color-panelg: #191514;
+  --color-line-g: rgba(242, 237, 226, 0.13);
+  --color-line-strong: rgba(242, 237, 226, 0.26);
+  --color-bone: #f2ede2;
+  --color-ash: #a39a8c;
+  --color-hellfire: #e11e15;
+  /* The flood coat. Black body copy on hellfire measures 4.39:1 — a hair under
+     the 4.5:1 bar — so a full-bleed red plate carrying black text is pulled in
+     this fractionally lighter mix of the same ink (4.85:1) instead. Line work
+     and small marks stay on hellfire proper; only plate grounds use this. */
+  --color-plate: #ea2a1b;
+  --color-blood: #7c100b;
+  --color-ember: #ff453a;
 
   --font-grimoire:
-    "Palatino", "Palatino Linotype", "Book Antiqua", Georgia, "Times New Roman", serif;
+    var(--font-plex-sans, "IBM Plex Sans"), "Helvetica Neue", Arial, sans-serif;
   --font-sigil: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
 
 /*
- * Marketing skin. A `.grimoire` root commits to the void palette and serif body
+ * Marketing skin. A `.grimoire` root commits to the void palette and sans body
  * regardless of the app's light/dark toggle, so landing pages read as one dark,
  * dramatic surface while the product chrome stays theme-aware.
  */
 .grimoire {
+  color-scheme: dark;
   background: var(--color-void);
   color: var(--color-bone);
   font-family: var(--font-grimoire);
   -webkit-font-smoothing: antialiased;
+
+  /*
+   * The app's semantic tokens, re-cut in press ink. Product primitives — Card,
+   * Button, Input, the host-pairing panel — turn up inside the signup funnel,
+   * and re-pointing the tokens is what makes them read as the poster does
+   * without a parallel component set to maintain.
+   */
+  --background: var(--color-void);
+  --foreground: var(--color-bone);
+  --muted: var(--color-panelg);
+  --muted-foreground: var(--color-ash);
+  --card: var(--color-char);
+  --card-foreground: var(--color-bone);
+  --popover: var(--color-panelg);
+  --popover-foreground: var(--color-bone);
+  --popover-border: var(--color-line-strong);
+  --popover-accent: rgba(242, 237, 226, 0.1);
+  /* The hero's CTA is bone on void, so every primary action is. Hellfire stays
+     the accent — a rule, a mark, a hover — never the button ground. */
+  --primary: var(--color-bone);
+  --primary-foreground: var(--color-void);
+  --secondary: rgba(242, 237, 226, 0.05);
+  --secondary-foreground: var(--color-bone);
+  --accent: rgba(242, 237, 226, 0.12);
+  --accent-foreground: var(--color-bone);
+  --destructive: var(--color-ember);
+  --destructive-foreground: var(--color-void);
+  --destructive-soft: rgba(255, 69, 58, 0.14);
+  /* One ink means one affirmative: status collapses onto the brand red and the
+     bone/ash pair rather than importing a green and a blue the press never
+     mixed. */
+  --success: var(--color-ember);
+  --success-soft: rgba(255, 69, 58, 0.12);
+  --warning: var(--color-ember);
+  --warning-soft: rgba(255, 69, 58, 0.12);
+  --info: var(--color-ash);
+  --info-soft: rgba(163, 154, 140, 0.14);
+  --tone-active: var(--color-ember);
+  --tone-waiting: var(--color-ash);
+  --tone-idle: var(--color-ash);
+  --tone-offline: var(--color-line-strong);
+  --border: var(--color-line-g);
+  --pane-divider: var(--color-line-strong);
+  --input: var(--color-line-strong);
+  --ring: var(--color-ember);
+  --brand-accent: var(--color-ember);
+  --brand-accent-soft: rgba(255, 69, 58, 0.14);
+}
+
+/*
+ * The account surfaces (signup, login, recovery, the onboarding gates) print
+ * their controls the way the poster does: sigil monospace, letterspaced, set
+ * in caps. Scoped to the class AuthShell sets rather than to `.grimoire`, so
+ * the same shared primitives keep their app voice everywhere else — and so a
+ * component the auth flow borrows, like the host-pairing panel, is dressed
+ * without knowing it was borrowed.
+ *
+ * Corners drop to the radius the landing page's chips use; every `rounded-*`
+ * utility reads its radius through `var()`, so one override re-cuts the whole
+ * surface.
+ */
+.pressroom {
+  --radius-lg: 0.375rem;
+  --radius-md: 0.375rem;
+}
+.pressroom :is(button, [role="button"], .ui-button) {
+  font-family: var(--font-sigil);
+  font-size: 0.75rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.pressroom label {
+  font-family: var(--font-sigil);
+  font-size: 0.6875rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-ash);
+}
+.pressroom :is(input, textarea, select) {
+  font-family: var(--font-sigil);
+}
+/* A quiet control on the press is a hairline plate — the poster fills nothing
+   in grey. Keyed off the variant the button reports, so every borrowed
+   secondary/outline control obeys without a class at the call site. */
+.pressroom .ui-button:is([data-variant="secondary"], [data-variant="outline"]) {
+  border: 1px solid var(--color-line-strong);
+  background-color: transparent;
+  color: var(--color-bone);
+}
+.pressroom .ui-button:is([data-variant="secondary"], [data-variant="outline"]):hover {
+  border-color: var(--color-bone);
+  background-color: rgba(242, 237, 226, 0.08);
+}
+/* A disabled control is an unstruck plate — a hairline and ash type, rather
+   than the bone slab dimmed to a muddy grey. */
+.pressroom .ui-button:disabled:not([data-variant="link"]) {
+  border: 1px solid var(--color-line-g);
+  background-color: transparent;
+  color: var(--color-ash);
+  opacity: 1;
 }
 .grimoire ::selection {
   background: var(--color-hellfire);
@@ -91,6 +242,17 @@
   to {
     transform: rotate(360deg);
   }
+}
+/* Slow specimen marquee on the landing page. The track holds its content
+ * twice; sliding half its own width then looping reads as an endless strip.
+ * The global reduced-motion rule collapses it to a static row. */
+@keyframes brand-marquee {
+  to {
+    transform: translateX(-50%);
+  }
+}
+.brand-marquee {
+  animation: brand-marquee 56s linear infinite;
 }
 .grimoire-ring {
   transform-origin: 50% 50%;
@@ -118,6 +280,8 @@
   --card-foreground: oklch(0.17 0 0);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0.17 0 0);
+  --popover-border: oklch(0.88 0 0);
+  --popover-accent: oklch(0.94 0 0);
   --primary: oklch(0.2 0 0);
   --primary-foreground: oklch(0.985 0 0);
   --secondary: oklch(0.95 0 0);
@@ -126,15 +290,59 @@
   --accent-foreground: oklch(0.17 0 0);
   --destructive: oklch(0.53 0.2 25);
   --destructive-foreground: oklch(0.99 0 0);
+  --destructive-soft: oklch(0.53 0.2 25 / 0.1);
+  /* Status hues: the one place chroma enters the palette. Light values sit at
+     L ≤ 0.55 so status text clears 4.5:1 on --background. */
+  --success: oklch(0.52 0.13 152);
+  --success-soft: oklch(0.52 0.13 152 / 0.12);
+  --warning: oklch(0.55 0.13 75);
+  --warning-soft: oklch(0.55 0.13 75 / 0.14);
+  --info: oklch(0.52 0.11 240);
+  --info-soft: oklch(0.52 0.11 240 / 0.12);
+  /* Code tokens, at the same L <= 0.55 the status hues use so each one
+     clears 4.5:1 on --background. */
+  --code-comment: oklch(0.55 0.02 260);
+  --code-string: oklch(0.48 0.12 150);
+  --code-keyword: oklch(0.50 0.16 305);
+  --code-number: oklch(0.52 0.13 60);
+  --code-punct: oklch(0.55 0.02 260);
+  /* Status dots: brighter than the text hues (a dot needs punch, not
+     contrast-for-reading). active/waiting mirror success/info hues. */
+  --tone-active: oklch(0.6 0.16 152);
+  --tone-waiting: oklch(0.6 0.13 240);
+  --tone-idle: oklch(0.6 0 0);
+  --tone-offline: oklch(0.78 0 0);
   --border: oklch(0.9 0 0);
+  --pane-divider: oklch(0.84 0 0);
   --input: oklch(0.9 0 0);
-  --ring: oklch(0.55 0 0);
+  /* Brand accent: the brand ink (#E11E15) pulled into the app chrome for the
+     wordmark and text selection. Light is the ink verbatim — it clears 4.5:1
+     on --background; dark brightens it to the ember value so it clears the
+     same bar on the dark ground. Focus rings stay neutral — foreground in
+     both themes — never the accent. */
+  --brand-accent: #e11e15;
+  --brand-accent-soft: rgba(225, 30, 21, 0.12);
+  --ring: var(--foreground);
+  --shell: oklch(0.945 0 0);
   --terminal-bg: oklch(0.99 0 0);
 
   --brand-bg: oklch(0.97 0 0);
   --brand-panel: oklch(1 0 0);
   --brand-well: oklch(0.94 0 0);
   --brand-hairline: oklch(0.88 0 0);
+
+  /* Chrome geometry — theme-invariant (not redefined in dark), so components
+     never hardcode these. Consume as arbitrary values: w-(--sidebar-width),
+     h-(--row-h), gap-(--pane-gap). */
+  --sidebar-width: 264px;
+  --sidebar-rail-width: 56px;
+  --row-h: 2.5rem; /* the 40px nav row rhythm */
+  --pane-gap: 6px; /* gutter between stacked panes on narrow screens */
+  /* Gap around the floating content panel. 0 by default so full-bleed layouts
+     (and mobile, where a floating panel only wastes width) need no special
+     case; AppShell raises it at the @md/shell breakpoint, and anything sizing
+     itself off --vv-height subtracts 2x this. */
+  --content-inset: 0px;
 
   /* Updated by useViewportInset() to track on-screen keyboard. */
   --vv-height: 100dvh;
@@ -148,14 +356,20 @@
 [data-theme="dark"] {
   color-scheme: dark;
 
-  --background: oklch(0.13 0 0);
+  --background: oklch(0.10 0 0);
   --foreground: oklch(0.97 0 0);
   --muted: oklch(0.21 0 0);
   --muted-foreground: oklch(0.71 0 0);
   --card: oklch(0.16 0 0);
   --card-foreground: oklch(0.97 0 0);
-  --popover: oklch(0.16 0 0);
+  /* Menus and popovers are the one surface that rises: lighter than --shell
+     (the sidebar) and well clear of --card (the content panel), so a menu
+     always reads as lifted off whatever it opens over rather than as a hole
+     cut into it. The hairline is lighter again — a lit top edge. */
+  --popover: oklch(0.235 0 0);
   --popover-foreground: oklch(0.97 0 0);
+  --popover-border: oklch(0.31 0 0);
+  --popover-accent: oklch(0.30 0 0);
   --primary: oklch(0.97 0 0);
   --primary-foreground: oklch(0.13 0 0);
   --secondary: oklch(0.24 0 0);
@@ -164,9 +378,29 @@
   --accent-foreground: oklch(0.97 0 0);
   --destructive: oklch(0.62 0.21 25);
   --destructive-foreground: oklch(0.97 0 0);
+  --destructive-soft: oklch(0.62 0.21 25 / 0.14);
+  --success: oklch(0.74 0.15 152);
+  --success-soft: oklch(0.74 0.15 152 / 0.14);
+  --warning: oklch(0.78 0.14 80);
+  --warning-soft: oklch(0.78 0.14 80 / 0.14);
+  --info: oklch(0.72 0.12 235);
+  --info-soft: oklch(0.72 0.12 235 / 0.14);
+  --code-comment: oklch(0.62 0.02 260);
+  --code-string: oklch(0.78 0.13 150);
+  --code-keyword: oklch(0.76 0.14 305);
+  --code-number: oklch(0.80 0.12 70);
+  --code-punct: oklch(0.66 0.02 260);
+  --tone-active: oklch(0.74 0.17 152);
+  --tone-waiting: oklch(0.72 0.13 235);
+  --tone-idle: oklch(0.68 0 0);
+  --tone-offline: oklch(0.44 0 0);
   --border: oklch(0.27 0 0);
+  --pane-divider: oklch(0.38 0 0);
   --input: oklch(0.27 0 0);
-  --ring: oklch(0.55 0 0);
+  --brand-accent: #ff453a;
+  --brand-accent-soft: rgba(255, 69, 58, 0.14);
+  --ring: var(--foreground);
+  --shell: oklch(0.2 0 0);
   --terminal-bg: oklch(0.145 0 0);
 
   --brand-bg: oklch(0.115 0 0);
@@ -180,6 +414,16 @@ body {
   height: 100%;
   background: var(--background);
   color: var(--foreground);
+  /*
+   * Mobile browsers "autosize" text: a block whose lines look long for the
+   * screen gets its font inflated, independent of any CSS. The terminal cannot
+   * survive that — xterm sizes its grid from a probe element the inflation
+   * treats differently to the rendered rows, so glyphs come out around 1.5x
+   * their cell and every line overruns the pane instead of wrapping. Pin it
+   * off document-wide; nothing here wants the browser choosing type sizes.
+   */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
   overscroll-behavior-y: contain;
@@ -191,6 +435,34 @@ body {
 body {
   /* Use the visualViewport-driven height so the layout shrinks with the keyboard. */
   min-height: var(--vv-height);
+}
+
+/* Selection picks up the brand accent app-wide, the same move `.grimoire`
+ * makes with raw hellfire. The terminal is excluded: xterm paints its own
+ * selection layer from its theme, and the WebGL renderer never sees this. */
+::selection {
+  background: var(--brand-accent);
+  color: var(--background);
+}
+
+/*
+ * Tailwind v4's Preflight gives buttons `cursor: default`, which left every
+ * clickable thing in the app without a pointer. Put it back for anything that
+ * behaves like a control. This lives in `base` so any explicit `cursor-*`
+ * utility still wins — the sidebar's `cursor-col-resize` grip, for one — and
+ * disabled controls are excluded so they keep the arrow. Anchors already get
+ * a pointer from the UA stylesheet.
+ */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="menuitem"]:not([aria-disabled="true"]),
+  [role="option"]:not([aria-disabled="true"]),
+  [role="tab"]:not([aria-disabled="true"]),
+  label[for],
+  summary {
+    cursor: pointer;
+  }
 }
 
 /*
@@ -234,6 +506,13 @@ body {
   touch-action: none;
 }
 
+/* A hair of breathing room so glyphs never sit hard against the pane edge.
+ * The fit addon subtracts this padding when it sizes the grid, so the columns
+ * still fill the pane exactly. */
+.xterm {
+  padding: 4px 6px;
+}
+
 .xterm .xterm-helper-textarea {
   touch-action: auto;
   -webkit-touch-callout: default;
@@ -241,11 +520,110 @@ body {
   user-select: text;
 }
 
+/* A selected tab and the panel under it are one sheet. Where the tab drops
+ * through the strip, these concave corners fill the notch either side of its
+ * foot — the surface curves out to the panel instead of stepping down. */
+.tab-connected {
+  position: relative;
+}
+.tab-connected::before,
+.tab-connected::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  width: 6px;
+  height: 6px;
+  background-color: var(--tab-surface);
+  pointer-events: none;
+}
+.tab-connected::before {
+  left: -6px;
+  -webkit-mask-image: radial-gradient(6px at 0 0, transparent 0 6px, #000 6px);
+  mask-image: radial-gradient(6px at 0 0, transparent 0 6px, #000 6px);
+}
+.tab-connected::after {
+  right: -6px;
+  -webkit-mask-image: radial-gradient(6px at 100% 0, transparent 0 6px, #000 6px);
+  mask-image: radial-gradient(6px at 100% 0, transparent 0 6px, #000 6px);
+}
+
 /* Swift, decelerating easing shared by shell chrome animations. */
 @layer utilities {
   .ease-swift {
     transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
   }
+}
+
+/* The pane launcher becomes a bin for the length of any drag. The wobble is
+ * what says so at a glance — a button that only swapped its icon reads as the
+ * same button. Rests at neutral on the last frame, so the global
+ * reduced-motion rule below leaves it sitting straight. */
+@keyframes bin-jiggle {
+  0% {
+    transform: rotate(0deg);
+  }
+  25% {
+    transform: rotate(-7deg);
+  }
+  75% {
+    transform: rotate(7deg);
+  }
+  100% {
+    transform: rotate(0deg);
+  }
+}
+.bin-jiggle {
+  animation: bin-jiggle 0.45s ease-in-out infinite;
+}
+
+/* Upload progress sheen: a white-to-transparent gradient that travels along
+ * the filled part of the terminal's upload bar, so a large upload still reads
+ * as live while the fill sits still between chunks. The track under it keeps
+ * a dim white base, which is what remains under reduced motion. */
+@keyframes upload-sheen {
+  to {
+    background-position: -100% 0;
+  }
+}
+.upload-sheen {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgb(255 255 255 / 0.95) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  background-position: 100% 0;
+  animation: upload-sheen 1.2s linear infinite;
+}
+
+/* The connecting terminal's channel line: dashes drifting toward the padlock
+ * between the two endpoints, so a pane that is still negotiating reads as
+ * working rather than hung. One dash period of travel per cycle, which makes
+ * the last frame identical to the first — the global reduced-motion rule below
+ * freezes it on a clean dashed hairline rather than mid-slide. Painted in
+ * currentColor so call sites tint the line with a text utility, exactly like
+ * the padlock it runs into. */
+@keyframes channel-drift {
+  to {
+    background-position-x: var(--channel-drift-to);
+  }
+}
+.channel-line {
+  --channel-drift-to: 8px;
+  background-image: repeating-linear-gradient(90deg, currentColor 0 2px, transparent 2px 8px);
+  background-size: 8px 1px;
+  background-repeat: repeat-x;
+  background-position: 0 center;
+}
+/* Only the half of the channel that is actually carrying anything drifts; the
+ * far half stays a still dashed gap until it comes up. */
+.channel-line-flow {
+  animation: channel-drift 0.75s linear infinite;
+}
+/* The far side of the channel drifts the other way; both flow inward. */
+.channel-line-rev {
+  --channel-drift-to: -8px;
 }
 
 /* Honor reduced-motion globally: collapse all transitions/animations to
@@ -277,5 +655,98 @@ body {
   }
   .min-h-vv {
     min-height: var(--vv-height);
+  }
+}
+
+/* Rendered markdown in the file viewer.
+   Scoped to one class rather than a typography plugin: the viewer is the only
+   surface that renders prose, and everything here resolves through the same
+   tokens as the rest of the app so it swaps with the theme. */
+@layer components {
+  .prose-preview > :first-child {
+    margin-top: 0;
+  }
+  .prose-preview h1,
+  .prose-preview h2,
+  .prose-preview h3,
+  .prose-preview h4 {
+    font-weight: 600;
+    line-height: 1.3;
+    margin-block: 1.4em 0.6em;
+  }
+  .prose-preview h1 {
+    font-size: 1.55em;
+  }
+  .prose-preview h2 {
+    font-size: 1.3em;
+  }
+  .prose-preview h3 {
+    font-size: 1.1em;
+  }
+  .prose-preview p,
+  .prose-preview ul,
+  .prose-preview ol,
+  .prose-preview blockquote,
+  .prose-preview table {
+    margin-block: 0.75em;
+  }
+  .prose-preview ul,
+  .prose-preview ol {
+    padding-left: 1.5em;
+  }
+  .prose-preview ul {
+    list-style: disc;
+  }
+  .prose-preview ol {
+    list-style: decimal;
+  }
+  .prose-preview li {
+    margin-block: 0.25em;
+  }
+  .prose-preview code {
+    background: var(--muted);
+    border-radius: 0.25rem;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 0.9em;
+    padding: 0.1em 0.35em;
+  }
+  .prose-preview pre {
+    background: var(--muted);
+    border-radius: 0.5rem;
+    overflow-x: auto;
+    padding: 0.75rem 1rem;
+  }
+  .prose-preview pre code {
+    background: none;
+    padding: 0;
+  }
+  .prose-preview blockquote {
+    border-left: 2px solid var(--border);
+    color: var(--muted-foreground);
+    padding-left: 1em;
+  }
+  .prose-preview hr {
+    border-color: var(--border);
+    margin-block: 1.5em;
+  }
+  .prose-preview table {
+    border-collapse: collapse;
+    display: block;
+    overflow-x: auto;
+    width: max-content;
+    max-width: 100%;
+  }
+  .prose-preview th,
+  .prose-preview td {
+    border: 1px solid var(--border);
+    padding: 0.35em 0.7em;
+    text-align: left;
+  }
+  .prose-preview th {
+    background: var(--muted);
+    font-weight: 600;
+  }
+  .prose-preview input[type="checkbox"] {
+    margin-right: 0.4em;
   }
 }

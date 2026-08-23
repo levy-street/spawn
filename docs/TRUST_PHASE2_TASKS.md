@@ -1,5 +1,13 @@
 # Trust Phase 2 — tracked task schedule
 
+> **Historical ledger:** statuses and implementation names below are retained
+> as the record of the pre-overhaul trust program. The current product uses
+> shell sessions, agent shortcut definitions, v3 browser/daemon signaling,
+> and `session.*` lifecycle frames. Use `INTERFACE_MATRIX.md`,
+> `proto/README.md`, and `TRUST.md` for the live surface. Rows are not renamed
+> retroactively because commit evidence and review gates refer to their
+> original terms.
+
 Last updated: 2026-07-17. Governing model: `docs/TRUST.md`. Build sequence and
 purge runbook: `docs/TRUST_PHASE2.md`.
 

@@ -1,3 +1,4 @@
+import { parseCapabilities } from "@/lib/preview/capabilities";
 import { hashStream, Sha256 } from "@/lib/sha256";
 import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
 import type { SignedRtcRefusalReason, SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
@@ -19,7 +20,25 @@ const STREAM_TIMEOUT_MS = 60_000;
 const FALLBACK_DOWNLOAD_MEMORY_LIMIT = 32 * 1024 * 1024;
 const MAX_STREAM_TOMBSTONES = 256;
 const STREAM_TOMBSTONE_TTL_MS = 120_000;
-const INDETERMINATE_REQUEST_OPERATIONS = new Set(["fs.mkdir", "fs.rename", "fs.remove"]);
+// A request whose acknowledgement is lost may or may not have taken effect, so
+// it must never be transparently retried. Launching an application is exactly
+// that: a lost ack could still have opened a window on someone's desktop.
+const INDETERMINATE_REQUEST_OPERATIONS = new Set([
+  "fs.mkdir",
+  "fs.rename",
+  "fs.remove",
+  "desktop.reveal",
+  "desktop.open",
+]);
+/**
+ * Rendering a preview waits on a third-party QuickLook generator, and the first
+ * one of a session also pays for QuickLook's agents starting up. This must stay
+ * comfortably above the daemon's own render timeout so the host always gets to
+ * answer with a real reason rather than the client giving up first.
+ */
+const PREVIEW_REQUEST_TIMEOUT_MS = 35_000;
+/** Largest slice `fs.read.range` will return in one request. */
+export const MAX_RANGE_BYTES = 16 * 1024 * 1024;
 export const HOST_DIRECTORY_PAGE_ENTRIES = 96;
 
 export class HostControlError extends Error {
@@ -30,6 +49,31 @@ export class HostControlError extends Error {
     super(detail || code);
     this.name = "HostControlError";
   }
+}
+
+/** One exact capacity reading, only ever carried by `spawn.host.ctl`. */
+export interface HostCapacitySample {
+  /** Whole-machine CPU use, 0-100, across every logical core. */
+  cpu_percent: number;
+  memory_used_bytes: number;
+  memory_total_bytes: number;
+  /** 1-minute load average where the platform keeps one. */
+  load_one?: number | null;
+  uptime_seconds: number;
+}
+
+/** What the machine is. Repeated on every sample so one request is enough. */
+export interface HostCapacitySpec {
+  cpu_cores: number;
+  cpu_physical_cores?: number | null;
+  cpu_model?: string | null;
+  memory_bytes: number;
+  gpu?: string | null;
+}
+
+export interface HostMetrics {
+  sample: HostCapacitySample;
+  spec?: HostCapacitySpec | null;
 }
 
 export interface HostDirEntry {
@@ -54,6 +98,16 @@ export interface HostFileOp {
   path?: string | null;
 }
 
+export interface HostFileStat {
+  path: string;
+  name: string;
+  kind: "file" | "directory" | "symlink" | "other";
+  size?: number | null;
+  modified_at?: number | null;
+  content_type?: string | null;
+  open_allowed?: boolean;
+}
+
 export interface HostReadStream {
   streamId: string;
   path: string;
@@ -61,6 +115,50 @@ export interface HostReadStream {
   length: number;
   sha256: string;
   stream: ReadableStream<Uint8Array>;
+}
+
+/** A bounded slice. `sha256` covers the slice, not the whole file. */
+export interface HostRangeStream extends HostReadStream {
+  offset: number;
+  fileSize: number;
+  /** Opaque validator; changes whenever the file does. */
+  version: string | null;
+  contentType: string | null;
+  /** The host's own verdict on whether it would launch this file. */
+  openAllowed: boolean;
+  /** The slice reached the end of the file. */
+  eof: boolean;
+}
+
+/** A host-rendered preview image for a format the browser cannot draw. */
+export interface HostPreviewStream extends HostReadStream {
+  mime: string;
+  width: number;
+  height: number;
+  version: string | null;
+}
+
+/** Render sizes the host accepts. An allowlist, never a clamped free integer. */
+export const PREVIEW_PIXEL_SIZES = [128, 256, 512, 1024];
+
+/** Drain a stream into one buffer. Only for content already known to be small. */
+async function collectStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 export type HostControlState = "idle" | "connecting" | "open" | "ready" | "closed" | "error";
@@ -177,6 +275,10 @@ export class HostControlClient {
   // unreachable during the window before signedRtcSession is armed. Reset on
   // every teardown so a fresh generation starts unpinned until it decides.
   private signedRtcRequired = false;
+  // What this generation's daemon said it can do, from its `hello`. Reset on
+  // teardown so a reconnect onto a downgraded daemon cannot inherit a stale
+  // capability set and keep offering actions that daemon no longer supports.
+  private capabilities: ReadonlySet<string> = new Set();
   // Non-null when the last attempt was refused because the host identity could
   // not be verified against a local pin. Terminal: blocks auto-reconnect.
   private signedRtcRefusal: SignedRtcRefusalReason | null = null;
@@ -397,20 +499,27 @@ export class HostControlClient {
     return this.request<HostFileOp>("fs.remove", { path, recursive }, options);
   }
 
-  async readFile(path: string, options?: HostControlRequestOptions): Promise<HostReadStream> {
-    const declaration = await this.request<{
-      stream_id: string;
-      path: string;
-      name: string;
-      length: number;
-      sha256: string;
-    }>("fs.read", { path }, options);
-    const { stream_id: streamId, length, sha256 } = declaration;
+  /**
+   * Issue a stream-producing request and wire up its incoming half.
+   *
+   * `fs.read`, `fs.read.range` and `fs.preview` all follow the same shape — a
+   * declaration carrying `stream_id`/`length`/`sha256`, then chunk frames under
+   * an ack window. The window, the running digest, the timeout, the cancel
+   * tombstone: all of it is integrity-critical and exists exactly once, here.
+   */
+  private async beginStream<T extends { stream_id: string; length: number; sha256: string }>(
+    operation: string,
+    payload: Record<string, unknown>,
+    options?: HostControlRequestOptions,
+  ): Promise<{ declaration: T; stream: ReadableStream<Uint8Array> }> {
+    const declaration = await this.request<T>(operation, payload, options);
+    const { stream_id: streamId, length, sha256 } = declaration ?? ({} as T);
     this.pruneIncomingTombstones();
     if (
       typeof streamId !== "string" ||
       !Number.isSafeInteger(length) ||
       length < 0 ||
+      typeof sha256 !== "string" ||
       !/^[0-9a-f]{64}$/.test(sha256) ||
       this.incomingStreams.has(streamId) ||
       this.cancelledIncomingStreams.has(streamId)
@@ -454,14 +563,235 @@ export class HostControlClient {
       { highWaterMark: 4 },
     );
     if (!state) throw new HostControlError("stream_failed", "Could not initialize file stream");
+    return { declaration, stream };
+  }
+
+  async readFile(path: string, options?: HostControlRequestOptions): Promise<HostReadStream> {
+    const { declaration, stream } = await this.beginStream<{
+      stream_id: string;
+      path: string;
+      name: string;
+      length: number;
+      sha256: string;
+    }>("fs.read", { path }, options);
     return {
-      streamId,
+      streamId: declaration.stream_id,
       path: declaration.path,
       name: declaration.name,
-      length,
-      sha256,
+      length: declaration.length,
+      sha256: declaration.sha256,
       stream,
     };
+  }
+
+  /**
+   * Read a bounded slice.
+   *
+   * Distinct from `fs.read` rather than an option on it, deliberately: an older
+   * daemon ignores unknown payload keys, so a ranged `fs.read` would silently
+   * stream — and whole-file hash — a 512 MiB video when 4 KiB was wanted. A
+   * separate operation earns a clean `unsupported_operation` instead.
+   *
+   * `sha256` here covers the returned slice, not the file, so the digest check
+   * that guards `fs.read` guards this identically.
+   */
+  async readRange(
+    path: string,
+    offset: number,
+    length: number,
+    options?: HostControlRequestOptions,
+  ): Promise<HostRangeStream> {
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new HostControlError("invalid_request", "Range offset must be a non-negative integer");
+    }
+    if (!Number.isSafeInteger(length) || length <= 0 || length > MAX_RANGE_BYTES) {
+      throw new HostControlError("invalid_request", "Range length must be between 1 and 16 MiB");
+    }
+    const { declaration, stream } = await this.beginStream<{
+      stream_id: string;
+      path: string;
+      name: string;
+      offset: number;
+      length: number;
+      file_size: number;
+      sha256: string;
+      version?: string;
+      content_type?: string;
+      preview_kind?: string;
+      open_allowed?: boolean;
+      eof?: boolean;
+    }>("fs.read.range", { path, offset, length }, options);
+    // The host may return less than asked for (a short tail) but never more:
+    // more would mean the digest covers bytes we did not budget for.
+    if (declaration.length > length) {
+      await stream.cancel("oversized range");
+      this.failRtc();
+      throw new HostControlError("invalid_response", "Host returned more bytes than requested");
+    }
+    return {
+      streamId: declaration.stream_id,
+      path: declaration.path,
+      name: declaration.name,
+      length: declaration.length,
+      sha256: declaration.sha256,
+      offset: declaration.offset,
+      fileSize: declaration.file_size,
+      version: declaration.version ?? null,
+      contentType: declaration.content_type ?? null,
+      openAllowed: declaration.open_allowed === true,
+      eof: declaration.eof === true,
+      stream,
+    };
+  }
+
+  /**
+   * Ask the host to render a preview image for a file the browser cannot draw.
+   *
+   * `maxPixels` is an allowlist rather than a clamp: a free integer lets a
+   * caller ask a third-party QuickLook generator for a 16384px render and
+   * allocate a gigabyte on someone's laptop.
+   */
+  async previewImage(
+    path: string,
+    maxPixels: number,
+    options?: HostControlRequestOptions,
+  ): Promise<HostPreviewStream> {
+    if (!PREVIEW_PIXEL_SIZES.includes(maxPixels)) {
+      throw new HostControlError("invalid_request", "Unsupported preview size");
+    }
+    const { declaration, stream } = await this.beginStream<{
+      stream_id: string;
+      path: string;
+      name: string;
+      length: number;
+      sha256: string;
+      content_type?: string;
+      width?: number;
+      height?: number;
+      version?: string;
+    }>(
+      "fs.preview",
+      { path, max_pixels: maxPixels },
+      { timeoutMs: PREVIEW_REQUEST_TIMEOUT_MS, ...options },
+    );
+    return {
+      streamId: declaration.stream_id,
+      path: declaration.path,
+      name: declaration.name,
+      length: declaration.length,
+      sha256: declaration.sha256,
+      mime: declaration.content_type ?? "image/png",
+      width: declaration.width ?? 0,
+      height: declaration.height ?? 0,
+      version: declaration.version ?? null,
+      stream,
+    };
+  }
+
+  /**
+   * The first `limit` bytes of a file.
+   *
+   * Never cancels a whole-file read to get them. Cancelling leaves a tombstone,
+   * and enough live tombstones tear the control channel down — a disconnect is
+   * a far worse outcome than a missing preview. So: read it whole when it is
+   * already small enough, use a real ranged read when the host offers one, and
+   * otherwise decline.
+   */
+  async readHead(
+    path: string,
+    limit: number,
+    options: HostControlRequestOptions & { size?: number | null } = {},
+  ): Promise<{ bytes: Uint8Array; total: number; truncated: boolean }> {
+    const { size, ...request } = options;
+    if (typeof size === "number" && size <= limit) {
+      const read = await this.readFile(path, request);
+      const bytes = await collectStream(read.stream);
+      return { bytes, total: read.length, truncated: false };
+    }
+    if (!this.hasCapability("fs.read.range")) {
+      throw new HostControlError(
+        "range_unsupported",
+        "This host cannot read part of a file, and the file is too large to read whole",
+      );
+    }
+    const read = await this.readRange(path, 0, limit, request);
+    const bytes = await collectStream(read.stream);
+    return { bytes, total: read.fileSize, truncated: !read.eof };
+  }
+
+  /** Metadata for one entry, without listing its parent. */
+  async stat(path: string, options?: HostControlRequestOptions): Promise<HostFileStat> {
+    const result = await this.request<HostFileStat>("fs.stat", { path }, options);
+    if (
+      !result ||
+      typeof result.path !== "string" ||
+      typeof result.name !== "string" ||
+      typeof result.kind !== "string" ||
+      (result.size !== null && result.size !== undefined && !Number.isSafeInteger(result.size))
+    ) {
+      this.failRtc();
+      throw new HostControlError("invalid_response", "Host returned an invalid file stat");
+    }
+    return result;
+  }
+
+  /**
+   * Select the file in the host's file manager.
+   *
+   * Reveal never executes the target, so unlike `openDefault` it is offered for
+   * any path the daemon will resolve, directories included.
+   */
+  reveal(path: string, options?: HostControlRequestOptions): Promise<HostFileOp> {
+    return this.request<HostFileOp>("desktop.reveal", { path }, options);
+  }
+
+  /**
+   * Hand the file to the host's default application for its type.
+   *
+   * The payload is a path and nothing else — there is no field for an
+   * application, arguments or flags, so no caller can steer what gets launched.
+   * The daemon still re-checks the file itself on every call; anything this
+   * client believes about openability is a hint for the menu, never a grant.
+   */
+  openDefault(path: string, options?: HostControlRequestOptions): Promise<HostFileOp> {
+    return this.request<HostFileOp>("desktop.open", { path }, options);
+  }
+
+  /**
+   * Exact capacity for this host, straight from its daemon.
+   *
+   * The whole point of asking here rather than reading the host list: the
+   * server is given a five-level bucket every thirty seconds, and these
+   * numbers have no server code path at all (see `daemon/src/host_metrics.rs`
+   * and docs/TRUST.md). A host with telemetry switched off never advertises
+   * `host.metrics`, so callers must gate on `hasCapability` and draw nothing
+   * rather than showing an empty gauge.
+   */
+  async metrics(options?: HostControlRequestOptions): Promise<HostMetrics> {
+    const result = await this.request<HostMetrics>("host.metrics", {}, options);
+    const sample = result?.sample;
+    if (
+      !sample ||
+      typeof sample.cpu_percent !== "number" ||
+      !Number.isFinite(sample.cpu_percent) ||
+      !Number.isSafeInteger(sample.memory_total_bytes) ||
+      !Number.isSafeInteger(sample.memory_used_bytes)
+    ) {
+      // Same posture as `stat`: a malformed answer on this channel means the
+      // peer is not the daemon this client thinks it is talking to.
+      this.failRtc();
+      throw new HostControlError("invalid_response", "Host returned an invalid capacity sample");
+    }
+    return result;
+  }
+
+  /** Operations this generation's daemon advertised in its `hello`. */
+  getCapabilities(): ReadonlySet<string> {
+    return this.capabilities;
+  }
+
+  hasCapability(operation: string): boolean {
+    return this.capabilities.has(operation);
   }
 
   async downloadFile(path: string, options?: HostControlRequestOptions): Promise<Blob> {
@@ -965,6 +1295,7 @@ export class HostControlClient {
       length?: number;
       sha256?: string;
       path?: string;
+      capabilities?: unknown;
     };
     if (message.version !== HOST_CONTROL_VERSION) {
       this.failRtc(sessionId);
@@ -973,6 +1304,11 @@ export class HostControlClient {
     if (message.type === "hello" && message.protocol === HOST_CONTROL_PROTOCOL) {
       this.clearConnectDeadline();
       this.reconnectAttempt = 0;
+      // Parsed before `ready` so no subscriber can observe a ready client with
+      // an empty capability set and decide the host supports nothing. A
+      // malformed list degrades to "offers nothing extra" rather than failing
+      // the channel: the connection is fine, we just cannot read its menu.
+      this.capabilities = parseCapabilities(message.capabilities);
       this.setState("ready");
       return;
     }
@@ -1343,6 +1679,7 @@ export class HostControlClient {
     this.signedRtcSession?.abort();
     this.signedRtcSession = null;
     this.signedRtcRequired = false;
+    this.capabilities = new Set();
     if (notifyServer && sessionId) this.sendSignal({ type: "rtc.close", session_id: sessionId });
     const channel = this.channel;
     const pc = this.pc;

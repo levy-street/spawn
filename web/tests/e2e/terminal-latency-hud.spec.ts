@@ -1,6 +1,6 @@
 import { expect, type Page, test } from "@playwright/test";
-import { handleAgentRtcSignal, installAgentRtcMock, sendPty } from "./agent-rtc-mock";
-import { AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
+import { mockApp, SESSION_ID, session } from "./app-mocks";
+import { handleSessionRtcSignal, installSessionRtcMock, sendPty } from "./session-rtc-mock";
 
 async function openTerminal(page: Page, { hud = true } = {}) {
   if (hud) {
@@ -9,14 +9,14 @@ async function openTerminal(page: Page, { hud = true } = {}) {
     });
   }
   const messages: Array<string | Buffer> = [];
-  await installAgentRtcMock(page, messages, {
+  await installSessionRtcMock(page, messages, {
     history: "ready\n$ ",
     control: { owner: true, cols: 120, rows: 36, viewers: 1 },
     autoSnapshot: true,
   });
-  await mockAuthenticatedApi(page, { agents: [agent()] });
+  await mockApp(page, { sessions: [session()] });
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
-    ws.onMessage((message) => handleAgentRtcSignal(ws, message));
+    ws.onMessage((message) => handleSessionRtcSignal(ws, message));
     ws.send(
       JSON.stringify({
         type: "rtc.config",
@@ -25,9 +25,9 @@ async function openTerminal(page: Page, { hud = true } = {}) {
         binding_nonce_required: true,
       }),
     );
-    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+    ws.send(JSON.stringify({ type: "session.status", status: "running" }));
   });
-  await page.goto(`/agents/${AGENT_ID}`);
+  await page.goto(`/sessions/${SESSION_ID}`);
   const live = page.getByTestId("terminal-live-host");
   await expect(live.locator(".xterm")).toBeVisible();
   await expect(live.locator(".xterm-rows")).toContainText("$");

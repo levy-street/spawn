@@ -1,6 +1,6 @@
 import { expect, type Page, test } from "@playwright/test";
-import { handleAgentRtcSignal, installAgentRtcMock, sendPty } from "./agent-rtc-mock";
-import { AGENT_ID, agent, mockAuthenticatedApi } from "./app-mocks";
+import { mockApp, SESSION_ID, session } from "./app-mocks";
+import { handleSessionRtcSignal, installSessionRtcMock, sendPty } from "./session-rtc-mock";
 
 // The live terminal defaults to the DOM renderer under automation
 // (navigator.webdriver) so content assertions on .xterm-rows keep working.
@@ -16,14 +16,14 @@ async function openGpuTerminal(page: Page) {
     window.localStorage.setItem("spawnRenderer", "gpu");
   });
   const messages: Array<string | Buffer> = [];
-  await installAgentRtcMock(page, messages, {
+  await installSessionRtcMock(page, messages, {
     history: `${Array.from({ length: 60 }, (_, i) => `gpu-history-${i}`).join("\n")}\nready\n$ `,
     control: { owner: true, cols: 120, rows: 36, viewers: 1 },
     autoSnapshot: true,
   });
-  await mockAuthenticatedApi(page, { agents: [agent()] });
+  await mockApp(page, { sessions: [session()] });
   await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
-    ws.onMessage((message) => handleAgentRtcSignal(ws, message));
+    ws.onMessage((message) => handleSessionRtcSignal(ws, message));
     ws.send(
       JSON.stringify({
         type: "rtc.config",
@@ -32,10 +32,10 @@ async function openGpuTerminal(page: Page) {
         binding_nonce_required: true,
       }),
     );
-    ws.send(JSON.stringify({ type: "agent.status", status: "running" }));
+    ws.send(JSON.stringify({ type: "session.status", status: "running" }));
   });
-  await page.goto(`/agents/${AGENT_ID}`);
-  await expect(page.getByLabel("Agent terminal")).toBeVisible();
+  await page.goto(`/sessions/${SESSION_ID}`);
+  await expect(page.getByLabel("Session terminal")).toBeVisible();
 }
 
 test("forced GPU renderer attaches a WebGL canvas to the live terminal", async ({ page }) => {

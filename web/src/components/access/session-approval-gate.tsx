@@ -162,7 +162,7 @@ export function SessionApprovalGate() {
                 {passkey.unlock.isPending ? "Checking…" : "Use passkey"}
               </Button>
             )}
-            <Button variant="ghost" className="w-full" onClick={() => router.push("/hosts")}>
+            <Button variant="ghost" className="w-full" onClick={() => router.push("/app")}>
               Go back
             </Button>
             <Link href="/device" className="text-xs text-muted-foreground underline">

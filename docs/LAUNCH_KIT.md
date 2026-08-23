@@ -52,15 +52,15 @@ the coordinating server carries signaling only — there is no server code path 
 **4/**
 the hosts dial out. no inbound ports, no exposed SSH, no tailnet. nothing reaches in; the demon only reaches out.
 
-and your agents are revenants: kill the daemon mid-session, restart it, the worker is re-adopted, scrollback intact. the daemon dies; the work does not.
+and your sessions are revenants: kill the daemon mid-session, restart it, the worker is re-adopted, scrollback intact. the daemon dies; the work does not.
 
 **5/**
-any CLI is a demon. claude, codex, opencode, aider, a bare shell — if it runs in a PTY, it can be possessed. summon it on your GPU rig from your phone at dinner, on the subscription you already pay for. we never touch your API keys because we never *have* them.
+every session is a real shell. claude, codex, opencode, aider, or any custom CLI is a visible shortcut inside it. summon one on your GPU rig from your phone at dinner, on the subscription you already pay for. we never touch your API keys because we never *have* them.
 
 **6/**
 "but this is literally what malware does."
 
-a botnet is possession *without* consent from a C2 that reads everything. spawnd is the inversion on every axis: you install it, you approve it, and the server is engineered to read nothing.
+a botnet is possession *without* consent from a C2 that reads everything. spawnd is the inversion on every axis: you install it, you approve it, and the server is engineered to receive no terminal content.
 
 we simply reversed every axis of evil.
 
@@ -81,7 +81,7 @@ possess your machines → https://spawnd.dev
 
 **First comment (founder account):**
 
-I run Claude Code and Codex across a laptop, a dev box, and a GPU rig, and I was tired of every session being marooned on one machine. spawnd is a single daemon you install on each host; you then summon, drive, and banish agents from any browser, including your phone.
+I run Claude Code and Codex across a laptop, a dev box, and a GPU rig, and I was tired of every session being marooned on one machine. spawnd is a daemon you install on each host; you then open shells and run those CLIs from any browser, including your phone.
 
 Architecture, because that's the interesting part:
 
@@ -91,7 +91,7 @@ Architecture, because that's the interesting part:
 - Session workers survive daemon restarts and are re-adopted, so a daemon update doesn't drop your live sessions.
 - Signed signaling with first-contact key pinning: a hostile relay that substitutes a key to MITM the handshake is detectable (you compare a fingerprint once).
 
-Honest limits, up front: the control plane still sees metadata (which hosts, when, how much) by design; a few launch/preset values are mid-migration to endpoint-only storage; and a hosted web client is still JS the operator serves — reproducible builds + self-hosting are how you close that. The threat model documents all of it and names our own infrastructure as the adversary.
+Honest limits, up front: the control plane still sees metadata and configuration listed in the threat model, including session directories, agent shortcut definitions, skill bodies, and host-agent check/install results; and a hosted web client is still JS the operator serves — reproducible builds + self-hosting are how you close that. The threat model documents all of it and names our own infrastructure as the adversary.
 
 Etymology footnote for the name: "daemon" enters computing via Maxwell's demon, borrowed at MIT's Project MAC in 1963 for background processes doing work unseen. We just stopped euphemizing it.
 
@@ -104,8 +104,8 @@ Threat model: https://spawnd.dev/veil
 **r/selfhosted** — *Title:* `Spawnd: drive CLI coding agents on your own hardware from any browser — and here's exactly what the control plane can and can't see`
 *Body:* Self-host the whole stack (daemon + control plane + optional TURN). Terminal traffic is E2E browser↔daemon; the server is signaling-only. Here's the honest metadata ledger [link /veil]. No inbound ports, outbound-only hosts, no tailnet. One click revokes a host and the socket dies.
 
-**r/LocalLLaMA** — *Title:* `Turn your GPU rig into a possessed host — queue jobs and drive any CLI agent from your phone`
-*Body:* The rig runs the daemon; you attach from a browser and watch nvtop in the real terminal. Any PTY agent (claude, codex, aider, a bare shell). Your hardware, your subscription, your keys — the server never has them.
+**r/LocalLLaMA** — *Title:* `Turn your GPU rig into a possessed host — run jobs and drive any CLI agent from your phone`
+*Body:* The rig runs the daemon; you attach from a browser to a real shell and watch nvtop in the terminal. Launch claude, codex, aider, or a custom CLI from visible shortcuts. Your hardware, your subscription, your keys — the server never has them.
 
 **r/ClaudeAI** — *Title:* `Drive Claude Code from your phone, on your Max subscription, on your own hardware`
 *Body:* Demo-first: summon Claude Code on your home box from a café. Real TUI, take-control from a second device mid-session, scrollback survives daemon restarts. Keep the theme in the flair, not the title.
@@ -122,7 +122,7 @@ Threat model: https://spawnd.dev/veil
 
 > Fair — a botnet is possession without consent, run from a C2 server that reads everything. spawnd is the inversion on every axis: **you** run the installer, **you** approve the pairing ceremony against a key fingerprint, and the coordinating server is engineered to be unable to read the session — no code path for terminal content, and the threat model treats our own infrastructure as hostile. The daemon opens no inbound ports; it only dials out. Revocation is one click and the socket dies. And it's open source, so you don't have to take a single sentence of this on faith — including this one.
 
-Short form: `a botnet is non-consensual possession with a C2 that reads everything. spawnd is consensual possession with a C2 that can't read anything. we simply reversed every axis of evil.`
+Short form: `a botnet is non-consensual possession with a C2 that reads everything. spawnd is consensual possession with a control plane that can't read your terminal. we simply reversed every axis of evil.`
 
 ---
 

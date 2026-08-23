@@ -268,16 +268,19 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
             version = conn.execute(text("select version_num from alembic_version")).scalar_one()
             assert version == _current_migration_head()
 
-            preset_rows = conn.execute(
-                text("select name, default_argv, install from presets")
+            agent_rows = conn.execute(
+                text("select name, command, install from agents where owner_user_id is null")
             ).mappings()
-            presets = {row["name"]: row for row in preset_rows}
-            assert {"claude-code", "codex", "opencode", "aider-sonnet", "shell"} <= set(presets)
-            assert json.loads(presets["codex"]["default_argv"]) == ["codex"]
-            assert presets["codex"]["install"] is None
+            agents = {row["name"]: row for row in agent_rows}
+            # The 0001 seed carried a `shell` builtin; 0043 deletes it —
+            # sessions ARE shells now.
+            assert set(agents) == {"claude-code", "codex", "opencode", "aider-sonnet"}
+            assert agents["codex"]["command"] == "codex"
+            assert agents["aider-sonnet"]["command"] == "aider --model claude-sonnet-4-6"
+            assert agents["codex"]["install"] is None
             conn.execute(
                 text(
-                    "update presets set install = 'npm install -g @openai/codex' "
+                    "update agents set install = 'npm install -g @openai/codex' "
                     "where owner_user_id is null and name = 'codex'"
                 )
             )
@@ -285,17 +288,17 @@ def test_alembic_upgrade_head_matches_current_orm_schema_and_startup_seed(tmp_pa
         engine.dispose()
 
     # App startup runs this seed hook after migrations. Prove it can load the
-    # migrated rows and backfill fields added after the initial preset seed.
+    # migrated rows and backfill fields added after the initial seed.
     seed_code = """
 import asyncio
 
+from spawn_server.agents_builtin import seed_builtin_agents
 from spawn_server.db import dispose_engine, get_sessionmaker, init_engine
-from spawn_server.presets import seed_builtin_presets
 
 async def main():
     init_engine()
     async with get_sessionmaker()() as session:
-        await seed_builtin_presets(session)
+        await seed_builtin_agents(session)
     await dispose_engine()
 
 asyncio.run(main())
@@ -306,16 +309,16 @@ asyncio.run(main())
     try:
         with engine.begin() as conn:
             install = conn.execute(
-                text("select install from presets where owner_user_id is null and name = 'codex'")
+                text("select install from agents where owner_user_id is null and name = 'codex'")
             ).scalar_one()
             assert (
                 install
                 == "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
             )
             count = conn.execute(
-                text("select count(*) from presets where owner_user_id is null")
+                text("select count(*) from agents where owner_user_id is null")
             ).scalar_one()
-            assert count == 5
+            assert count == 4
     finally:
         engine.dispose()
 

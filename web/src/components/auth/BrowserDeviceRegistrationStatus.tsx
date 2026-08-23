@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/lib/auth";
 import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
@@ -23,8 +23,8 @@ export function BrowserDeviceRegistrationStatus() {
             <Button size="sm" variant="secondary" onClick={() => void registration.refetch()}>
               Retry registration
             </Button>
-            <Button asChild size="sm" variant="outline">
-              <Link href="/settings">Open device settings</Link>
+            <Button size="sm" variant="outline" onClick={() => openSettings("access")}>
+              Open Access settings
             </Button>
           </div>
         </div>
@@ -36,14 +36,14 @@ export function BrowserDeviceRegistrationStatus() {
   // so the only sticky non-ready state is a local deletion that needs help.
   if (registration.data?.status !== "cleanup_pending") return null;
   return (
-    <div className="border-amber-500/40 border-b bg-amber-500/10 px-4 py-3" role="alert">
+    <div className="border-warning/40 border-b bg-warning-soft px-4 py-3" role="alert">
       <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3">
         <p className="text-sm">
           This device was removed, but deleting its old local key failed. Nothing can use that key
-          anymore; retry from device settings to finish cleaning up.
+          anymore; retry from Access settings to finish cleaning up.
         </p>
-        <Button asChild size="sm" variant="outline">
-          <Link href="/settings">Open device settings</Link>
+        <Button size="sm" variant="outline" onClick={() => openSettings("access")}>
+          Open Access settings
         </Button>
       </div>
     </div>

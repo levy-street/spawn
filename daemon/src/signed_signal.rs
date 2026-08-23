@@ -11,7 +11,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const TRANSCRIPT_MAGIC: &[u8] = b"SPAWN-RTC-SIGNAL-SIG-V1";
-pub const TRANSCRIPT_VERSION: u8 = 1;
+/// Revision 2: scope type 1 was renamed `agent` -> `session` for the
+/// workspace overhaul. The binary layout is unchanged, but the bump keeps v1
+/// signatures from being replayed into the renamed scope vocabulary.
+pub const TRANSCRIPT_VERSION: u8 = 2;
 pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 pub const ED25519_SIGNATURE_BYTES: usize = 64;
 pub const MAX_SESSION_ID_BYTES: usize = 36;
@@ -43,7 +46,7 @@ impl TryFrom<u8> for SignalKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ScopeType {
-    Agent = 1,
+    Session = 1,
     Host = 2,
 }
 
@@ -52,7 +55,7 @@ impl TryFrom<u8> for ScopeType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(Self::Agent),
+            1 => Ok(Self::Session),
             2 => Ok(Self::Host),
             _ => Err(SignedSignalError::InvalidEnum {
                 field: "scope_type",
@@ -635,7 +638,7 @@ mod tests {
             vector.protocol_version,
             &vector.session_id,
             match vector.scope_type.as_str() {
-                "agent" => ScopeType::Agent,
+                "session" => ScopeType::Session,
                 "host" => ScopeType::Host,
                 other => panic!("unknown golden scope type: {other}"),
             },
@@ -669,8 +672,8 @@ mod tests {
         };
         let scope_type = if field == "scope_type" {
             match original.scope_type() {
-                ScopeType::Agent => ScopeType::Host,
-                ScopeType::Host => ScopeType::Agent,
+                ScopeType::Session => ScopeType::Host,
+                ScopeType::Host => ScopeType::Session,
             }
         } else {
             original.scope_type()
@@ -717,7 +720,7 @@ mod tests {
             SignalKind::Offer,
             2,
             TEST_SESSION_ID,
-            ScopeType::Agent,
+            ScopeType::Session,
             TEST_SCOPE_ID,
             SenderRole::Browser,
             valid_peer_key(),
@@ -746,7 +749,7 @@ mod tests {
         bad_version[TRANSCRIPT_MAGIC.len()] = TRANSCRIPT_VERSION + 1;
         assert_eq!(
             SignedSignalTranscript::decode(&bad_version),
-            Err(SignedSignalError::UnsupportedTranscriptVersion(2))
+            Err(SignedSignalError::UnsupportedTranscriptVersion(3))
         );
     }
 
@@ -765,7 +768,7 @@ mod tests {
                     SignalKind::Offer,
                     2,
                     value,
-                    ScopeType::Agent,
+                    ScopeType::Session,
                     TEST_SCOPE_ID,
                     SenderRole::Browser,
                     valid_peer_key(),
@@ -781,7 +784,7 @@ mod tests {
                     SignalKind::Offer,
                     2,
                     TEST_SESSION_ID,
-                    ScopeType::Agent,
+                    ScopeType::Session,
                     value,
                     SenderRole::Browser,
                     valid_peer_key(),
@@ -818,7 +821,7 @@ mod tests {
                 SignalKind::Offer,
                 0,
                 TEST_SESSION_ID,
-                ScopeType::Agent,
+                ScopeType::Session,
                 TEST_SCOPE_ID,
                 SenderRole::Browser,
                 valid_peer_key(),
@@ -831,7 +834,7 @@ mod tests {
                 SignalKind::Offer,
                 1,
                 "x".repeat(MAX_SESSION_ID_BYTES + 1),
-                ScopeType::Agent,
+                ScopeType::Session,
                 TEST_SCOPE_ID,
                 SenderRole::Browser,
                 valid_peer_key(),
@@ -878,7 +881,7 @@ mod tests {
                     SignalKind::Offer,
                     1,
                     session,
-                    ScopeType::Agent,
+                    ScopeType::Session,
                     scope,
                     SenderRole::Browser,
                     valid_peer_key(),
@@ -1087,7 +1090,7 @@ mod tests {
                     SignalKind::Offer,
                     2,
                     TEST_SESSION_ID,
-                    ScopeType::Agent,
+                    ScopeType::Session,
                     TEST_SCOPE_ID,
                     SenderRole::Browser,
                     raw,
@@ -1131,7 +1134,7 @@ mod tests {
                 SignalKind::Offer,
                 2,
                 TEST_SESSION_ID,
-                ScopeType::Agent,
+                ScopeType::Session,
                 TEST_SCOPE_ID,
                 SenderRole::Browser,
                 raw,

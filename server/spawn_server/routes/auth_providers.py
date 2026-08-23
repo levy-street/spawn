@@ -368,11 +368,6 @@ async def _user_for_profile(
     return user
 
 
-@router.get("/providers", response_model=schemas.AuthProviderList)
-async def auth_providers() -> schemas.AuthProviderList:
-    return schemas.AuthProviderList(providers=enabled_provider_summaries())
-
-
 @router.get("/oauth/{provider}/start")
 async def provider_start(
     provider: ProviderId,

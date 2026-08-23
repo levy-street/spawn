@@ -1,34 +1,204 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import { ArrowRight, ChevronRight, Flame, Server, Smartphone } from "lucide-react";
+import { ArrowRight } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
-import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
-import { AgentListRow } from "@/components/agents/AgentListRow";
-import { AppShell } from "@/components/nav/AppShell";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { hostStatusTone, StatusDot } from "@/components/ui/status";
-import { type Agent, agents, type Host, hosts } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
+import type { ReactNode, RefObject } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Colophon,
+  CTA_QUIET,
+  CTA_SLAB,
+  InstallCommand,
+  Masthead,
+  RegistrationMarks,
+} from "@/components/brand/press";
+import { Wordmark } from "@/components/icons/BrandMark";
+import { poster } from "@/lib/fonts";
+import { cn } from "@/lib/utils";
 
-export default function HomePage() {
-  const { user } = useAuth();
+/*
+ * ── Scroll system ────────────────────────────────────────────────
+ * Every effect below is scrubbed: a pure function of scroll position,
+ * so it plays forward as you scroll down and in reverse as you scroll
+ * back. One shared shape — rAF-throttled scroll/resize listeners,
+ * transform-only writes, inert under reduced motion.
+ */
 
-  if (user) {
-    return (
-      <AppShell>
-        <Dashboard />
-      </AppShell>
-    );
-  }
-
-  return <LandingPage />;
+function useScrub(
+  ref: RefObject<HTMLElement | null>,
+  frame: (el: HTMLElement, viewProgress: number, scrollY: number) => void,
+): void {
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    let raf = 0;
+    const update = () => {
+      const rect = el.getBoundingClientRect();
+      const vh = window.innerHeight;
+      // 0 when the element's top edge is below the fold, 1 when its bottom
+      // edge has scrolled past the top — a full travel through the viewport.
+      const progress = Math.min(1, Math.max(0, (vh - rect.top) / (vh + rect.height)));
+      frame(el, progress, window.scrollY);
+    };
+    const schedule = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(update);
+    };
+    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    update();
+    return () => {
+      window.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
+      cancelAnimationFrame(raf);
+    };
+  }, [ref, frame]);
 }
 
-function LandingPage() {
+/** Scroll-scrubbed vertical drift: rises (or sinks, negative speed) as the
+ * element travels through the viewport, and reverses with the scroll. */
+function Drift({
+  speed,
+  className,
+  children,
+}: {
+  speed: number;
+  className?: string;
+  children: ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useScrub(
+    ref,
+    useCallback(
+      (el, progress) => {
+        el.style.transform = `translate3d(0, ${((progress - 0.5) * -speed).toFixed(2)}px, 0)`;
+      },
+      [speed],
+    ),
+  );
+  return (
+    <div ref={ref} className={cn("will-change-transform", className)}>
+      {children}
+    </div>
+  );
+}
+
+/** The black stamp on the red plate turns a few degrees with the scroll. */
+function ScrollStamp() {
+  const ref = useRef<HTMLDivElement>(null);
+  useScrub(
+    ref,
+    useCallback((el, progress) => {
+      el.style.transform = `rotate(${(4 + progress * 16).toFixed(2)}deg)`;
+    }, []),
+  );
+  return (
+    <div
+      ref={ref}
+      aria-hidden
+      className="pointer-events-none absolute -top-20 -right-20 size-[16rem] rotate-[4deg] opacity-[0.10] will-change-transform sm:size-[22rem]"
+    >
+      {/* biome-ignore lint/performance/noImgElement: decorative stamp, no optimization needed */}
+      <img src="/brand/spawnd-icon-black.svg" alt="" className="size-full" />
+    </div>
+  );
+}
+
+const AGENT_SPECIMENS = ["claude", "codex", "opencode", "aider", "$SHELL"];
+
+/** The specimen strip is driven by the scroll position itself — it slides as
+ * you scroll and slides back when you do. */
+function ScrubMarquee() {
+  const ref = useRef<HTMLDivElement>(null);
+  useScrub(
+    ref,
+    useCallback((el, _progress, scrollY) => {
+      const half = el.scrollWidth / 2;
+      if (!half) return;
+      const x = (scrollY * 0.45) % half;
+      el.style.transform = `translate3d(${(-x).toFixed(2)}px, 0, 0)`;
+    }, []),
+  );
+  return (
+    <div className="overflow-hidden">
+      <div
+        ref={ref}
+        className="flex w-max items-baseline font-sigil text-[clamp(26px,4.5vw,48px)] whitespace-nowrap text-bone will-change-transform"
+      >
+        {[0, 1].map((copy) => (
+          <div
+            key={copy}
+            aria-hidden={copy === 1}
+            className="flex items-baseline gap-8 whitespace-nowrap pr-8"
+          >
+            {AGENT_SPECIMENS.map((agent) => (
+              <span key={agent} className="flex items-baseline gap-8">
+                <span>{agent}</span>
+                <span aria-hidden className="text-hellfire">
+                  ✕
+                </span>
+              </span>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** A living print whose playhead is driven by the scroll: it scrubs forward
+ * as the plate travels up the viewport and rewinds when you scroll back.
+ * Under reduced motion the scrub never arms and the poster frame stands. */
+function ScrubVideo({ src, poster, alt }: { src: string; poster: string; alt: string }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  useScrub(
+    wrapRef,
+    useCallback((el, _progress) => {
+      const video = videoRef.current;
+      if (!video || video.readyState < 1 || !Number.isFinite(video.duration)) return;
+      // A pending seek means the decoder is still busy — queueing another
+      // behind it is what turns scrubbing into a slideshow.
+      if (video.seeking) return;
+      // Position through the viewport alone: playback begins once the plate's
+      // top has climbed into view and completes only when its BOTTOM nears
+      // the top edge, so tall plates play for their whole visible life.
+      const rect = el.getBoundingClientRect();
+      const vh = window.innerHeight;
+      const start = vh * 0.8;
+      const travelled = start - rect.top;
+      const full = start - vh * 0.3 + rect.height;
+      const p = Math.min(1, Math.max(0, travelled / full));
+      const t = Math.min(video.duration - 0.05, p * video.duration);
+      if (Math.abs(t - video.currentTime) < 1 / 30) return;
+      video.currentTime = t;
+    }, []),
+  );
+  return (
+    <div ref={wrapRef} className="absolute inset-0">
+      <video
+        ref={videoRef}
+        className="h-full w-full object-cover"
+        muted
+        playsInline
+        preload="auto"
+        poster={poster}
+        aria-label={alt}
+      >
+        <source src={src} type="video/mp4" />
+      </video>
+    </div>
+  );
+}
+
+/**
+ * The lander is `/` for everyone, signed in or not — the brand mark in the
+ * app chrome comes back here, and so does signing out. The masthead, the
+ * install chip, and the colophon are the shared press chrome
+ * (`components/brand/press`), so /security and /download wear them too.
+ */
+export default function LandingPage() {
   const [origin, setOrigin] = useState("https://spawnd.dev");
 
   useEffect(() => {
@@ -38,358 +208,375 @@ function LandingPage() {
   const installCommand = `curl -fsSL ${origin}/install.sh | sh`;
 
   return (
-    <main className="grimoire min-h-vv overflow-hidden">
-      {/* ── Hero ─────────────────────────────────────────────── */}
+    <main className="grimoire min-h-vv overflow-x-clip">
+      <Masthead />
+
+      {/* ── The living hero: full-bleed ink video, type top-left ── */}
       <section className="relative isolate overflow-hidden border-line-g border-b">
+        {/* The print hangs low in the frame — black headroom above it, and its
+         * own black edges blend into the ground. */}
+        <div className="absolute inset-x-0 top-0 bottom-0">
+          <video
+            className="pointer-events-none absolute inset-0 h-full w-full object-cover motion-reduce:hidden"
+            autoPlay
+            muted
+            loop
+            playsInline
+            preload="metadata"
+            onLoadedMetadata={(event) => {
+              // Half speed: the 15s loop breathes for 30.
+              event.currentTarget.playbackRate = 0.5;
+            }}
+            poster="/brand/ink/hero-ink.png"
+            aria-label="A lone figure before towering server racks in a vast machine hall, printed in red ink on black, gently animated"
+          >
+            <source src="/brand/ink/hero-ink.mp4" type="video/mp4" />
+          </video>
+          <Image
+            src="/brand/ink/hero-ink.png"
+            alt=""
+            aria-hidden
+            fill
+            priority
+            sizes="100vw"
+            className="pointer-events-none hidden object-cover motion-reduce:block"
+          />
+        </div>
+        {/* Registration marks: the corners of the press bed. */}
+        <RegistrationMarks />
+
+        <div className="relative z-10 mx-auto flex min-h-[90svh] w-full max-w-[1440px] flex-col items-start justify-start px-5 pt-4 pb-20 sm:px-8 sm:pt-6 sm:pb-24">
+          <h1
+            className={cn(
+              poster.className,
+              "max-w-[13ch] text-[clamp(32px,4.3vw,63px)] leading-[1.08] font-light text-bone uppercase [text-wrap:balance]",
+            )}
+          >
+            A daemon on every host <em className="text-hellfire not-italic">you&nbsp;own.</em>
+          </h1>
+
+          <div className="mt-auto flex w-full flex-col items-stretch gap-4 pt-16 sm:w-auto sm:flex-row sm:items-center">
+            <InstallCommand command={installCommand} />
+            <Link href="/download" className={CTA_SLAB}>
+              Install the daemon
+              <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+            </Link>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Plate II: the rite, black ink on red ───────────────── */}
+      <section className="relative overflow-hidden bg-plate text-void">
+        <ScrollStamp />
+        <div className="relative mx-auto w-full max-w-6xl px-5 py-24 sm:px-8">
+          <p className="mb-14 font-sigil text-[12px] font-medium tracking-[0.3em] uppercase">
+            The rite · how it works
+          </p>
+          <div className="grid min-w-0 gap-y-14 md:grid-cols-3 md:gap-x-12 md:gap-y-0">
+            <Rite title="One daemon per host.">
+              Installs with a line. It dials out, no inbound ports, no SSH, no tailnet, and
+              registers the host as yours.
+            </Rite>
+            <Rite title="Summon agents into it.">
+              Anything that runs in a PTY. Each agent runs on your hardware, on the subscriptions
+              you already pay for. We never hold your keys.
+            </Rite>
+            <Rite title="Reach them from anywhere.">
+              The real terminal, in any browser, down to the one in your pocket. A second device can
+              take the session mid-keystroke.
+            </Rite>
+          </div>
+        </div>
+      </section>
+
+      {/* ── The gallery: proofs on paper ───────────────────────── */}
+      <section className="border-t-4 border-hellfire bg-bone text-void">
+        <div className="mx-auto w-full max-w-6xl px-5 py-24 sm:px-8">
+          <div className="flex flex-wrap items-end justify-between gap-6">
+            <div>
+              <h2
+                className={cn(
+                  poster.className,
+                  "max-w-[20ch] text-[clamp(32px,4.8vw,60px)] leading-[0.98] font-light uppercase",
+                )}
+              >
+                The same terminal, anywhere you stand.
+              </h2>
+            </div>
+          </div>
+
+          <div className="mt-16 grid min-w-0 gap-14 sm:grid-cols-2 sm:gap-x-10 lg:gap-x-16">
+            <Drift speed={26} className="flex flex-col gap-14 sm:gap-20">
+              <PaperPlate
+                src="/brand/ink/pocket-ink.png"
+                video="/brand/ink/pocket-ink.mp4"
+                width={1122}
+                height={1402}
+                rotate="-rotate-1"
+                label="№ 1 · The pocket terminal"
+                alt="A hand holding a phone running a live terminal, printed in red ink on black"
+              >
+                Every session is a live PTY on your host, rendered faithfully in the browser in your
+                pocket, not a read-only viewer.
+              </PaperPlate>
+              <PaperPlate
+                src="/brand/ink/grid-ink.png"
+                video="/brand/ink/grid-ink.mp4"
+                width={1448}
+                height={1086}
+                rotate="rotate-[0.6deg]"
+                label="№ 3 · The workspace"
+                alt="A wall of terminal windows in a tidy grid, one brighter than the rest, printed in red ink on black"
+              >
+                A workspace is a named grid of terminal windows rooted in one folder on a host, with
+                shells, agents, and file explorers side by side.
+              </PaperPlate>
+            </Drift>
+            <Drift speed={-26} className="flex flex-col gap-14 sm:mt-24 sm:gap-20">
+              <PaperPlate
+                src="/brand/ink/hosts-ink.png"
+                video="/brand/ink/hosts-ink.mp4"
+                width={1448}
+                height={1086}
+                rotate="rotate-[0.75deg]"
+                label="№ 2 · The dial-out"
+                alt="Three monolithic hosts dialing out to a single point, printed in red ink on black"
+              >
+                Every daemon dials out to one master: no inbound ports, no SSH, no tailnet. Revoke a
+                host and the socket dies.
+              </PaperPlate>
+              <PaperPlate
+                src="/brand/ink/handoff-ink.png"
+                video="/brand/ink/handoff-ink.mp4"
+                width={1536}
+                height={1024}
+                rotate="-rotate-[0.5deg]"
+                label="№ 4 · The handoff"
+                alt="A laptop terminal and a phone showing the same session, joined by a thread of light, printed in red ink on black"
+              >
+                Walk away mid-command and pick the same session up on another device. It follows you{" "}
+                <em className="not-italic underline decoration-hellfire decoration-2 underline-offset-4">
+                  mid-keystroke
+                </em>
+                .
+              </PaperPlate>
+            </Drift>
+          </div>
+        </div>
+      </section>
+
+      {/* ── It answers only to you ─────────────────────────────── */}
+      <section className="relative overflow-hidden border-line-g border-b">
+        <div className="relative mx-auto w-full max-w-6xl px-5 py-24 sm:px-8">
+          <div className="grid min-w-0 gap-14 lg:grid-cols-[0.95fr_1.05fr] lg:items-center">
+            <div>
+              <h2
+                className={cn(
+                  poster.className,
+                  "max-w-[17ch] text-[clamp(28px,3.7vw,48px)] leading-[1.04] font-light text-bone uppercase",
+                )}
+              >
+                The server can't read your terminal.
+              </h2>
+              <p className="mt-6 max-w-[52ch] text-[17px] leading-8 text-ash">
+                Terminal bytes travel browser-to-daemon, end-to-end encrypted; a forced relay
+                carries ciphertext it can't read. The daemon dials out, so there are no inbound
+                ports, no SSH, no tailnet. The threat model names our own servers as the adversary,
+                because you should treat them as one.
+              </p>
+              <Link
+                href="/security"
+                className="mt-8 inline-block font-sigil text-[12px] tracking-[0.18em] text-ash uppercase underline decoration-line-strong underline-offset-8 transition-colors hover:text-bone hover:decoration-ember"
+              >
+                Read the threat model
+              </Link>
+            </div>
+            <Drift speed={28} className="min-w-0">
+              <figure className="min-w-0 border border-line-strong bg-char">
+                <figcaption className="flex items-center justify-between gap-4 border-line-g border-b px-5 py-3.5 font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
+                  <span>The server's entire view</span>
+                  <span aria-hidden className="flex items-center gap-1.5">
+                    <span className="size-2 rounded-full bg-hellfire" />
+                    <span className="size-2 rounded-full bg-blood" />
+                    <span className="size-2 rounded-full bg-line-strong" />
+                  </span>
+                </figcaption>
+                <div className="min-w-0 space-y-2.5 overflow-x-auto px-5 py-6 font-sigil text-[12px] leading-6 text-bone sm:px-6 sm:text-[13px]">
+                  <p className="whitespace-nowrap">
+                    <span className="text-ember">$</span> spawnd relay --attach 8f31c2
+                  </p>
+                  <ServerViewRow label="signal">
+                    browser ⇄ daemon · <span className="text-bone">introduced</span>
+                  </ServerViewRow>
+                  <ServerViewRow label="terminal">
+                    <Redacted /> ciphertext only
+                  </ServerViewRow>
+                  <ServerViewRow label="plaintext">never arrives</ServerViewRow>
+                  <ServerViewRow label="transcript">none kept</ServerViewRow>
+                  <ServerViewRow label="keys">none held, agents use their own logins</ServerViewRow>
+                  <p className="whitespace-nowrap pt-3">
+                    <span className="text-ember">$</span> spawnd revoke host-07
+                  </p>
+                  <p className="whitespace-nowrap text-hellfire">
+                    socket closed. it answers to no one now.
+                  </p>
+                </div>
+              </figure>
+            </Drift>
+          </div>
+          <Drift speed={16}>
+            <p
+              className={cn(
+                poster.className,
+                "mx-auto mt-24 max-w-[34ch] text-center text-[clamp(24px,3.7vw,41px)] leading-[1.25] text-bone italic",
+              )}
+            >
+              A daemon that dials out and answers to one master sounds ominous, until you notice
+              <span className="text-hellfire"> the master is you.</span>
+            </p>
+          </Drift>
+        </div>
+      </section>
+
+      {/* ── Specimen strip: scrubbed by the scroll itself ──────── */}
+      <section className="border-line-g border-b py-12">
+        <ScrubMarquee />
+        <p className="mx-auto mt-8 max-w-[64ch] px-5 text-center font-sigil text-[13px] leading-6 tracking-[0.04em] text-ash sm:px-8">
+          Agents are shortcuts, not lock-in: a named command typed into a real shell on your host.
+          If it runs in a terminal, it runs here, under its own login, on your machine.
+        </p>
+      </section>
+
+      {/* ── The closing poster ─────────────────────────────────── */}
+      <section className="relative isolate overflow-hidden">
         <Image
-          src="/hero-poster.jpg"
+          src="/brand/ink/altar-ink.png"
           alt=""
           aria-hidden
           fill
-          priority
           sizes="100vw"
-          className="pointer-events-none object-cover object-[58%_center] opacity-90"
+          className="pointer-events-none object-cover object-[50%_38%]"
         />
-        <video
-          className="pointer-events-none absolute inset-0 h-full w-full object-cover object-[58%_center] opacity-90 motion-reduce:hidden"
-          autoPlay
-          muted
-          loop
-          playsInline
-          preload="metadata"
-          poster="/hero-poster.jpg"
-          aria-hidden
-        >
-          <source src="/hero.mp4" type="video/mp4" />
-        </video>
         <div
           aria-hidden
           className="absolute inset-0"
           style={{
             background:
-              "linear-gradient(90deg, rgba(10,6,7,.96) 0%, rgba(10,6,7,.9) 28%, rgba(10,6,7,.5) 58%, rgba(10,6,7,.22) 100%), linear-gradient(180deg, rgba(10,6,7,.55) 0%, transparent 16%, transparent 72%, rgba(10,6,7,.92) 100%)",
+              "linear-gradient(180deg, rgba(0,0,0,.98) 0%, rgba(0,0,0,.9) 34%, rgba(0,0,0,.62) 62%, rgba(0,0,0,.82) 100%)",
           }}
         />
-
-        <nav className="relative z-10 mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-6 sm:px-8">
-          <Link href="/" className="flex items-center gap-2.5">
-            <Trident className="size-7" />
-            <span className="font-sigil text-[15px] tracking-[0.3em] text-hellfire lowercase">
-              spawnd
-            </span>
-          </Link>
-          <div className="flex items-center gap-4 font-sigil text-[12px] tracking-[0.18em] uppercase sm:gap-5">
-            <Link
-              href="/security"
-              className="hidden text-ash transition-colors hover:text-bone sm:inline"
-            >
-              Security
-            </Link>
-            <Link
-              href="/login"
-              className="hidden text-ash transition-colors hover:text-bone sm:inline"
-            >
-              Log&nbsp;in
-            </Link>
-            <Link
-              href="/signup"
-              className="rounded-sm border border-hellfire/60 px-3 py-1.5 text-ember transition-colors hover:border-hellfire hover:text-hellfire"
-            >
-              Sign&nbsp;up
-            </Link>
-          </div>
-        </nav>
-
-        <div className="relative z-10 mx-auto flex min-h-[86svh] w-full max-w-6xl flex-col justify-center px-5 pt-10 pb-20 sm:px-8">
-          <p className="mb-6 font-sigil text-[13px] tracking-[0.12em] text-ash">
-            Open-source control plane for CLI coding agents
-          </p>
-          <h1 className="max-w-3xl font-grimoire text-[clamp(42px,8vw,84px)] font-medium leading-[1.0] text-bone [text-wrap:balance]">
-            A daemon on every host you own.
-          </h1>
-          <p className="mt-7 max-w-[56ch] text-[18px] leading-8 text-ash sm:text-[19px]">
-            It <em className="text-bone not-italic">answers only to you</em>. Summon your agents
-            onto hosts you own and reach them from any browser — the server that connects you{" "}
-            <em className="text-bone not-italic">never hears a word</em>.
-          </p>
-
-          <div className="mt-9 flex flex-col gap-3 sm:flex-row sm:items-center">
-            <Link
-              href="/download"
-              className="group inline-flex items-center justify-center gap-2 rounded-sm bg-hellfire px-6 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-void uppercase transition-colors hover:bg-ember"
-            >
-              Install the daemon
-              <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
-            </Link>
-            <Link
-              href="/security"
-              className="inline-flex items-center justify-center gap-2 rounded-sm border border-line-strong px-6 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-bone uppercase transition-colors hover:border-ember hover:text-ember"
-            >
-              Read the threat model
-            </Link>
-          </div>
-
-          <div className="mt-8 inline-flex max-w-full items-center gap-3 overflow-x-auto rounded-sm border border-line-g bg-char/80 px-4 py-3 font-sigil text-[13px] text-bone backdrop-blur-sm">
-            <span className="text-hellfire">$</span>
-            <code className="whitespace-nowrap">{installCommand}</code>
-          </div>
-        </div>
-      </section>
-
-      {/* ── How it works ─────────────────────────────────────── */}
-      <section className="border-line-g border-b px-5 py-24 sm:px-8">
-        <div className="mx-auto w-full max-w-6xl">
-          <p className="mb-12 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
-            How it works
-          </p>
-          <div className="grid gap-px overflow-hidden rounded-md border border-line-g bg-line-g md:grid-cols-3">
-            <Step icon={<Server className="size-5" />} title="One daemon per host.">
-              Installs with a line. It dials out — no inbound ports, no SSH, no tailnet — and
-              registers the host as yours.
-            </Step>
-            <Step icon={<Flame className="size-5" />} title="Summon agents into it.">
-              claude, codex, opencode, aider, a bare shell — anything that runs in a PTY. Each runs
-              on your hardware, on the subscriptions you already pay for. We never hold your keys.
-            </Step>
-            <Step icon={<Smartphone className="size-5" />} title="Reach them from anywhere.">
-              The real terminal, in any browser, down to the one in your pocket. A second device can
-              take the session mid-keystroke.
-            </Step>
-          </div>
-        </div>
-      </section>
-
-      {/* ── It answers only to you ───────────────────────────── */}
-      <section className="border-line-g border-b px-5 py-24 sm:px-8">
-        <div className="mx-auto w-full max-w-6xl">
-          <div className="grid gap-12 lg:grid-cols-[1fr_1fr] lg:items-center">
-            <div>
-              <p className="mb-3 font-sigil text-[12px] tracking-[0.3em] text-hellfire uppercase">
-                It answers only to you
-              </p>
-              <h2 className="mb-6 font-grimoire text-[clamp(28px,4.4vw,40px)] font-medium leading-[1.12] text-bone">
-                The server can’t read your terminal.
-              </h2>
-              <p className="max-w-[56ch] text-[17px] leading-8 text-ash">
-                Your terminal runs straight from the browser to the daemon, end-to-end encrypted.
-                When your network forces a relay, it carries ciphertext the relay can’t read. No
-                server-side path to your terminal, no transcript, nothing to hand over — and the
-                threat model names our own servers as the adversary, because you should treat them
-                as one.
-              </p>
-            </div>
-            <ul className="space-y-px overflow-hidden rounded-md border border-line-g bg-line-g">
-              <Claim>No plaintext ever reaches our servers.</Claim>
-              <Claim>No inbound ports, no SSH, no tailnet — the daemon dials out.</Claim>
-              <Claim>No credential store — every agent uses its own login.</Claim>
-              <Claim>Revoke a host and the socket dies.</Claim>
-            </ul>
-          </div>
-          <p className="mx-auto mt-14 max-w-[62ch] text-center font-grimoire text-[19px] text-ash italic leading-[1.4]">
-            A daemon that dials out and answers to one master sounds ominous — until you notice the
-            master is you.
-          </p>
-        </div>
-      </section>
-
-      {/* ── Close ────────────────────────────────────────────── */}
-      <section className="relative overflow-hidden px-5 py-28 sm:px-8">
-        <div
-          aria-hidden
-          className="absolute inset-0"
-          style={{
-            background:
-              "radial-gradient(ellipse 60% 50% at 50% 0%, rgba(255,73,48,.1), transparent 60%)",
-          }}
-        />
-        <div className="relative mx-auto w-full max-w-3xl text-center">
-          <Trident className="mx-auto mb-8 size-16" />
-          <h2 className="mb-5 font-grimoire text-[clamp(32px,5.5vw,52px)] font-medium leading-[1.05] text-bone">
+        <div className="relative z-10 mx-auto w-full max-w-3xl px-5 pt-32 pb-20 text-center sm:px-8">
+          <h2
+            className={cn(
+              poster.className,
+              "mb-5 text-[clamp(40px,7.5vw,92px)] leading-[0.98] font-light text-bone uppercase",
+            )}
+          >
             Bring a host online.
           </h2>
-          <p className="mx-auto mb-9 max-w-[48ch] text-[17px] leading-8 text-ash">
+          <p className="mx-auto mb-9 max-w-[48ch] text-[clamp(17px,2vw,21px)] leading-[1.6] text-ash">
             One line installs the daemon; you approve it against a fingerprint you can see. From
             then on, it answers only to you.
           </p>
-          <div className="mb-8 inline-flex max-w-full items-center gap-3 overflow-x-auto rounded-sm border border-line-g bg-char px-4 py-3 font-sigil text-[13px] text-bone">
-            <span className="text-hellfire">$</span>
-            <code className="whitespace-nowrap">{installCommand}</code>
-          </div>
-          <div className="flex flex-col items-center justify-center gap-3 sm:flex-row">
-            <Link
-              href="/signup"
-              className="group inline-flex items-center justify-center gap-2 rounded-sm bg-hellfire px-7 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-void uppercase transition-colors hover:bg-ember"
-            >
+          <InstallCommand command={installCommand} className="mb-9" />
+          <div className="flex flex-col items-center justify-center gap-5 sm:flex-row sm:gap-7">
+            <Link href="/signup" className={CTA_SLAB}>
               Sign up
               <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
-            <Link
-              href="/download"
-              className="inline-flex items-center justify-center gap-2 rounded-sm border border-line-strong px-7 py-3.5 font-sigil text-[13px] tracking-[0.14em] text-bone uppercase transition-colors hover:border-ember hover:text-ember"
-            >
+            <Link href="/download" className={CTA_QUIET}>
               Install the daemon
             </Link>
           </div>
         </div>
+
+        {/* The brand poster: the drawn wordmark at full plate width, rising
+         * out of the fold as the page bottoms out — and sinking back. */}
+        <Drift speed={-56} className="relative z-10 px-2 pt-16 sm:px-3">
+          <Wordmark aria-hidden className="block w-full text-hellfire" />
+        </Drift>
       </section>
 
-      <footer className="border-line-g border-t px-5 py-10 sm:px-8">
-        <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-4 font-sigil text-[12px] tracking-[0.08em] text-ash sm:flex-row">
-          <span>
-            <span className="text-hellfire">spawnd</span> · consensual · auditable · revocable
-          </span>
-          <div className="flex items-center gap-5">
-            <Link href="/security" className="transition-colors hover:text-bone">
-              Security
-            </Link>
-            <Link href="/download" className="transition-colors hover:text-bone">
-              Install
-            </Link>
-            <Link href="/login" className="transition-colors hover:text-bone">
-              Log in
-            </Link>
-          </div>
-        </div>
-      </footer>
+      {/* ── Colophon ───────────────────────────────────────────── */}
+      <Colophon />
     </main>
   );
 }
 
-function Step({ icon, title, children }: { icon: ReactNode; title: string; children: ReactNode }) {
+function Rite({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <div className="bg-void p-8">
-      <div className="mb-5 flex size-10 items-center justify-center rounded-sm border border-hellfire/40 text-hellfire">
-        {icon}
-      </div>
-      <h3 className="mb-3 font-grimoire text-[21px] font-medium leading-tight text-bone">
+    <div className="border-t-2 border-void pt-6">
+      <h3 className={cn(poster.className, "mb-3 text-[26px] leading-[1.08] font-light uppercase")}>
         {title}
       </h3>
-      <p className="text-[15px] leading-7 text-ash">{children}</p>
+      <p className="max-w-[44ch] text-[16px] leading-7">{children}</p>
     </div>
   );
 }
 
-function Claim({ children }: { children: ReactNode }) {
+function PaperPlate({
+  src,
+  video,
+  width,
+  height,
+  rotate,
+  label,
+  alt,
+  children,
+}: {
+  src: string;
+  video: string;
+  width: number;
+  height: number;
+  rotate: string;
+  label: string;
+  alt: string;
+  children: ReactNode;
+}) {
   return (
-    <li className="flex items-start gap-3 bg-void px-6 py-4 text-[15px] leading-7 text-bone">
-      <Flame className="mt-1 size-3.5 shrink-0 text-hellfire" aria-hidden />
-      <span>{children}</span>
-    </li>
+    <figure>
+      {/* A living print. Hover presses it down into its own shadow. */}
+      <div
+        className={cn(
+          "border border-void/25 bg-void",
+          "ease-swift transition-transform duration-200 hover:translate-y-[4px]",
+          rotate,
+        )}
+      >
+        <div
+          className="relative w-full overflow-hidden"
+          style={{ aspectRatio: `${width} / ${height}` }}
+        >
+          <ScrubVideo src={video} poster={src} alt={alt} />
+        </div>
+      </div>
+      <figcaption className="mt-7">
+        <span className="font-sigil text-[12px] font-medium tracking-[0.22em] text-blood uppercase">
+          {label}
+        </span>
+        <p className="mt-3 max-w-[46ch] text-[15px] leading-7 text-void/80">{children}</p>
+      </figcaption>
+    </figure>
   );
 }
 
-/** The brand mark — the spawnd trident. Fits inside a square `size-N` box. */
-function Trident({ className }: { className?: string }) {
+function ServerViewRow({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <span className={`relative inline-block ${className ?? ""}`}>
-      <Image src="/trident.png" alt="" aria-hidden fill sizes="64px" className="object-contain" />
-    </span>
+    <p className="flex gap-4 whitespace-nowrap">
+      <span className="w-20 shrink-0 text-ash/70 sm:w-24">{label}</span>
+      <span className="text-ash">{children}</span>
+    </p>
   );
 }
 
-function Dashboard() {
-  const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, refetchInterval: 30_000 });
-  const agentsQ = useQuery({
-    queryKey: ["agents"],
-    queryFn: () => agents.list(),
-    refetchInterval: 5_000,
-  });
-  const recentAgents = [...(agentsQ.data ?? [])]
-    .sort((a, b) => (b.last_activity_at ?? "").localeCompare(a.last_activity_at ?? ""))
-    .slice(0, 6);
-
+function Redacted() {
   return (
-    <div className="mx-auto w-full max-w-5xl p-4 @container/dash">
-      <header className="mb-4 flex items-center justify-between gap-2">
-        <h1 className="text-xl font-semibold">Dashboard</h1>
-        <Button asChild size="sm">
-          <Link href="/agents/new">Summon</Link>
-        </Button>
-      </header>
-
-      <section className="grid gap-4 @md/dash:grid-cols-2">
-        <Card>
-          <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
-            <div className="min-w-0">
-              <CardTitle>Hosts</CardTitle>
-              <CardDescription>
-                {hostsQ.isLoading
-                  ? "Loading…"
-                  : hostsQ.error
-                    ? "Failed to load hosts"
-                    : `${hostsQ.data?.length ?? 0} possessed`}
-              </CardDescription>
-            </div>
-            <Button asChild variant="ghost" size="sm" className="shrink-0 text-muted-foreground">
-              <Link href="/hosts">All</Link>
-            </Button>
-          </CardHeader>
-          <CardContent className="p-0">
-            <ul className="border-t border-border">
-              {(hostsQ.data ?? []).slice(0, 5).map((h: Host) => (
-                <li key={h.id} className="border-b border-border last:border-b-0">
-                  <Link
-                    href={`/hosts/${h.id}`}
-                    className="flex items-center gap-3 px-4 py-3 transition-colors hover:bg-accent/40"
-                  >
-                    <StatusDot
-                      tone={hostStatusTone(h.status)}
-                      label={h.status}
-                      pulse={h.status === "online"}
-                    />
-                    <span className="min-w-0 flex-1 truncate text-sm font-medium">{h.name}</span>
-                    <span className="shrink-0 text-xs text-muted-foreground">
-                      {h.agent_count} agent{h.agent_count === 1 ? "" : "s"}
-                    </span>
-                    <ChevronRight
-                      className="size-4 shrink-0 text-muted-foreground/50"
-                      aria-hidden
-                    />
-                  </Link>
-                </li>
-              ))}
-              {!hostsQ.isLoading && (hostsQ.data?.length ?? 0) === 0 && (
-                <li className="px-4 py-3 text-sm text-muted-foreground">
-                  No hosts possessed yet. Run <code>spawnd login</code> on a machine and approve it
-                  at{" "}
-                  <Link href="/device" className="underline">
-                    /device
-                  </Link>
-                  .
-                </li>
-              )}
-            </ul>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
-            <div className="min-w-0">
-              <CardTitle>Recent agents</CardTitle>
-              <CardDescription>
-                {agentsQ.isLoading
-                  ? "Loading…"
-                  : agentsQ.error
-                    ? "Failed to load agents"
-                    : `${agentsQ.data?.length ?? 0} in the legion`}
-              </CardDescription>
-            </div>
-            <Button asChild variant="ghost" size="sm" className="shrink-0 text-muted-foreground">
-              <Link href="/agents">All</Link>
-            </Button>
-          </CardHeader>
-          <CardContent className="p-0">
-            <ul className="border-t border-border">
-              {recentAgents.map((a: Agent) => (
-                <AgentListRow key={a.id} agent={a} href={`/agents/${a.id}`} />
-              ))}
-              {!agentsQ.isLoading && recentAgents.length === 0 && (
-                <li className="px-4 py-3 text-sm text-muted-foreground">No agents summoned yet.</li>
-              )}
-            </ul>
-          </CardContent>
-        </Card>
-      </section>
-    </div>
+    <>
+      <span
+        aria-hidden
+        className="inline-block h-[0.8em] w-36 translate-y-[0.08em] bg-hellfire/90"
+      />
+      <span className="sr-only">redacted</span>{" "}
+    </>
   );
 }

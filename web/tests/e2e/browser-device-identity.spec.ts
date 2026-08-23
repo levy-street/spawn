@@ -13,8 +13,11 @@ test.beforeAll(() => {
   bundleDirectory = mkdtempSync(path.join(tmpdir(), "spawn-browser-device-identity-"));
   bundlePath = path.join(bundleDirectory, "fixture.js");
   execFileSync(
-    "bun",
+    "npx",
     [
+      "--package=bun",
+      "bunx",
+      "bun",
       "build",
       "tests/e2e/browser-device-identity.fixture.ts",
       "--target=browser",
@@ -31,9 +34,13 @@ test.afterAll(() => {
 });
 
 async function loadFixture(page: Page): Promise<void> {
-  await page.route("**/api/auth/providers", async (route) => {
+  await page.route("**/api/auth/config", async (route) => {
     await route.fulfill({
-      body: JSON.stringify({ providers: [] }),
+      body: JSON.stringify({
+        providers: [],
+        email_verification_required: false,
+        invite_only: false,
+      }),
       contentType: "application/json",
       status: 200,
     });

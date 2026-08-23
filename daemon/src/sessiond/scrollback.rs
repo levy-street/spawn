@@ -27,7 +27,7 @@
 //!
 //! Key model: the key is generated per worker process, lives only in locked
 //! worker memory (`secret::SecretBytes`), and is never persisted. A worker
-//! that dies takes its scrollback keys with it — the agent process died with
+//! that dies takes its scrollback keys with it — the session process died with
 //! the PTY anyway, so the log has nothing left to replay; leftover ciphertext
 //! is unreadable and is unlinked on the next start. docs/SESSIOND.md
 //! discusses host-key and device-sealed alternatives.
@@ -378,7 +378,7 @@ impl ScrollbackLog {
             .saturating_add(self.segment_memory_charge())
     }
 
-    /// Remove every segment file. Called when the agent exits.
+    /// Remove every segment file. Called when the session exits.
     pub fn destroy(mut self) {
         self.active.take();
         for seg in &self.segments {

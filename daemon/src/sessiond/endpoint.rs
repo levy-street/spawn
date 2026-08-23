@@ -1,6 +1,6 @@
 //! Local worker endpoint ownership and access controls.
 //!
-//! A per-agent advisory lock is held by the worker for its entire lifetime.
+//! A per-session advisory lock is held by the worker for its entire lifetime.
 //! The supervisor reserves that lock before spawning and passes the locked fd
 //! through `exec`, closing the create/create race without relying on a PID.
 
@@ -143,7 +143,7 @@ fn secure_regular_file(file: &File) -> Result<()> {
     Ok(())
 }
 
-/// Remove endpoints left by a crashed worker. Callers must hold the per-agent
+/// Remove endpoints left by a crashed worker. Callers must hold the per-session
 /// lock, which proves that no live conforming worker owns either pathname.
 pub fn remove_stale_socket(path: &Path) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
@@ -245,7 +245,7 @@ mod tests {
             0o700
         );
 
-        let socket = dir.join("agent.sock");
+        let socket = dir.join("session.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let identity = secure_bound_socket(&socket).unwrap();
         assert_eq!(
@@ -273,7 +273,7 @@ mod tests {
     fn stale_owner_cleanup_cannot_unlink_a_replacement_inode() {
         let root = tempfile::tempdir().unwrap();
         ensure_private_dir(root.path()).unwrap();
-        let socket = root.path().join("agent.sock");
+        let socket = root.path().join("session.sock");
         let old = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let old_identity = secure_bound_socket(&socket).unwrap();
         std::fs::remove_file(&socket).unwrap();
@@ -290,7 +290,7 @@ mod tests {
     fn exclusive_reservation_recovers_after_owner_close() {
         let root = tempfile::tempdir().unwrap();
         ensure_private_dir(root.path()).unwrap();
-        let socket = root.path().join("agent.sock");
+        let socket = root.path().join("session.sock");
         let first = match try_reserve(&socket).unwrap() {
             LockAttempt::Acquired(lock) => lock,
             LockAttempt::Busy => panic!("first reservation was busy"),

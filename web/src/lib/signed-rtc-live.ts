@@ -12,7 +12,7 @@ import {
 
 export type SignedRtcRoute =
   | {
-      readonly scopeType: "agent";
+      readonly scopeType: "session";
       readonly scopeId: string;
       readonly protocol: "spawn.pty";
       readonly protocolVersion: 2;
@@ -86,7 +86,7 @@ export class SignedRtcLiveSession {
     const protocolVersion = route.protocolVersion;
     if (
       !(
-        (scopeType === "agent" && protocol === "spawn.pty" && protocolVersion === 2) ||
+        (scopeType === "session" && protocol === "spawn.pty" && protocolVersion === 2) ||
         (scopeType === "host" && protocol === "spawn.host.ctl" && protocolVersion === 1)
       )
     ) {

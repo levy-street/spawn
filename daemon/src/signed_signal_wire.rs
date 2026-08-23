@@ -26,21 +26,21 @@ pub const MAX_SIGNED_RTC_WIRE_BYTES: usize =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RtcProtocol {
-    Agent,
+    Session,
     Host,
 }
 
 impl RtcProtocol {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Agent => "spawn.pty",
+            Self::Session => "spawn.pty",
             Self::Host => "spawn.host.ctl",
         }
     }
 
     fn parse(value: &str) -> Result<Self, SignedRtcWireError> {
         match value {
-            "spawn.pty" => Ok(Self::Agent),
+            "spawn.pty" => Ok(Self::Session),
             "spawn.host.ctl" => Ok(Self::Host),
             _ => Err(SignedRtcWireError::InvalidEnum("protocol")),
         }
@@ -49,7 +49,7 @@ impl RtcProtocol {
     fn validate_scope(self, scope: ScopeType) -> Result<(), SignedRtcWireError> {
         if matches!(
             (self, scope),
-            (Self::Agent, ScopeType::Agent) | (Self::Host, ScopeType::Host)
+            (Self::Session, ScopeType::Session) | (Self::Host, ScopeType::Host)
         ) {
             Ok(())
         } else {
@@ -296,7 +296,7 @@ fn validate_tuple(
 ) -> Result<(), SignedRtcWireError> {
     protocol.validate_scope(transcript.scope_type())?;
     let exact_version = match protocol {
-        RtcProtocol::Agent => 2,
+        RtcProtocol::Session => 2,
         RtcProtocol::Host => 1,
     };
     if transcript.protocol_version() != exact_version {
@@ -331,14 +331,14 @@ fn parse_signal_type(value: &str) -> Result<SignalKind, SignedRtcWireError> {
 
 fn scope_type(value: ScopeType) -> &'static str {
     match value {
-        ScopeType::Agent => "agent",
+        ScopeType::Session => "session",
         ScopeType::Host => "host",
     }
 }
 
 fn parse_scope_type(value: &str) -> Result<ScopeType, SignedRtcWireError> {
     match value {
-        "agent" => Ok(ScopeType::Agent),
+        "session" => Ok(ScopeType::Session),
         "host" => Ok(ScopeType::Host),
         _ => Err(SignedRtcWireError::InvalidEnum("scope_type")),
     }
@@ -384,7 +384,7 @@ mod tests {
 
     #[derive(Deserialize)]
     struct ProtocolVersionJsonTokens {
-        agent_accepted: Vec<String>,
+        session_accepted: Vec<String>,
         host_accepted: Vec<String>,
         rejected: Vec<String>,
     }
@@ -461,10 +461,10 @@ mod tests {
             "session_id" | "scope_id" | "sdp" => {
                 json!(format!("{}-mutated", object[field].as_str().unwrap()))
             }
-            "scope_type" => json!(if object[field] == "agent" {
+            "scope_type" => json!(if object[field] == "session" {
                 "host"
             } else {
-                "agent"
+                "session"
             }),
             "sender_role" => json!(if object[field] == "browser" {
                 "daemon"
@@ -564,7 +564,7 @@ mod tests {
         for (vector, tokens) in [
             (
                 &golden.vectors[0],
-                &golden.protocol_version_json_tokens.agent_accepted,
+                &golden.protocol_version_json_tokens.session_accepted,
             ),
             (
                 &golden.vectors[1],
@@ -728,9 +728,9 @@ mod tests {
     fn protocol_scope_and_offer_role_pairs_are_exact() {
         let golden = golden();
         let signing_key = SigningKey::from_bytes(&decode_hex_32(&golden.signing_seed_hex));
-        let agent = transcript(&golden.vectors[0].envelope);
+        let session = transcript(&golden.vectors[0].envelope);
         assert_eq!(
-            sign_rtc_signal_wire(&signing_key, RtcProtocol::Host, &agent),
+            sign_rtc_signal_wire(&signing_key, RtcProtocol::Host, &session),
             Err(SignedRtcWireError::InconsistentTuple(
                 "protocol does not match scope_type"
             ))
@@ -738,16 +738,16 @@ mod tests {
         let wrong_version = SignedSignalTranscript::new(
             SignalKind::Offer,
             1,
-            agent.session_id(),
-            agent.scope_type(),
-            agent.scope_id(),
+            session.session_id(),
+            session.scope_type(),
+            session.scope_id(),
             SenderRole::Browser,
-            *agent.intended_peer_public_key(),
-            agent.sdp(),
+            *session.intended_peer_public_key(),
+            session.sdp(),
         )
         .unwrap();
         assert_eq!(
-            sign_rtc_signal_wire(&signing_key, RtcProtocol::Agent, &wrong_version),
+            sign_rtc_signal_wire(&signing_key, RtcProtocol::Session, &wrong_version),
             Err(SignedRtcWireError::InconsistentTuple(
                 "protocol_version does not match the current protocol"
             ))
@@ -758,17 +758,17 @@ mod tests {
         );
         let wrong_role = SignedSignalTranscript::new(
             SignalKind::Offer,
-            agent.protocol_version(),
-            agent.session_id(),
-            agent.scope_type(),
-            agent.scope_id(),
+            session.protocol_version(),
+            session.session_id(),
+            session.scope_type(),
+            session.scope_id(),
             SenderRole::Daemon,
-            *agent.intended_peer_public_key(),
-            agent.sdp(),
+            *session.intended_peer_public_key(),
+            session.sdp(),
         )
         .unwrap();
         assert!(matches!(
-            sign_rtc_signal_wire(&signing_key, RtcProtocol::Agent, &wrong_role),
+            sign_rtc_signal_wire(&signing_key, RtcProtocol::Session, &wrong_role),
             Err(SignedRtcWireError::InconsistentTuple(_))
         ));
     }

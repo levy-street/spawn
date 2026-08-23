@@ -1,11 +1,11 @@
 import { expect, test } from "@playwright/test";
-import { mockAuthenticatedApi, USER_ID } from "./app-mocks";
+import { mockApp, openSettings, USER_ID } from "./app-mocks";
 
 test("removing this device is seamless: the key dies, a fresh one takes its place", async ({
   page,
 }) => {
-  await mockAuthenticatedApi(page);
-  await page.goto("/settings");
+  await mockApp(page);
+  await openSettings(page, "access");
 
   const fingerprint = page.getByTestId("browser-fingerprint");
   await expect(fingerprint).toHaveText(/^SHA256:/);
@@ -78,11 +78,18 @@ test("removing this device is seamless: the key dies, a fresh one takes its plac
   expect(afterReplace.publicKey).not.toBe(before.publicKey);
   expect(afterReplace.marker).toBeNull();
 
-  // The replacement survives a reload unchanged (no second mint).
+  // The replacement survives a reload unchanged (no second mint). A reload
+  // closes the settings modal (it is an overlay, not a page), so reopen it.
+  //
+  // There is deliberately no recovery button to press here. The pre-mesh
+  // Devices panel parked a removed device behind "Start fresh on this
+  // browser"; the Access UX removed that dead end — registration simply
+  // re-runs and the browser reappears as an ordinary device.
   await page.reload();
-  await page.goto("/settings");
+  await openSettings(page, "access");
   await expect(fingerprint).toHaveText(/^SHA256:/);
   await expect(page.getByRole("button", { name: "Start over" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toHaveCount(0);
 
   // The removed key stays in history (under Advanced), never resurrected.
   await page.getByTestId("access-advanced").locator("summary").click();
@@ -92,7 +99,7 @@ test("removing this device is seamless: the key dies, a fresh one takes its plac
 test("registration failure stays loud while settings and logout remain accessible", async ({
   page,
 }) => {
-  await mockAuthenticatedApi(page);
+  await mockApp(page);
   await page.route("**/api/browser-devices/register", async (route) => {
     await route.fulfill({
       status: 503,
@@ -100,7 +107,7 @@ test("registration failure stays loud while settings and logout remain accessibl
       json: { detail: "registration temporarily unavailable" },
     });
   });
-  await page.goto("/settings");
+  await openSettings(page, "access");
 
   await expect(page.getByRole("alert").first()).toContainText("could not register");
   await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
@@ -113,7 +120,7 @@ test("registration failure stays loud while settings and logout remain accessibl
 });
 
 test("rejects a substituted registration response", async ({ page }) => {
-  await mockAuthenticatedApi(page);
+  await mockApp(page);
   await page.route("**/api/browser-devices/register", async (route) => {
     await route.fulfill({
       status: 200,
@@ -127,7 +134,7 @@ test("rejects a substituted registration response", async ({ page }) => {
       },
     });
   });
-  await page.goto("/settings");
+  await openSettings(page, "access");
 
   await expect(page.getByRole("alert").first()).toContainText("could not register");
   await expect(page.getByTestId("browser-fingerprint")).not.toBeVisible();
@@ -141,8 +148,8 @@ test("rejects a substituted registration response", async ({ page }) => {
 test("rejects a substituted revocation response without deleting the local key", async ({
   page,
 }) => {
-  await mockAuthenticatedApi(page);
-  await page.goto("/settings");
+  await mockApp(page);
+  await openSettings(page, "access");
   await expect(page.getByTestId("browser-fingerprint")).toHaveText(/^SHA256:/);
 
   await page.route("**/api/browser-devices/*/revoke", async (route) => {
@@ -189,8 +196,8 @@ test("rejects a substituted revocation response without deleting the local key",
 });
 
 test("devices can be renamed for recognition without touching the key", async ({ page }) => {
-  await mockAuthenticatedApi(page);
-  await page.goto("/settings");
+  await mockApp(page);
+  await openSettings(page, "access");
 
   const fingerprint = page.getByTestId("browser-fingerprint");
   await expect(fingerprint).toHaveText(/^SHA256:/);
@@ -210,7 +217,7 @@ test("devices can be renamed for recognition without touching the key", async ({
 });
 
 test("clearing history prunes tombstones but never active devices", async ({ page }) => {
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     extraBrowserDevices: [
       {
         id: "00000000-0000-4000-8000-000000000041",
@@ -222,7 +229,7 @@ test("clearing history prunes tombstones but never active devices", async ({ pag
       },
     ],
   });
-  await page.goto("/settings");
+  await openSettings(page, "access");
 
   await page.getByTestId("access-advanced").locator("summary").click();
   await expect(page.getByText(/Removed devices \(1\)/)).toBeVisible();
@@ -239,7 +246,7 @@ test("clearing history prunes tombstones but never active devices", async ({ pag
 });
 
 test("a remotely-removed device replaces its key seamlessly on the next load", async ({ page }) => {
-  await mockAuthenticatedApi(page);
+  await mockApp(page);
   // The server refuses the FIRST key as revoked: this device was removed from
   // ANOTHER device, and this load is the moment it finds out. The replacement
   // key (second register call) is accepted by the underlying stateful mock.
@@ -256,7 +263,7 @@ test("a remotely-removed device replaces its key seamlessly on the next load", a
     }
     await route.fallback();
   });
-  await page.goto("/settings");
+  await openSettings(page, "access");
 
   // Straight to an ordinary registered device — no dead end, no button.
   await expect(page.getByTestId("browser-fingerprint")).toHaveText(/^SHA256:/, {

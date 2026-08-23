@@ -1,5 +1,14 @@
 # Trust Phase 2 — implementation spec (server holds no protected content)
 
+> **Historical checkpoint:** the "current source" statements below describe
+> the reviewed July 2026 checkpoint, not the shipped workspace/session
+> overhaul. Current sessions are login-shell PTYs, agents are CLI shortcut
+> definitions, browser signaling requires `spawn.v3`, daemon control requires
+> `spawn.control.v3`, and lifecycle frames use `session.*`. The locked
+> `spawn.ctl` v1 upload vocabulary is the documented compatibility exception.
+> See `INTERFACE_MATRIX.md`, `proto/README.md`, and `TRUST.md` for current
+> surfaces. The sequence and evidence below remain historical review records.
+
 Companion to `docs/TRUST.md` Phase 2. This revised cut sequence covers both
 agent-scoped terminal traffic and host-scoped operations. Each increment must
 be independently reviewed and shippable, but the Phase 2 claim is made only

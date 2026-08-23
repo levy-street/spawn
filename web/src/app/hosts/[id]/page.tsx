@@ -1,24 +1,22 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  ArrowLeft,
-  FolderOpen,
-  MoreHorizontal,
-  Pencil,
-  Server,
-  SquarePen,
-  Trash2,
-} from "lucide-react";
+import { ArrowLeft, FolderOpen, MoreHorizontal, Pencil, Server, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
-import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
+import { useEffect, useRef, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
-import { HostToolsPanel } from "@/components/hosts/HostToolsPanel";
+import { HostAgentsPanel } from "@/components/hosts/HostAgentsPanel";
+import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { AppShell } from "@/components/nav/AppShell";
+import {
+  openSettings,
+  type SettingsTab,
+  takeSettingsReturn,
+} from "@/components/settings/settings-dialog-store";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { confirm } from "@/components/ui/confirm";
 import {
   DropdownMenu,
   DropdownMenuItem,
@@ -26,9 +24,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { AgentStatusDot } from "@/components/ui/status";
-import { agentActivityDetail, agentCommand, agentTitle, relativeTime } from "@/lib/agents";
-import { ApiError, agents, hosts } from "@/lib/api";
+import { SessionStatusDot } from "@/components/ui/status";
+import { ApiError, hosts, sessions } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
   BrowserHostPinError,
@@ -37,6 +34,7 @@ import {
   resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
 } from "@/lib/browser-host-pins";
+import { relativeTime, sessionActivityDetail, sessionTitle } from "@/lib/sessions";
 import { SIGNED_RTC_REFUSAL_DETAIL, SIGNED_RTC_REFUSAL_NEXT_STEP } from "@/lib/signed-rtc-trust";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 
@@ -65,35 +63,37 @@ function HostDetail() {
   const params = useParams<{ id: string }>();
   const id = params?.id;
   const router = useRouter();
-  const qc = useQueryClient();
+  const queryClient = useQueryClient();
+  // Read once, on mount, and cleared by the read: the flag describes the
+  // navigation that landed here, not a persistent property of the page.
+  const settingsReturnRef = useRef<SettingsTab | null | undefined>(undefined);
+  if (settingsReturnRef.current === undefined) settingsReturnRef.current = takeSettingsReturn();
+  const settingsReturn = settingsReturnRef.current;
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [localDeletionPending, setLocalDeletionPending] = useState(false);
-  // The served key conflicts with the identity this browser approved for this
-  // Host ID (review R-b): a legitimate reinstall/re-key and a substitution
-  // look identical, so connections are hard-refused elsewhere — this page owns
-  // explaining the fork and offering the one safe exit (remove, possess again).
   const [identityConflict, setIdentityConflict] = useState(false);
 
-  const q = useQuery({
+  const hostQ = useQuery({
     queryKey: ["host", id],
     queryFn: () => hosts.get(id as string),
-    enabled: !!id,
+    enabled: Boolean(id),
     refetchInterval: 30_000,
   });
-  const agentsQ = useQuery({
-    queryKey: ["agents", { host_id: id }],
-    queryFn: () => agents.list({ host_id: id as string }),
-    enabled: !!id,
-    refetchInterval: 10_000,
+  const sessionsQ = useQuery({
+    queryKey: ["sessions", { host_id: id }],
+    queryFn: () => sessions.list({ host_id: id as string }),
+    enabled: Boolean(id),
+    refetchInterval: 5_000,
   });
+  const host = hostQ.data;
   // Displayed fingerprint, derived LOCALLY from the served key (mesh B5): the
   // server no longer serves one, and this page would not show it if it did.
   const hostFingerprintQ = useQuery({
-    queryKey: ["host-key-fingerprint", q.data?.host_public_key ?? null],
-    queryFn: () => ed25519PublicKeyFingerprint(q.data?.host_public_key as string),
-    enabled: Boolean(q.data?.host_public_key),
+    queryKey: ["host-key-fingerprint", hostQ.data?.host_public_key ?? null],
+    queryFn: () => ed25519PublicKeyFingerprint(hostQ.data?.host_public_key as string),
+    enabled: Boolean(hostQ.data?.host_public_key),
     staleTime: Number.POSITIVE_INFINITY,
   });
 
@@ -102,10 +102,10 @@ function HostDetail() {
     onSuccess: () => {
       setEditingName(false);
       setError(null);
-      qc.invalidateQueries({ queryKey: ["host", id] });
-      qc.invalidateQueries({ queryKey: ["hosts"] });
+      queryClient.invalidateQueries({ queryKey: ["host", id] });
+      queryClient.invalidateQueries({ queryKey: ["hosts"] });
     },
-    onError: (err) => setError(err instanceof ApiError ? err.message : String(err)),
+    onError: (caught) => setError(caught instanceof ApiError ? caught.message : String(caught)),
   });
   const removeM = useMutation({
     mutationFn: async () => {
@@ -140,44 +140,45 @@ function HostDetail() {
               claimedHostPublicKey: host.host_public_key,
             });
             localTombstoneWritten = true;
-          } catch (revokeErr) {
+          } catch (caught) {
             const nothingToRevoke =
-              revokeErr instanceof BrowserHostPinError &&
-              ["revoked_pin", "missing_pin", "null_key"].includes(revokeErr.code);
-            if (!nothingToRevoke) throw revokeErr;
+              caught instanceof BrowserHostPinError &&
+              ["revoked_pin", "missing_pin", "null_key"].includes(caught.code);
+            if (!nothingToRevoke) throw caught;
           }
         }
         setLocalDeletionPending(true);
         await hosts.remove(targetHostId);
-      } catch (err) {
-        const message = err instanceof ApiError || err instanceof Error ? err.message : String(err);
-        throw new HostDeletionFlowError(message, localTombstoneWritten);
+      } catch (caught) {
+        throw new HostDeletionFlowError(
+          caught instanceof Error ? caught.message : String(caught),
+          localTombstoneWritten,
+        );
       }
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["hosts"] });
-      qc.invalidateQueries({ queryKey: ["agents"] });
-      router.push("/hosts");
+      queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      openSettings("hosts");
+      router.push("/app");
     },
-    onError: (err) => {
-      if (err instanceof HostDeletionFlowError && err.localTombstoneWritten) {
+    onError: (caught) => {
+      if (caught instanceof HostDeletionFlowError && caught.localTombstoneWritten) {
         setLocalDeletionPending(true);
         setError(
-          `Local host trust is revoked, but server deletion did not complete: ${err.message}. Retry server deletion; the local tombstone will remain.`,
+          `Local host trust is revoked, but server deletion did not complete: ${caught.message}. Retry server deletion; the local tombstone will remain.`,
         );
         return;
       }
       setError(
-        `Host deletion was blocked before any server DELETE: ${err instanceof Error ? err.message : String(err)}`,
+        `Host deletion was blocked before any server DELETE: ${caught instanceof Error ? caught.message : String(caught)}`,
       );
     },
   });
 
-  const host = q.data;
-
   useEffect(() => {
     const hostPublicKey = host?.host_public_key;
-    if (!host || !user || !hostPublicKey) return;
+    if (!host || !user || !id || !hostPublicKey) return;
     let cancelled = false;
     void (async () => {
       try {
@@ -194,11 +195,11 @@ function HostDetail() {
             claimedHostPublicKey: hostPublicKey,
           });
           if (!cancelled) setIdentityConflict(false);
-        } catch (err) {
+        } catch (caught) {
           // The served key is not the one this browser approved for this Host
           // ID: reinstall/re-key or substitution. Show the guided panel (with
           // the safe exit) instead of a generic storage error.
-          if (err instanceof BrowserHostPinError && err.code === "host_id_key_conflict") {
+          if (caught instanceof BrowserHostPinError && caught.code === "host_id_key_conflict") {
             if (!cancelled) {
               setIdentityConflict(true);
               setLocalDeletionPending(false);
@@ -207,7 +208,9 @@ function HostDetail() {
           }
           // An already-bound tombstone is expected after a failed server
           // DELETE. Confirm its exact binding below without reactivating it.
-          if (!(err instanceof BrowserHostPinError) || err.code !== "revoked_pin") throw err;
+          if (!(caught instanceof BrowserHostPinError) || caught.code !== "revoked_pin") {
+            throw caught;
+          }
         }
         const pin = await loadBrowserHostPin({
           accountId: user.id,
@@ -219,11 +222,11 @@ function HostDetail() {
           throw new Error("No exact local Host-ID-to-key binding exists for this route");
         }
         if (!cancelled) setLocalDeletionPending(pin.state === "revoked");
-      } catch (err) {
+      } catch (caught) {
         if (!cancelled) {
           setLocalDeletionPending(false);
           setError(
-            `Local host trust status is unavailable: ${err instanceof Error ? err.message : String(err)}`,
+            `Local host trust status is unavailable: ${caught instanceof Error ? caught.message : String(caught)}`,
           );
         }
       }
@@ -231,7 +234,7 @@ function HostDetail() {
     return () => {
       cancelled = true;
     };
-  }, [host, user, id]);
+  }, [host, id, user]);
 
   const submitRename = () => {
     const next = draftName.trim();
@@ -242,246 +245,264 @@ function HostDetail() {
     renameM.mutate(next);
   };
 
+  const requestRemove = async () => {
+    if (!host) return;
+    const accepted = await confirm({
+      title: `Remove ${host.name}?`,
+      body: "Its daemon token will be revoked. Existing session processes on that machine may continue locally, but spawn will no longer connect to them.",
+      confirmLabel: localDeletionPending ? "Retry deletion" : "Remove host",
+      destructive: true,
+    });
+    if (accepted) removeM.mutate();
+  };
+
+  /**
+   * Back means back — always the route you came from. Arriving here from the
+   * settings dialog additionally reopens it on the way, because the dialog is
+   * not URL state and so is the one part of "where I was" that history cannot
+   * restore by itself. Opening it before the navigation is what carries it
+   * across: the store is a module singleton, so the shell that mounts on the
+   * far side finds it already open.
+   *
+   * A page opened cold in a fresh tab has nothing to pop, so it goes to the
+   * legion rather than leaving the arrow dead.
+   */
+  const goBack = () => {
+    if (settingsReturn) openSettings(settingsReturn);
+    if (window.history.length > 1) router.back();
+    else router.push("/legion");
+  };
+
   if (!id) return null;
 
   return (
-    <div className="mx-auto w-full max-w-3xl p-4 @md/shell:p-6">
-      {/* Toolbar */}
-      <header className="mb-5 flex items-center gap-2">
-        <Button
-          asChild
-          variant="ghost"
-          size="icon"
-          className="size-8 shrink-0"
-          aria-label="All hosts"
-        >
-          <Link href="/hosts">
-            <ArrowLeft className="size-4" />
-          </Link>
-        </Button>
-        <span className="grid size-8 shrink-0 place-items-center rounded-lg border border-border bg-muted/50 text-muted-foreground">
-          <Server className="size-4" aria-hidden />
-        </span>
-        <div className="flex min-w-0 flex-1 items-center gap-2">
-          {editingName ? (
-            <Input
-              aria-label="Host name"
-              autoFocus
-              value={draftName}
-              onChange={(e) => setDraftName(e.target.value)}
-              onBlur={submitRename}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") submitRename();
-                if (e.key === "Escape") setEditingName(false);
-              }}
-              className="h-8 max-w-56"
-              disabled={renameM.isPending}
-            />
-          ) : (
-            <button
-              type="button"
-              className="truncate rounded-md px-1 text-base font-semibold tracking-tight hover:bg-accent/50"
-              title="Rename host"
-              onClick={() => {
+    // The shell's <main> is `overflow-hidden` on desktop, so a page taller
+    // than the viewport has to carry its own scroller or it is simply clipped
+    // — and scrolling here rather than the document is also what keeps the
+    // sidebar still instead of riding up with the content.
+    <div className="h-full overflow-y-auto">
+      <main className="mx-auto w-full max-w-4xl p-4 @md/shell:p-6">
+        <header className="mb-6 flex items-center gap-2">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-8 shrink-0"
+            aria-label="Back"
+            onClick={goBack}
+          >
+            <ArrowLeft className="size-4" aria-hidden />
+          </Button>
+          <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-border bg-muted text-muted-foreground">
+            <Server className="size-4" aria-hidden />
+          </span>
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            {editingName ? (
+              <Input
+                aria-label="Host name"
+                autoFocus
+                value={draftName}
+                onChange={(event) => setDraftName(event.currentTarget.value)}
+                onBlur={submitRename}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") submitRename();
+                  if (event.key === "Escape") setEditingName(false);
+                }}
+                className="h-8 max-w-56"
+                disabled={renameM.isPending}
+              />
+            ) : (
+              <button
+                type="button"
+                className="truncate rounded-md px-1 text-base font-semibold tracking-tight hover:bg-accent/50"
+                title="Rename host"
+                onClick={() => {
+                  if (!host) return;
+                  setDraftName(host.name);
+                  setEditingName(true);
+                }}
+              >
+                {host?.name ?? "…"}
+              </button>
+            )}
+            {host && (
+              <Badge variant={host.status === "online" ? "success" : "outline"}>
+                {host.status}
+              </Badge>
+            )}
+          </div>
+          <Button asChild variant="outline" size="sm" className="shrink-0">
+            <Link href={`/hosts/${id}/files`}>
+              <FolderOpen className="size-4" aria-hidden />
+              <span className="hidden sm:inline">Files</span>
+            </Link>
+          </Button>
+          <DropdownMenu
+            renderTrigger={(props) => (
+              <Button
+                {...props}
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="size-8 shrink-0"
+                aria-label="Host actions"
+              >
+                <MoreHorizontal className="size-4" aria-hidden />
+              </Button>
+            )}
+          >
+            <DropdownMenuItem
+              onSelect={() => {
                 if (!host) return;
                 setDraftName(host.name);
                 setEditingName(true);
               }}
             >
-              {host?.name ?? "…"}
-            </button>
-          )}
-          {host &&
-            (host.status === "online" ? (
-              <Badge variant="success">online</Badge>
-            ) : (
-              <Badge variant="outline">offline</Badge>
-            ))}
-        </div>
-        <Button asChild variant="outline" size="sm" className="shrink-0">
-          <Link href={`/hosts/${id}/files`}>
-            <FolderOpen className="size-4" />
-            <span className="hidden sm:inline">Files</span>
-          </Link>
-        </Button>
-        <Button asChild size="sm" className="shrink-0">
-          <Link href={`/agents/new?host=${id}`}>
-            <SquarePen className="size-4" />
-            <span className="hidden sm:inline">New agent</span>
-          </Link>
-        </Button>
-        <DropdownMenu
-          renderTrigger={(props) => (
-            <Button
-              {...props}
-              variant="ghost"
-              size="icon"
-              className="size-8 shrink-0"
-              aria-label="Host actions"
-            >
-              <MoreHorizontal className="size-4" />
-            </Button>
-          )}
-        >
-          <DropdownMenuItem
-            onSelect={() => {
-              if (!host) return;
-              setDraftName(host.name);
-              setEditingName(true);
-            }}
-          >
-            <Pencil className="size-4" aria-hidden />
-            Rename
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem
-            destructive
-            onSelect={() => {
-              if (host && confirm(`Remove host ${host.name}? Its daemon token is revoked.`)) {
-                removeM.mutate();
-              }
-            }}
-          >
-            <Trash2 className="size-4" aria-hidden />
-            {localDeletionPending ? "Retry server deletion" : "Remove host"}
-          </DropdownMenuItem>
-        </DropdownMenu>
-      </header>
-
-      {error && (
-        <p className="mb-3 text-sm text-destructive" role="alert">
-          {error}
-        </p>
-      )}
-      {identityConflict && (
-        <div
-          className="mb-4 rounded-xl border border-amber-500/40 bg-amber-500/5 p-4"
-          data-testid="host-identity-conflict"
-          role="alert"
-        >
-          <p className="text-sm font-medium text-foreground">
-            This host's identity changed — connections are blocked
-          </p>
-          <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
-            {SIGNED_RTC_REFUSAL_DETAIL.host_key_substituted}
-          </p>
-          <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
-            {SIGNED_RTC_REFUSAL_NEXT_STEP.host_key_substituted}
-          </p>
-          <div className="mt-3">
-            {/* The safe exit and nothing else: removal, then a fresh possession
-                ceremony from the host's own terminal. There is deliberately no
-                "trust the new identity" control here. */}
-            <Button
-              variant="destructive"
-              size="sm"
-              data-testid="conflict-remove-host"
-              disabled={removeM.isPending}
-              onClick={() => {
-                if (host && confirm(`Remove host ${host.name}? Its daemon token is revoked.`)) {
-                  removeM.mutate();
-                }
-              }}
-            >
+              <Pencil className="size-4" aria-hidden />
+              Rename
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem destructive onSelect={() => void requestRemove()}>
               <Trash2 className="size-4" aria-hidden />
-              Remove this host
-            </Button>
-          </div>
-        </div>
-      )}
-      {localDeletionPending && (
-        <p className="mb-3 text-sm text-foreground" role="status">
-          This browser retains a revoked host/key tombstone. Server deletion is retryable and server
-          disappearance will not clear local trust state.
-        </p>
-      )}
-      {q.error && (
-        <p className="text-sm text-destructive" role="alert">
-          Failed to load host: {String(q.error)}
-        </p>
-      )}
+              {localDeletionPending ? "Retry server deletion" : "Remove host"}
+            </DropdownMenuItem>
+          </DropdownMenu>
+        </header>
 
-      {q.isLoading && (
-        <div className="space-y-4">
-          <Skeleton className="h-24 w-full rounded-xl" />
-          <Skeleton className="h-40 w-full rounded-xl" />
-        </div>
-      )}
-
-      {host && (
-        <div className="space-y-4">
-          {/* Facts */}
-          <dl className="grid grid-cols-2 gap-x-6 gap-y-3 rounded-xl border border-border p-4 text-sm @md/shell:grid-cols-3 @xl/shell:grid-cols-6">
-            <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
-            <Fact label="Daemon" value={`spawnd ${host.version ?? "?"}`} />
-            <Fact label="Files" value="end-to-end encrypted" />
-            <Fact label="Host identity" value={host.host_key_algorithm ?? "legacy unpaired"} />
-            <Fact
-              label="Fingerprint"
-              // Derived locally from the served key (mesh B5), never served.
-              value={host.host_public_key ? (hostFingerprintQ.data ?? "…") : "not pinned"}
-              mono
-            />
-            <Fact
-              label="Connection"
-              value={
-                host.status === "online"
-                  ? `wss control link · heartbeat ${relativeTime(host.last_seen_at) ?? "now"}`
-                  : `offline · last seen ${relativeTime(host.last_seen_at) ?? "never"}`
-              }
-            />
-          </dl>
-
-          <HostToolsPanel host={host} />
-
-          {/* Agents on this host */}
-          <section className="overflow-hidden rounded-xl border border-border">
-            <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
-              <h2 className="text-sm font-medium">
-                Agents
-                <span className="ml-2 text-xs font-normal text-muted-foreground">
-                  {agentsQ.data?.length ?? 0}
-                </span>
-              </h2>
+        {error && (
+          <p className="mb-3 text-sm text-destructive" role="alert">
+            {error}
+          </p>
+        )}
+        {identityConflict && (
+          <div
+            className="mb-4 rounded-xl border border-amber-500/40 bg-amber-500/5 p-4"
+            data-testid="host-identity-conflict"
+            role="alert"
+          >
+            <p className="text-sm font-medium text-foreground">
+              This host&apos;s identity changed — connections are blocked
+            </p>
+            <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+              {SIGNED_RTC_REFUSAL_DETAIL.host_key_substituted}
+            </p>
+            <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+              {SIGNED_RTC_REFUSAL_NEXT_STEP.host_key_substituted}
+            </p>
+            <div className="mt-3">
+              {/* The safe exit and nothing else: removal, then a fresh possession
+                  ceremony from the host's own terminal. There is deliberately no
+                  "trust the new identity" control here. */}
+              <Button
+                variant="destructive"
+                size="sm"
+                data-testid="conflict-remove-host"
+                disabled={removeM.isPending}
+                onClick={() => void requestRemove()}
+              >
+                <Trash2 className="size-4" aria-hidden />
+                Remove this host
+              </Button>
             </div>
-            {(agentsQ.data?.length ?? 0) === 0 && (
-              <div className="px-4 py-4 text-sm text-muted-foreground">
-                No agents on this host.{" "}
-                <Link href={`/agents/new?host=${id}`} className="underline underline-offset-2">
-                  Spawn one
-                </Link>
-                .
+          </div>
+        )}
+        {localDeletionPending && (
+          <p className="mb-3 text-sm text-foreground" role="status">
+            This browser retains a revoked host/key tombstone. Server deletion is retryable and
+            server disappearance will not clear local trust state.
+          </p>
+        )}
+        {hostQ.error && (
+          <p className="text-sm text-destructive" role="alert">
+            Failed to load host: {String(hostQ.error)}
+          </p>
+        )}
+        {hostQ.isLoading && (
+          <div className="space-y-4">
+            <Skeleton className="h-28 w-full rounded-xl" />
+            <Skeleton className="h-40 w-full rounded-xl" />
+          </div>
+        )}
+
+        {host && (
+          <div className="space-y-4">
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-xl border border-border p-4 text-sm @lg/shell:grid-cols-4">
+              <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
+              <Fact label="Daemon" value={host.version ?? "unknown"} />
+              <Fact label="Sessions" value={String(host.session_count)} />
+              <Fact
+                label="Connection"
+                value={
+                  host.status === "online"
+                    ? `online · heartbeat ${relativeTime(host.last_seen_at) ?? "now"}`
+                    : `offline · last seen ${relativeTime(host.last_seen_at) ?? "never"}`
+                }
+              />
+              <Fact label="Host identity" value={host.host_key_algorithm ?? "legacy unpaired"} />
+              <Fact
+                label="Fingerprint"
+                // Derived locally from the served key (mesh B5), never served.
+                value={host.host_public_key ? (hostFingerprintQ.data ?? "…") : "not pinned"}
+                mono
+              />
+            </dl>
+
+            <HostAgentsPanel host={host} />
+
+            <section
+              className="overflow-hidden rounded-xl border border-border"
+              aria-labelledby="host-sessions-title"
+            >
+              <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+                <h2 id="host-sessions-title" className="text-sm font-medium">
+                  Sessions
+                  <span className="ml-2 text-xs font-normal text-muted-foreground">
+                    {sessionsQ.data?.length ?? 0}
+                  </span>
+                </h2>
               </div>
-            )}
-            <ul>
-              {(agentsQ.data ?? []).map((agent) => (
-                <li key={agent.id} className="border-b border-border last:border-b-0">
-                  <Link
-                    href={`/agents/${agent.id}`}
-                    className="flex items-center gap-3 px-4 py-2.5 transition-colors hover:bg-accent/40"
-                  >
-                    <span className="relative shrink-0">
-                      <AgentKindIcon agent={agent} />
-                      <AgentStatusDot agent={agent} className="absolute -bottom-0.5 -right-0.5" />
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-sm font-medium">
-                        {agentTitle(agent)}
+              {sessionsQ.isLoading && <Skeleton className="m-4 h-12 w-[calc(100%-2rem)]" />}
+              {sessionsQ.error && (
+                <p className="px-4 py-3 text-sm text-destructive">{String(sessionsQ.error)}</p>
+              )}
+              {!sessionsQ.isLoading && !sessionsQ.error && sessionsQ.data?.length === 0 && (
+                <p className="px-4 py-4 text-sm text-muted-foreground">
+                  No sessions are running on this host.
+                </p>
+              )}
+              <ul className="divide-y divide-border">
+                {(sessionsQ.data ?? []).map((session) => (
+                  <li key={session.id}>
+                    <Link
+                      href={`/sessions/${session.id}`}
+                      className="flex items-center gap-3 px-4 py-3 transition-colors hover:bg-accent/40"
+                    >
+                      <span className="relative shrink-0">
+                        <AgentIcon command={session.foreground_command} size={28} />
+                        <SessionStatusDot
+                          session={session}
+                          className="absolute -bottom-0.5 -right-0.5"
+                        />
                       </span>
-                      <span className="block truncate font-mono text-[11px] text-muted-foreground">
-                        {agentCommand(agent)} · {agent.cwd}
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm font-medium">
+                          {sessionTitle(session)}
+                        </span>
+                        <span className="block truncate font-mono text-[11px] text-muted-foreground">
+                          {agentDisplayName(session.foreground_command)} · {session.cwd}
+                        </span>
                       </span>
-                    </span>
-                    <span className="shrink-0 text-[11px] text-muted-foreground">
-                      {agentActivityDetail(agent)}
-                    </span>
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          </section>
-        </div>
-      )}
+                      <span className="hidden shrink-0 text-[11px] text-muted-foreground sm:block">
+                        {sessionActivityDetail(session)}
+                      </span>
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          </div>
+        )}
+      </main>
     </div>
   );
 }

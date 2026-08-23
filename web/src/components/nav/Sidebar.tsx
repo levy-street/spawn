@@ -2,236 +2,620 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Archive,
-  LayoutGrid,
   LogOut,
-  MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
-  Pencil,
-  Pin,
-  PinOff,
-  RotateCcw,
+  Plus,
   Settings,
   ShieldCheck,
-  SquarePen,
-  SquareTerminal,
-  Trash2,
+  UserRound,
+  X,
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { type ReactNode, useMemo, useRef, useState } from "react";
-import { AgentKindIcon } from "@/components/agents/AgentKindIcon";
-import { NAV } from "@/components/nav/BottomTabs";
-import { ScreenIcon } from "@/components/screens/ScreenIcon";
+import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
+import { Trident, Wordmark } from "@/components/icons/BrandMark";
+import { LegionStrip } from "@/components/legion/LegionStrip";
+import { SidebarArchivedSection } from "@/components/nav/SidebarArchivedSection";
+import { SidebarWorkspaceRow } from "@/components/nav/SidebarWorkspaceRow";
+import {
+  SidebarIconSlot,
+  SidebarNoMatches,
+  SidebarRowLabel,
+  SidebarSearch,
+  sidebarRowClass,
+} from "@/components/nav/sidebar-parts";
+import { openProfile } from "@/components/profile/profile-dialog-store";
 import { openSettings } from "@/components/settings/settings-dialog-store";
-import { type AgentConnState, useAgentConnState } from "@/components/terminal/LiveTerminalProvider";
+import { Button } from "@/components/ui/button";
+import { confirm } from "@/components/ui/confirm";
 import {
   DropdownMenu,
-  type DropdownMenuHandle,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { AgentStatusDot } from "@/components/ui/status";
+import { toast } from "@/components/ui/toast";
 import { RailTooltip } from "@/components/ui/tooltip";
-import { agentActivityDetail, agentTitle } from "@/lib/agents";
-import { type Agent, agents, type Screen, screens } from "@/lib/api";
+import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
+import { hosts, sessions, type Workspace, workspaces } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
-import { setAgentDragData } from "@/lib/dnd";
-import { screenAttentionCount, screenPaneCount, screenRecency } from "@/lib/screens";
 import { cn } from "@/lib/utils";
-
-export const SIDEBAR_RAIL_WIDTH = 56;
-
-/**
- * Geometry contract that keeps collapse/expand smooth: every row is a fixed
- * `h-9` flex with a `size-9` icon slot whose left edge never moves (constant
- * `px-2.5` gutter). Only the aside width animates; labels stay mounted and
- * fade/clip, so icons hold their exact position through the transition.
- */
-function rowClass(active: boolean): string {
-  return cn(
-    "group/row flex h-9 w-full items-center rounded-lg text-sm transition-colors",
-    active
-      ? "bg-accent text-accent-foreground"
-      : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-  );
-}
-
-function IconSlot({ children }: { children: ReactNode }) {
-  return <span className="grid size-9 shrink-0 place-items-center">{children}</span>;
-}
-
-function RowLabel({
-  collapsed,
-  className,
-  children,
-}: {
-  collapsed: boolean;
-  className?: string;
-  children: ReactNode;
-}) {
-  return (
-    <span
-      aria-hidden={collapsed}
-      className={cn(
-        "min-w-0 flex-1 truncate whitespace-nowrap pr-1 text-left transition-opacity",
-        collapsed ? "opacity-0 duration-100" : "opacity-100 delay-75 duration-150",
-        className,
-      )}
-    >
-      {children}
-    </span>
-  );
-}
+import {
+  filterWorkspacesByName,
+  workspaceAttentionCount,
+  workspaceLiveSessionCount,
+} from "@/lib/workspaces";
 
 export function Sidebar({
   pathname,
   collapsed,
   onToggle,
+  onNavigate,
+  showCollapseControl = true,
 }: {
   pathname: string;
   collapsed: boolean;
   onToggle: () => void;
+  onNavigate?: () => void;
+  showCollapseControl?: boolean;
 }) {
+  const router = useRouter();
+  const queryClient = useQueryClient();
   const { user } = useAuth();
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+
+  const sessionsQ = useQuery({
+    queryKey: ["sessions"],
+    queryFn: () => sessions.list(),
+    refetchInterval: 5_000,
+  });
+  const workspacesQ = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: () => workspaces.list(),
+    refetchInterval: 30_000,
+  });
+  // Its own key: the archived list must never leak into ["workspaces"], which
+  // seven other surfaces read as "the workspaces I have".
+  const archivedQ = useQuery({
+    queryKey: ["workspaces", "archived"],
+    queryFn: () => workspaces.list({ archived: true }),
+    staleTime: 30_000,
+  });
+  const hostsQ = useQuery({
+    queryKey: ["hosts"],
+    queryFn: hosts.list,
+    refetchInterval: 30_000,
+  });
+
+  const orderedWorkspaces = useMemo(
+    () => [...(workspacesQ.data ?? [])].sort((a, b) => a.position - b.position),
+    [workspacesQ.data],
+  );
+  // What the tree actually renders. Reordering is disabled while a search is
+  // narrowing the list: a drop index counted over visible rows would mean
+  // something different from the position the server writes.
+  const visibleWorkspaces = useMemo(
+    () => filterWorkspacesByName(orderedWorkspaces, query),
+    [orderedWorkspaces, query],
+  );
+  const searching = query.trim().length > 0;
+  const sessionsById = useMemo(
+    () => new Map((sessionsQ.data ?? []).map((session) => [session.id, session])),
+    [sessionsQ.data],
+  );
+  const onlineHosts = (hostsQ.data ?? []).filter((host) => host.status === "online");
+  const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
+
+  const refresh = () => {
+    queryClient.invalidateQueries({ queryKey: ["sessions"] });
+    // Matches ["workspaces"] and ["workspaces", "archived"] both: archiving
+    // moves a row from one list to the other, so they always move together.
+    queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+    // The singular key the workspace page reads is a different cache entry —
+    // and it is the one that decides whether that page draws a live canvas or
+    // an archived snapshot.
+    queryClient.invalidateQueries({ queryKey: ["workspace"] });
+    queryClient.invalidateQueries({ queryKey: ["hosts"] });
+  };
+
+  const renameWorkspaceM = useMutation({
+    mutationFn: ({ id, name }: { id: string; name: string }) => workspaces.update(id, { name }),
+    onSuccess: refresh,
+    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
+  });
+  const iconWorkspaceM = useMutation({
+    // "custom" whichever way it went: a mark chosen here, and initials chosen
+    // here, are both the owner's answer — the folder scan must not undo it.
+    mutationFn: ({ id, icon }: { id: string; icon: string | null }) =>
+      workspaces.update(id, { icon, icon_source: "custom" }),
+    onSuccess: refresh,
+    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
+  });
+  const reorderWorkspaceM = useMutation({
+    // The server reorders by removal + reinsertion, so a single position
+    // write is a proper insert-at-index for the drag drop.
+    mutationFn: ({ id, position }: { id: string; position: number }) =>
+      workspaces.update(id, { position }),
+    // Optimistic: the drop lands instantly instead of snapping back for a
+    // round-trip; refresh reconciles either way.
+    onMutate: ({ id, position }) => {
+      queryClient.setQueryData<Workspace[]>(["workspaces"], (current) => {
+        if (!current) return current;
+        const ordered = [...current].sort((a, b) => a.position - b.position);
+        const moving = ordered.find((workspace) => workspace.id === id);
+        if (!moving) return current;
+        const without = ordered.filter((workspace) => workspace.id !== id);
+        without.splice(position, 0, moving);
+        return without.map((workspace, index) => ({ ...workspace, position: index }));
+      });
+    },
+    onSuccess: refresh,
+    onError: (error) => {
+      refresh();
+      setActionError(error instanceof Error ? error.message : String(error));
+    },
+  });
+  const deleteWorkspaceM = useMutation({
+    mutationFn: (id: string) => workspaces.remove(id),
+    onSuccess: (_result, id) => {
+      setActionError(null);
+      refresh();
+      if (currentWorkspaceId === id) router.push("/app");
+    },
+    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
+  });
+  const archiveWorkspaceM = useMutation({
+    mutationFn: ({ id }: { id: string; name: string; nextId: string | null }) =>
+      workspaces.archive(id),
+    onSuccess: (_result, { id, name, nextId }) => {
+      setActionError(null);
+      refresh();
+      // Said out loud, because the row leaves the list under your cursor and
+      // the only other evidence is a drawer that is probably closed.
+      toast(`Archived ${name}`);
+      // And carry on next door: the workspace you were looking at is stopped
+      // now, so the useful place to be is the one that took its slot.
+      if (currentWorkspaceId === id) {
+        router.push(nextId ? `/w/${nextId}` : "/app");
+        onNavigate?.();
+      }
+    },
+    onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
+  });
+  const unarchiveWorkspaceM = useMutation({
+    mutationFn: (id: string) => workspaces.unarchive(id),
+    onSuccess: (workspace) => {
+      setActionError(null);
+      refresh();
+      router.push(`/w/${workspace.id}`);
+      onNavigate?.();
+    },
+    // Restoring is a deliberate act with its own outcome, and the sidebar's
+    // inline error sits above a list the restored row is not in yet.
+    onError: (error) => toast.error(error instanceof Error ? error.message : String(error)),
+  });
+  const workspaceBusy =
+    renameWorkspaceM.isPending ||
+    iconWorkspaceM.isPending ||
+    reorderWorkspaceM.isPending ||
+    deleteWorkspaceM.isPending ||
+    archiveWorkspaceM.isPending ||
+    unarchiveWorkspaceM.isPending;
+
+  /**
+   * Drag a workspace row up or down to reorder. Pointer-based with a small
+   * threshold, so a plain click still navigates: past the threshold the row
+   * translates with the pointer, the drop index is the number of other rows
+   * whose midpoint sits above the release point, and the click that follows
+   * a real drag is swallowed.
+   */
+  const startWorkspaceDrag = (workspaceId: string, event: ReactPointerEvent<HTMLLIElement>) => {
+    if (event.button !== 0 || event.pointerType === "touch") return;
+    if ((event.target as Element).closest?.("button, input, [role='menu']")) return;
+    const rowElement = event.currentTarget;
+    const startY = event.clientY;
+    const startX = event.clientX;
+    let dragging = false;
+    // Geometry is captured up front: rows shift with transforms mid-drag, so
+    // both the target index and the shift math must use the resting rects.
+    const rows = Array.from(document.querySelectorAll<HTMLElement>("[data-workspace-row]"));
+    const restingRects = rows.map((row) => row.getBoundingClientRect());
+    const from = rows.indexOf(rowElement);
+    const fromRect = restingRects[from];
+    const rowStride = (fromRect?.height ?? 36) + 8; // + the list's space-y-2
+    let lastTarget = from;
+
+    const targetIndexFor = (clientY: number) => {
+      let target = 0;
+      for (const [index, row] of rows.entries()) {
+        const rect = restingRects[index];
+        if (row === rowElement || !rect) continue;
+        if (clientY > rect.top + rect.height / 2) target += 1;
+      }
+      return target;
+    };
+
+    const onMove = (moveEvent: PointerEvent) => {
+      if (!dragging) {
+        if (Math.abs(moveEvent.clientY - startY) < 5 && Math.abs(moveEvent.clientX - startX) < 5) {
+          return;
+        }
+        dragging = true;
+        rowElement.style.zIndex = "10";
+        rowElement.style.position = "relative";
+        rowElement.style.background = "var(--shell)";
+        rowElement.style.borderRadius = "0.5rem";
+        rowElement.style.boxShadow = "0 6px 16px rgb(0 0 0 / 0.35)";
+        document.body.style.cursor = "grabbing";
+        document.body.style.userSelect = "none";
+      }
+      moveEvent.preventDefault();
+      rowElement.style.transform = `translateY(${moveEvent.clientY - startY}px)`;
+      // Everything between the old and prospective slot slides one stride to
+      // make room, so the drop target is always visible.
+      const target = targetIndexFor(moveEvent.clientY);
+      if (target === lastTarget) return;
+      lastTarget = target;
+      rows.forEach((row, index) => {
+        if (row === rowElement) return;
+        let shift = 0;
+        if (from < target && index > from && index <= target) shift = -rowStride;
+        if (from > target && index < from && index >= target) shift = rowStride;
+        row.style.transition = "transform 150ms var(--ease-swift, ease-out)";
+        row.style.transform = shift === 0 ? "" : `translateY(${shift}px)`;
+      });
+    };
+    const finish = (commit: boolean, clientY: number) => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointercancel", onCancel);
+      for (const row of rows) {
+        row.style.transform = "";
+        row.style.transition = "";
+      }
+      rowElement.style.zIndex = "";
+      rowElement.style.position = "";
+      rowElement.style.background = "";
+      rowElement.style.borderRadius = "";
+      rowElement.style.boxShadow = "";
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      if (!dragging) return;
+      const swallowClick = (clickEvent: Event) => {
+        clickEvent.stopPropagation();
+        clickEvent.preventDefault();
+      };
+      document.addEventListener("click", swallowClick, { capture: true, once: true });
+      window.setTimeout(
+        () => document.removeEventListener("click", swallowClick, { capture: true }),
+        0,
+      );
+      if (!commit) return;
+      const target = targetIndexFor(clientY);
+      if (target !== from) reorderWorkspaceM.mutate({ id: workspaceId, position: target });
+    };
+    const onUp = (upEvent: PointerEvent) => finish(true, upEvent.clientY);
+    const onCancel = () => finish(false, startY);
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp, { once: true });
+    document.addEventListener("pointercancel", onCancel);
+  };
+
+  /**
+   * Archiving stops the work and keeps everything else, so it only stops to
+   * ask when there is work to stop: a workspace of stopped windows archives
+   * on the click. The destructive copy stays on Delete, which keeps nothing.
+   */
+  const requestWorkspaceArchive = async (workspace: Workspace) => {
+    const live = workspaceLiveSessionCount(workspace, sessionsById);
+    if (live > 0) {
+      const accepted = await confirm({
+        title: `Archive ${workspace.name}?`,
+        body: `${live} running ${live === 1 ? "session" : "sessions"} will be stopped. The layout is kept — restore it any time from Archived and every window starts again where it is.`,
+        confirmLabel: "Archive workspace",
+      });
+      if (!accepted) return;
+    }
+    archiveWorkspaceM.mutate({
+      id: workspace.id,
+      name: workspace.name,
+      // The row that will sit where this one did — or the one above it when
+      // this was the last, and nothing at all when it was the only one.
+      nextId: (() => {
+        const index = orderedWorkspaces.findIndex((row) => row.id === workspace.id);
+        if (index < 0) return null;
+        return (orderedWorkspaces[index + 1] ?? orderedWorkspaces[index - 1])?.id ?? null;
+      })(),
+    });
+  };
+
+  const requestArchivedDelete = async (workspace: Workspace) => {
+    const accepted = await confirm({
+      title: `Delete ${workspace.name} forever?`,
+      body: "Its layout is discarded. This cannot be undone.",
+      confirmLabel: "Delete forever",
+      destructive: true,
+    });
+    if (accepted) deleteWorkspaceM.mutate(workspace.id);
+  };
+
+  const requestWorkspaceDelete = async (workspace: Workspace) => {
+    const accepted = await confirm({
+      title: `Delete ${workspace.name}?`,
+      body: "Every session in this workspace will be closed and its process will be killed.",
+      confirmLabel: "Delete workspace",
+      destructive: true,
+    });
+    if (accepted) deleteWorkspaceM.mutate(workspace.id);
+  };
+
+  const newWorkspaceButton = (
+    // Dressed exactly like the workspace rows below it.
+    <button
+      type="button"
+      onClick={
+        onlineHosts.length > 0
+          ? undefined
+          : () => {
+              onNavigate?.();
+              openSettings("hosts");
+            }
+      }
+      className={cn(sidebarRowClass(false), "group/new")}
+    >
+      <SidebarIconSlot>
+        <Plus className="size-4 transition-transform duration-150 group-hover/new:rotate-90" />
+      </SidebarIconSlot>
+      <SidebarRowLabel collapsed={collapsed}>New workspace</SidebarRowLabel>
+    </button>
+  );
+
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      {/* Brand / toggle header */}
-      <div className="px-2.5 pb-1 pt-3">
+    <div className="group/rail flex h-full min-h-0 flex-col bg-shell">
+      {/* h-9, not the --row-h nav rhythm: this row holds the 36px trident
+       * plate and nothing that has to line up with the tree below it, so the
+       * lockup sits tighter to the top edge than a nav row would. */}
+      <div className="px-2.5 pb-1.5 pt-2.5">
         <div className="flex h-9 items-center">
-          {collapsed ? (
-            <RailTooltip label="Expand sidebar">
-              <button
-                type="button"
-                aria-label="Expand sidebar"
-                onClick={onToggle}
-                className="group/brand grid size-9 shrink-0 place-items-center rounded-lg text-foreground transition-colors hover:bg-accent/50"
+          {/* The whole lockup goes home, not just the trident: the wordmark
+           * carries a second link to the same place, hovering either lights
+           * the trident's plate, and only the trident is in the tab order and
+           * the accessibility tree — two stops reading "spawnd home" back to
+           * back is noise, and the wordmark is the redundant one. */}
+          <div className="group/home flex min-w-0 flex-1 items-center">
+            {collapsed ? (
+              <RailTooltip label="Expand sidebar">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Expand sidebar"
+                  onClick={onToggle}
+                  className="size-9 shrink-0"
+                >
+                  {/* Anywhere on the rail, not just this button: reaching for
+                   * the sidebar at all is the intent, and the swap tells you
+                   * the mark is a door back before you get to it. */}
+                  <Trident className="size-5.5 group-hover/rail:hidden" />
+                  <PanelLeftOpen
+                    className="hidden size-4.5 text-muted-foreground group-hover/rail:block"
+                    aria-hidden
+                  />
+                </Button>
+              </RailTooltip>
+            ) : (
+              <Link
+                href="/"
+                onClick={onNavigate}
+                className="grid size-9 shrink-0 place-items-center rounded-lg text-foreground transition-colors group-hover/home:bg-accent/50"
+                aria-label="spawnd home"
               >
-                <SquareTerminal className="size-4.5 group-hover/brand:hidden" aria-hidden />
-                <PanelLeftOpen
-                  className="hidden size-4.5 text-muted-foreground group-hover/brand:block"
-                  aria-hidden
-                />
-              </button>
-            </RailTooltip>
-          ) : (
-            <Link
-              href="/"
-              className="grid size-9 shrink-0 place-items-center rounded-lg text-foreground transition-colors hover:bg-accent/50"
-              aria-label="Dashboard"
-            >
-              <SquareTerminal className="size-4.5" aria-hidden />
-            </Link>
-          )}
-          <RowLabel collapsed={collapsed} className="text-base font-semibold tracking-tight">
-            spawnd
-          </RowLabel>
-          <button
-            type="button"
-            aria-label="Collapse sidebar"
-            aria-hidden={collapsed}
-            tabIndex={collapsed ? -1 : 0}
-            onClick={onToggle}
-            className={cn(
-              "grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-opacity hover:bg-accent/50 hover:text-foreground",
-              collapsed
-                ? "pointer-events-none opacity-0 duration-100"
-                : "opacity-100 delay-75 duration-150",
+                <Trident className="size-5.5" />
+              </Link>
             )}
-          >
-            <PanelLeftClose className="size-4" aria-hidden />
-          </button>
+            {/* The lockup, not two marks: `flex items-center` centres the
+             * wordmark on the trident's axis (left to itself the mask is an
+             * inline-block and sits on the row's text baseline, 3px high), and
+             * hellfire is the brand ink the trident is drawn in — the chrome
+             * accent would swap it to the dark-theme ember and split the pair. */}
+            <SidebarRowLabel collapsed={collapsed} className="ml-1.5 flex items-center">
+              <Link
+                href="/"
+                onClick={onNavigate}
+                aria-hidden
+                tabIndex={-1}
+                className={cn(
+                  "flex items-center text-hellfire",
+                  // Faded out on the rail, so it must not still be a target
+                  // sitting in the empty space beside the trident.
+                  collapsed && "pointer-events-none",
+                )}
+              >
+                <Wordmark className="h-[17px]" />
+              </Link>
+            </SidebarRowLabel>
+          </div>
+          {showCollapseControl ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Collapse sidebar"
+              aria-hidden={collapsed}
+              tabIndex={collapsed ? -1 : 0}
+              onClick={onToggle}
+              className={cn(
+                // Muted like the expand control it mirrors: chrome, not a
+                // destination.
+                "size-7 shrink-0 text-muted-foreground hover:text-foreground",
+                collapsed
+                  ? "pointer-events-none opacity-0 duration-100"
+                  : "opacity-100 delay-75 duration-150",
+              )}
+            >
+              <PanelLeftClose className="size-4" aria-hidden />
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="Close sidebar"
+              onClick={onNavigate}
+              className="size-8 shrink-0"
+            >
+              <X className="size-4" aria-hidden />
+            </Button>
+          )}
         </div>
       </div>
 
-      {/* Primary nav */}
-      <nav aria-label="Primary" className="px-2.5">
-        <ul className="space-y-0.5">
-          <li className="pb-1.5">
-            <RailTooltip label="New agent" disabled={!collapsed}>
-              {/* Inverted primary row — the one call-to-action in the rail. */}
-              <Link
-                href="/agents/new"
-                className={cn(
-                  "group/new flex h-9 w-full items-center rounded-lg bg-primary text-sm font-medium text-primary-foreground shadow-sm transition-[background-color,box-shadow]",
-                  "hover:bg-primary/90 hover:shadow-md",
-                  pathname === "/agents/new" && "ring-2 ring-ring/40",
-                )}
-              >
-                <IconSlot>
-                  <SquarePen
-                    className="size-4 transition-transform duration-150 group-hover/new:scale-110"
-                    aria-hidden
-                  />
-                </IconSlot>
-                <RowLabel collapsed={collapsed}>New agent</RowLabel>
-              </Link>
-            </RailTooltip>
-          </li>
-          {NAV.map((item) => {
-            const Icon = item.icon;
-            const active =
-              item.href === "/"
-                ? pathname === "/"
-                : pathname === item.href || pathname.startsWith(`${item.href}/`);
+      <div className="border-y border-border px-2.5 py-2">
+        <RailTooltip label="New workspace" disabled={!collapsed}>
+          {onlineHosts.length > 0 ? (
+            <NewWorkspaceMenu
+              trigger={newWorkspaceButton}
+              onCreated={({ workspaceId, focusSessionId }) => {
+                refresh();
+                router.push(
+                  focusSessionId
+                    ? `/w/${workspaceId}?focus=${focusSessionId}`
+                    : `/w/${workspaceId}`,
+                );
+                onNavigate?.();
+              }}
+            />
+          ) : (
+            newWorkspaceButton
+          )}
+        </RailTooltip>
+      </div>
+
+      <nav aria-label="Workspaces" className="min-h-0 flex-1 overflow-y-auto px-2.5 pb-3 pt-2.5">
+        {actionError && !collapsed && (
+          <p className="px-1.5 pb-2 text-xs text-destructive" role="alert">
+            {actionError}
+          </p>
+        )}
+        {!collapsed && orderedWorkspaces.length > 1 && (
+          // Full-bleed rule under the box, matching the section rules above
+          // and below the tree: the search is chrome, the list beneath it is
+          // the content it filters.
+          <div className="-mx-2.5 mb-2.5 border-b border-border px-2.5 pb-2.5">
+            <SidebarSearch value={query} onChange={setQuery} label="Search workspaces" />
+          </div>
+        )}
+        {!collapsed && !workspacesQ.isLoading && orderedWorkspaces.length === 0 && (
+          <p className="px-2 py-4 text-xs leading-5 text-muted-foreground">
+            Your workspaces will appear here.
+          </p>
+        )}
+        {!collapsed && searching && visibleWorkspaces.length === 0 && (
+          <SidebarNoMatches query={query.trim()} />
+        )}
+        <ul className="space-y-2">
+          {visibleWorkspaces.map((workspace) => {
             return (
-              <li key={item.href}>
-                <RailTooltip label={item.label} disabled={!collapsed}>
-                  <Link
-                    href={item.href}
-                    aria-current={active ? "page" : undefined}
-                    className={rowClass(active)}
-                  >
-                    <IconSlot>
-                      <Icon className="size-4" aria-hidden />
-                    </IconSlot>
-                    <RowLabel collapsed={collapsed}>{item.label}</RowLabel>
-                  </Link>
-                </RailTooltip>
-              </li>
+              <SidebarWorkspaceRow
+                key={workspace.id}
+                workspace={workspace}
+                active={currentWorkspaceId === workspace.id}
+                collapsed={collapsed}
+                attentionCount={workspaceAttentionCount(workspace, sessionsById)}
+                busy={workspaceBusy}
+                onNavigate={onNavigate}
+                onRename={(name) => renameWorkspaceM.mutate({ id: workspace.id, name })}
+                onIcon={(icon) => iconWorkspaceM.mutate({ id: workspace.id, icon })}
+                onArchive={() => void requestWorkspaceArchive(workspace)}
+                onDelete={() => void requestWorkspaceDelete(workspace)}
+                onRowPointerDown={
+                  searching ? undefined : (event) => startWorkspaceDrag(workspace.id, event)
+                }
+              />
             );
           })}
         </ul>
       </nav>
 
-      {/* Host -> agent tree */}
-      <AgentTree pathname={pathname} collapsed={collapsed} />
+      <SidebarArchivedSection
+        workspaces={archivedQ.data ?? []}
+        collapsed={collapsed}
+        busy={workspaceBusy}
+        currentWorkspaceId={currentWorkspaceId}
+        onNavigate={onNavigate}
+        onRestore={(workspace) => unarchiveWorkspaceM.mutate(workspace.id)}
+        onDelete={(workspace) => void requestArchivedDelete(workspace)}
+      />
 
-      {/* Account footer */}
-      <div className="border-t border-border px-2.5 py-2">
+      {/* Below Archived and above Settings: the machines you own are footer
+       * furniture like the drawer over them, not a live ticker competing with
+       * the workspace tree. Fed from the queries above rather than its own —
+       * the section must not cost a request, and its counts must never
+       * disagree with the rows it sits under. */}
+      <LegionStrip
+        hosts={hostsQ.data ?? []}
+        sessions={sessionsQ.data ?? []}
+        collapsed={collapsed}
+        onNavigate={onNavigate}
+      />
+
+      <div className="border-y border-border px-2.5 py-2">
+        <RailTooltip label="Settings" disabled={!collapsed}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              onNavigate?.();
+              openSettings("account");
+            }}
+            className={cn(sidebarRowClass(false), "justify-start px-0")}
+          >
+            <SidebarIconSlot>
+              <Settings className="size-4" aria-hidden />
+            </SidebarIconSlot>
+            <SidebarRowLabel collapsed={collapsed}>Settings</SidebarRowLabel>
+          </Button>
+        </RailTooltip>
+
         <DropdownMenu
           side="top"
           align="start"
           className="block w-full"
-          menuClassName="w-56"
           renderTrigger={(props) => (
             <RailTooltip label={user?.email ?? "Account"} disabled={!collapsed}>
-              <button
-                type="button"
+              <Button
                 {...props}
+                type="button"
+                variant="ghost"
+                size="sm"
                 aria-label="Account menu"
-                className={cn(rowClass(false), "h-11")}
+                className={cn(sidebarRowClass(false), "h-11 justify-start px-0")}
               >
-                <IconSlot>
+                <SidebarIconSlot>
                   <span className="grid size-6 place-items-center rounded-full bg-secondary text-[11px] font-semibold uppercase text-secondary-foreground">
                     {(user?.email ?? "?").slice(0, 1)}
                   </span>
-                </IconSlot>
-                <RowLabel collapsed={collapsed} className="text-xs">
+                </SidebarIconSlot>
+                <SidebarRowLabel collapsed={collapsed} className="text-xs">
                   {user?.email ?? "—"}
-                </RowLabel>
-              </button>
+                </SidebarRowLabel>
+              </Button>
             </RailTooltip>
           )}
         >
-          <DropdownMenuLabel className="truncate">{user?.email ?? "—"}</DropdownMenuLabel>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => openSettings("account")}>
-            <Settings className="size-4" aria-hidden />
-            Settings
+          <DropdownMenuItem
+            onSelect={() => {
+              onNavigate?.();
+              openProfile();
+            }}
+          >
+            <UserRound className="size-4" aria-hidden />
+            Profile
           </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          {/* Settings has its own rail row above; Access keeps the one-click
+              reach the v5 Access UX asks for (docs/TRUST_UX.md). */}
           <DropdownMenuItem onSelect={() => openSettings("access")}>
             <ShieldCheck className="size-4" aria-hidden />
             Access
@@ -248,500 +632,5 @@ export function Sidebar({
         </DropdownMenu>
       </div>
     </div>
-  );
-}
-
-function AgentTree({ pathname, collapsed }: { pathname: string; collapsed: boolean }) {
-  const qc = useQueryClient();
-  const router = useRouter();
-  const agentsQ = useQuery({
-    queryKey: ["agents"],
-    queryFn: () => agents.list(),
-    refetchInterval: 5_000,
-  });
-
-  const screensQ = useQuery({
-    queryKey: ["screens"],
-    queryFn: screens.list,
-    refetchInterval: 30_000,
-  });
-  const allScreens = screensQ.data ?? [];
-  const currentScreenId = /^\/screens\/([^/?]+)/.exec(pathname)?.[1] ?? null;
-  const agentsById = useMemo(
-    () => new Map((agentsQ.data ?? []).map((agent) => [agent.id, agent])),
-    [agentsQ.data],
-  );
-
-  // Recents: agents and screens as one recency-sorted list (pinned agents
-  // float to the top), so the sidebar has a single mental model instead of
-  // "agents grouped by host" plus a separate "screens" shelf.
-  // Pinned agents render in their own group above the "Recents" label; the
-  // rest sort by recency. Recency keys off last *input* (and screen edits),
-  // not output, so a chattering agent doesn't reshuffle the list every tick.
-  const { pinnedItems, recentItems } = useMemo(() => {
-    const agentItems: RecentItem[] = (agentsQ.data ?? []).map((agent) => ({
-      kind: "agent",
-      id: agent.id,
-      recency: agentRecency(agent),
-      pinned: Boolean(agent.pinned_at),
-      agent,
-    }));
-    const screenItems: RecentItem[] = allScreens.map((item) => ({
-      kind: "screen",
-      id: item.id,
-      recency: screenRecency(item, agentsById),
-      pinned: Boolean(item.pinned_at),
-      screen: item,
-    }));
-    const all = [...agentItems, ...screenItems];
-    const byRecency = (a: RecentItem, b: RecentItem) => b.recency - a.recency;
-    return {
-      pinnedItems: all.filter((item) => item.pinned).sort(byRecency),
-      recentItems: all.filter((item) => !item.pinned).sort(byRecency),
-    };
-  }, [agentsQ.data, allScreens, agentsById]);
-
-  const [actionError, setActionError] = useState<string | null>(null);
-
-  const invalidate = (id?: string) => {
-    qc.invalidateQueries({ queryKey: ["agents"] });
-    qc.invalidateQueries({ queryKey: ["hosts"] });
-    if (id) qc.invalidateQueries({ queryKey: ["agent", id] });
-  };
-
-  const renameM = useMutation({
-    mutationFn: ({ id, name }: { id: string; name: string }) => agents.rename(id, name),
-    onSuccess: (_agent, vars) => {
-      setActionError(null);
-      invalidate(vars.id);
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const archiveM = useMutation({
-    mutationFn: (id: string) => agents.archive(id),
-    onSuccess: (_agent, id) => {
-      setActionError(null);
-      invalidate(id);
-      if (pathname === `/agents/${id}`) router.push("/agents");
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const deleteM = useMutation({
-    mutationFn: (id: string) => agents.remove(id),
-    onSuccess: (_result, id) => {
-      setActionError(null);
-      invalidate(id);
-      if (pathname === `/agents/${id}`) router.push("/agents");
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const restartM = useMutation({
-    mutationFn: (id: string) => agents.restart(id),
-    onSuccess: (_agent, id) => {
-      setActionError(null);
-      invalidate(id);
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const deleteScreenM = useMutation({
-    mutationFn: (screenId: string) => screens.remove(screenId),
-    onSuccess: (_result, screenId) => {
-      setActionError(null);
-      qc.invalidateQueries({ queryKey: ["screens"] });
-      if (pathname === `/screens/${screenId}`) router.push("/agents");
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const pinScreenM = useMutation({
-    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) => screens.update(id, { pinned }),
-    onSuccess: () => {
-      setActionError(null);
-      qc.invalidateQueries({ queryKey: ["screens"] });
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-  const pinM = useMutation({
-    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) =>
-      pinned ? agents.pin(id) : agents.unpin(id),
-    onSuccess: (_agent, vars) => {
-      setActionError(null);
-      invalidate(vars.id);
-    },
-    onError: (err) => setActionError(String(err)),
-  });
-
-  const busy =
-    renameM.isPending ||
-    archiveM.isPending ||
-    deleteM.isPending ||
-    restartM.isPending ||
-    pinM.isPending;
-  const screenBusy = deleteScreenM.isPending || pinScreenM.isPending;
-
-  const promptRename = (agent: Agent) => {
-    const next = prompt("Rename agent", agent.name ?? agentTitle(agent));
-    if (next === null) return;
-    const name = next.trim();
-    if (!name || name === agent.name) return;
-    renameM.mutate({ id: agent.id, name });
-  };
-
-  const renderItem = (item: RecentItem) =>
-    item.kind === "screen" ? (
-      <ScreenRow
-        key={`screen-${item.id}`}
-        screen={item.screen}
-        agentsById={agentsById}
-        collapsed={collapsed}
-        active={currentScreenId === item.id}
-        busy={screenBusy}
-        onPin={() => pinScreenM.mutate({ id: item.id, pinned: !item.screen.pinned_at })}
-        onDelete={() => {
-          if (confirm(`Delete screen ${item.screen.name}?`)) deleteScreenM.mutate(item.id);
-        }}
-      />
-    ) : (
-      <AgentRow
-        key={`agent-${item.id}`}
-        agent={item.agent}
-        collapsed={collapsed}
-        active={pathname === `/agents/${item.id}`}
-        // Always open the full agent view — even when the agent is a pane on
-        // the screen you're viewing. To jump back into the screen, use the
-        // membership chip in the agent header or the pane itself.
-        href={`/agents/${item.id}`}
-        busy={busy}
-        onRename={() => promptRename(item.agent)}
-        onPin={() => pinM.mutate({ id: item.id, pinned: !item.agent.pinned_at })}
-        onRestart={() => {
-          if (confirm(`Restart ${agentTitle(item.agent)}?`)) restartM.mutate(item.id);
-        }}
-        onArchive={() => archiveM.mutate(item.id)}
-        onDelete={() => {
-          if (confirm(`Delete ${agentTitle(item.agent)}?`)) deleteM.mutate(item.id);
-        }}
-      />
-    );
-
-  return (
-    <section
-      aria-label="Recents"
-      className="mt-4 min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2.5 pb-2"
-    >
-      {actionError && !collapsed && (
-        <p className="mb-1 px-1.5 text-[11px] text-destructive">{actionError}</p>
-      )}
-      {pinnedItems.length > 0 && (
-        <ul className="mb-1">
-          <SidebarSectionLabel collapsed={collapsed}>Pinned</SidebarSectionLabel>
-          {pinnedItems.map(renderItem)}
-        </ul>
-      )}
-      <ul>
-        <SidebarSectionLabel collapsed={collapsed}>Recents</SidebarSectionLabel>
-        {recentItems.map(renderItem)}
-        {!agentsQ.isLoading &&
-          recentItems.length === 0 &&
-          pinnedItems.length === 0 &&
-          !collapsed && <li className="px-1.5 py-1 text-xs text-muted-foreground">Nothing yet</li>}
-      </ul>
-    </section>
-  );
-}
-
-type AgentItem = { kind: "agent"; id: string; recency: number; pinned: boolean; agent: Agent };
-type ScreenItem = { kind: "screen"; id: string; recency: number; pinned: boolean; screen: Screen };
-type RecentItem = AgentItem | ScreenItem;
-
-function SidebarSectionLabel({ collapsed, children }: { collapsed: boolean; children: ReactNode }) {
-  return (
-    <li aria-hidden={collapsed}>
-      <span
-        className={cn(
-          "flex items-center overflow-hidden whitespace-nowrap px-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground transition-all",
-          collapsed ? "h-4 opacity-0 duration-100" : "h-7 opacity-100 delay-75 duration-150",
-        )}
-      >
-        {children}
-      </span>
-    </li>
-  );
-}
-
-function agentRecency(agent: Agent): number {
-  // Last *input* (or start), not output — user-driven order that doesn't
-  // churn while an agent streams.
-  const value = agent.last_input_at ?? agent.started_at;
-  const time = Date.parse(value);
-  return Number.isFinite(time) ? time : 0;
-}
-
-const CONN_LABEL: Record<Exclude<AgentConnState, "off">, string> = {
-  connected: "Connected",
-  warm: "Warm — connected in the background",
-  connecting: "Connecting…",
-};
-
-/**
- * Whether this browser holds a live connection to the agent, as an edge marker
- * on the row rather than a dot on the icon.
- *
- * The icon already carries the activity dot, and two 8px circles stacked on one
- * 16px glyph read as a single smudge — worse, they encode unrelated things
- * (what the agent is doing vs whether we are attached to it) in the same shape
- * and nearly the same colour. A bar on the row edge is a different axis
- * entirely, so neither has to be told apart from the other.
- */
-function PoolConnMarker({ state }: { state: Exclude<AgentConnState, "off"> }) {
-  return (
-    <span
-      aria-hidden
-      title={CONN_LABEL[state]}
-      className={cn(
-        "pointer-events-none absolute left-0 top-1/2 w-[3px] -translate-y-1/2 rounded-r-full transition-all",
-        state === "connecting" ? "h-3 animate-pulse bg-amber-400" : "h-5",
-        state === "connected" && "bg-emerald-500",
-        state === "warm" && "bg-emerald-500/45",
-      )}
-    />
-  );
-}
-
-function AgentRow({
-  agent,
-  collapsed,
-  active,
-  href,
-  busy,
-  onRename,
-  onPin,
-  onRestart,
-  onArchive,
-  onDelete,
-}: {
-  agent: Agent;
-  collapsed: boolean;
-  active: boolean;
-  href: string;
-  busy: boolean;
-  onRename: () => void;
-  onPin: () => void;
-  onRestart: () => void;
-  onArchive: () => void;
-  onDelete: () => void;
-}) {
-  const menuHandle = useRef<DropdownMenuHandle>(null);
-  const conn = useAgentConnState(agent.id);
-  const attached = conn === "connected" || conn === "warm";
-  return (
-    <li
-      className="group/agentrow relative my-0.5"
-      onContextMenu={
-        collapsed
-          ? undefined
-          : (event) => {
-              event.preventDefault();
-              menuHandle.current?.openAt(event.clientX, event.clientY);
-            }
-      }
-    >
-      <RailTooltip
-        label={`${agentTitle(agent)} · ${agentActivityDetail(agent)}${
-          conn === "off" ? "" : ` · ${CONN_LABEL[conn]}`
-        }`}
-        disabled={!collapsed}
-      >
-        <Link
-          href={href}
-          aria-current={active ? "page" : undefined}
-          draggable
-          onDragStart={(event) => {
-            setAgentDragData(event.dataTransfer, agent.id, agentTitle(agent));
-          }}
-          className={cn(
-            rowClass(active),
-            "h-10",
-            !collapsed && "pr-7",
-            // An attached agent is one you are already holding open; let it
-            // read at full strength instead of the resting muted tone.
-            attached && !active && "text-foreground",
-          )}
-        >
-          <IconSlot>
-            <span className="relative">
-              <AgentKindIcon agent={agent} />
-              <AgentStatusDot agent={agent} className="absolute -bottom-0.5 -right-0.5" />
-            </span>
-          </IconSlot>
-          <RowLabel collapsed={collapsed}>
-            <span className="flex items-center gap-1 text-xs font-medium leading-4">
-              <span className="truncate">{agentTitle(agent)}</span>
-              {agent.pinned_at && (
-                <Pin className="size-3 shrink-0 text-muted-foreground" aria-label="Pinned" />
-              )}
-            </span>
-            <span className="block truncate text-[10px] leading-3 opacity-70">
-              {agentActivityDetail(agent)}
-            </span>
-          </RowLabel>
-        </Link>
-      </RailTooltip>
-      {conn !== "off" && <PoolConnMarker state={conn} />}
-      {!collapsed && (
-        <DropdownMenu
-          ref={menuHandle}
-          className="absolute right-1 top-1/2 -translate-y-1/2"
-          menuClassName="w-44"
-          renderTrigger={(props) => (
-            <button
-              {...props}
-              type="button"
-              aria-label={`${agentTitle(agent)} actions`}
-              className={cn(
-                "grid size-6 place-items-center rounded-md text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground",
-                "opacity-0 focus-visible:opacity-100 group-hover/agentrow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100",
-              )}
-            >
-              <MoreHorizontal className="size-3.5" aria-hidden />
-            </button>
-          )}
-        >
-          <DropdownMenuItem disabled={busy} onSelect={onRename}>
-            <Pencil className="size-4" aria-hidden />
-            Rename
-          </DropdownMenuItem>
-          <DropdownMenuItem disabled={busy} onSelect={onPin}>
-            {agent.pinned_at ? (
-              <PinOff className="size-4" aria-hidden />
-            ) : (
-              <Pin className="size-4" aria-hidden />
-            )}
-            {agent.pinned_at ? "Unpin" : "Pin"}
-          </DropdownMenuItem>
-          <DropdownMenuItem disabled={busy} onSelect={onRestart}>
-            <RotateCcw className="size-4" aria-hidden />
-            Restart
-          </DropdownMenuItem>
-          <DropdownMenuItem disabled={busy} onSelect={onArchive}>
-            <Archive className="size-4" aria-hidden />
-            Archive
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem destructive disabled={busy} onSelect={onDelete}>
-            <Trash2 className="size-4" aria-hidden />
-            Delete
-          </DropdownMenuItem>
-        </DropdownMenu>
-      )}
-    </li>
-  );
-}
-
-function ScreenRow({
-  screen,
-  agentsById,
-  collapsed,
-  active,
-  busy,
-  onPin,
-  onDelete,
-}: {
-  screen: Screen;
-  agentsById: Map<string, Agent>;
-  collapsed: boolean;
-  active: boolean;
-  busy: boolean;
-  onPin: () => void;
-  onDelete: () => void;
-}) {
-  const paneCount = screenPaneCount(screen);
-  const attention = screenAttentionCount(screen, agentsById);
-  const menuHandle = useRef<DropdownMenuHandle>(null);
-  return (
-    <li
-      className="group/agentrow relative my-0.5"
-      onContextMenu={
-        collapsed
-          ? undefined
-          : (event) => {
-              event.preventDefault();
-              menuHandle.current?.openAt(event.clientX, event.clientY);
-            }
-      }
-    >
-      <RailTooltip label={`${screen.name} · ${paneCount} panes`} disabled={!collapsed}>
-        <Link
-          href={`/screens/${screen.id}`}
-          aria-current={active ? "page" : undefined}
-          className={cn(rowClass(active), "h-10", !collapsed && "pr-7")}
-        >
-          <IconSlot>
-            <span className="relative">
-              <ScreenIcon paneCount={paneCount} />
-              {attention > 0 && (
-                <span className="absolute -right-1 -top-1 size-2 rounded-full bg-amber-400" />
-              )}
-            </span>
-          </IconSlot>
-          <RowLabel collapsed={collapsed}>
-            <span className="flex items-center gap-1 text-xs font-medium leading-4">
-              <span className={cn("truncate", screen.ephemeral && "italic opacity-80")}>
-                {screen.name}
-              </span>
-              {screen.pinned_at && (
-                <Pin className="size-3 shrink-0 text-muted-foreground" aria-label="Pinned" />
-              )}
-              {attention > 0 && (
-                <span className="shrink-0 rounded-full bg-amber-400/20 px-1 text-[9px] font-semibold text-amber-500">
-                  {attention}
-                </span>
-              )}
-            </span>
-            <span className="block truncate text-[10px] leading-3 opacity-70">
-              {paneCount} {paneCount === 1 ? "pane" : "panes"}
-              {screen.ephemeral ? " · temporary" : ""}
-            </span>
-          </RowLabel>
-        </Link>
-      </RailTooltip>
-      {!collapsed && (
-        <DropdownMenu
-          ref={menuHandle}
-          className="absolute right-1 top-1/2 -translate-y-1/2"
-          menuClassName="w-44"
-          renderTrigger={(props) => (
-            <button
-              {...props}
-              type="button"
-              aria-label={`${screen.name} actions`}
-              className={cn(
-                "grid size-6 place-items-center rounded-md text-muted-foreground transition-opacity hover:bg-accent hover:text-foreground",
-                "opacity-0 focus-visible:opacity-100 group-hover/agentrow:opacity-100 aria-expanded:opacity-100 [@media(pointer:coarse)]:opacity-100",
-              )}
-            >
-              <MoreHorizontal className="size-3.5" aria-hidden />
-            </button>
-          )}
-        >
-          <DropdownMenuItem href={`/screens/${screen.id}`}>
-            <LayoutGrid className="size-4" aria-hidden />
-            Open screen
-          </DropdownMenuItem>
-          <DropdownMenuItem disabled={busy} onSelect={onPin}>
-            {screen.pinned_at ? (
-              <PinOff className="size-4" aria-hidden />
-            ) : (
-              <Pin className="size-4" aria-hidden />
-            )}
-            {screen.pinned_at ? "Unpin" : "Pin"}
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem destructive disabled={busy} onSelect={onDelete}>
-            <Trash2 className="size-4" aria-hidden />
-            Delete screen
-          </DropdownMenuItem>
-        </DropdownMenu>
-      )}
-    </li>
   );
 }

@@ -623,12 +623,19 @@ worker_dir="$tmp_dir/workers"
 mkdir -p "$daemon_home" "$agent_cwd" "$fake_bin" "$worker_dir"
 validate_worker_socket_paths "$worker_dir"
 
-cat >"$fake_bin/codex" <<'SH'
+# Sessions are always the host's login shell (resolved from $SHELL in the
+# daemon's environment), so the smoke's stand-in IS the shell: it writes the
+# readiness markers the argv-era commands used to write, dumps the capability
+# surface the daemon materializes for every session, and then behaves like a
+# shell — alive on stdin until torn down.
+cat >"$fake_bin/spawn-smoke-shell" <<'SH'
 #!/usr/bin/env sh
-set -eu
+set -u
 
+printf 'spawn-smoke-ready\n' > .spawn-smoke-ready
+printf '%s-ready' "$(basename "$PWD")" > .spawn-worker-ready
 printf '%s\n' "fake-codex-ready"
-python3 - <<'PY'
+python3 - <<'PY' || printf '%s\n' "spawn-smoke-shell: capability dump failed"
 import json
 import os
 from pathlib import Path
@@ -675,7 +682,7 @@ while IFS= read -r line; do
   printf 'fake-codex-echo:%s\n' "$line"
 done
 SH
-chmod 755 "$fake_bin/codex"
+chmod 755 "$fake_bin/spawn-smoke-shell"
 
 start_server() {
   local identity uv_exe
@@ -740,6 +747,7 @@ start_daemon() {
     SPAWN_DISABLE_KEYRING=1 \
     SPAWN_CONFIG_DIR="$daemon_home/.config/spawn" \
     SPAWND_WORKER_DIR="$worker_dir" \
+    SHELL="$fake_bin/spawn-smoke-shell" \
     PATH="$fake_bin:$PATH" \
     python3 -c \
       'import os, sys; os.setsid(); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)' \
@@ -923,8 +931,8 @@ import urllib.request
 
 base_url, token, host_id = sys.argv[1:]
 headers = {"Authorization": f"Bearer {token}"}
-query = urllib.parse.urlencode({"host_id": host_id, "include_archived": "true"})
-req = urllib.request.Request(f"{base_url}/api/agents?{query}", headers=headers)
+query = urllib.parse.urlencode({"host_id": host_id})
+req = urllib.request.Request(f"{base_url}/api/sessions?{query}", headers=headers)
 with urllib.request.urlopen(req, timeout=10) as response:
     agents = json.loads(response.read().decode())
 
@@ -932,10 +940,10 @@ failures = []
 for agent in agents:
     agent_id = agent.get("id")
     if not isinstance(agent_id, str):
-        failures.append(f"invalid agent identity: {agent!r}")
+        failures.append(f"invalid session identity: {agent!r}")
         continue
     req = urllib.request.Request(
-        f"{base_url}/api/agents/{agent_id}", headers=headers, method="DELETE"
+        f"{base_url}/api/sessions/{agent_id}", headers=headers, method="DELETE"
     )
     try:
         with urllib.request.urlopen(req, timeout=10):
@@ -984,7 +992,7 @@ base_url, token, agent_id = sys.argv[1:]
 last = None
 for _ in range(120):
     req = urllib.request.Request(
-        f"{base_url}/api/agents/{agent_id}",
+        f"{base_url}/api/sessions/{agent_id}",
         headers={"Authorization": f"Bearer {token}"},
     )
     try:
@@ -1285,14 +1293,16 @@ def request(method: str, path: str, payload: dict | None = None) -> dict:
         raise SystemExit(f"{method} {path} failed: {error.code} {error.read().decode()}") from error
 
 
+# The session's login shell (the smoke's stand-in) performs the capability
+# dump itself; the smoke-created skill is enabled_by_default, so an omitted
+# skill_ids grants it.
 created = request(
     "POST",
-    "/api/agents",
+    "/api/sessions",
     {
         "host_id": host_id,
         "name": "fake-codex-capabilities",
         "cwd": cwd,
-        "argv": ["codex", "--yolo"],
     },
 )
 print(json.dumps({"agent_id": created["id"]}))
@@ -1312,7 +1322,7 @@ if not report["checks"] or not all(report["checks"].values()):
 PY
 curl -fsS -X DELETE \
   -H "Authorization: Bearer $smoke_token" \
-  "$base_url/api/agents/$smoke_agent_id" >/dev/null
+  "$base_url/api/sessions/$smoke_agent_id" >/dev/null
 smoke_agent_id=""
 wait_for_smoke_worker_teardown 200
 wait_daemon_ready
@@ -1344,17 +1354,14 @@ def request(method: str, path: str, payload: dict | None = None) -> dict:
         raise SystemExit(f"{method} {path} failed: {error.code} {error.read().decode()}") from error
 
 
+# The login shell writes .spawn-smoke-ready on startup and stays alive on
+# stdin — the same persistence the argv-era sleep loop provided.
 created = request(
     "POST",
-    "/api/agents",
+    "/api/sessions",
     {
         "host_id": host_id,
         "cwd": cwd,
-        "argv": [
-            "sh",
-            "-lc",
-            "printf 'spawn-smoke-ready\\n' > .spawn-smoke-ready; printf 'spawn-smoke-ready\\n'; while :; do sleep 1; done",
-        ],
     },
 )
 print(json.dumps({"agent_id": created["id"]}))
@@ -1402,30 +1409,27 @@ def request(method: str, path: str, payload: dict | None = None) -> dict:
 def wait_for(agent_id: str, path: Path, marker: str) -> None:
     last = None
     for _ in range(120):
-        agent = request("GET", f"/api/agents/{agent_id}")
+        agent = request("GET", f"/api/sessions/{agent_id}")
         last = agent
         if agent.get("status") == "running" and path.is_file() and path.read_text() == marker:
             return
         time.sleep(0.1)
-    raise RuntimeError(f"agent {agent_id} did not become isolated and ready; last={last!r}")
+    raise RuntimeError(f"session {agent_id} did not become isolated and ready; last={last!r}")
 
 
 def exercise(index: int) -> str:
+    # The login shell writes "<cwd basename>-ready" into .spawn-worker-ready,
+    # so distinct cwds prove distinct workers. The server always creates the
+    # session cwd.
     ready = f"concurrent-{index}-ready"
     cwd = Path(root_cwd) / f"concurrent-{index}"
     created = request(
         "POST",
-        "/api/agents",
+        "/api/sessions",
         {
             "host_id": host_id,
             "name": f"concurrent-{index}",
             "cwd": str(cwd),
-            "argv": [
-                "sh",
-                "-lc",
-                f"printf '{ready}' > .spawn-worker-ready; while :; do sleep 1; done",
-            ],
-            "create_cwd": True,
         },
     )
     agent_id = created["id"]
@@ -1443,7 +1447,7 @@ try:
 finally:
     for agent_id in list(agent_ids):
         try:
-            request("DELETE", f"/api/agents/{agent_id}")
+            request("DELETE", f"/api/sessions/{agent_id}")
         except Exception:
             pass
 PY
@@ -1466,7 +1470,7 @@ wait_file_contains "$agent_cwd/.spawn-smoke-ready" "spawn-smoke-ready"
 
 curl -fsS -X DELETE \
   -H "Authorization: Bearer $smoke_token" \
-  "$base_url/api/agents/$smoke_agent_id" >/dev/null
+  "$base_url/api/sessions/$smoke_agent_id" >/dev/null
 smoke_agent_id=""
 
 printf '%s\n' "smoke-local-daemon: passed"

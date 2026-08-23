@@ -24,9 +24,12 @@ import {
   useRef,
   useState,
 } from "react";
-import type { AgentConnectionInfo } from "@/components/terminal/ConnectionChip";
+import { ConnectingOverlay } from "@/components/terminal/ConnectingOverlay";
+import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
-import { useAgentSocket } from "@/components/terminal/useAgentSocket";
+import { type UploadTrack, uploadRatio } from "@/components/terminal/upload-progress";
+import { UploadProgressBar } from "@/components/terminal/upload-progress-bar";
+import { useSessionSocket } from "@/components/terminal/useSessionSocket";
 // Terminal configuration shared with the conformance harness
 // (tools/term-conformance/); see xterm-config.mjs before changing options.
 import {
@@ -39,12 +42,13 @@ import {
   terminalTheme,
   XTERM_EMULATION_OPTIONS,
 } from "@/components/terminal/xterm-config.mjs";
-import { DirectAgentUploadError } from "@/lib/agent-ctl";
-import { agents, hosts, trust } from "@/lib/api";
+import { hosts, sessions, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { CarriedEndorsement } from "@/lib/hostControl";
+import { DirectSessionUploadError } from "@/lib/session-ctl";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
+import { viewportInset } from "@/lib/viewport";
 import type { DisplayControlState } from "@/lib/ws";
 
 const TERMINAL_LINE_HEIGHT_PX = TERMINAL_FONT_SIZE * TERMINAL_LINE_HEIGHT;
@@ -63,7 +67,7 @@ const KEYBOARD_MIN_INSET_PX = 120;
 // Endpoint replay requests can time out without a reply; clear the in-flight
 // flag eventually or scrollback fetches would wedge for the whole session.
 const SCROLLBACK_SNAPSHOT_TIMEOUT_MS = 6_000;
-// The cache refresh debounces on output, but a continuously-streaming agent
+// The cache refresh debounces on output, but a continuously-streaming app
 // would postpone it forever — bound how stale the cache is allowed to get.
 const SCROLLBACK_REFRESH_MAX_WAIT_MS = 2_500;
 // Before an offset-anchored PTY stream is active, refresh less aggressively;
@@ -92,6 +96,20 @@ const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 
 type TouchVelocitySample = { time: number; y: number };
+
+/**
+ * Where a touch drag's vertical pixels go. Decided once per gesture, the
+ * moment it clears the tap slop, and held until the finger lifts (momentum
+ * included) so a flick never changes hands halfway down.
+ *
+ * "terminal" is this terminal's own scrollback; "page" is the pane stack it
+ * sits in. A terminal that cannot use the drag — the alternate buffer, which
+ * has no scrollback at all, or a normal buffer already at the end the finger
+ * is pulling toward — hands it to the stack instead of swallowing it. On
+ * mobile that handoff is the only way to scroll the stack: bar a 36px header,
+ * a pane is terminal from edge to edge.
+ */
+type TouchScrollRoute = "undecided" | "terminal" | "page";
 type MobileReturnMode = "submit" | "newline";
 type ImagePasteMode = "deferred" | "bracketed-path";
 type PendingAttachmentStatus = "uploading" | "ready" | "error";
@@ -144,9 +162,9 @@ class UploadReconciliationBlockedError extends Error {
 }
 
 export interface TerminalHandle {
-  /** Raw stdin into the agent (binary frame). */
+  /** Raw stdin into the session PTY (binary frame). */
   sendInput: (bytes: Uint8Array | string) => void;
-  /** Tell the agent the new TTY size. */
+  /** Tell the daemon the new TTY size. */
   resize: (cols: number, rows: number) => void;
   /** Force a re-fit against the current container size. */
   fit: () => void;
@@ -172,14 +190,14 @@ export interface TerminalHandle {
   pasteText: (text: string) => void;
   /** Promote this browser to the shared PTY geometry controller. */
   takeControl: () => void;
-  /** Open the native file picker to upload files to this agent. */
+  /** Open the native file picker to upload files to this session. */
   openUpload: () => void;
   /** Scroll the viewport back to the live edge (bottom of the buffer). */
   snapToLiveEdge: () => void;
 }
 
 export interface TerminalProps {
-  agentId: string;
+  sessionId: string;
   /** When false, keystrokes don't go to the WS; the Composer handles it. */
   rawInput?: boolean;
   /** On mobile soft keyboards, Return can be reserved for multiline prompts. */
@@ -199,18 +217,18 @@ export interface TerminalProps {
    *  reclaims control and fits to its container. Default true. */
   active?: boolean;
   /** Live transport snapshot (path kind, RTT) for connection indicators. */
-  onConnectionInfo?: (info: AgentConnectionInfo) => void;
+  onConnectionInfo?: (info: SessionConnectionInfo) => void;
   onExit?: (exitCode: number | null, signal: string | null) => void;
 }
 
 /**
- * Mounts xterm.js in a container, pipes its output through the per-agent
+ * Mounts xterm.js in a container, pipes its output through the per-session
  * WebSocket, and applies fit + resize handling. The component is a ref-forwarding
  * shell so the parent (terminal page) can poke it from the Composer / ModifierBar.
  */
 export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Terminal(
   {
-    agentId,
+    sessionId,
     rawInput = false,
     mobileReturnMode = "submit",
     mobileReturnBytes = ALT_ENTER,
@@ -420,6 +438,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     momentumLastTime: number;
     scrollRemainderPx: number;
     openedScrollback: boolean;
+    route: TouchScrollRoute;
+    pageScroller: HTMLElement | null;
   }>({
     active: false,
     startX: 0,
@@ -437,13 +457,29 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     momentumLastTime: 0,
     scrollRemainderPx: 0,
     openedScrollback: false,
+    route: "undecided",
+    pageScroller: null,
   });
   const [exitBanner, setExitBanner] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  // Whether this terminal has ever had bytes rendered into it. It is what the
+  // connecting overlay watches: an empty pane is worth explaining, a pane with
+  // output in it is not worth covering. Latched once and never cleared — a
+  // later reconnect belongs to the status chip, not to a full-pane card.
+  const [painted, setPainted] = useState(false);
+  const paintedRef = useRef(false);
+  const markPainted = useCallback(() => {
+    if (paintedRef.current) return;
+    paintedRef.current = true;
+    setPainted(true);
+  }, []);
   const [uploadReconciliations, setUploadReconciliations] = useState<UploadReconciliation[]>([]);
   const [uploadReconciliationFault, setUploadReconciliationFault] = useState<string | null>(null);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
+  // Byte progress of every upload in flight, keyed by upload id. Drives the
+  // hairline across the top of the terminal; see UploadProgressBar.
+  const [uploadTracks, setUploadTracks] = useState<Record<string, UploadTrack>>({});
   const [dropActive, setDropActive] = useState(false);
   // Live-edge tracking drives the "jump to latest" button. `atLiveEdge` is the
   // rendered state; the ref mirrors it for synchronous reads inside output
@@ -543,7 +579,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const pinLiveViewportToBottomRef = useRef<() => void>(() => {});
   const requestSnapshotRef = useRef<() => boolean>(() => false);
   const scheduleScrollbackCacheRefreshRef = useRef<(delayMs?: number) => void>(() => {});
-  // True once a snapshot/history proved this agent ships exact worker
+  // True once a snapshot/history proved this session ships exact worker
   // replays; used to widen the overlay fetch budget (the daemon maps lines
   // to a byte budget, and TUI redraw churn dwarfs line-based sizing).
   const exactStreamRef = useRef(false);
@@ -639,7 +675,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       // Clear via escape sequences instead of term.reset(): reset() also
       // wipes terminal modes (bracketed paste, mouse reporting, application
-      // cursor keys) that the agent still believes are active, garbling
+      // cursor keys) that the app still believes are active, garbling
       // input until the next full repaint. The 3J matters: without wiping
       // local scrollback, the seed's replayed output would duplicate lines
       // the buffer already scrolled in.
@@ -667,50 +703,69 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   }, []);
 
   const syncUploadReconciliations = useCallback(() => {
-    const state = loadUploadReconciliationState(agentId);
+    const state = loadUploadReconciliationState(sessionId);
     setUploadReconciliations(state.records);
     setUploadReconciliationFault(state.fault);
-  }, [agentId]);
+  }, [sessionId]);
 
   useEffect(() => syncUploadReconciliations(), [syncUploadReconciliations]);
 
   useEffect(() => {
     const sync = (event: Event) => {
-      if (!(event instanceof CustomEvent) || event.detail?.agentId !== agentId) return;
+      if (!(event instanceof CustomEvent) || event.detail?.sessionId !== sessionId) return;
       syncUploadReconciliations();
     };
     window.addEventListener(UPLOAD_RECONCILIATION_EVENT, sync);
     return () => window.removeEventListener(UPLOAD_RECONCILIATION_EVENT, sync);
-  }, [agentId, syncUploadReconciliations]);
+  }, [sessionId, syncUploadReconciliations]);
 
   const reserveUploadReconciliation = useCallback(
     (uploadId: string, fileName: string) =>
-      reserveUploadReconciliationSlot(agentId, uploadId, fileName),
-    [agentId],
+      reserveUploadReconciliationSlot(sessionId, uploadId, fileName),
+    [sessionId],
   );
 
   const promoteUploadReconciliation = useCallback(
     (uploadId: string, fileName: string, message: string) =>
-      promoteUploadReconciliationSlot(agentId, uploadId, fileName, message),
-    [agentId],
+      promoteUploadReconciliationSlot(sessionId, uploadId, fileName, message),
+    [sessionId],
   );
 
   const assertUploadReconciliation = useCallback(
-    (uploadId: string) => assertUploadReconciliationActive(agentId, uploadId),
-    [agentId],
+    (uploadId: string) => assertUploadReconciliationActive(sessionId, uploadId),
+    [sessionId],
   );
 
   const dismissUploadReconciliation = useCallback(
     (uploadId: string, recoverFault = false) => {
       try {
-        dismissUploadReconciliationSlot(agentId, uploadId, recoverFault);
+        dismissUploadReconciliationSlot(sessionId, uploadId, recoverFault);
       } catch {
         // The store emitted a fault event and retained the record. A later
         // explicit dismissal after storage recovers is the only safe unlock.
       }
     },
-    [agentId],
+    [sessionId],
   );
+
+  const beginUploadTrack = useCallback((id: string, total: number) => {
+    setUploadTracks((current) => ({ ...current, [id]: { sent: 0, total } }));
+  }, []);
+
+  const advanceUploadTrack = useCallback((id: string, sent: number, total: number) => {
+    // Only track uploads that are still open: a late chunk callback from an
+    // aborted upload must not resurrect the bar.
+    setUploadTracks((current) => (current[id] ? { ...current, [id]: { sent, total } } : current));
+  }, []);
+
+  const endUploadTrack = useCallback((id: string) => {
+    setUploadTracks((current) => {
+      if (!(id in current)) return current;
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+  }, []);
 
   const updatePendingAttachments = useCallback(
     (updater: (attachments: PendingAttachment[]) => PendingAttachment[]) => {
@@ -910,7 +965,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
       if (imagePasteMode === "bracketed-path") {
         removePendingAttachment(targetId);
-        socketRef.current.sendBinary(bracketedPaste(shellSingleQuote(path)));
+        const pasted = bracketedPaste(shellSingleQuote(path));
+        socketRef.current.sendBinary(pasted);
         showUploadStatus("Image pasted");
         termRef.current?.focus();
         return;
@@ -965,17 +1021,17 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     );
   };
 
-  // Signed-signaling trust inputs. Terminal only receives agentId, so it
-  // derives the account, the agent's host, and that host's server-claimed key
+  // Signed-signaling trust inputs. Terminal only receives sessionId, so it
+  // derives the account, the session's host, and that host's server-claimed key
   // and fingerprint (all react-query cached and shared with the pages). The
   // claimed values are untrusted; the local pin gate decides how to use them.
   const { user: authUser } = useAuth();
-  const agentIdentityQuery = useQuery({
-    queryKey: ["agent", agentId],
-    queryFn: () => agents.get(agentId),
+  const sessionIdentityQuery = useQuery({
+    queryKey: ["session", sessionId],
+    queryFn: () => sessions.get(sessionId),
     staleTime: 30_000,
   });
-  const signalingHostId = agentIdentityQuery.data?.host_id ?? null;
+  const signalingHostId = sessionIdentityQuery.data?.host_id ?? null;
   const hostIdentityQuery = useQuery({
     queryKey: ["host", signalingHostId],
     queryFn: () => hosts.get(signalingHostId as string),
@@ -1023,8 +1079,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     }));
   }, [signalingAccountId]);
 
-  const socket = useAgentSocket({
-    agentId,
+  const socket = useSessionSocket({
+    sessionId,
     enabled: socketInitialSize !== null && signalingIdentityKnown,
     resolveSignedRtcTrust: signalingIdentityKnown ? resolveTrust : undefined,
     loadCarriedEndorsements: signalingIdentityKnown ? loadCarriedEndorsements : undefined,
@@ -1079,6 +1135,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }, 250);
       }
       const closeHudSample = latencyHudRef.current?.noteEcho(performance.now()) ?? null;
+      markPainted();
       if (liveSeedWriteInFlightRef.current) {
         pendingLiveSeedWritesRef.current.enqueue(bytes, dcOffsetAfter, lastSizeRef.current);
       } else {
@@ -1097,6 +1154,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onHistory: (bytes, dcOffset, historyAnchor) => {
       const term = termRef.current;
       if (!term) return;
+      markPainted();
       clearPrediction();
       if (typeof dcOffset === "number") {
         scrollbackSnapshotOffsetsRef.current.set(bytes, dcOffset);
@@ -1117,7 +1175,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (lastChunk) {
         const { cols, rows } = lastSizeRef.current;
         if (lastChunk.cols !== cols || lastChunk.rows !== rows) {
-          // The seed renders at the agent's previous PTY geometry (set by
+          // The seed renders at the session's previous PTY geometry (set by
           // another window/session). The owner assertion converges the PTY,
           // but no LOCAL size change follows, so nothing else would trigger
           // the rewrap — request a reseed from a fresh checkpoint.
@@ -1252,11 +1310,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollbackSnapshotInFlightRef.current = false;
     },
     onExit: (code, sig) => {
-      const banner = `\r\n\x1b[33m[agent exited code=${code ?? "?"}${
+      const banner = `\r\n\x1b[33m[session exited code=${code ?? "?"}${
         sig ? ` signal=${sig}` : ""
       }]\x1b[0m\r\n`;
       termRef.current?.write(banner);
-      setExitBanner(`Agent exited (code=${code ?? "?"}${sig ? `, signal=${sig}` : ""})`);
+      markPainted();
+      setExitBanner(`Session exited (code=${code ?? "?"}${sig ? `, signal=${sig}` : ""})`);
       onExit?.(code, sig);
     },
   });
@@ -1267,13 +1326,13 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   socketRef.current = socket;
 
   // Surface the live transport for connection indicators without forcing the
-  // callback identity into effect deps (screen panes pass inline closures).
+  // callback identity into effect deps (workspace panes pass inline closures).
   const onConnectionInfoRef = useRef(onConnectionInfo);
   onConnectionInfoRef.current = onConnectionInfo;
   useEffect(() => {
     onConnectionInfoRef.current?.({
       socketState: socket.state,
-      v2: socket.v2,
+      v3: socket.v3,
       dcOpen: socket.dcOpen,
       signedRtcRefusal: socket.signedRtcRefusal,
       signalingTrust: socket.signalingTrust,
@@ -1283,7 +1342,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     });
   }, [
     socket.state,
-    socket.v2,
+    socket.v3,
     socket.dcOpen,
     socket.signedRtcRefusal,
     socket.signalingTrust,
@@ -1295,14 +1354,14 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   // the DC normally opens within a second or two of attach.
   const [channelPending, setChannelPending] = useState(false);
   useEffect(() => {
-    const pending = socket.v2 && socket.state === "open" && !socket.dcOpen;
+    const pending = socket.v3 && socket.state === "open" && !socket.dcOpen;
     if (!pending) {
       setChannelPending(false);
       return;
     }
     const timer = setTimeout(() => setChannelPending(true), 1_500);
     return () => clearTimeout(timer);
-  }, [socket.v2, socket.state, socket.dcOpen]);
+  }, [socket.v3, socket.state, socket.dcOpen]);
   rawInputRef.current = rawInput;
   mobileReturnModeRef.current = mobileReturnMode;
   mobileReturnBytesRef.current = mobileReturnBytes;
@@ -1338,7 +1397,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   const scheduleScrollbackCacheRefresh = useCallback(
     (delayMs?: number) => {
-      // Debounce on output, but bound the postponement: an agent that streams
+      // Debounce on output, but bound the postponement: an app that streams
       // faster than the debounce window would otherwise starve the refresh
       // forever, leaving the scrollback cache minutes stale.
       const unanchoredMode = !dcActiveRef.current;
@@ -1500,11 +1559,18 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
     // How much of the layout the on-screen keyboard is covering right now.
     // visualViewport shrinks (and can offset) under the keyboard while the
-    // layout viewport may not, so this is the authoritative signal.
+    // layout viewport may not, so this is the authoritative signal — read
+    // through viewportInset(), which discounts the same shrink when it comes
+    // from pinch zoom rather than a keyboard.
     const readKeyboardInset = () => {
       const vv = window.visualViewport;
       if (!vv) return 0;
-      return Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+      return viewportInset({
+        visualHeight: vv.height,
+        offsetTop: vv.offsetTop,
+        scale: vv.scale,
+        layoutHeight: window.innerHeight,
+      }).keyboard;
     };
 
     // The soft keyboard is up. In this state we must NOT refit: shrinking the
@@ -1524,18 +1590,32 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return keyboardPanActive();
     };
 
+    /** `.xterm`'s padding — the inset that keeps glyphs off the pane edge. */
+    const terminalInset = () => {
+      const xterm = terminalElement.querySelector<HTMLElement>(".xterm");
+      if (!xterm) return { x: 0, y: 0 };
+      const style = window.getComputedStyle(xterm);
+      const px = (value: string) => Number.parseFloat(value) || 0;
+      return {
+        x: px(style.paddingLeft) + px(style.paddingRight),
+        y: px(style.paddingTop) + px(style.paddingBottom),
+      };
+    };
+
     const getTerminalPixelSize = () => {
       const canvas = terminalElement.querySelector<HTMLCanvasElement>(".xterm-screen canvas");
       const canvasRect = canvas?.getBoundingClientRect();
       const elementRect = terminalElement.getBoundingClientRect();
+      // The canvas is the grid alone; the pan frame has to carry the inset
+      // around it too, or panning to the edge clips it. The element rect
+      // already includes the inset.
+      const inset = terminalInset();
+      const useCanvas = canvasRect && canvasRect.width > 0 && canvasRect.height > 0;
       return {
-        width: Math.max(
-          1,
-          Math.ceil(canvasRect && canvasRect.width > 0 ? canvasRect.width : elementRect.width),
-        ),
+        width: Math.max(1, Math.ceil(useCanvas ? canvasRect.width + inset.x : elementRect.width)),
         height: Math.max(
           1,
-          Math.ceil(canvasRect && canvasRect.height > 0 ? canvasRect.height : elementRect.height),
+          Math.ceil(useCanvas ? canvasRect.height + inset.y : elementRect.height),
         ),
       };
     };
@@ -1551,6 +1631,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const viewerPanFrameIsAtBottom = () => {
       const maxTop = maxFrameScrollTop();
       return maxTop <= 0 || terminalViewport.scrollTop >= maxTop - 1;
+    };
+
+    /** Is there frame left to pan in the direction this drag is pulling? */
+    const canPanFrameVertically = (deltaY: number) => {
+      const maxTop = maxFrameScrollTop();
+      if (maxTop <= 0 || deltaY === 0) return false;
+      return deltaY > 0
+        ? terminalViewport.scrollTop < maxTop - 0.5
+        : terminalViewport.scrollTop > 0.5;
     };
 
     const layoutTerminalSurface = (pinToBottom = false) => {
@@ -1702,28 +1791,77 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       return deltaY > 0 ? viewport.scrollTop < maxTop - 0.5 : viewport.scrollTop > 0.5;
     };
 
+    /**
+     * The scroller the pane stack lives in, found by walking out of the portal
+     * this terminal is rendered into. Resolved per gesture rather than cached:
+     * the pane moves between the mobile stack and the desktop grid, and only
+     * one of those layouts has a scrolling ancestor at all.
+     */
+    const findPageScroller = () => {
+      let node: HTMLElement | null = terminalElement.parentElement;
+      while (node) {
+        const overflowY = window.getComputedStyle(node).overflowY;
+        if ((overflowY === "auto" || overflowY === "scroll") && maxElementScrollTop(node) > 1) {
+          return node;
+        }
+        node = node.parentElement;
+      }
+      return null;
+    };
+
+    /**
+     * Can this terminal itself use a drag of `deltaY`? The same order the
+     * gesture is actually applied in: pan the frozen frame, then this
+     * terminal's scrollback. False means nothing here moves and the pane
+     * stack should have it.
+     */
+    const terminalCanTakeDrag = (deltaY: number) => {
+      if (coarsePointerRef.current && usesViewerPanFrame() && canPanFrameVertically(deltaY)) {
+        return true;
+      }
+      // The alternate buffer has no scrollback — a full-screen TUI owns the
+      // whole grid, which is most of what runs in these panes.
+      if (activeBufferIsAlternate()) return false;
+      return canScrollViewport(deltaY);
+    };
+
+    /**
+     * Settle the route from the gesture's NET travel, not the last frame's
+     * delta: which end of the scrollback a drag is pulling toward is the whole
+     * question, and a few pixels of jitter at the start point the wrong way.
+     * Called once the drag clears the tap slop; sub-slop pixels stay with the
+     * terminal, where they have always gone.
+     */
+    const routeTouchScroll = (netDeltaY: number) => {
+      const state = touchScrollRef.current;
+      if (state.route !== "undecided" || netDeltaY === 0) return state.route;
+      if (terminalCanTakeDrag(netDeltaY)) {
+        state.route = "terminal";
+      } else {
+        state.route = "page";
+        state.pageScroller = findPageScroller();
+      }
+      return state.route;
+    };
+
     const applyTouchScrollDelta = (deltaX: number, deltaY: number) => {
       const state = touchScrollRef.current;
+      state.scrollRemainderPx = 0;
+
+      if (state.route === "page") {
+        const scroller = state.pageScroller;
+        return scroller ? scrollElementPixels(scroller, deltaY) : false;
+      }
 
       if (coarsePointerRef.current && usesViewerPanFrame()) {
         const frameScroll = scrollViewerPanFrame(deltaX, deltaY);
-        if (frameScroll.movedX || frameScroll.movedY) {
-          state.scrollRemainderPx = 0;
-          return true;
-        }
+        if (frameScroll.movedX || frameScroll.movedY) return true;
       }
 
-      if (activeBufferIsAlternate()) {
-        state.scrollRemainderPx = 0;
-        return true;
-      }
+      if (activeBufferIsAlternate()) return false;
 
-      if (!scrollTerminalViewportPixels(deltaY)) {
-        state.scrollRemainderPx = 0;
-        return canScrollViewport(deltaY);
-      }
+      if (!scrollTerminalViewportPixels(deltaY)) return canScrollViewport(deltaY);
 
-      state.scrollRemainderPx = 0;
       return true;
     };
 
@@ -1735,7 +1873,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
       state.momentumLastTime = 0;
       state.scrollRemainderPx = 0;
-      if (!usesViewerPanFrame()) alignViewportToRows();
+      // Row-snapping is the terminal's own tidy-up; a drag that went to the
+      // pane stack must not jog this terminal's viewport on the way out.
+      if (state.route !== "page" && !usesViewerPanFrame()) alignViewportToRows();
     };
 
     const sendMobilePromptNewline = () => {
@@ -1827,6 +1967,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       touchScrollRef.current.pointerCaptured = false;
       touchScrollRef.current.scrollRemainderPx = 0;
       touchScrollRef.current.openedScrollback = false;
+      touchScrollRef.current.route = "undecided";
+      touchScrollRef.current.pageScroller = null;
     };
 
     const moveTouchScroll = (x: number, y: number, time: number) => {
@@ -1834,6 +1976,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (!state.active) return;
 
       state.movedPx = Math.max(state.movedPx, Math.hypot(x - state.startX, y - state.startY));
+      if (state.movedPx > TOUCH_TAP_SLOP_PX) routeTouchScroll(state.startY - y);
       const deltaX = state.lastX - x;
       const deltaY = state.lastY - y;
       state.lastX = x;
@@ -1881,7 +2024,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         state.momentumFrame = requestAnimationFrame(stepTouchMomentum);
       } else {
         state.scrollRemainderPx = 0;
-        if (!usesViewerPanFrame()) alignViewportToRows();
+        if (state.route !== "page" && !usesViewerPanFrame()) alignViewportToRows();
       }
     };
 
@@ -2132,7 +2275,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const fitTerminal = (preserveScroll: boolean) => {
       // Parked (background) instance: never fit or resize. Its host may be in
       // an offscreen park at a different size; fitting would churn the PTY
-      // geometry and disturb whoever is actually looking at this agent. It
+      // geometry and disturb whoever is actually looking at this session. It
       // reclaims + fits when re-activated (see the `active` effect).
       if (!activeRef.current) return;
       const anchor = preserveScroll ? captureScrollAnchor() : null;
@@ -2233,6 +2376,31 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       if (document.visibilityState === "visible") scheduleFit();
     };
     document.addEventListener("visibilitychange", onVisibility);
+
+    /*
+     * devicePixelRatio moves without a reload — browser zoom, dragging the
+     * window to a display with a different scale, DevTools device emulation.
+     * The GPU renderer rasterized its glyph atlas for the old ratio and has no
+     * idea, so every glyph keeps its old device-pixel size while the canvas is
+     * now measured against a new one: 2 -> 3 paints type half again as large
+     * as its cell, and lines run off the pane instead of wrapping. Clear the
+     * atlas (it re-rasterizes at the current ratio) and refit.
+     *
+     * A media query is the only DPR change event there is, and it has to be
+     * rebuilt each time because the ratio it tests for is baked into it.
+     */
+    let dprQuery: MediaQueryList | null = null;
+    const onDevicePixelRatioChange = () => {
+      webglAddonRef.current?.clearTextureAtlas();
+      watchDevicePixelRatio();
+      scheduleFit();
+    };
+    function watchDevicePixelRatio() {
+      dprQuery?.removeEventListener("change", onDevicePixelRatioChange);
+      dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      dprQuery.addEventListener("change", onDevicePixelRatioChange);
+    }
+    watchDevicePixelRatio();
     document.fonts?.ready
       .then(() => {
         scheduleFit();
@@ -2246,6 +2414,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       vv?.removeEventListener("resize", onVisualViewport);
       vv?.removeEventListener("scroll", onVisualViewport);
       document.removeEventListener("visibilitychange", onVisibility);
+      dprQuery?.removeEventListener("change", onDevicePixelRatioChange);
       term.attachCustomKeyEventHandler(() => true);
       term.textarea?.removeEventListener("beforeinput", onBeforeInput, { capture: true });
       term.textarea?.removeEventListener("input", onInput, { capture: true });
@@ -2324,9 +2493,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           },
         ]);
         try {
+          beginUploadTrack(clientId, file.size);
           reserveUploadReconciliation(clientId, file.name || "Image");
           const result = await socket.uploadFile(file, {
             uploadId: clientId,
+            onProgress: (uploaded, total) => advanceUploadTrack(clientId, uploaded, total),
             name: file.name || defaultImageName(file),
             mimeType: mimeTypeForFile(file),
             destination: "attachments",
@@ -2345,7 +2516,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           handleUploadSaved(result.path, result.uploadId);
         } catch (error) {
           const outcomeUnknown =
-            error instanceof DirectAgentUploadError && error.code === "outcome_unknown";
+            error instanceof DirectSessionUploadError && error.code === "outcome_unknown";
           // Removing an attachment is silent only while cancellation still
           // proves there was no endpoint effect. Once the final chunk was
           // dispatched, the same abort can race publication; keep the removed
@@ -2376,6 +2547,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
               attachment.id === clientId ? { ...attachment, status: "error" } : attachment,
             ),
           );
+        } finally {
+          endUploadTrack(clientId);
         }
       }
       if (sent > 0) {
@@ -2383,6 +2556,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
     },
     [
+      advanceUploadTrack,
+      beginUploadTrack,
+      endUploadTrack,
       handleUploadSaved,
       assertUploadReconciliation,
       dismissUploadReconciliation,
@@ -2408,9 +2584,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         }
         const uploadId = makeClientId();
         try {
+          beginUploadTrack(uploadId, file.size);
           reserveUploadReconciliation(uploadId, file.name || "File");
           const result = await socket.uploadFile(file, {
             uploadId,
+            onProgress: (uploaded, total) => advanceUploadTrack(uploadId, uploaded, total),
             destination: "cwd",
             name: file.name || "file",
             mimeType: mimeTypeForUpload(file),
@@ -2430,7 +2608,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             error instanceof Error && error.message
               ? error.message
               : `${file.name || "File"} could not be uploaded.`;
-          if (error instanceof DirectAgentUploadError && error.code === "outcome_unknown") {
+          if (error instanceof DirectSessionUploadError && error.code === "outcome_unknown") {
             try {
               promoteUploadReconciliation(uploadId, file.name || "File", message);
             } catch {
@@ -2442,6 +2620,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             dismissUploadReconciliation(uploadId);
             showUploadStatus(message);
           }
+        } finally {
+          endUploadTrack(uploadId);
         }
       }
       if (sent > 0) {
@@ -2449,7 +2629,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       }
     },
     [
+      advanceUploadTrack,
+      beginUploadTrack,
       dismissUploadReconciliation,
+      endUploadTrack,
       assertUploadReconciliation,
       promoteUploadReconciliation,
       reserveUploadReconciliation,
@@ -2559,7 +2742,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       );
       if (mapped !== filtered) lastMobileReturnAtRef.current = performance.now();
       const withAttachments = appendAttachmentsForSubmit(mapped);
-      if (withAttachments) socket.sendBinary(enc.encode(withAttachments));
+      if (withAttachments) {
+        socket.sendBinary(enc.encode(withAttachments));
+      }
       if (latencyHudRef.current && withAttachments === d && /^[\x20-\x7e]$/.test(d)) {
         latencyHudRef.current.noteKeystroke(performance.now());
       }
@@ -2808,7 +2993,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         const after = capture();
         return {
           kind: "terminal-refresh-diagnostics",
-          agentId,
+          sessionId,
           userAgent: navigator.userAgent,
           before,
           after,
@@ -2818,9 +3003,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         const uploadId = options?.uploadId ?? makeClientId();
         const fileName = file.name || "file";
         try {
+          beginUploadTrack(uploadId, file.size);
           reserveUploadReconciliation(uploadId, fileName);
           const result = await socket.uploadFile(file, {
             name: fileName,
+            onProgress: (uploaded, total) => advanceUploadTrack(uploadId, uploaded, total),
             mimeType: mimeTypeForUpload(file),
             destination: options?.destination ?? "attachments",
             uploadId,
@@ -2835,7 +3022,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           dismissUploadReconciliation(uploadId);
           return { path: result.path, uploadId: result.uploadId };
         } catch (error) {
-          if (error instanceof DirectAgentUploadError && error.code === "outcome_unknown") {
+          if (error instanceof DirectSessionUploadError && error.code === "outcome_unknown") {
             try {
               promoteUploadReconciliation(uploadId, fileName, error.message);
             } catch {
@@ -2845,12 +3032,15 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
             dismissUploadReconciliation(uploadId);
           }
           throw error;
+        } finally {
+          endUploadTrack(uploadId);
         }
       },
       focus: () => termRef.current?.focus(),
       submit: () => {
         snapToLiveEdge();
-        socket.sendBinary(appendAttachmentsForSubmit("\r"));
+        const payload = appendAttachmentsForSubmit("\r");
+        socket.sendBinary(payload);
         termRef.current?.focus();
       },
       pasteFromClipboard,
@@ -2861,9 +3051,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       snapToLiveEdge,
     }),
     [
+      advanceUploadTrack,
       appendAttachmentsForSubmit,
       assertUploadReconciliation,
+      beginUploadTrack,
       dismissUploadReconciliation,
+      endUploadTrack,
       snapToLiveEdge,
       pasteDataTransfer,
       pasteFromClipboard,
@@ -2871,9 +3064,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       promoteUploadReconciliation,
       reserveUploadReconciliation,
       socket,
-      agentId,
+      sessionId,
     ],
   );
+
+  const settledAttachments = pendingAttachments.filter(
+    (attachment) => attachment.status !== "uploading",
+  );
+
+  // While the connecting overlay is up it is the pane's transport story, told
+  // in full sentences — the corner chip would be the same news at 10px. The
+  // chip's node stays mounted either way: it is the live region, so it keeps
+  // announcing the transitions a screen reader would otherwise miss.
+  const connectingOverlayOwnsStatus =
+    !painted && (socket.state !== "open" || (socket.v3 && !socket.dcOpen));
 
   const onDragEnter = (event: DragEvent<HTMLDivElement>) => {
     if (!hasFileTransfer(event.dataTransfer)) return;
@@ -2902,7 +3106,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     dragDepthRef.current = 0;
     setDropActive(false);
     // Dropped images feed the prompt like a local terminal drop (attachment
-    // chip / pasted path per agent kind); only non-image files take the
+    // chip / pasted path per session app); only non-image files take the
     // save-to-working-directory path, keeping plain uploads intentional.
     const images = files.filter(isImageFile);
     const others = files.filter((file) => !isImageFile(file));
@@ -2925,7 +3129,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   return (
     <div
       role="application"
-      aria-label="Agent terminal"
+      aria-label="Session terminal"
       className="relative size-full touch-none bg-[var(--color-terminal-bg)]"
       onPasteCapture={onPasteCapture}
       onDragEnter={onDragEnter}
@@ -2971,14 +3175,26 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           />
         </div>
       </div>
+      {/* Before the first byte lands there is nothing under here but the
+          terminal's own black: the overlay explains the wait, and gets out of
+          the way the moment output arrives. */}
+      <ConnectingOverlay
+        socketState={socket.state}
+        v3={socket.v3}
+        dcOpen={socket.dcOpen}
+        refusal={socket.signedRtcRefusal}
+        painted={painted}
+        hostName={hostIdentityQuery.data?.name ?? null}
+        hostOffline={hostIdentityQuery.data?.status === "offline"}
+      />
       {(uploadReconciliations.length > 0 || uploadReconciliationFault) && (
         <div
           data-testid="upload-reconciliation"
           role="alert"
-          className="pointer-events-auto absolute left-2 top-2 z-40 flex max-w-[min(32rem,calc(100%-1rem))] flex-col gap-2 rounded-md border border-amber-500/60 bg-background/95 p-2 text-xs text-foreground shadow-lg backdrop-blur"
+          className="pointer-events-auto absolute left-2 top-2 z-40 flex max-w-[min(32rem,calc(100%-1rem))] flex-col gap-2 rounded-md border border-warning/60 bg-background/95 p-2 text-xs text-foreground shadow-lg backdrop-blur"
         >
           {uploadReconciliationFault && (
-            <div data-testid="upload-reconciliation-fault" className="font-medium text-amber-700">
+            <div data-testid="upload-reconciliation-fault" className="font-medium text-warning">
               {uploadReconciliationFault} New uploads are locked until storage recovers
               {uploadReconciliations.length > 0
                 ? " and you dismiss the retained record after checking it."
@@ -3020,9 +3236,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           ))}
         </div>
       )}
-      {pendingAttachments.length > 0 && (
+      {/* Upload progress reads as a hairline under the pane header. Uploads in
+          flight are only ever this bar: a thumbnail for something that is
+          about to disappear on its own just flashes. */}
+      <UploadProgressBar ratio={uploadRatio(Object.values(uploadTracks))} />
+      {/* What survives the upload does get a chip — a queued attachment (the
+          deferred paste mode) needs somewhere to be seen and removed, and a
+          failed one needs to say so. */}
+      {settledAttachments.length > 0 && (
         <div className="pointer-events-auto absolute bottom-2 left-2 z-20 flex max-w-[calc(100%-1rem)] gap-2 overflow-x-auto rounded-md border border-border bg-background/90 p-1 shadow-lg backdrop-blur">
-          {pendingAttachments.map((attachment) => (
+          {settledAttachments.map((attachment) => (
             <div
               key={attachment.id}
               className="relative h-14 w-14 shrink-0 overflow-hidden rounded border border-border bg-card"
@@ -3111,7 +3334,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           {newOutputWhileAway && (
             <>
               <span>New</span>
-              <span className="size-1.5 rounded-full bg-emerald-500" aria-hidden />
+              <span className="size-1.5 rounded-full bg-success" aria-hidden />
             </>
           )}
         </button>
@@ -3121,7 +3344,8 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
           a healthy "open" connection is the norm, not news. */}
       <div
         className={
-          socket.state !== "open" || channelPending || exitBanner || uploadStatus
+          (socket.state !== "open" || channelPending || exitBanner || uploadStatus) &&
+          !connectingOverlayOwnsStatus
             ? "pointer-events-none absolute right-2 top-2 rounded bg-popover/90 px-2 py-0.5 text-[10px] text-muted-foreground ring-1 ring-border"
             : "sr-only"
         }
@@ -3148,8 +3372,8 @@ function wheelEventToPixels(event: WheelEvent, rows: number): number {
       : event.deltaY;
 }
 
-function uploadReconciliationStorageKey(agentId: string): string {
-  return `${UPLOAD_RECONCILIATION_STORAGE_PREFIX}:${agentId}`;
+function uploadReconciliationStorageKey(sessionId: string): string {
+  return `${UPLOAD_RECONCILIATION_STORAGE_PREFIX}:${sessionId}`;
 }
 
 function uploadReconciliationStorageFault(): string {
@@ -3172,9 +3396,9 @@ function blockReservedUploadReconciliations(
   );
 }
 
-function dispatchUploadReconciliationEvent(agentId: string): void {
+function dispatchUploadReconciliationEvent(sessionId: string): void {
   try {
-    window.dispatchEvent(new CustomEvent(UPLOAD_RECONCILIATION_EVENT, { detail: { agentId } }));
+    window.dispatchEvent(new CustomEvent(UPLOAD_RECONCILIATION_EVENT, { detail: { sessionId } }));
   } catch {
     // The in-memory latch is authoritative for the current call even if a
     // hostile/broken event target prevents another mounted instance syncing.
@@ -3182,7 +3406,7 @@ function dispatchUploadReconciliationEvent(agentId: string): void {
 }
 
 function readUploadReconciliationHistoryFallback(
-  agentId: string,
+  sessionId: string,
 ): { records: UploadReconciliation[]; fault: string } | null {
   let state: unknown;
   try {
@@ -3193,7 +3417,7 @@ function readUploadReconciliationHistoryFallback(
   if (typeof state !== "object" || state === null) return null;
   const fallbacks = (state as Record<string, unknown>).__spawnUploadReconciliationFallback;
   if (typeof fallbacks !== "object" || fallbacks === null) return null;
-  const fallback = (fallbacks as Record<string, unknown>)[agentId];
+  const fallback = (fallbacks as Record<string, unknown>)[sessionId];
   if (typeof fallback !== "object" || fallback === null) return null;
   const records = (fallback as Record<string, unknown>).records;
   const fault = (fallback as Record<string, unknown>).fault;
@@ -3202,7 +3426,7 @@ function readUploadReconciliationHistoryFallback(
 }
 
 function writeUploadReconciliationHistoryFallback(
-  agentId: string,
+  sessionId: string,
   fallback: UploadReconciliationState | null,
 ): void {
   try {
@@ -3216,8 +3440,8 @@ function writeUploadReconciliationHistoryFallback(
         ? current.__spawnUploadReconciliationFallback
         : {};
     const fallbacks = { ...existing };
-    if (fallback) fallbacks[agentId] = fallback;
-    else delete fallbacks[agentId];
+    if (fallback) fallbacks[sessionId] = fallback;
+    else delete fallbacks[sessionId];
     window.history.replaceState(
       { ...current, __spawnUploadReconciliationFallback: fallbacks },
       document.title,
@@ -3228,17 +3452,17 @@ function writeUploadReconciliationHistoryFallback(
   }
 }
 
-function loadUploadReconciliationState(agentId: string): UploadReconciliationState {
+function loadUploadReconciliationState(sessionId: string): UploadReconciliationState {
   if (typeof window === "undefined") return { records: [], fault: null };
   const runtime = uploadReconciliationRuntime();
-  const historyFallback = readUploadReconciliationHistoryFallback(agentId);
+  const historyFallback = readUploadReconciliationHistoryFallback(sessionId);
   const memory = mergeUploadReconciliations(
-    runtime.memory.get(agentId) ?? [],
+    runtime.memory.get(sessionId) ?? [],
     historyFallback?.records ?? [],
   );
-  if (historyFallback) runtime.faults.set(agentId, historyFallback.fault);
+  if (historyFallback) runtime.faults.set(sessionId, historyFallback.fault);
   try {
-    const raw = window.sessionStorage.getItem(uploadReconciliationStorageKey(agentId));
+    const raw = window.sessionStorage.getItem(uploadReconciliationStorageKey(sessionId));
     let stored: UploadReconciliation[] = [];
     if (raw) {
       const parsed: unknown = JSON.parse(raw);
@@ -3270,24 +3494,24 @@ function loadUploadReconciliationState(agentId: string): UploadReconciliationSta
     const records = mergeUploadReconciliations(memory, stored);
     if (records.length > MAX_UPLOAD_RECONCILIATIONS) {
       runtime.faults.set(
-        agentId,
+        sessionId,
         "Upload reconciliation capacity was exceeded; no records were discarded.",
       );
     }
-    runtime.memory.set(agentId, records);
-    return { records, fault: runtime.faults.get(agentId) ?? null };
+    runtime.memory.set(sessionId, records);
+    return { records, fault: runtime.faults.get(sessionId) ?? null };
   } catch {
     const fault = uploadReconciliationStorageFault();
     const blocked = blockReservedUploadReconciliations(memory);
-    runtime.memory.set(agentId, blocked);
-    runtime.faults.set(agentId, fault);
-    writeUploadReconciliationHistoryFallback(agentId, { records: blocked, fault });
+    runtime.memory.set(sessionId, blocked);
+    runtime.faults.set(sessionId, fault);
+    writeUploadReconciliationHistoryFallback(sessionId, { records: blocked, fault });
     return { records: blocked, fault };
   }
 }
 
 function persistUploadReconciliations(
-  agentId: string,
+  sessionId: string,
   records: UploadReconciliation[],
   recordsOnFailure: UploadReconciliation[],
   clearFault = false,
@@ -3301,45 +3525,45 @@ function persistUploadReconciliations(
     );
   }
   const runtime = uploadReconciliationRuntime();
-  const existingFault = runtime.faults.get(agentId) ?? null;
+  const existingFault = runtime.faults.get(sessionId) ?? null;
   try {
-    const key = uploadReconciliationStorageKey(agentId);
+    const key = uploadReconciliationStorageKey(sessionId);
     if (records.length === 0) window.sessionStorage.removeItem(key);
     else window.sessionStorage.setItem(key, JSON.stringify(records));
-    runtime.memory.set(agentId, records);
+    runtime.memory.set(sessionId, records);
     if (clearFault) {
-      runtime.faults.delete(agentId);
-      writeUploadReconciliationHistoryFallback(agentId, null);
+      runtime.faults.delete(sessionId);
+      writeUploadReconciliationHistoryFallback(sessionId, null);
     } else if (existingFault) {
-      runtime.faults.set(agentId, existingFault);
-      writeUploadReconciliationHistoryFallback(agentId, {
+      runtime.faults.set(sessionId, existingFault);
+      writeUploadReconciliationHistoryFallback(sessionId, {
         records,
         fault: existingFault,
       });
     } else {
-      writeUploadReconciliationHistoryFallback(agentId, null);
+      writeUploadReconciliationHistoryFallback(sessionId, null);
     }
-    dispatchUploadReconciliationEvent(agentId);
+    dispatchUploadReconciliationEvent(sessionId);
   } catch {
     const blocked = blockReservedUploadReconciliations(recordsOnFailure);
-    runtime.memory.set(agentId, blocked);
+    runtime.memory.set(sessionId, blocked);
     const fault = uploadReconciliationStorageFault();
-    runtime.faults.set(agentId, fault);
-    writeUploadReconciliationHistoryFallback(agentId, {
+    runtime.faults.set(sessionId, fault);
+    writeUploadReconciliationHistoryFallback(sessionId, {
       records: blocked,
       fault,
     });
-    dispatchUploadReconciliationEvent(agentId);
+    dispatchUploadReconciliationEvent(sessionId);
     throw new UploadReconciliationBlockedError(fault);
   }
 }
 
 function reserveUploadReconciliationSlot(
-  agentId: string,
+  sessionId: string,
   uploadId: string,
   fileName: string,
 ): void {
-  const state = loadUploadReconciliationState(agentId);
+  const state = loadUploadReconciliationState(sessionId);
   if (state.fault) {
     const blocked = blockReservedUploadReconciliations(state.records);
     const existing = blocked.find((record) => record.uploadId === uploadId);
@@ -3358,10 +3582,10 @@ function reserveUploadReconciliationSlot(
           ]
         : state.records;
     const runtime = uploadReconciliationRuntime();
-    runtime.memory.set(agentId, records);
-    runtime.faults.set(agentId, state.fault);
-    writeUploadReconciliationHistoryFallback(agentId, { records, fault: state.fault });
-    dispatchUploadReconciliationEvent(agentId);
+    runtime.memory.set(sessionId, records);
+    runtime.faults.set(sessionId, state.fault);
+    writeUploadReconciliationHistoryFallback(sessionId, { records, fault: state.fault });
+    dispatchUploadReconciliationEvent(sessionId);
     throw new UploadReconciliationBlockedError(state.fault);
   }
   if (state.records.some((record) => record.uploadId === uploadId)) {
@@ -3384,20 +3608,20 @@ function reserveUploadReconciliationSlot(
   ];
   // A failed first write still retains the identity in same-window memory,
   // blocks endpoint dispatch, and survives SPA unmount/remount.
-  uploadReconciliationRuntime().memory.set(agentId, next);
-  persistUploadReconciliations(agentId, next, next);
+  uploadReconciliationRuntime().memory.set(sessionId, next);
+  persistUploadReconciliations(sessionId, next, next);
 }
 
 function promoteUploadReconciliationSlot(
-  agentId: string,
+  sessionId: string,
   uploadId: string,
   fileName: string,
   message: string,
 ): void {
-  const state = loadUploadReconciliationState(agentId);
+  const state = loadUploadReconciliationState(sessionId);
   const existing = state.records.find((record) => record.uploadId === uploadId);
   if (state.fault) {
-    dispatchUploadReconciliationEvent(agentId);
+    dispatchUploadReconciliationEvent(sessionId);
     throw new UploadReconciliationBlockedError(state.fault);
   }
   if (!existing) {
@@ -3423,14 +3647,14 @@ function promoteUploadReconciliationSlot(
   );
   // Persist ambiguity before the final frame. On failure the durable reserved
   // record remains and the caller throws before DataChannel dispatch.
-  persistUploadReconciliations(agentId, next, state.records);
+  persistUploadReconciliations(sessionId, next, state.records);
 }
 
-function assertUploadReconciliationActive(agentId: string, uploadId: string): void {
-  const state = loadUploadReconciliationState(agentId);
+function assertUploadReconciliationActive(sessionId: string, uploadId: string): void {
+  const state = loadUploadReconciliationState(sessionId);
   const record = state.records.find((candidate) => candidate.uploadId === uploadId);
   if (state.fault) {
-    dispatchUploadReconciliationEvent(agentId);
+    dispatchUploadReconciliationEvent(sessionId);
     throw new UploadReconciliationBlockedError(state.fault);
   }
   if (!record || record.phase === "blocked") {
@@ -3441,13 +3665,13 @@ function assertUploadReconciliationActive(agentId: string, uploadId: string): vo
 }
 
 function dismissUploadReconciliationSlot(
-  agentId: string,
+  sessionId: string,
   uploadId: string,
   recoverFault: boolean,
 ): void {
-  const state = loadUploadReconciliationState(agentId);
+  const state = loadUploadReconciliationState(sessionId);
   const next = state.records.filter((record) => record.uploadId !== uploadId);
-  persistUploadReconciliations(agentId, next, state.records, recoverFault);
+  persistUploadReconciliations(sessionId, next, state.records, recoverFault);
 }
 
 function mergeUploadReconciliations(
@@ -3564,7 +3788,7 @@ function flushViewportIntoScrollback(term: XTerm): string {
 }
 
 /**
- * Worker-backed agents ship snapshots as exact terminal byte streams,
+ * Worker-backed sessions ship snapshots as exact terminal byte streams,
  * self-described by geometry markers (`CSI 8 ; rows ; cols t`): one at the
  * head, one at every recorded PTY resize. Returns the geometry-tagged chunks,
  * or null when the endpoint returned a plain replay without geometry markers.
@@ -3715,7 +3939,7 @@ function containsAlternateBufferSwitch(bytes: Uint8Array): boolean {
 
 function stripDeviceAttributeResponses(data: string): string {
   // xterm.js answers terminal identity queries via `onData`; forwarding those
-  // back to the agent after replay can echo fragments like "0;276;0c".
+  // back to the app after replay can echo fragments like "0;276;0c".
   let filtered = "";
   for (let i = 0; i < data.length; i += 1) {
     if (

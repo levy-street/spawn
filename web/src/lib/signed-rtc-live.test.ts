@@ -14,17 +14,17 @@ import {
 } from "./signed-signal";
 import { signRtcSignalWire } from "./signed-signal-wire";
 
-const AGENT_ID = "11111111-2222-4333-8444-555555555555";
+const SESSION_ID = "11111111-2222-4333-8444-555555555555";
 const HOST_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-const SESSION_ID = "01234567-89ab-4cde-8fab-0123456789ab";
+const RTC_SESSION_ID = "01234567-89ab-4cde-8fab-0123456789ab";
 const VERIFIED_SDP = "v=0\r\ns=verified\r\na=fingerprint:sha-256 11:22:33:44:55:66:77:88\r\n";
 const HOSTILE_RAW_SDP =
   "v=0\r\ns=relay-substitution\r\na=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11\r\n";
 
 const routes: SignedRtcRoute[] = [
   {
-    scopeType: "agent",
-    scopeId: AGENT_ID,
+    scopeType: "session",
+    scopeId: SESSION_ID,
     protocol: "spawn.pty",
     protocolVersion: 2,
   },
@@ -69,7 +69,7 @@ class DelayedPeer extends FakePeer {
   }
 }
 
-async function fixture(route: SignedRtcRoute, sessionId = SESSION_ID) {
+async function fixture(route: SignedRtcRoute, sessionId = RTC_SESSION_ID) {
   const browser = await generateEd25519IdentityKeyPair();
   const host = await generateEd25519IdentityKeyPair();
   const browserPublicKeyWire = await exportEd25519PublicKeyWire(browser.publicKey);
@@ -388,7 +388,7 @@ describe("signed RTC live answer adapter", () => {
         ),
     };
 
-    const h1Session = new SignedRtcLiveSession(route, SESSION_ID, trust);
+    const h1Session = new SignedRtcLiveSession(route, RTC_SESSION_ID, trust);
     expect({ browserReads, hostReads }).toEqual({ browserReads: 1, hostReads: 1 });
     await h1Session.createOffer("v=0\r\ns=h1-offer\r\n");
     selectedHostWire = hostH2Wire;
@@ -398,8 +398,8 @@ describe("signed RTC live answer adapter", () => {
         h1Peer,
         answerFrame(
           route,
-          SESSION_ID,
-          await signedAnswer(route, SESSION_ID, hostH2, hostH2Wire, browserWire),
+          RTC_SESSION_ID,
+          await signedAnswer(route, RTC_SESSION_ID, hostH2, hostH2Wire, browserWire),
         ),
       ),
     ).rejects.toMatchObject({ code: "sender_pin_mismatch" });
@@ -462,7 +462,7 @@ describe("signed RTC live answer adapter", () => {
           input,
         ),
     };
-    const session = new SignedRtcLiveSession(routeProxy, SESSION_ID, trust);
+    const session = new SignedRtcLiveSession(routeProxy, RTC_SESSION_ID, trust);
     expect(browserReads).toBe(1);
     for (const property of ["scopeType", "scopeId", "protocol", "protocolVersion"]) {
       expect(routeReads.get(property)).toBe(1);
@@ -476,8 +476,8 @@ describe("signed RTC live answer adapter", () => {
         peer,
         answerFrame(
           routes[1],
-          SESSION_ID,
-          await signedAnswer(routes[1], SESSION_ID, host, hostWire, browserB2Wire),
+          RTC_SESSION_ID,
+          await signedAnswer(routes[1], RTC_SESSION_ID, host, hostWire, browserB2Wire),
         ),
       ),
     ).rejects.toMatchObject({ code: "peer_pin_mismatch" });
@@ -498,7 +498,7 @@ describe("signed RTC live answer adapter", () => {
         if (!active) throw new DOMException("trust epoch ended", "AbortError");
       },
     };
-    const session = new SignedRtcLiveSession(routes[0], SESSION_ID, mutableTrust);
+    const session = new SignedRtcLiveSession(routes[0], RTC_SESSION_ID, mutableTrust);
     mutableTrust.assertActive = () => {};
     mutableTrust.signOffer = async () => "attacker-controlled replacement";
     active = false;

@@ -53,18 +53,18 @@ async def _accept_owner(broker: Broker, daemon: DaemonConn, generation: int = 1)
 
 
 @pytest.mark.asyncio
-async def test_broker_daemon_reconnect_supersedes_stale_connection_and_reassociates_agents():
+async def test_broker_daemon_reconnect_supersedes_stale_connection_and_reassociates_sessions():
     broker = get_broker()
 
     host_id = "host-reconnect"
     user_id = "user-1"
-    agent_id = "00000000-0000-4000-8000-0000000000ad"
+    session_id = "00000000-0000-4000-8000-0000000000ad"
     old_ws = FakeWS()
     old_daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=old_ws)  # type: ignore[arg-type]
     await broker.register_daemon(old_daemon)
-    await broker.attach_agent_to_daemon(agent_id, old_daemon)
+    await broker.attach_session_to_daemon(session_id, old_daemon)
 
-    assert broker.get_daemon_for_agent(agent_id) is old_daemon
+    assert broker.get_daemon_for_session(session_id) is old_daemon
 
     new_ws = FakeWS()
     new_daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=new_ws)  # type: ignore[arg-type]
@@ -72,20 +72,20 @@ async def test_broker_daemon_reconnect_supersedes_stale_connection_and_reassocia
 
     assert old_ws.closed == [(4000, "superseded")]
     assert broker.get_daemon_for_host(host_id) is new_daemon
-    assert broker.get_daemon_for_agent(agent_id) is None
+    assert broker.get_daemon_for_session(session_id) is None
 
-    # Mirrors the daemon register(existing_agents=[...]) path after reconnect.
-    await broker.attach_agent_to_daemon(agent_id, new_daemon)
-    assert broker.get_daemon_for_agent(agent_id) is new_daemon
-    assert agent_id in new_daemon.agent_ids
-    assert agent_id not in old_daemon.agent_ids
+    # Mirrors the daemon register(existing_sessions=[...]) path after reconnect.
+    await broker.attach_session_to_daemon(session_id, new_daemon)
+    assert broker.get_daemon_for_session(session_id) is new_daemon
+    assert session_id in new_daemon.session_ids
+    assert session_id not in old_daemon.session_ids
 
     await broker.unregister_daemon(new_daemon)
 
 
 
 @pytest.mark.asyncio
-async def test_broker_tool_install_request_roundtrip(app):
+async def test_broker_agent_install_request_roundtrip(app):
     broker = get_broker()
 
     host_id = "host-tools-install"
@@ -98,21 +98,21 @@ async def test_broker_tool_install_request_roundtrip(app):
     await _accept_owner(broker, daemon)
 
     target = {
-        "preset_id": "00000000-0000-4000-8000-0000000000ef",
-        "preset_name": "codex",
+        "agent_id": "00000000-0000-4000-8000-0000000000ef",
+        "agent_name": "codex",
         "agent_kind": "codex",
         "command": "codex",
         "install": "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
     }
-    task = asyncio.create_task(broker.request_tool_install(daemon, target=target, timeout=1))
+    task = asyncio.create_task(broker.request_agent_install(daemon, target=target, timeout=1))
     await asyncio.sleep(0)
 
     sent = json.loads(daemon_ws.sent_text[-1])
-    assert sent["type"] == "host.tools.install"
+    assert sent["type"] == "host.agents.install"
     assert sent["target"] == target
 
     payload = {
-        "type": "host.tools.install_result",
+        "type": "host.agents.install_result",
         "request_id": sent["request_id"],
         "result": {
             **target,
@@ -123,7 +123,7 @@ async def test_broker_tool_install_request_roundtrip(app):
             "status": None,
         },
     }
-    await broker.resolve_tool_install(
+    await broker.resolve_agent_install(
         sent["request_id"], payload, daemon=daemon, expected_host_generation=1
     )
     assert await task == payload

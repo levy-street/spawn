@@ -1,0 +1,3420 @@
+{
+ "_doc": "Cross-language conformance suite for the 24x24 free-canvas grid algebra of workspace grid schema v3 (docs/OVERHAUL.md section 4.4). Each case names one operation (validate | autoPlace | move | resize | remove | compact | readingOrder | fromSplitTree), the exact input, and the exact expected result; web/src/lib/grid.ts and server/spawn_server/grid.py must both reproduce every expected value byte-for-byte after JSON normalization (deep equality on parsed values, array order included). Inputs to every op except validate are valid layouts per the section 4.4 invariants (integers, 24x24 bounds, min 4x4, no overlaps, max 16 tiles, unique session ids); validate cases probe arbitrary values. Where the section 4.4 prose is ambiguous, the `_rules` list below pins the behavior — together with the cases it is the authority both implementations follow.",
+ "_rules": [
+  "Every tile array returned by any operation is sorted in reading order — (y, x) ascending. Expected arrays compare exactly, order included.",
+  "validate returns {ok, errors}; error codes: shape (layout not an object or tiles not an array; reported alone), version (version !== 3), count (more than 16 tiles), session_id (missing or not a non-empty string; id FORMAT is deliberately not checked — pruning unknown/foreign ids is server policy upstream of the algebra), integer (x/y/w/h not all integers), bounds (outside the canvas), size (w or h < 4; at most one size error per tile), duplicate (same session_id as an earlier tile; index = later tile, other_index = first occurrence), overlap (index < other_index). Emission order: version, count, then per-tile errors in tile order (session_id, integer, bounds, size; an integer failure suppresses bounds/size for that tile), then duplicates in tile order, then overlaps for index pairs i<j in lexicographic order. Tiles failing integer or bounds checks are excluded from overlap checking.",
+  "autoPlace returns {tile, tiles}: tile is the new geometry (no session_id — the caller appends it), tiles the possibly-updated list. Scan: first free 4x4 by y then x; expand w rightward at height 4, then h downward at the expanded width. Fallback when no 4x4 is free: split candidates are tiles with max(w, h) >= 8; pick the largest area, ties broken by reading order; cut along the longer axis — vertical cut (side-by-side halves) when w >= h — the existing tile keeps ceil(side/2), the new tile gets floor(side/2). tile is null (tiles returned unchanged, sorted) when the input already has 16 tiles or no split candidate exists.",
+  "move(tiles, id, x, y): clamp the target into the canvas (x to [0, 24-w], y to [0, 24-h]). If the clamped target rect overlaps nothing, the tile simply takes it and the gap it leaves behind stays a gap — nothing repacks. If the target rect is occupied, the move is a SWAP: T = the tile with the greatest intersection area with the target rect, ties broken by reading order — lowest (y, x) first; the dragged tile adopts T's rect wholesale (x, y, w, AND h) and T adopts the dragged tile's original rect. A swap exchanges sizes between the two tiles — move preserves the multiset of sizes, not per-tile sizes. Unknown id: input returned unchanged (sorted).",
+  "resize(tiles, id, w, h): clamp w to [4, 24-x] and h to [4, 24-y] — the tile grows and shrinks about its own origin, which never moves. Nothing else moves either: shrinking leaves empty canvas behind, and growing is taken only when the resized rect overlaps no other tile; an overlapping growth returns the input unchanged (sorted). Unknown id: input returned unchanged (sorted).",
+  "compact: no operation calls this any more (the canvas is free-form); it stays in the contract as a pure utility. Process tiles in reading order of their input positions; each tile slides up as far as it can, then left, one continuous slide each, checked against ALL other tiles at their current positions (already-processed tiles at settled spots, later tiles at original spots). Tiles never pass through occupied cells, so validity is preserved at every step.",
+  "remove: drop the tile, then let the survivors absorb the rectangle it freed — nothing else on the canvas moves. Survivors grow one cell at a time in reading order of the post-drop list, trying right, down, left, then up; a step is taken only when the strip of cells it gains lies wholly inside the freed rectangle and overlaps no tile, and passes repeat until no tile can grow. Unknown id: input returned unchanged (sorted).",
+  "fromSplitTree: assign float rects from (0, 0, 24, 24); a row split puts a left and b right at s = x0 + ratio*(x1 - x0), a column split puts a top and b bottom (same formula on y); ratio is clamped to [0, 1]; each split position is computed once and shared by both children. Pane EDGES are rounded with floor(v + 0.5) — round half UP, not Python's banker's round(). If any rounded tile has w < 4 or h < 4, lies outside the canvas, or overlaps another, the whole layout falls back to repeated autoPlace from an empty canvas over the panes in v1 DFS order (a then b). Trees with more than 16 panes keep the first 16 in DFS order and drop the rest. Null root yields []. Pane agent_id becomes tile session_id verbatim.",
+  "All operations except validate assume valid input and are deterministic and free of randomness; both implementations must never mutate their inputs."
+ ],
+ "cases": [
+  {
+   "name": "validate-ok-full-single",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": 0,
+       "y": 0,
+       "w": 24,
+       "h": 24
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": true,
+    "errors": []
+   }
+  },
+  {
+   "name": "validate-ok-empty",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3,
+     "tiles": []
+    }
+   },
+   "expected": {
+    "ok": true,
+    "errors": []
+   }
+  },
+  {
+   "name": "validate-ok-at-max-tiles",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": 0,
+       "y": 0,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "b",
+       "x": 6,
+       "y": 0,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "c",
+       "x": 12,
+       "y": 0,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "d",
+       "x": 18,
+       "y": 0,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "e",
+       "x": 0,
+       "y": 6,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "f",
+       "x": 6,
+       "y": 6,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "g",
+       "x": 12,
+       "y": 6,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "h",
+       "x": 18,
+       "y": 6,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "i",
+       "x": 0,
+       "y": 12,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "j",
+       "x": 6,
+       "y": 12,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "k",
+       "x": 12,
+       "y": 12,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "l",
+       "x": 18,
+       "y": 12,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "m",
+       "x": 0,
+       "y": 18,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "n",
+       "x": 6,
+       "y": 18,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "o",
+       "x": 12,
+       "y": 18,
+       "w": 6,
+       "h": 6
+      },
+      {
+       "session_id": "p",
+       "x": 18,
+       "y": 18,
+       "w": 6,
+       "h": 6
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": true,
+    "errors": []
+   }
+  },
+  {
+   "name": "validate-bad-version",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 1,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": 0,
+       "y": 0,
+       "w": 24,
+       "h": 24
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "version"
+     }
+    ]
+   }
+  },
+  {
+   "name": "validate-overlap-pair",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": 0,
+       "y": 0,
+       "w": 12,
+       "h": 12
+      },
+      {
+       "session_id": "b",
+       "x": 6,
+       "y": 6,
+       "w": 12,
+       "h": 12
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "overlap",
+      "index": 0,
+      "other_index": 1
+     }
+    ]
+   }
+  },
+  {
+   "name": "validate-too-small",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": 0,
+       "y": 0,
+       "w": 2,
+       "h": 2
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "size",
+      "index": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "validate-out-of-bounds",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": 20,
+       "y": 0,
+       "w": 12,
+       "h": 12
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "bounds",
+      "index": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "validate-bounds-negative",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": -2,
+       "y": 0,
+       "w": 12,
+       "h": 12
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "bounds",
+      "index": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "validate-non-integer",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": 0.5,
+       "y": 0,
+       "w": 12,
+       "h": 12
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "integer",
+      "index": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "validate-duplicate-id",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": 0,
+       "y": 0,
+       "w": 12,
+       "h": 24
+      },
+      {
+       "session_id": "a",
+       "x": 12,
+       "y": 0,
+       "w": 12,
+       "h": 24
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "duplicate",
+      "index": 1,
+      "other_index": 0
+     }
+    ]
+   }
+  },
+  {
+   "name": "validate-too-many-tiles",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": 0,
+       "y": 0,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "b",
+       "x": 4,
+       "y": 0,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "c",
+       "x": 8,
+       "y": 0,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "d",
+       "x": 12,
+       "y": 0,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "e",
+       "x": 16,
+       "y": 0,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "f",
+       "x": 20,
+       "y": 0,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "g",
+       "x": 0,
+       "y": 4,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "h",
+       "x": 4,
+       "y": 4,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "i",
+       "x": 8,
+       "y": 4,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "j",
+       "x": 12,
+       "y": 4,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "k",
+       "x": 16,
+       "y": 4,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "l",
+       "x": 20,
+       "y": 4,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "m",
+       "x": 0,
+       "y": 8,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "n",
+       "x": 4,
+       "y": 8,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "o",
+       "x": 8,
+       "y": 8,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "p",
+       "x": 12,
+       "y": 8,
+       "w": 4,
+       "h": 4
+      },
+      {
+       "session_id": "q",
+       "x": 16,
+       "y": 8,
+       "w": 4,
+       "h": 4
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "count"
+     }
+    ]
+   }
+  },
+  {
+   "name": "validate-shape-tiles-missing",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 3
+    }
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "shape"
+     }
+    ]
+   }
+  },
+  {
+   "name": "validate-shape-not-object",
+   "op": "validate",
+   "input": {
+    "layout": "not a layout"
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "shape"
+     }
+    ]
+   }
+  },
+  {
+   "name": "validate-multi-error-order",
+   "op": "validate",
+   "input": {
+    "layout": {
+     "version": 1,
+     "tiles": [
+      {
+       "session_id": "a",
+       "x": 0,
+       "y": 0,
+       "w": 2,
+       "h": 6
+      },
+      {
+       "session_id": "b",
+       "x": 0,
+       "y": 0,
+       "w": 6,
+       "h": 6
+      }
+     ]
+    }
+   },
+   "expected": {
+    "ok": false,
+    "errors": [
+     {
+      "code": "version"
+     },
+     {
+      "code": "size",
+      "index": 0
+     },
+     {
+      "code": "overlap",
+      "index": 0,
+      "other_index": 1
+     }
+    ]
+   }
+  },
+  {
+   "name": "autoplace-empty",
+   "op": "autoPlace",
+   "input": {
+    "tiles": []
+   },
+   "expected": {
+    "tile": {
+     "x": 0,
+     "y": 0,
+     "w": 24,
+     "h": 24
+    },
+    "tiles": []
+   }
+  },
+  {
+   "name": "autoplace-beside-left-column",
+   "op": "autoPlace",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ]
+   },
+   "expected": {
+    "tile": {
+     "x": 12,
+     "y": 0,
+     "w": 12,
+     "h": 24
+    },
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "autoplace-below-top-row",
+   "op": "autoPlace",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 12
+     }
+    ]
+   },
+   "expected": {
+    "tile": {
+     "x": 0,
+     "y": 12,
+     "w": 24,
+     "h": 12
+    },
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "autoplace-into-corner-gap",
+   "op": "autoPlace",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   },
+   "expected": {
+    "tile": {
+     "x": 12,
+     "y": 12,
+     "w": 12,
+     "h": 12
+    },
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "autoplace-greedy-expansion",
+   "op": "autoPlace",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 6,
+      "w": 6,
+      "h": 18
+     }
+    ]
+   },
+   "expected": {
+    "tile": {
+     "x": 6,
+     "y": 6,
+     "w": 18,
+     "h": 18
+    },
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 6,
+      "w": 6,
+      "h": 18
+     }
+    ]
+   }
+  },
+  {
+   "name": "autoplace-split-fallback-no-free-slot",
+   "op": "autoPlace",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 6,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 12,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "d",
+      "x": 18,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "e",
+      "x": 0,
+      "y": 12,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "f",
+      "x": 6,
+      "y": 12,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "g",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   },
+   "expected": {
+    "tile": {
+     "x": 18,
+     "y": 12,
+     "w": 6,
+     "h": 12
+    },
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 6,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 12,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "d",
+      "x": 18,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "e",
+      "x": 0,
+      "y": 12,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "f",
+      "x": 6,
+      "y": 12,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "g",
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "autoplace-split-tie-reading-order",
+   "op": "autoPlace",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "d",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   },
+   "expected": {
+    "tile": {
+     "x": 6,
+     "y": 0,
+     "w": 6,
+     "h": 12
+    },
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "d",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "autoplace-split-odd-width",
+   "op": "autoPlace",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 7,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 7,
+      "y": 0,
+      "w": 17,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 7,
+      "y": 12,
+      "w": 17,
+      "h": 12
+     }
+    ]
+   },
+   "expected": {
+    "tile": {
+     "x": 16,
+     "y": 0,
+     "w": 8,
+     "h": 12
+    },
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 7,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 7,
+      "y": 0,
+      "w": 9,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 7,
+      "y": 12,
+      "w": 17,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "autoplace-two-wide-strip",
+   "op": "autoPlace",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 10,
+      "h": 10
+     },
+     {
+      "session_id": "b",
+      "x": 10,
+      "y": 0,
+      "w": 10,
+      "h": 10
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 10,
+      "w": 10,
+      "h": 10
+     },
+     {
+      "session_id": "d",
+      "x": 10,
+      "y": 10,
+      "w": 10,
+      "h": 10
+     }
+    ]
+   },
+   "expected": {
+    "tile": {
+     "x": 20,
+     "y": 0,
+     "w": 4,
+     "h": 24
+    },
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 10,
+      "h": 10
+     },
+     {
+      "session_id": "b",
+      "x": 10,
+      "y": 0,
+      "w": 10,
+      "h": 10
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 10,
+      "w": 10,
+      "h": 10
+     },
+     {
+      "session_id": "d",
+      "x": 10,
+      "y": 10,
+      "w": 10,
+      "h": 10
+     }
+    ]
+   }
+  },
+  {
+   "name": "autoplace-at-cap-null",
+   "op": "autoPlace",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 6,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "c",
+      "x": 12,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "d",
+      "x": 18,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "e",
+      "x": 0,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "f",
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "g",
+      "x": 12,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "h",
+      "x": 18,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "i",
+      "x": 0,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "j",
+      "x": 6,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "k",
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "l",
+      "x": 18,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "m",
+      "x": 0,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "n",
+      "x": 6,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "o",
+      "x": 12,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p",
+      "x": 18,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   },
+   "expected": {
+    "tile": null,
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 6,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "c",
+      "x": 12,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "d",
+      "x": 18,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "e",
+      "x": 0,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "f",
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "g",
+      "x": 12,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "h",
+      "x": 18,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "i",
+      "x": 0,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "j",
+      "x": 6,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "k",
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "l",
+      "x": 18,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "m",
+      "x": 0,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "n",
+      "x": 6,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "o",
+      "x": 12,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p",
+      "x": 18,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-swap-full-height-columns",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ],
+    "id": "b",
+    "x": 0,
+    "y": 0
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "a",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-swap-full-width-rows",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 12
+     }
+    ],
+    "id": "a",
+    "x": 0,
+    "y": 12
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 12
+     },
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-swap-differing-sizes",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 8,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 8,
+      "y": 0,
+      "w": 16,
+      "h": 24
+     }
+    ],
+    "id": "a",
+    "x": 8,
+    "y": 0
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 0,
+      "w": 8,
+      "h": 24
+     },
+     {
+      "session_id": "a",
+      "x": 8,
+      "y": 0,
+      "w": 16,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-swap-tie-break-reading-order",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "d",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ],
+    "id": "d",
+    "x": 6,
+    "y": 6
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "d",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "a",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-into-empty-space-no-op",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     }
+    ],
+    "id": "a",
+    "x": 12,
+    "y": 12
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-cascade-rescued-by-compact",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 6,
+      "h": 12
+     }
+    ],
+    "id": "a",
+    "x": 0,
+    "y": 18
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 12,
+      "w": 6,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-reorder-rows",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 6,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 6
+     }
+    ],
+    "id": "c",
+    "x": 0,
+    "y": 0
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 6,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-compact-repacks",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 6,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     }
+    ],
+    "id": "a",
+    "x": 18,
+    "y": 18
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "b",
+      "x": 6,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "a",
+      "x": 18,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-clamp-target",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 18
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "c",
+      "x": 6,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     }
+    ],
+    "id": "b",
+    "x": 198,
+    "y": 198
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 18
+     },
+     {
+      "session_id": "c",
+      "x": 6,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 18,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-single-tile-compacts-home",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     }
+    ],
+    "id": "a",
+    "x": 6,
+    "y": 6
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "move-unknown-id",
+   "op": "move",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 24
+     }
+    ],
+    "id": "zz",
+    "x": 0,
+    "y": 0
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "resize-grow-pushes-down",
+   "op": "resize",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 6,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 6
+     }
+    ],
+    "id": "a",
+    "w": 24,
+    "h": 12
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 6,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "resize-grow-impossible-no-op",
+   "op": "resize",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ],
+    "id": "a",
+    "w": 24,
+    "h": 24
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "resize-clamp",
+   "op": "resize",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 24
+     }
+    ],
+    "id": "a",
+    "w": 2,
+    "h": 40
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 4,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "resize-shrink-neighbor-slides-left",
+   "op": "resize",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ],
+    "id": "a",
+    "w": 6,
+    "h": 24
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "resize-clamp-at-position",
+   "op": "resize",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 18,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 18,
+      "y": 0,
+      "w": 6,
+      "h": 24
+     }
+    ],
+    "id": "b",
+    "w": 12,
+    "h": 24
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 18,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 18,
+      "y": 0,
+      "w": 6,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "resize-unknown-id",
+   "op": "resize",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 24
+     }
+    ],
+    "id": "zz",
+    "w": 12,
+    "h": 12
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "remove-expands-into-freed-column",
+   "op": "remove",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ],
+    "id": "b"
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "remove-reading-order-priority",
+   "op": "remove",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "d",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ],
+    "id": "d"
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "remove-middle-row-gravity-then-grow",
+   "op": "remove",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 8
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 8,
+      "w": 24,
+      "h": 8
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 16,
+      "w": 24,
+      "h": 8
+     }
+    ],
+    "id": "b"
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "remove-last-tile-empty",
+   "op": "remove",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 24
+     }
+    ],
+    "id": "a"
+   },
+   "expected": {
+    "tiles": []
+   }
+  },
+  {
+   "name": "remove-height-expansion",
+   "op": "remove",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ],
+    "id": "c"
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "remove-unknown-id",
+   "op": "remove",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     }
+    ],
+    "id": "zz"
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "compact-slides-up-left",
+   "op": "compact",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "compact-no-pass-through",
+   "op": "compact",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "t1",
+      "x": 6,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     },
+     {
+      "session_id": "t2",
+      "x": 0,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "t2",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "t1",
+      "x": 6,
+      "y": 0,
+      "w": 6,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "compact-up-then-left",
+   "op": "compact",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "blocker",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "t",
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "blocker",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "t",
+      "x": 12,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "compact-identity-on-packed",
+   "op": "compact",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "d",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "d",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "compact-input-order-irrelevant",
+   "op": "compact",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "p",
+      "x": 12,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "q",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "q",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p",
+      "x": 6,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "reading-order-by-y-then-x",
+   "op": "readingOrder",
+   "input": {
+    "tiles": [
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 12
+     },
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   },
+   "expected": {
+    "order": [
+     "a",
+     "b",
+     "c"
+    ]
+   }
+  },
+  {
+   "name": "reading-order-empty",
+   "op": "readingOrder",
+   "input": {
+    "tiles": []
+   },
+   "expected": {
+    "order": []
+   }
+  },
+  {
+   "name": "fst-null-root",
+   "op": "fromSplitTree",
+   "input": {
+    "root": null
+   },
+   "expected": {
+    "tiles": []
+   }
+  },
+  {
+   "name": "fst-single-pane",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "pane",
+     "agent_id": "a"
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-row-even",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "row",
+     "ratio": 0.5,
+     "a": {
+      "type": "pane",
+      "agent_id": "a"
+     },
+     "b": {
+      "type": "pane",
+      "agent_id": "b"
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-column-even",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "column",
+     "ratio": 0.5,
+     "a": {
+      "type": "pane",
+      "agent_id": "a"
+     },
+     "b": {
+      "type": "pane",
+      "agent_id": "b"
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-main-plus-stack",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "row",
+     "ratio": 0.5,
+     "a": {
+      "type": "pane",
+      "agent_id": "a"
+     },
+     "b": {
+      "type": "split",
+      "direction": "column",
+      "ratio": 0.5,
+      "a": {
+       "type": "pane",
+       "agent_id": "b"
+      },
+      "b": {
+       "type": "pane",
+       "agent_id": "c"
+      }
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-third-ratio-rounding",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "row",
+     "ratio": 0.3333333333333333,
+     "a": {
+      "type": "pane",
+      "agent_id": "a"
+     },
+     "b": {
+      "type": "pane",
+      "agent_id": "b"
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 8,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 8,
+      "y": 0,
+      "w": 16,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-main-stack-ratio-06",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "row",
+     "ratio": 0.6,
+     "a": {
+      "type": "pane",
+      "agent_id": "a"
+     },
+     "b": {
+      "type": "split",
+      "direction": "column",
+      "ratio": 0.5,
+      "a": {
+       "type": "pane",
+       "agent_id": "b"
+      },
+      "b": {
+       "type": "pane",
+       "agent_id": "c"
+      }
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 14,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 14,
+      "y": 0,
+      "w": 10,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 14,
+      "y": 12,
+      "w": 10,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-ratio-005-falls-back",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "row",
+     "ratio": 0.05,
+     "a": {
+      "type": "pane",
+      "agent_id": "a"
+     },
+     "b": {
+      "type": "pane",
+      "agent_id": "b"
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-ratio-095-column-falls-back",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "column",
+     "ratio": 0.95,
+     "a": {
+      "type": "pane",
+      "agent_id": "a"
+     },
+     "b": {
+      "type": "pane",
+      "agent_id": "b"
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 24
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-degenerate-depth-falls-back",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "row",
+     "ratio": 0.5,
+     "a": {
+      "type": "pane",
+      "agent_id": "a"
+     },
+     "b": {
+      "type": "split",
+      "direction": "row",
+      "ratio": 0.5,
+      "a": {
+       "type": "pane",
+       "agent_id": "b"
+      },
+      "b": {
+       "type": "split",
+       "direction": "row",
+       "ratio": 0.5,
+       "a": {
+        "type": "pane",
+        "agent_id": "c"
+       },
+       "b": {
+        "type": "pane",
+        "agent_id": "d"
+       }
+      }
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "d",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-deep-chain-caps-at-max-tiles",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "row",
+     "ratio": 0.5,
+     "a": {
+      "type": "pane",
+      "agent_id": "p01"
+     },
+     "b": {
+      "type": "split",
+      "direction": "row",
+      "ratio": 0.5,
+      "a": {
+       "type": "pane",
+       "agent_id": "p02"
+      },
+      "b": {
+       "type": "split",
+       "direction": "row",
+       "ratio": 0.5,
+       "a": {
+        "type": "pane",
+        "agent_id": "p03"
+       },
+       "b": {
+        "type": "split",
+        "direction": "row",
+        "ratio": 0.5,
+        "a": {
+         "type": "pane",
+         "agent_id": "p04"
+        },
+        "b": {
+         "type": "split",
+         "direction": "row",
+         "ratio": 0.5,
+         "a": {
+          "type": "pane",
+          "agent_id": "p05"
+         },
+         "b": {
+          "type": "split",
+          "direction": "row",
+          "ratio": 0.5,
+          "a": {
+           "type": "pane",
+           "agent_id": "p06"
+          },
+          "b": {
+           "type": "split",
+           "direction": "row",
+           "ratio": 0.5,
+           "a": {
+            "type": "pane",
+            "agent_id": "p07"
+           },
+           "b": {
+            "type": "split",
+            "direction": "row",
+            "ratio": 0.5,
+            "a": {
+             "type": "pane",
+             "agent_id": "p08"
+            },
+            "b": {
+             "type": "split",
+             "direction": "row",
+             "ratio": 0.5,
+             "a": {
+              "type": "pane",
+              "agent_id": "p09"
+             },
+             "b": {
+              "type": "split",
+              "direction": "row",
+              "ratio": 0.5,
+              "a": {
+               "type": "pane",
+               "agent_id": "p10"
+              },
+              "b": {
+               "type": "split",
+               "direction": "row",
+               "ratio": 0.5,
+               "a": {
+                "type": "pane",
+                "agent_id": "p11"
+               },
+               "b": {
+                "type": "split",
+                "direction": "row",
+                "ratio": 0.5,
+                "a": {
+                 "type": "pane",
+                 "agent_id": "p12"
+                },
+                "b": {
+                 "type": "split",
+                 "direction": "row",
+                 "ratio": 0.5,
+                 "a": {
+                  "type": "pane",
+                  "agent_id": "p13"
+                 },
+                 "b": {
+                  "type": "split",
+                  "direction": "row",
+                  "ratio": 0.5,
+                  "a": {
+                   "type": "pane",
+                   "agent_id": "p14"
+                  },
+                  "b": {
+                   "type": "split",
+                   "direction": "row",
+                   "ratio": 0.5,
+                   "a": {
+                    "type": "pane",
+                    "agent_id": "p15"
+                   },
+                   "b": {
+                    "type": "split",
+                    "direction": "row",
+                    "ratio": 0.5,
+                    "a": {
+                     "type": "pane",
+                     "agent_id": "p16"
+                    },
+                    "b": {
+                     "type": "split",
+                     "direction": "row",
+                     "ratio": 0.5,
+                     "a": {
+                      "type": "pane",
+                      "agent_id": "p17"
+                     },
+                     "b": {
+                      "type": "split",
+                      "direction": "row",
+                      "ratio": 0.5,
+                      "a": {
+                       "type": "pane",
+                       "agent_id": "p18"
+                      },
+                      "b": {
+                       "type": "split",
+                       "direction": "row",
+                       "ratio": 0.5,
+                       "a": {
+                        "type": "pane",
+                        "agent_id": "p19"
+                       },
+                       "b": {
+                        "type": "split",
+                        "direction": "row",
+                        "ratio": 0.5,
+                        "a": {
+                         "type": "pane",
+                         "agent_id": "p20"
+                        },
+                        "b": {
+                         "type": "pane",
+                         "agent_id": "p21"
+                        }
+                       }
+                      }
+                     }
+                    }
+                   }
+                  }
+                 }
+                }
+               }
+              }
+             }
+            }
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "p01",
+      "x": 0,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p05",
+      "x": 6,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p02",
+      "x": 12,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p06",
+      "x": 18,
+      "y": 0,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p09",
+      "x": 0,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p10",
+      "x": 6,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p11",
+      "x": 12,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p12",
+      "x": 18,
+      "y": 6,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p03",
+      "x": 0,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p07",
+      "x": 6,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p04",
+      "x": 12,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p08",
+      "x": 18,
+      "y": 12,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p13",
+      "x": 0,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p14",
+      "x": 6,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p15",
+      "x": 12,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     },
+     {
+      "session_id": "p16",
+      "x": 18,
+      "y": 18,
+      "w": 6,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-four-rows-buildeven",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "column",
+     "ratio": 0.25,
+     "a": {
+      "type": "pane",
+      "agent_id": "a"
+     },
+     "b": {
+      "type": "split",
+      "direction": "column",
+      "ratio": 0.3333333333333333,
+      "a": {
+       "type": "pane",
+       "agent_id": "b"
+      },
+      "b": {
+       "type": "split",
+       "direction": "column",
+       "ratio": 0.5,
+       "a": {
+        "type": "pane",
+        "agent_id": "c"
+       },
+       "b": {
+        "type": "pane",
+        "agent_id": "d"
+       }
+      }
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "b",
+      "x": 0,
+      "y": 6,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 24,
+      "h": 6
+     },
+     {
+      "session_id": "d",
+      "x": 0,
+      "y": 18,
+      "w": 24,
+      "h": 6
+     }
+    ]
+   }
+  },
+  {
+   "name": "fst-grid-2x2-ratios",
+   "op": "fromSplitTree",
+   "input": {
+    "root": {
+     "type": "split",
+     "direction": "column",
+     "ratio": 0.5,
+     "a": {
+      "type": "split",
+      "direction": "row",
+      "ratio": 0.5,
+      "a": {
+       "type": "pane",
+       "agent_id": "a"
+      },
+      "b": {
+       "type": "pane",
+       "agent_id": "b"
+      }
+     },
+     "b": {
+      "type": "split",
+      "direction": "row",
+      "ratio": 0.5,
+      "a": {
+       "type": "pane",
+       "agent_id": "c"
+      },
+      "b": {
+       "type": "pane",
+       "agent_id": "d"
+      }
+     }
+    }
+   },
+   "expected": {
+    "tiles": [
+     {
+      "session_id": "a",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "b",
+      "x": 12,
+      "y": 0,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "c",
+      "x": 0,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     },
+     {
+      "session_id": "d",
+      "x": 12,
+      "y": 12,
+      "w": 12,
+      "h": 12
+     }
+    ]
+   }
+  }
+ ]
+}

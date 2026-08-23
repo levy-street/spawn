@@ -1,7 +1,8 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { ApiError, auth, type User } from "@/lib/api";
+import { closeAlertSocket } from "@/lib/alert-socket";
+import { ApiError, type AuthConfig, auth, type User } from "@/lib/api";
 
 /**
  * `useAuth()` resolves the current user from `/api/me`. The server uses
@@ -31,7 +32,32 @@ export function useAuth() {
   };
 }
 
+/**
+ * `useAuthConfig()` resolves `GET /api/auth/config`: OAuth providers plus the
+ * gates the server actually enforces (email verification, invite-only).
+ * Public endpoint — safe to call signed out (login/signup/onboarding).
+ */
+export function useAuthConfig() {
+  const q = useQuery<AuthConfig>({
+    queryKey: ["auth-config"],
+    queryFn: () => auth.config(),
+    staleTime: 5 * 60_000,
+    retry: 1,
+  });
+
+  return {
+    config: q.data ?? null,
+    loading: q.isLoading,
+    error: q.error,
+    refetch: q.refetch,
+  };
+}
+
 export async function logout() {
+  // Drop the alert stream first: a socket whose cookie has just been revoked
+  // would otherwise sit in a reconnect loop against a 1008 until the redirect
+  // tears the page down.
+  closeAlertSocket();
   try {
     await auth.logout();
   } catch {
@@ -39,5 +65,8 @@ export async function logout() {
     // session may already be dead server-side (expired, or the account was
     // just deleted, which clears the cookie itself). Leaving is the point.
   }
-  if (typeof window !== "undefined") window.location.assign("/login");
+  // Out to the lander, not the login form: signing out is leaving, and being
+  // dropped straight back onto a password field reads as a failed session
+  // rather than a finished one. Signing in again is one nav click away.
+  if (typeof window !== "undefined") window.location.assign("/");
 }

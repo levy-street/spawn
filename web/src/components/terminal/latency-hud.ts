@@ -65,7 +65,7 @@ export class LatencyHud {
 
   /** Call when PTY bytes arrive; returns a token to close out paint time. */
   noteEcho(now: number): ((paintAt: number) => void) | null {
-    // Age out keystrokes the app never echoed (agent busy, control input).
+    // Age out keystrokes the app never echoed (app busy, control input).
     while (this.#pending.length > 0 && now - this.#pending[0] > 2_000) {
       this.#pending.shift();
     }

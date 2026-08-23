@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
+from . import grid
 from .browser_registration import ED25519_SIGNATURE_B64URL_LENGTH
 from .host_identity import (
     decode_ed25519_public_key,
@@ -188,7 +198,7 @@ class AdminUserOut(BaseModel):
     email_verified_at: datetime | None = None
     is_admin: bool = False
     host_count: int = 0
-    agent_count: int = 0
+    session_count: int = 0
     browser_device_count: int = 0
 
 
@@ -243,8 +253,16 @@ class AuthProviderOut(BaseModel):
     name: str
 
 
-class AuthProviderList(BaseModel):
+class AuthConfigOut(BaseModel):
+    """Everything the login/signup/onboarding surfaces need in one request.
+
+    `email_verification_required` mirrors the exact condition `auth.verified_user`
+    enforces, so onboarding never shows a gate the server won't enforce.
+    """
+
     providers: list[AuthProviderOut] = Field(default_factory=list)
+    email_verification_required: bool = False
+    invite_only: bool = False
 
 
 # ---------- device code ----------
@@ -727,10 +745,92 @@ class HostOut(BaseModel):
     host_public_key: str | None = None
     status: str
     last_seen_at: datetime | None = None
-    agent_count: int = 0
+    session_count: int = 0
     # Mesh R9: true once this host's daemon validates account-scoped chains;
     # the legacy per-host device-endorsement path is refused for such hosts.
     supports_account_chains: bool = False
+    # Capacity. Every field is optional and stays None for a daemon that
+    # predates telemetry or runs with SPAWND_NO_TELEMETRY — the UI draws no
+    # meter rather than an empty one, which is a different statement.
+    cpu_cores: int | None = None
+    cpu_physical_cores: int | None = None
+    cpu_model: str | None = None
+    memory_bytes: int | None = None
+    gpu: str | None = None
+    # Meter segment counts in 0..=5, never percentages. Exact figures exist and
+    # travel browser-to-daemon over `spawn.host.ctl`; see daemon host_metrics.
+    cpu_bucket: int | None = None
+    mem_bucket: int | None = None
+    capacity_at: datetime | None = None
+
+
+class LegionDayOut(BaseModel):
+    """One UTC day of fleet activity. Sparse: unrecorded days are simply absent."""
+
+    model_config = ConfigDict(from_attributes=True)
+    day: str
+    sessions_started: int = 0
+    session_seconds: int = 0
+    peak_sessions: int = 0
+    peak_hosts_online: int = 0
+
+
+class LegionAgentOut(BaseModel):
+    """A foreground basename and how often it has been seen. Never a path."""
+
+    command: str
+    count: int
+
+
+class LegionTotalsOut(BaseModel):
+    hosts: int = 0
+    hosts_online: int = 0
+    # Summed across hosts that report them; a fleet with one silent daemon
+    # under-reports rather than guessing.
+    cores: int = 0
+    memory_bytes: int = 0
+    sessions_live: int = 0
+    sessions_started: int = 0
+    session_seconds: int = 0
+    active_days: int = 0
+    current_streak: int = 0
+    longest_streak: int = 0
+    peak_hosts_online: int = 0
+    peak_sessions: int = 0
+    first_day: str | None = None
+
+
+class LegionHostOut(BaseModel):
+    """A host as the profile lists it — identity and spec, no live buckets."""
+
+    id: str
+    name: str
+    os: str | None = None
+    status: str
+    cpu_cores: int | None = None
+    memory_bytes: int | None = None
+    gpu: str | None = None
+    session_count: int = 0
+    created_at: datetime | None = None
+    last_seen_at: datetime | None = None
+
+
+class ProfileOut(BaseModel):
+    """Everything the profile dialog draws, in one request."""
+
+    id: str
+    email: str
+    created_at: datetime
+    email_verified_at: datetime | None = None
+    is_admin: bool = False
+    totals: LegionTotalsOut
+    agents: list[LegionAgentOut] = Field(default_factory=list)
+    days: list[LegionDayOut] = Field(default_factory=list)
+    hosts: list[LegionHostOut] = Field(default_factory=list)
+    # The window `days` covers, so the client can densify it into a calendar
+    # without having to agree with the server about "today" independently.
+    history_days: int
+    today: str
 
 
 class HostPatch(BaseModel):
@@ -739,15 +839,20 @@ class HostPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
 
 
-class HostToolTarget(BaseModel):
-    preset_id: str
-    preset_name: str
+class HostAgentTarget(BaseModel):
+    agent_id: str
+    agent_name: str
+    # Deliberate asymmetry: the agents table (and AgentOut) call this `kind`,
+    # but the host-availability wire keeps `agent_kind`, which the daemon and
+    # web both encode by that name.
     agent_kind: str
+    # The binary to `which` on the host: the first word of the agent's
+    # command string, computed server-side.
     command: str
     install: str | None = None
 
 
-class HostToolStatus(HostToolTarget):
+class HostAgentStatus(HostAgentTarget):
     installed: bool = False
     path: str | None = None
     version: str | None = None
@@ -760,13 +865,13 @@ class HostToolStatus(HostToolTarget):
     last_auto_update_error: str | None = None
 
 
-class HostToolList(BaseModel):
-    tools: list[HostToolStatus] = Field(default_factory=list)
+class HostAgentList(BaseModel):
+    agents: list[HostAgentStatus] = Field(default_factory=list)
 
 
-class HostToolInstallResult(BaseModel):
-    preset_id: str
-    preset_name: str
+class HostAgentInstallResult(BaseModel):
+    agent_id: str
+    agent_name: str
     agent_kind: str
     command: str
     install: str | None = None
@@ -774,50 +879,76 @@ class HostToolInstallResult(BaseModel):
     exit_code: int | None = None
     output: str = ""
     error: str | None = None
-    status: HostToolStatus | None = None
+    status: HostAgentStatus | None = None
 
 
-class HostToolPolicyPatch(BaseModel):
+class HostAgentPolicyPatch(BaseModel):
     auto_update: bool | None = None
 
 
-class HostToolPolicyOut(BaseModel):
+class HostAgentPolicyOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    preset_id: str
+    agent_id: str
     auto_update: bool = False
     last_checked_at: datetime | None = None
     last_auto_update_at: datetime | None = None
     last_auto_update_error: str | None = None
 
 
-# ---------- presets ----------
+class RecentDirOut(BaseModel):
+    path: str
+    last_used_at: datetime
 
 
-class PresetCreate(BaseModel):
+class RecentDirList(BaseModel):
+    dirs: list[RecentDirOut] = Field(default_factory=list)
+
+
+# ---------- agents (definitions) ----------
+
+
+class AgentCreate(BaseModel):
     name: str = Field(max_length=128)
-    agent_kind: str = Field(max_length=64)
-    default_argv: list[str] = Field(default_factory=list)
-    env_template: dict[str, str] = Field(default_factory=dict)
+    kind: str = Field(max_length=64)
+    command: str = Field(max_length=1024)
+    env: dict[str, str] = Field(default_factory=dict)
     install: str | None = Field(default=None, max_length=2048)
+    yolo_args: str | None = Field(default=None, max_length=256)
+    yolo_env: dict[str, str] = Field(default_factory=dict)
 
 
-class PresetPatch(BaseModel):
+class AgentPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
-    agent_kind: str | None = Field(default=None, max_length=64)
-    default_argv: list[str] | None = None
-    env_template: dict[str, str] | None = None
+    kind: str | None = Field(default=None, max_length=64)
+    command: str | None = Field(default=None, max_length=1024)
+    env: dict[str, str] | None = None
     install: str | None = Field(default=None, max_length=2048)
+    yolo_args: str | None = Field(default=None, max_length=256)
+    yolo_env: dict[str, str] | None = None
 
 
-class PresetOut(BaseModel):
+class AgentPreferencePatch(BaseModel):
+    """Settings a user holds over an agent — built-ins included."""
+
+    yolo: bool | None = None
+
+
+class AgentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
+    # None marks a built-in (immutable via the API).
     owner_user_id: str | None
     name: str
-    agent_kind: str
-    default_argv: list[str]
-    env_template: dict[str, str]
+    kind: str
+    command: str
+    env: dict[str, str]
     install: str | None = None
+    # How this CLI is told to skip its permission prompts. Both empty means it
+    # has no such mode, and the client does not offer the toggle.
+    yolo_args: str | None = None
+    yolo_env: dict[str, str] = Field(default_factory=dict)
+    # The reading user's own choice, not a property of the definition.
+    yolo: bool = False
 
 
 # ---------- managed skills ----------
@@ -848,111 +979,350 @@ class SkillOut(BaseModel):
     created_at: datetime
 
 
-class AgentAccessPatch(BaseModel):
+class SessionAccessPatch(BaseModel):
     skill_ids: list[str] | None = None
 
 
-class AgentAccessOut(BaseModel):
-    agent_id: str
+class SessionAccessOut(BaseModel):
+    session_id: str
     skills: list[SkillOut] = Field(default_factory=list)
 
 
-class AgentSkillConfig(BaseModel):
+class SkillLaunchConfig(BaseModel):
     id: str
     name: str
     description: str
     content: str
 
 
-# ---------- agents ----------
+# ---------- sessions ----------
 
 
-class AgentCreate(BaseModel):
-    name: str | None = Field(default=None, max_length=128)
+class TilePlacement(BaseModel):
+    """An explicit grid position for a newly created session's tile."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+class SessionCreate(BaseModel):
     host_id: str
-    preset_id: str | None = None
     cwd: str
-    argv: list[str] | None = None
-    env: dict[str, str] | None = None
-    skill_ids: list[str] | None = None
-    create_cwd: bool = True
-
-
-class AgentRestart(BaseModel):
-    create_cwd: bool = True
-
-
-class AgentPatch(BaseModel):
     name: str | None = Field(default=None, max_length=128)
-    archived: bool | None = None
-    pinned: bool | None = None
+    # Omitted -> all skills marked enabled_by_default.
+    skill_ids: list[str] | None = None
+    # Optional: transactionally append a tile for this session to a workspace.
+    workspace_id: str | None = None
+    # Only meaningful with workspace_id; omitted -> server auto-places (§4.4).
+    tile: TilePlacement | None = None
 
 
-class AgentOut(BaseModel):
+class SessionPatch(BaseModel):
+    name: str | None = Field(default=None, max_length=128)
+
+
+class SessionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     name: str | None = None
     host_id: str
     host_name: str | None = None
-    preset_id: str | None = None
     cwd: str
-    argv: list[str]
-    env: dict[str, str]
     status: str
     started_at: datetime
     exited_at: datetime | None = None
+    exit_code: int | None = None
     last_output_at: datetime | None = None
     last_input_at: datetime | None = None
     last_activity_at: datetime | None = None
     activity_state: str = "unknown"
     activity_label: str = "Unknown"
-    exit_code: int | None = None
-    pinned_at: datetime | None = None
-    archived_at: datetime | None = None
+    foreground_command: str | None = None
 
 
-# ---------- screens ----------
+# ---------- workspaces ----------
+
+# A workspace icon is a small square thumbnail the browser renders itself, from
+# an image found in the workspace's folder or picked by the owner. 32 KiB of
+# base64 is roughly a 128x128 WebP with room to spare; anything larger is not an
+# icon, it is a picture, and it would be paid for on every sidebar render.
+WORKSPACE_ICON_MAX_CHARS = 32 * 1024
+# Deliberately narrow: `data:` only, so a stored icon can never make a client
+# fetch from a third party, and raster only — SVG is markup, and markup in an
+# `<img>` is a surface we have no reason to take on for a 24px tile.
+_WORKSPACE_ICON_PATTERN = re.compile(r"^data:image/(?:png|webp);base64,[A-Za-z0-9+/]+={0,2}$")
+
+WorkspaceIconSource = Literal["auto", "custom", "none"]
 
 
-class LayoutPane(BaseModel):
-    type: Literal["pane"]
-    agent_id: str
+def validate_workspace_icon(value: str | None) -> str | None:
+    """The icon as stored, or a `ValueError` naming what was wrong with it.
+
+    Null is always allowed: it is how a workspace says "draw my initials".
+    """
+    if value is None:
+        return None
+    if len(value) > WORKSPACE_ICON_MAX_CHARS:
+        raise ValueError("icon is too large")
+    if _WORKSPACE_ICON_PATTERN.fullmatch(value) is None:
+        raise ValueError("icon must be a base64 data URL of a PNG or WebP image")
+    return value
 
 
-class LayoutSplit(BaseModel):
-    type: Literal["split"]
-    direction: Literal["row", "column"]
-    ratio: float = Field(default=0.5, ge=0.05, le=0.95)
-    a: LayoutNode
-    b: LayoutNode
+class WorkspaceIconFields(BaseModel):
+    """The icon pair, shared by workspaces and the templates saved from them.
+
+    `icon` absent and `icon` explicitly null are different requests on a PATCH
+    — "leave it" versus "clear it" — so routes read `model_fields_set` rather
+    than testing for None.
+    """
+
+    icon: str | None = None
+    icon_source: WorkspaceIconSource | None = None
+
+    @field_validator("icon")
+    @classmethod
+    def _validate_icon(cls, value: str | None) -> str | None:
+        return validate_workspace_icon(value)
 
 
-LayoutNode = Annotated[LayoutPane | LayoutSplit, Field(discriminator="type")]
+class TileWidget(BaseModel):
+    """Non-session pane content. A widget tile's `session_id` is its own id."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["files"]
+    host_id: str
+    path: str
 
 
-class ScreenLayout(BaseModel):
-    root: LayoutNode | None = None
+class WorkspaceTile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    x: int
+    y: int
+    w: int
+    h: int
+    # Set -> the tile renders a widget instead of a session terminal.
+    widget: TileWidget | None = None
+
+    @model_serializer(mode="plain")
+    def _serialize(self) -> dict:
+        # `widget` stays off the wire unless set: session tiles are the norm
+        # and their shape must not change.
+        tile: dict = {
+            "session_id": self.session_id,
+            "x": self.x,
+            "y": self.y,
+            "w": self.w,
+            "h": self.h,
+        }
+        if self.widget is not None:
+            tile["widget"] = self.widget.model_dump()
+        return tile
 
 
-class ScreenCreate(BaseModel):
-    name: str = Field(max_length=128)
-    layout: ScreenLayout = Field(default_factory=ScreenLayout)
-    ephemeral: bool = False
+class WorkspaceLayout(BaseModel):
+    """One tab's tile grid, in the 24x24 space of grid schema v3.
+
+    A v2 grid is accepted and lifted on the way in. During a deploy there is a
+    window where a browser still holds the old bundle and keeps PATCHing 12x12
+    layouts; scaling them here means those writes land correctly instead of
+    being rejected, or — far worse — being stored as v3 and read back at half
+    scale. `grid.LAYOUT_VERSION` is the only thing that ever reaches the DB.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[3]
+    tiles: list[WorkspaceTile] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lift_v2_grid(cls, value: Any) -> Any:
+        return grid.lift_layout(value)
 
 
-class ScreenPatch(BaseModel):
+class WorkspaceTab(BaseModel):
+    """One named 24x24 grid inside a workspace (layout schema v3).
+
+    `host_id`/`cwd` are the tab's own default folder — where a window added to
+    this tab opens. Null means "inherit the workspace's home", so a tab that
+    has never been re-pointed follows the workspace as it moves; a host that
+    stops being the owner's is nulled back to inheriting on the next write.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=64)
+    layout: WorkspaceLayout
+    host_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=1024)
+
+
+class WorkspaceLayoutV3(BaseModel):
+    """The workspace layout envelope: an ordered list of tabs, each holding a
+    tile grid. The grid algebra (grid.py / grid.ts and the shared fixtures)
+    sits below this — tabs are an envelope over it, and the two are versioned
+    independently. A workspace always has at least one tab.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[3]
+    # The tab the workspace last had open; must name a tab when set. Carried
+    # along on layout writes rather than written on every switch.
+    active_tab: str | None = None
+    tabs: list[WorkspaceTab] = Field(min_length=1, max_length=8)
+
+
+class WorkspaceFirstSession(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    host_id: str
+    cwd: str
+    skill_ids: list[str] | None = None
+
+
+class WorkspaceCreate(WorkspaceIconFields):
+    # Omitted -> the server names it "Workspace N" (next free N).
     name: str | None = Field(default=None, max_length=128)
-    layout: ScreenLayout | None = None
-    ephemeral: bool | None = None
-    pinned: bool | None = None
+    # Optional: create the workspace and its first shell session atomically;
+    # the session gets the full-canvas tile.
+    first_session: WorkspaceFirstSession | None = None
+    # The workspace's home host/folder, for a workspace created empty — the
+    # tab opens on its empty state and every pane added later starts here.
+    # Ignored when `first_session` is given, which sets the home itself.
+    host_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=1024)
 
 
-class ScreenOut(BaseModel):
+class WorkspacePatch(WorkspaceIconFields):
+    name: str | None = Field(default=None, max_length=128)
+    layout: WorkspaceLayoutV3 | None = None
+    position: int | None = Field(default=None, ge=0)
+    # The workspace's home host/folder ("core settings"): both optional and
+    # independently patchable.
+    host_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=1024)
+
+
+class WorkspaceOut(WorkspaceIconFields):
     id: str
     name: str
-    layout: ScreenLayout
-    ephemeral: bool = False
-    pinned_at: datetime | None = None
+    host_id: str | None = None
+    cwd: str | None = None
+    layout: WorkspaceLayoutV3
+    position: int = 0
+    # Set -> the workspace is put away: out of the default list and stopped.
+    # Its layout is untouched, so what it holds is readable from `layout` and
+    # the session rows it names, exactly as an active workspace's is.
+    archived_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkspaceCreateResponse(BaseModel):
+    workspace: WorkspaceOut
+    session: SessionOut | None = None
+
+
+class TemplateRun(BaseModel):
+    """What a template tile launches when instantiated."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["shell", "agent", "files"]
+    # Required (non-empty) when kind == "agent": the command typed into the
+    # freshly spawned shell.
+    command: str | None = Field(default=None, max_length=512)
+
+
+class TemplateTile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: int
+    y: int
+    w: int
+    h: int
+    run: TemplateRun
+
+
+class TemplateTab(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=64)
+    tiles: list[TemplateTile] = Field(default_factory=list, max_length=grid.MAX_TILES)
+
+
+class WorkspaceTemplateSpec(BaseModel):
+    """A workspace's shape, portable across folders: geometry + what runs.
+    Tile geometry is validated against the same grid invariants as layouts.
+
+    Version 2 carries 24x24 geometry; a v1 spec is 12x12 and is lifted on the
+    way in, for the same reason `WorkspaceLayout` lifts a v2 grid.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[2]
+    tabs: list[TemplateTab] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lift_v1_spec(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or value.get("version") != 1:
+            return value
+        scale = grid.GRID_COLS // grid.V2_GRID_COLS
+        tabs = []
+        for tab in value.get("tabs") or []:
+            if not isinstance(tab, dict):
+                tabs.append(tab)
+                continue
+            tiles = []
+            for tile in tab.get("tiles") or []:
+                if not isinstance(tile, dict):
+                    tiles.append(tile)
+                    continue
+                scaled = dict(tile)
+                for key in ("x", "y", "w", "h"):
+                    size = scaled.get(key)
+                    if isinstance(size, int) and not isinstance(size, bool):
+                        scaled[key] = size * scale
+                tiles.append(scaled)
+            tabs.append({**tab, "tiles": tiles})
+        return {**value, "version": 2, "tabs": tabs}
+
+
+class WorkspaceTemplateCreate(WorkspaceIconFields):
+    name: str = Field(min_length=1, max_length=128)
+    # The folder the template remembers: instantiation goes straight there.
+    host_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=1024)
+    spec: WorkspaceTemplateSpec
+
+
+class WorkspaceTemplatePatch(WorkspaceIconFields):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    host_id: str | None = None
+    cwd: str | None = Field(default=None, max_length=1024)
+    spec: WorkspaceTemplateSpec | None = None
+
+
+class WorkspaceTemplateOut(WorkspaceIconFields):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    host_id: str | None = None
+    cwd: str | None = None
+    spec: WorkspaceTemplateSpec
     created_at: datetime
     updated_at: datetime
 
@@ -1016,7 +1386,7 @@ class BrowserEndorsementRecord(BaseModel):
     browser re-encodes the endorsement transcript from these claims plus its
     OWN key and device id, verifies the signature against the endorser key
     whose fingerprint the operator confirmed on the endorsing browser's
-    screen, and only then treats `host_public_key` as introduced.
+    display, and only then treats `host_public_key` as introduced.
     """
 
     host_id: str

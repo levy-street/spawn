@@ -2,17 +2,17 @@
 //! byte in source order and emits only content-free activity metadata.
 //!
 //! Terminal sequences and UTF-8 code points can be split across arbitrary PTY
-//! reads, so classification is deliberately stateful per agent. CSI/OSC
+//! reads, so classification is deliberately stateful per session. CSI/OSC
 //! parsing uses constant state; there is no intermediate terminal status bar
 //! whose repaint needs content-specific filtering.
 
 use std::time::Duration;
 
-/// Throttle: at most one output-activity ping per agent per this interval.
+/// Throttle: at most one output-activity ping per session per this interval.
 pub const OUTPUT_TOUCH_INTERVAL: Duration = Duration::from_secs(2);
-/// Throttle: at most one input-activity ping per agent per this interval.
+/// Throttle: at most one input-activity ping per session per this interval.
 pub const INPUT_TOUCH_INTERVAL: Duration = Duration::from_secs(1);
-/// After local input, suppress the echo from counting as agent work.
+/// After local input, suppress the echo from counting as session work.
 pub const INPUT_ECHO_SUPPRESS_WINDOW: Duration = Duration::from_millis(750);
 /// After an injected resize/redraw, suppress the resulting repaint.
 pub const REDRAW_SUPPRESS_WINDOW: Duration = Duration::from_millis(1500);
@@ -41,7 +41,7 @@ enum TerminalState {
     Charset,
 }
 
-/// Per-agent streaming classifier. `observe` must be called for every PTY
+/// Per-session streaming classifier. `observe` must be called for every PTY
 /// chunk, including chunks received while output activity is throttled or
 /// suppressed. `eligible` controls whether visible characters from this chunk
 /// may contribute to activity while parser state always advances.
@@ -309,12 +309,12 @@ mod tests {
     }
 }
 
-/// Streaming classifier for the browser→agent direction.
+/// Streaming classifier for the browser→session direction.
 ///
 /// Not every byte arriving on the data channel is someone typing. A terminal
 /// answers questions the application asked it — where the cursor is, whether
 /// it has focus, where the mouse went — and xterm.js emits those replies
-/// through the same path as keystrokes. Counting them as input makes an agent
+/// through the same path as keystrokes. Counting them as input makes a session
 /// report "Input sent" because somebody clicked on it to see what it was
 /// doing, which is exactly when the badge should say nothing at all.
 ///

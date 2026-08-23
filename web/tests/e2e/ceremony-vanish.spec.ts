@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync, type KeyObject, randomBytes, sign } from "node:crypto";
 import { expect, type Page, test } from "@playwright/test";
-import { BROWSER_DEVICE_ID, mockAuthenticatedApi, USER_ID } from "./app-mocks";
+import { BROWSER_DEVICE_ID, mockApp, USER_ID } from "./app-mocks";
 
 // The C1 terminal-state truth, joiner side (docs/TRUST_DEVICE_MESH.md §4 —
 // mutual endorsement is a REQUIRED P1 invariant; the relay row's absence
@@ -72,7 +72,7 @@ async function installVanishingCeremony(page: Page): Promise<VanishHarness> {
   const initiatorWire = b64url(initiatorRaw);
   const initiatorNonce = randomBytes(32);
 
-  await mockAuthenticatedApi(page, {
+  await mockApp(page, {
     hostPins: {},
     extraBrowserDevices: [
       {
@@ -209,7 +209,7 @@ test("a vanished row whose verified approval landed reads approved — and recip
   page,
 }) => {
   const harness = await installVanishingCeremony(page);
-  await page.goto("/hosts");
+  await page.goto("/app");
 
   // The joiner runs the commit/reveal dance and shows its number.
   const ceremony = page.getByTestId("approve-ceremony");
@@ -236,7 +236,7 @@ test("a vanished row with no verified edge stays stopped — nothing was trusted
   page,
 }) => {
   const harness = await installVanishingCeremony(page);
-  await page.goto("/hosts");
+  await page.goto("/app");
 
   await expect(page.getByTestId("ceremony-sas")).toBeVisible({ timeout: 15_000 });
   harness.setVanished(); // peer cancel; no edge ever appears
