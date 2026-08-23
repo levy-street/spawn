@@ -159,10 +159,21 @@ class QuietWatch:
         if timer is not None:
             timer.cancel()
 
-    def shutdown(self) -> None:
-        for timer in self._timers.values():
+    async def shutdown(self) -> None:
+        """Cancel every pending timer and drain them.
+
+        Awaited so a publish that already started runs to completion before
+        the caller's own teardown proceeds: cancelling a callback mid-flight
+        can interrupt a DB operation partway, which is fatal to pools that
+        share one connection (the test harness's in-memory SQLite) and buys
+        nothing anywhere else — the publish is one bounded read-and-emit.
+        """
+        timers = list(self._timers.values())
+        for timer in timers:
             timer.cancel()
         self._timers.clear()
+        if timers:
+            await asyncio.gather(*timers, return_exceptions=True)
 
     @property
     def pending(self) -> int:
@@ -171,7 +182,19 @@ class QuietWatch:
     async def _wait(self, session_id: str) -> None:
         try:
             await asyncio.sleep(self._delay)
-            await self._on_quiet(session_id)
+            # The clock ran out: from here the publish runs to completion even
+            # if this timer is cancelled meanwhile. Only the sleep is a
+            # cancellation point — see shutdown() for why interrupting the
+            # callback itself is never worth it.
+            publish = asyncio.ensure_future(self._on_quiet(session_id))
+            try:
+                await asyncio.shield(publish)
+            except asyncio.CancelledError:
+                try:
+                    await publish
+                except Exception as e:  # noqa: BLE001
+                    log.warning("quiet watch failed for session %s: %s", session_id, e)
+                raise
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
