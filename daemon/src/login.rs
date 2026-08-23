@@ -125,6 +125,13 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
     println!("spawn:   asked to compare a fingerprint instead? it must be exactly:");
     println!("spawn:     {}", identity.fingerprint);
     println!();
+    // The app's "enter a pairing code" fallback exists for exactly the case
+    // where this link cannot travel (no browser here, approving from another
+    // device). It is only reachable if the code is actually shown somewhere,
+    // and this terminal is that somewhere.
+    println!("spawn:   can't use the link? in the app, choose \"enter a pairing code\"");
+    println!("spawn:   and type: {}", start.user_code);
+    println!();
     println!("spawn: waiting for approval…");
 
     // 2. poll
