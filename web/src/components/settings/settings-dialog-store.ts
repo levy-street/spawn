@@ -13,10 +13,15 @@ export type SettingsTab =
   | "notifications"
   | "hosts"
   | "agents"
+  | "access"
   | "skills"
-  | "templates"
-  | "devices"
-  | "trust";
+  | "templates";
+
+/**
+ * Old bookmarks and copy said "Browser devices" / "Device trust"; both now
+ * live on the one Access tab (docs/TRUST_UX.md).
+ */
+export type SettingsTabRequest = SettingsTab | "devices" | "trust";
 
 let openTab: SettingsTab | null = null;
 const listeners = new Set<() => void>();
@@ -25,8 +30,8 @@ function emit() {
   for (const listener of listeners) listener();
 }
 
-export function openSettings(tab: SettingsTab = "account") {
-  openTab = tab;
+export function openSettings(tab: SettingsTabRequest = "account") {
+  openTab = tab === "devices" || tab === "trust" ? "access" : tab;
   emit();
 }
 

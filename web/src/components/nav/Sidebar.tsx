@@ -1,7 +1,16 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { LogOut, PanelLeftClose, PanelLeftOpen, Plus, Settings, UserRound, X } from "lucide-react";
+import {
+  LogOut,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plus,
+  Settings,
+  ShieldCheck,
+  UserRound,
+  X,
+} from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
@@ -605,6 +614,12 @@ export function Sidebar({
             Profile
           </DropdownMenuItem>
           <DropdownMenuSeparator />
+          {/* Settings has its own rail row above; Access keeps the one-click
+              reach the v5 Access UX asks for (docs/TRUST_UX.md). */}
+          <DropdownMenuItem onSelect={() => openSettings("access")}>
+            <ShieldCheck className="size-4" aria-hidden />
+            Access
+          </DropdownMenuItem>
           <DropdownMenuItem
             destructive
             onSelect={() => {

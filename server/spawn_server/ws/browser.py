@@ -30,10 +30,12 @@ from .host_signal import (
     valid_rtc_binding_nonce,
 )
 from .signed_signal_relay import (
+    CARRIED_ENDORSEMENTS_FIELD,
     MAX_RTC_ROUTING_FRAME_BYTES,
     SIGNED_ENVELOPE_FIELD,
     SignedRtcRelayError,
     reject_raw_sdp_in_signed_mode,
+    sanitize_carried_endorsements,
     signed_mode_selected,
     validate_signed_rtc_relay_envelope,
 )
@@ -281,9 +283,10 @@ async def browser_ws(
                                     expected_protocol=binding.protocol,
                                     expected_protocol_version=binding.protocol_version,
                                 )
-                            elif signed_mode_selected(signal) or _valid_rtc_sdp(
-                                signal.get("sdp")
-                            ) is None:
+                            elif (
+                                signed_mode_selected(signal)
+                                or _valid_rtc_sdp(signal.get("sdp")) is None
+                            ):
                                 continue
                         except SignedRtcRelayError:
                             continue
@@ -306,9 +309,7 @@ async def browser_ws(
                             await broker.unregister_rtc_session(session_id, route)
                             rtc_routes.pop(session_id, None)
                         elif status_value == "connected":
-                            connected = await broker.mark_rtc_session_connected(
-                                session_id, binding
-                            )
+                            connected = await broker.mark_rtc_session_connected(session_id, binding)
                             if connected is None:
                                 continue
                             binding = connected
@@ -321,9 +322,7 @@ async def browser_ws(
                         "failed",
                         "unavailable",
                     }
-                    if not terminal_status and not (
-                        await broker.rtc_session_is_current(binding)
-                    ):
+                    if not terminal_status and not (await broker.rtc_session_is_current(binding)):
                         continue
                     await conn.send_text(signal)
         except Exception as e:  # noqa: BLE001
@@ -525,6 +524,12 @@ async def browser_ws(
                     if signed_signal:
                         assert signed_envelope is not None
                         offer_payload[SIGNED_ENVELOPE_FIELD] = signed_envelope
+                        # Relay any carried endorsement edges opaquely so a daemon
+                        # that does not directly pin this browser can still admit
+                        # it via a chain. The daemon re-verifies every edge.
+                        carried = sanitize_carried_endorsements(obj.get(CARRIED_ENDORSEMENTS_FIELD))
+                        if carried is not None:
+                            offer_payload[CARRIED_ENDORSEMENTS_FIELD] = carried
                     else:
                         assert sdp is not None
                         offer_payload["sdp"] = sdp

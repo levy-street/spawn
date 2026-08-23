@@ -24,10 +24,12 @@ mod host_mime;
 mod host_preview;
 mod host_signal;
 mod login;
+mod possess;
 mod proto;
 mod pty;
 mod rtc;
 mod run;
+mod service;
 mod session_ctl;
 mod sessions;
 mod upload;
@@ -40,9 +42,17 @@ use cli::{Cli, Command};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Some(dir) = cli.config_dir.as_deref() {
+        // The whole daemon keys its per-host state off SPAWN_CONFIG_DIR. Set it
+        // once here — single-threaded, before any config access or thread spawn
+        // — so --config-dir and the env var are one mechanism.
+        std::env::set_var("SPAWN_CONFIG_DIR", dir);
+    }
     init_tracing(cli.verbose);
 
     match cli.command {
+        Command::Possess(args) => possess::possess(cli.server.clone(), args).await,
+        Command::Exorcise(args) => possess::exorcise(cli.server.clone(), args).await,
         Command::Login(args) => {
             let no_run = args.no_run;
             login::run(cli.server.clone(), args).await?;

@@ -1,6 +1,13 @@
+import { encodeAcctEndorsementTranscript } from "./acct-endorsement-transcript";
 import { encodeBrowserDeviceRegistrationTranscript } from "./browser-device-registration-transcript";
 import { encodeBrowserEndorsementTranscript } from "./browser-endorsement-transcript";
+import {
+  encodeDeviceIntroductionTranscript,
+  encodeHostIntroductionBroadcastTranscript,
+  encodeHostIntroductionTranscript,
+} from "./host-introduction";
 import { encodeHostPairApprovalTranscript } from "./host-pair-approval-transcript";
+import { encodeRootIntroductionTranscript } from "./root-introduction";
 import {
   ED25519_PUBLIC_KEY_WIRE_CHARS,
   ED25519_SIGNATURE_BYTES,
@@ -407,7 +414,14 @@ export async function createBrowserDeviceRegistrationProof(
       "browser device identity does not belong to the authenticated account",
     );
   }
-  const transcript = encodeBrowserDeviceRegistrationTranscript(accountId, record.publicKeyWire);
+  // An ordinary browser device, never the account root: this signer attests
+  // is_root=false inside the V2 transcript, so the server cannot promote this
+  // key to root authority by flipping the request flag.
+  const transcript = encodeBrowserDeviceRegistrationTranscript(
+    accountId,
+    record.publicKeyWire,
+    false,
+  );
   const ownedTranscript = new ArrayBuffer(transcript.byteLength);
   new Uint8Array(ownedTranscript).set(transcript);
   const signature = new Uint8Array(
@@ -497,6 +511,210 @@ export async function createBrowserEndorsementProof(
     throw new BrowserDeviceIdentityError(
       "corrupt_record",
       "browser endorsement signer returned an invalid signature length",
+    );
+  }
+  return encodeBase64Url(signature);
+}
+
+/**
+ * Sign an ACCOUNT-scoped endorsement of another device's key (device mesh §3).
+ *
+ * Unlike {@link createBrowserEndorsementProof} there is no host: the same signed
+ * edge is valid toward every host of the account, carried by the endorsed device
+ * and presented on connect. The endorsed key must be the one the operator
+ * confirmed via the SAS number-match; signing does not establish where it came
+ * from, only that this device vouched for it account-wide.
+ */
+export async function createAccountEndorsementProof(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+  endorsedPublicKey: string,
+  endorsedDeviceId: string,
+): Promise<string> {
+  assertAccountId(accountId);
+  const record = privateIdentityRecords.get(identity);
+  if (record === undefined || record.accountId !== accountId) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not belong to the authenticated account",
+    );
+  }
+  const transcript = encodeAcctEndorsementTranscript(
+    accountId,
+    record.publicKeyWire,
+    endorsedPublicKey,
+    endorsedDeviceId,
+  );
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new BrowserDeviceIdentityError(
+      "corrupt_record",
+      "account endorsement signer returned an invalid signature length",
+    );
+  }
+  return encodeBase64Url(signature);
+}
+
+/**
+ * Sign a host-key introduction toward one specific joiner (device mesh R7).
+ *
+ * The statement is scoped: THIS device (which verified `hostPublicKey` out of
+ * band, or it must not sign) vouches that key to exactly `joinerPublicKey` —
+ * the key the SAS ceremony authenticated. Domain-separated from every
+ * endorsement transcript; the daemon never sees or accepts it.
+ */
+export async function createHostIntroductionProof(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+  hostPublicKey: string,
+  joinerPublicKey: string,
+): Promise<string> {
+  assertAccountId(accountId);
+  const record = privateIdentityRecords.get(identity);
+  if (record === undefined || record.accountId !== accountId) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not belong to the authenticated account",
+    );
+  }
+  const transcript = encodeHostIntroductionTranscript(
+    accountId,
+    record.publicKeyWire,
+    hostPublicKey,
+    joinerPublicKey,
+  );
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new BrowserDeviceIdentityError(
+      "corrupt_record",
+      "host introduction signer returned an invalid signature length",
+    );
+  }
+  return encodeBase64Url(signature);
+}
+
+/**
+ * Sign the DURABLE broadcast form of a host introduction (continuous gossip):
+ * this device vouches `hostPublicKey` — a key it verified out of band, or it
+ * must not sign — to the whole account, unscoped to any recipient. Recipients
+ * only honor it if they hold THIS device's key firsthand.
+ */
+export async function createHostIntroductionBroadcastProof(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+  hostPublicKey: string,
+): Promise<string> {
+  assertAccountId(accountId);
+  const record = privateIdentityRecords.get(identity);
+  if (record === undefined || record.accountId !== accountId) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not belong to the authenticated account",
+    );
+  }
+  const transcript = encodeHostIntroductionBroadcastTranscript(
+    accountId,
+    record.publicKeyWire,
+    hostPublicKey,
+  );
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new BrowserDeviceIdentityError(
+      "corrupt_record",
+      "host introduction signer returned an invalid signature length",
+    );
+  }
+  return encodeBase64Url(signature);
+}
+
+/**
+ * Sign a root-key introduction (SPAWN-ROOT-INTRO-V1): this device vouches
+ * `rootPublicKey` — a key it holds FIRSTHAND (minted it, or unsealed it from
+ * the passkey bundle), or it must not sign — to the whole account. Recipients
+ * only honor it if they hold THIS device's key firsthand; it is what lets a
+ * pinned device anchor the root without ever trusting the server's `is_root`
+ * claim (§4.1 provenance rule).
+ */
+export async function createRootIntroductionProof(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+  rootPublicKey: string,
+): Promise<string> {
+  assertAccountId(accountId);
+  const record = privateIdentityRecords.get(identity);
+  if (record === undefined || record.accountId !== accountId) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not belong to the authenticated account",
+    );
+  }
+  const transcript = encodeRootIntroductionTranscript(
+    accountId,
+    record.publicKeyWire,
+    rootPublicKey,
+  );
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new BrowserDeviceIdentityError(
+      "corrupt_record",
+      "root introduction signer returned an invalid signature length",
+    );
+  }
+  return encodeBase64Url(signature);
+}
+
+/**
+ * Sign a device-key introduction toward one specific joiner: this device hands
+ * over a peer device key it learned FIRSTHAND, so the joiner can later verify
+ * that peer's broadcast host introductions without having met it.
+ */
+export async function createDeviceIntroductionProof(
+  identity: BrowserDeviceIdentity,
+  accountId: string,
+  peerPublicKey: string,
+  peerDeviceId: string,
+  joinerPublicKey: string,
+): Promise<string> {
+  assertAccountId(accountId);
+  const record = privateIdentityRecords.get(identity);
+  if (record === undefined || record.accountId !== accountId) {
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "browser device identity does not belong to the authenticated account",
+    );
+  }
+  const transcript = encodeDeviceIntroductionTranscript(
+    accountId,
+    record.publicKeyWire,
+    peerPublicKey,
+    peerDeviceId,
+    joinerPublicKey,
+  );
+  const ownedTranscript = new ArrayBuffer(transcript.byteLength);
+  new Uint8Array(ownedTranscript).set(transcript);
+  const signature = new Uint8Array(
+    await crypto.subtle.sign({ name: "Ed25519" }, record.privateKey, ownedTranscript),
+  );
+  if (signature.byteLength !== ED25519_SIGNATURE_BYTES) {
+    throw new BrowserDeviceIdentityError(
+      "corrupt_record",
+      "device introduction signer returned an invalid signature length",
     );
   }
   return encodeBase64Url(signature);

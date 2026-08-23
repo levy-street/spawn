@@ -47,8 +47,15 @@ run_guard() {
     local filtered_paths=()
     local scan_path
     for scan_path in "${scan_paths[@]}"; do
-      [[ "$scan_path" == "scripts/check-worker-only-daemon.sh" ]] || \
-        filtered_paths+=("$scan_path")
+      case "$scan_path" in
+        # This script names every forbidden token; the trust-ux presentation
+        # is a frozen design snapshot whose inline base64 screenshots contain
+        # random case-insensitive "tmux" byte runs (e.g. "TMuXEejQBwC").
+        # Filtered HERE because rg only applies --glob during directory
+        # traversal — explicitly listed files are searched unconditionally.
+        scripts/check-worker-only-daemon.sh | web/src/trust-ux/presentation.html) ;;
+        *) filtered_paths+=("$scan_path") ;;
+      esac
     done
     scan_paths=("${filtered_paths[@]}")
   else
@@ -76,7 +83,8 @@ run_guard() {
     --glob '!server/data/**' \
     --glob '!test-results/**' \
     --glob '!web/test-results/**' \
-    --glob '!check-worker-only-daemon.sh' || true)"
+    --glob '!check-worker-only-daemon.sh' \
+    --glob '!web/src/trust-ux/presentation.html' || true)"
   if [[ -n "$matches" ]]; then
     printf '%s\n' "worker-only guard: retired backend surface found:" >&2
     printf '%s\n' "$matches" >&2

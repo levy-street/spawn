@@ -289,6 +289,11 @@ export interface AppMockOptions {
   extraBrowserDevices?: Array<Record<string, unknown>>;
   hostPins?: Record<string, string[]>;
   endorsementsFor?: Record<string, Array<Record<string, unknown>>>;
+  /** Seeded add-device pairing relay rows (served by GET, mutated by the
+   * introductions endpoint). Shape: DevicePairingState JSON. */
+  pairings?: Array<Record<string, unknown>>;
+  /** Seeded durable host-introduction rows (continuous gossip store). */
+  hostIntroductions?: Array<Record<string, unknown>>;
 }
 
 export async function mockApp(page: Page, options: AppMockOptions = {}): Promise<AppMockStore> {
@@ -346,6 +351,12 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     ...(options.extraBrowserDevices ?? []),
   ];
   const hostPinMap: Record<string, string[]> = { ...(options.hostPins ?? {}) };
+  const pairingRows: Array<Record<string, unknown>> = (options.pairings ?? []).map((row) => ({
+    ...row,
+  }));
+  const hostIntroductionRows: Array<Record<string, unknown>> = (
+    options.hostIntroductions ?? []
+  ).map((row) => ({ ...row }));
 
   const invokeFileHandler = async (
     handler: ((hostId: string, body: unknown, route: Route) => Promise<void> | void) | undefined,
@@ -918,6 +929,24 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       await json(route, browserDeviceList);
       return;
     }
+    const requestApprovalMatch = path.match(/^\/api\/browser-devices\/([^/]+)\/request-approval$/);
+    if (requestApprovalMatch && method === "POST") {
+      // Advisory only — it stamps "this device is asking", never authorization.
+      const body = (await request.postDataJSON()) as { public_key?: string };
+      const device = browserDeviceList.find((item) => item.id === requestApprovalMatch[1]);
+      if (!device) {
+        await route.fulfill({ status: 404, json: { detail: "browser device not found" } });
+        return;
+      }
+      if (device.public_key !== body.public_key) {
+        await route.fulfill({ status: 409, json: { detail: "browser device changed" } });
+        return;
+      }
+      device.approval_requested_at = new Date().toISOString();
+      device.last_seen_at = device.approval_requested_at;
+      await json(route, device);
+      return;
+    }
     const browserRevokeMatch = path.match(/^\/api\/browser-devices\/([^/]+)\/revoke$/);
     if (browserRevokeMatch && method === "POST") {
       const body = (await request.postDataJSON()) as { expected_public_key?: string };
@@ -947,6 +976,100 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       await json(route, hostPinMap[hostPinsMatch[1]] ?? []);
       return;
     }
+    const hostPinDetailsMatch = path.match(/^\/api\/trust\/hosts\/([^/]+)\/pin-details$/);
+    if (hostPinDetailsMatch && method === "GET") {
+      const pinned = hostPinMap[hostPinDetailsMatch[1]] ?? [];
+      await json(
+        route,
+        pinned.map((deviceId) => {
+          const device = browserDeviceList.find((item) => item.id === deviceId);
+          return {
+            browser_device_id: deviceId,
+            browser_public_key: device?.public_key ?? null,
+            endorser_device_id: null,
+            direct: true,
+            created_at: CREATED_AT,
+          };
+        }),
+      );
+      return;
+    }
+    if (path === "/api/trust/account-endorsements" && method === "GET") {
+      await json(route, []);
+      return;
+    }
+    if (path === "/api/trust/pairing" && method === "GET") {
+      const forDevice = url.searchParams.get("device_id");
+      await json(
+        route,
+        pairingRows.filter(
+          (row) => row.initiator_device_id === forDevice || row.joiner_device_id === forDevice,
+        ),
+      );
+      return;
+    }
+    const pairingIntroductionsMatch = path.match(/^\/api\/trust\/pairing\/([^/]+)\/introductions$/);
+    if (pairingIntroductionsMatch && method === "POST") {
+      const row = pairingRows.find((item) => item.id === pairingIntroductionsMatch[1]);
+      if (!row) {
+        await route.fulfill({ status: 404, json: { detail: "pairing not found" } });
+        return;
+      }
+      // Set-once, like the server: a second write is a conflict, never a
+      // silent overwrite of statements a peer may already have verified.
+      if (row.introductions != null) {
+        await route.fulfill({ status: 409, json: { detail: "introductions already recorded" } });
+        return;
+      }
+      const body = (await request.postDataJSON()) as {
+        introductions?: unknown[];
+        device_introductions?: unknown[];
+      };
+      const hostItems = Array.isArray(body.introductions) ? body.introductions : [];
+      const deviceItems = Array.isArray(body.device_introductions) ? body.device_introductions : [];
+      if (hostItems.length === 0 && deviceItems.length === 0) {
+        await route.fulfill({ status: 422, json: { detail: "invalid introductions" } });
+        return;
+      }
+      row.introductions = hostItems;
+      row.device_introductions = deviceItems.length > 0 ? deviceItems : null;
+      await json(route, row);
+      return;
+    }
+    if (path === "/api/trust/host-introductions" && method === "GET") {
+      await json(route, hostIntroductionRows);
+      return;
+    }
+    if (path === "/api/trust/host-introductions" && method === "POST") {
+      const body = (await request.postDataJSON()) as Record<string, string>;
+      const publisher = browserDeviceList.find((item) => item.id === body.publisher_device_id);
+      if (!publisher) {
+        await route.fulfill({ status: 404, json: { detail: "publisher device not found" } });
+        return;
+      }
+      const existing = hostIntroductionRows.find(
+        (item) =>
+          item.publisher_device_id === body.publisher_device_id &&
+          item.host_public_key === body.host_public_key,
+      );
+      if (existing) {
+        await json(route, existing);
+        return;
+      }
+      const record = {
+        id: `intro-${hostIntroductionRows.length + 1}`,
+        publisher_device_id: body.publisher_device_id,
+        publisher_public_key: String(publisher.public_key),
+        host_id: body.host_id,
+        host_name: body.host_name,
+        host_public_key: body.host_public_key,
+        signature: body.signature,
+        created_at: CREATED_AT,
+      };
+      hostIntroductionRows.push(record);
+      await json(route, record);
+      return;
+    }
     if (path === "/api/trust/endorsements" && method === "GET") {
       const endorsedId = url.searchParams.get("endorsed_device_id");
       await json(route, options.endorsementsFor?.[endorsedId ?? ""] ?? []);
@@ -967,10 +1090,11 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       hostPinMap[body.host_id] = [
         ...new Set([...(hostPinMap[body.host_id] ?? []), body.endorsed_device_id]),
       ];
+      // Mesh B5: the server serves no fingerprint next to a key — clients
+      // derive the display value locally from the key they verified.
       await json(route, {
         host_id: body.host_id,
         endorsed_device_id: body.endorsed_device_id,
-        endorsed_key_fingerprint: endorsed.fingerprint,
         endorser_device_id: body.endorser_device_id,
         created_at: CREATED_AT,
       });
@@ -1542,8 +1666,8 @@ export async function openSettings(
     | "hosts"
     | "agents"
     | "skills"
-    | "devices"
-    | "trust" = "account",
+    | "templates"
+    | "access" = "account",
   workspaceId = WORKSPACE_ID,
 ) {
   await page.goto(`/w/${workspaceId}`);
@@ -1560,6 +1684,7 @@ const SETTINGS_TAB_LABELS = {
   hosts: "Hosts",
   agents: "Agents",
   skills: "Skills",
-  devices: "Browser devices",
-  trust: "Device trust",
+  templates: "Templates",
+  // "Browser devices" and "Device trust" merged into one Access tab (mesh v5).
+  access: "Access",
 } as const;

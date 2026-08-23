@@ -233,6 +233,16 @@ export interface HostControlRequestOptions {
   timeoutMs?: number;
 }
 
+/** One account-scoped endorsement edge carried on an offer (device mesh §3),
+ * in the exact wire shape the daemon reconstructs to re-verify. */
+export interface CarriedEndorsement {
+  account_id: string;
+  endorser_public_key: string;
+  endorsed_public_key: string;
+  endorsed_device_id: string;
+  signature: string;
+}
+
 export interface HostControlClientOptions {
   connectTimeoutMs?: number;
   requestTimeoutMs?: number;
@@ -243,6 +253,9 @@ export interface HostControlClientOptions {
   /** Resolve, per RTC generation, whether this host requires signed signaling,
    * may use raw (unpinned TOFU first-contact), or must be refused. */
   resolveSignedRtcTrust?: () => Promise<SignedRtcTrustDecision>;
+  /** Account endorsement edges to carry on the offer so a daemon that does not
+   * directly pin this browser can admit it via a chain to an anchor (§3). */
+  loadCarriedEndorsements?: () => Promise<CarriedEndorsement[]>;
 }
 
 export class HostControlClient {
@@ -1214,9 +1227,27 @@ export class HostControlClient {
       const carrier = nextSignedRtcSession
         ? await nextSignedRtcSession.createOffer(offer.sdp ?? "")
         : { sdp: offer.sdp ?? "" };
+      // A device the host does not directly pin carries its account endorsement
+      // edges so the daemon can admit it via a chain to an anchor (device mesh
+      // §3). Best-effort: on failure the offer still goes, and a directly-pinned
+      // device is admitted exactly as before.
+      let carried: CarriedEndorsement[] = [];
+      if (nextSignedRtcSession && this.options.loadCarriedEndorsements) {
+        try {
+          carried = await this.options.loadCarriedEndorsements();
+        } catch {
+          carried = [];
+        }
+      }
       if (this.sessionId !== sessionId || !this.isCurrentWebSocket(ws, attempt)) return;
       this.signedRtcSession = nextSignedRtcSession;
-      this.sendSignal({ type: "rtc.offer", session_id: sessionId, ...carrier }, ws, attempt);
+      const offerFrame: Record<string, unknown> = {
+        type: "rtc.offer",
+        session_id: sessionId,
+        ...carrier,
+      };
+      if (carried.length > 0) offerFrame.carried_endorsements = carried;
+      this.sendSignal(offerFrame, ws, attempt);
       // The offer (signed envelope when signed) is now the first frame that can
       // disclose this session to the server. Only now release the buffered
       // local candidates, and let later ones flow directly.

@@ -5,7 +5,6 @@ import {
   Bot,
   ExternalLink,
   LayoutTemplate,
-  MonitorSmartphone,
   Palette,
   Server,
   ShieldCheck,
@@ -14,10 +13,10 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import type { ComponentType } from "react";
+import { AccessPanel } from "@/components/settings/AccessPanel";
 import { AccountPanel } from "@/components/settings/AccountPanel";
 import { AgentsPanel } from "@/components/settings/AgentsPanel";
 import { AppearancePanel } from "@/components/settings/AppearancePanel";
-import { DevicesPanel } from "@/components/settings/DevicesPanel";
 import { HostsPanel } from "@/components/settings/HostsPanel";
 import { NotificationsPanel } from "@/components/settings/NotificationsPanel";
 import { SkillsPanel } from "@/components/settings/SkillsPanel";
@@ -28,12 +27,18 @@ import {
   useSettingsDialog,
 } from "@/components/settings/settings-dialog-store";
 import { TemplatesPanel } from "@/components/settings/TemplatesPanel";
-import { TrustPanel } from "@/components/settings/TrustPanel";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
+/**
+ * Identity first, then the resources a workspace draws on, then Access —
+ * which is the one tab about who may reach those resources at all, and so
+ * reads as the floor under the rest rather than another resource beside them.
+ * "Browser devices" and "Device trust" were two tabs before the mesh; both
+ * now live on Access (docs/TRUST_UX.md).
+ */
 const TABS: Array<{
   key: SettingsTab;
   label: string;
@@ -46,8 +51,7 @@ const TABS: Array<{
   { key: "agents", label: "Agents", icon: Bot },
   { key: "skills", label: "Skills", icon: Wrench },
   { key: "templates", label: "Templates", icon: LayoutTemplate },
-  { key: "devices", label: "Browser devices", icon: MonitorSmartphone },
-  { key: "trust", label: "Device trust", icon: ShieldCheck },
+  { key: "access", label: "Access", icon: ShieldCheck },
 ];
 
 export function SettingsDialog() {
@@ -58,8 +62,8 @@ export function SettingsDialog() {
     <Dialog open={tab !== null} onOpenChange={(open) => (open ? undefined : closeSettings())}>
       <DialogContent size="full-mobile" data-testid="settings-dialog" className="md:flex-row">
         <DialogDescription className="sr-only">
-          Manage your account, appearance, notifications, hosts, agents, skills, browser devices,
-          and device trust.
+          Manage your account, appearance, notifications, hosts, agents, skills, templates, and
+          access.
         </DialogDescription>
 
         <nav
@@ -112,8 +116,7 @@ export function SettingsDialog() {
             {tab === "agents" && <AgentsPanel />}
             {tab === "skills" && <SkillsPanel />}
             {tab === "templates" && <TemplatesPanel />}
-            {tab === "devices" && <DevicesPanel />}
-            {tab === "trust" && <TrustPanel />}
+            {tab === "access" && <AccessPanel />}
           </div>
         </div>
       </DialogContent>

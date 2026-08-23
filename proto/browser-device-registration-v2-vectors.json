@@ -1,0 +1,46 @@
+{
+  "contract": "SPAWN-BROWSER-REGISTER-V2",
+  "version": 2,
+  "positive": {
+    "user_id": "00000000-0000-4000-8000-000000000001",
+    "public_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+    "is_root": false,
+    "transcript_hex": "535041574e2d42524f575345522d52454749535445522d56320200000000000040008000000000000001008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "transcript_sha256": "0c1f27dc858f8673e698fa25cccf9e4d8113b2c77e620a83cce714d4dcc62d2c",
+    "signature": "hPuPZkucfSBSgPkFzwOpPVwP2mbT_OlyQwQNzz9B4f7atI1lrj5ny6hRZR-5RvOqfN7mCbSzP42Cq8QdvuQSDw"
+  },
+  "positive_root": {
+    "user_id": "00000000-0000-4000-8000-000000000001",
+    "public_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+    "is_root": true,
+    "transcript_hex": "535041574e2d42524f575345522d52454749535445522d56320200000000000040008000000000000001018a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "transcript_sha256": "f0a6aaf4ed4cab7c8287a22acd282b1b0b7200d8c070c929c82b287b9821f469",
+    "signature": "KyxjPYMx3ysq7y9epEU8pkV5coFVvbEwN7lfKLPS0hX18R8iXi_ay5EmK463aocb3R2o9azBdY5wG6IgayJ_Cw"
+  },
+  "mutations": {
+    "user_id": "00000000-0000-4000-8000-000000000002",
+    "public_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+    "signature": "MPuPZkucfSBSgPkFzwOpPVwP2mbT_OlyQwQNzz9B4f7atI1lrj5ny6hRZR-5RvOqfN7mCbSzP42Cq8QdvuQSDw"
+  },
+  "malformed_user_ids": [
+    "ABCDEFAB-1234-4ABC-8DEF-ABCDEFABCDEF",
+    "abcdefab12344abc8defabcdefabcdef",
+    "{abcdefab-1234-4abc-8def-abcdefabcdef}",
+    "urn:uuid:abcdefab-1234-4abc-8def-abcdefabcdef",
+    "uuid:abcdefab-1234-4abc-8def-abcdefabcdef",
+    " abcdefab-1234-4abc-8def-abcdefabcdef",
+    "abcdefab-1234-4abc-8def-abcdefabcdef "
+  ],
+  "malformed_public_keys": [
+    "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1",
+    "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w=",
+    "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1+",
+    "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "7f_______________________________________38"
+  ],
+  "malformed_signatures": [
+    "hPuPZkucfSBSgPkFzwOpPVwP2mbT_OlyQwQNzz9B4f7atI1lrj5ny6hRZR-5RvOqfN7mCbSzP42Cq8QdvuQSD",
+    "hPuPZkucfSBSgPkFzwOpPVwP2mbT_OlyQwQNzz9B4f7atI1lrj5ny6hRZR-5RvOqfN7mCbSzP42Cq8QdvuQSDw=",
+    "hPuPZkucfSBSgPkFzwOpPVwP2mbT_OlyQwQNzz9B4f7atI1lrj5ny6hRZR-5RvOqfN7mCbSzP42Cq8QdvuQS+A"
+  ]
+}

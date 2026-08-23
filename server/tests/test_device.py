@@ -94,7 +94,9 @@ async def _register_browser(client, user_id: str, auth: dict[str, str]):
             "key_algorithm": "ed25519",
             "public_key": public_wire,
             "signature": _wire(
-                private_key.sign(encode_browser_registration_transcript(user_id, public_key))
+                private_key.sign(
+                    encode_browser_registration_transcript(user_id, public_key, is_root=False)
+                )
             ),
         },
         headers=auth,
@@ -212,7 +214,9 @@ def _approval_body(
         "browser_device_id": device["id"],
         "browser_key_algorithm": device["key_algorithm"],
         "browser_public_key": device["public_key"],
-        "browser_key_fingerprint": device["fingerprint"],
+        # Derived locally, as the real client does (mesh B5): the register
+        # response no longer serves a fingerprint next to the key.
+        "browser_key_fingerprint": ed25519_key_fingerprint(device["public_key"]),
         "signature": _wire(private_key.sign(transcript)),
     }
 
@@ -271,6 +275,9 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
         "host_key_algorithm": "ed25519",
         "host_public_key": public_key,
         "host_key_fingerprint": fingerprint,
+        # No SAS in this ceremony (daemon sent no commitment) → both null.
+        "sas_commit": None,
+        "sas_host_nonce": None,
     }
 
     untrusted_fingerprint = await client.post(
@@ -293,13 +300,19 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
     approval = await _approve(client, start, user_id, auth, review, browser)
     assert approval.status_code == 200
     assert approval.json() == {
-        **review,
+        # The approve response mirrors the review minus the SAS relay fields
+        # (pending-only) and minus the fingerprint — it carries the keys, so
+        # any fingerprint is derived client-side (mesh B5).
+        **{
+            k: v
+            for k, v in review.items()
+            if k not in ("sas_commit", "sas_host_nonce", "host_key_fingerprint")
+        },
         # First pairing: the Host row does not exist yet, so no UUID to bind.
         "host_id": None,
         "browser_device_id": browser[0]["id"],
         "browser_key_algorithm": "ed25519",
         "browser_public_key": browser[0]["public_key"],
-        "browser_key_fingerprint": browser[0]["fingerprint"],
     }
 
     # Move the earlier pending poll outside the rate-limit window.
@@ -330,13 +343,17 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
     assert len(hosts) == 1
     assert hosts[0]["id"] == success["host_id"]
     assert hosts[0]["host_public_key"] == public_key
-    assert hosts[0]["host_key_fingerprint"] == fingerprint
+    # Mesh B5: the hosts listing serves the key alone; fingerprints shown in
+    # the UI are locally derived from it, never read off this response.
+    assert "host_key_fingerprint" not in hosts[0]
 
     async with get_sessionmaker()() as session:
         pin = await session.get(HostBrowserPin, (success["host_id"], browser[0]["id"]))
         assert pin is not None
         assert pin.browser_public_key == browser[0]["public_key"]
-        assert pin.browser_key_fingerprint == browser[0]["fingerprint"]
+        assert pin.browser_key_fingerprint == ed25519_key_fingerprint(
+            browser[0]["public_key"]
+        )
 
 
 async def test_host_possession_is_required_before_review_approval_or_token_issue(client):
@@ -846,9 +863,13 @@ async def test_approval_rejects_stale_nonce_and_substituted_browser_tuple(client
     review = await _review(client, start, auth)
     body = _approval_body(start, review, user_id, browser)
 
+    # Deterministic mangle: flip the first character to one it is not, so the
+    # nonce ALWAYS differs (a fixed "_" prefix was a no-op whenever the random
+    # nonce already started with "_" — a 1-in-64 flake).
+    nonce = body["approval_nonce"]
     stale_nonce = await client.post(
         "/api/auth/device/approve",
-        json={**body, "approval_nonce": "_" + body["approval_nonce"][1:]},
+        json={**body, "approval_nonce": ("_" if nonce[0] != "_" else "-") + nonce[1:]},
         headers=auth,
     )
     assert stale_nonce.status_code == 409
@@ -1022,7 +1043,7 @@ async def _assert_browser_binding_constraint_is_exact(client, *, email: str) -> 
         "browser_device_id": browser["id"],
         "browser_key_algorithm": "ed25519",
         "browser_public_key": browser["public_key"],
-        "browser_key_fingerprint": browser["fingerprint"],
+        "browser_key_fingerprint": ed25519_key_fingerprint(browser["public_key"]),
     }
 
     async with get_sessionmaker()() as session:
@@ -1179,6 +1200,54 @@ async def test_approval_rejects_identity_changed_after_review_without_token_or_p
     fresh_review = await _review(client, start, auth)
     assert fresh_review["host_public_key"] == changed_key
     assert fresh_review["host_key_fingerprint"] != review["host_key_fingerprint"]
+
+
+async def test_substituted_pending_host_key_cannot_absorb_an_out_of_band_approval(client):
+    """The /device fragment contract, server side (regression for the
+    URL-fragment possession flow): the browser only ever approves the host key
+    it was handed out-of-band — the `#k=` fragment the daemon appended to the
+    approval URL locally. If the server substitutes a different key into the
+    ceremony it relays (`/pending` returns a key ≠ the fragment), the browser
+    refuses outright; and even an approval forced through bound to the REAL
+    key must not attach to the substituted ceremony. Nothing may reach an
+    approved state, no Host row may exist, and the substituted ceremony must
+    stay pending for its own (wrong) key only."""
+
+    user_id, auth = await _signup(client, "fragment-substitution@example.com")
+    browser = await _register_browser(client, user_id, auth)
+    fragment_key = _public_key(11)  # what the daemon's link carries, out of band
+    substituted_key = _public_key(12)  # what a hostile server put in the ceremony
+
+    start = await _start(client, substituted_key)
+    review = await _review(client, start, auth)
+    # What the browser compares against its fragment — and refuses on. The rest
+    # of the test forces the approval anyway, as a defense-in-depth check.
+    assert review["host_public_key"] == substituted_key
+    forced_review = {
+        **review,
+        "host_public_key": fragment_key,
+        "host_key_fingerprint": host_key_fingerprint("ed25519", fragment_key),
+    }
+
+    approval = await _approve(client, start, user_id, auth, forced_review, browser)
+    assert approval.status_code == 409
+    assert "review" in approval.json()["detail"]
+
+    async with get_sessionmaker()() as session:
+        dc = await session.get(DeviceCode, start["device_code"])
+        assert dc is not None
+        assert dc.status == "pending"
+        assert dc.user_id is None
+        assert dc.browser_device_id is None
+        assert (await session.execute(select(func.count(Host.id)))).scalar_one() == 0
+
+    # The real daemon (polling with the fragment key) can never complete this
+    # ceremony, and the substituted ceremony itself is still unapproved.
+    assert (await _poll(client, start, fragment_key)).json() == {"error": "invalid_device_binding"}
+    assert (await _poll(client, start, substituted_key)).json() == {
+        "error": "authorization_pending"
+    }
+    assert (await client.get("/api/hosts", headers=auth)).json() == []
 
 
 async def test_concurrent_approval_and_poll_issue_exactly_one_token_and_pin(client):
@@ -2092,3 +2161,80 @@ async def test_revoking_the_browser_clears_the_retained_approval_proof(client):
         assert row is not None
         assert row.browser_device_id is None
         assert row.browser_approval_signature is None
+
+
+async def test_sas_relay_forwards_nonces_and_enforces_commit_reveal_order(client):
+    # The server is a dumb relay for the committed-ephemeral SAS: it forwards Cd,
+    # Nb/B, and Nd, and enforces that Nd is only recorded once Nb is present
+    # (commit-reveal ordering) — see docs/TRUST_DEVICE_MESH.md Appendix A.
+    import os
+
+    user_id, auth = await _signup(client, "sas-relay@example.com")
+    browser, _bk = await _register_browser(client, user_id, auth)
+
+    host_pub = _wire(Ed25519PrivateKey.generate().public_key().public_bytes_raw())
+    cd = _wire(os.urandom(32))  # daemon commitment
+    nb = _wire(os.urandom(32))  # browser nonce
+    nd = _wire(os.urandom(32))  # daemon nonce
+
+    start = (
+        await client.post(
+            "/api/auth/device/start",
+            json={
+                "host_name": "sas-box",
+                "os": "linux",
+                "arch": "x86_64",
+                "version": "0.1.0",
+                "host_key_algorithm": "ed25519",
+                "host_public_key": host_pub,
+                "sas_commit": cd,
+            },
+        )
+    ).json()
+    await _mark_possession_verified(start["device_code"])
+    ref = start["approval_ref"]
+    host_body = {
+        "device_code": start["device_code"],
+        "host_key_algorithm": "ed25519",
+        "host_public_key": host_pub,
+    }
+
+    # Browser sees the commitment via pending.
+    pending = (await client.post("/api/auth/device/pending", json={"approval_ref": ref}, headers=auth)).json()
+    assert pending["sas_commit"] == cd
+    assert pending["sas_host_nonce"] is None
+
+    # Commit-reveal ordering: the daemon revealing Nd BEFORE the browser's Nb is
+    # present must NOT be recorded (a relay can't rush the reveal).
+    r = (await client.post("/api/auth/device/sas-host", json={**host_body, "sas_host_nonce": nd})).json()
+    assert r["sas_browser_nonce"] is None and r["sas_host_nonce"] is None
+
+    # Browser contributes Nb + B.
+    ok = await client.post(
+        "/api/auth/device/sas",
+        json={"approval_ref": ref, "sas_browser_nonce": nb, "browser_public_key": browser["public_key"]},
+        headers=auth,
+    )
+    assert ok.status_code == 200, ok.text
+
+    # Set-once: a second browser contribution is refused (no swapping Nb later).
+    dup = await client.post(
+        "/api/auth/device/sas",
+        json={"approval_ref": ref, "sas_browser_nonce": _wire(os.urandom(32)), "browser_public_key": browser["public_key"]},
+        headers=auth,
+    )
+    assert dup.status_code == 409
+
+    # Daemon fetches Nb/B (no reveal yet).
+    r = (await client.post("/api/auth/device/sas-host", json=host_body)).json()
+    assert r["sas_browser_nonce"] == nb
+    assert r["sas_browser_key"] == browser["public_key"]
+    assert r["sas_host_nonce"] is None
+
+    # Now the daemon reveals Nd (Nb present) — recorded and echoed.
+    r = (await client.post("/api/auth/device/sas-host", json={**host_body, "sas_host_nonce": nd})).json()
+    assert r["sas_host_nonce"] == nd
+
+    # Browser now sees Nd via pending; it can verify the commit and show the SAS.
+    pending = (await client.post("/api/auth/device/pending", json={"approval_ref": ref}, headers=auth)).json()
+    assert pending["sas_host_nonce"] == nd

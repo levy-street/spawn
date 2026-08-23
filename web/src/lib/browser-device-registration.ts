@@ -2,14 +2,13 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
-import { type BrowserDevice, browserDevices } from "./api";
+import { ApiError, type BrowserDevice, browserDevices } from "./api";
 import {
   createBrowserDeviceRegistrationProof,
   deleteBrowserDeviceIdentity,
   loadBrowserDeviceIdentity,
   loadOrCreateBrowserDeviceIdentity,
 } from "./browser-device-identity";
-import { ed25519PublicKeyFingerprint } from "./signed-signal";
 
 const REVOCATION_MARKER_PREFIX = "spawn.browser-device.revocation.v1.";
 
@@ -137,23 +136,71 @@ export function defaultDeviceLabel(): string | null {
     .slice(0, 64);
 }
 
-async function registerBrowserDevice(userId: string): Promise<BrowserDeviceRegistrationState> {
-  const marker = readBrowserDeviceRevocationMarker(userId);
-  if (marker !== null) return { status: marker.status, publicKey: marker.publicKey };
+async function registerBrowserDevice(
+  userId: string,
+  replacedRevokedKey = false,
+): Promise<BrowserDeviceRegistrationState> {
+  // A removal is not a dead end for the browser it happened to: the removed
+  // KEY stays dead for good (R10), and this signed-in browser simply becomes
+  // a new, unapproved device — visible in every roster, waiting for approval
+  // (R4). No button, no ceremony to get *here*; the ceremony guards approval,
+  // never presence. Finish any interrupted cleanup, drop the marker, and fall
+  // through to minting a fresh identity.
+  let marker = readBrowserDeviceRevocationMarker(userId);
+  if (marker?.status === "cleanup_pending") {
+    try {
+      await finishBrowserDeviceLocalCleanup(userId, marker.publicKey);
+    } catch {
+      // The dead key could not be deleted locally; surface that explicitly
+      // rather than minting a second identity next to it.
+      return { status: "cleanup_pending", publicKey: marker.publicKey };
+    }
+    marker = readBrowserDeviceRevocationMarker(userId);
+  }
+  if (marker?.status === "revoked") {
+    allowExplicitBrowserIdentityReplacement(userId, marker.publicKey);
+  }
 
   const identity = await loadOrCreateBrowserDeviceIdentity(userId);
   const signature = await createBrowserDeviceRegistrationProof(identity, userId);
-  const device = await browserDevices.register({
-    key_algorithm: "ed25519",
-    public_key: identity.publicKeyWire,
-    signature,
-    label: defaultDeviceLabel(),
-  });
-  const expectedFingerprint = await ed25519PublicKeyFingerprint(identity.publicKeyWire);
+  let device: BrowserDevice;
+  try {
+    device = await browserDevices.register({
+      key_algorithm: "ed25519",
+      public_key: identity.publicKeyWire,
+      signature,
+      label: defaultDeviceLabel(),
+    });
+  } catch (error) {
+    if (
+      error instanceof ApiError &&
+      error.status === 409 &&
+      /revoked/iu.test(error.message) &&
+      !replacedRevokedKey
+    ) {
+      // The server refused this key as revoked: this device was removed FROM
+      // ANOTHER device (R1), and this is the moment it finds out. Clean up the
+      // dead key and register a fresh one in the same pass — seamlessly, the
+      // way any unapproved sign-in appears. Guarded to a single replacement:
+      // a server refusing the brand-new key too is an error worth seeing.
+      const status = await beginBrowserDeviceLocalCleanup(userId, identity.publicKeyWire);
+      if (status === "cleanup_pending") {
+        await finishBrowserDeviceLocalCleanup(userId, identity.publicKeyWire);
+      }
+      const cleared = readBrowserDeviceRevocationMarker(userId);
+      if (cleared?.status === "revoked") {
+        allowExplicitBrowserIdentityReplacement(userId, cleared.publicKey);
+      }
+      return registerBrowserDevice(userId, true);
+    }
+    throw error;
+  }
+  // The response carries the key alone (mesh B5); the exact-key comparison is
+  // the whole check, and any fingerprint shown for this device is derived
+  // locally from the key.
   if (
     device.key_algorithm !== "ed25519" ||
     device.public_key !== identity.publicKeyWire ||
-    device.fingerprint !== expectedFingerprint ||
     device.revoked_at !== null
   ) {
     throw new Error("browser registration response did not match the submitted active key");
@@ -179,7 +226,14 @@ export function useBrowserDeviceRegistration(userId: string | undefined) {
     queryFn: () => registerBrowserDevice(userId!),
     enabled: userId !== undefined,
     retry: false,
-    staleTime: Number.POSITIVE_INFINITY,
+    // Registration is the reconcile: it stamps last-seen and is the moment a
+    // device discovers it was removed elsewhere (409-revoked → seamless key
+    // replacement). Long-lived pages must keep having that moment — a page
+    // that registers once and never again retries dead keys forever. Focus
+    // and a slow interval keep every open page honest within ~a minute.
+    staleTime: 30_000,
+    refetchInterval: 90_000,
+    refetchOnWindowFocus: "always",
   });
 
   useEffect(() => {

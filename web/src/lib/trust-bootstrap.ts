@@ -9,22 +9,25 @@
  * See docs/TRUST.md "how a new device bootstraps trust".
  */
 
+import type { AccountRootMaterial } from "./account-root";
 import {
   approveBrowserHostPin,
   type BrowserHostPin,
   type BrowserHostPinStorageOptions,
   browserHostPinServerOrigin,
+  forgetActiveBrowserHostPins,
   listActiveBrowserHostPins,
   loadBrowserHostPin,
-  revokeBrowserHostPin,
 } from "./browser-host-pins";
 import type { TrustBundleHost } from "./trust-bundle";
 import {
   enrollPasskeyInEnvelope,
+  mergeEnvelopeHosts,
   openTrustEnvelope,
   type PasskeyWrapInput,
   revokePasskeyFromEnvelope,
   sealTrustEnvelope,
+  setEnvelopeRoot,
 } from "./trust-envelope";
 import {
   enforceBundleFreshness,
@@ -47,6 +50,14 @@ export interface ImportedTrust {
   readonly alreadyTrusted: readonly string[];
   /** Hosts the bundle named that this device has locally revoked, left untouched. */
   readonly skippedRevoked: readonly string[];
+  /**
+   * The account root's sealed material, when the bundle carries one. This is the
+   * healing key: the caller re-endorses the account's devices off it and then
+   * drops it — it must never be persisted outside the sealed bundle.
+   */
+  readonly root: AccountRootMaterial | null;
+  /** Every host the bundle names, for the heal's per-host anchor upgrades. */
+  readonly hosts: readonly TrustBundleHost[];
 }
 
 /** The bundle rollback floor lives in the same origin-partitioned storage as pins. */
@@ -77,6 +88,7 @@ export async function sealCurrentTrust(
   passkey: PasskeyWrapInput,
   scope: TrustBootstrapScope,
   serverRevision: number,
+  root: AccountRootMaterial | null = null,
 ): Promise<{ readonly sealed: string; readonly hostCount: number; readonly revision: number }> {
   const origin = scope.origin ?? browserHostPinServerOrigin();
   const pins = await listActiveBrowserHostPins(
@@ -87,7 +99,7 @@ export async function sealCurrentTrust(
   const floor = await readHighestSeenRevision(scope.accountId, revisionOptions(scope));
   const revision = Math.max(floor, Number.isInteger(serverRevision) ? serverRevision : 0) + 1;
   return {
-    sealed: await sealTrustEnvelope(scope.accountId, hosts, [passkey], revision),
+    sealed: await sealTrustEnvelope(scope.accountId, hosts, [passkey], revision, root),
     hostCount: hosts.length,
     revision,
   };
@@ -116,6 +128,91 @@ export async function enrollBackupPasskey(
   const opened = await openTrustEnvelope(scope.accountId, sealed, unlockWith);
   await enforceBundleFreshness(scope.accountId, opened.revision, revisionOptions(scope));
   return enrollPasskeyInEnvelope(scope.accountId, sealed, unlockWith, newPasskey);
+}
+
+/**
+ * Retrofit a freshly minted root into a pre-root bundle at unlock time, so
+ * accounts sealed before stage 5 gain recovery without re-running setup.
+ * Returns null when the bundle already carries a root (nothing to do). The
+ * caller stores the returned envelope, records the revision, and only then
+ * registers/heals off the root — a root whose seed is not durably sealed must
+ * never become an endorser or anchor.
+ */
+export async function retrofitAccountRoot(
+  scope: TrustBootstrapScope,
+  sealed: string,
+  unlockWith: PasskeyWrapInput,
+  serverRevision: number,
+  root: AccountRootMaterial,
+  /** Root ROTATION: replace a sealed root whose key was revoked (never a live one). */
+  replace = false,
+): Promise<{ readonly sealed: string; readonly revision: number } | null> {
+  const opened = await openTrustEnvelope(scope.accountId, sealed, unlockWith);
+  if (opened.root !== null && !replace) return null;
+  await enforceBundleFreshness(scope.accountId, opened.revision, revisionOptions(scope));
+  const floor = await readHighestSeenRevision(scope.accountId, revisionOptions(scope));
+  const revision =
+    Math.max(floor, Number.isInteger(serverRevision) ? serverRevision : 0, opened.revision) + 1;
+  return {
+    sealed: await setEnvelopeRoot(scope.accountId, sealed, unlockWith, root, revision, replace),
+    revision,
+  };
+}
+
+/**
+ * RESEAL-ON-UNLOCK (review P-C1): merge this device's ACTIVE local pins into
+ * the sealed bundle's host set, under the same data key at a bumped revision.
+ *
+ * `sealCurrentTrust` runs exactly once ever (passkey setup) and seals only the
+ * minting device's pins at that instant; without this, a host possessed later
+ * never enters the bundle and the "passkey brings everything back" promise
+ * silently rots. Every unlock already proves the passkey and holds the data
+ * key, so the merge costs no extra gesture. Local pins are firsthand by
+ * definition — this device verified each host key out of band (possess,
+ * ceremony gossip, or a previous import).
+ *
+ * Deliberately a UNION, never a replacement: a host another device sealed
+ * that this device has locally revoked (a local tombstone) stays in the
+ * bundle — local withdrawal is this-device-only, and resealing from local
+ * pins alone would evict it for everyone.
+ *
+ * Returns null when the bundle already covers everything. The caller stores
+ * with CAS at the revision it read; a 409 loser just skips — another device's
+ * merge won and the next unlock retries.
+ */
+export async function resealBundleWithLocalPins(
+  scope: TrustBootstrapScope,
+  sealed: string,
+  unlockWith: PasskeyWrapInput,
+  serverRevision: number,
+): Promise<{
+  readonly sealed: string;
+  readonly revision: number;
+  readonly addedHostKeys: readonly string[];
+} | null> {
+  const origin = scope.origin ?? browserHostPinServerOrigin();
+  const pins = await listActiveBrowserHostPins(
+    { accountId: scope.accountId, origin },
+    scope.pinStorage ?? {},
+  );
+  if (pins.length === 0) return null;
+  // Refuse to merge on top of a rolled-back bundle (same guard as retrofit):
+  // a server replaying an old authentic envelope must not launder it back to
+  // the current revision via this device's own write.
+  const opened = await openTrustEnvelope(scope.accountId, sealed, unlockWith);
+  await enforceBundleFreshness(scope.accountId, opened.revision, revisionOptions(scope));
+  const floor = await readHighestSeenRevision(scope.accountId, revisionOptions(scope));
+  const revision =
+    Math.max(floor, Number.isInteger(serverRevision) ? serverRevision : 0, opened.revision) + 1;
+  const merged = await mergeEnvelopeHosts(
+    scope.accountId,
+    sealed,
+    unlockWith,
+    pins.map(pinToBundleHost),
+    revision,
+  );
+  if (merged === null) return null;
+  return { sealed: merged.sealed, revision, addedHostKeys: merged.addedHostKeys };
 }
 
 /**
@@ -194,7 +291,10 @@ export async function importTrustBundle(
     }
     // Honour a local tombstone: importing must never silently resurrect a host
     // the operator revoked on this device. approveBrowserHostPin would otherwise
-    // reactivate it, undoing a deliberate withdrawal.
+    // reactivate it, undoing a deliberate withdrawal. A tombstone here always
+    // means a TARGETED revocation — a device-local "forget" deletes its records
+    // outright (see forgetTrustOnThisDevice), so a forgotten host re-imports
+    // freely while a removed one stays removed.
     const existing = await loadBrowserHostPin(
       {
         accountId: scope.accountId,
@@ -224,7 +324,7 @@ export async function importTrustBundle(
     );
     added.push(host.hostPublicKey);
   }
-  return { added, alreadyTrusted, skippedRevoked };
+  return { added, alreadyTrusted, skippedRevoked, root: bundle.root, hosts: bundle.hosts };
 }
 
 /**
@@ -236,32 +336,22 @@ export async function importTrustBundle(
  * can be re-endorsed afterwards. Without this the only remedy is clearing site
  * data through browser settings, which also destroys the device identity and so
  * invalidates any endorsement already granted to it.
+ *
+ * Forgetting DELETES the records rather than writing `revoked` tombstones
+ * (review P-C6). A tombstone here meant three lies at once: the device did not
+ * return to the unpinned path (the signed-RTC gate refuses a revoked pin), a
+ * later passkey import skipped the host forever, and the unlock then claimed
+ * the device "already knows your hosts" while it could reach none of them.
+ * Retained tombstones now always mean an operator's TARGETED host revocation
+ * (`revokeBrowserHostPin`), which imports still honour and the gate still
+ * refuses; such tombstones are untouched by a forget.
  */
 export async function forgetTrustOnThisDevice(
   scope: TrustBootstrapScope,
 ): Promise<{ readonly forgotten: number }> {
   const origin = scope.origin ?? browserHostPinServerOrigin();
-  const pins = await listActiveBrowserHostPins(
+  return forgetActiveBrowserHostPins(
     { accountId: scope.accountId, origin },
     scope.pinStorage ?? {},
   );
-  let forgotten = 0;
-  for (const pin of pins) {
-    for (const hostId of pin.hostIds) {
-      await revokeBrowserHostPin(
-        {
-          accountId: scope.accountId,
-          origin,
-          targetHostId: hostId,
-          claimedHostId: hostId,
-          claimedHostPublicKey: pin.hostPublicKey,
-          claimedHostFingerprint: pin.hostFingerprint,
-        },
-        scope.pinStorage ?? {},
-      );
-      forgotten += 1;
-      break;
-    }
-  }
-  return { forgotten };
 }

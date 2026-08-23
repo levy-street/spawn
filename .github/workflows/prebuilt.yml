@@ -1,0 +1,214 @@
+name: prebuilt
+
+# Build + test the daemon on real macOS and Linux and publish signed-by-toolchain
+# (ad-hoc) binaries for every supported target as a single rolling prerelease
+# that deploy-prod.sh pulls onto the server. One workflow owns the rolling
+# `prebuilt-latest` release: the per-platform build jobs upload artifacts and a
+# single publish job assembles them, so the jobs never race to delete+recreate
+# the same release. Gated to daemon changes so it rarely spends macOS/arm minutes
+# (billed on private repos; free entirely once the repo is public).
+"on":
+  push:
+    branches:
+      - master
+    paths:
+      - "daemon/**"
+      - ".github/workflows/prebuilt.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: prebuilt-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-14 # Apple Silicon; also cross-builds x86_64 from here
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable + x86_64 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            daemon/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('daemon/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      # Runs the full daemon suite on real macOS — this is what catches
+      # macOS-only regressions like the sun_path socket bug before they ship.
+      # Non-blocking for now: the worker integration tests set a long temp
+      # SPAWND_WORKER_DIR that itself overflows sun_path on macOS, so this is
+      # expected red until those tests are hardened (tracked follow-up). Kept
+      # visible so we get the signal; flip to a hard gate once green.
+      - name: Test on macOS
+        working-directory: daemon
+        continue-on-error: true
+        run: cargo test --locked
+
+      - name: Build arm64 (aarch64-apple-darwin)
+        working-directory: daemon
+        run: cargo build --release --locked --bin spawnd --bin spawn-worker
+
+      - name: Build x86_64 (cross)
+        working-directory: daemon
+        run: cargo build --release --locked --target x86_64-apple-darwin --bin spawnd --bin spawn-worker
+
+      - name: Stage binaries
+        run: |
+          set -eu
+          mkdir -p out
+          cp daemon/target/release/spawnd                          out/spawnd-aarch64-apple-darwin
+          cp daemon/target/release/spawn-worker                    out/spawn-worker-aarch64-apple-darwin
+          cp daemon/target/x86_64-apple-darwin/release/spawnd       out/spawnd-x86_64-apple-darwin
+          cp daemon/target/x86_64-apple-darwin/release/spawn-worker out/spawn-worker-x86_64-apple-darwin
+
+      - name: Upload darwin artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-darwin
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+
+  linux-x86_64:
+    runs-on: ubuntu-22.04 # glibc 2.35 floor — older hosts fall back to source
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            daemon/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('daemon/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build x86_64 (x86_64-unknown-linux-gnu)
+        working-directory: daemon
+        run: cargo build --release --locked --bin spawnd --bin spawn-worker
+
+      - name: Stage binaries
+        run: |
+          set -eu
+          mkdir -p out
+          cp daemon/target/release/spawnd       out/spawnd-x86_64-unknown-linux-gnu
+          cp daemon/target/release/spawn-worker out/spawn-worker-x86_64-unknown-linux-gnu
+
+      - name: Upload linux-x86_64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-linux-x86_64
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+
+  linux-aarch64:
+    runs-on: ubuntu-22.04-arm # native arm64 — no cross toolchain, glibc 2.35 floor
+    timeout-minutes: 40
+    # Non-blocking: native arm64 hosted runners depend on the repo's plan, and a
+    # missing runner must not wedge the whole rolling release (which would also
+    # stop shipping the Darwin + linux-x86_64 prebuilts). If this job is skipped
+    # or fails, publish still cuts the release from whatever artifacts exist; the
+    # absent target is loud at deploy (publish_prebuilts) and verify time (SKIP).
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            daemon/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('daemon/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build arm64 (aarch64-unknown-linux-gnu)
+        working-directory: daemon
+        run: cargo build --release --locked --bin spawnd --bin spawn-worker
+
+      - name: Stage binaries
+        run: |
+          set -eu
+          mkdir -p out
+          cp daemon/target/release/spawnd       out/spawnd-aarch64-unknown-linux-gnu
+          cp daemon/target/release/spawn-worker out/spawn-worker-aarch64-unknown-linux-gnu
+
+      - name: Upload linux-aarch64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-linux-aarch64
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+
+  # Assemble every platform's binaries into one checksummed rolling prerelease.
+  # deploy always pulls `prebuilt-latest`; since it only changes when the daemon
+  # changes, it always reflects current daemon code. The single SHA256SUMS here
+  # is the source of truth: deploy verifies against it before scp'ing to prod,
+  # and the installer pins the same hashes — so the bytes CI built, prod serves.
+  publish:
+    needs: [macos, linux-x86_64, linux-aarch64]
+    # The rolling release is the PROD install channel (deploy-prod.sh and the
+    # installer both pull it), so only master may move it. A workflow_dispatch
+    # on any other ref still builds and uploads run artifacts — the way to get
+    # branch binaries for a dev host — but must never touch prebuilt-latest.
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # move the rolling `prebuilt-latest` tag + upload assets
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: prebuilt-*
+          merge-multiple: true
+          path: out
+
+      - name: Checksum + manifest
+        run: |
+          set -eu
+          cd out
+          # Deterministic ordering so the SHA256SUMS diff is stable build-to-build.
+          sha256sum $(ls spawnd-* spawn-worker-* | sort) > SHA256SUMS
+          echo "${GITHUB_SHA}" > COMMIT
+          echo "----- prebuilt-latest SHA256SUMS -----"
+          cat SHA256SUMS
+
+      - name: Publish rolling prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release delete prebuilt-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create prebuilt-latest out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Prebuilt daemon (rolling)" \
+            --notes "Auto-built from ${GITHUB_SHA}. Consumed by deploy-prod.sh; not for manual download. Verify prod with scripts/verify-prebuilts.sh." \
+            --prerelease

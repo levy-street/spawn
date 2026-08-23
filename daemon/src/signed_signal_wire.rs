@@ -227,6 +227,19 @@ pub fn sign_rtc_signal_wire(
     Ok(encoded)
 }
 
+/// Extract the sender identity key an envelope *claims*, without verifying its
+/// signature. The connect path uses this to identify a not-yet-pinned signer so
+/// it can be checked against a carried endorsement chain. It proves nothing on
+/// its own: the caller MUST then call [`verify_rtc_signal_wire`] with this key as
+/// `expected_sender` to prove possession before trusting the offer.
+pub fn envelope_sender(wire: &str) -> Result<VerifyingKey, SignedRtcWireError> {
+    if wire.len() > MAX_SIGNED_RTC_WIRE_BYTES {
+        return Err(SignedRtcWireError::WireTooLarge);
+    }
+    let envelope: SignedRtcEnvelope = serde_json::from_str(wire)?;
+    Ok(public_key_from_wire(&envelope.sender_identity_public_key)?)
+}
+
 /// Parse, pin-check, reconstruct, and verify an untrusted signed RTC envelope.
 /// A value is returned only after every operation succeeds.
 pub fn verify_rtc_signal_wire(
@@ -397,6 +410,17 @@ mod tests {
             .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect();
         decoded.try_into().unwrap()
+    }
+
+    #[test]
+    fn envelope_sender_extracts_the_claimed_key_without_verifying() {
+        // The connect path reads the claimed sender before it can know a pin to
+        // check against; it must match what the full verify would bind as sender.
+        let golden = golden();
+        let expected = public_key_from_wire(&golden.sender_public_key_wire).unwrap();
+        let wire = serde_json::to_string(&golden.vectors[0].envelope).unwrap();
+        let extracted = envelope_sender(&wire).expect("sender extracted");
+        assert_eq!(extracted.as_bytes(), expected.as_bytes());
     }
 
     fn transcript(envelope: &Value) -> SignedSignalTranscript {

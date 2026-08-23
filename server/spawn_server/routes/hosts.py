@@ -20,7 +20,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
 from ..db import get_session, get_sessionmaker
-from ..host_identity import host_key_fingerprint
 from ..host_key_claims import lock_host_key_claim
 from ..models import (
     Agent,
@@ -58,11 +57,6 @@ def _aware(dt: datetime | None) -> datetime | None:
 
 
 def _to_out(host: Host, session_count: int) -> schemas.HostOut:
-    fingerprint = (
-        host_key_fingerprint(host.host_key_algorithm, host.host_public_key)
-        if host.host_key_algorithm is not None and host.host_public_key is not None
-        else None
-    )
     return schemas.HostOut(
         id=host.id,
         name=host.name,
@@ -71,10 +65,10 @@ def _to_out(host: Host, session_count: int) -> schemas.HostOut:
         version=host.version,
         host_key_algorithm=host.host_key_algorithm,
         host_public_key=host.host_public_key,
-        host_key_fingerprint=fingerprint,
         status=host.status,
         last_seen_at=host.last_seen_at,
         session_count=session_count,
+        supports_account_chains=host.supports_account_chains,
         cpu_cores=host.cpu_cores,
         cpu_physical_cores=host.cpu_physical_cores,
         cpu_model=host.cpu_model,
@@ -612,6 +606,18 @@ async def patch_host_agent_policy(
     return schemas.HostAgentPolicyOut.model_validate(policy)
 
 
+# Registered before `/{host_id}` so the literal path wins the match.
+@router.delete("/self", status_code=status.HTTP_204_NO_CONTENT)
+async def deregister_self(
+    session: AsyncSession = Depends(get_session),
+    host: Host = Depends(auth.daemon_principal),
+) -> None:
+    """A daemon revokes its OWN host registration — used by `spawnd exorcise`
+    and the possess re-identify dedup. Authenticated by the daemon token, so a
+    host can only remove itself; no owning-user session is required."""
+    await _revoke_host(session, host)
+
+
 @router.delete("/{host_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_host(
     host_id: str,
@@ -619,7 +625,13 @@ async def delete_host(
     user: User = Depends(auth.current_user),
 ) -> None:
     h = await _get_owned_host(session, host_id, user)
+    await _revoke_host(session, h)
 
+
+async def _revoke_host(session: AsyncSession, h: Host) -> None:
+    """Durable revocation cascade shared by the user- and daemon-authenticated
+    delete routes: drop the host's device codes and browser pins inside the same
+    transaction as the Host row, then disconnect any live daemon."""
     if h.host_key_algorithm is not None and h.host_public_key is not None:
         claimed_owner = await lock_host_key_claim(
             session,
@@ -653,6 +665,7 @@ async def delete_host(
             .where(HostBrowserPin.host_id == h.id)
             .execution_options(synchronize_session=False)
         )
+    host_id = h.id
     await session.delete(h)
     await session.commit()
 

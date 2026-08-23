@@ -5,8 +5,11 @@
 //! foundation shared with browser golden vectors. Everything else (WS client,
 //! WebRTC, supervisor, CLI) stays private to the `spawnd` binary.
 
+pub mod acct_endorsement;
 pub mod browser_endorsement;
+pub mod endorsement_chain;
 pub mod host_pair_approval;
+pub mod sas;
 pub mod host_pair_possession;
 pub mod sessiond;
 pub mod signed_signal;

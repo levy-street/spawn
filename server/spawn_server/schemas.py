@@ -75,6 +75,13 @@ class BrowserDeviceRegisterRequest(BaseModel):
         min_length=ED25519_SIGNATURE_B64URL_LENGTH,
         max_length=ED25519_SIGNATURE_B64URL_LENGTH,
     )
+    # Register this key as the account ROOT (pk_R), not a browser (device mesh
+    # §3). BOUND in the V2 registration proof (security hardening B1): the
+    # stored flag feeds real server-side authority (the R9 per-host endorsement
+    # exemption and the pin-liveness ratchet), so the claim must carry the key
+    # holder's signature — a flipped flag fails proof verification and is
+    # refused.
+    is_root: bool = False
 
     @field_validator("public_key")
     @classmethod
@@ -87,6 +94,10 @@ class BrowserDeviceRevokeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_public_key: str = Field(min_length=43, max_length=43)
+    # Which of the caller's devices is asking — display attribution only (the
+    # removed screen names its remover, R4); ignored if it isn't a live device
+    # of this account. Never an authorization input.
+    revoked_by_device_id: str | None = Field(default=None, min_length=36, max_length=36)
 
     @field_validator("expected_public_key")
     @classmethod
@@ -96,19 +107,58 @@ class BrowserDeviceRevokeRequest(BaseModel):
 
 
 class BrowserDeviceOut(BaseModel):
+    # No fingerprint field on purpose (mesh B5): the key is right here, so a
+    # display fingerprint must be derived locally from it — a served one is a
+    # server-authored comparison label a lazy consumer could trust.
     id: str
     key_algorithm: Literal["ed25519"]
     public_key: str
-    fingerprint: str
     label: str | None = None
     created_at: datetime
+    last_seen_at: datetime | None = None
+    # When this device last actively asked to be approved (it tried to open an
+    # agent session). Surfaces — and re-surfaces — the approval toast elsewhere.
+    approval_requested_at: datetime | None = None
     revoked_at: datetime | None = None
+    revoked_by_device_id: str | None = None
+    # True for the account root (pk_R): clients filter it out of connect/ceremony
+    # lists since it never connects — it only endorses and anchors.
+    is_root: bool = False
+
+
+class RevokedBrowserKeyOut(BaseModel):
+    """One entry of the account's PERMANENT key deny-list (R10 tombstones).
+
+    Served so a client can corroborate a roster row's revocation claim against
+    the add-only tombstone table before acting on it destructively (hardening
+    B2): a bare roster lie is then insufficient — the server must also commit
+    the claim into permanent, add-only state.
+    """
+
+    public_key: str
+    key_algorithm: str
+    revoked_at: datetime
 
 
 class BrowserDeviceRenameRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     label: str | None = Field(default=None, max_length=64)
+
+
+class BrowserDeviceApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # The caller proves it is talking about the key it actually holds, exactly
+    # like revoke's expected_public_key: a consistency check, not authorization
+    # (the stamp is advisory display data either way).
+    public_key: str = Field(min_length=43, max_length=43)
+
+    @field_validator("public_key")
+    @classmethod
+    def validate_public_key(cls, value: str) -> str:
+        decode_ed25519_public_key(value)
+        return value
 
 
 class BrowserDevicePruneResponse(BaseModel):
@@ -227,6 +277,9 @@ class DeviceStartRequest(BaseModel):
     version: str | None = None
     host_key_algorithm: Literal["ed25519"]
     host_public_key: str = Field(min_length=43, max_length=43)
+    # Committed-ephemeral SAS: the daemon's commitment Cd = H(domain ‖ H ‖ Nd),
+    # opaque to the server. Absent from a pre-SAS daemon.
+    sas_commit: str | None = Field(default=None, min_length=43, max_length=43)
 
     @field_validator("host_public_key")
     @classmethod
@@ -238,6 +291,8 @@ class DeviceStartRequest(BaseModel):
 class DeviceStartResponse(BaseModel):
     device_code: str
     user_code: str
+    # Opaque handle the daemon bakes into the browser URL (`/device?ref=…`).
+    approval_ref: str
     approval_nonce: str
     verification_uri: str
     interval: int
@@ -332,7 +387,17 @@ class DevicePollPending(BaseModel):
 class DevicePendingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    user_code: str
+    # Identify the pending ceremony by either the short human code OR the opaque
+    # URL handle. Exactly one is required; the browser normally sends the ref it
+    # read from the URL, the manual-entry form sends the user_code.
+    user_code: str | None = None
+    approval_ref: str | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_identifier(self) -> DevicePendingRequest:
+        if bool(self.user_code) == bool(self.approval_ref):
+            raise ValueError("provide exactly one of user_code or approval_ref")
+        return self
 
 
 class DeviceApproveRequest(DevicePendingRequest):
@@ -393,15 +458,16 @@ class DeviceApproveRequest(DevicePendingRequest):
 
 
 class DeviceApproveResponse(BaseModel):
+    # Both keys are echoed below, so no fingerprints ride along (mesh B5): the
+    # approving browser verifies the echoed keys byte-for-byte and derives any
+    # fingerprint it displays locally.
     host_name: str
     approval_nonce: str
     host_key_algorithm: Literal["ed25519"]
     host_public_key: str
-    host_key_fingerprint: str
     browser_device_id: str
     browser_key_algorithm: Literal["ed25519"]
     browser_public_key: str
-    browser_key_fingerprint: str
     # Existing Host row for this key (re-pair only): lets the approving
     # browser bind its local pin to the host UUID immediately. Null on a
     # first pairing — the Host row is created later by the daemon's poll, and
@@ -415,6 +481,252 @@ class DevicePendingResponse(BaseModel):
     host_key_algorithm: Literal["ed25519"]
     host_public_key: str
     host_key_fingerprint: str
+    # SAS relay: the daemon's commitment (present ⇒ the browser runs the SAS and
+    # contributes Nb via POST /sas), and the daemon's opened nonce Nd once it has
+    # revealed it (present ⇒ the browser can verify the commit and show the SAS).
+    sas_commit: str | None = None
+    sas_host_nonce: str | None = None
+
+
+class DeviceSasRequest(DevicePendingRequest):
+    """Browser's SAS contribution: its fresh nonce Nb and its public key B, so
+    the daemon can compute the number before the human approves. Identified like
+    pending, by exactly one of user_code / approval_ref."""
+
+    sas_browser_nonce: str = Field(min_length=43, max_length=43)
+    browser_public_key: str = Field(min_length=43, max_length=43)
+
+    @field_validator("browser_public_key")
+    @classmethod
+    def validate_browser_public_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class DeviceSasResponse(BaseModel):
+    # Echoed back so the browser can confirm its contribution landed; the daemon
+    # nonce Nd arrives later via DevicePendingResponse.sas_host_nonce.
+    ok: bool = True
+
+
+class DeviceSasHostRequest(BaseModel):
+    """Daemon's side of the SAS handshake, authenticated by the device_code
+    (like poll — no user session). The daemon calls this to fetch the browser's
+    Nb/B and, once it has them, to reveal its own Nd. Kept off the poll's
+    approval CAS so the pairing race logic is untouched."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    device_code: str
+    host_key_algorithm: Literal["ed25519"]
+    host_public_key: str = Field(min_length=43, max_length=43)
+    # The daemon's opened nonce Nd — sent only after it has seen Nb here
+    # (commit-reveal ordering). Omitted until then.
+    sas_host_nonce: str | None = Field(default=None, min_length=43, max_length=43)
+
+
+class DeviceSasHostResponse(BaseModel):
+    sas_browser_nonce: str | None = None
+    sas_browser_key: str | None = None
+    sas_host_nonce: str | None = None
+
+
+# ---------- browser-to-browser add-device pairing (device mesh §4) ----------
+
+
+class DevicePairingStart(BaseModel):
+    """Initiator opens a committed-ephemeral SAS ceremony to admit a new device.
+
+    It sends its own key K_I and the commitment Cd = SHA256(tag ‖ K_I ‖ N_I),
+    hiding its fresh nonce N_I until the joiner has contributed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    initiator_device_id: str = Field(min_length=36, max_length=36)
+    joiner_device_id: str = Field(min_length=36, max_length=36)
+    initiator_public_key: str = Field(min_length=43, max_length=43)
+    initiator_commit: str = Field(min_length=43, max_length=43)
+
+    @field_validator("initiator_public_key")
+    @classmethod
+    def _validate_initiator_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class DevicePairingContribute(BaseModel):
+    """Joiner's move: its own key K_J and a fresh nonce N_J (sent before it can
+    learn the initiator's opened nonce, so it cannot adapt N_J to the number)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    joiner_public_key: str = Field(min_length=43, max_length=43)
+    joiner_nonce: str = Field(min_length=43, max_length=43)
+
+    @field_validator("joiner_public_key")
+    @classmethod
+    def _validate_joiner_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class DevicePairingReveal(BaseModel):
+    """Initiator opens its commitment by revealing N_I (only accepted after the
+    joiner has contributed, and only if it opens Cd)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    initiator_nonce: str = Field(min_length=43, max_length=43)
+
+
+class DevicePairingOut(BaseModel):
+    id: str
+    expires_at: datetime
+
+
+class DevicePairingIntroductionItem(BaseModel):
+    """One host-key introduction (mesh R7), relayed verbatim. The signature is
+    over the SPAWN-HOST-INTRO-V1 transcript and only the joiner can judge it —
+    against the initiator key its ceremony pinned. Shape checks only here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    host_id: str = Field(min_length=1, max_length=36)
+    host_name: str = Field(min_length=1, max_length=128)
+    host_public_key: str = Field(min_length=43, max_length=43)
+    signature: str = Field(min_length=86, max_length=86)
+
+    @field_validator("host_public_key")
+    @classmethod
+    def _validate_host_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class DevicePairingDeviceIntroductionItem(BaseModel):
+    """One device-key introduction (continuous gossip bootstrap), relayed
+    verbatim. The signature is over the SPAWN-DEVICE-INTRO-V1 transcript and
+    only the joiner can judge it — against the initiator key its ceremony
+    pinned. Shape checks only here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str = Field(min_length=36, max_length=36)
+    device_label: str = Field(min_length=1, max_length=128)
+    device_public_key: str = Field(min_length=43, max_length=43)
+    signature: str = Field(min_length=86, max_length=86)
+
+    @field_validator("device_public_key")
+    @classmethod
+    def _validate_device_key(cls, value: str) -> str:
+        decode_ed25519_public_key(value)
+        return value
+
+
+class DevicePairingIntroductions(BaseModel):
+    """Initiator's move, after the reveal: the hosts it vouches to the joiner,
+    plus (optionally) the peer device keys it learned firsthand so the joiner
+    can honor those peers' broadcast introductions later."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    introductions: list[DevicePairingIntroductionItem] = Field(
+        default_factory=list, max_length=64
+    )
+    device_introductions: list[DevicePairingDeviceIntroductionItem] = Field(
+        default_factory=list, max_length=32
+    )
+
+    @model_validator(mode="after")
+    def _require_some_payload(self) -> DevicePairingIntroductions:
+        if not self.introductions and not self.device_introductions:
+            raise ValueError("introductions must carry at least one host or device entry")
+        return self
+
+
+class DevicePairingState(BaseModel):
+    """The relayed ceremony state, polled by both devices. Every value is
+    server-relayed and untrusted on its own — the SAS number each side derives
+    from it, compared by the human across both screens, is the check."""
+
+    id: str
+    initiator_device_id: str
+    joiner_device_id: str
+    initiator_public_key: str
+    initiator_commit: str
+    joiner_public_key: str | None = None
+    joiner_nonce: str | None = None
+    initiator_nonce: str | None = None
+    introductions: list[DevicePairingIntroductionItem] | None = None
+    device_introductions: list[DevicePairingDeviceIntroductionItem] | None = None
+    created_at: datetime
+    expires_at: datetime
+
+
+class HostIntroductionPublish(BaseModel):
+    """One durable broadcast introduction (continuous gossip). The signature is
+    over the SPAWN-HOST-INTRO-BCAST-V1 transcript; the server verifies it
+    against the publisher's registered key as hygiene, recipients re-verify it
+    against the key they learned firsthand."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    publisher_device_id: str = Field(min_length=36, max_length=36)
+    host_id: str = Field(min_length=1, max_length=36)
+    host_name: str = Field(min_length=1, max_length=128)
+    host_public_key: str = Field(min_length=43, max_length=43)
+    signature: str = Field(min_length=86, max_length=86)
+
+    @field_validator("host_public_key")
+    @classmethod
+    def _validate_host_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class HostIntroductionOut(BaseModel):
+    id: str
+    publisher_device_id: str
+    # The publisher's registered key, echoed for the recipient's convenience;
+    # display-adjacent — acceptance requires the FIRSTHAND copy to match.
+    publisher_public_key: str
+    host_id: str
+    host_name: str
+    host_public_key: str
+    signature: str
+    created_at: datetime
+
+
+class RootIntroductionPublish(BaseModel):
+    """One durable root-key introduction (mesh §4.1 provenance channel). The
+    signature is over the SPAWN-ROOT-INTRO-V1 transcript; the server verifies
+    it against the introducer's registered key as hygiene, recipients
+    re-verify it against the introducer key they learned firsthand."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    introducer_device_id: str = Field(min_length=36, max_length=36)
+    root_public_key: str = Field(min_length=43, max_length=43)
+    signature: str = Field(min_length=86, max_length=86)
+
+    @field_validator("root_public_key")
+    @classmethod
+    def _validate_root_key(cls, value: str) -> str:
+        decode_host_public_key("ed25519", value)
+        return value
+
+
+class RootIntroductionOut(BaseModel):
+    id: str
+    introducer_device_id: str
+    # The introducer's registered key, echoed for the recipient's convenience;
+    # display-adjacent — acceptance requires the FIRSTHAND copy to match.
+    introducer_public_key: str
+    root_public_key: str
+    signature: str
+    created_at: datetime
+    updated_at: datetime
 
 
 # ---------- hosts ----------
@@ -428,11 +740,15 @@ class HostOut(BaseModel):
     arch: str | None = None
     version: str | None = None
     host_key_algorithm: Literal["ed25519"] | None = None
+    # The key travels alone (mesh B5): its display fingerprint is derived
+    # locally by the client, never served next to the key it must vouch for.
     host_public_key: str | None = None
-    host_key_fingerprint: str | None = None
     status: str
     last_seen_at: datetime | None = None
     session_count: int = 0
+    # Mesh R9: true once this host's daemon validates account-scoped chains;
+    # the legacy per-host device-endorsement path is refused for such hosts.
+    supports_account_chains: bool = False
     # Capacity. Every field is optional and stays None for a daemon that
     # predates telemetry or runs with SPAWND_NO_TELEMETRY — the UI draws no
     # meter rather than an empty one, which is a different statement.
@@ -1054,9 +1370,11 @@ class BrowserEndorsementCreate(BaseModel):
 
 
 class BrowserEndorsementOut(BaseModel):
+    # No endorsed_key_fingerprint (mesh B5): the endorser just signed over the
+    # endorsed key it verified on-screen, so a server-derived fingerprint here
+    # is at best redundant and at worst a substituted comparison label.
     host_id: str
     endorsed_device_id: str
-    endorsed_key_fingerprint: str
     endorser_device_id: str
     created_at: datetime
 
@@ -1078,3 +1396,45 @@ class BrowserEndorsementRecord(BaseModel):
     endorser_public_key: str
     endorser_label: str | None = None
     signature: str
+
+
+class AccountEndorsementCreate(BaseModel):
+    """One device account-endorsing another (no host — docs §3).
+
+    The signature is over the SPAWN-ACCT-ENDORSE-V1 transcript
+    (account_id, endorser_pk, endorsed_pk, endorsed_device_id).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    endorser_device_id: str = Field(min_length=36, max_length=36)
+    endorsed_device_id: str = Field(min_length=36, max_length=36)
+    signature: str = Field(
+        min_length=ED25519_SIGNATURE_B64URL_LENGTH,
+        max_length=ED25519_SIGNATURE_B64URL_LENGTH,
+    )
+
+
+class AccountEndorsementOut(BaseModel):
+    id: str
+    endorser_device_id: str
+    endorsed_device_id: str
+    created_at: datetime
+
+
+class AccountEndorsementRecord(BaseModel):
+    """One account-scoped endorsement edge, as served to a device assembling its
+    carried chain.
+
+    Untrusted on its own, exactly like BrowserEndorsementRecord: the consumer
+    re-encodes the SPAWN-ACCT-ENDORSE-V1 transcript from these claims and
+    verifies the signature against the endorser key. The account has no host in
+    the transcript, so the same edge is valid toward every host.
+    """
+
+    endorser_device_id: str
+    endorser_public_key: str
+    endorsed_device_id: str
+    endorsed_public_key: str
+    signature: str
+    created_at: datetime

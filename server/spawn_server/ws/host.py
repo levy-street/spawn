@@ -40,10 +40,12 @@ from .host_signal import (
     wait_for_signal_pump,
 )
 from .signed_signal_relay import (
+    CARRIED_ENDORSEMENTS_FIELD,
     MAX_RTC_ROUTING_FRAME_BYTES,
     SIGNED_ENVELOPE_FIELD,
     SignedRtcRelayError,
     reject_raw_sdp_in_signed_mode,
+    sanitize_carried_endorsements,
     signed_mode_selected,
     validate_signed_rtc_relay_envelope,
 )
@@ -117,10 +119,7 @@ def _retire_binding(
     changed: asyncio.Event | None = None,
 ) -> bool:
     identity = _binding_identity(binding)
-    if (
-        identity not in retired
-        and len(retired) >= MAX_HOST_RTC_BINDING_IDENTITIES
-    ):
+    if identity not in retired and len(retired) >= MAX_HOST_RTC_BINDING_IDENTITIES:
         return False
     retired[_binding_identity(binding)] = now + RTC_BINDING_TOMBSTONE_TTL_SECONDS
     if changed is not None:
@@ -140,9 +139,7 @@ def _prune_sessions(
         binding = sessions.get(session_id)
         if binding is not None and _retire_binding(retired, binding, now, changed):
             sessions.pop(session_id, None)
-    for identity in [
-        identity for identity, expires_at in retired.items() if expires_at <= now
-    ]:
+    for identity in [identity for identity, expires_at in retired.items() if expires_at <= now]:
         retired.pop(identity, None)
 
 
@@ -150,9 +147,7 @@ def _rtc_binding_capacity_available(
     sessions: dict[str, BrowserRtcSession],
     retired: dict[tuple[str, str, int, str], float],
 ) -> bool:
-    return (
-        len(sessions) + len(retired) < MAX_HOST_RTC_BINDING_IDENTITIES
-    )
+    return len(sessions) + len(retired) < MAX_HOST_RTC_BINDING_IDENTITIES
 
 
 async def _cleanup_retired_bindings(
@@ -195,10 +190,7 @@ async def _forward_if_exact_binding(
     async with sessions_lock:
         now = time.monotonic()
         _prune_sessions(sessions, retired, now, tombstones_changed)
-        if (
-            sessions.get(binding.session_id) is not binding
-            or _binding_identity(binding) in retired
-        ):
+        if sessions.get(binding.session_id) is not binding or _binding_identity(binding) in retired:
             return False
         if retire:
             if not _retire_binding(retired, binding, now, tombstones_changed):
@@ -223,9 +215,7 @@ async def _retire_if_exact_binding(
     async with sessions_lock:
         if sessions.get(binding.session_id) is not binding:
             return False
-        if not _retire_binding(
-            retired, binding, time.monotonic(), tombstones_changed
-        ):
+        if not _retire_binding(retired, binding, time.monotonic(), tombstones_changed):
             return False
         sessions.pop(binding.session_id, None)
         return True
@@ -279,9 +269,7 @@ async def _pump_browser_signals(
             if session_id is None:
                 continue
             async with sessions_lock:
-                _prune_sessions(
-                    sessions, retired, time.monotonic(), tombstones_changed
-                )
+                _prune_sessions(sessions, retired, time.monotonic(), tombstones_changed)
                 binding = sessions.get(session_id)
                 if binding is None:
                     continue
@@ -308,9 +296,7 @@ async def _pump_browser_signals(
                             expected_protocol=HOST_CONTROL_PROTOCOL,
                             expected_protocol_version=HOST_CONTROL_VERSION,
                         )
-                    elif signed_mode_selected(signal) or _valid_rtc_sdp(
-                        signal.get("sdp")
-                    ) is None:
+                    elif signed_mode_selected(signal) or _valid_rtc_sdp(signal.get("sdp")) is None:
                         continue
                 except SignedRtcRelayError:
                     continue
@@ -343,10 +329,7 @@ async def _pump_browser_signals(
                 sessions_lock,
                 tombstones_changed,
                 connected=dispatch_is_session_owner and status_value == "connected",
-                retire=(
-                    not dispatch_is_session_owner
-                    or status_value in {"failed", "unavailable"}
-                ),
+                retire=(not dispatch_is_session_owner or status_value in {"failed", "unavailable"}),
             )
 
 
@@ -542,6 +525,11 @@ async def host_ws(
                 if signed_signal:
                     assert signed_envelope is not None
                     values[SIGNED_ENVELOPE_FIELD] = signed_envelope
+                    # Relay carried endorsement edges opaquely so a daemon that
+                    # does not directly pin this browser can admit it via a chain.
+                    carried = sanitize_carried_endorsements(obj.get(CARRIED_ENDORSEMENTS_FIELD))
+                    if carried is not None:
+                        values[CARRIED_ENDORSEMENTS_FIELD] = carried
                 else:
                     assert sdp is not None
                     values["sdp"] = sdp
@@ -564,9 +552,7 @@ async def host_ws(
             elif frame_type == "rtc.candidate":
                 candidate = _valid_rtc_candidate(obj.get("candidate"))
                 async with sessions_lock:
-                    _prune_sessions(
-                        sessions, retired, time.monotonic(), tombstones_changed
-                    )
+                    _prune_sessions(sessions, retired, time.monotonic(), tombstones_changed)
                     binding = sessions.get(session_id)
                 if candidate is None or binding is None:
                     continue
@@ -606,11 +592,11 @@ async def host_ws(
                 async with sessions_lock:
                     binding = sessions.get(session_id)
                     if binding is not None and _retire_binding(
-                            retired,
-                            binding,
-                            time.monotonic(),
-                            tombstones_changed,
-                        ):
+                        retired,
+                        binding,
+                        time.monotonic(),
+                        tombstones_changed,
+                    ):
                         sessions.pop(session_id, None)
                 if binding is not None and await _binding_is_current_owner(host_id, binding):
                     await _publish_signal(

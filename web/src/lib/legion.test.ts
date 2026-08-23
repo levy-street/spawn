@@ -34,7 +34,7 @@ function makeHost(id: string, name: string, overrides: Partial<Host> = {}): Host
     version: "0.1.0",
     host_key_algorithm: "ed25519",
     host_public_key: null,
-    host_key_fingerprint: null,
+    supports_account_chains: false,
     status: "online",
     last_seen_at: "2026-08-21T00:00:00Z",
     session_count: 0,

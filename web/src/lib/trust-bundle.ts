@@ -14,6 +14,7 @@
  * replayed into another account or reinterpreted under a later format.
  */
 
+import type { AccountRootMaterial } from "./account-root";
 import { ed25519PublicKeyFingerprint, encodeBase64Url } from "./signed-signal";
 
 /** Domain separation: this secret must never collide with another PRF use. */
@@ -27,6 +28,14 @@ export const TRUST_IV_BYTES = 12;
 const IV_BYTES = TRUST_IV_BYTES;
 const PUBLIC_KEY_WIRE_LENGTH = 43;
 const MAX_HOSTS = 256;
+/**
+ * Retired (rotated-away) roots kept inside the sealed bundle. Bounded so a
+ * server cannot induce unbounded growth; rotation REFUSES beyond the cap
+ * rather than dropping the oldest, because silently evicting retired material
+ * would let repeated fabricated rotations destroy the original root after all
+ * — exactly the loss retention exists to prevent (hardening B2).
+ */
+export const MAX_RETIRED_ROOTS = 8;
 
 export type TrustBundleErrorCode =
   | "invalid_account"
@@ -70,6 +79,72 @@ export interface TrustBundle {
    */
   readonly revision: number;
   readonly hosts: readonly TrustBundleHost[];
+  /**
+   * The account root (device mesh §3, stage 5): `pk_R` and the sealed seed of
+   * `sk_R`. Sealed alongside the host keys so any passkey-holder recovers the
+   * root and can heal/re-anchor. Null for accounts (and legacy bundles) with no
+   * root — pure device-chain mode, which fully works without one.
+   */
+  readonly root: AccountRootMaterial | null;
+  /**
+   * Roots retired by rotation, oldest first (hardening B2). Rotation replaces
+   * `root` but never destroys the prior seed: the retired material stays
+   * sealed under the same data key, so a server-fabricated "your root was
+   * revoked" claim can at worst trigger a pointless rotation that loses
+   * nothing, and a real rotation keeps its history. Retired roots are archival
+   * only — nothing ever signs with them again (R10: the revoked key stays
+   * revoked forever).
+   */
+  readonly retiredRoots: readonly AccountRootMaterial[];
+}
+
+/** Validate root material without trusting the sealed bytes' shape. */
+function canonicalRoot(root: AccountRootMaterial | null | undefined): AccountRootMaterial | null {
+  if (root === null || root === undefined) {
+    return null;
+  }
+  const okKey =
+    typeof root.publicKeyWire === "string" && root.publicKeyWire.length === PUBLIC_KEY_WIRE_LENGTH;
+  const okSeed =
+    typeof root.seedWire === "string" && root.seedWire.length === PUBLIC_KEY_WIRE_LENGTH;
+  if (!okKey || !okSeed) {
+    throw new TrustBundleError("invalid_bundle", "trust bundle root material is malformed");
+  }
+  return { publicKeyWire: root.publicKeyWire, seedWire: root.seedWire };
+}
+
+/** Validate the retired-root archive: bounded, well-formed, duplicate-free,
+ * and never containing the live root's key. */
+function canonicalRetiredRoots(
+  retiredRoots: readonly AccountRootMaterial[] | undefined,
+  liveRoot: AccountRootMaterial | null,
+): readonly AccountRootMaterial[] {
+  if (retiredRoots === undefined) {
+    return [];
+  }
+  if (!Array.isArray(retiredRoots)) {
+    throw new TrustBundleError("invalid_bundle", "trust bundle retired roots are malformed");
+  }
+  if (retiredRoots.length > MAX_RETIRED_ROOTS) {
+    throw new TrustBundleError(
+      "invalid_bundle",
+      `a trust bundle retains at most ${MAX_RETIRED_ROOTS} retired roots`,
+    );
+  }
+  const seen = new Set<string>();
+  const canonical: AccountRootMaterial[] = [];
+  for (const entry of retiredRoots) {
+    const validated = canonicalRoot(entry);
+    if (validated === null) {
+      throw new TrustBundleError("invalid_bundle", "trust bundle retired roots are malformed");
+    }
+    if (seen.has(validated.publicKeyWire) || validated.publicKeyWire === liveRoot?.publicKeyWire) {
+      throw new TrustBundleError("invalid_bundle", "trust bundle retired roots repeat a root key");
+    }
+    seen.add(validated.publicKeyWire);
+    canonical.push(validated);
+  }
+  return canonical;
 }
 
 export function requireRevision(revision: number): number {
@@ -235,6 +310,8 @@ export async function canonicalBundle(
   accountId: string,
   hosts: readonly TrustBundleHost[],
   revision: number,
+  root: AccountRootMaterial | null = null,
+  retiredRoots: readonly AccountRootMaterial[] = [],
 ): Promise<TrustBundle> {
   if (hosts.length > MAX_HOSTS) {
     throw new TrustBundleError("too_many_hosts", `a trust bundle holds at most ${MAX_HOSTS} hosts`);
@@ -249,7 +326,15 @@ export async function canonicalBundle(
     seen.add(host.hostPublicKey);
   }
   canonical.sort((left, right) => (left.hostPublicKey < right.hostPublicKey ? -1 : 1));
-  return { version: TRUST_BUNDLE_VERSION, accountId, revision, hosts: canonical };
+  const canonicalLiveRoot = canonicalRoot(root);
+  return {
+    version: TRUST_BUNDLE_VERSION,
+    accountId,
+    revision,
+    hosts: canonical,
+    root: canonicalLiveRoot,
+    retiredRoots: canonicalRetiredRoots(retiredRoots, canonicalLiveRoot),
+  };
 }
 
 /** Seal a bundle for storage on the server, which only ever sees ciphertext. */
@@ -258,10 +343,11 @@ export async function sealTrustBundle(
   accountId: string,
   hosts: readonly TrustBundleHost[],
   revision: number,
+  root: AccountRootMaterial | null = null,
 ): Promise<string> {
   const subtle = requireSubtle();
   requireAccountId(accountId);
-  const bundle = await canonicalBundle(accountId, hosts, revision);
+  const bundle = await canonicalBundle(accountId, hosts, revision, root);
   const iv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
   const plaintext = new TextEncoder().encode(JSON.stringify(bundle));
   const ciphertext = new Uint8Array(
@@ -337,5 +423,12 @@ export async function openTrustBundle(
   // Legacy bundles predate the revision field; they open as revision 0, which is
   // the floor, so they establish rather than trip the rollback check.
   const revision = candidate.revision === undefined ? 0 : requireRevision(candidate.revision);
-  return canonicalBundle(accountId, candidate.hosts, revision);
+  // Legacy bundles (and no-root accounts) simply have no root field.
+  return canonicalBundle(
+    accountId,
+    candidate.hosts,
+    revision,
+    candidate.root ?? null,
+    candidate.retiredRoots ?? [],
+  );
 }

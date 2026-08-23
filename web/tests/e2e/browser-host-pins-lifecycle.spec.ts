@@ -21,8 +21,8 @@ const host = {
   arch: "x86_64",
   version: "0.1.0",
   host_key_algorithm: "ed25519",
+  // No host_key_fingerprint (mesh B5): the app derives it from the key.
   host_public_key: HOST_PUBLIC_KEY,
-  host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
   status: "online",
   last_seen_at: "2026-07-17T00:00:00Z",
   session_count: 0,
@@ -127,15 +127,11 @@ async function corruptExistingPin(page: Page): Promise<void> {
 }
 
 async function approveExactHost(page: Page): Promise<void> {
-  await page.goto("/device");
-  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Look up host" }).click();
-  await page
-    .getByRole("button", {
-      name: /Fingerprint matches — approve|Approve this host again|Retry server approval/u,
-    })
-    .click();
-  await expect(page.getByRole("status")).toContainText("is connected");
+  // The primary lane: the daemon's link carries the host key as a `#k=`
+  // fragment; the page verifies it invisibly and offers a single Approve.
+  await page.goto(`/device?code=QZ4K-7HMT#k=${HOST_PUBLIC_KEY}`);
+  await page.getByRole("button", { name: /^(?:Approve deletion-host|Retry)$/u }).click();
+  await expect(page.getByTestId("ceremony-done")).toContainText("is possessed");
 }
 
 async function requestHostDeletion(page: Page): Promise<void> {
@@ -181,7 +177,6 @@ async function installRoutes(
           id: BROWSER_DEVICE_ID,
           key_algorithm: "ed25519",
           public_key: body.public_key,
-          fingerprint: fingerprint(body.public_key),
           created_at: "2026-07-17T00:00:00Z",
           revoked_at: null,
         },
@@ -206,15 +201,14 @@ async function installRoutes(
       await route.fulfill({
         status: 200,
         json: {
+          // Keys alone, like the real approve echo (mesh B5).
           host_name: host.name,
           approval_nonce: APPROVAL_NONCE,
           host_key_algorithm: "ed25519",
           host_public_key: HOST_PUBLIC_KEY,
-          host_key_fingerprint: fingerprint(HOST_PUBLIC_KEY),
           browser_device_id: body.browser_device_id,
           browser_key_algorithm: body.browser_key_algorithm,
           browser_public_key: body.browser_public_key,
-          browser_key_fingerprint: body.browser_key_fingerprint,
         },
       });
       return;
@@ -280,9 +274,7 @@ test("response-ID substitution blocks local mutation and the route-target DELETE
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 });
 
-test("key and fingerprint substitution cannot retarget an established Host-ID binding", async ({
-  page,
-}) => {
+test("key substitution cannot retarget an established Host-ID binding", async ({ page }) => {
   const state: {
     deleteCalls: number;
     hostVisible: boolean;
@@ -299,27 +291,36 @@ test("key and fingerprint substitution cannot retarget an established Host-ID bi
   await expectExactHostBinding(page);
   const before = JSON.stringify(await readHostPins(page));
 
-  state.hostResponse = {
-    ...host,
-    host_public_key: OTHER_HOST_PUBLIC_KEY,
-    host_key_fingerprint: fingerprint(OTHER_HOST_PUBLIC_KEY),
-  };
+  state.hostResponse = { ...host, host_public_key: OTHER_HOST_PUBLIC_KEY };
   await page.reload();
-  await expect(page.locator("p[role=alert]")).toContainText("bound to a different local key");
-  await requestHostDeletion(page);
-  await expect(page.locator("p[role=alert]")).toContainText("blocked before any server DELETE");
-  expect(state.deleteCalls).toBe(0);
+  // The guided panel (review R-b) replaces the raw storage error: it names
+  // both possibilities honestly — the owner's own reinstall/re-key cycle and
+  // a substitution attack are indistinguishable — keeps connections blocked,
+  // and offers exactly one exit: removal, then a fresh possession ceremony.
+  // There is no "accept the new identity" control anywhere.
+  const panel = page.getByTestId("host-identity-conflict");
+  await expect(panel).toBeVisible();
+  await expect(panel).toContainText("identity changed");
+  await expect(panel).toContainText("spawnd possess");
+  await expect(panel.getByRole("button")).toHaveText(/Remove this host/u);
+  // Nothing was rebound or reactivated by the substituted key.
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 
-  state.hostResponse = { ...host, host_key_fingerprint: "SHA256:AAAAAAAAAAAAAAAA" };
-  await page.reload();
-  await expect(page.locator("p[role=alert]")).toContainText(
-    "claimed host fingerprint does not match",
-  );
-  await requestHostDeletion(page);
-  await expect(page.locator("p[role=alert]")).toContainText("blocked before any server DELETE");
-  expect(state.deleteCalls).toBe(0);
-  expect(JSON.stringify(await readHostPins(page))).toBe(before);
+  // The safe exit works (previously this wedged on host_id_key_conflict):
+  // removal tombstones the BOUND record — the key this device actually
+  // approved; the server's claimed key cannot veto a local trust withdrawal —
+  // and the server DELETE proceeds, clearing the way for `spawnd possess`.
+  page.once("dialog", (dialog) => dialog.accept());
+  await panel.getByTestId("conflict-remove-host").click();
+  await page.waitForURL("**/hosts");
+  expect(state.deleteCalls).toBe(1);
+  const pins = await readHostPins(page);
+  expect(pins).toHaveLength(1);
+  expect(pins[0]).toMatchObject({ hostPublicKey: HOST_PUBLIC_KEY, state: "revoked" });
+  // NOTE (mesh B5): the old fingerprint-substitution half of this test is
+  // structurally impossible now — the Host API serves no fingerprint field,
+  // so the only identity a server can lie about is the key itself, covered
+  // above.
 });
 
 test("deletion never revokes among multiple active unbound host pins", async ({ page }) => {
@@ -426,12 +427,10 @@ test("server delete failure retains tombstone across disappearance, reload, retr
   expect(state.deleteCalls).toBe(2);
   expect(await readHostPins(page)).toMatchObject([{ state: "revoked" }]);
 
-  await page.goto("/device");
-  await page.getByLabel("Code from the terminal").fill("QZ4K-7HMT");
-  await page.getByRole("button", { name: "Look up host" }).click();
-  await expect(page.getByTestId("local-pin-state")).toContainText("deletion tombstone");
-  await page.getByRole("button", { name: "Approve this host again" }).click();
-  await expect(page.getByRole("status")).toContainText("is connected");
+  await page.goto(`/device?code=QZ4K-7HMT#k=${HOST_PUBLIC_KEY}`);
+  await expect(page.getByTestId("local-pin-state")).toContainText("previously removed this host");
+  await page.getByRole("button", { name: "Approve deletion-host" }).click();
+  await expect(page.getByTestId("ceremony-done")).toContainText("is possessed");
   expect(await readHostPins(page)).toMatchObject([
     { hostIds: [HOST_ID], hostPublicKey: HOST_PUBLIC_KEY, state: "active" },
   ]);

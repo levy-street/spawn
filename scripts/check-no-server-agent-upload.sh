@@ -207,7 +207,8 @@ if direct_api != ["new", "transport", "publish", "publish_read_chunk", "decode_w
 if direct.count("dc: Arc<RTCDataChannel>") != 2 or direct.count("self.dc.send_text(") != 1:
     raise SystemExit("no-server-agent-upload: protected host direct transport ownership changed")
 
-expected_control_imports = """use crate::host_direct::{decode_write_chunk, HostDirectChannel};
+expected_control_imports = """use crate::host_desktop::DesktopAction;
+use crate::host_direct::{decode_write_chunk, HostDirectChannel};
 use crate::host_files::{
     HostFileOperations, HostFileService, PendingWrite, WriteSessionGuard, MAX_FILE_BYTES,
     STREAM_CHUNK_BYTES,
@@ -215,7 +216,21 @@ use crate::host_files::{
 use crate::host_signal::HostConnectedSignal;"""
 if control.count(expected_control_imports) != 1:
     raise SystemExit("no-server-agent-upload: protected host-control dependency list changed")
-if set(re.findall(r"crate::(\w+)", control)) != {"host_direct", "host_files", "host_signal"}:
+# Reviewed allowlist. host_desktop/host_metrics/host_mime/host_preview are the
+# workspaces-overhaul host capabilities: all four are host-local and reachable
+# only over the direct RTC data channel — none of them imports the server
+# WebSocket or any Outbound frame, so no agent or file content can reach the
+# server through them (docs/TRUST.md). host_desktop has its own dedicated guard
+# in scripts/check-host-desktop-launch.sh.
+if set(re.findall(r"crate::(\w+)", control)) != {
+    "host_desktop",
+    "host_direct",
+    "host_files",
+    "host_metrics",
+    "host_mime",
+    "host_preview",
+    "host_signal",
+}:
     raise SystemExit("no-server-agent-upload: protected host-control gained an unreviewed crate dependency")
 if re.search(r"\b(?:WsOutbound|SessionSink|out_tx)\b|crate::(?:pty|ws|run)\b", control):
     raise SystemExit("no-server-agent-upload: raw server transport entered protected host-control")
@@ -270,7 +285,7 @@ if found_symbol_counts != expected_symbol_counts:
         + repr(found_symbol_counts)
     )
 if rtc.count("use crate::host_signal::HostConnectedSignal;") != 1 or rtc.count(
-    "HostConnectedSignal::new(out_tx, session_id, binding)"
+    "HostConnectedSignal::new(out_tx, signal_id, binding)"
 ) != 1:
     raise SystemExit("no-server-agent-upload: connected signal construction topology changed")
 PY
