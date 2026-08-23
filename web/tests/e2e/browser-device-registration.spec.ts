@@ -78,34 +78,18 @@ test("removing this device is seamless: the key dies, a fresh one takes its plac
   expect(afterReplace.publicKey).not.toBe(before.publicKey);
   expect(afterReplace.marker).toBeNull();
 
-  // The replacement survives a reload unchanged (no second mint).
+  // The replacement survives a reload unchanged (no second mint). A reload
+  // closes the settings modal (it is an overlay, not a page), so reopen it.
+  //
+  // There is deliberately no recovery button to press here. The pre-mesh
+  // Devices panel parked a removed device behind "Start fresh on this
+  // browser"; the Access UX removed that dead end — registration simply
+  // re-runs and the browser reappears as an ordinary device.
   await page.reload();
-  // A reload closes the settings modal (it is an overlay, not a page); the
-  // revoked state must survive it and greet the user on reopen.
   await openSettings(page, "access");
-  await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toBeVisible();
-  const stillAbsent = await page.evaluate(async (userId) => {
-    const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open("spawn-browser-device-identity");
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    const request = database
-      .transaction("device-identities", "readonly")
-      .objectStore("device-identities")
-      .get(userId);
-    const result = await new Promise<unknown>((resolve, reject) => {
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    database.close();
-    return result;
-  }, USER_ID);
-  expect(stillAbsent).toBeUndefined();
-
-  await page.getByRole("button", { name: "Start fresh on this browser" }).click();
   await expect(fingerprint).toHaveText(/^SHA256:/);
   await expect(page.getByRole("button", { name: "Start over" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Start fresh on this browser" })).toHaveCount(0);
 
   // The removed key stays in history (under Advanced), never resurrected.
   await page.getByTestId("access-advanced").locator("summary").click();

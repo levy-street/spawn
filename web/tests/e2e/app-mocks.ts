@@ -1669,8 +1669,16 @@ export async function openSettings(
     | "templates"
     | "access" = "account",
   workspaceId = WORKSPACE_ID,
+  /**
+   * Where to open Settings from. Defaults to a workspace, which is what a real
+   * operator does — but a workspace is a live-terminal surface, so on a device
+   * the account has not approved the session-approval gate legitimately covers
+   * it (docs/TRUST_UX.md §3). Specs that deliberately run an unapproved device
+   * pass a neutral route instead of weakening the gate.
+   */
+  landOn = `/w/${workspaceId}`,
 ) {
-  await page.goto(`/w/${workspaceId}`);
+  await page.goto(landOn);
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   if (tab !== "account") {
     await page.getByRole("button", { name: SETTINGS_TAB_LABELS[tab], exact: true }).click();
