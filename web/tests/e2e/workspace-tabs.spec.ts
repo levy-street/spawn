@@ -1,6 +1,6 @@
 import { expect, type Locator, type Page, test } from "@playwright/test";
 import type { LayoutV3 } from "../../src/lib/tabs";
-import { mockApp, WORKSPACE_ID, workspace } from "./app-mocks";
+import { HOST_ID, mockApp, WORKSPACE_ID, workspace } from "./app-mocks";
 
 const THREE_TABS: LayoutV3 = {
   version: 3,
@@ -9,6 +9,65 @@ const THREE_TABS: LayoutV3 = {
     { id: "tab-1", name: "Alpha", layout: { version: 3, tiles: [] } },
     { id: "tab-2", name: "Beta", layout: { version: 3, tiles: [] } },
     { id: "tab-3", name: "Gamma", layout: { version: 3, tiles: [] } },
+  ],
+};
+
+/** Two tabs, the second holding a window — what a merge has to carry over. */
+const TABS_WITH_A_WINDOW: LayoutV3 = {
+  version: 3,
+  active_tab: "tab-1",
+  tabs: [
+    { id: "tab-1", name: "Alpha", layout: { version: 3, tiles: [] } },
+    {
+      id: "tab-2",
+      name: "Beta",
+      layout: {
+        version: 3,
+        tiles: [
+          {
+            session_id: "00000000-0000-4000-8000-0000000000f1",
+            x: 0,
+            y: 0,
+            w: 24,
+            h: 24,
+            widget: { kind: "files", host_id: HOST_ID, path: "/Users/tester" },
+          },
+        ],
+      },
+    },
+  ],
+};
+
+const FILES = { kind: "files" as const, host_id: HOST_ID, path: "/Users/tester" };
+
+function widgetTile(id: string, x: number, y: number, w: number, h: number) {
+  return { session_id: id, x, y, w, h, widget: FILES };
+}
+
+/** An occupied tab beside one holding two windows side by side. */
+const AIMED_TABS: LayoutV3 = {
+  version: 3,
+  active_tab: "tab-1",
+  tabs: [
+    {
+      id: "tab-1",
+      name: "Alpha",
+      layout: {
+        version: 3,
+        tiles: [widgetTile("00000000-0000-4000-8000-0000000000a1", 0, 0, 24, 24)],
+      },
+    },
+    {
+      id: "tab-2",
+      name: "Beta",
+      layout: {
+        version: 3,
+        tiles: [
+          widgetTile("00000000-0000-4000-8000-0000000000b1", 0, 0, 12, 24),
+          widgetTile("00000000-0000-4000-8000-0000000000b2", 12, 0, 12, 24),
+        ],
+      },
+    },
   ],
 };
 
@@ -41,6 +100,17 @@ async function paintedOrder(strip: Locator) {
 
 function patchedOrder(body: unknown) {
   return ((body as { layout: LayoutV3 }).layout.tabs ?? []).map((tab) => tab.name);
+}
+
+/**
+ * The layout writes among the workspace PATCHes. A workspace with a home of
+ * its own also gets an icon PATCH the first time it is opened, which says
+ * nothing about tabs.
+ */
+function layoutPatches(patches: Array<{ body: unknown }>) {
+  return patches
+    .map((patch) => (patch.body as { layout?: LayoutV3 }).layout)
+    .filter((layout): layout is LayoutV3 => layout !== undefined);
 }
 
 /** Press the tab itself and carry it to `toX` — the whole tab is the grab. */
@@ -271,4 +341,134 @@ test("a plain tab drag still reorders — the modifier is what copies", async ({
     "Beta",
   ]);
   expect(store.requests.sessions).toEqual([]);
+});
+
+test("the + asks what goes in the tab, and makes the tab and the window together", async ({
+  page,
+}) => {
+  const store = await mockApp(page, {
+    sessions: [],
+    // A workspace with a home: one click answers "what", and "where" is
+    // already known, which is the whole point of the picker being one step.
+    workspaces: [workspace({ layout: THREE_TABS, host_id: HOST_ID, cwd: "/Users/tester" })],
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  const strip = page.getByRole("tablist", { name: "Workspace tabs" });
+  await expect(strip.getByRole("tab", { name: "Alpha" })).toBeVisible();
+
+  // Opening the picker makes nothing: there is no empty tab to abandon.
+  await page.getByRole("button", { name: "New tab" }).click();
+  // The trigger already says New tab, so the menu is the choices alone — and
+  // only the choices: a new tab opens at the workspace's folder, so the
+  // "somewhere else" row has nothing to add.
+  const menu = page.getByRole("menu");
+  await expect(menu.getByRole("menuitem", { name: /A plain login shell/ })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: /another folder|another host/ })).toHaveCount(0);
+  expect(layoutPatches(store.requests.workspacePatches)).toHaveLength(0);
+  expect(store.requests.sessions).toHaveLength(0);
+
+  // Choosing what goes in it writes the tab, then opens the window there.
+  await menu.getByRole("menuitem", { name: /A plain login shell/ }).click();
+  await expect.poll(() => store.requests.sessions.length).toBe(1);
+  const added = layoutPatches(store.requests.workspacePatches)[0] as LayoutV3;
+  expect(added.tabs.map((tab) => tab.name)).toEqual(["Alpha", "Beta", "Gamma", "Tab 4"]);
+  expect(added.active_tab).toBe(added.tabs[3]?.id);
+  await expect(strip.getByRole("tab", { name: "Tab 4" })).toHaveAttribute("aria-selected", "true");
+});
+
+test("dragging a tab down onto the canvas folds its windows into the open one", async ({
+  page,
+}) => {
+  const store = await mockApp(page, {
+    sessions: [],
+    workspaces: [workspace({ layout: TABS_WITH_A_WINDOW })],
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  const strip = page.getByRole("tablist", { name: "Workspace tabs" });
+  const beta = strip.getByRole("tab", { name: "Beta" });
+  await expect(beta).toBeVisible();
+
+  const box = await beta.boundingBox();
+  const canvas = await page.locator("[data-workspace-canvas]").boundingBox();
+  if (!box || !canvas) throw new Error("geometry unavailable");
+
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(canvas.x + canvas.width / 2, canvas.y + canvas.height * 0.8, { steps: 10 });
+  // The canvas says what the drop will do before the hand lets go.
+  await expect(page.getByText("Merge Beta into Alpha")).toBeVisible();
+  await page.mouse.up();
+
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  const merged = (store.requests.workspacePatches[0]?.body as { layout: LayoutV3 }).layout;
+  expect(merged.tabs.map((tab) => tab.name)).toEqual(["Alpha"]);
+  expect(merged.active_tab).toBe("tab-1");
+  expect(merged.tabs[0]?.layout.tiles.map((tile) => tile.session_id)).toEqual([
+    "00000000-0000-4000-8000-0000000000f1",
+  ]);
+  await expect(strip.getByRole("tab", { name: "Beta" })).toHaveCount(0);
+});
+
+test("a sideways tab drag never becomes a merge", async ({ page }) => {
+  const store = await setupTabs(page);
+  const strip = page.getByRole("tablist", { name: "Workspace tabs" });
+  const box = await strip.getByRole("tab", { name: "Alpha" }).boundingBox();
+  const beta = await strip.getByRole("tab", { name: "Beta" }).boundingBox();
+  if (!box || !beta) throw new Error("tab geometry unavailable");
+
+  // A little downward drift on the way past Beta is still a reorder: the
+  // merge only takes over well clear of the strip.
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(beta.x + beta.width * 0.6, box.y + box.height, { steps: 8 });
+  await expect(page.getByText(/^Merge /)).toHaveCount(0);
+  await page.mouse.up();
+
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  expect(patchedOrder(store.requests.workspacePatches[0]?.body)).toEqual([
+    "Beta",
+    "Alpha",
+    "Gamma",
+  ]);
+});
+
+test("a tab aimed at half a window lands there, keeping its own arrangement", async ({ page }) => {
+  const store = await mockApp(page, {
+    sessions: [],
+    workspaces: [workspace({ layout: AIMED_TABS })],
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  const strip = page.getByRole("tablist", { name: "Workspace tabs" });
+  const beta = strip.getByRole("tab", { name: "Beta" });
+  await expect(beta).toBeVisible();
+
+  const box = await beta.boundingBox();
+  const canvas = await page.locator("[data-workspace-canvas]").boundingBox();
+  if (!box || !canvas) throw new Error("geometry unavailable");
+
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  // Hard against the right edge of the one window on the canvas: it gives up
+  // its right half, and Beta's two windows share that half between them.
+  await page.mouse.move(canvas.x + canvas.width * 0.95, canvas.y + canvas.height / 2, {
+    steps: 10,
+  });
+  const outlines = page.locator("[data-merge-window]");
+  await expect(outlines).toHaveCount(2);
+  const first = await outlines.first().boundingBox();
+  if (!first) throw new Error("outline geometry unavailable");
+  // Two windows in the right half means a quarter of the canvas each, and the
+  // first of them starts at the halfway line.
+  expect(first.x).toBeCloseTo(canvas.x + canvas.width / 2, -1);
+  expect(first.width).toBeCloseTo(canvas.width / 4, -1);
+
+  await page.mouse.up();
+  await expect.poll(() => store.requests.workspacePatches.length).toBe(1);
+  const merged = (store.requests.workspacePatches[0]?.body as { layout: LayoutV3 }).layout;
+  expect(merged.tabs).toHaveLength(1);
+  expect(merged.tabs[0]?.layout.tiles).toEqual([
+    widgetTile("00000000-0000-4000-8000-0000000000a1", 0, 0, 12, 24),
+    widgetTile("00000000-0000-4000-8000-0000000000b1", 12, 0, 6, 24),
+    widgetTile("00000000-0000-4000-8000-0000000000b2", 18, 0, 6, 24),
+  ]);
 });

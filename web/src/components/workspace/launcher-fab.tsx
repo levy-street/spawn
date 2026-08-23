@@ -27,6 +27,7 @@ import { activeTab, tabById, tabHome, tabTiles, withActiveTab, withTabTiles } fr
 import { cn } from "@/lib/utils";
 import { agentRunCommand } from "./agent-command";
 import { isWorkspaceFullError } from "./new-session-menu-helpers";
+import { queryAllInPane, queryInPane, usePaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
 import {
   addPaneTiles,
@@ -88,8 +89,12 @@ export function LauncherFab({
   onCreated?: (result: { sessionId: string | null }) => void;
 }) {
   const queryClient = useQueryClient();
+  // This half of the window: in a split there are two launchers on screen, and
+  // the canvas and openings this one measures have to be its own.
+  const { rootRef: paneRootRef, split } = usePaneScope();
   const [open, setOpen] = useState(false);
   const [dragging, setDragging] = useState<{ icon: ReactNode; choice: Choice } | null>(null);
+  const fabRef = useRef<HTMLDivElement>(null);
   const ghostRef = useRef<HTMLDivElement>(null);
   const dropPreviewRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{
@@ -100,11 +105,14 @@ export function LauncherFab({
     started: boolean;
     target: Element | null;
     /**
-     * The canvas as it rests: its box, its openings, and where auto-place
-     * would land. All read once, at drag start, and never again — the panes
-     * on it are showing this drag's own preview, so measuring them mid-drag
-     * would have each frame answer the last one.
+     * The canvas as it rests: the element, its box, its openings, and where
+     * auto-place would land. All read once, at drag start, and never again —
+     * the panes on it are showing this drag's own preview, so measuring them
+     * mid-drag would have each frame answer the last one. The element is kept
+     * so the pointer can be asked whether it is over *this* half's canvas
+     * rather than over any canvas.
      */
+    canvasElement: Element | null;
     canvas: DOMRect | null;
     openings: Array<{ rect: Rect; button: Element | null }>;
     autoRect: Rect | null;
@@ -296,7 +304,7 @@ export function LauncherFab({
     document.removeEventListener("keydown", drag.key);
     clearDropTarget(drag);
     previewPanes(null);
-    document.querySelector("[data-launcher-fab]")?.removeAttribute("data-trash-hover");
+    fabRef.current?.removeAttribute("data-trash-hover");
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
     setDragging(null);
@@ -330,12 +338,14 @@ export function LauncherFab({
         ghost.style.top = `${moveEvent.clientY + 14}px`;
       }
       const under = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY);
-      document
-        .querySelector("[data-launcher-fab]")
-        ?.toggleAttribute("data-trash-hover", Boolean(under?.closest?.("[data-launcher-fab]")));
+      fabRef.current?.toggleAttribute(
+        "data-trash-hover",
+        Boolean(under?.closest?.("[data-launcher-fab]")),
+      );
       const preview = dropPreviewRef.current;
       const canvas = drag.canvas;
-      if (!preview || !canvas) return;
+      const canvasElement = drag.canvasElement;
+      if (!preview || !canvas || !canvasElement) return;
 
       // What the pointer is aimed at, resolved in cell space against the
       // resting layout rather than by hit-testing the panes: they are already
@@ -353,7 +363,10 @@ export function LauncherFab({
         pointerY < rect.y + rect.h;
 
       const resting = tabTiles(layoutRef.current, tabId);
-      const overCanvas = Boolean(under?.closest?.("[data-workspace-canvas]"));
+      // This half's canvas specifically. Carrying an item over the other
+      // workspace's grid promises nothing and drops nothing: panes belong to
+      // the workspace whose launcher they came from.
+      const overCanvas = under?.closest?.("[data-workspace-canvas]") === canvasElement;
       const opening = overCanvas ? (drag.openings.find((slot) => covers(slot.rect)) ?? null) : null;
       const hovered = overCanvas && !opening ? (resting.find(covers) ?? null) : null;
       const zone = hovered
@@ -450,6 +463,12 @@ export function LauncherFab({
       keyEvent.stopPropagation();
       endDrag();
     };
+    // Read out of this half rather than the document: with two workspaces up
+    // the document's first canvas and every opening in it belong to whichever
+    // half is on the left, and a pane dropped here would land at coordinates
+    // measured off the other grid.
+    const paneRoot = paneRootRef.current;
+    const canvasElement = queryInPane(paneRoot, "[data-workspace-canvas]");
     dragRef.current = {
       choice,
       icon,
@@ -457,8 +476,9 @@ export function LauncherFab({
       startY: event.clientY,
       started: false,
       target: null,
-      canvas: document.querySelector("[data-workspace-canvas]")?.getBoundingClientRect() ?? null,
-      openings: [...document.querySelectorAll("[data-grid-opening]")].flatMap((element) => {
+      canvasElement,
+      canvas: canvasElement?.getBoundingClientRect() ?? null,
+      openings: queryAllInPane(paneRoot, "[data-grid-opening]").flatMap((element) => {
         const rect = parseOpening(element.getAttribute("data-grid-opening"));
         return rect ? [{ rect, button: element.querySelector("button") }] : [];
       }),
@@ -500,6 +520,7 @@ export function LauncherFab({
   return (
     <>
       <div
+        ref={fabRef}
         data-launcher-fab
         // Not while dragging: the drawer would fan out under the cursor at
         // the exact moment the button means "drop here to discard".
@@ -514,7 +535,14 @@ export function LauncherFab({
         // One pill that grows from a circle: the items sit inside it and are
         // revealed by the container's own width, not a separate tray.
         className={cn(
-          "group/fab fixed right-4 z-40 flex items-center rounded-2xl border border-border bg-popover shadow-lg",
+          "group/fab right-4 z-40 flex items-center rounded-2xl border border-border bg-popover shadow-lg",
+          // Split, the button hangs off its own half — two viewport-fixed
+          // launchers would sit on the same pixel, one hiding the other. A
+          // single workspace stays fixed rather than being pinned to a half
+          // that fills the window anyway: fixed is measured off the viewport,
+          // so it keeps clearing the safe area and the modifier bar however
+          // the content panel is inset or clipped.
+          split ? "absolute" : "fixed",
           "bottom-[calc(1rem+var(--safe-bottom))]",
           // Clear of the touch modifier bar on phones.
           "[@media(pointer:coarse)]:bottom-[calc(4.5rem+var(--safe-bottom))]",

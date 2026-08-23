@@ -248,3 +248,59 @@ export function moveSessionToTab(
     moved,
   ]);
 }
+
+/**
+ * Fold one tab's windows into another and drop the emptied tab — the drop at
+ * the end of dragging a tab down onto the canvas.
+ *
+ * The target keeps its own arrangement; the newcomers arrive in reading order
+ * and are auto-placed around it, which is the same algebra a window added to
+ * the target would use. All or nothing: if the target runs out of room part
+ * way through, the whole merge is refused rather than leaving half a tab's
+ * windows behind in a tab that is about to be closed.
+ *
+ * Null when either tab is unknown, they are the same tab, or the target
+ * cannot hold everything the source is carrying — callers treat null as
+ * "nothing to persist".
+ */
+export function mergeTabs(
+  layout: LayoutV3,
+  sourceTabId: string,
+  targetTabId: string,
+): LayoutV3 | null {
+  const source = tabById(layout, sourceTabId);
+  const target = tabById(layout, targetTabId);
+  if (!source || !target || source.id === target.id) return null;
+  let tiles = target.layout.tiles;
+  for (const sessionId of readingOrder(source.layout.tiles)) {
+    const tile = source.layout.tiles.find((item) => item.session_id === sessionId);
+    if (!tile) continue;
+    const placed = autoPlace(tiles);
+    if (placed.tile === null) return null;
+    tiles = [...placed.tiles, { ...tile, ...placed.tile }];
+  }
+  return foldTabInto(layout, sourceTabId, targetTabId, tiles);
+}
+
+/**
+ * The envelope with `targetTabId` holding `tiles` and `sourceTabId` gone — the
+ * last step of every merge, however the tiles were worked out. The target is
+ * made active, since it is the tab that survives and the one being looked at.
+ *
+ * Split out because where the windows land is a canvas question (see
+ * `workspace/tab-merge.ts`, which aims them) while dropping the emptied tab is
+ * an envelope one, and only this file may answer that. Null when the source is
+ * unknown or is the workspace's last tab.
+ */
+export function foldTabInto(
+  layout: LayoutV3,
+  sourceTabId: string,
+  targetTabId: string,
+  tiles: Tile[],
+): LayoutV3 | null {
+  if (!tabById(layout, targetTabId)) return null;
+  // Remove second, so the source's tiles are never in two tabs at once in the
+  // envelope handed to the caller.
+  const next = removeTab(withTabTiles(layout, targetTabId, tiles), sourceTabId);
+  return next ? withActiveTab(next, targetTabId) : null;
+}
