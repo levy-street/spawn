@@ -160,7 +160,7 @@ test("an invite link carries its code into signup", async ({ page }) => {
   await expect(page.getByRole("status")).toContainText("You have an invite");
 
   await page.getByLabel("Email").fill("guest@example.com");
-  await page.locator("#password").fill("correct-horse-battery");
+  await page.getByLabel("Password", { exact: true }).fill("correct-horse-battery");
   await page.getByRole("button", { name: /Create account|Sign up/i }).click();
 
   await expect.poll(() => submitted).toHaveLength(1);
