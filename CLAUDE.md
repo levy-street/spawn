@@ -34,64 +34,10 @@ cd mobile && npm run ci        # typecheck + lint + jest
 cd server && .venv/bin/ruff check . && .venv/bin/python -m pytest -q
 ```
 
-## Releasing: the server and the app go out together
+## Releasing
 
-Deployment is over SSH, from a coding agent, using the script in this repo.
-It refuses to run against a dirty checkout, unpushed commits, a branch other
-than master (`--allow-branch` to mean it), an inherited
-`SPAWN_API_PROXY_TARGET` (`--api-proxy-target` to mean it — the 2026-08-24
-incident was a dev shell's value baked into the prod web build), or a
-`prebuilt-latest` release built from a different daemon tree. Before anything
-restarts it verifies the proxy target the build actually baked, and after the
-restart it fetches `/healthz` through the web app's rewrite — the one probe
-that exercises the chain a browser uses. A failed smoke check prints the
-rollback command.
-
-```bash
-scripts/deploy-prod.sh <ssh-host>     # pulls, migrates, restarts spawn-server + spawn-web
-```
-
-That ships the server and the web app. **It does not touch the phone.** The
-installed app keeps running whatever JavaScript it was built with, so a release
-that stops there leaves the two frontends on different versions of the same
-feature — exactly the split the section above exists to prevent.
-
-Push the matching update in the same release:
-
-```bash
-cd mobile && eas update --branch production -m "<same summary as the deploy>"
-```
-
-Over-the-air updates carry JavaScript and assets, and they reach installed
-builds within a launch or two. They cannot carry native changes. Anything that
-alters the native layer needs a real build instead:
-
-- a new dependency with native code, or a config plugin
-- entitlements, capabilities, permissions, or `Info.plist` keys
-- app icons, the splash screen, the bundle identifier, the display name
-- bumping `version` in `app.json` — `runtimeVersion` follows `appVersion`, so a
-  version bump orphans every install from further updates until they rebuild
-
-```bash
-cd mobile && EXPO_NO_CAPABILITY_SYNC=1 \
-  eas build -p ios -e production --non-interactive --auto-submit
-```
-
-Credentials live on EAS — distribution certificate, provisioning profile, APNs
-key, and the App Store Connect key for submissions — so this needs no Apple
-login and runs unattended.
-
-`EXPO_NO_CAPABILITY_SYNC=1` is required until Associated Domains is either used
-in the entitlements or removed from the App ID: Apple's API rejects EAS's
-attempt to switch it off, and it should stay on for universal links.
-
-## Order of operations
-
-Migrations run before the new server starts, so a release is safe only when the
-old code tolerates the new schema. Add columns and backfill in one release,
-then start depending on them in the next.
-
-Server config lives in the environment on the production host, not in this repo
-and not in EAS. EAS environment variables are build inputs for the app; the
-only one this project uses is `EXPO_PUBLIC_API_URL`, already committed in
-`eas.json`. A server secret placed in EAS is both ineffective and exposed.
+Before deploying or releasing anything — server, web, a mobile update or
+build, daemon prebuilts — read `docs/RELEASE.md` in full. It is the entire
+release process: what ships together, what the deploy script refuses and why,
+and how to verify what actually reached production. Its guard rails exist
+because skipping one has already caused an outage.
