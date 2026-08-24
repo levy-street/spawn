@@ -73,7 +73,7 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
       // fingerprint of the key being signed. Re-derive it locally and refuse
       // on mismatch, so a substituted key cannot harvest a signature.
       const derived = formatHostFingerprint(target.public_key);
-      if (derived !== request.fingerprint || derived !== target.fingerprint) {
+      if (derived !== request.fingerprint) {
         throw new Error(
           "This device's fingerprint does not match its key. The server may be substituting a key.",
         );

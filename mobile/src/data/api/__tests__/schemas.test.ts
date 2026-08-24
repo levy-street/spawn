@@ -83,11 +83,13 @@ it("round-trips auth/account response JSON", () => {
 });
 
 it("round-trips browser-device and pairing response JSON", () => {
+  // No fingerprint: the server does not send one, by design. This fixture
+  // used to invent one, which is how a schema that rejected every real
+  // response passed its own round-trip test.
   const browserDevice = {
     id: UUID_A,
     key_algorithm: "ed25519",
     public_key: "browser-public-key",
-    fingerprint: "SHA256:browser",
     label: null,
     created_at: NOW,
     revoked_at: null,

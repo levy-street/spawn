@@ -25,7 +25,6 @@ const PHONE: BrowserDeviceOut = {
   id: PHONE_ID,
   key_algorithm: "ed25519",
   public_key: PHONE_KEY,
-  fingerprint: formatHostFingerprint(PHONE_KEY),
   label: "spawn on iPhone",
   created_at: "2026-08-22T00:00:00Z",
   revoked_at: null,
@@ -132,7 +131,7 @@ describe("pairing query orchestration", () => {
           browser_device_id: PHONE.id,
           browser_key_algorithm: "ed25519",
           browser_public_key: PHONE.public_key,
-          browser_key_fingerprint: PHONE.fingerprint,
+          browser_key_fingerprint: formatHostFingerprint(PHONE.public_key),
           host_id: null,
         };
       },

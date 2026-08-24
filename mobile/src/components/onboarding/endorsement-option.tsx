@@ -136,7 +136,7 @@ export function EndorsementOption({
           This phone
         </Text>
         <Text selectable style={styles.phoneFingerprint} variant="mono">
-          {phone.fingerprint}
+          {formatHostFingerprint(phone.public_key)}
         </Text>
       </View>
 

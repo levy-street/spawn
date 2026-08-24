@@ -4,7 +4,6 @@ import type {
   BrowserDeviceRegisterRequest,
   BrowserDeviceRevokeRequest,
 } from "@/data/api/schemas/devices";
-import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { encodeBase64Url } from "@/lib/crypto/bytes";
 import { deviceIdentity, setDeviceIdentityAccount } from "@/lib/crypto/identity";
 
@@ -65,11 +64,9 @@ export async function ensureDeviceRegistered(input: {
   } finally {
     signature.fill(0);
   }
-  const fingerprint = formatHostFingerprint(publicKey);
   if (
     registered.key_algorithm !== "ed25519" ||
     registered.public_key !== publicKey ||
-    registered.fingerprint !== fingerprint ||
     registered.revoked_at !== null
   ) {
     throw new DeviceRegistrationError(

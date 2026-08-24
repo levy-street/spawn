@@ -3,7 +3,6 @@ import * as Clipboard from "expo-clipboard";
 import { useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
-
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
 import { EndorsementOption } from "@/components/onboarding/endorsement-option";
@@ -29,6 +28,7 @@ import {
 import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
 import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
+import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { haptics } from "@/lib/haptics";
 import { fontSize, spacing } from "@/theme";
 
@@ -138,7 +138,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
 
   const copyFingerprint = async (): Promise<void> => {
     if (!phone) return;
-    await Clipboard.setStringAsync(phone.fingerprint);
+    await Clipboard.setStringAsync(formatHostFingerprint(phone.public_key));
     haptics.success();
     setCopied(true);
   };
@@ -193,7 +193,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
               {phone?.label ?? "This device"}
             </Text>
             <Text selectable style={styles.fingerprint} variant="mono">
-              {phone?.fingerprint ?? "…"}
+              {phone ? formatHostFingerprint(phone.public_key) : "…"}
             </Text>
             <Text color="mutedForeground" variant="caption">
               The approving device shows a fingerprint too. They must match — that comparison is the
