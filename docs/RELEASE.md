@@ -44,8 +44,19 @@ leaves the two frontends on different versions of the same feature.
 Push the matching update in the same release:
 
 ```bash
-cd mobile && eas update --branch production -m "<same summary as the deploy>"
+scripts/update-mobile-prod.sh -m "<same summary as the deploy>"
 ```
+
+Never run `eas update` by hand for production. The `env` blocks in
+`eas.json` apply to `eas build` profiles only — `eas update` re-evaluates
+`app.config.ts` with the caller's shell environment, so a bare invocation
+from a shell without `EXPO_PUBLIC_API_URL` publishes a bundle with no API
+URL baked in, and every installed app falls back to `http://localhost:3000`
+and breaks at sign-in. (This happened on 2026-08-24.) The script bakes the
+URL itself, refuses a disagreeing inherited value, proves the evaluated
+config carries it before publishing, and proves the manifest served by
+`u.expo.dev` carries it after. Its guards are pinned by
+`server/tests/test_update_mobile_script.py`.
 
 Over-the-air updates carry JavaScript and assets, and they reach installed
 builds within a launch or two. They cannot carry native changes. Anything that
@@ -126,5 +137,7 @@ then start depending on them in the next.
 
 Server config lives in the environment on the production host, not in this repo
 and not in EAS. EAS environment variables are build inputs for the app; the
-only one this project uses is `EXPO_PUBLIC_API_URL`, already committed in
-`eas.json`. A server secret placed in EAS is both ineffective and exposed.
+only one this project uses is `EXPO_PUBLIC_API_URL`, committed in `eas.json`
+for **builds** — over-the-air updates do not read `eas.json`, which is why
+`scripts/update-mobile-prod.sh` sets it itself (see "The phone"). A server
+secret placed in EAS is both ineffective and exposed.
