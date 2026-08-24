@@ -23,14 +23,40 @@ function phone(overrides: Partial<BrowserDeviceOut> = {}): BrowserDeviceOut {
   } as BrowserDeviceOut;
 }
 
+const LAPTOP_ID = "b6b3d3d0-4d8b-4f53-9b1f-3a0d9b6f1e21";
+
 function probeApi(overrides: Partial<DeviceTrustProbeApi> = {}): Partial<DeviceTrustProbeApi> {
   return {
     publicKey: async () => new Uint8Array(32),
     listBrowserDevices: async () => [phone()],
     listHostPins: async () => [PHONE_ID],
+    listAccountEndorsements: async () => [],
+    getHost: async () => ({ id: HOST_ID, supports_account_chains: true }) as never,
     nowMs: () => 1_000,
     ...overrides,
   };
+}
+
+function chainApi(overrides: Partial<DeviceTrustProbeApi> = {}): Partial<DeviceTrustProbeApi> {
+  // The host pins the laptop; the laptop account-endorses the phone.
+  return probeApi({
+    listBrowserDevices: async () => [
+      phone(),
+      phone({ id: LAPTOP_ID, label: "Chrome on Mac", public_key: "laptop-key" }),
+    ],
+    listHostPins: async () => [LAPTOP_ID],
+    listAccountEndorsements: async () => [
+      {
+        endorser_device_id: LAPTOP_ID,
+        endorser_public_key: "laptop-key",
+        endorsed_device_id: PHONE_ID,
+        endorsed_public_key: PHONE_KEY,
+        signature: "sig",
+        created_at: "2026-08-24T05:48:37Z",
+      },
+    ],
+    ...overrides,
+  });
 }
 
 describe("probeDeviceHostTrust", () => {
@@ -44,6 +70,43 @@ describe("probeDeviceHostTrust", () => {
     await expect(
       probeDeviceHostTrust(HOST_ID, probeApi({ listHostPins: async () => [] })),
     ).resolves.toBe("untrusted");
+  });
+
+  it("trusts a device that reaches the host's pin through an account chain", async () => {
+    await expect(probeDeviceHostTrust(HOST_ID, chainApi())).resolves.toBe("trusted");
+  });
+
+  it("ignores the chain toward a host whose daemon does not validate chains", async () => {
+    await expect(
+      probeDeviceHostTrust(
+        HOST_ID,
+        chainApi({
+          getHost: async () => ({ id: HOST_ID, supports_account_chains: false }) as never,
+        }),
+      ),
+    ).resolves.toBe("untrusted");
+  });
+
+  it("distrusts a chain whose anchor the host does not pin", async () => {
+    await expect(
+      probeDeviceHostTrust(HOST_ID, chainApi({ listHostPins: async () => [] })),
+    ).resolves.toBe("untrusted");
+  });
+
+  it("shares the account-wide reads across a burst of probes", async () => {
+    const listBrowserDevices = jest.fn(async () => [phone()]);
+    const listAccountEndorsements = jest.fn(async () => []);
+    const api = probeApi({
+      listBrowserDevices,
+      listAccountEndorsements,
+      listHostPins: async () => [],
+    });
+    await Promise.all([
+      probeDeviceHostTrust(HOST_ID, api),
+      probeDeviceHostTrust("11111111-1111-4111-8111-111111111111", api),
+    ]);
+    expect(listBrowserDevices).toHaveBeenCalledTimes(1);
+    expect(listAccountEndorsements).toHaveBeenCalledTimes(1);
   });
 
   it("distrusts an identity the server has no live registration for", async () => {

@@ -150,7 +150,15 @@
       sdp: transcript.sdp,
       signature: message.signature,
     };
-    emitSignal({ type: "rtc.offer", ...outerTuple(), signed_envelope: JSON.stringify(envelope) });
+    const offerFrame = {
+      type: "rtc.offer",
+      ...outerTuple(),
+      signed_envelope: JSON.stringify(envelope),
+    };
+    if (Array.isArray(message.carriedEndorsements) && message.carriedEndorsements.length > 0) {
+      offerFrame.carried_endorsements = message.carriedEndorsements;
+    }
+    emitSignal(offerFrame);
     if (!isSessionMode()) {
       state.offerSent = true;
       for (const candidate of state.pendingLocalCandidates.splice(0)) emitSignal(candidate);

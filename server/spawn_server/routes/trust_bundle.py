@@ -549,6 +549,18 @@ async def create_account_endorsement(
         )
     ).scalar_one_or_none()
     if existing is not None:
+        # The knock still closes on a retry, exactly as the per-host path does:
+        # a device admitted between the request and the retry would otherwise
+        # keep prompting every screen on the account.
+        resolved = await _resolve_pending_requests(
+            session, user_id, endorsed.id, "approved", endorser.id
+        )
+        if resolved:
+            await session.commit()
+            for request_id in resolved:
+                await publish_trust_event(
+                    user_id, approval_resolved_payload(request_id, endorsed.id, "approved")
+                )
         return schemas.AccountEndorsementOut(
             id=existing.id,
             endorser_device_id=existing.endorser_device_id,
@@ -578,6 +590,12 @@ async def create_account_endorsement(
             created_at=created_at,
         )
     )
+    # The knock and the edge resolve in one transaction: an account endorsement
+    # is the answer a knock toward a chain-capable host was waiting for (the
+    # per-host path is refused there, mesh R9), so the prompt must close on it.
+    resolved = await _resolve_pending_requests(
+        session, user_id, endorsed.id, "approved", endorser.id
+    )
     try:
         await session.commit()
     except IntegrityError:
@@ -598,6 +616,11 @@ async def create_account_endorsement(
             endorser_device_id=winner.endorser_device_id,
             endorsed_device_id=winner.endorsed_device_id,
             created_at=winner.created_at,
+        )
+
+    for request_id in resolved:
+        await publish_trust_event(
+            user_id, approval_resolved_payload(request_id, endorsed.id, "approved")
         )
 
     # Nudge every host of the account so their pin/deny state reconciles NOW,

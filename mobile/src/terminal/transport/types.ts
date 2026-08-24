@@ -1,3 +1,4 @@
+import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import type { DeviceHostTrust } from "@/data/trust/device-trust";
 import type { TerminalTheme } from "@/theme";
 
@@ -119,6 +120,7 @@ export interface SessionTransportOptions {
   fontSize?: number;
   forceRelay?: boolean;
   openSignal?: (sessionId: string) => SignalChannelLike;
+  loadCarriedEndorsements?: () => Promise<readonly CarriedEndorsement[]>;
   /** Enables the trust preflight; without it an unapproved device only learns from the watchdog. */
   hostId?: string;
   probeTrust?: (hostId: string) => Promise<DeviceHostTrust>;
@@ -260,6 +262,7 @@ export interface HostTransportOptions {
   bridge: WorkerEndpoint;
   forceRelay?: boolean;
   openSignal?: (hostId: string) => SignalChannelLike;
+  loadCarriedEndorsements?: () => Promise<readonly CarriedEndorsement[]>;
   /** Defaults to the protocol maximum of 60 seconds; lower values support deterministic tests. */
   streamTimeoutMs?: number;
   probeTrust?: (hostId: string) => Promise<DeviceHostTrust>;

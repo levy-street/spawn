@@ -1,5 +1,10 @@
-import { createEndorsement } from "@/data/api/endpoints/trust";
-import type { BrowserEndorsementCreate, BrowserEndorsementOut } from "@/data/api/schemas/trust";
+import { createAccountEndorsement, createEndorsement } from "@/data/api/endpoints/trust";
+import type {
+  AccountEndorsementCreate,
+  AccountEndorsementOut,
+  BrowserEndorsementCreate,
+  BrowserEndorsementOut,
+} from "@/data/api/schemas/trust";
 import { formatHostFingerprint, type HostPin, type HostPinStore } from "@/data/trust/host-pins";
 import { decodeBase64UrlExact, encodeBase64Url } from "@/lib/crypto/bytes";
 import { verifyPureEd25519Strict } from "@/lib/crypto/ed25519";
@@ -28,9 +33,10 @@ export interface VerifiedEndorsement extends EndorsementIntroduction {
 
 export interface EndorsementApi {
   createEndorsement(input: BrowserEndorsementCreate): Promise<BrowserEndorsementOut>;
+  createAccountEndorsement(input: AccountEndorsementCreate): Promise<AccountEndorsementOut>;
 }
 
-const endpointApi: EndorsementApi = { createEndorsement };
+const endpointApi: EndorsementApi = { createEndorsement, createAccountEndorsement };
 
 export const passkeyPrfCapability = {
   available: false as const,
@@ -119,6 +125,47 @@ export async function createDeviceEndorsement(input: {
       response.endorser_device_id !== input.endorserDeviceId ||
       response.endorsed_device_id !== input.endorsedDeviceId ||
       response.endorsed_key_fingerprint !== formatHostFingerprint(input.endorsedPublicKey)
+    ) {
+      throw new Error("Endorsement response does not match the signed introduction");
+    }
+  } finally {
+    signature.fill(0);
+  }
+}
+
+/**
+ * Vouch for another device account-wide (mesh §3): one signed edge, carried
+ * by that device to every host that anchors on this one. This is what answers
+ * a knock toward a chain-capable host, where the per-host endorsement above
+ * is refused (mesh R9). One direction only — the operator compared the OTHER
+ * device's fingerprint, so nothing here claims that device verified this one.
+ */
+export async function createAccountDeviceEndorsement(input: {
+  accountId: string;
+  endorserDeviceId: string;
+  endorsedDeviceId: string;
+  endorsedPublicKey: string;
+  api?: EndorsementApi;
+}): Promise<void> {
+  setDeviceIdentityAccount(input.accountId);
+  const publicKey = await deviceIdentity.publicKey();
+  if (publicKey === null) throw new Error("Device identity is unavailable");
+  const endorserPublicKey = encodeBase64Url(publicKey);
+  const signature = await deviceIdentity.signAccountEndorsement({
+    accountId: input.accountId,
+    endorserPublicKey,
+    endorsedPublicKey: input.endorsedPublicKey,
+    endorsedDeviceId: input.endorsedDeviceId,
+  });
+  try {
+    const response = await (input.api ?? endpointApi).createAccountEndorsement({
+      endorser_device_id: input.endorserDeviceId,
+      endorsed_device_id: input.endorsedDeviceId,
+      signature: encodeBase64Url(signature),
+    });
+    if (
+      response.endorser_device_id !== input.endorserDeviceId ||
+      response.endorsed_device_id !== input.endorsedDeviceId
     ) {
       throw new Error("Endorsement response does not match the signed introduction");
     }

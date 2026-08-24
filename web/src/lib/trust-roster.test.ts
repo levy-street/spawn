@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { hostsSolelyTrustedBy, unprotectedOrphanHostIds } from "./trust-roster";
+import {
+  chainReachableFrom,
+  hostsSolelyTrustedBy,
+  hostsTrustingDevice,
+  unprotectedOrphanHostIds,
+} from "./trust-roster";
 
 const HOST = "00000000-0000-4000-8000-00000000000a";
 const OTHER_HOST = "00000000-0000-4000-8000-00000000000b";
@@ -68,5 +73,51 @@ describe("unprotectedOrphanHostIds (P-C7: the promise gate)", () => {
         ROOT_DEVICE,
       ),
     ).toEqual([HOST]);
+  });
+});
+
+describe("chainReachableFrom / hostsTrustingDevice (mesh §3 coverage)", () => {
+  const PHONE = "00000000-0000-4000-8000-000000000201";
+  const live = (id: string) => ({ id, revoked_at: null, is_root: false });
+  const devices = [live(DEVICE_X), live(DEVICE_Y), live(PHONE)];
+  const edge = (from: string, to: string) => ({ endorser_device_id: from, endorsed_device_id: to });
+
+  test("a device reaches a host through a live account edge from that host's pin", () => {
+    expect(chainReachableFrom([DEVICE_X], devices, [edge(DEVICE_X, PHONE)]).has(PHONE)).toBe(true);
+    // Not from a pin the host does not hold, and never backwards.
+    expect(chainReachableFrom([DEVICE_Y], devices, [edge(DEVICE_X, PHONE)]).has(PHONE)).toBe(false);
+    expect(chainReachableFrom([PHONE], devices, [edge(DEVICE_X, PHONE)]).has(DEVICE_X)).toBe(false);
+  });
+
+  test("an edge from a revoked device grants nothing", () => {
+    const withRevoked = [
+      { id: DEVICE_X, revoked_at: "2026-08-24T00:00:00Z", is_root: false },
+      live(PHONE),
+    ];
+    expect(chainReachableFrom([DEVICE_X], withRevoked, [edge(DEVICE_X, PHONE)]).has(PHONE)).toBe(
+      false,
+    );
+  });
+
+  test("the approval a browser signs covers exactly the hosts that trust it", () => {
+    const chainHost = { id: HOST, name: "dream", supports_account_chains: true };
+    const legacyHost = { id: OTHER_HOST, name: "old", supports_account_chains: false };
+    const pinsByHost = new Map<string, readonly string[]>([
+      [HOST, [DEVICE_X]],
+      [OTHER_HOST, [DEVICE_Y]],
+    ]);
+    // Directly pinned on the chain host, nothing on the legacy one.
+    expect(hostsTrustingDevice(DEVICE_X, [chainHost, legacyHost], pinsByHost, devices, [])).toEqual(
+      [chainHost],
+    );
+    // Chained onto the chain host through X; the legacy host ignores chains.
+    const edges = [edge(DEVICE_X, PHONE), edge(DEVICE_Y, PHONE)];
+    expect(hostsTrustingDevice(PHONE, [chainHost, legacyHost], pinsByHost, devices, edges)).toEqual(
+      [chainHost],
+    );
+    // Pinned directly on the legacy host: covered there, as before.
+    expect(hostsTrustingDevice(DEVICE_Y, [chainHost, legacyHost], pinsByHost, devices, [])).toEqual(
+      [legacyHost],
+    );
   });
 });

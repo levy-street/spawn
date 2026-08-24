@@ -57,6 +57,17 @@ export function AccessCeremonyHost() {
     refetchInterval: 15_000,
   });
   const trustMap = useDeviceTrustMap(user !== null);
+  // A device that knocked (the phone's path — it has no SAS role) is answered
+  // by the DeviceApprovalPrompt modal, not by this toast: offering to "enter
+  // its number" for a device that can never show one is a dead end. Shares
+  // the prompt's cache key so both see the same pending set.
+  const knocks = useQuery({
+    queryKey: ["trust", "device-approvals"],
+    queryFn: () => trust.listDeviceApprovals(),
+    enabled: user !== null,
+    refetchInterval: 60_000,
+  });
+  const knockingDeviceIds = new Set((knocks.data ?? []).map((k) => k.browser_device_id));
 
   // The roster fetched before this browser's own registration landed cannot
   // contain this device, and until it does `canApprove` reads false — the
@@ -111,6 +122,7 @@ export function AccessCeremonyHost() {
             d.id !== currentDevice?.id &&
             !(roster.get(d.id)?.chainTrusted ?? false) &&
             trustMap.trustedHostIdsFor(d.id).length === 0 &&
+            !knockingDeviceIds.has(d.id) &&
             approvalToastEligible(d, ignoredAt.get(d.id)),
         );
   // One toast at a time (the most urgent ask first); the settings dialog

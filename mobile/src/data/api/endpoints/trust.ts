@@ -2,6 +2,12 @@ import { z } from "zod";
 import { api } from "@/data/api/client";
 import { jsonBody, pathPart, queryString } from "@/data/api/endpoints/helpers";
 import {
+  type AccountEndorsementCreate,
+  AccountEndorsementCreateSchema,
+  type AccountEndorsementOut,
+  AccountEndorsementOutSchema,
+  type AccountEndorsementRecord,
+  AccountEndorsementRecordSchema,
   type BrowserEndorsementCreate,
   BrowserEndorsementCreateSchema,
   type BrowserEndorsementOut,
@@ -59,6 +65,32 @@ export function createEndorsement(body: BrowserEndorsementCreate): Promise<Brows
     method: "POST",
     body: jsonBody(BrowserEndorsementCreateSchema.parse(body)),
     schema: BrowserEndorsementOutSchema,
+  });
+}
+
+/**
+ * Every account-scoped endorsement edge whose endpoints are both live, for this
+ * device to assemble the carried chain it presents on connect (mesh §3).
+ * Server-claimed; the daemon re-verifies each signature.
+ */
+export function listAccountEndorsements(): Promise<AccountEndorsementRecord[]> {
+  return api("/api/trust/account-endorsements", {
+    schema: z.array(AccountEndorsementRecordSchema),
+  });
+}
+
+/**
+ * Record this device vouching for another account-wide. The server verifies
+ * the signature only to keep malformed rows out; authority is decided by each
+ * daemon when the endorsed device carries the edge to it.
+ */
+export function createAccountEndorsement(
+  body: AccountEndorsementCreate,
+): Promise<AccountEndorsementOut> {
+  return api("/api/trust/account-endorsements", {
+    method: "POST",
+    body: jsonBody(AccountEndorsementCreateSchema.parse(body)),
+    schema: AccountEndorsementOutSchema,
   });
 }
 

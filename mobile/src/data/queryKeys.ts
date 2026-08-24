@@ -40,6 +40,7 @@ export const qk = {
   trustLocalPins: (accountId: string) => ["trust", "local-pins", accountId] as const,
   trustHosts: () => ["trust", "hosts"] as const,
   trustHostPinMap: (hostIdsCsv: string) => ["trust", "host-pin-map", hostIdsCsv] as const,
+  trustAccountEndorsements: () => ["trust", "account-endorsements"] as const,
   trustIntroductions: (accountId: string, deviceId: string) =>
     ["trust", "introductions", accountId, deviceId] as const,
   deviceHostTrust: (hostIds: readonly string[]) =>

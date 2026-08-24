@@ -175,6 +175,19 @@ terminal state precisely so the residual is a chosen, contained trade.
   waiting row is the pull path to the same place. An actively-asking device's toast
   says so ("It's asking for approval to reach your hosts") and outranks quiet
   sign-ins.
+- **the knock prompt** *(as built for the phone, 2026-08-25;
+  `DeviceApprovalPrompt` on web, `DeviceApprovalPrompt` on mobile)*: the phone
+  has no SAS role, so its knock is answered by a fingerprint compare instead of
+  a number — the prompt is a standard modal (title, the fingerprint as the one
+  thing to check, *Deny* / *It matches — approve*) that shows only on a screen
+  some host trusts, and it names the hosts the approval reaches ("Approving
+  here lets it connect to dream and minivac. Other hosts will ask again from a
+  screen they already trust."). Approve signs ONE account endorsement toward
+  chain-capable hosts (`TRUST_DEVICE_MESH.md` §4, *approve-knock*) and the
+  legacy per-host statement toward the rest; the knock closes on either. The
+  asking phone watches for the approval and reconnects on its own (ceremony
+  sheet: "waiting on your say-so"), with the `spawnd login` pairing code kept
+  as the no-other-device fallback.
 - With a passkey there is **no flow at all**: signing in with it is the approval.
   Recovery-after-total-loss is deliberately the *same non-flow*.
 

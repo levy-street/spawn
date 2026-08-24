@@ -1,4 +1,5 @@
 import { openHostSignal } from "@/data/realtime/host-signal";
+import { loadCarriedEndorsements } from "@/data/trust/carried-endorsements";
 import {
   DEVICE_NOT_TRUSTED_CODE,
   DEVICE_NOT_TRUSTED_MESSAGE,
@@ -663,12 +664,19 @@ class WebViewHostTransport implements StreamingHostTransport {
         break;
       case "sign-request":
         try {
-          const signature = await signWorkerRequest(message);
+          const [signature, carriedEndorsements] = await Promise.all([
+            signWorkerRequest(message),
+            (this.options.loadCarriedEndorsements ?? loadCarriedEndorsements)().catch(() => {
+              // Endorsements are best-effort; direct pins can still admit this signed offer.
+              return [];
+            }),
+          ]);
           this.options.bridge.send({
             v: TERMINAL_BRIDGE_VERSION,
             type: "sign-response",
             requestId: message.requestId,
             signature,
+            ...(carriedEndorsements.length > 0 ? { carriedEndorsements } : {}),
           });
         } catch (error) {
           this.options.bridge.send({

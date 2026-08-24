@@ -55,6 +55,31 @@ export const BrowserEndorsementRecordSchema = z.object({
   endorser_label: z.string().nullable(),
   signature: z.string(),
 });
+/**
+ * Account-scoped endorsement (device mesh §3): one device vouching for
+ * another's key for the whole account, no host in the transcript. Carried by
+ * the endorsed device on every offer and re-verified by the daemon against its
+ * own anchors, so nothing here is trusted as served.
+ */
+export const AccountEndorsementCreateSchema = z.object({
+  endorser_device_id: UUIDSchema,
+  endorsed_device_id: UUIDSchema,
+  signature: z.string(),
+});
+export const AccountEndorsementOutSchema = z.object({
+  id: UUIDSchema,
+  endorser_device_id: UUIDSchema,
+  endorsed_device_id: UUIDSchema,
+  created_at: IsoDateTimeSchema,
+});
+export const AccountEndorsementRecordSchema = z.object({
+  endorser_device_id: UUIDSchema,
+  endorser_public_key: z.string(),
+  endorsed_device_id: UUIDSchema,
+  endorsed_public_key: z.string(),
+  signature: z.string(),
+  created_at: IsoDateTimeSchema,
+});
 
 export type TrustBundleOut = z.infer<typeof TrustBundleOutSchema>;
 export type TrustBundlePut = z.infer<typeof TrustBundlePutSchema>;
@@ -63,5 +88,8 @@ export type PasskeyCredentialCreate = z.infer<typeof PasskeyCredentialCreateSche
 export type BrowserEndorsementCreate = z.infer<typeof BrowserEndorsementCreateSchema>;
 export type BrowserEndorsementOut = z.infer<typeof BrowserEndorsementOutSchema>;
 export type BrowserEndorsementRecord = z.infer<typeof BrowserEndorsementRecordSchema>;
+export type AccountEndorsementCreate = z.infer<typeof AccountEndorsementCreateSchema>;
+export type AccountEndorsementOut = z.infer<typeof AccountEndorsementOutSchema>;
+export type AccountEndorsementRecord = z.infer<typeof AccountEndorsementRecordSchema>;
 export type DeviceApprovalRequestCreate = z.infer<typeof DeviceApprovalRequestCreateSchema>;
 export type DeviceApprovalRequestOut = z.infer<typeof DeviceApprovalRequestOutSchema>;
