@@ -436,7 +436,10 @@ class Host(Base):
     )
 
     owner: Mapped[User] = relationship(back_populates="hosts")
-    sessions: Mapped[list[Session]] = relationship(back_populates="host")
+    # passive_deletes: without it the ORM nulls sessions.host_id (NOT NULL)
+    # instead of letting the FK cascade fire, so deleting a host with any
+    # session rows 500s.
+    sessions: Mapped[list[Session]] = relationship(back_populates="host", passive_deletes=True)
     browser_pins: Mapped[list[HostBrowserPin]] = relationship(
         back_populates="host", passive_deletes=True
     )
