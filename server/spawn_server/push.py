@@ -15,6 +15,7 @@ not displayed, so the app can open the right session on tap.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Settings, get_settings
+from .db import get_sessionmaker
 from .models import PushDevice
 
 log = logging.getLogger("spawn.push")
@@ -86,6 +88,20 @@ def alert_push_message(payload: dict[str, Any]) -> PushMessage | None:
     return PushMessage(title=title, body=body, data={"sessionId": session_id, "event": event})
 
 
+def approval_push_message(request_id: str, label: str | None) -> PushMessage:
+    """The knock (docs/TRUST_UX.md §3) as lock-screen copy for the phones that
+    can answer it. The label is the asking device's own name for itself and is
+    the only device-derived string shown; the fingerprint the operator must
+    compare is deliberately NOT here, because a lock screen is not where that
+    comparison happens — the prompt the tap opens is."""
+    subject = label.strip() if isinstance(label, str) and label.strip() else "A new device"
+    return PushMessage(
+        title=f"Approve {subject}?",
+        body="It signed in to your account and is waiting for you.",
+        data={"event": "device.approval_requested", "requestId": request_id},
+    )
+
+
 async def _live_tokens(session: AsyncSession, user_id: str) -> list[PushDevice]:
     rows = await session.execute(
         select(PushDevice).where(
@@ -132,16 +148,93 @@ async def send_alert_push(
     settings = settings or get_settings()
     if not settings.push_enabled:
         return 0
-
     message = alert_push_message(payload)
     if message is None:
         return 0
+    return await _send_push(
+        session=session, user_id=user_id, message=message, client=client, settings=settings
+    )
 
+
+async def send_approval_push(
+    *,
+    session: AsyncSession,
+    user_id: str,
+    request_id: str,
+    label: str | None,
+    exclude_browser_device_id: str | None,
+    client: httpx.AsyncClient | None = None,
+    settings: Settings | None = None,
+) -> int:
+    """Tell the account's phones a device is knocking. Returns the count sent.
+
+    The knocking device's own install is skipped: it registered its push token
+    with its browser device id, and "Approve spawn on iPhone?" arriving on that
+    same iPhone would only confuse. Never raises, same as the alert path.
+    """
+    settings = settings or get_settings()
+    if not settings.push_enabled:
+        return 0
+    return await _send_push(
+        session=session,
+        user_id=user_id,
+        message=approval_push_message(request_id, label),
+        exclude_browser_device_id=exclude_browser_device_id,
+        client=client,
+        settings=settings,
+    )
+
+
+_push_tasks: set[asyncio.Task[None]] = set()
+
+
+def schedule_approval_push(
+    user_id: str, request_id: str, label: str | None, exclude_browser_device_id: str | None
+) -> None:
+    """Fire-and-forget `send_approval_push` from a request handler.
+
+    The knock must return as soon as its row is durable; a push round-trip to
+    an external service is neither quick nor reliable enough to sit in that
+    response. Nothing waits on the result and the sender never raises.
+    """
+
+    async def deliver() -> None:
+        try:
+            async with get_sessionmaker()() as session:
+                await send_approval_push(
+                    session=session,
+                    user_id=user_id,
+                    request_id=request_id,
+                    label=label,
+                    exclude_browser_device_id=exclude_browser_device_id,
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("approval push failed: %s", e)
+
+    try:
+        task = asyncio.create_task(deliver())
+    except RuntimeError:
+        return
+    _push_tasks.add(task)
+    task.add_done_callback(_push_tasks.discard)
+
+
+async def _send_push(
+    *,
+    session: AsyncSession,
+    user_id: str,
+    message: PushMessage,
+    settings: Settings,
+    exclude_browser_device_id: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> int:
     try:
         devices = await _live_tokens(session, user_id)
     except Exception as e:  # noqa: BLE001
         log.warning("push token lookup failed: %s", e)
         return 0
+    if exclude_browser_device_id is not None:
+        devices = [d for d in devices if d.browser_device_id != exclude_browser_device_id]
     if not devices:
         return 0
 

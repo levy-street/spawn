@@ -45,6 +45,7 @@ jest.mock("@/lib/notifications", () => {
   return {
     configureLocalNotifications: jest.fn(),
     consumeLastLocalNotificationResponse: jest.fn(() => null),
+    consumeLastApprovalNotificationResponse: jest.fn(() => null),
     getNotificationPreferences: jest.fn(() => prefs),
     hydrateNotificationPreferences: jest.fn(async () => prefs),
     notificationEventEnabled: jest.fn(

@@ -176,7 +176,7 @@ export function DeviceApprovalCeremony({
               : phase === "identity-blocked"
                 ? "It could not register the key that hosts pin, so nothing can vouch for it yet."
                 : phase === "waiting"
-                  ? "A prompt is up on every screen where you're already signed in — your Mac's browser counts. Approve it from one this host already trusts."
+                  ? "A prompt is up on every screen where you are already signed in, including your Mac's browser. Approve it from one this host already trusts."
                   : phase === "pair-only"
                     ? "Nothing else is signed in to answer for it. Pair directly with a code from the host."
                     : ""}
@@ -206,7 +206,7 @@ export function DeviceApprovalCeremony({
             {formatHostFingerprint(phone.public_key)}
           </Text>
           <Text color="mutedForeground" style={styles.centered} variant="caption">
-            The approving screen shows a fingerprint too. Approve only an exact match — that
+            The approving screen shows a fingerprint too. Approve only an exact match. That
             comparison is the whole of what makes this safe.
           </Text>
           <View style={[styles.actionsRow, { gap: theme.space(2) }]}>

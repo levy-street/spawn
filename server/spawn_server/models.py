@@ -261,6 +261,10 @@ class PushDevice(Base):
     platform: Mapped[str] = mapped_column(String(16), nullable=False)
     # Recognition only, for a future "signed-in devices" screen. Never trusted.
     label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The browser device (trust identity) this install registered as, so a
+    # knock is never pushed back to the phone that made it. Advisory routing
+    # only: it decides who is NOT told, never who is admitted.
+    browser_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )

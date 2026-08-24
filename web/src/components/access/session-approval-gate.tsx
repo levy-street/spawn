@@ -12,6 +12,7 @@ import { browserDevices, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
 import { isAgentSessionPath } from "@/lib/session-approval";
+import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { usePasskeyTrust } from "@/lib/trust-passkeys";
 import { computeTrustRoster } from "@/lib/trust-roster";
 
@@ -90,11 +91,22 @@ export function SessionApprovalGate() {
   });
   const ceremonyLive = (pairings.data ?? []).length > 0;
 
-  // Ask out loud, once per blocked sitting: the stamp is what makes the other
-  // devices' toast surface now (and re-surface past an earlier Ignore).
+  // Ask out loud, once per blocked sitting. The roster stamp marks this device
+  // as asking; the knock raises the approval prompt on every trusted screen
+  // and pushes to the account's phones (docs/TRUST_UX.md §3).
   const request = useMutation({
-    mutationFn: (device: { id: string; public_key: string }) =>
-      browserDevices.requestApproval(device.id, device.public_key),
+    mutationFn: async (device: { id: string; public_key: string }) => {
+      await browserDevices.requestApproval(device.id, device.public_key);
+      await trust.requestDeviceApproval(device.id);
+    },
+  });
+  // What the approver compares against: derived here from this browser's own
+  // key, never served (mesh B5).
+  const fingerprint = useQuery({
+    queryKey: ["browser-device-fingerprint", currentDevice?.public_key ?? null],
+    queryFn: () => ed25519PublicKeyFingerprint(currentDevice?.public_key ?? ""),
+    enabled: show && currentDevice !== undefined,
+    staleTime: Number.POSITIVE_INFINITY,
   });
   const askedForRef = useRef<string | null>(null);
   // biome-ignore lint/correctness/useExhaustiveDependencies: fires once per device per sitting; reads live state
@@ -122,9 +134,19 @@ export function SessionApprovalGate() {
           <Dialog.Title className="text-center text-base font-semibold">One step left</Dialog.Title>
           <Dialog.Description className="mt-2 text-center text-sm leading-relaxed text-muted-foreground">
             Approve {deviceName === "This device" ? "this device" : `“${deviceName}”`} from a device
-            you already use — you&apos;ll type this device&apos;s number there
-            {passkey.hasBundle ? ", or sign in here with your passkey" : ""}.
+            you already use{passkey.hasBundle ? ", or sign in here with your passkey" : ""}.
           </Dialog.Description>
+
+          {fingerprint.data !== undefined && (
+            <div className="mt-4 space-y-1.5" data-testid="session-gate-fingerprint">
+              <p className="text-center text-xs text-muted-foreground">
+                This device&apos;s fingerprint. The approving screen must show exactly this.
+              </p>
+              <p className="select-all break-all rounded-lg border border-border bg-muted/60 px-3 py-2 text-center font-mono text-sm font-semibold tracking-wide">
+                {fingerprint.data}
+              </p>
+            </div>
+          )}
 
           <div
             className="mt-4 flex items-center justify-center gap-2 text-sm text-muted-foreground"
@@ -133,7 +155,7 @@ export function SessionApprovalGate() {
             <Loader2 className="size-4 animate-spin" aria-hidden />
             <span>
               {request.isSuccess
-                ? "Your other devices have been asked — the number appears here once one responds."
+                ? "Your other devices have been asked. This closes on its own once one approves."
                 : "Waiting for approval…"}
             </span>
           </div>

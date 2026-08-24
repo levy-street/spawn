@@ -13,6 +13,7 @@ jest.mock("expo-constants", () => ({
 }));
 jest.mock("expo-notifications", () => ({
   getPermissionsAsync: jest.fn(),
+  requestPermissionsAsync: jest.fn(),
   getExpoPushTokenAsync: jest.fn(),
   setNotificationChannelAsync: jest.fn(),
   AndroidImportance: { HIGH: 4 },
@@ -33,9 +34,12 @@ function withProjectId(id: string | undefined): void {
 function granted(token = TOKEN) {
   return {
     getPermissionsAsync: jest.fn().mockResolvedValue({ status: "granted" }),
+    requestPermissionsAsync: jest.fn().mockResolvedValue({ status: "granted" }),
     getExpoPushTokenAsync: jest.fn().mockResolvedValue({ data: token }),
   };
 }
+
+const DEVICE_ID = "00000000-0000-4000-8000-000000000123";
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -57,8 +61,57 @@ describe("registerForPushNotifications", () => {
     const result = await registerForPushNotifications({ api });
 
     expect(api.getExpoPushTokenAsync).toHaveBeenCalledWith({ projectId: "project-abc" });
-    expect(registerPushDevice).toHaveBeenCalledWith({ token: TOKEN, platform: "ios" });
+    expect(registerPushDevice).toHaveBeenCalledWith({
+      token: TOKEN,
+      platform: "ios",
+      browser_device_id: null,
+    });
     expect(result).toEqual({ status: "registered", token: TOKEN });
+  });
+
+  it("asks for permission the first time, and registers once it is granted", async () => {
+    // Nobody else ever asks; an install that skipped this never got a push.
+    const api = {
+      getPermissionsAsync: jest.fn().mockResolvedValue({ status: "undetermined" }),
+      requestPermissionsAsync: jest.fn().mockResolvedValue({ status: "granted" }),
+      getExpoPushTokenAsync: jest.fn().mockResolvedValue({ data: TOKEN }),
+    };
+    (registerPushDevice as jest.Mock).mockResolvedValue({ id: "d1" });
+    await expect(registerForPushNotifications({ api })).resolves.toEqual({
+      status: "registered",
+      token: TOKEN,
+    });
+    expect(api.requestPermissionsAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it("respects a refusal at the system prompt", async () => {
+    const api = {
+      getPermissionsAsync: jest.fn().mockResolvedValue({ status: "undetermined" }),
+      requestPermissionsAsync: jest.fn().mockResolvedValue({ status: "denied" }),
+      getExpoPushTokenAsync: jest.fn().mockResolvedValue({ data: TOKEN }),
+    };
+    await expect(registerForPushNotifications({ api })).resolves.toMatchObject({
+      status: "unavailable",
+    });
+    expect(api.getExpoPushTokenAsync).not.toHaveBeenCalled();
+    expect(registerPushDevice).not.toHaveBeenCalled();
+  });
+
+  it("registers the token against this install's trust identity, once per pairing", async () => {
+    const api = granted();
+    (registerPushDevice as jest.Mock).mockResolvedValue({ id: "d1" });
+    await registerForPushNotifications({ api, browserDeviceId: null });
+    expect(registerPushDevice).toHaveBeenLastCalledWith(
+      expect.objectContaining({ token: TOKEN, browser_device_id: null }),
+    );
+    // The identity lands later; the token is re-registered carrying it.
+    await registerForPushNotifications({ api, browserDeviceId: DEVICE_ID });
+    expect(registerPushDevice).toHaveBeenLastCalledWith(
+      expect.objectContaining({ token: TOKEN, browser_device_id: DEVICE_ID }),
+    );
+    // The same pairing again is a no-op: the server already knows.
+    await registerForPushNotifications({ api, browserDeviceId: DEVICE_ID });
+    expect(registerPushDevice).toHaveBeenCalledTimes(2);
   });
 
   it("does nothing in a build with no EAS project to address", async () => {
@@ -79,6 +132,7 @@ describe("registerForPushNotifications", () => {
   it("does not ask for a token without permission", async () => {
     const api = {
       getPermissionsAsync: jest.fn().mockResolvedValue({ status: "denied" }),
+      requestPermissionsAsync: jest.fn(),
       getExpoPushTokenAsync: jest.fn(),
     };
 
@@ -92,6 +146,7 @@ describe("registerForPushNotifications", () => {
   it("reports a device the push service will not issue a token for", async () => {
     const api = {
       getPermissionsAsync: jest.fn().mockResolvedValue({ status: "granted" }),
+      requestPermissionsAsync: jest.fn(),
       getExpoPushTokenAsync: jest.fn().mockRejectedValue(new Error("simulator")),
     };
 

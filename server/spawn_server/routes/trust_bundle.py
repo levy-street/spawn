@@ -35,6 +35,7 @@ from ..models import (
     User,
 )
 from ..pin_liveness import live_browser_device_id_set
+from ..push import schedule_approval_push
 from ..trust_events import (
     approval_requested_payload,
     approval_resolved_payload,
@@ -52,6 +53,14 @@ MAX_PASSKEYS_PER_ACCOUNT = 32
 #: How long a knock stays live. Long enough to walk to another machine, short
 #: enough that a request nobody answered stops nagging every device that opens.
 APPROVAL_REQUEST_TTL = timedelta(minutes=30)
+#: How often a re-asked knock may push again. Every ask still publishes the
+#: live frame; this only keeps the lock screen from repeating itself.
+APPROVAL_PUSH_INTERVAL = timedelta(minutes=2)
+
+
+def _aware(dt: datetime) -> datetime:
+    """SQLite hands back naive UTC; compare in one convention."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 @router.get("/bundle", response_model=schemas.TrustBundleOut | None)
@@ -833,6 +842,12 @@ async def request_device_approval(
             )
         )
     ).scalar_one_or_none()
+    # Every ask publishes the live frame; the push is rate-limited so a sheet
+    # that re-knocks each time it opens does not buzz every phone each time.
+    # A knock refreshed within the window is one ask, not a new one.
+    push = existing is None or (
+        _aware(existing.expires_at) - APPROVAL_REQUEST_TTL + APPROVAL_PUSH_INTERVAL <= now
+    )
     if existing is not None:
         # Re-asking extends the same knock rather than minting a second one, so
         # a device that reopens the app does not stack prompts elsewhere.
@@ -858,6 +873,10 @@ async def request_device_approval(
         user.id,
         approval_requested_payload(row.id, device.id, device.label, out.fingerprint),
     )
+    # The frame reaches screens that are open; the push reaches the phone in a
+    # pocket, which is where the device that can approve usually is.
+    if push:
+        schedule_approval_push(user.id, row.id, device.label, exclude_browser_device_id=device.id)
     return out
 
 

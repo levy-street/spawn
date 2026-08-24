@@ -9,7 +9,12 @@ from sqlalchemy import select
 from spawn_server.config import Settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import PushDevice
-from spawn_server.push import alert_push_message, send_alert_push
+from spawn_server.push import (
+    alert_push_message,
+    approval_push_message,
+    send_alert_push,
+    send_approval_push,
+)
 
 TOKEN = "ExponentPushToken[aaaaaaaaaaaaaaaaaaaaaa]"
 OTHER_TOKEN = "ExponentPushToken[bbbbbbbbbbbbbbbbbbbbbb]"
@@ -315,3 +320,78 @@ class TestDelivery:
                 settings=Settings(),
             )
         assert sent == 0
+
+
+class TestApprovalPush:
+    """The knock (docs/TRUST_UX.md §3) reaching a phone that is closed."""
+
+    def test_the_copy_names_the_asking_device_and_nothing_else(self):
+        message = approval_push_message("req-1", "spawn on iPhone")
+        assert message.title == "Approve spawn on iPhone?"
+        assert message.data == {"event": "device.approval_requested", "requestId": "req-1"}
+        # The fingerprint is compared in the prompt, never on a lock screen.
+        assert "SHA256" not in message.title + message.body
+        assert approval_push_message("req-2", "  ").title == "Approve A new device?"
+
+    async def _register(self, client, headers, token: str, browser_device_id: str | None) -> None:
+        body: dict[str, object] = {"token": token, "platform": "ios"}
+        if browser_device_id is not None:
+            body["browser_device_id"] = browser_device_id
+        assert (
+            await client.post("/api/notifications/devices", json=body, headers=headers)
+        ).status_code == 200
+
+    async def test_the_knocking_phone_is_not_told_about_its_own_knock(self, client):
+        user_id, headers = await _account(client, "knock-push@example.com")
+        asking = "00000000-0000-4000-8000-000000000aaa"
+        await self._register(client, headers, TOKEN, asking)
+        await self._register(client, headers, OTHER_TOKEN, "00000000-0000-4000-8000-000000000bbb")
+
+        seen: list[list[dict]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            import json
+
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json={"data": [{"status": "ok"}]})
+
+        sm = get_sessionmaker()
+        async with sm() as session, httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http:
+            sent = await send_approval_push(
+                session=session,
+                user_id=user_id,
+                request_id="req-1",
+                label="spawn on iPhone",
+                exclude_browser_device_id=asking,
+                client=http,
+                settings=Settings(),
+            )
+
+        assert sent == 1
+        assert [message["to"] for message in seen[0]] == [OTHER_TOKEN]
+        assert seen[0][0]["title"] == "Approve spawn on iPhone?"
+        assert seen[0][0]["data"]["requestId"] == "req-1"
+
+    async def test_an_older_app_with_no_device_id_is_still_told(self, client):
+        user_id, headers = await _account(client, "knock-legacy@example.com")
+        await self._register(client, headers, TOKEN, None)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"data": [{"status": "ok"}]})
+
+        sm = get_sessionmaker()
+        async with sm() as session, httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http:
+            sent = await send_approval_push(
+                session=session,
+                user_id=user_id,
+                request_id="req-1",
+                label=None,
+                exclude_browser_device_id="00000000-0000-4000-8000-000000000aaa",
+                client=http,
+                settings=Settings(),
+            )
+        assert sent == 1

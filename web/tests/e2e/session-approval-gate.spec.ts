@@ -24,6 +24,12 @@ test("an unapproved device opening an agent session gets the approval card and a
       request.url().endsWith("/request-approval") &&
       request.method() === "POST",
   );
+  // The knock: what raises the approval prompt on trusted screens and pushes
+  // to the account's phones.
+  const knocked = page.waitForRequest(
+    (request) =>
+      request.url().endsWith("/api/trust/device-approvals") && request.method() === "POST",
+  );
   await page.goto(`/sessions/${SESSION_ID}`);
 
   const gate = page.getByTestId("session-approval-gate");
@@ -33,7 +39,10 @@ test("an unapproved device opening an agent session gets the approval card and a
   // stable either way.
   await expect(gate).toContainText("from a device you already use");
   await asked;
+  await knocked;
   await expect(gate).toContainText("Your other devices have been asked");
+  // The approver compares against this: the browser's own key, derived here.
+  await expect(gate.getByTestId("session-gate-fingerprint")).toContainText("SHA256:");
   // No passkey on this account: the escape hatch is possession, not unlock.
   await expect(gate.getByTestId("session-gate-passkey")).toHaveCount(0);
   await expect(gate.getByRole("link", { name: /Possess a host directly/u })).toBeVisible();
@@ -97,28 +106,4 @@ test("the card yields to the number check when an approver starts", async ({ pag
   const ceremony = page.getByTestId("approve-ceremony");
   await expect(ceremony).toBeVisible();
   await expect(page.getByTestId("session-approval-gate")).toHaveCount(0);
-});
-
-test("a device actively asking re-labels the approval toast for the approver", async ({ page }) => {
-  await mockApp(page, {
-    hosts: [KEYED_HOST],
-    hostPins: { [HOST_ID]: [BROWSER_DEVICE_ID] },
-    extraBrowserDevices: [
-      {
-        id: "00000000-0000-4000-8000-000000000078",
-        key_algorithm: "ed25519",
-        public_key: "QUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
-        label: "Pixel phone",
-        created_at: "2026-08-01T00:00:00Z",
-        approval_requested_at: "2026-08-21T00:00:00Z",
-        revoked_at: null,
-      },
-    ],
-  });
-  await page.goto("/app");
-
-  const toast = page.getByTestId("approve-toast");
-  await expect(toast).toBeVisible({ timeout: 20_000 });
-  await expect(toast).toContainText("Approve Pixel phone?");
-  await expect(toast).toContainText("asking for approval");
 });

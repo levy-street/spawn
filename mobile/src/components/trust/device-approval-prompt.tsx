@@ -23,7 +23,7 @@ import { fontSize, spacing } from "@/theme";
  * this query the moment a knock lands, so an app already open interrupts
  * itself rather than waiting for a poll.
  *
- * Renders nothing unless this device can actually help — approving means
+ * Renders nothing unless this device can actually help: approving means
  * signing an endorsement, which only a device some host already trusts can do.
  * Prompting a device that could only fail is worse than staying quiet. Toward
  * a host that validates account chains the endorsement is account-wide (one
@@ -134,28 +134,30 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
     <Dialog
       onDismiss={() => dismiss(request.id)}
       testID="device-approval-prompt"
-      title={`${target.label ?? "A device"} wants to connect`}
+      title={`Approve ${target.label ?? "this device"}?`}
       visible
     >
       <View style={styles.body}>
         <Text color="mutedForeground" variant="body">
-          It signed in to your account and cannot open anything until a device you already trust
-          vouches for it.
+          It signed in to your account. It cannot open anything on your hosts until you approve it
+          here.
         </Text>
-        <Text variant="body">Check that the asking device shows exactly this fingerprint:</Text>
+        <Text variant="body">
+          It is showing a fingerprint on its screen. Check it is exactly this:
+        </Text>
         <Text selectable style={styles.fingerprint} variant="mono">
           {request.fingerprint}
         </Text>
         <Text color="mutedForeground" variant="caption">
-          The name is a label anyone can set — only a matching fingerprint proves you are trusting
-          the device you think you are. If it differs, deny.
+          The name can be anything; the fingerprint is what identifies the device. If it differs,
+          deny.
         </Text>
         <Text color="mutedForeground" variant="caption">
-          Approving here lets it connect to{" "}
+          This approval covers{" "}
           <Text variant="caption">
             {formatHostList(endorsableHosts.map((entry) => entry.host.name))}
           </Text>
-          . Other hosts will ask again from a screen they already trust.
+          . Any other host will ask again from a screen it already trusts.
         </Text>
         {error ? (
           <Text accessibilityRole="alert" color="destructive" variant="caption">
@@ -167,7 +169,7 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
             Deny
           </Button>
           <Button loading={approve.isPending} disabled={busy} onPress={() => approve.mutate()}>
-            It matches — approve
+            Approve
           </Button>
         </View>
       </View>

@@ -18,6 +18,8 @@ import { registerPushDevice, unregisterPushDevice } from "@/data/api/endpoints/n
 export const ALERT_CHANNEL_ID = "alerts";
 
 let registeredToken: string | null = null;
+/** What the last successful registration told the server, to skip repeats. */
+let registeredKey: string | null = null;
 
 export type PushRegistration =
   | { status: "registered"; token: string }
@@ -53,9 +55,18 @@ export async function ensureAlertChannel(
  */
 export async function registerForPushNotifications(
   options: {
-    api?: Pick<typeof Notifications, "getPermissionsAsync" | "getExpoPushTokenAsync">;
+    api?: Pick<
+      typeof Notifications,
+      "getPermissionsAsync" | "requestPermissionsAsync" | "getExpoPushTokenAsync"
+    >;
     register?: typeof registerPushDevice;
     label?: string | null;
+    /**
+     * This install's trust identity. Sent with the token so the server never
+     * pushes this device's own knock back to it; null until registration of
+     * the identity has landed, after which the caller registers again.
+     */
+    browserDeviceId?: string | null;
   } = {},
 ): Promise<PushRegistration> {
   const api = options.api ?? Notifications;
@@ -69,7 +80,13 @@ export async function registerForPushNotifications(
   }
 
   try {
-    const permission = await api.getPermissionsAsync();
+    let permission = await api.getPermissionsAsync();
+    if (permission.status === "undetermined") {
+      // The system prompt shows once per install; iOS remembers the answer
+      // and every later call returns it without asking. Nobody else asks, so
+      // an install that skipped this never received a single push.
+      permission = await api.requestPermissionsAsync();
+    }
     if (permission.status !== "granted") {
       return { status: "unavailable", reason: "Notification permission has not been granted." };
     }
@@ -86,17 +103,23 @@ export async function registerForPushNotifications(
     return { status: "unavailable", reason: "This device could not be issued a push token." };
   }
 
+  const browserDeviceId = options.browserDeviceId ?? null;
+  const key = `${token}:${browserDeviceId ?? ""}`;
+  if (registeredKey === key) return { status: "registered", token };
+
   try {
     await register({
       token,
       platform: Platform.OS === "android" ? "android" : "ios",
       ...(options.label ? { label: options.label } : {}),
+      browser_device_id: browserDeviceId,
     });
   } catch {
     return { status: "unavailable", reason: "The server did not accept this device." };
   }
 
   registeredToken = token;
+  registeredKey = key;
   return { status: "registered", token };
 }
 
@@ -113,6 +136,7 @@ export async function unregisterForPushNotifications(
 ): Promise<void> {
   const token = registeredToken;
   registeredToken = null;
+  registeredKey = null;
   if (token === null) return;
   try {
     await unregister(token);
@@ -124,4 +148,5 @@ export async function unregisterForPushNotifications(
 /** Test seam: forget any token this process believes it registered. */
 export function resetPushRegistration(): void {
   registeredToken = null;
+  registeredKey = null;
 }

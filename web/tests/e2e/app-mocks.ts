@@ -351,6 +351,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     ...(options.extraBrowserDevices ?? []),
   ];
   const hostPinMap: Record<string, string[]> = { ...(options.hostPins ?? {}) };
+  const knockRows: Array<Record<string, unknown> & { browser_device_id: string }> = [];
   const pairingRows: Array<Record<string, unknown>> = (options.pairings ?? []).map((row) => ({
     ...row,
   }));
@@ -945,6 +946,38 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       device.approval_requested_at = new Date().toISOString();
       device.last_seen_at = device.approval_requested_at;
       await json(route, device);
+      return;
+    }
+    // The knock (docs/TRUST_UX.md §3): a pending row per asking device, served
+    // to every screen of the account and answered by an endorsement elsewhere.
+    if (path === "/api/trust/device-approvals" && method === "GET") {
+      await json(route, knockRows);
+      return;
+    }
+    if (path === "/api/trust/device-approvals" && method === "POST") {
+      const body = (await request.postDataJSON()) as { browser_device_id?: string };
+      const device = browserDeviceList.find((item) => item.id === body.browser_device_id);
+      if (!device) {
+        await route.fulfill({ status: 404, json: { detail: "browser device not found" } });
+        return;
+      }
+      const digest = createHash("sha256")
+        .update(Buffer.from(device.public_key as string, "base64url"))
+        .digest()
+        .subarray(0, 12)
+        .toString("base64url");
+      const existing = knockRows.find((row) => row.browser_device_id === device.id);
+      const row = existing ?? {
+        id: `00000000-0000-4000-8000-${String(knockRows.length + 900).padStart(12, "0")}`,
+        browser_device_id: device.id as string,
+        label: (device.label as string | null | undefined) ?? null,
+        fingerprint: `SHA256:${digest}`,
+        status: "pending",
+        created_at: CREATED_AT,
+        expires_at: "2099-01-01T00:00:00Z",
+      };
+      if (!existing) knockRows.push(row);
+      await json(route, row);
       return;
     }
     const browserRevokeMatch = path.match(/^\/api\/browser-devices\/([^/]+)\/revoke$/);
