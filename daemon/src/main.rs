@@ -33,6 +33,7 @@ mod service;
 mod session_ctl;
 mod sessions;
 mod upload;
+mod version;
 mod worker_backend;
 mod ws;
 

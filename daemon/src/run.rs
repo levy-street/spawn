@@ -735,7 +735,7 @@ async fn serve_one_connection_with_loader(
         host_name,
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::version::build_version(),
         existing_sessions: registry.ids(),
         spec: crate::host_metrics::sampler().spec(),
         supports_account_chains: true,
