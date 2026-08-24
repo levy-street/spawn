@@ -12,7 +12,6 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "dev.spawnd",
-      "buildNumber": "1",
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "spawn connects directly to machines you own on your local network."
       },
@@ -25,7 +24,6 @@
     },
     "android": {
       "package": "dev.spawnd",
-      "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "monochromeImage": "./assets/images/adaptive-icon-monochrome.png",
