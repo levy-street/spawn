@@ -825,3 +825,51 @@ async def test_daemon_deregisters_its_own_host(client):
     # The token now resolves to no host — a second call is unauthorized.
     r2 = await client.delete("/api/hosts/self", headers=headers)
     assert r2.status_code == 401
+
+
+async def test_host_deletion_cascades_over_its_sessions(client):
+    # The 2026-08-24 production 500: deleting a host that still has session
+    # rows died in the ORM flush (host_id nulled against NOT NULL) before the
+    # FK cascade could fire. Both delete routes share _revoke_host, so cover
+    # the daemon self-delete with a session attached and assert the session
+    # rows die with the host.
+    from sqlalchemy import select
+
+    from spawn_server import auth
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, Session, User
+
+    await _signup(client, "deregister-cascade@example.com")
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "deregister-cascade@example.com")
+            )
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="session-box", status="offline")
+        session.add(host)
+        await session.flush()
+        session.add(
+            Session(owner_user_id=user.id, host_id=host.id, cwd="/home/user", status="running")
+        )
+        await session.commit()
+        host_id, user_id = host.id, user.id
+
+    daemon_token = auth.issue_daemon_token(host_id, user_id)
+    r = await client.delete(
+        "/api/hosts/self", headers={"Authorization": f"Bearer {daemon_token}"}
+    )
+    assert r.status_code == 204, r.text
+
+    async with sm() as session:
+        gone_host = (
+            await session.execute(select(Host).where(Host.id == host_id))
+        ).scalar_one_or_none()
+        orphan_sessions = (
+            (await session.execute(select(Session).where(Session.host_id == host_id)))
+            .scalars()
+            .all()
+        )
+    assert gone_host is None
+    assert orphan_sessions == []
