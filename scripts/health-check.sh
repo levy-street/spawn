@@ -14,6 +14,9 @@ set -uo pipefail
 
 API_URL="${SPAWN_HEALTH_API_URL:-http://127.0.0.1:8001/healthz}"
 WEB_URL="${SPAWN_HEALTH_WEB_URL:-http://127.0.0.1:3001/}"
+# /healthz on the WEB port is served by the API through the web app's rewrite.
+# Set empty to skip on a host with no proxied /healthz.
+WEB_API_URL="${SPAWN_HEALTH_WEB_API_URL:-http://127.0.0.1:3001/healthz}"
 BACKUP_DIR="${SPAWN_BACKUP_DIR:-/opt/spawn-backups}"
 DISK_PATH="${SPAWN_HEALTH_DISK_PATH:-/}"
 DISK_WARN_PCT="${SPAWN_HEALTH_DISK_WARN_PCT:-85}"
@@ -53,6 +56,20 @@ case "$web_code" in
   200 | 3??) note "web $web_code" ;;
   *) fail "web returned $web_code at $WEB_URL" ;;
 esac
+
+# 2026-08-24: API 200, web 200, and every browser request dead — the web build
+# had baked a proxy target nothing listened on. The two checks above cannot see
+# that; only a request THROUGH the web app's rewrite exercises the path a
+# browser actually uses.
+if [ -n "$WEB_API_URL" ]; then
+  chain_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$WEB_API_URL" 2>/dev/null)"
+  chain_code="${chain_code:-000}"
+  if [ "$chain_code" = "200" ]; then
+    note "web->api $chain_code"
+  else
+    fail "web->api returned $chain_code (expected 200) at $WEB_API_URL — the web app cannot reach the API even though each may look healthy alone"
+  fi
+fi
 
 # --- disk -------------------------------------------------------------------
 disk_pct="$(df --output=pcent "$DISK_PATH" 2>/dev/null | tail -1 | tr -dc '0-9')"
