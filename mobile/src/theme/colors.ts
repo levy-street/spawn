@@ -33,6 +33,9 @@ export const lightColors = {
   toneWaiting: "#1A89C5",
   toneIdle: "#808080",
   toneOffline: "#B7B7B7",
+  // Dims what sits behind an overlay. A scrim darkens in every theme — using
+  // `foreground` here painted dark mode's sheets under a white haze.
+  scrim: "#0F0F0F",
   border: "#DEDEDE",
   paneDivider: "#CACACA",
   input: "#DEDEDE",
@@ -85,6 +88,7 @@ export const darkColors = {
   toneWaiting: "#3FB1EA",
   toneIdle: "#989898",
   toneOffline: "#525252",
+  scrim: "#000000",
   border: "#262626",
   paneDivider: "#424242",
   input: "#262626",
