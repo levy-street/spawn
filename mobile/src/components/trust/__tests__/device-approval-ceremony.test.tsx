@@ -23,6 +23,7 @@ jest.mock("@/data/queries/settings", () => ({
 
 let mockPhoneQuery: Record<string, unknown> = {};
 let mockTrust: "trusted" | "untrusted" = "untrusted";
+let mockChainHost = false;
 jest.mock("@/data/queries/pairing", () => ({
   useRegisteredPhone: () => mockPhoneQuery,
   useAccountDevices: () => ({
@@ -38,7 +39,12 @@ jest.mock("@/data/queries/pairing", () => ({
 
 jest.mock("@/data/queries/device-trust", () => ({
   useDeviceHostApprovals: () => ({
-    approvals: [{ host: { id: HOST_ID, name: "office-mac" }, trust: mockTrust }],
+    approvals: [
+      {
+        host: { id: HOST_ID, name: "office-mac", supports_account_chains: mockChainHost },
+        trust: mockTrust,
+      },
+    ],
     approved: [],
     awaiting: [],
     resolved: true,
@@ -72,6 +78,7 @@ describe("device approval ceremony", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockTrust = "untrusted";
+    mockChainHost = false;
     mockPhoneQuery = {
       data: { id: PHONE_ID, label: "spawn on iPhone", public_key: PHONE_KEY, revoked_at: null },
       isPending: false,
@@ -110,5 +117,13 @@ describe("device approval ceremony", () => {
     expect(mockRequestApproval).not.toHaveBeenCalled();
     expect(screen.getByText(/no identity yet/i)).toBeOnTheScreen();
     expect(screen.getByText(/Device identity could not be stored/)).toBeOnTheScreen();
+  });
+
+  test("a chain-capable host leads with the pairing code, not a false promise", async () => {
+    mockChainHost = true;
+    await renderCeremony();
+    expect(screen.getByText(/takes a pairing code/i)).toBeOnTheScreen();
+    expect(screen.queryByText(/prompt is up on every screen/i)).toBeNull();
+    expect(screen.getByText("Enter a pairing code")).toBeOnTheScreen();
   });
 });

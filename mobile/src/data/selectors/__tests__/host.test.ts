@@ -20,6 +20,7 @@ function host(id: string, name: string, status: string, overrides: Partial<Host>
     status,
     last_seen_at: null,
     session_count: 0,
+    supports_account_chains: false,
     cpu_cores: null,
     cpu_physical_cores: null,
     cpu_model: null,
@@ -80,6 +81,7 @@ describe("host selectors", () => {
   it("suppresses stale capacity buckets while offline but retains telemetry existence", () => {
     const machine = host("a", "A", "offline", {
       session_count: 9,
+      supports_account_chains: false,
       cpu_bucket: 4,
       mem_bucket: 3,
       capacity_at: "2026-08-22T00:00:00Z",

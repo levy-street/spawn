@@ -14,6 +14,10 @@ export const HostOutSchema = z.object({
   status: z.string(),
   last_seen_at: IsoDateTimeSchema.nullable(),
   session_count: z.number().int().nonnegative(),
+  // Mesh R9: chain-capable hosts refuse the legacy per-host endorsement path,
+  // and this app cannot join an account chain yet — so for these hosts the
+  // pairing code is the only admission, and the UI must say so.
+  supports_account_chains: z.boolean().default(false),
   cpu_cores: z.number().int().nullable(),
   cpu_physical_cores: z.number().int().nullable(),
   cpu_model: z.string().nullable(),

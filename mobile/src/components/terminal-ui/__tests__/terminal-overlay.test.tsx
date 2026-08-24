@@ -228,6 +228,7 @@ const host: HostOut = {
   status: "online",
   last_seen_at: null,
   session_count: 1,
+  supports_account_chains: false,
   cpu_cores: 8,
   cpu_physical_cores: 8,
   cpu_model: null,

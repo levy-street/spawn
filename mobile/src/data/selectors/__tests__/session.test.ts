@@ -50,6 +50,7 @@ function host(status: string): Host {
     status,
     last_seen_at: iso(1_000),
     session_count: 1,
+    supports_account_chains: false,
     cpu_cores: 8,
     cpu_physical_cores: 4,
     cpu_model: null,
