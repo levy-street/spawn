@@ -8,8 +8,9 @@ export const HostOutSchema = z.object({
   arch: z.string().nullable(),
   version: z.string().nullable(),
   host_key_algorithm: z.literal("ed25519").nullable(),
+  // The key travels alone (mesh B5): any fingerprint shown or compared is
+  // derived locally from it, never read off a server response.
   host_public_key: z.string().nullable(),
-  host_key_fingerprint: z.string().nullable(),
   status: z.string(),
   last_seen_at: IsoDateTimeSchema.nullable(),
   session_count: z.number().int().nonnegative(),

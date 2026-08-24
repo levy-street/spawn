@@ -35,7 +35,6 @@ const host = {
   version: "0.1.0",
   host_key_algorithm: "ed25519" as const,
   host_public_key: "host-public-key",
-  host_key_fingerprint: "SHA256:fingerprint",
   status: "online",
   last_seen_at: NOW,
   session_count: 1,

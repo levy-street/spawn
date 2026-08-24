@@ -13,8 +13,8 @@ export const onlineHost: HostOut = {
   arch: "arm64",
   version: "1.4.2",
   host_key_algorithm: "ed25519",
-  host_public_key: "host-public-key",
-  host_key_fingerprint: "SHA256:hostfingerprint",
+  // A real curve point: HostFacts derives the fingerprint from it locally.
+  host_public_key: "XOCTsSKj9-Z7qRynE70szG_DNBeHiLzEBOCG1clQbz8",
   status: "online",
   last_seen_at: "2026-08-22T00:00:00Z",
   session_count: 3,
