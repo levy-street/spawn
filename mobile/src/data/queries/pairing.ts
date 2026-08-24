@@ -195,7 +195,7 @@ function responseMatchesReview(
     response.browser_device_id === phone.id &&
     response.browser_key_algorithm === "ed25519" &&
     response.browser_public_key === phone.public_key &&
-    response.browser_key_fingerprint === phone.fingerprint
+    response.browser_key_fingerprint === formatHostFingerprint(phone.public_key)
   );
 }
 
@@ -240,7 +240,7 @@ export async function approvePendingPairing(input: {
     phonePublicKeyBytes.fill(0);
     if (
       phonePublicKey !== input.phone.public_key ||
-      formatHostFingerprint(phonePublicKey) !== input.phone.fingerprint
+      formatHostFingerprint(phonePublicKey) !== formatHostFingerprint(input.phone.public_key)
     ) {
       throw new PairingFlowError(pairingFailure("identity-revoked"));
     }
@@ -287,7 +287,7 @@ export async function approvePendingPairing(input: {
       browser_device_id: input.phone.id,
       browser_key_algorithm: "ed25519",
       browser_public_key: phonePublicKey,
-      browser_key_fingerprint: input.phone.fingerprint,
+      browser_key_fingerprint: formatHostFingerprint(input.phone.public_key),
       signature: encodeBase64Url(signature),
     });
     if (!responseMatchesReview(response, input.ceremony, input.phone)) {

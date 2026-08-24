@@ -1,7 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
-
 import { EndorsementOption } from "@/components/onboarding/endorsement-option";
 import { FingerprintReview } from "@/components/onboarding/fingerprint-review";
 import {
@@ -33,6 +32,7 @@ import {
   useRegisteredPhone,
 } from "@/data/queries/pairing";
 import { qk } from "@/data/queryKeys";
+import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { haptics } from "@/lib/haptics";
 import { spacing } from "@/theme";
 
@@ -233,7 +233,7 @@ export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
           setFailure({ kind: "fingerprint-mismatch" });
           setStage("failure");
         }}
-        phoneFingerprint={phoneQuery.data.fingerprint}
+        phoneFingerprint={formatHostFingerprint(phoneQuery.data.public_key)}
         reapprovingRevokedPin={allowRevokedPin}
       />
     );
@@ -256,7 +256,7 @@ export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
             setStage("failure");
           }}
           onPairAnother={pairAnother}
-          phoneFingerprint={phoneQuery.data.fingerprint}
+          phoneFingerprint={formatHostFingerprint(phoneQuery.data.public_key)}
         />
       );
     }

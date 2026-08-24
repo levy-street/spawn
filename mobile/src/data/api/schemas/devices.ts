@@ -15,7 +15,11 @@ export const BrowserDeviceOutSchema = z.object({
   id: UUIDSchema,
   key_algorithm: Ed25519AlgorithmSchema,
   public_key: z.string(),
-  fingerprint: z.string(),
+  // No fingerprint field (mesh B5): the key is right here, so a display
+  // fingerprint is derived locally with formatHostFingerprint. A
+  // server-authored one would be a comparison label the server could forge,
+  // which is the whole thing the fingerprint exists to defeat. Requiring it
+  // here made zod reject every response the server sent.
   label: z.string().nullable(),
   created_at: IsoDateTimeSchema,
   revoked_at: IsoDateTimeSchema.nullable(),
