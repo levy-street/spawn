@@ -167,7 +167,16 @@ export function HostPairingStep({ accountId, onSkip }: HostPairingStepProps) {
     return (
       <TrustFailureState
         failure={toPairingFailure(phoneQuery.error)}
-        onAction={() => void phoneQuery.refetch()}
+        onAction={() => {
+          // Reset before refetching. A query that has already failed keeps its
+          // error, and `retry: false` means nothing re-runs on its own — so a
+          // bare refetch can leave the same message on screen with no request
+          // ever leaving the device, which is exactly how this button came to
+          // look broken.
+          queryClient.resetQueries({ queryKey: qk.browserDeviceRegistration(accountId) });
+          void phoneQuery.refetch();
+        }}
+        {...(onSkip === undefined ? {} : { onSkip })}
       />
     );
   }

@@ -82,9 +82,22 @@ export interface TrustFailureStateProps {
   failure: PairingFailure;
   onAction: () => void;
   onRestart?: () => void;
+  /**
+   * A way past a step that will not complete.
+   *
+   * Connecting a machine is not a precondition for having an account, and a
+   * failure here used to leave one button on screen and no route onward. Every
+   * one of these failures can be resolved later from Settings.
+   */
+  onSkip?: () => void;
 }
 
-export function TrustFailureState({ failure, onAction, onRestart }: TrustFailureStateProps) {
+export function TrustFailureState({
+  failure,
+  onAction,
+  onRestart,
+  onSkip,
+}: TrustFailureStateProps) {
   const copy = FAILURE_COPY[failure.kind];
   const description =
     failure.detail === undefined ? (
@@ -108,6 +121,11 @@ export function TrustFailureState({ failure, onAction, onRestart }: TrustFailure
           {onRestart !== undefined ? (
             <Button onPress={onRestart} variant="ghost">
               Enter a new code
+            </Button>
+          ) : null}
+          {onSkip !== undefined ? (
+            <Button onPress={onSkip} variant="ghost">
+              Set this up later
             </Button>
           ) : null}
         </View>
