@@ -5,11 +5,16 @@ import {
   verifyPureEd25519Strict,
 } from "@/lib/crypto/ed25519";
 
-const REGISTRATION_MAGIC = encodeUtf8("SPAWN-BROWSER-REGISTER-V1");
+const REGISTRATION_MAGIC = encodeUtf8("SPAWN-BROWSER-REGISTER-V2");
 const APPROVAL_MAGIC = encodeUtf8("SPAWN-HOST-PAIR-APPROVE-V1");
 const POSSESSION_MAGIC = encodeUtf8("SPAWN-HOST-PAIR-POSSESSION-V1");
 const ENDORSEMENT_MAGIC = encodeUtf8("SPAWN-BROWSER-ENDORSE-V1");
 const VERSION_ONE = Uint8Array.of(1);
+const VERSION_TWO = Uint8Array.of(2);
+// V2 flags byte, bit 0: the account-root claim (pk_R). Root-hood carries real
+// server-side authority, so it lives inside the signed bytes — a flag the
+// proof does not cover is exactly the unsigned authority the mesh forbids.
+const REGISTRATION_FLAG_ROOT = 0x01;
 
 function publicKey(value: string): Uint8Array {
   const bytes = decodeBase64UrlExact(value, 32);
@@ -20,6 +25,8 @@ function publicKey(value: string): Uint8Array {
 export interface RegistrationTranscript {
   accountId: string;
   browserPublicKey: string;
+  /** The account-root claim (pk_R). A phone registers as an ordinary device. */
+  isRoot: boolean;
 }
 
 export interface ApprovalTranscript {
@@ -43,11 +50,12 @@ export interface EndorsementTranscript {
   endorsedDeviceId: string;
 }
 
-export function encodeBrowserRegistrationV1(input: RegistrationTranscript): Uint8Array {
+export function encodeBrowserRegistrationV2(input: RegistrationTranscript): Uint8Array {
   return concatBytes(
     REGISTRATION_MAGIC,
-    VERSION_ONE,
+    VERSION_TWO,
     uuidToBytes(input.accountId),
+    Uint8Array.of(input.isRoot ? REGISTRATION_FLAG_ROOT : 0),
     publicKey(input.browserPublicKey),
   );
 }
@@ -85,11 +93,11 @@ export function encodeBrowserEndorsementV1(input: EndorsementTranscript): Uint8A
   );
 }
 
-export function signBrowserRegistrationV1(
+export function signBrowserRegistrationV2(
   seed: Uint8Array,
   input: RegistrationTranscript,
 ): Uint8Array {
-  return signPureEd25519(seed, encodeBrowserRegistrationV1(input));
+  return signPureEd25519(seed, encodeBrowserRegistrationV2(input));
 }
 
 export function signHostPairApprovalV1(seed: Uint8Array, input: ApprovalTranscript): Uint8Array {
@@ -110,12 +118,12 @@ export function signBrowserEndorsementV1(
   return signPureEd25519(seed, encodeBrowserEndorsementV1(input));
 }
 
-export function verifyBrowserRegistrationV1(
+export function verifyBrowserRegistrationV2(
   publicKey: Uint8Array,
   input: RegistrationTranscript,
   signature: Uint8Array,
 ): boolean {
-  return verifyPureEd25519Strict(publicKey, encodeBrowserRegistrationV1(input), signature);
+  return verifyPureEd25519Strict(publicKey, encodeBrowserRegistrationV2(input), signature);
 }
 
 export function verifyHostPairApprovalV1(

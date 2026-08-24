@@ -50,6 +50,9 @@ export async function ensureDeviceRegistered(input: {
   const signature = await deviceIdentity.signRegistration({
     accountId: input.accountId,
     browserPublicKey: publicKey,
+    // A phone is an ordinary device, never the account root; the claim is
+    // bound inside the signed V2 transcript, so it cannot be flipped later.
+    isRoot: false,
   });
   let registered: BrowserDeviceRecord;
   try {

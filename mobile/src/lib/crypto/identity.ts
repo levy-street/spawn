@@ -19,7 +19,7 @@ import {
   type ApprovalTranscript,
   type EndorsementTranscript,
   encodeBrowserEndorsementV1,
-  encodeBrowserRegistrationV1,
+  encodeBrowserRegistrationV2,
   encodeHostPairApprovalV1,
   type RegistrationTranscript,
 } from "@/lib/crypto/transcripts";
@@ -266,7 +266,7 @@ export const deviceIdentity = {
       if (transcript.accountId !== accountId || transcript.browserPublicKey !== publicKeyWire) {
         throw new Error("Registration transcript does not match the active device identity");
       }
-      return encodeBrowserRegistrationV1(transcript);
+      return encodeBrowserRegistrationV2(transcript);
     });
   },
 
