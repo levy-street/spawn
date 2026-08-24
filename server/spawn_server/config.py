@@ -49,6 +49,32 @@ class Settings(BaseSettings):
     github_client_id: str | None = None
     github_client_secret: str | None = None
 
+    # Sign in with Apple does not issue a client secret. You sign one yourself,
+    # as a short-lived ES256 JWT over the team/key/client triple below, so all
+    # four values have to be present before the provider can be offered at all.
+    #
+    # There are two client ids because Apple treats the app and the website as
+    # different clients: the web redirect uses a Services ID, the native button
+    # authorizes under the app's bundle id. Both are minted from the same key,
+    # and an id_token from either one is accepted.
+    apple_team_id: str | None = None
+    apple_key_id: str | None = None
+    apple_private_key: str | None = None
+    apple_client_id: str | None = None
+    apple_native_client_id: str | None = Field(
+        default=None,
+        description="Bundle id the iOS button authorizes under; defaults to apple_client_id.",
+    )
+    # Apple caps a client secret at six months. Well under it, so a long-lived
+    # process re-signs rather than waking up one day holding an expired secret.
+    apple_client_secret_ttl_seconds: int = 15_552_000
+
+    # Push delivery goes through Expo's service, which fronts both APNs and
+    # FCM, so the signing keys live with the EAS project rather than here.
+    push_enabled: bool = True
+    # Only required when the Expo project enables enhanced push security.
+    expo_access_token: str | None = None
+
     public_url: str = Field(default="http://localhost:8000")
 
     # Where password-reset and verification links point. Falls back to

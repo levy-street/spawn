@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { IsoDateTimeSchema, UUIDSchema } from "@/data/api/schemas/common";
 
-export const ProviderIdSchema = z.enum(["google", "microsoft", "github"]);
+export const ProviderIdSchema = z.enum(["google", "microsoft", "github", "apple"]);
 export const HealthzResponseSchema = z.object({ status: z.literal("ok") });
 export const UserOutSchema = z.object({
   id: UUIDSchema,
@@ -35,6 +35,13 @@ export const AccountDeleteRequestSchema = z.object({
   password: z.string().nullable().optional(),
 });
 export const AuthProviderOutSchema = z.object({ id: ProviderIdSchema, name: z.string() });
+export const OAuthExchangeRequestSchema = z.object({ code: z.string().min(16).max(256) });
+// Sign in with Apple on iOS never leaves the app, so there is no callback and no
+// one-time code: the identity token Apple hands the button goes straight up.
+export const AppleNativeSignInSchema = z.object({
+  identity_token: z.string().min(16).max(8192),
+  invite: z.string().max(256).nullable().optional(),
+});
 export const AuthConfigOutSchema = z.object({
   providers: z.array(AuthProviderOutSchema),
   email_verification_required: z.boolean(),
@@ -53,4 +60,6 @@ export type PasswordResetConfirm = z.infer<typeof PasswordResetConfirmSchema>;
 export type EmailVerifyConfirm = z.infer<typeof EmailVerifyConfirmSchema>;
 export type AccountDeleteRequest = z.infer<typeof AccountDeleteRequestSchema>;
 export type AuthProviderOut = z.infer<typeof AuthProviderOutSchema>;
+export type OAuthExchangeRequest = z.infer<typeof OAuthExchangeRequestSchema>;
+export type AppleNativeSignIn = z.infer<typeof AppleNativeSignInSchema>;
 export type AuthConfigOut = z.infer<typeof AuthConfigOutSchema>;

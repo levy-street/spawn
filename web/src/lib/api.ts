@@ -438,7 +438,7 @@ export const DeviceApproveResponseSchema = DevicePendingResponseSchema.omit({
 export type DeviceApproval = z.infer<typeof DeviceApproveResponseSchema>;
 
 export const AuthProviderSchema = z.object({
-  id: z.enum(["google", "microsoft", "github"]),
+  id: z.enum(["google", "microsoft", "github", "apple"]),
   name: z.string(),
 });
 export type AuthProvider = z.infer<typeof AuthProviderSchema>;

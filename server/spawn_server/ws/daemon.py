@@ -21,6 +21,7 @@ from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
 from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, Session
 from ..pin_liveness import live_browser_device_id_set
+from ..push import send_alert_push
 from ..redis import get_backend, session_event_channel, user_alert_channel
 from .alerts import (
     ALERT_QUIET_SECONDS,
@@ -734,6 +735,39 @@ async def _publish_user_alert(
         await _publish_channel_if_owner(conn, user_alert_channel(owner_user_id), payload)
     except Exception as e:  # noqa: BLE001
         log.warning("alert publish failed: %s", e)
+    _schedule_alert_push(owner_user_id, payload)
+
+
+#: Strong references to in-flight push tasks. Without this the event loop holds
+#: only a weak one and a task can be collected mid-send.
+_push_tasks: set[asyncio.Task[None]] = set()
+
+
+def _schedule_alert_push(owner_user_id: str, payload: dict[str, object]) -> None:
+    """Send the same alert to the account's phones, off this socket's hot path.
+
+    Deliberately fire-and-forget. The socket publish above has to stay quick —
+    it sits in the daemon's read loop — and a push round-trip to an external
+    service is neither quick nor reliable enough to put there. Nothing waits on
+    the result, and `send_alert_push` is written not to raise.
+    """
+    try:
+        task = asyncio.create_task(_deliver_alert_push(owner_user_id, payload))
+    except RuntimeError:
+        # No running loop (shutdown). Losing a courtesy alert is the right
+        # outcome; raising into a teardown path is not.
+        return
+    _push_tasks.add(task)
+    task.add_done_callback(_push_tasks.discard)
+
+
+async def _deliver_alert_push(owner_user_id: str, payload: dict[str, object]) -> None:
+    try:
+        sm = get_sessionmaker()
+        async with sm() as session:
+            await send_alert_push(session=session, user_id=owner_user_id, payload=payload)
+    except Exception as e:  # noqa: BLE001
+        log.warning("alert push failed: %s", e)
 
 
 async def _lock_durable_host_owner(session: AsyncSession, conn: DaemonConn) -> bool:

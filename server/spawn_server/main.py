@@ -28,6 +28,7 @@ from .routes import host_introductions as host_introductions_routes
 from .routes import hosts as hosts_routes
 from .routes import install as install_routes
 from .routes import profile as profile_routes
+from .routes import push as push_routes
 from .routes import root_introductions as root_introductions_routes
 from .routes import sessions as sessions_routes
 from .routes import trust_bundle as trust_bundle_routes
@@ -93,6 +94,7 @@ def create_app() -> FastAPI:
     app.include_router(root_introductions_routes.router)
     app.include_router(hosts_routes.router)
     app.include_router(profile_routes.router)
+    app.include_router(push_routes.router)
     app.include_router(sessions_routes.router)
     app.include_router(workspace_templates_routes.router)
     app.include_router(workspaces_routes.router)

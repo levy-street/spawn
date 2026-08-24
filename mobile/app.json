@@ -11,7 +11,7 @@
     "platforms": ["ios", "android"],
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "dev.spawnd.spawn",
+      "bundleIdentifier": "dev.spawnd",
       "buildNumber": "1",
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "spawn connects directly to machines you own on your local network."
@@ -20,10 +20,11 @@
         "light": "./assets/images/icon.png",
         "dark": "./assets/images/icon-dark.png",
         "tinted": "./assets/images/icon-tinted.png"
-      }
+      },
+      "usesAppleSignIn": true
     },
     "android": {
-      "package": "dev.spawnd.spawn",
+      "package": "dev.spawnd",
       "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
@@ -31,7 +32,13 @@
         "backgroundColor": "#E11E15"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": true
+      "predictiveBackGestureEnabled": true,
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.CAMERA",
+        "android.permission.USE_BIOMETRIC",
+        "android.permission.USE_FINGERPRINT"
+      ]
     },
     "plugins": [
       "expo-router",
@@ -84,10 +91,24 @@
         }
       ],
       "expo-font",
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-web-browser",
+      "expo-apple-authentication"
     ],
     "experiments": {
       "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "8f87ab3b-1f34-4d2b-b1b3-653511c070a0"
+      }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/8f87ab3b-1f34-4d2b-b1b3-653511c070a0"
     }
   }
 }

@@ -10,8 +10,10 @@ import {
   signUp,
 } from "@/data/api/endpoints/auth";
 import { listHosts } from "@/data/api/endpoints/hosts";
-import type { MeResponse, UserOut } from "@/data/api/schemas/auth";
+import type { MeResponse, ProviderId, TokenResponse, UserOut } from "@/data/api/schemas/auth";
 import { qk } from "@/data/queryKeys";
+import { isAppleSignInAvailable, signInWithAppleNatively } from "@/lib/apple-auth";
+import { signInWithProvider } from "@/lib/oauth";
 
 function seedMe(queryClient: ReturnType<typeof useQueryClient>, user: UserOut): void {
   queryClient.setQueryData<MeResponse>(qk.me(), { user });
@@ -58,6 +60,33 @@ export function useSignupMutation() {
   return useMutation({
     mutationFn: signUp,
     onSuccess: (result) => {
+      queryClient.removeQueries();
+      seedMe(queryClient, result.user);
+    },
+  });
+}
+
+/**
+ * A provider sign-in, as a mutation the auth screens can drive.
+ *
+ * Resolves to `null` when the user backs out of the web view or the Apple
+ * sheet. That is not an error and must not be shown as one — the screen simply
+ * returns to where it was, with nothing said.
+ */
+export function useOAuthSignInMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (provider: ProviderId): Promise<TokenResponse | null> => {
+      const outcome =
+        provider === "apple" && (await isAppleSignInAvailable())
+          ? await signInWithAppleNatively()
+          : await signInWithProvider(provider);
+      if (outcome.status === "cancelled") return null;
+      if (outcome.status === "failed") throw new Error(outcome.message);
+      return outcome.token;
+    },
+    onSuccess: (result) => {
+      if (result === null) return;
       queryClient.removeQueries();
       seedMe(queryClient, result.user);
     },

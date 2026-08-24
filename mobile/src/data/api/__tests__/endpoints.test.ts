@@ -52,9 +52,16 @@ it("serializes the auth domain request and captures the durable cookie", async (
   );
 });
 
-it("constructs the disabled OAuth route with an encoded return path", async () => {
-  await expect(getOAuthStartUrl("github", "/settings?tab=account")).resolves.toBe(
+it("constructs the OAuth route with an encoded return path", async () => {
+  await expect(getOAuthStartUrl("github", { returnTo: "/settings?tab=account" })).resolves.toBe(
     "https://spawn.example.com/api/auth/oauth/github/start?return_to=%2Fsettings%3Ftab%3Daccount",
+  );
+});
+
+it("adds the native redirect that makes the callback hand back a code", async () => {
+  await expect(getOAuthStartUrl("google", { redirectUri: "spawn://auth/oauth" })).resolves.toBe(
+    "https://spawn.example.com/api/auth/oauth/google/start" +
+      "?return_to=%2F&redirect_uri=spawn%3A%2F%2Fauth%2Foauth",
   );
 });
 

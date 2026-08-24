@@ -249,7 +249,7 @@ class AdminTestEmail(BaseModel):
 
 
 class AuthProviderOut(BaseModel):
-    id: Literal["google", "microsoft", "github"]
+    id: Literal["google", "microsoft", "github", "apple"]
     name: str
 
 
@@ -257,6 +257,39 @@ class OAuthExchangeRequest(BaseModel):
     """The one-time code a native app carries back from the provider callback."""
 
     code: str = Field(min_length=16, max_length=256)
+
+
+class AppleNativeSignInRequest(BaseModel):
+    """The identity token the iOS Sign in with Apple sheet hands back.
+
+    There is no one-time code here because there was no browser and no
+    callback: the sheet is part of the app, so the token it produces is the
+    whole of the evidence and is verified against Apple's keys on arrival.
+    """
+
+    identity_token: str = Field(min_length=16, max_length=8192)
+    invite: str | None = Field(default=None, max_length=256)
+
+
+class PushDeviceRegisterRequest(BaseModel):
+    """Where to reach one app install when it is not holding a socket."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=8, max_length=255)
+    platform: Literal["ios", "android"]
+    # Recognition only, for a future signed-in-devices screen. Never trusted.
+    label: str | None = Field(default=None, max_length=64)
+
+
+class PushDeviceOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    platform: str
+    label: str | None = None
+    created_at: datetime
+    last_seen_at: datetime
 
 
 class AuthConfigOut(BaseModel):
