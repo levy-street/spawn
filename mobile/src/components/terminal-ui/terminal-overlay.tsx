@@ -40,6 +40,7 @@ import {
 import { TerminalNotice } from "@/components/terminal-ui/terminal-notice";
 import { UploadProgressBar } from "@/components/terminal-ui/upload-progress-bar";
 import { useTerminalTransfers } from "@/components/terminal-ui/use-terminal-transfers";
+import { DeviceApprovalOverlay } from "@/components/trust/device-approval-overlay";
 import { Confirm } from "@/components/ui/confirm";
 import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
@@ -76,8 +77,6 @@ export interface TerminalOverlayProps {
   onRestart: () => Promise<void>;
   /** Reports its own outcome and must not reject: the window is already gone. */
   onKill: () => Promise<void>;
-  /** Opens the device-trust settings when a host has not approved this device. */
-  onDeviceTrust?: () => void;
 }
 
 function safeTerminalLink(url: string): boolean {
@@ -113,7 +112,6 @@ export function TerminalOverlay({
   onRename,
   onRestart,
   onKill,
-  onDeviceTrust,
 }: TerminalOverlayProps): React.JSX.Element {
   const theme = useTheme();
   const surfaceRef = useRef<TerminalSurfaceHandle>(null);
@@ -138,6 +136,7 @@ export function TerminalOverlay({
   const [diagnosticsVisible, setDiagnosticsVisible] = useState(false);
   const [selectionVisible, setSelectionVisible] = useState(false);
   const [killConfirmVisible, setKillConfirmVisible] = useState(false);
+  const [approvalVisible, setApprovalVisible] = useState(false);
   const [attachVisible, setAttachVisible] = useState(false);
   const [moreVisible, setMoreVisible] = useState(false);
   const [headerMenuVisible, setHeaderMenuVisible] = useState(false);
@@ -295,8 +294,19 @@ export function TerminalOverlay({
     connectionState === "failed" && connectionError?.code === DEVICE_NOT_TRUSTED_CODE;
   const hostApproval = useHostApprovalWatch(host.id, awaitingApproval);
   useEffect(() => {
-    if (awaitingApproval && hostApproval === "trusted") retry();
+    if (awaitingApproval && hostApproval === "trusted") {
+      setApprovalVisible(false);
+      retry();
+    }
   }, [awaitingApproval, hostApproval, retry]);
+
+  // The ceremony presents itself: a trust failure is not something Retry can
+  // fix, so waiting for the operator to find the right button is a dead end.
+  // Dismissing it keeps it closed for this failure; the error screen's
+  // "Approve this device" reopens it.
+  useEffect(() => {
+    if (awaitingApproval) setApprovalVisible(true);
+  }, [awaitingApproval]);
 
   const sendAccessoryKey = (sequence: string, _spec: KeySpec): void => {
     surfaceRef.current?.sendKey(sequence);
@@ -478,8 +488,8 @@ export function TerminalOverlay({
         <ConnectionStateOverlay
           error={connectionError}
           hasEverBeenReady={hasEverBeenReady}
+          onDeviceTrust={() => setApprovalVisible(true)}
           onRetry={retry}
-          {...(onDeviceTrust === undefined ? {} : { onDeviceTrust })}
           state={hostKey ? connectionState : "failed"}
         />
         {shouldShowJumpToLatest(followState) ? (
@@ -537,6 +547,11 @@ export function TerminalOverlay({
         onDismiss={() => setDiagnosticsVisible(false)}
         state={connectionState}
         visible={diagnosticsVisible}
+      />
+      <DeviceApprovalOverlay
+        hostId={host.id}
+        onDismiss={() => setApprovalVisible(false)}
+        visible={approvalVisible}
       />
       <SessionTargetSheets
         agentVisible={agentVisible}
