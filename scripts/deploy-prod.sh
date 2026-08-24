@@ -80,6 +80,39 @@ run_build="${SPAWN_DEPLOY_BUILD:-1}"
 # listens on 127.0.0.1:8001; override for a host whose API is elsewhere.
 api_proxy_target="${SPAWN_API_PROXY_TARGET:-http://127.0.0.1:8001}"
 
+# A rolling prebuilt may lag master when its workflow is cancelled or cannot
+# start. That is harmless only while daemon/ is unchanged: otherwise the
+# installer hands out a client for a different control protocol than the server
+# being deployed. Compare trees rather than commit IDs so web/server-only
+# commits do not unnecessarily block a release.
+prebuilt_manifest_matches_daemon() {
+  local manifest="$1"
+  local target_ref="$2"
+  local prebuilt_commit
+
+  [[ -f "$manifest" ]] || return 1
+  IFS= read -r prebuilt_commit < "$manifest"
+  [[ "$prebuilt_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+  git cat-file -e "$prebuilt_commit^{commit}" 2>/dev/null || return 1
+  git diff --quiet "$prebuilt_commit" "$target_ref" -- daemon
+}
+
+# Fail before touching production when a reachable release is known stale.
+# An unavailable release remains best-effort as before; the installer can use
+# its source-build fallback. Re-check after deployment too, because the rolling
+# release can move between this preflight and publication.
+if [[ "${SPAWN_DEPLOY_PREBUILTS:-1}" == "1" ]] && command -v gh >/dev/null 2>&1; then
+  preflight_tmp="$(mktemp -d)"
+  if gh release download prebuilt-latest --repo levy-street/spawn \
+    --pattern COMMIT --dir "$preflight_tmp" --clobber >/dev/null 2>&1; then
+    if ! prebuilt_manifest_matches_daemon "$preflight_tmp/COMMIT" "$remote_ref"; then
+      rm -rf "$preflight_tmp"
+      die "prebuilt-latest was built from a different daemon tree; wait for the prebuilt workflow or set SPAWN_DEPLOY_PREBUILTS=0 and remove incompatible hosted prebuilts"
+    fi
+  fi
+  rm -rf "$preflight_tmp"
+fi
+
 printf 'deploy-prod: deploying %s to %s:%s\n' "$remote_ref" "$host" "$remote_path"
 
 env_prefix="$(
@@ -217,6 +250,11 @@ publish_prebuilts() {
     printf 'deploy-prod: prebuilt checksum verification failed; not publishing\n' >&2
     rm -rf "$tmp"
     return 0
+  fi
+  if ! prebuilt_manifest_matches_daemon "$tmp/COMMIT" "$remote_ref"; then
+    printf 'deploy-prod: prebuilt-latest moved to an incompatible daemon build; not publishing\n' >&2
+    rm -rf "$tmp"
+    return 1
   fi
   local pair target triple dest
   for pair in "${PREBUILT_TARGETS[@]}"; do
