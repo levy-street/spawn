@@ -63,6 +63,10 @@ spawn.log
 # Apple signing keys (Sign in with Apple, APNs, App Store Connect API).
 # Downloadable exactly once, and authenticate as you — never in the tree.
 *.p8
+# Google service-account keys (Play submissions, FCM sending). These authorise
+# uploads and pushes as you; they belong in ~/.spawn/google/, never in the tree.
+*service-account*.json
+*-service_account*.json
 
 # Reference screenshots dropped in the repo root
 Screenshot *.png
