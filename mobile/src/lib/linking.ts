@@ -1,7 +1,6 @@
 export const APP_SCHEME = "spawn";
 
-// Owner input: replace this placeholder with the canonical HTTPS host before universal links ship.
-export const UNIVERSAL_LINK_HOST = "spawn.example.com";
+export const UNIVERSAL_LINK_HOST = "spawnd.dev";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INVITE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32}$/;

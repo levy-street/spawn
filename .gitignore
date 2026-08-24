@@ -60,6 +60,9 @@ spawn.log
 # Downloaded credential files: never let `git add -A` publish one.
 *credentials.csv
 *.pem
+# Apple signing keys (Sign in with Apple, APNs, App Store Connect API).
+# Downloadable exactly once, and authenticate as you — never in the tree.
+*.p8
 
 # Reference screenshots dropped in the repo root
 Screenshot *.png

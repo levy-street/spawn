@@ -93,11 +93,12 @@ describe("notification preferences and capability", () => {
     expect(getNotificationPreferences().system).toBe(false);
   });
 
-  it("reports remote push and suspended delivery as explicitly unavailable", () => {
+  it("reports remote push and suspended delivery as available now that push ships", () => {
     expect(notificationCapabilities.local.available).toBe(true);
-    expect(notificationCapabilities.remote.available).toBe(false);
-    expect(notificationCapabilities.remote.reason).toContain("unavailable in Expo Go");
-    expect(notificationCapabilities.suspendedDelivery.available).toBe(false);
+    expect(notificationCapabilities.remote.available).toBe(true);
+    expect(notificationCapabilities.remote.detail).toContain("while spawn is closed");
+    // The alert socket cannot reach a suspended app; push is what covers it.
+    expect(notificationCapabilities.suspendedDelivery.available).toBe(true);
   });
 });
 

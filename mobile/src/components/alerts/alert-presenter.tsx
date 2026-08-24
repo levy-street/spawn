@@ -26,6 +26,7 @@ import {
   scheduleLocalAlertNotification,
   subscribeToLocalNotificationResponses,
 } from "@/lib/notifications";
+import { registerForPushNotifications } from "@/lib/push";
 
 export interface AlertPresenterProps {
   currentSessionId?: string | null;
@@ -85,6 +86,10 @@ export function AlertPresenter({
   useEffect(() => {
     configureLocalNotifications();
     void hydrateNotificationPreferences();
+    // Re-registered on every mount on purpose: push tokens are reissued on
+    // reinstall, on restore to a new handset and sometimes on an OS upgrade,
+    // and a stale registration fails silently — the alerts simply stop.
+    void registerForPushNotifications();
     const lastResponse = consumeLastLocalNotificationResponse();
     if (lastResponse) void handleNotificationTarget(lastResponse);
     return subscribeToLocalNotificationResponses((target) => {

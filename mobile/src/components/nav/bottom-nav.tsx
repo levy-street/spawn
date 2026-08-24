@@ -1,5 +1,5 @@
 import { type Href, usePathname, useRouter } from "expo-router";
-import { useEffect, useRef } from "react";
+import { useRef } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
 import Animated, { useAnimatedStyle, useSharedValue } from "react-native-reanimated";

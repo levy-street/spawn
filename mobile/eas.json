@@ -5,7 +5,8 @@
   },
   "build": {
     "base": {
-      "node": "22.19.0"
+      "node": "22.19.0",
+      "channel": "base"
     },
     "development": {
       "extends": "base",
@@ -18,14 +19,20 @@
       "extends": "base",
       "distribution": "internal",
       "environment": "preview",
-      "channel": "preview"
+      "channel": "preview",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://spawnd.dev"
+      }
     },
     "production": {
       "extends": "base",
       "distribution": "store",
       "environment": "production",
       "channel": "production",
-      "autoIncrement": true
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://spawnd.dev"
+      }
     }
   },
   "submit": {

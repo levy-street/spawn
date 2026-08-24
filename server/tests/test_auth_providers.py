@@ -27,6 +27,11 @@ def isolated_provider_settings(monkeypatch):
     for provider in ("GOOGLE", "MICROSOFT", "GITHUB"):
         monkeypatch.setenv(f"SPAWN_{provider}_CLIENT_ID", "")
         monkeypatch.setenv(f"SPAWN_{provider}_CLIENT_SECRET", "")
+    # Apple is configured from four values rather than a pair, and a developer
+    # with real ones in a local .env would otherwise see this file's exact
+    # provider-list assertions fail for reasons that have nothing to do with it.
+    for key in ("TEAM_ID", "KEY_ID", "PRIVATE_KEY", "CLIENT_ID", "NATIVE_CLIENT_ID"):
+        monkeypatch.setenv(f"SPAWN_APPLE_{key}", "")
     get_settings.cache_clear()  # type: ignore[attr-defined]
     yield
     get_settings.cache_clear()  # type: ignore[attr-defined]

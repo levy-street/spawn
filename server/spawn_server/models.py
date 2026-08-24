@@ -228,6 +228,43 @@ class AuthProviderExchange(Base):
     )
 
 
+class PushDevice(Base):
+    """One app install that has asked to be told about alerts while closed.
+
+    Keyed on the push token rather than the account, because the token is what
+    the push service actually addresses and it is the thing that goes stale:
+    reinstalls, restores onto a new phone and OS upgrades all mint a new one.
+    A token that arrives already attached to a different account is reassigned
+    rather than duplicated — the same handset handed to a second user must not
+    keep receiving the first user's alerts.
+
+    `disabled_at` is set when the push service reports the token dead
+    (`DeviceNotRegistered`). The row is kept rather than deleted so a later
+    registration of the same token is an update, not a resurrection of state
+    nobody can account for.
+    """
+
+    __tablename__ = "push_devices"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Expo push tokens look like ExponentPushToken[xxxxxxxx]; the length cap is
+    # generous so a format change does not start silently rejecting devices.
+    token: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    platform: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Recognition only, for a future "signed-in devices" screen. Never trusted.
+    label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class TrustBundle(Base):
     """The operator's sealed trust bundle: ciphertext the server cannot read.
 

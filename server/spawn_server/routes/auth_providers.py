@@ -16,11 +16,19 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, rate_limit, schemas
+from ..apple_identity import (
+    APPLE_AUTHORIZATION_ENDPOINT,
+    APPLE_TOKEN_ENDPOINT,
+    AppleIdentityError,
+    apple_client_secret,
+    apple_is_configured,
+    verify_apple_identity_token,
+)
 from ..config import Settings, get_settings
 from ..db import get_session
 from ..models import AuthIdentity, AuthProviderExchange, AuthProviderState, User
 
-ProviderId = Literal["google", "microsoft", "github"]
+ProviderId = Literal["google", "microsoft", "github", "apple"]
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -74,6 +82,21 @@ PROVIDER_DEFINITIONS: dict[ProviderId, AuthProviderDefinition] = {
         token_endpoint="https://github.com/login/oauth/access_token",
         scopes=("read:user", "user:email"),
     ),
+    "apple": AuthProviderDefinition(
+        id="apple",
+        name="Apple",
+        authorization_endpoint=APPLE_AUTHORIZATION_ENDPOINT,
+        token_endpoint=APPLE_TOKEN_ENDPOINT,
+        # Email only. Apple will also hand over the account holder's name, but
+        # only on a first authorization and never again, and there is nowhere to
+        # put it — `User` carries an email and nothing else. Asking for data
+        # that is immediately discarded is a consent prompt charging the user
+        # for nothing.
+        #
+        # Asking for any scope at all obliges Apple to POST the callback back as
+        # a form, which is why there is a POST route below as well as a GET.
+        scopes=("email",),
+    ),
 }
 
 
@@ -103,6 +126,16 @@ def _provider_credentials(
         return settings.google_client_id, settings.google_client_secret
     if provider == "microsoft":
         return settings.microsoft_client_id, settings.microsoft_client_secret
+    if provider == "apple":
+        # Apple's "secret" is a JWT this server signs, so it is minted on demand
+        # rather than configured; a key that cannot sign disables the provider
+        # instead of failing every sign-in at the token endpoint.
+        if not apple_is_configured(settings):
+            return None, None
+        try:
+            return settings.apple_client_id, apple_client_secret(settings)
+        except AppleIdentityError:
+            return None, None
     return settings.github_client_id, settings.github_client_secret
 
 
@@ -237,6 +270,8 @@ async def _exchange_provider_code(
                 status.HTTP_502_BAD_GATEWAY,
             )
         token_body = token_response.json()
+        if config.definition.id == "apple":
+            return await _apple_profile(client, token_body)
         access_token = token_body.get("access_token")
         if not isinstance(access_token, str) or not access_token:
             raise ProviderAuthError(
@@ -246,6 +281,51 @@ async def _exchange_provider_code(
         if config.definition.id == "github":
             return await _github_profile(client, access_token)
         return await _oidc_profile(client, config.definition, access_token)
+
+
+async def _apple_profile(
+    client: httpx.AsyncClient,
+    token_body: dict[str, Any],
+) -> ProviderProfile:
+    """Read the account out of Apple's id_token; there is no userinfo endpoint."""
+    id_token = token_body.get("id_token")
+    if not isinstance(id_token, str) or not id_token:
+        raise ProviderAuthError(
+            "Apple did not return an identity token",
+            status.HTTP_502_BAD_GATEWAY,
+        )
+    return await apple_profile_from_identity_token(id_token, client=client)
+
+
+async def apple_profile_from_identity_token(
+    id_token: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> ProviderProfile:
+    """Verify an Apple id_token — from either the web callback or the app.
+
+    The email is deliberately allowed to be missing. Apple releases it only on
+    the first authorization for a given Apple ID; every sign-in after that
+    carries `sub` alone. Demanding an email here is the standard way this
+    provider ends up working exactly once per user, so the absent case is
+    resolved later against the identity already on file.
+    """
+    try:
+        identity = await verify_apple_identity_token(
+            id_token,
+            settings=get_settings(),
+            client=client,
+        )
+    except AppleIdentityError as e:
+        raise ProviderAuthError(str(e), status.HTTP_401_UNAUTHORIZED) from e
+
+    email = auth.normalize_email(identity.email) if identity.email else ""
+    return ProviderProfile(
+        provider="apple",
+        provider_user_id=identity.subject,
+        email=email,
+        email_verified=bool(email) and identity.email_verified,
+    )
 
 
 async def _oidc_profile(
@@ -364,14 +444,37 @@ async def _user_for_profile(
         )
     ).scalar_one_or_none()
     if identity is not None:
-        identity.email = profile.email
-        identity.email_verified = profile.email_verified
+        # An empty email means the provider simply did not resend it (Apple after
+        # the first authorization), not that the account lost one — so keep what
+        # is already on file rather than blanking it.
+        if profile.email:
+            identity.email = profile.email
+            identity.email_verified = profile.email_verified
         identity.last_login_at = now
-        await session.commit()
         user = await session.get(User, identity.user_id)
         if user is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user gone")
+        # Reads the stored flag rather than this sign-in's, because Apple sends
+        # the email only on a first authorization: a returning user arrives with
+        # nothing to assert, and the claim on file is the one that was proved.
+        # This also catches accounts linked before provider sign-ins were
+        # trusted, which would otherwise stay stuck behind the gate forever.
+        if identity.email_verified and user.email_verified_at is None:
+            user.email_verified_at = now
+        await session.commit()
         return user
+
+    # Reaching here means there is no identity on file, so this is a first
+    # sign-in and an email is the only thing that can name the account.
+    if not profile.email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "this provider account is not linked yet and the provider sent no email; "
+                "sign in on the web once, or revoke the app under your provider account "
+                "and try again"
+            ),
+        )
 
     user: User | None = None
     if linked_user_id is not None:
@@ -384,10 +487,32 @@ async def _user_for_profile(
                 select(User).where(func.lower(User.email) == profile.email.lower())
             )
         ).scalar_one_or_none()
+        if user is not None and profile.email_verified and user.email_verified_at is None:
+            # Adopting an account that exists but was never verified, on the
+            # word of a provider that *has* verified this address.
+            #
+            # Whoever created that row proved nothing, so it cannot be assumed
+            # to be the same person now signing in — planting an unverified
+            # account under someone else's address and waiting for them to
+            # arrive by provider is the standard pre-hijacking move. Retiring
+            # the password and bumping the epoch is what stops the plant from
+            # being worth anything: the address's real owner keeps the account,
+            # and anyone else is left holding a credential that no longer opens
+            # it. A local password set legitimately but never verified is lost
+            # here too, and recovering it is a password reset away.
+            user.password_hash = auth.hash_random_password()
+            user.session_epoch += 1
     if user is None:
         user = User(email=profile.email, password_hash=auth.hash_random_password(), created_at=now)
         session.add(user)
         await session.flush()
+
+    if profile.email_verified and user.email_verified_at is None:
+        # The provider has already proved control of this address, which is a
+        # stronger claim than a link clicked in an inbox — and on a relayed
+        # Apple address the verification mail cannot arrive at all, so leaving
+        # the gate up would strand that account with nothing to diagnose.
+        user.email_verified_at = now
 
     session.add(
         AuthIdentity(
@@ -437,6 +562,10 @@ async def provider_start(
     }
     if config.definition.id in {"google", "microsoft"}:
         params["prompt"] = "select_account"
+    if config.definition.id == "apple":
+        # Apple requires form_post the moment any scope is requested, and then
+        # delivers the result as a POST body rather than query parameters.
+        params["response_mode"] = "form_post"
     return RedirectResponse(
         f"{config.definition.authorization_endpoint}?{urlencode(params)}",
         status_code=status.HTTP_302_FOUND,
@@ -450,15 +579,53 @@ async def provider_callback(
     response: Response,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
+    return await _complete_callback(
+        provider=provider,
+        values=dict(request.query_params),
+        response=response,
+        session=session,
+    )
+
+
+@router.post("/oauth/{provider}/callback")
+async def provider_callback_post(
+    provider: ProviderId,
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Apple's half of the callback: response_mode=form_post arrives as a POST.
+
+    No CSRF token guards this route and none can — the request is a cross-site
+    form submission from Apple, by design. The `state` value consumed below is
+    what ties it to a flow this server started, and it is single-use.
+    """
+    form = await request.form()
+    values = {key: str(value) for key, value in form.items() if isinstance(value, str)}
+    return await _complete_callback(
+        provider=provider,
+        values=values,
+        response=response,
+        session=session,
+    )
+
+
+async def _complete_callback(
+    *,
+    provider: ProviderId,
+    values: dict[str, str],
+    response: Response,
+    session: AsyncSession,
+) -> Response:
     config = _enabled_config(provider)
-    provider_error = request.query_params.get("error")
+    provider_error = values.get("error")
     if provider_error:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"{config.definition.name} sign-in failed: {provider_error}",
         )
-    state = request.query_params.get("state", "")
-    code = request.query_params.get("code", "")
+    state = values.get("state", "")
+    code = values.get("code", "")
     if not state or not code:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -520,6 +687,38 @@ async def provider_exchange(
     user = await session.get(User, row.user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user gone")
+    auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
+    return schemas.TokenResponse(
+        access_token=auth.issue_access_token(user.id, user.session_epoch),
+        user=schemas.UserOut.model_validate(user),
+    )
+
+
+@router.post(
+    "/oauth/apple/native",
+    response_model=schemas.TokenResponse,
+    dependencies=[Depends(rate_limit.limiter(rate_limit.LOGIN))],
+)
+async def apple_native_sign_in(
+    body: schemas.AppleNativeSignInRequest,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+) -> schemas.TokenResponse:
+    """Sign in from the iOS Sign in with Apple sheet.
+
+    There is no redirect, no state and no one-time code here, because there was
+    no browser: the sheet runs inside the app and hands it a signed identity
+    token directly. That token is the entire proof, so it is verified against
+    Apple's published keys — signature, issuer, expiry and audience — before it
+    is allowed to name an account.
+    """
+    _enabled_config("apple")
+    try:
+        profile = await apple_profile_from_identity_token(body.identity_token)
+    except ProviderAuthError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from e
+
+    user = await _user_for_profile(session=session, profile=profile, linked_user_id=None)
     auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     return schemas.TokenResponse(
         access_token=auth.issue_access_token(user.id, user.session_epoch),

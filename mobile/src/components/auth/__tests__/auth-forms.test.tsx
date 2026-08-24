@@ -12,12 +12,21 @@ import {
 import { validateSignupForm } from "@/components/auth/signup-form";
 import { ApiError } from "@/data/api/client";
 import { confirmPasswordReset, getAuthConfig, logIn } from "@/data/api/endpoints/auth";
+import { signInWithProvider } from "@/lib/oauth";
 import { fontFamily, ThemeProvider } from "@/theme";
 
 const mockReplace = jest.fn();
 const mockPush = jest.fn();
 const mockBack = jest.fn();
 const mockCanGoBack = jest.fn(() => true);
+
+jest.mock("@/lib/oauth", () => ({ signInWithProvider: jest.fn() }));
+// The Apple sheet is iOS-only and the test renderer is not a device, so the
+// button is absent here by default; its own suite drives the available case.
+jest.mock("@/lib/apple-auth", () => ({
+  isAppleSignInAvailable: jest.fn(async () => false),
+  signInWithAppleNatively: jest.fn(),
+}));
 
 jest.mock("expo-router", () => ({
   useRouter: () => ({
@@ -77,7 +86,7 @@ describe("auth form wiring", () => {
 
   it("blocks invalid login input and shows the shared exact validation copy", async () => {
     const screen = await renderAuth(<LoginScreen />);
-    await screen.findByText("Available in installed builds");
+    await screen.findByRole("button", { name: "Continue with Google" });
     await fireEvent.changeText(screen.getByTestId("login-email"), "not-an-email");
     await fireEvent.changeText(screen.getByTestId("login-password"), "secret");
     await fireEvent.press(screen.getByRole("button", { name: "Sign in" }));
@@ -88,7 +97,7 @@ describe("auth form wiring", () => {
 
   it("prints the sign-in form on the sheet, using the app's own fields", async () => {
     const screen = await renderAuth(<LoginScreen />);
-    await screen.findByText("Available in installed builds");
+    await screen.findByRole("button", { name: "Continue with Google" });
 
     // The controls are the shared plated input, not a field cut only for auth.
     expect(screen.getByTestId("login-email-focus-halo")).toBeTruthy();
@@ -143,21 +152,47 @@ describe("auth form wiring", () => {
   );
 });
 
-describe("OAuth unavailable state", () => {
-  it("renders configured providers disabled with a visible reason", async () => {
+describe("OAuth buttons", () => {
+  it("offers each configured provider as a live control", async () => {
     const screen = await renderAuth(
       <OAuthButtons providers={[{ id: "google", name: "Google" }]} />,
     );
 
-    expect(
-      screen.getByRole("button", { name: "Continue with Google" }).props["accessibilityState"],
-    ).toMatchObject({ disabled: true });
-    expect(screen.getByText("Available in installed builds")).toBeTruthy();
+    const button = await screen.findByRole("button", { name: "Continue with Google" });
+    expect(button.props["accessibilityState"]).toMatchObject({ disabled: false });
+  });
+
+  it("starts the provider flow and reports a failure in place", async () => {
+    jest.mocked(signInWithProvider).mockResolvedValueOnce({
+      status: "failed",
+      message: "Google rejected the authorization code",
+    });
+    const screen = await renderAuth(
+      <OAuthButtons providers={[{ id: "google", name: "Google" }]} />,
+    );
+
+    await fireEvent.press(await screen.findByRole("button", { name: "Continue with Google" }));
+
+    expect(signInWithProvider).toHaveBeenCalledWith("google");
+    expect(await screen.findByText("Google rejected the authorization code")).toBeTruthy();
+  });
+
+  it("says nothing when the user backs out of the web view", async () => {
+    jest.mocked(signInWithProvider).mockResolvedValueOnce({ status: "cancelled" });
+    const screen = await renderAuth(
+      <OAuthButtons providers={[{ id: "google", name: "Google" }]} />,
+    );
+
+    await fireEvent.press(await screen.findByRole("button", { name: "Continue with Google" }));
+
+    await waitFor(() => expect(signInWithProvider).toHaveBeenCalled());
+    // A cancellation is a non-event: no error copy appears under the buttons.
+    expect(screen.queryByText(/could not|failed|rejected/i)).toBeNull();
   });
 
   it("renders nothing when no providers are configured", async () => {
     const screen = await renderAuth(<OAuthButtons providers={[]} />);
-    expect(screen.queryByText("Available in installed builds")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Continue with Google" })).toBeNull();
     expect(screen.queryByText("OR USE EMAIL")).toBeNull();
   });
 });

@@ -1,6 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Notifications from "expo-notifications";
-import type { AppStateStatus } from "react-native";
+import { AppState, type AppStateStatus } from "react-native";
 
 import type { AlertEvent, AlertEventKind } from "@/data/realtime/alert-socket";
 
@@ -33,7 +33,7 @@ export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
 };
 
 export const REMOTE_NOTIFICATIONS_UNAVAILABLE_REASON =
-  "Remote notifications are unavailable in Expo Go, and spawn has no server push delivery path. Alerts can arrive only while the app is running.";
+  "Remote notifications need an installed build. Expo Go cannot be issued a push token, so alerts arrive only while spawn is running.";
 
 export const notificationCapabilities = {
   local: {
@@ -41,12 +41,12 @@ export const notificationCapabilities = {
     detail: "Local notifications can show alerts received while spawn is running.",
   },
   remote: {
-    available: false,
-    reason: REMOTE_NOTIFICATIONS_UNAVAILABLE_REASON,
+    available: true,
+    detail: "Installed builds register for push, so alerts arrive while spawn is closed.",
   },
   suspendedDelivery: {
-    available: false,
-    reason: "A suspended or closed app cannot receive new spawn alerts.",
+    available: true,
+    detail: "A suspended or closed app is reached by push instead of the alert socket.",
   },
 } as const;
 
@@ -226,12 +226,19 @@ export function configureLocalNotifications(): void {
   notificationsConfigured = true;
   try {
     Notifications.setNotificationHandler({
-      handleNotification: async () => ({
-        shouldShowBanner: true,
-        shouldShowList: true,
-        shouldPlaySound: false,
-        shouldSetBadge: false,
-      }),
+      handleNotification: async () => {
+        // A push can land while spawn is open, and the alert socket has
+        // already drawn a toast for the same event. Two notices for one
+        // alert reads as a bug, so the banner yields to the toast and the
+        // notification is left in the tray for later.
+        const foreground = AppState.currentState === "active";
+        return {
+          shouldShowBanner: !foreground,
+          shouldShowList: true,
+          shouldPlaySound: false,
+          shouldSetBadge: false,
+        };
+      },
     });
   } catch {
     // In-app toasts remain available when the native notification surface is absent.
