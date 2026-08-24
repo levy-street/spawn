@@ -47,7 +47,6 @@ function host(status: string): Host {
     version: "1",
     host_key_algorithm: "ed25519",
     host_public_key: null,
-    host_key_fingerprint: null,
     status,
     last_seen_at: iso(1_000),
     session_count: 1,

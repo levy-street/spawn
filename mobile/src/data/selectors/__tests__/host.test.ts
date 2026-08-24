@@ -17,7 +17,6 @@ function host(id: string, name: string, status: string, overrides: Partial<Host>
     version: null,
     host_key_algorithm: null,
     host_public_key: null,
-    host_key_fingerprint: null,
     status,
     last_seen_at: null,
     session_count: 0,

@@ -4,6 +4,7 @@ import { ListGroup } from "@/components/ui/list-group";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Text } from "@/components/ui/text";
 import type { HostOut } from "@/data/api/schemas/hosts";
+import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { spacing } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
@@ -20,6 +21,17 @@ function Fact({ label, value, mono = false }: { label: string; value: string; mo
   );
 }
 
+// The server never sends a fingerprint next to the key it vouches for
+// (mesh B5) — display it the same way it is verified: derived locally.
+function hostFingerprint(publicKeyWire: string | null): string {
+  if (publicKeyWire === null) return "not pinned";
+  try {
+    return formatHostFingerprint(publicKeyWire);
+  } catch {
+    return "invalid key";
+  }
+}
+
 export function HostFacts({ host }: { host: HostOut }) {
   return (
     <View style={styles.section} testID="host-facts">
@@ -34,7 +46,7 @@ export function HostFacts({ host }: { host: HostOut }) {
           value={host.host_key_algorithm === "ed25519" ? "ed25519" : "legacy unpaired"}
         />
         <Fact label="Public key" mono value={host.host_public_key ?? "not pinned"} />
-        <Fact label="Fingerprint" mono value={host.host_key_fingerprint ?? "not pinned"} />
+        <Fact label="Fingerprint" mono value={hostFingerprint(host.host_public_key)} />
       </ListGroup>
     </View>
   );

@@ -30,7 +30,6 @@ export function makeHost(overrides: Partial<HostOut> = {}): HostOut {
     version: "1",
     host_key_algorithm: "ed25519",
     host_public_key: "host-key",
-    host_key_fingerprint: null,
     status: "online",
     last_seen_at: NOW,
     session_count: 0,

@@ -43,7 +43,6 @@ function host(status = "online"): Host {
     version: null,
     host_key_algorithm: null,
     host_public_key: null,
-    host_key_fingerprint: null,
     status,
     last_seen_at: null,
     session_count: 2,

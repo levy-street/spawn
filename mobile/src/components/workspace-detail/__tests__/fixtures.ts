@@ -33,7 +33,6 @@ export function makeHost(overrides: Partial<Host> = {}): Host {
     version: "1",
     host_key_algorithm: "ed25519",
     host_public_key: "key",
-    host_key_fingerprint: "fingerprint",
     status: "online",
     last_seen_at: NOW,
     session_count: 1,

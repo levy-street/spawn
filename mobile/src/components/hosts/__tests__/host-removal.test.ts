@@ -25,10 +25,7 @@ describe("host removal trust sequencing", () => {
   test("deletes a legacy host without inventing a pin", async () => {
     const calls: string[] = [];
     const deps = dependencies(calls);
-    await removeHostWithTrust(
-      { ...offlineHost, host_public_key: null, host_key_fingerprint: null },
-      deps,
-    );
+    await removeHostWithTrust({ ...offlineHost, host_public_key: null }, deps);
     expect(deps.hasLocalPin).not.toHaveBeenCalled();
     expect(calls).toEqual(["remove"]);
   });
