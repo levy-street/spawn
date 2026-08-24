@@ -56,6 +56,12 @@ def _init_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
     (local / "server" / ".keep").write_text("")
     (local / "web").mkdir()
     (local / "web" / ".keep").write_text("")
+    # The smoke check derives its probe port from the start script, so the
+    # fixture carries the same shape the real web/package.json has.
+    (local / "web" / "package.json").write_text(
+        '{"scripts": {"start:spawn": "node scripts/next-with-proxy-target.mjs'
+        ' start -H 0.0.0.0 -p 3001"}}\n'
+    )
     (local / "daemon").mkdir()
     (local / "daemon" / "Cargo.toml").write_text("[package]\nname='fake'\nversion='0.1.0'\n")
     _git(["add", "."], local)
@@ -72,7 +78,7 @@ def _fake_remote_home(tmp_path: Path) -> Path:
     home = tmp_path / "remote-home"
     bin_dir = home / ".local" / "bin"
     bin_dir.mkdir(parents=True)
-    for name in ["uv", "bun", "cargo", "systemctl", "sudo"]:
+    for name in ["uv", "bun", "cargo", "systemctl", "sudo", "curl"]:
         _write_executable(
             bin_dir / name,
             f"""#!/usr/bin/env bash
@@ -81,6 +87,18 @@ printf '%s\\n' "{name} $*" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/{name}.log"
 if [[ "{name}" == "sudo" ]]; then
   if [[ "${{1:-}}" == "-n" ]]; then shift; fi
   exec "$@"
+fi
+if [[ "{name}" == "bun" && "${{1:-}}" == "run" && "${{2:-}}" == "build" ]]; then
+  # A real build freezes the proxy target into the routes manifest; the deploy
+  # verifies that bake before restarting anything. SPAWN_TEST_BAKED_TARGET lets
+  # a test simulate a build that baked something other than what was asked for.
+  mkdir -p .next
+  baked="${{SPAWN_TEST_BAKED_TARGET:-$SPAWN_API_PROXY_TARGET}}"
+  printf '{{"rewrites":{{"afterFiles":[{{"source":"/api/:path*","destination":"%s/api/:path*"}}]}}}}\\n' \\
+    "$baked" > .next/routes-manifest.json
+fi
+if [[ "{name}" == "curl" ]]; then
+  printf '%s' "${{SPAWN_TEST_CURL_CODE:-200}}"
 fi
 exit 0
 """,
@@ -128,6 +146,9 @@ exit 1
 
 def _deploy_env(tmp_path: Path, fakebin: Path, remote: Path, **overrides: str) -> dict[str, str]:
     env = os.environ.copy()
+    # The deploy refuses an inherited SPAWN_API_PROXY_TARGET by design; a dev
+    # shell running this suite must not trip every test into that refusal.
+    env.pop("SPAWN_API_PROXY_TARGET", None)
     env.update(
         {
             "PATH": f"{fakebin}:{env['PATH']}",
@@ -137,6 +158,9 @@ def _deploy_env(tmp_path: Path, fakebin: Path, remote: Path, **overrides: str) -
             # Prebuilt publishing pulls a real GitHub release and scp's to the
             # target host; tests exercise it only via the explicit opt-in below.
             "SPAWN_DEPLOY_PREBUILTS": "0",
+            # The smoke check probes a live web server; tests that exercise it
+            # opt in with the fake curl above and a small attempt budget.
+            "SPAWN_DEPLOY_SMOKE": "0",
         }
     )
     env.update(overrides)
@@ -337,3 +361,94 @@ def test_deploy_refuses_remote_branch_commits_not_in_origin(tmp_path: Path):
     assert result.returncode != 0
     assert "production branch has 1 commit(s) not present in origin/master" in result.stderr
     assert _log(tmp_path, "systemctl.log") == ""
+
+
+def test_deploy_refuses_inherited_proxy_target_env(tmp_path: Path):
+    """The 2026-08-24 incident: a dev shell's SPAWN_API_PROXY_TARGET was baked
+    into the production web build. An inherited value must be a hard error
+    before SSH is invoked; only the flag may carry a non-default target."""
+
+    _origin, local, remote = _init_repo(tmp_path)
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    env = _deploy_env(
+        tmp_path, fakebin, remote, SPAWN_API_PROXY_TARGET="http://127.0.0.1:8010"
+    )
+
+    result = _deploy(local, env)
+
+    assert result.returncode != 0
+    assert "refusing to bake SPAWN_API_PROXY_TARGET" in result.stderr
+    assert _log(tmp_path, "ssh-host.log") == ""
+
+
+def test_deploy_flag_bakes_and_verifies_requested_target(tmp_path: Path):
+    _origin, local, remote = _init_repo(tmp_path)
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    env = _deploy_env(tmp_path, fakebin, remote)
+
+    result = _run(
+        [str(DEPLOY_SCRIPT), "prod", "--api-proxy-target", "http://127.0.0.1:9001"],
+        local,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "SPAWN_API_PROXY_TARGET=http://127.0.0.1:9001" in _log(tmp_path, "ssh-command.log")
+    assert "verified baked proxy target http://127.0.0.1:9001" in result.stdout
+
+
+def test_deploy_aborts_before_restart_when_build_bakes_wrong_target(tmp_path: Path):
+    """A build whose manifest disagrees with the requested target must abort
+    while the previous build is still serving: nothing restarted."""
+
+    _origin, local, remote = _init_repo(tmp_path)
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    env = _deploy_env(
+        tmp_path, fakebin, remote, SPAWN_TEST_BAKED_TARGET="http://127.0.0.1:8010"
+    )
+
+    result = _deploy(local, env)
+
+    assert result.returncode != 0
+    assert "baked the wrong API proxy target" in result.stderr
+    assert "bun run build" in _log(tmp_path, "bun.log")
+    assert _log(tmp_path, "systemctl.log") == ""
+
+
+def test_deploy_smoke_probes_healthz_through_the_web_proxy(tmp_path: Path):
+    _origin, local, remote = _init_repo(tmp_path)
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    env = _deploy_env(
+        tmp_path, fakebin, remote, SPAWN_DEPLOY_SMOKE="1", SPAWN_DEPLOY_SMOKE_ATTEMPTS="2"
+    )
+
+    result = _deploy(local, env)
+
+    assert result.returncode == 0, result.stderr
+    # Port derived from web/package.json's start script, not hardcoded.
+    assert "http://127.0.0.1:3001/healthz" in _log(tmp_path, "curl.log")
+    assert "smoke check ok" in result.stdout
+
+
+def test_deploy_smoke_failure_fails_the_deploy_and_names_the_rollback(tmp_path: Path):
+    _origin, local, remote = _init_repo(tmp_path)
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    env = _deploy_env(
+        tmp_path,
+        fakebin,
+        remote,
+        SPAWN_DEPLOY_SMOKE="1",
+        SPAWN_DEPLOY_SMOKE_ATTEMPTS="2",
+        SPAWN_TEST_CURL_CODE="502",
+    )
+
+    result = _deploy(local, env)
+
+    assert result.returncode != 0
+    assert "post-deploy smoke check failed" in result.stderr
+    assert "Roll back with" in result.stderr
