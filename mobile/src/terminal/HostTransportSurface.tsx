@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef } from "react";
 import { AppState, Image, StyleSheet } from "react-native";
 import WebView, { type WebViewMessageEvent } from "react-native-webview";
 import { WorkerBridge } from "@/terminal/transport/bridge";
+import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
 import { createHostTransport } from "@/terminal/transport/host-transport";
 import type {
   HostTransport,
@@ -70,8 +71,10 @@ export function HostTransportSurface({
 
   const openTransport = useCallback((): void => {
     void transport.open().catch((error: unknown) => {
+      // A coded rejection (device_not_trusted above all) keeps its code:
+      // rewrapping it generically is what hid the approval ceremony.
       callbacks.current.onError?.({
-        code: "host_transport_open",
+        code: error instanceof HostControlTransportError ? error.code : "host_transport_open",
         message: error instanceof Error ? error.message : "Host transport failed to open.",
         retryable: true,
       });

@@ -16,6 +16,7 @@ import {
   WorkerBridge,
   type WorkerToNativeMessage,
 } from "@/terminal/transport/bridge";
+import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
 import { createSessionTransport } from "@/terminal/transport/session-transport";
 import type {
   DisplayControlState,
@@ -201,8 +202,10 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
 
     const openTransport = useCallback((): void => {
       void transport.open().catch((error: unknown) => {
+        // A coded rejection (device_not_trusted above all) keeps its code:
+        // rewrapping it generically is what hid the approval ceremony.
         callbacks.current.onError?.({
-          code: "transport_open",
+          code: error instanceof HostControlTransportError ? error.code : "transport_open",
           message: error instanceof Error ? error.message : "Terminal transport failed to open.",
           retryable: true,
         });

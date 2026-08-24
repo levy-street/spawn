@@ -164,12 +164,6 @@ export default function TerminalScreen(): React.JSX.Element {
       <TerminalOverlay
         focused={focused}
         host={host}
-        onDeviceTrust={() =>
-          router.push({
-            pathname: "/device-approval",
-            params: { hostId: host.id },
-          })
-        }
         onDismiss={() => router.back()}
         onKill={() => killSession(sessionName)}
         onRename={(name) => rename.mutateAsync(name).then(() => undefined)}

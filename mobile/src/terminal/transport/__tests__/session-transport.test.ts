@@ -283,7 +283,12 @@ describe("SessionTransport connect failures", () => {
     });
     transport.on("error", (error) => errors.push(error));
     transport.on("state", (state) => states.push(state));
-    await expect(transport.open()).rejects.toThrow(/has not approved this device/i);
+    // The rejection carries the code too: a caller that rewraps the rejection
+    // must still be able to tell a trust failure from a network one.
+    await expect(transport.open()).rejects.toMatchObject({
+      code: "device_not_trusted",
+      message: expect.stringMatching(/has not approved this device/i),
+    });
     expect(errors).toContainEqual(
       expect.objectContaining({ code: "device_not_trusted", retryable: false }),
     );

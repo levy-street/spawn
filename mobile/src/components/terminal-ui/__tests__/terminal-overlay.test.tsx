@@ -99,6 +99,24 @@ jest.mock("@/components/terminal-ui/upload-progress-bar", () => ({
 jest.mock("@/components/terminal-ui/connection-status", () => ({
   ConnectionStateOverlay: () => null,
 }));
+let mockApprovalOverlayProps: { hostId?: string; visible?: boolean; onDismiss?: () => void } = {};
+jest.mock("@/components/trust/device-approval-overlay", () => {
+  const React = require("react") as typeof import("react");
+  const { View } = require("react-native") as typeof import("react-native");
+  return {
+    DeviceApprovalOverlay: (props: { hostId: string; visible: boolean; onDismiss: () => void }) => {
+      mockApprovalOverlayProps = props;
+      return props.visible
+        ? React.createElement(View, { testID: "mock-device-approval-overlay" })
+        : null;
+    },
+  };
+});
+let mockHostApproval: "trusted" | "untrusted" | "unknown" = "unknown";
+jest.mock("@/data/trust/use-host-approval-watch", () => ({
+  APPROVAL_WATCH_INTERVAL_MS: 3_000,
+  useHostApprovalWatch: () => mockHostApproval,
+}));
 jest.mock("@/components/ui/confirm", () => {
   const React = require("react") as typeof import("react");
   const { Pressable, Text } = require("react-native") as typeof import("react-native");
@@ -142,6 +160,7 @@ interface MockSurfaceProps {
   onLink?: (url: string) => void;
   onDisplayChange?: (display: DisplayControlState) => void;
   onTransport?: (transport: unknown) => void;
+  onError?: (error: { code: string; message: string; retryable: boolean }) => void;
 }
 
 let mockTerminalSurfaceProps: MockSurfaceProps = {};
@@ -499,5 +518,46 @@ describe("terminal overlay agent keys", () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+describe("device approval ceremony", () => {
+  const untrustedError = {
+    code: "device_not_trusted",
+    message: "This host has not approved this device yet.",
+    retryable: false,
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockTerminalSurfaceProps = {};
+    mockApprovalOverlayProps = {};
+    mockHostApproval = "unknown";
+  });
+
+  test("an untrusted failure raises the approval ceremony by itself", async () => {
+    await renderOverlay();
+    await act(() => mockTerminalSurfaceProps.onError?.(untrustedError));
+    expect(screen.getByTestId("mock-device-approval-overlay")).toBeOnTheScreen();
+    expect(mockApprovalOverlayProps.hostId).toBe(host.id);
+  });
+
+  test("an unrelated failure leaves the ceremony down", async () => {
+    await renderOverlay();
+    await act(() =>
+      mockTerminalSurfaceProps.onError?.({
+        code: "transport_open",
+        message: "The network went away.",
+        retryable: true,
+      }),
+    );
+    expect(screen.queryByTestId("mock-device-approval-overlay")).toBeNull();
+  });
+
+  test("a dismissed ceremony stays down until asked for again", async () => {
+    await renderOverlay();
+    await act(() => mockTerminalSurfaceProps.onError?.(untrustedError));
+    await act(() => mockApprovalOverlayProps.onDismiss?.());
+    expect(screen.queryByTestId("mock-device-approval-overlay")).toBeNull();
   });
 });

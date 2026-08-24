@@ -12,6 +12,7 @@ import {
   type WorkerToNativeMessage,
 } from "@/terminal/transport/bridge";
 import { chunkPtyInput, PTY_INPUT_MAX_BYTES } from "@/terminal/transport/ctl-codec";
+import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
 import { SessionUploadCoordinator } from "@/terminal/transport/session-upload";
 import {
   browserIdentityWire,
@@ -497,7 +498,9 @@ class WebViewSessionTransport implements SessionTransport {
     this.#emitError(error);
     this.#machine = reduceConnection(this.#machine, { type: "fail" });
     this.#setState("failed");
-    this.#rejectOpen?.(new Error(message));
+    // The rejection must carry the code: a caller that rewraps a bare Error
+    // erases device_not_trusted, and with it the approval ceremony.
+    this.#rejectOpen?.(new HostControlTransportError(code, message));
     this.#settleOpening();
     this.#retireSignal();
   }
