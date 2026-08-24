@@ -26,25 +26,36 @@ use crate::{config, creds, login, service};
 
 pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()> {
     force_file_store();
-    let server = config::server_url(server_cli.clone())?;
 
     // Explicit --config-dir → that dir is the instance, no per-account derivation.
     if explicit_config_dir() {
-        return possess_dir(&server, server_cli, args, &config::config_dir()?).await;
+        return possess_dir(server_cli, args, &config::config_dir()?).await;
     }
 
     let base = default_base()?;
-    // Silent resume: exactly one existing per-account registration.
+    // Silent resume: exactly one existing per-account registration. Unreadable
+    // credentials only cost the stored-server fallback, never the resume.
     let existing = account_dirs_with_creds(&base)?;
     if existing.len() == 1 {
         let dir = &existing[0];
+        std::env::set_var("SPAWN_CONFIG_DIR", dir);
+        let stored = creds::load().ok();
+        let server = config::server_url_for_instance(
+            server_cli,
+            stored
+                .as_ref()
+                .and_then(|creds| creds.server_url.as_deref()),
+        )?;
         service::install(dir, server.as_str()).context("starting the background service")?;
         println!(
             "spawn: already possessed ({}); daemon running in the background.",
             instance_account(dir)
         );
+        println!("{}", relogin_hint(&server, dir));
         return Ok(());
     }
+
+    let server = config::server_url(server_cli.clone())?;
 
     // One auth flow, staged, then promoted to <base>/<account_id>.
     let staging = base.join(".possess-staging");
@@ -92,13 +103,18 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
     Ok(())
 }
 
-async fn possess_dir(
-    server: &Url,
-    server_cli: Option<String>,
-    args: PossessArgs,
-    dir: &Path,
-) -> Result<()> {
-    if creds::load().map(|c| c.is_logged_in()).unwrap_or(false) {
+async fn possess_dir(server_cli: Option<String>, args: PossessArgs, dir: &Path) -> Result<()> {
+    // Unreadable credentials mean "not possessed" here, exactly as before:
+    // the login flow rebuilds them.
+    let stored = creds::load().ok();
+    let resumed = stored.as_ref().is_some_and(|creds| creds.is_logged_in());
+    let server = config::server_url_for_instance(
+        server_cli.clone(),
+        stored
+            .as_ref()
+            .and_then(|creds| creds.server_url.as_deref()),
+    )?;
+    if resumed {
         println!("spawn: already possessed; ensuring the background daemon is running.");
     } else {
         login::run(
@@ -116,18 +132,26 @@ async fn possess_dir(
         "spawn: possessed. daemon running in the background ({}).",
         service::instance_name(dir)
     );
+    if resumed {
+        println!("{}", relogin_hint(&server, dir));
+    }
     Ok(())
 }
 
 pub async fn exorcise(server_cli: Option<String>, args: ExorciseArgs) -> Result<()> {
     force_file_store();
-    let server = config::server_url(server_cli.clone())?;
+    // An explicit server must parse before anything is torn down; without one,
+    // each instance deregisters from the server it registered with.
+    let explicit = match server_cli {
+        Some(raw) => Some(config::server_url(Some(raw))?),
+        None => None,
+    };
 
     if args.all {
         let base = default_base()?;
         let mut removed = 0;
         for dir in account_dirs_with_creds(&base)? {
-            exorcise_one(&server, &dir).await;
+            exorcise_one(explicit.as_ref(), &dir).await;
             removed += 1;
         }
         println!("spawn: exorcised {removed} instance(s).");
@@ -145,17 +169,29 @@ pub async fn exorcise(server_cli: Option<String>, args: ExorciseArgs) -> Result<
             _ => bail!("multiple instances on this host; pass --config-dir <dir> or --all"),
         }
     };
-    exorcise_one(&server, &dir).await;
+    exorcise_one(explicit.as_ref(), &dir).await;
     println!("spawn: exorcised.");
     Ok(())
 }
 
-async fn exorcise_one(server: &Url, dir: &Path) {
+async fn exorcise_one(explicit: Option<&Url>, dir: &Path) {
     std::env::set_var("SPAWN_CONFIG_DIR", dir);
     if let Ok(creds) = creds::load() {
         if let Some(token) = creds.access_token.as_deref() {
-            if let Err(error) = deregister_self(server, token).await {
-                tracing::warn!(%error, dir = %dir.display(), "deregistering host");
+            match config::server_url_for_instance(
+                explicit.map(Url::to_string),
+                creds.server_url.as_deref(),
+            ) {
+                Ok(server) => {
+                    if let Err(error) = deregister_self(&server, token).await {
+                        tracing::warn!(%error, dir = %dir.display(), "deregistering host");
+                    }
+                }
+                // A damaged stored URL only skips the best-effort deregister;
+                // local teardown still proceeds.
+                Err(error) => {
+                    tracing::warn!(%error, dir = %dir.display(), "resolving the server to deregister from");
+                }
             }
         }
     }
@@ -236,6 +272,20 @@ fn staging_token() -> Result<String> {
         .context("staged login has no access token")
 }
 
+/// A resumed possession mints no approval link — only a fresh login ceremony
+/// does — so a browser sent here by the web app's "possess a host directly"
+/// escape would otherwise dead-end on "already possessed". Name the command
+/// that prints one, with the server and instance dir baked in so it works as
+/// typed: a bare `spawnd login` would target the default server and mint a
+/// fresh identity in the base dir.
+fn relogin_hint(server: &Url, dir: &Path) -> String {
+    format!(
+        "spawn: need an approval link for a new browser or device? run:\n\
+         spawn:   spawnd login --no-run --server \"{server}\" --config-dir \"{}\"",
+        dir.display()
+    )
+}
+
 fn instance_account(dir: &Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -275,6 +325,17 @@ mod tests {
         );
         assert_eq!(sanitize_account("../../etc/passwd"), "etc_passwd");
         assert_eq!(sanitize_account("///"), "account");
+    }
+
+    #[test]
+    fn relogin_hint_bakes_server_and_quotes_the_instance_dir() {
+        let hint = relogin_hint(
+            &Url::parse("https://spawn.example").unwrap(),
+            Path::new("/Users/x/Library/Application Support/spawn/acct-1"),
+        );
+        assert!(hint.contains("spawnd login --no-run"));
+        assert!(hint.contains("--server \"https://spawn.example/\""));
+        assert!(hint.contains("--config-dir \"/Users/x/Library/Application Support/spawn/acct-1\""));
     }
 
     #[test]

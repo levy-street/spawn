@@ -1541,10 +1541,11 @@ fn keyring_disabled() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// `spawnd status` — print what we know.
+/// `spawnd status` — print what we know. The "server:" line shows the URL the
+/// other commands would actually use: explicit flag/env, else the stored one.
 pub async fn status(server_cli: Option<String>) -> Result<()> {
-    let server = config::server_url(server_cli.clone())?;
     let creds = load().context("loading stored credentials")?;
+    let server = config::server_url_for_instance(server_cli, creds.server_url.as_deref())?;
     print!("{}", format_status(server.as_ref(), &creds)?);
     Ok(())
 }

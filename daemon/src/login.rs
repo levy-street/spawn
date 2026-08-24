@@ -34,11 +34,12 @@ pub struct LoginOutcome {
 }
 
 pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOutcome> {
-    let server = config::server_url(server_cli)?;
-
     // Persist before starting the ceremony so retries and interrupted logins
     // never rotate identity. A corrupt existing seed fails closed.
     let mut stored = creds::load().context("loading stored credentials")?;
+    // Re-authenticating an existing instance targets the server it registered
+    // with unless one is named explicitly; localhost is a fresh-install default.
+    let server = config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
     let expected = creds::credential_revision(&stored)?;
     let identity = creds::ensure_host_identity(&mut stored)?;
     creds::save(&mut stored, &expected).context("persisting host identity")?;
