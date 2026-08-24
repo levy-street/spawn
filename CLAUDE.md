@@ -3,6 +3,25 @@
 Read this before changing anything. `AGENTS.md` is a symlink to this file, so
 there is one copy and it cannot drift.
 
+## The map
+
+```
+web/      Next.js browser app                → web/CLAUDE.md
+mobile/   Expo / React Native app            → mobile/CLAUDE.md
+server/   FastAPI API + websockets + Alembic → server/CLAUDE.md
+daemon/   Rust spawnd + spawn-worker         → daemon/CLAUDE.md
+proto/    cross-runtime golden vectors shared by daemon and web crypto
+scripts/  deploy, health, smoke, and guard scripts; test-all.sh runs the lot
+infra/    docker-compose and nginx examples
+docs/     design docs, and docs/RELEASE.md — the release process
+tools/    development utilities
+.github/  CI workflows: tests and the rolling daemon prebuilts
+```
+
+Each product folder has its own `CLAUDE.md` (with an `AGENTS.md` symlink
+beside it) describing its layout, where new things go, and its checks. Read
+the one for the folder you are changing before you change it.
+
 ## spawn has two frontends. A change to one is a change to both
 
 `web/` (Next.js) and `mobile/` (Expo/React Native) are two clients of the same
@@ -39,5 +58,19 @@ cd server && .venv/bin/ruff check . && .venv/bin/python -m pytest -q
 Before deploying or releasing anything — server, web, a mobile update or
 build, daemon prebuilts — read `docs/RELEASE.md` in full. It is the entire
 release process: what ships together, what the deploy script refuses and why,
-and how to verify what actually reached production. Its guard rails exist
-because skipping one has already caused an outage.
+and how to verify what actually reached production.
+
+## These files stay true, or they are worse than nothing
+
+People and agents plan work from the CLAUDE.md files, so a stale one misroutes
+every change that follows it. Two rules keep them honest:
+
+- A commit that changes structure — a directory added, renamed, or moved — or
+  changes a convention or a command, updates the owning CLAUDE.md **in the
+  same commit**. The tree change and its documentation are one change, never
+  two.
+- `scripts/check-claude-md.sh` enforces the structural half mechanically:
+  every git-tracked directory under a documented root must be named in the
+  CLAUDE.md that owns it. `scripts/test-all.sh` runs it with the other
+  guards. When it fails, the fix is updating the CLAUDE.md — not widening the
+  guard.

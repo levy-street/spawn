@@ -47,6 +47,10 @@ printf '%s\n' "== host desktop launch guard =="
 scripts/check-host-desktop-launch.sh --self-test
 scripts/check-host-desktop-launch.sh
 
+printf '%s\n' "== CLAUDE.md structure guard =="
+scripts/check-claude-md.sh --self-test
+scripts/check-claude-md.sh
+
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
 
