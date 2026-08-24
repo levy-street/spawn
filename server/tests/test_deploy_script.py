@@ -452,3 +452,40 @@ def test_deploy_smoke_failure_fails_the_deploy_and_names_the_rollback(tmp_path: 
     assert result.returncode != 0
     assert "post-deploy smoke check failed" in result.stderr
     assert "Roll back with" in result.stderr
+
+
+def _push_side_branch(local: Path) -> None:
+    _git(["checkout", "-b", "feat/side"], local)
+    (local / "side.txt").write_text("side\n")
+    _git(["add", "side.txt"], local)
+    _git(["commit", "-m", "side"], local)
+    _git(["push", "-u", "origin", "feat/side"], local)
+
+
+def test_deploy_refuses_non_master_branch_without_opt_in(tmp_path: Path):
+    _origin, local, remote = _init_repo(tmp_path)
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    _push_side_branch(local)
+
+    result = _deploy(local, _deploy_env(tmp_path, fakebin, remote))
+
+    assert result.returncode != 0
+    assert "production deploys from master" in result.stderr
+    assert _log(tmp_path, "ssh-host.log") == ""
+
+
+def test_deploy_allows_non_master_branch_with_explicit_flag(tmp_path: Path):
+    _origin, local, remote = _init_repo(tmp_path)
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+    _push_side_branch(local)
+
+    result = _run(
+        [str(DEPLOY_SCRIPT), "prod", "--allow-branch"],
+        local,
+        env=_deploy_env(tmp_path, fakebin, remote),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "SPAWN_DEPLOY_BRANCH=feat/side" in _log(tmp_path, "ssh-command.log")

@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/deploy-prod.sh [ssh-host] [--api-proxy-target URL]
+Usage: scripts/deploy-prod.sh [ssh-host] [--api-proxy-target URL] [--allow-branch]
 
 Deploy the remote version of the current branch to a production host.
 
@@ -17,6 +17,9 @@ Options:
                           the build, so it MUST be passed as a flag -- an
                           inherited SPAWN_API_PROXY_TARGET is refused, not
                           used. See "The proxy target" below.
+  --allow-branch          Deploy the current non-master branch. Without this,
+                          only master deploys: production tracking a feature
+                          branch is drift, not a release.
 
 Environment:
   SPAWN_DEPLOY_HOST       SSH host alias/name. Overridden by [ssh-host].
@@ -68,11 +71,16 @@ quote_env() {
 
 host=""
 proxy_target_flag=""
+allow_branch=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
       usage
       exit 0
+      ;;
+    --allow-branch)
+      allow_branch=1
+      shift
       ;;
     --api-proxy-target)
       [[ $# -ge 2 ]] || die "--api-proxy-target needs a URL"
@@ -108,6 +116,14 @@ cd "$repo_root"
 
 branch="$(git branch --show-current)"
 [[ -n "$branch" ]] || die "detached HEAD is not deployable"
+
+# Production runs master. A branch deploy that looks routine is how prod
+# drifts from the one line of history everyone reads, so any other branch
+# needs the flag -- a flag can only arrive on purpose.
+if [[ "$branch" != "master" && "$allow_branch" != "1" ]]; then
+  die "refusing to deploy branch '$branch'; production deploys from master.
+  Pass --allow-branch to deploy this branch on purpose."
+fi
 
 remote="${SPAWN_DEPLOY_REMOTE:-origin}"
 remote_ref="$remote/$branch"
