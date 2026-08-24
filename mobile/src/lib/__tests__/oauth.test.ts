@@ -59,6 +59,7 @@ describe("signInWithProvider", () => {
 
     expect(getOAuthStartUrl).toHaveBeenCalledWith("google", {
       redirectUri: NATIVE_REDIRECT_URI,
+      invite: null,
     });
     // The redirect passed to the web view must match the one the URL was built
     // with, or the session never closes on the callback.
@@ -106,6 +107,23 @@ describe("signInWithProvider", () => {
     expect(await signInWithProvider("google", { browser })).toEqual({
       status: "failed",
       message: "this sign-in code is invalid or has expired",
+    });
+  });
+
+  it("carries an invite so a closed deployment can admit the account", async () => {
+    const browser = {
+      openAuthSessionAsync: jest.fn().mockResolvedValue({
+        type: "success",
+        url: "spawn://auth/oauth?code=one-time-code",
+      }),
+    };
+    jest.mocked(exchangeOAuthCode).mockResolvedValue(token);
+
+    await signInWithProvider("google", { browser, invite: "an-invite-code" });
+
+    expect(getOAuthStartUrl).toHaveBeenCalledWith("google", {
+      redirectUri: NATIVE_REDIRECT_URI,
+      invite: "an-invite-code",
     });
   });
 

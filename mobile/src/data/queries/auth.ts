@@ -76,11 +76,17 @@ export function useSignupMutation() {
 export function useOAuthSignInMutation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (provider: ProviderId): Promise<TokenResponse | null> => {
+    mutationFn: async ({
+      provider,
+      invite,
+    }: {
+      provider: ProviderId;
+      invite?: string | null;
+    }): Promise<TokenResponse | null> => {
       const outcome =
         provider === "apple" && (await isAppleSignInAvailable())
-          ? await signInWithAppleNatively()
-          : await signInWithProvider(provider);
+          ? await signInWithAppleNatively({ invite: invite ?? null })
+          : await signInWithProvider(provider, { invite: invite ?? null });
       if (outcome.status === "cancelled") return null;
       if (outcome.status === "failed") throw new Error(outcome.message);
       return outcome.token;

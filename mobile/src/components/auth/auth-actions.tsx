@@ -1,4 +1,5 @@
-import { StyleSheet } from "react-native";
+import type { ReactNode } from "react";
+import { StyleSheet, View } from "react-native";
 import { Button, type ButtonProps } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
 import { borderWidth, spacing, useTheme } from "@/theme";
@@ -8,6 +9,8 @@ type ActionOwnProps = Omit<ButtonProps, "children" | "size" | "style" | "variant
 export interface AuthActionProps extends ActionOwnProps {
   /** Both the struck label and the control's name. Sigil casing is visual only. */
   label: string;
+  /** Set beside the label, for the provider marks the brands require. */
+  icon?: ReactNode;
   /**
    * `primary` is the inked slab that commits the screen. `quiet` is the press's
    * own secondary: a hairline plate with bone type, never a filled grey one.
@@ -15,7 +18,7 @@ export interface AuthActionProps extends ActionOwnProps {
   tone?: "primary" | "quiet";
 }
 
-export function AuthAction({ label, tone = "primary", ...props }: AuthActionProps) {
+export function AuthAction({ icon, label, tone = "primary", ...props }: AuthActionProps) {
   // A disabled control on the press is an *unstruck* plate — a hairline and ash
   // type — not the bone slab dimmed to a muddy grey. Button dims an inactive
   // control by half, which turns bone into exactly the ash the press wants, so
@@ -37,9 +40,18 @@ export function AuthAction({ label, tone = "primary", ...props }: AuthActionProp
       ]}
       variant={hairline ? "outline" : "default"}
     >
-      <Text color={hairline ? "foreground" : "primaryForeground"} variant="sigilButton">
-        {label}
-      </Text>
+      {icon === undefined ? (
+        <Text color={hairline ? "foreground" : "primaryForeground"} variant="sigilButton">
+          {label}
+        </Text>
+      ) : (
+        <View style={styles.marked}>
+          {icon}
+          <Text color={hairline ? "foreground" : "primaryForeground"} variant="sigilButton">
+            {label}
+          </Text>
+        </View>
+      )}
     </Button>
   );
 }
@@ -68,6 +80,11 @@ export function AuthLink({ emphasis = false, label, ...props }: AuthLinkProps) {
 }
 
 const styles = StyleSheet.create({
+  marked: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: spacing[3],
+  },
   action: {
     width: "100%",
   },

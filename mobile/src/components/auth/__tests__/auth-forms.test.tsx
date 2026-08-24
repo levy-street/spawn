@@ -173,7 +173,7 @@ describe("OAuth buttons", () => {
 
     await fireEvent.press(await screen.findByRole("button", { name: "Continue with Google" }));
 
-    expect(signInWithProvider).toHaveBeenCalledWith("google");
+    expect(signInWithProvider).toHaveBeenCalledWith("google", { invite: null });
     expect(await screen.findByText("Google rejected the authorization code")).toBeTruthy();
   });
 

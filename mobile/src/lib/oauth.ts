@@ -59,6 +59,7 @@ export async function signInWithProvider(
   options: {
     browser?: AuthSessionOpener;
     exchange?: typeof exchangeOAuthCode;
+    invite?: string | null;
   } = {},
 ): Promise<OAuthSignInOutcome> {
   const browser = options.browser ?? WebBrowser;
@@ -66,7 +67,10 @@ export async function signInWithProvider(
 
   let result: WebBrowser.WebBrowserAuthSessionResult;
   try {
-    const startUrl = await getOAuthStartUrl(provider, { redirectUri: NATIVE_REDIRECT_URI });
+    const startUrl = await getOAuthStartUrl(provider, {
+      redirectUri: NATIVE_REDIRECT_URI,
+      invite: options.invite ?? null,
+    });
     result = await browser.openAuthSessionAsync(startUrl, NATIVE_REDIRECT_URI);
   } catch (error) {
     return { status: "failed", message: messageFor(error, "Sign-in could not be started.") };

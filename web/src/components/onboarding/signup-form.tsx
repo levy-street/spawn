@@ -50,7 +50,11 @@ export function SignupForm({
 
   return (
     <div className="space-y-5">
-      <OAuthButtons providers={config.providers} returnTo={oauthReturnTo} />
+      <OAuthButtons
+        invite={invite.trim() === "" ? null : invite.trim()}
+        providers={config.providers}
+        returnTo={oauthReturnTo}
+      />
 
       <form className="space-y-4" onSubmit={onSubmit}>
         <div className="space-y-2">

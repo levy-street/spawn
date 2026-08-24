@@ -191,6 +191,11 @@ class AuthProviderState(Base):
     state_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
     return_to: Mapped[str] = mapped_column(String(2048), nullable=False, default="/")
+    # An invite carried across the provider round trip on a closed deployment.
+    # Hashed, because this row outlives the request that made it and a raw code
+    # sitting in the database would be a usable credential; the invite table is
+    # keyed on the same hash, so nothing is lost.
+    invite_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
