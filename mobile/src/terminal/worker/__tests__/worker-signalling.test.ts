@@ -14,6 +14,13 @@ const RTC_SESSION_ID = "rtc-session";
 const CLIENT_NONCE = "0123456789abcdef0123456789abcdef";
 const SERVER_NONCE = "fedcba9876543210fedcba9876543210";
 const HOST_KEY = "host-key";
+const CARRIED_EDGE = {
+  account_id: "account-id",
+  endorser_public_key: "endorser-key",
+  endorsed_public_key: "browser-key",
+  endorsed_device_id: "endorsed-device-id",
+  signature: "endorsement-signature",
+};
 
 function moduleSource(marker: string): string {
   const markerIndex = TERMINAL_WORKER_HTML.indexOf(marker);
@@ -179,12 +186,16 @@ async function connect(harness: Harness): Promise<void> {
   });
 }
 
-async function signOffer(harness: Harness): Promise<void> {
+async function signOffer(
+  harness: Harness,
+  carriedEndorsements?: readonly Record<string, string>[],
+): Promise<void> {
   const request = posted(harness, "sign-request").at(-1);
   await harness.handleTransportMessage?.({
     type: "sign-response",
     requestId: request?.["requestId"],
     signature: "signature",
+    ...(carriedEndorsements === undefined ? {} : { carriedEndorsements }),
   });
 }
 
@@ -205,6 +216,26 @@ afterEach(() => {
 });
 
 describe("host-scoped signalling", () => {
+  test("carries endorsements on the outer offer only", async () => {
+    const harness = createHarness("host");
+    await connect(harness);
+    await signOffer(harness, [CARRIED_EDGE]);
+
+    const offer = emittedFrames(harness, "rtc.offer")[0];
+    expect(offer?.["carried_endorsements"]).toEqual([CARRIED_EDGE]);
+    expect(JSON.parse(String(offer?.["signed_envelope"]))).not.toHaveProperty(
+      "carried_endorsements",
+    );
+  });
+
+  test("omits carried_endorsements when the sign response has none", async () => {
+    const harness = createHarness("host");
+    await connect(harness);
+    await signOffer(harness);
+
+    expect(emittedFrames(harness, "rtc.offer")[0]).not.toHaveProperty("carried_endorsements");
+  });
+
   test("accepts daemon frames carrying the server's own binding nonce", async () => {
     const harness = createHarness("host");
     await connect(harness);
@@ -292,6 +323,26 @@ describe("host-scoped signalling", () => {
 });
 
 describe("session-scoped signalling", () => {
+  test("carries endorsements on the outer offer only", async () => {
+    const harness = createHarness("session");
+    await connect(harness);
+    await signOffer(harness, [CARRIED_EDGE]);
+
+    const offer = emittedFrames(harness, "rtc.offer")[0];
+    expect(offer?.["carried_endorsements"]).toEqual([CARRIED_EDGE]);
+    expect(JSON.parse(String(offer?.["signed_envelope"]))).not.toHaveProperty(
+      "carried_endorsements",
+    );
+  });
+
+  test("omits carried_endorsements when the sign response has none", async () => {
+    const harness = createHarness("session");
+    await connect(harness);
+    await signOffer(harness);
+
+    expect(emittedFrames(harness, "rtc.offer")[0]).not.toHaveProperty("carried_endorsements");
+  });
+
   test("keeps the nonce match and generation gate the session channel provides", async () => {
     const harness = createHarness("session");
     await connect(harness);

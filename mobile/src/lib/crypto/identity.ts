@@ -16,8 +16,10 @@ import {
 } from "@/lib/crypto/ed25519";
 import { encodeSignedSignalV2, type SignalTranscript } from "@/lib/crypto/signed-signal";
 import {
+  type AccountEndorsementTranscript,
   type ApprovalTranscript,
   type EndorsementTranscript,
+  encodeAccountEndorsementV1,
   encodeBrowserEndorsementV1,
   encodeBrowserRegistrationV2,
   encodeHostPairApprovalV1,
@@ -64,6 +66,11 @@ export function setDeviceIdentityAccount(accountId: string): void {
 
 export function clearDeviceIdentityAccount(): void {
   activeAccountId = null;
+}
+
+/** The account the identity is currently bound to, or null when signed out. */
+export function activeDeviceIdentityAccount(): string | null {
+  return activeAccountId;
 }
 
 export function onDeviceIdentityReset(handler: (accountId: string) => Promise<void>): () => void {
@@ -276,6 +283,21 @@ export const deviceIdentity = {
         throw new Error("Endorsement transcript does not match the active device identity");
       }
       return encodeBrowserEndorsementV1(transcript);
+    });
+  },
+
+  /**
+   * Vouch for another device account-wide (mesh §3). The caller has compared
+   * the endorsed key's fingerprint against the one that device shows; signing
+   * records that comparison, and the edge is carried by the endorsed device to
+   * every host that anchors on this one.
+   */
+  signAccountEndorsement(transcript: AccountEndorsementTranscript): Promise<Uint8Array> {
+    return signBounded((accountId, publicKeyWire) => {
+      if (transcript.accountId !== accountId || transcript.endorserPublicKey !== publicKeyWire) {
+        throw new Error("Account endorsement transcript does not match the active device identity");
+      }
+      return encodeAccountEndorsementV1(transcript);
     });
   },
 

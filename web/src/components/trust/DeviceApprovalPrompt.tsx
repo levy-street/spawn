@@ -1,15 +1,26 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Laptop, ShieldAlert, Smartphone } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { useDeviceTrustMap, useEndorseDevice } from "@/components/trust/device-endorsement";
+import {
+  useAccountEndorsementEdges,
+  useDeviceTrustMap,
+  useEndorseDevice,
+} from "@/components/trust/device-endorsement";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { subscribeToTrustEvents } from "@/lib/alert-socket";
 import { type BrowserDevice, browserDevices, type DeviceApprovalRequest, trust } from "@/lib/api";
 import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
+import { hostsTrustingDevice } from "@/lib/trust-roster";
 
 /**
  * The prompt a trusted browser shows when another device knocks.
@@ -22,14 +33,11 @@ import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
  * when the tab opens.
  *
  * It renders nothing unless this browser can actually help: approving means
- * signing an endorsement, which only a browser some host already trusts can
- * do. Prompting a browser that would only fail is worse than staying quiet.
- *
- * Chain-capable hosts refuse the per-host endorsement this dialog signs
- * (mesh R9), and the asking device may not speak the account ceremony at all
- * (the phone doesn't yet) — so when no approvable host remains, the dialog
- * offers the path that does work, a `spawnd login` pairing code, instead of
- * an approve button that can only throw.
+ * signing an endorsement, and only a browser some host already trusts —
+ * directly, or through an account chain — can sign one that any host will
+ * honour. Prompting a browser that would only fail is worse than staying quiet.
+ * The hosts the approval reaches are named in the dialog, so "approve" never
+ * promises more than the hosts anchored on this browser.
  */
 export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }) {
   const queryClient = useQueryClient();
@@ -56,19 +64,23 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
     enabled: accountId !== null,
   });
   const trustMap = useDeviceTrustMap(accountId !== null);
+  const edges = useAccountEndorsementEdges(accountId !== null);
   const thisBrowser = (devices.data ?? []).find(
     (device) => device.public_key === identity.data?.publicKeyWire,
   );
-  // Only a browser some host already trusts can vouch at all. Within that,
-  // the per-host endorsement this dialog signs works only toward hosts that
-  // have not moved to account chains (mesh R9).
-  const trustedHostIds =
-    thisBrowser === undefined ? [] : trustMap.trustedHostIdsFor(thisBrowser.id);
-  const canHelp = trustedHostIds.length > 0;
-  const legacyHosts = trustedHostIds
-    .map((hostId) => trustMap.hostsById.get(hostId))
-    .filter((host) => host !== undefined && host.supports_account_chains !== true);
-  const canApprove = legacyHosts.length > 0;
+  // Only a browser some host already trusts can vouch at all, and the approval
+  // it signs reaches exactly the hosts that trust it (mesh §3).
+  const coveredHosts =
+    thisBrowser === undefined
+      ? []
+      : hostsTrustingDevice(
+          thisBrowser.id,
+          trustMap.keyedHosts,
+          trustMap.pinsByHost,
+          devices.data ?? [],
+          edges.data ?? [],
+        );
+  const canHelp = coveredHosts.length > 0;
 
   useEffect(() => {
     if (accountId === null) return;
@@ -110,57 +122,41 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
 
   const busy = endorse.isPending || deny.isPending;
   const label = target.label ?? "A device";
-  const isPhone = /iphone|ipad|android|pixel|phone|tablet/iu.test(label);
-  const DeviceGlyph = isPhone ? Smartphone : Laptop;
 
   return (
     <Dialog open onOpenChange={(open) => (open ? undefined : dismiss(request.id))}>
       <DialogContent size="sm" hideClose data-testid="device-approval-prompt">
-        <div className="flex flex-col items-center gap-1 pt-2 text-center">
-          <span className="flex size-12 items-center justify-center rounded-full border border-border bg-muted/60">
-            <DeviceGlyph aria-hidden className="size-6 text-muted-foreground" />
-          </span>
-          <DialogTitle className="pt-2 text-base font-semibold">
-            {label} is asking to join
-          </DialogTitle>
-          <DialogDescription className="max-w-[36ch] text-sm text-muted-foreground">
-            It signed in as you, and stays locked out of every host until you vouch for it.
+        <DialogHeader>
+          <DialogTitle>{label} is asking to join</DialogTitle>
+          <DialogDescription>
+            It signed in as you, and stays locked out of your hosts until you vouch for it.
           </DialogDescription>
-        </div>
+        </DialogHeader>
 
-        <div className="space-y-2 pt-1">
-          <p className="select-all break-all rounded-lg border border-border bg-muted/60 px-3 py-3 text-center font-mono text-base font-semibold tracking-wide">
+        <div className="space-y-3 px-4">
+          <p className="select-all break-all rounded-md border border-border bg-muted/60 px-3 py-2.5 text-center font-mono text-sm font-semibold tracking-wide">
             {request.fingerprint}
           </p>
-          <p className="text-center text-xs leading-relaxed text-muted-foreground">
-            The asking device shows a fingerprint on its screen. It must match this one, character
-            for character — the name above is a label anyone can set; only the fingerprint proves
-            which device you are trusting.
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            {label} shows a fingerprint on its screen. Approve only if it matches this one exactly —
+            the name is a label anyone can set; the fingerprint is what proves which device you are
+            trusting.
           </p>
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            Approving here lets it connect to{" "}
+            <span className="text-foreground">
+              {formatHostList(coveredHosts.map((h) => h.name))}
+            </span>
+            . Other hosts will ask again from a screen they already trust.
+          </p>
+          {failure !== null && (
+            <p className="text-sm text-destructive" role="alert">
+              {failure}
+            </p>
+          )}
         </div>
 
-        {!canApprove && (
-          <div className="space-y-1.5 rounded-lg border border-border bg-muted/40 p-3">
-            <p className="flex items-center gap-2 text-sm font-medium">
-              <ShieldAlert aria-hidden className="size-4 text-muted-foreground" />
-              Your hosts take a pairing code
-            </p>
-            <p className="text-sm leading-relaxed text-muted-foreground">
-              They use account-wide trust, which {label} cannot join remotely yet. On the host, run{" "}
-              <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">spawnd login</code>{" "}
-              and enter the code it prints on {label} under{" "}
-              <span className="text-foreground">Enter a pairing code</span>.
-            </p>
-          </div>
-        )}
-
-        {failure !== null && (
-          <p className="text-center text-sm text-destructive" role="alert">
-            {failure}
-          </p>
-        )}
-
-        <div className="flex justify-center gap-2 pt-1">
+        <DialogFooter>
           <Button
             type="button"
             variant="outline"
@@ -170,31 +166,33 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
           >
             Deny
           </Button>
-          {canApprove ? (
-            <Button
-              type="button"
-              size="sm"
-              disabled={busy}
-              onClick={() => {
-                setFailure(null);
-                endorse.mutate(
-                  { target, targetFingerprint: request.fingerprint },
-                  {
-                    onError: (error) =>
-                      setFailure(error instanceof Error ? error.message : String(error)),
-                  },
-                );
-              }}
-            >
-              {endorse.isPending ? "Approving…" : "It matches — approve"}
-            </Button>
-          ) : (
-            <Button type="button" size="sm" disabled={busy} onClick={() => dismiss(request.id)}>
-              Got it
-            </Button>
-          )}
-        </div>
+          <Button
+            type="button"
+            size="sm"
+            disabled={busy}
+            onClick={() => {
+              setFailure(null);
+              endorse.mutate(
+                { target, targetFingerprint: request.fingerprint },
+                {
+                  onError: (error) =>
+                    setFailure(error instanceof Error ? error.message : String(error)),
+                },
+              );
+            }}
+          >
+            {endorse.isPending ? "Approving…" : "It matches — approve"}
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
+}
+
+/** "dream", "dream and minivac", "dream, minivac and 3 more". */
+function formatHostList(names: readonly string[]): string {
+  if (names.length <= 2) return names.join(" and ");
+  const shown = names.slice(0, 2).join(", ");
+  const rest = names.length - 2;
+  return `${shown} and ${rest} more`;
 }

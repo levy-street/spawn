@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render, screen } from "@testing-library/react-native";
+import { render, screen } from "@testing-library/react-native";
 
 import { DeviceApprovalCeremony } from "@/components/trust/device-approval-ceremony";
 import { ThemeProvider } from "@/theme";
@@ -119,11 +119,16 @@ describe("device approval ceremony", () => {
     expect(screen.getByText(/Device identity could not be stored/)).toBeOnTheScreen();
   });
 
-  test("a chain-capable host leads with the pairing code, not a false promise", async () => {
+  test("a chain-capable host is approved from another screen too, with the code as fallback", async () => {
+    // The knock is answered with an account endorsement, which this device
+    // carries to every host anchored on the approving screen (mesh §3) — so
+    // the promise holds for chain hosts exactly as for per-host ones.
     mockChainHost = true;
     await renderCeremony();
-    expect(screen.getByText(/takes a pairing code/i)).toBeOnTheScreen();
-    expect(screen.queryByText(/prompt is up on every screen/i)).toBeNull();
+    expect(mockRequestApproval).toHaveBeenCalledWith(PHONE_ID);
+    expect(screen.getByText(/waiting on your say-so/i)).toBeOnTheScreen();
+    expect(screen.getByText(/prompt is up on every screen/i)).toBeOnTheScreen();
+    expect(screen.queryByText(/takes a pairing code/i)).toBeNull();
     expect(screen.getByText("Enter a pairing code")).toBeOnTheScreen();
   });
 });

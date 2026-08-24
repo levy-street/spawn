@@ -14,6 +14,7 @@ import base64
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from spawn_server.acct_endorsement import encode_acct_endorsement_transcript
 from spawn_server.browser_registration import encode_browser_registration_transcript
 from spawn_server.host_identity import ed25519_key_fingerprint
 
@@ -35,6 +36,13 @@ async def _signup(client, email: str) -> tuple[str, dict[str, str]]:
 
 
 async def _register_device(client, user_id: str, headers: dict[str, str], label: str) -> dict:
+    device, _key = await _register_device_with_key(client, user_id, headers, label)
+    return device
+
+
+async def _register_device_with_key(
+    client, user_id: str, headers: dict[str, str], label: str
+) -> tuple[dict, Ed25519PrivateKey]:
     key = Ed25519PrivateKey.generate()
     public_key = key.public_key().public_bytes_raw()
     response = await client.post(
@@ -52,7 +60,7 @@ async def _register_device(client, user_id: str, headers: dict[str, str], label:
         headers=headers,
     )
     assert response.status_code == 200, response.text
-    return response.json()
+    return response.json(), key
 
 
 async def test_knock_is_listed_for_the_account_and_carries_the_real_fingerprint(client):
@@ -161,3 +169,53 @@ async def test_a_knock_alone_admits_nothing(client):
     for host in hosts.json():
         pins = await client.get(f"/api/trust/hosts/{host['id']}/pins", headers=headers)
         assert device["id"] not in pins.json()
+
+
+async def test_an_account_endorsement_answers_the_knock(client):
+    """Toward a chain-capable host the per-host path is refused (mesh R9), so
+    the approval a knock waits for is an account endorsement. It must close the
+    knock like the per-host one does, or the prompt keeps nagging every screen
+    on the account after the device has already been admitted."""
+
+    user_id, headers = await _signup(client, "acct-answers-knock@example.com")
+    laptop, laptop_key = await _register_device_with_key(client, user_id, headers, "Laptop")
+    phone, phone_key = await _register_device_with_key(client, user_id, headers, "iPhone")
+    knock = await client.post(
+        "/api/trust/device-approvals",
+        json={"browser_device_id": phone["id"]},
+        headers=headers,
+    )
+    assert knock.status_code == 200, knock.text
+    assert [
+        row["id"]
+        for row in (await client.get("/api/trust/device-approvals", headers=headers)).json()
+    ] == [knock.json()["id"]]
+
+    transcript = encode_acct_endorsement_transcript(
+        user_id,
+        laptop_key.public_key().public_bytes_raw(),
+        phone_key.public_key().public_bytes_raw(),
+        phone["id"],
+    )
+    body = {
+        "endorser_device_id": laptop["id"],
+        "endorsed_device_id": phone["id"],
+        "signature": _wire(laptop_key.sign(transcript)),
+    }
+    endorsed = await client.post("/api/trust/account-endorsements", json=body, headers=headers)
+    assert endorsed.status_code == 200, endorsed.text
+
+    listed = await client.get("/api/trust/device-approvals", headers=headers)
+    assert listed.status_code == 200
+    assert listed.json() == [], "the knock is answered, so nothing is pending"
+
+    # A retry of the same edge is idempotent and still closes a fresh knock.
+    again = await client.post(
+        "/api/trust/device-approvals",
+        json={"browser_device_id": phone["id"]},
+        headers=headers,
+    )
+    assert again.status_code == 200
+    retried = await client.post("/api/trust/account-endorsements", json=body, headers=headers)
+    assert retried.status_code == 200, retried.text
+    assert (await client.get("/api/trust/device-approvals", headers=headers)).json() == []

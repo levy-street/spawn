@@ -1,3 +1,4 @@
+import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import type {
   ScrollState,
   TransportState,
@@ -48,6 +49,7 @@ export type NativeToWorkerMessage =
       type: "sign-response";
       requestId: string;
       signature?: string;
+      carriedEndorsements?: readonly CarriedEndorsement[];
       error?: string;
     })
   | (NativeMessage & { type: "input"; sequence: number; data: string })

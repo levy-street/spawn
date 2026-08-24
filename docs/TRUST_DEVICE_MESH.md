@@ -134,6 +134,21 @@ Commit-then-reveal is mandatory — see §6, Proof of P2.
   directions are equally justified). If `x` holds the passkey, `c` is *also*
   endorsed directly by `R`. `c` receives the trust bundle (host keys) so it knows
   every host.
+- **approve-knock(new = c, from existing = x)** *(2026-08-25; the mobile app's
+  admission path).* `c` knocks (`/api/trust/device-approvals`, advisory — grants
+  nothing); every screen `x` that some host trusts shows the prompt with `c`'s
+  fingerprint, derived locally from `pk_c`. On an exact match against the
+  fingerprint `c` shows on its own screen, `x` signs the account endorsement
+  `x → c` **only** — the same `SPAWN-ACCT-ENDORSE-V1` statement `add-device`
+  makes, over a full-entropy compare instead of the SAS number (the compare
+  A5 already accepts as the possess fallback; a server cannot grind a key to a
+  chosen fingerprint). No reverse edge: `c` verified nothing about `x`, so
+  `c → x` would let a key `x`'s owner never checked reach hosts anchored on
+  `c`. `c` is therefore admitted exactly to the hosts anchored on — or chained
+  to — `x`, and the prompt names them; a host anchored elsewhere raises the
+  knock again on a screen it trusts. P1's mutual invariant is restored by a
+  later `add-device` or heal. Toward a host without `supports_account_chains`
+  the prompt signs the legacy per-host statement instead (R9 exemption path).
 - **connect(d → h).** `d` presents its chain; `h` applies the admission rule.
 - **revoke(d).** Account owner adds `pk_d` to `Rev`. Server pushes to all
   connected hosts immediately and holds it for offline hosts to fetch on

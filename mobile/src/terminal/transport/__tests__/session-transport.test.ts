@@ -1,3 +1,4 @@
+import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import type { NativeToWorkerMessage, WorkerToNativeMessage } from "@/terminal/transport/bridge";
 import { decodeBridgeBytes } from "@/terminal/transport/bridge";
 import { createSessionTransport } from "@/terminal/transport/session-transport";
@@ -20,6 +21,14 @@ jest.mock("@/terminal/transport/signed-signalling", () => ({
 jest.mock("@/lib/crypto/bootstrap", () => ({
   randomBytes: jest.fn((length: number) => new Uint8Array(length)),
 }));
+
+const CARRIED_EDGE: CarriedEndorsement = {
+  account_id: "account-id",
+  endorser_public_key: "endorser-key",
+  endorsed_public_key: "browser-key",
+  endorsed_device_id: "endorsed-device-id",
+  signature: "endorsement-signature",
+};
 
 class FakeBridge implements WorkerEndpoint {
   readonly sent: NativeToWorkerMessage[] = [];
@@ -66,7 +75,9 @@ function flush(): Promise<void> {
   return new Promise((resolve) => setImmediate(() => resolve()));
 }
 
-async function readyTransport(): Promise<{
+async function readyTransport(
+  options: { loadCarriedEndorsements?: () => Promise<readonly CarriedEndorsement[]> } = {},
+): Promise<{
   bridge: FakeBridge;
   signal: FakeSignal;
   transport: ReturnType<typeof createSessionTransport>;
@@ -80,6 +91,7 @@ async function readyTransport(): Promise<{
     theme: terminalDark,
     bridge,
     openSignal: () => signal,
+    loadCarriedEndorsements: options.loadCarriedEndorsements ?? (async () => []),
   });
   const opening = transport.open();
   await flush();
@@ -137,6 +149,74 @@ describe("SessionTransport", () => {
       requestId: "sign-1",
       signature: "signature",
     });
+    transport.close();
+  });
+
+  test("passes loaded carried endorsements in the sign response", async () => {
+    const loadCarriedEndorsements = jest.fn(async () => [CARRIED_EDGE]);
+    const { bridge, transport } = await readyTransport({ loadCarriedEndorsements });
+
+    bridge.emit({
+      v: 1,
+      type: "sign-request",
+      requestId: "sign-with-chain",
+      transcript: {
+        signalKind: "offer",
+        protocolVersion: 2,
+        sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
+        scopeType: "session",
+        scopeId: "00112233-4455-6677-8899-aabbccddeeff",
+        senderRole: "browser",
+        intendedPeerIdentityPublicKey: "host-key",
+        sdp: "v=0",
+      },
+    });
+    await flush();
+
+    expect(loadCarriedEndorsements).toHaveBeenCalledTimes(1);
+    expect(bridge.sent).toContainEqual({
+      v: 1,
+      type: "sign-response",
+      requestId: "sign-with-chain",
+      signature: "signature",
+      carriedEndorsements: [CARRIED_EDGE],
+    });
+    transport.close();
+  });
+
+  test("still sends the signature when loading carried endorsements fails", async () => {
+    const loadCarriedEndorsements = jest.fn(async () => {
+      throw new Error("offline");
+    });
+    const { bridge, transport } = await readyTransport({ loadCarriedEndorsements });
+
+    bridge.emit({
+      v: 1,
+      type: "sign-request",
+      requestId: "sign-without-chain",
+      transcript: {
+        signalKind: "offer",
+        protocolVersion: 2,
+        sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
+        scopeType: "session",
+        scopeId: "00112233-4455-6677-8899-aabbccddeeff",
+        senderRole: "browser",
+        intendedPeerIdentityPublicKey: "host-key",
+        sdp: "v=0",
+      },
+    });
+    await flush();
+
+    const response = bridge.sent.find(
+      (message) => message.type === "sign-response" && message.requestId === "sign-without-chain",
+    );
+    expect(response).toEqual({
+      v: 1,
+      type: "sign-response",
+      requestId: "sign-without-chain",
+      signature: "signature",
+    });
+    expect(response).not.toHaveProperty("carriedEndorsements");
     transport.close();
   });
 

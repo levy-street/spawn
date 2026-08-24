@@ -5,10 +5,12 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { type BrowserDevice, browserDevices, hosts, trust } from "@/lib/api";
 import {
+  createAccountEndorsementProof,
   createBrowserEndorsementProof,
   loadBrowserDeviceIdentity,
 } from "@/lib/browser-device-identity";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
+import { hostsTrustingDevice } from "@/lib/trust-roster";
 
 /**
  * Advisory trust coverage: which hosts already accept which browser devices.
@@ -54,17 +56,20 @@ export function useDeviceTrustMap(enabled: boolean) {
   };
 }
 
-/**
- * The endorsement ceremony, inline. The fingerprint comparison is the entire
- * security value: signing proves this device vouched for a key, but only the
- * operator seeing the same fingerprint on both screens proves the key belongs
- * to the device they think it does. Everything security-relevant here is
- * preserved from the original /trust flow: the endorsed fingerprint is
- * re-derived locally from the key (a server-substituted key is refused), and
- * the endorsement covers every host this endorsing device is trusted by.
- */
+/** The account's endorsement edges, for coverage and carried chains. */
+export function useAccountEndorsementEdges(enabled: boolean) {
+  return useQuery({
+    queryKey: ["trust", "account-endorsements"],
+    queryFn: () => trust.accountEndorsements(),
+    enabled,
+    refetchInterval: 15_000,
+  });
+}
+
 export interface EndorsementResult {
+  /** Hosts this approval covers — where the device can connect next. */
   count: number;
+  hostNames: string[];
   fingerprint: string;
 }
 
@@ -77,6 +82,18 @@ export interface EndorsementResult {
  * anything if the key being signed is the key that fingerprint describes. A
  * server that pairs the victim's fingerprint with its own key gets a refusal,
  * not a signature.
+ *
+ * What gets signed depends on the hosts this browser can vouch toward:
+ * - toward a host that validates account chains (mesh §3, every current
+ *   daemon), ONE account-scoped endorsement — this browser → the device — which
+ *   the device carries on its offers and every such host anchored on (or
+ *   chained to) this browser accepts;
+ * - toward a host still on the per-host path, one per-host endorsement each,
+ *   exactly as before (a chain-capable host refuses these — mesh R9).
+ * The account edge is one-directional on purpose: the operator verified the
+ * asking device's key, not the other way round, so no reverse edge is signed
+ * (the mutual edge of the SAS ceremony would let a key this browser never
+ * checked reach hosts anchored on the new device).
  */
 export function useEndorseDevice(
   accountId: string,
@@ -99,22 +116,6 @@ export function useEndorseDevice(
       if (mine === undefined) {
         throw new Error("This browser is not registered with the server.");
       }
-      // Mesh R9: chain-capable hosts refuse per-host device endorsements (the
-      // add-device ceremony covers them account-wide), so this legacy path only
-      // targets hosts that have not advertised chain support.
-      const keyed = (await hosts.list()).filter(
-        (host) => (host.host_public_key ?? null) !== null && !host.supports_account_chains,
-      );
-      const myHostIds = new Set<string>();
-      for (const host of keyed) {
-        if ((await trust.hostPins(host.id)).includes(mine.id)) myHostIds.add(host.id);
-      }
-      const targets = keyed.filter((host) => myHostIds.has(host.id));
-      if (targets.length === 0) {
-        throw new Error(
-          "Every host you can vouch toward accepts account-wide trust — use “Add a device to your account” above instead of per-host approval.",
-        );
-      }
       // The fingerprint the operator compared is only meaningful if it is the
       // fingerprint of the key being signed. Re-derive and refuse on mismatch
       // so a hostile server cannot pair the victim's fingerprint with its own
@@ -126,8 +127,35 @@ export function useEndorseDevice(
           "This device's fingerprint does not match its key. Refusing to approve — the server may be substituting a key.",
         );
       }
-      let count = 0;
-      for (const host of targets) {
+      const keyed = (await hosts.list()).filter((host) => (host.host_public_key ?? null) !== null);
+      const pinsByHost = new Map(
+        await Promise.all(
+          keyed.map(async (host) => [host.id, await trust.hostPins(host.id)] as const),
+        ),
+      );
+      const edges = await trust.accountEndorsements();
+      const covered = hostsTrustingDevice(mine.id, keyed, pinsByHost, registered, edges);
+      if (covered.length === 0) {
+        throw new Error(
+          "No host trusts this browser yet, so it cannot vouch for another device. Approve from a device that already works.",
+        );
+      }
+      const chainHosts = covered.filter((host) => host.supports_account_chains);
+      const legacyHosts = covered.filter((host) => !host.supports_account_chains);
+      if (chainHosts.length > 0) {
+        const signature = await createAccountEndorsementProof(
+          identity,
+          accountId,
+          target.public_key,
+          target.id,
+        );
+        await trust.createAccountEndorsement({
+          endorser_device_id: mine.id,
+          endorsed_device_id: target.id,
+          signature,
+        });
+      }
+      for (const host of legacyHosts) {
         const signature = await createBrowserEndorsementProof(
           identity,
           accountId,
@@ -141,9 +169,12 @@ export function useEndorseDevice(
           endorsed_device_id: target.id,
           signature,
         });
-        count += 1;
       }
-      return { count, fingerprint: derived };
+      return {
+        count: covered.length,
+        hostNames: covered.map((host) => host.name),
+        fingerprint: derived,
+      };
     },
     onSuccess: (result, variables) => {
       queryClient.invalidateQueries({ queryKey: ["trust"] });

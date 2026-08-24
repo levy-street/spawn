@@ -9,6 +9,7 @@ const REGISTRATION_MAGIC = encodeUtf8("SPAWN-BROWSER-REGISTER-V2");
 const APPROVAL_MAGIC = encodeUtf8("SPAWN-HOST-PAIR-APPROVE-V1");
 const POSSESSION_MAGIC = encodeUtf8("SPAWN-HOST-PAIR-POSSESSION-V1");
 const ENDORSEMENT_MAGIC = encodeUtf8("SPAWN-BROWSER-ENDORSE-V1");
+const ACCT_ENDORSEMENT_MAGIC = encodeUtf8("SPAWN-ACCT-ENDORSE-V1");
 const VERSION_ONE = Uint8Array.of(1);
 const VERSION_TWO = Uint8Array.of(2);
 // V2 flags byte, bit 0: the account-root claim (pk_R). Root-hood carries real
@@ -45,6 +46,20 @@ export interface PossessionTranscript {
 export interface EndorsementTranscript {
   accountId: string;
   hostPublicKey: string;
+  endorserPublicKey: string;
+  endorsedPublicKey: string;
+  endorsedDeviceId: string;
+}
+
+/**
+ * Account-scoped endorsement (device mesh §3): the per-host transcript with the
+ * host field removed, so one signed edge is valid toward every host of the
+ * account. Byte-identical to daemon/src/acct_endorsement.rs, the server's
+ * acct_endorsement.py and web's acct-endorsement-transcript.ts — the daemon is
+ * the party that verifies what this signs.
+ */
+export interface AccountEndorsementTranscript {
+  accountId: string;
   endorserPublicKey: string;
   endorsedPublicKey: string;
   endorsedDeviceId: string;
@@ -93,6 +108,21 @@ export function encodeBrowserEndorsementV1(input: EndorsementTranscript): Uint8A
   );
 }
 
+export function encodeAccountEndorsementV1(input: AccountEndorsementTranscript): Uint8Array {
+  if (input.endorserPublicKey === input.endorsedPublicKey) {
+    // A device admitting itself is exactly the authority endorsement withholds.
+    throw new Error("a device may not endorse itself");
+  }
+  return concatBytes(
+    ACCT_ENDORSEMENT_MAGIC,
+    VERSION_ONE,
+    uuidToBytes(input.accountId),
+    publicKey(input.endorserPublicKey),
+    publicKey(input.endorsedPublicKey),
+    uuidToBytes(input.endorsedDeviceId),
+  );
+}
+
 export function signBrowserRegistrationV2(
   seed: Uint8Array,
   input: RegistrationTranscript,
@@ -116,6 +146,13 @@ export function signBrowserEndorsementV1(
   input: EndorsementTranscript,
 ): Uint8Array {
   return signPureEd25519(seed, encodeBrowserEndorsementV1(input));
+}
+
+export function signAccountEndorsementV1(
+  seed: Uint8Array,
+  input: AccountEndorsementTranscript,
+): Uint8Array {
+  return signPureEd25519(seed, encodeAccountEndorsementV1(input));
 }
 
 export function verifyBrowserRegistrationV2(
@@ -148,4 +185,12 @@ export function verifyBrowserEndorsementV1(
   signature: Uint8Array,
 ): boolean {
   return verifyPureEd25519Strict(publicKey, encodeBrowserEndorsementV1(input), signature);
+}
+
+export function verifyAccountEndorsementV1(
+  publicKey: Uint8Array,
+  input: AccountEndorsementTranscript,
+  signature: Uint8Array,
+): boolean {
+  return verifyPureEd25519Strict(publicKey, encodeAccountEndorsementV1(input), signature);
 }

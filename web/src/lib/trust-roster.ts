@@ -38,35 +38,32 @@ export interface DeviceTrustSummary {
  * only — an edge from a revoked device grants nothing, exactly like the
  * daemon's `RevocationSet` subtraction.
  */
-export function computeTrustRoster(
-  devices: readonly RosterDevice[],
+/**
+ * Device ids reachable from `anchorIds` over live→live edges — the client-side
+ * mirror of the daemon's chain search from one host's pins (mesh §3), so a
+ * surface can tell whether a device would be admitted through a chain. Only
+ * live anchors seed the walk: a revoked pin grants nothing.
+ */
+export function chainReachableFrom(
+  anchorIds: Iterable<string>,
+  devices: readonly Pick<RosterDevice, "id" | "revoked_at">[],
   edges: readonly RosterEdge[],
-  pinnedDeviceIds: ReadonlySet<string>,
-): Map<string, DeviceTrustSummary> {
-  const live = new Map(devices.filter((d) => d.revoked_at === null).map((d) => [d.id, d]));
-  const liveRoot = devices.find((d) => d.is_root && d.revoked_at === null) ?? null;
-
-  const liveEdges = edges.filter(
-    (e) => live.has(e.endorser_device_id) && live.has(e.endorsed_device_id),
-  );
+): Set<string> {
+  const live = new Set(devices.filter((d) => d.revoked_at === null).map((d) => d.id));
   const outgoing = new Map<string, string[]>();
-  const vouchers = new Map<string, Set<string>>();
-  for (const edge of liveEdges) {
+  for (const edge of edges) {
+    if (!live.has(edge.endorser_device_id) || !live.has(edge.endorsed_device_id)) continue;
     outgoing.set(edge.endorser_device_id, [
       ...(outgoing.get(edge.endorser_device_id) ?? []),
       edge.endorsed_device_id,
     ]);
-    const set = vouchers.get(edge.endorsed_device_id) ?? new Set<string>();
-    set.add(edge.endorser_device_id);
-    vouchers.set(edge.endorsed_device_id, set);
   }
-
   const reachable = new Set<string>();
   const queue: string[] = [];
-  for (const device of live.values()) {
-    if (device.is_root || pinnedDeviceIds.has(device.id)) {
-      reachable.add(device.id);
-      queue.push(device.id);
+  for (const id of anchorIds) {
+    if (live.has(id) && !reachable.has(id)) {
+      reachable.add(id);
+      queue.push(id);
     }
   }
   while (queue.length > 0) {
@@ -78,6 +75,52 @@ export function computeTrustRoster(
       }
     }
   }
+  return reachable;
+}
+
+/**
+ * The hosts that would admit `deviceId` today, and therefore the hosts an
+ * endorsement signed by it can cover: every host that pins it directly, plus —
+ * on hosts whose daemons validate account chains (mesh §3) — every host one of
+ * whose pins reaches it through live account endorsements. Advisory like the
+ * rest of this file; the daemon decides at the door.
+ */
+export function hostsTrustingDevice<H extends { id: string; supports_account_chains?: boolean }>(
+  deviceId: string,
+  hostList: readonly H[],
+  pinsByHost: ReadonlyMap<string, readonly string[]>,
+  devices: readonly Pick<RosterDevice, "id" | "revoked_at">[],
+  edges: readonly RosterEdge[],
+): H[] {
+  return hostList.filter((host) => {
+    const pins = pinsByHost.get(host.id) ?? [];
+    if (pins.includes(deviceId)) return true;
+    if (host.supports_account_chains !== true) return false;
+    return chainReachableFrom(pins, devices, edges).has(deviceId);
+  });
+}
+
+export function computeTrustRoster(
+  devices: readonly RosterDevice[],
+  edges: readonly RosterEdge[],
+  pinnedDeviceIds: ReadonlySet<string>,
+): Map<string, DeviceTrustSummary> {
+  const live = new Map(devices.filter((d) => d.revoked_at === null).map((d) => [d.id, d]));
+  const liveRoot = devices.find((d) => d.is_root && d.revoked_at === null) ?? null;
+
+  const vouchers = new Map<string, Set<string>>();
+  for (const edge of edges) {
+    if (!live.has(edge.endorser_device_id) || !live.has(edge.endorsed_device_id)) continue;
+    const set = vouchers.get(edge.endorsed_device_id) ?? new Set<string>();
+    set.add(edge.endorser_device_id);
+    vouchers.set(edge.endorsed_device_id, set);
+  }
+
+  const reachable = chainReachableFrom(
+    [...live.values()].filter((d) => d.is_root || pinnedDeviceIds.has(d.id)).map((d) => d.id),
+    devices,
+    edges,
+  );
 
   const summaries = new Map<string, DeviceTrustSummary>();
   for (const device of devices) {

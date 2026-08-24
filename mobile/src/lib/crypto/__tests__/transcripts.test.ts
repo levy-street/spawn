@@ -14,13 +14,16 @@ import {
   verifySignedSignalV2,
 } from "@/lib/crypto/signed-signal";
 import {
+  encodeAccountEndorsementV1,
   encodeBrowserEndorsementV1,
   encodeBrowserRegistrationV2,
   encodeHostPairApprovalV1,
   encodeHostPairPossessionV1,
+  signAccountEndorsementV1,
   signBrowserRegistrationV2,
   signHostPairApprovalV1,
   signHostPairPossessionV1,
+  verifyAccountEndorsementV1,
   verifyBrowserRegistrationV2,
   verifyHostPairPossessionV1,
 } from "@/lib/crypto/transcripts";
@@ -37,7 +40,60 @@ import wireFixture from "../../../../tests/fixtures/signed-signal-wire-v1-vector
 const RFC_SEED = decodeHex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
 const RFC_PUBLIC_KEY = deriveEd25519PublicKey(RFC_SEED);
 
+// Produced by daemon/src/acct_endorsement.rs and spawn_server/acct_endorsement.py;
+// web/src/lib/acct-endorsement-transcript.test.ts pins the same digest. The
+// daemon verifies what this runtime signs, so a divergence here would refuse
+// every phone admitted through an account chain while each side still agreed
+// with itself.
+const ACCT_ENDORSEMENT_VECTOR = {
+  accountId: "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
+  deviceId: "11111111-2222-4333-8444-555555555555",
+  endorser: "C1E62bSSQBXKCQLtB5BE06xdvsIwbwaUjBDajrbjny0",
+  endorsed: "kaKKC3Q4FZOk2UaVeSCJJq_IrYLIg5t2RDWbnrqaSzo",
+  sha256: "7HXf12SEyR3WDpy4EeHKVQCsffmdTnMgMVPbq9jgnq8",
+};
+
 describe("canonical trust transcripts", () => {
+  test("matches the account endorsement vector shared with the daemon and web", () => {
+    const transcript = encodeAccountEndorsementV1({
+      accountId: ACCT_ENDORSEMENT_VECTOR.accountId,
+      endorserPublicKey: ACCT_ENDORSEMENT_VECTOR.endorser,
+      endorsedPublicKey: ACCT_ENDORSEMENT_VECTOR.endorsed,
+      endorsedDeviceId: ACCT_ENDORSEMENT_VECTOR.deviceId,
+    });
+    expect(transcript.byteLength).toBe(118);
+    expect(encodeBase64Url(sha256(transcript))).toBe(ACCT_ENDORSEMENT_VECTOR.sha256);
+  });
+
+  test("signs an account endorsement this runtime can itself verify", () => {
+    const input = {
+      accountId: ACCT_ENDORSEMENT_VECTOR.accountId,
+      endorserPublicKey: encodeBase64Url(RFC_PUBLIC_KEY),
+      endorsedPublicKey: ACCT_ENDORSEMENT_VECTOR.endorsed,
+      endorsedDeviceId: ACCT_ENDORSEMENT_VECTOR.deviceId,
+    };
+    const signature = signAccountEndorsementV1(RFC_SEED, input);
+    expect(verifyAccountEndorsementV1(RFC_PUBLIC_KEY, input, signature)).toBe(true);
+    expect(
+      verifyAccountEndorsementV1(
+        RFC_PUBLIC_KEY,
+        { ...input, endorsedDeviceId: "22222222-2222-4333-8444-555555555555" },
+        signature,
+      ),
+    ).toBe(false);
+  });
+
+  test("refuses an account self-endorsement", () => {
+    expect(() =>
+      encodeAccountEndorsementV1({
+        accountId: ACCT_ENDORSEMENT_VECTOR.accountId,
+        endorserPublicKey: ACCT_ENDORSEMENT_VECTOR.endorser,
+        endorsedPublicKey: ACCT_ENDORSEMENT_VECTOR.endorser,
+        endorsedDeviceId: ACCT_ENDORSEMENT_VECTOR.deviceId,
+      }),
+    ).toThrow(/endorse itself/);
+  });
+
   test("matches the browser registration v2 vectors, both flag values", () => {
     for (const positive of [registrationFixture.positive, registrationFixture.positive_root]) {
       const input = {

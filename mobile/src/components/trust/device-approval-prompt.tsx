@@ -10,7 +10,7 @@ import { useDeviceHostApprovals } from "@/data/queries/device-trust";
 import { useAccountDevices, useRegisteredPhone } from "@/data/queries/pairing";
 import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
-import { createDeviceEndorsement } from "@/data/trust/endorsement";
+import { createAccountDeviceEndorsement, createDeviceEndorsement } from "@/data/trust/endorsement";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { haptics } from "@/lib/haptics";
 import { fontSize, spacing } from "@/theme";
@@ -25,7 +25,11 @@ import { fontSize, spacing } from "@/theme";
  *
  * Renders nothing unless this device can actually help — approving means
  * signing an endorsement, which only a device some host already trusts can do.
- * Prompting a device that could only fail is worse than staying quiet.
+ * Prompting a device that could only fail is worse than staying quiet. Toward
+ * a host that validates account chains the endorsement is account-wide (one
+ * edge the other device carries everywhere this phone is trusted); toward an
+ * older host it is per-host, as before. The hosts it reaches are named, so
+ * "approve" never promises more than the hosts anchored on this phone.
  */
 export function DeviceApprovalPrompt(): React.JSX.Element | null {
   const queryClient = useQueryClient();
@@ -58,6 +62,8 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
   );
   // Hosts that trust this device are exactly the ones it can vouch for.
   const endorsableHosts = approvals.approved.filter((entry) => entry.host.host_public_key !== null);
+  const chainHosts = endorsableHosts.filter((entry) => entry.host.supports_account_chains);
+  const legacyHosts = endorsableHosts.filter((entry) => !entry.host.supports_account_chains);
 
   const dismiss = (requestId: string): void => {
     setError(null);
@@ -78,7 +84,15 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
           "This device's fingerprint does not match its key. The server may be substituting a key.",
         );
       }
-      for (const { host } of endorsableHosts) {
+      if (chainHosts.length > 0) {
+        await createAccountDeviceEndorsement({
+          accountId,
+          endorserDeviceId: phone.id,
+          endorsedDeviceId: target.id,
+          endorsedPublicKey: target.public_key,
+        });
+      }
+      for (const { host } of legacyHosts) {
         if (host.host_public_key === null) continue;
         await createDeviceEndorsement({
           accountId,
@@ -136,6 +150,13 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
           The name is a label anyone can set — only a matching fingerprint proves you are trusting
           the device you think you are. If it differs, deny.
         </Text>
+        <Text color="mutedForeground" variant="caption">
+          Approving here lets it connect to{" "}
+          <Text variant="caption">
+            {formatHostList(endorsableHosts.map((entry) => entry.host.name))}
+          </Text>
+          . Other hosts will ask again from a screen they already trust.
+        </Text>
         {error ? (
           <Text accessibilityRole="alert" color="destructive" variant="caption">
             {error}
@@ -152,6 +173,12 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
       </View>
     </Dialog>
   );
+}
+
+/** "dream", "dream and minivac", "dream, minivac and 3 more". */
+function formatHostList(names: readonly string[]): string {
+  if (names.length <= 2) return names.join(" and ");
+  return `${names.slice(0, 2).join(", ")} and ${names.length - 2} more`;
 }
 
 const styles = StyleSheet.create({

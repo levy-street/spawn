@@ -1,4 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2.js";
+import type { CarriedEndorsement } from "@/data/trust/carried-endorsements";
 import type { NativeToWorkerMessage, WorkerToNativeMessage } from "@/terminal/transport/bridge";
 import { decodeBridgeBytes, encodeBridgeBytes } from "@/terminal/transport/bridge";
 import { HOST_FILE_MAX_BYTES, HOST_STREAM_CHUNK_BYTES } from "@/terminal/transport/host-ctl-codec";
@@ -16,6 +17,13 @@ jest.mock("@/lib/crypto/bootstrap", () => ({
 }));
 
 const FULL_CAPABILITIES = ["fs.read", "fs.read.range", "fs.preview", "fs.write.begin"] as const;
+const CARRIED_EDGE: CarriedEndorsement = {
+  account_id: "account-id",
+  endorser_public_key: "endorser-key",
+  endorsed_public_key: "browser-key",
+  endorsed_device_id: "endorsed-device-id",
+  signature: "endorsement-signature",
+};
 
 function digest(bytes: Uint8Array): string {
   return [...sha256(bytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -117,6 +125,7 @@ async function readyTransport(options?: {
   capabilities?: readonly string[];
   omitCapabilities?: boolean;
   streamTimeoutMs?: number;
+  loadCarriedEndorsements?: () => Promise<readonly CarriedEndorsement[]>;
 }) {
   const bridge = new FakeBridge();
   const signal = new FakeSignal();
@@ -126,6 +135,9 @@ async function readyTransport(options?: {
     bridge,
     openSignal: () => signal,
     ...(options?.streamTimeoutMs === undefined ? {} : { streamTimeoutMs: options.streamTimeoutMs }),
+    ...(options?.loadCarriedEndorsements === undefined
+      ? {}
+      : { loadCarriedEndorsements: options.loadCarriedEndorsements }),
   });
   const opening = transport.open();
   await flush();
@@ -200,6 +212,74 @@ function openTransport(bridge: FakeBridge, signal: FakeSignal) {
 }
 
 describe("HostTransport signalling", () => {
+  test("passes loaded carried endorsements in the sign response", async () => {
+    const loadCarriedEndorsements = jest.fn(async () => [CARRIED_EDGE]);
+    const { bridge, transport } = await readyTransport({ loadCarriedEndorsements });
+
+    bridge.emit({
+      v: 1,
+      type: "sign-request",
+      requestId: "sign-with-chain",
+      transcript: {
+        signalKind: "offer",
+        protocolVersion: 1,
+        sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
+        scopeType: "host",
+        scopeId: HOST_ID,
+        senderRole: "browser",
+        intendedPeerIdentityPublicKey: "host-key",
+        sdp: "v=0",
+      },
+    });
+    await flush();
+
+    expect(loadCarriedEndorsements).toHaveBeenCalledTimes(1);
+    expect(bridge.sent).toContainEqual({
+      v: 1,
+      type: "sign-response",
+      requestId: "sign-with-chain",
+      signature: "signature",
+      carriedEndorsements: [CARRIED_EDGE],
+    });
+    transport.close();
+  });
+
+  test("still sends the signature when loading carried endorsements fails", async () => {
+    const loadCarriedEndorsements = jest.fn(async () => {
+      throw new Error("offline");
+    });
+    const { bridge, transport } = await readyTransport({ loadCarriedEndorsements });
+
+    bridge.emit({
+      v: 1,
+      type: "sign-request",
+      requestId: "sign-without-chain",
+      transcript: {
+        signalKind: "offer",
+        protocolVersion: 1,
+        sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
+        scopeType: "host",
+        scopeId: HOST_ID,
+        senderRole: "browser",
+        intendedPeerIdentityPublicKey: "host-key",
+        sdp: "v=0",
+      },
+    });
+    await flush();
+
+    const response = bridge.sent.find(
+      (message) => message.type === "sign-response" && message.requestId === "sign-without-chain",
+    );
+    expect(response).toEqual({
+      v: 1,
+      type: "sign-response",
+      requestId: "sign-without-chain",
+      signature: "signature",
+    });
+    expect(response).not.toHaveProperty("carriedEndorsements");
+    transport.close();
+  });
+
   test("accepts the bound rtc.config /ws/host actually sends", async () => {
     const bridge = new FakeBridge();
     const signal = new FakeSignal();
