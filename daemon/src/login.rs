@@ -46,7 +46,7 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
     let host_name = args.host_name.unwrap_or_else(detect_hostname);
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
-    let version = env!("CARGO_PKG_VERSION").to_string();
+    let version = crate::version::build_version();
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))

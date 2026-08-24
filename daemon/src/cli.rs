@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "spawnd", version, about = "spawn daemon")]
+#[command(name = "spawnd", version = crate::version::BUILD_VERSION, about = "spawn daemon")]
 pub struct Cli {
     /// Override the spawn server base URL (default: env SPAWN_SERVER_URL or
     /// https://localhost:8000).
