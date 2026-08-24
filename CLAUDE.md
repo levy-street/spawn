@@ -37,7 +37,15 @@ cd server && .venv/bin/ruff check . && .venv/bin/python -m pytest -q
 ## Releasing: the server and the app go out together
 
 Deployment is over SSH, from a coding agent, using the script in this repo.
-It refuses to run against a dirty checkout or unpushed commits.
+It refuses to run against a dirty checkout, unpushed commits, a branch other
+than master (`--allow-branch` to mean it), an inherited
+`SPAWN_API_PROXY_TARGET` (`--api-proxy-target` to mean it — the 2026-08-24
+incident was a dev shell's value baked into the prod web build), or a
+`prebuilt-latest` release built from a different daemon tree. Before anything
+restarts it verifies the proxy target the build actually baked, and after the
+restart it fetches `/healthz` through the web app's rewrite — the one probe
+that exercises the chain a browser uses. A failed smoke check prints the
+rollback command.
 
 ```bash
 scripts/deploy-prod.sh <ssh-host>     # pulls, migrates, restarts spawn-server + spawn-web
