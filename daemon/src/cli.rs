@@ -7,8 +7,9 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "spawnd", version = crate::version::BUILD_VERSION, about = "spawn daemon")]
 pub struct Cli {
-    /// Override the spawn server base URL (default: env SPAWN_SERVER_URL or
-    /// https://localhost:8000).
+    /// Override the spawn server base URL (default: env SPAWN_SERVER_URL,
+    /// else the server this instance registered with, else
+    /// http://localhost:8000).
     #[arg(long, global = true, env = "SPAWN_SERVER_URL")]
     pub server: Option<String>,
 

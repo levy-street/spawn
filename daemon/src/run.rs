@@ -18,7 +18,6 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::sessions::SessionRegistry;
 use crate::cli::RunArgs;
 use crate::config;
 use crate::creds::{self, CredentialRevision, StoredCreds};
@@ -28,12 +27,12 @@ use crate::proto::{
 };
 use crate::pty::{self, WsOutbound};
 use crate::rtc::{HostRtcSignal, RtcAnswerSigner, RtcSessions};
+use crate::sessions::SessionRegistry;
 use crate::worker_backend;
 use crate::ws::{self, WsInbound};
 use spawnd::acct_endorsement::{signature_from_wire, AcctEndorsementTranscript};
 use spawnd::endorsement_chain::{
-    find_valid_chain, ChainEdge, RevocationSet, DEFAULT_MAX_CHAIN_EDGES,
-    MAX_CARRIED_ENDORSEMENTS,
+    find_valid_chain, ChainEdge, RevocationSet, DEFAULT_MAX_CHAIN_EDGES, MAX_CARRIED_ENDORSEMENTS,
 };
 use spawnd::host_pair_approval::account_id_bytes;
 use spawnd::signed_signal::{
@@ -460,13 +459,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
         .context("loading stored credentials")?;
     // Prefer the explicit --server flag, then $SPAWN_SERVER_URL (already
     // wired into clap), then the URL we logged in against.
-    let server_url = match server_cli {
-        Some(s) => config::server_url(Some(s))?,
-        None => match stored.server_url.clone() {
-            Some(s) => config::server_url(Some(s))?,
-            None => config::server_url(None)?,
-        },
-    };
+    let server_url = config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
     let ws_url = config::ws_url(&server_url)?;
     let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
@@ -1172,7 +1165,10 @@ fn verify_signed_rtc_offer_admitted(
         return None;
     };
     if carried.is_empty() {
-        tracing::warn!(reason = "no-carried-endorsements", "signed RTC offer refused");
+        tracing::warn!(
+            reason = "no-carried-endorsements",
+            "signed RTC offer refused"
+        );
         return None;
     }
     // Independent daemon-side cap, before any parse or signature work. The
@@ -1200,7 +1196,10 @@ fn verify_signed_rtc_offer_admitted(
     // Verify against the sender the envelope CLAIMS: this proves possession of
     // that private key. Only a proven-possessed key is a candidate for a chain.
     let Ok(claimed_sender) = envelope_sender(envelope) else {
-        tracing::warn!(reason = "unreadable-envelope-sender", "signed RTC offer refused");
+        tracing::warn!(
+            reason = "unreadable-envelope-sender",
+            "signed RTC offer refused"
+        );
         return None;
     };
     let Ok(verified) = verify_rtc_signal_wire(envelope, &claimed_sender, &host_key) else {
@@ -1244,7 +1243,10 @@ fn verify_signed_rtc_offer_admitted(
 
 /// First bytes of a key, hex, for log correlation (never a trust input).
 fn short_key(key: &ed25519_dalek::VerifyingKey) -> String {
-    key.to_bytes()[..6].iter().map(|b| format!("{b:02x}")).collect()
+    key.to_bytes()[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Build the deny-list from the wire keys the server delivers. Malformed keys
@@ -1451,8 +1453,7 @@ async fn dispatch_loop(
                                 &carried_endorsements,
                             ) {
                                 Some(verified)
-                                    if verified.transcript().session_id()
-                                        == signal_id.as_str() =>
+                                    if verified.transcript().session_id() == signal_id.as_str() =>
                                 {
                                     tracing::info!(
                                         scope_type = ?verified.transcript().scope_type(),
@@ -1762,7 +1763,9 @@ async fn dispatch_loop(
                             ) {
                                 let (signal_id, generation, session_id) =
                                     binding.into_routing_parts();
-                                rtc_sessions.close(&signal_id, &generation, session_id).await;
+                                rtc_sessions
+                                    .close(&signal_id, &generation, session_id)
+                                    .await;
                             }
                         }
                         (
@@ -5521,4 +5524,3 @@ async fn rediscover_existing_sessions(
         }
     }
 }
-

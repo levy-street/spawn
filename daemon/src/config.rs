@@ -16,6 +16,16 @@ pub fn server_url(cli_value: Option<String>) -> Result<Url> {
     Url::parse(&raw).with_context(|| format!("invalid server URL {raw:?}"))
 }
 
+/// Resolve the server URL for a command acting on an existing instance: the
+/// explicit `--server`/`SPAWN_SERVER_URL` value wins, then the server this
+/// instance registered with (from its stored credentials), then the dev
+/// default. Every instance-facing command resolves through here so a bare
+/// `spawnd possess`/`login`/`exorcise` on a possessed host reaches the host's
+/// real server — localhost is only ever a fresh-install default.
+pub fn server_url_for_instance(cli_value: Option<String>, stored: Option<&str>) -> Result<Url> {
+    server_url(cli_value.or_else(|| stored.map(str::to_string)))
+}
+
 /// Returns the daemon config dir, creating it if missing. Defaults to
 /// `~/.config/spawn/`; `SPAWN_CONFIG_DIR` overrides it so multiple daemons
 /// (e.g. one per server) can coexist on a host without sharing credentials.
@@ -68,4 +78,36 @@ pub fn api_url(server: &Url, path: &str) -> Result<Url> {
     let base = joined.path().trim_end_matches('/').to_string();
     joined.set_path(&format!("{base}{path}"));
     Ok(joined)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_resolution_prefers_explicit_over_stored() {
+        let url = server_url_for_instance(
+            Some("https://explicit.example".into()),
+            Some("https://stored.example"),
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://explicit.example/");
+    }
+
+    #[test]
+    fn instance_resolution_falls_back_to_the_stored_server() {
+        let url = server_url_for_instance(None, Some("https://stored.example")).unwrap();
+        assert_eq!(url.as_str(), "https://stored.example/");
+    }
+
+    #[test]
+    fn instance_resolution_defaults_only_without_either() {
+        let url = server_url_for_instance(None, None).unwrap();
+        assert_eq!(url.as_str(), "http://localhost:8000/");
+    }
+
+    #[test]
+    fn instance_resolution_refuses_a_damaged_stored_url() {
+        assert!(server_url_for_instance(None, Some("not a url")).is_err());
+    }
 }
