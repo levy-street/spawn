@@ -110,11 +110,15 @@ export function confirmEmailVerification(body: EmailVerifyConfirm): Promise<MeRe
  */
 export async function getOAuthStartUrl(
   provider: ProviderId,
-  options: { returnTo?: string; redirectUri?: string } = {},
+  options: { returnTo?: string; redirectUri?: string; invite?: string | null } = {},
 ): Promise<string> {
   return `${await getBaseUrl()}/api/auth/oauth/${pathPart(provider)}/start${queryString({
     return_to: options.returnTo ?? "/",
     redirect_uri: options.redirectUri,
+    // Carried to the provider and back: on a closed deployment the callback
+    // needs it to admit a new account, and it is the only chance to supply one
+    // — there is no form between the button and the account being created.
+    invite: options.invite ?? undefined,
   })}`;
 }
 

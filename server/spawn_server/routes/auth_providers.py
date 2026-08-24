@@ -15,7 +15,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, rate_limit, schemas
+from .. import auth, invites, rate_limit, schemas
 from ..apple_identity import (
     APPLE_AUTHORIZATION_ENDPOINT,
     APPLE_TOKEN_ENDPOINT,
@@ -433,6 +433,7 @@ async def _user_for_profile(
     session: AsyncSession,
     profile: ProviderProfile,
     linked_user_id: str | None,
+    invite_code_hash: str | None = None,
 ) -> User:
     now = _now()
     identity = (
@@ -502,10 +503,33 @@ async def _user_for_profile(
             # here too, and recovering it is a password reset away.
             user.password_hash = auth.hash_random_password()
             user.session_epoch += 1
+    invite = None
     if user is None:
+        # Creating an account, which is the moment the deployment's admission
+        # rule applies. Signing in to an account that already exists, or
+        # linking a provider to one, is not a signup and is never gated.
+        if not await invites.signup_is_open(session):
+            if invite_code_hash is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="spawn is invite only right now",
+                )
+            try:
+                invite = await invites.redeem_invite_hash(session, invite_code_hash)
+            except ValueError as cause:
+                # One message for every failure mode, matching signup: a
+                # stranger probing codes learns nothing from the difference.
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="this invite is not valid",
+                ) from cause
+
         user = User(email=profile.email, password_hash=auth.hash_random_password(), created_at=now)
         session.add(user)
         await session.flush()
+        if invite is not None:
+            invite.used_at = now
+            invite.used_by_user_id = user.id
 
     if profile.email_verified and user.email_verified_at is None:
         # The provider has already proved control of this address, which is a
@@ -535,6 +559,7 @@ async def provider_start(
     provider: ProviderId,
     return_to: str | None = Query(default="/"),
     redirect_uri: str | None = Query(default=None),
+    invite: str | None = Query(default=None, max_length=256),
     session: AsyncSession = Depends(get_session),
     user: User | None = Depends(auth.current_user_optional),
 ) -> RedirectResponse:
@@ -547,6 +572,10 @@ async def provider_start(
             state_hash=_hash_state(state),
             provider=config.definition.id,
             return_to=native or _clean_return_to(return_to),
+            # Not validated here on purpose. Checking it now would turn this
+            # endpoint into an oracle for probing codes, and the redemption at
+            # the callback is the only check that has to hold.
+            invite_code_hash=invites.hash_code(invite) if invite else None,
             user_id=user.id if user else None,
             expires_at=_now() + timedelta(minutes=settings.oauth_provider_state_ttl_minutes),
             created_at=_now(),
@@ -640,6 +669,7 @@ async def _complete_callback(
         session=session,
         profile=profile,
         linked_user_id=state_row.user_id,
+        invite_code_hash=state_row.invite_code_hash,
     )
     if _is_native_redirect(state_row.return_to):
         # The app cannot read the cookie this would otherwise set: its sign-in
@@ -718,7 +748,14 @@ async def apple_native_sign_in(
     except ProviderAuthError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e)) from e
 
-    user = await _user_for_profile(session=session, profile=profile, linked_user_id=None)
+    # The native Apple sheet has no start URL to carry an invite, so the app
+    # sends it with the identity token instead.
+    user = await _user_for_profile(
+        session=session,
+        profile=profile,
+        linked_user_id=None,
+        invite_code_hash=invites.hash_code(body.invite) if body.invite else None,
+    )
     auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     return schemas.TokenResponse(
         access_token=auth.issue_access_token(user.id, user.session_epoch),

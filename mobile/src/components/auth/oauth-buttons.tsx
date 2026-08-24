@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { AuthAction } from "@/components/auth/auth-actions";
 import { authGutter } from "@/components/auth/auth-shell";
+import { ProviderMark } from "@/components/auth/provider-mark";
 import { Text } from "@/components/ui/text";
 import type { AuthProviderOut, ProviderId } from "@/data/api/schemas/auth";
 import { useOAuthSignInMutation } from "@/data/queries/auth";
@@ -11,6 +12,12 @@ import { borderWidth, spacing, useTheme } from "@/theme";
 export interface OAuthButtonsProps {
   loading?: boolean;
   providers: readonly AuthProviderOut[];
+  /**
+   * Carried through the provider round trip so a closed deployment can admit
+   * the account at the callback. There is no form between this button and the
+   * account being created, so this is the only chance to supply one.
+   */
+  invite?: string | null;
 }
 
 /**
@@ -18,7 +25,7 @@ export interface OAuthButtonsProps {
  * the route that works in every build, and burying it under a stack of
  * third-party plates is what made this screen read as a web form.
  */
-export function OAuthButtons({ loading = false, providers }: OAuthButtonsProps) {
+export function OAuthButtons({ invite = null, loading = false, providers }: OAuthButtonsProps) {
   const theme = useTheme();
   const signIn = useOAuthSignInMutation();
   const [appleReady, setAppleReady] = useState(false);
@@ -44,7 +51,7 @@ export function OAuthButtons({ loading = false, providers }: OAuthButtonsProps) 
   const pending = signIn.isPending;
   const press = (id: ProviderId) => () => {
     signIn.reset();
-    signIn.mutate(id);
+    signIn.mutate({ provider: id, invite });
   };
 
   return (
@@ -61,6 +68,7 @@ export function OAuthButtons({ loading = false, providers }: OAuthButtonsProps) 
           <AuthAction
             accessibilityLabel="Sign in with Apple"
             disabled={pending}
+            icon={<ProviderMark provider="apple" />}
             key="apple"
             label="Sign in with Apple"
             onPress={press("apple")}
@@ -71,6 +79,7 @@ export function OAuthButtons({ loading = false, providers }: OAuthButtonsProps) 
           <AuthAction
             accessibilityLabel={`Continue with ${provider.name}`}
             disabled={pending}
+            icon={<ProviderMark provider={provider.id} />}
             key={provider.id}
             label={`Continue with ${provider.name}`}
             onPress={press(provider.id)}

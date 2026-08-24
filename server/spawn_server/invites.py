@@ -74,8 +74,20 @@ async def redeem_invite(session: AsyncSession, code: str) -> Invite:
     every failure so a stranger probing codes cannot learn which ones exist.
     """
 
+    return await redeem_invite_hash(session, hash_code(code))
+
+
+async def redeem_invite_hash(session: AsyncSession, code_hash: str) -> Invite:
+    """Claim an invite already reduced to its hash.
+
+    A provider sign-in cannot hold the raw code across the round trip: the
+    invite arrives on the start URL, and what comes back from the provider is
+    only the state this server minted. So the hash is what gets stored, and the
+    lookup is against the hash either way — `Invite` never holds the code.
+    """
+
     invite = (
-        await session.execute(select(Invite).where(Invite.code_hash == hash_code(code)))
+        await session.execute(select(Invite).where(Invite.code_hash == code_hash))
     ).scalar_one_or_none()
     if invite is None:
         raise ValueError("unknown invite")
