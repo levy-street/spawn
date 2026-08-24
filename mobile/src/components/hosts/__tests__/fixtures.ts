@@ -18,6 +18,7 @@ export const onlineHost: HostOut = {
   status: "online",
   last_seen_at: "2026-08-22T00:00:00Z",
   session_count: 3,
+  supports_account_chains: false,
   cpu_cores: 12,
   cpu_physical_cores: 10,
   cpu_model: "Apple M4 Pro",

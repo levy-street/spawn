@@ -39,6 +39,7 @@ export function makeHost(overrides: Partial<Host> = {}): Host {
     status: "online",
     last_seen_at: FIXTURE_NOW,
     session_count: 1,
+    supports_account_chains: false,
     cpu_cores: 10,
     cpu_physical_cores: 10,
     cpu_model: "Apple Silicon",

@@ -46,6 +46,7 @@ function host(status = "online"): Host {
     status,
     last_seen_at: null,
     session_count: 2,
+    supports_account_chains: false,
     cpu_cores: null,
     cpu_physical_cores: null,
     cpu_model: null,

@@ -70,6 +70,10 @@ export function DeviceApprovalCeremony({
 
   const target = approvals.approvals.find((entry) => entry.host.id === hostId);
   const hostName = target?.host.name ?? "This host";
+  // Mesh R9: a chain-capable host refuses per-host endorsements, and this app
+  // cannot join an account chain yet — the pairing code is the admission, and
+  // promising a remote approve that can only fail would be a lie.
+  const chainHost = target?.host.supports_account_chains === true;
   const otherDeviceCount =
     devices.data?.filter((device) => device.id !== phone?.id && device.revoked_at === null)
       .length ?? 0;
@@ -167,7 +171,9 @@ export function DeviceApprovalCeremony({
                 : phase === "identity-blocked"
                   ? "This device has no identity yet"
                   : phase === "waiting"
-                    ? `${hostName} is waiting on your say-so`
+                    ? chainHost
+                      ? `${hostName} takes a pairing code`
+                      : `${hostName} is waiting on your say-so`
                     : `${hostName} has not approved this device`}
           </Text>
           <Text color="mutedForeground" style={styles.centered} variant="caption">
@@ -176,7 +182,9 @@ export function DeviceApprovalCeremony({
               : phase === "identity-blocked"
                 ? "It could not register the key that hosts pin, so nothing can vouch for it yet."
                 : phase === "waiting"
-                  ? "A prompt is up on every screen where you're already signed in — your Mac's browser counts."
+                  ? chainHost
+                    ? "Its trust is account-wide, which this app cannot join remotely yet. Run the command below on the host and enter the code here."
+                    : "A prompt is up on every screen where you're already signed in — your Mac's browser counts."
                   : phase === "pair-only"
                     ? "Nothing else is signed in to answer for it. Pair directly with a code from the host."
                     : ""}
@@ -271,7 +279,7 @@ export function DeviceApprovalCeremony({
                 onRequestClose();
                 onNavigateToPairing();
               }}
-              variant={phase === "pair-only" ? "default" : "outline"}
+              variant={phase === "pair-only" || chainHost ? "default" : "outline"}
             >
               Enter a pairing code
             </Button>
