@@ -5,3 +5,6 @@ __pycache__/
 .ruff_cache/
 *.db
 .env
+# Timestamped .env backups. These live in the deploy checkout, and an untracked
+# file there stops scripts/deploy-prod.sh dead — keep them out of the tree.
+.env.bak.*
