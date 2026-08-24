@@ -5,19 +5,31 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from fastapi import HTTPException
 from sqlalchemy import select
 
 from spawn_server import auth, invites
 from spawn_server.config import get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Invite, User
-from spawn_server.routes.auth_providers import ProviderProfile, _user_for_profile
+from spawn_server.routes.auth_providers import (
+    InviteRequired,
+    ProviderProfile,
+    _user_for_profile,
+)
 
 
 @pytest.fixture(autouse=True)
 def closed_deployment(monkeypatch):
     monkeypatch.setenv("SPAWN_INVITE_ONLY", "true")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    yield
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+def configured_google(monkeypatch):
+    monkeypatch.setenv("SPAWN_GOOGLE_CLIENT_ID", "google-client")
+    monkeypatch.setenv("SPAWN_GOOGLE_CLIENT_SECRET", "google-secret")
     get_settings.cache_clear()  # type: ignore[attr-defined]
     yield
     get_settings.cache_clear()  # type: ignore[attr-defined]
@@ -65,10 +77,10 @@ class TestClosedDeployment:
     async def test_a_provider_signup_without_an_invite_is_refused(self, app):
         """The hole this closes: OAuth used to walk straight past the gate."""
         await _seed_owner()
-        with pytest.raises(HTTPException) as caught:
+        with pytest.raises(InviteRequired) as caught:
             await _link(_profile())
-        assert caught.value.status_code == 403
-        assert "invite only" in caught.value.detail
+        assert "invite only" in str(caught.value)
+        assert caught.value.provider == "google"
 
         sm = get_sessionmaker()
         async with sm() as session:
@@ -94,10 +106,9 @@ class TestClosedDeployment:
         code, _ = await _make_invite()
         await _link(_profile(), invite_code=code)
 
-        with pytest.raises(HTTPException) as caught:
+        with pytest.raises(InviteRequired) as caught:
             await _link(_profile("second@example.com", sub="sub-2"), invite_code=code)
-        assert caught.value.status_code == 403
-        assert caught.value.detail == "this invite is not valid"
+        assert str(caught.value) == "this invite is not valid"
 
     @pytest.mark.parametrize(
         "overrides",
@@ -111,15 +122,15 @@ class TestClosedDeployment:
         """One message for every failure, so codes cannot be probed."""
         await _seed_owner()
         code, _ = await _make_invite(**overrides)
-        with pytest.raises(HTTPException) as caught:
+        with pytest.raises(InviteRequired) as caught:
             await _link(_profile(), invite_code=code)
-        assert caught.value.detail == "this invite is not valid"
+        assert str(caught.value) == "this invite is not valid"
 
     async def test_an_unknown_code_is_refused_the_same_way(self, app):
         await _seed_owner()
-        with pytest.raises(HTTPException) as caught:
+        with pytest.raises(InviteRequired) as caught:
             await _link(_profile(), invite_code="not-a-real-invite-code-at-all")
-        assert caught.value.detail == "this invite is not valid"
+        assert str(caught.value) == "this invite is not valid"
 
 
 class TestNotASignup:
@@ -157,3 +168,71 @@ class TestOpenDeployment:
         await _seed_owner()
         user = await _link(_profile())
         assert user.email == "newcomer@example.com"
+
+
+class TestTheBrowserNeverSeesJson:
+    """A redirect flow must not end on `{"detail": ...}`.
+
+    The callback is reached by following a redirect, so whatever it returns is
+    rendered as a page. A 403 there strands the person on a JSON body with no
+    way forward and no explanation of what an invite even is.
+    """
+
+    async def _start(self, client, **params):
+        from urllib.parse import parse_qs, urlparse
+
+        r = await client.get(
+            "/api/auth/oauth/google/start", params=params, follow_redirects=False
+        )
+        return parse_qs(urlparse(r.headers["location"]).query)["state"][0]
+
+    async def _stub_exchange(self, monkeypatch, email="newcomer@example.com"):
+        from spawn_server.routes import auth_providers
+
+        async def fake(*, config, code):
+            return ProviderProfile(
+                provider="google", provider_user_id="sub-1", email=email, email_verified=True
+            )
+
+        monkeypatch.setattr(auth_providers, "_exchange_provider_code", fake)
+
+    async def test_web_callback_redirects_to_a_page_that_can_ask(
+        self, client, monkeypatch, configured_google
+    ):
+        await _seed_owner()
+        state = await self._start(client)
+        await self._stub_exchange(monkeypatch)
+
+        r = await client.get(
+            "/api/auth/oauth/google/callback",
+            params={"state": state, "code": "authorization-code"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 302
+        location = r.headers["location"]
+        assert "invite_required=1" in location
+        assert "provider=google" in location
+        assert "/signup" in location
+        # And nothing was created on the way past.
+        sm = get_sessionmaker()
+        async with sm() as session:
+            emails = [u.email for u in (await session.execute(select(User))).scalars()]
+        assert emails == ["owner@example.com"]
+
+    async def test_native_callback_signals_on_its_own_scheme(
+        self, client, monkeypatch, configured_google
+    ):
+        """The app cannot show a web page, so it gets the reason on its scheme."""
+        await _seed_owner()
+        state = await self._start(client, redirect_uri="spawn://auth/oauth")
+        await self._stub_exchange(monkeypatch)
+
+        r = await client.get(
+            "/api/auth/oauth/google/callback",
+            params={"state": state, "code": "authorization-code"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 302
+        assert r.headers["location"].startswith("spawn://auth/oauth?")
+        assert "error=invite_required" in r.headers["location"]
+        assert "set-cookie" not in r.headers
