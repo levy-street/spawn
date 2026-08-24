@@ -41,7 +41,16 @@ export function readCallbackCode(url: string): { code: string } | { error: strin
     return { error: "The sign-in callback was not a valid URL." };
   }
   const failure = parsed.searchParams.get("error");
-  if (failure) return { error: failure };
+  if (failure) {
+    // The server's own signal, not the provider's: the sign-in worked and the
+    // deployment is closed. Worth naming plainly, because "access_denied" is
+    // what a provider says when *it* refused, and the two need different
+    // responses from the person reading it.
+    if (failure === "invite_required") {
+      return { error: "spawn is invite only right now. Enter an invite code to continue." };
+    }
+    return { error: failure };
+  }
   const code = parsed.searchParams.get("code");
   if (!code) return { error: "The sign-in callback did not include a code." };
   return { code };

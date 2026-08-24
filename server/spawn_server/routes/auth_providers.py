@@ -118,6 +118,29 @@ def _public_url(path: str = "") -> str:
     return f"{get_settings().public_url.rstrip('/')}{path}"
 
 
+def _web_url(path: str = "") -> str:
+    """Where a browser should be sent. Falls back to the API origin."""
+    settings = get_settings()
+    base = (settings.web_url or settings.public_url).rstrip("/")
+    return f"{base}{path}"
+
+
+class InviteRequired(Exception):
+    """A provider sign-in that would create an account on a closed deployment.
+
+    Carried out of `_user_for_profile` as an exception rather than an HTTP
+    error because the right answer depends on who is asking. An API client
+    wants a 403; a browser mid-redirect wants a page that explains itself and
+    offers somewhere to type the code. Returning JSON to the browser — which is
+    what raising here used to do — ends the flow on a wall of `{"detail": …}`.
+    """
+
+    def __init__(self, provider: str, reason: str) -> None:
+        super().__init__(reason)
+        self.provider = provider
+        self.reason = reason
+
+
 def _provider_credentials(
     provider: ProviderId,
     settings: Settings,
@@ -510,18 +533,14 @@ async def _user_for_profile(
         # linking a provider to one, is not a signup and is never gated.
         if not await invites.signup_is_open(session):
             if invite_code_hash is None:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="spawn is invite only right now",
-                )
+                raise InviteRequired(profile.provider, "spawn is invite only right now")
             try:
                 invite = await invites.redeem_invite_hash(session, invite_code_hash)
             except ValueError as cause:
                 # One message for every failure mode, matching signup: a
                 # stranger probing codes learns nothing from the difference.
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="this invite is not valid",
+                raise InviteRequired(
+                    profile.provider, "this invite is not valid"
                 ) from cause
 
         user = User(email=profile.email, password_hash=auth.hash_random_password(), created_at=now)
@@ -665,13 +684,25 @@ async def _complete_callback(
         profile = await _exchange_provider_code(config=config, code=code)
     except ProviderAuthError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e)) from e
-    user = await _user_for_profile(
-        session=session,
-        profile=profile,
-        linked_user_id=state_row.user_id,
-        invite_code_hash=state_row.invite_code_hash,
-    )
-    if _is_native_redirect(state_row.return_to):
+    native = _is_native_redirect(state_row.return_to)
+    try:
+        user = await _user_for_profile(
+            session=session,
+            profile=profile,
+            linked_user_id=state_row.user_id,
+            invite_code_hash=state_row.invite_code_hash,
+        )
+    except InviteRequired as e:
+        # Hand the flow back to a surface that can ask for a code, rather than
+        # ending it on a JSON body. The app gets the same signal on its own
+        # scheme so it can show its invite field instead of a browser error.
+        target = (
+            f"{state_row.return_to}?{urlencode({'error': 'invite_required'})}"
+            if native
+            else _web_url(f"/signup?{urlencode({'invite_required': '1', 'provider': e.provider})}")
+        )
+        return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
+    if native:
         # The app cannot read the cookie this would otherwise set: its sign-in
         # ran in a system web view with its own jar. Hand back a single-use code
         # instead and let it trade that for a token over the API, and set no
@@ -750,12 +781,15 @@ async def apple_native_sign_in(
 
     # The native Apple sheet has no start URL to carry an invite, so the app
     # sends it with the identity token instead.
-    user = await _user_for_profile(
-        session=session,
-        profile=profile,
-        linked_user_id=None,
-        invite_code_hash=invites.hash_code(body.invite) if body.invite else None,
-    )
+    try:
+        user = await _user_for_profile(
+            session=session,
+            profile=profile,
+            linked_user_id=None,
+            invite_code_hash=invites.hash_code(body.invite) if body.invite else None,
+        )
+    except InviteRequired as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     auth.set_session_cookie(response, auth.issue_session_token(user.id, user.session_epoch))
     return schemas.TokenResponse(
         access_token=auth.issue_access_token(user.id, user.session_epoch),

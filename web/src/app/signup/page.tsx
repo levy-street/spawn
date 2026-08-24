@@ -9,11 +9,25 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useAuthConfig } from "@/lib/auth";
 
+/** Display name for a provider id, for copy that names who signed you in. */
+function providerName(id: string): string {
+  if (id === "apple") return "Apple";
+  if (id === "google") return "Google";
+  if (id === "github") return "GitHub";
+  if (id === "microsoft") return "Microsoft";
+  return id;
+}
+
 function SignupPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { config, loading, error, refetch } = useAuthConfig();
   const invite = searchParams.get("invite");
+  // Set by the OAuth callback when the provider verified someone but the
+  // deployment is closed and they carried no invite. They are one field away
+  // from an account, so say that rather than showing a bare refusal.
+  const inviteRequired = searchParams.get("invite_required") === "1";
+  const blockedProvider = searchParams.get("provider");
 
   if (loading || config === null) {
     if (error) {
@@ -37,7 +51,18 @@ function SignupPageContent() {
       description="Start with an account, then connect the machine where your agents work."
     >
       <div className="space-y-5">
-        {invite !== null ? (
+        {inviteRequired ? (
+          <p
+            className="rounded-sm border border-ember/40 bg-ember/10 px-3 py-2 text-sm text-bone"
+            role="status"
+          >
+            {blockedProvider
+              ? `${providerName(blockedProvider)} signed you in`
+              : "You're signed in"}
+            , but spawn is invite only right now. Enter your invite code below and continue with{" "}
+            {blockedProvider ? providerName(blockedProvider) : "your provider"} again to finish.
+          </p>
+        ) : invite !== null ? (
           <p
             className="rounded-sm border border-ember/40 bg-ember/10 px-3 py-2 text-sm text-bone"
             role="status"
