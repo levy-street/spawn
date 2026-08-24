@@ -2,8 +2,9 @@
 
 Read this in full before deploying anything. A spawn release has four moving
 pieces — the server + web app, the mobile JavaScript, the mobile native app,
-and the daemon binaries — and the 2026-08-24 incident happened in the gaps
-between them. Ship every piece the change touches, in the same release.
+and the daemon binaries. Ship every piece the change touches, in the same
+release; a piece left behind leaves production running two versions of the
+same feature.
 
 ## The server and the web app go out together
 
@@ -17,10 +18,10 @@ The script refuses to run when the release would not be what it looks like:
 
 - a dirty checkout or unpushed commits
 - a branch other than master (`--allow-branch` to deploy one on purpose)
-- an inherited `SPAWN_API_PROXY_TARGET` — the 2026-08-24 incident was a dev
-  shell's value baked into the prod web build. Pass `--api-proxy-target URL`
-  when you genuinely mean a non-default target; the default is prod's
-  `http://127.0.0.1:8001`.
+- an inherited `SPAWN_API_PROXY_TARGET` — the target is baked into the web
+  build at build time, and an inherited value is indistinguishable from an
+  intended one. Pass `--api-proxy-target URL` when you mean a non-default
+  target; the default is prod's `http://127.0.0.1:8001`.
 - a `prebuilt-latest` release built from a different daemon tree than the
   commit being deployed (see "The daemon prebuilts" below)
 
