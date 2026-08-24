@@ -361,7 +361,7 @@ export function Sheet({
             accessibilityLabel="Dismiss drawer"
             accessibilityRole="button"
             onAccessibilityTap={dismissBySelf}
-            style={[styles.scrim, { backgroundColor: theme.colors.foreground }, scrimStyle]}
+            style={[styles.scrim, { backgroundColor: theme.colors.scrim }, scrimStyle]}
             testID="sheet-scrim"
           />
         </GestureDetector>

@@ -15,7 +15,7 @@ import { scheduleOnRN } from "react-native-worklets";
 
 import { registerNavigationOverlayDismiss } from "@/components/nav/overlay-dismiss";
 import { haptics } from "@/lib/haptics";
-import { alpha, chrome, pressroomColors, useTheme } from "@/theme";
+import { alpha, chrome, useTheme } from "@/theme";
 
 const DEFAULT_DISMISS_RATIO = 0.22;
 const VELOCITY_PROJECTION_SECONDS = 0.2;
@@ -250,7 +250,10 @@ export function SwipeDismissOverlay({
       visible
     >
       <View style={styles.root} testID="swipe-dismiss-overlay">
-        <Animated.View pointerEvents="none" style={[styles.backdrop, backdropStyle]} />
+        <Animated.View
+          pointerEvents="none"
+          style={[styles.backdrop, { backgroundColor: theme.colors.scrim }, backdropStyle]}
+        />
         <GestureDetector gesture={pan}>
           <Animated.View
             style={[
@@ -274,7 +277,6 @@ export function SwipeDismissOverlay({
 const styles = StyleSheet.create({
   backdrop: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: pressroomColors.void,
   },
   panel: {
     flex: 1,
