@@ -329,6 +329,29 @@ export interface NotificationNavigationTarget {
   eventKey?: string;
 }
 
+/**
+ * A knock pushed by the server (`device.approval_requested`): another device
+ * of this account is waiting to be approved. Tapping it opens the app, where
+ * the approval prompt takes over; nothing about the device travels in the
+ * payload beyond the request id, and the fingerprint comparison happens in
+ * the prompt, never on the lock screen.
+ */
+export interface NotificationApprovalTarget {
+  requestId: string;
+}
+
+export function parseNotificationApprovalTarget(value: unknown): NotificationApprovalTarget | null {
+  if (
+    !isRecord(value) ||
+    value["event"] !== "device.approval_requested" ||
+    typeof value["requestId"] !== "string" ||
+    !value["requestId"]
+  ) {
+    return null;
+  }
+  return { requestId: value["requestId"] };
+}
+
 export function parseNotificationNavigationTarget(
   value: unknown,
 ): NotificationNavigationTarget | null {
@@ -351,10 +374,16 @@ function targetFromResponse(
 
 export function subscribeToLocalNotificationResponses(
   listener: (target: NotificationNavigationTarget) => void,
+  onApproval?: (target: NotificationApprovalTarget) => void,
 ): () => void {
   const subscription = Notifications.addNotificationResponseReceivedListener((response) => {
     const target = targetFromResponse(response);
-    if (target) listener(target);
+    if (target) {
+      listener(target);
+      return;
+    }
+    const approval = parseNotificationApprovalTarget(response.notification.request.content.data);
+    if (approval && onApproval) onApproval(approval);
   });
   return () => subscription.remove();
 }
@@ -365,4 +394,13 @@ export function consumeLastLocalNotificationResponse(): NotificationNavigationTa
   const target = targetFromResponse(response);
   Notifications.clearLastNotificationResponse();
   return target;
+}
+
+/** The knock the app was opened from, if it was: consumed once, like the session target. */
+export function consumeLastApprovalNotificationResponse(): NotificationApprovalTarget | null {
+  const response = Notifications.getLastNotificationResponse();
+  if (!response) return null;
+  const approval = parseNotificationApprovalTarget(response.notification.request.content.data);
+  if (approval) Notifications.clearLastNotificationResponse();
+  return approval;
 }

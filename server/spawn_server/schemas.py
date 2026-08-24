@@ -280,6 +280,9 @@ class PushDeviceRegisterRequest(BaseModel):
     platform: Literal["ios", "android"]
     # Recognition only, for a future signed-in-devices screen. Never trusted.
     label: str | None = Field(default=None, max_length=64)
+    # This install's browser device id, so its own knock is not pushed back to
+    # it. Optional: older apps register without it.
+    browser_device_id: str | None = Field(default=None, min_length=36, max_length=36)
 
 
 class PushDeviceOut(BaseModel):

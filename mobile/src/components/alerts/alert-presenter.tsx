@@ -13,12 +13,16 @@ import {
 import { useToast } from "@/components/ui/toast";
 import { AgentIcon } from "@/components/workspace-detail/agent-icon";
 import { getAlertQueryContext, refreshAlertSession } from "@/data/queries/alerts";
+import { useRegisteredPhone } from "@/data/queries/pairing";
+import { useMeSettingsQuery } from "@/data/queries/settings";
+import { qk } from "@/data/queryKeys";
 import type { AlertEvent } from "@/data/realtime/alert-socket";
 import { identifyAgent } from "@/data/selectors/agent";
 import { alertEventKey, useAlertStore } from "@/data/stores/alerts";
 import { haptics } from "@/lib/haptics";
 import {
   configureLocalNotifications,
+  consumeLastApprovalNotificationResponse,
   consumeLastLocalNotificationResponse,
   getNotificationPreferences,
   hydrateNotificationPreferences,
@@ -53,6 +57,11 @@ export function AlertPresenter({
     explicitCurrentSessionId === undefined
       ? currentTerminalSession(pathname)
       : explicitCurrentSessionId;
+  // The push token is registered against this install's trust identity so
+  // the server never pushes this device's own knock back to it.
+  const me = useMeSettingsQuery();
+  const phone = useRegisteredPhone(me.data?.user.id);
+  const browserDeviceId = phone.data?.id ?? null;
 
   const openSession = useCallback(
     (sessionId: string) => {
@@ -83,19 +92,30 @@ export function AlertPresenter({
     [openSession, queryClient, toast],
   );
 
+  // A tapped knock opens the app; the approval prompt is mounted in the
+  // signed-in shell and shows the moment the pending list is fresh.
+  const surfaceApproval = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: qk.deviceApprovals() });
+  }, [queryClient]);
+
   useEffect(() => {
     configureLocalNotifications();
     void hydrateNotificationPreferences();
     // Re-registered on every mount on purpose: push tokens are reissued on
     // reinstall, on restore to a new handset and sometimes on an OS upgrade,
-    // and a stale registration fails silently — the alerts simply stop.
-    void registerForPushNotifications();
+    // and a stale registration fails silently — the alerts simply stop. Runs
+    // again once the trust identity is known, so the token carries it.
+    void registerForPushNotifications({ browserDeviceId });
     const lastResponse = consumeLastLocalNotificationResponse();
     if (lastResponse) void handleNotificationTarget(lastResponse);
-    return subscribeToLocalNotificationResponses((target) => {
-      void handleNotificationTarget(target);
-    });
-  }, [handleNotificationTarget]);
+    else if (consumeLastApprovalNotificationResponse()) surfaceApproval();
+    return subscribeToLocalNotificationResponses(
+      (target) => {
+        void handleNotificationTarget(target);
+      },
+      () => surfaceApproval(),
+    );
+  }, [handleNotificationTarget, surfaceApproval, browserDeviceId]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (state) => {

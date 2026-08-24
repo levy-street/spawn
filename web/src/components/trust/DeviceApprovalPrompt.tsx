@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
+import { Trident } from "@/components/icons/BrandMark";
 import {
   useAccountEndorsementEdges,
   useDeviceTrustMap,
@@ -33,11 +34,11 @@ import { hostsTrustingDevice } from "@/lib/trust-roster";
  * when the tab opens.
  *
  * It renders nothing unless this browser can actually help: approving means
- * signing an endorsement, and only a browser some host already trusts —
- * directly, or through an account chain — can sign one that any host will
- * honour. Prompting a browser that would only fail is worse than staying quiet.
- * The hosts the approval reaches are named in the dialog, so "approve" never
- * promises more than the hosts anchored on this browser.
+ * signing an endorsement, and only a browser some host already trusts, either
+ * directly or through an account chain, can sign one that any host will
+ * honour. Prompting a browser that would only fail is worse than staying
+ * quiet. The hosts the approval reaches are named in the dialog, so "approve"
+ * never promises more than the hosts anchored on this browser.
  */
 export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }) {
   const queryClient = useQueryClient();
@@ -121,33 +122,35 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
   }
 
   const busy = endorse.isPending || deny.isPending;
-  const label = target.label ?? "A device";
+  const label = target.label ?? "A new device";
 
   return (
     <Dialog open onOpenChange={(open) => (open ? undefined : dismiss(request.id))}>
-      <DialogContent size="sm" hideClose data-testid="device-approval-prompt">
-        <DialogHeader>
-          <DialogTitle>{label} is asking to join</DialogTitle>
-          <DialogDescription>
-            It signed in as you, and stays locked out of your hosts until you vouch for it.
+      <DialogContent size="md" hideClose data-testid="device-approval-prompt">
+        <DialogHeader className="items-center px-6 pt-7 text-center">
+          <Trident className="mb-3 size-12" />
+          <DialogTitle className="text-lg">Approve {label}?</DialogTitle>
+          <DialogDescription className="max-w-[44ch]">
+            It signed in to your account. It cannot open anything on your hosts until you approve it
+            here.
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-3 px-4">
-          <p className="select-all break-all rounded-md border border-border bg-muted/60 px-3 py-2.5 text-center font-mono text-sm font-semibold tracking-wide">
+        <div className="space-y-4 px-6 py-3">
+          <p className="select-all break-all rounded-lg border border-border bg-muted/60 px-4 py-3 text-center font-mono text-base font-semibold tracking-wide">
             {request.fingerprint}
           </p>
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            {label} shows a fingerprint on its screen. Approve only if it matches this one exactly —
-            the name is a label anyone can set; the fingerprint is what proves which device you are
-            trusting.
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            {label} is showing a fingerprint on its screen. Approve only if it is exactly the same
+            as the one above. The name can be anything; the fingerprint is what identifies the
+            device.
           </p>
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            Approving here lets it connect to{" "}
-            <span className="text-foreground">
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            This approval covers{" "}
+            <span className="font-medium text-foreground">
               {formatHostList(coveredHosts.map((h) => h.name))}
             </span>
-            . Other hosts will ask again from a screen they already trust.
+            . Any other host will ask again from a screen it already trusts.
           </p>
           {failure !== null && (
             <p className="text-sm text-destructive" role="alert">
@@ -156,11 +159,10 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
           )}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="px-6 pb-6 pt-3">
           <Button
             type="button"
             variant="outline"
-            size="sm"
             disabled={busy}
             onClick={() => deny.mutate(request.id)}
           >
@@ -168,7 +170,6 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
           </Button>
           <Button
             type="button"
-            size="sm"
             disabled={busy}
             onClick={() => {
               setFailure(null);
@@ -181,7 +182,7 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
               );
             }}
           >
-            {endorse.isPending ? "Approving…" : "It matches — approve"}
+            {endorse.isPending ? "Approving" : "Approve"}
           </Button>
         </DialogFooter>
       </DialogContent>

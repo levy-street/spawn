@@ -170,24 +170,34 @@ terminal state precisely so the residual is a chosen, contained trade.
   two escapes that need no other device (the passkey, possessing a host from its
   terminal). The stamp is advisory in both directions: it grants nothing, and a device
   that never stamps is still a visible waiting row (R4).
-- existing device: the request arrives as a prompt (`ApproveRequest`) or, on desktop, a
-  corner toast — *Enter its number* / *Ignore* → NumberCheck (enter side). The roster's
-  waiting row is the pull path to the same place. An actively-asking device's toast
-  says so ("It's asking for approval to reach your hosts") and outranks quiet
-  sign-ins.
+- existing device: the request arrives as a prompt (`ApproveRequest`) → NumberCheck
+  (enter side). The roster's waiting row is the pull path to the same place. *(The
+  desktop corner toast that offered "Enter its number" for every unapproved sign-in
+  was retired 2026-08-25: the phone has no number to enter, so for the device that
+  actually asks it was a dead end, and it outlived the approval it was nagging about.
+  The knock prompt below is the one push path; the roster remains the pull path.)*
 - **the knock prompt** *(as built for the phone, 2026-08-25;
   `DeviceApprovalPrompt` on web, `DeviceApprovalPrompt` on mobile)*: the phone
   has no SAS role, so its knock is answered by a fingerprint compare instead of
-  a number — the prompt is a standard modal (title, the fingerprint as the one
-  thing to check, *Deny* / *It matches — approve*) that shows only on a screen
-  some host trusts, and it names the hosts the approval reaches ("Approving
-  here lets it connect to dream and minivac. Other hosts will ask again from a
-  screen they already trust."). Approve signs ONE account endorsement toward
+  a number — the prompt is a standard modal (the trident, "Approve spawn on
+  iPhone?", the fingerprint as the one thing to check, *Deny* / *Approve*) that
+  shows only on a screen some host trusts, and it names the hosts the approval
+  reaches ("This approval covers dream and minivac. Any other host will ask
+  again from a screen it already trusts."). Plain sentences, no dashes: the
+  copy is read by someone deciding whether to trust a device. Approve signs ONE account endorsement toward
   chain-capable hosts (`TRUST_DEVICE_MESH.md` §4, *approve-knock*) and the
   legacy per-host statement toward the rest; the knock closes on either. The
   asking phone watches for the approval and reconnects on its own (ceremony
   sheet: "waiting on your say-so"), with the `spawnd login` pairing code kept
-  as the no-other-device fallback.
+  as the no-other-device fallback. A knock also reaches the phones that are
+  closed: the server pushes "Approve spawn on iPhone?" to every install of the
+  account except the one that asked (push tokens register with their browser
+  device id for exactly this), at most once per two minutes per knock; the tap
+  opens the app, where the prompt takes over. The app asks for notification
+  permission on first launch after sign-in; before 2026-08-25 it only ever
+  read the answer, so no phone had ever registered a token. The web's session
+  gate knocks the same way (beside its roster stamp) and shows its own
+  fingerprint, so a new browser reaches a phone and an open screen alike.
 - With a passkey there is **no flow at all**: signing in with it is the approval.
   Recovery-after-total-loss is deliberately the *same non-flow*.
 

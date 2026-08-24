@@ -48,6 +48,7 @@ async def register_push_device(
             token=body.token,
             platform=body.platform,
             label=body.label,
+            browser_device_id=body.browser_device_id,
             created_at=now,
             last_seen_at=now,
         )
@@ -60,6 +61,7 @@ async def register_push_device(
         device.user_id = user.id
         device.platform = body.platform
         device.label = body.label
+        device.browser_device_id = body.browser_device_id
         device.last_seen_at = now
         device.disabled_at = None
 

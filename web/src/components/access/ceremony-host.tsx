@@ -2,21 +2,18 @@
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Laptop, Smartphone } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { consumeApprovalRequest, useApprovalRequest } from "@/components/access/ceremony-store";
 import { NumberCheck } from "@/components/access/number-check";
 import { useSettingsDialog } from "@/components/settings/settings-dialog-store";
 import { useDeviceTrustMap } from "@/components/trust/device-endorsement";
 import { Button } from "@/components/ui/button";
 import { CEREMONY_SAS_DIGITS } from "@/lib/add-device-ceremony";
-import { type BrowserDevice, browserDevices, trust } from "@/lib/api";
+import { browserDevices, trust } from "@/lib/api";
 import { type ApproveCeremonyView, useApproveDeviceCeremony } from "@/lib/approve-ceremony";
 import { useAuth } from "@/lib/auth";
 import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
 import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
-import { approvalToastEligible, pickApprovalToastDevice } from "@/lib/session-approval";
-import { computeTrustRoster } from "@/lib/trust-roster";
 
 /**
  * The one place the approve-a-device ceremony runs (docs/TRUST_UX.md). Mounted
@@ -24,9 +21,10 @@ import { computeTrustRoster } from "@/lib/trust-roster";
  *
  * - a NEW device shows its number the moment an approver starts, wherever the
  *   operator happens to be in the app;
- * - an APPROVER gets the corner toast when an unapproved sign-in appears
- *   (R4 made visible), and the number-entry dialog when they act on it — from
- *   the toast or from the Access roster (via the ceremony store).
+ * - an APPROVER gets the number-entry dialog when they act on a waiting row
+ *   in the Access roster (via the ceremony store). A device that knocks is
+ *   answered by the DeviceApprovalPrompt modal instead; the corner toast that
+ *   used to offer "enter its number" for every unapproved sign-in is gone.
  *
  * Exactly one instance drives the relay; every surface that wants a ceremony
  * asks through `requestApproval`.
@@ -34,14 +32,14 @@ import { computeTrustRoster } from "@/lib/trust-roster";
 export function AccessCeremonyHost() {
   const { user } = useAuth();
   const qc = useQueryClient();
-  const settingsTab = useSettingsDialog();
+  const _settingsTab = useSettingsDialog();
   const registration = useBrowserDeviceRegistration(user?.id);
   const devices = useQuery({
     queryKey: ["browser-devices"],
     queryFn: browserDevices.list,
     enabled: user !== null,
-    // The toast is how an operator learns a new sign-in is waiting; poll
-    // gently app-wide (the Access panel polls faster while open).
+    // A new sign-in shows up in the Access roster; poll gently app-wide (the
+    // panel polls faster while open).
     refetchInterval: 10_000,
   });
   const localIdentity = useQuery({
@@ -50,29 +48,17 @@ export function AccessCeremonyHost() {
     enabled: user !== null,
     retry: false,
   });
-  const edges = useQuery({
+  const _edges = useQuery({
     queryKey: ["account-endorsements"],
     queryFn: trust.accountEndorsements,
     enabled: user !== null,
     refetchInterval: 15_000,
   });
-  const trustMap = useDeviceTrustMap(user !== null);
-  // A device that knocked (the phone's path — it has no SAS role) is answered
-  // by the DeviceApprovalPrompt modal, not by this toast: offering to "enter
-  // its number" for a device that can never show one is a dead end. Shares
-  // the prompt's cache key so both see the same pending set.
-  const knocks = useQuery({
-    queryKey: ["trust", "device-approvals"],
-    queryFn: () => trust.listDeviceApprovals(),
-    enabled: user !== null,
-    refetchInterval: 60_000,
-  });
-  const knockingDeviceIds = new Set((knocks.data ?? []).map((k) => k.browser_device_id));
-
+  const _trustMap = useDeviceTrustMap(user !== null);
   // The roster fetched before this browser's own registration landed cannot
-  // contain this device, and until it does `canApprove` reads false — the
-  // toast would wait a full poll cycle for no reason. Refetch the moment the
-  // identity is ready (same pattern as the Access panel).
+  // contain this device, and a ceremony started before it appears would wait a
+  // full poll cycle for no reason. Refetch the moment the identity is ready
+  // (same pattern as the Access panel).
   useEffect(() => {
     if (registration.data?.status === "ready") {
       void qc.invalidateQueries({ queryKey: ["browser-devices"] });
@@ -104,43 +90,8 @@ export function AccessCeremonyHost() {
     if (target) ceremony.start(target);
   }, [requestedId, devices.data]);
 
-  // Waiting devices (unapproved sign-ins), for the corner toast: live, not the
-  // root, not this device, unreachable from any anchor, holding no pins.
-  const roster = computeTrustRoster(devices.data ?? [], edges.data ?? [], trustMap.pinnedDeviceIds);
-  const canApprove =
-    currentDevice !== null && (roster.get(currentDevice.id)?.chainTrusted ?? false);
-  // Ignore is per sitting AND per ask: a device that actively asks again after
-  // being ignored (it tried to open an agent session) re-raises the toast.
-  const [ignoredAt, setIgnoredAt] = useState<Map<string, number>>(new Map());
-  const waiting =
-    !canApprove || !trustMap.ready || !edges.data
-      ? []
-      : (devices.data ?? []).filter(
-          (d) =>
-            d.revoked_at === null &&
-            !d.is_root &&
-            d.id !== currentDevice?.id &&
-            !(roster.get(d.id)?.chainTrusted ?? false) &&
-            trustMap.trustedHostIdsFor(d.id).length === 0 &&
-            !knockingDeviceIds.has(d.id) &&
-            approvalToastEligible(d, ignoredAt.get(d.id)),
-        );
-  // One toast at a time (the most urgent ask first); the settings dialog
-  // already shows waiting rows.
-  const toastDevice =
-    settingsTab === null && ceremony.ceremonies.length === 0
-      ? pickApprovalToastDevice(waiting)
-      : null;
-
   return (
     <>
-      {toastDevice && (
-        <ApproveRequestToast
-          device={toastDevice}
-          onEnterNumber={() => ceremony.start(toastDevice)}
-          onIgnore={() => setIgnoredAt((prev) => new Map(prev).set(toastDevice.id, Date.now()))}
-        />
-      )}
       {ceremony.ceremonies.map((view) => (
         <CeremonyDialog
           key={view.pairingId}
@@ -265,54 +216,5 @@ function CeremonyDialog({
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
-  );
-}
-
-/**
- * The request as it arrives on whatever the operator is doing: a corner toast.
- * Approving opens the number check; Ignore dismisses — nothing is trusted from
- * this card alone.
- */
-function ApproveRequestToast({
-  device,
-  onEnterNumber,
-  onIgnore,
-}: {
-  device: BrowserDevice;
-  onEnterNumber: () => void;
-  onIgnore: () => void;
-}) {
-  const name = device.label ?? "Unnamed device";
-  const isPhone = /iphone|ipad|android|pixel|phone|tablet/iu.test(name);
-  // An active ask (it tried to open an agent session) reads differently from a
-  // quiet sign-in: someone is standing at that device waiting on this one.
-  const asking = device.approval_requested_at !== null;
-  return (
-    <div
-      data-testid="approve-toast"
-      className="fixed bottom-4 right-4 z-40 w-[320px] rounded-2xl border border-border bg-card p-4 shadow-2xl shadow-black/30"
-    >
-      <div className="flex items-start gap-3">
-        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-          {isPhone ? <Smartphone className="size-4" /> : <Laptop className="size-4" />}
-        </span>
-        <div className="min-w-0 flex-1">
-          <p className="text-sm font-medium text-foreground">Approve {name}?</p>
-          <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-            {asking
-              ? "It's asking for approval to reach your hosts. If that wasn't you, ignore this."
-              : "It just signed in as you. If that wasn't you, ignore this."}
-          </p>
-        </div>
-      </div>
-      <div className="mt-3 flex gap-2">
-        <Button size="sm" onClick={onEnterNumber}>
-          Enter its number
-        </Button>
-        <Button size="sm" variant="ghost" onClick={onIgnore}>
-          Ignore
-        </Button>
-      </div>
-    </div>
   );
 }
