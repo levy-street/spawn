@@ -270,6 +270,44 @@ def test_deploy_prebuilt_publish_skips_cleanly_without_a_release(tmp_path: Path)
     assert "remote deploy: complete" in result.stdout
 
 
+def test_deploy_refuses_stale_prebuilt_before_touching_production(tmp_path: Path):
+    _origin, local, remote = _init_repo(tmp_path)
+    prebuilt_commit = _git(["rev-parse", "HEAD"], local).stdout.strip()
+    remote_home = _fake_remote_home(tmp_path)
+    fakebin = _fake_ssh(tmp_path, remote_home)
+
+    # The rolling release still describes the old daemon tree while master has
+    # moved on. This is the exact v2-prebuilt/v3-server incident the preflight
+    # must stop before SSH is invoked.
+    (local / "daemon" / "Cargo.toml").write_text(
+        "[package]\nname='fake'\nversion='0.2.0'\n"
+    )
+    _git(["add", "daemon/Cargo.toml"], local)
+    _git(["commit", "-m", "change daemon protocol"], local)
+    _git(["push", "origin", "master"], local)
+
+    _write_executable(
+        fakebin / "gh",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$SPAWN_DEPLOY_TEST_LOG_DIR/gh.log"
+out=''
+while [[ "$#" -gt 0 ]]; do
+  if [[ "$1" == "--dir" ]]; then out="$2"; shift 2; else shift; fi
+done
+mkdir -p "$out"
+printf '%s\\n' {prebuilt_commit!r} > "$out/COMMIT"
+""",
+    )
+    env = _deploy_env(tmp_path, fakebin, remote, SPAWN_DEPLOY_PREBUILTS="1")
+
+    result = _deploy(local, env)
+
+    assert result.returncode != 0
+    assert "prebuilt-latest was built from a different daemon tree" in result.stderr
+    assert _log(tmp_path, "ssh-host.log") == ""
+
+
 def test_deploy_refuses_dirty_remote_checkout_before_build_or_restart(tmp_path: Path):
     _origin, local, remote = _init_repo(tmp_path)
     remote_home = _fake_remote_home(tmp_path)
