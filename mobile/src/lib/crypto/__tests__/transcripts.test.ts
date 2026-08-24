@@ -15,15 +15,20 @@ import {
 } from "@/lib/crypto/signed-signal";
 import {
   encodeBrowserEndorsementV1,
-  encodeBrowserRegistrationV1,
+  encodeBrowserRegistrationV2,
   encodeHostPairApprovalV1,
   encodeHostPairPossessionV1,
-  signBrowserRegistrationV1,
+  signBrowserRegistrationV2,
   signHostPairApprovalV1,
   signHostPairPossessionV1,
+  verifyBrowserRegistrationV2,
   verifyHostPairPossessionV1,
 } from "@/lib/crypto/transcripts";
-import registrationFixture from "../../../../tests/fixtures/browser-device-registration-v1-vectors.json";
+// The registration vectors come straight from proto/ — the cross-runtime
+// source of truth — so a contract bump there breaks this suite instead of
+// silently stranding the app on the old transcript. (A local V1 copy is
+// exactly how this file kept passing after the server moved to V2.)
+import registrationFixture from "../../../../../proto/browser-device-registration-v2-vectors.json";
 import approvalFixture from "../../../../tests/fixtures/host-pair-approval-v1-vectors.json";
 import possessionFixture from "../../../../tests/fixtures/host-pair-possession-v1-vectors.json";
 import signalFixture from "../../../../tests/fixtures/signed-signal-v1-vectors.json";
@@ -33,22 +38,71 @@ const RFC_SEED = decodeHex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703b
 const RFC_PUBLIC_KEY = deriveEd25519PublicKey(RFC_SEED);
 
 describe("canonical trust transcripts", () => {
-  test("matches the browser registration vector", () => {
+  test("matches the browser registration v2 vectors, both flag values", () => {
+    for (const positive of [registrationFixture.positive, registrationFixture.positive_root]) {
+      const input = {
+        accountId: positive.user_id,
+        browserPublicKey: positive.public_key,
+        isRoot: positive.is_root,
+      };
+      const transcript = encodeBrowserRegistrationV2(input);
+      expect(encodeHex(transcript)).toBe(positive.transcript_hex);
+      expect(encodeHex(sha256(transcript))).toBe(positive.transcript_sha256);
+      // The vector's signature verifies against the vector's own key: our
+      // encoding and Ed25519 agree byte-for-byte with the other runtimes.
+      expect(
+        verifyBrowserRegistrationV2(
+          decodeBase64UrlExact(positive.public_key, 32),
+          input,
+          decodeBase64UrlExact(positive.signature, 64),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  test("signs a registration this runtime can itself verify", () => {
+    const input = {
+      accountId: registrationFixture.positive.user_id,
+      browserPublicKey: encodeBase64Url(RFC_PUBLIC_KEY),
+      isRoot: false,
+    };
+    const signature = signBrowserRegistrationV2(RFC_SEED, input);
+    expect(verifyBrowserRegistrationV2(RFC_PUBLIC_KEY, input, signature)).toBe(true);
+    // The root claim lives inside the signed bytes: flipping it kills the proof.
+    expect(verifyBrowserRegistrationV2(RFC_PUBLIC_KEY, { ...input, isRoot: true }, signature)).toBe(
+      false,
+    );
+  });
+
+  test("a flipped root flag fails against the shared vector too", () => {
+    const positive = registrationFixture.positive;
+    expect(
+      verifyBrowserRegistrationV2(
+        decodeBase64UrlExact(positive.public_key, 32),
+        {
+          accountId: positive.user_id,
+          browserPublicKey: positive.public_key,
+          isRoot: !positive.is_root,
+        },
+        decodeBase64UrlExact(positive.signature, 64),
+      ),
+    ).toBe(false);
+  });
+
+  test("rejects malformed registration wire forms", () => {
     const input = {
       accountId: registrationFixture.positive.user_id,
       browserPublicKey: registrationFixture.positive.public_key,
+      isRoot: false,
     };
-    const transcript = encodeBrowserRegistrationV1(input);
-    expect(encodeHex(transcript)).toBe(registrationFixture.positive.transcript_hex);
-    expect(encodeHex(sha256(transcript))).toBe(registrationFixture.positive.transcript_sha256);
-    expect(encodeBase64Url(signBrowserRegistrationV1(RFC_SEED, input))).toBe(
-      registrationFixture.positive.signature,
-    );
     for (const accountId of registrationFixture.malformed_user_ids) {
-      expect(() => encodeBrowserRegistrationV1({ ...input, accountId })).toThrow();
+      expect(() => encodeBrowserRegistrationV2({ ...input, accountId })).toThrow();
     }
     for (const browserPublicKey of registrationFixture.malformed_public_keys) {
-      expect(() => encodeBrowserRegistrationV1({ ...input, browserPublicKey })).toThrow();
+      expect(() => encodeBrowserRegistrationV2({ ...input, browserPublicKey })).toThrow();
+    }
+    for (const signature of registrationFixture.malformed_signatures) {
+      expect(() => decodeBase64UrlExact(signature, 64)).toThrow();
     }
   });
 
