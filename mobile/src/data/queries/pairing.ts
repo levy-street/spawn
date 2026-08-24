@@ -357,11 +357,19 @@ export async function acceptPairingEndorsement(input: {
   }
 }
 
-export function useRegisteredPhone(accountId: string) {
+export function useRegisteredPhone(accountId: string | undefined) {
   return useQuery({
-    queryKey: qk.browserDeviceRegistration(accountId),
-    queryFn: () => ensureDeviceRegistered({ accountId, label: "spawn on iPhone" }),
-    retry: false,
+    queryKey: qk.browserDeviceRegistration(accountId ?? "pending"),
+    queryFn: () => {
+      if (accountId === undefined) throw new Error("Account is not ready");
+      return ensureDeviceRegistered({ accountId, label: "spawn on iPhone" });
+    },
+    // Never run against a half-loaded account: a query keyed on "" used to
+    // throw before the account arrived and its failure looked real.
+    enabled: accountId !== undefined,
+    // Registration is idempotent, so one silent retry absorbs a network blip;
+    // a real failure still surfaces (and callers must show it, not shrug).
+    retry: 1,
   });
 }
 

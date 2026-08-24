@@ -31,7 +31,7 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
   const queryClient = useQueryClient();
   const me = useMeSettingsQuery();
   const accountId = me.data?.user.id;
-  const phoneQuery = useRegisteredPhone(accountId ?? "");
+  const phoneQuery = useRegisteredPhone(accountId);
   const phone = phoneQuery.data;
   const devices = useAccountDevices(phoneQuery.isSuccess);
   const approvals = useDeviceHostApprovals();

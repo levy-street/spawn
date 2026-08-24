@@ -64,7 +64,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
   const queryClient = useQueryClient();
   const me = useMeSettingsQuery();
   const accountId = me.data?.user.id;
-  const phoneQuery = useRegisteredPhone(accountId ?? "");
+  const phoneQuery = useRegisteredPhone(accountId);
   const phone = phoneQuery.data;
   const devicesQuery = useAccountDevices(phoneQuery.isSuccess);
   const endorsements = usePendingEndorsements(accountId ?? "", phone?.id ?? null);
@@ -183,6 +183,19 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
         <Text accessibilityRole="alert" color="destructive" variant="body">
           {error}
         </Text>
+      ) : null}
+
+      {phoneQuery.isError ? (
+        <View style={styles.section}>
+          <Text accessibilityRole="alert" color="destructive" variant="body">
+            {phoneQuery.error instanceof Error
+              ? `This device could not register its identity: ${phoneQuery.error.message}`
+              : "This device could not register its identity."}
+          </Text>
+          <Button onPress={() => void phoneQuery.refetch()} size="sm" variant="outline">
+            Try again
+          </Button>
+        </View>
       ) : null}
 
       <View style={styles.section}>
