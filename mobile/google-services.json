@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "934733122600",
+    "project_id": "spawn-d-c0c4e",
+    "storage_bucket": "spawn-d-c0c4e.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:934733122600:android:7089f71284e84a8f35391d",
+        "android_client_info": {
+          "package_name": "dev.spawnd"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAHNJKVG1UpJhoNskVRjM2hbxsBkOn4lmw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
