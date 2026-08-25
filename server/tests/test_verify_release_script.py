@@ -120,6 +120,7 @@ def _run_verifier(tmp_path: Path, *, manifest_counter: int) -> subprocess.Comple
                 "--ref",
                 "HEAD",
                 "--skip-mobile",
+                "--skip-desktop",
                 f"http://127.0.0.1:{server.server_port}",
             ],
             cwd=REPO_ROOT,
