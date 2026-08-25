@@ -3,6 +3,7 @@ import { StyleSheet, View } from "react-native";
 import type { SharedValue } from "react-native-reanimated";
 import Animated, { Extrapolation, interpolate, useAnimatedStyle } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useOverlaySurface } from "@/components/ui/overlay-surface";
 import { useReducedMotion } from "@/lib/motion/reduced-motion";
 import { borderWidth, useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
@@ -40,6 +41,9 @@ export function FooterActions({
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const reducedMotion = useReducedMotion();
+  // The foot takes the colour of whatever it is pinned to. Painting the page
+  // colour under a drawer's panel is what put a black band under a grey sheet.
+  const surface = useOverlaySurface();
   const tracksKeyboard = keyboardAnimation !== undefined;
   // Reserved chrome already covers the device inset it stands on, so it replaces
   // that inset rather than stacking on top of it.
@@ -74,10 +78,15 @@ export function FooterActions({
     <Animated.View
       style={[
         styles.container,
-        {
-          backgroundColor: theme.colors.background,
-          borderTopColor: theme.colors.border,
-        },
+        surface === "popover"
+          ? {
+              backgroundColor: theme.colors.popover,
+              borderTopColor: theme.colors.popoverBorder,
+            }
+          : {
+              backgroundColor: theme.colors.background,
+              borderTopColor: theme.colors.border,
+            },
         animatedStyle,
       ]}
       testID="footer-actions"

@@ -13,7 +13,7 @@
       "supportsTablet": true,
       "bundleIdentifier": "dev.spawnd",
       "infoPlist": {
-        "NSLocalNetworkUsageDescription": "spawn connects directly to machines you own on your local network."
+        "NSLocalNetworkUsageDescription": "SPAWN D connects directly to machines you own on your local network."
       },
       "icon": {
         "light": "./assets/images/icon.png",
@@ -57,14 +57,14 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Allow spawn to attach photos to a terminal session.",
-          "cameraPermission": "Allow spawn to take a photo and attach it to a terminal session."
+          "photosPermission": "Allow SPAWN D to attach photos to a terminal session.",
+          "cameraPermission": "Allow SPAWN D to take a photo and attach it to a terminal session."
         }
       ],
       [
         "expo-camera",
         {
-          "cameraPermission": "Allow spawn to scan a machine pairing QR code.",
+          "cameraPermission": "Allow SPAWN D to scan a machine pairing QR code.",
           "microphonePermission": false,
           "recordAudioAndroid": false
         }
@@ -72,14 +72,14 @@
       [
         "expo-local-authentication",
         {
-          "faceIDPermission": "Allow spawn to unlock with Face ID."
+          "faceIDPermission": "Allow SPAWN D to unlock with Face ID."
         }
       ],
       [
         "expo-secure-store",
         {
           "configureAndroidBackup": true,
-          "faceIDPermission": "Allow spawn to access protected credentials with Face ID."
+          "faceIDPermission": "Allow SPAWN D to access protected credentials with Face ID."
         }
       ],
       [

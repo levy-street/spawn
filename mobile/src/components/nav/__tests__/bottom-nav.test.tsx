@@ -1,4 +1,4 @@
-import { act, fireEvent, render } from "@testing-library/react-native";
+import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 import { StyleSheet } from "react-native";
 import { SafeAreaInsetsContext } from "react-native-safe-area-context";
 
@@ -11,11 +11,51 @@ import { registerNavigationOverlayDismiss } from "@/components/nav/overlay-dismi
 import { haptics } from "@/lib/haptics";
 import { borderWidth, ThemeProvider } from "@/theme";
 
-const mockCanDismissRoutes = jest.fn(() => true);
-const mockDismissAllRoutes = jest.fn();
+const mockDispatch = jest.fn();
 const mockDismissAllSheets = jest.fn();
 const mockNavigateRoute = jest.fn();
 let mockPathname = "/workspaces";
+
+interface MockState {
+  type?: string;
+  key?: string;
+  index?: number;
+  routes: { name: string; state?: MockState }[];
+}
+
+/** Nothing above the roots: every stack on the way down holds one screen. */
+const ROOTS_ONLY: MockState = {
+  type: "stack",
+  key: "root",
+  index: 0,
+  routes: [
+    {
+      name: "(drawer)",
+      state: { type: "stack", key: "drawer", index: 0, routes: [{ name: "(tabs)" }] },
+    },
+  ],
+};
+
+/** A host pushed over the tabs, and the terminal pushed over that at the root. */
+const TERMINAL_OVER_HOST: MockState = {
+  type: "stack",
+  key: "root",
+  index: 1,
+  routes: [
+    {
+      name: "(drawer)",
+      state: {
+        type: "stack",
+        key: "drawer",
+        index: 1,
+        routes: [{ name: "(tabs)" }, { name: "host/[id]/index" }],
+      },
+    },
+    { name: "terminal/[sessionId]" },
+  ],
+};
+
+let mockRootState: MockState = ROOTS_ONLY;
 
 jest.mock("@/components/ui/sheet", () => ({
   // Read lazily: the factory is hoisted above the const it closes over.
@@ -23,12 +63,13 @@ jest.mock("@/components/ui/sheet", () => ({
 }));
 
 jest.mock("expo-router", () => ({
-  usePathname: () => mockPathname,
-  useRouter: () => ({
-    canDismiss: () => mockCanDismissRoutes(),
-    dismissAll: mockDismissAllRoutes,
-    navigate: mockNavigateRoute,
+  useNavigationContainerRef: () => ({
+    dispatch: mockDispatch,
+    getRootState: () => mockRootState,
+    isReady: () => true,
   }),
+  usePathname: () => mockPathname,
+  useRouter: () => ({ navigate: mockNavigateRoute }),
 }));
 
 jest.mock("@/lib/haptics", () => ({
@@ -73,6 +114,7 @@ function renderNav(pathname: string) {
 describe("BottomNav", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockRootState = ROOTS_ONLY;
   });
 
   it("rides the keyboard down instead of ghosting through it", async () => {
@@ -129,42 +171,50 @@ describe("BottomNav", () => {
 
     expect(haptics.selection).toHaveBeenCalledTimes(1);
     expect(mockDismissAllSheets).toHaveBeenCalledTimes(1);
-    expect(mockNavigateRoute).toHaveBeenCalledWith("/settings");
+    await waitFor(() => expect(mockNavigateRoute).toHaveBeenCalledWith("/settings"));
   });
 
-  it("pops a pushed screen before landing on the root", async () => {
-    const screen = await renderNav("/host/one");
+  it("pops every stack on the way down, not only the nearest one", async () => {
+    // A terminal over a host over the tabs: `dismissAll` only ever popped the
+    // terminal, which left the host standing over the destination tab.
+    mockRootState = TERMINAL_OVER_HOST;
+    const screen = await renderNav("/terminal/one");
 
     await fireEvent.press(screen.getByRole("tab", { name: "Legion" }));
 
-    expect(mockDismissAllSheets).toHaveBeenCalledTimes(1);
-    expect(mockDismissAllRoutes).toHaveBeenCalledTimes(1);
-    expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts");
+    await waitFor(() => expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts"));
+    expect(mockDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "POP_TO_TOP", target: "root" }),
+    );
+    expect(mockDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "POP_TO_TOP", target: "drawer" }),
+    );
+    expect(mockDispatch).toHaveBeenCalledTimes(2);
   });
 
   it("closes registered overlays before landing on a destination root", async () => {
     const onDismiss = jest.fn();
     const unregister = registerNavigationOverlayDismiss(onDismiss);
+    mockRootState = TERMINAL_OVER_HOST;
     const screen = await renderNav("/workspaces");
 
     await fireEvent.press(screen.getByRole("tab", { name: "Legion" }));
 
     expect(onDismiss).toHaveBeenCalledTimes(1);
-    expect(mockDismissAllRoutes).toHaveBeenCalledTimes(1);
-    expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts");
+    await waitFor(() => expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts"));
+    expect(mockDispatch).toHaveBeenCalled();
     unregister();
   });
 
   it("leaves the stack alone when there is nothing above the roots", async () => {
     // Dispatching a pop with nothing to pop is an unhandled action, which React
     // Navigation reports — on every single nav tap.
-    mockCanDismissRoutes.mockReturnValueOnce(false);
     const screen = await renderNav("/workspaces");
 
     await fireEvent.press(screen.getByRole("tab", { name: "Legion" }));
 
-    expect(mockDismissAllRoutes).not.toHaveBeenCalled();
-    expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts");
+    await waitFor(() => expect(mockNavigateRoute).toHaveBeenCalledWith("/hosts"));
+    expect(mockDispatch).not.toHaveBeenCalled();
   });
 
   it("owns its bottom safe-area inset and top hairline", async () => {

@@ -18,6 +18,7 @@ import {
   normalizeServerUrl,
   setBaseUrl,
 } from "@/data/api/config";
+import { testServerConnection } from "@/data/api/health";
 import { useConnectionStore } from "@/data/stores/connection";
 import { haptics } from "@/lib/haptics";
 import { spacing, useTheme } from "@/theme";
@@ -32,21 +33,8 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "An unknown error occurred.";
 }
 
-export async function testServerConnection(
-  baseUrl: string,
-  request: typeof fetch = globalThis.fetch,
-): Promise<void> {
-  const normalized = normalizeServerUrl(baseUrl);
-  const response = await request(`${normalized}/healthz`, {
-    credentials: "omit",
-    headers: { Accept: "application/json" },
-    method: "GET",
-  });
-  if (!response.ok) {
-    const status = [response.status, response.statusText].filter(Boolean).join(" ");
-    throw new Error(`Server responded with ${status || "an error"}`);
-  }
-}
+/** Re-exported for the settings suite; the probe itself lives with the API config. */
+export { testServerConnection };
 
 export function ServerPanel(): React.JSX.Element {
   const queryClient = useQueryClient();

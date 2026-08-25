@@ -213,7 +213,7 @@ export function DeviceApprovalCeremony({
       ) : phone && phase === "waiting" ? (
         <View style={[styles.section, { gap: theme.space(2) }]}>
           <Text color="mutedForeground" variant="sigilLabel">
-            This device · {phone.label ?? "spawn on iPhone"}
+            This device · {phone.label ?? "SPAWN D on iPhone"}
           </Text>
           <View style={[styles.actionsRow, { gap: theme.space(2) }]}>
             <Button

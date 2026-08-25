@@ -53,6 +53,21 @@ cd mobile && npm run ci        # typecheck + lint + jest
 cd server && .venv/bin/ruff check . && .venv/bin/python -m pytest -q
 ```
 
+## The product is called SPAWN D
+
+The folder is `spawn` and the daemon is `spawnd`; the product is neither. In
+anything a person reads — screen copy, error messages, permission prompts,
+notification text, passkey and OAuth labels — the name is **SPAWN D**, set
+exactly like that: capitals, a space, no trailing period. So "SPAWN D needs
+camera access", "Back to SPAWN D", "while SPAWN D is closed".
+
+Lower-case `spawnd` is still right where it names a technical thing: the
+daemon and its CLI (`spawnd login`), the server it talks to ("a spawnd
+server"), and the domain `spawnd.dev`. Identifiers never change for this:
+the URL scheme, the storage keys, package names and paths stay `spawn`.
+
+Bare lower-case "spawn" as the product name is a bug, in either frontend.
+
 ## Releasing
 
 Before deploying or releasing anything — server, web, a mobile update or

@@ -40,7 +40,7 @@ function AdminChrome({ children }: { children: ReactNode }) {
             This account does not administer this deployment.
           </p>
           <Link className="text-sm underline" href="/">
-            Back to spawn
+            Back to SPAWN D
           </Link>
         </div>
       </div>
@@ -52,7 +52,7 @@ function AdminChrome({ children }: { children: ReactNode }) {
       <header className="border-b border-border">
         <div className="mx-auto flex w-full max-w-5xl items-center justify-between gap-4 px-4 py-3">
           <div className="flex items-baseline gap-2">
-            <span className="text-base font-semibold tracking-tight">spawn</span>
+            <span className="text-base font-semibold tracking-tight">SPAWN D</span>
             <span className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground">
               admin
             </span>

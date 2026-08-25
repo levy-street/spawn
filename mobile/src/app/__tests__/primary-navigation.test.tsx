@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { Stack } from "expo-router";
-import { act, fireEvent, renderRouter } from "expo-router/testing-library";
+import { act, fireEvent, renderRouter, waitFor } from "expo-router/testing-library";
 import { Text, View } from "react-native";
 
 import TabsLayout from "@/app/(drawer)/(tabs)/_layout";
@@ -91,7 +91,8 @@ describe("primary navigation", () => {
       fireEvent.press(view.getByLabelText(label));
     });
 
-    expect(rendered.getPathname()).toBe(path);
+    // The landing waits a frame so the stacks can drop their animation first.
+    await waitFor(() => expect(rendered.getPathname()).toBe(path));
 
     // The regression this guards: when the three roots were siblings of the
     // detail screens, a nav tap pushed a card and left the previous root
@@ -110,11 +111,12 @@ describe("primary navigation", () => {
     await act(async () => {
       fireEvent.press(view.getByLabelText("Settings"));
     });
+    await waitFor(() => expect(rendered.getPathname()).toBe("/settings"));
     await act(async () => {
       fireEvent.press(view.getByLabelText("Workspaces"));
     });
 
-    expect(rendered.getPathname()).toBe("/workspaces");
+    await waitFor(() => expect(rendered.getPathname()).toBe("/workspaces"));
     const drawer = findState(rendered.getRouterState() as NavigationState, "(drawer)");
     expect(drawer?.routes.map((route) => route.name)).toEqual(["(tabs)"]);
   });

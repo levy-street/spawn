@@ -85,6 +85,8 @@ export const sizing = {
     /** The bordered plate every empty state now sits on. */
     containerPadding: 24,
     containerMinHeight: 200,
+    /** Air above the plate, so it never hugs the rule or copy it follows. */
+    topGap: 16,
   },
   /** A bottom drawer's action rows: roomier than a plain list row, since a drawer
    *  is a deliberate stop rather than something you scan past. */

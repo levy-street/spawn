@@ -14,7 +14,6 @@ import { Icon } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
 import { ListRow } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
-import { Text } from "@/components/ui/text";
 import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
@@ -34,6 +33,14 @@ export interface HostListItemProps {
   onOpenActions(): void;
 }
 
+/**
+ * One machine in the legion.
+ *
+ * A row is a glance, not a fact sheet: the name, whether it is up, what it has
+ * to give, and what is running on it. The OS, the architecture and the daemon
+ * version belong to the machine's own page — printed on every row they made the
+ * list read as an inventory rather than a fleet.
+ */
 export function HostListItem({
   host,
   sessions = [],
@@ -43,7 +50,6 @@ export function HostListItem({
 }: HostListItemProps) {
   const theme = useTheme();
   const online = host.status === "online";
-  const system = `${host.os ?? "unknown"}/${host.arch ?? "unknown"} · daemon ${host.version ?? "unknown"}`;
 
   const liveSessions = useMemo(
     () => sessions.filter((session) => session.status !== "exited" && session.status !== "killed"),
@@ -59,11 +65,11 @@ export function HostListItem({
   const spec = [
     host.cpu_cores === null ? null : pluralize(host.cpu_cores, "core"),
     host.memory_bytes === null ? null : formatBytes(host.memory_bytes),
-    host.gpu,
   ].filter((value): value is string => Boolean(value));
+  const subtitle = [hostConnectionLabel(host), ...spec].join(" · ");
 
-  const hasBody =
-    capacity.source === "bucketed" || spec.length > 0 || running.length > 0 || needYou > 0;
+  const showCapacity = online && capacity.source === "bucketed";
+  const hasBody = showCapacity || running.length > 0 || needYou > 0;
 
   return (
     <View testID={`host-row-${host.id}`}>
@@ -72,12 +78,7 @@ export function HostListItem({
           ? {
               body: (
                 <>
-                  {spec.length > 0 ? (
-                    <Text color="mutedForeground" variant="caption">
-                      {spec.join(" · ")}
-                    </Text>
-                  ) : null}
-                  {capacity.source === "bucketed" ? <CapacityMeter capacity={capacity} /> : null}
+                  {showCapacity ? <CapacityMeter capacity={capacity} compact /> : null}
                   {running.length > 0 || needYou > 0 ? (
                     <View style={styles.activity}>
                       <RunningAgents groups={running} testID={`host-running-${host.id}`} />
@@ -91,10 +92,10 @@ export function HostListItem({
                 </>
               ),
               bodyLabel: hostBodyLabel({
-                capacity,
+                capacity: showCapacity ? capacity : { source: "unavailable" },
                 liveSessions: liveSessions.length,
                 needYou,
-                spec,
+                sessionCount: host.session_count,
               }),
             }
           : {})}
@@ -130,21 +131,17 @@ export function HostListItem({
           onOpen();
         }}
         shape="fullBleed"
-        subtitle={`${hostConnectionLabel(host)}\n${system}`}
+        subtitle={subtitle}
         title={host.name}
         trailing={
-          <View style={styles.trailing}>
-            <Badge testID={`host-session-count-${host.id}`} variant="outline">
-              {pluralize(host.session_count, "session")}
-            </Badge>
-            <IconButton
-              accessibilityLabel={`Actions for ${host.name}`}
-              icon="Ellipsis"
-              onPress={onOpenActions}
-              size="sm"
-            />
-          </View>
+          <IconButton
+            accessibilityLabel={`Actions for ${host.name}`}
+            icon="Ellipsis"
+            onPress={onOpenActions}
+            size="lg"
+          />
         }
+        trailingPlacement="action"
       />
     </View>
   );
@@ -158,22 +155,21 @@ function hostBodyLabel({
   capacity,
   liveSessions,
   needYou,
-  spec,
+  sessionCount,
 }: {
   capacity: ReturnType<typeof capacityPresentation>;
   liveSessions: number;
   needYou: number;
-  spec: readonly string[];
+  sessionCount: number;
 }): string {
   const parts: string[] = [];
-  if (spec.length > 0) parts.push(spec.join(", "));
   if (capacity.source === "bucketed") {
     parts.push(
       `CPU ${capacityLabel(capacity.cpuSegments)}`,
       `memory ${capacityLabel(capacity.memorySegments)}`,
     );
   }
-  if (liveSessions > 0) parts.push(pluralize(liveSessions, "live session"));
+  parts.push(pluralize(liveSessions > 0 ? liveSessions : sessionCount, "session"));
   if (needYou > 0) parts.push(`${needYou} need you`);
   return parts.join(", ");
 }
@@ -197,10 +193,5 @@ const styles = StyleSheet.create({
     bottom: -spacing[0.5],
     position: "absolute",
     right: -spacing[0.5],
-  },
-  trailing: {
-    alignItems: "center",
-    flexDirection: "row",
-    gap: spacing[1],
   },
 });

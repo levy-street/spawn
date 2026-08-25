@@ -9,18 +9,29 @@ import { useTheme } from "@/theme";
  * Not decoration. Apple's Human Interface Guidelines require its mark to
  * accompany "Sign in with Apple", and Google's branding rules say the same for
  * the G — a wordmark alone is the version that gets flagged in review. Each is
- * drawn at the brand's own colours except Apple's, which is monochrome by rule
- * and therefore takes the button's ink so it survives both themes.
+ * drawn at the brand's own colours except Apple's and GitHub's, which are
+ * monochrome by rule and therefore take the button's ink so they survive both
+ * themes and both button tones.
  */
-export function ProviderMark({ provider, size = 18 }: { provider: ProviderId; size?: number }) {
+export function ProviderMark({
+  provider,
+  size = 18,
+  color,
+}: {
+  provider: ProviderId;
+  size?: number;
+  /** The ink for a monochrome mark. Defaults to the theme's foreground. */
+  color?: string;
+}) {
   const theme = useTheme();
+  const ink = color ?? theme.colors.foreground;
 
   if (provider === "apple") {
     return (
       <Svg height={size} viewBox="0 0 24 24" width={size}>
         <Path
           d="M17.05 12.53c-.02-2.2 1.8-3.26 1.88-3.31-1.02-1.5-2.62-1.7-3.19-1.72-1.36-.14-2.65.8-3.34.8-.69 0-1.75-.78-2.88-.76-1.48.02-2.85.86-3.61 2.18-1.54 2.67-.39 6.62 1.11 8.79.73 1.06 1.6 2.25 2.75 2.21 1.1-.05 1.52-.71 2.85-.71 1.33 0 1.71.71 2.88.69 1.19-.02 1.94-1.08 2.67-2.15.84-1.23 1.19-2.42 1.21-2.48-.03-.01-2.32-.89-2.33-3.54zM14.86 5.6c.6-.74 1.01-1.76.9-2.78-.87.04-1.93.58-2.56 1.31-.56.65-1.05 1.7-.92 2.7.97.08 1.97-.49 2.58-1.23z"
-          fill={theme.colors.foreground}
+          fill={ink}
         />
       </Svg>
     );
@@ -54,7 +65,7 @@ export function ProviderMark({ provider, size = 18 }: { provider: ProviderId; si
       <Svg height={size} viewBox="0 0 24 24" width={size}>
         <Path
           d="M12 .5C5.73.5.7 5.57.7 11.86c0 5.03 3.22 9.29 7.69 10.79.56.11.77-.24.77-.54 0-.27-.01-1.16-.02-2.1-3.13.69-3.79-1.34-3.79-1.34-.51-1.31-1.25-1.66-1.25-1.66-1.02-.7.08-.69.08-.69 1.13.08 1.72 1.17 1.72 1.17 1 1.73 2.63 1.23 3.27.94.1-.73.39-1.23.71-1.51-2.5-.29-5.13-1.26-5.13-5.6 0-1.24.44-2.25 1.16-3.04-.12-.29-.5-1.44.11-3 0 0 .95-.31 3.1 1.16a10.6 10.6 0 015.65 0c2.15-1.47 3.09-1.16 3.09-1.16.62 1.56.23 2.71.11 3 .73.79 1.16 1.8 1.16 3.04 0 4.35-2.63 5.31-5.14 5.59.4.35.76 1.04.76 2.1 0 1.52-.01 2.75-.01 3.12 0 .3.2.66.78.54 4.46-1.5 7.68-5.76 7.68-10.79C23.3 5.57 18.27.5 12 .5z"
-          fill={theme.colors.foreground}
+          fill={ink}
         />
       </Svg>
     );

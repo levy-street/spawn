@@ -41,7 +41,7 @@ export const SETTINGS_PANELS = [
   {
     key: "appearance",
     label: "Appearance",
-    description: "Choose how spawn looks on this device",
+    description: "Choose how SPAWN D looks on this device",
     icon: "Palette",
     route: "/settings/appearance",
     controls: ["Light", "Dark", "System"],

@@ -6,11 +6,19 @@ import { borderWidth, opacity, spacing, useTheme } from "@/theme";
 
 const CAPACITY_SEGMENTS = ["one", "two", "three", "four", "five"] as const;
 
-function SegmentedMeter({ label, segments }: { label: string; segments: number }) {
+function SegmentedMeter({
+  compact = false,
+  label,
+  segments,
+}: {
+  compact?: boolean;
+  label: string;
+  segments: number;
+}) {
   const theme = useTheme();
   return (
-    <View style={styles.meterRow}>
-      <Text style={styles.meterLabel} variant="micro">
+    <View style={[styles.meterRow, compact && styles.compactMeterRow]}>
+      <Text color="mutedForeground" style={styles.meterLabel} variant="micro">
         {label}
       </Text>
       <View accessibilityLabel={`${label} ${capacityLabel(segments)}`} style={styles.segments}>
@@ -28,9 +36,11 @@ function SegmentedMeter({ label, segments }: { label: string; segments: number }
           />
         ))}
       </View>
-      <Text color="mutedForeground" style={styles.value} variant="caption">
-        {capacityLabel(segments)}
-      </Text>
+      {compact ? null : (
+        <Text color="mutedForeground" style={styles.value} variant="caption">
+          {capacityLabel(segments)}
+        </Text>
+      )}
     </View>
   );
 }
@@ -68,7 +78,17 @@ function ExactMeter({ label, percent }: { label: string; percent: number }) {
   );
 }
 
-export function CapacityMeter({ capacity }: { capacity: CapacityPresentation }) {
+export interface CapacityMeterProps {
+  capacity: CapacityPresentation;
+  /**
+   * Both coarse meters on one line, without their word labels — the shape a
+   * list row has room for. The words are still spoken: each meter names its
+   * reading for assistive tech either way.
+   */
+  compact?: boolean;
+}
+
+export function CapacityMeter({ capacity, compact = false }: CapacityMeterProps) {
   if (capacity.source === "unavailable") {
     return (
       <Text color="mutedForeground" variant="caption">
@@ -78,9 +98,9 @@ export function CapacityMeter({ capacity }: { capacity: CapacityPresentation }) 
   }
   if (capacity.source === "bucketed") {
     return (
-      <View style={styles.stack} testID="bucketed-capacity">
-        <SegmentedMeter label="CPU" segments={capacity.cpuSegments} />
-        <SegmentedMeter label="MEM" segments={capacity.memorySegments} />
+      <View style={compact ? styles.compactPair : styles.stack} testID="bucketed-capacity">
+        <SegmentedMeter compact={compact} label="CPU" segments={capacity.cpuSegments} />
+        <SegmentedMeter compact={compact} label="MEM" segments={capacity.memorySegments} />
       </View>
     );
   }
@@ -98,6 +118,13 @@ export function CapacityMeter({ capacity }: { capacity: CapacityPresentation }) 
 }
 
 const styles = StyleSheet.create({
+  compactMeterRow: {
+    flex: 1,
+  },
+  compactPair: {
+    flexDirection: "row",
+    gap: spacing[4],
+  },
   exactFill: {
     height: "100%",
     minWidth: spacing.px,

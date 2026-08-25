@@ -59,7 +59,7 @@ function SignupPageContent() {
             {blockedProvider
               ? `${providerName(blockedProvider)} signed you in`
               : "You're signed in"}
-            , but spawn is invite only right now. Enter your invite code below and continue with{" "}
+            , but SPAWN D is invite only right now. Enter your invite code below and continue with{" "}
             {blockedProvider ? providerName(blockedProvider) : "your provider"} again to finish.
           </p>
         ) : invite !== null ? (

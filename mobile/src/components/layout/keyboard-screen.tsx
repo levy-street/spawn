@@ -83,6 +83,7 @@ export function KeyboardScreen({
       {header}
       {scroll ? (
         <KeyboardAwareScrollView
+          alwaysBounceVertical={false}
           bottomOffset={spacing[3]}
           contentContainerStyle={[styles.scrollContent, contentInsets]}
           contentInsetAdjustmentBehavior="never"

@@ -9,6 +9,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
+import { CameraHost } from "@/components/media/camera-host";
 import { ConfirmHost } from "@/components/ui/confirm";
 import { ToastProvider } from "@/components/ui/toast";
 import { RealtimeProvider } from "@/data/realtime/provider";
@@ -23,6 +24,7 @@ export const APP_PROVIDER_ORDER = [
   "ToastProvider",
   "KeyboardProvider",
   "ConfirmHost",
+  "CameraHost",
   "Router",
 ] as const;
 
@@ -86,6 +88,8 @@ export function AppProviders({ children }: PropsWithChildren): React.JSX.Element
                 <ToastProvider>
                   <KeyboardProvider>
                     <ConfirmHost />
+                    {/* Opened on demand over everything, the nav bar included. */}
+                    <CameraHost />
                     {children}
                   </KeyboardProvider>
                 </ToastProvider>

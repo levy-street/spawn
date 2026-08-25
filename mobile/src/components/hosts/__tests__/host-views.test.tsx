@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react-native";
-import { AccessibilityInfo, Text as NativeText } from "react-native";
+import { AccessibilityInfo } from "react-native";
 import {
   codexAgent,
   offlineHost,
@@ -29,23 +29,19 @@ describe("host list and detail rendering", () => {
           onOpenActions={onOpenActions}
           onRefresh={jest.fn()}
           refreshing={false}
-          summary={<NativeText>Legion rollup</NativeText>}
         />
       </ThemeProvider>,
     );
 
     expect(screen.getByText("office-mac")).toBeOnTheScreen();
-    expect(
-      screen.getByText(/online · heartbeat [\s\S]*macOS\/arm64 · daemon 1\.4\.2/),
-    ).toBeOnTheScreen();
-    expect(
-      screen.getByText(/offline · last seen [\s\S]*macOS\/arm64 · daemon 1\.4\.2/),
-    ).toBeOnTheScreen();
-    expect(screen.getAllByText("3 sessions")).toHaveLength(2);
+    // A row is a glance: the heartbeat and what the machine has to give. The
+    // OS, the architecture and the daemon version belong to its own page.
+    expect(screen.getByText(/online · heartbeat [\s\S]*12 cores · 24 GiB/)).toBeOnTheScreen();
+    expect(screen.getByText(/offline · last seen [\s\S]*12 cores · 24 GiB/)).toBeOnTheScreen();
+    expect(screen.queryByText(/daemon 1\.4\.2/)).toBeNull();
     expect(
       screen.getByTestId(`host-status-${onlineHost.id}`, { includeHiddenElements: true }),
     ).toHaveStyle({ position: "absolute" });
-    expect(screen.getByTestId(`host-session-count-${onlineHost.id}`)).toBeOnTheScreen();
     // Between the two hosts, and under the last of them to close the list.
     expect(screen.getAllByTestId("list-separator")).toHaveLength(2);
     expect(screen.getByText("old-laptop")).toBeOnTheScreen();
@@ -61,9 +57,9 @@ describe("host list and detail rendering", () => {
     await fireEvent(officeMacRow, "longPress");
     expect(onOpenActions).toHaveBeenCalledTimes(2);
 
-    // The legion's numbers sit at the head of the list itself; there is no row
-    // here that opens a page of its own to show them.
-    expect(screen.getByText("Legion rollup")).toBeOnTheScreen();
+    // The list is the machines and nothing else: no bank of fleet totals above
+    // the first host, and no row that opens a page of its own to show them.
+    expect(screen.queryByTestId("legion-summary")).toBeNull();
     expect(screen.queryByText("Fleet overview")).toBeNull();
   });
 
@@ -88,7 +84,7 @@ describe("host list and detail rendering", () => {
     expect(screen.getByLabelText("CPU Busy")).toBeOnTheScreen();
     expect(screen.getByLabelText("MEM Working")).toBeOnTheScreen();
     // Both fixtures share a spec; the offline one keeps it and loses the meter.
-    expect(screen.getAllByText("12 cores · 24 GiB · Apple M4 Pro")).toHaveLength(2);
+    expect(screen.getAllByText(/12 cores · 24 GiB/)).toHaveLength(2);
 
     // What is on the machine, not just how many of it.
     expect(screen.getByTestId(`host-running-${onlineHost.id}`)).toBeOnTheScreen();

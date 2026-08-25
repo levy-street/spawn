@@ -46,7 +46,7 @@ const PLATFORM_COPY: Record<
     label: "Windows",
     title: "Use a macOS or Linux host",
     recommendation:
-      "The daemon does not ship a Windows build yet. Install spawn from a Mac, Linux workstation, or Linux server.",
+      "The daemon does not ship a Windows build yet. Install SPAWN D from a Mac, Linux workstation, or Linux server.",
     service: "Windows service support is not available yet.",
     status: "unsupported",
   },

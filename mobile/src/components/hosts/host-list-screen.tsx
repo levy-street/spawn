@@ -1,10 +1,9 @@
 import { useRouter } from "expo-router";
-import { type ReactNode, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { FlatList, RefreshControl, StyleSheet, View } from "react-native";
 import { HostActionsSheet } from "@/components/hosts/host-actions-sheet";
 import { HostListItem } from "@/components/hosts/host-list-item";
 import { errorMessage, pluralize } from "@/components/hosts/host-model";
-import { LegionSummary } from "@/components/hosts/legion-summary";
 import { RenameHostDialog } from "@/components/hosts/rename-host-dialog";
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
@@ -45,8 +44,6 @@ export interface HostListViewProps {
   onOpenActions(host: HostOut): void;
   onRefresh(): void;
   onApproveDevice?(): void;
-  /** The legion's rollup, drawn above the machines it counts. */
-  summary?: ReactNode;
 }
 
 export function HostListView({
@@ -60,7 +57,6 @@ export function HostListView({
   onOpenActions,
   onRefresh,
   onApproveDevice,
-  summary,
 }: HostListViewProps) {
   const theme = useTheme();
   return (
@@ -77,25 +73,25 @@ export function HostListView({
           title="No hosts are connected yet."
         />
       }
+      // The machines are the page. The fleet's totals used to sit above them
+      // in a bank of tiles, which on a phone was a screen of arithmetic before
+      // the first host; they live on the Legion page now, with the live meters.
       ListHeaderComponent={
-        hosts.length > 0 ? (
+        hosts.length > 0 && unapprovedCount > 0 && onApproveDevice ? (
           <View style={styles.header}>
-            {unapprovedCount > 0 && onApproveDevice ? (
-              <Card padded={false} variant="flat">
-                <ListRow
-                  height="tall"
-                  leading={<Icon color="warning" name="ShieldAlert" size={spacing[5]} />}
-                  onPress={() => {
-                    haptics.selection();
-                    onApproveDevice();
-                  }}
-                  subtitle={`${pluralize(unapprovedCount, "host")} will not open a terminal here until this device is approved.`}
-                  title="This device is not approved yet"
-                  trailing={<Icon color="mutedForeground" name="ChevronRight" />}
-                />
-              </Card>
-            ) : null}
-            {summary === undefined ? null : <View style={styles.fleet}>{summary}</View>}
+            <Card padded={false} variant="flat">
+              <ListRow
+                height="tall"
+                leading={<Icon color="warning" name="ShieldAlert" size={spacing[5]} />}
+                onPress={() => {
+                  haptics.selection();
+                  onApproveDevice();
+                }}
+                subtitle={`${pluralize(unapprovedCount, "host")} will not open a terminal here until this device is approved.`}
+                title="This device is not approved yet"
+                trailing={<Icon color="mutedForeground" name="ChevronRight" />}
+              />
+            </Card>
           </View>
         ) : null
       }
@@ -188,13 +184,6 @@ export function HostListScreen() {
             }}
             refreshing={manualRefreshing}
             sessions={sessionsQuery.data ?? []}
-            summary={
-              <LegionSummary
-                agents={agentsQuery.data ?? []}
-                hosts={hosts}
-                sessions={sessionsQuery.data ?? []}
-              />
-            }
             unapprovedCount={approvals.awaiting.length}
           />
         )}
@@ -253,6 +242,8 @@ export function HostListScreen() {
 const styles = StyleSheet.create({
   header: {
     gap: spacing[3],
+    marginHorizontal: spacing[4],
+    marginTop: spacing[4],
   },
   centered: {
     alignItems: "center",
@@ -262,10 +253,6 @@ const styles = StyleSheet.create({
   emptyState: {
     marginHorizontal: spacing[4],
     marginTop: spacing[6],
-  },
-  fleet: {
-    marginHorizontal: spacing[4],
-    marginTop: spacing[4],
   },
   list: {
     flexGrow: 1,

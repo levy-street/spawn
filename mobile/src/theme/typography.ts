@@ -36,6 +36,8 @@ export const fontSize = {
   displaySm: 24,
   displayMd: 26,
   displayLg: 28,
+  /** A single figure set large enough to be the point of a page. */
+  hero: 44,
 } as const;
 
 export const lineHeight = {

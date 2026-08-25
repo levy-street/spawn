@@ -31,7 +31,7 @@ describe("admin authorization", () => {
     expect(screen.getByText("Nothing here")).toBeOnTheScreen();
     expect(screen.getByText("This account does not administer this deployment.")).toBeOnTheScreen();
     expect(screen.queryByText("Secret admin content")).toBeNull();
-    await fireEvent.press(screen.getByRole("button", { name: "Back to spawn" }));
+    await fireEvent.press(screen.getByRole("button", { name: "Back to SPAWN D" }));
     expect(onBack).toHaveBeenCalledTimes(1);
   });
 });

@@ -30,7 +30,7 @@ function VerifySuccess({ signedIn }: { signedIn: boolean }) {
       <AuthMessage tone="success">Your true name is confirmed.</AuthMessage>
       <AuthBlock>
         <AuthAction
-          label={signedIn ? "Continue to spawn" : "Sign in to continue"}
+          label={signedIn ? "Continue to SPAWN D" : "Sign in to continue"}
           onPress={() => router.replace(signedIn ? "/" : "/login")}
         />
       </AuthBlock>

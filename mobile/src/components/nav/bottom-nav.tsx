@@ -1,10 +1,12 @@
-import { type Href, usePathname, useRouter } from "expo-router";
+import { type Href, useNavigationContainerRef, usePathname, useRouter } from "expo-router";
 import { useRef } from "react";
 import { Pressable, StyleSheet, View } from "react-native";
 import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
 import Animated, { useAnimatedStyle, useSharedValue } from "react-native-reanimated";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { FullWindowOverlay } from "react-native-screens";
+import { useCameraOpen } from "@/components/media/camera-host";
+import { landOnRoot } from "@/components/nav/navigation-reset";
 import { dismissNavigationOverlays } from "@/components/nav/overlay-dismiss";
 import { switchToTab } from "@/components/nav/tab-switcher";
 import { Icon, type IconName } from "@/components/ui/icon";
@@ -58,6 +60,7 @@ export function BottomNav(): React.JSX.Element {
   const insets = useSafeAreaInsets();
   const pathname = usePathname();
   const router = useRouter();
+  const navigation = useNavigationContainerRef();
   const theme = useTheme();
   // A card pushed over the tabs — profile, the terminal — belongs to no root, and
   // blanking the bar there reads as having left the app. It stays on whichever
@@ -114,16 +117,17 @@ export function BottomNav(): React.JSX.Element {
             onPress={() => {
               haptics.selection();
               // A nav tap always lands on a root, so anything covering the tabs —
-              // sheets, a pushed detail, the terminal — is cleared first. The
-              // check matters: dispatching a pop with nothing to pop is an
-              // unhandled action, which React Navigation reports on every tap.
+              // sheets, dialogs, a pushed detail, the terminal — is cleared first,
+              // and cleared at once: the page underneath is the destination, and
+              // it stays put while what was over it goes.
               dismissAllSheets();
               dismissNavigationOverlays();
-              if (router.canDismiss()) router.dismissAll();
               // Switching roots is a tab jump, not a push: routing to the href
               // from out here appends a card and slides the destination in over
               // the app, which is not what a nav bar does.
-              switchToTab(destination.rootRoute, () => router.navigate(destination.href));
+              void landOnRoot(navigation, () =>
+                switchToTab(destination.rootRoute, () => router.navigate(destination.href)),
+              );
             }}
             style={({ pressed }) => [
               styles.item,
@@ -149,7 +153,11 @@ export function BottomNav(): React.JSX.Element {
  * layout; nothing holds its footprint open in the layout flow, so `Screen`
  * reserves it via BottomChromeProvider.
  */
-export function PersistentBottomNav(): React.JSX.Element {
+export function PersistentBottomNav(): React.JSX.Element | null {
+  // The window-level bar would sit across the camera's viewfinder, which is
+  // presented as a modal underneath it. It steps aside while the camera is up.
+  const cameraOpen = useCameraOpen();
+  if (cameraOpen) return null;
   return (
     <FullWindowOverlay unstable_accessibilityContainerViewIsModal={false}>
       <View pointerEvents="box-none" style={styles.portal}>

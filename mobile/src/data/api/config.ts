@@ -49,14 +49,14 @@ let loadingOverride: Promise<string | null> | null = null;
 function normalizeAbsoluteBaseUrl(value: string): string {
   const trimmed = value.trim().replace(/\/+$/, "");
   if (trimmed.length === 0) {
-    throw new Error("Enter a spawn server URL");
+    throw new Error("Enter a SPAWN D server URL");
   }
 
   let url: URL;
   try {
     url = new URL(trimmed);
   } catch {
-    throw new Error("Enter a valid spawn server URL");
+    throw new Error("Enter a valid SPAWN D server URL");
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("Spawn API URL must use http or https");
@@ -73,10 +73,10 @@ function normalizeAbsoluteBaseUrl(value: string): string {
 export function normalizeServerUrl(value: string): string {
   const trimmed = value.trim();
   if (trimmed.length === 0) {
-    throw new Error("Enter a spawn server URL");
+    throw new Error("Enter a SPAWN D server URL");
   }
   if (/^https?:/i.test(trimmed) && !/^https?:\/\//i.test(trimmed)) {
-    throw new Error("Enter a valid spawn server URL");
+    throw new Error("Enter a valid SPAWN D server URL");
   }
 
   const explicitScheme = /^[a-z][a-z\d+.-]*:\/\//i.test(trimmed);

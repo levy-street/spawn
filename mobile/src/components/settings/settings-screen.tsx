@@ -45,6 +45,9 @@ export function SettingsScreen({
       padded={false}
     >
       <ScrollView
+        // Pull-to-refresh needs the bounce; a page without it that fits the
+        // screen has nothing to rubber-band for.
+        alwaysBounceVertical={refreshControl !== undefined}
         automaticallyAdjustContentInsets
         contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={styles.content}

@@ -105,6 +105,9 @@ const styles = StyleSheet.create({
     alignSelf: "stretch",
     gap: sizing.emptyState.contentGap,
     justifyContent: "center",
+    // A plate set straight under a section rule read as part of the rule. The
+    // caller's own style still wins where an empty state is centred on a page.
+    marginTop: sizing.emptyState.topGap,
   },
   copy: {
     gap: sizing.emptyState.copyGap,

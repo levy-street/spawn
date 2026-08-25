@@ -25,6 +25,13 @@ export interface OverlayEntry {
   closing: boolean;
   restore(): void;
   teardown(): void;
+  /**
+   * Something new has opened over this overlay while it was showing. A drawer
+   * that came back after the one above it was dismissed — its owner still
+   * believing it closed — uses this to step aside again, so the next thing
+   * raised from it behaves exactly as the first did.
+   */
+  covered?(): void;
 }
 
 const stack: OverlayEntry[] = [];
@@ -33,6 +40,9 @@ export function enterOverlay(entry: OverlayEntry): void {
   entry.suspended = false;
   entry.closing = false;
   if (!stack.includes(entry)) stack.push(entry);
+  for (const below of stack) {
+    if (below !== entry && !below.suspended && !below.closing) below.covered?.();
+  }
 }
 
 export function leaveOverlay(entry: OverlayEntry): void {

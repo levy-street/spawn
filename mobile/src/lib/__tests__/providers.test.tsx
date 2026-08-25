@@ -64,6 +64,10 @@ jest.mock("@/components/ui/confirm", () => ({
   ConfirmHost: mockOrderedProvider("ConfirmHost"),
 }));
 
+jest.mock("@/components/media/camera-host", () => ({
+  CameraHost: mockOrderedProvider("CameraHost"),
+}));
+
 import {
   APP_PROVIDER_ORDER,
   APP_QUERY_DEFAULTS,

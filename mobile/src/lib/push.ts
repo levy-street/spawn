@@ -21,6 +21,25 @@ let registeredToken: string | null = null;
 /** What the last successful registration told the server, to skip repeats. */
 let registeredKey: string | null = null;
 
+const registrationRequests = new Set<() => void>();
+
+/**
+ * Something outside the signed-in shell — the notifications panel, after the
+ * person turned system notifications on — wants this install registered now
+ * rather than at the next launch. The shell is the only place that knows the
+ * device's trust identity, so it listens and registers on its behalf.
+ */
+export function subscribePushRegistrationRequests(listener: () => void): () => void {
+  registrationRequests.add(listener);
+  return () => {
+    registrationRequests.delete(listener);
+  };
+}
+
+export function requestPushRegistration(): void {
+  for (const listener of registrationRequests) listener();
+}
+
 export type PushRegistration =
   | { status: "registered"; token: string }
   | { status: "unavailable"; reason: string };
@@ -62,6 +81,12 @@ export async function registerForPushNotifications(
     register?: typeof registerPushDevice;
     label?: string | null;
     /**
+     * Whether to put the system prompt up if permission has never been asked
+     * for. A registration retried on foregrounding must not: the prompt is a
+     * question, and it belongs to a moment the person chose.
+     */
+    ask?: boolean;
+    /**
      * This install's trust identity. Sent with the token so the server never
      * pushes this device's own knock back to it; null until registration of
      * the identity has landed, after which the caller registers again.
@@ -81,7 +106,7 @@ export async function registerForPushNotifications(
 
   try {
     let permission = await api.getPermissionsAsync();
-    if (permission.status === "undetermined") {
+    if (permission.status === "undetermined" && (options.ask ?? true)) {
       // The system prompt shows once per install; iOS remembers the answer
       // and every later call returns it without asking. Nobody else asks, so
       // an install that skipped this never received a single push.

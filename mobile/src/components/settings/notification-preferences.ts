@@ -25,7 +25,7 @@ export interface NotificationPreferenceStorage {
 export const DEFAULT_NOTIFICATION_PREFERENCES: Readonly<NotificationPreferences> = Object.freeze({
   toast: true,
   sound: false,
-  system: false,
+  system: true,
   haptics: false,
   onFinished: true,
   onAwaiting: true,

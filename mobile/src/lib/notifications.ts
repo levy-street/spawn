@@ -24,7 +24,7 @@ export type NotificationPreferenceKey = keyof NotificationPreferences;
 export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
   toast: true,
   sound: false,
-  system: false,
+  system: true,
   haptics: false,
   onFinished: true,
   onAwaiting: true,
@@ -33,16 +33,16 @@ export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
 };
 
 export const REMOTE_NOTIFICATIONS_UNAVAILABLE_REASON =
-  "Remote notifications need an installed build. Expo Go cannot be issued a push token, so alerts arrive only while spawn is running.";
+  "Remote notifications need an installed build. Expo Go cannot be issued a push token, so alerts arrive only while SPAWN D is running.";
 
 export const notificationCapabilities = {
   local: {
     available: true,
-    detail: "Local notifications can show alerts received while spawn is running.",
+    detail: "Local notifications can show alerts received while SPAWN D is running.",
   },
   remote: {
     available: true,
-    detail: "Installed builds register for push, so alerts arrive while spawn is closed.",
+    detail: "Installed builds register for push, so alerts arrive while SPAWN D is closed.",
   },
   suspendedDelivery: {
     available: true,

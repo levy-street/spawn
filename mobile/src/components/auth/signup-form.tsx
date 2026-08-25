@@ -159,7 +159,7 @@ function SignupForm({ config, initialInvite }: { config: AuthConfigOut; initialI
           }}
         />
       </AuthBlock>
-      <OAuthButtons providers={config.providers} />
+      <OAuthButtons divider providers={config.providers} />
     </>
   );
 }

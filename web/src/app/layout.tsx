@@ -9,11 +9,11 @@ export const metadata: Metadata = {
   metadataBase: new URL("https://spawnd.dev"),
   title: {
     default: "SPAWN D - Host your daemons",
-    template: "%s · spawnd",
+    template: "%s · SPAWN D",
   },
   description:
     "The open-source control plane for CLI coding agents. A daemon on every host you own — summon your agents, reach them from any browser, and the server that connects you never hears a word.",
-  applicationName: "spawnd",
+  applicationName: "SPAWN D",
   manifest: "/manifest.webmanifest",
   openGraph: {
     title: "spawnd — a daemon on every host you own",

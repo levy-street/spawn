@@ -172,7 +172,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
               {done
                 ? "You can go back and open a terminal. This screen keeps watching in case that changes."
                 : waiting
-                  ? "Open spawn on a device that already works. A prompt is waiting there."
+                  ? "Open SPAWN D on a device that already works. A prompt is waiting there."
                   : "A host only answers devices whose key it has pinned, and no other device is registered to vouch for this one. Use a pairing code below."}
             </Text>
           </View>
@@ -230,7 +230,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
           <ListBlock>
             <View style={styles.steps}>
               <Text color="mutedForeground" variant="body">
-                1. Open spawn there, signed in to this same account.
+                1. Open SPAWN D there, signed in to this same account.
               </Text>
               <Text color="mutedForeground" variant="body">
                 2. A prompt appears asking whether to let {phone?.label ?? "this device"} connect.

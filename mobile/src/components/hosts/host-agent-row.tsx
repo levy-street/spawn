@@ -66,21 +66,27 @@ export function HostAgentRow({
           ? (agent.path ?? agent.command)
           : (agent.install ?? "No install command is available.")}
       </Text>
+      {/* One quiet line of controls: the policy and the one action, sized as
+          the row's accessories rather than a form of their own. */}
       <View style={styles.controls}>
-        <View style={styles.policyCopy}>
-          <Text variant="body">Auto update</Text>
-          {!canInstall ? (
+        <View style={styles.policy}>
+          <Switch
+            accessibilityLabel={`Auto update ${agent.agent_name}`}
+            disabled={!canInstall || policySaving}
+            onValueChange={onPolicyChange}
+            value={agent.auto_update}
+          />
+          <View style={styles.policyCopy}>
             <Text color="mutedForeground" variant="caption">
-              No install command
+              Auto update
             </Text>
-          ) : null}
+            {!canInstall ? (
+              <Text color="mutedForeground" variant="micro">
+                No install command
+              </Text>
+            ) : null}
+          </View>
         </View>
-        <Switch
-          accessibilityLabel={`Auto update ${agent.agent_name}`}
-          disabled={!canInstall || policySaving}
-          onValueChange={onPolicyChange}
-          value={agent.auto_update}
-        />
         <Button
           disabled={!canInstall}
           loading={installing}
@@ -133,7 +139,8 @@ const styles = StyleSheet.create({
   controls: {
     alignItems: "center",
     flexDirection: "row",
-    gap: spacing[2],
+    gap: spacing[3],
+    justifyContent: "space-between",
   },
   heading: {
     alignItems: "center",
@@ -145,8 +152,15 @@ const styles = StyleSheet.create({
     gap: spacing[1],
     minWidth: 0,
   },
-  policyCopy: {
+  policy: {
+    alignItems: "center",
     flex: 1,
+    flexDirection: "row",
+    gap: spacing[2],
+    minWidth: 0,
+  },
+  policyCopy: {
+    flexShrink: 1,
   },
   result: {
     gap: spacing[2],

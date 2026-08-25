@@ -31,7 +31,7 @@ import {
   scheduleLocalAlertNotification,
   subscribeToLocalNotificationResponses,
 } from "@/lib/notifications";
-import { registerForPushNotifications } from "@/lib/push";
+import { registerForPushNotifications, subscribePushRegistrationRequests } from "@/lib/push";
 
 export interface AlertPresenterProps {
   currentSessionId?: string | null;
@@ -110,16 +110,37 @@ export function AlertPresenter({
     // OS upgrade, and a stale registration fails silently — the alerts simply
     // stop. Runs again once the trust identity is known, so the token carries
     // it. Signed out, it neither asks for permission nor registers.
-    if (accountId !== null) void registerForPushNotifications({ browserDeviceId });
+    // Only while system notifications are wanted: the preference is the one
+    // switch for alerts that reach the phone as notifications, push included.
+    const registerPush = (ask: boolean) => {
+      if (accountId === null) return;
+      void hydrateNotificationPreferences().then((prefs) => {
+        if (prefs.system) void registerForPushNotifications({ ask, browserDeviceId });
+      });
+    };
+    registerPush(true);
     const lastResponse = consumeLastLocalNotificationResponse();
     if (lastResponse) void handleNotificationTarget(lastResponse);
     else if (consumeLastApprovalNotificationResponse()) surfaceApproval();
-    return subscribeToLocalNotificationResponses(
+    const unsubscribeResponses = subscribeToLocalNotificationResponses(
       (target) => {
         void handleNotificationTarget(target);
       },
       () => surfaceApproval(),
     );
+    // The notifications panel asks for this once permission has been granted
+    // from there, so the token goes out at that moment rather than next launch.
+    const unsubscribeRequests = subscribePushRegistrationRequests(() => registerPush(true));
+    // Coming back from the system Settings, where notifications may just have
+    // been turned on: register if allowed now, but never put the prompt up.
+    const foreground = AppState.addEventListener("change", (state) => {
+      if (state === "active") registerPush(false);
+    });
+    return () => {
+      unsubscribeResponses();
+      unsubscribeRequests();
+      foreground.remove();
+    };
   }, [handleNotificationTarget, surfaceApproval, browserDeviceId, accountId]);
 
   useEffect(() => {

@@ -96,7 +96,7 @@ describe("notification preferences and capability", () => {
   it("reports remote push and suspended delivery as available now that push ships", () => {
     expect(notificationCapabilities.local.available).toBe(true);
     expect(notificationCapabilities.remote.available).toBe(true);
-    expect(notificationCapabilities.remote.detail).toContain("while spawn is closed");
+    expect(notificationCapabilities.remote.detail).toContain("while SPAWN D is closed");
     // The alert socket cannot reach a suspended app; push is what covers it.
     expect(notificationCapabilities.suspendedDelivery.available).toBe(true);
   });

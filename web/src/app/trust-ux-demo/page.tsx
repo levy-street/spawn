@@ -66,7 +66,7 @@ export default function TrustUxDemoPage() {
       <div className="mx-auto max-w-7xl">
         <header className="max-w-2xl">
           <h1 className="text-2xl font-medium tracking-tight text-zinc-100">
-            spawn trust — every screen, every state
+            SPAWN D trust — every screen, every state
           </h1>
           <p className="mt-2 text-sm leading-relaxed text-zinc-500">
             Two nouns (device, host), three verbs (approve, possess, remove), one artifact (the
@@ -490,7 +490,7 @@ function DesktopFrame({
     <div className="relative w-[1080px] max-w-full overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-xl shadow-black/30">
       <div className="flex">
         <aside className="flex w-52 shrink-0 flex-col border-r border-zinc-800/70 bg-zinc-900/30 p-4">
-          <p className="px-2 text-sm font-semibold tracking-tight text-zinc-100">spawn</p>
+          <p className="px-2 text-sm font-semibold tracking-tight text-zinc-100">SPAWN D</p>
           <nav className="mt-5 space-y-0.5">
             {nav.map((item) => (
               <p

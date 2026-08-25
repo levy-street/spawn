@@ -160,12 +160,14 @@ describe("settings panel behavior", () => {
     }
   });
 
-  test("push-dependent notification preference is explicitly unavailable", async () => {
+  test("system notifications are a live toggle, with a way back in after a refusal", async () => {
     const screen = await render(<NotificationsPanel />, { wrapper });
-    await waitFor(() => expect(screen.getByTestId("push-unavailable")).toBeOnTheScreen());
-    expect(screen.getByText("System notification")).toBeOnTheScreen();
-    expect(screen.queryByRole("switch", { name: "System notification" })).toBeNull();
-    expect(screen.getByText("Unavailable")).toBeOnTheScreen();
+    await waitFor(() => expect(screen.getByTestId("push-toggle")).toBeOnTheScreen());
+    expect(screen.getByRole("switch", { name: "System notification" })).toBeOnTheScreen();
+    expect(screen.queryByText("Unavailable")).toBeNull();
+    // Permission has never been asked for here, so there is nothing to reverse
+    // in the system Settings yet and no row that sends you there.
+    expect(screen.queryByTestId("push-open-settings")).toBeNull();
   });
 
   test("passkey capability probe renders the honest Expo Go state", async () => {

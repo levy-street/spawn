@@ -6,6 +6,7 @@ import { AppHeaderLeadingProvider } from "@/components/layout/app-header";
 import { BottomChromeProvider } from "@/components/layout/bottom-chrome";
 import { PersistentBottomNav } from "@/components/nav/bottom-nav";
 import { ROUNDED_CARD_GESTURE_OPTIONS } from "@/components/nav/navigation-options";
+import { useCardAnimation } from "@/components/nav/navigation-reset";
 import { ProfileMenu } from "@/components/nav/profile-menu";
 import { DeviceApprovalPrompt } from "@/components/trust/device-approval-prompt";
 import { useMeQuery } from "@/data/queries/auth";
@@ -75,6 +76,7 @@ function AdminRouteBoundary({ children }: { children: ReactNode }): React.JSX.El
 
 export default function AppStackLayout(): React.JSX.Element | null {
   const theme = useTheme();
+  const animation = useCardAnimation();
   const account = useAuthenticatedAccount();
 
   if (!account.ready) return null;
@@ -86,6 +88,7 @@ export default function AppStackLayout(): React.JSX.Element | null {
           <Stack
             screenOptions={{
               ...ROUNDED_CARD_GESTURE_OPTIONS,
+              animation,
               contentStyle: {
                 backgroundColor: theme.colors.background,
                 borderRadius: theme.radii.device,
