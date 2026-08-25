@@ -781,6 +781,11 @@ class HostUpdateOut(BaseModel):
     requested_at: datetime | None = None
 
 
+class HostDisconnectOut(BaseModel):
+    at: datetime | None = None
+    reason: str | None = None
+
+
 class HostOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -796,6 +801,7 @@ class HostOut(BaseModel):
     host_public_key: str | None = None
     status: str
     last_seen_at: datetime | None = None
+    last_disconnect: HostDisconnectOut = Field(default_factory=HostDisconnectOut)
     session_count: int = 0
     # Mesh R9: true once this host's daemon validates account-scoped chains;
     # the legacy per-host device-endorsement path is refused for such hosts.

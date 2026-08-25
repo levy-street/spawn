@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import auth, release, schemas
 from ..db import get_session, get_sessionmaker
 from ..host_key_claims import lock_host_key_claim
+from ..host_status import derived_host_status, stamp_stale_disconnect
 from ..models import (
     Agent,
     DeviceCode,
@@ -59,7 +60,8 @@ def _aware(dt: datetime | None) -> datetime | None:
     return dt
 
 
-def _to_out(host: Host, session_count: int) -> schemas.HostOut:
+def _to_out(host: Host, session_count: int, *, now: datetime | None = None) -> schemas.HostOut:
+    derived_status = derived_host_status(host, now)
     return schemas.HostOut(
         id=host.id,
         name=host.name,
@@ -70,8 +72,12 @@ def _to_out(host: Host, session_count: int) -> schemas.HostOut:
         update=release.host_update_state(host),
         host_key_algorithm=host.host_key_algorithm,
         host_public_key=host.host_public_key,
-        status=host.status,
+        status=derived_status,
         last_seen_at=host.last_seen_at,
+        last_disconnect=schemas.HostDisconnectOut(
+            at=host.last_disconnect_at,
+            reason=host.last_disconnect_reason,
+        ),
         session_count=session_count,
         supports_account_chains=host.supports_account_chains,
         cpu_cores=host.cpu_cores,
@@ -82,8 +88,8 @@ def _to_out(host: Host, session_count: int) -> schemas.HostOut:
         # An offline host's last reading is a stale reading. Reporting it would
         # draw a live-looking meter for a machine that is gone, so the buckets
         # go with the daemon and only the spec (which is still true) stays.
-        cpu_bucket=host.cpu_bucket if host.status == "online" else None,
-        mem_bucket=host.mem_bucket if host.status == "online" else None,
+        cpu_bucket=host.cpu_bucket if derived_status == "online" else None,
+        mem_bucket=host.mem_bucket if derived_status == "online" else None,
         capacity_at=host.capacity_at,
     )
 
@@ -444,9 +450,15 @@ async def list_hosts(
     rows = (
         (await session.execute(select(Host).where(Host.owner_user_id == user.id))).scalars().all()
     )
+    now = _utcnow()
+    changed = False
+    for host in rows:
+        changed = stamp_stale_disconnect(host, now) or changed
+    if changed:
+        await session.commit()
     out: list[schemas.HostOut] = []
     for h in rows:
-        out.append(_to_out(h, await _session_count(session, h, user)))
+        out.append(_to_out(h, await _session_count(session, h, user), now=now))
     return out
 
 
@@ -457,7 +469,10 @@ async def get_host(
     user: User = Depends(auth.current_user),
 ) -> schemas.HostOut:
     h = await _get_owned_host(session, host_id, user)
-    return _to_out(h, await _session_count(session, h, user))
+    now = _utcnow()
+    if stamp_stale_disconnect(h, now):
+        await session.commit()
+    return _to_out(h, await _session_count(session, h, user), now=now)
 
 
 @router.patch("/{host_id}", response_model=schemas.HostOut)
@@ -472,7 +487,10 @@ async def patch_host(
         h.name = body.name
     await session.commit()
     await session.refresh(h)
-    return _to_out(h, await _session_count(session, h, user))
+    now = _utcnow()
+    if stamp_stale_disconnect(h, now):
+        await session.commit()
+    return _to_out(h, await _session_count(session, h, user), now=now)
 
 
 def _enforce_daemon_update_rate(host_id: str) -> None:

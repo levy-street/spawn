@@ -19,12 +19,14 @@ spawn_server/
                 workspace_templates, workspaces
   ws/           websocket handlers: browser.py, daemon.py, host.py,
                 broker.py, alerts.py, activity.py, host_signal.py,
-                owner_dispatch.py, signed_signal_relay.py
+                owner_dispatch.py, signed_signal_relay.py, reliability.py,
+                close_codes.py
   models.py     SQLAlchemy models — the schema of record
   schemas.py    pydantic request/response shapes
   main.py       app assembly, startup, route registration
   <concern>.py  one module per concern: auth, config, db, redis, mail, push,
-                release, invites, limits, rate_limit, trust_events, …
+                release, invites, limits, rate_limit, trust_events,
+                host_status, …
 alembic/        migrations
 tests/          pytest; test_<module>.py mirrors the module it covers
 ```

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from ..redis import get_backend
+from .close_codes import WS_CLOSE_SUPERSEDED
 from .owner_dispatch import (
     OwnerResultEnvelope,
     decode_owner_result,
@@ -34,13 +35,18 @@ class DaemonConn:
     session_ids: set[str] = field(default_factory=set)
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     superseded_close_started: bool = False
+    superseded_by_newer: bool = False
     rtc_revocation_started: bool = False
+    keeps_peers_across_reconnect: bool = False
+    session_ice_policy: bool = False
+    durable_owner_valid_until: float = 0.0
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
             await self.websocket.send_text(
                 json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
             )
+
 
 @dataclass(eq=False)
 class BrowserConn:
@@ -96,6 +102,8 @@ class RtcSessionBinding:
     # Selected by the initiating offer and immutable for this RTC generation.
     # A signed session must never accept or forward a legacy raw-SDP answer.
     signed_signal: bool = False
+    daemon_orphaned_until: float | None = None
+    browser_orphaned_until: float | None = None
 
 
 @dataclass(frozen=True)
@@ -124,9 +132,11 @@ class Broker:
         if conn is None or conn.superseded_close_started:
             return
         conn.superseded_close_started = True
+        conn.superseded_by_newer = True
         try:
             await asyncio.wait_for(
-                conn.websocket.close(code=4000, reason="superseded"), timeout=1.0
+                conn.websocket.close(code=WS_CLOSE_SUPERSEDED, reason="superseded"),
+                timeout=1.0,
             )
         except Exception:
             conn.superseded_close_started = False
@@ -144,11 +154,15 @@ class Broker:
                 # event after the replacement daemon claims its Redis lease.
                 # Keep them long enough to send unavailable/rtc.close instead
                 # of silently orphaning an established DataChannel.
+                # A newer accepted generation is real supersession, not a
+                # signalling-only disconnect. Preserve host bindings just
+                # long enough for their explicit revocation; session bindings
+                # retain the legacy immediate-retire behavior.
                 self._drop_rtc_sessions_for_daemon_locked(existing, include_host=False)
             self._daemons_by_host[conn.host_id] = conn
         await self._close_superseded(superseded)
 
-    async def unregister_daemon(self, conn: DaemonConn) -> None:
+    async def unregister_daemon(self, conn: DaemonConn, *, preserve_rtc: bool = False) -> None:
         async with self._lock:
             if self._daemons_by_host.get(conn.host_id) is conn:
                 self._daemons_by_host.pop(conn.host_id, None)
@@ -160,7 +174,8 @@ class Broker:
                 if self._daemon_by_session.get(sid) is conn:
                     self._daemon_by_session.pop(sid, None)
             conn.session_ids.clear()
-            self._drop_rtc_sessions_for_daemon_locked(conn)
+            if not preserve_rtc:
+                self._drop_rtc_sessions_for_daemon_locked(conn)
 
     def _drop_rtc_sessions_for_daemon_locked(
         self, conn: DaemonConn, *, include_host: bool = True
@@ -174,6 +189,209 @@ class Broker:
             binding = self._rtc_sessions.get(session_id)
             if binding is not None and self._retire_rtc_binding_locked(binding):
                 self._rtc_sessions.pop(session_id, None)
+
+    def _orphan_rtc_sessions_for_daemon_locked(
+        self,
+        conn: DaemonConn,
+        now: float,
+        *,
+        grace_seconds: float | None = None,
+    ) -> list[RtcSessionBinding]:
+        from .host_signal import RTC_BINDING_ORPHAN_GRACE_SECONDS
+
+        deadline = now + (
+            RTC_BINDING_ORPHAN_GRACE_SECONDS if grace_seconds is None else grace_seconds
+        )
+        orphaned: list[RtcSessionBinding] = []
+        for session_id, binding in list(self._rtc_sessions.items()):
+            if binding.daemon is not conn:
+                continue
+            updated = replace(binding, daemon_orphaned_until=deadline)
+            self._rtc_sessions[session_id] = updated
+            orphaned.append(updated)
+        return orphaned
+
+    async def orphan_rtc_sessions_for_daemon(
+        self,
+        conn: DaemonConn,
+        *,
+        grace_seconds: float | None = None,
+        now: float | None = None,
+    ) -> list[RtcSessionBinding]:
+        async with self._lock:
+            return self._orphan_rtc_sessions_for_daemon_locked(
+                conn,
+                time.monotonic() if now is None else now,
+                grace_seconds=grace_seconds,
+            )
+
+    async def orphan_rtc_sessions_for_browser(
+        self,
+        conn: BrowserConn | HostBrowserConn | RedisBrowserConn,
+        *,
+        grace_seconds: float | None = None,
+        now: float | None = None,
+    ) -> list[RtcSessionBinding]:
+        from .host_signal import RTC_BINDING_ORPHAN_GRACE_SECONDS
+
+        async with self._lock:
+            timestamp = time.monotonic() if now is None else now
+            deadline = timestamp + (
+                RTC_BINDING_ORPHAN_GRACE_SECONDS if grace_seconds is None else grace_seconds
+            )
+            orphaned: list[RtcSessionBinding] = []
+            for session_id, binding in list(self._rtc_sessions.items()):
+                if binding.browser is not conn:
+                    continue
+                updated = replace(binding, browser_orphaned_until=deadline)
+                self._rtc_sessions[session_id] = updated
+                orphaned.append(updated)
+            return orphaned
+
+    @staticmethod
+    def rtc_binding_tuple(binding: RtcSessionBinding) -> tuple[object, ...]:
+        return (
+            binding.session_id,
+            binding.nonce,
+            binding.daemon_generation,
+            binding.scope_type,
+            binding.scope_id,
+            binding.protocol,
+            binding.protocol_version,
+        )
+
+    async def reconcile_daemon_live_bindings(
+        self,
+        daemon: DaemonConn,
+        live_bindings: list[dict[str, object]],
+        *,
+        now: float | None = None,
+    ) -> tuple[
+        list[RtcSessionBinding],
+        list[RtcSessionBinding],
+        list[dict[str, object]],
+    ]:
+        """Rebind exact live tuples, retire omissions, and return unknown tuples."""
+
+        async with self._lock:
+            timestamp = time.monotonic() if now is None else now
+            offered = {
+                (
+                    item["session_id"],
+                    item["binding_nonce"],
+                    item["binding_generation"],
+                    item["scope_type"],
+                    item["scope_id"],
+                    item["protocol"],
+                    item["protocol_version"],
+                ): item
+                for item in live_bindings
+            }
+            rebound: list[RtcSessionBinding] = []
+            revoked: list[RtcSessionBinding] = []
+            matched: set[tuple[object, ...]] = set()
+            for session_id, binding in list(self._rtc_sessions.items()):
+                if (
+                    binding.daemon.host_id != daemon.host_id
+                    or binding.daemon_orphaned_until is None
+                ):
+                    continue
+                identity = self.rtc_binding_tuple(binding)
+                if binding.daemon_orphaned_until >= timestamp and identity in offered:
+                    updated = replace(
+                        binding,
+                        daemon=daemon,
+                        daemon_orphaned_until=None,
+                    )
+                    self._rtc_sessions[session_id] = updated
+                    rebound.append(updated)
+                    matched.add(identity)
+                    continue
+                revoked.append(binding)
+            unknown = [
+                item
+                for item in live_bindings
+                if (
+                    item["session_id"],
+                    item["binding_nonce"],
+                    item["binding_generation"],
+                    item["scope_type"],
+                    item["scope_id"],
+                    item["protocol"],
+                    item["protocol_version"],
+                )
+                not in matched
+            ]
+            return rebound, revoked, unknown
+
+    async def resume_rtc_session(
+        self,
+        session_id: str,
+        browser: BrowserConn | HostBrowserConn | RedisBrowserConn,
+        *,
+        binding_nonce: str,
+        binding_generation: int,
+        scope_type: str,
+        scope_id: str,
+        protocol: str,
+        protocol_version: int,
+        now: float | None = None,
+    ) -> RtcSessionBinding | None:
+        async with self._lock:
+            timestamp = time.monotonic() if now is None else now
+            binding = self._rtc_sessions.get(session_id)
+            if binding is None or binding.browser_orphaned_until is None:
+                return None
+            if binding.browser_orphaned_until < timestamp:
+                return None
+            if binding.browser.user_id != browser.user_id:
+                return None
+            expected = (
+                session_id,
+                binding_nonce,
+                binding_generation,
+                scope_type,
+                scope_id,
+                protocol,
+                protocol_version,
+            )
+            if self.rtc_binding_tuple(binding) != expected:
+                return None
+            resumed = replace(
+                binding,
+                browser=browser,
+                browser_orphaned_until=None,
+            )
+            self._rtc_sessions[session_id] = resumed
+            return resumed
+
+    async def expire_rtc_orphan(
+        self,
+        session_id: str,
+        binding_nonce: str,
+        binding_generation: int,
+        *,
+        side: str,
+        now: float | None = None,
+    ) -> RtcSessionBinding | None:
+        async with self._lock:
+            timestamp = time.monotonic() if now is None else now
+            binding = self._rtc_sessions.get(session_id)
+            if binding is None or not (
+                binding.nonce == binding_nonce and binding.daemon_generation == binding_generation
+            ):
+                return None
+            deadline = (
+                binding.browser_orphaned_until
+                if side == "browser"
+                else binding.daemon_orphaned_until
+            )
+            if deadline is None or deadline > timestamp:
+                return None
+            if not self._retire_rtc_binding_locked(binding, now=timestamp):
+                return None
+            self._rtc_sessions.pop(session_id, None)
+            return binding
 
     async def accept_daemon_owner(self, conn: DaemonConn, generation: int) -> DaemonOwnerAcceptance:
         """Atomically expose a fully claimed daemon to local routing.
@@ -202,6 +420,9 @@ class Broker:
                     if self._daemon_by_session.get(sid) is existing:
                         self._daemon_by_session.pop(sid, None)
                 existing.session_ids.clear()
+                # Capability-enabled peers are orphaned only when their socket
+                # ends without supersession. A live newer generation is an
+                # authoritative takeover and keeps the immediate revoke path.
                 self._drop_rtc_sessions_for_daemon_locked(existing, include_host=False)
 
             self._daemons_by_host[conn.host_id] = conn
@@ -266,6 +487,63 @@ class Broker:
 
     def get_daemon_for_session(self, session_id: str) -> DaemonConn | None:
         return self._daemon_by_session.get(session_id)
+
+    async def reclaim_daemon_presence_if_missing(self, daemon: DaemonConn) -> bool:
+        """Recreate a lost Redis lease for an accepted local daemon owner."""
+
+        from ..db import get_sessionmaker
+        from ..models import Host
+        from .host_signal import (
+            HOST_DAEMON_PRESENCE_TTL_SECONDS,
+            HostPresenceOwner,
+            encode_host_presence_owner,
+            host_pending_presence_key,
+            host_presence_key,
+        )
+
+        generation = daemon.host_generation
+        if generation is None or not await self.is_accepted_daemon_owner(daemon, generation):
+            return False
+        backend = get_backend()
+        active_key = host_presence_key(daemon.host_id)
+        value = encode_host_presence_owner(HostPresenceOwner(daemon.id, generation))
+        current = await backend.get_ephemeral(active_key)
+        if current is None:
+            # A broker entry is process-local and may be stale after a remote
+            # takeover. Redis loss is therefore not authority to recreate its
+            # lease until the durable owner tuple agrees exactly.
+            async with get_sessionmaker()() as session:
+                host = await session.get(Host, daemon.host_id)
+                if host is None or not (
+                    host.daemon_connection_id == daemon.id
+                    and host.daemon_generation == generation
+                    and host.status == "online"
+                ):
+                    daemon.durable_owner_valid_until = 0.0
+                    return False
+            try:
+                await backend.set_ephemeral_if_newer(
+                    active_key,
+                    value,
+                    generation=generation,
+                    ttl_seconds=HOST_DAEMON_PRESENCE_TTL_SECONDS,
+                )
+            except Exception:
+                daemon.durable_owner_valid_until = 0.0
+                raise
+        try:
+            current_owner = await backend.host_owner_is_current(
+                active_key,
+                host_pending_presence_key(daemon.host_id),
+                value,
+                generation=generation,
+            )
+        except Exception:
+            daemon.durable_owner_valid_until = 0.0
+            raise
+        if not current_owner:
+            daemon.durable_owner_valid_until = 0.0
+        return current_owner
 
     async def register_rtc_session(
         self,
@@ -336,6 +614,26 @@ class Broker:
                     >= MAX_HOST_RTC_SESSIONS_PER_BROWSER
                 ):
                     return False
+            elif scope_type == "session":
+                from .host_signal import (
+                    MAX_SESSION_RTC_SESSIONS_PER_BROWSER,
+                    MAX_SESSION_RTC_SESSIONS_PER_USER,
+                )
+
+                session_bindings = [
+                    binding
+                    for binding in self._rtc_sessions.values()
+                    if binding.scope_type == "session"
+                ]
+                if (
+                    sum(binding.browser.user_id == conn.user_id for binding in session_bindings)
+                    >= MAX_SESSION_RTC_SESSIONS_PER_USER
+                    or sum(
+                        binding.browser.route_id == conn.route_id for binding in session_bindings
+                    )
+                    >= MAX_SESSION_RTC_SESSIONS_PER_BROWSER
+                ):
+                    return False
             self._rtc_sessions[session_id] = RtcSessionBinding(
                 session_id=session_id,
                 browser=conn,
@@ -351,6 +649,31 @@ class Broker:
                 signed_signal=signed_signal,
             )
             return True
+
+    async def session_rtc_capacity_available(
+        self,
+        *,
+        user_id: str,
+        route_id: str,
+    ) -> bool:
+        from .host_signal import (
+            MAX_SESSION_RTC_SESSIONS_PER_BROWSER,
+            MAX_SESSION_RTC_SESSIONS_PER_USER,
+        )
+
+        async with self._lock:
+            self._prune_expired_rtc_sessions_locked(time.monotonic())
+            bindings = [
+                binding
+                for binding in self._rtc_sessions.values()
+                if binding.scope_type == "session"
+            ]
+            return (
+                sum(binding.browser.user_id == user_id for binding in bindings)
+                < MAX_SESSION_RTC_SESSIONS_PER_USER
+                and sum(binding.browser.route_id == route_id for binding in bindings)
+                < MAX_SESSION_RTC_SESSIONS_PER_BROWSER
+            )
 
     async def unregister_rtc_session(
         self,

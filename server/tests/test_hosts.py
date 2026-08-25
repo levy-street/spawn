@@ -6,8 +6,10 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from spawn_server.host_status import derived_host_status, stamp_stale_disconnect
 from spawn_server.routes import hosts as hosts_routes
 
 
@@ -130,6 +132,69 @@ async def test_host_scoping(client):
     # User B can't delete it either.
     r = await client.delete(f"/api/hosts/{host_id}", headers={"Authorization": f"Bearer {b_token}"})
     assert r.status_code == 404
+
+
+def test_derived_host_status_requires_a_fresh_online_heartbeat():
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    fresh = type("Presence", (), {})()
+    fresh.status = "online"
+    fresh.last_seen_at = now - timedelta(seconds=90)
+    fresh.last_disconnect_at = None
+    fresh.last_disconnect_reason = None
+    assert derived_host_status(fresh, now) == "online"
+    fresh.last_seen_at = now - timedelta(seconds=91)
+    assert derived_host_status(fresh, now) == "offline"
+    assert stamp_stale_disconnect(fresh, now)
+    assert fresh.status == "online"
+    assert fresh.last_disconnect_at == now
+    assert fresh.last_disconnect_reason == "stale"
+    assert not stamp_stale_disconnect(fresh, now + timedelta(seconds=1))
+
+
+async def test_stale_host_status_and_disconnect_shape_on_all_host_routes(client):
+    from sqlalchemy import select
+
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+
+    token = await _signup(client, "stale-host-surfaces@example.com")
+    async with get_sessionmaker()() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "stale-host-surfaces@example.com")
+            )
+        ).scalar_one()
+        host = Host(
+            owner_user_id=user.id,
+            name="stale-box",
+            status="online",
+            last_seen_at=datetime.now(UTC) - timedelta(minutes=5),
+        )
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+
+    headers = {"Authorization": f"Bearer {token}"}
+    listed = await client.get("/api/hosts", headers=headers)
+    got = await client.get(f"/api/hosts/{host_id}", headers=headers)
+    patched = await client.patch(
+        f"/api/hosts/{host_id}", headers=headers, json={"name": "stale-renamed"}
+    )
+    profile = await client.get("/api/profile", headers=headers)
+    assert listed.status_code == got.status_code == patched.status_code == 200
+    list_host = next(item for item in listed.json() if item["id"] == host_id)
+    for payload in (list_host, got.json(), patched.json()):
+        assert payload["status"] == "offline"
+        assert payload["last_disconnect"]["reason"] == "stale"
+        assert payload["last_disconnect"]["at"] is not None
+    profile_host = next(item for item in profile.json()["hosts"] if item["id"] == host_id)
+    assert profile_host["status"] == "offline"
+
+    async with get_sessionmaker()() as session:
+        persisted = await session.get(Host, host_id)
+        assert persisted is not None
+        assert persisted.status == "online"
+        assert persisted.last_disconnect_reason == "stale"
 
 
 def _stage_daemon_manifest(tmp_path: Path) -> None:
