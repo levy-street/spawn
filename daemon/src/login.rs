@@ -33,7 +33,17 @@ pub struct LoginOutcome {
     pub account_id: Option<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("login interrupted")]
+pub struct LoginInterrupted;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct UserFacingError(String);
+
 pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOutcome> {
+    let force_qr = args.qr;
+    let no_qr = args.no_qr;
     // Persist before starting the ceremony so retries and interrupted logins
     // never rotate identity. A corrupt existing seed fails closed.
     let mut stored = creds::load().context("loading stored credentials")?;
@@ -62,24 +72,26 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         version: &version,
         host_key_algorithm: identity.algorithm,
         host_public_key: &identity.public_key,
+        setup_token: args.setup_token.as_deref(),
     };
-    let start: DeviceStartResponse = client
+    let start_response = client
         .post(start_url.as_str())
         .json(&start_req)
         .send()
         .await
-        .context("POST /api/auth/device/start")?
-        .error_for_status()?
+        .map_err(|error| connect_error(&server, &error))?;
+    ensure_login_http_status(&server, start_response.status())?;
+    let start: DeviceStartResponse = start_response
         .json()
         .await
-        .context("decoding device/start response")?;
+        .map_err(|_| user_error(format!("{} answered, but it isn't a SPAWN D server. Re-run the install command from the app — it carries the right address.", server_origin(&server))))?;
 
     // Prove possession before activating the human-visible user code. The
     // private seed stays inside creds; only the fixed-width signature leaves.
     let possession_signature =
         creds::sign_host_pair_possession(&stored, &start.device_code, &start.approval_nonce)?;
     let possession_url = config::api_url(&server, "/api/auth/device/possession")?;
-    let possession: DevicePossessionResponse = client
+    let possession_response = client
         .post(possession_url.as_str())
         .json(&DevicePossessionRequest {
             device_code: &start.device_code,
@@ -90,11 +102,12 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
         })
         .send()
         .await
-        .context("POST /api/auth/device/possession")?
-        .error_for_status()?
+        .map_err(|error| connect_error(&server, &error))?;
+    ensure_login_http_status(&server, possession_response.status())?;
+    let possession: DevicePossessionResponse = possession_response
         .json()
         .await
-        .context("decoding device/possession response")?;
+        .map_err(|_| user_error(format!("{} answered, but it isn't a SPAWN D server. Re-run the install command from the app — it carries the right address.", server_origin(&server))))?;
     if !possession.verified || possession.version != 1 {
         return Err(anyhow!(
             "device/possession returned an unsupported verification state"
@@ -109,14 +122,24 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
     // public key as a `#k=` fragment appended LOCALLY — see `approval_url` for
     // why that is the ceremony's out-of-band host-key check.
     let approve_url = approval_url(&server, &start, &identity.public_key)?;
-    if open_browser(&approve_url) {
-        println!("spawn: opened your browser to approve this host.");
-        println!("spawn:   didn't open? use this link on any device:");
-    } else {
-        println!("spawn: approve this host in your browser — open this link on any device:");
+    let opener_available = browser_opener_available();
+    let open_decision = browser_open_decision(possession.attended);
+    let browser_opened =
+        open_decision == BrowserOpenDecision::Immediate && open_browser(&approve_url);
+    print!("{}", approval_link_block(browser_opened, &approve_url));
+
+    let opener_failed = open_decision == BrowserOpenDecision::Immediate && !browser_opened;
+    if !no_qr && (force_qr || !opener_available || opener_failed) {
+        println!("spawn:   Scan this with your phone, or open the link on any device:");
+        println!();
+        // The QR contains the full URL, including the locally-appended #k=
+        // fragment. A camera transfers it out of band; fragments never reach
+        // the HTTP server.
+        if let Ok(qr) = render_qr(&approve_url) {
+            print!("{qr}");
+        }
+        println!();
     }
-    println!("spawn:   {approve_url}");
-    println!();
 
     // The link's fragment carries the key check; the fingerprint stays printed
     // for the fallback (a browser that never received the fragment — retyped
@@ -134,25 +157,70 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
     println!("spawn:   and type: {}", start.user_code);
     println!();
     println!("spawn: waiting for approval…");
+    let wait_spinner = crate::tui::Spinner::start("waiting for approval");
 
     // 2. poll
     let poll_url = config::api_url(&server, "/api/auth/device/poll")?;
     let mut interval = Duration::from_secs(start.interval.max(1));
+    let started_waiting = tokio::time::Instant::now();
+    let attended_open_at = (open_decision == BrowserOpenDecision::AfterPendingTimeout)
+        .then(|| started_waiting + Duration::from_secs(25));
     let poll_body = DevicePollRequest {
         device_code: &start.device_code,
         host_key_algorithm: identity.algorithm,
         host_public_key: &identity.public_key,
     };
 
+    let mut attended_fallback_attempted = false;
+    let mut elapsed_shown = false;
+    let mut hint_shown = false;
     loop {
-        tokio::time::sleep(interval).await;
+        let sleep_for = attended_open_at
+            .filter(|_| !attended_fallback_attempted)
+            .map(|open_at| open_at.saturating_duration_since(tokio::time::Instant::now()))
+            .map_or(interval, |until_fallback| interval.min(until_fallback));
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_for) => {}
+            interrupted = tokio::signal::ctrl_c() => {
+                interrupted.context("ctrl-c handler")?;
+                wait_spinner.finish(false, "approval stopped");
+                println!("spawn: stopped. Nothing was registered — run spawnd possess to start again.");
+                return Err(LoginInterrupted.into());
+            }
+        }
 
-        let resp = client
-            .post(poll_url.as_str())
-            .json(&poll_body)
-            .send()
-            .await
-            .context("POST /api/auth/device/poll")?;
+        let elapsed = started_waiting.elapsed();
+        if !elapsed_shown && elapsed >= Duration::from_secs(30) {
+            elapsed_shown = true;
+            let remaining = start.expires_in.saturating_sub(elapsed.as_secs());
+            let minutes = remaining.div_ceil(60);
+            println!(
+                "spawn: still waiting — {} s elapsed (code expires in {minutes} min)",
+                elapsed.as_secs()
+            );
+        }
+        if !hint_shown && elapsed >= Duration::from_secs(60) {
+            hint_shown = true;
+            println!("spawn: Still waiting — is the browser open? The link is above; the code works on any device.");
+        }
+
+        let resp = tokio::select! {
+            response = client.post(poll_url.as_str()).json(&poll_body).send() => {
+                match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        wait_spinner.finish(false, "approval failed");
+                        return Err(connect_error(&server, &error));
+                    }
+                }
+            }
+            interrupted = tokio::signal::ctrl_c() => {
+                interrupted.context("ctrl-c handler")?;
+                wait_spinner.finish(false, "approval stopped");
+                println!("spawn: stopped. Nothing was registered — run spawnd possess to start again.");
+                return Err(LoginInterrupted.into());
+            }
+        };
 
         let status = resp.status();
         // 200 with body that may carry either {access_token, host_id} or {error: ...}.
@@ -162,44 +230,125 @@ pub async fn run(server_cli: Option<String>, args: LoginArgs) -> Result<LoginOut
             || status == StatusCode::FORBIDDEN
             || status == StatusCode::GONE)
         {
+            wait_spinner.finish(false, "approval failed");
             return Err(anyhow!("device/poll: HTTP {status}"));
         }
-        let body: DevicePollResponse =
-            resp.json().await.context("decoding device/poll response")?;
+        let body: DevicePollResponse = match resp.json().await {
+            Ok(body) => body,
+            Err(error) => {
+                wait_spinner.finish(false, "approval failed");
+                return Err(error).context("decoding device/poll response");
+            }
+        };
 
         if poll_has_success_fields(&body) {
             let account_id = body.account_id.clone();
-            let host_id = commit_poll_success(
+            let host_id = match commit_poll_success(
                 &mut stored,
                 body,
                 &identity,
                 &server,
                 &start.approval_nonce,
                 creds::save,
-            )?;
+            ) {
+                Ok(host_id) => host_id,
+                Err(error) => {
+                    wait_spinner.finish(false, "approval failed");
+                    return Err(error);
+                }
+            };
+            wait_spinner.finish(true, "approval received");
             println!("spawn: logged in. host_id = {host_id}");
             return Ok(LoginOutcome { account_id });
         }
 
         match body.error.as_deref() {
             Some("authorization_pending") | None => {
-                // keep polling
+                if should_open_attended_fallback(
+                    open_decision,
+                    attended_fallback_attempted,
+                    elapsed,
+                    body.error.as_deref(),
+                ) {
+                    attended_fallback_attempted = true;
+                    if open_browser(&approve_url) {
+                        println!("spawn: opened your browser to approve this host.");
+                    }
+                }
             }
             Some("slow_down") => {
                 interval += Duration::from_secs(5);
                 tracing::debug!(?interval, "server requested slow_down");
             }
             Some("expired_token") => {
-                return Err(anyhow!("device code expired; run `spawnd login` again"));
+                wait_spinner.finish(false, "approval expired");
+                return Err(user_error("The approval expired before anyone finished it. Run spawnd possess again for a fresh one."));
             }
             Some("denied") => {
-                return Err(anyhow!("login was denied"));
+                wait_spinner.finish(false, "approval declined");
+                return Err(user_error(
+                    "The approval was declined in the browser. Nothing was registered.",
+                ));
+            }
+            Some("key_conflict") => {
+                wait_spinner.finish(false, "approval failed");
+                return Err(user_error(key_conflict_copy()));
+            }
+            Some("pin_conflict") => {
+                wait_spinner.finish(false, "approval failed");
+                return Err(user_error("The browser that approved this machine doesn't match its earlier approval. Approve again from a browser you've used with this host before — or remove the host on the web and start fresh."));
+            }
+            Some("pin_limit") => {
+                wait_spinner.finish(false, "approval failed");
+                return Err(user_error("This host has reached its limit of approving browsers (32). Remove old devices under Access, then try again."));
             }
             Some(other) => {
+                wait_spinner.finish(false, "approval failed");
                 return Err(anyhow!("device/poll returned error: {other}"));
             }
         }
     }
+}
+
+fn approval_link_block(browser_opened: bool, approve_url: &str) -> String {
+    if browser_opened {
+        format!(
+            "spawn: opened your browser to approve this host.\n\
+             spawn:   didn't open? use this link on any device:\n\
+             spawn:   {approve_url}\n\n"
+        )
+    } else {
+        format!(
+            "spawn: approve this host in your browser — open this link on any device:\n\
+             spawn:   {approve_url}\n\n"
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserOpenDecision {
+    Immediate,
+    AfterPendingTimeout,
+}
+
+fn browser_open_decision(attended: bool) -> BrowserOpenDecision {
+    if attended {
+        BrowserOpenDecision::AfterPendingTimeout
+    } else {
+        BrowserOpenDecision::Immediate
+    }
+}
+
+fn should_open_attended_fallback(
+    decision: BrowserOpenDecision,
+    attempted: bool,
+    elapsed: Duration,
+    poll_error: Option<&str>,
+) -> bool {
+    decision == BrowserOpenDecision::AfterPendingTimeout
+        && !attempted
+        && elapsed >= Duration::from_secs(25)
+        && matches!(poll_error, Some("authorization_pending") | None)
 }
 
 /// Build the browser approval URL for this ceremony.
@@ -275,6 +424,113 @@ fn open_browser(url: &str) -> bool {
             .is_ok(),
         None => false,
     }
+}
+
+fn browser_opener_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        std::path::Path::new("/usr/bin/open").is_file()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        (std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some())
+            && command_on_path("xdg-open")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn command_on_path(command: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| directory.join(command).is_file())
+    })
+}
+
+fn render_qr(value: &str) -> Result<String> {
+    use qrcode::types::Color;
+
+    let code = qrcode::QrCode::new(value.as_bytes()).context("encoding approval QR")?;
+    let width = code.width();
+    let quiet = 2usize;
+    let module = |x: isize, y: isize| -> bool {
+        if x < 0 || y < 0 || x >= width as isize || y >= width as isize {
+            false
+        } else {
+            code[(x as usize, y as usize)] == Color::Dark
+        }
+    };
+    let mut rendered = String::new();
+    for y in (-(quiet as isize)..(width + quiet) as isize).step_by(2) {
+        rendered.push_str("     ");
+        for x in -(quiet as isize)..(width + quiet) as isize {
+            rendered.push(match (module(x, y), module(x, y + 1)) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        rendered.push('\n');
+    }
+    Ok(rendered)
+}
+
+fn key_conflict_copy() -> &'static str {
+    "This machine was set up before, under a different SPAWN D account, and\n\
+     spawn: that account still holds its identity. Nothing was changed.\n\
+     spawn:   • To use it under THAT account: sign in there and approve as usual.\n\
+     spawn:   • To hand it to THIS account: remove the host from the old account's\n\
+     spawn:     Hosts page first, then run  spawnd possess  again.\n\
+     spawn:   • To keep both accounts on this machine:  spawnd possess --new-account"
+}
+
+pub(crate) fn user_error(message: impl Into<String>) -> anyhow::Error {
+    UserFacingError(message.into()).into()
+}
+
+pub(crate) fn background_service_error(error: &anyhow::Error) -> anyhow::Error {
+    user_error(format!(
+        "Couldn't install the background service ({error}). The daemon still works in the foreground: spawnd run. To retry the service: spawnd reconnect."
+    ))
+}
+
+fn server_origin(server: &url::Url) -> String {
+    server.origin().ascii_serialization()
+}
+
+fn connect_error(server: &url::Url, error: &reqwest::Error) -> anyhow::Error {
+    let rendered = error.to_string().to_ascii_lowercase();
+    let origin = server_origin(server);
+    let host = server.host_str().unwrap_or("the server");
+    if rendered.contains("dns") || rendered.contains("resolve") {
+        user_error(format!("Can't find {host}. Check the server address — spawnd status shows what this machine uses."))
+    } else if rendered.contains("certificate") || rendered.contains("tls") {
+        user_error(format!("Secure connection to {origin} failed. If this machine's clock is wrong, fix that first (spawnd doctor checks it)."))
+    } else {
+        user_error(format!(
+            "{origin} didn't answer. Is the machine online? A firewall or VPN may be blocking it."
+        ))
+    }
+}
+
+fn ensure_login_http_status(server: &url::Url, status: StatusCode) -> Result<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+    if matches!(status.as_u16(), 502 | 503) {
+        return Err(user_error(format!(
+            "{} is having trouble (HTTP {}). Try again in a minute.",
+            server_origin(server),
+            status.as_u16()
+        )));
+    }
+    Err(user_error(format!(
+        "{} answered, but it isn't a SPAWN D server. Re-run the install command from the app — it carries the right address.",
+        server_origin(server)
+    )))
 }
 
 fn poll_has_success_fields(body: &DevicePollResponse) -> bool {
@@ -958,5 +1214,135 @@ mod tests {
         )
         .expect("a pre-0022 server must still be able to pair");
         assert!(persisted.get());
+    }
+
+    #[test]
+    fn attended_handoff_delays_the_browser_and_legacy_opens_immediately() {
+        assert_eq!(browser_open_decision(false), BrowserOpenDecision::Immediate);
+        assert_eq!(
+            browser_open_decision(true),
+            BrowserOpenDecision::AfterPendingTimeout
+        );
+        assert!(!should_open_attended_fallback(
+            BrowserOpenDecision::AfterPendingTimeout,
+            false,
+            Duration::from_secs(24),
+            Some("authorization_pending")
+        ));
+        assert!(should_open_attended_fallback(
+            BrowserOpenDecision::AfterPendingTimeout,
+            false,
+            Duration::from_secs(25),
+            Some("authorization_pending")
+        ));
+        assert!(!should_open_attended_fallback(
+            BrowserOpenDecision::AfterPendingTimeout,
+            false,
+            Duration::from_secs(25),
+            Some("denied")
+        ));
+    }
+
+    #[test]
+    fn plain_login_link_block_is_byte_stable() {
+        assert_eq!(
+            approval_link_block(false, "https://spawnd.dev/device?ref=x#k=y"),
+            "spawn: approve this host in your browser — open this link on any device:\nspawn:   https://spawnd.dev/device?ref=x#k=y\n\n"
+        );
+        assert_eq!(
+            approval_link_block(true, "https://spawnd.dev/device?ref=x#k=y"),
+            "spawn: opened your browser to approve this host.\nspawn:   didn't open? use this link on any device:\nspawn:   https://spawnd.dev/device?ref=x#k=y\n\n"
+        );
+    }
+
+    #[test]
+    fn qr_encodes_the_full_fragment_bearing_approval_url() {
+        let full = "https://spawnd.dev/device?ref=opaque#k=host-public-key";
+        let qr = qrcode::QrCode::new(full.as_bytes()).unwrap();
+        let rendered = render_qr(full).unwrap();
+        assert!(qr.width() > 0);
+        assert!(rendered.contains(['█', '▀', '▄']));
+        assert!(!rendered.contains(full));
+    }
+
+    #[test]
+    fn key_conflict_uses_the_three_option_transcript() {
+        let copy = key_conflict_copy();
+        assert!(copy.contains("To use it under THAT account"));
+        assert!(copy.contains("To hand it to THIS account"));
+        assert!(copy.contains("spawnd possess --new-account"));
+        assert!(copy.contains("Nothing was changed."));
+    }
+
+    #[tokio::test]
+    async fn fake_server_observes_setup_token_and_marks_the_handoff_attended() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let read = first.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.contains(r#""setup_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa""#)
+            );
+            let start = r#"{"device_code":"code","user_code":"ABCD-EFGH","approval_nonce":"nonce","verification_uri":"http://127.0.0.1/device","interval":1,"expires_in":1800}"#;
+            first
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{start}",
+                        start.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let mut second_request = vec![0u8; 4096];
+            let _ = second.read(&mut second_request).await.unwrap();
+            let possession = r#"{"verified":true,"version":1,"attended":true}"#;
+            second
+                .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{possession}", possession.len()).as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let origin = url::Url::parse(&format!("http://{address}/")).unwrap();
+        let client = reqwest::Client::new();
+        let start: DeviceStartResponse = client
+            .post(origin.join("start").unwrap())
+            .json(&DeviceStartRequest {
+                host_name: "host",
+                os: "linux",
+                arch: "x86_64",
+                version: "0.1.0",
+                host_key_algorithm: "ed25519",
+                host_public_key: "host-key",
+                setup_token: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(start.user_code, "ABCD-EFGH");
+        let possession: DevicePossessionResponse = client
+            .post(origin.join("possession").unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(possession.attended);
+        assert_eq!(
+            browser_open_decision(possession.attended),
+            BrowserOpenDecision::AfterPendingTimeout
+        );
+        server.await.unwrap();
     }
 }

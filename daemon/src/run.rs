@@ -461,6 +461,7 @@ async fn wait_for_credential_change_with(
 }
 
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
+    install_sighup_handler();
     crate::update::prepare_probation()?;
     crate::update::arm_probation_deadline();
     crate::update::refresh_worker_pair_status().await;
@@ -476,6 +477,21 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
     let registry = SessionRegistry::new();
+    let state_store = Arc::new(crate::state::StateStore::new(
+        &crate::config::config_dir()?,
+        server_url.as_str(),
+    ));
+    crate::state::install_active(Arc::clone(&state_store));
+    state_store.heartbeat(0);
+    let state_registry = registry.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            state_store.heartbeat(state_registry.ids().len());
+        }
+    });
     let rtc_sessions = RtcSessions::new();
     // Process-lifetime monotonic floor for the account deny-list (device mesh
     // §3). Owned here — above the per-connection loop — so a reconnect cannot
@@ -558,13 +574,26 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             ServeOutcome::SessionEnded(ended) => {
                 if ended.stable {
                     attempt = 0;
+                    unauthorized_logged = false;
                 } else {
                     attempt = attempt.saturating_add(1);
                 }
                 ended.result
             }
         };
+        if let Err(error) = &res {
+            let class = ws::failure_class(error);
+            let (kind, default_detail) = crate::state::connection_error_class(class);
+            let detail = ws::auth_refusal(error)
+                .map(ws::AuthRefusal::as_str)
+                .unwrap_or(default_detail);
+            crate::state::active_disconnected(kind, detail, registry.ids().len());
+        } else {
+            crate::state::active_disconnected("protocol", "socket_closed", registry.ids().len());
+        }
         let protocol_required = matches!(&res, Err(error) if ws::is_protocol_required(error));
+        let reconnect_now = res.as_ref().err().and_then(ws::close_disposition)
+            == Some(ws::CloseDisposition::ImmediateReconnect);
         let delay = if protocol_required {
             let failure = match crate::update::apply_from_release(&server_url).await {
                 Ok(crate::update::HttpUpdateOutcome::Applied(applied)) => {
@@ -611,10 +640,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 Some(ws::CloseDisposition::Unauthorized) => {
                     if !unauthorized_logged {
                         unauthorized_logged = true;
-                        tracing::error!(
-                            class = "unauthorized",
-                            "daemon credentials were refused by the control server"
-                        );
+                        tracing::error!(class = "unauthorized", "token expired — run spawnd login");
                     }
                     Duration::from_secs(60)
                 }
@@ -666,6 +692,9 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             }
         };
         tracing::info!(?delay, "reconnecting after backoff");
+        if reconnect_now {
+            attempt = 0;
+        }
         let reloaded = {
             let sleep_fut = tokio::time::sleep(delay);
             let reload_fut = wait_for_credential_change(&live_credentials, &mut credential_loader);
@@ -674,6 +703,10 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             tokio::select! {
                 _ = &mut sleep_fut => None,
                 reloaded = &mut reload_fut => Some(reloaded),
+                _ = sighup_signal() => {
+                    attempt = 0;
+                    None
+                }
                 r = tokio::signal::ctrl_c() => {
                     r.context("ctrl-c handler")?;
                     tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
@@ -695,6 +728,31 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             continue 'supervisor;
         }
     }
+}
+
+fn reconnect_notify() -> &'static tokio::sync::Notify {
+    static RECONNECT: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    RECONNECT.get_or_init(tokio::sync::Notify::new)
+}
+
+#[cfg(unix)]
+fn install_sighup_handler() {
+    tokio::spawn(async {
+        let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        else {
+            return;
+        };
+        while signal.recv().await.is_some() {
+            reconnect_notify().notify_one();
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_sighup_handler() {}
+
+async fn sighup_signal() {
+    reconnect_notify().notified().await;
 }
 
 async fn serve_one_connection(
@@ -798,6 +856,7 @@ async fn serve_one_connection_with_loader(
         }
     }
     tracing::info!(%ws_url, "ws connected");
+    crate::state::active_connected(registry.ids().len());
 
     let (write_half, read_half) = stream.split();
 
@@ -855,6 +914,7 @@ async fn serve_one_connection_with_loader(
         daemon_tree: crate::version::daemon_tree().map(str::to_string),
         self_update: update_capability.self_update,
         self_update_blocked: update_capability.blocked.map(str::to_string),
+        worker_mismatch: crate::update::worker_mismatch(),
         keeps_peers_across_reconnect: true,
         live_bindings,
         session_ice_policy: true,
@@ -929,7 +989,9 @@ async fn serve_one_connection_with_loader(
             biased;
             reader = &mut reader_task => {
                 let result = match reader {
-                    Ok(ws::ReaderOutcome::Closed(disposition)) => Err(ws::close_error(disposition)),
+                    Ok(ws::ReaderOutcome::Closed(disposition, auth_refusal)) => {
+                        Err(ws::close_error_with_auth(disposition, auth_refusal))
+                    }
                     Err(_) => Ok(()),
                 };
                 tracing::info!("ws reader task ended; ending session");
@@ -946,6 +1008,12 @@ async fn serve_one_connection_with_loader(
             }
             reloaded = wait_for_credential_change_with(live_credentials, poll_interval, loader) => {
                 ActiveSessionEvent::CredentialReload(reloaded.map(Box::new))
+            }
+            _ = sighup_signal() => {
+                tracing::info!("SIGHUP received; reconnecting now");
+                ActiveSessionEvent::SessionEnded(Err(ws::close_error(
+                    ws::CloseDisposition::ImmediateReconnect,
+                )))
             }
         }
     };
@@ -1089,6 +1157,7 @@ async fn reconcile_browser_pins(
     account_id: Option<&str>,
     proposed: Option<&[crate::proto::InboundBrowserPin]>,
     live_device_ids: Option<&[String]>,
+    out_tx: &mpsc::Sender<WsOutbound>,
 ) {
     // Snapshot the frame into owned values on the async task; only the blocking
     // keyring/file load+save is moved off Tokio below.
@@ -1112,19 +1181,27 @@ async fn reconcile_browser_pins(
     };
     // Absent the field nothing is dropped, so an older server cannot empty the
     // local pins by staying silent.
+    let proposed_ids = proposed
+        .unwrap_or_default()
+        .iter()
+        .map(|pin| pin.browser_device_id.clone())
+        .collect::<Vec<_>>();
     let prune = live_device_ids.map(<[String]>::to_vec);
     if adopt.is_none() && prune.is_none() {
         return;
     }
 
-    type ReconcileOutcomes = (Option<Result<usize>>, Option<Result<usize>>);
+    type ReconcileOutcomes = (
+        Option<Result<Vec<creds::PinAdoptionOutcome>>>,
+        Option<Result<usize>>,
+    );
     let outcome = run_isolated_credential_blocking(move || -> ReconcileOutcomes {
         // Ordinary (non-panic) backend errors on one side do not skip the
         // other, matching the previous inline behavior; only a genuine panic
         // short-circuits both, which the isolation redacts and fails closed.
-        let adopted = adopt
-            .as_ref()
-            .map(|(account, candidates)| creds::adopt_endorsed_browser_pins(account, candidates));
+        let adopted = adopt.as_ref().map(|(account, candidates)| {
+            creds::adopt_endorsed_browser_pins_report(account, candidates)
+        });
         let removed = prune
             .as_ref()
             .map(|live| creds::prune_browser_pins_to_live_set(live));
@@ -1139,24 +1216,48 @@ async fn reconcile_browser_pins(
                 error = format!("{error:#}"),
                 "could not reconcile browser pins off the dispatch task"
             );
+            send_pin_adoption_failures(out_tx, &proposed_ids, "other").await;
             return;
         }
     };
 
     let mut changed = false;
     match adopted {
-        None | Some(Ok(0)) => {}
-        Some(Ok(adopted)) => {
-            changed = true;
-            tracing::info!(
-                adopted,
-                "adopted browser pins endorsed by an already-trusted device"
-            );
+        None => {}
+        Some(Ok(outcomes)) => {
+            let adopted = outcomes
+                .iter()
+                .filter(|outcome| outcome.newly_adopted)
+                .count();
+            changed |= adopted > 0;
+            if adopted > 0 {
+                tracing::info!(
+                    adopted,
+                    "adopted browser pins endorsed by an already-trusted device"
+                );
+            }
+            for outcome in outcomes {
+                let frame = match outcome.reason {
+                    None => Outbound::HostPinAdopted {
+                        browser_device_id: outcome.device_id,
+                    },
+                    Some(reason) => Outbound::HostPinAdoptFailed {
+                        browser_device_id: outcome.device_id,
+                        reason: reason.to_string(),
+                    },
+                };
+                if let Ok(frame) = serde_json::to_string(&frame) {
+                    let _ = out_tx.send(WsOutbound::json(frame)).await;
+                }
+            }
         }
-        Some(Err(error)) => tracing::warn!(
-            error = format!("{error:#}"),
-            "could not adopt endorsed browser pins"
-        ),
+        Some(Err(error)) => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "could not adopt endorsed browser pins"
+            );
+            send_pin_adoption_failures(out_tx, &proposed_ids, "other").await;
+        }
     }
     match removed {
         None | Some(Ok(0)) => {}
@@ -1176,6 +1277,22 @@ async fn reconcile_browser_pins(
         // which a revoked browser's signed offers still verify) collapses to
         // the reload itself.
         credentials_touched_notify().notify_one();
+    }
+}
+
+async fn send_pin_adoption_failures(
+    out_tx: &mpsc::Sender<WsOutbound>,
+    device_ids: &[String],
+    reason: &str,
+) {
+    for browser_device_id in device_ids {
+        let frame = Outbound::HostPinAdoptFailed {
+            browser_device_id: browser_device_id.clone(),
+            reason: reason.to_owned(),
+        };
+        if let Ok(frame) = serde_json::to_string(&frame) {
+            let _ = out_tx.send(WsOutbound::json(frame)).await;
+        }
     }
 }
 
@@ -1565,12 +1682,16 @@ async fn dispatch_loop(
     // (R10); this floor removes the in-process half of the P3′ residual.
     while let Some(msg) = in_rx.recv().await {
         match msg {
-            WsInbound::Closed { disposition } => {
-                return Err(ws::close_error(disposition));
+            WsInbound::Closed {
+                disposition,
+                auth_refusal,
+            } => {
+                return Err(ws::close_error_with_auth(disposition, auth_refusal));
             }
             WsInbound::Json(frame) => match *frame {
                 Inbound::Registered {
                     host_id,
+                    access_token,
                     account_id,
                     browser_pins,
                     browser_device_ids,
@@ -1586,6 +1707,19 @@ async fn dispatch_loop(
                     *registered_at.lock().expect("registered timestamp lock") =
                         Some(Instant::now());
                     crate::update::registered(out_tx).await;
+                    if let Some(access_token) = access_token {
+                        let persisted = run_isolated_credential_blocking(move || {
+                            creds::replace_access_token(&access_token)
+                        })
+                        .await;
+                        match persisted {
+                            Ok(Ok(())) => credentials_touched_notify().notify_one(),
+                            Ok(Err(error)) | Err(error) => tracing::warn!(
+                                error = format!("{error:#}"),
+                                "could not persist rotated daemon token"
+                            ),
+                        }
+                    }
                     rtc_sessions.reannounce_live_statuses().await;
                     daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
                     let newly_revoked = daemon_revoked
@@ -1594,6 +1728,7 @@ async fn dispatch_loop(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
                         browser_device_ids.as_deref(),
+                        out_tx,
                     )
                     .await;
                     if newly_revoked {
@@ -1628,6 +1763,7 @@ async fn dispatch_loop(
                         account_id.as_deref(),
                         browser_pins.as_deref(),
                         browser_device_ids.as_deref(),
+                        out_tx,
                     )
                     .await;
                     if newly_revoked {
@@ -1661,6 +1797,7 @@ async fn dispatch_loop(
                     target,
                     spawnd,
                     spawn_worker,
+                    allow_downgrade,
                 } => {
                     let server_origin = live_credentials
                         .server_origin
@@ -1678,6 +1815,7 @@ async fn dispatch_loop(
                             target,
                             spawnd,
                             spawn_worker,
+                            allow_downgrade,
                         },
                         out_tx,
                     ));
@@ -2802,6 +2940,19 @@ async fn handle_session_create(
     let session_id = create.session_id;
     tracing::info!(%session_id, "session.create");
 
+    let _ = crate::update::refresh_worker_pair_status().await;
+    if crate::update::worker_mismatch() {
+        send_error_code(
+            out_tx,
+            Some(session_id),
+            "worker_mismatch",
+            "spawn-worker does not match spawnd; run spawnd update to repair the installed pair",
+        )
+        .await;
+        send_spawn_failed_exit(session_id, out_tx, "worker mismatch").await;
+        return;
+    }
+
     // Build the env for the session's login shell: the daemon's process env
     // (so HOME, XDG_CONFIG_HOME, PATH, etc. flow through naturally and agent
     // CLIs launched from the shell find their own credentials), normalized
@@ -3409,6 +3560,7 @@ mod tests {
                         path: "/api/install/spawn-worker/darwin-aarch64".into(),
                         sha256: "c".repeat(64),
                     },
+                    allow_downgrade: false,
                 })))
                 .await
                 .unwrap();
@@ -5027,8 +5179,9 @@ mod tests {
                 .expect("send post-offer ping");
 
             // Dispatch is serial, so by pong time the offer was fully handled.
-            // Any frame besides the pong (an rtc.answer, a host status) proves
-            // the revoked key reached the RTC path.
+            // A revoked key is now answered with an explicit refusal so the
+            // client does not spin forever. The refusal is not admission: no
+            // RTC answer or resident session may be produced.
             let mut unexpected = Vec::new();
             loop {
                 let message = tokio::time::timeout(Duration::from_secs(1), socket.next())
@@ -5044,7 +5197,10 @@ mod tests {
                 }
                 unexpected.push(value);
             }
-            assert_eq!(unexpected, Vec::<serde_json::Value>::new());
+            assert_eq!(unexpected.len(), 1);
+            assert_eq!(unexpected[0]["type"], "rtc.status");
+            assert_eq!(unexpected[0]["status"], "failed");
+            assert_eq!(unexpected[0]["session_id"], server_session_id);
             observed_tx.send(()).expect("refusal observation");
             close_rx.await.expect("close request");
             socket.close(None).await.expect("close daemon socket");
@@ -5278,7 +5434,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::result_large_err)]
-    async fn session_end_slow_cleanup_cannot_revive_late_cancelled_loader_reply() {
+    async fn credential_failure_slow_cleanup_cannot_revive_late_cancelled_loader_reply() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind local websocket");
@@ -5288,7 +5444,6 @@ mod tests {
         let registered_state = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server_registered_state = Arc::clone(&registered_state);
         let (registered_tx, registered_rx) = oneshot::channel();
-        let (close_tx, close_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.expect("accept daemon socket");
             let mut socket = tokio_tungstenite::accept_hdr_async(
@@ -5318,8 +5473,7 @@ mod tests {
                 .expect("valid daemon register frame");
             server_registered_state.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = registered_tx.send(());
-            close_rx.await.expect("request server close");
-            socket.close(None).await.expect("close daemon socket");
+            while socket.next().await.is_some() {}
         });
 
         let host_id = Uuid::from_u128(10);
@@ -5365,6 +5519,7 @@ mod tests {
         assert!(registry.claim_discovery());
         let rtc_sessions = RtcSessions::new();
         assert!(rtc_sessions.bind_registered_host_id(host_id).await);
+        let epoch_before = rtc_sessions.trust_epoch_for_test();
         let cleanup_gate = rtc_sessions.stall_next_close_all_for_test().await;
         let mut daemon_revoked = RevocationSet::new();
 
@@ -5401,7 +5556,9 @@ mod tests {
                     panic!("connection ended before loader stall: {}", result.is_ok());
                 }
             }
-            close_tx.send(()).expect("request socket close");
+            // The hard loader deadline is a trust failure. It must enter the
+            // invalidate_trust_and_close_all path even though an ordinary
+            // socket close deliberately would not.
             tokio::time::timeout(Duration::from_secs(1), async {
                 tokio::select! {
                     _ = cleanup_gate.wait_entered() => {}
@@ -5413,27 +5570,19 @@ mod tests {
             .await
             .expect("session cleanup did not begin");
 
-            // The active reload future is now cancelled while its exact
-            // request/deadline remain in `loader`; ordinary session cleanup is
-            // deliberately held beyond that deadline.
-            tokio::time::sleep(Duration::from_millis(350)).await;
+            // The active reload future has hit its hard deadline while the
+            // underlying blocking request is still running. Trust cleanup is
+            // deliberately held while that cancelled request replies late.
             release_tx.send(()).expect("release cleanup-race loader");
             receive_std_signal(&reply_rx, Duration::from_secs(1), "late cleanup-race reply").await;
             cleanup_gate.release();
             tokio::time::timeout(Duration::from_secs(1), &mut connection)
                 .await
                 .expect("connection cleanup timeout")
-                .expect("connection cleanup result")
         };
-        assert!(matches!(outcome, ServeOutcome::SessionEnded(_)));
-
-        let epoch_before = rtc_sessions.trust_epoch_for_test();
-        let error = match credential_change_now_with(&active, &mut loader).await {
-            Ok(_) => panic!("late queued credential reply authorized reconnect"),
-            Err(error) => {
-                rtc_sessions.invalidate_trust_and_close_all().await;
-                error
-            }
+        let error = match outcome {
+            Err(error) => error,
+            Ok(_) => panic!("credential deadline must fail closed"),
         };
         let message = format!("{error:#}");
         assert!(message.contains("hard deadline"));
@@ -5450,6 +5599,78 @@ mod tests {
             .await
             .expect("local websocket server timeout")
             .expect("local websocket server task");
+    }
+
+    #[tokio::test]
+    async fn ordinary_socket_close_keeps_peer_trust_and_skips_cleanup_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_url = url::Url::parse(&format!("http://{address}")).unwrap();
+        let ws_url = config::ws_url(&server_url).unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        SEC_WEBSOCKET_PROTOCOL,
+                        HeaderValue::from_static("spawn.control.v3"),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            socket.next().await.unwrap().unwrap();
+            socket.close(None).await.unwrap();
+        });
+
+        let host_id = Uuid::from_u128(10);
+        let record = credential_record(
+            1,
+            1,
+            "ordinary-close-token",
+            host_id,
+            server_url.as_str(),
+            7,
+            &[],
+        );
+        let active = LiveCredentialSnapshot::initial(record.clone(), &server_url).unwrap();
+        let mut loader =
+            CredentialLoader::start(Duration::from_secs(1), move || Ok(record.clone())).unwrap();
+        let registry = SessionRegistry::new();
+        assert!(registry.claim_discovery());
+        let rtc_sessions = RtcSessions::new();
+        assert!(rtc_sessions.bind_registered_host_id(host_id).await);
+        let epoch_before = rtc_sessions.trust_epoch_for_test();
+        let cleanup_gate = rtc_sessions.stall_next_close_all_for_test().await;
+        let mut revoked = RevocationSet::new();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            serve_one_connection_with_loader(
+                &active,
+                &ws_url,
+                &registry,
+                &rtc_sessions,
+                Duration::from_secs(5),
+                &mut loader,
+                &mut revoked,
+            ),
+        )
+        .await
+        .expect("ordinary close timeout")
+        .expect("ordinary close result");
+        assert!(matches!(outcome, ServeOutcome::SessionEnded(_)));
+        assert_eq!(rtc_sessions.trust_epoch_for_test(), epoch_before);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), cleanup_gate.wait_entered())
+                .await
+                .is_err(),
+            "ordinary close entered trust cleanup"
+        );
+        server.await.unwrap();
     }
 
     fn tool_status(
@@ -5710,6 +5931,7 @@ async fn handle_session_restart(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let _ = registry.remove_if_generation(session_id, binding.generation());
+        crate::state::active_heartbeat(registry.ids().len());
     }
     drop(transition);
 
@@ -5850,6 +6072,7 @@ async fn spawn_exit_forwarder(
         tracing::debug!(%session_id, generation, "ignoring stale session exit");
         return;
     }
+    crate::state::active_heartbeat(registry.ids().len());
     let exit = Outbound::SessionExit {
         session_id,
         exit_code: reason.exit_code,
@@ -5910,6 +6133,7 @@ async fn register_attached(
     }
     let generation = registry.insert(launched.handle);
     drop(transition);
+    crate::state::active_heartbeat(registry.ids().len());
 
     if notify_started {
         let started = Outbound::SessionStarted { session_id, pid };

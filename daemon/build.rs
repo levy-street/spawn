@@ -31,6 +31,11 @@ fn main() {
     // repository commit stamped into the human-readable version. Dirty builds
     // are deliberately distinct so release comparison can decline to update
     // either side while a developer is working locally.
+    println!("cargo:rerun-if-env-changed=SPAWND_DAEMON_TREE_OVERRIDE");
+    println!("cargo:rerun-if-env-changed=SPAWND_BUILD_COUNTER_OVERRIDE");
+    println!("cargo:rerun-if-env-changed=SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE");
+
+    let tree_override = std::env::var("SPAWND_DAEMON_TREE_OVERRIDE").unwrap_or_default();
     let tree = Command::new("git")
         .current_dir(&manifest_dir)
         .args(["rev-parse", "HEAD:daemon"])
@@ -40,7 +45,9 @@ fn main() {
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|stdout| stdout.trim().to_string())
         .unwrap_or_default();
-    let tree = if tree.is_empty() {
+    let tree = if !tree_override.is_empty() {
+        tree_override
+    } else if tree.is_empty() {
         tree
     } else {
         let clean = Command::new("git")
@@ -55,6 +62,28 @@ fn main() {
         }
     };
     println!("cargo:rustc-env=SPAWND_DAEMON_TREE={tree}");
+
+    let counter = std::env::var("SPAWND_BUILD_COUNTER_OVERRIDE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            Command::new("git")
+                .current_dir(&manifest_dir)
+                .args(["show", "-s", "--format=%ct", "HEAD"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|stdout| stdout.trim().to_string())
+                .unwrap_or_default()
+        });
+    println!("cargo:rustc-env=SPAWND_BUILD_COUNTER={counter}");
+
+    let release_keys = std::env::var("SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "8nE_rD4eVv8QFuNMbBQ3023vuU7V-OWxRl70ni4WOf0".to_string());
+    println!("cargo:rustc-env=SPAWND_RELEASE_PUBLIC_KEYS={release_keys}");
 
     // Re-stamp when HEAD moves; .git sits at the repo root, one level up.
     println!("cargo:rerun-if-changed=../.git/HEAD");

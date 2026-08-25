@@ -2,9 +2,198 @@ use super::*;
 
 use std::sync::atomic::AtomicBool;
 
+use base64::Engine;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn manifest_request() -> UpdateRequest {
+    UpdateRequest {
+        request_id: Some("request-1".into()),
+        version: "0.1.0+gnew".into(),
+        tree: "b".repeat(40),
+        target: "darwin-aarch64".into(),
+        spawnd: DaemonUpdateArtifact {
+            path: "/api/install/spawnd/darwin-aarch64".into(),
+            sha256: "c".repeat(64),
+        },
+        spawn_worker: DaemonUpdateArtifact {
+            path: "/api/install/spawn-worker/darwin-aarch64".into(),
+            sha256: "d".repeat(64),
+        },
+        allow_downgrade: false,
+    }
+}
+
+fn signed_manifest(
+    signing_key: &ed25519_dalek::SigningKey,
+    counter: u64,
+) -> (Vec<u8>, String, String) {
+    use ed25519_dalek::Signer;
+
+    let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+    let key_id =
+        digest_hex(&Sha256::digest(signing_key.verifying_key().to_bytes()))[..8].to_string();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "commit": "a".repeat(40),
+        "tree": "b".repeat(40),
+        "version": "0.1.0+gnew",
+        "release_counter": counter,
+        "signing_key_id": key_id,
+        "targets": {
+            "darwin-aarch64": {
+                "spawnd_sha256": "c".repeat(64),
+                "spawn_worker_sha256": "d".repeat(64)
+            }
+        }
+    }))
+    .unwrap();
+    let signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&bytes).to_bytes());
+    (bytes, signature, public_key)
+}
+
+#[test]
+fn signed_manifest_accepts_exact_bytes_and_rejects_bad_missing_or_wrong_signatures() {
+    use ed25519_dalek::Signer;
+
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let wrong = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+    let (manifest, signature, public_key) = signed_manifest(&key, 2_000);
+    let request = manifest_request();
+    verify_manifest_bytes(
+        &manifest,
+        Some(signature.as_bytes()),
+        &request,
+        "darwin-aarch64",
+        false,
+        &[&public_key],
+        Some(1_000),
+    )
+    .unwrap();
+
+    let missing = verify_manifest_bytes(
+        &manifest,
+        None,
+        &request,
+        "darwin-aarch64",
+        false,
+        &[&public_key],
+        Some(1_000),
+    )
+    .unwrap_err();
+    assert_eq!(
+        (missing.stage, missing.error),
+        (UpdateStage::Verify, "manifest_unsigned")
+    );
+
+    let mut bad = signature.into_bytes();
+    bad[0] = if bad[0] == b'A' { b'B' } else { b'A' };
+    let failure = verify_manifest_bytes(
+        &manifest,
+        Some(&bad),
+        &request,
+        "darwin-aarch64",
+        false,
+        &[&public_key],
+        Some(1_000),
+    )
+    .unwrap_err();
+    assert_eq!(failure.error, "manifest_bad_signature");
+
+    let wrong_key = URL_SAFE_NO_PAD.encode(wrong.verifying_key().to_bytes());
+    let valid_signature = URL_SAFE_NO_PAD.encode(key.sign(&manifest).to_bytes());
+    let failure = verify_manifest_bytes(
+        &manifest,
+        Some(valid_signature.as_bytes()),
+        &request,
+        "darwin-aarch64",
+        false,
+        &[&wrong_key],
+        Some(1_000),
+    )
+    .unwrap_err();
+    assert_eq!(failure.error, "manifest_bad_signature");
+}
+
+#[test]
+fn manifest_mismatch_counter_guard_downgrade_and_escape_hatch_are_stable() {
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let (older, signature, public_key) = signed_manifest(&key, 500);
+    let mut request = manifest_request();
+    let downgrade = verify_manifest_bytes(
+        &older,
+        Some(signature.as_bytes()),
+        &request,
+        "darwin-aarch64",
+        false,
+        &[&public_key],
+        Some(1_000),
+    )
+    .unwrap_err();
+    assert_eq!(
+        (downgrade.stage, downgrade.error),
+        (UpdateStage::Precondition, "downgrade")
+    );
+
+    request.allow_downgrade = true;
+    verify_manifest_bytes(
+        &older,
+        Some(signature.as_bytes()),
+        &request,
+        "darwin-aarch64",
+        false,
+        &[&public_key],
+        Some(1_000),
+    )
+    .unwrap();
+
+    request.allow_downgrade = false;
+    let (equal, equal_signature, _) = signed_manifest(&key, 1_000);
+    verify_manifest_bytes(
+        &equal,
+        Some(equal_signature.as_bytes()),
+        &request,
+        "darwin-aarch64",
+        false,
+        &[&public_key],
+        Some(1_000),
+    )
+    .unwrap();
+
+    verify_manifest_bytes(
+        &older,
+        None,
+        &request,
+        "darwin-aarch64",
+        true,
+        &[],
+        Some(1_000),
+    )
+    .unwrap();
+
+    request.spawnd.sha256 = "e".repeat(64);
+    let mismatch = verify_manifest_bytes(
+        &equal,
+        Some(equal_signature.as_bytes()),
+        &request,
+        "darwin-aarch64",
+        false,
+        &[&public_key],
+        Some(1_000),
+    )
+    .unwrap_err();
+    assert_eq!(
+        (mismatch.stage, mismatch.error),
+        (UpdateStage::Verify, "manifest_mismatch")
+    );
+}
+
+#[test]
+fn worker_mismatch_bypasses_only_same_tree_idempotence() {
+    assert!(same_tree_is_current("tree", "tree", false));
+    assert!(!same_tree_is_current("tree", "tree", true));
+    assert!(!same_tree_is_current("new", "old", false));
+}
 
 #[test]
 fn install_url_join_accepts_only_server_local_install_paths() {
@@ -192,7 +381,18 @@ fn precondition_reasons_are_short_stable_classes() {
         "unsupported_target"
     );
     assert_eq!(BlockReason::WorkerMissing.as_str(), "worker_missing");
-    assert_eq!(BlockReason::WorkerMismatch.as_str(), "worker_mismatch");
+}
+
+#[test]
+fn plain_cli_outcomes_are_byte_stable() {
+    assert_eq!(
+        cli_no_update_line("current"),
+        "SPAWN D daemon update not applied (current)."
+    );
+    assert_eq!(
+        UpdateFailure::new(UpdateStage::Verify, "manifest_bad_signature").to_string(),
+        "verify: manifest_bad_signature"
+    );
 }
 
 #[test]
@@ -302,6 +502,22 @@ fn health_revert_restores_both_fake_binaries() {
     assert_eq!(fs::read(&worker).unwrap(), b"old worker");
     assert!(!previous_path(&daemon).exists());
     assert!(!previous_path(&worker).exists());
+}
+
+#[test]
+fn corrupt_marker_recovery_requires_both_previous_binaries() {
+    let directory = tempdir().unwrap();
+    let daemon = directory.path().join("spawnd");
+    let worker = directory.path().join("spawn-worker");
+    fs::write(previous_path(&daemon), b"old daemon").unwrap();
+    assert!(!complete_previous_pair(&daemon, &worker));
+    fs::write(previous_path(&worker), b"old worker").unwrap();
+    assert!(complete_previous_pair(&daemon, &worker));
+    assert_eq!(
+        previous_worker_path_for_recovery(&daemon),
+        Some(worker),
+        "recovery must find spawn-worker.prev even when the current worker is missing"
+    );
 }
 
 #[cfg(unix)]

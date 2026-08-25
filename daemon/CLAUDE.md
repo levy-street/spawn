@@ -20,8 +20,14 @@ src/
                  emulator, scrollback, worker runtime
   <feature>.rs   one module per concern: run.rs (register + main loop),
                  ws.rs, update.rs + update_io.rs (verified daemon self-update;
-                 focused tests live in update_tests.rs), rtc.rs, login.rs,
-                 creds.rs, host_*.rs, upload.rs, sessions.rs, service.rs, …
+                 focused tests live in update_tests.rs), release_key.rs (pinned
+                 release trust roots), login.rs, creds.rs, rtc.rs, host_*.rs,
+                 upload.rs, sessions.rs, service.rs, …
+  tui.rs         shared TTY/NO_COLOR presentation, logo, steps, and spinner
+  state.rs       atomic local daemon heartbeat contract (`state.json`)
+  status.rs      human/JSON status across local account instances
+  doctor.rs      the ordered 14-check local health report
+  lifecycle.rs   reconnect, disconnect, logout, and local reset commands
   version.rs     the version the daemon reports; build.rs stamps the source
                  commit into it (0.1.0+g<commit>)
 tests/           integration tests (worker_e2e.rs)
@@ -42,7 +48,8 @@ vendor/          exact upstream crate sources for narrowly documented patches;
 ## Before calling a change done
 
 ```bash
-cargo build --locked && cargo test --locked
+cargo build --locked
+cargo test --locked --bin spawnd <module>::
 ```
 
 Run `cargo clippy` and `cargo fmt` on what you touched. Shipping binaries to
@@ -57,11 +64,29 @@ SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
 `spawn-worker --version` prints the same build/tree identity stamped into
 `spawnd`. The supervisor checks that pair at startup and before every new
 session; a mismatch is reported as `worker_mismatch` and existing workers keep
-running, but new sessions are refused. Self-updates retain both `.prev`
+running, but new sessions are refused. Reapplying the same release is allowed
+while mismatched so self-update can repair the pair. Self-updates retain both `.prev`
 binaries and a sibling `spawnd.updating` probation marker until the new daemon
 registers. Two failed startups or five minutes without registration atomically
 restore the pair and report a `health` update failure after the old daemon
 registers.
+
+Every self-update first downloads the origin-pinned
+`/api/install/manifest.json{,.sig}`, verifies the exact manifest bytes against
+the rotation list in `release_key.rs`, matches its tree and both artifact
+hashes, and enforces the build.rs-stamped monotonic release counter. Development
+harness builds may set `SPAWND_DAEMON_TREE_OVERRIDE`,
+`SPAWND_BUILD_COUNTER_OVERRIDE`, and
+`SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE`. `SPAWND_ALLOW_UNSIGNED_UPDATE=1` is a
+local-development-only escape hatch that skips the signature and counter
+checks, emits one warning, and must never be used by production tooling.
+
+The user-facing command set is `possess` (`setup`), `exorcise` (`remove`),
+`status`, `doctor`, `reconnect`, `disconnect`, `update`, `login`, `logout`,
+`reset`, and foreground-only `run`. `possess --new-account` creates another
+isolated account instance. `run` writes `<config_dir>/state.json` atomically on
+connection/session transitions and every 30 seconds; SIGHUP requests an
+immediate reconnect without terminating session workers.
 
 ## Keeping this file true
 
