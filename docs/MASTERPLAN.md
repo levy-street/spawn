@@ -76,7 +76,19 @@ rebuild it — build on it.
 | `9c23957` feat(daemon) | `spawnd` stamps `SPAWND_DAEMON_TREE` (git tree of `daemon/`, `-dirty` aware), registers with it + `self_update`/`self_update_blocked`, handles `daemon.update` (path-only URLs pinned to `/api/install/` on its own origin, sha256 + `--version` verification, atomic two-binary swap with `.prev`, flush-tracked result frame, exec-in-place keeping the PID, workers survive), `spawnd update` subcommand, protocol-refused (4003 / subprotocol) → HTTP self-update with 5-min backoff and hourly reinstall hint. Modules: `daemon/src/update.rs`, `update_io.rs`, `update_tests.rs`. |
 | `ef17da8` feat(infra) | `infra/nginx-spawnd.conf.example` (real prod vhost + 300 s `/ws/` timeouts), `infra/coturn.conf.example`, `docs/NETWORK.md` (UDP `turn:` mandatory for daemons; `turns:443` options; daemon UDP port range + firewall; one-uvicorn-worker constraint), `scripts/connection-probe.py` (stdlib WS handshake + STUN binding probes) wired into `health-check.sh` and post-deploy. |
 | `c48b8dd` feat(server) | Public `GET /api/release` (all identities; daemon section only from a fully hash-verified manifest), Host columns for `daemon_tree`/self-update state (alembic 0062), computed `HostOut.update` state machine (current/available/updating/failed/unsupported/unknown; dirty and dev identities never prompt), auto-`daemon.update` after `registered` (`SPAWN_DAEMON_AUTO_UPDATE=false` to disable), `POST /api/hosts/{id}/update` (200/202/409/429), `daemon.update_result` recording, re-register reconciliation, installer pins fed from the manifest. |
-| (in flight) | Three connection-fix streams — web (`W2`), mobile (`M2`), daemon (`D2` incl. the ErrChunk fix) — were mid-implementation when this document was written. Their scope is Part 3; check `git log` for `feat(web): connection`, `feat(mobile): connection`, `feat(daemon): connection`-shaped commits and the reports `docs/masterplan/IMPL-web2.md`, `IMPL-mobile2.md`, `IMPL-daemon2.md` to see what landed. Anything from Part 3 NOT in those commits is yours. |
+| (in flight) | Three connection-fix streams — web (`W2`), mobile (`M2`), daemon (`D2` incl. the ErrChunk fix) — were mid-implementation when this document was written. Their scope is Part 3; check `git log` for `feat(web): connection`, `feat(mobile): connection`, `feat(daemon): connection`-shaped commits and the reports `docs/masterplan/IMPL-web2.md`, `IMPL-mobile2.md`, `IMPL-daemon2.md` to see what landed. All three LANDED with nothing undone — see the updated 2.2 status; Phase B shrinks to verification plus the cross-stream Part 6 items (#2 signed manifest, #3 downgrade guard). |
+
+### Phase log — the executing session (started 2026-08-25, this branch)
+
+Kept current as phases land; the per-phase worker reports live in `docs/masterplan/IMPL-*.md`.
+
+| Phase | Status | Evidence |
+|---|---|---|
+| 0 Orient | DONE 2026-08-25 | Baseline on the dirty tree before any new work: server `pytest -q` **769 passed / 14 skipped / 0 failed** (15 m 34 s); web bun **1076 pass / 0 fail**; mobile `npm run ci` green per `IMPL-mobile2.md` (227 suites / 1562 tests); `alembic heads` = `0062`; `bash -n scripts/*.sh` clean. Known macOS daemon reds unchanged (see the machine-quirks list above). Cross-folder contracts for the phases below were written before dispatch (setup claims / pairing push / host mini-doctor; signed manifest + counter + health stage; session renewal + pin capacity). |
+| B (part) D2 daemon | IN FLIGHT | `daemon/` uncommitted: ErrChunk F1+F2 (webrtc 0.17.2 + vendored `webrtc-sctp` #822 re-admission patch), keep-peers-across-WS-loss, ICE restart, pacing + `pty_gap`, full jitter, probation health gate, worker-pair check. Report: `IMPL-daemon2.md` when the worker finishes. |
+| A S2 server | IN FLIGHT | `server/` uncommitted: SPEC-connection S2 items 1–17 + stale presence + `Host.last_disconnect_*` (alembic 0063). Report: `IMPL-server-S2.md`. |
+| C W3/M3 frontends | IN FLIGHT | setup-claim checklist + inline approve + fragment stash + error catalogue + host "Something wrong?" panel + Add a machine (both frontends, same commit). |
+| T1 scripts | IN FLIGHT | release-lib signing (Ed25519, key on the operator Mac), deploy gate, verify-release signature + counter rows, RELEASE.md custody/loss plan/OTA kill switch. |
 
 ### The release-identity model (as built — the mental model everything else rides on)
 
@@ -158,9 +170,12 @@ only, no `turns:`; uvicorn access log on).
   hook API, fake-WS/PC state-machine tests. Report:
   `docs/masterplan/IMPL-web2.md` (its "Notes for S2/D2/M2" pin the exact
   frame expectations — treat as contract).
-- **M2 (mobile)** and **D2 (daemon incl. ErrChunk)** — check `git log` and
-  `docs/masterplan/IMPL-mobile2.md` / `IMPL-daemon2.md`; whatever their
-  reports mark undone is yours.
+- **M2 (mobile) — LANDED** (`feat(mobile): the phone survives bad networks…`),
+  all 16 items, nothing undone: report `docs/masterplan/IMPL-mobile2.md`.
+- **D2 (daemon incl. the ErrChunk fix and the research addendum: probation
+  health gate, worker pair check, 16 KiB outbound, full jitter) — LANDED**
+  (`feat(daemon): connections that survive the real world…`), all 12 items,
+  nothing undone: report `docs/masterplan/IMPL-daemon2.md`.
 - **R2 (infra) — LANDED** (`feat(infra)`).
 - **S2 (server) — NOT STARTED. This is the largest remaining implementation
   block and your first coding phase (Phase A below).** Full scope =
