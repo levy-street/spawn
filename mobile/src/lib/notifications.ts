@@ -7,6 +7,7 @@ import type { AlertEvent, AlertEventKind } from "@/data/realtime/alert-socket";
 export const NOTIFICATION_PREFERENCES_STORAGE_KEY = "spawn.notify.prefs";
 export const LOCAL_NOTIFICATION_RATE_LIMIT_MS = 30_000;
 const MAX_MUTED_SESSIONS = 200;
+const MAX_NOTIFICATION_APPROVAL_REF_LENGTH = 512;
 
 export interface NotificationPreferences {
   toast: boolean;
@@ -340,6 +341,11 @@ export interface NotificationApprovalTarget {
   requestId: string;
 }
 
+/** A possession-verified host request. The opaque ref only pre-fills lookup. */
+export interface NotificationPairingTarget {
+  approvalRef: string;
+}
+
 export function parseNotificationApprovalTarget(value: unknown): NotificationApprovalTarget | null {
   if (
     !isRecord(value) ||
@@ -350,6 +356,20 @@ export function parseNotificationApprovalTarget(value: unknown): NotificationApp
     return null;
   }
   return { requestId: value["requestId"] };
+}
+
+export function parseNotificationPairingTarget(value: unknown): NotificationPairingTarget | null {
+  if (
+    !isRecord(value) ||
+    value["event"] !== "host.pair_requested" ||
+    typeof value["approvalRef"] !== "string" ||
+    value["approvalRef"].length === 0 ||
+    value["approvalRef"].length > MAX_NOTIFICATION_APPROVAL_REF_LENGTH ||
+    value["approvalRef"].trim() !== value["approvalRef"]
+  ) {
+    return null;
+  }
+  return { approvalRef: value["approvalRef"] };
 }
 
 export function parseNotificationNavigationTarget(
@@ -375,6 +395,7 @@ function targetFromResponse(
 export function subscribeToLocalNotificationResponses(
   listener: (target: NotificationNavigationTarget) => void,
   onApproval?: (target: NotificationApprovalTarget) => void,
+  onPairing?: (target: NotificationPairingTarget) => void,
 ): () => void {
   const subscription = Notifications.addNotificationResponseReceivedListener((response) => {
     const target = targetFromResponse(response);
@@ -383,7 +404,12 @@ export function subscribeToLocalNotificationResponses(
       return;
     }
     const approval = parseNotificationApprovalTarget(response.notification.request.content.data);
-    if (approval && onApproval) onApproval(approval);
+    if (approval && onApproval) {
+      onApproval(approval);
+      return;
+    }
+    const pairing = parseNotificationPairingTarget(response.notification.request.content.data);
+    if (pairing && onPairing) onPairing(pairing);
   });
   return () => subscription.remove();
 }
@@ -403,4 +429,13 @@ export function consumeLastApprovalNotificationResponse(): NotificationApprovalT
   const approval = parseNotificationApprovalTarget(response.notification.request.content.data);
   if (approval) Notifications.clearLastNotificationResponse();
   return approval;
+}
+
+/** The host-pairing push the app was opened from, consumed once. */
+export function consumeLastPairingNotificationResponse(): NotificationPairingTarget | null {
+  const response = Notifications.getLastNotificationResponse();
+  if (!response) return null;
+  const pairing = parseNotificationPairingTarget(response.notification.request.content.data);
+  if (pairing) Notifications.clearLastNotificationResponse();
+  return pairing;
 }

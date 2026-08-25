@@ -16,6 +16,19 @@ export const HostUpdateOutSchema = z.object({
   requested_at: IsoDateTimeSchema.nullable().default(null),
 });
 export const HostUpdateResponseSchema = z.object({ update: HostUpdateOutSchema });
+export const HostDisconnectSchema = z.object({
+  at: IsoDateTimeSchema.nullable(),
+  reason: z
+    .enum([
+      "socket_closed",
+      "superseded",
+      "keepalive_timeout",
+      "auth_rejected",
+      "server_restart",
+      "stale",
+    ])
+    .nullable(),
+});
 
 export const HostOutSchema = z.object({
   id: UUIDSchema,
@@ -31,6 +44,7 @@ export const HostOutSchema = z.object({
   host_public_key: z.string().nullable(),
   status: z.string(),
   last_seen_at: IsoDateTimeSchema.nullable(),
+  last_disconnect: HostDisconnectSchema.optional(),
   session_count: z.number().int().nonnegative(),
   // Mesh R9: chain-capable hosts refuse the legacy per-host endorsement path,
   // and this app cannot join an account chain yet — so for these hosts the

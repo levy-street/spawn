@@ -281,7 +281,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
           <ListBlock>
             <View style={styles.steps}>
               <Text color="mutedForeground" variant="body">
-                Run <Text variant="mono">spawnd login</Text> on the host and enter the code it
+                Run <Text variant="mono">spawnd possess</Text> on the host and enter the code it
                 prints. That approves this device directly, without another one.
               </Text>
               <Button onPress={() => router.push("/onboarding/host")} variant="outline">

@@ -7,6 +7,7 @@ import { useParams, useRouter } from "next/navigation";
 import { type ReactNode, useEffect, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { HostAgentsPanel } from "@/components/hosts/HostAgentsPanel";
+import { HostHealthPanel } from "@/components/hosts/host-health-panel";
 import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { AppShell } from "@/components/nav/AppShell";
 import {
@@ -447,6 +448,8 @@ function HostDetail() {
                 mono
               />
             </dl>
+
+            <HostHealthPanel host={host} />
 
             <HostAgentsPanel host={host} />
 

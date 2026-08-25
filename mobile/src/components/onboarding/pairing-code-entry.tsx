@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { formatPairingCodeInput, pairingCodeError } from "@/components/onboarding/pairing-code";
+import { PairingWaitingEscape } from "@/components/onboarding/pairing-countdown";
 import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
@@ -31,7 +32,7 @@ export function PairingCodeEntry({ busy, error, onBack, onSubmit }: PairingCodeE
           Enter the code from Terminal
         </Text>
         <Text color="mutedForeground">
-          spawnd login shows an eight-character code. It is valid for 30 minutes.
+          spawnd possess shows an eight-character code. It is valid for 30 minutes.
         </Text>
       </View>
 
@@ -57,6 +58,8 @@ export function PairingCodeEntry({ busy, error, onBack, onSubmit }: PairingCodeE
           value={code}
         />
       </Field>
+
+      <PairingWaitingEscape onEscape={onBack} />
 
       <View style={styles.actions}>
         <Button onPress={onBack} variant="outline">

@@ -31,7 +31,7 @@ const PHONE: BrowserDeviceOut = {
 };
 
 const CEREMONY: PendingPairingCeremony = {
-  userCode: "QZ4K7HMT",
+  identifier: { user_code: "QZ4K7HMT" },
   accountId: ACCOUNT_ID,
   serverOrigin: "https://spawn.example.com",
   hostName: "Studio Mac",
@@ -40,6 +40,7 @@ const CEREMONY: PendingPairingCeremony = {
   hostFingerprint: formatHostFingerprint(HOST_KEY),
   expiresAtMs: 10_000,
   pinState: "new",
+  linkVerifiedHostKey: null,
 };
 
 function emptyPinStore() {
@@ -75,6 +76,56 @@ describe("pairing query orchestration", () => {
     expect(ceremony.hostFingerprint).toBe(formatHostFingerprint(HOST_KEY));
     expect(ceremony.pinState).toBe("new");
     expect(ceremony.expiresAtMs).toBe(1_000 + PAIRING_CEREMONY_TTL_MS);
+  });
+
+  it("pre-fills the same fingerprint review through pending approval_ref", async () => {
+    const getPendingDevice = jest.fn(async () => ({
+      host_name: "Studio Mac",
+      approval_nonce: NONCE,
+      host_key_algorithm: "ed25519" as const,
+      host_public_key: HOST_KEY,
+      host_key_fingerprint: formatHostFingerprint(HOST_KEY),
+    }));
+
+    const ceremony = await lookupPendingPairing({
+      approvalRef: "approval-ref-123",
+      accountId: ACCOUNT_ID,
+      serverOrigin: "https://spawn.example.com",
+      linkHostKey: HOST_KEY,
+      dependencies: {
+        getPendingDevice,
+        openHostPinStore: async () => emptyPinStore(),
+      },
+    });
+
+    expect(getPendingDevice).toHaveBeenCalledWith({ approval_ref: "approval-ref-123" });
+    expect(ceremony).toMatchObject({
+      identifier: { approval_ref: "approval-ref-123" },
+      hostName: "Studio Mac",
+      hostFingerprint: formatHostFingerprint(HOST_KEY),
+      linkVerifiedHostKey: HOST_KEY,
+    });
+  });
+
+  it("terminally refuses an approval ref whose fragment key does not match pending", async () => {
+    await expect(
+      lookupPendingPairing({
+        approvalRef: "approval-ref-123",
+        accountId: ACCOUNT_ID,
+        serverOrigin: "https://spawn.example.com",
+        linkHostKey: PHONE_KEY,
+        dependencies: {
+          getPendingDevice: async () => ({
+            host_name: "Studio Mac",
+            approval_nonce: NONCE,
+            host_key_algorithm: "ed25519",
+            host_public_key: HOST_KEY,
+            host_key_fingerprint: formatHostFingerprint(HOST_KEY),
+          }),
+          openHostPinStore: async () => emptyPinStore(),
+        },
+      }),
+    ).rejects.toMatchObject({ failure: { kind: "link-identity-mismatch" } });
   });
 
   it("fails closed when the claimed host fingerprint is different", async () => {

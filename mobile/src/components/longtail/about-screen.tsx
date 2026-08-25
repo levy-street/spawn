@@ -85,7 +85,7 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
   const shareInstructions = async () => {
     try {
       await presentShareSheet({
-        message: `Install spawnd on a Mac or Linux machine you control:\n\n${commands.standard}\n\nAfter installation, run spawnd login on that machine.`,
+        message: `Install spawnd on a Mac or Linux machine you control:\n\n${commands.standard}\n\nAfter installation, run spawnd possess on that machine.`,
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : undefined;
@@ -156,6 +156,9 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
           >
             <Text selectable variant="mono">
               {commands.standard}
+            </Text>
+            <Text color="mutedForeground" variant="caption">
+              Already running SPAWN D for another account on that machine? Add --new-account.
             </Text>
           </View>
           <View style={styles.commandActions}>

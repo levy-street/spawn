@@ -8,6 +8,7 @@ const mockReplace = jest.fn();
 const mockRefetch = jest.fn(async () => undefined);
 
 jest.mock("expo-router", () => ({
+  useLocalSearchParams: () => ({}),
   useRouter: () => ({
     back: mockBack,
     canGoBack: mockCanGoBack,

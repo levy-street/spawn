@@ -264,8 +264,8 @@ export function DeviceApprovalCeremony({
           </View>
           <View style={[styles.section, { gap: theme.space(2) }]}>
             <Text color="mutedForeground" style={styles.centered} variant="caption">
-              Run <Text variant="mono">spawnd login</Text> on the host and enter the code it prints.
-              That approves this device directly, without another one.
+              Run <Text variant="mono">spawnd possess</Text> on the host and enter the code it
+              prints. That approves this device directly, without another one.
             </Text>
             <Button
               onPress={() => {

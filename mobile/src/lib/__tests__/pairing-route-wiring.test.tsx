@@ -91,7 +91,7 @@ describe("standalone host pairing route", () => {
 
   it("is reachable from both connect controls on Hosts", async () => {
     const screen = await render(<HostListScreen />, { wrapper: Providers });
-    const connectButtons = screen.getAllByRole("button", { name: "Connect a host" });
+    const connectButtons = screen.getAllByRole("button", { name: "Add a machine" });
     expect(connectButtons).toHaveLength(2);
 
     for (const button of connectButtons) await fireEvent.press(button);

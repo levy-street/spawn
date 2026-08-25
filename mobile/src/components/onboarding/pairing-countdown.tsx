@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
-
+import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
 import { spacing } from "@/theme";
 
 export const PAIRING_CEREMONY_TTL_MS = 30 * 60 * 1000;
+export const PAIRING_WAIT_HINT_MS = 30_000;
+export const PAIRING_WAIT_ESCAPE_MS = 60_000;
 
 export function pairingSecondsRemaining(deadlineMs: number, nowMs: number): number {
   return Math.max(0, Math.ceil((deadlineMs - nowMs) / 1000));
@@ -52,11 +54,45 @@ export function PairingCountdown({ deadlineMs, onExpired }: PairingCountdownProp
   );
 }
 
+export function PairingWaitingEscape({ onEscape }: { onEscape(): void }): React.JSX.Element {
+  const [elapsedMs, setElapsedMs] = useState(0);
+
+  useEffect(() => {
+    const startedAt = Date.now();
+    const timer = setInterval(() => setElapsedMs(Date.now() - startedAt), 1_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  if (elapsedMs < PAIRING_WAIT_HINT_MS) return <View />;
+
+  return (
+    <View style={styles.waitingHint} testID="pairing-waiting-hint">
+      <Text color="mutedForeground" variant="caption">
+        Elapsed {formatPairingCountdown(Math.floor(elapsedMs / 1_000))}
+      </Text>
+      {elapsedMs >= PAIRING_WAIT_ESCAPE_MS ? (
+        <>
+          <Text color="mutedForeground" variant="caption">
+            Having trouble? Re-run the install command — it's safe to repeat.
+          </Text>
+          <Button onPress={onEscape} size="sm" variant="outline">
+            Back to install instructions
+          </Button>
+        </>
+      ) : null}
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   row: {
     alignItems: "center",
     flexDirection: "row",
     gap: spacing[2],
     justifyContent: "space-between",
+  },
+  waitingHint: {
+    alignItems: "flex-start",
+    gap: spacing[2],
   },
 });

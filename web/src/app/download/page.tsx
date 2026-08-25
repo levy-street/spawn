@@ -190,6 +190,10 @@ export default function DownloadPage() {
               <span className="text-ember">$</span>
               <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{command}</code>
             </div>
+            <p className="mt-2 max-w-[65ch] text-xs leading-5 text-ash">
+              Already running SPAWN D for another account on that machine? Add{" "}
+              <code>--new-account</code>.
+            </p>
 
             <div className="mt-8 flex flex-col items-stretch gap-5 sm:flex-row sm:items-center sm:gap-7">
               <button type="button" onClick={copyCommand} disabled={!canCopy} className={CTA_SLAB}>

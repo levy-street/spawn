@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { HostHealthPanel } from "@/components/hosts/host-health-panel";
 import { CapacityBar, LegionDot, RunningLabel } from "@/components/legion/legion-parts";
 import { HostUpdateBadge } from "@/components/release/HostUpdateDialog";
 import { useHostCapacity } from "@/hooks/useHostCapacity";
@@ -103,6 +104,8 @@ export function LegionHostCard({
           )}
         </div>
       )}
+
+      {!online && <HostHealthPanel host={host} compact />}
 
       <footer className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-border pt-2.5">
         <span className="font-mono text-[10px] tabular-nums text-muted-foreground">

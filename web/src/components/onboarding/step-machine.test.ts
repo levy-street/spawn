@@ -51,7 +51,7 @@ describe("deriveStep", () => {
       deriveStep({
         user: verifiedUser,
         config: { email_verification_required: true },
-        hosts: [{}],
+        hosts: [{ status: "online" }],
         skippedHost: false,
       }),
     ).toBe("done");
@@ -65,11 +65,22 @@ describe("deriveStep", () => {
     ).toBe("done");
   });
 
+  test("keeps an approved-but-offline host in the host hand-off instead of reinstalling", () => {
+    expect(
+      deriveStep({
+        user: verifiedUser,
+        config: { email_verification_required: true },
+        hosts: [{ status: "offline" }],
+        skippedHost: false,
+      }),
+    ).toBe("host");
+  });
+
   test("never lets a deep link bypass or revive a satisfied gate", () => {
     const input = {
       user: unverifiedUser,
       config: { email_verification_required: true },
-      hosts: [] as unknown[],
+      hosts: [] as Array<{ status?: string }>,
       skippedHost: false,
     };
     expect(resolveStep(input, "host")).toBe("verify");

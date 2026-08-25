@@ -49,7 +49,7 @@ export function PairingSuccess({
           Compare this phone on the machine
         </Text>
         <Text color="mutedForeground">
-          spawnd login now prints the approving phone fingerprint. Confirm it shows this exact
+          spawnd possess now prints the approving phone fingerprint. Confirm it shows this exact
           value.
         </Text>
       </View>

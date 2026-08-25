@@ -222,34 +222,38 @@ export function InstallCommand({
 }) {
   const [copied, setCopied] = useState(false);
   return (
-    <div
-      className={cn(
-        // inline-flex so the chip shrinks to its one line of shell wherever it
-        // lands; a stretching flex parent (the hero column on mobile) still
-        // pulls it full-width.
-        "inline-flex max-w-full items-center gap-3 rounded-sm border border-bone bg-void py-3.5 pr-3 pl-4 font-sigil text-[13px] text-bone",
-        className,
-      )}
-    >
-      <span className="text-ember">$</span>
-      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{command}</code>
-      <button
-        type="button"
-        aria-label={copyLabel}
-        onClick={() => {
-          void navigator.clipboard?.writeText(command).then(() => {
-            setCopied(true);
-            window.setTimeout(() => setCopied(false), 2000);
-          });
-        }}
-        className="ml-1 shrink-0 rounded-sm p-1 text-bone/50 transition-colors hover:text-bone"
-      >
-        {copied ? (
-          <Check className="size-4 text-ember" aria-hidden />
-        ) : (
-          <Copy className="size-4" aria-hidden />
+    <div className={cn("max-w-full", className)}>
+      <div
+        className={cn(
+          // inline-flex so the chip shrinks to its one line of shell wherever it
+          // lands; a stretching flex parent (the hero column on mobile) still
+          // pulls it full-width.
+          "inline-flex max-w-full items-center gap-3 rounded-sm border border-bone bg-void py-3.5 pr-3 pl-4 font-sigil text-[13px] text-bone",
         )}
-      </button>
+      >
+        <span className="text-ember">$</span>
+        <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{command}</code>
+        <button
+          type="button"
+          aria-label={copyLabel}
+          onClick={() => {
+            void navigator.clipboard?.writeText(command).then(() => {
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 2000);
+            });
+          }}
+          className="ml-1 shrink-0 rounded-sm p-1 text-bone/50 transition-colors hover:text-bone"
+        >
+          {copied ? (
+            <Check className="size-4 text-ember" aria-hidden />
+          ) : (
+            <Copy className="size-4" aria-hidden />
+          )}
+        </button>
+      </div>
+      <p className="mt-2 max-w-[65ch] text-xs leading-5 text-ash">
+        Already running SPAWN D for another account on that machine? Add <code>--new-account</code>.
+      </p>
     </div>
   );
 }

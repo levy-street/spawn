@@ -85,7 +85,21 @@ export const DevicePollErrorSchema = z.enum([
 ]);
 export const DevicePollPendingSchema = z.object({ error: DevicePollErrorSchema });
 export const DevicePollResponseSchema = z.union([DevicePollSuccessSchema, DevicePollPendingSchema]);
-export const DevicePendingRequestSchema = z.object({ user_code: z.string() });
+const DeviceApprovalIdentifierShape = {
+  user_code: z.string().optional(),
+  approval_ref: z.string().optional(),
+};
+
+function hasExactlyOneApprovalIdentifier(value: {
+  user_code?: string | undefined;
+  approval_ref?: string | undefined;
+}): boolean {
+  return (value.user_code === undefined) !== (value.approval_ref === undefined);
+}
+
+export const DevicePendingRequestSchema = z
+  .object(DeviceApprovalIdentifierShape)
+  .refine(hasExactlyOneApprovalIdentifier);
 export const DevicePendingResponseSchema = z.object({
   host_name: z.string(),
   approval_nonce: z.string(),
@@ -93,17 +107,20 @@ export const DevicePendingResponseSchema = z.object({
   host_public_key: z.string(),
   host_key_fingerprint: z.string(),
 });
-export const DeviceApproveRequestSchema = DevicePendingRequestSchema.extend({
-  approval_nonce: z.string(),
-  host_key_algorithm: Ed25519AlgorithmSchema,
-  host_public_key: z.string(),
-  host_key_fingerprint: z.string(),
-  browser_device_id: UUIDSchema,
-  browser_key_algorithm: Ed25519AlgorithmSchema,
-  browser_public_key: z.string(),
-  browser_key_fingerprint: z.string(),
-  signature: z.string(),
-});
+export const DeviceApproveRequestSchema = z
+  .object({
+    ...DeviceApprovalIdentifierShape,
+    approval_nonce: z.string(),
+    host_key_algorithm: Ed25519AlgorithmSchema,
+    host_public_key: z.string(),
+    host_key_fingerprint: z.string(),
+    browser_device_id: UUIDSchema,
+    browser_key_algorithm: Ed25519AlgorithmSchema,
+    browser_public_key: z.string(),
+    browser_key_fingerprint: z.string(),
+    signature: z.string(),
+  })
+  .refine(hasExactlyOneApprovalIdentifier);
 export const DeviceApproveResponseSchema = DevicePendingResponseSchema.extend({
   browser_device_id: UUIDSchema,
   browser_key_algorithm: Ed25519AlgorithmSchema,

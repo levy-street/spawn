@@ -200,7 +200,7 @@ export function OnboardingFlow(): React.JSX.Element {
       testID="onboarding-flow"
     >
       <Screen
-        header={<AppHeader onBack={() => leaveOnboarding(router)} title="Set up Spawn" />}
+        header={<AppHeader onBack={() => leaveOnboarding(router)} title="Set up SPAWN D" />}
         padded={false}
         scroll
       >

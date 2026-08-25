@@ -163,6 +163,7 @@ export function OnboardingFlow() {
   const workspaceDataReady = workspacesQuery.data !== undefined;
   const workspaceCount = workspacesQuery.data?.length ?? 0;
   const onlineHost = hostsQuery.data?.find((host) => host.status === "online") ?? null;
+  const approvedOfflineHost = hostsQuery.data?.find((host) => host.status !== "online") ?? null;
   const discoveredVerification =
     previousStepRef.current === "verify" &&
     step !== "verify" &&
@@ -306,7 +307,12 @@ export function OnboardingFlow() {
       ) : step === "host" ? (
         <div className="space-y-5">
           <div className="min-w-0 [&_button]:min-h-11 [&_button]:min-w-11 [&_input]:min-h-11">
-            <ConnectHostSection onHostOnline={onHostOnline} frameless />
+            <ConnectHostSection
+              onHostOnline={onHostOnline}
+              frameless
+              mintSetupClaim={approvedOfflineHost === null}
+              resumeApprovedHost={approvedOfflineHost}
+            />
           </div>
           <Button
             type="button"
