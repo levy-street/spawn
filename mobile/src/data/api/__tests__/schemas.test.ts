@@ -14,7 +14,11 @@ import { SessionOutSchema } from "@/data/api/schemas/sessions";
 import { SetupClaimCreateResponseSchema, SetupClaimStatusSchema } from "@/data/api/schemas/setup";
 import { SessionAccessOutSchema, SkillOutSchema } from "@/data/api/schemas/skills";
 import { WorkspaceTemplateOutSchema } from "@/data/api/schemas/templates";
-import { BrowserEndorsementRecordSchema, TrustBundleOutSchema } from "@/data/api/schemas/trust";
+import {
+  BrowserEndorsementRecordSchema,
+  HostPinsOutSchema,
+  TrustBundleOutSchema,
+} from "@/data/api/schemas/trust";
 import { WorkspaceOutSchema, WorkspacePatchSchema } from "@/data/api/schemas/workspaces";
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
@@ -282,6 +286,31 @@ it("round-trips trust response JSON", () => {
     signature: "signature",
   };
   expect(BrowserEndorsementRecordSchema.parse(endorsement)).toEqual(endorsement);
+  expect(
+    HostPinsOutSchema.parse({
+      pins: [
+        {
+          browser_device_id: UUID_A,
+          delivered: false,
+          undelivered_reason: "pin_limit",
+        },
+      ],
+      capacity: { used: 28, max: 32 },
+    }),
+  ).toEqual({
+    pins: [
+      {
+        browser_device_id: UUID_A,
+        delivered: false,
+        undelivered_reason: "pin_limit",
+      },
+    ],
+    capacity: { used: 28, max: 32 },
+  });
+  expect(HostPinsOutSchema.parse([UUID_A])).toEqual({
+    pins: [{ browser_device_id: UUID_A, delivered: true, undelivered_reason: null }],
+    capacity: null,
+  });
 });
 
 it("round-trips Legion/profile response JSON", () => {

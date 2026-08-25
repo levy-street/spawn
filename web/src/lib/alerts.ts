@@ -66,7 +66,19 @@ export interface HostPairResolvedEvent {
   at: string;
 }
 
-export type TrustEvent = DeviceTrustEvent | HostPairRequestedEvent | HostPairResolvedEvent;
+export interface HostPinUndeliveredEvent {
+  event: "host.pin_undelivered";
+  host_id: string;
+  browser_device_id: string;
+  reason: "pin_limit" | "invalid_chain" | "other";
+  at: string;
+}
+
+export type TrustEvent =
+  | DeviceTrustEvent
+  | HostPairRequestedEvent
+  | HostPairResolvedEvent
+  | HostPinUndeliveredEvent;
 
 /** Frames the socket can deliver. `alerts.ping` is an idle keepalive. */
 export type AlertFrame =
@@ -79,6 +91,7 @@ const TRUST_EVENT_KINDS = new Set<string>([
   "device.approval_resolved",
   "host.pair_requested",
   "host.pair_resolved",
+  "host.pin_undelivered",
 ]);
 
 function parseTrustFrame(record: Record<string, unknown>): AlertFrame | null {
@@ -126,6 +139,27 @@ function parseTrustFrame(record: Record<string, unknown>): AlertFrame | null {
       approval_ref: record.approval_ref,
       outcome: record.outcome as HostPairResolvedEvent["outcome"],
       host_id: typeof record.host_id === "string" ? record.host_id : null,
+      at: typeof record.at === "string" ? record.at : "",
+    };
+  }
+  if (event === "host.pin_undelivered") {
+    if (
+      typeof record.host_id !== "string" ||
+      !record.host_id ||
+      typeof record.browser_device_id !== "string" ||
+      !record.browser_device_id ||
+      (record.reason !== "pin_limit" &&
+        record.reason !== "invalid_chain" &&
+        record.reason !== "other")
+    ) {
+      return null;
+    }
+    return {
+      type: "trust",
+      event,
+      host_id: record.host_id,
+      browser_device_id: record.browser_device_id,
+      reason: record.reason,
       at: typeof record.at === "string" ? record.at : "",
     };
   }

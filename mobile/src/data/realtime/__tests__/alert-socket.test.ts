@@ -139,6 +139,24 @@ describe("parseAlertFrame", () => {
     ).toMatchObject({ event: "device.approval_resolved", status: "approved" });
   });
 
+  it("parses a host pin delivery failure", () => {
+    expect(
+      parseAlertFrame({
+        type: "trust",
+        event: "host.pin_undelivered",
+        host_id: "host-1",
+        browser_device_id: "device-1",
+        reason: "invalid_chain",
+      }),
+    ).toEqual({
+      type: "trust",
+      event: "host.pin_undelivered",
+      host_id: "host-1",
+      browser_device_id: "device-1",
+      reason: "invalid_chain",
+    });
+  });
+
   it.each([
     { type: "trust", event: "device.exfiltrated", request_id: "r", browser_device_id: "d" },
     { type: "trust", event: "device.approval_requested", request_id: "", browser_device_id: "d" },

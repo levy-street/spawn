@@ -7,6 +7,7 @@ import { useParams, useRouter } from "next/navigation";
 import { type ReactNode, useEffect, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { HostAgentsPanel } from "@/components/hosts/HostAgentsPanel";
+import { HostApprovingDevicesPanel } from "@/components/hosts/host-approving-devices-panel";
 import { HostHealthPanel } from "@/components/hosts/host-health-panel";
 import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { AppShell } from "@/components/nav/AppShell";
@@ -452,6 +453,8 @@ function HostDetail() {
             <HostHealthPanel host={host} />
 
             <HostAgentsPanel host={host} />
+
+            <HostApprovingDevicesPanel hostId={host.id} />
 
             <section
               className="overflow-hidden rounded-xl border border-border"

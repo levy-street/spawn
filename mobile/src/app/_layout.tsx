@@ -20,6 +20,7 @@ import {
   takePendingAuthenticatedLink,
 } from "@/lib/linking";
 import { AppProviders } from "@/lib/providers";
+import { SessionRenewal } from "@/lib/session-renewal";
 import { useTheme } from "@/theme";
 
 void SplashScreen.preventAutoHideAsync();
@@ -104,6 +105,7 @@ function RootNavigator(): React.JSX.Element {
       />
       <IncomingLinkCoordinator />
       <AuthGate>
+        <SessionRenewal />
         <AlertPresenter />
         <Stack
           screenOptions={{

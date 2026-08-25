@@ -20,7 +20,12 @@ import { api } from "@/data/api/client";
 import { deleteAccount } from "@/data/api/endpoints/account";
 import { listAdminEmails } from "@/data/api/endpoints/admin";
 import { patchAgentPreferences } from "@/data/api/endpoints/agents";
-import { getOAuthStartUrl, logIn } from "@/data/api/endpoints/auth";
+import {
+  getOAuthStartUrl,
+  logIn,
+  renewSession,
+  signOutEverywhere,
+} from "@/data/api/endpoints/auth";
 import { getPendingDevice } from "@/data/api/endpoints/devices";
 import { patchHost, updateHost } from "@/data/api/endpoints/hosts";
 import { downloadSpawnWorker } from "@/data/api/endpoints/install";
@@ -39,7 +44,7 @@ beforeEach(() => {
   jest.mocked(authToken.clear).mockClear();
 });
 
-it("serializes the auth domain request and captures the durable cookie", async () => {
+it("serializes the auth domain request through the shared response-capturing client", async () => {
   await logIn({ email: "owner@example.com", password: "password" });
   expect(api).toHaveBeenCalledWith(
     "/api/auth/login",
@@ -47,10 +52,29 @@ it("serializes the auth domain request and captures the durable cookie", async (
       method: "POST",
       auth: false,
       body: '{"email":"owner@example.com","password":"password"}',
-      onResponse: authToken.captureFromResponse,
       schema: expect.any(Object),
     }),
   );
+});
+
+it("renews the current session and keeps the caller signed in after signing out elsewhere", async () => {
+  jest.mocked(api).mockResolvedValueOnce({
+    access_token: "renewed-session",
+    expires_at: "2026-09-24T00:00:00Z",
+  });
+  await renewSession();
+  expect(api).toHaveBeenLastCalledWith(
+    "/api/auth/session/renew",
+    expect.objectContaining({ method: "POST" }),
+  );
+
+  jest.mocked(api).mockResolvedValueOnce({ access_token: "caller-session" });
+  await signOutEverywhere();
+  expect(api).toHaveBeenLastCalledWith(
+    "/api/auth/sign-out-everywhere",
+    expect.objectContaining({ method: "POST" }),
+  );
+  expect(authToken.set).toHaveBeenCalledWith("caller-session");
 });
 
 it("constructs the OAuth route with an encoded return path", async () => {

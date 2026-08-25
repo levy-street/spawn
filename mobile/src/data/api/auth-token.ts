@@ -4,6 +4,7 @@ import { secureStorage } from "@/lib/secure-storage";
 
 type StoredToken = {
   jwt: string;
+  issuedAt: number | null;
   expiresAt: number | null;
 };
 
@@ -19,19 +20,36 @@ function storageKey(baseUrl: string): string {
   return `${TOKEN_KEY_PREFIX}.${encodedOrigin}`;
 }
 
-function decodeExpiry(jwt: string): number | null {
+interface SessionTokenClaims {
+  issuedAt: number | null;
+  expiresAt: number | null;
+}
+
+function decodeClaims(jwt: string): SessionTokenClaims {
   const payload = jwt.split(".")[1];
-  if (!payload) return null;
+  if (!payload) return { issuedAt: null, expiresAt: null };
   try {
     const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
     const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
     const decoded: unknown = JSON.parse(globalThis.atob(padded));
-    if (typeof decoded !== "object" || decoded === null || !("exp" in decoded)) return null;
-    const expiry = (decoded as { exp?: unknown }).exp;
-    return typeof expiry === "number" && Number.isFinite(expiry) ? expiry : null;
+    if (typeof decoded !== "object" || decoded === null) {
+      return { issuedAt: null, expiresAt: null };
+    }
+    const record = decoded as { iat?: unknown; exp?: unknown };
+    return {
+      issuedAt: typeof record.iat === "number" && Number.isFinite(record.iat) ? record.iat : null,
+      expiresAt: typeof record.exp === "number" && Number.isFinite(record.exp) ? record.exp : null,
+    };
   } catch {
-    return null;
+    return { issuedAt: null, expiresAt: null };
   }
+}
+
+/** True at and after the midpoint of a JWT's declared lifetime. */
+export function sessionTokenNeedsRenewal(jwt: string, nowSeconds = Date.now() / 1_000): boolean {
+  const { issuedAt, expiresAt } = decodeClaims(jwt);
+  if (issuedAt === null || expiresAt === null || expiresAt <= issuedAt) return false;
+  return nowSeconds >= issuedAt + (expiresAt - issuedAt) / 2 && nowSeconds < expiresAt;
 }
 
 function isExpired(token: StoredToken): boolean {
@@ -52,14 +70,16 @@ async function get(): Promise<string | null> {
     } else {
       try {
         const parsed: unknown = JSON.parse(encoded);
-        stored =
+        if (
           typeof parsed === "object" &&
           parsed !== null &&
-          typeof (parsed as Partial<StoredToken>).jwt === "string" &&
-          (typeof (parsed as Partial<StoredToken>).expiresAt === "number" ||
-            (parsed as Partial<StoredToken>).expiresAt === null)
-            ? (parsed as StoredToken)
-            : null;
+          typeof (parsed as Partial<StoredToken>).jwt === "string"
+        ) {
+          const jwt = (parsed as StoredToken).jwt;
+          stored = { jwt, ...decodeClaims(jwt) };
+        } else {
+          stored = null;
+        }
       } catch {
         stored = null;
       }
@@ -106,7 +126,7 @@ function subscribe(listener: () => void): () => void {
 
 async function set(jwt: string): Promise<void> {
   const key = await currentStorageKey();
-  const stored: StoredToken = { jwt, expiresAt: decodeExpiry(jwt) };
+  const stored: StoredToken = { jwt, ...decodeClaims(jwt) };
   await secureStorage.set(key, JSON.stringify(stored));
   tokenCache.set(key, stored);
   notifyTokenChanged();

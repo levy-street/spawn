@@ -21,10 +21,10 @@ export interface AlertEvent {
  * whichever device they are looking at, not the one it happened on. A distinct
  * frame `type` keeps the alert validation exactly as narrow as it was.
  */
-export type TrustEventKind = "device.approval_requested" | "device.approval_resolved";
+export type DeviceApprovalTrustEventKind = "device.approval_requested" | "device.approval_resolved";
 
-export interface TrustEvent {
-  event: TrustEventKind;
+export interface DeviceApprovalTrustEvent {
+  event: DeviceApprovalTrustEventKind;
   request_id: string;
   browser_device_id: string;
   label: string | null;
@@ -33,6 +33,15 @@ export interface TrustEvent {
   status: "approved" | "denied" | null;
   at: string;
 }
+
+export interface HostPinUndeliveredTrustEvent {
+  event: "host.pin_undelivered";
+  host_id: string;
+  browser_device_id: string;
+  reason: "pin_limit" | "invalid_chain" | "other";
+}
+
+export type TrustEvent = DeviceApprovalTrustEvent | HostPinUndeliveredTrustEvent;
 
 export type AlertFrame =
   | ({ type: "alert" } & AlertEvent)
@@ -75,12 +84,27 @@ function isAlertEventKind(value: unknown): value is AlertEventKind {
   return value === "agent.finished" || value === "agent.awaiting_input" || value === "session.died";
 }
 
-function isTrustEventKind(value: unknown): value is TrustEventKind {
+function isDeviceApprovalTrustEventKind(value: unknown): value is DeviceApprovalTrustEventKind {
   return value === "device.approval_requested" || value === "device.approval_resolved";
 }
 
 function parseTrustFrame(frame: Record<string, unknown>): AlertFrame | null {
-  if (!isTrustEventKind(frame["event"])) return null;
+  if (frame["event"] === "host.pin_undelivered") {
+    const hostId = frame["host_id"];
+    const deviceId = frame["browser_device_id"];
+    const reason = frame["reason"];
+    if (typeof hostId !== "string" || hostId.length === 0) return null;
+    if (typeof deviceId !== "string" || deviceId.length === 0) return null;
+    if (reason !== "pin_limit" && reason !== "invalid_chain" && reason !== "other") return null;
+    return {
+      type: "trust",
+      event: "host.pin_undelivered",
+      host_id: hostId,
+      browser_device_id: deviceId,
+      reason,
+    };
+  }
+  if (!isDeviceApprovalTrustEventKind(frame["event"])) return null;
   const requestId = frame["request_id"];
   const deviceId = frame["browser_device_id"];
   if (typeof requestId !== "string" || requestId.length === 0) return null;

@@ -127,6 +127,10 @@ export async function api<T>(path: string, init: ApiRequestInit<T> = {}): Promis
       );
     }
 
+    // Sliding sessions can arrive on any authenticated response, not only on
+    // login. Capture before parsing either success or error so the native
+    // bearer stays in lockstep with the server's session cookie.
+    await authToken.captureFromResponse(response);
     await onResponse?.(response);
     if (!response.ok) {
       if (response.status === 401 && auth) {
