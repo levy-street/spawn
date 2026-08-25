@@ -20,6 +20,8 @@
   const session = {
     ready: false,
     bootstrapStarted: false,
+    bootstrapCount: 0,
+    requestedOffset: null,
     displaySeen: false,
     claiming: false,
     history: null,
@@ -44,6 +46,7 @@
     for (const key of Object.keys(gates)) gates[key] = false;
     session.ready = false;
     session.bootstrapStarted = false;
+    session.requestedOffset = null;
     session.displaySeen = false;
     session.claiming = false;
     state.displayOwner = null;
@@ -134,6 +137,7 @@
       !sendCtlText(requestId, "history", {
         lines: 400,
         plain: false,
+        ...(session.requestedOffset === null ? {} : { offset: session.requestedOffset }),
         cols: state.cols,
         rows: state.rows,
       })
@@ -276,7 +280,7 @@
     }
     history.rendering = true;
     if (history.operation === "snapshot") state.term.reset();
-    state.term.write(replay, () => {
+    const finish = () => {
       let barrier = Number.isSafeInteger(anchor) ? anchor : null;
       for (const entry of session.preboot) {
         if (barrier !== null && entry.offsetAfter <= barrier) {
@@ -293,9 +297,38 @@
       session.prebootBytes = 0;
       session.history = null;
       session.stale = false;
+      session.requestedOffset = null;
+      session.bootstrapCount += 1;
       api.sessionGate("historyReady");
       flushWrites();
-    });
+    };
+    const alternate = state.term.buffer.active === state.term.buffer.alternate;
+    if (history.operation === "history" && session.bootstrapCount > 0 && alternate) {
+      finish();
+      return;
+    }
+    const writeReplay = () => state.term.write(replay, finish);
+    if (history.operation === "history" && session.bootstrapCount > 0) {
+      state.term.write("\x1b[0m\x1b[H\x1b[2J\x1b[3J", writeReplay);
+    } else {
+      writeReplay();
+    }
+  }
+
+  function recoverFromGap(offset) {
+    if (!Number.isSafeInteger(offset) || offset < 0) return;
+    session.preboot.splice(0);
+    session.prebootBytes = 0;
+    session.writes.splice(0);
+    session.writeBytes = 0;
+    session.history = null;
+    session.stale = false;
+    session.ready = false;
+    session.bootstrapStarted = false;
+    session.requestedOffset = offset;
+    session.ptyOffset = offset;
+    gates.historyReady = false;
+    startBootstrap();
   }
 
   function acceptReplayMetadata(message) {
@@ -466,7 +499,11 @@
       }
       if (message?.version !== 1) return;
       if (message.kind === "event" && message.event === "ready") handleReady(message);
-      else if (message.kind === "event" && message.event === "display_state") {
+      else if (message.kind === "event" && message.event === "history_gap") {
+        recoverFromGap(session.ptyOffset);
+      } else if (message.kind === "event" && message.event === "pty_gap") {
+        recoverFromGap(message.offset);
+      } else if (message.kind === "event" && message.event === "display_state") {
         handleDisplayState(message);
       } else if (message.kind === "response") {
         if (!handleUploadResponse(message)) acceptReplayMetadata(message);

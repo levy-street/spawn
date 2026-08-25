@@ -56,6 +56,7 @@ import { haptics } from "@/lib/haptics";
 import { encodeKey } from "@/terminal/key-encoder";
 import { TerminalSurface, type TerminalSurfaceHandle } from "@/terminal/TerminalSurface";
 import type {
+  ConnectionInfo,
   DisplayControlState,
   KeySpec,
   SessionTransport,
@@ -129,6 +130,7 @@ export function TerminalOverlay({
   const [connectionState, setConnectionState] = useState<TransportState>("idle");
   const [connectionError, setConnectionError] = useState<TransportError | null>(null);
   const [diagnostic, setDiagnostic] = useState<WorkerDiagnostic | null>(null);
+  const [connectionInfo, setConnectionInfo] = useState<ConnectionInfo | null>(null);
   const [hasEverBeenReady, setHasEverBeenReady] = useState(false);
   const [followState, setFollowState] = useState<FollowState>(INITIAL_FOLLOW_STATE);
   const [searchVisible, setSearchVisible] = useState(false);
@@ -406,6 +408,7 @@ export function TerminalOverlay({
       testID="terminal-overlay-route-scene"
     >
       <TerminalHeader
+        connectionInfo={connectionInfo}
         cwd={session.cwd}
         foregroundCommand={session.foreground_command}
         hostName={session.host_name ?? host.name}
@@ -459,6 +462,7 @@ export function TerminalOverlay({
               initialSize={INITIAL_TERMINAL_GRID}
               key={`${session.id}-${surfaceGeneration}`}
               onDiagnostic={setDiagnostic}
+              onConnectionInfo={setConnectionInfo}
               onDisplayChange={setDisplay}
               onError={(error) => {
                 setConnectionError(error);
@@ -542,6 +546,7 @@ export function TerminalOverlay({
         visible={fontSheetVisible}
       />
       <DiagnosticsSheet
+        connectionInfo={connectionInfo}
         diagnostic={diagnostic}
         error={connectionError}
         onDismiss={() => setDiagnosticsVisible(false)}

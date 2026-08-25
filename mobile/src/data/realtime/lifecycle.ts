@@ -19,6 +19,14 @@ export interface RealtimeGenerationTarget {
 }
 
 const GENERATION_TARGETS = new Set<RealtimeGenerationTarget>();
+const RETIREMENT_LISTENERS = new Set<(reason: RetirementReason) => void>();
+
+export function subscribeRetirementReason(
+  listener: (reason: RetirementReason) => void,
+): () => void {
+  RETIREMENT_LISTENERS.add(listener);
+  return () => RETIREMENT_LISTENERS.delete(listener);
+}
 
 export function registerRealtimeGenerationTarget(target: RealtimeGenerationTarget): () => void {
   GENERATION_TARGETS.add(target);
@@ -28,6 +36,7 @@ export function registerRealtimeGenerationTarget(target: RealtimeGenerationTarge
 }
 
 export function retireRegisteredGenerations(reason: RetirementReason): void {
+  for (const listener of RETIREMENT_LISTENERS) listener(reason);
   for (const target of GENERATION_TARGETS) {
     target.retire(reason);
   }

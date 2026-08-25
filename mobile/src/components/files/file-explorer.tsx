@@ -72,6 +72,7 @@ export function FileExplorer({
   const [folderActionsVisible, setFolderActionsVisible] = useState(false);
   const [operationPending, setOperationPending] = useState(false);
   const [operationError, setOperationError] = useState<string | null>(null);
+  const [transportGeneration, setTransportGeneration] = useState(0);
   const ready = transportState === "ready";
   const home = useHostHome(hostId, transport, ready);
 
@@ -200,6 +201,18 @@ export function FileExplorer({
       <Screen header={header} padded={false}>
         <View style={[styles.root, { backgroundColor: theme.colors.background }]}>
           <EmptyState
+            action={
+              <Button
+                onPress={() => {
+                  setTransport(null);
+                  setTransportState("idle");
+                  setTransportGeneration((generation) => generation + 1);
+                }}
+                variant="outline"
+              >
+                Retry
+              </Button>
+            }
             description="The direct host connection could not be established."
             icon="Unplug"
             title="Files unavailable"
@@ -215,6 +228,7 @@ export function FileExplorer({
         <HostTransportSurface
           hostId={hostId}
           hostIdentityPublicKey={hostIdentityPublicKey}
+          key={`${hostId}:${transportGeneration}`}
           onStateChange={setTransportState}
           onTransport={setTransport}
         />

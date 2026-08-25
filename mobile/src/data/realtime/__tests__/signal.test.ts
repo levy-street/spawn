@@ -9,11 +9,15 @@ import { useSessionUiStore } from "@/data/stores/session-ui";
 
 jest.mock("@/data/api/socket-urls", () => ({
   buildBrowserSocketUrl: jest.fn(
-    async (sessionId: string) => `wss://spawn.test/ws/browser?session_id=${sessionId}&token=secret`,
+    async (sessionId: string) => `wss://spawn.test/ws/browser?session_id=${sessionId}`,
   ),
   buildHostSocketUrl: jest.fn(
-    async (hostId: string) => `wss://spawn.test/ws/host?host_id=${hostId}&token=secret`,
+    async (hostId: string) => `wss://spawn.test/ws/host?host_id=${hostId}`,
   ),
+}));
+
+jest.mock("@/data/api/auth-token", () => ({
+  authToken: { get: jest.fn(async () => "secret") },
 }));
 
 class FakeWebSocket {
@@ -21,6 +25,7 @@ class FakeWebSocket {
 
   readonly url: string;
   readonly protocol: string;
+  readonly options: { headers: Record<string, string> } | undefined;
   readyState = 0;
   sent: string[] = [];
   onopen: WebSocket["onopen"] = null;
@@ -28,9 +33,10 @@ class FakeWebSocket {
   onerror: WebSocket["onerror"] = null;
   onclose: WebSocket["onclose"] = null;
 
-  constructor(url: string, protocol: string) {
+  constructor(url: string, protocol: string, options?: { headers: Record<string, string> }) {
     this.url = url;
     this.protocol = protocol;
+    this.options = options;
     FakeWebSocket.instances.push(this);
   }
 
@@ -89,8 +95,9 @@ describe("signalling relays", () => {
 
     const socket = FakeWebSocket.instances[0];
     expect(socket).toMatchObject({
-      url: "wss://spawn.test/ws/browser?session_id=session-1&token=secret",
+      url: "wss://spawn.test/ws/browser?session_id=session-1",
       protocol: "spawn.v3",
+      options: { headers: { Authorization: "Bearer secret" } },
     });
     socket?.open();
     socket?.message('{"type":"rtc.answer","sdp":"opaque"}');
@@ -106,8 +113,9 @@ describe("signalling relays", () => {
     const channel = openHostSignal("host-1");
     await flushPromises();
     expect(FakeWebSocket.instances[0]).toMatchObject({
-      url: "wss://spawn.test/ws/host?host_id=host-1&token=secret",
+      url: "wss://spawn.test/ws/host?host_id=host-1",
       protocol: "spawn.host.v1",
+      options: { headers: { Authorization: "Bearer secret" } },
     });
     channel.close();
   });
@@ -131,7 +139,9 @@ describe("signalling relays", () => {
     for (const socket of reopenedSockets) socket.open();
 
     retireRegisteredGenerations("interface-change");
-    expect(reopenedSockets.map((socket) => socket.readyState)).toEqual([3, 3]);
+    expect(reopenedSockets.map((socket) => socket.readyState)).toEqual([1, 1]);
+    expect(sessionChannel.state).toBe("open");
+    expect(hostChannel.state).toBe("open");
 
     sessionChannel.close();
     hostChannel.close();

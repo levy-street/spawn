@@ -1,3 +1,4 @@
+import { authToken } from "@/data/api/auth-token";
 import { buildAlertsSocketUrl } from "@/data/api/socket-urls";
 import { ReconnectingSocket, type SocketState } from "@/data/realtime/socket";
 
@@ -159,6 +160,8 @@ export class AlertSocketClient {
     this.socket = new ReconnectingSocket({
       url,
       protocol: ALERT_PROTOCOL,
+      ...(createWebSocket ? {} : { authorization: () => authToken.get() }),
+      watchdogFrameTypes: ["alerts.ping"],
       ...(createWebSocket ? { createWebSocket } : {}),
     });
     this.unsubscribeMessage = this.socket.onMessage((value) => {

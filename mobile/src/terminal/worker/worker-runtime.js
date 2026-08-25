@@ -3,7 +3,7 @@
   "use strict";
 
   const BRIDGE_VERSION = 1;
-  const MAX_INPUT_BYTES = 64 * 1024;
+  const MAX_INPUT_BYTES = 16 * 1024;
   const TELEMETRY_DELAY_MS = 8;
   const FIT_DEBOUNCE_MS = 60;
   /** Floor for the type when this viewer is matching someone else's grid. */
@@ -53,6 +53,9 @@
     clipboardSequence: 0,
     search: null,
     disconnectTimer: null,
+    restartTimer: null,
+    statsTimer: null,
+    pendingRestartRequests: new Set(),
     stopped: false,
   };
 
@@ -638,6 +641,18 @@
       state.fontSize = message.fontSize;
       if (message.mode === "session" && !state.term) initializeTerminal(message);
       else api.post({ type: "ready", renderer: null });
+      if (message.skipLoopbackProbe === true) {
+        api.capability.dataChannel = api.capability.peerConnection;
+        api.capability.loopback = api.capability.peerConnection;
+        api.capabilityProbeComplete = true;
+      } else if (typeof message.cachedLoopback === "boolean") {
+        api.capability.dataChannel = api.capability.peerConnection;
+        api.capability.loopback = message.cachedLoopback;
+        api.capabilityProbeComplete = true;
+      } else if (!api.capabilityProbeStarted) {
+        api.capabilityProbeStarted = true;
+        void probeLoopback();
+      }
       if (api.capabilityProbeComplete) {
         api.post({
           type: "diagnostic",
@@ -657,18 +672,12 @@
     }
   }
 
-  let lastRaw = null;
-  let lastRawAt = 0;
   const listener = (event) => {
     if (typeof event.data !== "string") return;
-    const now = performance.now();
-    if (event.data === lastRaw && now - lastRawAt < 1) return;
-    lastRaw = event.data;
-    lastRawAt = now;
     void receiveMessage(event.data);
   };
-  window.addEventListener("message", listener);
-  document.addEventListener("message", listener);
+  const bridgeTarget = /Android/i.test(navigator.userAgent) ? document : window;
+  bridgeTarget.addEventListener("message", listener);
 
   api.sendPty = (bytes) => {
     if (!state.pty || state.pty.readyState !== "open") return false;
@@ -700,6 +709,7 @@
     renderer: null,
   };
   api.capabilityProbeComplete = false;
+  api.capabilityProbeStarted = false;
 
   async function probeLoopback() {
     if (!api.capability.peerConnection) {
@@ -740,6 +750,4 @@
       api.post({ type: "diagnostic", diagnostic: { ...api.capability, renderer: state.renderer } });
     }
   }
-
-  void probeLoopback();
 })();

@@ -55,6 +55,28 @@ class FakePeerConnection {
   connectionState = "new";
   onicecandidate: ((event: { candidate: unknown }) => void) | null = null;
   onconnectionstatechange: (() => void) | null = null;
+  readonly offerOptions: unknown[] = [];
+  readonly setConfiguration = jest.fn();
+  readonly restartIce = jest.fn();
+  readonly getStats = jest.fn(
+    async () =>
+      new Map([
+        [
+          "pair",
+          {
+            id: "pair",
+            type: "candidate-pair",
+            state: "succeeded",
+            nominated: true,
+            localCandidateId: "local",
+            remoteCandidateId: "remote",
+            currentRoundTripTime: 0.042,
+          },
+        ],
+        ["local", { id: "local", type: "local-candidate", candidateType: "relay" }],
+        ["remote", { id: "remote", type: "remote-candidate", candidateType: "host" }],
+      ]),
+  );
 
   constructor(readonly config: unknown) {
     FakePeerConnection.last = this;
@@ -77,7 +99,8 @@ class FakePeerConnection {
     return channel;
   }
 
-  createOffer(): Promise<{ type: string; sdp: string }> {
+  createOffer(options?: unknown): Promise<{ type: string; sdp: string }> {
+    this.offerOptions.push(options);
     return Promise.resolve({ type: "offer", sdp: "v=0\r\nlocal-offer" });
   }
 
@@ -323,6 +346,56 @@ describe("host-scoped signalling", () => {
 });
 
 describe("session-scoped signalling", () => {
+  test("reports selected path and RTT every five seconds while connected", async () => {
+    jest.useFakeTimers();
+    const harness = createHarness("session");
+    try {
+      await connect(harness);
+      const pc = FakePeerConnection.last;
+      if (pc) pc.connectionState = "connected";
+      pc?.onconnectionstatechange?.();
+
+      jest.advanceTimersByTime(5_000);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(posted(harness, "connection-info")).toContainEqual({
+        type: "connection-info",
+        info: { kind: "relay", rttMs: 42 },
+      });
+      await harness.handleTransportMessage?.({ type: "close" });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("restarts ICE on the same binding after a network change", async () => {
+    const harness = createHarness("session");
+    await connect(harness);
+    await signOffer(harness);
+    const pc = FakePeerConnection.last;
+
+    await harness.handleTransportMessage?.({
+      type: "network-changed",
+      iceServers: [{ urls: "stun:refreshed.example" }],
+      iceTransportPolicy: "all",
+    });
+    await signOffer(harness);
+
+    expect(pc?.setConfiguration).toHaveBeenCalledWith({
+      iceServers: [{ urls: "stun:refreshed.example" }],
+      iceTransportPolicy: "all",
+    });
+    expect(pc?.restartIce).toHaveBeenCalledTimes(1);
+    expect(pc?.offerOptions.at(-1)).toEqual({ iceRestart: true });
+    expect(emittedFrames(harness, "rtc.offer").at(-1)).toMatchObject({
+      session_id: RTC_SESSION_ID,
+      binding_nonce: CLIENT_NONCE,
+      ice_restart: true,
+    });
+    await harness.handleTransportMessage?.({ type: "close" });
+  });
+
   test("carries endorsements on the outer offer only", async () => {
     const harness = createHarness("session");
     await connect(harness);

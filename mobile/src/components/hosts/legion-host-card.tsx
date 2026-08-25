@@ -28,6 +28,7 @@ export interface LegionHostCardProps {
   agents: readonly AgentOut[];
   host: HostOut;
   liveEnabled: boolean;
+  probeEnabled?: boolean;
   sessions: readonly SessionOut[];
   onOpen(): void;
 }
@@ -36,6 +37,7 @@ export function LegionHostCard({
   agents,
   host,
   liveEnabled,
+  probeEnabled = true,
   sessions,
   onOpen,
 }: LegionHostCardProps) {
@@ -61,7 +63,7 @@ export function LegionHostCard({
   }, [liveEnabled]);
 
   const capacity = capacityPresentation(host, liveEnabled ? metrics : null);
-  const canProbe = liveEnabled && online && host.host_public_key !== null;
+  const canProbe = liveEnabled && probeEnabled && online && host.host_public_key !== null;
   const liveUnavailable =
     liveEnabled &&
     online &&

@@ -6,6 +6,7 @@ import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import { TerminalSurface } from "@/terminal/TerminalSurface";
 import type { HostTransport, SessionTransport } from "@/terminal/transport/types";
 import { isWorkerBootstrapNavigation, WORKER_BASE_URL } from "@/terminal/worker/navigation-policy";
+import { TERMINAL_WORKER_HTML } from "@/terminal/worker/worker-html";
 
 type CapturedWebViewProps = Record<string, unknown> & {
   allowsLinkPreview?: boolean;
@@ -92,6 +93,10 @@ describe("worker navigation containment", () => {
     const workerUrl = "file:///app/worker.html";
     expect(isWorkerBootstrapNavigation({ url: workerUrl }, workerUrl)).toBe(true);
     expect(isWorkerBootstrapNavigation({ url: `${workerUrl}?external` }, workerUrl)).toBe(false);
+  });
+
+  test("prevents the embedded worker document from opening network connections", () => {
+    expect(TERMINAL_WORKER_HTML).toContain("connect-src 'none'");
   });
 
   test("routes every terminal URL through the strict callback and intercepts _blank", async () => {
