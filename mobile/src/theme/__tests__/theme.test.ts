@@ -15,6 +15,7 @@ import {
   terminalLightSelectionSources,
   terminalPalette,
   themeForMode,
+  withAlpha,
 } from "@/theme";
 
 function isValidNativeColor(value: string): boolean {
@@ -123,5 +124,20 @@ describe("assembled themes", () => {
 
   it("matches the dark token snapshot", () => {
     expect(darkTheme).toMatchSnapshot();
+  });
+});
+
+describe("a colour token at a chosen alpha", () => {
+  it("fades a hex token in the channel", () => {
+    expect(withAlpha("#F5F5F5", 0.2)).toBe("rgba(245,245,245,0.2)");
+    expect(withAlpha(lightColors.foreground, 0)).toBe("rgba(15,15,15,0)");
+  });
+
+  it("re-alphas a token that already carries one", () => {
+    expect(withAlpha(grimoireColors.border, 0.95)).toBe("rgba(242,237,226,0.95)");
+  });
+
+  it("leaves anything it does not understand alone", () => {
+    expect(withAlpha("transparent", 0.5)).toBe("transparent");
   });
 });

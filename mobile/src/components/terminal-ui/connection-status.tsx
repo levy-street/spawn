@@ -120,8 +120,10 @@ export function ConnectionStateOverlay({
         {
           backgroundColor: compact ? theme.colors.popover : theme.colors.terminalBg,
           borderColor: theme.colors.border,
-          borderRadius: compact ? theme.radii.lg : 0,
-          borderWidth: compact ? borderWidth.hairline : borderWidth.none,
+          // The compact form spans the foot of the terminal rather than
+          // floating over it, so it is a bar and not a card: square corners,
+          // and a single rule along the top where it meets the output.
+          borderTopWidth: compact ? borderWidth.hairline : borderWidth.none,
           gap: theme.space(compact ? 2 : 3),
           padding: theme.space(compact ? 3 : 6),
           zIndex: layer.connecting,
