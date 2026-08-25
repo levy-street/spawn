@@ -28,7 +28,8 @@ export interface ListRowProps {
    * Where the trailing control sits. "center" is the default: centred on the
    * row, inside its gutter. "action" is for a row's overflow control: it lines
    * up with the header's actions above — the same column from the screen edge,
-   * and level with the title rather than with the middle of a two-line block.
+   * and on the title's own line rather than in the middle of a two-line block
+   * or wherever a taller leading glyph happens to centre it.
    */
   trailingPlacement?: "center" | "action";
 }
@@ -49,6 +50,7 @@ export function ListRow({
 }: ListRowProps): React.JSX.Element {
   const theme = useTheme();
   const interactive = onPress !== undefined || onLongPress !== undefined;
+  const actionTrailing = trailing !== undefined && trailingPlacement === "action";
 
   return (
     <Pressable
@@ -73,9 +75,19 @@ export function ListRow({
           </View>
         ) : null}
         <View style={styles.copy}>
-          <Text numberOfLines={1} style={styles.title} variant="label" weight={titleWeight}>
-            {title}
-          </Text>
+          {/* The action shares the title's line, so it stays level with the title
+            however tall the leading glyph or the subtitle make the rest of the row. */}
+          <View style={styles.titleRow}>
+            <Text
+              numberOfLines={1}
+              style={[styles.title, styles.titleCopy]}
+              variant="label"
+              weight={titleWeight}
+            >
+              {title}
+            </Text>
+            {actionTrailing ? <View style={styles.trailingAction}>{trailing}</View> : null}
+          </View>
           {subtitle !== undefined ? (
             <Text
               color="mutedForeground"
@@ -87,10 +99,8 @@ export function ListRow({
             </Text>
           ) : null}
         </View>
-        {trailing !== undefined ? (
-          <View style={[styles.trailing, trailingPlacement === "action" && styles.trailingAction]}>
-            {trailing}
-          </View>
+        {trailing !== undefined && !actionTrailing ? (
+          <View style={styles.trailing}>{trailing}</View>
         ) : null}
       </View>
       {body === undefined ? null : <View style={styles.body}>{body}</View>}
@@ -161,6 +171,15 @@ const styles = StyleSheet.create({
     fontSize: sizing.type.rowLabel.fontSize,
     lineHeight: sizing.type.rowLabel.lineHeight,
   },
+  titleCopy: {
+    flex: 1,
+    minWidth: 0,
+  },
+  titleRow: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: sizing.listRow.contentGap,
+  },
   trailing: {
     alignItems: "center",
     justifyContent: "center",
@@ -168,12 +187,11 @@ const styles = StyleSheet.create({
     minWidth: sizing.listRow.trailingTarget,
   },
   trailingAction: {
-    alignSelf: "flex-start",
-    // Its centre on the title's line: the copy block sits `textGap` below the
-    // row's top once centred, and the target is taller than that line.
-    marginTop:
-      (sizing.type.rowLabel.lineHeight - sizing.listRow.trailingTarget) / 2 +
-      sizing.listRow.textGap,
+    alignItems: "center",
+    // As tall as the title's line and no taller, so the control centres on that
+    // line and its target overhangs above and below rather than pushing it.
+    height: sizing.type.rowLabel.lineHeight,
+    justifyContent: "center",
     // Pulled out of the row's gutter to the header's action column.
     marginRight: -(sizing.listRow.horizontalPadding - sizing.listRow.trailingActionInset),
   },

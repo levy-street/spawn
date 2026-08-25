@@ -1,7 +1,7 @@
 import * as ExpoCrypto from "expo-crypto";
 import { Directory, File, type FileHandle, Paths } from "expo-file-system";
-import { Share } from "react-native";
 import type { VerifiedFileSink } from "@/components/files/transfer";
+import { presentShareSheet } from "@/lib/share";
 
 const DOWNLOADS_DIRECTORY = "spawn-downloads";
 
@@ -55,5 +55,5 @@ export function createLocalDownload(name: string): LocalDownload {
 }
 
 export async function shareLocalFile(file: File): Promise<void> {
-  await Share.share({ title: file.name, url: file.uri });
+  await presentShareSheet({ title: file.name, url: file.uri });
 }

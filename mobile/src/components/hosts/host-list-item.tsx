@@ -9,7 +9,6 @@ import {
   pluralize,
 } from "@/components/hosts/host-model";
 import { RunningAgents } from "@/components/hosts/running-agents";
-import { Badge } from "@/components/ui/badge";
 import { Icon } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
 import { ListRow } from "@/components/ui/list-row";
@@ -18,7 +17,6 @@ import type { AgentOut } from "@/data/api/schemas/agents";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
 import { groupRunningAgents } from "@/data/selectors/agent";
-import { sessionAttention } from "@/data/selectors/session";
 import { haptics } from "@/lib/haptics";
 import { borderWidth, spacing, useTheme } from "@/theme";
 import { sizing } from "@/theme/sizing";
@@ -39,7 +37,9 @@ export interface HostListItemProps {
  * A row is a glance, not a fact sheet: the name, whether it is up, what it has
  * to give, and what is running on it. The OS, the architecture and the daemon
  * version belong to the machine's own page — printed on every row they made the
- * list read as an inventory rather than a fleet.
+ * list read as an inventory rather than a fleet. Sessions waiting on a person
+ * are not counted here either: that is the workspace's business, and a row
+ * that nagged about it read as an alert rather than a machine.
  */
 export function HostListItem({
   host,
@@ -55,7 +55,6 @@ export function HostListItem({
     () => sessions.filter((session) => session.status !== "exited" && session.status !== "killed"),
     [sessions],
   );
-  const needYou = sessions.filter((session) => sessionAttention(session) !== null).length;
   const running = useMemo(() => groupRunningAgents(liveSessions, agents), [agents, liveSessions]);
 
   // The heartbeat's five-level reading, which is all the server is ever given.
@@ -69,7 +68,7 @@ export function HostListItem({
   const subtitle = [hostConnectionLabel(host), ...spec].join(" · ");
 
   const showCapacity = online && capacity.source === "bucketed";
-  const hasBody = showCapacity || running.length > 0 || needYou > 0;
+  const hasBody = showCapacity || running.length > 0;
 
   return (
     <View testID={`host-row-${host.id}`}>
@@ -79,22 +78,14 @@ export function HostListItem({
               body: (
                 <>
                   {showCapacity ? <CapacityMeter capacity={capacity} compact /> : null}
-                  {running.length > 0 || needYou > 0 ? (
-                    <View style={styles.activity}>
-                      <RunningAgents groups={running} testID={`host-running-${host.id}`} />
-                      {needYou > 0 ? (
-                        <Badge testID={`host-attention-${host.id}`} variant="warning">
-                          {`${needYou} need you`}
-                        </Badge>
-                      ) : null}
-                    </View>
+                  {running.length > 0 ? (
+                    <RunningAgents groups={running} testID={`host-running-${host.id}`} />
                   ) : null}
                 </>
               ),
               bodyLabel: hostBodyLabel({
                 capacity: showCapacity ? capacity : { source: "unavailable" },
                 liveSessions: liveSessions.length,
-                needYou,
                 sessionCount: host.session_count,
               }),
             }
@@ -154,12 +145,10 @@ export function HostListItem({
 function hostBodyLabel({
   capacity,
   liveSessions,
-  needYou,
   sessionCount,
 }: {
   capacity: ReturnType<typeof capacityPresentation>;
   liveSessions: number;
-  needYou: number;
   sessionCount: number;
 }): string {
   const parts: string[] = [];
@@ -170,17 +159,10 @@ function hostBodyLabel({
     );
   }
   parts.push(pluralize(liveSessions > 0 ? liveSessions : sessionCount, "session"));
-  if (needYou > 0) parts.push(`${needYou} need you`);
   return parts.join(", ");
 }
 
 const styles = StyleSheet.create({
-  activity: {
-    alignItems: "center",
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: spacing[2],
-  },
   machine: {
     alignItems: "center",
     borderWidth: borderWidth.hairline,

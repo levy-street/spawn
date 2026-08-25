@@ -86,7 +86,8 @@ export function HostDetailView({
           {host.os ?? "unknown"} · {host.arch ?? "unknown"} · daemon {host.version ?? "unknown"}
         </Text>
       </View>
-      <ListGroup testID="host-destinations">
+      {/* No heading over these, so the group opens with its own rule. */}
+      <ListGroup openingRule testID="host-destinations">
         <DestinationRow
           detail={online ? "Browse this machine" : "Unavailable while the daemon is offline"}
           disabled={!online}

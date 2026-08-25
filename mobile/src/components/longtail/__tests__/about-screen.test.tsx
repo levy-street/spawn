@@ -33,6 +33,8 @@ describe("about and public content", () => {
     );
 
     expect(screen.getByText("Version 2.4.0")).toBeOnTheScreen();
+    // The product's own mark beside its name, not a stand-in glyph.
+    expect(screen.getByTestId("about-brand-mark")).toBeOnTheScreen();
     expect(screen.getByText("MIT / Apache-2.0")).toBeOnTheScreen();
     expect(screen.getByText("We introduce. We never listen.")).toBeOnTheScreen();
     await fireEvent.press(screen.getByRole("button", { name: "Copy install command" }));

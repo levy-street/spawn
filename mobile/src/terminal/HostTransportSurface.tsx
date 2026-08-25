@@ -121,6 +121,10 @@ export function HostTransportSurface({
       ref={webViewRef}
       source={source}
       style={styles.hiddenWorker}
+      // The library wraps the web view in a container of its own that grows to
+      // fill its column; positioned like the worker itself, it takes no room
+      // from whatever screen hosts the transport.
+      containerStyle={styles.hiddenWorker}
       accessible={false}
       pointerEvents="none"
       originWhitelist={["*"]}
