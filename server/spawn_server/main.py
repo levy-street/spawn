@@ -35,6 +35,7 @@ from .routes import sessions as sessions_routes
 from .routes import trust_bundle as trust_bundle_routes
 from .routes import workspace_templates as workspace_templates_routes
 from .routes import workspaces as workspaces_routes
+from .turn import validate_and_log_ice_config
 from .ws import alerts as alerts_ws
 from .ws import browser as browser_ws
 from .ws import daemon as daemon_ws
@@ -48,6 +49,7 @@ log = logging.getLogger("spawn.main")
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     log.info("starting spawn-server (db=%s redis=%s)", settings.database_url, settings.redis_url)
+    validate_and_log_ice_config(settings)
 
     init_engine()
     await redis_startup()

@@ -149,6 +149,7 @@ class Settings(BaseSettings):
     )
     turn_secret: str | None = Field(default=None)
     turn_ttl_seconds: int = Field(default=24 * 3600)
+    daemon_registration_concurrency: int = Field(default=32, ge=1, le=256)
 
     @property
     def oauth_native_redirect_uri_list(self) -> list[str]:

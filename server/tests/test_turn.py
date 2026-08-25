@@ -7,11 +7,16 @@ import hashlib
 import hmac
 import time
 
+import pytest
+
 from spawn_server.config import Settings
 from spawn_server.turn import (
     ice_servers_for_session,
     ice_transport_policy,
     mint_turn_credential,
+    validate_and_log_ice_config,
+    validate_ice_config,
+    validate_ice_url,
 )
 
 
@@ -32,7 +37,9 @@ def test_mint_turn_credential_matches_coturn_convention():
 
 def test_ice_servers_include_minted_turn_only_when_configured():
     plain = Settings(turn_urls="", turn_secret=None)
-    assert all("turn:" not in u for s in ice_servers_for_session(plain, label="u") for u in s["urls"])
+    assert all(
+        "turn:" not in u for s in ice_servers_for_session(plain, label="u") for u in s["urls"]
+    )
 
     configured = Settings(
         turn_urls="turn:relay.example:3478?transport=udp, turn:relay.example:3478?transport=tcp",
@@ -122,3 +129,63 @@ def test_policy_matches_the_retired_is_turn_only_logic():
     for servers in cases:
         expected = "relay" if old_is_turn_only(servers) else "all"
         assert ice_transport_policy(servers) == expected, servers
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "stun:stun.example.com",
+        "stuns:stun.example.com:5349",
+        "turn:192.0.2.1:3478?transport=udp",
+        "turns:[2001:db8::1]:5349?transport=tcp",
+        "turn:relay-1.example:3478",
+    ],
+)
+def test_ice_url_validator_accepts_supported_forms(url):
+    assert validate_ice_url(url) == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://relay.example",
+        "turn:",
+        "turn:bad_host:3478",
+        "turn:999.1.1.1:3478",
+        "turn:relay.example:0",
+        "turn:relay.example:65536",
+        "turn:relay.example:3478?transport=sctp",
+        "turn:2001:db8::1:3478",
+        "turn:[not-ipv6]:3478",
+        "turn:good.-bad:3478",
+        "turn:bad-.good:3478",
+    ],
+)
+def test_ice_url_validator_rejects_malformed_forms(url):
+    with pytest.raises(ValueError, match="ICE URL"):
+        validate_ice_url(url)
+
+
+def test_ice_config_validator_checks_static_and_turn_urls():
+    settings = Settings(
+        webrtc_ice_servers='[{"urls":["stun:stun.example:19302"]}]',
+        turn_urls="turn:relay.example:3478?transport=udp",
+        turn_secret="secret",
+    )
+    assert validate_ice_config(settings) == [
+        "stun:stun.example:19302",
+        "turn:relay.example:3478?transport=udp",
+    ]
+    with pytest.raises(ValueError, match="valid JSON"):
+        validate_ice_config(Settings(webrtc_ice_servers="not-json"))
+
+
+def test_ice_startup_summary_warns_without_udp_turn(caplog):
+    settings = Settings(
+        webrtc_ice_servers='[{"urls":"turns:relay.example:443?transport=tcp"}]',
+        turn_urls="",
+        turn_secret="never-log-this",
+    )
+    validate_and_log_ice_config(settings)
+    assert "without a UDP turn: URL" in caplog.text
+    assert "never-log-this" not in caplog.text

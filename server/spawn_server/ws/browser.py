@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
@@ -15,11 +16,18 @@ from ..models import Session, User
 from ..redis import get_backend, session_event_channel
 from ..turn import ice_servers_for_session, ice_transport_policy
 from .broker import BrowserConn, RtcSessionBinding, get_broker
+from .close_codes import (
+    WS_CLOSE_CONTENT_FORBIDDEN,
+    WS_CLOSE_PROTOCOL_REQUIRED,
+    WS_CLOSE_SERVER_RESTART,
+    WS_CLOSE_SUBSCRIPTION_LOST,
+)
 from .host_signal import (
     HOST_RTC_SESSION_TTL_SECONDS,
     HostPresenceOwner,
     HostSignalEnvelope,
     RedisBrowserConn,
+    SubscriptionLostError,
     browser_signal_channel,
     decode_rtc_signal_dispatch,
     encode_host_presence_owner,
@@ -27,7 +35,16 @@ from .host_signal import (
     host_pending_presence_key,
     host_presence_key,
     host_signal_channel,
+    receive_with_signal_pumps,
     valid_rtc_binding_nonce,
+)
+from .reliability import (
+    RTC_CONFIG_REQUEST_MIN_INTERVAL_SECONDS,
+    WS_KEEPALIVE_SECONDS,
+    ErrorFrameSender,
+    FrameRateLimiter,
+    rtc_config_refresh_seconds,
+    warn_query_token_once,
 )
 from .signed_signal_relay import (
     CARRIED_ENDORSEMENTS_FIELD,
@@ -45,8 +62,6 @@ log = logging.getLogger("spawn.ws.browser")
 SESSION_RTC_PROTOCOL = "spawn.pty"
 SESSION_RTC_PROTOCOL_VERSION = 2
 BROWSER_WS_PROTOCOL = "spawn.v3"
-WS_CLOSE_PROTOCOL_REQUIRED = 4003
-WS_CLOSE_CONTENT_FORBIDDEN = 4002
 
 
 def _rtc_config_payload(user_id: str, *, binding_nonce_required: bool = False) -> dict[str, object]:
@@ -63,7 +78,7 @@ def _rtc_config_payload(user_id: str, *, binding_nonce_required: bool = False) -
     }
 
 
-def _offer_ice(user_id: str) -> dict[str, object]:
+def _offer_ice(user_id: str, daemon: object | None = None) -> dict[str, object]:
     """Freshly minted ICE for one session offer.
 
     Deliberately *without* `ice_transport_policy`. On the wire to a daemon that
@@ -72,11 +87,15 @@ def _offer_ice(user_id: str) -> dict[str, object]:
     field is absent (`ice_transport_policy.is_none()`). Adding it here would
     make every already-deployed daemon silently drop every terminal offer.
 
-    The client learns the policy from `rtc.config` on its own socket instead,
-    which is the side that has to act on it. Teaching the daemon to read it
-    here needs a protocol-version bump, not an extra key.
+    The client learns the policy from `rtc.config` on its own socket instead.
+    A daemon that advertises `session_ice_policy` opts into receiving the same
+    policy on offers; capability absence keeps the legacy wire shape exact.
     """
-    return {"ice_servers": ice_servers_for_session(get_settings(), label=user_id)}
+    ice_servers = ice_servers_for_session(get_settings(), label=user_id)
+    payload: dict[str, object] = {"ice_servers": ice_servers}
+    if getattr(daemon, "session_ice_policy", False) is True:
+        payload["ice_transport_policy"] = ice_transport_policy(ice_servers)
+    return payload
 
 
 def _valid_rtc_session_id(value: object) -> str | None:
@@ -100,9 +119,26 @@ def _valid_rtc_candidate(value: object) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
     candidate = value.get("candidate")
-    if not isinstance(candidate, str) or len(candidate) > 64 * 1024:
+    if not isinstance(candidate, str) or len(candidate) > 1024:
         return None
-    return dict(value)
+    sanitized: dict[str, object] = {"candidate": candidate}
+    optional_strings = {"sdpMid": 64, "usernameFragment": 256}
+    for field, limit in optional_strings.items():
+        item = value.get(field)
+        if field in value:
+            if not isinstance(item, str) or len(item) > limit:
+                return None
+            sanitized[field] = item
+    if "sdpMLineIndex" in value:
+        line_index = value.get("sdpMLineIndex")
+        if (
+            not isinstance(line_index, int)
+            or isinstance(line_index, bool)
+            or not 0 <= line_index <= 65535
+        ):
+            return None
+        sanitized["sdpMLineIndex"] = line_index
+    return sanitized
 
 
 def _valid_browser_session_rtc_tuple(obj: dict, session_id: str) -> bool:
@@ -142,6 +178,53 @@ async def _publish_session_rtc_signal(
     )
 
 
+_orphan_expiry_tasks: set[asyncio.Task[None]] = set()
+
+
+def _binding_frame(
+    binding: RtcSessionBinding,
+    frame_type: str,
+    **values: object,
+) -> dict[str, object]:
+    return {
+        "type": frame_type,
+        "session_id": binding.session_id,
+        "binding_nonce": binding.nonce,
+        "binding_generation": binding.daemon_generation,
+        "scope_type": binding.scope_type,
+        "scope_id": binding.scope_id,
+        "protocol": binding.protocol,
+        "protocol_version": binding.protocol_version,
+        **values,
+    }
+
+
+def _schedule_browser_orphan_expiry(host_id: str, binding: RtcSessionBinding) -> None:
+    async def expire() -> None:
+        deadline = binding.browser_orphaned_until
+        if deadline is None:
+            return
+        await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+        expired = await get_broker().expire_rtc_orphan(
+            binding.session_id,
+            binding.nonce,
+            binding.daemon_generation,
+            side="browser",
+        )
+        if expired is None or not isinstance(expired.browser, RedisBrowserConn):
+            return
+        await _publish_session_rtc_signal(
+            host_id,
+            expired,
+            expired.browser.channel,
+            _binding_frame(expired, "rtc.close"),
+        )
+
+    task = asyncio.create_task(expire())
+    _orphan_expiry_tasks.add(task)
+    task.add_done_callback(_orphan_expiry_tasks.discard)
+
+
 async def _resolve_user(websocket: WebSocket, query_token: str | None) -> User | None:
     raw: str | None = None
     auth_h = websocket.headers.get("authorization")
@@ -152,6 +235,7 @@ async def _resolve_user(websocket: WebSocket, query_token: str | None) -> User |
     if raw is None:
         raw = websocket.cookies.get("spawn_session")
     if raw is None and query_token:
+        warn_query_token_once(log)
         raw = query_token
     if raw is None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="not authenticated")
@@ -174,6 +258,12 @@ async def _resolve_user(websocket: WebSocket, query_token: str | None) -> User |
         user = await session.get(User, user_id)
     if user is None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="user gone")
+        return None
+    if int(payload.get("epoch", 0) or 0) != int(user.session_epoch or 0):
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason="not authenticated",
+        )
         return None
     return user
 
@@ -210,6 +300,8 @@ async def browser_ws(
 
     broker = get_broker()
     conn = BrowserConn(user_id=user.id, session_id=pty_session_id, websocket=websocket)
+    errors = ErrorFrameSender(conn.send_text)
+    config_requests = FrameRateLimiter(RTC_CONFIG_REQUEST_MIN_INTERVAL_SECONDS)
     log.info("browser signaling attached session=%s user=%s", pty_session_id, user.id)
 
     # Only content-free signaling/lifecycle metadata is sent on this socket.
@@ -224,6 +316,16 @@ async def browser_ws(
     rtc_ready = asyncio.Event()
     rtc_response_channel = browser_signal_channel(conn.id)
     rtc_routes: dict[str, RedisBrowserConn] = {}
+
+    async def _keepalive() -> None:
+        while True:
+            await asyncio.sleep(WS_KEEPALIVE_SECONDS)
+            await conn.send_text({"type": "ping", "ts": int(time.time() * 1000)})
+
+    async def _refresh_rtc_config() -> None:
+        while True:
+            await asyncio.sleep(rtc_config_refresh_seconds(get_settings()))
+            await conn.send_text(_rtc_config_payload(user.id, binding_nonce_required=True))
 
     async def _pump_events() -> None:
         try:
@@ -271,7 +373,22 @@ async def browser_ws(
                         continue
                     route = rtc_routes.get(session_id)
                     binding = await broker.rtc_session_for(session_id)
-                    if route is None or binding is None or binding.browser is not route:
+                    if route is None:
+                        continue
+                    if binding is None:
+                        if (
+                            signal.get("type") == "rtc.status"
+                            and signal.get("status") in {"unavailable", "expired"}
+                            and dispatch.session_connection_id == route.daemon_connection_id
+                            and dispatch.session_generation == route.daemon_generation
+                            and dispatch.binding_nonce == route.binding_nonce
+                            and signal.get("binding_nonce") == route.binding_nonce
+                            and signal.get("binding_generation") == route.daemon_generation
+                        ):
+                            rtc_routes.pop(session_id, None)
+                            await conn.send_text(signal)
+                        continue
+                    if binding.browser is not route:
                         continue
                     if not (
                         dispatch.session_connection_id == route.daemon_connection_id
@@ -282,8 +399,9 @@ async def browser_ws(
                     ):
                         continue
                     dispatch_is_session_owner = (
-                        dispatch.dispatch_connection_id == route.daemon_connection_id
-                        and dispatch.dispatch_generation == route.daemon_generation
+                        binding.daemon.host_generation is not None
+                        and dispatch.dispatch_connection_id == binding.daemon.id
+                        and dispatch.dispatch_generation == binding.daemon.host_generation
                     )
                     frame_type = signal.get("type")
                     if frame_type == "rtc.answer":
@@ -333,7 +451,7 @@ async def browser_ws(
                             if connected is None:
                                 continue
                             binding = connected
-                        elif status_value in {"failed", "unavailable"}:
+                        elif status_value in {"failed", "unavailable", "expired"}:
                             await broker.unregister_rtc_session(session_id, route)
                             rtc_routes.pop(session_id, None)
                     else:
@@ -341,6 +459,7 @@ async def browser_ws(
                     terminal_status = frame_type == "rtc.status" and signal.get("status") in {
                         "failed",
                         "unavailable",
+                        "expired",
                     }
                     if not terminal_status and not (await broker.rtc_session_is_current(binding)):
                         continue
@@ -352,17 +471,25 @@ async def browser_ws(
 
     event_task = asyncio.create_task(_pump_events())
     rtc_task = asyncio.create_task(_pump_rtc_signals())
-    try:
-        await asyncio.gather(
-            asyncio.wait_for(event_ready.wait(), timeout=1.0),
-            asyncio.wait_for(rtc_ready.wait(), timeout=1.0),
-        )
-    except TimeoutError:
-        pass
+    keepalive_task = asyncio.create_task(_keepalive())
+    config_task = asyncio.create_task(_refresh_rtc_config())
 
     try:
+        try:
+            await asyncio.gather(
+                asyncio.wait_for(event_ready.wait(), timeout=1.0),
+                asyncio.wait_for(rtc_ready.wait(), timeout=1.0),
+            )
+            if event_task.done() or rtc_task.done():
+                raise SubscriptionLostError("browser subscription stopped")
+        except (TimeoutError, SubscriptionLostError):
+            await websocket.close(
+                code=WS_CLOSE_SUBSCRIPTION_LOST,
+                reason="subscription lost",
+            )
+            return
         while True:
-            msg = await websocket.receive()
+            msg = await receive_with_signal_pumps(websocket, (event_task, rtc_task))
             if msg["type"] == "websocket.disconnect":
                 break
             data_text = msg.get("text")
@@ -383,8 +510,22 @@ async def browser_ws(
                 try:
                     obj = json.loads(data_text)
                 except json.JSONDecodeError:
+                    await errors.send("invalid_frame", None)
+                    continue
+                if not isinstance(obj, dict):
+                    await errors.send("invalid_frame", None)
                     continue
                 ftype = obj.get("type")
+                if ftype == "pong":
+                    continue
+                if ftype == "rtc.config.request":
+                    if set(obj) != {"type"}:
+                        await errors.send("invalid_frame", ftype)
+                    elif config_requests.allow():
+                        await conn.send_text(
+                            _rtc_config_payload(user.id, binding_nonce_required=True)
+                        )
+                    continue
                 if ftype in {
                     "resize",
                     "take_control",
@@ -407,6 +548,71 @@ async def browser_ws(
                         reason="agent uploads belong on spawn.ctl",
                     )
                     break
+                elif ftype == "rtc.resume":
+                    session_id = _valid_rtc_session_id(obj.get("session_id"))
+                    binding_nonce = obj.get("binding_nonce")
+                    binding_generation = obj.get("binding_generation")
+                    if (
+                        session_id is None
+                        or not valid_rtc_binding_nonce(binding_nonce)
+                        or not isinstance(binding_generation, int)
+                        or isinstance(binding_generation, bool)
+                        or binding_generation < 1
+                        or not _valid_browser_session_rtc_tuple(obj, pty_session_id)
+                    ):
+                        await errors.send("invalid_frame", ftype)
+                        continue
+                    existing = await broker.rtc_session_for(session_id)
+                    if existing is None:
+                        await conn.send_text(
+                            {
+                                "type": "rtc.status",
+                                "session_id": session_id,
+                                "binding_nonce": binding_nonce,
+                                "binding_generation": binding_generation,
+                                "scope_type": "session",
+                                "scope_id": pty_session_id,
+                                "protocol": SESSION_RTC_PROTOCOL,
+                                "protocol_version": SESSION_RTC_PROTOCOL_VERSION,
+                                "status": "unavailable",
+                            }
+                        )
+                        continue
+                    route = RedisBrowserConn(
+                        user_id=user.id,
+                        host_id=host_id,
+                        channel=rtc_response_channel,
+                        daemon_connection_id=existing.daemon_connection_id,
+                        daemon_generation=existing.daemon_generation,
+                        binding_nonce=binding_nonce,
+                    )
+                    resumed = await broker.resume_rtc_session(
+                        session_id,
+                        route,
+                        binding_nonce=binding_nonce,
+                        binding_generation=binding_generation,
+                        scope_type="session",
+                        scope_id=pty_session_id,
+                        protocol=SESSION_RTC_PROTOCOL,
+                        protocol_version=SESSION_RTC_PROTOCOL_VERSION,
+                    )
+                    if resumed is None:
+                        await conn.send_text(
+                            {
+                                "type": "rtc.status",
+                                "session_id": session_id,
+                                "binding_nonce": binding_nonce,
+                                "binding_generation": binding_generation,
+                                "scope_type": "session",
+                                "scope_id": pty_session_id,
+                                "protocol": SESSION_RTC_PROTOCOL,
+                                "protocol_version": SESSION_RTC_PROTOCOL_VERSION,
+                                "status": "unavailable",
+                            }
+                        )
+                        continue
+                    rtc_routes[session_id] = route
+                    await conn.send_text(_binding_frame(resumed, "rtc.status", status="resumed"))
                 elif ftype == "rtc.offer":
                     proposed_nonce = obj.get("binding_nonce")
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
@@ -415,6 +621,11 @@ async def browser_ws(
                         or not valid_rtc_binding_nonce(proposed_nonce)
                         or not _valid_browser_session_rtc_tuple(obj, pty_session_id)
                     ):
+                        await errors.send("invalid_frame", ftype)
+                        continue
+                    ice_restart = obj.get("ice_restart") is True
+                    if "ice_restart" in obj and obj.get("ice_restart") is not True:
+                        await errors.send("invalid_frame", ftype)
                         continue
                     signed_signal = signed_mode_selected(obj)
                     try:
@@ -434,10 +645,12 @@ async def browser_ws(
                             signed_envelope = None
                             sdp = _valid_rtc_sdp(obj.get("sdp"))
                             if sdp is None:
+                                await errors.send("invalid_frame", ftype)
                                 continue
                     except SignedRtcRelayError:
                         # Presence selects signed mode; malformed/missing signed
                         # data never falls through to the legacy raw-SDP path.
+                        await errors.send("invalid_frame", ftype)
                         continue
                     if not get_settings().webrtc_enabled:
                         disabled: dict[str, object] = {
@@ -453,9 +666,9 @@ async def browser_ws(
                         }
                         await conn.send_text(disabled)
                         continue
-                    daemon = broker.get_daemon_for_session(pty_session_id) or broker.get_daemon_for_host(
-                        host_id
-                    )
+                    daemon = broker.get_daemon_for_session(
+                        pty_session_id
+                    ) or broker.get_daemon_for_host(host_id)
                     if daemon is None:
                         unavailable: dict[str, object] = {
                             "type": "rtc.status",
@@ -479,6 +692,79 @@ async def browser_ws(
                             unavailable["binding_nonce"] = proposed_nonce
                         await conn.send_text(unavailable)
                         continue
+                    if not await broker.reclaim_daemon_presence_if_missing(daemon):
+                        await conn.send_text(
+                            {
+                                "type": "rtc.status",
+                                "session_id": session_id,
+                                "binding_nonce": proposed_nonce,
+                                "status": "unavailable",
+                                "message": "WebRTC signaling could not reach the daemon.",
+                            }
+                        )
+                        continue
+                    if ice_restart:
+                        route = rtc_routes.get(session_id)
+                        binding = await broker.rtc_session_for(session_id)
+                        if not (
+                            route is not None
+                            and binding is not None
+                            and binding.browser is route
+                            and binding.daemon is daemon
+                            and binding.daemon_orphaned_until is None
+                            and binding.scope_type == "session"
+                            and binding.scope_id == pty_session_id
+                            and binding.protocol == SESSION_RTC_PROTOCOL
+                            and binding.protocol_version == SESSION_RTC_PROTOCOL_VERSION
+                            and binding.nonce == proposed_nonce
+                            and obj.get("binding_generation") == binding.daemon_generation
+                            and binding.signed_signal == signed_signal
+                        ):
+                            await conn.send_text(
+                                {
+                                    "type": "rtc.status",
+                                    "session_id": session_id,
+                                    "binding_nonce": proposed_nonce,
+                                    "binding_generation": obj.get("binding_generation"),
+                                    "scope_type": "session",
+                                    "scope_id": pty_session_id,
+                                    "protocol": SESSION_RTC_PROTOCOL,
+                                    "protocol_version": SESSION_RTC_PROTOCOL_VERSION,
+                                    "status": "unavailable",
+                                }
+                            )
+                            continue
+                        offer_payload = _binding_frame(
+                            binding,
+                            "rtc.offer",
+                            ice_restart=True,
+                            **_offer_ice(user.id, daemon),
+                        )
+                        if signed_signal:
+                            assert signed_envelope is not None
+                            offer_payload[SIGNED_ENVELOPE_FIELD] = signed_envelope
+                            carried = sanitize_carried_endorsements(
+                                obj.get(CARRIED_ENDORSEMENTS_FIELD)
+                            )
+                            if carried is not None:
+                                offer_payload[CARRIED_ENDORSEMENTS_FIELD] = carried
+                        else:
+                            assert sdp is not None
+                            offer_payload["sdp"] = sdp
+                        if not await _publish_session_rtc_signal(
+                            host_id,
+                            binding,
+                            rtc_response_channel,
+                            offer_payload,
+                        ):
+                            await conn.send_text(
+                                _binding_frame(
+                                    binding,
+                                    "rtc.status",
+                                    status="unavailable",
+                                )
+                            )
+                        continue
                     binding_nonce = proposed_nonce
                     route = RedisBrowserConn(
                         user_id=user.id,
@@ -488,6 +774,22 @@ async def browser_ws(
                         daemon_generation=generation,
                         binding_nonce=binding_nonce,
                     )
+                    capacity_available = await broker.session_rtc_capacity_available(
+                        user_id=user.id,
+                        route_id=route.route_id,
+                    )
+                    if not capacity_available:
+                        await conn.send_text(
+                            {
+                                "type": "rtc.status",
+                                "session_id": session_id,
+                                "binding_nonce": binding_nonce,
+                                "binding_generation": generation,
+                                "status": "failed",
+                                "message": "RTC session limit reached.",
+                            }
+                        )
+                        continue
                     registered = await broker.register_rtc_session(
                         session_id,
                         route,
@@ -519,7 +821,7 @@ async def browser_ws(
                             {
                                 "type": "rtc.status",
                                 "session_id": session_id,
-                                    "binding_nonce": binding.nonce,
+                                "binding_nonce": binding.nonce,
                                 "binding_generation": binding.daemon_generation,
                                 "scope_type": binding.scope_type,
                                 "scope_id": binding.scope_id,
@@ -539,7 +841,7 @@ async def browser_ws(
                         "scope_id": pty_session_id,
                         "protocol": SESSION_RTC_PROTOCOL,
                         "protocol_version": SESSION_RTC_PROTOCOL_VERSION,
-                        **_offer_ice(user.id),
+                        **_offer_ice(user.id, daemon),
                     }
                     if signed_signal:
                         assert signed_envelope is not None
@@ -580,6 +882,7 @@ async def browser_ws(
                         or candidate is None
                         or not _valid_browser_session_rtc_tuple(obj, pty_session_id)
                     ):
+                        await errors.send("invalid_frame", ftype)
                         continue
                     route = rtc_routes.get(session_id)
                     binding = await broker.rtc_session_for(session_id)
@@ -592,7 +895,12 @@ async def browser_ws(
                         or binding.protocol != SESSION_RTC_PROTOCOL
                         or binding.protocol_version != SESSION_RTC_PROTOCOL_VERSION
                         or obj.get("binding_nonce") != binding.nonce
+                        or (
+                            "binding_generation" in obj
+                            and obj.get("binding_generation") != binding.daemon_generation
+                        )
                     ):
+                        await errors.send("invalid_frame", ftype)
                         continue
                     await _publish_session_rtc_signal(
                         host_id,
@@ -612,7 +920,10 @@ async def browser_ws(
                     )
                 elif ftype == "rtc.close":
                     session_id = _valid_rtc_session_id(obj.get("session_id"))
-                    if session_id is None or not _valid_browser_session_rtc_tuple(obj, pty_session_id):
+                    if session_id is None or not _valid_browser_session_rtc_tuple(
+                        obj, pty_session_id
+                    ):
+                        await errors.send("invalid_frame", ftype)
                         continue
                     route = rtc_routes.get(session_id)
                     binding = await broker.rtc_session_for(session_id)
@@ -624,7 +935,12 @@ async def browser_ws(
                         or binding.protocol != SESSION_RTC_PROTOCOL
                         or binding.protocol_version != SESSION_RTC_PROTOCOL_VERSION
                         or obj.get("binding_nonce") != binding.nonce
+                        or (
+                            "binding_generation" in obj
+                            and obj.get("binding_generation") != binding.daemon_generation
+                        )
                     ):
+                        await errors.send("invalid_frame", ftype)
                         continue
                     rtc_routes.pop(session_id, None)
                     await broker.unregister_rtc_session(session_id, route)
@@ -643,39 +959,46 @@ async def browser_ws(
                             "protocol_version": binding.protocol_version,
                         },
                     )
+                else:
+                    await errors.send("unknown_frame", ftype)
+    except SubscriptionLostError:
+        await websocket.close(
+            code=WS_CLOSE_SUBSCRIPTION_LOST,
+            reason="subscription lost",
+        )
     except WebSocketDisconnect:
         pass
+    except asyncio.CancelledError:
+        await websocket.close(code=WS_CLOSE_SERVER_RESTART, reason="server restart")
+        raise
     except Exception as e:  # noqa: BLE001
         log.exception("browser ws crashed: %s", e)
     finally:
-        rtc_task.cancel()
-        try:
-            await rtc_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        event_task.cancel()
-        try:
-            await event_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        for task in (rtc_task, event_task, keepalive_task, config_task):
+            task.cancel()
+        await asyncio.gather(
+            rtc_task,
+            event_task,
+            keepalive_task,
+            config_task,
+            return_exceptions=True,
+        )
         bindings: list[RtcSessionBinding] = []
-        for route in list(rtc_routes.values()):
-            bindings.extend(await broker.unregister_rtc_sessions_for(route))
-        rtc_routes.clear()
-        for binding in bindings:
+        for session_id, route in list(rtc_routes.items()):
+            binding = await broker.rtc_session_for(session_id, browser=route)
+            if binding is None:
+                continue
+            if binding.daemon.keeps_peers_across_reconnect:
+                bindings.extend(await broker.orphan_rtc_sessions_for_browser(route))
+                continue
+            await broker.unregister_rtc_session(binding.session_id, route)
             await _publish_session_rtc_signal(
                 host_id,
                 binding,
-                rtc_response_channel,
-                {
-                    "type": "rtc.close",
-                    "session_id": binding.session_id,
-                    "binding_nonce": binding.nonce,
-                    "binding_generation": binding.daemon_generation,
-                    "scope_type": binding.scope_type,
-                    "scope_id": binding.scope_id,
-                    "protocol": binding.protocol,
-                    "protocol_version": binding.protocol_version,
-                },
+                route.channel,
+                _binding_frame(binding, "rtc.close"),
             )
+        rtc_routes.clear()
+        for binding in bindings:
+            _schedule_browser_orphan_expiry(host_id, binding)
         log.info("browser detached session=%s user=%s", pty_session_id, user.id)

@@ -29,12 +29,18 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from ..redis import get_backend, user_alert_channel
 from ..trust_events import forwardable_trust_frame
 from .browser import _resolve_user
+from .close_codes import (
+    WS_CLOSE_PROTOCOL_REQUIRED,
+    WS_CLOSE_SERVER_RESTART,
+    WS_CLOSE_SUBSCRIPTION_LOST,
+)
+from .host_signal import SubscriptionLostError, receive_with_signal_pump
+from .reliability import ErrorFrameSender
 
 router = APIRouter()
 log = logging.getLogger("spawn.ws.alerts")
 
 ALERTS_WS_PROTOCOL = "spawn.alerts.v1"
-WS_CLOSE_PROTOCOL_REQUIRED = 4003
 
 #: Idle keepalive. Proxies drop a silent WebSocket well before an agent run
 #: ends, and a browser that never hears anything cannot tell a quiet link from
@@ -271,6 +277,8 @@ async def alerts_ws(websocket: WebSocket, token: str | None = Query(default=None
         async with send_lock:
             await websocket.send_text(json.dumps(payload, separators=(",", ":")))
 
+    errors = ErrorFrameSender(_send)
+
     ready = asyncio.Event()
 
     async def _pump_alerts() -> None:
@@ -307,22 +315,47 @@ async def alerts_ws(websocket: WebSocket, token: str | None = Query(default=None
     pump_task = asyncio.create_task(_pump_alerts())
     keepalive_task = asyncio.create_task(_keepalive())
     try:
-        await asyncio.wait_for(ready.wait(), timeout=1.0)
-    except TimeoutError:
-        pass
-
-    try:
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=1.0)
+            if pump_task.done():
+                raise SubscriptionLostError("alert subscription stopped")
+        except (TimeoutError, SubscriptionLostError):
+            await websocket.close(
+                code=WS_CLOSE_SUBSCRIPTION_LOST,
+                reason="subscription lost",
+            )
+            return
         # Nothing is expected inbound; receiving is how a disconnect is seen.
-        # A client that sends anyway is ignored rather than closed on: this
-        # socket has no command surface to protect.
         while True:
-            message = await websocket.receive()
+            message = await receive_with_signal_pump(websocket, pump_task)
             if message["type"] == "websocket.disconnect":
                 break
             if message.get("bytes") is not None:
-                log.warning("binary frame on alert socket; ignoring")
+                await errors.send("invalid_frame", None)
+                continue
+            raw = message.get("text")
+            if raw is None:
+                await errors.send("invalid_frame", None)
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                await errors.send("invalid_frame", None)
+                continue
+            if not isinstance(obj, dict):
+                await errors.send("invalid_frame", None)
+                continue
+            await errors.send("unknown_frame", obj.get("type"))
+    except SubscriptionLostError:
+        await websocket.close(
+            code=WS_CLOSE_SUBSCRIPTION_LOST,
+            reason="subscription lost",
+        )
     except WebSocketDisconnect:
         pass
+    except asyncio.CancelledError:
+        await websocket.close(code=WS_CLOSE_SERVER_RESTART, reason="server restart")
+        raise
     except Exception as e:  # noqa: BLE001
         log.warning("alert ws crashed: %s", e)
     finally:

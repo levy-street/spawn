@@ -430,6 +430,10 @@ class Host(Base):
         nullable=True,
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_disconnect_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_disconnect_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # What the machine is. Written once from `register` and stable after that,
     # so nothing here is refreshed per heartbeat. All nullable: a daemon older
     # than the field, or one running with SPAWND_NO_TELEMETRY, reports none of

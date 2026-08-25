@@ -10,6 +10,7 @@ import pytest
 
 from spawn_server.ws.broker import (
     Broker,
+    BrowserConn,
     DaemonConn,
     HostBrowserConn,
     get_broker,
@@ -51,6 +52,177 @@ async def _accept_owner(broker: Broker, daemon: DaemonConn, generation: int = 1)
     )
 
 
+@pytest.mark.asyncio
+async def test_rtc_orphan_rebind_expiry_resume_and_user_isolation():
+    broker = Broker()
+    old_daemon = DaemonConn("orphan-host", "owner", FakeWS())  # type: ignore[arg-type]
+    old_daemon.host_generation = 7
+    old_daemon.keeps_peers_across_reconnect = True
+    old_browser = BrowserConn("owner", "pty", FakeWS())  # type: ignore[arg-type]
+    assert await broker.register_rtc_session(
+        "binding-rebind",
+        old_browser,
+        daemon=old_daemon,
+        scope_type="session",
+        scope_id="pty",
+        protocol="spawn.pty",
+        protocol_version=2,
+        binding_nonce="a" * 32,
+        now=100,
+    )
+    orphaned = await broker.orphan_rtc_sessions_for_daemon(old_daemon, grace_seconds=60, now=100)
+    assert len(orphaned) == 1
+
+    new_daemon = DaemonConn("orphan-host", "owner", FakeWS())  # type: ignore[arg-type]
+    new_daemon.host_generation = 8
+    live = {
+        "session_id": "binding-rebind",
+        "binding_nonce": "a" * 32,
+        "binding_generation": 7,
+        "scope_type": "session",
+        "scope_id": "pty",
+        "protocol": "spawn.pty",
+        "protocol_version": 2,
+    }
+    rebound, absent, unknown = await broker.reconcile_daemon_live_bindings(
+        new_daemon, [live], now=120
+    )
+    assert len(rebound) == 1 and absent == [] and unknown == []
+    assert rebound[0].daemon is new_daemon
+    assert rebound[0].daemon_generation == 7
+
+    await broker.orphan_rtc_sessions_for_browser(old_browser, grace_seconds=60, now=130)
+    attacker = BrowserConn("other-user", "pty", FakeWS())  # type: ignore[arg-type]
+    assert (
+        await broker.resume_rtc_session(
+            "binding-rebind",
+            attacker,
+            binding_nonce="a" * 32,
+            binding_generation=7,
+            scope_type="session",
+            scope_id="pty",
+            protocol="spawn.pty",
+            protocol_version=2,
+            now=140,
+        )
+        is None
+    )
+    resumed_browser = BrowserConn("owner", "pty", FakeWS())  # type: ignore[arg-type]
+    resumed = await broker.resume_rtc_session(
+        "binding-rebind",
+        resumed_browser,
+        binding_nonce="a" * 32,
+        binding_generation=7,
+        scope_type="session",
+        scope_id="pty",
+        protocol="spawn.pty",
+        protocol_version=2,
+        now=140,
+    )
+    assert resumed is not None and resumed.browser is resumed_browser
+
+    await broker.orphan_rtc_sessions_for_daemon(new_daemon, grace_seconds=10, now=200)
+    expired = await broker.expire_rtc_orphan("binding-rebind", "a" * 32, 7, side="daemon", now=211)
+    assert expired is not None
+    assert await broker.rtc_session_for("binding-rebind", now=211) is None
+
+
+@pytest.mark.asyncio
+async def test_rtc_live_binding_reconcile_revokes_absent_and_closes_unknown():
+    broker = Broker()
+    daemon = DaemonConn("reconcile-host", "owner", FakeWS())  # type: ignore[arg-type]
+    daemon.host_generation = 3
+    browser = BrowserConn("owner", "pty", FakeWS())  # type: ignore[arg-type]
+    assert await broker.register_rtc_session(
+        "known",
+        browser,
+        daemon=daemon,
+        scope_type="session",
+        scope_id="pty",
+        protocol="spawn.pty",
+        protocol_version=2,
+        binding_nonce="b" * 32,
+    )
+    await broker.orphan_rtc_sessions_for_daemon(daemon, now=10)
+    replacement = DaemonConn("reconcile-host", "owner", FakeWS())  # type: ignore[arg-type]
+    replacement.host_generation = 4
+    unknown_item = {
+        "session_id": "unknown",
+        "binding_nonce": "c" * 32,
+        "binding_generation": 3,
+        "scope_type": "session",
+        "scope_id": "pty",
+        "protocol": "spawn.pty",
+        "protocol_version": 2,
+    }
+    rebound, absent, unknown = await broker.reconcile_daemon_live_bindings(
+        replacement, [unknown_item], now=20
+    )
+    assert rebound == []
+    assert [binding.session_id for binding in absent] == ["known"]
+    assert unknown == [unknown_item]
+
+
+@pytest.mark.asyncio
+async def test_session_rtc_caps_are_per_user_and_browser(monkeypatch):
+    from spawn_server.ws import host_signal
+
+    monkeypatch.setattr(host_signal, "MAX_SESSION_RTC_SESSIONS_PER_USER", 2)
+    monkeypatch.setattr(host_signal, "MAX_SESSION_RTC_SESSIONS_PER_BROWSER", 1)
+    broker = Broker()
+    daemon = DaemonConn("cap-host", "owner", FakeWS())  # type: ignore[arg-type]
+    first = BrowserConn("owner", "pty-a", FakeWS())  # type: ignore[arg-type]
+    second = BrowserConn("owner", "pty-b", FakeWS())  # type: ignore[arg-type]
+
+    async def register(session_id: str, browser: BrowserConn) -> bool:
+        return await broker.register_rtc_session(
+            session_id,
+            browser,
+            daemon=daemon,
+            scope_type="session",
+            scope_id=browser.session_id,
+            protocol="spawn.pty",
+            protocol_version=2,
+        )
+
+    assert await register("one", first)
+    assert not await register("same-browser-over-cap", first)
+    assert await register("two", second)
+    third = BrowserConn("owner", "pty-c", FakeWS())  # type: ignore[arg-type]
+    assert not await register("user-over-cap", third)
+
+
+@pytest.mark.asyncio
+async def test_local_accepted_daemon_eagerly_reclaims_lost_presence(app):
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+    from spawn_server.redis import get_backend
+    from spawn_server.ws.host_signal import host_presence_key
+
+    broker = Broker()
+    daemon = DaemonConn("reclaim-host", "owner", FakeWS())  # type: ignore[arg-type]
+    async with get_sessionmaker()() as session:
+        session.add(User(id="owner", email="reclaim@example.com", password_hash="hash"))
+        session.add(
+            Host(
+                id=daemon.host_id,
+                owner_user_id="owner",
+                name="reclaim",
+                status="online",
+                daemon_connection_id=daemon.id,
+                daemon_generation=9,
+                daemon_generation_counter=9,
+            )
+        )
+        await session.commit()
+    await _accept_owner(broker, daemon, generation=9)
+    current = await get_backend().get_ephemeral(host_presence_key(daemon.host_id))
+    assert current is not None
+    assert await get_backend().delete_ephemeral_if(host_presence_key(daemon.host_id), current)
+    assert await get_backend().get_ephemeral(host_presence_key(daemon.host_id)) is None
+    assert await broker.reclaim_daemon_presence_if_missing(daemon)
+    assert await get_backend().get_ephemeral(host_presence_key(daemon.host_id)) is not None
+
 
 @pytest.mark.asyncio
 async def test_broker_daemon_reconnect_supersedes_stale_connection_and_reassociates_sessions():
@@ -81,7 +253,6 @@ async def test_broker_daemon_reconnect_supersedes_stale_connection_and_reassocia
     assert session_id not in old_daemon.session_ids
 
     await broker.unregister_daemon(new_daemon)
-
 
 
 @pytest.mark.asyncio
@@ -165,7 +336,6 @@ async def test_host_ping_rejects_stale_daemon_and_generation(app):
     assert await task
 
     await broker.unregister_daemon(new)
-
 
 
 @pytest.mark.asyncio
@@ -336,7 +506,6 @@ async def test_committed_owner_promotion_repairs_older_cache_but_never_overwrite
         assert await backend.get_ephemeral(active_key) == protected
 
 
-
 @pytest.mark.asyncio
 async def test_host_rtc_replacement_blocks_stale_publish_and_preserves_binding(app):
     from spawn_server.redis import get_backend
@@ -464,9 +633,7 @@ async def test_rtc_binding_nonce_is_immutable_across_session_id_reuse(app):
 
 
 @pytest.mark.asyncio
-async def test_broker_rtc_tombstones_cap_and_expire_without_later_operation(
-    app, monkeypatch
-):
+async def test_broker_rtc_tombstones_cap_and_expire_without_later_operation(app, monkeypatch):
     from spawn_server.ws import host_signal
 
     monkeypatch.setattr(host_signal, "MAX_RTC_BINDING_IDENTITIES", 2)

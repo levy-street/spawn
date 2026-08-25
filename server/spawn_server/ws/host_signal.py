@@ -19,7 +19,8 @@ from .signed_signal_relay import (
 
 HOST_CONTROL_PROTOCOL = "spawn.host.ctl"
 HOST_CONTROL_VERSION = 1
-HOST_RTC_SESSION_TTL_SECONDS = 60
+HOST_RTC_SESSION_TTL_SECONDS = 120
+RTC_BINDING_ORPHAN_GRACE_SECONDS = 60
 RTC_CONNECTED_SESSION_TTL_SECONDS = 24 * 60 * 60
 RTC_BINDING_TOMBSTONE_TTL_SECONDS = 5 * 60
 MAX_RTC_BINDING_IDENTITIES = 4096
@@ -27,10 +28,26 @@ HOST_DAEMON_PRESENCE_TTL_SECONDS = 90
 MAX_HOST_RTC_SESSIONS_PER_BROWSER = 8
 MAX_HOST_RTC_SESSIONS_PER_HOST = 64
 MAX_HOST_RTC_SESSIONS_PER_DAEMON = 64
+MAX_SESSION_RTC_SESSIONS_PER_USER = 64
+MAX_SESSION_RTC_SESSIONS_PER_BROWSER = 16
 MAX_HOST_SIGNAL_ENVELOPE_BYTES = 1200 * 1024
-HOST_RTC_STATUS_ALLOWLIST = frozenset({"connected", "failed", "unavailable"})
+HOST_RTC_STATUS_ALLOWLIST = frozenset(
+    {
+        "connected",
+        "failed",
+        "unavailable",
+        "expired",
+        "signalling_lost",
+        "rebound",
+        "resumed",
+    }
+)
 HOST_OWNER_REVOKED_EVENT = "host.owner_revoked"
 BROWSER_PINS_CHANGED_EVENT = "host.browser_pins_changed"
+
+
+class SubscriptionLostError(RuntimeError):
+    """A Redis subscription pump ended while its WebSocket was still live."""
 
 
 async def wait_for_signal_pump(pump: asyncio.Task[None], ready: asyncio.Event) -> None:
@@ -48,7 +65,7 @@ async def wait_for_signal_pump(pump: asyncio.Task[None], ready: asyncio.Event) -
         with suppress(asyncio.CancelledError):
             await ready_task
         await pump
-        raise RuntimeError("host signal subscription stopped before becoming ready")
+        raise SubscriptionLostError("host signal subscription stopped before becoming ready")
     await ready_task
 
 
@@ -67,7 +84,30 @@ async def receive_with_signal_pump(websocket: Any, pump: asyncio.Task[None]) -> 
         with suppress(asyncio.CancelledError):
             await receive_task
         await pump
-        raise RuntimeError("host signal subscription stopped")
+        raise SubscriptionLostError("host signal subscription stopped")
+    return await receive_task
+
+
+async def receive_with_signal_pumps(
+    websocket: Any, pumps: tuple[asyncio.Task[None], ...]
+) -> dict[str, Any]:
+    """Receive while treating termination of any subscription as fatal."""
+
+    receive_task = asyncio.create_task(websocket.receive())
+    try:
+        done, _ = await asyncio.wait({*pumps, receive_task}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        receive_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await receive_task
+        raise
+    ended = next((pump for pump in pumps if pump in done), None)
+    if ended is not None:
+        receive_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await receive_task
+        await ended
+        raise SubscriptionLostError("websocket subscription stopped")
     return await receive_task
 
 
@@ -405,6 +445,37 @@ class RedisBrowserConn:
         if replacement.daemon_connection_id == self.daemon_connection_id:
             raise StaleHostOwnerError("revocation requires a replacement owner")
         await self._send_text_as_owner(payload, replacement)
+
+    async def send_server_status(
+        self,
+        payload: dict,
+        *,
+        dispatch_owner: HostPresenceOwner | None = None,
+    ) -> None:
+        """Publish server-derived binding status after signalling ownership loss.
+
+        Unlike peer-authored SDP/candidates this carries no endpoint content
+        and is derived from the broker's exact binding identity, so it need not
+        pretend a vanished Redis presence lease is still current.
+        """
+
+        owner = dispatch_owner or HostPresenceOwner(
+            self.daemon_connection_id,
+            self.daemon_generation,
+        )
+        dispatch = RtcSignalDispatch(
+            host_id=self.host_id,
+            session_connection_id=self.daemon_connection_id,
+            session_generation=self.daemon_generation,
+            binding_nonce=self.binding_nonce,
+            dispatch_connection_id=owner.daemon_connection_id,
+            dispatch_generation=owner.generation,
+            signal=payload,
+        )
+        await get_backend().publish_channel(
+            self.channel,
+            encode_rtc_signal_dispatch(dispatch),
+        )
 
 
 class StaleHostOwnerError(RuntimeError):

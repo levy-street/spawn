@@ -1,8 +1,11 @@
 """Redis connection and pub/sub helpers, with an in-process fallback for tests.
 
 The fallback implements the publish/subscribe API that the broker uses, keyed
-off agent UUIDs, in a single process. Production deployments use real Redis so
-multiple uvicorn workers can share state.
+off agent UUIDs, in a single process. Real Redis provides cross-worker host
+control routing, but the terminal-session signalling and daemon-facing HTTP
+paths still depend on the worker-local broker. Production therefore remains a
+one-uvicorn-worker deployment; see ``docs/NETWORK.md`` for the constraint and
+the named horizontal-scaling follow-up.
 """
 
 from __future__ import annotations
