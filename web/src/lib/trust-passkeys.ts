@@ -229,7 +229,7 @@ export function usePasskeyTrust() {
     const id = accountId as string;
     return {
       scope: { accountId: id },
-      userLabel: user?.email ?? "spawn operator",
+      userLabel: user?.email ?? "SPAWN D operator",
       trust,
       browserDevices,
       createTrustPasskey,

@@ -30,7 +30,9 @@ function assetName(asset: ImagePicker.ImagePickerAsset, fallback: string): strin
  * Resolves one image, or null when the operator backed out.
  *
  * Permission is asked for at the point of use rather than up front, so a refusal
- * explains itself against the thing that was just tapped.
+ * explains itself against the thing that was just tapped. The camera is the
+ * app's own overlay (`camera-overlay.tsx`), which stands over the nav bar and
+ * every drawer; the system picker sat underneath them.
  */
 export async function pickImage(
   source: ImageSource,
@@ -47,21 +49,16 @@ export async function pickImage(
   }
 
   if (source === "camera") {
-    const permission = await ImagePicker.requestCameraPermissionsAsync();
-    if (!permission.granted) throw new Error("spawn needs camera access to take a photo.");
-    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ["images"], quality: 0.9 });
-    const asset = result.canceled ? undefined : result.assets[0];
-    return asset
-      ? {
-          uri: asset.uri,
-          name: assetName(asset, "photo.jpg"),
-          mimeType: asset.mimeType ?? "image/jpeg",
-        }
-      : null;
+    // Loaded here rather than at the top: the host is a React component tree,
+    // and this module is imported by plain data code.
+    const { captureWithCamera } =
+      require("@/components/media/camera-host") as typeof import("@/components/media/camera-host");
+    return captureWithCamera();
   }
 
   const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-  if (!permission.granted) throw new Error("spawn needs photo access to upload from your library.");
+  if (!permission.granted)
+    throw new Error("SPAWN D needs photo access to upload from your library.");
   const result = await ImagePicker.launchImageLibraryAsync({
     mediaTypes: ["images"],
     quality: 0.9,

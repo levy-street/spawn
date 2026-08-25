@@ -109,7 +109,7 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
               <Icon color="brandAccent" name="Terminal" size={spacing[6]} />
             </View>
             <View style={styles.identityCopy}>
-              <Text variant="title">spawn</Text>
+              <Text variant="title">SPAWN D</Text>
               <Text color="mutedForeground" variant="caption">
                 Version {appVersion}
               </Text>
@@ -206,7 +206,7 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
 
       <SettingsSection title="Links">
         <SettingsLinkRow
-          accessibilityHint="Opens the spawn security page in your browser"
+          accessibilityHint="Opens the SPAWN D security page in your browser"
           icon="ShieldCheck"
           label="Security"
           onPress={() => void openExternal("Security", SECURITY_URL)}

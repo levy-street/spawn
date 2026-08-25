@@ -69,7 +69,7 @@ export function HostsPanel() {
             Hosts
           </h2>
           <p className="mt-1 text-sm leading-6 text-muted-foreground">
-            Machines running the spawn daemon and the sessions attached to them.
+            Machines running the spawnd daemon and the sessions attached to them.
           </p>
         </div>
 

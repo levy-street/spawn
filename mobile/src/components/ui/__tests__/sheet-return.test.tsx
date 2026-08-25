@@ -127,6 +127,61 @@ describe("a drawer opened from inside a drawer", () => {
     await view.unmount();
   });
 
+  it("keeps a returned drawer up although its owner still holds it closed", async () => {
+    // Most owners never mirror the return: they let go of the drawer when they
+    // raised the next one and hear nothing more. The returned drawer used to
+    // read that stale `visible={false}` as an order and go straight back down.
+    function Unmirrored(): React.JSX.Element {
+      const [menu, setMenu] = useState(true);
+      const [picker, setPicker] = useState(false);
+      return (
+        <>
+          <Pressable
+            onPress={() => {
+              setMenu(false);
+              setPicker(true);
+            }}
+          >
+            <NativeText>Open the picker</NativeText>
+          </Pressable>
+          <Sheet
+            onDismiss={() => {
+              menuHandlers.onDismiss();
+              setMenu(false);
+            }}
+            visible={menu}
+          >
+            <NativeText>Menu row</NativeText>
+          </Sheet>
+          <Sheet
+            onDismiss={() => {
+              pickerDismiss();
+              setPicker(false);
+            }}
+            visible={picker}
+          >
+            <NativeText>Picker row</NativeText>
+          </Sheet>
+        </>
+      );
+    }
+
+    const view = await render(<Unmirrored />, { wrapper: Providers });
+    await measurePanels(300);
+    await raisePickerFromMenu();
+
+    await dismissTopmost();
+    await waitFor(() => expect(screen.queryByText("Picker row")).toBeNull());
+    // Back on screen and taking touches again — and staying, with no
+    // dismissal reported to an owner that never asked for one.
+    await waitFor(() => {
+      expect(screen.getAllByTestId("sheet-overlay")[0]).toHaveProp("pointerEvents", "auto");
+    });
+    expect(screen.getByText("Menu row")).toBeTruthy();
+    expect(menuHandlers.onDismiss).not.toHaveBeenCalled();
+    await view.unmount();
+  });
+
   it("takes both away when the second one is answered instead", async () => {
     const view = await render(<Pair />, { wrapper: Providers });
     await measurePanels(300);

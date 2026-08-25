@@ -44,18 +44,24 @@ import {
   resolveOverlayClose,
   restoreOverlay,
 } from "@/components/ui/overlay-stack";
+import { OverlaySurfaceContext } from "@/components/ui/overlay-surface";
 import { useReducedMotionPreference } from "@/components/ui/swipe-dismiss-overlay";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
-import { layer, spacing, useTheme } from "@/theme";
+import { alpha, layer, spacing, useTheme } from "@/theme";
 import { bottomNavHeight, sizing } from "@/theme/sizing";
 
 export type DialogSize = "sm" | "md" | "lg" | "full-mobile" | "viewer";
 
 /** Long enough to read as an arrival, short enough not to delay the first tap. */
-const DIALOG_RISE_MS = 300;
+const DIALOG_RISE_MS = 260;
+/**
+ * Leaving is quick: the decision has been made, and a surface that lingers on
+ * its way out holds the page underneath hostage for no reason.
+ */
+const DIALOG_LEAVE_MS = 150;
 /** Carrying the surface off the side once a swipe has committed to it. */
-const DIALOG_SLIDE_MS = 220;
+const DIALOG_SLIDE_MS = 180;
 /** Rightward travel before the surface starts following the finger. */
 const SWIPE_ACTIVATION = 16;
 /** Vertical slack that hands the touch back to whatever scrolls underneath. */
@@ -164,6 +170,8 @@ export function Dialog({
   const entryRef = useRef<OverlayEntry | null>(null);
   const restoreRef = useRef<() => void>(() => undefined);
   const teardownRef = useRef<() => void>(() => undefined);
+  /** What the owner asked for last time the close effect ran. */
+  const wasVisibleRef = useRef(false);
   const insets = useSafeAreaInsets();
   const childInsets = useMemo(() => ({ ...insets, top: spacing[0] }), [insets]);
   // The nav bar is portalled to window level, which puts it *over* this modal
@@ -172,6 +180,7 @@ export function Dialog({
   const reservedBottomChrome = useBottomChromeOwnsInset() ? bottomNavHeight(insets.bottom) : 0;
 
   const enterDuration = reducedMotion ? theme.motion.duration.reduced : DIALOG_RISE_MS;
+  const leaveDuration = reducedMotion ? theme.motion.duration.reduced : DIALOG_LEAVE_MS;
 
   const restore = useCallback(() => {
     setSuspended(false);
@@ -231,11 +240,11 @@ export function Dialog({
       // It leaves the way it arrived: back down the short distance it rose, fading out.
       presence.value = withTiming(
         0,
-        { duration: enterDuration, easing: Easing.in(Easing.cubic) },
+        { duration: leaveDuration, easing: Easing.in(Easing.cubic) },
         settled,
       );
     },
-    [enterDuration, finishDismiss, presence, reducedMotion, slide, windowWidth],
+    [finishDismiss, leaveDuration, presence, reducedMotion, slide, windowWidth],
   );
 
   const requestClose = useCallback(
@@ -247,13 +256,36 @@ export function Dialog({
     [close],
   );
 
+  /**
+   * Gone at once, exit and all. A dialog is state-driven rather than a route,
+   * so a nav tap had nothing to pop and left the form standing over the
+   * destination; playing an exit there would hold a modal window over the
+   * destination tab for as long as the exit took.
+   */
+  const teardownNow = useCallback(() => {
+    closingRef.current = false;
+    closedItselfRef.current = false;
+    const entry = entryRef.current;
+    if (entry) resolveOverlayClose(entry, "owner");
+    setSuspended(false);
+    slide.value = 0;
+    setMounted(false);
+    onDismiss();
+  }, [onDismiss, slide]);
+  const teardownNowRef = useRef(teardownNow);
+  teardownNowRef.current = teardownNow;
+
+  // The owner's `visible` is read as an edge, not a level: a dialog the stack
+  // brought back is on screen while its owner still says `visible={false}`.
   useEffect(() => {
+    const wasVisible = wasVisibleRef.current;
+    wasVisibleRef.current = visible;
     if (visible) {
       closingRef.current = false;
       setMounted(true);
       return;
     }
-    if (mounted && !suspended) close("rise");
+    if (wasVisible && mounted && !suspended) close("rise");
   }, [close, mounted, suspended, visible]);
 
   // Raised again through its owner while it was waiting: the same return, with
@@ -288,13 +320,12 @@ export function Dialog({
     haptics.overlayOpen();
   }, [enterDuration, mounted, presence, slide, visible]);
 
-  // A dialog is state-driven rather than a route, so a nav tap had nothing to pop
-  // and left the form standing over the destination. It leaves at once there —
-  // playing an exit would hold a modal window over the destination tab.
+  // For the whole time it is mounted, waiting included: a dialog parked under a
+  // drawer is still a window that would otherwise survive the nav tap.
   useEffect(() => {
-    if (!visible) return;
-    return registerNavigationOverlayDismiss(onDismiss);
-  }, [onDismiss, visible]);
+    if (!mounted) return;
+    return registerNavigationOverlayDismiss(() => teardownNowRef.current());
+  }, [mounted]);
 
   const swipe = useMemo(
     () =>
@@ -331,6 +362,14 @@ export function Dialog({
       { translateX: slide.value },
     ],
   }));
+  // The page underneath dims as the surface arrives, and a swipe that carries
+  // the surface aside lets it back through in step.
+  const scrimStyle = useAnimatedStyle(() => ({
+    opacity:
+      presence.value *
+      alpha.a50 *
+      (1 - Math.min(1, Math.max(0, slide.value / Math.max(1, windowWidth)))),
+  }));
 
   if (!mounted) return null;
 
@@ -339,111 +378,128 @@ export function Dialog({
   const ChildInsetsProvider = SafeAreaInsetsContext?.Provider;
 
   return (
+    // Transparent on purpose: the window behind a full-screen modal is the
+    // system's own, and it is white. Every rise and every exit used to fade
+    // through that, which in dark mode was a white flash on both ends.
     <Modal
       animationType="none"
       onRequestClose={() => requestClose("rise")}
-      presentationStyle="fullScreen"
+      presentationStyle="overFullScreen"
       statusBarTranslucent
+      transparent
       // A dialog waiting under something raised from inside it is still mounted,
       // holding its form, but must not stand over what is on top of it.
       visible={!suspended}
     >
-      <GestureDetector gesture={swipe}>
+      <View style={styles.window} testID="dialog-window">
         <Animated.View
-          accessibilityViewIsModal
-          style={[
-            styles.surface,
-            {
-              paddingBottom:
-                footer === undefined ? Math.max(insets.bottom, reservedBottomChrome) : spacing[0],
-            },
-            contentStyle,
-            { backgroundColor: theme.colors.background, zIndex: layer.modal },
-            surfaceStyle,
-          ]}
-          testID={testID ?? "dialog-content"}
-        >
-          {hasHeader ? (
-            <View
-              style={[
-                styles.header,
-                {
-                  gap: theme.space(1),
-                  paddingBottom: theme.space(4),
-                  paddingHorizontal: theme.space(4),
-                  // The title row stands as tall as its close control now, which
-                  // carries part of the clearance the padding used to owe on its own.
-                  paddingTop: insets.top + theme.space(3),
-                },
-              ]}
-              testID="dialog-header"
-            >
-              {/* The close control shares a row with the title alone, so it centres
-                on that line rather than on a copy block a description may extend. */}
-              <View style={[styles.titleRow, { gap: theme.space(3) }]}>
-                <View style={styles.titleCopy}>
-                  {title !== undefined ? (
-                    <Text accessibilityRole="header" variant="uiLg" weight="semibold">
-                      {title}
-                    </Text>
+          pointerEvents="none"
+          style={[styles.scrim, { backgroundColor: theme.colors.scrim }, scrimStyle]}
+        />
+        <GestureDetector gesture={swipe}>
+          <Animated.View
+            accessibilityViewIsModal
+            style={[
+              styles.surface,
+              {
+                paddingBottom:
+                  footer === undefined ? Math.max(insets.bottom, reservedBottomChrome) : spacing[0],
+              },
+              contentStyle,
+              { backgroundColor: theme.colors.background, zIndex: layer.modal },
+              surfaceStyle,
+            ]}
+            testID={testID ?? "dialog-content"}
+          >
+            <OverlaySurfaceContext.Provider value="background">
+              {hasHeader ? (
+                <View
+                  style={[
+                    styles.header,
+                    {
+                      gap: theme.space(1),
+                      paddingBottom: theme.space(4),
+                      paddingHorizontal: theme.space(4),
+                      // The title row stands as tall as its close control now, which
+                      // carries part of the clearance the padding used to owe on its own.
+                      paddingTop: insets.top + theme.space(3),
+                    },
+                  ]}
+                  testID="dialog-header"
+                >
+                  {/* The close control shares a row with the title alone, so it centres
+                    on that line rather than on a copy block a description may extend. */}
+                  <View style={[styles.titleRow, { gap: theme.space(3) }]}>
+                    <View style={styles.titleCopy}>
+                      {title !== undefined ? (
+                        <Text accessibilityRole="header" variant="uiLg" weight="semibold">
+                          {title}
+                        </Text>
+                      ) : null}
+                    </View>
+                    {showCloseButton ? (
+                      // The same way out as the headerless X and the swipe: through
+                      // the dialog's own close, so it reads as backed out of rather
+                      // than closed from outside — which is what decides whether the
+                      // drawer it was raised from comes back.
+                      <IconButton
+                        accessibilityLabel={closeAccessibilityLabel}
+                        icon="X"
+                        onPress={() => requestClose("rise")}
+                        size="lg"
+                      />
+                    ) : null}
+                  </View>
+                  {description !== undefined ? (
+                    typeof description === "string" ? (
+                      <Text color="mutedForeground" variant="body">
+                        {description}
+                      </Text>
+                    ) : (
+                      description
+                    )
                   ) : null}
                 </View>
-                {showCloseButton ? (
-                  // The same way out as the headerless X and the swipe: through
-                  // the dialog's own close, so it reads as backed out of rather
-                  // than closed from outside — which is what decides whether the
-                  // drawer it was raised from comes back.
+              ) : null}
+
+              {ChildInsetsProvider === undefined ? (
+                <View style={styles.body} testID="dialog-body">
+                  {children}
+                </View>
+              ) : (
+                <ChildInsetsProvider value={childInsets}>
+                  <View style={styles.body} testID="dialog-body">
+                    {children}
+                  </View>
+                </ChildInsetsProvider>
+              )}
+
+              {footerActions.length > 0 ? (
+                <DialogFooter reservedBottomChrome={reservedBottomChrome}>
+                  {footerActions}
+                </DialogFooter>
+              ) : null}
+
+              {!hasHeader && showCloseButton ? (
+                <View
+                  pointerEvents="box-none"
+                  style={[
+                    styles.close,
+                    { right: theme.space(3), top: insets.top + theme.space(2) },
+                  ]}
+                >
                   <IconButton
                     accessibilityLabel={closeAccessibilityLabel}
                     icon="X"
                     onPress={() => requestClose("rise")}
-                    size="lg"
+                    size="sm"
                   />
-                ) : null}
-              </View>
-              {description !== undefined ? (
-                typeof description === "string" ? (
-                  <Text color="mutedForeground" variant="body">
-                    {description}
-                  </Text>
-                ) : (
-                  description
-                )
+                </View>
               ) : null}
-            </View>
-          ) : null}
-
-          {ChildInsetsProvider === undefined ? (
-            <View style={styles.body} testID="dialog-body">
-              {children}
-            </View>
-          ) : (
-            <ChildInsetsProvider value={childInsets}>
-              <View style={styles.body} testID="dialog-body">
-                {children}
-              </View>
-            </ChildInsetsProvider>
-          )}
-
-          {footerActions.length > 0 ? (
-            <DialogFooter reservedBottomChrome={reservedBottomChrome}>{footerActions}</DialogFooter>
-          ) : null}
-
-          {!hasHeader && showCloseButton ? (
-            <View
-              pointerEvents="box-none"
-              style={[styles.close, { right: theme.space(3), top: insets.top + theme.space(2) }]}
-            >
-              <IconButton
-                accessibilityLabel={closeAccessibilityLabel}
-                icon="X"
-                onPress={() => requestClose("rise")}
-                size="sm"
-              />
-            </View>
-          ) : null}
-        </Animated.View>
-      </GestureDetector>
+            </OverlaySurfaceContext.Provider>
+          </Animated.View>
+        </GestureDetector>
+      </View>
     </Modal>
   );
 }
@@ -458,6 +514,9 @@ const styles = StyleSheet.create({
   header: {
     alignItems: "stretch",
   },
+  scrim: {
+    ...StyleSheet.absoluteFillObject,
+  },
   titleCopy: {
     flex: 1,
     justifyContent: "center",
@@ -470,5 +529,8 @@ const styles = StyleSheet.create({
   surface: {
     flex: 1,
     width: "100%",
+  },
+  window: {
+    flex: 1,
   },
 });

@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Children, type ReactNode } from "react";
 import { type StyleProp, StyleSheet, View, type ViewStyle } from "react-native";
 import { Text } from "@/components/ui/text";
 import { alpha, borderWidth, useTheme } from "@/theme";
@@ -50,9 +50,22 @@ function colorWithAlpha(color: string, channelAlpha: number): string {
   return `rgba(${red},${green},${blue},${channelAlpha})`;
 }
 
+/**
+ * The badge's text, when its children are text. JSX like `🔥 {n} day streak`
+ * arrives as several strings and numbers rather than one, and a badge that only
+ * recognised a single string drew an empty pill around them.
+ */
+function textOf(children: ReactNode): string | null {
+  const parts = Children.toArray(children);
+  if (parts.length === 0) return null;
+  if (!parts.every((part) => typeof part === "string" || typeof part === "number")) return null;
+  return parts.map(String).join("");
+}
+
 export function Badge({ children, style, testID, variant = "default" }: BadgeProps) {
   const theme = useTheme();
   const normalizedVariant = canonicalBadgeVariant(variant);
+  const text = textOf(children);
   const palette = (() => {
     switch (normalizedVariant) {
       case "default":
@@ -107,9 +120,9 @@ export function Badge({ children, style, testID, variant = "default" }: BadgePro
       ]}
       testID={testID}
     >
-      {typeof children === "string" || typeof children === "number" ? (
+      {text !== null ? (
         <Text color={palette.textColor} variant="micro">
-          {children}
+          {text}
         </Text>
       ) : (
         children

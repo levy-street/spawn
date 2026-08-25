@@ -249,7 +249,7 @@ function HostDetail() {
     if (!host) return;
     const accepted = await confirm({
       title: `Remove ${host.name}?`,
-      body: "Its daemon token will be revoked. Existing session processes on that machine may continue locally, but spawn will no longer connect to them.",
+      body: "Its daemon token will be revoked. Existing session processes on that machine may continue locally, but SPAWN D will no longer connect to them.",
       confirmLabel: localDeletionPending ? "Retry deletion" : "Remove host",
       destructive: true,
     });

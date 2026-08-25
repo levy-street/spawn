@@ -47,7 +47,7 @@ export function readCallbackCode(url: string): { code: string } | { error: strin
     // what a provider says when *it* refused, and the two need different
     // responses from the person reading it.
     if (failure === "invite_required") {
-      return { error: "spawn is invite only right now. Enter an invite code to continue." };
+      return { error: "SPAWN D is invite only right now. Enter an invite code to continue." };
     }
     return { error: failure };
   }

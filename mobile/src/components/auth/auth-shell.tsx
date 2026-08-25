@@ -65,6 +65,17 @@ export interface AuthShellProps {
   brand?: boolean;
   children: ReactNode;
   description?: ReactNode;
+  /**
+   * Set above the lockup, at the very top of the sheet: the one choice that
+   * comes before everything else on it, such as which server this is.
+   */
+  lead?: ReactNode;
+  /**
+   * Pinned to the foot of the sheet, just above the foot rule, with the
+   * content pushed up to make room. The ways in sit here on the sign-in
+   * screen, where the thumb already is.
+   */
+  dock?: ReactNode;
   /** Marginalia set below the sheet's foot rule — the account switch, mostly. */
   footer?: ReactNode;
   /** Given when the screen was pushed: the rail grows a back control. */
@@ -154,6 +165,8 @@ export function AuthShell({
   brand = false,
   children,
   description,
+  lead,
+  dock,
   footer,
   onBack,
   title,
@@ -200,6 +213,9 @@ export function AuthShell({
             KeyboardAvoidingView stacked on the scroll view's own keyboard
             insets was compensating twice and overshooting the lower fields. */}
         <KeyboardAwareScrollView
+          // A sheet that fits the screen has nothing to scroll, and rubber-
+          // banding it read as a page that had lost something off the bottom.
+          alwaysBounceVertical={false}
           bottomOffset={spacing[3]}
           contentContainerStyle={[
             styles.scrollContent,
@@ -212,8 +228,13 @@ export function AuthShell({
         >
           <Animated.View
             entering={enter(0)}
-            style={[styles.masthead, !brand && styles.mastheadPlain]}
+            style={[
+              styles.masthead,
+              !brand && styles.mastheadPlain,
+              lead !== undefined && styles.mastheadLed,
+            ]}
           >
+            {lead === undefined ? null : <View style={styles.lead}>{lead}</View>}
             {brand ? <BrandLockup /> : null}
             <Text
               accessibilityRole="header"
@@ -243,8 +264,13 @@ export function AuthShell({
             {children}
           </Animated.View>
           <View style={styles.gap} />
+          {dock === undefined ? null : (
+            <Animated.View entering={enter(2)} style={styles.dock} testID="auth-dock">
+              {dock}
+            </Animated.View>
+          )}
           {footer === undefined ? null : (
-            <Animated.View entering={enter(2)} testID="auth-footer">
+            <Animated.View entering={enter(3)} testID="auth-footer">
               <AuthRule />
               <View style={styles.footer}>{footer}</View>
             </Animated.View>
@@ -275,6 +301,9 @@ const styles = StyleSheet.create({
     // foot. What sits between them is the work.
     paddingTop: spacing[7],
   },
+  dock: {
+    paddingBottom: spacing[6],
+  },
   description: {
     fontFamily: fontFamily.grimoireRegular,
     fontSize: fontSize.fifteen,
@@ -291,6 +320,12 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     minHeight: spacing[8],
   },
+  // The strip runs the full width of the sheet, the way its rules do, and
+  // stands clear of the lockup it introduces.
+  lead: {
+    marginBottom: spacing[10],
+    marginHorizontal: -authGutter,
+  },
   ground: {
     flex: 1,
   },
@@ -298,6 +333,11 @@ const styles = StyleSheet.create({
     paddingBottom: spacing[7],
     paddingHorizontal: authGutter,
     paddingTop: spacing[10],
+  },
+  // A strip at the head of the sheet sits close under the status bar, the way
+  // a tab bar does; the lockup's lead-in moves below it.
+  mastheadLed: {
+    paddingTop: spacing[3],
   },
   // Without the lockup above it the title needs less lead-in, and a pushed
   // screen already spent height on the control that got you here.

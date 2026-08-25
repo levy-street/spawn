@@ -64,7 +64,7 @@ export function AdminAccessBoundary({
         />
       ) : (
         <EmptyState
-          action={<Button onPress={onBack}>Back to spawn</Button>}
+          action={<Button onPress={onBack}>Back to SPAWN D</Button>}
           description="This account does not administer this deployment."
           icon="ShieldOff"
           testID="admin-access-denied"

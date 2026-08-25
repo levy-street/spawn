@@ -106,7 +106,7 @@ function VerifyEmail() {
         </div>
         {routingReady ? (
           <Button asChild className="h-11 w-full">
-            <Link href={continueHref}>Continue to spawn</Link>
+            <Link href={continueHref}>Continue to SPAWN D</Link>
           </Button>
         ) : (
           <Button className="h-11 w-full" disabled>

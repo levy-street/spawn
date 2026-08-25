@@ -168,7 +168,7 @@ export async function createTrustPasskey(
     created = await credentials.create({
       publicKey: {
         challenge: randomChallenge(),
-        rp: { id: options.rpId, name: options.rpName ?? "spawn" },
+        rp: { id: options.rpId, name: options.rpName ?? "SPAWN D" },
         user: {
           // The account UUID, not an email: this identifies the trust anchor,
           // and must stay stable if the operator changes their address.

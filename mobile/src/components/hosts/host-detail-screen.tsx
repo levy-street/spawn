@@ -162,7 +162,7 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
         />
         <Confirm
           confirmLabel={remove.error ? "Retry deletion" : "Remove host"}
-          description="Its daemon token is revoked. spawn stops connecting to that machine."
+          description="Its daemon token is revoked. SPAWN D stops connecting to that machine."
           destructive
           onCancel={() => setRemoveVisible(false)}
           onConfirm={() => {

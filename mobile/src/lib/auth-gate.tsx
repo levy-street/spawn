@@ -258,7 +258,7 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
 }
 
 const ALWAYS_PUBLIC_PATHS = new Set(["/reset-password", "/verify-email"]);
-const SIGNED_OUT_PUBLIC_PATHS = new Set(["/login", "/signup", "/forgot-password"]);
+const SIGNED_OUT_PUBLIC_PATHS = new Set(["/login", "/login-email", "/signup", "/forgot-password"]);
 const STANDALONE_PAIRING_PATHS = new Set([
   "/device",
   "/host",

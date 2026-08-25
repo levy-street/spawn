@@ -8,6 +8,7 @@ import { useCallback, useEffect } from "react";
 
 import { AlertPresenter } from "@/components/alerts/alert-presenter";
 import { ROUNDED_CARD_GESTURE_OPTIONS } from "@/components/nav/navigation-options";
+import { useCardAnimation } from "@/components/nav/navigation-reset";
 import { useToast } from "@/components/ui/toast";
 import { authToken } from "@/data/api/auth-token";
 import { AuthGate } from "@/lib/auth-gate";
@@ -31,11 +32,24 @@ void SplashScreen.preventAutoHideAsync();
  */
 export const TERMINAL_ROUTE_OPTIONS = ROUNDED_CARD_GESTURE_OPTIONS;
 
+/**
+ * The gate's own screens — the launch resolver, the account flow, onboarding,
+ * the signed-in shell — replace one another rather than stacking, and they do
+ * it under the gate's loading cover. A replace still played the push animation
+ * by default, so the very first screen slid in from the right over nothing;
+ * and the replace is animated off the screen *leaving*, which has had its
+ * options for the whole launch, rather than the one arriving. There is never
+ * anything legitimate under these to swipe back to, so the back gesture is off
+ * here — it was catching every horizontal swipe on the sign-in sheet. Only the
+ * terminal, a card pushed over the shell, animates and swipes at this level.
+ */
 export const ROOT_CARD_OPTIONS = {
   presentation: "card",
-  gestureEnabled: true,
+  gestureEnabled: false,
   gestureDirection: "horizontal",
-  fullScreenGestureEnabled: true,
+  fullScreenGestureEnabled: false,
+  animation: "none",
+  animationTypeForReplace: "pop",
 } as const;
 
 function IncomingLinkCoordinator(): null {
@@ -49,7 +63,7 @@ function IncomingLinkCoordinator(): null {
       if (!link) {
         if (isSpawnOwnedUrl(url)) {
           toast.error("Can’t open link", {
-            detail: "This spawn link is invalid or incomplete.",
+            detail: "This SPAWN D link is invalid or incomplete.",
           });
         }
         return;
@@ -80,6 +94,7 @@ function IncomingLinkCoordinator(): null {
 
 function RootNavigator(): React.JSX.Element {
   const theme = useTheme();
+  const cardAnimation = useCardAnimation();
 
   return (
     <>
@@ -108,7 +123,10 @@ function RootNavigator(): React.JSX.Element {
           <Stack.Screen name="(auth)" />
           <Stack.Screen name="onboarding" />
           <Stack.Screen name="(drawer)" />
-          <Stack.Screen name="terminal/[sessionId]" options={TERMINAL_ROUTE_OPTIONS} />
+          <Stack.Screen
+            name="terminal/[sessionId]"
+            options={{ ...TERMINAL_ROUTE_OPTIONS, animation: cardAnimation }}
+          />
         </Stack>
       </AuthGate>
     </>

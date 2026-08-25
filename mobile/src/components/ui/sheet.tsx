@@ -1,12 +1,14 @@
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Keyboard,
   type LayoutChangeEvent,
   Modal,
   Platform,
   ScrollView,
   type StyleProp,
   StyleSheet,
+  TextInput,
   useWindowDimensions,
   View,
   type ViewStyle,
@@ -33,6 +35,7 @@ import {
   resolveOverlayClose,
   restoreOverlay,
 } from "@/components/ui/overlay-stack";
+import { OverlaySurfaceContext } from "@/components/ui/overlay-surface";
 import { Text } from "@/components/ui/text";
 import { haptics } from "@/lib/haptics";
 import { alpha, borderWidth, chrome, opacity, shadow, useTheme } from "@/theme";
@@ -53,6 +56,8 @@ const OPEN_MS = 260;
 const CLOSE_MS = 200;
 /** Settling back after a drag that did not go far enough to close. */
 const SETTLE_SPRING = { damping: 26, mass: 0.7, stiffness: 260 } as const;
+
+type FocusedInput = ReturnType<typeof TextInput.State.currentlyFocusedInput>;
 
 /**
  * "content" hugs whatever the sheet holds — the shape every menu and confirm
@@ -99,6 +104,11 @@ export const SheetScrollView = ScrollView;
 /** Every sheet currently on screen, so navigation can clear them all at once. */
 const openSheets = new Set<() => void>();
 
+/**
+ * Takes every drawer down at once, without an exit. Primary navigation is
+ * replacing the whole scene underneath, and a panel sliding away over a page
+ * that is already gone reads as a leftover rather than a dismissal.
+ */
 export function dismissAllSheets(): void {
   for (const close of [...openSheets]) close();
 }
@@ -139,6 +149,10 @@ export function SheetHeader({ title, action }: SheetHeaderProps): React.JSX.Elem
  * holds — unless `size="tall"` claims the available height for content that
  * scrolls. Either way it owns the bottom safe-area inset so its last row clears
  * the home indicator.
+ *
+ * A drawer also owns the keyboard while it is up: whatever field had focus when
+ * it rose is put away, and gets its focus — and the keys — back when the drawer
+ * leaves, so a choice made from inside a form returns you to the form.
  */
 export function Sheet({
   visible,
@@ -165,6 +179,13 @@ export function Sheet({
   const [suspended, setSuspended] = useState(false);
   const closeReason = useRef<OverlayCloseReason>("owner");
   const entryRef = useRef<OverlayEntry | null>(null);
+  /** The prop as last rendered, for callbacks the stack fires between renders. */
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  /** What the owner asked for last time the close effect ran. */
+  const wasVisibleRef = useRef(false);
+  /** The field that had the keyboard when the drawer rose, owed its focus back. */
+  const focusedInputRef = useRef<FocusedInput>(null);
   /**
    * What was last rendered while this drawer was open. An owner usually clears
    * the state its rows were built from in the same breath as closing it, so a
@@ -178,6 +199,13 @@ export function Sheet({
   // refs rather than the closures it was built with.
   const restoreRef = useRef<() => void>(() => undefined);
   const teardownRef = useRef<() => void>(() => undefined);
+  const coveredRef = useRef<() => void>(() => undefined);
+
+  const restoreFocus = useCallback(() => {
+    const input = focusedInputRef.current;
+    focusedInputRef.current = null;
+    if (input) TextInput.State.focusTextInput(input);
+  }, []);
 
   const restore = useCallback(() => {
     setSuspended(false);
@@ -190,7 +218,8 @@ export function Sheet({
     setSuspended(false);
     setMounted(false);
     onDismiss();
-  }, [onDismiss]);
+    restoreFocus();
+  }, [onDismiss, restoreFocus]);
 
   restoreRef.current = restore;
   teardownRef.current = teardown;
@@ -204,7 +233,8 @@ export function Sheet({
     }
     setMounted(false);
     onDismiss();
-  }, [onDismiss]);
+    restoreFocus();
+  }, [onDismiss, restoreFocus]);
 
   const closeWith = useCallback(
     (velocity: number | null, reason: OverlayCloseReason) => {
@@ -234,13 +264,53 @@ export function Sheet({
   /** Closed by whatever owns it, which means its work here is finished. */
   const closeByOwner = useCallback(() => closeWith(null, "owner"), [closeWith]);
 
+  /**
+   * Gone at once, exit and all: primary navigation is replacing the scene this
+   * drawer stood over. Focus is not handed back — the field it belonged to is
+   * on a screen that is leaving too.
+   */
+  const teardownNow = useCallback(() => {
+    closingRef.current = false;
+    focusedInputRef.current = null;
+    const entry = entryRef.current;
+    if (entry) resolveOverlayClose(entry, "owner");
+    setSuspended(false);
+    setMounted(false);
+    onDismiss();
+  }, [onDismiss]);
+  const teardownNowRef = useRef(teardownNow);
+  teardownNowRef.current = teardownNow;
+
+  // Something opened over a drawer that had come back on its own — its owner
+  // still holds it closed, so as far as the owner is concerned nothing changed.
+  // Stepping aside here is what lets it return again if the new thing is
+  // dismissed, and go for good if the new thing is answered.
+  coveredRef.current = () => {
+    if (!visibleRef.current) closeByOwner();
+  };
+
+  // The owner's `visible` is read as an edge, not a level. A drawer brought back
+  // by the stack is on screen while its owner still says `visible={false}` —
+  // the owner let go of it when it raised the one above — and reading that as
+  // an instruction to close is what sent a returned drawer straight back down.
   useEffect(() => {
+    const wasVisible = wasVisibleRef.current;
+    wasVisibleRef.current = visible;
     if (visible) {
       closingRef.current = false;
+      if (!wasVisible || !mounted) {
+        // Whatever field had the keys gives them up while the drawer is up;
+        // they come back with the field when the drawer leaves.
+        const focused = TextInput.State.currentlyFocusedInput();
+        if (focused) {
+          focusedInputRef.current = focused;
+          Keyboard.dismiss();
+        }
+      }
       setMounted(true);
       return;
     }
-    if (mounted && !suspended) closeByOwner();
+    if (wasVisible && mounted && !suspended) closeByOwner();
   }, [closeByOwner, mounted, suspended, visible]);
 
   // Raised again through its owner while it was waiting: the same return, with
@@ -259,6 +329,7 @@ export function Sheet({
       closing: false,
       restore: () => restoreRef.current(),
       teardown: () => teardownRef.current(),
+      covered: () => coveredRef.current(),
     };
     entryRef.current = entry;
     enterOverlay(entry);
@@ -270,11 +341,12 @@ export function Sheet({
 
   useEffect(() => {
     if (!mounted) return;
-    openSheets.add(closeByOwner);
+    const close = () => teardownNowRef.current();
+    openSheets.add(close);
     return () => {
-      openSheets.delete(closeByOwner);
+      openSheets.delete(close);
     };
-  }, [closeByOwner, mounted]);
+  }, [mounted]);
 
   // The panel rises only once measured, so it never flashes at the wrong place —
   // and only on the first measurement. A sheet whose content changes size while
@@ -371,7 +443,7 @@ export function Sheet({
             styles.panel,
             {
               backgroundColor: theme.colors.popover,
-              borderColor: theme.colors.border,
+              borderColor: theme.colors.popoverBorder,
               // The foot only clears the screen edge while the sheet is being
               // dragged, so it carries the display's own radius the way a pushed
               // card does — square corners there cut across the hardware curve.
@@ -392,20 +464,22 @@ export function Sheet({
             <View
               style={[
                 styles.handle,
-                { backgroundColor: theme.colors.border, borderRadius: theme.radii.pill },
+                { backgroundColor: theme.colors.popoverBorder, borderRadius: theme.radii.pill },
               ]}
             />
           </View>
-          <View
-            style={[
-              isTall && styles.tallContent,
-              contentStyle,
-              { paddingBottom: Math.max(insets.bottom, sizing.screen.gutter) },
-            ]}
-            testID={testID ?? "sheet-content"}
-          >
-            {shownRef.current}
-          </View>
+          <OverlaySurfaceContext.Provider value="popover">
+            <View
+              style={[
+                isTall && styles.tallContent,
+                contentStyle,
+                { paddingBottom: Math.max(insets.bottom, sizing.screen.gutter) },
+              ]}
+              testID={testID ?? "sheet-content"}
+            >
+              {shownRef.current}
+            </View>
+          </OverlaySurfaceContext.Provider>
         </Animated.View>
       </View>
     </GestureDetector>

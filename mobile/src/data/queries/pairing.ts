@@ -362,7 +362,7 @@ export function useRegisteredPhone(accountId: string | undefined) {
     queryKey: qk.browserDeviceRegistration(accountId ?? "pending"),
     queryFn: () => {
       if (accountId === undefined) throw new Error("Account is not ready");
-      return ensureDeviceRegistered({ accountId, label: "spawn on iPhone" });
+      return ensureDeviceRegistered({ accountId, label: "SPAWN D on iPhone" });
     },
     // Never run against a half-loaded account: a query keyed on "" used to
     // throw before the account arrived and its failure looked real.

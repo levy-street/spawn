@@ -23,7 +23,9 @@ const AnimatedView = Animated.createAnimatedComponent(View);
 export function Spinner({
   color = "mutedForeground",
   label = "Loading",
-  size = spacing[4],
+  // A page's loading mark, not an inline one: buttons and strips pass their
+  // own smaller size. At the old 16pt it was a fleck in the middle of a screen.
+  size = spacing[7],
   testID,
 }: SpinnerProps) {
   const theme = useTheme();

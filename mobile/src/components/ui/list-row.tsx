@@ -24,6 +24,13 @@ export interface ListRowProps {
   shape?: "inset" | "fullBleed";
   /** Weight of the row's title. Default "medium"; "normal" for a quieter row. */
   titleWeight?: TextWeight;
+  /**
+   * Where the trailing control sits. "center" is the default: centred on the
+   * row, inside its gutter. "action" is for a row's overflow control: it lines
+   * up with the header's actions above — the same column from the screen edge,
+   * and level with the title rather than with the middle of a two-line block.
+   */
+  trailingPlacement?: "center" | "action";
 }
 
 export function ListRow({
@@ -38,6 +45,7 @@ export function ListRow({
   title,
   titleWeight = "medium",
   trailing,
+  trailingPlacement = "center",
 }: ListRowProps): React.JSX.Element {
   const theme = useTheme();
   const interactive = onPress !== undefined || onLongPress !== undefined;
@@ -79,7 +87,11 @@ export function ListRow({
             </Text>
           ) : null}
         </View>
-        {trailing !== undefined ? <View style={styles.trailing}>{trailing}</View> : null}
+        {trailing !== undefined ? (
+          <View style={[styles.trailing, trailingPlacement === "action" && styles.trailingAction]}>
+            {trailing}
+          </View>
+        ) : null}
       </View>
       {body === undefined ? null : <View style={styles.body}>{body}</View>}
     </Pressable>
@@ -154,5 +166,15 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     minHeight: sizing.listRow.trailingTarget,
     minWidth: sizing.listRow.trailingTarget,
+  },
+  trailingAction: {
+    alignSelf: "flex-start",
+    // Its centre on the title's line: the copy block sits `textGap` below the
+    // row's top once centred, and the target is taller than that line.
+    marginTop:
+      (sizing.type.rowLabel.lineHeight - sizing.listRow.trailingTarget) / 2 +
+      sizing.listRow.textGap,
+    // Pulled out of the row's gutter to the header's action column.
+    marginRight: -(sizing.listRow.horizontalPadding - sizing.listRow.trailingActionInset),
   },
 });

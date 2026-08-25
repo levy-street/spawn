@@ -7,8 +7,10 @@ import { SettingsBlock } from "@/components/settings/settings-block";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 import { Confirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
+import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import { listHostPins } from "@/data/api/endpoints/trust";
 import type { BrowserDeviceOut } from "@/data/api/schemas/devices";
@@ -23,7 +25,7 @@ import { qk } from "@/data/queryKeys";
 import { createDeviceEndorsement } from "@/data/trust/endorsement";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { ensureDeviceRegistered, revokeThisDevice } from "@/data/trust/registration";
-import { spacing } from "@/theme";
+import { spacing, useTheme } from "@/theme";
 
 interface HostDeviceTrust {
   host: HostOut;
@@ -39,6 +41,7 @@ function derivedDeviceFingerprint(device: BrowserDeviceOut): string {
 }
 
 export function BrowserDevicesPanel(): React.JSX.Element {
+  const theme = useTheme();
   const router = useRouter();
   const queryClient = useQueryClient();
   const me = useMeSettingsQuery();
@@ -63,7 +66,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
     if (!accountId) return;
     setRegistrationError(null);
     try {
-      const registered = await ensureDeviceRegistered({ accountId, label: "iPhone" });
+      const registered = await ensureDeviceRegistered({ accountId, label: "SPAWN D on iPhone" });
       setCurrentDevice(registered);
       setRevokedCurrent(false);
       await queryClient.invalidateQueries({ queryKey: qk.browserDevices() });
@@ -170,22 +173,31 @@ export function BrowserDevicesPanel(): React.JSX.Element {
   };
 
   return (
-    <SettingsScreen testID="browser-devices-panel" title="Browser devices">
+    <SettingsScreen
+      description="Every phone and browser signed in as you. A host only opens a terminal for a device it trusts."
+      testID="browser-devices-panel"
+      title="Browser devices"
+    >
       {registrationError ? (
-        <SettingsBlock>
-          <View style={styles.notice}>
-            <Text accessibilityRole="alert" variant="label">
-              This device's identity registration failed. Terminal access and approvals are
-              unavailable from here until it succeeds.
+        <Card style={[styles.notice, { borderColor: theme.colors.destructive }]} variant="flat">
+          <View style={styles.noticeHeading}>
+            <Icon color="destructive" name="ShieldOff" size={spacing[5]} />
+            <Text accessibilityRole="alert" style={styles.noticeTitle} variant="label">
+              This device could not register its identity
             </Text>
-            <Text color="destructive" variant="caption">
-              {registrationError}
-            </Text>
+          </View>
+          <Text color="mutedForeground" variant="body">
+            Terminal access and approvals are unavailable from here until it succeeds.
+          </Text>
+          <Text color="destructive" variant="caption">
+            {registrationError}
+          </Text>
+          <View style={styles.actions}>
             <Button onPress={() => void register()} size="sm" variant="outline">
               Retry registration
             </Button>
           </View>
-        </SettingsBlock>
+        </Card>
       ) : null}
       {revokedCurrent ? (
         <Button onPress={() => void register()} variant="outline">
@@ -193,9 +205,17 @@ export function BrowserDevicesPanel(): React.JSX.Element {
         </Button>
       ) : null}
       {approvalNote ? (
-        <Text accessibilityLiveRegion="polite" variant="body">
-          {approvalNote}
-        </Text>
+        <Card style={[styles.notice, { borderColor: theme.colors.success }]} variant="flat">
+          <View style={styles.noticeHeading}>
+            <Icon color="success" name="ShieldCheck" size={spacing[5]} />
+            <Text accessibilityLiveRegion="polite" style={styles.noticeTitle} variant="label">
+              Device approved
+            </Text>
+          </View>
+          <Text color="mutedForeground" variant="body">
+            {approvalNote}
+          </Text>
+        </Card>
       ) : null}
       {devices.error || trustMapError || actionError ? (
         <Text accessibilityRole="alert" color="destructive" variant="body">
@@ -204,29 +224,65 @@ export function BrowserDevicesPanel(): React.JSX.Element {
       ) : null}
 
       {currentDevice && trustedCount(currentDevice.id) === 0 ? (
-        <SettingsBlock>
-          <View style={styles.notice}>
-            <Text variant="label">This device can't open terminals yet</Text>
-            <Text color="mutedForeground" selectable variant="mono">
-              {derivedDeviceFingerprint(currentDevice)}
+        <Card style={[styles.notice, { borderColor: theme.colors.warning }]} variant="flat">
+          <View style={styles.noticeHeading}>
+            <Icon color="warning" name="ShieldAlert" size={spacing[5]} />
+            <Text style={styles.noticeTitle} variant="label">
+              This device can't open terminals yet
             </Text>
-            <Text color="mutedForeground" variant="body">
-              Open Browser devices on a working device and approve this fingerprint, or connect a
-              host directly.
-            </Text>
-            <View style={styles.actions}>
-              <Button onPress={() => router.push("/device-approval")} size="sm">
-                Approve this device
-              </Button>
-              <Button onPress={() => router.push("/onboarding/host")} size="sm" variant="outline">
-                Connect a host
-              </Button>
-            </View>
           </View>
-        </SettingsBlock>
+          <Text color="mutedForeground" variant="body">
+            No host trusts it. Approve this fingerprint from a device that already works, or connect
+            a host directly.
+          </Text>
+          <Text selectable variant="mono">
+            {derivedDeviceFingerprint(currentDevice)}
+          </Text>
+          <View style={styles.actions}>
+            <Button onPress={() => router.push("/device-approval")} size="sm">
+              Approve this device
+            </Button>
+            <Button onPress={() => router.push("/onboarding/host")} size="sm" variant="outline">
+              Connect a host
+            </Button>
+          </View>
+        </Card>
       ) : null}
 
-      <SettingsSection>
+      {approveTarget ? (
+        <Card style={[styles.notice, { borderColor: theme.colors.info }]} variant="flat">
+          <View style={styles.noticeHeading}>
+            <Icon color="info" name="Fingerprint" size={spacing[5]} />
+            <Text style={styles.noticeTitle} variant="label">
+              Approve {approveTarget.label ?? "this device"}?
+            </Text>
+          </View>
+          <Text color="mutedForeground" variant="body">
+            Compare this exact fingerprint on the other device. The name is only a label — cancel if
+            the fingerprint differs.
+          </Text>
+          <Text selectable variant="mono">
+            {derivedDeviceFingerprint(approveTarget)}
+          </Text>
+          <View style={styles.actions}>
+            <Button
+              disabled={endorsableHosts.length === 0}
+              loading={busy}
+              onPress={() => void approve()}
+              size="sm"
+            >
+              {busy ? "Approving…" : "It matches, approve"}
+            </Button>
+            <Button onPress={() => setApproveTarget(null)} size="sm" variant="outline">
+              Cancel
+            </Button>
+          </View>
+        </Card>
+      ) : null}
+
+      <SettingsSection
+        title={`Devices${activeDevices.length > 0 ? ` · ${activeDevices.length}` : ""}`}
+      >
         {activeDevices.length === 0 && !devices.isPending ? (
           <EmptyState icon="MonitorSmartphone" title="No registered browsers." />
         ) : (
@@ -262,37 +318,18 @@ export function BrowserDevicesPanel(): React.JSX.Element {
         )}
       </SettingsSection>
 
-      {approveTarget ? (
-        <SettingsBlock>
-          <View style={styles.notice}>
-            <Text variant="label">Approve {approveTarget.label ?? "this device"}?</Text>
-            <Text color="mutedForeground" variant="body">
-              Compare this exact fingerprint on the target device. The name is only a mutable label.
-              Cancel if the fingerprint differs.
-            </Text>
-            <Text selectable variant="mono">
-              {derivedDeviceFingerprint(approveTarget)}
-            </Text>
-            <View style={styles.actions}>
-              <Button
-                disabled={endorsableHosts.length === 0}
-                loading={busy}
-                onPress={() => void approve()}
-              >
-                {busy ? "Approving…" : "It matches, approve"}
-              </Button>
-              <Button onPress={() => setApproveTarget(null)} variant="secondary">
-                Cancel
-              </Button>
-            </View>
-          </View>
-        </SettingsBlock>
-      ) : null}
-
       {revokedDevices.length > 0 ? (
-        <SettingsSection>
-          <Button onPress={() => setShowRevoked((value) => !value)} variant="ghost">
-            Revoked devices ({revokedDevices.length})
+        <SettingsSection
+          description="Revoked devices keep no access. This is only a record."
+          title={`Revoked · ${revokedDevices.length}`}
+        >
+          <Button
+            onPress={() => setShowRevoked((value) => !value)}
+            size="sm"
+            style={styles.revokedToggle}
+            variant="outline"
+          >
+            {showRevoked ? "Hide revoked devices" : "Show revoked devices"}
           </Button>
           {showRevoked
             ? revokedDevices.map((device) => (
@@ -309,7 +346,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
               loading={mutations.prune.isPending}
               onPress={() => setConfirmPrune(true)}
               size="sm"
-              variant="outline"
+              variant="ghost"
             >
               Clear history
             </Button>
@@ -354,5 +391,16 @@ const styles = StyleSheet.create({
   },
   notice: {
     gap: spacing[3],
+  },
+  noticeHeading: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: spacing[2],
+  },
+  noticeTitle: {
+    flex: 1,
+  },
+  revokedToggle: {
+    alignSelf: "flex-start",
   },
 });

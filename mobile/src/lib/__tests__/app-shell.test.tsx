@@ -30,6 +30,11 @@ jest.mock("expo-router", () => {
   return {
     Stack,
     Tabs,
+    useNavigationContainerRef: () => ({
+      dispatch: jest.fn(),
+      getRootState: () => undefined,
+      isReady: () => false,
+    }),
     usePathname: () => "/workspaces",
     useRouter: () => ({ navigate: jest.fn(), replace: jest.fn(), push: jest.fn() }),
   };

@@ -134,7 +134,7 @@ export function FileExplorer({
                 label: "Download & Share…",
                 disabled: !hasHostFileStreams(transport),
                 detail: hasHostFileStreams(transport)
-                  ? "Keep spawn open until transfer finishes."
+                  ? "Keep SPAWN D open until transfer finishes."
                   : "Requires the verified host stream bridge.",
                 onPress: () => setSelected(actionEntry),
               },

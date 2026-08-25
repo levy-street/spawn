@@ -83,8 +83,8 @@ function viewFor(
       return {
         title: `Reconnecting${where}`,
         body: slow
-          ? "The link is still down. spawn keeps retrying — nothing in the session is lost."
-          : "The link dropped. spawn is retrying automatically.",
+          ? "The link is still down. SPAWN D keeps retrying — nothing in the session is lost."
+          : "The link dropped. SPAWN D is retrying automatically.",
         icon: PlugZap,
         tone: "text-warning",
         ring: "ring-warning/40",

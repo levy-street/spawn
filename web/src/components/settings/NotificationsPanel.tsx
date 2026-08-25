@@ -166,9 +166,9 @@ export function NotificationsPanel() {
           hint={
             systemUnavailable && support?.needsInstall ? (
               <>
-                On iPhone and iPad this needs spawn added to your home screen — open the share menu
-                and choose <span className="font-medium">Add to Home Screen</span>, then come back
-                here.
+                On iPhone and iPad this needs SPAWN D added to your home screen — open the share
+                menu and choose <span className="font-medium">Add to Home Screen</span>, then come
+                back here.
               </>
             ) : systemUnavailable ? (
               "This browser does not support web notifications."
@@ -229,7 +229,7 @@ export function NotificationsPanel() {
 
       <p className="text-xs text-muted-foreground">
         To silence one noisy session without turning any of this off, use{" "}
-        <span className="font-medium">Mute alerts</span> in that pane's menu. Closing every spawn
+        <span className="font-medium">Mute alerts</span> in that pane's menu. Closing every SPAWN D
         tab stops alerts entirely — nothing is delivered to a browser that is not running.
       </p>
     </section>
