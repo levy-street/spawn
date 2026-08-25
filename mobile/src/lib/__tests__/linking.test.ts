@@ -13,6 +13,8 @@ const TAB_ID = "33333333-3333-4333-8333-333333333333";
 const SESSION_ID = "44444444-4444-4444-8444-444444444444";
 const INVITE_TOKEN = "a".repeat(32);
 const ACCOUNT_TOKEN = "b".repeat(43);
+const APPROVAL_REF = "approval-ref-123";
+const HOST_KEY = "k".repeat(43);
 
 describe("incoming spawn links", () => {
   test.each([
@@ -82,6 +84,32 @@ describe("incoming spawn links", () => {
     expect(resolveIncomingLink(`exp://192.0.2.1:8081/--/sessions/${SESSION_ID}`)?.route).toBe(
       "/terminal/[sessionId]",
     );
+  });
+
+  it("routes host pairing refs to the pre-filled review with and without a host-key fragment", () => {
+    expect(resolveIncomingLink(`spawn://device?ref=${APPROVAL_REF}`)).toMatchObject({
+      route: "/onboarding/device",
+      params: { approvalRef: APPROVAL_REF },
+      href: `/onboarding/device?approvalRef=${APPROVAL_REF}`,
+    });
+    expect(resolveIncomingLink(`spawn://device?ref=${APPROVAL_REF}#k=${HOST_KEY}`)).toMatchObject({
+      route: "/onboarding/device",
+      params: { approvalRef: APPROVAL_REF, hostKey: HOST_KEY },
+    });
+    expect(
+      resolveIncomingLink(
+        `https://${UNIVERSAL_LINK_HOST}/device?ref=${APPROVAL_REF}#k=${HOST_KEY}`,
+      ),
+    ).toMatchObject({
+      route: "/onboarding/device",
+      params: { approvalRef: APPROVAL_REF, hostKey: HOST_KEY },
+    });
+  });
+
+  it("keeps a damaged identity fragment on the terminal-refusal path", () => {
+    expect(resolveIncomingLink(`spawn://device?ref=${APPROVAL_REF}#k=cut-off`)).toMatchObject({
+      params: { approvalRef: APPROVAL_REF, fragmentMalformed: "true" },
+    });
   });
 
   it("keeps drawer destination links public and route-group independent", () => {

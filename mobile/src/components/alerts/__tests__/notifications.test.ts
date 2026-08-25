@@ -10,6 +10,7 @@ import {
   normalizeNotificationPreferences,
   notificationCapabilities,
   parseNotificationNavigationTarget,
+  parseNotificationPairingTarget,
   scheduleLocalAlertNotification,
   setNotificationPreference,
   setSessionNotificationsMuted,
@@ -221,5 +222,25 @@ describe("local alert scheduling", () => {
       eventKey: "event-1",
     });
     expect(parseNotificationNavigationTarget({ workspaceId: "workspace-1" })).toBeNull();
+  });
+
+  it("accepts only the exact host pairing push shape", () => {
+    expect(
+      parseNotificationPairingTarget({
+        event: "host.pair_requested",
+        approvalRef: "approval-ref-123",
+      }),
+    ).toEqual({ approvalRef: "approval-ref-123" });
+    for (const malformed of [
+      null,
+      {},
+      { event: "host.pair_requested" },
+      { event: "host.pair_requested", approvalRef: "" },
+      { event: "host.pair_requested", approvalRef: " approval-ref-123" },
+      { event: "host.pair_requested", approvalRef: 42 },
+      { event: "device.approval_requested", approvalRef: "approval-ref-123" },
+    ]) {
+      expect(parseNotificationPairingTarget(malformed)).toBeNull();
+    }
   });
 });

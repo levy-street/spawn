@@ -1,15 +1,25 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Copy, KeyRound, Terminal } from "lucide-react";
-import { type FormEvent, type JSX, useEffect, useRef, useState } from "react";
+import { Check, CheckCircle2, Circle, Copy, KeyRound, Loader2, Terminal } from "lucide-react";
+import { type FormEvent, type JSX, useEffect, useMemo, useRef, useState } from "react";
 import { NumberCheck } from "@/components/access/number-check";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { StatusDot } from "@/components/ui/status";
-import { ApiError, auth, type DevicePendingApproval, type Host, hosts } from "@/lib/api";
+import { subscribeToTrustEvents } from "@/lib/alert-socket";
+import {
+  ApiError,
+  auth,
+  type DevicePendingApproval,
+  type Host,
+  hosts,
+  type SetupClaim,
+  type SetupClaimMint,
+  setupClaims,
+} from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
   createHostPairApprovalProof,
@@ -23,7 +33,13 @@ import {
   loadBrowserHostPin,
 } from "@/lib/browser-host-pins";
 import { publishHostIntroductionBroadcast } from "@/lib/host-gossip";
-import { detectPlatform, UNDETECTED_PLATFORM } from "@/lib/platform";
+import { PAIRING_FAILURE_COPY, pairingFailureCode } from "@/lib/pairing-errors";
+import { detectPlatform, setupInstallCommand, UNDETECTED_PLATFORM } from "@/lib/platform";
+import {
+  deriveSetupChecklist,
+  SETUP_CHECKLIST_LABELS,
+  setupChecklistStalledHint,
+} from "@/lib/setup-claims";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { cn } from "@/lib/utils";
 
@@ -95,33 +111,197 @@ async function seedApprovedHostBinding(input: {
 
 export function ConnectHostSection(props: {
   onHostOnline?: (host: Host) => void;
+  onPairingApproved?: (hostName: string) => void;
   /** Drop the card chrome and its heading: the host is already inside a framed,
    * titled surface (the onboarding sheet) and a second frame just doubles it. */
   frameless?: boolean;
   /** Forwarded to {@link PairingCodeForm}: read the possession handle and the
    * `#k=` identity fragment from the URL. Only `/device` sets this. */
   autoLoadFromUrl?: boolean;
+  /** `/device` approves a ceremony it was handed; onboarding and Add a
+   * machine mint attended setup claims. */
+  mintSetupClaim?: boolean;
+  /** An approval completed before this surface mounted, but its daemon has not
+   * connected yet. Resume at Approved instead of teaching installation again. */
+  resumeApprovedHost?: Host | null;
 }): JSX.Element {
-  const { onHostOnline, frameless = false, autoLoadFromUrl = false } = props;
+  const {
+    onHostOnline,
+    onPairingApproved,
+    frameless = false,
+    autoLoadFromUrl = false,
+    mintSetupClaim = !autoLoadFromUrl,
+    resumeApprovedHost = null,
+  } = props;
+  const { user } = useAuth();
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
-  const [copied, setCopied] = useState(false);
+  const [copyPulse, setCopyPulse] = useState(false);
+  const [commandCopied, setCommandCopied] = useState(false);
+  const [minted, setMinted] = useState<SetupClaimMint | null>(null);
+  const [claimSupport, setClaimSupport] = useState<
+    "idle" | "loading" | "supported" | "unsupported" | "error"
+  >("idle");
+  const [mintError, setMintError] = useState<string | null>(null);
+  const [mintAttempt, setMintAttempt] = useState(0);
+  const [locallyApproved, setLocallyApproved] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
   const notifiedRef = useRef(false);
+  const initialOnlineIdsRef = useRef<Set<string> | null>(null);
+  const progressStartedAtRef = useRef(Date.now());
   const hostsQ = useQuery({
-    queryKey: ["hosts"],
+    // Separate cache lane from onboarding's step derivation: this component
+    // gets one render with Online checked before `onHostOnline` advances the
+    // parent into its existing success beat.
+    queryKey: ["hosts", "setup"],
     queryFn: hosts.list,
     refetchInterval: 3_000,
   });
-  const onlineHost = hostsQ.data?.find((host) => host.status === "online");
+
+  useEffect(() => {
+    if (hostsQ.data === undefined || initialOnlineIdsRef.current !== null) return;
+    initialOnlineIdsRef.current = new Set(
+      hostsQ.data.filter((host) => host.status === "online").map((host) => host.id),
+    );
+  }, [hostsQ.data]);
 
   useEffect(() => {
     setPlatform(detectPlatform());
   }, []);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mintAttempt is an explicit retry/remint trigger
+  useEffect(() => {
+    if (!mintSetupClaim || !user) {
+      setClaimSupport("idle");
+      setMinted(null);
+      return;
+    }
+    let cancelled = false;
+    setClaimSupport("loading");
+    setMintError(null);
+    setMinted(null);
+    void setupClaims
+      .mint()
+      .then((response) => {
+        if (cancelled) return;
+        setMinted(response);
+        setClaimSupport("supported");
+      })
+      .catch((caught) => {
+        if (cancelled) return;
+        if (caught instanceof ApiError && (caught.status === 404 || caught.status === 405)) {
+          setClaimSupport("unsupported");
+          return;
+        }
+        setClaimSupport("error");
+        setMintError(
+          caught instanceof Error ? caught.message : "Live setup progress is unavailable",
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mintAttempt, mintSetupClaim, user]);
+
+  // A visible setup surface must never leave an expired token in the command.
+  // Hidden tabs pause the timer and re-check immediately when shown again.
+  useEffect(() => {
+    if (!minted) return;
+    let timer: number | null = null;
+    const expiration = Date.parse(minted.expires_at);
+    const remint = () => setMintAttempt((value) => value + 1);
+    const arm = () => {
+      if (document.hidden || !Number.isFinite(expiration)) return;
+      const remaining = expiration - Date.now();
+      if (remaining <= 0) {
+        remint();
+        return;
+      }
+      timer = window.setTimeout(remint, remaining);
+    };
+    const onVisibility = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+      if (!document.hidden) arm();
+    };
+    arm();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      if (timer !== null) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [minted]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new token starts a fresh visible checklist
+  useEffect(() => {
+    setCommandCopied(false);
+    setLocallyApproved(false);
+  }, [minted?.token]);
+
+  const claimQ = useQuery({
+    queryKey: ["setup-claim", minted?.token ?? null],
+    queryFn: () => setupClaims.get(minted?.token as string),
+    enabled: claimSupport === "supported" && minted !== null,
+    retry: (count, caught) =>
+      !(caught instanceof ApiError && (caught.status === 404 || caught.status === 405)) &&
+      count < 2,
+    refetchInterval: () => (typeof document !== "undefined" && document.hidden ? false : 2_000),
+  });
+  const claim = claimQ.data ?? null;
+
+  useEffect(() => {
+    if (!minted) return;
+    return subscribeToTrustEvents((event) => {
+      if (event.event !== "host.pair_requested" && event.event !== "host.pair_resolved") return;
+      if (claim?.approval_ref && event.approval_ref !== claim.approval_ref) return;
+      void claimQ.refetch();
+    });
+  }, [claim?.approval_ref, claimQ.refetch, minted]);
+
+  const onlineHost = useMemo(() => {
+    const listed = hostsQ.data ?? [];
+    if (resumeApprovedHost) {
+      return (
+        listed.find((host) => host.id === resumeApprovedHost.id && host.status === "online") ?? null
+      );
+    }
+    if (claim?.host_id) {
+      return listed.find((host) => host.id === claim.host_id && host.status === "online") ?? null;
+    }
+    const initial = initialOnlineIdsRef.current;
+    if (!initial) return null;
+    return listed.find((host) => host.status === "online" && !initial.has(host.id)) ?? null;
+  }, [claim?.host_id, hostsQ.data, resumeApprovedHost]);
+
   useEffect(() => {
     if (!onlineHost || notifiedRef.current) return;
-    notifiedRef.current = true;
-    onHostOnline?.(onlineHost);
+    // Let the checked Online milestone paint before onboarding replaces this
+    // surface with its existing success beat. The callback still fires once.
+    const timer = window.setTimeout(() => {
+      notifiedRef.current = true;
+      onHostOnline?.(onlineHost);
+    }, 350);
+    return () => window.clearTimeout(timer);
   }, [onlineHost, onHostOnline]);
+
+  const checklist = deriveSetupChecklist({
+    copied: commandCopied,
+    claim,
+    locallyApproved: locallyApproved || resumeApprovedHost !== null,
+    hostOnline: onlineHost !== null,
+  });
+  const progressKey = `${minted?.token ?? "fallback"}:${checklist.completedThrough}:${checklist.failed ?? "ok"}`;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: progressKey intentionally resets elapsed time on a milestone transition
+  useEffect(() => {
+    progressStartedAtRef.current = Date.now();
+    setNow(Date.now());
+  }, [progressKey]);
+  useEffect(() => {
+    if (checklist.completedThrough === 4 || checklist.failed) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [checklist.completedThrough, checklist.failed]);
+  const elapsedMs = now - progressStartedAtRef.current;
+  const stalledHint = setupChecklistStalledHint(checklist, elapsedMs);
 
   const platformName =
     platform.os === "macos"
@@ -131,6 +311,22 @@ export function ConnectHostSection(props: {
         : platform.os === "windows"
           ? "Windows"
           : "your machine";
+  const displayedCommand =
+    minted && typeof window !== "undefined"
+      ? setupInstallCommand(window.location.origin, minted.token)
+      : platform.installCommand;
+  const copyDisabled = claimSupport === "loading";
+
+  const copyCommand = async () => {
+    setCommandCopied(true);
+    try {
+      await navigator.clipboard.writeText(displayedCommand);
+      setCopyPulse(true);
+      window.setTimeout(() => setCopyPulse(false), 1_500);
+    } catch {
+      setCopyPulse(false);
+    }
+  };
 
   return (
     <Card className={cn("overflow-hidden shadow-none", frameless && "border-0 bg-transparent")}>
@@ -144,69 +340,239 @@ export function ConnectHostSection(props: {
         </CardHeader>
       )}
       <CardContent className={cn("space-y-5", frameless && "p-0")}>
-        <section aria-labelledby="install-daemon-title" className="space-y-2">
-          <div className="flex items-center gap-2">
-            <Terminal className="size-4 text-muted-foreground" aria-hidden />
-            <h3 id="install-daemon-title" className="text-sm font-medium">
-              Install on {platformName}
-            </h3>
-          </div>
-          <div className="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-muted p-2">
-            <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap px-1 font-mono text-xs">
-              {platform.installCommand}
-            </code>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-8 shrink-0"
-              aria-label="Copy install command"
-              onClick={async () => {
-                await navigator.clipboard.writeText(platform.installCommand);
-                setCopied(true);
-                window.setTimeout(() => setCopied(false), 1_500);
-              }}
-            >
-              {copied ? (
-                <Check className="size-4 text-success" aria-hidden />
-              ) : (
-                <Copy className="size-4" aria-hidden />
-              )}
-            </Button>
-          </div>
-          <p className="text-xs leading-5 text-muted-foreground">
-            After installation, run <code>spawnd possess</code> on that machine.
-          </p>
-        </section>
+        {resumeApprovedHost ? null : (
+          <section aria-labelledby="install-daemon-title" className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Terminal className="size-4 text-muted-foreground" aria-hidden />
+              <h3 id="install-daemon-title" className="text-sm font-medium">
+                Install on {platformName}
+              </h3>
+            </div>
+            <div className="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-muted p-2">
+              <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap px-1 font-mono text-xs">
+                {displayedCommand}
+              </code>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="size-8 shrink-0"
+                aria-label="Copy install command"
+                disabled={copyDisabled}
+                onClick={() => void copyCommand()}
+              >
+                {claimSupport === "loading" ? (
+                  <Loader2 className="size-4 animate-spin" aria-hidden />
+                ) : copyPulse ? (
+                  <Check className="size-4 text-success" aria-hidden />
+                ) : (
+                  <Copy className="size-4" aria-hidden />
+                )}
+              </Button>
+            </div>
+            <p className="text-xs leading-5 text-muted-foreground">
+              After installation, run <code>spawnd possess</code> on that machine.
+            </p>
+            <p className="text-xs leading-5 text-muted-foreground">
+              Already running SPAWN D for another account on that machine? Add{" "}
+              <code>--new-account</code>.
+            </p>
+            {mintError && (
+              <p className="text-xs leading-5 text-muted-foreground" role="status">
+                Live setup progress could not start ({mintError}). The install command still works.
+              </p>
+            )}
+          </section>
+        )}
 
-        <div className="h-px bg-border" />
+        {resumeApprovedHost ? null : <div className="h-px bg-border" />}
 
-        <section aria-labelledby="pair-host-title" className="space-y-3">
-          <div className="flex items-center gap-2">
-            <KeyRound className="size-4 text-muted-foreground" aria-hidden />
-            <h3 id="pair-host-title" className="text-sm font-medium">
-              Enter a pairing code
-            </h3>
-          </div>
-          <PairingCodeForm autoLoadFromUrl={autoLoadFromUrl} />
-        </section>
-
-        <div className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2.5 text-xs text-muted-foreground">
-          <StatusDot
-            tone={onlineHost ? "active" : "waiting"}
-            pulse={!onlineHost}
-            label={onlineHost ? `${onlineHost.name} is online` : "Waiting for your machine"}
+        {resumeApprovedHost ? (
+          <SetupChecklist
+            claim={null}
+            completedThrough={checklist.completedThrough}
+            elapsedMs={elapsedMs}
+            stalledHint={stalledHint}
           />
-          <span>{onlineHost ? `${onlineHost.name} is online.` : "Waiting for your machine…"}</span>
-        </div>
+        ) : claimSupport === "supported" && minted ? (
+          <SetupChecklist
+            claim={claim}
+            completedThrough={checklist.completedThrough}
+            elapsedMs={elapsedMs}
+            stalledHint={stalledHint}
+          />
+        ) : (
+          <LegacyWaitingState
+            onlineHost={onlineHost}
+            elapsedMs={elapsedMs}
+            onRetryClaims={
+              claimSupport === "error" ? () => setMintAttempt((value) => value + 1) : undefined
+            }
+          />
+        )}
+
+        {resumeApprovedHost ? null : claim?.status === "failed" && claim.error ? (
+          <PairingFailure failure={claim.error} />
+        ) : claim?.status === "ready" && claim.approval_ref ? (
+          <section className="space-y-3" aria-labelledby="inline-approve-title">
+            <div className="space-y-1">
+              <h3 id="inline-approve-title" className="text-sm font-medium">
+                Approve this machine
+              </h3>
+              <p className="text-xs leading-5 text-muted-foreground">
+                Fastest: open the link in the machine&apos;s terminal — it verifies the identity
+                automatically. Or compare the fingerprint below against the terminal.
+              </p>
+            </div>
+            <PairingCodeForm
+              approvalRef={claim.approval_ref}
+              inlineReview
+              onApproved={(hostName) => {
+                setLocallyApproved(true);
+                onPairingApproved?.(hostName);
+                void claimQ.refetch();
+              }}
+            />
+          </section>
+        ) : claim?.status === "approved" || locallyApproved ? null : (
+          <>
+            <div className="h-px bg-border" />
+
+            <section aria-labelledby="pair-host-title" className="space-y-3">
+              <div className="flex items-center gap-2">
+                <KeyRound className="size-4 text-muted-foreground" aria-hidden />
+                <h3 id="pair-host-title" className="text-sm font-medium">
+                  Enter a pairing code
+                </h3>
+              </div>
+              <PairingCodeForm autoLoadFromUrl={autoLoadFromUrl} onApproved={onPairingApproved} />
+            </section>
+          </>
+        )}
       </CardContent>
     </Card>
+  );
+}
+
+function SetupChecklist({
+  claim,
+  completedThrough,
+  elapsedMs,
+  stalledHint,
+}: {
+  claim: SetupClaim | null;
+  completedThrough: 0 | 1 | 2 | 3 | 4;
+  elapsedMs: number;
+  stalledHint: string | null;
+}) {
+  return (
+    <section className="space-y-3" aria-labelledby="setup-progress-title">
+      <h3 id="setup-progress-title" className="text-sm font-medium">
+        Setup progress
+      </h3>
+      <ol className="space-y-2" data-testid="setup-checklist">
+        {SETUP_CHECKLIST_LABELS.map((label, index) => {
+          const step = (index + 1) as 1 | 2 | 3 | 4;
+          const complete = completedThrough >= step;
+          const current = !complete && completedThrough + 1 === step;
+          return (
+            <li
+              key={label}
+              className="flex items-center gap-2 text-sm"
+              data-step={step}
+              data-state={complete ? "complete" : current ? "current" : "pending"}
+            >
+              {complete ? (
+                <CheckCircle2 className="size-4 shrink-0 text-success" aria-hidden />
+              ) : (
+                <Circle className="size-4 shrink-0 text-muted-foreground/50" aria-hidden />
+              )}
+              <span className={complete ? "text-foreground" : "text-muted-foreground"}>
+                {label}
+              </span>
+              {current && elapsedMs >= 30_000 && elapsedMs < 60_000 ? (
+                <span className="ml-auto text-xs text-muted-foreground" role="status">
+                  Still waiting…
+                </span>
+              ) : null}
+            </li>
+          );
+        })}
+      </ol>
+      {stalledHint ? (
+        <p className="text-xs leading-5 text-muted-foreground" data-testid="setup-stalled-hint">
+          {stalledHint}
+        </p>
+      ) : null}
+      {claim?.host_name && claim.status !== "pending" ? (
+        <p className="text-xs text-muted-foreground" role="status">
+          {claim.host_name} registered{claim.os ? ` · ${claim.os}` : ""}
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+function LegacyWaitingState({
+  onlineHost,
+  elapsedMs,
+  onRetryClaims,
+}: {
+  onlineHost: Host | null;
+  elapsedMs: number;
+  onRetryClaims?: () => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2.5 text-xs text-muted-foreground">
+        <StatusDot
+          tone={onlineHost ? "active" : "waiting"}
+          pulse={!onlineHost}
+          label={onlineHost ? `${onlineHost.name} is online` : "Waiting for your machine"}
+        />
+        <span>{onlineHost ? `${onlineHost.name} is online.` : "Waiting for your machine…"}</span>
+      </div>
+      {!onlineHost && elapsedMs >= 30_000 && elapsedMs < 60_000 ? (
+        <p className="text-xs text-muted-foreground" role="status">
+          Still waiting…
+        </p>
+      ) : null}
+      {!onlineHost && elapsedMs >= 60_000 ? (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-xs leading-5 text-muted-foreground">
+            Having trouble? Re-run the install command — it&apos;s safe to repeat.
+          </p>
+          {onRetryClaims ? (
+            <Button type="button" variant="outline" size="sm" onClick={onRetryClaims}>
+              Retry live progress
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function PairingFailure({ failure }: { failure: keyof typeof PAIRING_FAILURE_COPY }) {
+  return (
+    <div
+      className="space-y-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3"
+      data-testid="pairing-failure"
+      role="alert"
+    >
+      <p className="text-sm font-medium">This machine was not approved</p>
+      <p className="whitespace-pre-line text-sm leading-6 text-muted-foreground">
+        {PAIRING_FAILURE_COPY[failure]}
+      </p>
+    </div>
   );
 }
 
 export function PairingCodeForm({
   onApproved,
   autoLoadFromUrl = false,
+  approvalRef = null,
+  inlineReview = false,
 }: {
   onApproved?: (hostName: string) => void;
   /**
@@ -216,6 +582,11 @@ export function PairingCodeForm({
    * onboarding embeddings type a code by hand and leave this off.
    */
   autoLoadFromUrl?: boolean;
+  /** Setup-claim inline review. It has no `#k=` channel, so this deliberately
+   * enters the full-fingerprint compare frame. */
+  approvalRef?: string | null;
+  /** Keep the typed-code fallback below the claim-fed review card. */
+  inlineReview?: boolean;
 } = {}) {
   const { user } = useAuth();
   const queryClient = useQueryClient();
@@ -226,7 +597,12 @@ export function PairingCodeForm({
   const [localPinState, setLocalPinState] = useState<BrowserHostPinState | "new" | null>(null);
   const [localPinCommitted, setLocalPinCommitted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<keyof typeof PAIRING_FAILURE_COPY | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [submittingSince, setSubmittingSince] = useState<number | null>(null);
+  const [submittingNow, setSubmittingNow] = useState(() => Date.now());
+  const operationRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
   // The identifier a successful review was loaded with, reused verbatim by
   // approve: the opaque URL ref (auto-open path) or the typed user_code.
   const [identifier, setIdentifier] = useState<{
@@ -243,7 +619,34 @@ export function PairingCodeForm({
   // The operator said the fingerprints do not match. Terminal, like a refusal.
   const [stopped, setStopped] = useState(false);
 
+  const beginOperation = () => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const operation = operationRef.current + 1;
+    operationRef.current = operation;
+    const started = Date.now();
+    setSubmitting(true);
+    setSubmittingSince(started);
+    setSubmittingNow(started);
+    return { operation, signal: controller.signal };
+  };
+
+  const operationIsCurrent = (operation: number) => operationRef.current === operation;
+
+  useEffect(() => {
+    if (submittingSince === null) return;
+    const timer = window.setInterval(() => setSubmittingNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [submittingSince]);
+  const submittingElapsed = submittingSince === null ? 0 : submittingNow - submittingSince;
+
   const resetCeremony = () => {
+    operationRef.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setSubmitting(false);
+    setSubmittingSince(null);
     setPending(null);
     setFragmentVerified(false);
     setRefusal(null);
@@ -252,6 +655,7 @@ export function PairingCodeForm({
     setLocalPinCommitted(false);
     setStopped(false);
     setError(null);
+    setFailure(null);
     setIdentifier(null);
     setHostName(null);
     setCode("");
@@ -268,10 +672,13 @@ export function PairingCodeForm({
       : { user_code: (id.user_code ?? "").trim().toUpperCase() };
     if (!lookup.approval_ref && !lookup.user_code) return;
     setError(null);
-    setSubmitting(true);
+    setFailure(null);
+    const { operation, signal } = beginOperation();
     try {
-      const response = await auth.pendingDevice(lookup);
+      const response = await auth.pendingDevice(lookup, signal);
+      if (!operationIsCurrent(operation)) return;
       const expectedFingerprint = await ed25519PublicKeyFingerprint(response.host_public_key);
+      if (!operationIsCurrent(operation)) return;
       if (response.host_key_fingerprint !== expectedFingerprint) {
         throw new ApprovalIdentityError(
           "The host's identity did not check out; nothing was trusted",
@@ -292,12 +699,19 @@ export function PairingCodeForm({
         hostPublicKey: response.host_public_key,
         hostFingerprint: expectedFingerprint,
       });
+      if (!operationIsCurrent(operation)) return;
       setFragmentVerified(fragmentKey !== null);
       setIdentifier(lookup);
       setPending(response);
       setLocalPinState(existing?.state ?? "new");
       setLocalPinCommitted(existing?.state === "active");
     } catch (caught) {
+      if (!operationIsCurrent(operation) || signal.aborted) return;
+      const knownFailure = pairingFailureCode(caught);
+      if (knownFailure) {
+        setFailure(knownFailure);
+        return;
+      }
       setError(
         caught instanceof ApiError || caught instanceof ApprovalIdentityError
           ? caught.message
@@ -306,7 +720,11 @@ export function PairingCodeForm({
             : "Approval failed",
       );
     } finally {
-      setSubmitting(false);
+      if (operationIsCurrent(operation)) {
+        abortRef.current = null;
+        setSubmitting(false);
+        setSubmittingSince(null);
+      }
     }
   };
 
@@ -338,13 +756,24 @@ export function PairingCodeForm({
     void review(ref ? { approval_ref: ref } : { user_code: urlCode ?? undefined });
   }, [user, autoLoadFromUrl]);
 
+  const approvalRefTriedRef = useRef<string | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: review is the ceremony operation; the ref makes this one-shot per approval_ref
+  useEffect(() => {
+    if (!approvalRef || !user || approvalRefTriedRef.current === approvalRef) return;
+    approvalRefTriedRef.current = approvalRef;
+    fragmentKeyRef.current = null;
+    void review({ approval_ref: approvalRef });
+  }, [approvalRef, user]);
+
   const onApprove = async () => {
     if (!pending || !user || registration.data?.status !== "ready") return;
     setError(null);
-    setSubmitting(true);
+    setFailure(null);
+    const { operation, signal } = beginOperation();
     let localPinPersisted = false;
     try {
       const localIdentity = await loadBrowserDeviceIdentity(user.id);
+      if (!operationIsCurrent(operation)) return;
       if (
         localIdentity === null ||
         localIdentity.publicKeyWire !== registration.data.device.public_key
@@ -362,6 +791,7 @@ export function PairingCodeForm({
         );
       }
       const expectedFingerprint = await ed25519PublicKeyFingerprint(pending.host_public_key);
+      if (!operationIsCurrent(operation)) return;
       if (pending.host_key_fingerprint !== expectedFingerprint) {
         throw new ApprovalIdentityError(
           "The host's identity changed mid-check; nothing was trusted",
@@ -373,6 +803,7 @@ export function PairingCodeForm({
         hostPublicKey: pending.host_public_key,
         hostFingerprint: expectedFingerprint,
       });
+      if (!operationIsCurrent(operation)) return;
       localPinPersisted = true;
       setLocalPinCommitted(true);
       setLocalPinState("active");
@@ -382,23 +813,30 @@ export function PairingCodeForm({
         pending.approval_nonce,
         pending.host_public_key,
       );
-      const response = await auth.approveDevice({
-        ...(identifier ?? { user_code: code.trim().toUpperCase() }),
-        approval_nonce: pending.approval_nonce,
-        host_key_algorithm: pending.host_key_algorithm,
-        host_public_key: pending.host_public_key,
-        host_key_fingerprint: pending.host_key_fingerprint,
-        browser_device_id: registration.data.device.id,
-        browser_key_algorithm: registration.data.device.key_algorithm,
-        browser_public_key: registration.data.device.public_key,
-        // Derived locally from this browser's own key (mesh B5): the server
-        // serves no fingerprint next to a key, so the wire copy the daemon
-        // stores originates here, from the key holder.
-        browser_key_fingerprint: await ed25519PublicKeyFingerprint(
-          registration.data.device.public_key,
-        ),
-        signature,
-      });
+      if (!operationIsCurrent(operation)) return;
+      const browserKeyFingerprint = await ed25519PublicKeyFingerprint(
+        registration.data.device.public_key,
+      );
+      if (!operationIsCurrent(operation)) return;
+      const response = await auth.approveDevice(
+        {
+          ...(identifier ?? { user_code: code.trim().toUpperCase() }),
+          approval_nonce: pending.approval_nonce,
+          host_key_algorithm: pending.host_key_algorithm,
+          host_public_key: pending.host_public_key,
+          host_key_fingerprint: pending.host_key_fingerprint,
+          browser_device_id: registration.data.device.id,
+          browser_key_algorithm: registration.data.device.key_algorithm,
+          browser_public_key: registration.data.device.public_key,
+          // Derived locally from this browser's own key (mesh B5): the server
+          // serves no fingerprint next to a key, so the wire copy the daemon
+          // stores originates here, from the key holder.
+          browser_key_fingerprint: browserKeyFingerprint,
+          signature,
+        },
+        signal,
+      );
+      if (!operationIsCurrent(operation)) return;
       // The approve echo carries the keys alone (mesh B5); comparing them
       // byte-for-byte subsumes any fingerprint comparison.
       if (
@@ -454,6 +892,12 @@ export function PairingCodeForm({
       setIdentifier(null);
       setCode("");
     } catch (caught) {
+      if (!operationIsCurrent(operation) || signal.aborted) return;
+      const knownFailure = pairingFailureCode(caught);
+      if (knownFailure) {
+        setFailure(knownFailure);
+        return;
+      }
       const message =
         caught instanceof ApiError || caught instanceof ApprovalIdentityError
           ? caught.message
@@ -466,7 +910,11 @@ export function PairingCodeForm({
           : message,
       );
     } finally {
-      setSubmitting(false);
+      if (operationIsCurrent(operation)) {
+        abortRef.current = null;
+        setSubmitting(false);
+        setSubmittingSince(null);
+      }
     }
   };
 
@@ -519,34 +967,50 @@ export function PairingCodeForm({
   // surface, not the identity check again — that part already passed.
   const retryable = Boolean(error && localPinCommitted && pending);
 
+  if (failure) return <PairingFailure failure={failure} />;
+
   return (
     <form className="space-y-3" onSubmit={onReview}>
-      <div className="space-y-1.5">
-        <Label htmlFor="host-pairing-code">Code from the terminal</Label>
-        <Input
-          id="host-pairing-code"
-          placeholder="QZ4K-7HMT"
-          inputMode="text"
-          autoCapitalize="characters"
-          autoComplete="one-time-code"
-          value={code}
-          onChange={(event) => {
-            setCode(event.currentTarget.value);
-            setPending(null);
-            setLocalPinState(null);
-            setLocalPinCommitted(false);
-            setHostName(null);
-          }}
-          required
-          disabled={pending !== null}
-        />
-      </div>
+      {!inlineReview || (!pending && !hostName) ? (
+        <div className="space-y-1.5">
+          <Label htmlFor={inlineReview ? "inline-host-pairing-code" : "host-pairing-code"}>
+            Code from the terminal
+          </Label>
+          <Input
+            id={inlineReview ? "inline-host-pairing-code" : "host-pairing-code"}
+            placeholder="QZ4K-7HMT"
+            inputMode="text"
+            autoCapitalize="characters"
+            autoComplete="one-time-code"
+            value={code}
+            onChange={(event) => {
+              setCode(event.currentTarget.value);
+              setPending(null);
+              setLocalPinState(null);
+              setLocalPinCommitted(false);
+              setHostName(null);
+            }}
+            required
+            disabled={pending !== null}
+          />
+        </div>
+      ) : null}
 
       {error && !retryable && (
         <p className="text-sm text-destructive" role="alert">
           {error}
         </p>
       )}
+      {submitting && !pending && submittingElapsed >= 30_000 ? (
+        <div className="flex flex-wrap items-center justify-between gap-2" role="status">
+          <p className="text-xs text-muted-foreground">Still waiting…</p>
+          {submittingElapsed >= 60_000 ? (
+            <Button type="button" variant="ghost" size="sm" onClick={resetCeremony}>
+              Cancel
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       {registration.isError && (
         <p className="text-sm text-destructive" role="alert">
           This browser&apos;s identity registration failed, so it cannot approve hosts. Reload to
@@ -559,6 +1023,18 @@ export function PairingCodeForm({
           approve hosts.
         </p>
       )}
+      {submitting && pending && (fragmentVerified || retryable) && submittingElapsed >= 30_000 ? (
+        <div className="flex flex-wrap items-center justify-between gap-2" role="status">
+          <p className="text-xs text-muted-foreground">
+            Taking a while? Make sure the machine is still open.
+          </p>
+          {submittingElapsed >= 60_000 ? (
+            <Button type="button" variant="ghost" size="sm" onClick={resetCeremony}>
+              Cancel
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       {retryable ? (
         // The local pin already landed and only the server step failed. The
         // identity check has passed, so re-running it would be theatre — offer
@@ -670,6 +1146,13 @@ export function PairingCodeForm({
             phase={checkPhase}
             mode="enter"
             fingerprint={pending?.host_key_fingerprint}
+            fingerprintHelp={
+              inlineReview
+                ? "Compare this full fingerprint against the one shown in the machine's terminal."
+                : undefined
+            }
+            slowHint={submitting && submittingElapsed >= 30_000}
+            waitingEscape={submitting && submittingElapsed >= 60_000}
             otherScreen="in the host's terminal"
             doneText={`${hostName} is possessed. All your devices can reach it.`}
             stoppedText="The fingerprints don't match, so nothing was trusted. Start over from the host's terminal."
@@ -681,6 +1164,11 @@ export function PairingCodeForm({
             onDone={resetCeremony}
             onClose={resetCeremony}
           />
+          {inlineReview && pending && !hostName && !stopped ? (
+            <Button type="button" variant="ghost" className="w-full" onClick={resetCeremony}>
+              Enter a pairing code instead
+            </Button>
+          ) : null}
         </>
       ) : (
         <div className="space-y-3" data-testid="possess-instructions">

@@ -218,6 +218,8 @@ export interface AppMockStore {
   hosts: JsonRecord[];
   sessions: JsonRecord[];
   workspaces: JsonRecord[];
+  /** Mutable so a spec can advance pending → ready → approved between polls. */
+  setupClaim: JsonRecord | null;
   agents: JsonRecord[];
   workspaceTemplates: JsonRecord[];
   skills: JsonRecord[];
@@ -228,6 +230,7 @@ export interface AppMockStore {
     auth: JsonRecord[];
     sessions: JsonRecord[];
     workspaces: JsonRecord[];
+    setupClaims: JsonRecord[];
     workspacePatches: Array<{ id: string; body: JsonRecord }>;
     workspaceArchives: Array<{ id: string; restoring: boolean }>;
     agents: JsonRecord[];
@@ -240,6 +243,14 @@ export interface AppMockOptions {
   sessions?: unknown[];
   hosts?: unknown[];
   workspaces?: unknown[];
+  /** Omit for an older server (POST /api/setup/claims returns 404). */
+  setupClaim?: JsonRecord & {
+    token: string;
+    expires_in: number;
+    expires_at: string;
+  };
+  devicePendingError?: { status: number; code?: string; message?: string; detail?: unknown };
+  deviceApproveError?: { status: number; code?: string; message?: string; detail?: unknown };
   agents?: unknown[];
   workspaceTemplates?: JsonRecord[];
   skills?: unknown[];
@@ -306,6 +317,8 @@ export interface AppMockOptions {
 export async function mockApp(page: Page, options: AppMockOptions = {}): Promise<AppMockStore> {
   let workspaceFull = options.workspaceFull ?? false;
   let nextWorkspacePatchFailure: { status: number; detail: string } | null = null;
+  const setupClaimInput = options.setupClaim;
+  const setupClaimToken = setupClaimInput?.token ?? null;
   const store: AppMockStore = {
     user: options.me === undefined ? { ...user } : options.me,
     config: {
@@ -317,6 +330,20 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     hosts: (options.hosts ?? [host]).map((item) => ({ ...(item as JsonRecord) })),
     sessions: (options.sessions ?? []).map((item) => ({ ...(item as JsonRecord) })),
     workspaces: (options.workspaces ?? [workspace()]).map((item) => ({ ...(item as JsonRecord) })),
+    setupClaim: setupClaimInput
+      ? {
+          status: "pending",
+          approval_ref: null,
+          host_name: null,
+          os: null,
+          host_key_fingerprint: null,
+          host_id: null,
+          error: null,
+          ...setupClaimInput,
+          token: undefined,
+          expires_in: undefined,
+        }
+      : null,
     agents: (options.agents ?? [agent()]).map((item) => ({ ...(item as JsonRecord) })),
     workspaceTemplates: (options.workspaceTemplates ?? []).map((item) => ({
       ...(item as JsonRecord),
@@ -341,6 +368,7 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       auth: [],
       sessions: [],
       workspaces: [],
+      setupClaims: [],
       workspacePatches: [],
       workspaceArchives: [],
       agents: [],
@@ -827,6 +855,32 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       await json(route, store.config);
       return;
     }
+    if (path === "/api/setup/claims" && method === "POST") {
+      store.requests.setupClaims.push(await readBody());
+      if (!setupClaimInput) {
+        await json(route, { detail: "not found" }, 404);
+        return;
+      }
+      await json(
+        route,
+        {
+          token: setupClaimInput.token,
+          expires_in: setupClaimInput.expires_in,
+          expires_at: setupClaimInput.expires_at,
+        },
+        201,
+      );
+      return;
+    }
+    const setupClaimMatch = path.match(/^\/api\/setup\/claims\/([^/]+)$/);
+    if (setupClaimMatch && method === "GET") {
+      if (!store.setupClaim || setupClaimMatch[1] !== setupClaimToken) {
+        await json(route, { detail: "not found" }, 404);
+        return;
+      }
+      await json(route, store.setupClaim);
+      return;
+    }
     if (path === "/api/me" && method === "GET") {
       const sequence = options.meSequence;
       const selected = sequence?.length
@@ -862,6 +916,10 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     }
     if (path === "/api/auth/device/pending" && method === "POST") {
       store.requests.auth.push({ path, ...(await readBody()) });
+      if (options.devicePendingError) {
+        await json(route, options.devicePendingError, options.devicePendingError.status);
+        return;
+      }
       const digest = createHash("sha256")
         .update(Buffer.from(HOST_PUBLIC_KEY, "base64url"))
         .digest()
@@ -879,6 +937,10 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     if (path === "/api/auth/device/approve" && method === "POST") {
       const body = await readBody();
       store.requests.auth.push({ path, ...body });
+      if (options.deviceApproveError) {
+        await json(route, options.deviceApproveError, options.deviceApproveError.status);
+        return;
+      }
       await json(route, {
         host_name: String(store.hosts[0]?.name ?? "Mac"),
         host_id: store.hosts[0]?.id ?? null,

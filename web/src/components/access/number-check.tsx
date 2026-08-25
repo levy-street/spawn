@@ -27,6 +27,8 @@ export interface NumberCheckProps {
    * comparing this full fingerprint — never a weaker code. Compare-style.
    */
   fingerprint?: string;
+  /** Optional context for a current host using the no-fragment fallback. */
+  fingerprintHelp?: string;
   /** Where the other half is: "on the new device" / "in the host's terminal". */
   otherScreen: string;
   /** One line shown on success: "mac-studio is possessed. …" */
@@ -37,6 +39,8 @@ export interface NumberCheckProps {
   digits?: number;
   /** `waiting`: show a quiet nudge once the caller considers it slow. */
   slowHint?: boolean;
+  /** `waiting`: reveal Cancel once the caller's operation can be abandoned. */
+  waitingEscape?: boolean;
   /** Optional line under the stopped headline (defaults to the safe-abort copy). */
   stoppedText?: string;
   /** `half-done`: the honest in-between — this side finished, the other never
@@ -66,11 +70,13 @@ export function NumberCheck({
   mode,
   number,
   fingerprint,
+  fingerprintHelp,
   otherScreen,
   doneText,
   entryError,
   digits: expected = 6,
   slowHint = false,
+  waitingEscape = false,
   stoppedText,
   halfDoneText,
   onSubmit,
@@ -112,7 +118,8 @@ export function NumberCheck({
               {fingerprint}
             </p>
             <p className="mt-6 max-w-[30ch] text-balance text-center text-sm leading-relaxed text-muted-foreground">
-              This host runs older software, so compare its full fingerprint — shown {otherScreen}.
+              {fingerprintHelp ??
+                `This host runs older software, so compare its full fingerprint — shown ${otherScreen}.`}
             </p>
           </div>
           <div className="flex flex-col gap-2">
@@ -212,6 +219,15 @@ export function NumberCheck({
                 Taking a while? Make sure the other side is still open.
               </p>
             )}
+            {waitingEscape && onClose ? (
+              <button
+                type="button"
+                onClick={onClose}
+                className="text-xs text-muted-foreground/70 transition-colors hover:text-foreground"
+              >
+                Cancel
+              </button>
+            ) : null}
           </div>
         </>
       )}

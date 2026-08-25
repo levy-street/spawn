@@ -102,6 +102,23 @@ export type HostUpdate = z.infer<typeof HostUpdateSchema>;
 export const HostUpdateResponseSchema = z.object({ update: HostUpdateSchema });
 export type HostUpdateResponse = z.infer<typeof HostUpdateResponseSchema>;
 
+export const HostLastDisconnectSchema = z
+  .object({
+    at: z.string().nullable(),
+    reason: z
+      .enum([
+        "socket_closed",
+        "superseded",
+        "keepalive_timeout",
+        "auth_rejected",
+        "server_restart",
+        "stale",
+      ])
+      .nullable(),
+  })
+  .nullable()
+  .optional();
+
 export const HostSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
@@ -119,6 +136,9 @@ export const HostSchema = z.object({
   host_public_key: z.string().nullable().optional(),
   status: z.enum(["online", "offline"]),
   last_seen_at: z.string().nullable(),
+  // Additive Phase C field. Older servers omit it; absence is deliberately
+  // indistinguishable from an ordinary offline disconnect in the UI.
+  last_disconnect: HostLastDisconnectSchema,
   session_count: z.number().int(),
   /** Mesh R9: chain-capable hosts refuse the legacy per-host endorsement path. */
   supports_account_chains: z.boolean().default(false),
@@ -138,6 +158,25 @@ export const HostSchema = z.object({
   capacity_at: z.string().nullable().default(null),
 });
 export type Host = z.infer<typeof HostSchema>;
+
+export const SetupClaimMintSchema = z.object({
+  token: z.string().length(43),
+  expires_in: z.number().int().positive(),
+  expires_at: z.string(),
+});
+export type SetupClaimMint = z.infer<typeof SetupClaimMintSchema>;
+
+export const SetupClaimSchema = z.object({
+  status: z.enum(["pending", "ready", "approved", "failed"]),
+  approval_ref: z.string().nullable(),
+  host_name: z.string().nullable(),
+  os: z.string().nullable(),
+  host_key_fingerprint: z.string().nullable(),
+  host_id: z.string().uuid().nullable(),
+  error: z.enum(["expired", "denied", "key_conflict", "pin_conflict", "pin_limit"]).nullable(),
+  expires_at: z.string(),
+});
+export type SetupClaim = z.infer<typeof SetupClaimSchema>;
 
 /** One UTC day of fleet activity. Sparse — quiet days are simply absent. */
 export const LegionDaySchema = z.object({
@@ -580,28 +619,33 @@ export const auth = {
       method: "GET",
       schema: AuthConfigSchema,
     }),
-  approveDevice: (body: {
-    user_code?: string;
-    approval_ref?: string;
-    approval_nonce: string;
-    host_key_algorithm: "ed25519";
-    host_public_key: string;
-    host_key_fingerprint: string;
-    browser_device_id: string;
-    browser_key_algorithm: "ed25519";
-    browser_public_key: string;
-    browser_key_fingerprint: string;
-    signature: string;
-  }) =>
+  approveDevice: (
+    body: {
+      user_code?: string;
+      approval_ref?: string;
+      approval_nonce: string;
+      host_key_algorithm: "ed25519";
+      host_public_key: string;
+      host_key_fingerprint: string;
+      browser_device_id: string;
+      browser_key_algorithm: "ed25519";
+      browser_public_key: string;
+      browser_key_fingerprint: string;
+      signature: string;
+    },
+    signal?: AbortSignal,
+  ) =>
     api("/api/auth/device/approve", {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
       schema: DeviceApproveResponseSchema,
     }),
-  pendingDevice: (body: { user_code?: string; approval_ref?: string }) =>
+  pendingDevice: (body: { user_code?: string; approval_ref?: string }, signal?: AbortSignal) =>
     api("/api/auth/device/pending", {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
       schema: DevicePendingResponseSchema,
     }),
 };
@@ -651,6 +695,20 @@ export const hosts = {
     api(`/api/hosts/${id}/recent-dirs`, {
       method: "GET",
       schema: RecentDirsSchema,
+    }),
+};
+
+export const setupClaims = {
+  mint: () =>
+    api("/api/setup/claims", {
+      method: "POST",
+      body: JSON.stringify({}),
+      schema: SetupClaimMintSchema,
+    }),
+  get: (token: string) =>
+    api(`/api/setup/claims/${encodeURIComponent(token)}`, {
+      method: "GET",
+      schema: SetupClaimSchema,
     }),
 };
 

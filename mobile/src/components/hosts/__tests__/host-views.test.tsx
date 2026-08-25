@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react-native";
+import * as Clipboard from "expo-clipboard";
 import { AccessibilityInfo } from "react-native";
 import {
   codexAgent,
@@ -6,9 +7,12 @@ import {
   onlineHost,
   runningSession,
 } from "@/components/hosts/__tests__/fixtures";
-import { HostDetailView } from "@/components/hosts/host-detail-view";
+import { HostDetailView, hostDoctorPresentation } from "@/components/hosts/host-detail-view";
 import { HostListView } from "@/components/hosts/host-list-screen";
+import { HostOutSchema } from "@/data/api/schemas/hosts";
 import { ThemeProvider } from "@/theme";
+
+jest.mock("expo-clipboard", () => ({ setStringAsync: jest.fn(async () => undefined) }));
 
 describe("host list and detail rendering", () => {
   beforeEach(() => {
@@ -167,5 +171,97 @@ describe("host list and detail rendering", () => {
       </ThemeProvider>,
     );
     expect(screen.getByText("updating")).toBeOnTheScreen();
+  });
+
+  test("selects every offline mini-doctor case and collapses it online", () => {
+    const now = Date.parse("2026-08-22T02:00:00Z");
+    expect(hostDoctorPresentation({ ...offlineHost, last_seen_at: null }, now)).toEqual({
+      kind: "never-connected",
+      message: "SPAWN D hasn't checked in from this machine yet. On it, run: spawnd doctor",
+      command: "spawnd doctor",
+    });
+    expect(
+      hostDoctorPresentation(
+        {
+          ...offlineHost,
+          last_disconnect: { at: "2026-08-22T01:59:00Z", reason: "auth_rejected" },
+        },
+        now,
+      ),
+    ).toEqual({
+      kind: "auth-rejected",
+      message: "old-laptop can't sign in. On that machine, run: spawnd login",
+      command: "spawnd login",
+    });
+    expect(
+      hostDoctorPresentation(
+        {
+          ...offlineHost,
+          update: {
+            state: "failed",
+            latest_version: "2.0.0",
+            error: "update failed",
+            requested_at: null,
+          },
+        },
+        now,
+      ),
+    ).toEqual({
+      kind: "stale-version",
+      message:
+        "old-laptop runs 1.4.2. On it, run: spawnd update (or it will self-update when idle).",
+      command: "spawnd update",
+    });
+    expect(hostDoctorPresentation(offlineHost, now)).toEqual({
+      kind: "plain-offline",
+      message:
+        "Last seen 2h ago (connection dropped). If the machine is on, run spawnd doctor there.",
+      command: "spawnd doctor",
+    });
+    expect(hostDoctorPresentation(onlineHost, now)).toEqual({
+      kind: "online",
+      message: "Daemon 1.4.2",
+      command: null,
+    });
+  });
+
+  test("accepts older host responses without last_disconnect", () => {
+    const parsed = HostOutSchema.parse(offlineHost);
+    expect(parsed.last_disconnect).toBeUndefined();
+  });
+
+  test("renders the helper only for an offline host", async () => {
+    const offline = await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={{ ...offlineHost, last_seen_at: null }}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.getByText("Something wrong?")).toBeOnTheScreen();
+    expect(screen.getByTestId("host-doctor-never-connected")).toBeOnTheScreen();
+    await fireEvent.press(screen.getByRole("button", { name: "Copy spawnd doctor" }));
+    expect(Clipboard.setStringAsync).toHaveBeenCalledWith("spawnd doctor");
+    await offline.unmount();
+
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={onlineHost}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.queryByText("Something wrong?")).toBeNull();
+    expect(screen.getByText(/daemon 1\.4\.2/i)).toBeOnTheScreen();
   });
 });

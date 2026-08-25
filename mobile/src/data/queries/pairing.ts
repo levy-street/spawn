@@ -11,8 +11,10 @@ import { listEndorsements } from "@/data/api/endpoints/trust";
 import type {
   BrowserDeviceOut,
   DeviceApproveResponse,
+  DevicePendingRequest,
   DevicePendingResponse,
 } from "@/data/api/schemas/devices";
+import type { SetupClaimError } from "@/data/api/schemas/setup";
 import type { BrowserEndorsementRecord } from "@/data/api/schemas/trust";
 import { qk } from "@/data/queryKeys";
 import { acceptVerifiedEndorsement, verifyEndorsementIntroduction } from "@/data/trust/endorsement";
@@ -39,6 +41,12 @@ export type PairingFailureKind =
   | "pin-revoked"
   | "pin-storage-unavailable"
   | "pairing-expired"
+  | "pairing-denied"
+  | "key-conflict"
+  | "pin-conflict"
+  | "pin-limit"
+  | "link-identity-mismatch"
+  | "link-identity-malformed"
   | "unknown-code"
   | "host-not-ready"
   | "approval-incomplete"
@@ -58,7 +66,7 @@ export class PairingFlowError extends Error {
 }
 
 export interface PendingPairingCeremony {
-  userCode: string;
+  identifier: DevicePendingRequest;
   accountId: string;
   serverOrigin: string;
   hostName: string;
@@ -67,6 +75,7 @@ export interface PendingPairingCeremony {
   hostFingerprint: string;
   expiresAtMs: number;
   pinState: "new" | "active" | "revoked";
+  linkVerifiedHostKey: string | null;
 }
 
 export interface PairingApprovalResult {
@@ -77,6 +86,37 @@ export interface PairingApprovalResult {
 
 function pairingFailure(kind: PairingFailureKind, detail?: string): PairingFailure {
   return detail === undefined ? { kind } : { kind, detail };
+}
+
+export function pairingFailureForProtocolError(error: SetupClaimError): PairingFailure {
+  if (error === "expired") return pairingFailure("pairing-expired");
+  if (error === "denied") return pairingFailure("pairing-denied");
+  if (error === "key_conflict") return pairingFailure("key-conflict");
+  if (error === "pin_conflict") return pairingFailure("pin-conflict");
+  return pairingFailure("pin-limit");
+}
+
+function protocolErrorFromApiError(error: ApiError): SetupClaimError | null {
+  const detailCandidates =
+    typeof error.detail === "object" && error.detail !== null
+      ? Object.values(error.detail).filter((value): value is string => typeof value === "string")
+      : [];
+  const candidates = [
+    error.code,
+    error.message,
+    typeof error.detail === "string" ? error.detail : "",
+    ...detailCandidates,
+  ].map((value) => value.trim().toLowerCase());
+  for (const candidate of candidates) {
+    if (candidate === "denied" || candidate.includes("approval was denied")) return "denied";
+    if (candidate === "key_conflict" || candidate.includes("key conflict")) return "key_conflict";
+    if (candidate === "pin_conflict" || candidate.includes("pin conflict")) return "pin_conflict";
+    if (candidate === "pin_limit" || candidate.includes("pin limit")) return "pin_limit";
+    if (candidate === "expired" || candidate === "expired_token" || candidate.includes("expired")) {
+      return "expired";
+    }
+  }
+  return null;
 }
 
 export function toPairingFailure(error: unknown): PairingFailure {
@@ -91,8 +131,8 @@ export function toPairingFailure(error: unknown): PairingFailure {
       : pairingFailure("pairing-rejected", error.message);
   }
   if (error instanceof ApiError) {
-    const message = error.message.toLowerCase();
-    if (message.includes("expired")) return pairingFailure("pairing-expired");
+    const protocolError = protocolErrorFromApiError(error);
+    if (protocolError !== null) return pairingFailureForProtocolError(protocolError);
     if (error.status === 404) return pairingFailure("unknown-code");
     if (error.status === 409) return pairingFailure("host-not-ready");
     return pairingFailure("pairing-rejected", error.message);
@@ -113,7 +153,9 @@ interface LookupDependencies {
 }
 
 export async function lookupPendingPairing(input: {
-  userCode: string;
+  userCode?: string;
+  approvalRef?: string;
+  linkHostKey?: string | null;
   accountId: string;
   serverOrigin: string;
   nowMs?: number;
@@ -123,10 +165,13 @@ export async function lookupPendingPairing(input: {
     getPendingDevice: input.dependencies?.getPendingDevice ?? getPendingDevice,
     openHostPinStore: input.dependencies?.openHostPinStore ?? openHostPinStore,
   };
-  const userCode = pairingCodeForRequest(input.userCode);
+  const identifier: DevicePendingRequest =
+    input.approvalRef === undefined
+      ? { user_code: pairingCodeForRequest(input.userCode ?? "") }
+      : { approval_ref: input.approvalRef };
   let pending: DevicePendingResponse;
   try {
-    pending = await dependencies.getPendingDevice({ user_code: userCode });
+    pending = await dependencies.getPendingDevice(identifier);
   } catch (error) {
     throw new PairingFlowError(toPairingFailure(error));
   }
@@ -139,6 +184,11 @@ export async function lookupPendingPairing(input: {
   }
   if (derivedFingerprint !== pending.host_key_fingerprint) {
     throw new PairingFlowError(pairingFailure("fingerprint-mismatch"));
+  }
+  if (input.linkHostKey !== undefined && input.linkHostKey !== null) {
+    if (pending.host_public_key !== input.linkHostKey) {
+      throw new PairingFlowError(pairingFailure("link-identity-mismatch"));
+    }
   }
 
   let pinStore: HostPinStore;
@@ -164,7 +214,7 @@ export async function lookupPendingPairing(input: {
   }
 
   return {
-    userCode,
+    identifier,
     accountId: input.accountId,
     serverOrigin: input.serverOrigin,
     hostName: pending.host_name,
@@ -178,6 +228,7 @@ export async function lookupPendingPairing(input: {
         : resolution.status === "match"
           ? "active"
           : "new",
+    linkVerifiedHostKey: input.linkHostKey ?? null,
   };
 }
 
@@ -232,6 +283,12 @@ export async function approvePendingPairing(input: {
   let pinSaved = false;
 
   try {
+    if (
+      input.ceremony.linkVerifiedHostKey !== null &&
+      input.ceremony.hostPublicKey !== input.ceremony.linkVerifiedHostKey
+    ) {
+      throw new PairingFlowError(pairingFailure("link-identity-mismatch"));
+    }
     const phonePublicKeyBytes = await dependencies.identity.publicKey();
     if (phonePublicKeyBytes === null) {
       throw new PairingFlowError(pairingFailure("identity-missing"));
@@ -279,7 +336,7 @@ export async function approvePendingPairing(input: {
       browserPublicKey: phonePublicKey,
     });
     const response = await dependencies.approveDevicePairing({
-      user_code: input.ceremony.userCode,
+      ...input.ceremony.identifier,
       approval_nonce: input.ceremony.approvalNonce,
       host_key_algorithm: "ed25519",
       host_public_key: input.ceremony.hostPublicKey,
@@ -308,6 +365,12 @@ export async function approvePendingPairing(input: {
     };
   } catch (error) {
     if (error instanceof PairingFlowError) throw error;
+    if (error instanceof ApiError) {
+      const protocolError = protocolErrorFromApiError(error);
+      if (protocolError !== null) {
+        throw new PairingFlowError(pairingFailureForProtocolError(protocolError));
+      }
+    }
     if (pinSaved) {
       throw new PairingFlowError(
         pairingFailure(

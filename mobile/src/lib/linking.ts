@@ -5,6 +5,8 @@ export const UNIVERSAL_LINK_HOST = "spawnd.dev";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INVITE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{32}$/;
 const ACCOUNT_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const HOST_KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const MAX_APPROVAL_REF_LENGTH = 512;
 const ONBOARDING_STEPS = new Set(["account", "verify", "host", "done"]);
 
 export type DeepLinkRoute =
@@ -35,6 +37,7 @@ export interface ResolvedDeepLink {
 interface ParsedIncomingUrl {
   path: string;
   searchParams: URLSearchParams;
+  hash: string;
 }
 
 export interface IncomingUrlSource {
@@ -75,7 +78,11 @@ function parseIncomingUrl(input: string): ParsedIncomingUrl | null {
   try {
     if (trimmed.startsWith("/")) {
       const parsed = new URL(trimmed, `https://${UNIVERSAL_LINK_HOST}`);
-      return { path: normalizedPath(parsed.pathname), searchParams: parsed.searchParams };
+      return {
+        path: normalizedPath(parsed.pathname),
+        searchParams: parsed.searchParams,
+        hash: parsed.hash,
+      };
     }
 
     const parsed = new URL(trimmed);
@@ -87,17 +94,26 @@ function parseIncomingUrl(input: string): ParsedIncomingUrl | null {
       return {
         path: normalizedPath(customSchemePath || "/"),
         searchParams: parsed.searchParams,
+        hash: parsed.hash,
       };
     }
     if (scheme === "http" || scheme === "https") {
       if (parsed.hostname.toLowerCase() !== UNIVERSAL_LINK_HOST) return null;
-      return { path: normalizedPath(parsed.pathname), searchParams: parsed.searchParams };
+      return {
+        path: normalizedPath(parsed.pathname),
+        searchParams: parsed.searchParams,
+        hash: parsed.hash,
+      };
     }
     if (scheme === "exp" || scheme === "exps") {
       const marker = "/--";
       const markerIndex = parsed.pathname.indexOf(marker);
       const expoPath = markerIndex >= 0 ? parsed.pathname.slice(markerIndex + marker.length) : "/";
-      return { path: normalizedPath(expoPath), searchParams: parsed.searchParams };
+      return {
+        path: normalizedPath(expoPath),
+        searchParams: parsed.searchParams,
+        hash: parsed.hash,
+      };
     }
   } catch {
     return null;
@@ -123,7 +139,7 @@ function validFilePath(value: string): boolean {
 export function resolveIncomingLink(input: string): ResolvedDeepLink | null {
   const parsed = parseIncomingUrl(input);
   if (!parsed) return null;
-  const { path, searchParams } = parsed;
+  const { path, searchParams, hash } = parsed;
 
   if (path === "/" || path === "/app") return result("/", "/");
   if (path === "/login") return result("/(auth)/login", "/login");
@@ -147,7 +163,29 @@ export function resolveIncomingLink(input: string): ResolvedDeepLink | null {
     return result(route, withQuery(path, params), { params, sensitive: true });
   }
   if (path === "/device") {
-    return result("/onboarding/device", "/device", { requiresAuth: true });
+    const approvalRef = searchParams.get("ref");
+    if (approvalRef === null) {
+      return result("/onboarding/device", "/onboarding/device", { requiresAuth: true });
+    }
+    if (
+      approvalRef.length === 0 ||
+      approvalRef.length > MAX_APPROVAL_REF_LENGTH ||
+      approvalRef.trim() !== approvalRef
+    ) {
+      return null;
+    }
+    const fragment = hash.startsWith("#") ? hash.slice(1) : hash;
+    const rawHostKey = fragment ? new URLSearchParams(fragment).get("k") : null;
+    const params: Record<string, string> = { approvalRef };
+    if (rawHostKey !== null) {
+      if (HOST_KEY_PATTERN.test(rawHostKey)) params["hostKey"] = rawHostKey;
+      else params["fragmentMalformed"] = "true";
+    }
+    return result("/onboarding/device", withQuery("/onboarding/device", params), {
+      params,
+      requiresAuth: true,
+      sensitive: true,
+    });
   }
   if (path === "/onboarding") {
     const step = searchParams.get("step");

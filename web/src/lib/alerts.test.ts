@@ -109,6 +109,37 @@ describe("parseAlertFrame", () => {
     ).toMatchObject({ event: "device.approval_resolved", status: "approved" });
   });
 
+  test("accepts setup-claim host pairing events without ever carrying the token", () => {
+    expect(
+      parseAlertFrame(
+        JSON.stringify({
+          type: "trust",
+          event: "host.pair_requested",
+          approval_ref: "approval-ref",
+          host_name: "mac-studio",
+          os: "macos",
+          host_key_fingerprint: "SHA256:abcdefghijklmnop",
+        }),
+      ),
+    ).toMatchObject({
+      type: "trust",
+      event: "host.pair_requested",
+      approval_ref: "approval-ref",
+      host_name: "mac-studio",
+    });
+    expect(
+      parseAlertFrame(
+        JSON.stringify({
+          type: "trust",
+          event: "host.pair_resolved",
+          approval_ref: "approval-ref",
+          outcome: "approved",
+          host_id: "host-id",
+        }),
+      ),
+    ).toMatchObject({ event: "host.pair_resolved", outcome: "approved", host_id: "host-id" });
+  });
+
   test("rejects a trust frame this build cannot act on", () => {
     const rejected = [
       JSON.stringify({

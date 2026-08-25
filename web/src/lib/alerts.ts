@@ -36,10 +36,10 @@ export interface AlertEvent {
  * looking at, which is not the device it happened on. They are a separate
  * frame `type` so the alert validation below stays exactly as narrow.
  */
-export type TrustEventKind = "device.approval_requested" | "device.approval_resolved";
+export type DeviceTrustEventKind = "device.approval_requested" | "device.approval_resolved";
 
-export interface TrustEvent {
-  event: TrustEventKind;
+export interface DeviceTrustEvent {
+  event: DeviceTrustEventKind;
   request_id: string;
   browser_device_id: string;
   label: string | null;
@@ -48,6 +48,25 @@ export interface TrustEvent {
   status: "approved" | "denied" | null;
   at: string;
 }
+
+export interface HostPairRequestedEvent {
+  event: "host.pair_requested";
+  approval_ref: string;
+  host_name: string;
+  os: string | null;
+  host_key_fingerprint: string;
+  at: string;
+}
+
+export interface HostPairResolvedEvent {
+  event: "host.pair_resolved";
+  approval_ref: string;
+  outcome: "approved" | "denied" | "expired" | "key_conflict" | "pin_conflict" | "pin_limit";
+  host_id: string | null;
+  at: string;
+}
+
+export type TrustEvent = DeviceTrustEvent | HostPairRequestedEvent | HostPairResolvedEvent;
 
 /** Frames the socket can deliver. `alerts.ping` is an idle keepalive. */
 export type AlertFrame =
@@ -58,11 +77,58 @@ export type AlertFrame =
 const TRUST_EVENT_KINDS = new Set<string>([
   "device.approval_requested",
   "device.approval_resolved",
+  "host.pair_requested",
+  "host.pair_resolved",
 ]);
 
 function parseTrustFrame(record: Record<string, unknown>): AlertFrame | null {
   const event = record.event;
   if (typeof event !== "string" || !TRUST_EVENT_KINDS.has(event)) return null;
+  if (event === "host.pair_requested") {
+    if (
+      typeof record.approval_ref !== "string" ||
+      !record.approval_ref ||
+      typeof record.host_name !== "string" ||
+      typeof record.host_key_fingerprint !== "string"
+    ) {
+      return null;
+    }
+    return {
+      type: "trust",
+      event,
+      approval_ref: record.approval_ref,
+      host_name: record.host_name,
+      os: typeof record.os === "string" ? record.os : null,
+      host_key_fingerprint: record.host_key_fingerprint,
+      at: typeof record.at === "string" ? record.at : "",
+    };
+  }
+  if (event === "host.pair_resolved") {
+    const outcomes = new Set([
+      "approved",
+      "denied",
+      "expired",
+      "key_conflict",
+      "pin_conflict",
+      "pin_limit",
+    ]);
+    if (
+      typeof record.approval_ref !== "string" ||
+      !record.approval_ref ||
+      typeof record.outcome !== "string" ||
+      !outcomes.has(record.outcome)
+    ) {
+      return null;
+    }
+    return {
+      type: "trust",
+      event,
+      approval_ref: record.approval_ref,
+      outcome: record.outcome as HostPairResolvedEvent["outcome"],
+      host_id: typeof record.host_id === "string" ? record.host_id : null,
+      at: typeof record.at === "string" ? record.at : "",
+    };
+  }
   const requestId = record.request_id;
   const deviceId = record.browser_device_id;
   if (typeof requestId !== "string" || !requestId) return null;
@@ -70,7 +136,7 @@ function parseTrustFrame(record: Record<string, unknown>): AlertFrame | null {
   const status = record.status;
   return {
     type: "trust",
-    event: event as TrustEventKind,
+    event: event as DeviceTrustEventKind,
     request_id: requestId,
     browser_device_id: deviceId,
     label: typeof record.label === "string" ? record.label : null,

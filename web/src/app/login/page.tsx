@@ -3,7 +3,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useEffect, useState } from "react";
 import { AuthShell } from "@/components/onboarding/auth-shell";
 import { OAuthButtons } from "@/components/onboarding/oauth-buttons";
 import { Button } from "@/components/ui/button";
@@ -18,8 +18,8 @@ import { useAuthConfig } from "@/lib/auth";
  * URLs so `next` can't become an open redirect.
  */
 function safeNext(raw: string | null): string {
-  if (!raw || !raw.startsWith("/") || raw.startsWith("//")) return "/app";
-  return raw;
+  if (!raw?.startsWith("/") || raw.startsWith("//")) return "/app";
+  return raw.split("#", 1)[0] || "/app";
 }
 
 export default function LoginPage() {
@@ -30,6 +30,11 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [returnTo, setReturnTo] = useState("/app");
+
+  useEffect(() => {
+    setReturnTo(safeNext(new URLSearchParams(window.location.search).get("next")));
+  }, []);
 
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
@@ -39,7 +44,7 @@ export default function LoginPage() {
       const result = await auth.login({ email, password });
       queryClient.setQueryData(["me"], { user: result.user });
       void queryClient.invalidateQueries({ queryKey: ["me"] });
-      router.replace(safeNext(new URLSearchParams(window.location.search).get("next")));
+      router.replace(returnTo);
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : "Login failed");
     } finally {
@@ -53,7 +58,11 @@ export default function LoginPage() {
       description="Sign in to reach the shells running across your machines."
     >
       <div className="space-y-5">
-        <OAuthButtons providers={config?.providers ?? []} returnTo="/app" loading={configLoading} />
+        <OAuthButtons
+          providers={config?.providers ?? []}
+          returnTo={returnTo}
+          loading={configLoading}
+        />
         {configError ? (
           <p className="text-sm text-muted-foreground" role="status">
             Social sign-in is temporarily unavailable. Email sign-in still works.

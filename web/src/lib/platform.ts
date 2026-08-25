@@ -23,6 +23,11 @@ export function installCommand(origin: string): string {
   return `curl -fsSL ${origin}/install.sh | sh`;
 }
 
+/** Phase C attended setup: the claim routes the existing approval ceremony. */
+export function setupInstallCommand(origin: string, token: string): string {
+  return `curl -fsSL ${origin}/install.sh | sh -s -- --setup ${token}`;
+}
+
 export function prebuiltInstallCommand(origin: string): string {
   return `curl -fsSL ${origin}/install.sh | sh -s -- --prebuilt-only`;
 }
