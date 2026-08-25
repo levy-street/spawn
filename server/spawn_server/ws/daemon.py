@@ -6,11 +6,13 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import jwt
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import SQLAlchemyError
@@ -26,6 +28,7 @@ from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, Ses
 from ..pin_liveness import live_browser_device_id_set
 from ..push import send_alert_push
 from ..redis import get_backend, session_event_channel, user_alert_channel
+from ..trust_events import pin_undelivered_payload, publish_trust_event
 from .alerts import (
     ALERT_QUIET_SECONDS,
     QuietWatch,
@@ -105,7 +108,42 @@ def _aware_utc(value: datetime | None) -> datetime | None:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-async def _resolve_daemon_host(websocket: WebSocket, query_token: str | None) -> Host | None:
+async def _record_auth_rejection(host_id: str | None) -> None:
+    if host_id is None:
+        return
+    async with _bounded_host_ownership_session() as session:
+        host = await session.get(Host, host_id)
+        if host is None:
+            return
+        if host.daemon_connection_id is None:
+            host.status = "offline"
+        host.last_disconnect_at = _utcnow()
+        host.last_disconnect_reason = "auth_rejected"
+        await session.commit()
+
+
+def _identifiable_host_id(payload: dict[str, object] | None) -> str | None:
+    if payload is None:
+        return None
+    sub = payload.get("sub")
+    if not isinstance(sub, str) or not sub.startswith("host:"):
+        return None
+    host_id = sub.split(":", 1)[1]
+    return host_id if host_id else None
+
+
+async def _reject_daemon_auth(
+    websocket: WebSocket,
+    reason: str,
+    payload: dict[str, object] | None = None,
+) -> None:
+    await _record_auth_rejection(_identifiable_host_id(payload))
+    await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=reason)
+
+
+async def _resolve_daemon_host(
+    websocket: WebSocket, query_token: str | None
+) -> tuple[Host, dict[str, Any]] | None:
     """Resolve the Host bound to the daemon JWT, or close the WS and return None."""
     raw: str | None = None
     auth = websocket.headers.get("authorization")
@@ -117,20 +155,33 @@ async def _resolve_daemon_host(websocket: WebSocket, query_token: str | None) ->
         warn_query_token_once(log)
         raw = query_token
     if raw is None:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="missing token")
+        await _reject_daemon_auth(websocket, "token_invalid")
         return None
 
     try:
-        payload = auth_mod.decode_token(raw)
-    except Exception:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="bad token")
+        settings = auth_mod.get_settings()
+        payload = jwt.decode(raw, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    except jwt.ExpiredSignatureError:
+        try:
+            expired = jwt.decode(
+                raw,
+                settings.jwt_secret,
+                algorithms=[settings.jwt_algorithm],
+                options={"verify_exp": False},
+            )
+        except jwt.PyJWTError:
+            expired = None
+        await _reject_daemon_auth(websocket, "token_expired", expired)
+        return None
+    except jwt.PyJWTError:
+        await _reject_daemon_auth(websocket, "token_invalid")
         return None
     if payload.get("kind") != auth_mod.KIND_DAEMON:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="not a daemon token")
+        await _reject_daemon_auth(websocket, "token_invalid", payload)
         return None
-    sub = payload.get("sub", "")
-    if not sub.startswith("host:"):
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="bad subject")
+    sub = payload.get("sub")
+    if not isinstance(sub, str) or not sub.startswith("host:"):
+        await _reject_daemon_auth(websocket, "token_invalid", payload)
         return None
     host_id = sub.split(":", 1)[1]
     user_id = payload.get("user_id")
@@ -138,15 +189,18 @@ async def _resolve_daemon_host(websocket: WebSocket, query_token: str | None) ->
     async with _bounded_host_ownership_session() as session:
         host = await session.get(Host, host_id)
         authorized = host is not None and host.owner_user_id == user_id
-        if host is not None and not authorized and host.daemon_connection_id is None:
-            host.status = "offline"
-            host.last_disconnect_at = _utcnow()
-            host.last_disconnect_reason = "auth_rejected"
-            await session.commit()
     if not authorized:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="host gone")
+        await _reject_daemon_auth(websocket, "token_revoked", payload)
         return None
-    return host
+    assert host is not None
+    return host, payload
+
+
+def _daemon_token_needs_rotation(payload: dict[str, Any]) -> bool:
+    expires = payload.get("exp")
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        return True
+    return datetime.fromtimestamp(expires, UTC) - _utcnow() < timedelta(days=30)
 
 
 def _registration_semaphore() -> asyncio.Semaphore:
@@ -261,6 +315,9 @@ async def _prepare_host_activation(
         "daemon_tree": daemon_tree,
         "self_update": self_update_raw if isinstance(self_update_raw, bool) else False,
         "self_update_blocked": self_update_blocked,
+        # Describes this exact binary pair, so omission by an older or repaired
+        # daemon clears a stale mismatch rather than inheriting it.
+        "worker_mismatch": registration.get("worker_mismatch") is True,
     }
     if current.daemon_connection_id is not None and current.daemon_connection_id != connection_id:
         values["last_disconnect_at"] = _utcnow()
@@ -305,8 +362,6 @@ async def _prepare_host_activation(
 
 
 async def _auto_update_after_registration(conn: DaemonConn) -> None:
-    if not get_settings().daemon_auto_update:
-        return
     manifest = release.read_prebuilt_manifest()
     if manifest is None:
         return
@@ -314,7 +369,12 @@ async def _auto_update_after_registration(conn: DaemonConn) -> None:
     payload: dict[str, Any] | None = None
     async with _bounded_host_ownership_session() as session:
         host = await session.get(Host, conn.host_id)
-        if host is None or release.host_update_state(host, manifest).state != "available":
+        if host is None:
+            return
+        repair = host.worker_mismatch
+        if not repair and not get_settings().daemon_auto_update:
+            return
+        if not repair and release.host_update_state(host, manifest).state != "available":
             return
         payload = release.mark_update_requested(host, manifest)
         if payload is None:
@@ -351,9 +411,7 @@ def _short_update_result_string(value: object, *, limit: int) -> str | None:
     return value if value and len(value) <= limit else None
 
 
-async def _handle_daemon_update_result(
-    conn: DaemonConn, payload: dict[str, object]
-) -> bool | None:
+async def _handle_daemon_update_result(conn: DaemonConn, payload: dict[str, object]) -> bool | None:
     request_id = _short_update_result_string(payload.get("request_id"), limit=128)
     ok = payload.get("ok")
     tree = release.valid_daemon_tree(payload.get("tree"))
@@ -365,7 +423,7 @@ async def _handle_daemon_update_result(
         return True
 
     stage = _short_update_result_string(payload.get("stage"), limit=64)
-    if stage not in {"download", "verify", "swap", "exec", "precondition"}:
+    if stage not in {"download", "verify", "swap", "exec", "precondition", "health"}:
         stage = None
     error = _short_update_result_string(payload.get("error"), limit=256)
     async with _bounded_host_ownership_session() as session:
@@ -393,6 +451,56 @@ async def _handle_daemon_update_result(
         error,
         request_id,
     )
+    return True
+
+
+async def _handle_pin_adoption_result(
+    conn: DaemonConn,
+    payload: dict[str, object],
+    *,
+    failed: bool,
+) -> bool | None:
+    allowed = (
+        {"type", "browser_device_id", "reason"}
+        if failed
+        else {
+            "type",
+            "browser_device_id",
+        }
+    )
+    if set(payload) != allowed:
+        return None
+    browser_device_id = payload.get("browser_device_id")
+    if not isinstance(browser_device_id, str) or len(browser_device_id) > 64:
+        return None
+    try:
+        if str(uuid.UUID(browser_device_id)) != browser_device_id:
+            return None
+    except ValueError:
+        return None
+    reason = payload.get("reason") if failed else None
+    if failed and reason not in {"pin_limit", "invalid_chain", "other"}:
+        return None
+
+    known = False
+    async with _bounded_host_ownership_session() as session:
+        pin = await session.get(HostBrowserPin, (conn.host_id, browser_device_id))
+        if pin is not None:
+            known = True
+            if failed:
+                pin.delivered_at = None
+                pin.undelivered_reason = str(reason)
+            else:
+                pin.delivered_at = _utcnow()
+                pin.undelivered_reason = None
+            await session.commit()
+    # An unknown device id carries no authority and produces no observable
+    # account event. This also makes a late nack after revocation harmless.
+    if known and failed:
+        await publish_trust_event(
+            conn.user_id,
+            pin_undelivered_payload(conn.host_id, browser_device_id, str(reason)),
+        )
     return True
 
 
@@ -1819,9 +1927,10 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
         await websocket.close(code=WS_CLOSE_PROTOCOL_REQUIRED, reason="protocol upgrade required")
         return
     await websocket.accept(subprotocol=DAEMON_WS_PROTOCOL)
-    host = await _resolve_daemon_host(websocket, token)
-    if host is None:
+    principal = await _resolve_daemon_host(websocket, token)
+    if principal is None:
         return
+    host, daemon_token_payload = principal
 
     broker = get_broker()
     conn = DaemonConn(host_id=host.id, user_id=host.owner_user_id, websocket=websocket)
@@ -1901,6 +2010,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         for field in (
                             "keeps_peers_across_reconnect",
                             "session_ice_policy",
+                            "worker_mismatch",
                         )
                     ):
                         await errors.send("invalid_frame", ftype)
@@ -2019,19 +2129,19 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         # self-healing: a daemon that was offline or attached
                         # to another worker when the revocation happened still
                         # converges on its next connect.
-                        await _bounded_send_text(
-                            conn,
-                            {
-                                "type": "registered",
-                                "host_id": host.id,
-                                "account_id": host.owner_user_id,
-                                "browser_device_ids": await _live_browser_device_ids(host.id),
-                                "browser_pins": await _live_browser_pins(host.id),
-                                "revoked_browser_keys": await _revoked_browser_keys(
-                                    host.owner_user_id
-                                ),
-                            },
-                        )
+                        registered_payload = {
+                            "type": "registered",
+                            "host_id": host.id,
+                            "account_id": host.owner_user_id,
+                            "browser_device_ids": await _live_browser_device_ids(host.id),
+                            "browser_pins": await _live_browser_pins(host.id),
+                            "revoked_browser_keys": await _revoked_browser_keys(host.owner_user_id),
+                        }
+                        if _daemon_token_needs_rotation(daemon_token_payload):
+                            registered_payload["access_token"] = auth_mod.issue_daemon_token(
+                                host.id, host.owner_user_id
+                            )
+                        await _bounded_send_text(conn, registered_payload)
                         registered = True
                         conn.durable_owner_valid_until = (
                             time.monotonic() + DURABLE_OWNERSHIP_CACHE_SECONDS
@@ -2063,6 +2173,16 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                     if handled is False:
                         await _close_daemon_consistency_failure(conn)
                         break
+                    if handled is None:
+                        await errors.send("invalid_frame", ftype)
+
+                elif ftype == "host.pin_adopt_failed":
+                    handled = await _handle_pin_adoption_result(conn, obj, failed=True)
+                    if handled is None:
+                        await errors.send("invalid_frame", ftype)
+
+                elif ftype == "host.pin_adopted":
+                    handled = await _handle_pin_adoption_result(conn, obj, failed=False)
                     if handled is None:
                         await errors.send("invalid_frame", ftype)
 
@@ -2101,9 +2221,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         break
                     capacity = host_capacity.bucket_values(obj)
                     async with _bounded_host_ownership_session() as session:
-                        touched = await _touch_host(
-                            session, host.id, conn.id, generation, capacity
-                        )
+                        touched = await _touch_host(session, host.id, conn.id, generation, capacity)
                     if touched:
                         conn.durable_owner_valid_until = (
                             time.monotonic() + DURABLE_OWNERSHIP_CACHE_SECONDS
@@ -2125,9 +2243,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         rejected_owner = False
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
-                            session_row = (
-                                await session.get(Session, sid) if durable_owner else None
-                            )
+                            session_row = await session.get(Session, sid) if durable_owner else None
                             if session_row is not None and session_row.host_id == host.id:
                                 result = await session.execute(
                                     update(Session)
@@ -2181,9 +2297,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         rejected_owner = False
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
-                            session_row = (
-                                await session.get(Session, sid) if durable_owner else None
-                            )
+                            session_row = await session.get(Session, sid) if durable_owner else None
                             if session_row is not None and session_row.host_id == host.id:
                                 generation = conn.host_generation
                                 if generation is None:
@@ -2227,9 +2341,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         rejected_owner = False
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
-                            session_row = (
-                                await session.get(Session, sid) if durable_owner else None
-                            )
+                            session_row = await session.get(Session, sid) if durable_owner else None
                             if session_row is not None and session_row.host_id == host.id:
                                 generation = conn.host_generation
                                 if generation is None:
@@ -2277,8 +2389,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         basename: str | None = None
                         if isinstance(command, str):
                             basename = (
-                                command.strip().replace("\\", "/").rsplit("/", 1)[-1][:64]
-                                or None
+                                command.strip().replace("\\", "/").rsplit("/", 1)[-1][:64] or None
                             )
                         durable_owner = False
                         rejected_owner = False
@@ -2290,9 +2401,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         summoned_agent: str | None = None
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
-                            session_row = (
-                                await session.get(Session, sid) if durable_owner else None
-                            )
+                            session_row = await session.get(Session, sid) if durable_owner else None
                             if session_row is not None and session_row.host_id == host.id:
                                 previous_command = session_row.foreground_command
                                 session_status = session_row.status
@@ -2315,9 +2424,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                     # to the foreground is not an agent run.
                                     if basename and not is_shell_command(basename):
                                         summoned_agent = basename
-                                    if is_agent_finish(
-                                        previous_command, basename, session_status
-                                    ):
+                                    if is_agent_finish(previous_command, basename, session_status):
                                         finished_alert = agent_finished_payload(
                                             sid, previous_command or ""
                                         )
@@ -2363,9 +2470,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         ran_seconds = 0
                         async with _bounded_host_ownership_session() as session:
                             durable_owner = await _lock_durable_host_owner(session, conn)
-                            session_row = (
-                                await session.get(Session, sid) if durable_owner else None
-                            )
+                            session_row = await session.get(Session, sid) if durable_owner else None
                             if session_row is not None and session_row.host_id == host.id:
                                 # Read before the write, which nulls it. This
                                 # is what lets the alert name the agent that
@@ -2381,9 +2486,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                                 if started is not None:
                                     if started.tzinfo is None:
                                         started = started.replace(tzinfo=UTC)
-                                    ran_seconds = max(
-                                        0, int((_utcnow() - started).total_seconds())
-                                    )
+                                    ran_seconds = max(0, int((_utcnow() - started).total_seconds()))
                                 result = await session.execute(
                                     update(Session)
                                     .where(

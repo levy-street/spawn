@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -56,6 +56,7 @@ APPROVAL_REQUEST_TTL = timedelta(minutes=30)
 #: How often a re-asked knock may push again. Every ask still publishes the
 #: live frame; this only keeps the lock screen from repeating itself.
 APPROVAL_PUSH_INTERVAL = timedelta(minutes=2)
+APPROVAL_REQUEST_RETENTION = timedelta(days=30)
 
 
 def _aware(dt: datetime) -> datetime:
@@ -442,15 +443,7 @@ async def create_browser_endorsement(
             created_at=existing.created_at,
         )
 
-    count = len(
-        (
-            await session.execute(
-                select(HostBrowserPin.browser_device_id).where(HostBrowserPin.host_id == host.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
+    count = len(await live_browser_device_id_set(session, host.id))
     if count >= MAX_BROWSER_PINS_PER_HOST:
         raise HTTPException(status_code=409, detail="host browser pin capacity is exhausted")
 
@@ -711,6 +704,22 @@ class HostPinDetail(BaseModel):
     created_at: datetime
 
 
+class HostPinDelivery(BaseModel):
+    browser_device_id: str
+    delivered: bool
+    undelivered_reason: str | None = None
+
+
+class HostPinCapacity(BaseModel):
+    used: int
+    max: int
+
+
+class HostPinsOut(BaseModel):
+    pins: list[HostPinDelivery]
+    capacity: HostPinCapacity
+
+
 @router.get("/hosts/{host_id}/pin-details", response_model=list[HostPinDetail])
 async def list_host_browser_pin_details(
     host_id: str,
@@ -752,12 +761,12 @@ async def list_host_browser_pin_details(
     ]
 
 
-@router.get("/hosts/{host_id}/pins", response_model=list[str])
+@router.get("/hosts/{host_id}/pins", response_model=HostPinsOut)
 async def list_host_browser_pins(
     host_id: str,
     user: User = Depends(auth.current_user),
     session: AsyncSession = Depends(get_session),
-) -> list[str]:
+) -> HostPinsOut:
     """Browser device IDs this host trusts, so the UI can offer to endorse the rest.
 
     Transitively-live pins only (the daemon's own computation): revoked devices
@@ -767,7 +776,29 @@ async def list_host_browser_pins(
     host = await session.get(Host, host_id)
     if host is None or host.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="host not found")
-    return sorted(await live_browser_device_id_set(session, host_id))
+    live_ids = await live_browser_device_id_set(session, host_id)
+    rows = (
+        await session.execute(
+            select(
+                HostBrowserPin.browser_device_id,
+                HostBrowserPin.undelivered_reason,
+            )
+            .where(HostBrowserPin.host_id == host_id)
+            .order_by(HostBrowserPin.browser_device_id)
+        )
+    ).all()
+    return HostPinsOut(
+        pins=[
+            HostPinDelivery(
+                browser_device_id=row.browser_device_id,
+                delivered=row.undelivered_reason is None,
+                undelivered_reason=row.undelivered_reason,
+            )
+            for row in rows
+            if row.browser_device_id in live_ids
+        ],
+        capacity=HostPinCapacity(used=len(live_ids), max=MAX_BROWSER_PINS_PER_HOST),
+    )
 
 
 async def _resolve_pending_requests(
@@ -799,6 +830,18 @@ async def _resolve_pending_requests(
     return [row.id for row in rows]
 
 
+async def _prune_old_approval_requests(session: AsyncSession, now: datetime) -> None:
+    cutoff = now - APPROVAL_REQUEST_RETENTION
+    await session.execute(
+        delete(DeviceApprovalRequest).where(
+            or_(
+                DeviceApprovalRequest.resolved_at < cutoff,
+                DeviceApprovalRequest.expires_at < cutoff,
+            )
+        )
+    )
+
+
 def _approval_out(
     row: DeviceApprovalRequest, device: BrowserDevice
 ) -> schemas.DeviceApprovalRequestOut:
@@ -827,6 +870,7 @@ async def request_device_approval(
     signed on a device the host trusts. Requiring a second signature here would
     add a transcript to maintain and stop nothing.
     """
+    await _prune_old_approval_requests(session, datetime.now(UTC))
     device = await session.get(BrowserDevice, body.browser_device_id)
     if device is None or device.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="browser device not found")
@@ -887,6 +931,7 @@ async def list_device_approvals(
 ) -> list[schemas.DeviceApprovalRequestOut]:
     """Live knocks, so a device that opens later still offers the ceremony."""
     now = datetime.now(UTC)
+    await _prune_old_approval_requests(session, now)
     rows = (
         await session.execute(
             select(DeviceApprovalRequest, BrowserDevice)
@@ -900,6 +945,7 @@ async def list_device_approvals(
             .order_by(DeviceApprovalRequest.created_at)
         )
     ).all()
+    await session.commit()
     return [_approval_out(row, device) for row, device in rows]
 
 

@@ -36,6 +36,9 @@ def _fake_spawnd_body() -> str:
     return """#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "$SPAWN_FAKE_LOG_DIR/spawnd.log"
+if [ -n "${SPAWN_SETUP_TOKEN:-}" ]; then
+  printf '%s|%s\\n' "$SPAWN_SETUP_TOKEN" "$*" >> "$SPAWN_FAKE_LOG_DIR/setup-token.log"
+fi
 if [ "${1:-}" = "--version" ]; then
   printf '%s\\n' "${SPAWN_FAKE_SPAWND_VERSION:-spawnd fake 1.0}"
   exit 0
@@ -331,9 +334,68 @@ async def test_install_script_is_shell_and_uses_public_url(client):
     assert "linux-x86_64" in r.text
     assert "start_launchd_service" in r.text
     assert "https://github.com/levy-street/spawn.git" in r.text
-    assert 'login --no-run' in r.text
+    assert "login --no-run" in r.text
     assert "spawnd.service" in r.text
     assert "--prebuilt-only" in r.text
+    assert "--setup TOKEN" in r.text
+    assert "--new-account" in r.text
+
+
+async def test_manifest_and_signature_are_served_byte_exact_with_no_store(
+    client, tmp_path: Path, monkeypatch
+):
+    from spawn_server import release
+
+    repo = tmp_path / "signed-prebuilt"
+    prebuilt = repo / "daemon" / "target" / "prebuilt"
+    target = prebuilt / "linux-x86_64"
+    target.mkdir(parents=True)
+    spawnd = b"signed-spawnd"
+    worker = b"signed-worker"
+    (target / "spawnd").write_bytes(spawnd)
+    (target / "spawn-worker").write_bytes(worker)
+    manifest_bytes = (
+        json.dumps(
+            {
+                "commit": "a" * 40,
+                "tree": "b" * 40,
+                "version": "0.2.0+gaaaaaaaaaaaa",
+                "release_counter": 1234,
+                "signing_key_id": "e65c013f",
+                "targets": {
+                    "linux-x86_64": {
+                        "spawnd_sha256": hashlib.sha256(spawnd).hexdigest(),
+                        "spawn_worker_sha256": hashlib.sha256(worker).hexdigest(),
+                    }
+                },
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+    signature = b"detached-signature-without-newline"
+    (prebuilt / "manifest.json").write_bytes(manifest_bytes)
+    (prebuilt / "manifest.json.sig").write_bytes(signature)
+    monkeypatch.setattr(install_routes, "_repo_root", lambda: repo)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+
+    manifest = await client.get("/api/install/manifest.json")
+    assert manifest.status_code == 200
+    assert manifest.content == manifest_bytes
+    assert manifest.headers["content-type"].startswith("application/json")
+    assert manifest.headers["cache-control"] == "no-store"
+    sig = await client.get("/api/install/manifest.json.sig")
+    assert sig.status_code == 200
+    assert sig.content == signature
+    assert sig.headers["content-type"].startswith("text/plain")
+    assert sig.headers["cache-control"] == "no-store"
+
+    (target / "spawn-worker").write_bytes(b"corrupt")
+    release.refresh()
+    assert (await client.get("/api/install/manifest.json")).status_code == 404
+    # Detached bytes have their own absence rule; diagnostics can still fetch
+    # the signature even while the manifest fails binary/hash validation.
+    assert (await client.get("/api/install/manifest.json.sig")).content == signature
 
 
 async def test_installer_smoke_uses_real_curl_against_local_http_server(client, tmp_path: Path):
@@ -611,6 +673,45 @@ async def test_installer_default_runs_possess_on_macos(client, tmp_path: Path):
     assert _log(logs, "launchctl.log") == ""
 
 
+async def test_installer_passes_setup_environment_and_new_account_flag(client, tmp_path: Path):
+    script = await _install_script_file(client, tmp_path)
+    token = "S" * 43
+
+    default, logs, _home, _install_root = _run_installer(
+        script,
+        tmp_path / "claimed",
+        os_name="Linux",
+        arch="x86_64",
+        args=["--setup", token, "--new-account"],
+    )
+    assert default.returncode == 0, default.stderr
+    assert "--server http://spawn.test possess --new-account" in _log(logs, "spawnd.log")
+    setup_lines = _log(logs, "setup-token.log")
+    assert f"{token}|--server http://spawn.test possess --new-account" in setup_lines
+
+    no_start, no_start_logs, _home, _install_root = _run_installer(
+        script,
+        tmp_path / "claimed-no-start",
+        os_name="Linux",
+        arch="x86_64",
+        args=[f"--setup={token}", "--no-start"],
+    )
+    assert no_start.returncode == 0, no_start.stderr
+    assert f"{token}|--server http://spawn.test login --no-run" in _log(
+        no_start_logs, "setup-token.log"
+    )
+
+    empty, _logs, _home, _install_root = _run_installer(
+        script,
+        tmp_path / "claimed-empty",
+        os_name="Linux",
+        arch="x86_64",
+        args=["--setup", ""],
+    )
+    assert empty.returncode != 0
+    assert "--setup requires a token" in empty.stderr
+
+
 async def test_installer_replaces_existing_binary_on_reinstall(client, tmp_path: Path):
     script = await _install_script_file(client, tmp_path)
     install_root = tmp_path / "install-root"
@@ -713,7 +814,9 @@ async def test_worker_binary_serves_supported_target(client, tmp_path: Path, mon
     assert 'filename="spawn-worker"' in r.headers["content-disposition"]
 
 
-async def test_daemon_binary_supported_target_missing_binary_404(client, tmp_path: Path, monkeypatch):
+async def test_daemon_binary_supported_target_missing_binary_404(
+    client, tmp_path: Path, monkeypatch
+):
     monkeypatch.setattr(
         install_routes, "_binary_candidates", lambda target, name: [tmp_path / "missing"]
     )
@@ -732,16 +835,10 @@ def test_binary_candidates_include_local_release_fallback(tmp_path: Path, monkey
     remote_paths = install_routes._binary_candidates("linux-aarch64", "spawn-worker")
 
     assert (
-        tmp_path / "daemon" / "target" / "prebuilt" / "linux-x86_64" / "spawn-worker"
-        in local_paths
+        tmp_path / "daemon" / "target" / "prebuilt" / "linux-x86_64" / "spawn-worker" in local_paths
     )
     assert (
-        tmp_path
-        / "daemon"
-        / "target"
-        / "x86_64-unknown-linux-gnu"
-        / "release"
-        / "spawn-worker"
+        tmp_path / "daemon" / "target" / "x86_64-unknown-linux-gnu" / "release" / "spawn-worker"
         in local_paths
     )
     assert tmp_path / "daemon" / "target" / "release" / "spawn-worker" in local_paths

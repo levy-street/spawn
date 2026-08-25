@@ -150,7 +150,9 @@ async def test_passkeys_are_per_account(client):
     passkey_id = created.json()["id"]
 
     assert (await client.get("/api/trust/passkeys", headers=second)).json() == []
-    assert (await client.delete(f"/api/trust/passkeys/{passkey_id}", headers=second)).status_code == 404
+    assert (
+        await client.delete(f"/api/trust/passkeys/{passkey_id}", headers=second)
+    ).status_code == 404
     assert len((await client.get("/api/trust/passkeys", headers=first)).json()) == 1
 
 
@@ -171,7 +173,11 @@ async def test_the_same_credential_id_may_belong_to_two_accounts(client):
 
 
 def _endorsement_signature(
-    *, user_id: str, host_public_key: str, endorser_private, endorsed_public_key: str,
+    *,
+    user_id: str,
+    host_public_key: str,
+    endorser_private,
+    endorsed_public_key: str,
     endorsed_device_id: str,
 ) -> str:
     import base64
@@ -205,9 +211,7 @@ async def _endorsement_fixture(client, email: str):
     def wire(key) -> str:
         import base64
 
-        return (
-            base64.urlsafe_b64encode(key.public_key().public_bytes_raw()).rstrip(b"=").decode()
-        )
+        return base64.urlsafe_b64encode(key.public_key().public_bytes_raw()).rstrip(b"=").decode()
 
     async with get_sessionmaker()() as session:
         host = Host(
@@ -275,6 +279,80 @@ async def test_a_pinned_browser_can_endorse_another(client):
         headers=auth,
     )
     assert again.status_code == 200
+
+
+async def test_endorsement_capacity_counts_only_live_pins(client):
+    import base64
+    from datetime import UTC, datetime
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from sqlalchemy import func, select
+
+    from spawn_server.host_identity import ed25519_key_fingerprint
+    from spawn_server.models import BrowserDevice, HostBrowserPin
+    from spawn_server.pin_liveness import live_browser_device_id_set
+
+    user_id, auth, endorser_key, _, ids = await _endorsement_fixture(
+        client, "endorsement-live-capacity@example.com"
+    )
+    host_id, host_pub, endorser_id, endorsed_id, endorsed_pub = ids
+
+    async with get_sessionmaker()() as session:
+        for index in range(31):
+            private_key = Ed25519PrivateKey.generate()
+            public_key = (
+                base64.urlsafe_b64encode(private_key.public_key().public_bytes_raw())
+                .rstrip(b"=")
+                .decode()
+            )
+            device = BrowserDevice(
+                owner_user_id=user_id,
+                key_algorithm="ed25519",
+                public_key=public_key,
+                revoked_at=datetime.now(UTC) if index == 0 else None,
+            )
+            session.add(device)
+            await session.flush()
+            session.add(
+                HostBrowserPin(
+                    host_id=host_id,
+                    browser_device_id=device.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=public_key,
+                    browser_key_fingerprint=ed25519_key_fingerprint(public_key),
+                )
+            )
+        await session.commit()
+        assert len(await live_browser_device_id_set(session, host_id)) == 31
+
+    response = await client.post(
+        "/api/trust/endorsements",
+        json={
+            "host_id": host_id,
+            "endorser_device_id": endorser_id,
+            "endorsed_device_id": endorsed_id,
+            "signature": _endorsement_signature(
+                user_id=user_id,
+                host_public_key=host_pub,
+                endorser_private=endorser_key,
+                endorsed_public_key=endorsed_pub,
+                endorsed_device_id=endorsed_id,
+            ),
+        },
+        headers=auth,
+    )
+
+    assert response.status_code == 200, response.text
+    async with get_sessionmaker()() as session:
+        assert len(await live_browser_device_id_set(session, host_id)) == 32
+        raw_count = (
+            await session.execute(
+                select(func.count(HostBrowserPin.browser_device_id)).where(
+                    HostBrowserPin.host_id == host_id
+                )
+            )
+        ).scalar_one()
+        assert raw_count == 33
 
 
 async def test_an_unpinned_browser_cannot_endorse(client):
@@ -584,9 +662,7 @@ async def _pin_liveness_fixture(client, email: str):
     user_id, auth = await _signup(client, email)
 
     def wire(key) -> str:
-        return (
-            base64.urlsafe_b64encode(key.public_key().public_bytes_raw()).rstrip(b"=").decode()
-        )
+        return base64.urlsafe_b64encode(key.public_key().public_bytes_raw()).rstrip(b"=").decode()
 
     async with get_sessionmaker()() as session:
         host = Host(
@@ -648,11 +724,17 @@ async def test_pins_routes_serve_transitively_live_pins_only(client):
 
     both = await client.get(f"/api/trust/hosts/{host_id}/pins", headers=auth)
     assert both.status_code == 200
-    assert sorted(both.json()) == sorted([x_id, root_id])
+    assert sorted(pin["browser_device_id"] for pin in both.json()["pins"]) == sorted(
+        [x_id, root_id]
+    )
+    assert both.json()["capacity"] == {"used": 2, "max": 32}
 
     await _revoke_device(root_id)
     pins = await client.get(f"/api/trust/hosts/{host_id}/pins", headers=auth)
-    assert pins.json() == [x_id]
+    assert pins.json()["pins"] == [
+        {"browser_device_id": x_id, "delivered": True, "undelivered_reason": None}
+    ]
+    assert pins.json()["capacity"] == {"used": 1, "max": 32}
     details = await client.get(f"/api/trust/hosts/{host_id}/pin-details", headers=auth)
     assert [row["device_id"] for row in details.json()] == [x_id]
 
@@ -669,7 +751,10 @@ async def test_pins_routes_drop_a_revoked_direct_pin(client):
     pins = await client.get(f"/api/trust/hosts/{host_id}/pins", headers=auth)
     # X's own pin is gone. The ROOT pin it endorsed survives (mesh §3 ratchet):
     # anchoring on R exists precisely to outlive any single device's fate.
-    assert pins.json() == [root_id]
+    assert pins.json()["pins"] == [
+        {"browser_device_id": root_id, "delivered": True, "undelivered_reason": None}
+    ]
+    assert pins.json()["capacity"] == {"used": 1, "max": 32}
     details = await client.get(f"/api/trust/hosts/{host_id}/pin-details", headers=auth)
     assert [row["device_id"] for row in details.json()] == [root_id]
 
@@ -687,7 +772,41 @@ async def test_pins_routes_match_the_daemon_computation(client):
     async with get_sessionmaker()() as session:
         expected = sorted(await live_browser_device_id_set(session, host_id))
     pins = await client.get(f"/api/trust/hosts/{host_id}/pins", headers=auth)
-    assert pins.json() == expected == [x_id]
+    assert expected == [x_id]
+    assert pins.json()["pins"] == [
+        {"browser_device_id": x_id, "delivered": True, "undelivered_reason": None}
+    ]
+    assert pins.json()["capacity"] == {"used": 1, "max": 32}
+
+
+async def test_pins_route_reports_undelivered_adoption(client):
+    from spawn_server.models import HostBrowserPin
+
+    _, auth, (host_id, x_id, root_id) = await _pin_liveness_fixture(
+        client, "pin-delivery-state@example.com"
+    )
+    async with get_sessionmaker()() as session:
+        pin = await session.get(HostBrowserPin, (host_id, root_id))
+        assert pin is not None
+        pin.delivered_at = None
+        pin.undelivered_reason = "invalid_chain"
+        await session.commit()
+
+    response = await client.get(f"/api/trust/hosts/{host_id}/pins", headers=auth)
+
+    assert response.status_code == 200
+    by_id = {pin["browser_device_id"]: pin for pin in response.json()["pins"]}
+    assert by_id[x_id] == {
+        "browser_device_id": x_id,
+        "delivered": True,
+        "undelivered_reason": None,
+    }
+    assert by_id[root_id] == {
+        "browser_device_id": root_id,
+        "delivered": False,
+        "undelivered_reason": "invalid_chain",
+    }
+    assert response.json()["capacity"] == {"used": 2, "max": 32}
 
 
 async def test_an_endorsement_closes_the_knock_it_answers(client):
@@ -724,3 +843,80 @@ async def test_an_endorsement_closes_the_knock_it_answers(client):
     )
     assert response.status_code == 200, response.text
     assert (await client.get("/api/trust/device-approvals", headers=auth)).json() == []
+
+
+@pytest.mark.parametrize("trigger", ["create", "list"])
+async def test_device_approval_paths_prune_rows_older_than_thirty_days(client, trigger):
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from spawn_server.models import BrowserDevice, DeviceApprovalRequest
+
+    user_id, auth, _, _, ids = await _endorsement_fixture(
+        client, f"approval-retention-{trigger}@example.com"
+    )
+    endorsed_id = ids[3]
+    now = datetime.now(UTC)
+    async with get_sessionmaker()() as session:
+        stale_resolved_device = BrowserDevice(
+            owner_user_id=user_id,
+            key_algorithm="ed25519",
+            public_key="A" * 42 + "1",
+        )
+        stale_expired_device = BrowserDevice(
+            owner_user_id=user_id,
+            key_algorithm="ed25519",
+            public_key="B" * 42 + "2",
+        )
+        recent_device = BrowserDevice(
+            owner_user_id=user_id,
+            key_algorithm="ed25519",
+            public_key="C" * 42 + "3",
+        )
+        session.add_all([stale_resolved_device, stale_expired_device, recent_device])
+        await session.flush()
+        stale_resolved = DeviceApprovalRequest(
+            owner_user_id=user_id,
+            browser_device_id=stale_resolved_device.id,
+            status="denied",
+            created_at=now - timedelta(days=40),
+            expires_at=now - timedelta(days=39),
+            resolved_at=now - timedelta(days=31),
+        )
+        stale_expired = DeviceApprovalRequest(
+            owner_user_id=user_id,
+            browser_device_id=stale_expired_device.id,
+            status="pending",
+            created_at=now - timedelta(days=40),
+            expires_at=now - timedelta(days=31),
+        )
+        recent = DeviceApprovalRequest(
+            owner_user_id=user_id,
+            browser_device_id=recent_device.id,
+            status="approved",
+            created_at=now - timedelta(days=10),
+            expires_at=now - timedelta(days=9),
+            resolved_at=now - timedelta(days=8),
+        )
+        session.add_all([stale_resolved, stale_expired, recent])
+        await session.commit()
+        stale_ids = {stale_resolved.id, stale_expired.id}
+        recent_id = recent.id
+
+    if trigger == "create":
+        response = await client.post(
+            "/api/trust/device-approvals",
+            json={"browser_device_id": endorsed_id},
+            headers=auth,
+        )
+    else:
+        response = await client.get("/api/trust/device-approvals", headers=auth)
+    assert response.status_code == 200, response.text
+
+    async with get_sessionmaker()() as session:
+        remaining = {
+            row.id for row in (await session.execute(select(DeviceApprovalRequest))).scalars()
+        }
+    assert stale_ids.isdisjoint(remaining)
+    assert recent_id in remaining

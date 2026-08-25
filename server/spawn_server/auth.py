@@ -9,7 +9,7 @@ from typing import Any
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import Cookie, Depends, Header, HTTPException, Query, Response, status
+from fastapi import Cookie, Depends, Header, HTTPException, Query, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -123,6 +123,13 @@ def set_session_cookie(response: Response, token: str) -> None:
     )
 
 
+def session_cookie_header(token: str) -> str:
+    """Render the canonical cookie attributes for an ASGI response hook."""
+    response = Response()
+    set_session_cookie(response, token)
+    return response.headers["set-cookie"]
+
+
 def _extract_bearer(authorization: str | None) -> str | None:
     if not authorization:
         return None
@@ -133,6 +140,7 @@ def _extract_bearer(authorization: str | None) -> str | None:
 
 
 async def current_user(
+    request: Request,
     authorization: str | None = Header(default=None),
     spawn_session: str | None = Cookie(default=None),
     token_q: str | None = Query(default=None, alias="token"),
@@ -152,6 +160,7 @@ async def current_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user gone")
     _assert_current_epoch(payload, user)
+    _schedule_session_renewal(request, payload, user)
     return user
 
 
@@ -169,6 +178,23 @@ def _assert_current_epoch(payload: dict[str, Any], user: User) -> None:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="session ended; sign in again",
         )
+
+
+def _schedule_session_renewal(request: Request, payload: dict[str, Any], user: User) -> None:
+    """Stage one sliding cookie refresh after epoch validation.
+
+    The HTTP ASGI response hook attaches it before the response starts,
+    including redirects and streaming responses. WebSockets never traverse
+    that hook and keep their existing authentication path.
+    """
+
+    issued_at = payload.get("iat")
+    if isinstance(issued_at, bool) or not isinstance(issued_at, (int, float)):
+        return
+    half_life = timedelta(days=get_settings().jwt_refresh_ttl_days) / 2
+    if _now() - datetime.fromtimestamp(issued_at, UTC) <= half_life:
+        return
+    request.state.session_renewal_token = issue_session_token(user.id, user.session_epoch)
 
 
 async def verified_user(user: User = Depends(current_user)) -> User:
@@ -199,6 +225,7 @@ async def verified_user(user: User = Depends(current_user)) -> User:
 
 
 async def current_user_optional(
+    request: Request,
     authorization: str | None = Header(default=None),
     spawn_session: str | None = Cookie(default=None),
     session: AsyncSession = Depends(get_session),
@@ -221,6 +248,7 @@ async def current_user_optional(
     # An evicted session must read as anonymous here too, not as the user.
     if int(payload.get("epoch", 0) or 0) != int(user.session_epoch or 0):
         return None
+    _schedule_session_renewal(request, payload, user)
     return user
 
 
