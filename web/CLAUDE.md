@@ -16,7 +16,7 @@ src/
                   legion/ login/ onboarding/ reset-password/ security/
                   sessions/ signup/ trust-ux-demo/ verify-email/ w/
   components/     UI grouped by product area
-                  access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/
+                  access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/ release/
                   onboarding/ profile/ session/ settings/ terminal/ trust/
                   ui/ workspace/
   hooks/          React hooks shared across areas (useHostControl, …)

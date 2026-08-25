@@ -29,6 +29,13 @@ export const host = {
   os: "macos",
   arch: "aarch64",
   version: "0.1.0",
+  daemon_tree: "1111111111111111111111111111111111111111",
+  update: {
+    state: "current",
+    latest_version: "0.1.0",
+    error: null,
+    requested_at: null,
+  },
   status: "online",
   last_seen_at: CREATED_AT,
   session_count: 1,
@@ -1168,6 +1175,33 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     }
     if (path === "/api/hosts" && method === "GET") {
       await json(route, hostList);
+      return;
+    }
+    if (path === "/api/release" && method === "GET") {
+      await json(route, {
+        server: { commit: null, dirty: false },
+        web: { build_id: null },
+        daemon: null,
+        mobile: { tree: null, runtime_version: null },
+        protocols: { daemon: null, browser: null, alerts: null },
+      });
+      return;
+    }
+    const hostUpdateMatch = path.match(/^\/api\/hosts\/([^/]+)\/update$/);
+    if (hostUpdateMatch && method === "POST") {
+      const selected = findById(store.hosts, hostUpdateMatch[1]);
+      if (!selected) {
+        await json(route, { detail: "host not found" }, 404);
+        return;
+      }
+      const update = {
+        state: "current",
+        latest_version: selected.version ?? null,
+        error: null,
+        requested_at: new Date().toISOString(),
+      };
+      selected.update = update;
+      await json(route, { update });
       return;
     }
     const hostMatch = path.match(/^\/api\/hosts\/([^/]+)$/);

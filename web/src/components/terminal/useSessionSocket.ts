@@ -1493,11 +1493,15 @@ export function useSessionSocket({
         if (!isCurrentWs()) return;
         setState("error");
       };
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         if (!isCurrentSessionGeneration() || wsRef.current !== ws) return;
         cleanupRtc(false);
         wsRef.current = null;
         setState("closed");
+        if (event.code === 4003) {
+          window.dispatchEvent(new CustomEvent("spawn:client-stale", { detail: { hard: true } }));
+          return;
+        }
         scheduleReconnect();
       };
     };

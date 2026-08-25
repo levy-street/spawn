@@ -44,6 +44,7 @@ const nextConfig: NextConfig = {
     middlewareClientMaxBodySize: 64 * 1024 * 1024,
   },
   env: {
+    NEXT_PUBLIC_SPAWN_BUILD_ID: buildId(),
     NEXT_PUBLIC_SPAWN_WS_URL: defaultPublicWsUrl(),
   },
   async headers() {

@@ -742,6 +742,21 @@ describe("HostControlClient", () => {
     third.client.close();
   });
 
+  test("a protocol-required close is terminal without becoming a trust refusal", async () => {
+    const client = new HostControlClient(hostId, { reconnectBaseDelayMs: 1 });
+    client.connect();
+    const ws = FakeWebSocket.instances[0];
+    ws.onopen?.();
+    ws.onclose?.({ code: 4003 });
+
+    await Bun.sleep(5);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(client.getState()).toBe("error");
+    expect(client.getTerminalReason()).toBe("protocol_required");
+    expect(client.getSignedRtcRefusal()).toBeNull();
+    client.close();
+  });
+
   test("queued callbacks from a replaced websocket cannot affect the current attempt", async () => {
     const client = new HostControlClient(hostId, {
       connectTimeoutMs: 1000,
