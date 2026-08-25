@@ -44,6 +44,10 @@ Environment:
   SPAWN_DEPLOY_PREBUILTS Publish the verified prebuilt-latest binaries and
                           manifest. Default: 1. Set to 0 only as an explicit
                           emergency override; daemons will not auto-update.
+  SPAWN_RELEASE_SIGNING_KEY
+                          Ed25519 seed used to sign daemon manifests. Default:
+                          ~/.config/spawn/release-signing.key. Required when
+                          prebuilts are published; never copied to the host.
 
 The proxy target:
 
@@ -82,6 +86,7 @@ source "$script_dir/release-lib.sh"
 if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$#" -eq 1 ]] || die "--self-test takes no other arguments"
   command -v python3 >/dev/null 2>&1 || die "python3 is required for --self-test"
+  command -v uv >/dev/null 2>&1 || die "uv is required for --self-test"
   release_contract_self_test || die "release contract self-test failed"
   "$script_dir/health-check.sh" --self-test || die "connection probe self-test failed"
   printf 'deploy-prod: self-test ok\n'
@@ -130,6 +135,8 @@ host="${host:-${SPAWN_DEPLOY_HOST:-}}"
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v ssh >/dev/null 2>&1 || die "ssh is required"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
+command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v uv >/dev/null 2>&1 || die "uv is required"
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run from inside the spawn repo"
 cd "$repo_root"
@@ -217,6 +224,10 @@ prebuilt_reason="not checked"
 release_commit=""
 release_tree=""
 release_version=""
+release_counter=""
+release_public_key=""
+release_key_id=""
+release_signing_key_file="$(release_signing_key_path)"
 prebuilt_entries=()
 
 target_commit="$(git rev-parse "$remote_ref")"
@@ -243,9 +254,25 @@ if [[ "$prebuilt_setting" == "0" ]]; then
   prebuilt_override=1
   printf '%s\n' \
     'deploy-prod: WARNING: SPAWN_DEPLOY_PREBUILTS=0 overrides the daemon release gate.' \
+    'deploy-prod: WARNING: daemons will refuse unsigned manifests.' \
     'deploy-prod: WARNING: daemons will not auto-update; users may need to reinstall SPAWN D.' >&2
 else
   prepare_prebuilt_release
+  if [[ "$prebuilt_ready" == "1" ]]; then
+    if ! release_signing_key_readable "$release_signing_key_file"; then
+      prebuilt_ready=0
+      prebuilt_reason="release signing key is missing or unreadable: $release_signing_key_file"
+    elif ! release_public_key="$(release_signing_public_key "$release_signing_key_file")"; then
+      prebuilt_ready=0
+      prebuilt_reason="release signing key is invalid: $release_signing_key_file"
+    elif ! release_key_id="$(release_signing_key_id "$release_public_key")"; then
+      prebuilt_ready=0
+      prebuilt_reason="could not derive the release signing key id"
+    elif ! release_counter="$(release_counter_for_commit "$release_commit")"; then
+      prebuilt_ready=0
+      prebuilt_reason="could not derive the release counter for $release_commit"
+    fi
+  fi
   if [[ "$prebuilt_stale" == "1" ]]; then
     die "$prebuilt_reason; wait for the prebuilt workflow. To override only in an emergency, set SPAWN_DEPLOY_PREBUILTS=0; daemons will not auto-update and users must reinstall with curl -fsSL https://spawnd.dev/install.sh | sh"
   fi
@@ -438,9 +465,10 @@ printf 'remote deploy: services updated\n'
 REMOTE
 
 # Publish the exact release snapshot verified before deployment. Binaries land
-# through temporary names, then the manifest is copied as manifest.json.tmp and
-# renamed last. The live server either sees the previous complete manifest or
-# the new complete one, never a partially-rendered identity document.
+# through temporary names. The manifest and detached signature are copied to
+# temporary paths and renamed atomically, with the signature made live last.
+# A reader may briefly see a manifest/signature mismatch, which is safe: the
+# daemon rejects it and retries rather than trusting an unsigned identity.
 prebuilts_published=0
 publish_prebuilts() {
   if [[ "$prebuilt_setting" != "1" ]]; then
@@ -467,18 +495,58 @@ publish_prebuilts() {
   done
 
   local manifest="$prebuilt_tmp/manifest.json"
+  local signature="$prebuilt_tmp/manifest.json.sig"
   render_prebuilt_manifest \
     "$release_commit" "$release_tree" "$release_version" \
+    "$release_counter" "$release_key_id" \
     "${prebuilt_entries[@]}" > "$manifest" ||
     die "could not render the verified prebuilt manifest"
+  sign_prebuilt_manifest \
+    "$manifest" "$signature" "$release_signing_key_file" ||
+    die "could not sign the verified prebuilt manifest"
   local prebuilt_root="$remote_path/daemon/target/prebuilt"
   ssh "$host" "mkdir -p '$prebuilt_root'"
   scp -q "$manifest" "$host:$prebuilt_root/manifest.json.tmp"
-  ssh "$host" "mv '$prebuilt_root/manifest.json.tmp' '$prebuilt_root/manifest.json'"
+  scp -q "$signature" "$host:$prebuilt_root/manifest.json.sig.tmp"
+  ssh "$host" "mv '$prebuilt_root/manifest.json.tmp' '$prebuilt_root/manifest.json' && mv '$prebuilt_root/manifest.json.sig.tmp' '$prebuilt_root/manifest.json.sig'"
   prebuilts_published=1
-  printf 'deploy-prod: published prebuilt manifest for daemon tree %s\n' "$release_tree"
+  printf 'deploy-prod: published signed prebuilt manifest for daemon tree %s (key %s)\n' \
+    "$release_tree" "$release_key_id"
 }
 publish_prebuilts
+
+# Prove that the public origin serves the exact signed pair just published.
+# This checks the nginx -> web -> API route, not merely the files over SSH.
+verify_published_manifest_signature() {
+  local served_manifest="$prebuilt_tmp/served-manifest.json"
+  local served_signature="$prebuilt_tmp/served-manifest.json.sig"
+  local attempt
+  for attempt in $(seq 1 "$smoke_attempts"); do
+    if curl -fsS --max-time 10 "$public_origin/api/install/manifest.json" \
+        -o "$served_manifest" &&
+      curl -fsS --max-time 10 "$public_origin/api/install/manifest.json.sig" \
+        -o "$served_signature" &&
+      cmp -s "$prebuilt_tmp/manifest.json" "$served_manifest" &&
+      verify_prebuilt_manifest_signature \
+        "$served_manifest" "$served_signature" "$release_public_key"; then
+      printf 'deploy-prod: verified public daemon manifest signature at %s (key %s)\n' \
+        "$public_origin" "$release_key_id"
+      return 0
+    fi
+    printf 'deploy-prod: public signed manifest not ready (attempt %s)\n' \
+      "$attempt" >&2
+    [[ "$attempt" == "$smoke_attempts" ]] || sleep 2
+  done
+  return 1
+}
+
+if [[ "$prebuilts_published" == "1" ]] &&
+  ! verify_published_manifest_signature; then
+  die "post-deploy daemon manifest signature proof failed through $public_origin.
+  The services and prebuilt files HAVE been updated. Roll back with:
+    ssh $host \"cd $remote_path && git checkout -B $branch $host_current_commit\"
+  then restore or republish the last known-good signed daemon manifest."
+fi
 
 # Fetch /api/release through the same web origin used by the health probe. This
 # happens after manifest publication because the server discovers prebuilts

@@ -42,6 +42,8 @@ binaries:
   "commit": "40hex",
   "tree": "40hex daemon tree",
   "version": "0.1.0+g<commit12>",
+  "release_counter": 1770000000,
+  "signing_key_id": "8hex",
   "targets": {
     "darwin-aarch64": {
       "spawnd_sha256": "64hex",
@@ -54,6 +56,53 @@ binaries:
 Do not hand-edit this manifest. Its hashes come from the already-verified
 `SHA256SUMS` in `prebuilt-latest`, and it includes only target pairs actually
 copied to the host.
+
+## Signed daemon releases
+
+Every daemon release has two public metadata files:
+`/api/install/manifest.json` and `/api/install/manifest.json.sig`. The second
+is a detached Ed25519 signature, encoded as one line of unpadded base64url,
+over the exact bytes of the first. There is no JSON reformatting or
+canonicalisation between signing and verification. The signed bytes bind the
+release commit and daemon tree, the version, the committer-timestamp
+`release_counter`, the signing key id, and both binary hashes for every
+published target. `deploy-prod.sh` publishes the manifest atomically and then
+the signature atomically, last; a daemon never installs from an unsigned or
+badly signed manifest.
+
+The private key is a 32-byte Ed25519 seed stored as one line of unpadded
+base64url at
+`${SPAWN_RELEASE_SIGNING_KEY:-$HOME/.config/spawn/release-signing.key}` on the
+operator Mac. Its mode is `0600`. Custody is deliberately narrow:
+
+- keep the working seed on that one operator Mac;
+- keep one backup of the seed in the password manager;
+- never put it in this repository, CI, EAS, the production server, a deploy
+  log, or a shell command line.
+
+The production public key is
+`8nE_rD4eVv8QFuNMbBQ3023vuU7V-OWxRl70ni4WOf0`, key id `e65c013f`. Public keys
+are compiled into the daemon as a list so rotation can overlap. To rotate,
+add the new public key beside the old one and ship that daemon release in a
+manifest signed by the old key. After it is deployed and the fleet has
+updated, retire the old key from the list in the following daemon release.
+Never remove the old key in the release that first introduces the new one.
+If the private seed is lost and the password-manager backup is also gone,
+there is no signed recovery path for installed daemons: rotate the key and do
+one fleet reinstall wave with the install one-liner.
+
+`scripts/verify-release.sh https://spawnd.dev` fetches the manifest and
+signature through the public origin, verifies them against the public-key list
+compiled into the expected daemon source, and proves `release_counter` equals
+`git show -s --format=%ct` for the expected commit. It also continues to prove
+the server/web identity, daemon tree and served binary hashes, and mobile
+identity. A failed signature or counter row is a failed release.
+
+The counter is also the downgrade boundary. Automatic daemon updates never
+downgrade. A deliberate operator retry may bypass the monotonicity check only
+through `POST /api/hosts/{id}/update` with
+`{"allow_downgrade": true}`. Use that override only when the older signed
+release is the intended recovery; it does not permit unsigned updates.
 
 ## The server and the web app go out together
 
@@ -114,6 +163,20 @@ Push the matching update in the same release:
 ```bash
 scripts/update-mobile-prod.sh -m "<same summary as the deploy>"
 ```
+
+For a bad OTA, the operator kill switches are:
+
+```bash
+eas update:rollback
+eas update:revert-update-rollout
+```
+
+The first publishes a rollback directive; the second backs out an in-progress
+percentage rollout. Use the one matching how the update was published, then
+verify the production manifest again. Separately, `expo-updates` has client
+error recovery: an update that crashes during startup can fall back through an
+emergency launch (`isEmergencyLaunch` / `emergencyLaunchReason`). That safety
+net is not a substitute for issuing the rollback promptly.
 
 Never run `eas update` by hand for production. The `env` blocks in
 `eas.json` apply to `eas build` profiles only — `eas update` re-evaluates
@@ -205,12 +268,33 @@ gh release create prebuilt-latest out/* --repo levy-street/spawn \
 
 `spawnd --version` prints `0.1.0+g<commit>`, so a running daemon can always be
 matched to its source. `deploy-prod.sh` converts these release files into the
-host manifest and refuses to publish a partial target pair. For a focused
-binary-only diagnostic, compare the served bytes with the rolling release:
+host manifest, signs it locally, and refuses to publish a partial target pair
+or to publish without the readable release-signing key. For a focused
+diagnostic, compare the served signature and bytes with the rolling release:
 
 ```bash
 scripts/verify-prebuilts.sh https://spawnd.dev
 ```
+
+## Pre-release version skew and canaries
+
+Before a release that changes the daemon/server contract, exercise the four
+cells that can coexist during one release-and-rollback window: previous server
+with previous daemon, previous server with the new daemon, new server with the
+previous daemon, and new server with the new daemon. Build the previous side
+from the last deployed tag in a temporary worktree. For each cross-version
+cell, prove registration and a PTY smoke; for old daemon/new server also prove
+the auto-update path, and for new daemon/old server prove that the downgrade
+guard fires without an update loop. Do the equivalent old-web/new-server
+protocol-refusal check when the browser contract changes. This is a weekly or
+pre-release ritual, not a per-commit test matrix.
+
+Here “A/B” means **interleaved canary cohorts**, not a statistical experiment:
+hold one host back with `settings.daemon_auto_update` off while another host
+updates, compare update stages, time-to-register and reconnect log classes,
+then advance the held-back host. A small EAS percentage rollout across the
+operator's own devices, with `eas update:revert-update-rollout` ready, is the
+mobile equivalent.
 
 ## Order of operations
 
@@ -243,8 +327,9 @@ IP or an SNI/TURN-aware router; it is not enabled in current production.
 
 ## Release checklist
 
-1. Confirm the checkout is clean, the intended commit is pushed, and daemon CI
-   has finished when `daemon/` changed.
+1. Confirm the checkout is clean, the intended commit is pushed, daemon CI has
+   finished when `daemon/` changed, and the local release-signing key is
+   present and readable when prebuilts will be published.
 2. Run `scripts/deploy-prod.sh <ssh-host>`. Do not continue past a hard gate by
    habit; fix the release or record why the emergency prebuilt override is safe.
 3. If `mobile/` changed, run

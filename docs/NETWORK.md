@@ -110,3 +110,16 @@ The named horizontal-scaling follow-up is to make the terminal session path
 resolve the owner through Redis presence and `owner_dispatch`, matching the
 host-control path. Do not raise the worker count until that work has shipped
 and has a cross-worker signalling test.
+
+## Protocol horizon
+
+WebTransport signalling and MASQUE relays are watch-only, not planned work.
+WebTransport is the credible HTTP/3 successor to watch for signalling, but
+[current guidance](https://ably.com/blog/can-webtransport-replace-websockets)
+still favors WebSockets for this application. MASQUE's
+[CONNECT-UDP](https://http.dev/masque) and emerging relay patterns are the
+potential long-term exit from TURN's awkward TCP/TLS topology, with
+[MASQUE relays](https://smallstep.com/blog/masque-relays-vs-vpns/) already
+demonstrating the shape. Neither changes the production contract above until
+browser, daemon-library, proxy, and operational support are mature enough to
+replace a path end to end.

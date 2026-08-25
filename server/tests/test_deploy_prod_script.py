@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -10,6 +11,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy-prod.sh"
 HEALTH_SCRIPT = REPO_ROOT / "scripts" / "health-check.sh"
+RELEASE_LIB = REPO_ROOT / "scripts" / "release-lib.sh"
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -18,7 +20,7 @@ def _write_executable(path: Path, body: str) -> None:
 
 
 def test_deploy_self_test_covers_release_contract_without_remote_calls(tmp_path: Path):
-    """The renderer, tree gate, and API comparison run without ssh/scp/gh."""
+    """Rendering, signing failures, tree gate, and API checks stay local."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     forbidden_log = tmp_path / "forbidden.log"
@@ -113,3 +115,76 @@ def test_deploy_smoke_names_the_public_websocket_probe():
     source = DEPLOY_SCRIPT.read_text()
     assert "SPAWN_DEPLOY_PUBLIC_ORIGIN" in source
     assert "health-check.sh --probe-websocket" in source
+
+
+def test_manifest_renderer_includes_signed_release_identity():
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; render_prebuilt_manifest '
+            "1111111111111111111111111111111111111111 "
+            "2222222222222222222222222222222222222222 "
+            "0.1.0+g111111111111 1700000000 e65c013f "
+            "darwin-aarch64:"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "release-render-test",
+            str(RELEASE_LIB),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads(result.stdout)
+    assert manifest["release_counter"] == 1_700_000_000
+    assert manifest["signing_key_id"] == "e65c013f"
+    assert manifest["targets"]["darwin-aarch64"]["spawn_worker_sha256"] == "b" * 64
+
+
+def test_deploy_signing_key_gate_and_unsigned_override_warning_are_pinned():
+    source = DEPLOY_SCRIPT.read_text()
+    key_gate = source.index('release_signing_key_readable "$release_signing_key_file"')
+    release_prepare = source.index("prepare_prebuilt_release")
+
+    assert release_prepare < key_gate
+    assert "release signing key is missing or unreadable" in source
+    assert "daemons will refuse unsigned manifests" in source
+    assert "SPAWN_DEPLOY_PREBUILTS=0 overrides the daemon release gate" in source
+    assert "manifest.json.sig.tmp" in source
+    assert (
+        "mv '$prebuilt_root/manifest.json.tmp' '$prebuilt_root/manifest.json' && mv "
+        in source
+    )
+
+
+def test_release_key_parser_accepts_daemon_rotation_list(tmp_path: Path):
+    public_key = "8nE_rD4eVv8QFuNMbBQ3023vuU7V-OWxRl70ni4WOf0"
+    rust_source = tmp_path / "release_key.rs"
+    rust_source.write_text(
+        "pub const RELEASE_SIGNING_PUBLIC_KEYS: &[&str] = &[\n"
+        f'    "{public_key}",\n'
+        "];\n"
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; release_public_keys_from_rust_file "$2"',
+            "release-key-parser-test",
+            str(RELEASE_LIB),
+            str(rust_source),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == public_key

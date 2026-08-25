@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Verify that the daemon binaries a spawn server hands out are byte-identical to
-# the ones GitHub CI built and published to the rolling `prebuilt-latest`
-# release. For every supported target this downloads what the server serves at
-# /api/install/{spawnd,spawn-worker}/<target>, hashes it, and compares against
-# CI's SHA256SUMS. No trust in the server required — the release SHA256SUMS is
-# the reference, the served bytes are the subject.
+# Verify the server's daemon manifest signature, then prove the handed-out
+# binaries are byte-identical to the rolling `prebuilt-latest` release. For
+# every supported target this downloads /api/install/{spawnd,spawn-worker},
+# hashes it, and compares against CI's SHA256SUMS.
 #
 # Usage: scripts/verify-prebuilts.sh [server-url]
 #   server-url  Base URL of the spawn server. Default: https://spawnd.dev
@@ -27,10 +25,64 @@ die() {
 
 command -v gh >/dev/null 2>&1 || die "gh is required to fetch the reference SHA256SUMS"
 command -v curl >/dev/null 2>&1 || die "curl is required"
+command -v git >/dev/null 2>&1 || die "git is required"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+command -v uv >/dev/null 2>&1 || die "uv is required"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" ||
+  die "run from inside the spawn repo"
+
+manifest="$tmp/manifest.json"
+signature="$tmp/manifest.json.sig"
+manifest_signature_ok=0
+manifest_key_id=""
+release_public_keys=()
+release_key_source="$repo_root/daemon/src/release_key.rs"
+if [[ -f "$release_key_source" ]]; then
+  while IFS= read -r public_key; do
+    [[ -n "$public_key" ]] && release_public_keys+=("$public_key")
+  done < <(release_public_keys_from_rust_file "$release_key_source" 2>/dev/null || true)
+else
+  release_key_source="SPAWN_RELEASE_PUBLIC_KEY fallback"
+  if [[ -n "${SPAWN_RELEASE_PUBLIC_KEY:-}" ]]; then
+    IFS=, read -r -a release_public_keys <<< "$SPAWN_RELEASE_PUBLIC_KEY"
+  fi
+fi
+
+if curl -fsSL "$SERVER/api/install/manifest.json" -o "$manifest" &&
+  curl -fsSL "$SERVER/api/install/manifest.json.sig" -o "$signature"; then
+  manifest_key_id="$(python3 - "$manifest" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8")).get("signing_key_id")
+if isinstance(value, str):
+    print(value)
+PY
+)"
+  for public_key in "${release_public_keys[@]}"; do
+    if verify_prebuilt_manifest_signature \
+      "$manifest" "$signature" "$public_key" 2>/dev/null; then
+      verified_key_id="$(release_signing_key_id "$public_key" 2>/dev/null || true)"
+      if [[ -n "$verified_key_id" && "$verified_key_id" == "$manifest_key_id" ]]; then
+        manifest_signature_ok=1
+        break
+      fi
+    fi
+  done
+fi
+
+if [[ "$manifest_signature_ok" == "1" ]]; then
+  printf 'verify-prebuilts: manifest signature OK (key %s; %s)\n' \
+    "$manifest_key_id" "$release_key_source"
+else
+  printf 'verify-prebuilts: manifest signature FAIL (key %s; %s)\n' \
+    "${manifest_key_id:-unknown}" "$release_key_source" >&2
+fi
 
 printf 'verify-prebuilts: fetching reference SHA256SUMS from %s (%s)\n' "$REPO" prebuilt-latest
 gh release download prebuilt-latest --repo "$REPO" --pattern SHA256SUMS --dir "$tmp" --clobber \
@@ -45,6 +97,7 @@ printf '\n%-22s %-14s %s\n' TARGET BINARY RESULT
 printf -- '---------------------------------------------------------------\n'
 
 fail=0
+[[ "$manifest_signature_ok" == "1" ]] || fail=1
 checked=0
 for pair in "${PREBUILT_TARGETS[@]}"; do
   target="${pair%%:*}"
@@ -77,7 +130,7 @@ done
 
 printf -- '---------------------------------------------------------------\n'
 if [[ "$fail" != 0 ]]; then
-  die "one or more served binaries do not match CI — see above"
+  die "the manifest signature or one or more served binaries failed verification — see above"
 fi
 [[ "$checked" -gt 0 ]] || die "nothing verified (no matching assets served)"
 printf 'verify-prebuilts: all %d served binaries match CI (%s)\n' "$checked" "$SERVER"
