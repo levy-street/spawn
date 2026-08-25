@@ -19,6 +19,9 @@ struct InstanceStatus {
     account: String,
     config_dir: String,
     server: String,
+    /// A stored daemon token exists; scripts test this instead of parsing the
+    /// human layout (scripts/dev.sh, scripts/smoke-local-login.sh).
+    signed_in: bool,
     connection: String,
     service: crate::service::ServiceStatus,
     sessions: usize,
@@ -81,6 +84,7 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
             .unwrap_or_else(|| "default".into()),
         config_dir: dir.display().to_string(),
         server: server.to_string(),
+        signed_in: stored.is_logged_in(),
         connection,
         service: crate::service::status(dir),
         sessions,
@@ -267,6 +271,7 @@ mod tests {
                 account: "9f1c2d3e".into(),
                 config_dir: "/tmp/spawn/9f1c2d3e".into(),
                 server: "https://spawnd.dev/".into(),
+                signed_in: true,
                 connection: "connected · 42 min · last error: none".into(),
                 service: crate::service::ServiceStatus {
                     installed: true,

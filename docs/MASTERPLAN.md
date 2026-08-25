@@ -76,7 +76,7 @@ rebuild it — build on it.
 | `9c23957` feat(daemon) | `spawnd` stamps `SPAWND_DAEMON_TREE` (git tree of `daemon/`, `-dirty` aware), registers with it + `self_update`/`self_update_blocked`, handles `daemon.update` (path-only URLs pinned to `/api/install/` on its own origin, sha256 + `--version` verification, atomic two-binary swap with `.prev`, flush-tracked result frame, exec-in-place keeping the PID, workers survive), `spawnd update` subcommand, protocol-refused (4003 / subprotocol) → HTTP self-update with 5-min backoff and hourly reinstall hint. Modules: `daemon/src/update.rs`, `update_io.rs`, `update_tests.rs`. |
 | `ef17da8` feat(infra) | `infra/nginx-spawnd.conf.example` (real prod vhost + 300 s `/ws/` timeouts), `infra/coturn.conf.example`, `docs/NETWORK.md` (UDP `turn:` mandatory for daemons; `turns:443` options; daemon UDP port range + firewall; one-uvicorn-worker constraint), `scripts/connection-probe.py` (stdlib WS handshake + STUN binding probes) wired into `health-check.sh` and post-deploy. |
 | `c48b8dd` feat(server) | Public `GET /api/release` (all identities; daemon section only from a fully hash-verified manifest), Host columns for `daemon_tree`/self-update state (alembic 0062), computed `HostOut.update` state machine (current/available/updating/failed/unsupported/unknown; dirty and dev identities never prompt), auto-`daemon.update` after `registered` (`SPAWN_DAEMON_AUTO_UPDATE=false` to disable), `POST /api/hosts/{id}/update` (200/202/409/429), `daemon.update_result` recording, re-register reconciliation, installer pins fed from the manifest. |
-| (in flight) | Three connection-fix streams — web (`W2`), mobile (`M2`), daemon (`D2` incl. the ErrChunk fix) — were mid-implementation when this document was written. Their scope is Part 3; check `git log` for `feat(web): connection`, `feat(mobile): connection`, `feat(daemon): connection`-shaped commits and the reports `docs/masterplan/IMPL-web2.md`, `IMPL-mobile2.md`, `IMPL-daemon2.md` to see what landed. All three LANDED with nothing undone — see the updated 2.2 status; Phase B shrinks to verification plus the cross-stream Part 6 items (#2 signed manifest, #3 downgrade guard). |
+| `8d2c960` `d3babb3` `b592326` | Three connection-fix streams — web (`W2`), mobile (`M2`), daemon (`D2` incl. the ErrChunk fix) — were mid-implementation when this document was written. Their scope is Part 3; check `git log` for `feat(web): connection`, `feat(mobile): connection`, `feat(daemon): connection`-shaped commits and the reports `docs/masterplan/IMPL-web2.md`, `IMPL-mobile2.md`, `IMPL-daemon2.md` to see what landed. All three LANDED with nothing undone — see the updated 2.2 status; Phase B shrinks to verification plus the cross-stream Part 6 items (#2 signed manifest, #3 downgrade guard). |
 
 ### Phase log — the executing session (started 2026-08-25, this branch)
 
@@ -96,6 +96,15 @@ Kept current as phases land; the per-phase worker reports live in `docs/masterpl
 | Wrap-up | DONE | Web full Playwright: 231 passed; the six reds it surfaced were fixed in `e07f23e` (download-page heading regression from F; three host-pins assertions stale since `8ef696d`; one load flake). Review guards re-pinned after review in `c65d4c5`. Server full suite on the S3 tree: 848 passed + the two scripts-owned fixture cases and the executable-bit case that T2 then fixed (16/16 green). Left open, with reasons, in the final report below. |
 | F desktop (Stage 1 MVP) | DONE (this commit) | `desktop/` — a standalone Tauri v2 macOS tray-first companion linking the daemon crate: keychain token + device keypair (registered as an ordinary revocable device), native password/sign-up + OAuth via the system browser (`spawn://oauth/callback`) + exchange, the mobile-compatible four-digit approval card for existing accounts, the server picker with mobile's validation copy, Possess = attended setup claim → signed-manifest-verified download of both binaries → `~/.local/bin` → `spawnd possess --setup-token` → `#k=` read from the child's stable plain output line (local pipe) → one-click approval signing the daemon crate's `SPAWN-HOST-PAIR-APPROVE-V1` (mismatch = terminal refusal), tray status/supervision from `status --json`/`doctor --json`/`state.json`/`launchctl`, Repair (possess → verified reinstall → log tail), Settings/Quit copy; Tauri updater pinned to the vendor `spawnd.dev/desktop/latest.json` (+beta) with the minisign public key committed and the scratch private key held OUTSIDE the repo at `~/.config/spawn/desktop-updater.key`; `.github/workflows/desktop.yml` (manual dispatch only, secrets placeholders, never run); `verify-release.sh --skip-desktop` rows; RELEASE.md piece five; root map + `desktop/CLAUDE.md`; the web download page leads with "Get SPAWN D for Mac" only once `/api/release.desktop` exists (hidden until S4 adds it). Report `IMPL-desktop-F.md`. Independent re-verification: desktop `cargo build/test (12)/clippy -D warnings` clean, `check-claude-md` clean, web lint/tsc/bun 1106/0; the unsigned debug `SPAWN D.app` launches and stays up outside the codex sandbox (its AppKit init was what the sandbox blocked) — the wizard was not driven by hand. Not done by design: Developer ID signing, notarization, a real updater endpoint, Stage 2/3. |
 | B/C/D/E S3 server | DONE (this commit) | Phase C: `SetupClaim` (alembic 0064) + `POST/GET /api/setup/claims` (owner-scoped, 10/min, 30 min TTL), `DeviceCode.setup_token`, the first possession-proved ceremony binds the claim `ready` (CAS) and answers `attended: true`, resolution on approve/deny/expire/conflict, `host.pair_requested`/`host.pair_resolved` trust events, the pairing push (`SPAWN D` / `<host> is ready to join your account`, `approvalRef`), install.sh `--setup` → `SPAWN_SETUP_TOKEN` and `--new-account`. Phase B: `SPAWN_PREBUILT_DIR`, byte-exact `/api/install/manifest.json{,.sig}` (no-store), `release_counter`/`signed` on `/api/release`, strict `allow_downgrade` on manual updates only, `health` stage, `worker_mismatch` register key → repair push even same-tree/auto-off. Phase D: sliding session cookie after half-life via an ASGI response hook (after epoch validation; never on WebSockets), `POST /api/auth/session/renew`, `POST /api/auth/sign-out-everywhere` (epoch bump + fresh caller token), daemon token rotation in `registered` under 30 d + fixed 1008 `token_*` reasons stamping `auth_rejected`, revoke deletes the device's pins (deny-list untouched), live-pin cap counting, pins API `capacity {used,max}` + per-pin delivery, `host.pin_adopt_failed`/`host.pin_adopted` frames + `host.pin_undelivered` event, 30 d/90 d row hygiene. Report `IMPL-server-S3.md`. Independent re-verification: ruff clean, `alembic heads` = 0064, claims/auth/release/hosts/install/alerts/push suites 129 passed; the worker's full run 849 passed with only the two scripts-owned `test_verify_release_script.py` cases red (their fake `git` predates the desktop rows F added — fixed in T2). |
+
+### Testing this branch locally (read before you start)
+
+- **Your production daemon lives on this Mac**: `~/.local/bin/spawnd` + the default per-account config dir under `~/Library/Application Support/spawn/`. Never run a bare `spawnd possess` or the install one-liner against a local server — `possess` would resume/reinstall the prod instance's service with whatever binary you ran, and `install.sh` overwrites `~/.local/bin`. Always give local runs their own `SPAWN_CONFIG_DIR` (or `--config-dir`) and, for the installer, `SPAWN_INSTALL_ROOT=/tmp/somewhere`.
+- **The sanctioned path is `scripts/dev.sh`** (Postgres + Redis + `alembic upgrade head` + web on :3000 + API on :8010 + an isolated debug daemon under `.spawn/local-daemon`). It prints the exact `spawnd login` line to pair the local daemon; after pairing, restart `dev.sh` and it supervises the daemon. Migrations on this branch: 0063, 0064.
+- **The onboarding hand-off end to end**: sign up in the browser → the host step shows `curl … | sh -s -- --setup <token>`. Locally run the equivalent by hand instead of the curl: `SPAWN_CONFIG_DIR=/tmp/spawn-local daemon/target/debug/spawnd --server http://localhost:3000 possess --setup-token <token>` — the checklist should move to *Machine registered*, the inline fingerprint card should appear, approve, then *Approved* → *Online* (no browser tab opens; after 25 s unapproved the daemon opens one). `spawnd status --json` / `doctor` / `state.json` under that config dir show the rest.
+- **What only works with a signed manifest**: self-update. Locally `/api/release.daemon` is null and the daemon says `manifest_missing`; that is correct. The updater is proven by `scripts/test-update-e2e.sh` (throwaway key); the prod key is the one in `~/.config/spawn/release-signing.key`.
+- **Known local quirks** (not product bugs): on sqlite (the smokes, not `dev.sh`) sign-up takes ~12 s because the email-log row waits on sqlite's write lock behind the sign-up transaction (ordering from 2026-08-06) — `smoke-local-login.sh`'s 10 s client timeout trips; `smoke-local-daemon.sh` is Linux-only (`/proc`); the two browser/http smokes need a global `bun` (Xcode CLT required on this Mac); guard `--self-test`s need Homebrew bash/ripgrep/coreutils/gnu-sed on PATH.
+- **Phone**: Expo Go against `SPAWN_DEV_API_HOST=0.0.0.0` (see `dev.sh`); the pairing push needs a registered push token (first launch after sign-in); the ICE-restart-on-network-change signal needs a native build (`expo-network` is a guarded require).
 
 ### The release-identity model (as built — the mental model everything else rides on)
 
@@ -184,36 +193,17 @@ only, no `turns:`; uvicorn access log on).
   (`feat(daemon): connections that survive the real world…`), all 12 items,
   nothing undone: report `docs/masterplan/IMPL-daemon2.md`.
 - **R2 (infra) — LANDED** (`feat(infra)`).
-- **S2 (server) — NOT STARTED. This is the largest remaining implementation
-  block and your first coding phase (Phase A below).** Full scope =
-  SPEC-connection "Server (server/) — owner S2" items 1–17 plus the
-  Addendum's stale-presence items. Highlights, in priority order:
-  1. `_resolve_user` on every WS enforces `session_epoch` (security hole:
-     revoked sessions keep signalling today) — close 1008.
-  2. Keepalive pings on `/ws/browser` + `/ws/host`; `rtc.config` refresh +
-     request handler.
-  3. Redis pump death closes sockets with 4010 (today: browser/alerts go
-     deaf-but-open; daemon gets a misleading 4000 "superseded").
-  4. Host status derived from `last_seen_at` (crash leaves "online" forever)
-     + eager Redis presence reclaim — the "daemon says connected but the web
-     disagrees" bug.
-  5. Orphan-grace/rebind/`rtc.resume` + `live_bindings` reconcile; ICE
-     restart acceptance (`ice_restart: true` on a live binding, fresh ICE,
-     no new generation).
-  6. `/ws/host` gets `protocol.required`+4003 like the other three; unknown
-     frames get a rate-limited error frame instead of silence.
-  7. ICE config validation at startup (a malformed TURN URL currently ships
-     to every client and breaks `new RTCPeerConnection`); warn when TURN has
-     no UDP `turn:` entry (daemons are UDP-only for relay).
-  8. Per-frame `SELECT … FOR UPDATE` on the signalling hot path replaced
-     with a 10 s cached ownership check; transient DB timeouts drop the
-     frame, never fence the whole daemon socket.
-  9. Registration admission semaphore (32) against reconnect storms;
-     candidate/status field allowlists and size caps; binding TTL 60→120 s
-     with `rtc.status expired`; per-user session-binding caps; deaf-socket
-     guard (subscriptions ready in 1 s or close 4010).
-  10. Session offers carry `ice_transport_policy` ONLY when the daemon
-      registered `session_ice_policy: true` (see trap #1).
+- **S2 (server) — LANDED** (`0750f34`, Phase A; report `docs/masterplan/IMPL-server-S2.md`). The original item list is preserved in that report and in `SPEC-connection.md`; highlights that shipped, in the order they were built:
+  1. `_resolve_user` on every WS enforces `session_epoch` (close 1008).
+  2. Keepalive pings on `/ws/browser` + `/ws/host`; `rtc.config` refresh + request handler.
+  3. Redis pump death closes sockets with 4010; 4004 for fencing/consistency; 4000 only for real supersession.
+  4. Host status derived from `last_seen_at` (90 s) + eager Redis presence reclaim.
+  5. Orphan-grace/rebind/`rtc.resume` + `live_bindings` reconcile; ICE restart acceptance.
+  6. `/ws/host` gets `protocol.required`+4003; unknown frames get a rate-limited error frame.
+  7. ICE config validation at startup; UDP `turn:` warning.
+  8. Hot-path `SELECT … FOR UPDATE` replaced with a 10 s cached ownership check.
+  9. Registration admission semaphore (32); candidate allowlists; 120 s binding TTL with `rtc.status expired`; per-user session-binding caps; pump-readiness guard.
+  10. Session offers carry `ice_transport_policy` ONLY when the daemon registered `session_ice_policy: true`.
   W2's and M2's already-shipped clients feature-detect all of it, so S2 can
   land server-side with zero client coordination.
 
@@ -422,7 +412,7 @@ close codes, k8s skew windows, Expo policies, WebRTC/TURN/backoff canon) with
 a tagged gap list and sources. What it validated as already-right and what it
 demands, in order:
 
-**ADOPT-NOW (some may already be in D2's commit — verify, then build the rest):**
+**ADOPT-NOW — all eight LANDED (1, 4, 5, 6 in `b592326`; 2, 3 across `3d7deda`/`aeee8c5`/`652fff7`; 7 in `3d7deda`; 8 in `d2bb137`):**
 
 1. **Post-update health gate with automatic revert** — the single biggest
    hole in any self-updater and ours until built: at swap, write a probation
