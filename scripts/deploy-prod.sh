@@ -38,6 +38,9 @@ Environment:
   SPAWN_DEPLOY_SMOKE_ATTEMPTS
                           Probes before the smoke check gives up (2s apart).
                           Default: 20.
+  SPAWN_DEPLOY_PREBUILTS Publish the verified prebuilt-latest binaries and
+                          manifest. Default: 1. Set to 0 only as an explicit
+                          emergency override; daemons will not auto-update.
 
 The proxy target:
 
@@ -68,6 +71,18 @@ quote_env() {
   local value="$2"
   printf '%s=%q ' "$name" "$value"
 }
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=release-lib.sh
+source "$script_dir/release-lib.sh"
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  [[ "$#" -eq 1 ]] || die "--self-test takes no other arguments"
+  command -v python3 >/dev/null 2>&1 || die "python3 is required for --self-test"
+  release_contract_self_test || die "release contract self-test failed"
+  printf 'deploy-prod: self-test ok\n'
+  exit 0
+fi
 
 host=""
 proxy_target_flag=""
@@ -110,6 +125,7 @@ host="${host:-${SPAWN_DEPLOY_HOST:-}}"
 
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v ssh >/dev/null 2>&1 || die "ssh is required"
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run from inside the spawn repo"
 cd "$repo_root"
@@ -184,37 +200,64 @@ smoke="${SPAWN_DEPLOY_SMOKE:-1}"
 smoke_attempts="${SPAWN_DEPLOY_SMOKE_ATTEMPTS:-20}"
 web_origin="${SPAWN_DEPLOY_WEB_ORIGIN:-}"
 
-# A rolling prebuilt may lag master when its workflow is cancelled or cannot
-# start. That is harmless only while daemon/ is unchanged: otherwise the
-# installer hands out a client for a different control protocol than the server
-# being deployed. Compare trees rather than commit IDs so web/server-only
-# commits do not unnecessarily block a release.
-prebuilt_manifest_matches_daemon() {
-  local manifest="$1"
-  local target_ref="$2"
-  local prebuilt_commit
-
-  [[ -f "$manifest" ]] || return 1
-  IFS= read -r prebuilt_commit < "$manifest"
-  [[ "$prebuilt_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
-  git cat-file -e "$prebuilt_commit^{commit}" 2>/dev/null || return 1
-  git diff --quiet "$prebuilt_commit" "$target_ref" -- daemon
+prebuilt_tmp="$(mktemp -d)"
+cleanup_prebuilt_tmp() {
+  rm -rf -- "$prebuilt_tmp"
 }
+trap cleanup_prebuilt_tmp EXIT
 
-# Fail before touching production when a reachable release is known stale.
-# An unavailable release remains best-effort as before; the installer can use
-# its source-build fallback. Re-check after deployment too, because the rolling
-# release can move between this preflight and publication.
-if [[ "${SPAWN_DEPLOY_PREBUILTS:-1}" == "1" ]] && command -v gh >/dev/null 2>&1; then
-  preflight_tmp="$(mktemp -d)"
-  if gh release download prebuilt-latest --repo levy-street/spawn \
-    --pattern COMMIT --dir "$preflight_tmp" --clobber >/dev/null 2>&1; then
-    if ! prebuilt_manifest_matches_daemon "$preflight_tmp/COMMIT" "$remote_ref"; then
-      rm -rf "$preflight_tmp"
-      die "prebuilt-latest was built from a different daemon tree; wait for the prebuilt workflow or set SPAWN_DEPLOY_PREBUILTS=0 and remove incompatible hosted prebuilts"
-    fi
+prebuilt_ready=0
+prebuilt_stale=0
+prebuilt_reason="not checked"
+release_commit=""
+release_tree=""
+release_version=""
+prebuilt_entries=()
+
+target_commit="$(git rev-parse "$remote_ref")"
+target_tree="$(git rev-parse "$remote_ref:daemon")"
+host_probe_env="$(quote_env SPAWN_DEPLOY_PATH "$remote_path")"
+host_current_commit="$(ssh "$host" "${host_probe_env}bash -se" <<'REMOTE'
+set -euo pipefail
+cd "$SPAWN_DEPLOY_PATH"
+git rev-parse HEAD
+REMOTE
+)" || die "could not read the production checkout before deployment"
+host_manifest_json="$(ssh "$host" "${host_probe_env}bash -se" <<'REMOTE'
+set -euo pipefail
+cat "$SPAWN_DEPLOY_PATH/daemon/target/prebuilt/manifest.json" 2>/dev/null || true
+REMOTE
+)" || die "could not read the production prebuilt manifest before deployment"
+host_manifest_tree="$(manifest_tree_from_json "$host_manifest_json" 2>/dev/null || true)"
+
+prebuilt_setting="${SPAWN_DEPLOY_PREBUILTS:-1}"
+[[ "$prebuilt_setting" == "0" || "$prebuilt_setting" == "1" ]] ||
+  die "SPAWN_DEPLOY_PREBUILTS must be 0 or 1"
+prebuilt_override=0
+if [[ "$prebuilt_setting" == "0" ]]; then
+  prebuilt_override=1
+  printf '%s\n' \
+    'deploy-prod: WARNING: SPAWN_DEPLOY_PREBUILTS=0 overrides the daemon release gate.' \
+    'deploy-prod: WARNING: daemons will not auto-update; users may need to reinstall SPAWN D.' >&2
+else
+  prepare_prebuilt_release
+  if [[ "$prebuilt_stale" == "1" ]]; then
+    die "$prebuilt_reason; wait for the prebuilt workflow. To override only in an emergency, set SPAWN_DEPLOY_PREBUILTS=0; daemons will not auto-update and users must reinstall with curl -fsSL https://spawnd.dev/install.sh | sh"
   fi
-  rm -rf "$preflight_tmp"
+fi
+
+if tree_changed_but_cannot_publish \
+  "$host_manifest_tree" "$target_tree" "$prebuilt_ready" "$prebuilt_override"; then
+  die "daemon tree changes from ${host_manifest_tree:-<no production manifest>} to $target_tree, but prebuilts cannot be published: $prebuilt_reason.
+  Wait for prebuilt-latest to contain verified COMMIT, TREE, VERSION, and
+  SHA256SUMS assets, or use SPAWN_DEPLOY_PREBUILTS=0 only as an emergency
+  override. Without prebuilts, daemons cannot auto-update; users must reinstall:
+    curl -fsSL https://spawnd.dev/install.sh | sh"
+fi
+
+if [[ "$prebuilt_setting" == "1" && "$prebuilt_ready" != "1" ]]; then
+  printf 'deploy-prod: prebuilt publish unavailable (%s); daemon tree is unchanged, continuing\n' \
+    "$prebuilt_reason" >&2
 fi
 
 printf 'deploy-prod: deploying %s to %s:%s\n' "$remote_ref" "$host" "$remote_path"
@@ -367,67 +410,101 @@ if [[ "${SPAWN_DEPLOY_SMOKE:-1}" != "0" ]] && command -v curl >/dev/null 2>&1; t
   printf 'remote deploy: smoke check ok (%s/healthz -> 200)\n' "$origin"
 fi
 
-printf 'remote deploy: complete\n'
+printf 'remote deploy: services updated\n'
 REMOTE
 
-# Publish CI-built prebuilt daemon binaries to the host. Every supported target
-# is built + checksummed by CI (.github/workflows/prebuilt.yml) into the rolling
-# `prebuilt-latest` release; we pull it HERE — the deploy invoker is already
-# GitHub-authed, so prod needs no gh/token — verify it against SHA256SUMS, and
-# scp the bytes into the server's prebuilt dir. The server serves prebuilts over
-# the source-build fallback, so what CI built is exactly what prod hands out
-# (verify with scripts/verify-prebuilts.sh). Best-effort: a miss leaves the
-# from-source fallback intact, and the server reads prebuilts live (no restart).
-#
-# Map of install.py's friendly target name -> release-asset triple. The prebuilt
-# dir uses the friendly name; the release assets use the triple.
-PREBUILT_TARGETS=(
-  "darwin-aarch64:aarch64-apple-darwin"
-  "darwin-x86_64:x86_64-apple-darwin"
-  "linux-x86_64:x86_64-unknown-linux-gnu"
-  "linux-aarch64:aarch64-unknown-linux-gnu"
-)
+# Publish the exact release snapshot verified before deployment. Binaries land
+# through temporary names, then the manifest is copied as manifest.json.tmp and
+# renamed last. The live server either sees the previous complete manifest or
+# the new complete one, never a partially-rendered identity document.
+prebuilts_published=0
 publish_prebuilts() {
-  if [[ "${SPAWN_DEPLOY_PREBUILTS:-1}" != "1" ]]; then
+  if [[ "$prebuilt_setting" != "1" ]]; then
     printf 'deploy-prod: prebuilt publish disabled (SPAWN_DEPLOY_PREBUILTS=0)\n'
-    return 0
+    return
   fi
-  command -v gh >/dev/null 2>&1 || {
-    printf 'deploy-prod: gh not found locally; skipping prebuilt publish\n'
-    return 0
-  }
-  local tmp
-  tmp="$(mktemp -d)"
-  if ! gh release download prebuilt-latest --repo levy-street/spawn --dir "$tmp" --clobber >/dev/null 2>&1; then
-    printf 'deploy-prod: no prebuilt-latest release; skipping prebuilt publish\n'
-    rm -rf "$tmp"
-    return 0
+  if [[ "$prebuilt_ready" != "1" ]]; then
+    printf 'deploy-prod: prebuilt publish skipped (%s)\n' "$prebuilt_reason"
+    return
   fi
-  if ! (cd "$tmp" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
-    printf 'deploy-prod: prebuilt checksum verification failed; not publishing\n' >&2
-    rm -rf "$tmp"
-    return 0
-  fi
-  if ! prebuilt_manifest_matches_daemon "$tmp/COMMIT" "$remote_ref"; then
-    printf 'deploy-prod: prebuilt-latest moved to an incompatible daemon build; not publishing\n' >&2
-    rm -rf "$tmp"
-    return 1
-  fi
+
   local pair target triple dest
   for pair in "${PREBUILT_TARGETS[@]}"; do
     target="${pair%%:*}"
     triple="${pair##*:}"
     dest="$remote_path/daemon/target/prebuilt/$target"
-    if [[ -f "$tmp/spawnd-$triple" && -f "$tmp/spawn-worker-$triple" ]]; then
+    if [[ -f "$prebuilt_tmp/spawnd-$triple" && -f "$prebuilt_tmp/spawn-worker-$triple" ]]; then
       ssh "$host" "mkdir -p '$dest'"
-      scp -q "$tmp/spawnd-$triple" "$host:$dest/spawnd"
-      scp -q "$tmp/spawn-worker-$triple" "$host:$dest/spawn-worker"
-      ssh "$host" "chmod 755 '$dest/spawnd' '$dest/spawn-worker'"
+      scp -q "$prebuilt_tmp/spawnd-$triple" "$host:$dest/spawnd.tmp"
+      scp -q "$prebuilt_tmp/spawn-worker-$triple" "$host:$dest/spawn-worker.tmp"
+      ssh "$host" "chmod 755 '$dest/spawnd.tmp' '$dest/spawn-worker.tmp' && mv '$dest/spawnd.tmp' '$dest/spawnd' && mv '$dest/spawn-worker.tmp' '$dest/spawn-worker'"
       printf 'deploy-prod: published %s prebuilt to %s\n' "$target" "$host"
-    else
-      printf 'deploy-prod: no %s binaries in prebuilt-latest; skipping\n' "$target"
     fi
   done
-  rm -rf "$tmp"
+
+  local manifest="$prebuilt_tmp/manifest.json"
+  render_prebuilt_manifest \
+    "$release_commit" "$release_tree" "$release_version" \
+    "${prebuilt_entries[@]}" > "$manifest" ||
+    die "could not render the verified prebuilt manifest"
+  local prebuilt_root="$remote_path/daemon/target/prebuilt"
+  ssh "$host" "mkdir -p '$prebuilt_root'"
+  scp -q "$manifest" "$host:$prebuilt_root/manifest.json.tmp"
+  ssh "$host" "mv '$prebuilt_root/manifest.json.tmp' '$prebuilt_root/manifest.json'"
+  prebuilts_published=1
+  printf 'deploy-prod: published prebuilt manifest for daemon tree %s\n' "$release_tree"
 }
-publish_prebuilts || true
+publish_prebuilts
+
+# Fetch /api/release through the same web origin used by the health probe. This
+# happens after manifest publication because the server discovers prebuilts
+# live, without a restart.
+release_probe_env="$(
+  quote_env SPAWN_DEPLOY_PATH "$remote_path"
+  quote_env SPAWN_DEPLOY_WEB_ORIGIN "$web_origin"
+  quote_env SPAWN_DEPLOY_SMOKE_ATTEMPTS "$smoke_attempts"
+)"
+release_json="$(ssh "$host" "${release_probe_env}bash -se" <<'REMOTE'
+set -euo pipefail
+cd "$SPAWN_DEPLOY_PATH"
+command -v curl >/dev/null 2>&1 || {
+  printf 'remote release proof: curl is required\n' >&2
+  exit 1
+}
+origin="${SPAWN_DEPLOY_WEB_ORIGIN:-}"
+if [[ -z "$origin" ]]; then
+  web_port="$(grep -o -- '-p [0-9]\{2,\}' web/package.json | head -1 | grep -o '[0-9]\{2,\}' || true)"
+  origin="http://127.0.0.1:${web_port:-3000}"
+fi
+payload=""
+for attempt in $(seq 1 "${SPAWN_DEPLOY_SMOKE_ATTEMPTS:-20}"); do
+  if payload="$(curl -fsS --max-time 5 "$origin/api/release" 2>/dev/null)"; then
+    printf '%s' "$payload"
+    exit 0
+  fi
+  printf 'remote release proof: /api/release not ready (attempt %s)\n' "$attempt" >&2
+  sleep 2
+done
+printf 'remote release proof: could not fetch %s/api/release\n' "$origin" >&2
+exit 1
+REMOTE
+)" || die "post-deploy /api/release fetch failed"
+
+expected_daemon_tree=""
+if [[ "$prebuilts_published" == "1" ]]; then
+  expected_daemon_tree="$target_tree"
+fi
+release_matches_expected "$release_json" "$target_commit" "$expected_daemon_tree" ||
+  die "post-deploy /api/release proof failed"
+printf 'deploy-prod: verified /api/release server.commit=%s' "$target_commit"
+if [[ -n "$expected_daemon_tree" ]]; then
+  printf ' daemon.tree=%s' "$expected_daemon_tree"
+fi
+printf '\n'
+
+if git cat-file -e "$host_current_commit^{commit}" 2>/dev/null &&
+  ! git diff --quiet "$host_current_commit" "$target_commit" -- mobile; then
+  printf "%s\n" "mobile/ changed — run scripts/update-mobile-prod.sh -m '<same message>'"
+fi
+
+printf 'deploy-prod: complete\n'

@@ -16,6 +16,9 @@ set -euo pipefail
 SERVER="${1:-https://spawnd.dev}"
 SERVER="${SERVER%/}"
 REPO="${SPAWN_REPO:-levy-street/spawn}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=release-lib.sh
+source "$script_dir/release-lib.sh"
 
 die() {
   printf 'verify-prebuilts: %s\n' "$*" >&2
@@ -25,14 +28,6 @@ die() {
 command -v gh >/dev/null 2>&1 || die "gh is required to fetch the reference SHA256SUMS"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
-
-# install.py's friendly target name -> release-asset triple.
-TARGETS=(
-  "darwin-aarch64:aarch64-apple-darwin"
-  "darwin-x86_64:x86_64-apple-darwin"
-  "linux-x86_64:x86_64-unknown-linux-gnu"
-  "linux-aarch64:aarch64-unknown-linux-gnu"
-)
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -51,7 +46,7 @@ printf -- '---------------------------------------------------------------\n'
 
 fail=0
 checked=0
-for pair in "${TARGETS[@]}"; do
+for pair in "${PREBUILT_TARGETS[@]}"; do
   target="${pair%%:*}"
   triple="${pair##*:}"
   for kind in spawnd spawn-worker; do

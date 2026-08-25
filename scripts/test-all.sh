@@ -18,6 +18,9 @@ if [[ -n "$non_executable_scripts" ]]; then
   exit 1
 fi
 
+printf '%s\n' "== production release script self-test =="
+scripts/deploy-prod.sh --self-test
+
 printf '%s\n' "== worker-only daemon guard =="
 scripts/check-worker-only-daemon.sh --self-test
 scripts/check-worker-only-daemon.sh
@@ -116,8 +119,9 @@ printf '%s\n' "== public HTTP surface smoke (optional) =="
 http_smoke_url="${SPAWN_HTTP_SMOKE_URL:-${SPAWN_PROD_URL:-}}"
 if [[ -n "$http_smoke_url" ]]; then
   scripts/smoke-http-surface.sh "$http_smoke_url"
+  scripts/verify-release.sh "$http_smoke_url"
 else
-  printf '%s\n' "set SPAWN_HTTP_SMOKE_URL=https://host to verify landing, download, installer, health, and hosted daemon binary"
+  printf '%s\n' "set SPAWN_HTTP_SMOKE_URL=https://host to verify the HTTP surface and release identities"
 fi
 
 printf '%s\n' "== web lint + browser tests + build =="

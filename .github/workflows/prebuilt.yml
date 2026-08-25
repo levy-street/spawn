@@ -188,6 +188,11 @@ jobs:
     permissions:
       contents: write # move the rolling `prebuilt-latest` tag + upload assets
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4
         with:
@@ -198,10 +203,16 @@ jobs:
       - name: Checksum + manifest
         run: |
           set -eu
+          tree="$(git rev-parse HEAD:daemon)"
+          chmod +x out/spawnd-x86_64-unknown-linux-gnu
+          version="$(out/spawnd-x86_64-unknown-linux-gnu --version | awk '{print $2}')"
+          test -n "$version"
           cd out
           # Deterministic ordering so the SHA256SUMS diff is stable build-to-build.
           sha256sum $(ls spawnd-* spawn-worker-* | sort) > SHA256SUMS
           echo "${GITHUB_SHA}" > COMMIT
+          echo "$tree" > TREE
+          echo "$version" > VERSION
           echo "----- prebuilt-latest SHA256SUMS -----"
           cat SHA256SUMS
 

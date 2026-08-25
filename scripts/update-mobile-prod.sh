@@ -12,9 +12,9 @@ to `eas build` profiles only. `eas update` re-evaluates app.config.ts with
 the CALLER'S shell environment, so a bare `eas update` from a shell without
 EXPO_PUBLIC_API_URL publishes a bundle with no API URL baked in — release
 builds then fall back to http://localhost:3000 and every phone breaks at
-sign-in. The script bakes the URL itself, proves the evaluated config
-carries it BEFORE publishing, and proves the served manifest carries it
-AFTER publishing.
+sign-in. The script bakes the URL itself, proves the evaluated config carries
+it and the mobile source tree BEFORE publishing, and proves the served
+manifest carries both AFTER publishing.
 
 Options:
   -m MESSAGE        Update message (required). Use the same summary as the
@@ -127,10 +127,12 @@ if [[ -n "${EXPO_PUBLIC_API_URL:-}" && "${EXPO_PUBLIC_API_URL}" != "$api_url" ]]
   die "inherited EXPO_PUBLIC_API_URL=${EXPO_PUBLIC_API_URL} disagrees with --api-url $api_url; unset it or pass it explicitly"
 fi
 export EXPO_PUBLIC_API_URL="$api_url"
+mobile_tree="$(git -C "$repo_root" rev-parse HEAD:mobile)"
+export EXPO_PUBLIC_SPAWN_MOBILE_TREE="$mobile_tree"
 
 # Prove the bake BEFORE publishing: evaluate app.config.ts exactly the way
-# `eas update` will, and require extra.apiUrl to have come out the other end.
-echo "update-mobile-prod: verifying the evaluated expo config bakes $api_url"
+# `eas update` will, and require both release inputs to come out the other end.
+echo "update-mobile-prod: verifying the evaluated expo config bakes $api_url and mobile tree $mobile_tree"
 evaluated="$(cd "$repo_root/mobile" && npx expo config --json 2>/dev/null)" ||
   die "npx expo config failed; cannot prove the bake, refusing to publish"
 baked="$(node -e '
@@ -142,6 +144,15 @@ baked="$(node -e '
 ' <<<"$evaluated")" || die "could not parse expo config output"
 [[ "$baked" == "$api_url" ]] ||
   die "evaluated config has extra.apiUrl='${baked:-<absent>}', expected $api_url; app.config.ts wiring changed — fix that before publishing"
+baked_tree="$(node -e '
+  const raw = require("fs").readFileSync(0, "utf8");
+  const start = raw.indexOf("{");
+  if (start < 0) process.exit(1);
+  const config = JSON.parse(raw.slice(start));
+  process.stdout.write(String(config?.extra?.mobileTree ?? ""));
+' <<<"$evaluated")" || die "could not parse expo config output"
+[[ "$baked_tree" == "$mobile_tree" ]] ||
+  die "evaluated config has extra.mobileTree='${baked_tree:-<absent>}', expected $mobile_tree; app.config.ts wiring changed — fix that before publishing"
 
 eas_bin=(eas)
 command -v eas >/dev/null 2>&1 || eas_bin=(npx --yes eas-cli)
@@ -168,7 +179,7 @@ if [[ "$skip_verify" -eq 1 ]]; then
 fi
 
 # Prove the serve AFTER publishing: the manifest the phones will fetch must
-# name one of the update ids just published and carry the baked URL.
+# name one of the update ids just published and carry both baked identities.
 read -r project_id runtime_version <<<"$(node -e '
   const app = require(process.argv[1] + "/mobile/app.json");
   const expo = app.expo ?? app;
@@ -206,16 +217,21 @@ for attempt in $(seq 1 "$verify_attempts"); do
     if (end < 0) process.exit(1);
     const manifest = JSON.parse(raw.slice(start, end + 1));
     const served = manifest?.extra?.expoClient?.extra?.apiUrl ?? "";
+    const servedTree = manifest?.extra?.expoClient?.extra?.mobileTree ?? "";
     const ids = process.argv[1].split(" ");
     if (served !== process.argv[2]) {
       console.error("served apiUrl=" + (served || "<absent>") + ", expected " + process.argv[2]);
+      process.exit(1);
+    }
+    if (servedTree !== process.argv[3]) {
+      console.error("served mobileTree=" + (servedTree || "<absent>") + ", expected " + process.argv[3]);
       process.exit(1);
     }
     if (!ids.includes(manifest.id)) {
       console.error("served update " + manifest.id + " is not the one just published");
       process.exit(1);
     }
-  ' "$published_ids" "$api_url" <<<"$manifest"; then
+  ' "$published_ids" "$api_url" "$mobile_tree" <<<"$manifest"; then
     verified=1
     break
   fi
@@ -223,6 +239,6 @@ for attempt in $(seq 1 "$verify_attempts"); do
   sleep "$verify_delay"
 done
 [[ "$verified" -eq 1 ]] ||
-  die "the served manifest never showed the published update with apiUrl=$api_url; phones may be broken — investigate before walking away"
+  die "the served manifest never showed the published update with apiUrl=$api_url and mobileTree=$mobile_tree; phones may be broken — investigate before walking away"
 
-echo "update-mobile-prod: verified — phones will fetch $api_url"
+echo "update-mobile-prod: verified — phones will fetch $api_url at mobile tree $mobile_tree"
