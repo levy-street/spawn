@@ -908,6 +908,12 @@ class MobileReleaseOut(BaseModel):
     runtime_version: str | None = None
 
 
+class ReleaseDesktop(BaseModel):
+    version: str
+    tree: str
+    platforms: list[str]
+
+
 class ReleaseProtocolsOut(BaseModel):
     daemon: str
     browser: str
@@ -919,6 +925,7 @@ class ReleaseOut(BaseModel):
     web: WebReleaseOut
     daemon: DaemonReleaseOut | None = None
     mobile: MobileReleaseOut
+    desktop: ReleaseDesktop | None = None
     protocols: ReleaseProtocolsOut
 
 

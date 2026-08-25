@@ -32,6 +32,7 @@ SUPPORTED_DAEMON_TARGETS = (
     "linux-x86_64",
     "linux-aarch64",
 )
+DESKTOP_PLATFORMS = ("darwin-aarch64", "darwin-x86_64")
 DAEMON_UPDATE_TIMEOUT = timedelta(minutes=3)
 
 _HEX_40 = re.compile(r"^[0-9a-f]{40}$")
@@ -48,6 +49,7 @@ class _ReleaseIdentity:
     web_build_id: str | None
     mobile_tree: str | None
     mobile_runtime_version: str | None
+    desktop: schemas.ReleaseDesktop | None
 
 
 _identity: _ReleaseIdentity | None = None
@@ -113,6 +115,20 @@ def _read_mobile_runtime_version() -> str | None:
     return version.strip() if isinstance(version, str) and version.strip() else None
 
 
+def _clean_desktop_version(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _read_desktop_version() -> str | None:
+    try:
+        raw = json.loads((REPO_ROOT / "desktop" / "src-tauri" / "tauri.conf.json").read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return _clean_desktop_version(raw.get("version"))
+
+
 def _read_web_build_id() -> str | None:
     try:
         value = (REPO_ROOT / "web" / ".next" / "BUILD_ID").read_text().strip()
@@ -137,12 +153,33 @@ def _compute_identity() -> _ReleaseIdentity:
     else:
         mobile_tree = None
 
+    if settings.desktop_version is not None:
+        desktop_version = _clean_desktop_version(settings.desktop_version)
+    else:
+        desktop_version = _read_desktop_version()
+
+    if settings.desktop_tree is not None:
+        desktop_tree = _clean_hex_40(settings.desktop_tree)
+    elif _git_path_is_clean("desktop") is True:
+        desktop_tree = _clean_hex_40(_git_output("rev-parse", "HEAD:desktop"))
+    else:
+        desktop_tree = None
+
+    desktop = None
+    if desktop_version is not None and desktop_tree is not None:
+        desktop = schemas.ReleaseDesktop(
+            version=desktop_version,
+            tree=desktop_tree,
+            platforms=list(DESKTOP_PLATFORMS),
+        )
+
     return _ReleaseIdentity(
         server_commit=server_commit,
         server_dirty=server_dirty,
         web_build_id=_read_web_build_id(),
         mobile_tree=mobile_tree,
         mobile_runtime_version=_read_mobile_runtime_version(),
+        desktop=desktop,
     )
 
 
@@ -318,6 +355,7 @@ def release_info() -> schemas.ReleaseOut:
             tree=identity.mobile_tree,
             runtime_version=identity.mobile_runtime_version,
         ),
+        desktop=identity.desktop,
         protocols=schemas.ReleaseProtocolsOut(
             daemon="spawn.control.v3",
             browser="spawn.v3",

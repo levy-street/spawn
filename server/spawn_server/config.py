@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     # a prefix or host rule here would let anything claiming the scheme collect
     # codes on the real app's behalf.
     oauth_native_redirect_uris: str = Field(
-        default="spawn://auth/oauth",
+        default="spawn://auth/oauth,spawn://oauth/callback",
         description="Comma-separated exact redirect URIs the native app may hand back to.",
     )
     # Long enough to survive a slow provider handoff, short enough that a code
@@ -82,6 +82,8 @@ class Settings(BaseSettings):
     # values fall back to the checkout when git is available.
     release_commit: str | None = None
     mobile_tree: str | None = None
+    desktop_version: str | None = None
+    desktop_tree: str | None = None
     daemon_auto_update: bool = True
     prebuilt_dir: Path = Field(
         default=Path(__file__).resolve().parents[2] / "daemon" / "target" / "prebuilt"
