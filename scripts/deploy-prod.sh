@@ -33,6 +33,9 @@ Environment:
                           Set to 0 to only pull and restart.
   SPAWN_DEPLOY_WEB_ORIGIN Origin the post-deploy smoke check probes on the
                           host. Default: derived from web/package.json.
+  SPAWN_DEPLOY_PUBLIC_ORIGIN
+                          Public nginx origin used for the WebSocket upgrade
+                          smoke check. Default: https://spawnd.dev.
   SPAWN_DEPLOY_SMOKE      Post-deploy smoke check. Default: 1. Set to 0 only
                           when the host has no proxied /healthz to probe.
   SPAWN_DEPLOY_SMOKE_ATTEMPTS
@@ -80,6 +83,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$#" -eq 1 ]] || die "--self-test takes no other arguments"
   command -v python3 >/dev/null 2>&1 || die "python3 is required for --self-test"
   release_contract_self_test || die "release contract self-test failed"
+  "$script_dir/health-check.sh" --self-test || die "connection probe self-test failed"
   printf 'deploy-prod: self-test ok\n'
   exit 0
 fi
@@ -199,6 +203,7 @@ api_proxy_target="${api_proxy_target%/}"
 smoke="${SPAWN_DEPLOY_SMOKE:-1}"
 smoke_attempts="${SPAWN_DEPLOY_SMOKE_ATTEMPTS:-20}"
 web_origin="${SPAWN_DEPLOY_WEB_ORIGIN:-}"
+public_origin="${SPAWN_DEPLOY_PUBLIC_ORIGIN:-https://spawnd.dev}"
 
 prebuilt_tmp="$(mktemp -d)"
 cleanup_prebuilt_tmp() {
@@ -274,6 +279,7 @@ env_prefix="$(
   quote_env SPAWN_DEPLOY_SMOKE "$smoke"
   quote_env SPAWN_DEPLOY_SMOKE_ATTEMPTS "$smoke_attempts"
   quote_env SPAWN_DEPLOY_WEB_ORIGIN "$web_origin"
+  quote_env SPAWN_DEPLOY_PUBLIC_ORIGIN "$public_origin"
 )"
 
 ssh "$host" "${env_prefix}bash -se" <<'REMOTE'
@@ -382,32 +388,50 @@ done
 
 # A unit that is "active" only means the process is up. /healthz is served by
 # the API and reached THROUGH the web app's rewrite, so a 200 here is the one
-# check that exercises the whole chain the browser uses -- nginx aside -- and
-# the only one that would have caught the 2026-08-24 dead-port build.
-if [[ "${SPAWN_DEPLOY_SMOKE:-1}" != "0" ]] && command -v curl >/dev/null 2>&1; then
-  origin="${SPAWN_DEPLOY_WEB_ORIGIN:-}"
-  if [[ -z "$origin" ]]; then
-    # Whatever port the start script binds is the port to probe, so read it
-    # from there rather than hardcoding a second copy that can drift.
-    web_port="$(grep -o -- '-p [0-9]\{2,\}' web/package.json | head -1 | grep -o '[0-9]\{2,\}' || true)"
-    origin="http://127.0.0.1:${web_port:-3000}"
-  fi
-  code=""
-  for _ in $(seq 1 "${SPAWN_DEPLOY_SMOKE_ATTEMPTS:-20}"); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$origin/healthz" || true)"
-    [[ "$code" == "200" ]] && break
-    sleep 2
-  done
-  if [[ "$code" != "200" ]]; then
-    die "post-deploy smoke check failed: GET $origin/healthz returned ${code:-no response}.
+# check that exercises the HTTP chain the browser uses -- nginx aside -- and
+# the only one that would have caught the 2026-08-24 dead-port build. The
+# anonymous WebSocket probe that follows crosses public nginx as well.
+if [[ "${SPAWN_DEPLOY_SMOKE:-1}" != "0" ]]; then
+  if command -v curl >/dev/null 2>&1; then
+    origin="${SPAWN_DEPLOY_WEB_ORIGIN:-}"
+    if [[ -z "$origin" ]]; then
+      # Whatever port the start script binds is the port to probe, so read it
+      # from there rather than hardcoding a second copy that can drift.
+      web_port="$(grep -o -- '-p [0-9]\{2,\}' web/package.json | head -1 | grep -o '[0-9]\{2,\}' || true)"
+      origin="http://127.0.0.1:${web_port:-3000}"
+    fi
+    code=""
+    for _ in $(seq 1 "${SPAWN_DEPLOY_SMOKE_ATTEMPTS:-20}"); do
+      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$origin/healthz" || true)"
+      [[ "$code" == "200" ]] && break
+      sleep 2
+    done
+    if [[ "$code" != "200" ]]; then
+      die "post-deploy smoke check failed: GET $origin/healthz returned ${code:-no response}.
   /healthz is proxied to the API, so this usually means the web app is pointed
   at the wrong API target or the API did not come back up. The services HAVE
   been restarted. Roll back with:
     cd $SPAWN_DEPLOY_PATH && git checkout -B $SPAWN_DEPLOY_BRANCH $old_rev
   then re-run the deploy once the cause is fixed.
   Set SPAWN_DEPLOY_SMOKE=0 if this host genuinely has no proxied /healthz."
+    fi
+    printf 'remote deploy: smoke check ok (%s/healthz -> 200)\n' "$origin"
+  else
+    printf 'remote deploy: WARNING: curl unavailable; HTTP smoke probe skipped\n' >&2
   fi
-  printf 'remote deploy: smoke check ok (%s/healthz -> 200)\n' "$origin"
+
+  if [[ -x scripts/health-check.sh ]]; then
+    if ! scripts/health-check.sh --probe-websocket \
+      "${SPAWN_DEPLOY_PUBLIC_ORIGIN:-https://spawnd.dev}"; then
+      die "post-deploy WebSocket smoke check failed through ${SPAWN_DEPLOY_PUBLIC_ORIGIN:-https://spawnd.dev}.
+  The services HAVE been restarted. Check nginx's /ws/ upgrade headers and
+  Next's API proxy target, then roll back if the public socket cannot upgrade."
+    fi
+  else
+    # Older checkouts and deliberately minimal test hosts do not have the new
+    # probe. This is feature detection for a deployment peer that predates it.
+    printf 'remote deploy: WARNING: scripts/health-check.sh unavailable; WebSocket smoke probe skipped\n' >&2
+  fi
 fi
 
 printf 'remote deploy: services updated\n'
