@@ -1,5 +1,7 @@
+import type { ReactNode } from "react";
 import { StyleSheet, View } from "react-native";
 import { hostConnectionLabel, pluralize } from "@/components/hosts/host-model";
+import { HostUpdateChip } from "@/components/hosts/host-update-status";
 import { ListGroup } from "@/components/ui/list-group";
 import { SectionHeader } from "@/components/ui/section-header";
 import { Text } from "@/components/ui/text";
@@ -8,15 +10,19 @@ import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { spacing } from "@/theme";
 import { sizing } from "@/theme/sizing";
 
-function Fact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+function Fact({ label, value, mono = false }: { label: string; value: ReactNode; mono?: boolean }) {
   return (
     <View style={styles.fact}>
       <Text color="mutedForeground" style={styles.factLabel} variant="caption">
         {label}
       </Text>
-      <Text selectable={mono} style={styles.factValue} variant={mono ? "mono" : "body"}>
-        {value}
-      </Text>
+      {typeof value === "string" || typeof value === "number" ? (
+        <Text selectable={mono} style={styles.factValue} variant={mono ? "mono" : "body"}>
+          {value}
+        </Text>
+      ) : (
+        <View style={styles.factValue}>{value}</View>
+      )}
     </View>
   );
 }
@@ -39,6 +45,9 @@ export function HostFacts({ host }: { host: HostOut }) {
       <ListGroup>
         <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
         <Fact label="Daemon" value={host.version ?? "unknown"} />
+        {hostUpdateLabelForFacts(host) ? (
+          <Fact label="Daemon update" value={<HostUpdateChip host={host} />} />
+        ) : null}
         <Fact label="Sessions" value={pluralize(host.session_count, "session")} />
         <Fact label="Connection" value={hostConnectionLabel(host)} />
         <Fact
@@ -50,6 +59,10 @@ export function HostFacts({ host }: { host: HostOut }) {
       </ListGroup>
     </View>
   );
+}
+
+function hostUpdateLabelForFacts(host: HostOut): boolean {
+  return host.update?.state === "available" || host.update?.state === "updating";
 }
 
 const styles = StyleSheet.create({

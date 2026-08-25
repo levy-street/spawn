@@ -30,6 +30,8 @@ function host(id: string, name: string, status: string, overrides: Partial<Host>
     mem_bucket: null,
     capacity_at: null,
     ...overrides,
+    daemon_tree: overrides.daemon_tree ?? null,
+    update: overrides.update ?? null,
   };
 }
 

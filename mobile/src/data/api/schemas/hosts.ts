@@ -1,12 +1,30 @@
 import { z } from "zod";
 import { IsoDateTimeSchema, UUIDSchema } from "@/data/api/schemas/common";
 
+export const HostUpdateStateSchema = z.enum([
+  "current",
+  "available",
+  "updating",
+  "failed",
+  "unsupported",
+  "unknown",
+]);
+export const HostUpdateOutSchema = z.object({
+  state: HostUpdateStateSchema,
+  latest_version: z.string().nullable().default(null),
+  error: z.string().nullable().default(null),
+  requested_at: IsoDateTimeSchema.nullable().default(null),
+});
+export const HostUpdateResponseSchema = z.object({ update: HostUpdateOutSchema });
+
 export const HostOutSchema = z.object({
   id: UUIDSchema,
   name: z.string(),
   os: z.string().nullable(),
   arch: z.string().nullable(),
   version: z.string().nullable(),
+  daemon_tree: z.string().nullable().default(null),
+  update: HostUpdateOutSchema.nullable().default(null),
   host_key_algorithm: z.literal("ed25519").nullable(),
   // The key travels alone (mesh B5): any fingerprint shown or compared is
   // derived locally from it, never read off a server response.
@@ -72,6 +90,8 @@ export const RecentDirOutSchema = z.object({
 export const RecentDirListSchema = z.object({ dirs: z.array(RecentDirOutSchema) });
 
 export type HostOut = z.infer<typeof HostOutSchema>;
+export type HostUpdateOut = z.infer<typeof HostUpdateOutSchema>;
+export type HostUpdateResponse = z.infer<typeof HostUpdateResponseSchema>;
 export type HostPatch = z.infer<typeof HostPatchSchema>;
 export type HostAgentTarget = z.infer<typeof HostAgentTargetSchema>;
 export type HostAgentStatus = z.infer<typeof HostAgentStatusSchema>;

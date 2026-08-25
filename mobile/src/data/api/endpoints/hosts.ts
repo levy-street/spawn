@@ -14,6 +14,8 @@ import {
   HostOutSchema,
   type HostPatch,
   HostPatchSchema,
+  type HostUpdateResponse,
+  HostUpdateResponseSchema,
   type RecentDirList,
   RecentDirListSchema,
 } from "@/data/api/schemas/hosts";
@@ -31,6 +33,13 @@ export function patchHost(hostId: string, body: HostPatch): Promise<HostOut> {
     method: "PATCH",
     body: jsonBody(HostPatchSchema.parse(body)),
     schema: HostOutSchema,
+  });
+}
+
+export function updateHost(hostId: string): Promise<HostUpdateResponse> {
+  return api(`/api/hosts/${pathPart(hostId)}/update`, {
+    method: "POST",
+    schema: HostUpdateResponseSchema,
   });
 }
 

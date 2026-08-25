@@ -8,6 +8,7 @@ import {
   hostConnectionLabel,
   pluralize,
 } from "@/components/hosts/host-model";
+import { HostUpdateBadge, hostUpdateLabel } from "@/components/hosts/host-update-status";
 import { RunningAgents } from "@/components/hosts/running-agents";
 import { Icon } from "@/components/ui/icon";
 import { IconButton } from "@/components/ui/icon-button";
@@ -68,7 +69,8 @@ export function HostListItem({
   const subtitle = [hostConnectionLabel(host), ...spec].join(" · ");
 
   const showCapacity = online && capacity.source === "bucketed";
-  const hasBody = showCapacity || running.length > 0;
+  const updateLabel = hostUpdateLabel(host);
+  const hasBody = showCapacity || running.length > 0 || updateLabel !== null;
 
   return (
     <View testID={`host-row-${host.id}`}>
@@ -77,6 +79,7 @@ export function HostListItem({
           ? {
               body: (
                 <>
+                  <HostUpdateBadge host={host} />
                   {showCapacity ? <CapacityMeter capacity={capacity} compact /> : null}
                   {running.length > 0 ? (
                     <RunningAgents groups={running} testID={`host-running-${host.id}`} />
@@ -87,6 +90,7 @@ export function HostListItem({
                 capacity: showCapacity ? capacity : { source: "unavailable" },
                 liveSessions: liveSessions.length,
                 sessionCount: host.session_count,
+                updateLabel,
               }),
             }
           : {})}
@@ -146,12 +150,15 @@ function hostBodyLabel({
   capacity,
   liveSessions,
   sessionCount,
+  updateLabel,
 }: {
   capacity: ReturnType<typeof capacityPresentation>;
   liveSessions: number;
   sessionCount: number;
+  updateLabel: string | null;
 }): string {
   const parts: string[] = [];
+  if (updateLabel) parts.push(updateLabel);
   if (capacity.source === "bucketed") {
     parts.push(
       `CPU ${capacityLabel(capacity.cpuSegments)}`,

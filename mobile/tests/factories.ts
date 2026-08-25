@@ -34,6 +34,8 @@ export function makeHost(overrides: Partial<Host> = {}): Host {
     os: "darwin",
     arch: "arm64",
     version: "1.0.0",
+    daemon_tree: null,
+    update: null,
     host_key_algorithm: "ed25519",
     host_public_key: "host-public-key",
     status: "online",

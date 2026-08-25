@@ -1,4 +1,20 @@
+import { execSync } from "node:child_process";
 import type { ConfigContext, ExpoConfig } from "expo/config";
+
+function mobileTree(): string | undefined {
+  const stamped = process.env["EXPO_PUBLIC_SPAWN_MOBILE_TREE"]?.trim();
+  if (stamped) return stamped;
+
+  try {
+    const tree = execSync("git rev-parse HEAD:mobile", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return tree || undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * app.json holds everything static; this layer adds what only the build knows.
@@ -10,7 +26,8 @@ import type { ConfigContext, ExpoConfig } from "expo/config";
  * the compiled default — https://spawnd.dev for production.
  */
 export default ({ config }: ConfigContext): ExpoConfig => {
-  const apiUrl = process.env.EXPO_PUBLIC_API_URL?.trim();
+  const apiUrl = process.env["EXPO_PUBLIC_API_URL"]?.trim();
+  const tree = mobileTree();
 
   return {
     ...config,
@@ -57,6 +74,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
     extra: {
       ...config.extra,
       ...(apiUrl ? { apiUrl } : {}),
+      ...(tree ? { mobileTree: tree } : {}),
     },
   };
 };

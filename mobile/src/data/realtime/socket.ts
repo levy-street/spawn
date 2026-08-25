@@ -20,6 +20,24 @@ interface RetirableSocket {
 }
 
 const SOCKET_REGISTRY = new Set<RetirableSocket>();
+const PROTOCOL_REQUIRED_LISTENERS = new Set<() => void>();
+
+export function subscribeProtocolRequired(listener: () => void): () => void {
+  PROTOCOL_REQUIRED_LISTENERS.add(listener);
+  return () => {
+    PROTOCOL_REQUIRED_LISTENERS.delete(listener);
+  };
+}
+
+function emitProtocolRequired(): void {
+  for (const listener of PROTOCOL_REQUIRED_LISTENERS) {
+    try {
+      listener();
+    } catch {
+      // One update listener cannot prevent the rest from hearing the refusal.
+    }
+  }
+}
 
 export function retireAll(): void {
   for (const socket of SOCKET_REGISTRY) {
@@ -219,6 +237,7 @@ export class ReconnectingSocket<Outbound = unknown> {
         this.setState("closed");
         return;
       }
+      if (event.code === 4003) emitProtocolRequired();
       if (PERMANENT_CLOSE_CODES.has(event.code)) {
         this.setState("failed");
         return;

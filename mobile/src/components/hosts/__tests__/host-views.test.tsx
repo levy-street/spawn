@@ -128,4 +128,44 @@ describe("host list and detail rendering", () => {
     expect(screen.queryByText(/update daemon/i)).not.toBeOnTheScreen();
     expect(screen.queryByText(/daemon logs/i)).not.toBeOnTheScreen();
   });
+
+  test("surfaces daemon update state on host rows and facts", async () => {
+    const outdated = {
+      ...onlineHost,
+      update: {
+        state: "available" as const,
+        latest_version: "2.0.0",
+        error: null,
+        requested_at: null,
+      },
+    };
+    const list = await render(
+      <ThemeProvider>
+        <HostListView
+          hosts={[outdated]}
+          onConnect={jest.fn()}
+          onOpen={jest.fn()}
+          onOpenActions={jest.fn()}
+          onRefresh={jest.fn()}
+          refreshing={false}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.getByText("update available")).toBeOnTheScreen();
+    await list.unmount();
+
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={{ ...outdated, update: { ...outdated.update, state: "updating" } }}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.getByText("updating")).toBeOnTheScreen();
+  });
 });

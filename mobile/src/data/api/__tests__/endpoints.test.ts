@@ -22,9 +22,10 @@ import { listAdminEmails } from "@/data/api/endpoints/admin";
 import { patchAgentPreferences } from "@/data/api/endpoints/agents";
 import { getOAuthStartUrl, logIn } from "@/data/api/endpoints/auth";
 import { getPendingDevice } from "@/data/api/endpoints/devices";
-import { patchHost } from "@/data/api/endpoints/hosts";
+import { patchHost, updateHost } from "@/data/api/endpoints/hosts";
 import { downloadSpawnWorker } from "@/data/api/endpoints/install";
 import { getProfile } from "@/data/api/endpoints/legion";
+import { getRelease } from "@/data/api/endpoints/release";
 import { createSession, patchSessionAccess } from "@/data/api/endpoints/sessions";
 import { createSkill } from "@/data/api/endpoints/skills";
 import { deleteWorkspaceTemplate } from "@/data/api/endpoints/templates";
@@ -87,6 +88,22 @@ it("encodes host identifiers and serializes host patches", async () => {
   expect(api).toHaveBeenCalledWith(
     "/api/hosts/host%2Fone",
     expect.objectContaining({ method: "PATCH", body: '{"name":"Laptop"}' }),
+  );
+});
+
+it("requests a daemon update for an encoded host identifier", async () => {
+  await updateHost("host/one");
+  expect(api).toHaveBeenCalledWith(
+    "/api/hosts/host%2Fone/update",
+    expect.objectContaining({ method: "POST", schema: expect.any(Object) }),
+  );
+});
+
+it("fetches the public release contract without auth", async () => {
+  await getRelease();
+  expect(api).toHaveBeenCalledWith(
+    "/api/release",
+    expect.objectContaining({ auth: false, schema: expect.any(Object) }),
   );
 });
 
