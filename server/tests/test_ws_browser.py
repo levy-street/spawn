@@ -717,3 +717,41 @@ async def test_browser_ws_v3_rejects_server_visible_viewport_control(client):
     await asyncio.wait_for(task, timeout=1)
 
     assert ws.closed == (4002, "terminal control belongs on spawn.ctl")
+
+
+def test_session_rtc_config_carries_the_transport_policy(monkeypatch):
+    """The terminal is told how to reach the host, not just where.
+
+    Before this, `ice_transport_policy` existed only on the host-control
+    channel, so an operator who configured a relay-only deployment had the
+    terminal quietly keep trying direct paths that do not exist.
+    """
+    from spawn_server.config import get_settings
+    from spawn_server.ws.browser import _rtc_config_payload
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    assert _rtc_config_payload("user-1")["ice_transport_policy"] == "all"
+
+    monkeypatch.setenv("SPAWN_WEBRTC_ICE_SERVERS", "[]")
+    monkeypatch.setenv("SPAWN_TURN_URLS", "turn:relay.example:3478?transport=udp")
+    monkeypatch.setenv("SPAWN_TURN_SECRET", "s3cret")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    payload = _rtc_config_payload("user-1")
+    assert payload["ice_transport_policy"] == "relay"
+    assert payload["ice_servers"][-1]["username"].endswith(":user-1")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+
+def test_session_offers_never_carry_ice_transport_policy():
+    """A guard, not a preference.
+
+    `daemon/src/run.rs` dispatches a session offer only when
+    `ice_transport_policy` is absent — the field's presence is how it
+    recognises a *host* offer. Putting it on a session offer would make every
+    daemon already in the field drop every terminal offer on the floor, which
+    no server-side version check can save. The client is told the policy on
+    its own `rtc.config` instead.
+    """
+    from spawn_server.ws.browser import _offer_ice
+
+    assert set(_offer_ice("user-1")) == {"ice_servers"}

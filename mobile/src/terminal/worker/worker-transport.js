@@ -73,9 +73,13 @@
     state.bindingNonce = message.bindingNonce;
     state.bindingGeneration = null;
     state.offerSent = false;
+    // Either the operator's deployment says every peer relays, or this client
+    // was asked to prove it can. Native used to read neither, so a relay-only
+    // deployment kept the phone hunting for direct paths that do not exist.
+    const relayOnly = message.forceRelay === true || message.iceTransportPolicy === "relay";
     const pc = new RTCPeerConnection({
       iceServers: message.iceServers,
-      iceTransportPolicy: message.forceRelay ? "relay" : "all",
+      iceTransportPolicy: relayOnly ? "relay" : "all",
     });
     state.pc = pc;
     if (state.mode === "session") {
