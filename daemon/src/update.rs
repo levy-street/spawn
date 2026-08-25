@@ -13,7 +13,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::proto::DaemonUpdateArtifact;
@@ -26,8 +30,10 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 const PROBATION_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static WORKER_MISMATCH: AtomicBool = AtomicBool::new(false);
+static UNSIGNED_WARNING_LOGGED: AtomicBool = AtomicBool::new(false);
 static PROBATION: OnceLock<Arc<Mutex<Option<ProbationRuntime>>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -38,6 +44,7 @@ pub struct UpdateRequest {
     pub target: String,
     pub spawnd: DaemonUpdateArtifact,
     pub spawn_worker: DaemonUpdateArtifact,
+    pub allow_downgrade: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +96,6 @@ enum BlockReason {
     Unwritable,
     UnsupportedTarget,
     WorkerMissing,
-    WorkerMismatch,
 }
 
 impl BlockReason {
@@ -99,7 +105,6 @@ impl BlockReason {
             Self::Unwritable => "unwritable",
             Self::UnsupportedTarget => "unsupported_target",
             Self::WorkerMissing => "worker_missing",
-            Self::WorkerMismatch => "worker_mismatch",
         }
     }
 }
@@ -184,19 +189,186 @@ struct ReleaseDaemon {
     targets: HashMap<String, ReleaseTarget>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ReleaseTarget {
     spawnd_sha256: String,
     spawn_worker_sha256: String,
 }
 
-pub fn capability() -> Capability {
-    if WORKER_MISMATCH.load(Ordering::Acquire) {
-        return Capability {
-            self_update: false,
-            blocked: Some(BlockReason::WorkerMismatch.as_str()),
-        };
+#[derive(Debug, Deserialize)]
+struct SignedReleaseManifest {
+    tree: String,
+    release_counter: u64,
+    #[serde(default)]
+    signing_key_id: Option<String>,
+    targets: HashMap<String, ReleaseTarget>,
+}
+
+async fn fetch_bounded_metadata(
+    client: &reqwest::Client,
+    server_origin: &Url,
+    path: &str,
+    missing_error: &'static str,
+) -> Result<Vec<u8>, UpdateFailure> {
+    let url = join_install_url(server_origin, path)?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| UpdateFailure::new(UpdateStage::Verify, missing_error))?;
+    if !response.status().is_success() {
+        return Err(UpdateFailure::new(UpdateStage::Verify, missing_error));
     }
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_MANIFEST_BYTES as u64)
+    {
+        return Err(UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| UpdateFailure::new(UpdateStage::Verify, missing_error))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_MANIFEST_BYTES {
+            return Err(UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn allow_unsigned_update() -> bool {
+    let allowed =
+        std::env::var_os("SPAWND_ALLOW_UNSIGNED_UPDATE").is_some_and(|value| value == "1");
+    if allowed && !UNSIGNED_WARNING_LOGGED.swap(true, Ordering::AcqRel) {
+        tracing::warn!(
+            "SPAWND_ALLOW_UNSIGNED_UPDATE=1: release signature and downgrade checks are disabled"
+        );
+    }
+    allowed
+}
+
+async fn verify_release_manifest(
+    client: &reqwest::Client,
+    server_origin: &Url,
+    request: &UpdateRequest,
+    target: &str,
+) -> Result<(), UpdateFailure> {
+    let allow_unsigned = allow_unsigned_update();
+    let manifest = fetch_bounded_metadata(
+        client,
+        server_origin,
+        "/api/install/manifest.json",
+        "manifest_missing",
+    )
+    .await?;
+    let signature = if allow_unsigned {
+        None
+    } else {
+        Some(
+            fetch_bounded_metadata(
+                client,
+                server_origin,
+                "/api/install/manifest.json.sig",
+                "manifest_unsigned",
+            )
+            .await?,
+        )
+    };
+    let keys: Vec<&str> = crate::release_key::effective_release_signing_public_keys().collect();
+    verify_manifest_bytes(
+        &manifest,
+        signature.as_deref(),
+        request,
+        target,
+        allow_unsigned,
+        &keys,
+        crate::version::build_counter(),
+    )
+}
+
+fn verify_manifest_bytes(
+    manifest_bytes: &[u8],
+    signature_bytes: Option<&[u8]>,
+    request: &UpdateRequest,
+    target: &str,
+    allow_unsigned: bool,
+    public_keys: &[&str],
+    build_counter: Option<u64>,
+) -> Result<(), UpdateFailure> {
+    let manifest: SignedReleaseManifest = serde_json::from_slice(manifest_bytes)
+        .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"))?;
+
+    if !allow_unsigned {
+        let Some(signing_key_id) = manifest.signing_key_id.as_deref() else {
+            return Err(UpdateFailure::new(
+                UpdateStage::Verify,
+                "manifest_bad_signature",
+            ));
+        };
+        let signature_bytes = signature_bytes
+            .ok_or_else(|| UpdateFailure::new(UpdateStage::Verify, "manifest_unsigned"))?;
+        let signature_wire = std::str::from_utf8(signature_bytes)
+            .map(str::trim)
+            .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "manifest_bad_signature"))?;
+        let signature_raw = URL_SAFE_NO_PAD
+            .decode(signature_wire)
+            .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "manifest_bad_signature"))?;
+        let signature_raw: [u8; 64] = signature_raw
+            .try_into()
+            .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "manifest_bad_signature"))?;
+        let signature = Signature::from_bytes(&signature_raw);
+        let verified = public_keys.iter().any(|wire| {
+            let Ok(raw) = URL_SAFE_NO_PAD.decode(wire) else {
+                return false;
+            };
+            let Ok(raw) = <[u8; 32]>::try_from(raw) else {
+                return false;
+            };
+            let key_id = &digest_hex(&Sha256::digest(raw))[..8];
+            if signing_key_id != key_id {
+                return false;
+            }
+            VerifyingKey::from_bytes(&raw)
+                .is_ok_and(|key| key.verify(manifest_bytes, &signature).is_ok())
+        });
+        if !verified {
+            return Err(UpdateFailure::new(
+                UpdateStage::Verify,
+                "manifest_bad_signature",
+            ));
+        }
+    }
+
+    let Some(artifacts) = manifest.targets.get(target) else {
+        return Err(UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"));
+    };
+    if manifest.tree != request.tree
+        || !artifacts
+            .spawnd_sha256
+            .eq_ignore_ascii_case(&request.spawnd.sha256)
+        || !artifacts
+            .spawn_worker_sha256
+            .eq_ignore_ascii_case(&request.spawn_worker.sha256)
+    {
+        return Err(UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"));
+    }
+    if !allow_unsigned
+        && !request.allow_downgrade
+        && build_counter.is_some_and(|counter| manifest.release_counter < counter)
+    {
+        return Err(UpdateFailure::new(UpdateStage::Precondition, "downgrade"));
+    }
+    Ok(())
+}
+
+fn same_tree_is_current(release_tree: &str, own_tree: &str, worker_mismatch: bool) -> bool {
+    release_tree == own_tree && !worker_mismatch
+}
+
+pub fn capability() -> Capability {
     match evaluate_preconditions() {
         Ok(_) => Capability {
             self_update: true,
@@ -248,7 +420,7 @@ pub async fn apply_from_release(server: &Url) -> Result<HttpUpdateOutcome, Updat
     let Some(daemon) = release.daemon.filter(|daemon| clean_tree(&daemon.tree)) else {
         return Ok(HttpUpdateOutcome::NoUpdate("release_unavailable"));
     };
-    if daemon.tree == own_tree {
+    if same_tree_is_current(&daemon.tree, own_tree, worker_mismatch()) {
         return Ok(HttpUpdateOutcome::NoUpdate("current"));
     }
     let Some(target) = daemon.targets.get(preconditions.target) else {
@@ -267,6 +439,7 @@ pub async fn apply_from_release(server: &Url) -> Result<HttpUpdateOutcome, Updat
             path: format!("/api/install/spawn-worker/{}", preconditions.target),
             sha256: target.spawn_worker_sha256.clone(),
         },
+        allow_downgrade: false,
     };
     apply_guarded(server, &request, preconditions, permit)
         .await
@@ -288,8 +461,10 @@ async fn apply_guarded(
         return Err(UpdateFailure::new(UpdateStage::Verify, "invalid_sha256"));
     }
 
-    let temporary = TempFiles::new(&preconditions)?;
     let client = http_client()?;
+    verify_release_manifest(&client, server_origin, request, preconditions.target).await?;
+
+    let temporary = TempFiles::new(&preconditions)?;
     log_stage(UpdateStage::Download);
     let downloads = async {
         let daemon_hash = download_to(&client, daemon_url, &temporary.daemon).await?;
@@ -391,17 +566,27 @@ fn log_stage(stage: UpdateStage) {
 pub async fn run_cli(server_cli: Option<String>) -> Result<()> {
     let stored = crate::creds::load().context("loading stored credentials")?;
     let server = crate::config::server_url_for_instance(server_cli, stored.server_url.as_deref())?;
+    let spinner = crate::tui::Spinner::start("checking for an update");
     match apply_from_release(&server).await {
         Ok(HttpUpdateOutcome::NoUpdate(reason)) => {
-            println!("SPAWN D daemon update not applied ({reason}).");
+            spinner.finish(true, "update check complete");
+            println!("{}", cli_no_update_line(reason));
             Ok(())
         }
         Ok(HttpUpdateOutcome::Applied(applied)) => {
+            spinner.finish(true, "update verified; restarting");
             let failure = exec(applied);
             anyhow::bail!("SPAWN D daemon update failed: {failure}")
         }
-        Err(failure) => anyhow::bail!("SPAWN D daemon update failed: {failure}"),
+        Err(failure) => {
+            spinner.finish(false, "update not applied");
+            anyhow::bail!("SPAWN D daemon update failed: {failure}")
+        }
     }
+}
+
+fn cli_no_update_line(reason: &str) -> String {
+    format!("SPAWN D daemon update not applied ({reason}).")
 }
 
 /// Re-check the co-installed worker identity and publish the result through
@@ -421,6 +606,10 @@ pub async fn refresh_worker_pair_status() -> bool {
         );
     }
     matches
+}
+
+pub fn worker_mismatch() -> bool {
+    WORKER_MISMATCH.load(Ordering::Acquire)
 }
 
 pub async fn ensure_worker_pair() -> Result<()> {
@@ -507,7 +696,41 @@ pub fn prepare_probation() -> Result<()> {
         return Ok(());
     }
 
-    let mut marker = read_marker(&marker_path)?;
+    let mut marker = match read_marker(&marker_path) {
+        Ok(marker) => marker,
+        Err(error) => {
+            let worker_path = previous_worker_path_for_recovery(&daemon_path);
+            tracing::warn!(stage = "health", %error, "self-update probation marker is unreadable");
+            if let Some(worker_path) = worker_path {
+                let recovered = ProbationMarker {
+                    attempts: 2,
+                    old_tree: String::new(),
+                    deadline_unix_ms: unix_millis(),
+                    attempted_tree: crate::version::daemon_tree()
+                        .unwrap_or_default()
+                        .to_string(),
+                    version_before: crate::version::build_version(),
+                    request_id: None,
+                    worker_path,
+                    reverted: false,
+                };
+                return revert_and_exec(ProbationRuntime {
+                    marker_path,
+                    marker: recovered,
+                    daemon_path,
+                });
+            }
+            if let Err(remove_error) = fs::remove_file(&marker_path) {
+                if remove_error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        stage = "health",
+                        "could not delete unreadable probation marker"
+                    );
+                }
+            }
+            return Ok(());
+        }
+    };
     match probation_decision(&marker, unix_millis()) {
         ProbationDecision::Continue => {
             marker.attempts = marker.attempts.saturating_add(1);
@@ -534,6 +757,29 @@ pub fn prepare_probation() -> Result<()> {
             daemon_path,
         }),
     }
+}
+
+fn complete_previous_pair(daemon_path: &Path, worker_path: &Path) -> bool {
+    previous_path(daemon_path).is_file() && previous_path(worker_path).is_file()
+}
+
+fn previous_worker_path_for_recovery(daemon_path: &Path) -> Option<PathBuf> {
+    let configured = crate::worker_backend::worker_bin();
+    let mut candidates = Vec::new();
+    if let Some(parent) = daemon_path.parent() {
+        candidates.push(parent.join("spawn-worker"));
+    }
+    if configured.is_absolute() {
+        candidates.push(configured.clone());
+    } else if let Some(parent) = daemon_path.parent() {
+        candidates.push(parent.join(&configured));
+    }
+    if let Some(resolved) = resolve_program(configured) {
+        candidates.push(resolved);
+    }
+    candidates
+        .into_iter()
+        .find(|worker| complete_previous_pair(daemon_path, worker))
 }
 
 /// Arm the five-minute health deadline. Registration removes this task's

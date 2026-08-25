@@ -26,6 +26,13 @@ use crate::{config, creds, login, service};
 
 pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()> {
     force_file_store();
+    crate::tui::print_logo();
+    if crate::tui::styled_stdout() {
+        println!(
+            "{}",
+            crate::tui::step_line(1, 2, "Registering this machine")
+        );
+    }
 
     // Explicit --config-dir → that dir is the instance, no per-account derivation.
     if explicit_config_dir() {
@@ -36,7 +43,8 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
     // Silent resume: exactly one existing per-account registration. Unreadable
     // credentials only cost the stored-server fallback, never the resume.
     let existing = account_dirs_with_creds(&base)?;
-    if existing.len() == 1 {
+    let stage_login = staged_login_required(existing.len(), args.new_account);
+    if existing.len() == 1 && !stage_login {
         let dir = &existing[0];
         std::env::set_var("SPAWN_CONFIG_DIR", dir);
         let stored = creds::load().ok();
@@ -46,12 +54,22 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
                 .as_ref()
                 .and_then(|creds| creds.server_url.as_deref()),
         )?;
-        service::install(dir, server.as_str()).context("starting the background service")?;
-        println!(
-            "spawn: already possessed ({}); daemon running in the background.",
-            instance_account(dir)
-        );
+        print_starting_step();
+        service::install(dir, server.as_str())
+            .map_err(|error| login::background_service_error(&error))?;
+        println!("{}", resume_line(&instance_account(dir)));
         println!("{}", relogin_hint(&server, dir));
+        println!("spawn: already possessed for {}; to connect another account run `spawnd possess --new-account`", instance_account(dir));
+        print_auth_note(dir);
+        return Ok(());
+    }
+    if !existing.is_empty() && !stage_login {
+        let accounts = existing
+            .iter()
+            .map(|dir| instance_account(dir))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("spawn: already possessed for {accounts}; to connect another account run `spawnd possess --new-account`");
         return Ok(());
     }
 
@@ -67,6 +85,9 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
         LoginArgs {
             host_name: args.host_name,
             no_run: true,
+            setup_token: args.setup_token,
+            qr: args.qr,
+            no_qr: args.no_qr,
         },
     )
     .await
@@ -98,7 +119,9 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
     }
 
     std::env::set_var("SPAWN_CONFIG_DIR", &final_dir);
-    service::install(&final_dir, server.as_str()).context("starting the background service")?;
+    print_starting_step();
+    service::install(&final_dir, server.as_str())
+        .map_err(|error| login::background_service_error(&error))?;
     println!("spawn: possessed as {account}. daemon running in the background.");
     Ok(())
 }
@@ -122,20 +145,46 @@ async fn possess_dir(server_cli: Option<String>, args: PossessArgs, dir: &Path) 
             LoginArgs {
                 host_name: args.host_name,
                 no_run: true,
+                setup_token: args.setup_token,
+                qr: args.qr,
+                no_qr: args.no_qr,
             },
         )
         .await
         .context("registering this host")?;
     }
-    service::install(dir, server.as_str()).context("starting the background service")?;
+    print_starting_step();
+    service::install(dir, server.as_str())
+        .map_err(|error| login::background_service_error(&error))?;
     println!(
         "spawn: possessed. daemon running in the background ({}).",
         service::instance_name(dir)
     );
     if resumed {
         println!("{}", relogin_hint(&server, dir));
+        print_auth_note(dir);
     }
     Ok(())
+}
+
+fn print_auth_note(dir: &Path) {
+    if crate::state::read(dir)
+        .ok()
+        .flatten()
+        .and_then(|state| state.last_error)
+        .is_some_and(|error| error.kind == "auth")
+    {
+        println!("spawn: note — the server is rejecting this machine's sign-in. Run: spawnd login");
+    }
+}
+
+fn print_starting_step() {
+    if crate::tui::styled_stdout() {
+        println!(
+            "{}",
+            crate::tui::step_line(2, 2, "Starting the background daemon")
+        );
+    }
 }
 
 pub async fn exorcise(server_cli: Option<String>, args: ExorciseArgs) -> Result<()> {
@@ -146,6 +195,18 @@ pub async fn exorcise(server_cli: Option<String>, args: ExorciseArgs) -> Result<
         Some(raw) => Some(config::server_url(Some(raw))?),
         None => None,
     };
+
+    if !args.yes {
+        let scope = if args.all {
+            "every SPAWN D instance, its service, credentials, identity, and approvals"
+        } else {
+            "this SPAWN D instance, its service, credentials, identity, and approvals"
+        };
+        if !crate::tui::confirm(&format!("Exorcise {scope}?"))? {
+            println!("spawn: exorcise cancelled.");
+            return Ok(());
+        }
+    }
 
     if args.all {
         let base = default_base()?;
@@ -244,7 +305,7 @@ fn default_base() -> Result<PathBuf> {
 
 /// Immediate subdirectories of `base` that hold a `credentials.json` — i.e. the
 /// per-account instances. Hidden dirs (the staging dir) are skipped.
-fn account_dirs_with_creds(base: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn account_dirs_with_creds(base: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let Ok(read) = std::fs::read_dir(base) else {
         return Ok(out);
@@ -260,6 +321,10 @@ fn account_dirs_with_creds(base: &Path) -> Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+pub(crate) fn default_instance_base() -> Result<PathBuf> {
+    default_base()
 }
 
 fn staging_token() -> Result<String> {
@@ -290,6 +355,14 @@ fn instance_account(dir: &Path) -> String {
     dir.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
+}
+
+fn resume_line(account: &str) -> String {
+    format!("spawn: already possessed ({account}); daemon running in the background.")
+}
+
+fn staged_login_required(existing_instances: usize, new_account: bool) -> bool {
+    new_account || existing_instances == 0
 }
 
 /// Keep an account id safe as a directory component. Server account ids are
@@ -336,6 +409,23 @@ mod tests {
         assert!(hint.contains("spawnd login --no-run"));
         assert!(hint.contains("--server \"https://spawn.example/\""));
         assert!(hint.contains("--config-dir \"/Users/x/Library/Application Support/spawn/acct-1\""));
+    }
+
+    #[test]
+    fn plain_resume_line_is_byte_stable() {
+        assert_eq!(
+            resume_line("9f1c2d3e"),
+            "spawn: already possessed (9f1c2d3e); daemon running in the background."
+        );
+    }
+
+    #[test]
+    fn new_account_forces_staging_and_plain_possess_never_adds_one_implicitly() {
+        assert!(staged_login_required(0, false));
+        assert!(!staged_login_required(1, false));
+        assert!(!staged_login_required(3, false));
+        assert!(staged_login_required(1, true));
+        assert!(staged_login_required(3, true));
     }
 
     #[test]

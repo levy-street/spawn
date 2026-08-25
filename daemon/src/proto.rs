@@ -112,6 +112,10 @@ pub enum Outbound {
         daemon_tree: Option<String>,
         self_update: bool,
         self_update_blocked: Option<String>,
+        /// A mismatched co-installed worker is repairable by reapplying the
+        /// current release, so it is reported separately from blockers.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        worker_mismatch: bool,
         /// New daemons keep established peer-to-peer channels alive while the
         /// control websocket reconnects. Old servers ignore both additions.
         keeps_peers_across_reconnect: bool,
@@ -147,6 +151,13 @@ pub enum Outbound {
     },
     #[serde(rename = "host.pong")]
     HostPong { request_id: String },
+    #[serde(rename = "host.pin_adopt_failed")]
+    HostPinAdoptFailed {
+        browser_device_id: String,
+        reason: String,
+    },
+    #[serde(rename = "host.pin_adopted")]
+    HostPinAdopted { browser_device_id: String },
     #[serde(rename = "daemon.update_result")]
     DaemonUpdateResult {
         request_id: String,
@@ -299,6 +310,9 @@ pub struct DaemonUpdateArtifact {
 pub enum Inbound {
     Registered {
         host_id: Uuid,
+        /// Optional daemon-token rotation. Old servers omit it.
+        #[serde(default)]
+        access_token: Option<String>,
         /// Account the host belongs to. Server-supplied, and safe to be: it is
         /// only an input to endorsement verification, so a wrong value makes
         /// the signature fail rather than admitting anything.
@@ -345,6 +359,8 @@ pub enum Inbound {
         target: String,
         spawnd: DaemonUpdateArtifact,
         spawn_worker: DaemonUpdateArtifact,
+        #[serde(default)]
+        allow_downgrade: bool,
     },
     #[serde(rename = "host.agents.check")]
     HostAgentsCheck {
@@ -550,6 +566,8 @@ pub struct DeviceStartRequest<'a> {
     pub version: &'a str,
     pub host_key_algorithm: &'a str,
     pub host_public_key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_token: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -582,6 +600,8 @@ pub struct DevicePossessionRequest<'a> {
 pub struct DevicePossessionResponse {
     pub verified: bool,
     pub version: u8,
+    #[serde(default)]
+    pub attended: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -627,6 +647,7 @@ mod daemon_update_wire_tests {
             daemon_tree: Some("a".repeat(40)),
             self_update: true,
             self_update_blocked: None,
+            worker_mismatch: false,
             keeps_peers_across_reconnect: true,
             live_bindings: vec![LiveRtcBinding {
                 session_id: "signal-1".into(),
@@ -659,6 +680,7 @@ mod daemon_update_wire_tests {
             daemon_tree: None,
             self_update: false,
             self_update_blocked: Some("worker_missing".into()),
+            worker_mismatch: false,
             keeps_peers_across_reconnect: true,
             live_bindings: Vec::new(),
             session_ice_policy: true,
@@ -706,6 +728,53 @@ mod daemon_update_wire_tests {
         assert_eq!(result["type"], "daemon.update_result");
         assert_eq!(result["stage"], "verify");
         assert_eq!(result["error"], "sha256_mismatch");
+    }
+
+    #[test]
+    fn pin_adoption_ack_and_nack_use_the_contract_frames() {
+        let adopted = serde_json::to_value(Outbound::HostPinAdopted {
+            browser_device_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+        })
+        .unwrap();
+        assert_eq!(adopted["type"], "host.pin_adopted");
+        assert_eq!(
+            adopted["browser_device_id"],
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        );
+        let failed = serde_json::to_value(Outbound::HostPinAdoptFailed {
+            browser_device_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+            reason: "pin_limit".into(),
+        })
+        .unwrap();
+        assert_eq!(failed["type"], "host.pin_adopt_failed");
+        assert_eq!(failed["reason"], "pin_limit");
+    }
+
+    #[test]
+    fn registered_token_rotation_is_optional_for_old_servers() {
+        let old: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "registered",
+            "host_id": "11111111-2222-4333-8444-555555555555"
+        }))
+        .unwrap();
+        assert!(matches!(
+            old,
+            Inbound::Registered {
+                access_token: None,
+                ..
+            }
+        ));
+
+        let rotated: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "registered",
+            "host_id": "11111111-2222-4333-8444-555555555555",
+            "access_token": "rotated-token"
+        }))
+        .unwrap();
+        assert!(matches!(
+            rotated,
+            Inbound::Registered { access_token: Some(token), .. } if token == "rotated-token"
+        ));
     }
 }
 
@@ -1023,6 +1092,10 @@ mod device_pair_response_tests {
             serde_json::from_str(r#"{"verified":true,"version":1}"#).unwrap();
         assert!(body.verified);
         assert_eq!(body.version, 1);
+        assert!(!body.attended, "old servers default to unattended");
+        let attended: DevicePossessionResponse =
+            serde_json::from_str(r#"{"verified":true,"version":1,"attended":true}"#).unwrap();
+        assert!(attended.attended);
 
         for rejected in [
             r#"{"verified":true,"version":1,"error":"denied"}"#,

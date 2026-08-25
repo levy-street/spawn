@@ -115,6 +115,7 @@ pub struct BrowserPin {
 }
 
 impl BrowserPin {
+    #[allow(dead_code)] // Retained for credential/status golden tests.
     pub fn device_id(&self) -> Uuid {
         // Construction and credential loading validate this exact field.
         Uuid::parse_str(&self.browser_device_id).expect("validated browser device UUID")
@@ -158,6 +159,7 @@ impl BrowserPin {
         Ok(true)
     }
 
+    #[allow(dead_code)] // Retained for credential/status golden tests.
     pub fn key_algorithm(&self) -> &str {
         &self.browser_key_algorithm
     }
@@ -167,6 +169,7 @@ impl BrowserPin {
         &self.browser_public_key
     }
 
+    #[allow(dead_code)] // Retained for credential/status golden tests.
     pub fn fingerprint(&self) -> &str {
         &self.browser_key_fingerprint
     }
@@ -318,6 +321,23 @@ pub fn validate_login_access_token(access_token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Commit a server-rotated daemon token as a new whole credential generation.
+/// The remaining host identity, pins, server, and Host ID move atomically with
+/// it through the same conflict-checked path used by login.
+pub fn replace_access_token(access_token: &str) -> Result<()> {
+    validate_login_access_token(access_token)?;
+    let mut stored = load().context("loading credentials for daemon token rotation")?;
+    let expected = credential_revision(&stored)?;
+    if stored.access_token.as_deref() == Some(access_token) {
+        return Ok(());
+    }
+    if let Some(old) = stored.access_token.as_mut() {
+        old.zeroize();
+    }
+    stored.access_token = Some(access_token.to_owned());
+    save(&mut stored, &expected).context("persisting rotated daemon token")
+}
+
 pub fn browser_key_fingerprint(public_key: &str) -> Result<String> {
     if public_key.len() != PUBLIC_KEY_WIRE_BYTES {
         bail!("approved browser public key has the wrong encoded length")
@@ -375,14 +395,41 @@ fn retain_live_browser_pins(creds: &mut StoredCreds, live_device_ids: &[String])
 /// browser to this host no matter what it puts in the frame.
 ///
 /// Returns how many pins were adopted.
+#[allow(dead_code)] // Compatibility wrapper used by focused credential tests.
 pub fn adopt_endorsed_browser_pins(
     account_id: &str,
     proposed: &[ProposedBrowserPin],
 ) -> Result<usize> {
+    Ok(adopt_endorsed_browser_pins_report(account_id, proposed)?
+        .into_iter()
+        .filter(|outcome| outcome.newly_adopted)
+        .count())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinAdoptionOutcome {
+    pub device_id: String,
+    pub newly_adopted: bool,
+    pub reason: Option<&'static str>,
+}
+
+/// Adopt proposed pins while retaining a per-device acknowledgement result for
+/// the control plane. Invalid proposals never mutate the pin store.
+pub fn adopt_endorsed_browser_pins_report(
+    account_id: &str,
+    proposed: &[ProposedBrowserPin],
+) -> Result<Vec<PinAdoptionOutcome>> {
     let mut stored = load().context("loading credentials to adopt endorsed browser pins")?;
     let expected = credential_revision(&stored)?;
     let Some(identity) = host_identity(&stored)? else {
-        return Ok(0);
+        return Ok(proposed
+            .iter()
+            .map(|candidate| PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            })
+            .collect());
     };
     let host_key = public_key_from_wire(&identity.public_key)
         .context("decoding the stored host public key")?;
@@ -396,19 +443,30 @@ pub fn adopt_endorsed_browser_pins(
         .filter_map(|pin| public_key_from_wire(&pin.browser_public_key).ok())
         .collect();
 
-    let mut adopted = 0;
+    let mut outcomes = Vec::with_capacity(proposed.len());
+    let mut adopted = 0usize;
     for candidate in proposed {
         if stored
             .browser_pins
             .iter()
             .any(|pin| pin.browser_device_id == candidate.device_id)
         {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: None,
+            });
             continue;
         }
         let (Some(endorser), Some(signature_wire)) = (
             &candidate.endorser_public_key,
             &candidate.endorsement_signature,
         ) else {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            });
             continue;
         };
         let Ok(transcript) = BrowserEndorsementTranscript::from_wire(
@@ -418,32 +476,72 @@ pub fn adopt_endorsed_browser_pins(
             &candidate.public_key,
             &candidate.device_id,
         ) else {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            });
             continue;
         };
         let Ok(signature) = browser_endorsement::signature_from_wire(signature_wire) else {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            });
             continue;
         };
         if browser_endorsement::verify_endorsement(&transcript, &signature, &host_key, &trusted)
             .is_err()
         {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            });
             continue;
         }
-        let pin = browser_pin_from_approval(
+        let Ok(pin) = browser_pin_from_approval(
             &candidate.device_id,
             &candidate.key_algorithm,
             &candidate.public_key,
             &candidate.fingerprint,
-        )
-        .context("validating an endorsed browser pin")?;
-        if merge_browser_pin(&mut stored, pin)? {
+        ) else {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("invalid_chain"),
+            });
+            continue;
+        };
+        if stored.browser_pins.len() >= MAX_BROWSER_PINS {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("pin_limit"),
+            });
+            continue;
+        }
+        if merge_browser_pin(&mut stored, pin).is_err() {
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: false,
+                reason: Some("other"),
+            });
+            continue;
+        } else {
             adopted += 1;
+            outcomes.push(PinAdoptionOutcome {
+                device_id: candidate.device_id.clone(),
+                newly_adopted: true,
+                reason: None,
+            });
         }
     }
-    if adopted == 0 {
-        return Ok(0);
+    if adopted > 0 {
+        save(&mut stored, &expected).context("persisting adopted browser pins")?;
     }
-    save(&mut stored, &expected).context("persisting adopted browser pins")?;
-    Ok(adopted)
+    Ok(outcomes)
 }
 
 /// A pin the server proposes, before any verification.
@@ -1451,16 +1549,7 @@ fn host_signing_key(creds: &StoredCreds) -> Result<Option<SigningKey>> {
 
 /// Wipe stored creds (file + keyring).
 pub async fn logout() -> Result<()> {
-    let outcome = with_credential_lock(|| {
-        let path = config::credentials_path()?;
-        cleanup_stale_credential_temps(&path)?;
-        clear_stored_credentials(
-            Ok(path),
-            keyring_delete,
-            |path| std::fs::remove_file(path),
-            sync_parent_directory,
-        )
-    })?;
+    let outcome = reset_local_credentials()?;
     if outcome.file_removed {
         let path = outcome
             .path
@@ -1472,7 +1561,34 @@ pub async fn logout() -> Result<()> {
     Ok(())
 }
 
-struct ClearOutcome {
+/// Clear both credential backends without presentation output. Recovery
+/// commands use this before removing the rest of the instance directory.
+pub(crate) fn reset_local_credentials() -> Result<ClearOutcome> {
+    with_credential_lock(|| {
+        let path = config::credentials_path()?;
+        cleanup_stale_credential_temps(&path)?;
+        clear_stored_credentials(
+            Ok(path),
+            keyring_delete,
+            |path| std::fs::remove_file(path),
+            sync_parent_directory,
+        )
+    })
+}
+
+/// Remove only the daemon token while retaining the host identity, server,
+/// Host ID, and browser pins for a one-approval re-attachment.
+pub fn logout_keep_identity() -> Result<()> {
+    let mut stored = load().context("loading credentials to sign out")?;
+    let expected = credential_revision(&stored)?;
+    if let Some(token) = stored.access_token.as_mut() {
+        token.zeroize();
+    }
+    stored.access_token = None;
+    save(&mut stored, &expected).context("persisting signed-out host identity")
+}
+
+pub(crate) struct ClearOutcome {
     path: Option<PathBuf>,
     file_removed: bool,
 }
@@ -1543,6 +1659,7 @@ fn keyring_disabled() -> bool {
 
 /// `spawnd status` — print what we know. The "server:" line shows the URL the
 /// other commands would actually use: explicit flag/env, else the stored one.
+#[allow(dead_code)] // Pre-TUI formatter retained for byte-equality regression tests.
 pub async fn status(server_cli: Option<String>) -> Result<()> {
     let creds = load().context("loading stored credentials")?;
     let server = config::server_url_for_instance(server_cli, creds.server_url.as_deref())?;
@@ -1550,6 +1667,7 @@ pub async fn status(server_cli: Option<String>) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn format_status(server: &str, creds: &StoredCreds) -> Result<String> {
     let mut output = String::new();
     writeln!(&mut output, "server:     {server}")?;

@@ -498,7 +498,7 @@ impl Emulator {
         // mapped glyphs, so painting above never needed these).
         for (i, charset) in self.shadow.charsets.iter().enumerate() {
             if *charset != StandardCharset::Ascii {
-                let designator = [b'(', b')', b'*', b'+'][i];
+                let designator = b"()*+"[i];
                 out.extend_from_slice(&[0x1b, designator, b'0']);
             }
         }

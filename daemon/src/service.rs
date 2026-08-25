@@ -317,6 +317,107 @@ pub fn uninstall(config_dir: &Path) -> Result<()> {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServiceStatus {
+    pub installed: bool,
+    pub running: bool,
+    pub name: String,
+}
+
+/// Inspect the per-instance service without changing it.
+pub fn status(config_dir: &Path) -> ServiceStatus {
+    #[cfg(target_os = "macos")]
+    {
+        let label = launchd_label(config_dir);
+        let installed = launchd_plist_path(config_dir).is_ok_and(|path| path.is_file());
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let running = Command::new("launchctl")
+            .args(["print", &format!("gui/{uid}/{label}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        return ServiceStatus {
+            installed,
+            running,
+            name: format!("launchd {label}"),
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let name = systemd_unit_name(config_dir);
+        let installed = systemd_unit_path(config_dir).is_ok_and(|path| path.is_file());
+        let running = Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", &name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        return ServiceStatus {
+            installed,
+            running,
+            name: format!("systemd {name}"),
+        };
+    }
+    #[allow(unreachable_code)]
+    ServiceStatus {
+        installed: false,
+        running: false,
+        name: "unsupported".into(),
+    }
+}
+
+pub fn user_linger_enabled() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let user = std::env::var("USER").ok()?;
+        let output = Command::new("loginctl")
+            .args(["show-user", &user, "-p", "Linger", "--value"])
+            .output()
+            .ok()?;
+        return output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim() == "yes");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Restart an installed service; if none exists, install it from the supplied
+/// instance data.
+pub fn reconnect(config_dir: &Path, server: &str) -> Result<()> {
+    let current = status(config_dir);
+    if !current.installed {
+        return install(config_dir, server);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let target = format!("gui/{uid}/{}", launchd_label(config_dir));
+        let result = Command::new("launchctl")
+            .args(["kickstart", "-k", &target])
+            .status()
+            .context("running launchctl kickstart")?;
+        if !result.success() {
+            bail!("launchctl kickstart failed")
+        }
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let name = systemd_unit_name(config_dir);
+        if !systemctl(&["restart", &name])? {
+            bail!("systemctl --user restart {name} failed")
+        }
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
+    install(config_dir, server)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

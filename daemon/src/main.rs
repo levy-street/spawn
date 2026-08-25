@@ -15,6 +15,7 @@ mod cli;
 mod config;
 mod cpu_scopes;
 mod creds;
+mod doctor;
 mod host_control;
 mod host_desktop;
 mod host_direct;
@@ -23,15 +24,20 @@ mod host_metrics;
 mod host_mime;
 mod host_preview;
 mod host_signal;
+mod lifecycle;
 mod login;
 mod possess;
 mod proto;
 mod pty;
+mod release_key;
 mod rtc;
 mod run;
 mod service;
 mod session_ctl;
 mod sessions;
+mod state;
+mod status;
+mod tui;
 mod update;
 mod upload;
 mod version;
@@ -43,7 +49,12 @@ use cli::{Cli, Command};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if cli::print_top_help_if_requested() {
+        return Ok(());
+    }
     let cli = Cli::parse();
+    let explicit_config = cli.config_dir.is_some()
+        || std::env::var_os("SPAWN_CONFIG_DIR").is_some_and(|value| !value.is_empty());
     if let Some(dir) = cli.config_dir.as_deref() {
         // The whole daemon keys its per-host state off SPAWN_CONFIG_DIR. Set it
         // once here — single-threaded, before any config access or thread spawn
@@ -52,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     }
     init_tracing(cli.verbose);
 
-    match cli.command {
+    let result = match cli.command {
         Command::Possess(args) => possess::possess(cli.server.clone(), args).await,
         Command::Exorcise(args) => possess::exorcise(cli.server.clone(), args).await,
         Command::Login(args) => {
@@ -66,9 +77,31 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Run(args) => run::run(cli.server.clone(), args).await,
         Command::Update => update::run_cli(cli.server.clone()).await,
-        Command::Logout => creds::logout().await,
-        Command::Status => creds::status(cli.server.clone()).await,
+        Command::Doctor(args) => doctor::run(cli.server.clone(), args).await,
+        Command::Reconnect => lifecycle::reconnect(cli.server.clone(), explicit_config).await,
+        Command::Disconnect => lifecycle::disconnect(explicit_config),
+        Command::Logout(args) => lifecycle::logout(args, explicit_config).await,
+        Command::Reset(args) => lifecycle::reset(args, explicit_config).await,
+        Command::Status(args) => {
+            status::run(cli.server.clone(), args, explicit_config, cli.verbose).await
+        }
+    };
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.downcast_ref::<login::LoginInterrupted>().is_some())
+    {
+        return Ok(());
     }
+    if let Some(error) = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<login::UserFacingError>())
+    {
+        eprintln!("spawn: ✗ {error}");
+        std::process::exit(1);
+    }
+    result
 }
 
 fn init_tracing(verbose: u8) {

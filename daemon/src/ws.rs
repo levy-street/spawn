@@ -44,6 +44,27 @@ pub enum CloseDisposition {
 #[error("daemon control websocket closed")]
 struct ControlClose(CloseDisposition);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRefusal {
+    Expired,
+    Revoked,
+    Invalid,
+}
+
+impl AuthRefusal {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "token_expired",
+            Self::Revoked => "token_revoked",
+            Self::Invalid => "token_invalid",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("daemon control websocket authentication rejected")]
+struct AuthControlClose(AuthRefusal);
+
 #[derive(Debug, thiserror::Error)]
 #[error("daemon control websocket connection failed")]
 struct ConnectFailure(&'static str);
@@ -67,17 +88,36 @@ pub fn close_error(disposition: CloseDisposition) -> anyhow::Error {
     ControlClose(disposition).into()
 }
 
-pub fn close_disposition(error: &anyhow::Error) -> Option<CloseDisposition> {
+pub fn close_error_with_auth(
+    disposition: CloseDisposition,
+    auth: Option<AuthRefusal>,
+) -> anyhow::Error {
+    if let Some(auth) = auth {
+        return AuthControlClose(auth).into();
+    }
+    close_error(disposition)
+}
+
+pub fn auth_refusal(error: &anyhow::Error) -> Option<AuthRefusal> {
     error
         .chain()
-        .find_map(|cause| cause.downcast_ref::<ControlClose>().map(|close| close.0))
+        .find_map(|cause| cause.downcast_ref::<AuthControlClose>().map(|auth| auth.0))
+}
+
+pub fn close_disposition(error: &anyhow::Error) -> Option<CloseDisposition> {
+    let disposition = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ControlClose>().map(|close| close.0));
+    disposition.or_else(|| auth_refusal(error).map(|_| CloseDisposition::Unauthorized))
 }
 
 pub fn failure_class(error: &anyhow::Error) -> &'static str {
     if is_protocol_required(error) {
         return "protocol_required";
     }
-    if close_disposition(error) == Some(CloseDisposition::Unauthorized) {
+    if auth_refusal(error).is_some()
+        || close_disposition(error) == Some(CloseDisposition::Unauthorized)
+    {
         return "unauthorized";
     }
     error
@@ -250,12 +290,13 @@ pub enum WsInbound {
     /// Server closed the connection.
     Closed {
         disposition: CloseDisposition,
+        auth_refusal: Option<AuthRefusal>,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReaderOutcome {
-    Closed(CloseDisposition),
+    Closed(CloseDisposition, Option<AuthRefusal>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,11 +318,24 @@ fn classify(msg: Message) -> std::result::Result<Option<WsInbound>, InboundFrame
             Ok(Some(WsInbound::Json(Box::new(frame))))
         }
         Message::Binary(_) => Err(InboundFrameError::BinaryForbidden),
-        Message::Close(frame) => Ok(Some(WsInbound::Closed {
-            disposition: close_disposition_for_code(
-                frame.as_ref().map_or(1006, |close| u16::from(close.code)),
-            ),
-        })),
+        Message::Close(frame) => {
+            let code = frame.as_ref().map_or(1006, |close| u16::from(close.code));
+            let auth_refusal = frame.as_ref().and_then(|close| {
+                if code != 1008 {
+                    return None;
+                }
+                match close.reason.as_ref() {
+                    "token_expired" => Some(AuthRefusal::Expired),
+                    "token_revoked" => Some(AuthRefusal::Revoked),
+                    "token_invalid" => Some(AuthRefusal::Invalid),
+                    _ => None,
+                }
+            });
+            Ok(Some(WsInbound::Closed {
+                disposition: close_disposition_for_code(code),
+                auth_refusal,
+            }))
+        }
         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
     }
 }
@@ -360,7 +414,7 @@ pub async fn run_reader_loop(
                 "ws read idle {:?}; treating as disconnected",
                 READ_IDLE_TIMEOUT
             );
-            return ReaderOutcome::Closed(CloseDisposition::Reconnect);
+            return ReaderOutcome::Closed(CloseDisposition::Reconnect, None);
         }
         let remaining = READ_IDLE_TIMEOUT - elapsed;
         let next = tokio::time::timeout(remaining, stream_rx.next()).await;
@@ -371,11 +425,11 @@ pub async fn run_reader_loop(
                     "ws read idle {:?}; treating as disconnected",
                     READ_IDLE_TIMEOUT
                 );
-                return ReaderOutcome::Closed(CloseDisposition::Reconnect);
+                return ReaderOutcome::Closed(CloseDisposition::Reconnect, None);
             }
         };
         let Some(msg) = msg_opt else {
-            return ReaderOutcome::Closed(CloseDisposition::Reconnect);
+            return ReaderOutcome::Closed(CloseDisposition::Reconnect, None);
         };
         let msg = match msg {
             Ok(m) => m,
@@ -383,7 +437,7 @@ pub async fn run_reader_loop(
                 // Tungstenite protocol errors can include peer-controlled
                 // close reasons. Keep the ingress diagnostic content-free.
                 tracing::warn!("daemon control websocket read failed");
-                return ReaderOutcome::Closed(CloseDisposition::Reconnect);
+                return ReaderOutcome::Closed(CloseDisposition::Reconnect, None);
             }
         };
         if matches!(msg, Message::Pong(_)) {
@@ -392,14 +446,22 @@ pub async fn run_reader_loop(
             continue;
         }
         match classify(msg) {
-            Ok(Some(WsInbound::Closed { disposition })) => {
-                let _ = inbound_tx.send(WsInbound::Closed { disposition }).await;
-                return ReaderOutcome::Closed(disposition);
+            Ok(Some(WsInbound::Closed {
+                disposition,
+                auth_refusal,
+            })) => {
+                let _ = inbound_tx
+                    .send(WsInbound::Closed {
+                        disposition,
+                        auth_refusal,
+                    })
+                    .await;
+                return ReaderOutcome::Closed(disposition, auth_refusal);
             }
             Ok(Some(other)) => {
                 last_meaningful = Instant::now();
                 if inbound_tx.send(other).await.is_err() {
-                    return ReaderOutcome::Closed(CloseDisposition::Reconnect);
+                    return ReaderOutcome::Closed(CloseDisposition::Reconnect, None);
                 }
             }
             Ok(None) => {
@@ -533,7 +595,8 @@ mod tests {
         assert!(matches!(
             required,
             WsInbound::Closed {
-                disposition: CloseDisposition::ProtocolRequired
+                disposition: CloseDisposition::ProtocolRequired,
+                ..
             }
         ));
 
@@ -546,7 +609,55 @@ mod tests {
         assert!(matches!(
             ordinary,
             WsInbound::Closed {
-                disposition: CloseDisposition::Reconnect
+                disposition: CloseDisposition::Reconnect,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn token_close_reasons_are_bounded_and_preserved_for_local_auth_health() {
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+        for (reason, expected) in [
+            ("token_expired", AuthRefusal::Expired),
+            ("token_revoked", AuthRefusal::Revoked),
+            ("token_invalid", AuthRefusal::Invalid),
+        ] {
+            let classified = classify(Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: reason.into(),
+            })))
+            .unwrap()
+            .unwrap();
+            assert!(matches!(
+                classified,
+                WsInbound::Closed {
+                    disposition: CloseDisposition::Unauthorized,
+                    auth_refusal: Some(actual),
+                } if actual == expected
+            ));
+            let error = close_error_with_auth(CloseDisposition::Unauthorized, Some(expected));
+            assert_eq!(auth_refusal(&error), Some(expected));
+            assert_eq!(
+                close_disposition(&error),
+                Some(CloseDisposition::Unauthorized)
+            );
+            assert_eq!(failure_class(&error), "unauthorized");
+        }
+
+        let untrusted = classify(Message::Close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: "attacker-controlled detail".into(),
+        })))
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            untrusted,
+            WsInbound::Closed {
+                auth_refusal: None,
+                ..
             }
         ));
     }
