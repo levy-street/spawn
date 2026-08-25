@@ -81,10 +81,12 @@ And it checks its own work:
 - after the web build and **before any restart**, the proxy target actually
   baked into `.next/routes-manifest.json` is compared against the requested
   one; a mismatch aborts with the previous build still serving
-- after the restart, `/healthz` is fetched **through the web app's rewrite** —
-  the one probe that exercises the chain a browser uses. A failure prints the
+- after the restart, `/healthz` is fetched **through the web app's rewrite**,
+  then an anonymous `spawn.alerts.v1` WebSocket must upgrade through the public
+  origin and close with the expected 1008 auth policy code. Together they
+  exercise the HTTP and WebSocket chains a browser uses. A failure prints the
   rollback command. (`scripts/health-check.sh` on the host's timer walks the
-  same path between deploys.)
+  same paths between deploys.)
 - after prebuilt publication, `/api/release` must report the new full server
   commit and the new daemon tree; this proves the manifest became live
 
@@ -224,6 +226,21 @@ mobile tree is computed by `app.config.ts`. Over-the-air updates do not read
 (see "The phone"). A server secret placed in EAS is both ineffective and
 exposed.
 
+## Production network
+
+Read [NETWORK.md](NETWORK.md) before changing nginx, firewall rules, WebSocket
+timeouts, ICE/TURN settings, coturn, or the `spawn-server` worker count. It
+records the verified production topology and the checked-in nginx/coturn
+examples. Two constraints are release blockers:
+
+- keep an ordinary UDP `turn:` endpoint; the daemon's current WebRTC stack
+  cannot use TURN over TCP or TLS;
+- run exactly one uvicorn worker until terminal session signalling resolves
+  daemon ownership through Redis like the host-control path does.
+
+`turns:` on 443 is recommended for browser/phone fallback after it has its own
+IP or an SNI/TURN-aware router; it is not enabled in current production.
+
 ## Release checklist
 
 1. Confirm the checkout is clean, the intended commit is pushed, and daemon CI
@@ -234,8 +251,11 @@ exposed.
    `scripts/update-mobile-prod.sh -m "<same summary as the deploy>"`. If native
    code, configuration, entitlements, or the runtime version changed, publish a
    real store build as well.
-4. Exercise the changed user flow. Keep the migration compatibility rule above
-   in mind while the previous processes are still draining.
+4. Exercise the changed user flow. For network or signalling changes, also run
+   `scripts/health-check.sh` with the production `SPAWN_TURN_URLS`; this checks
+   the public WebSocket upgrade and the configured UDP TURN listener. Keep the
+   migration compatibility rule above in mind while the previous processes are
+   still draining.
 5. Last, prove the independently shipped identities and served daemon bytes:
 
    ```bash
