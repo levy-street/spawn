@@ -187,7 +187,7 @@ if hashlib.sha256(direct_bytes).hexdigest() != expected_direct_hash:
         "no-server-agent-upload: protected host direct module changed; review its complete capability inventory"
     )
 
-expected_signal_hash = "067e64aacd59f2f74749f1dffd9759337b6f62c4dafaaf7c66b78130d769ebc6"
+expected_signal_hash = "2db23387b1baf49a214f6c26e7dbdbc1ab7648ff1e549edac4c0f041a7f0a7da"
 if hashlib.sha256(signal_bytes).hexdigest() != expected_signal_hash:
     raise SystemExit(
         "no-server-agent-upload: fixed host signaling capability changed; review its complete implementation"
@@ -285,7 +285,7 @@ if found_symbol_counts != expected_symbol_counts:
         + repr(found_symbol_counts)
     )
 if rtc.count("use crate::host_signal::HostConnectedSignal;") != 1 or rtc.count(
-    "HostConnectedSignal::new(out_tx, signal_id, binding)"
+    "HostConnectedSignal::new(signaling, signal_id, binding)"
 ) != 1:
     raise SystemExit("no-server-agent-upload: connected signal construction topology changed")
 PY
@@ -302,7 +302,10 @@ PY
 
   local receivers expected_receivers
   receivers="$(rg -o --color never '[A-Za-z_$][A-Za-z0-9_$?.]*\.send\(' "$web_file" | sort | uniq -c)"
-  expected_receivers=$'      2 channel.send(\n      1 this.channel.send(\n      1 ws.send('
+  # ws.send( carries signalling only: the offer/answer/candidate frames, the
+  # keepalive pong reply, and rtc.config.request (connection stream 8d2c960).
+  # File bytes go over channel.send( / this.channel.send( — the direct data channel.
+  expected_receivers=$'      2 channel.send(\n      1 this.channel.send(\n      3 ws.send('
   if [[ "$receivers" != "$expected_receivers" ]]; then
     printf 'no-server-agent-upload: web host-control send topology changed; review direct vs signaling channels:\n%s\n' \
       "$receivers" >&2
@@ -607,6 +610,8 @@ self_test() {
     '}' \
     'private sendSignal() {' \
     '  ws.send(frame);' \
+    '  ws.send(pong);' \
+    '  ws.send(configRequest);' \
     '}' \
     'function directTopology() {' \
     '  channel.send(one);' \
