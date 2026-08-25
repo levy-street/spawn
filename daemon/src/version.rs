@@ -16,3 +16,8 @@ pub fn build_version() -> String {
 pub fn daemon_tree() -> Option<&'static str> {
     (!DAEMON_TREE.is_empty()).then_some(DAEMON_TREE)
 }
+
+/// Stable, machine-readable identity emitted by `spawn-worker --version`.
+pub fn worker_identity_line() -> String {
+    format!("spawn-worker {BUILD_VERSION} tree={DAEMON_TREE}")
+}

@@ -275,7 +275,10 @@ fn main() {
     });
 
     let proto_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../proto");
-    write_pretty(&proto_dir.join("signed-signal-v1-vectors.json"), &transcript_file);
+    write_pretty(
+        &proto_dir.join("signed-signal-v1-vectors.json"),
+        &transcript_file,
+    );
     write_pretty(
         &proto_dir.join("signed-signal-wire-v1-vectors.json"),
         &wire_file,

@@ -255,3 +255,45 @@ pub(super) fn swap_binaries(
     }
     Ok(())
 }
+
+/// Restore the complete previous daemon/worker pair. Both backups are checked
+/// before the first rename, and every partial step is rolled back on failure.
+pub(super) fn revert_binaries(daemon: &Path, worker: &Path) -> std::io::Result<()> {
+    let daemon_previous = previous_path(daemon);
+    let worker_previous = previous_path(worker);
+    if !daemon_previous.is_file() || !worker_previous.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "complete previous daemon pair is unavailable",
+        ));
+    }
+    let daemon_failed = daemon.with_extension(format!("failed.{}", std::process::id()));
+    let worker_failed = worker.with_extension(format!("failed.{}", std::process::id()));
+    if daemon_failed.exists() || worker_failed.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "health-revert temporary already exists",
+        ));
+    }
+
+    fs::rename(daemon, &daemon_failed)?;
+    if let Err(error) = fs::rename(&daemon_previous, daemon) {
+        let _ = fs::rename(&daemon_failed, daemon);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(worker, &worker_failed) {
+        let _ = fs::rename(daemon, &daemon_previous);
+        let _ = fs::rename(&daemon_failed, daemon);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&worker_previous, worker) {
+        let _ = fs::rename(&worker_failed, worker);
+        let _ = fs::rename(daemon, &daemon_previous);
+        let _ = fs::rename(&daemon_failed, daemon);
+        return Err(error);
+    }
+
+    let _ = fs::remove_file(daemon_failed);
+    let _ = fs::remove_file(worker_failed);
+    Ok(())
+}

@@ -169,10 +169,7 @@ impl Sampler {
         let mut spec = self
             .spec
             .get_or_init(|| {
-                let system = self
-                    .system
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
+                let system = self.system.lock().unwrap_or_else(PoisonError::into_inner);
                 let cpus = system.cpus();
                 HostSpec {
                     cpu_cores: u16::try_from(cpus.len()).unwrap_or(u16::MAX),

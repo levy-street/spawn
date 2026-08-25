@@ -2,12 +2,15 @@
 //! frames forever (with reconnect + exponential backoff).
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,6 +44,7 @@ use spawnd::signed_signal::{
 use spawnd::signed_signal_wire::{envelope_sender, verify_rtc_signal_wire, VerifiedRtcSignal};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const WS_PING_INTERVAL: Duration = Duration::from_secs(15);
 const OUTBOUND_CHANNEL_DEPTH: usize = 1024;
 const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -391,8 +395,13 @@ impl LiveCredentialSnapshot {
 }
 
 enum ServeOutcome {
-    SessionEnded(Result<()>),
+    SessionEnded(SessionEnd),
     CredentialsChanged(Box<LiveCredentialSnapshot>),
+}
+
+struct SessionEnd {
+    result: Result<()>,
+    stable: bool,
 }
 
 enum ActiveSessionEvent {
@@ -452,6 +461,9 @@ async fn wait_for_credential_change_with(
 }
 
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
+    crate::update::prepare_probation()?;
+    crate::update::arm_probation_deadline();
+    crate::update::refresh_worker_pair_status().await;
     let mut credential_loader = CredentialLoader::for_daemon()?;
     let stored = credential_loader
         .load()
@@ -486,6 +498,10 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     // are adopted by the next `spawnd` process.
     let mut attempt: u32 = 0;
     let mut last_protocol_update_error: Option<Instant> = None;
+    let mut last_supersession: Option<Instant> = None;
+    let mut supersession_count = 0_u8;
+    let mut supersession_logged = false;
+    let mut unauthorized_logged = false;
 
     'supervisor: loop {
         // A session close or backoff timer can become ready in the same
@@ -539,7 +555,14 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 attempt = 0;
                 continue;
             }
-            ServeOutcome::SessionEnded(result) => result,
+            ServeOutcome::SessionEnded(ended) => {
+                if ended.stable {
+                    attempt = 0;
+                } else {
+                    attempt = attempt.saturating_add(1);
+                }
+                ended.result
+            }
         };
         let protocol_required = matches!(&res, Err(error) if ws::is_protocol_required(error));
         let delay = if protocol_required {
@@ -572,20 +595,75 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             }
             ws::self_update_backoff()
         } else {
-            match res {
-                Ok(()) => {
-                    tracing::info!("ws closed cleanly; reconnecting");
-                    attempt = 0;
+            let disposition = res.as_ref().err().and_then(ws::close_disposition);
+            if disposition != Some(ws::CloseDisposition::Superseded) {
+                last_supersession = None;
+                supersession_count = 0;
+                supersession_logged = false;
+            }
+            match disposition {
+                Some(ws::CloseDisposition::ClientBug) => {
+                    return Err(anyhow!(
+                        "server rejected this daemon as a client bug (close 4002)"
+                    ));
                 }
-                Err(_) => {
-                    // Connection/handshake error text can include data supplied
-                    // by the remote endpoint. Keep the reconnect diagnostic
-                    // class-only at this final WebSocket logging boundary.
-                    tracing::warn!("daemon control websocket session ended with error");
-                    attempt = attempt.saturating_add(1);
+                Some(ws::CloseDisposition::ImmediateReconnect) => Duration::ZERO,
+                Some(ws::CloseDisposition::Unauthorized) => {
+                    if !unauthorized_logged {
+                        unauthorized_logged = true;
+                        tracing::error!(
+                            class = "unauthorized",
+                            "daemon credentials were refused by the control server"
+                        );
+                    }
+                    Duration::from_secs(60)
+                }
+                Some(ws::CloseDisposition::Superseded) => {
+                    let now = Instant::now();
+                    supersession_count = if last_supersession
+                        .is_some_and(|last| now.duration_since(last) <= Duration::from_secs(60))
+                    {
+                        supersession_count.saturating_add(1)
+                    } else {
+                        1
+                    };
+                    last_supersession = Some(now);
+                    if supersession_count >= 2 {
+                        if !supersession_logged {
+                            supersession_logged = true;
+                            tracing::error!("another daemon instance is using these credentials");
+                        }
+                        Duration::from_secs(60)
+                    } else {
+                        ws::backoff_for_attempt(attempt.saturating_sub(1))
+                    }
+                }
+                _ => {
+                    match &res {
+                        Ok(()) => tracing::info!("ws closed cleanly; reconnecting"),
+                        Err(error) => tracing::warn!(
+                            class = ws::failure_class(error),
+                            "daemon control websocket session ended with error"
+                        ),
+                    }
+                    if res
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| ws::failure_class(error) == "unauthorized")
+                    {
+                        if !unauthorized_logged {
+                            unauthorized_logged = true;
+                            tracing::error!(
+                                class = "unauthorized",
+                                "daemon credentials were refused by the control server"
+                            );
+                        }
+                        Duration::from_secs(60)
+                    } else {
+                        ws::backoff_for_attempt(attempt.saturating_sub(1))
+                    }
                 }
             }
-            ws::backoff_for_attempt(attempt)
         };
         tracing::info!(?delay, "reconnecting after backoff");
         let reloaded = {
@@ -679,7 +757,10 @@ async fn serve_one_connection_with_loader(
         tokio::select! {
             connected = ws::connect(ws_url, token) => match connected {
                 Ok(stream) => ConnectOutcome::Connected(stream),
-                Err(error) => return Ok(ServeOutcome::SessionEnded(Err(error))),
+                Err(error) => return Ok(ServeOutcome::SessionEnded(SessionEnd {
+                    result: Err(error),
+                    stable: false,
+                })),
             },
             reloaded = &mut reload_fut => ConnectOutcome::Reloaded(reloaded.map(Box::new)),
         }
@@ -726,12 +807,19 @@ async fn serve_one_connection_with_loader(
     // install/clear this session's `out_tx` as the forwarder's "sink" on
     // connect/disconnect so reader threads survive WS reconnects.
     let (out_tx, out_rx) = mpsc::channel::<WsOutbound>(OUTBOUND_CHANNEL_DEPTH);
+    rtc_sessions.install_ws_sender(out_tx.clone());
 
     // mpsc for inbound frames so we have a single dispatch loop.
     let (in_tx, mut in_rx) = mpsc::channel::<WsInbound>(256);
 
+    let pong_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut sender_task = tokio::spawn(ws::run_sender_loop(write_half, out_rx));
-    let mut reader_task = tokio::spawn(ws::run_reader_loop(read_half, in_tx));
+    let mut reader_task = tokio::spawn(ws::run_reader_loop(
+        read_half,
+        in_tx,
+        Arc::clone(&pong_count),
+    ));
+    let registered_at = Arc::new(StdMutex::new(None::<Instant>));
 
     // First WS session of this daemon process: scan for live session workers
     // left behind by a previous instance, adopt each, and surface them in
@@ -758,6 +846,7 @@ async fn serve_one_connection_with_loader(
     crate::host_metrics::sampler().probe_gpu();
 
     let update_capability = crate::update::capability();
+    let live_bindings = rtc_sessions.live_bindings().await;
     let register = Outbound::Register {
         host_name,
         os: std::env::consts::OS.to_string(),
@@ -766,6 +855,9 @@ async fn serve_one_connection_with_loader(
         daemon_tree: crate::version::daemon_tree().map(str::to_string),
         self_update: update_capability.self_update,
         self_update_blocked: update_capability.blocked.map(str::to_string),
+        keeps_peers_across_reconnect: true,
+        live_bindings,
+        session_ice_policy: true,
         existing_sessions: registry.ids(),
         spec: crate::host_metrics::sampler().spec(),
         supports_account_chains: true,
@@ -780,21 +872,39 @@ async fn serve_one_connection_with_loader(
     // can't reach the channel (sender_task died) we know the WS is dead.
     let hb_tx = out_tx.clone();
     let mut heartbeat_task = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
-        tick.tick().await; // consume the immediate first tick
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+        heartbeat.tick().await;
+        ping.tick().await;
+        let mut pong_liveness =
+            crate::ws::PongLiveness::new(pong_count.load(std::sync::atomic::Ordering::Relaxed));
         loop {
-            tick.tick().await;
-            let (cpu_bucket, mem_bucket) = crate::host_metrics::sampler().heartbeat_buckets();
-            let frame = match serde_json::to_string(&Outbound::HostHeartbeat {
-                cpu_bucket,
-                mem_bucket,
-            }) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            if hb_tx.send(WsOutbound::json(frame)).await.is_err() {
-                tracing::warn!("heartbeat send failed; ws likely dead");
-                break;
+            tokio::select! {
+                _ = ping.tick() => {
+                    let current = pong_count.load(std::sync::atomic::Ordering::Relaxed);
+                    if pong_liveness.before_ping(current) {
+                        tracing::warn!("two websocket pongs missed; treating control socket as disconnected");
+                        break;
+                    }
+                    if hb_tx.send(WsOutbound::ping()).await.is_err() {
+                        tracing::warn!("websocket ping send failed; ws likely dead");
+                        break;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    let (cpu_bucket, mem_bucket) = crate::host_metrics::sampler().heartbeat_buckets();
+                    let frame = match serde_json::to_string(&Outbound::HostHeartbeat {
+                        cpu_bucket,
+                        mem_bucket,
+                    }) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if hb_tx.send(WsOutbound::json(frame)).await.is_err() {
+                        tracing::warn!("heartbeat send failed; ws likely dead");
+                        break;
+                    }
+                }
             }
         }
     });
@@ -812,14 +922,15 @@ async fn serve_one_connection_with_loader(
             &out_tx,
             live_credentials,
             daemon_revoked,
+            Arc::clone(&registered_at),
         );
         tokio::pin!(dispatch_fut);
         tokio::select! {
             biased;
             reader = &mut reader_task => {
                 let result = match reader {
-                    Ok(ws::ReaderOutcome::ProtocolRequired) => Err(ws::protocol_required_error()),
-                    Ok(ws::ReaderOutcome::Closed) | Err(_) => Ok(()),
+                    Ok(ws::ReaderOutcome::Closed(disposition)) => Err(ws::close_error(disposition)),
+                    Err(_) => Ok(()),
                 };
                 tracing::info!("ws reader task ended; ending session");
                 ActiveSessionEvent::SessionEnded(result)
@@ -856,11 +967,12 @@ async fn serve_one_connection_with_loader(
         reader_task.abort();
         sender_task.abort();
         let _ = tokio::join!(&mut heartbeat_task, &mut reader_task, &mut sender_task);
+        rtc_sessions.clear_ws_sender();
         rtc_sessions.invalidate_trust_and_close_all().await;
         clear_session_sinks(registry).await;
     } else {
+        rtc_sessions.clear_ws_sender();
         clear_session_sinks(registry).await;
-        rtc_sessions.close_all().await;
     }
     heartbeat_task.abort();
     reader_task.abort();
@@ -870,7 +982,13 @@ async fn serve_one_connection_with_loader(
     drop(reader_task);
     drop(heartbeat_task);
     match dispatch_result {
-        ActiveSessionEvent::SessionEnded(result) => Ok(ServeOutcome::SessionEnded(result)),
+        ActiveSessionEvent::SessionEnded(result) => {
+            let stable = registered_at
+                .lock()
+                .expect("registered timestamp lock")
+                .is_some_and(|registered| registered.elapsed() >= Duration::from_secs(60));
+            Ok(ServeOutcome::SessionEnded(SessionEnd { result, stable }))
+        }
         ActiveSessionEvent::CredentialReload(result) => {
             Ok(ServeOutcome::CredentialsChanged(result?))
         }
@@ -897,23 +1015,23 @@ async fn clear_session_sinks(registry: &SessionRegistry) {
     }
 }
 
-/// Verify an opaque signed RTC offer against this host's identity and each
-/// locally-approved browser pin. Returns the verified signal on the first pin
-/// that matches (the browser that signed it is `sender_public_key`); `None`
-/// when no local pin verifies it, so an unverifiable offer is never downgraded.
-/// Whether this daemon refuses RTC offers that carry no verified signed
-/// envelope.
-///
-/// On by default (see `require_signed_rtc_offers`): an unsigned offer to a
-/// daemon that has never pinned the offering browser is exactly the attack
-/// signed signaling refuses. `SPAWND_REQUIRE_SIGNED_RTC=0` is the escape hatch
-/// for operators who accept raw first-contact (e.g. recovering a deployment
-/// whose browser identities were lost).
-///
-/// While it is off, the browser-side pin gate still protects the operator's own
-/// browser from being downgraded, but does not stop a server from opening its
-/// own unsigned session to this daemon — so authentication soundness (P5 in
-/// docs/TRUST_DEVICE_MESH.md) holds only with enforcement on (assumption A7).
+// Verify an opaque signed RTC offer against this host's identity and each
+// locally-approved browser pin. Returns the verified signal on the first pin
+// that matches (the browser that signed it is `sender_public_key`); `None`
+// when no local pin verifies it, so an unverifiable offer is never downgraded.
+// Whether this daemon refuses RTC offers that carry no verified signed
+// envelope.
+//
+// On by default (see `require_signed_rtc_offers`): an unsigned offer to a
+// daemon that has never pinned the offering browser is exactly the attack
+// signed signaling refuses. `SPAWND_REQUIRE_SIGNED_RTC=0` is the escape hatch
+// for operators who accept raw first-contact (e.g. recovering a deployment
+// whose browser identities were lost).
+//
+// While it is off, the browser-side pin gate still protects the operator's own
+// browser from being downgraded, but does not stop a server from opening its
+// own unsigned session to this daemon — so authentication soundness (P5 in
+// docs/TRUST_DEVICE_MESH.md) holds only with enforcement on (assumption A7).
 
 /// Run one blocking credential mutation off the Tokio dispatch task with the
 /// exact isolation the single-flight loader uses for the same backend:
@@ -1402,6 +1520,25 @@ async fn handle_daemon_update(
     }
 }
 
+type RtcSignalJob = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+fn enqueue_rtc_job(
+    tasks: &mut HashMap<String, mpsc::UnboundedSender<RtcSignalJob>>,
+    signal_id: String,
+    job: RtcSignalJob,
+) {
+    let sender = tasks.entry(signal_id).or_insert_with(|| {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<RtcSignalJob>();
+        tokio::spawn(async move {
+            while let Some(job) = receiver.recv().await {
+                job.await;
+            }
+        });
+        sender
+    });
+    let _ = sender.send(job);
+}
+
 async fn dispatch_loop(
     in_rx: &mut mpsc::Receiver<WsInbound>,
     registry: &SessionRegistry,
@@ -1409,7 +1546,9 @@ async fn dispatch_loop(
     out_tx: &mpsc::Sender<WsOutbound>,
     live_credentials: &LiveCredentialSnapshot,
     daemon_revoked: &mut RevocationSet,
+    registered_at: Arc<StdMutex<Option<Instant>>>,
 ) -> Result<()> {
+    let mut rtc_tasks: HashMap<String, mpsc::UnboundedSender<RtcSignalJob>> = HashMap::new();
     // This host's account, as canonical UUID bytes, learned from registration.
     // Used to scope carried endorsement chains at connect (device mesh §3). A
     // wrong/absent value only denies the chain path — it never grants — so a
@@ -1426,12 +1565,8 @@ async fn dispatch_loop(
     // (R10); this floor removes the in-process half of the P3′ residual.
     while let Some(msg) = in_rx.recv().await {
         match msg {
-            WsInbound::Closed { protocol_required } => {
-                return if protocol_required {
-                    Err(ws::protocol_required_error())
-                } else {
-                    Ok(())
-                };
+            WsInbound::Closed { disposition } => {
+                return Err(ws::close_error(disposition));
             }
             WsInbound::Json(frame) => match *frame {
                 Inbound::Registered {
@@ -1448,6 +1583,10 @@ async fn dispatch_loop(
                         return Err(anyhow!("server registered daemon as an unexpected host"));
                     }
                     tracing::info!(%host_id, "registered with server");
+                    *registered_at.lock().expect("registered timestamp lock") =
+                        Some(Instant::now());
+                    crate::update::registered(out_tx).await;
+                    rtc_sessions.reannounce_live_statuses().await;
                     daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
                     let newly_revoked = daemon_revoked
                         .absorb(revocation_set_from_wire(revoked_browser_keys.as_deref()));
@@ -1528,10 +1667,12 @@ async fn dispatch_loop(
                         .parse::<url::Url>()
                         .expect("validated server origin remains a URL");
                     let out_tx = out_tx.clone();
+                    let update_request_id = request_id.clone();
                     tokio::spawn(handle_daemon_update(
                         server_origin,
                         request_id,
                         crate::update::UpdateRequest {
+                            request_id: Some(update_request_id),
                             version,
                             tree,
                             target,
@@ -1572,6 +1713,7 @@ async fn dispatch_loop(
                     carried_endorsements,
                     ice_servers,
                     ice_transport_policy,
+                    ice_restart,
                 } => {
                     if signed_envelope.is_some() && sdp.is_some() {
                         tracing::warn!("rejecting mixed signed/raw RTC offer");
@@ -1607,7 +1749,7 @@ async fn dispatch_loop(
                                         "rejecting signed RTC offer with mismatched session"
                                     );
                                     refuse_rtc_offer(
-                                        &out_tx,
+                                        out_tx,
                                         &signal_id,
                                         binding_nonce.as_ref(),
                                         scope_type.as_ref(),
@@ -1632,7 +1774,7 @@ async fn dispatch_loop(
                                         ),
                                     }
                                     refuse_rtc_offer(
-                                        &out_tx,
+                                        out_tx,
                                         &signal_id,
                                         binding_nonce.as_ref(),
                                         scope_type.as_ref(),
@@ -1656,7 +1798,7 @@ async fn dispatch_loop(
                                         "cannot sign RTC answer for verified signed offer"
                                     );
                                     refuse_rtc_offer(
-                                        &out_tx,
+                                        out_tx,
                                         &signal_id,
                                         binding_nonce.as_ref(),
                                         scope_type.as_ref(),
@@ -1671,6 +1813,9 @@ async fn dispatch_loop(
                         }
                         None => None,
                     };
+                    let offer_key = verified_offer
+                        .as_ref()
+                        .map(|verified| verified.sender_public_key().to_bytes());
                     let offer_sdp = match &verified_offer {
                         Some(verified) => verified.transcript().sdp().to_string(),
                         None => {
@@ -1683,7 +1828,7 @@ async fn dispatch_loop(
                                     "rejecting unsigned RTC offer: signed signaling is required"
                                 );
                                 refuse_rtc_offer(
-                                    &out_tx,
+                                    out_tx,
                                     &signal_id,
                                     binding_nonce.as_ref(),
                                     scope_type.as_ref(),
@@ -1734,29 +1879,40 @@ async fn dispatch_loop(
                                     continue;
                                 }
                             }
-                            if ice_transport_policy.is_none() {
-                                if let Some(binding) = crate::rtc::RtcSignalBinding::from_server(
-                                    signal_id,
-                                    nonce,
-                                    owner_generation,
-                                    scope_id,
-                                ) {
-                                    rtc_sessions
-                                        .handle_offer(
-                                            binding,
-                                            offer_sdp,
-                                            ice_servers,
-                                            registry.clone(),
-                                            out_tx.clone(),
-                                            answer_signer,
-                                        )
-                                        .await;
-                                }
+                            if let Some(binding) = crate::rtc::RtcSignalBinding::from_server(
+                                signal_id,
+                                nonce,
+                                owner_generation,
+                                scope_id,
+                            ) {
+                                let task_key = binding.signal_id().to_string();
+                                let rtc_sessions = rtc_sessions.clone();
+                                let registry = registry.clone();
+                                let out_tx = out_tx.clone();
+                                enqueue_rtc_job(
+                                    &mut rtc_tasks,
+                                    task_key,
+                                    Box::pin(async move {
+                                        rtc_sessions
+                                            .handle_offer(
+                                                binding,
+                                                offer_sdp,
+                                                ice_servers,
+                                                ice_transport_policy,
+                                                ice_restart,
+                                                offer_key,
+                                                registry,
+                                                out_tx,
+                                                answer_signer,
+                                            )
+                                            .await;
+                                    }),
+                                );
                             }
                         }
                         (
                             Some(binding_nonce),
-                            None,
+                            binding_generation,
                             scope_type,
                             scope_id,
                             protocol,
@@ -1767,9 +1923,9 @@ async fn dispatch_loop(
                             if let Some(verified) = &verified_offer {
                                 let t = verified.transcript();
                                 let scope_ok = t.scope_type() == ScopeType::Host
-                                    && scope_id.as_ref().map_or(false, |id| {
-                                        t.scope_id() == id.to_string().as_str()
-                                    });
+                                    && scope_id
+                                        .as_ref()
+                                        .is_some_and(|id| t.scope_id() == id.to_string().as_str());
                                 if !scope_ok {
                                     tracing::warn!(
                                         "signed RTC offer scope does not match host routing"
@@ -1777,23 +1933,33 @@ async fn dispatch_loop(
                                     continue;
                                 }
                             }
-                            rtc_sessions
-                                .handle_host_offer(
-                                    HostRtcSignal {
-                                        signal_id,
-                                        binding_nonce: Some(binding_nonce),
-                                        scope_type,
-                                        scope_id,
-                                        protocol,
-                                        protocol_version,
-                                    },
-                                    offer_sdp,
-                                    ice_servers,
-                                    ice_transport_policy,
-                                    out_tx.clone(),
-                                    answer_signer,
-                                )
-                                .await;
+                            let task_key = signal_id.clone();
+                            let rtc_sessions = rtc_sessions.clone();
+                            let out_tx = out_tx.clone();
+                            enqueue_rtc_job(
+                                &mut rtc_tasks,
+                                task_key,
+                                Box::pin(async move {
+                                    rtc_sessions
+                                        .handle_host_offer(
+                                            HostRtcSignal {
+                                                signal_id,
+                                                binding_nonce: Some(binding_nonce),
+                                                binding_generation,
+                                                scope_type,
+                                                scope_id,
+                                                protocol,
+                                                protocol_version,
+                                            },
+                                            offer_sdp,
+                                            ice_servers,
+                                            ice_transport_policy,
+                                            out_tx,
+                                            answer_signer,
+                                        )
+                                        .await;
+                                }),
+                            );
                         }
                         _ => tracing::warn!("rejecting malformed mixed-scope rtc offer"),
                     }
@@ -1835,32 +2001,51 @@ async fn dispatch_loop(
                             ) {
                                 let (signal_id, generation, session_id) =
                                     binding.into_routing_parts();
-                                rtc_sessions
-                                    .handle_candidate(signal_id, generation, session_id, candidate)
-                                    .await;
+                                let task_key = signal_id.clone();
+                                let rtc_sessions = rtc_sessions.clone();
+                                enqueue_rtc_job(
+                                    &mut rtc_tasks,
+                                    task_key,
+                                    Box::pin(async move {
+                                        rtc_sessions
+                                            .handle_candidate(
+                                                signal_id, generation, session_id, candidate,
+                                            )
+                                            .await;
+                                    }),
+                                );
                             }
                         }
                         (
                             Some(binding_nonce),
-                            None,
+                            binding_generation,
                             scope_type,
                             scope_id,
                             protocol,
                             protocol_version,
                         ) => {
-                            rtc_sessions
-                                .handle_host_candidate(
-                                    HostRtcSignal {
-                                        signal_id,
-                                        binding_nonce: Some(binding_nonce),
-                                        scope_type,
-                                        scope_id,
-                                        protocol,
-                                        protocol_version,
-                                    },
-                                    candidate,
-                                )
-                                .await;
+                            let task_key = signal_id.clone();
+                            let rtc_sessions = rtc_sessions.clone();
+                            enqueue_rtc_job(
+                                &mut rtc_tasks,
+                                task_key,
+                                Box::pin(async move {
+                                    rtc_sessions
+                                        .handle_host_candidate(
+                                            HostRtcSignal {
+                                                signal_id,
+                                                binding_nonce: Some(binding_nonce),
+                                                binding_generation,
+                                                scope_type,
+                                                scope_id,
+                                                protocol,
+                                                protocol_version,
+                                            },
+                                            candidate,
+                                        )
+                                        .await;
+                                }),
+                            );
                         }
                         _ => tracing::warn!("rejecting malformed mixed-scope rtc candidate"),
                     }
@@ -1901,29 +2086,46 @@ async fn dispatch_loop(
                             ) {
                                 let (signal_id, generation, session_id) =
                                     binding.into_routing_parts();
-                                rtc_sessions
-                                    .close(&signal_id, &generation, session_id)
-                                    .await;
+                                let task_key = signal_id.clone();
+                                let rtc_sessions = rtc_sessions.clone();
+                                enqueue_rtc_job(
+                                    &mut rtc_tasks,
+                                    task_key,
+                                    Box::pin(async move {
+                                        rtc_sessions
+                                            .close(&signal_id, &generation, session_id)
+                                            .await;
+                                    }),
+                                );
                             }
                         }
                         (
                             Some(binding_nonce),
-                            None,
+                            binding_generation,
                             scope_type,
                             scope_id,
                             protocol,
                             protocol_version,
                         ) => {
-                            rtc_sessions
-                                .close_host(HostRtcSignal {
-                                    signal_id,
-                                    binding_nonce: Some(binding_nonce),
-                                    scope_type,
-                                    scope_id,
-                                    protocol,
-                                    protocol_version,
-                                })
-                                .await;
+                            let task_key = signal_id.clone();
+                            let rtc_sessions = rtc_sessions.clone();
+                            enqueue_rtc_job(
+                                &mut rtc_tasks,
+                                task_key,
+                                Box::pin(async move {
+                                    rtc_sessions
+                                        .close_host(HostRtcSignal {
+                                            signal_id,
+                                            binding_nonce: Some(binding_nonce),
+                                            binding_generation,
+                                            scope_type,
+                                            scope_id,
+                                            protocol,
+                                            protocol_version,
+                                        })
+                                        .await;
+                                }),
+                            );
                         }
                         _ => tracing::warn!("rejecting malformed mixed-scope rtc close"),
                     }
@@ -3034,6 +3236,55 @@ mod tests {
     const PANIC_CANARY_TOKEN: &str = "panic-canary-token-7f9c";
     const PANIC_CANARY_PATH: &str = "/panic/canary/private/credentials.json";
 
+    #[tokio::test]
+    async fn rtc_signal_queues_order_each_peer_without_blocking_other_peers() {
+        let mut queues = HashMap::new();
+        let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let release_first = Arc::new(tokio::sync::Notify::new());
+
+        enqueue_rtc_job(&mut queues, "peer-a".into(), {
+            let events = Arc::clone(&events);
+            let release = Arc::clone(&release_first);
+            Box::pin(async move {
+                release.notified().await;
+                events.lock().await.push("a1");
+            })
+        });
+        enqueue_rtc_job(&mut queues, "peer-a".into(), {
+            let events = Arc::clone(&events);
+            Box::pin(async move { events.lock().await.push("a2") })
+        });
+        enqueue_rtc_job(&mut queues, "peer-b".into(), {
+            let events = Arc::clone(&events);
+            Box::pin(async move { events.lock().await.push("b1") })
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !events.lock().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(&*events.lock().await, &["b1"]);
+
+        release_first.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if events.lock().await.len() == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(&*events.lock().await, &["b1", "a1", "a2"]);
+    }
+
     async fn receive_std_signal(
         receiver: &std_mpsc::Receiver<()>,
         bound: Duration,
@@ -3141,6 +3392,7 @@ mod tests {
             &out_tx,
             &live,
             &mut revoked,
+            Arc::new(StdMutex::new(None)),
         );
         let exercise = async move {
             in_tx

@@ -4,6 +4,9 @@
 //! to the dispatch loop, and a single sender task that owns the write half
 //! and is fed by an mpsc channel from any number of per-session reader tasks.
 
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::proto::{Inbound, Outbound};
@@ -11,7 +14,7 @@ use crate::pty::WsOutbound;
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use socket2::{SockRef, TcpKeepalive};
-use tokio::net::TcpStream;
+use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue};
@@ -23,6 +26,27 @@ pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const SUBPROTOCOL: &str = "spawn.control.v3";
 const PROTOCOL_REQUIRED_CLOSE_CODE: u16 = 4003;
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const ADDRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TOTAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseDisposition {
+    Reconnect,
+    Superseded,
+    Unauthorized,
+    ClientBug,
+    ProtocolRequired,
+    ImmediateReconnect,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("daemon control websocket closed")]
+struct ControlClose(CloseDisposition);
+
+#[derive(Debug, thiserror::Error)]
+#[error("daemon control websocket connection failed")]
+struct ConnectFailure(&'static str);
 
 #[derive(Debug, thiserror::Error)]
 #[error("server did not select the required websocket subprotocol")]
@@ -36,6 +60,36 @@ pub fn protocol_required_error() -> anyhow::Error {
     ProtocolRequired.into()
 }
 
+pub fn close_error(disposition: CloseDisposition) -> anyhow::Error {
+    if disposition == CloseDisposition::ProtocolRequired {
+        return protocol_required_error();
+    }
+    ControlClose(disposition).into()
+}
+
+pub fn close_disposition(error: &anyhow::Error) -> Option<CloseDisposition> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ControlClose>().map(|close| close.0))
+}
+
+pub fn failure_class(error: &anyhow::Error) -> &'static str {
+    if is_protocol_required(error) {
+        return "protocol_required";
+    }
+    if close_disposition(error) == Some(CloseDisposition::Unauthorized) {
+        return "unauthorized";
+    }
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<ConnectFailure>()
+                .map(|failure| failure.0)
+        })
+        .unwrap_or("handshake")
+}
+
 /// Open a WS/WSS connection with `Authorization: Bearer <token>` and
 /// `Sec-WebSocket-Protocol: spawn.control.v3`. We TCP-connect manually first so we
 /// can enable TCP keepalive on the socket — without it, a half-dead remote
@@ -44,6 +98,16 @@ pub fn protocol_required_error() -> anyhow::Error {
 /// notice. With keepalive at 30s/5s/3 (idle/interval/probes), the kernel
 /// surfaces the death within ~45s and read/write start failing.
 pub async fn connect(ws_url: &Url, token: &str) -> Result<WsStream> {
+    connect_with_timeout(ws_url, token, TOTAL_CONNECT_TIMEOUT).await
+}
+
+async fn connect_with_timeout(ws_url: &Url, token: &str, total: Duration) -> Result<WsStream> {
+    tokio::time::timeout(total, connect_inner(ws_url, token))
+        .await
+        .map_err(|_| ConnectFailure("timeout"))?
+}
+
+async fn connect_inner(ws_url: &Url, token: &str) -> Result<WsStream> {
     let mut req = ws_url
         .as_str()
         .into_client_request()
@@ -60,7 +124,9 @@ pub async fn connect(ws_url: &Url, token: &str) -> Result<WsStream> {
         HeaderValue::from_static(SUBPROTOCOL),
     );
 
-    let scheme = ws_url.scheme();
+    if !matches!(ws_url.scheme(), "ws" | "wss") {
+        return Err(ConnectFailure("handshake").into());
+    }
     let host = ws_url
         .host_str()
         .ok_or_else(|| anyhow!("ws url has no host"))?;
@@ -70,17 +136,32 @@ pub async fn connect(ws_url: &Url, token: &str) -> Result<WsStream> {
 
     // Lookup + connect TCP ourselves so we can configure keepalive before
     // handing the stream to tokio-tungstenite.
-    let tcp = TcpStream::connect((host, port))
+    let resolved = tokio::time::timeout(DNS_TIMEOUT, lookup_host((host, port)))
         .await
-        .with_context(|| format!("tcp connect {host}:{port}"))?;
+        .map_err(|_| ConnectFailure("dns"))?
+        .map_err(|_| ConnectFailure("dns"))?
+        .collect::<Vec<_>>();
+    let addresses = alternate_address_families(resolved);
+    if addresses.is_empty() {
+        return Err(ConnectFailure("dns").into());
+    }
+    let mut tcp = None;
+    for address in addresses {
+        if let Ok(Ok(stream)) =
+            tokio::time::timeout(ADDRESS_CONNECT_TIMEOUT, TcpStream::connect(address)).await
+        {
+            tcp = Some(stream);
+            break;
+        }
+    }
+    let tcp = tcp.ok_or(ConnectFailure("tcp"))?;
+    tcp.set_nodelay(true).map_err(|_| ConnectFailure("tcp"))?;
     if let Err(e) = configure_keepalive(&tcp) {
         tracing::warn!(error = %e, "could not enable TCP keepalive on ws socket");
     }
 
-    // Hand the configured TCP stream to tungstenite. For `ws://` we pass
-    // the bare TCP; for `wss://` we'd need a TLS upgrade — supported by
-    // `client_async_tls_with_config`, deferred until the deployment uses
-    // wss in earnest.
+    // Hand the configured TCP stream to tungstenite. The helper preserves a
+    // bare stream for `ws://` and performs the TLS upgrade for `wss://`.
     // Explorer fs.read/fs.write payloads can be ~43MB of base64 in a single
     // frame (the server's websockets stack doesn't fragment sends), so lift
     // tungstenite's 16MiB-frame / 64MiB-message defaults.
@@ -90,28 +171,42 @@ pub async fn connect(ws_url: &Url, token: &str) -> Result<WsStream> {
         ..WebSocketConfig::default()
     };
 
-    let (stream, response) = match scheme {
-        "ws" => {
-            let maybe_tls = MaybeTlsStream::Plain(tcp);
-            tokio_tungstenite::client_async_with_config(req, maybe_tls, Some(ws_config))
-                .await
-                .context("ws handshake")?
-        }
-        "wss" => {
-            // Fall back to the convenience helper which does its own TCP
-            // connect + TLS. We can't preconfigure keepalive here without
-            // pulling in tokio-rustls directly; revisit when the public
-            // deployment switches to TLS.
-            tokio_tungstenite::connect_async_with_config(req, Some(ws_config), false)
-                .await
-                .context("ws connect (tls)")?
-        }
-        other => anyhow::bail!("unsupported ws scheme: {other}"),
-    };
+    let (stream, response) =
+        tokio_tungstenite::client_async_tls_with_config(req, tcp, Some(ws_config), None)
+            .await
+            .map_err(|error| match error {
+                tokio_tungstenite::tungstenite::Error::Tls(_) => ConnectFailure("tls"),
+                tokio_tungstenite::tungstenite::Error::Http(ref response)
+                    if matches!(response.status().as_u16(), 401 | 403) =>
+                {
+                    ConnectFailure("unauthorized")
+                }
+                _ => ConnectFailure("handshake"),
+            })?;
 
     require_selected_subprotocol(response.headers())?;
 
     Ok(stream)
+}
+
+fn alternate_address_families(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut v6 = addresses.iter().copied().filter(SocketAddr::is_ipv6);
+    let mut v4 = addresses.iter().copied().filter(SocketAddr::is_ipv4);
+    let prefer_v6 = addresses.first().is_some_and(SocketAddr::is_ipv6);
+    let mut result = Vec::with_capacity(addresses.len());
+    loop {
+        let (first, second) = if prefer_v6 {
+            (v6.next(), v4.next())
+        } else {
+            (v4.next(), v6.next())
+        };
+        if first.is_none() && second.is_none() {
+            break;
+        }
+        result.extend(first);
+        result.extend(second);
+    }
+    result
 }
 
 fn require_selected_subprotocol(headers: &HeaderMap) -> Result<()> {
@@ -154,14 +249,13 @@ pub enum WsInbound {
     Json(Box<Inbound>),
     /// Server closed the connection.
     Closed {
-        protocol_required: bool,
+        disposition: CloseDisposition,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReaderOutcome {
-    Closed,
-    ProtocolRequired,
+    Closed(CloseDisposition),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,11 +278,22 @@ fn classify(msg: Message) -> std::result::Result<Option<WsInbound>, InboundFrame
         }
         Message::Binary(_) => Err(InboundFrameError::BinaryForbidden),
         Message::Close(frame) => Ok(Some(WsInbound::Closed {
-            protocol_required: frame
-                .as_ref()
-                .is_some_and(|close| u16::from(close.code) == PROTOCOL_REQUIRED_CLOSE_CODE),
+            disposition: close_disposition_for_code(
+                frame.as_ref().map_or(1006, |close| u16::from(close.code)),
+            ),
         })),
         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
+    }
+}
+
+fn close_disposition_for_code(code: u16) -> CloseDisposition {
+    match code {
+        1008 => CloseDisposition::Unauthorized,
+        4000 => CloseDisposition::Superseded,
+        4002 => CloseDisposition::ClientBug,
+        PROTOCOL_REQUIRED_CLOSE_CODE => CloseDisposition::ProtocolRequired,
+        4010 => CloseDisposition::ImmediateReconnect,
+        _ => CloseDisposition::Reconnect,
     }
 }
 
@@ -199,9 +304,11 @@ pub async fn run_sender_loop(
     mut rx: mpsc::Receiver<WsOutbound>,
 ) {
     while let Some(out) = rx.recv().await {
-        let (text, close, flushed) = out.into_parts();
+        let (text, ping, close, flushed) = out.into_parts();
         let res = if close {
             stream_tx.close().await
+        } else if ping {
+            stream_tx.send(Message::Ping(Vec::new())).await
         } else {
             stream_tx
                 .send(Message::Text(text.expect("text outbound has payload")))
@@ -239,6 +346,7 @@ const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 pub async fn run_reader_loop(
     mut stream_rx: futures_util::stream::SplitStream<WsStream>,
     inbound_tx: mpsc::Sender<WsInbound>,
+    pong_count: Arc<AtomicU64>,
 ) -> ReaderOutcome {
     use std::time::Instant;
     let mut last_meaningful = Instant::now();
@@ -252,7 +360,7 @@ pub async fn run_reader_loop(
                 "ws read idle {:?}; treating as disconnected",
                 READ_IDLE_TIMEOUT
             );
-            return ReaderOutcome::Closed;
+            return ReaderOutcome::Closed(CloseDisposition::Reconnect);
         }
         let remaining = READ_IDLE_TIMEOUT - elapsed;
         let next = tokio::time::timeout(remaining, stream_rx.next()).await;
@@ -263,11 +371,11 @@ pub async fn run_reader_loop(
                     "ws read idle {:?}; treating as disconnected",
                     READ_IDLE_TIMEOUT
                 );
-                return ReaderOutcome::Closed;
+                return ReaderOutcome::Closed(CloseDisposition::Reconnect);
             }
         };
         let Some(msg) = msg_opt else {
-            return ReaderOutcome::Closed;
+            return ReaderOutcome::Closed(CloseDisposition::Reconnect);
         };
         let msg = match msg {
             Ok(m) => m,
@@ -275,24 +383,23 @@ pub async fn run_reader_loop(
                 // Tungstenite protocol errors can include peer-controlled
                 // close reasons. Keep the ingress diagnostic content-free.
                 tracing::warn!("daemon control websocket read failed");
-                return ReaderOutcome::Closed;
+                return ReaderOutcome::Closed(CloseDisposition::Reconnect);
             }
         };
+        if matches!(msg, Message::Pong(_)) {
+            pong_count.fetch_add(1, Ordering::Relaxed);
+            last_meaningful = Instant::now();
+            continue;
+        }
         match classify(msg) {
-            Ok(Some(WsInbound::Closed { protocol_required })) => {
-                let _ = inbound_tx
-                    .send(WsInbound::Closed { protocol_required })
-                    .await;
-                return if protocol_required {
-                    ReaderOutcome::ProtocolRequired
-                } else {
-                    ReaderOutcome::Closed
-                };
+            Ok(Some(WsInbound::Closed { disposition })) => {
+                let _ = inbound_tx.send(WsInbound::Closed { disposition }).await;
+                return ReaderOutcome::Closed(disposition);
             }
             Ok(Some(other)) => {
                 last_meaningful = Instant::now();
                 if inbound_tx.send(other).await.is_err() {
-                    return ReaderOutcome::Closed;
+                    return ReaderOutcome::Closed(CloseDisposition::Reconnect);
                 }
             }
             Ok(None) => {
@@ -310,11 +417,54 @@ pub async fn run_reader_loop(
     }
 }
 
-/// Compute backoff delay for the Nth attempt (zero-indexed). 1s, 2s, 4s, ...
-/// capped at 60s.
+/// AWS full-jitter backoff: uniformly select from zero through the exponential
+/// ceiling (1s, 2s, 4s, ...), capped at 60s.
 pub fn backoff_for_attempt(attempt: u32) -> Duration {
-    let secs = 1u64.checked_shl(attempt.min(6)).unwrap_or(60);
-    Duration::from_secs(secs.min(60))
+    let ceiling_ms = backoff_ceiling(attempt).as_millis() as u64;
+    let mut random = [0_u8; 8];
+    if getrandom::getrandom(&mut random).is_err() {
+        return Duration::from_millis(ceiling_ms / 2);
+    }
+    Duration::from_millis(u64::from_le_bytes(random) % (ceiling_ms + 1))
+}
+
+/// Tracks Pong progress between Ping sends. The first tick only sends a Ping;
+/// a miss is counted on the following tick, after the peer had a full interval
+/// in which to answer it.
+pub struct PongLiveness {
+    observed: u64,
+    missed: u8,
+    ping_outstanding: bool,
+}
+
+impl PongLiveness {
+    pub fn new(observed: u64) -> Self {
+        Self {
+            observed,
+            missed: 0,
+            ping_outstanding: false,
+        }
+    }
+
+    /// Record the result of the previous Ping immediately before sending the
+    /// next one. Returns true after two consecutive unanswered Pings.
+    pub fn before_ping(&mut self, current: u64) -> bool {
+        if self.ping_outstanding {
+            if current == self.observed {
+                self.missed = self.missed.saturating_add(1);
+            } else {
+                self.missed = 0;
+                self.observed = current;
+            }
+        }
+        self.ping_outstanding = true;
+        self.missed >= 2
+    }
+}
+
+fn backoff_ceiling(attempt: u32) -> Duration {
+    let secs = 1_u64.checked_shl(attempt.min(6)).unwrap_or(60).min(60);
+    Duration::from_secs(secs)
 }
 
 /// Protocol refusal needs enough space for an HTTP update attempt and avoids
@@ -383,7 +533,7 @@ mod tests {
         assert!(matches!(
             required,
             WsInbound::Closed {
-                protocol_required: true
+                disposition: CloseDisposition::ProtocolRequired
             }
         ));
 
@@ -396,15 +546,79 @@ mod tests {
         assert!(matches!(
             ordinary,
             WsInbound::Closed {
-                protocol_required: false
+                disposition: CloseDisposition::Reconnect
             }
         ));
     }
 
     #[test]
     fn protocol_update_backoff_is_separate_from_the_normal_ladder() {
-        assert_eq!(backoff_for_attempt(99), Duration::from_secs(60));
+        assert_eq!(backoff_ceiling(0), Duration::from_secs(1));
+        assert_eq!(backoff_ceiling(6), Duration::from_secs(60));
+        assert_eq!(backoff_ceiling(99), Duration::from_secs(60));
+        for attempt in 0..10 {
+            assert!(backoff_for_attempt(attempt) <= backoff_ceiling(attempt));
+        }
         assert_eq!(self_update_backoff(), Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn pong_liveness_allows_two_complete_reply_windows() {
+        let mut liveness = PongLiveness::new(0);
+        assert!(!liveness.before_ping(0), "first tick only sends a ping");
+        assert!(!liveness.before_ping(0), "first unanswered ping");
+        assert!(liveness.before_ping(0), "second unanswered ping");
+
+        let mut recovered = PongLiveness::new(4);
+        assert!(!recovered.before_ping(4));
+        assert!(!recovered.before_ping(4));
+        assert!(
+            !recovered.before_ping(5),
+            "a pong resets consecutive misses"
+        );
+        assert!(!recovered.before_ping(5));
+        assert!(recovered.before_ping(5));
+    }
+
+    #[test]
+    fn close_codes_have_stable_reconnect_policy() {
+        assert_eq!(
+            close_disposition_for_code(1008),
+            CloseDisposition::Unauthorized
+        );
+        assert_eq!(
+            close_disposition_for_code(4000),
+            CloseDisposition::Superseded
+        );
+        assert_eq!(
+            close_disposition_for_code(4002),
+            CloseDisposition::ClientBug
+        );
+        assert_eq!(
+            close_disposition_for_code(4010),
+            CloseDisposition::ImmediateReconnect
+        );
+        for code in [1000, 1001, 1006, 1012, 1013, 4008] {
+            assert_eq!(
+                close_disposition_for_code(code),
+                CloseDisposition::Reconnect
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_addresses_alternate_families() {
+        let addresses = vec![
+            "[2001:db8::1]:443".parse().unwrap(),
+            "[2001:db8::2]:443".parse().unwrap(),
+            "192.0.2.1:443".parse().unwrap(),
+            "192.0.2.2:443".parse().unwrap(),
+        ];
+        let ordered = alternate_address_families(addresses);
+        assert!(ordered[0].is_ipv6());
+        assert!(ordered[1].is_ipv4());
+        assert!(ordered[2].is_ipv6());
+        assert!(ordered[3].is_ipv4());
     }
 
     #[tokio::test]
@@ -460,6 +674,22 @@ mod tests {
             .expect("tracked close flush");
         sender.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn whole_connect_times_out_when_the_server_never_handshakes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "ws://{}/ws/daemon",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+
+        let error = connect_with_timeout(&url, "test-token", Duration::from_millis(50))
+            .await
+            .expect_err("a server that never accepts must hit the whole-connect deadline");
+        assert_eq!(failure_class(&error), "timeout");
+        drop(listener);
     }
 
     #[test]
@@ -601,7 +831,8 @@ mod tests {
             .with_max_level(tracing::Level::WARN)
             .with_writer(move || CapturedLogWriter(Arc::clone(&captured_writer)))
             .finish();
-        let reader = run_reader_loop(read_half, inbound_tx).with_subscriber(subscriber);
+        let reader = run_reader_loop(read_half, inbound_tx, Arc::new(AtomicU64::new(0)))
+            .with_subscriber(subscriber);
         let reader_task = tokio::spawn(reader);
 
         let inbound = tokio::time::timeout(Duration::from_secs(2), inbound_rx.recv())

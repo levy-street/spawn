@@ -61,6 +61,30 @@ async fn version_check_requires_success_and_expected_suffix() {
     assert_eq!(failure.error, "version_mismatch");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_pair_check_requires_the_exact_shared_tree_stamp() {
+    let directory = tempdir().unwrap();
+    let worker = directory.path().join("spawn-worker");
+    fs::write(
+        &worker,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+            crate::version::worker_identity_line()
+        ),
+    )
+    .unwrap();
+    chmod_executable(&worker).unwrap();
+    assert!(worker_pair_matches(&worker).await);
+
+    fs::write(
+        &worker,
+        b"#!/bin/sh\nprintf 'spawn-worker wrong tree=wrong\\n'\n",
+    )
+    .unwrap();
+    assert!(!worker_pair_matches(&worker).await);
+}
+
 #[test]
 fn swap_rolls_back_when_the_second_rename_fails() {
     let directory = tempdir().unwrap();
@@ -168,6 +192,7 @@ fn precondition_reasons_are_short_stable_classes() {
         "unsupported_target"
     );
     assert_eq!(BlockReason::WorkerMissing.as_str(), "worker_missing");
+    assert_eq!(BlockReason::WorkerMismatch.as_str(), "worker_mismatch");
 }
 
 #[test]
@@ -192,8 +217,10 @@ fn update_guard_is_single_flight_and_releases_on_drop() {
 }
 
 #[test]
-fn startup_cleanup_removes_only_exact_previous_binary_names() {
+fn post_register_cleanup_removes_only_the_installed_pair_backups() {
     let directory = tempdir().unwrap();
+    let daemon = directory.path().join("spawnd");
+    let worker = directory.path().join("spawn-worker");
     let daemon_previous = directory.path().join("spawnd.prev");
     let worker_previous = directory.path().join("spawn-worker.prev");
     let unrelated = directory.path().join("notes.prev");
@@ -201,11 +228,80 @@ fn startup_cleanup_removes_only_exact_previous_binary_names() {
     fs::write(&worker_previous, b"old worker").unwrap();
     fs::write(&unrelated, b"keep").unwrap();
 
-    cleanup_previous_in(&[directory.path().to_path_buf()]);
+    cleanup_previous_paths(&daemon, &worker);
 
     assert!(!daemon_previous.exists());
     assert!(!worker_previous.exists());
     assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+}
+
+fn test_marker(attempts: u32, deadline_unix_ms: u64, reverted: bool) -> ProbationMarker {
+    ProbationMarker {
+        attempts,
+        old_tree: "a".repeat(40),
+        deadline_unix_ms,
+        attempted_tree: "b".repeat(40),
+        version_before: "0.1.0+gold".into(),
+        request_id: Some("request-1".into()),
+        worker_path: PathBuf::from("/bin/spawn-worker"),
+        reverted,
+    }
+}
+
+#[test]
+fn probation_state_machine_continues_once_then_reverts_or_reports() {
+    assert_eq!(
+        probation_decision(&test_marker(0, 10_000, false), 1_000),
+        ProbationDecision::Continue
+    );
+    assert_eq!(
+        probation_decision(&test_marker(1, 10_000, false), 1_000),
+        ProbationDecision::Revert
+    );
+    assert_eq!(
+        probation_decision(&test_marker(0, 999, false), 1_000),
+        ProbationDecision::Revert
+    );
+    assert_eq!(
+        probation_decision(&test_marker(99, 1, true), 1_000),
+        ProbationDecision::ReportRevert
+    );
+}
+
+#[test]
+fn reverted_probation_reports_a_stable_health_failure() {
+    let mut marker = test_marker(2, 1, true);
+    let frame = serde_json::to_value(health_failure_result(&marker)).unwrap();
+    assert_eq!(frame["type"], "daemon.update_result");
+    assert_eq!(frame["request_id"], "request-1");
+    assert_eq!(frame["ok"], false);
+    assert_eq!(frame["stage"], "health");
+    assert_eq!(frame["tree"], marker.attempted_tree);
+
+    marker.request_id = None;
+    let fallback = serde_json::to_value(health_failure_result(&marker)).unwrap();
+    assert_eq!(
+        fallback["request_id"],
+        format!("health-{}", marker.attempted_tree)
+    );
+}
+
+#[test]
+fn health_revert_restores_both_fake_binaries() {
+    let directory = tempdir().unwrap();
+    let daemon = directory.path().join("spawnd");
+    let worker = directory.path().join("spawn-worker");
+    fs::write(&daemon, b"bad daemon").unwrap();
+    fs::write(&worker, b"bad worker").unwrap();
+    fs::write(previous_path(&daemon), b"old daemon").unwrap();
+    fs::write(previous_path(&worker), b"old worker").unwrap();
+
+    revert_binaries(&daemon, &worker).unwrap();
+
+    assert_eq!(fs::read(&daemon).unwrap(), b"old daemon");
+    assert_eq!(fs::read(&worker).unwrap(), b"old worker");
+    assert!(!previous_path(&daemon).exists());
+    assert!(!previous_path(&worker).exists());
 }
 
 #[cfg(unix)]

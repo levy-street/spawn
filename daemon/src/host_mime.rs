@@ -60,10 +60,47 @@ const OCTET: &str = "application/octet-stream";
 /// be hopeless on macOS — any installed app can claim any extension — but as a
 /// second gate behind the allowlist it closes the one hole the allowlist has.
 const NEVER_OPEN: &[&str] = &[
-    "webloc", "inetloc", "fileloc", "url", "desktop", "lnk", "scf", "command", "app", "workflow",
-    "scpt", "scptd", "applescript", "action", "sh", "bash", "zsh", "fish", "ksh", "csh", "ps1",
-    "bat", "cmd", "com", "exe", "msi", "pkg", "mpkg", "dmg", "jar", "apk", "appex", "kext",
-    "prefpane", "qlgenerator", "saver", "service", "wflow", "terminal", "vbs", "js",
+    "webloc",
+    "inetloc",
+    "fileloc",
+    "url",
+    "desktop",
+    "lnk",
+    "scf",
+    "command",
+    "app",
+    "workflow",
+    "scpt",
+    "scptd",
+    "applescript",
+    "action",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ksh",
+    "csh",
+    "ps1",
+    "bat",
+    "cmd",
+    "com",
+    "exe",
+    "msi",
+    "pkg",
+    "mpkg",
+    "dmg",
+    "jar",
+    "apk",
+    "appex",
+    "kext",
+    "prefpane",
+    "qlgenerator",
+    "saver",
+    "service",
+    "wflow",
+    "terminal",
+    "vbs",
+    "js",
 ];
 
 /// ZIP-container formats we are willing to open, keyed by extension.
@@ -72,9 +109,18 @@ const NEVER_OPEN: &[&str] = &[
 /// thing separating a Word document from a `.jar`. Anything not listed keeps
 /// the generic zip type and stays unopenable.
 const ZIP_DOCUMENTS: &[(&str, &str)] = &[
-    ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-    ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-    ("pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+    (
+        "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ),
+    (
+        "xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ),
+    (
+        "pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
     ("odt", "application/vnd.oasis.opendocument.text"),
     ("ods", "application/vnd.oasis.opendocument.spreadsheet"),
     ("odp", "application/vnd.oasis.opendocument.presentation"),
@@ -399,12 +445,10 @@ fn preview_for_type(mime: &str) -> PreviewKind {
         return PreviewKind::Native;
     }
     match mime {
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
-        | "image/x-icon" | "image/avif" | "image/svg+xml" | "application/pdf" | "video/mp4"
-        | "video/webm" | "video/quicktime" | "audio/mpeg" | "audio/wav" | "audio/flac"
-        | "audio/ogg" | "audio/mp4" | "application/json" | "application/xml" => {
-            PreviewKind::Native
-        }
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp" | "image/x-icon"
+        | "image/avif" | "image/svg+xml" | "application/pdf" | "video/mp4" | "video/webm"
+        | "video/quicktime" | "audio/mpeg" | "audio/wav" | "audio/flac" | "audio/ogg"
+        | "audio/mp4" | "application/json" | "application/xml" => PreviewKind::Native,
         "application/gzip"
         | "application/zip"
         | "application/x-7z-compressed"

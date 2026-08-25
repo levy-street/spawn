@@ -40,7 +40,9 @@ serde_json = "1"
 # errors / logging
 anyhow = "1"
 thiserror = "1"
+arc-swap = "1"
 tracing = "0.1"
+tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # pty + bytes
@@ -80,6 +82,11 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1.42", features = ["test-util"] }
+
+# Remove this override after a published webrtc-sctp release contains the
+# receiver zero-window re-admission fix from webrtc-rs/rtc#201.
+[patch.crates-io]
+webrtc-sctp = { path = "vendor/sctp" }
 
 [profile.release]
 lto = "thin"

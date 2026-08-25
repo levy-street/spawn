@@ -43,7 +43,7 @@ pub(crate) trait Launcher: Send + Sync + 'static {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{DesktopAction, Launcher};
-    use crate::host_files::{FsError, FsResult, HostFileService, HostFileOperations, LaunchTarget};
+    use crate::host_files::{FsError, FsResult, HostFileOperations, HostFileService, LaunchTarget};
     use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
@@ -276,7 +276,12 @@ mod imp {
 
         #[test]
         fn url_indirection_is_refused() {
-            let result = gate_open(&target("link.webloc", b"<?xml version=\"1.0\"?>", 0o644, false));
+            let result = gate_open(&target(
+                "link.webloc",
+                b"<?xml version=\"1.0\"?>",
+                0o644,
+                false,
+            ));
             assert_eq!(result.unwrap_err().code, "open_not_permitted");
         }
 

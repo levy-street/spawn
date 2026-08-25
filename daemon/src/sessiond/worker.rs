@@ -687,11 +687,14 @@ async fn handle_frame(
     match frame_type {
         wire::T_START => {
             if !matches!(state, State::AwaitingStart) {
-                bail!("Start received but session is already {}", state_name(state));
+                bail!(
+                    "Start received but session is already {}",
+                    state_name(state)
+                );
             }
             let mut spec: wire::StartSpec = wire::decode_json(&payload)?;
-            let canonical_cwd =
-                std::fs::canonicalize(&spec.cwd).context("resolving session cwd capability root")?;
+            let canonical_cwd = std::fs::canonicalize(&spec.cwd)
+                .context("resolving session cwd capability root")?;
             if !canonical_cwd.is_dir() {
                 bail!("session cwd capability root is not a directory");
             }

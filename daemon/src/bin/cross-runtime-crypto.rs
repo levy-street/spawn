@@ -509,7 +509,11 @@ fn encode_browser_registration(
     output.extend_from_slice(BROWSER_REGISTRATION_MAGIC);
     output.push(BROWSER_REGISTRATION_VERSION);
     output.extend_from_slice(&user_id);
-    output.push(if is_root { BROWSER_REGISTRATION_FLAG_ROOT } else { 0 });
+    output.push(if is_root {
+        BROWSER_REGISTRATION_FLAG_ROOT
+    } else {
+        0
+    });
     output.extend_from_slice(browser_key.as_bytes());
     Ok(output)
 }
