@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-# Shared, side-effect-free release contract helpers plus the local validation
-# of a downloaded prebuilt-latest snapshot. This file is sourced by deploy;
-# executing it directly is only supported for its self-test.
+# Shared release contract, signing, and downloaded-prebuilt validation helpers.
+# This file is sourced by deploy; executing it directly is only supported for
+# its self-test.
 
 PREBUILT_TARGETS=(
   "darwin-aarch64:aarch64-apple-darwin"
@@ -17,23 +17,219 @@ is_lower_hex() {
   [[ "${#value}" -eq "$length" && ! "$value" =~ [^0-9a-f] ]]
 }
 
+release_counter_for_commit() {
+  local commit="$1"
+  local counter
+  counter="$(git show -s --format=%ct "$commit" 2>/dev/null)" || return 1
+  [[ "$counter" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$counter"
+}
+
+release_signing_key_path() {
+  printf '%s\n' "${SPAWN_RELEASE_SIGNING_KEY:-$HOME/.config/spawn/release-signing.key}"
+}
+
+release_signing_key_readable() {
+  local keyfile="${1:-$(release_signing_key_path)}"
+  [[ -f "$keyfile" && -r "$keyfile" ]]
+}
+
+# The release key helpers deliberately use the server project's Python. It is
+# the one release environment that already pins cryptography, and keeps private
+# key material out of command arguments and shell output.
+release_signing_public_key() {
+  local keyfile="${1:-$(release_signing_key_path)}"
+  release_signing_key_readable "$keyfile" || return 1
+  UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/spawn-release-uv-cache}" \
+    uv run --project "$(cd "$(dirname "${BASH_SOURCE[0]}")/../server" && pwd)" --frozen python - "$keyfile" <<'PY'
+import base64
+import re
+import sys
+from pathlib import Path
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+
+def decode_unpadded(value: str, length: int) -> bytes:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value) or "=" in value:
+        raise ValueError("not unpadded base64url")
+    raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    if len(raw) != length or base64.urlsafe_b64encode(raw).decode().rstrip("=") != value:
+        raise ValueError("wrong length or non-canonical encoding")
+    return raw
+
+
+try:
+    lines = Path(sys.argv[1]).read_text(encoding="ascii").splitlines()
+    if len(lines) != 1:
+        raise ValueError("the signing seed must be exactly one line")
+    seed = decode_unpadded(lines[0], 32)
+    public = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+except (OSError, UnicodeError, ValueError) as exc:
+    print(f"invalid release signing key file: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(base64.urlsafe_b64encode(public).decode().rstrip("="))
+PY
+}
+
+release_signing_key_id() {
+  local public_key="$1"
+  python3 - "$public_key" <<'PY'
+import base64
+import hashlib
+import re
+import sys
+
+value = sys.argv[1]
+try:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value) or "=" in value:
+        raise ValueError
+    raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    if len(raw) != 32 or base64.urlsafe_b64encode(raw).decode().rstrip("=") != value:
+        raise ValueError
+except ValueError:
+    raise SystemExit(1)
+print(hashlib.sha256(raw).hexdigest()[:8])
+PY
+}
+
+sign_prebuilt_manifest() {
+  local manifest="$1"
+  local signature_out="$2"
+  local keyfile="${3:-$(release_signing_key_path)}"
+  [[ -f "$manifest" && -r "$manifest" ]] || return 1
+  release_signing_key_readable "$keyfile" || return 1
+  UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/spawn-release-uv-cache}" \
+    uv run --project "$(cd "$(dirname "${BASH_SOURCE[0]}")/../server" && pwd)" --frozen python - \
+      "$manifest" "$signature_out" "$keyfile" <<'PY'
+import base64
+import re
+import sys
+from pathlib import Path
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+
+def decode_seed(path: str) -> bytes:
+    lines = Path(path).read_text(encoding="ascii").splitlines()
+    if len(lines) != 1:
+        raise ValueError("the signing seed must be exactly one line")
+    value = lines[0]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value) or "=" in value:
+        raise ValueError("the signing seed is not unpadded base64url")
+    raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    if len(raw) != 32 or base64.urlsafe_b64encode(raw).decode().rstrip("=") != value:
+        raise ValueError("the signing seed has the wrong length or encoding")
+    return raw
+
+
+try:
+    manifest = Path(sys.argv[1]).read_bytes()
+    seed = decode_seed(sys.argv[3])
+    signature = Ed25519PrivateKey.from_private_bytes(seed).sign(manifest)
+    encoded = base64.urlsafe_b64encode(signature).decode().rstrip("=")
+    Path(sys.argv[2]).write_text(encoded + "\n", encoding="ascii")
+except (OSError, UnicodeError, ValueError) as exc:
+    print(f"could not sign prebuilt manifest: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+verify_prebuilt_manifest_signature() {
+  local manifest="$1"
+  local signature="$2"
+  local public_key="$3"
+  [[ -f "$manifest" && -r "$manifest" && -f "$signature" && -r "$signature" ]] || return 1
+  UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/spawn-release-uv-cache}" \
+    uv run --project "$(cd "$(dirname "${BASH_SOURCE[0]}")/../server" && pwd)" --frozen python - \
+      "$manifest" "$signature" "$public_key" <<'PY'
+import base64
+import re
+import sys
+from pathlib import Path
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+
+def decode_unpadded(value: str, length: int) -> bytes:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value) or "=" in value:
+        raise ValueError
+    raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    if len(raw) != length or base64.urlsafe_b64encode(raw).decode().rstrip("=") != value:
+        raise ValueError
+    return raw
+
+
+try:
+    signature_lines = Path(sys.argv[2]).read_text(encoding="ascii").splitlines()
+    if len(signature_lines) != 1:
+        raise ValueError
+    signature = decode_unpadded(signature_lines[0], 64)
+    public = decode_unpadded(sys.argv[3], 32)
+    Ed25519PublicKey.from_public_bytes(public).verify(
+        signature, Path(sys.argv[1]).read_bytes()
+    )
+except (InvalidSignature, OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+# Extract unpadded base64url-encoded 32-byte public keys from the daemon's
+# release-key source. Keeping the parser encoding-based makes it tolerate a
+# singular constant today and the rotation list the daemon contract requires.
+release_public_keys_from_rust_file() {
+  local source_file="$1"
+  [[ -f "$source_file" && -r "$source_file" ]] || return 1
+  python3 - "$source_file" <<'PY'
+import base64
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+found = []
+for value in re.findall(r'["\u0027]([A-Za-z0-9_-]{43})["\u0027]', text):
+    try:
+        raw = base64.urlsafe_b64decode(value + "=")
+    except ValueError:
+        continue
+    if len(raw) == 32 and value not in found:
+        found.append(value)
+if not found:
+    raise SystemExit(1)
+print("\n".join(found))
+PY
+}
+
 # Each remaining argument is target:spawnd_sha256:spawn_worker_sha256.
 render_prebuilt_manifest() {
   local commit="$1"
   local tree="$2"
   local version="$3"
-  shift 3
+  local release_counter="$4"
+  local signing_key_id="$5"
+  shift 5
 
   is_lower_hex "$commit" 40 || return 1
   is_lower_hex "$tree" 40 || return 1
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+g[0-9a-f]{12}$ ]] || return 1
   [[ "${version##*+g}" == "${commit:0:12}" ]] || return 1
+  [[ "$release_counter" =~ ^[0-9]+$ ]] || return 1
+  is_lower_hex "$signing_key_id" 8 || return 1
   [[ "$#" -gt 0 ]] || return 1
 
   printf '{\n'
   printf '  "commit": "%s",\n' "$commit"
   printf '  "tree": "%s",\n' "$tree"
   printf '  "version": "%s",\n' "$version"
+  printf '  "release_counter": %s,\n' "$release_counter"
+  printf '  "signing_key_id": "%s",\n' "$signing_key_id"
   printf '  "targets": {\n'
 
   local entry target spawnd_sha worker_sha separator=""
@@ -227,17 +423,63 @@ prepare_prebuilt_release() {
   prebuilt_reason="verified"
 }
 
-release_contract_self_test() {
+release_contract_self_test() (
   local commit="1111111111111111111111111111111111111111"
   local tree="2222222222222222222222222222222222222222"
   local spawnd_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   local worker_sha="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  local manifest release
-  manifest="$(render_prebuilt_manifest \
-    "$commit" "$tree" "0.1.0+g111111111111" \
-    "darwin-aarch64:$spawnd_sha:$worker_sha")" || return 1
+  local tmp key wrong_key public_key wrong_public key_id manifest_file signature_file
+  local flipped_file manifest release
+  tmp="$(mktemp -d)" || return 1
+  trap 'rm -rf -- "$tmp"' EXIT
+  key="$tmp/release-signing.key"
+  wrong_key="$tmp/wrong-release-signing.key"
+  python3 - "$key" "$wrong_key" <<'PY' || return 1
+import base64
+import os
+import sys
+from pathlib import Path
+
+for name in sys.argv[1:]:
+    Path(name).write_text(
+        base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=") + "\n",
+        encoding="ascii",
+    )
+    Path(name).chmod(0o600)
+PY
+  public_key="$(release_signing_public_key "$key")" || return 1
+  wrong_public="$(release_signing_public_key "$wrong_key")" || return 1
+  key_id="$(release_signing_key_id "$public_key")" || return 1
+  manifest_file="$tmp/manifest.json"
+  signature_file="$tmp/manifest.json.sig"
+  render_prebuilt_manifest \
+    "$commit" "$tree" "0.1.0+g111111111111" 1700000000 "$key_id" \
+    "darwin-aarch64:$spawnd_sha:$worker_sha" > "$manifest_file" || return 1
+  manifest="$(<"$manifest_file")"
   [[ "$(manifest_tree_from_json "$manifest")" == "$tree" ]] || return 1
+  grep -q '"release_counter": 1700000000' <<< "$manifest" || return 1
+  grep -q "\"signing_key_id\": \"$key_id\"" <<< "$manifest" || return 1
   grep -q '"spawn_worker_sha256": "bbbbbbbb' <<< "$manifest" || return 1
+
+  sign_prebuilt_manifest "$manifest_file" "$signature_file" "$key" || return 1
+  verify_prebuilt_manifest_signature \
+    "$manifest_file" "$signature_file" "$public_key" || return 1
+  flipped_file="$tmp/manifest-flipped.json"
+  python3 - "$manifest_file" "$flipped_file" <<'PY' || return 1
+import sys
+from pathlib import Path
+
+data = bytearray(Path(sys.argv[1]).read_bytes())
+data[10] ^= 1
+Path(sys.argv[2]).write_bytes(data)
+PY
+  ! verify_prebuilt_manifest_signature \
+    "$flipped_file" "$signature_file" "$public_key" || return 1
+  ! verify_prebuilt_manifest_signature \
+    "$manifest_file" "$signature_file" "$wrong_public" || return 1
+  release_signing_key_readable "$key" || return 1
+  ! release_signing_key_readable "$tmp/missing.key" || return 1
+
   tree_changed_but_cannot_publish "$commit" "$tree" 0 0 || return 1
   ! tree_changed_but_cannot_publish "$tree" "$tree" 0 0 || return 1
   ! tree_changed_but_cannot_publish "$commit" "$tree" 1 0 || return 1
@@ -247,7 +489,7 @@ release_contract_self_test() {
   release_matches_expected "$release" "$commit" "$tree" || return 1
   ! release_matches_expected "$release" "$tree" "$tree" 2>/dev/null || return 1
   ! release_matches_expected "$release" "$commit" "$commit" 2>/dev/null || return 1
-}
+)
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   if [[ "${1:-}" != "--self-test" || "$#" -ne 1 ]]; then
@@ -256,6 +498,10 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   fi
   command -v python3 >/dev/null 2>&1 || {
     printf 'release-lib: python3 is required\n' >&2
+    exit 1
+  }
+  command -v uv >/dev/null 2>&1 || {
+    printf 'release-lib: uv is required\n' >&2
     exit 1
   }
   release_contract_self_test || {

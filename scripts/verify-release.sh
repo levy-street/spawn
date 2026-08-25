@@ -10,6 +10,8 @@ Read-only proof that a deployed SPAWN D release matches a git ref.
 Checks:
   - /api/release server.commit matches the ref's commit
   - /api/release daemon.tree matches the ref's daemon/ tree
+  - /api/install/manifest.json has a valid daemon-pinned signature
+  - the signed manifest counter matches the ref commit's committer timestamp
   - every advertised daemon binary hashes to its advertised sha256
   - the production Expo manifest carries the ref's mobile/ tree
 
@@ -86,6 +88,7 @@ server="${server%/}"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
+command -v uv >/dev/null 2>&1 || die "uv is required"
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   die "sha256sum or shasum is required"
 fi
@@ -98,6 +101,8 @@ expected_daemon_tree="$(git rev-parse "$git_ref:daemon" 2>/dev/null)" ||
   die "cannot resolve daemon/ at $git_ref"
 expected_mobile_tree="$(git rev-parse "$git_ref:mobile" 2>/dev/null)" ||
   die "cannot resolve mobile/ at $git_ref"
+expected_release_counter="$(release_counter_for_commit "$expected_commit")" ||
+  die "cannot derive the release counter for $expected_commit"
 
 tmp_dir="$(mktemp -d)"
 cleanup() {
@@ -219,6 +224,82 @@ fi
 check_row "server.commit" "$expected_commit" "$actual_commit"
 check_row "daemon.tree" "$expected_daemon_tree" "$actual_daemon_tree"
 
+manifest_file="$tmp_dir/manifest.json"
+signature_file="$tmp_dir/manifest.json.sig"
+manifest_available=1
+if ! curl -fsS --max-time 20 "$server/api/install/manifest.json" \
+    -o "$manifest_file"; then
+  manifest_available=0
+fi
+signature_available=1
+if ! curl -fsS --max-time 20 "$server/api/install/manifest.json.sig" \
+    -o "$signature_file"; then
+  signature_available=0
+fi
+
+release_key_source_file="$tmp_dir/release_key.rs"
+release_public_keys=()
+release_key_source="daemon/src/release_key.rs at $git_ref"
+if git show "$git_ref:daemon/src/release_key.rs" > "$release_key_source_file" 2>/dev/null; then
+  while IFS= read -r public_key; do
+    [[ -n "$public_key" ]] && release_public_keys+=("$public_key")
+  done < <(release_public_keys_from_rust_file "$release_key_source_file" 2>/dev/null || true)
+else
+  release_key_source="SPAWN_RELEASE_PUBLIC_KEY fallback (release_key.rs absent at $git_ref)"
+  if [[ -n "${SPAWN_RELEASE_PUBLIC_KEY:-}" ]]; then
+    IFS=, read -r -a release_public_keys <<< "$SPAWN_RELEASE_PUBLIC_KEY"
+  fi
+fi
+
+manifest_key_id=""
+manifest_daemon_tree=""
+actual_release_counter=""
+if [[ "$manifest_available" == "1" ]]; then
+  manifest_key_id="$(json_get "$manifest_file" signing_key_id 2>/dev/null || true)"
+  manifest_daemon_tree="$(json_get "$manifest_file" tree 2>/dev/null || true)"
+  actual_release_counter="$(json_get "$manifest_file" release_counter 2>/dev/null || true)"
+fi
+
+signature_ok=0
+verified_key_id=""
+if [[ "$manifest_available" == "1" && "$signature_available" == "1" ]]; then
+  for public_key in "${release_public_keys[@]}"; do
+    if verify_prebuilt_manifest_signature \
+      "$manifest_file" "$signature_file" "$public_key" 2>/dev/null; then
+      candidate_key_id="$(release_signing_key_id "$public_key" 2>/dev/null || true)"
+      if [[ -n "$candidate_key_id" && "$candidate_key_id" == "$manifest_key_id" ]]; then
+        signature_ok=1
+        verified_key_id="$candidate_key_id"
+        break
+      fi
+    fi
+  done
+fi
+
+if [[ "$signature_ok" == "1" ]]; then
+  print_row "daemon manifest signature" "$release_key_source" \
+    "valid (key $verified_key_id)" "OK"
+else
+  if [[ "$manifest_available" != "1" ]]; then
+    signature_actual="<manifest fetch failed>"
+  elif [[ "$signature_available" != "1" ]]; then
+    signature_actual="<signature fetch failed>"
+  elif [[ "${#release_public_keys[@]}" -eq 0 ]]; then
+    signature_actual="<no release public keys found>"
+  elif [[ -z "$manifest_key_id" ]]; then
+    signature_actual="<manifest signing_key_id missing>"
+  else
+    signature_actual="invalid or key id mismatch ($manifest_key_id)"
+  fi
+  print_row "daemon manifest signature" "$release_key_source" \
+    "$signature_actual" "FAIL"
+  fail=1
+fi
+check_row "daemon release counter" "$expected_release_counter" \
+  "$actual_release_counter"
+check_row "daemon signed manifest tree" "$expected_daemon_tree" \
+  "$manifest_daemon_tree"
+
 advertised_targets=0
 if [[ "$release_available" == "1" ]]; then
   while IFS= read -r target; do
@@ -236,15 +317,22 @@ if [[ "$release_available" == "1" ]]; then
       else
         hash_field="spawn_worker_sha256"
       fi
-      expected_hash="$(json_get "$release_file" "daemon.targets.$target.$hash_field" 2>/dev/null || true)"
+      expected_hash="$(json_get "$manifest_file" "targets.$target.$hash_field" 2>/dev/null || true)"
+      advertised_hash="$(json_get "$release_file" "daemon.targets.$target.$hash_field" 2>/dev/null || true)"
       binary_file="$tmp_dir/$target-$kind"
       if [[ -z "$expected_hash" ]]; then
-        print_row "daemon.$target.$kind" "advertised sha256" "<null>" "FAIL"
+        print_row "daemon.$target.$kind" "signed manifest sha256" "<null>" "FAIL"
         fail=1
-      elif curl -fsS --max-time 60 "$server/api/install/$kind/$target" -o "$binary_file"; then
+      elif [[ "$advertised_hash" != "$expected_hash" ]]; then
+        print_row "daemon.$target.$kind metadata" "$expected_hash" \
+          "${advertised_hash:-<null>}" "FAIL"
+        fail=1
+      fi
+      if [[ -n "$expected_hash" ]] &&
+        curl -fsS --max-time 60 "$server/api/install/$kind/$target" -o "$binary_file"; then
         actual_hash="$(sha256_file "$binary_file")"
         check_row "daemon.$target.$kind" "$expected_hash" "$actual_hash"
-      else
+      elif [[ -n "$expected_hash" ]]; then
         print_row "daemon.$target.$kind" "$expected_hash" "<fetch failed>" "FAIL"
         fail=1
       fi
