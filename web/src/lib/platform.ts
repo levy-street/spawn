@@ -10,6 +10,7 @@ export type PlatformOS = "macos" | "linux" | "windows" | "unknown";
 
 export interface PlatformInfo {
   os: PlatformOS;
+  origin: string;
   /** One-line daemon install for the current deployment origin. */
   installCommand: string;
   /** Variant that refuses the source-build fallback (deploy smoke tests). */
@@ -18,6 +19,38 @@ export interface PlatformInfo {
 
 /** Used until the real origin is known (SSR render, tests). */
 export const FALLBACK_ORIGIN = "https://spawnd.dev";
+
+export type DesktopPlatform = "darwin-aarch64" | "darwin-x86_64";
+
+export interface DesktopRelease {
+  version: string;
+  tree: string;
+  platforms: DesktopPlatform[];
+}
+
+/** Strictly feature-detect the additive /api/release.desktop block. */
+export function desktopReleaseFromPayload(payload: unknown): DesktopRelease | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const desktop = (payload as Record<string, unknown>).desktop;
+  if (typeof desktop !== "object" || desktop === null) return null;
+  const value = desktop as Record<string, unknown>;
+  if (typeof value.version !== "string" || value.version.trim() === "") return null;
+  if (typeof value.tree !== "string" || !/^[0-9a-f]{40}$/u.test(value.tree)) return null;
+  if (!Array.isArray(value.platforms)) return null;
+  const platforms = value.platforms.filter(
+    (item): item is DesktopPlatform => item === "darwin-aarch64" || item === "darwin-x86_64",
+  );
+  if (platforms.length === 0 || platforms.length !== value.platforms.length) return null;
+  return { version: value.version, tree: value.tree, platforms: [...new Set(platforms)] };
+}
+
+export function desktopDownloadUrl(
+  origin: string,
+  version: string,
+  platform: DesktopPlatform,
+): string {
+  return `${origin.replace(/\/$/u, "")}/desktop/SPAWN-D_${encodeURIComponent(version)}_${platform}.dmg`;
+}
 
 export function installCommand(origin: string): string {
   return `curl -fsSL ${origin}/install.sh | sh`;
@@ -46,6 +79,7 @@ export function detectOS(platform: string, userAgent: string): PlatformOS {
 /** What a server render (or a browser we can't identify) gets. */
 export const UNDETECTED_PLATFORM: PlatformInfo = {
   os: "unknown",
+  origin: FALLBACK_ORIGIN,
   installCommand: installCommand(FALLBACK_ORIGIN),
   prebuiltInstallCommand: prebuiltInstallCommand(FALLBACK_ORIGIN),
 };
@@ -61,6 +95,7 @@ export function detectPlatform(): PlatformInfo {
   const origin = window.location.origin;
   return {
     os: detectOS(window.navigator.platform, window.navigator.userAgent),
+    origin,
     installCommand: installCommand(origin),
     prebuiltInstallCommand: prebuiltInstallCommand(origin),
   };

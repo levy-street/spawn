@@ -8,6 +8,7 @@ there is one copy and it cannot drift.
 ```
 web/      Next.js browser app                → web/CLAUDE.md
 mobile/   Expo / React Native app            → mobile/CLAUDE.md
+desktop/  Tauri v2 macOS companion           → desktop/CLAUDE.md
 server/   FastAPI API + websockets + Alembic → server/CLAUDE.md
 daemon/   Rust spawnd + spawn-worker         → daemon/CLAUDE.md
 proto/    cross-runtime golden vectors shared by daemon and web crypto

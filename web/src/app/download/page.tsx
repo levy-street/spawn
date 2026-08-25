@@ -1,6 +1,14 @@
 "use client";
 
-import { AlertTriangle, ArrowRight, Check, CheckCircle2, Copy, Laptop } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowRight,
+  Check,
+  CheckCircle2,
+  Copy,
+  Download,
+  Laptop,
+} from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
@@ -13,7 +21,14 @@ import {
   RegistrationMarks,
 } from "@/components/brand/press";
 import { poster } from "@/lib/fonts";
-import { detectPlatform, type PlatformOS, UNDETECTED_PLATFORM } from "@/lib/platform";
+import {
+  type DesktopRelease,
+  desktopDownloadUrl,
+  desktopReleaseFromPayload,
+  detectPlatform,
+  type PlatformOS,
+  UNDETECTED_PLATFORM,
+} from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
 const PLATFORM_COPY: Record<
@@ -79,10 +94,21 @@ export default function DownloadPage() {
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
   const [copied, setCopied] = useState(false);
   const [canCopy, setCanCopy] = useState(false);
+  const [desktopRelease, setDesktopRelease] = useState<DesktopRelease | null>(null);
 
   useEffect(() => {
     setPlatform(detectPlatform());
     setCanCopy(Boolean(navigator.clipboard));
+    const controller = new AbortController();
+    void fetch("/api/release", {
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload: unknown) => setDesktopRelease(desktopReleaseFromPayload(payload)))
+      .catch(() => undefined);
+    return () => controller.abort();
   }, []);
 
   const command = platform.installCommand;
@@ -109,6 +135,68 @@ export default function DownloadPage() {
     <main className="grimoire min-h-vv overflow-x-clip">
       <Masthead current="download" />
 
+      {desktopRelease && (
+        <section className="relative isolate overflow-hidden border-line-g border-b bg-bone text-void">
+          <div
+            aria-hidden
+            className="absolute -top-28 right-[4%] size-[32rem] rotate-[9deg] opacity-[0.07]"
+          >
+            {/* biome-ignore lint/performance/noImgElement: decorative brand stamp */}
+            <img src="/brand/spawnd-icon-black.svg" alt="" className="size-full" />
+          </div>
+          <div className="relative mx-auto grid w-full max-w-6xl gap-10 px-5 py-16 sm:px-8 lg:grid-cols-[1fr_auto] lg:items-end lg:py-20">
+            <div>
+              <p className="mb-5 font-sigil text-[11px] font-medium tracking-[0.28em] uppercase">
+                Native macOS companion
+              </p>
+              <h1
+                className={cn(
+                  poster.className,
+                  "max-w-[15ch] text-[clamp(38px,6vw,68px)] leading-[0.96] font-light uppercase",
+                )}
+              >
+                Get SPAWN D for Mac
+              </h1>
+              <p className="mt-6 max-w-[56ch] text-[16px] leading-7">
+                A tray-first, signed app that verifies the daemon, possesses this Mac, and then gets
+                out of the way.
+              </p>
+              <p className="mt-5 font-sigil text-[11px] tracking-[0.18em] uppercase">
+                Version {desktopRelease.version} · SHA {desktopRelease.tree.slice(0, 12)}
+              </p>
+            </div>
+            <div className="flex min-w-[15rem] flex-col gap-3">
+              {desktopRelease.platforms.includes("darwin-aarch64") && (
+                <a
+                  className={cn(CTA_SLAB, "justify-between border-void bg-void text-bone")}
+                  href={desktopDownloadUrl(
+                    platform.origin,
+                    desktopRelease.version,
+                    "darwin-aarch64",
+                  )}
+                >
+                  Apple silicon
+                  <Download className="size-4" aria-hidden />
+                </a>
+              )}
+              {desktopRelease.platforms.includes("darwin-x86_64") && (
+                <a
+                  className="flex items-center justify-between border border-void px-5 py-3 font-sigil text-[12px] tracking-[0.12em] uppercase transition-colors hover:bg-void hover:text-bone"
+                  href={desktopDownloadUrl(
+                    platform.origin,
+                    desktopRelease.version,
+                    "darwin-x86_64",
+                  )}
+                >
+                  Intel Mac
+                  <Download className="size-4" aria-hidden />
+                </a>
+              )}
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* ── The hero: the dial-out plate, type ranged left ─────── */}
       <section className="relative isolate overflow-hidden border-line-g border-b">
         <Image
@@ -133,19 +221,20 @@ export default function DownloadPage() {
         <div className="relative z-10 mx-auto w-full max-w-6xl min-w-0 px-5 py-24 sm:px-8">
           <div className="grid min-w-0 gap-14 lg:grid-cols-[1.05fr_0.95fr] lg:items-center">
             <div>
-              <Eyebrow className="mb-5">Possess a host</Eyebrow>
+              <Eyebrow className="mb-5">Servers and Linux</Eyebrow>
               <h1
                 className={cn(
                   poster.className,
                   "text-[clamp(35px,5.6vw,63px)] leading-[1.02] font-light text-bone uppercase [text-wrap:balance]",
                 )}
               >
-                Install the daemon. <em className="text-hellfire not-italic">Possess the host.</em>
+                Possess any machine.{" "}
+                <em className="text-hellfire not-italic">From its terminal.</em>
               </h1>
               <p className="mt-6 max-w-[54ch] text-[17px] leading-8 text-ash">
-                The installer detects macOS or Linux on the machine where it runs, downloads the
-                matching prebuilt daemon, then starts it as a user service. One line, then the
-                pairing ceremony — consensual, auditable, revocable.
+                Use the one-line installer for a Linux server, a remote host, or a Mac where you do
+                not want the companion app. It downloads the matching daemon and starts the user
+                service.
               </p>
             </div>
 
@@ -184,7 +273,7 @@ export default function DownloadPage() {
            * way, so the fold always ends on something you can act on. */}
           <div className="mt-16 min-w-0 border-line-g border-t pt-10">
             <p className="mb-5 font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
-              {detected.title}
+              Or possess any machine from its terminal: {detected.title}
             </p>
             <div className="flex max-w-full min-w-0 items-center gap-3 rounded-sm border border-bone bg-void py-4 pr-3 pl-4 font-sigil text-[13px] text-bone">
               <span className="text-ember">$</span>

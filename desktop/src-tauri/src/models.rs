@@ -1,0 +1,180 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DesktopPreferences {
+    pub server_origin: String,
+    pub account_id: Option<String>,
+    pub account_email: Option<String>,
+    pub device_id: Option<String>,
+    pub device_approved: bool,
+    pub first_run_complete: bool,
+    pub host_name: Option<String>,
+}
+
+impl Default for DesktopPreferences {
+    fn default() -> Self {
+        Self {
+            server_origin: "https://spawnd.dev".into(),
+            account_id: None,
+            account_email: None,
+            device_id: None,
+            device_approved: false,
+            first_run_complete: false,
+            host_name: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UserOut {
+    pub id: String,
+    pub email: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TokenResponse {
+    pub access_token: String,
+    pub user: UserOut,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SessionRenewResponse {
+    pub access_token: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AuthOutcome {
+    pub account_id: String,
+    pub email: String,
+    pub device_id: String,
+    pub approval_required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BrowserDevice {
+    pub id: String,
+    pub key_algorithm: String,
+    pub public_key: String,
+    pub label: Option<String>,
+    pub revoked_at: Option<String>,
+    #[serde(default)]
+    pub is_root: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SetupClaimMint {
+    pub token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SetupClaim {
+    pub status: String,
+    pub approval_ref: Option<String>,
+    pub host_name: Option<String>,
+    pub os: Option<String>,
+    pub host_key_fingerprint: Option<String>,
+    pub host_id: Option<String>,
+    pub error: Option<String>,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DevicePending {
+    pub host_name: String,
+    pub approval_nonce: String,
+    pub host_key_algorithm: String,
+    pub host_public_key: String,
+    pub host_key_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeviceApproveResponse {
+    pub host_name: String,
+    pub approval_nonce: String,
+    pub host_key_algorithm: String,
+    pub host_public_key: String,
+    pub browser_device_id: String,
+    pub browser_key_algorithm: String,
+    pub browser_public_key: String,
+    pub host_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PairingState {
+    pub id: String,
+    pub initiator_device_id: String,
+    pub joiner_device_id: String,
+    pub initiator_public_key: String,
+    pub initiator_commit: String,
+    pub joiner_public_key: Option<String>,
+    pub joiner_nonce: Option<String>,
+    pub initiator_nonce: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AccountEndorsement {
+    pub endorser_device_id: String,
+    pub endorser_public_key: String,
+    pub endorsed_device_id: String,
+    pub endorsed_public_key: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeviceApprovalProgress {
+    Waiting,
+    ShowNumber { pairing_id: String, number: String },
+    Approved,
+    Refused { message: String },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ApprovalReview {
+    pub approval_ref: String,
+    pub host_name: String,
+    pub host_public_key: String,
+    pub fingerprint: String,
+    pub local_fingerprint: Option<String>,
+    pub exact_key_match: bool,
+    pub needs_fingerprint_compare: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PossessionProgress {
+    pub claim_token: String,
+    pub claim: SetupClaim,
+    pub review: Option<ApprovalReview>,
+    pub child_finished: bool,
+    pub child_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HeartbeatState {
+    pub pid: u32,
+    pub version: String,
+    pub connected: bool,
+    pub connected_at: Option<String>,
+    pub server: String,
+    pub last_error: Option<HeartbeatError>,
+    pub sessions: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HeartbeatError {
+    pub kind: String,
+    pub detail: String,
+    pub at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LocalStatus {
+    pub status: serde_json::Value,
+    pub doctor: Option<serde_json::Value>,
+    pub heartbeat: Option<HeartbeatState>,
+    pub launchctl: String,
+    pub hosts: serde_json::Value,
+    pub release: serde_json::Value,
+    pub log_tail: String,
+}
