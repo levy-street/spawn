@@ -6,7 +6,12 @@ import {
   parseAlertFrame,
   type TrustEvent,
 } from "@/lib/alerts";
-import { buildAlertsWsUrl } from "@/lib/ws";
+import {
+  backoffDelay,
+  buildAlertsWsUrl,
+  notifySocketUnauthorized,
+  socketCloseAction,
+} from "@/lib/ws";
 
 /**
  * The owner's attention stream: one socket per tab, opened once, kept alive
@@ -25,7 +30,7 @@ import { buildAlertsWsUrl } from "@/lib/ws";
  * the background.
  */
 
-export type AlertSocketState = "idle" | "connecting" | "open" | "closed";
+export type AlertSocketState = "idle" | "connecting" | "open" | "closed" | "unauthorized";
 
 type AlertListener = (event: AlertEvent) => void;
 type TrustListener = (event: TrustEvent) => void;
@@ -90,8 +95,7 @@ function scheduleReconnect(): void {
   reconnectTimer = clearTimer(reconnectTimer);
   // Exponential with a ceiling, jittered so many tabs waking together do not
   // redial in lockstep.
-  const base = Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * 2 ** attempt);
-  const delay = base * (0.7 + Math.random() * 0.6);
+  const delay = backoffDelay(attempt, { base: RECONNECT_MIN_MS, cap: RECONNECT_MAX_MS });
   attempt = Math.min(attempt + 1, 6);
   reconnectTimer = window.setTimeout(connect, delay);
 }
@@ -118,7 +122,6 @@ function connect(): void {
 
   ws.onopen = () => {
     if (socket !== ws) return;
-    attempt = 0;
     setState("open");
     armWatchdog();
   };
@@ -129,6 +132,7 @@ function connect(): void {
     if (typeof message.data !== "string") return;
     const frame = parseAlertFrame(message.data);
     if (!frame) return;
+    attempt = 0;
     if (frame.type === "trust") {
       const { type: _trustType, ...trustEvent } = frame;
       for (const listener of [...trustListeners]) {
@@ -155,11 +159,32 @@ function connect(): void {
     if (socket !== ws) return;
     socket = null;
     watchdogTimer = clearTimer(watchdogTimer);
-    setState("closed");
-    if ("code" in event && event.code === 4003) {
+    const action = socketCloseAction(
+      "code" in event && typeof event.code === "number" ? event.code : 1006,
+    );
+    if (action === "client_stale") {
       protocolRequired = true;
       reconnectTimer = clearTimer(reconnectTimer);
       window.dispatchEvent(new CustomEvent("spawn:client-stale", { detail: { hard: true } }));
+      return;
+    }
+    if (action === "unauthorized") {
+      stopped = true;
+      reconnectTimer = clearTimer(reconnectTimer);
+      setState("unauthorized");
+      notifySocketUnauthorized();
+      return;
+    }
+    if (action === "client_bug") {
+      stopped = true;
+      reconnectTimer = clearTimer(reconnectTimer);
+      setState("closed");
+      console.error("SPAWN D alert signalling stopped after a client protocol error.");
+      return;
+    }
+    setState("closed");
+    if (action === "reconnect_immediately") {
+      reconnectTimer = window.setTimeout(connect, 0);
       return;
     }
     scheduleReconnect();
@@ -189,6 +214,7 @@ function installGlobalListeners(): void {
     if (document.visibilityState === "visible") wake();
   });
   window.addEventListener("online", wake);
+  window.addEventListener("pageshow", wake);
   window.addEventListener("pagehide", () => {
     // Bfcache: let the socket go rather than restoring a corpse.
     watchdogTimer = clearTimer(watchdogTimer);

@@ -20,6 +20,103 @@ const WS_URL = process.env.NEXT_PUBLIC_SPAWN_WS_URL ?? "";
 
 export const SPAWN_WS_SUBPROTOCOL = "spawn.v3";
 
+export const SOCKET_UNAUTHORIZED_EVENT = "spawn:socket-unauthorized";
+
+export interface BackoffOptions {
+  base: number;
+  cap: number;
+}
+
+/** Exponential reconnect delay with enough jitter to keep waking tabs from
+ * redialling in lockstep. `attempt=0` is the first retry. */
+export function backoffDelay(
+  attempt: number,
+  { base, cap }: BackoffOptions,
+  random: () => number = Math.random,
+): number {
+  const boundedAttempt = Math.max(0, Math.min(30, Math.floor(attempt)));
+  const ceiling = Math.max(0, cap);
+  const exponential = Math.min(ceiling, Math.max(0, base) * 2 ** boundedAttempt);
+  return exponential * (0.7 + Math.min(1, Math.max(0, random())) * 0.6);
+}
+
+export type SocketCloseAction =
+  | "reconnect"
+  | "reconnect_immediately"
+  | "unauthorized"
+  | "client_bug"
+  | "client_stale";
+
+/** One close-code policy shared by browser, host, and alert signalling. */
+export function socketCloseAction(code: number): SocketCloseAction {
+  if (code === 1008) return "unauthorized";
+  if (code === 4002 || code === 1002) return "client_bug";
+  if (code === 4003) return "client_stale";
+  if (code === 4010) return "reconnect_immediately";
+  return "reconnect";
+}
+
+export function notifySocketUnauthorized(): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent(SOCKET_UNAUTHORIZED_EVENT));
+}
+
+const ICE_URL_PATTERN = /^(stuns?|turns?):/i;
+const TURN_URL_PATTERN = /^turns?:/i;
+const MAX_ICE_SERVER_ENTRIES = 8;
+
+/** Treat server-provided ICE configuration as untrusted protocol input. */
+export function sanitizeIceServers(value: unknown): RTCIceServer[] {
+  if (!Array.isArray(value)) return [];
+  const sanitized: RTCIceServer[] = [];
+  for (const candidate of value) {
+    if (sanitized.length >= MAX_ICE_SERVER_ENTRIES) break;
+    if (typeof candidate !== "object" || candidate === null) continue;
+    const record = candidate as Record<string, unknown>;
+    const rawUrls = record.urls;
+    const urls = typeof rawUrls === "string" ? [rawUrls] : rawUrls;
+    if (
+      !Array.isArray(urls) ||
+      urls.length === 0 ||
+      urls.some((url) => typeof url !== "string" || !ICE_URL_PATTERN.test(url))
+    ) {
+      continue;
+    }
+    const needsCredentials = urls.some((url) => TURN_URL_PATTERN.test(url));
+    if (
+      needsCredentials &&
+      (typeof record.username !== "string" ||
+        record.username.length === 0 ||
+        typeof record.credential !== "string" ||
+        record.credential.length === 0)
+    ) {
+      continue;
+    }
+    sanitized.push({
+      urls: typeof rawUrls === "string" ? rawUrls : (urls as string[]),
+      ...(typeof record.username === "string" ? { username: record.username } : {}),
+      ...(typeof record.credential === "string" ? { credential: record.credential } : {}),
+      ...(record.credentialType === "password" ? { credentialType: "password" as const } : {}),
+    });
+  }
+  return sanitized;
+}
+
+/** Coturn REST usernames start with their Unix expiry. Refresh one hour early. */
+export function iceServersNeedRefresh(
+  iceServers: readonly RTCIceServer[],
+  nowMs = Date.now(),
+): boolean {
+  const refreshBeforeSeconds = Math.floor(nowMs / 1000) + 60 * 60;
+  for (const server of iceServers) {
+    const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
+    if (!urls.some((url) => TURN_URL_PATTERN.test(url))) continue;
+    const expiry = Number.parseInt(server.username?.split(":", 1)[0] ?? "", 10);
+    if (Number.isSafeInteger(expiry) && expiry <= refreshBeforeSeconds) return true;
+  }
+  return false;
+}
+
 function originForWs(): string {
   if (WS_URL) return WS_URL;
   if (typeof window === "undefined") return "ws://localhost:3000";
@@ -57,6 +154,8 @@ export interface DisplayControlState {
 }
 
 export type InboundMessage =
+  | { type: "ping"; ts: number }
+  | { type: "error"; code?: string; frame_type?: string; message?: string }
   | { type: "session.exit"; exit_code: number | null; signal: string | null }
   | { type: "session.status"; status: "starting" | "running" | "exited" | "killed" }
   | {
@@ -134,6 +233,8 @@ export function sessionRtcTuple(sessionId: string): SessionRtcTuple {
 }
 
 export type OutboundMessage =
+  | { type: "pong"; ts: number }
+  | { type: "rtc.config.request" }
   | { type: "resize"; cols: number; rows: number }
   | { type: "take_control"; cols: number; rows: number }
   | { type: "scroll"; lines: number }
@@ -142,21 +243,32 @@ export type OutboundMessage =
       type: "rtc.offer";
       session_id: string;
       binding_nonce: string;
+      binding_generation?: number;
+      ice_restart?: boolean;
       sdp: string;
     })
   | (SessionRtcTuple & {
       type: "rtc.offer";
       session_id: string;
       binding_nonce: string;
+      binding_generation?: number;
+      ice_restart?: boolean;
       signed_envelope: string;
     })
   | (SessionRtcTuple & {
       type: "rtc.candidate";
       session_id: string;
       binding_nonce: string;
+      binding_generation?: number;
       candidate: RTCIceCandidateInit;
     })
-  | (SessionRtcTuple & { type: "rtc.close"; session_id: string; binding_nonce: string });
+  | (SessionRtcTuple & { type: "rtc.close"; session_id: string; binding_nonce: string })
+  | (SessionRtcTuple & {
+      type: "rtc.resume";
+      session_id: string;
+      binding_nonce: string;
+      binding_generation: number;
+    });
 
 export interface RtcBindingIdentity {
   /** RTC signaling session (wire `session_id`). */

@@ -37,6 +37,16 @@ export function useHostControl(hostId: string | null, enabled = true) {
     claimedHostPublicKey: hostQuery.data?.host_public_key ?? null,
   };
 
+  const signalingReady = (user?.id ?? null) !== null && hostId !== null && !hostQuery.isLoading;
+  const accountEndorsementsQuery = useQuery({
+    queryKey: ["account-endorsements", user?.id ?? null],
+    queryFn: () => trust.accountEndorsements(),
+    enabled: signalingReady,
+    staleTime: 5 * 60_000,
+  });
+  const endorsementsRef = useRef(accountEndorsementsQuery.data);
+  endorsementsRef.current = accountEndorsementsQuery.data;
+
   const client = useMemo(
     () =>
       hostId
@@ -58,7 +68,7 @@ export function useHostControl(hostId: string | null, enabled = true) {
             loadCarriedEndorsements: async (): Promise<CarriedEndorsement[]> => {
               const accountId = trustRef.current.accountId;
               if (!accountId) return [];
-              const edges = await trust.accountEndorsements();
+              const edges = endorsementsRef.current ?? [];
               return edges.map((edge) => ({
                 account_id: accountId,
                 endorser_public_key: edge.endorser_public_key,
@@ -84,8 +94,6 @@ export function useHostControl(hostId: string | null, enabled = true) {
   // Only connect once the account and the host record are known, so a pinned
   // host is never reached (or falsely, terminally refused) before its identity
   // is available for the gate to check.
-  const signalingReady = (user?.id ?? null) !== null && hostId !== null && !hostQuery.isLoading;
-
   useEffect(() => {
     if (!client || !enabled || !signalingReady) {
       setSnapshot({ state: "idle", capabilities: EMPTY_CAPABILITIES });
