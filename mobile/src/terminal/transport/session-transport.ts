@@ -38,6 +38,7 @@ import type {
   UploadRequest,
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
+import { readTransportPolicy } from "@/terminal/transport/types";
 import { terminalMetrics } from "@/theme";
 
 /**
@@ -62,6 +63,7 @@ interface ConfigFrame extends Record<string, unknown> {
   type?: unknown;
   enabled?: unknown;
   ice_servers?: unknown;
+  ice_transport_policy?: unknown;
   binding_nonce_required?: unknown;
 }
 
@@ -301,6 +303,7 @@ class WebViewSessionTransport implements SessionTransport {
         rtcSessionId: newUuid(),
         bindingNonce: encodeHex(randomBytes(16)),
         iceServers: frame.ice_servers,
+        iceTransportPolicy: readTransportPolicy(frame.ice_transport_policy),
         forceRelay: this.options.forceRelay ?? false,
       });
       return;

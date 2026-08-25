@@ -397,3 +397,14 @@ export interface KeyModifiers {
 export type KeySpec =
   | { kind: "named"; key: NamedTerminalKey; modifiers?: KeyModifiers; applicationCursor?: boolean }
   | { kind: "text"; text: string; modifiers?: KeyModifiers };
+
+/**
+ * The server's `ice_transport_policy`, read defensively.
+ *
+ * Anything but an explicit "relay" means the deployment still offers direct
+ * paths: an older server that does not send the field at all must not be read
+ * as forbidding them.
+ */
+export function readTransportPolicy(value: unknown): "all" | "relay" {
+  return value === "relay" ? "relay" : "all";
+}

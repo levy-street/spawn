@@ -39,3 +39,25 @@ def ice_servers_for_session(settings: Settings, *, label: str) -> list[dict[str,
         )
         servers.append({"urls": urls, "username": username, "credential": credential})
     return servers
+
+
+def _urls_of(server: dict[str, Any]) -> list[str]:
+    raw = server.get("urls")
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [value for value in raw if isinstance(value, str)]
+    return []
+
+
+def ice_transport_policy(ice_servers: list[dict[str, Any]]) -> str:
+    """``"relay"`` when the only way out is the TURN relay.
+
+    Configuring nothing but TURN servers is how an operator says "every peer
+    goes through the relay" — there is no direct path to offer. Every channel
+    reads it from here so the answer cannot differ between the terminal, the
+    host control channel, and the daemon.
+    """
+    urls = [url for server in ice_servers for url in _urls_of(server)]
+    relay_only = bool(urls) and all(url.startswith(("turn:", "turns:")) for url in urls)
+    return "relay" if relay_only else "all"

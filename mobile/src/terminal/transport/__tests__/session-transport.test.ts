@@ -109,6 +109,40 @@ async function readyTransport(
 }
 
 describe("SessionTransport", () => {
+  test("relays the terminal's own relay-only policy to the worker", async () => {
+    const bridge = new FakeBridge();
+    const signal = new FakeSignal();
+    const transport = createSessionTransport({
+      sessionId: "00112233-4455-6677-8899-aabbccddeeff",
+      hostIdentityPublicKey: "host-key",
+      initialSize: { cols: 80, rows: 24 },
+      theme: terminalDark,
+      bridge,
+      openSignal: () => signal,
+      loadCarriedEndorsements: async () => [],
+    });
+    // Never becomes ready here: this test only cares what the worker is told
+    // at connect time, so the open promise is expected to reject on close.
+    const opening = transport.open().catch(() => undefined);
+    await flush();
+
+    // The session channel is the one that carries the terminal, and it was the
+    // one channel never told whether a direct path exists.
+    signal.emit({
+      type: "rtc.config",
+      enabled: true,
+      binding_nonce_required: true,
+      ice_servers: [],
+      ice_transport_policy: "relay",
+    });
+    await flush();
+
+    const connect = bridge.sent.find((message) => message.type === "connect");
+    expect(connect).toMatchObject({ iceTransportPolicy: "relay" });
+    transport.close();
+    await opening;
+  });
+
   test("initializes the worker, relays signalling, and signs worker requests", async () => {
     const { bridge, signal, transport } = await readyTransport();
     expect(bridge.sent[0]).toMatchObject({

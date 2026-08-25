@@ -308,6 +308,8 @@ export function useSessionSocket({
     let rtcRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let rtcRetryAttempts = 0;
     let lastRtcIceServers: RTCIceServer[] | null = null;
+    /** The deployment's answer to "is there a direct path?", from `rtc.config`. */
+    let lastRtcTransportPolicy: RTCIceTransportPolicy = "all";
     let signedRtcSession: SignedRtcLiveSession | null = null;
 
     const isCurrentSessionGeneration = () => sessionGenerationRef.current === sessionGeneration;
@@ -433,12 +435,13 @@ export function useSessionSocket({
       }
       // Debug/acceptance hook: force TURN-relay-only ICE to prove sessions
       // survive networks where no direct path exists (docs/TRUST.md Phase 1).
+      // A relay-only deployment says the same thing for real, in `rtc.config`.
       const forceRelay =
         typeof window !== "undefined" &&
         (window as { __spawnRtcForceRelay?: boolean }).__spawnRtcForceRelay === true;
       const pc = new RTCPeerConnection({
         iceServers,
-        iceTransportPolicy: forceRelay ? "relay" : "all",
+        iceTransportPolicy: forceRelay ? "relay" : lastRtcTransportPolicy,
       });
       // Omitting both partial-reliability fields is intentional: both session
       // channels are fully reliable as well as ordered, and the daemon rejects
@@ -1309,6 +1312,7 @@ export function useSessionSocket({
                 return;
               }
               lastRtcIceServers = msg.ice_servers ?? [];
+              lastRtcTransportPolicy = msg.ice_transport_policy === "relay" ? "relay" : "all";
               rtcRetryAttempts = 0;
               void startRtc(lastRtcIceServers);
             } else {

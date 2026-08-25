@@ -13,7 +13,7 @@ from ..config import get_settings
 from ..db import get_sessionmaker
 from ..models import Session, User
 from ..redis import get_backend, session_event_channel
-from ..turn import ice_servers_for_session
+from ..turn import ice_servers_for_session, ice_transport_policy
 from .broker import BrowserConn, RtcSessionBinding, get_broker
 from .host_signal import (
     HOST_RTC_SESSION_TTL_SECONDS,
@@ -51,12 +51,32 @@ WS_CLOSE_CONTENT_FORBIDDEN = 4002
 
 def _rtc_config_payload(user_id: str, *, binding_nonce_required: bool = False) -> dict[str, object]:
     settings = get_settings()
+    ice_servers = ice_servers_for_session(settings, label=user_id)
     return {
         "type": "rtc.config",
         "enabled": settings.webrtc_enabled,
-        "ice_servers": ice_servers_for_session(settings, label=user_id),
+        "ice_servers": ice_servers,
+        # The terminal is the channel that matters most on a hostile network,
+        # and it was the one channel never told whether a direct path exists.
+        "ice_transport_policy": ice_transport_policy(ice_servers),
         "binding_nonce_required": binding_nonce_required,
     }
+
+
+def _offer_ice(user_id: str) -> dict[str, object]:
+    """Freshly minted ICE for one session offer.
+
+    Deliberately *without* `ice_transport_policy`. On the wire to a daemon that
+    field is not a setting, it is the discriminator that tells a session offer
+    from a host one: `daemon/src/run.rs` runs the session path only when the
+    field is absent (`ice_transport_policy.is_none()`). Adding it here would
+    make every already-deployed daemon silently drop every terminal offer.
+
+    The client learns the policy from `rtc.config` on its own socket instead,
+    which is the side that has to act on it. Teaching the daemon to read it
+    here needs a protocol-version bump, not an extra key.
+    """
+    return {"ice_servers": ice_servers_for_session(get_settings(), label=user_id)}
 
 
 def _valid_rtc_session_id(value: object) -> str | None:
@@ -519,7 +539,7 @@ async def browser_ws(
                         "scope_id": pty_session_id,
                         "protocol": SESSION_RTC_PROTOCOL,
                         "protocol_version": SESSION_RTC_PROTOCOL_VERSION,
-                        "ice_servers": ice_servers_for_session(get_settings(), label=user.id),
+                        **_offer_ice(user.id),
                     }
                     if signed_signal:
                         assert signed_envelope is not None

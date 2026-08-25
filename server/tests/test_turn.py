@@ -8,7 +8,11 @@ import hmac
 import time
 
 from spawn_server.config import Settings
-from spawn_server.turn import ice_servers_for_session, mint_turn_credential
+from spawn_server.turn import (
+    ice_servers_for_session,
+    ice_transport_policy,
+    mint_turn_credential,
+)
 
 
 def test_mint_turn_credential_matches_coturn_convention():
@@ -51,3 +55,70 @@ def test_turn_urls_without_secret_do_not_leak_an_unauthenticated_entry():
     settings = Settings(turn_urls="turn:relay.example:3478", turn_secret=None)
     servers = ice_servers_for_session(settings, label="u")
     assert all("turn:relay.example:3478" not in s["urls"] for s in servers)
+
+
+def test_transport_policy_is_relay_only_when_there_is_no_direct_path():
+    # A STUN entry alongside TURN means direct paths are on offer.
+    mixed = Settings(turn_urls="turn:relay.example:3478", turn_secret="s3cret")
+    assert ice_transport_policy(ice_servers_for_session(mixed, label="u")) == "all"
+
+    # Dropping the STUN defaults is how an operator says "everything relays".
+    relay_only = Settings(
+        webrtc_ice_servers="[]",
+        turn_urls="turn:relay.example:3478,turns:relay.example:443",
+        turn_secret="s3cret",
+    )
+    assert ice_transport_policy(ice_servers_for_session(relay_only, label="u")) == "relay"
+
+    # Nothing configured at all is not a relay instruction.
+    assert ice_transport_policy([]) == "all"
+    assert ice_transport_policy([{"urls": "stun:stun.example:19302"}]) == "all"
+
+
+def test_transport_policy_is_always_a_concrete_string():
+    """The other half of the daemon's discriminator.
+
+    A *host* offer is recognised by `ice_transport_policy` being present
+    (`daemon/src/run.rs`); a session offer by its absence. So this helper must
+    never return None or "" for any configuration, or a host offer would start
+    looking like a session one to every daemon in the field.
+    """
+    for settings in (
+        Settings(),
+        Settings(webrtc_ice_servers="[]"),
+        Settings(webrtc_ice_servers="not json"),
+        Settings(turn_urls="turn:relay.example:3478", turn_secret="s3cret"),
+        Settings(webrtc_ice_servers="[]", turn_urls="turn:r.example:3478", turn_secret="s"),
+    ):
+        assert ice_transport_policy(ice_servers_for_session(settings, label="u")) in {
+            "all",
+            "relay",
+        }
+
+
+def test_policy_matches_the_retired_is_turn_only_logic():
+    """Byte-for-byte the behaviour `ws/host.py` had before it shared this."""
+
+    def old_is_turn_only(ice_servers):
+        urls = []
+        for server in ice_servers:
+            raw = server.get("urls")
+            if isinstance(raw, str):
+                urls.append(raw)
+            elif isinstance(raw, list):
+                urls.extend(v for v in raw if isinstance(v, str))
+        return bool(urls) and all(u.startswith(("turn:", "turns:")) for u in urls)
+
+    cases = [
+        [],
+        [{"urls": []}],
+        [{"urls": "stun:a:1"}],
+        [{"urls": ["turn:a:1", "turns:b:2"]}],
+        [{"urls": ["turn:a:1", "stun:b:2"]}],
+        [{"urls": "turn:a:1"}, {"urls": ["turns:b:2"]}],
+        [{"urls": [1, "turn:a:1"]}],
+        [{"nope": 1}],
+    ]
+    for servers in cases:
+        expected = "relay" if old_is_turn_only(servers) else "all"
+        assert ice_transport_policy(servers) == expected, servers

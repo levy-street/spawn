@@ -14,7 +14,7 @@ from ..config import get_settings
 from ..db import get_sessionmaker
 from ..models import Host
 from ..redis import get_backend
-from ..turn import ice_servers_for_session
+from ..turn import ice_servers_for_session, ice_transport_policy
 from .broker import HostBrowserConn
 from .browser import _resolve_user, _valid_rtc_candidate, _valid_rtc_sdp, _valid_rtc_session_id
 from .host_signal import (
@@ -67,17 +67,6 @@ class BrowserRtcSession:
     nonce: str
     expires_at: float
     signed_signal: bool = False
-
-
-def _is_turn_only(ice_servers: list[dict[str, object]]) -> bool:
-    urls: list[str] = []
-    for server in ice_servers:
-        raw = server.get("urls")
-        if isinstance(raw, str):
-            urls.append(raw)
-        elif isinstance(raw, list):
-            urls.extend(value for value in raw if isinstance(value, str))
-    return bool(urls) and all(url.startswith(("turn:", "turns:")) for url in urls)
 
 
 def _metadata_matches(obj: dict, host_id: str) -> bool:
@@ -387,8 +376,12 @@ async def host_ws(
     tombstones_changed = asyncio.Event()
     pump_ready = asyncio.Event()
 
+    # Only the opening greeting. Every offer mints its own below: a daemon holds
+    # this socket for days, and a TURN credential minted here dies after its TTL
+    # while the socket lives on — which is how hosts ended up presenting
+    # credentials that coturn had already expired.
     ice_servers = ice_servers_for_session(get_settings(), label=user.id)
-    transport_policy = "relay" if _is_turn_only(ice_servers) else "all"
+    transport_policy = ice_transport_policy(ice_servers)
 
     pump_task = asyncio.create_task(
         _pump_browser_signals(
@@ -517,10 +510,11 @@ async def host_ws(
                     )
                     await _send_status(conn, host_id, session_id, "unavailable")
                     continue
+                offer_ice = ice_servers_for_session(get_settings(), label=user.id)
                 values: dict[str, object] = {
                     "binding_nonce": binding.nonce,
-                    "ice_servers": ice_servers,
-                    "ice_transport_policy": transport_policy,
+                    "ice_servers": offer_ice,
+                    "ice_transport_policy": ice_transport_policy(offer_ice),
                 }
                 if signed_signal:
                     assert signed_envelope is not None

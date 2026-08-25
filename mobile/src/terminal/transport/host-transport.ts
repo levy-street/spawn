@@ -53,6 +53,7 @@ import type {
   TransportState,
   WorkerDiagnostic,
 } from "@/terminal/transport/types";
+import { readTransportPolicy } from "@/terminal/transport/types";
 import { terminalDark, terminalMetrics } from "@/theme";
 
 const MAX_PENDING_REQUESTS = 32;
@@ -73,6 +74,7 @@ interface FrameRecord extends Record<string, unknown> {
   type?: unknown;
   enabled?: unknown;
   ice_servers?: unknown;
+  ice_transport_policy?: unknown;
   scope_type?: unknown;
   scope_id?: unknown;
   protocol?: unknown;
@@ -625,6 +627,7 @@ class WebViewHostTransport implements StreamingHostTransport {
         rtcSessionId: newUuid(),
         bindingNonce: encodeHex(randomBytes(16)),
         iceServers: frame.ice_servers,
+        iceTransportPolicy: readTransportPolicy(frame.ice_transport_policy),
         forceRelay: this.options.forceRelay ?? false,
       });
       return;

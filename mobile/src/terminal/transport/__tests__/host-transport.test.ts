@@ -305,6 +305,56 @@ describe("HostTransport signalling", () => {
     await settled;
   });
 
+  test("carries the deployment's relay-only policy through to the worker", async () => {
+    const bridge = new FakeBridge();
+    const signal = new FakeSignal();
+    const { transport, settled } = openTransport(bridge, signal);
+    await flush();
+
+    signal.emit({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      // A deployment with no direct path on offer says so here. Native used to
+      // ignore this field entirely and keep hunting for one.
+      ice_transport_policy: "relay",
+      scope_type: "host",
+      scope_id: HOST_ID,
+      protocol: "spawn.host.ctl",
+      protocol_version: 1,
+    });
+    await flush();
+
+    const connect = bridge.sent.find((message) => message.type === "connect");
+    expect(connect).toMatchObject({ iceTransportPolicy: "relay" });
+    transport.close();
+    await settled;
+  });
+
+  test("a server that never sends the policy still gets direct paths", async () => {
+    const bridge = new FakeBridge();
+    const signal = new FakeSignal();
+    const { transport, settled } = openTransport(bridge, signal);
+    await flush();
+
+    // An older server omits the field; that is not an instruction to relay.
+    signal.emit({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      scope_type: "host",
+      scope_id: HOST_ID,
+      protocol: "spawn.host.ctl",
+      protocol_version: 1,
+    });
+    await flush();
+
+    const connect = bridge.sent.find((message) => message.type === "connect");
+    expect(connect).toMatchObject({ iceTransportPolicy: "all" });
+    transport.close();
+    await settled;
+  });
+
   test("rejects an rtc.config bound to another host", async () => {
     const bridge = new FakeBridge();
     const signal = new FakeSignal();

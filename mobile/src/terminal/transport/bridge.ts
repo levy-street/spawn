@@ -42,6 +42,8 @@ export type NativeToWorkerMessage =
       rtcSessionId: string;
       bindingNonce: string;
       iceServers: readonly unknown[];
+      /** The server's `ice_transport_policy`: "relay" when it offers no direct path. */
+      iceTransportPolicy: "all" | "relay";
       forceRelay: boolean;
     })
   | (NativeMessage & { type: "signal-frame"; frame: unknown })

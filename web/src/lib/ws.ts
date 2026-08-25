@@ -63,6 +63,8 @@ export type InboundMessage =
       type: "rtc.config";
       enabled: boolean;
       ice_servers?: RTCIceServer[];
+      /** "relay" when the deployment offers no direct path at all. */
+      ice_transport_policy?: RTCIceTransportPolicy;
       binding_nonce_required?: boolean;
     }
   | {
