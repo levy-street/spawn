@@ -11,12 +11,15 @@ import { LegionHostCard } from "@/components/hosts/legion-host-card";
 import { fleetRollup } from "@/data/selectors/host";
 import { ThemeProvider } from "@/theme";
 
+const mockLiveCapacityProbe = jest.fn((_props: unknown) => null);
+
 jest.mock("@/components/hosts/live-capacity-probe", () => ({
-  LiveCapacityProbe: () => null,
+  LiveCapacityProbe: (props: unknown) => mockLiveCapacityProbe(props),
 }));
 
 describe("Legion fleet surface", () => {
   beforeEach(() => {
+    mockLiveCapacityProbe.mockClear();
     jest.spyOn(AccessibilityInfo, "isReduceMotionEnabled").mockResolvedValue(true);
   });
 
@@ -110,5 +113,24 @@ describe("Legion fleet surface", () => {
       </ThemeProvider>,
     );
     expect(screen.getByText("updating")).toBeOnTheScreen();
+  });
+
+  test("pauses a live-capacity probe while its card is outside the viewport", async () => {
+    await render(
+      <ThemeProvider>
+        <LegionHostCard
+          agents={[]}
+          host={onlineHost}
+          liveEnabled
+          onOpen={jest.fn()}
+          probeEnabled={false}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(mockLiveCapacityProbe).toHaveBeenCalledWith(
+      expect.objectContaining({ enabled: false, hostId: onlineHost.id }),
+    );
   });
 });

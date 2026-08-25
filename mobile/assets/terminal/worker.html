@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <base href="https://spawn.local/">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' https: wss: ws:; img-src data:; font-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src data:; font-src 'none'; base-uri 'none'; form-action 'none'">
 <style>/**
  * Copyright (c) 2014 The xterm.js authors. All rights reserved.
  * Copyright (c) 2012-2013, Christopher Jeffrey (MIT License)
@@ -259,7 +259,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   "use strict";
 
   const BRIDGE_VERSION = 1;
-  const MAX_INPUT_BYTES = 64 * 1024;
+  const MAX_INPUT_BYTES = 16 * 1024;
   const TELEMETRY_DELAY_MS = 8;
   const FIT_DEBOUNCE_MS = 60;
   /** Floor for the type when this viewer is matching someone else's grid. */
@@ -309,6 +309,9 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     clipboardSequence: 0,
     search: null,
     disconnectTimer: null,
+    restartTimer: null,
+    statsTimer: null,
+    pendingRestartRequests: new Set(),
     stopped: false,
   };
 
@@ -894,6 +897,18 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       state.fontSize = message.fontSize;
       if (message.mode === "session" && !state.term) initializeTerminal(message);
       else api.post({ type: "ready", renderer: null });
+      if (message.skipLoopbackProbe === true) {
+        api.capability.dataChannel = api.capability.peerConnection;
+        api.capability.loopback = api.capability.peerConnection;
+        api.capabilityProbeComplete = true;
+      } else if (typeof message.cachedLoopback === "boolean") {
+        api.capability.dataChannel = api.capability.peerConnection;
+        api.capability.loopback = message.cachedLoopback;
+        api.capabilityProbeComplete = true;
+      } else if (!api.capabilityProbeStarted) {
+        api.capabilityProbeStarted = true;
+        void probeLoopback();
+      }
       if (api.capabilityProbeComplete) {
         api.post({
           type: "diagnostic",
@@ -913,18 +928,12 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     }
   }
 
-  let lastRaw = null;
-  let lastRawAt = 0;
   const listener = (event) => {
     if (typeof event.data !== "string") return;
-    const now = performance.now();
-    if (event.data === lastRaw && now - lastRawAt < 1) return;
-    lastRaw = event.data;
-    lastRawAt = now;
     void receiveMessage(event.data);
   };
-  window.addEventListener("message", listener);
-  document.addEventListener("message", listener);
+  const bridgeTarget = /Android/i.test(navigator.userAgent) ? document : window;
+  bridgeTarget.addEventListener("message", listener);
 
   api.sendPty = (bytes) => {
     if (!state.pty || state.pty.readyState !== "open") return false;
@@ -956,6 +965,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     renderer: null,
   };
   api.capabilityProbeComplete = false;
+  api.capabilityProbeStarted = false;
 
   async function probeLoopback() {
     if (!api.capability.peerConnection) {
@@ -996,8 +1006,6 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       api.post({ type: "diagnostic", diagnostic: { ...api.capability, renderer: state.renderer } });
     }
   }
-
-  void probeLoopback();
 })();
 
 // biome-ignore-all lint: This source executes inside WKWebView, not the React Native runtime.
@@ -1022,6 +1030,8 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   const session = {
     ready: false,
     bootstrapStarted: false,
+    bootstrapCount: 0,
+    requestedOffset: null,
     displaySeen: false,
     claiming: false,
     history: null,
@@ -1046,6 +1056,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     for (const key of Object.keys(gates)) gates[key] = false;
     session.ready = false;
     session.bootstrapStarted = false;
+    session.requestedOffset = null;
     session.displaySeen = false;
     session.claiming = false;
     state.displayOwner = null;
@@ -1136,6 +1147,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       !sendCtlText(requestId, "history", {
         lines: 400,
         plain: false,
+        ...(session.requestedOffset === null ? {} : { offset: session.requestedOffset }),
         cols: state.cols,
         rows: state.rows,
       })
@@ -1278,7 +1290,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     }
     history.rendering = true;
     if (history.operation === "snapshot") state.term.reset();
-    state.term.write(replay, () => {
+    const finish = () => {
       let barrier = Number.isSafeInteger(anchor) ? anchor : null;
       for (const entry of session.preboot) {
         if (barrier !== null && entry.offsetAfter <= barrier) {
@@ -1295,9 +1307,38 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       session.prebootBytes = 0;
       session.history = null;
       session.stale = false;
+      session.requestedOffset = null;
+      session.bootstrapCount += 1;
       api.sessionGate("historyReady");
       flushWrites();
-    });
+    };
+    const alternate = state.term.buffer.active === state.term.buffer.alternate;
+    if (history.operation === "history" && session.bootstrapCount > 0 && alternate) {
+      finish();
+      return;
+    }
+    const writeReplay = () => state.term.write(replay, finish);
+    if (history.operation === "history" && session.bootstrapCount > 0) {
+      state.term.write("\x1b[0m\x1b[H\x1b[2J\x1b[3J", writeReplay);
+    } else {
+      writeReplay();
+    }
+  }
+
+  function recoverFromGap(offset) {
+    if (!Number.isSafeInteger(offset) || offset < 0) return;
+    session.preboot.splice(0);
+    session.prebootBytes = 0;
+    session.writes.splice(0);
+    session.writeBytes = 0;
+    session.history = null;
+    session.stale = false;
+    session.ready = false;
+    session.bootstrapStarted = false;
+    session.requestedOffset = offset;
+    session.ptyOffset = offset;
+    gates.historyReady = false;
+    startBootstrap();
   }
 
   function acceptReplayMetadata(message) {
@@ -1468,7 +1509,11 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       }
       if (message?.version !== 1) return;
       if (message.kind === "event" && message.event === "ready") handleReady(message);
-      else if (message.kind === "event" && message.event === "display_state") {
+      else if (message.kind === "event" && message.event === "history_gap") {
+        recoverFromGap(session.ptyOffset);
+      } else if (message.kind === "event" && message.event === "pty_gap") {
+        recoverFromGap(message.offset);
+      } else if (message.kind === "event" && message.event === "display_state") {
         handleDisplayState(message);
       } else if (message.kind === "response") {
         if (!handleUploadResponse(message)) acceptReplayMetadata(message);
@@ -1748,12 +1793,22 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   async function waitForWritable() {
-    const deadline = Date.now() + STREAM_TIMEOUT_MS;
-    while (state.ctl?.readyState === "open" && state.ctl.bufferedAmount > BUFFERED_HIGH_WATER) {
-      if (Date.now() >= deadline) throw new Error("Host stream backpressure timed out.");
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    if (state.ctl?.readyState !== "open") throw new Error("Host-control channel is not ready.");
+    const channel = state.ctl;
+    if (channel?.readyState !== "open") throw new Error("Host-control channel is not ready.");
+    if (channel.bufferedAmount <= BUFFERED_HIGH_WATER) return;
+    channel.bufferedAmountLowThreshold = BUFFERED_HIGH_WATER / 2;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        channel.removeEventListener("bufferedamountlow", onWritable);
+        reject(new Error("Host stream backpressure timed out."));
+      }, STREAM_TIMEOUT_MS);
+      const onWritable = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      channel.addEventListener("bufferedamountlow", onWritable, { once: true });
+    });
+    if (channel.readyState !== "open") throw new Error("Host-control channel is not ready.");
   }
 
   function streamFrame(type, payload) {
@@ -1896,6 +1951,9 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   const api = globalThis.spawnWorker;
   const state = api.state;
   const CHANNEL_OPTIONS = Object.freeze({ ordered: true });
+  state.restartTimer ??= null;
+  state.statsTimer ??= null;
+  state.pendingRestartRequests ??= new Set();
 
   function protocolTuple() {
     return state.mode === "session"
@@ -1938,7 +1996,96 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     // only thing that tells the operator why, so it wins over the generic text.
     api.error("channel_closed", reason || `${label} closed before the session retired.`, true);
     api.post({ type: "state", state: "reconnecting" });
-    teardown(false);
+    teardown(true);
+  }
+
+  async function requestSignedOffer(pc, iceRestart) {
+    const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
+    await pc.setLocalDescription(offer);
+    const tuple = protocolTuple();
+    const requestId = crypto.randomUUID();
+    const transcript = {
+      signalKind: "offer",
+      protocolVersion: tuple.protocolVersion,
+      sessionId: state.rtcSessionId,
+      scopeType: tuple.scopeType,
+      scopeId: state.scopeId,
+      senderRole: "browser",
+      intendedPeerIdentityPublicKey: state.hostKey,
+      sdp: offer.sdp,
+    };
+    state.pendingSign.set(requestId, transcript);
+    if (iceRestart) state.pendingRestartRequests.add(requestId);
+    api.post({ type: "sign-request", requestId, transcript });
+  }
+
+  function scheduleStats() {
+    clearTimeout(state.statsTimer);
+    if (!state.pc || state.pc.connectionState !== "connected") return;
+    state.statsTimer = setTimeout(async () => {
+      const pc = state.pc;
+      if (!pc || pc.connectionState !== "connected") return;
+      try {
+        const stats = await pc.getStats();
+        let selected = null;
+        const records = new Map();
+        stats.forEach((entry) => {
+          records.set(entry.id, entry);
+          if (entry.type === "candidate-pair" && entry.state === "succeeded" && entry.nominated) {
+            selected = entry;
+          }
+        });
+        const local = selected ? records.get(selected.localCandidateId) : null;
+        const remote = selected ? records.get(selected.remoteCandidateId) : null;
+        const candidateTypes = [local?.candidateType, remote?.candidateType];
+        const kind = candidateTypes.includes("relay")
+          ? "relay"
+          : candidateTypes.some((value) => value === "srflx" || value === "prflx")
+            ? "stun"
+            : candidateTypes.includes("host")
+              ? "direct"
+              : "unknown";
+        const rttMs =
+          typeof selected?.currentRoundTripTime === "number"
+            ? Math.round(selected.currentRoundTripTime * 1_000)
+            : null;
+        api.post({ type: "connection-info", info: { kind, rttMs } });
+      } catch {
+        // Stats are diagnostic only; an older WebKit must not affect the channel.
+      } finally {
+        scheduleStats();
+      }
+    }, 5_000);
+  }
+
+  async function restartPeer(message = {}, cause = "connection lost") {
+    const pc = state.pc;
+    if (!pc || pc.connectionState === "closed" || state.restartTimer !== null) {
+      if (!pc) channelFailed("RTCPeerConnection");
+      return;
+    }
+    clearTimeout(state.disconnectTimer);
+    state.disconnectTimer = null;
+    if (Array.isArray(message.iceServers) && typeof pc.setConfiguration === "function") {
+      const relayOnly = message.iceTransportPolicy === "relay";
+      pc.setConfiguration({
+        iceServers: message.iceServers,
+        iceTransportPolicy: relayOnly ? "relay" : "all",
+      });
+    }
+    pc.restartIce?.();
+    await requestSignedOffer(pc, true);
+    state.restartTimer = setTimeout(() => {
+      state.restartTimer = null;
+      if (state.pc?.connectionState !== "connected") {
+        channelFailed(
+          "ICE restart",
+          cause === "network changed"
+            ? "The network changed and the terminal connection could not be restored."
+            : "The host connection was lost and could not be restored.",
+        );
+      }
+    }, 10_000);
   }
 
   function configureChannel(channel, kind) {
@@ -1958,6 +2105,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   }
 
   async function startPeer(message) {
+    if (state.pc?.connectionState === "connected" && message.forceRebuild !== true) return;
     if (state.pc && state.rtcSessionId === message.rtcSessionId) return;
     teardown(false);
     state.stopped = false;
@@ -1996,37 +2144,26 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       else state.pendingLocalCandidates.push(frame);
     };
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "failed") channelFailed("RTCPeerConnection");
+      if (pc.connectionState === "failed") void restartPeer();
       if (pc.connectionState === "disconnected") {
         clearTimeout(state.disconnectTimer);
-        state.disconnectTimer = setTimeout(() => channelFailed("RTCPeerConnection"), 5_000);
+        state.disconnectTimer = setTimeout(() => void restartPeer(), 5_000);
       } else if (pc.connectionState === "connected") {
         clearTimeout(state.disconnectTimer);
+        clearTimeout(state.restartTimer);
+        state.restartTimer = null;
+        scheduleStats();
       }
     };
     api.post({ type: "state", state: "connecting" });
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    const tuple = protocolTuple();
-    const requestId = crypto.randomUUID();
-    const transcript = {
-      signalKind: "offer",
-      protocolVersion: tuple.protocolVersion,
-      sessionId: state.rtcSessionId,
-      scopeType: tuple.scopeType,
-      scopeId: state.scopeId,
-      senderRole: "browser",
-      intendedPeerIdentityPublicKey: state.hostKey,
-      sdp: offer.sdp,
-    };
-    state.pendingSign.set(requestId, transcript);
-    api.post({ type: "sign-request", requestId, transcript });
+    await requestSignedOffer(pc, false);
   }
 
   async function acceptSignResponse(message) {
     const transcript = state.pendingSign.get(message.requestId);
     if (!transcript) return;
     state.pendingSign.delete(message.requestId);
+    const iceRestart = state.pendingRestartRequests.delete(message.requestId);
     if (!message.signature) {
       api.error("signal_signing", message.error ?? "Signal signing failed.");
       return;
@@ -2050,6 +2187,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       type: "rtc.offer",
       ...outerTuple(),
       signed_envelope: JSON.stringify(envelope),
+      ...(iceRestart ? { ice_restart: true } : {}),
     };
     if (Array.isArray(message.carriedEndorsements) && message.carriedEndorsements.length > 0) {
       offerFrame.carried_endorsements = message.carriedEndorsements;
@@ -2125,7 +2263,11 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
       emitSignal({ type: "rtc.close", ...outerTuple() });
     }
     clearTimeout(state.disconnectTimer);
+    clearTimeout(state.restartTimer);
+    clearTimeout(state.statsTimer);
     state.disconnectTimer = null;
+    state.restartTimer = null;
+    state.statsTimer = null;
     for (const channel of [state.pty, state.ctl]) {
       if (!channel) continue;
       channel.onclose = null;
@@ -2140,6 +2282,7 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     state.pendingLocalCandidates.splice(0);
     state.pendingRemoteCandidates.splice(0);
     state.pendingSign.clear();
+    state.pendingRestartRequests.clear();
   }
 
   api.handleTransportMessage = async (message) => {
@@ -2152,6 +2295,9 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
         break;
       case "signal-frame":
         await acceptSignal(message.frame);
+        break;
+      case "network-changed":
+        await restartPeer(message, "network changed");
         break;
       case "request-replay":
         api.requestReplay?.(message.fromOffset);

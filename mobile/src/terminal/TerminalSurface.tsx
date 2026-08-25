@@ -10,6 +10,7 @@ import {
 } from "react-native";
 import WebView, { type WebViewMessageEvent } from "react-native-webview";
 import { createKeyboardFitGate } from "@/components/terminal-ui/keyboard-fit-gate";
+import { subscribeRetirementReason } from "@/data/realtime/lifecycle";
 import {
   BridgeProtocolError,
   TERMINAL_BRIDGE_VERSION,
@@ -19,6 +20,7 @@ import {
 import { HostControlTransportError } from "@/terminal/transport/host-ctl-codec";
 import { createSessionTransport } from "@/terminal/transport/session-transport";
 import type {
+  ConnectionInfo,
   DisplayControlState,
   SessionTransport,
   SessionTransportOptions,
@@ -55,6 +57,7 @@ export interface TerminalSurfaceProps extends Omit<SessionTransportOptions, "bri
   onDiagnostic?(diagnostic: WorkerDiagnostic): void;
   onTitleChange?(title: string): void;
   onDisplayChange?(display: DisplayControlState): void;
+  onConnectionInfo?(info: ConnectionInfo): void;
   onBell?(): void;
   onLink?(url: string): void;
   /** The system has, or no longer has, text selected in the terminal. */
@@ -84,6 +87,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       onDiagnostic,
       onTitleChange,
       onDisplayChange,
+      onConnectionInfo,
       onBell,
       onLink,
       onNativeSelection,
@@ -106,6 +110,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       onDiagnostic,
       onTitleChange,
       onDisplayChange,
+      onConnectionInfo,
       onBell,
       onLink,
       onNativeSelection,
@@ -118,6 +123,7 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
       onDiagnostic,
       onTitleChange,
       onDisplayChange,
+      onConnectionInfo,
       onBell,
       onLink,
       onNativeSelection,
@@ -192,12 +198,20 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
         transport.on("diagnostic", (diagnostic) => callbacks.current.onDiagnostic?.(diagnostic)),
         transport.on("title", (title) => callbacks.current.onTitleChange?.(title)),
         transport.on("display", (display) => callbacks.current.onDisplayChange?.(display)),
+        transport.on("connection-info", (info) => callbacks.current.onConnectionInfo?.(info)),
         transport.on("bell", () => callbacks.current.onBell?.()),
       ];
       return () => {
         for (const unsubscribe of unsubscribers) unsubscribe();
         transport.close();
       };
+    }, [transport]);
+
+    useEffect(() => {
+      transport.prepare?.();
+      return subscribeRetirementReason((reason) => {
+        if (reason === "interface-change") transport.networkChanged?.();
+      });
     }, [transport]);
 
     const openTransport = useCallback((): void => {
@@ -213,19 +227,30 @@ export const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurface
     }, [transport]);
 
     useEffect(() => {
+      let backgroundTimer: ReturnType<typeof setTimeout> | null = null;
       const subscription = AppState.addEventListener("change", (nextState) => {
-        if (nextState !== "active") {
-          if (workerLoaded.current) {
+        if (nextState === "inactive") return;
+        if (nextState === "background") {
+          if (!workerLoaded.current || backgroundTimer !== null) return;
+          backgroundTimer = setTimeout(() => {
+            backgroundTimer = null;
             retiredForBackground.current = true;
             transport.close();
-          }
+          }, 3_000);
           return;
+        }
+        if (backgroundTimer !== null) {
+          clearTimeout(backgroundTimer);
+          backgroundTimer = null;
         }
         if (!retiredForBackground.current || !workerLoaded.current) return;
         retiredForBackground.current = false;
         openTransport();
       });
-      return () => subscription.remove();
+      return () => {
+        if (backgroundTimer !== null) clearTimeout(backgroundTimer);
+        subscription.remove();
+      };
     }, [openTransport, transport]);
 
     useEffect(() => {

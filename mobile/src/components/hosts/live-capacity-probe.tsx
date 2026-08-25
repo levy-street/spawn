@@ -4,7 +4,7 @@ import { parseHostMetrics } from "@/components/hosts/host-model";
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import type { HostTransport, TransportState } from "@/terminal/transport/types";
 
-const CAPACITY_REFRESH_MS = 1_000;
+const CAPACITY_REFRESH_MS = 3_000;
 
 export interface LiveCapacityProbeProps {
   enabled: boolean;

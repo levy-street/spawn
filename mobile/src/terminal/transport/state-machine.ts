@@ -55,8 +55,9 @@ export function readinessComplete(gates: ReadinessGates): boolean {
   );
 }
 
-export function reconnectDelay(attempt: number): number {
-  return Math.min(60_000, 5_000 * 2 ** Math.max(0, attempt));
+export function reconnectDelay(attempt: number, random = Math.random()): number {
+  const base = Math.min(30_000, 500 * 2 ** Math.max(0, attempt));
+  return Math.round(base * (0.7 + Math.max(0, Math.min(1, random)) * 0.6));
 }
 
 export function reduceConnection(
@@ -68,12 +69,25 @@ export function reduceConnection(
       if (state.phase !== "idle" && state.phase !== "closed") return state;
       return { ...INITIAL_CONNECTION_STATE, phase: "signalling" };
     case "signal-open":
-      if (state.phase !== "signalling" && state.phase !== "reconnecting") return state;
-      return { ...state, phase: "connecting", reconnectDelayMs: null };
+      if (
+        state.phase !== "signalling" &&
+        state.phase !== "reconnecting" &&
+        state.phase !== "ready"
+      ) {
+        return state;
+      }
+      return { ...state, phase: "connecting", gates: EMPTY_GATES, reconnectDelayMs: null };
     case "gate": {
       if (state.phase !== "connecting") return state;
       const gates = { ...state.gates, [event.gate]: true };
-      return { ...state, gates, phase: readinessComplete(gates) ? "ready" : "connecting" };
+      const ready = readinessComplete(gates);
+      return {
+        ...state,
+        gates,
+        phase: ready ? "ready" : "connecting",
+        reconnectAttempt: ready ? 0 : state.reconnectAttempt,
+        reconnectDelayMs: ready ? null : state.reconnectDelayMs,
+      };
     }
     case "disconnect": {
       if (state.phase === "closed" || state.phase === "failed" || state.retired) return state;

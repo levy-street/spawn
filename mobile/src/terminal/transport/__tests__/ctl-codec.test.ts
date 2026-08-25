@@ -4,6 +4,7 @@ import {
   encodeSpctFrame,
   makeSessionCtlRequest,
   makeUploadStart,
+  PTY_INPUT_CHUNK_BYTES,
   PTY_INPUT_MAX_BYTES,
   parseSessionCtlText,
   ReplayAssembler,
@@ -163,12 +164,11 @@ describe("spawn.ctl JSON", () => {
 });
 
 describe("PTY chunking and replay merge", () => {
-  test("splits every input frame at 64 KiB", () => {
+  test("splits every input frame at 16 KiB while retaining the 64 KiB pending cap", () => {
     const bytes = new Uint8Array(PTY_INPUT_MAX_BYTES * 2 + 1);
     const chunks = chunkPtyInput(bytes);
     expect(chunks.map((chunk) => chunk.byteLength)).toEqual([
-      PTY_INPUT_MAX_BYTES,
-      PTY_INPUT_MAX_BYTES,
+      ...Array(8).fill(PTY_INPUT_CHUNK_BYTES),
       1,
     ]);
   });

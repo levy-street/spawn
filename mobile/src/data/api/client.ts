@@ -41,6 +41,14 @@ function emitUnauthenticated(): void {
   for (const listener of unauthenticatedListeners) listener();
 }
 
+/** Make a non-HTTP authentication refusal follow the same signed-out path. */
+export async function reportUnauthenticated(): Promise<void> {
+  const token = await authToken.get().catch(() => null);
+  if (token !== null) unauthenticatedEmitted = false;
+  await authToken.clear();
+  emitUnauthenticated();
+}
+
 function shouldSetContentType(body: BodyInit | null | undefined): boolean {
   if (typeof FormData !== "undefined" && body instanceof FormData) return false;
   if (typeof Blob !== "undefined" && body instanceof Blob) return false;
@@ -123,8 +131,7 @@ export async function api<T>(path: string, init: ApiRequestInit<T> = {}): Promis
     if (!response.ok) {
       if (response.status === 401 && auth) {
         if (!unauthenticatedEmitted) {
-          await authToken.clear();
-          emitUnauthenticated();
+          await reportUnauthenticated();
         }
       }
       throw await apiErrorFromResponse(response);

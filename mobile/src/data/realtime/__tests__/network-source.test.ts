@@ -60,7 +60,7 @@ const WIFI: NetworkSnapshot = {
 
 describe("production network source fallback", () => {
   it("forces retirement before reconnect after an established socket fails", async () => {
-    const source = createProductionNetworkSource();
+    const source = createProductionNetworkSource(null);
     const { controller, order } = recoveryHarness(source);
 
     source.reportSocketOpen();
@@ -72,7 +72,7 @@ describe("production network source fallback", () => {
   });
 
   it("coalesces one failure episode until the socket opens again", () => {
-    const source = createProductionNetworkSource();
+    const source = createProductionNetworkSource(null);
     const snapshots: NetworkSnapshot[] = [];
     const unsubscribe = source.addEventListener((snapshot) => snapshots.push(snapshot));
 
@@ -88,6 +88,29 @@ describe("production network source fallback", () => {
       "socket-observed:2",
     ]);
     unsubscribe();
+  });
+
+  it("prefers native interface changes when the next app build provides expo-network", () => {
+    let emitNative: ((state: { type?: unknown; isConnected?: boolean }) => void) | undefined;
+    const remove = jest.fn();
+    const source = createProductionNetworkSource({
+      addNetworkStateListener: (listener) => {
+        emitNative = listener;
+        return { remove };
+      },
+    });
+    const snapshots: NetworkSnapshot[] = [];
+    const unsubscribe = source.addEventListener((snapshot) => snapshots.push(snapshot));
+
+    emitNative?.({ type: "CELLULAR", isConnected: true });
+    expect(snapshots.at(-1)).toEqual({
+      type: "native:CELLULAR",
+      isConnected: true,
+      isInternetReachable: null,
+    });
+
+    unsubscribe();
+    expect(remove).toHaveBeenCalledTimes(1);
   });
 });
 

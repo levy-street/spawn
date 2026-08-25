@@ -1,4 +1,18 @@
-export type SocketState = "idle" | "connecting" | "open" | "reconnecting" | "closed" | "failed";
+import { ApiError, reportUnauthenticated } from "@/data/api/client";
+
+export type SocketState =
+  | "idle"
+  | "connecting"
+  | "open"
+  | "reconnecting"
+  | "closed"
+  | "failed"
+  | "unauthenticated";
+
+export interface SocketCloseInfo {
+  code: number;
+  reason: string;
+}
 
 export const SOCKET_TIMING = {
   serverPingMs: 25_000,
@@ -12,7 +26,7 @@ export const SOCKET_TIMING = {
 const WS_OPEN = 1;
 const NORMAL_CLOSE = 1000;
 const PROTOCOL_CLOSE = 1002;
-const PERMANENT_CLOSE_CODES = new Set([1002, 1008, 1009, 4002, 4003]);
+const PERMANENT_CLOSE_CODES = new Set([1002, 1009, 4002, 4003]);
 
 type Listener<T> = (value: T) => void;
 interface RetirableSocket {
@@ -54,7 +68,13 @@ export interface ReconnectingSocketOptions {
   maxReconnectAttempt?: number;
   reconnectDelayMs?: (attempt: number, random: number) => number;
   random?: () => number;
-  createWebSocket?: (url: string, protocol: string) => WebSocket;
+  watchdogFrameTypes?: readonly string[];
+  authorization?: () => string | null | Promise<string | null>;
+  createWebSocket?: (
+    url: string,
+    protocol: string,
+    options?: { headers: Record<string, string> },
+  ) => WebSocket;
 }
 
 /** A generation-fenced JSON socket. Application protocols own frame validation. */
@@ -67,6 +87,8 @@ export class ReconnectingSocket<Outbound = unknown> {
     reconnectCapMs: number;
     maxReconnectAttempt: number;
     reconnectDelayMs: ((attempt: number, random: number) => number) | null;
+    watchdogFrameTypes: readonly string[];
+    authorization: (() => string | null | Promise<string | null>) | null;
   };
 
   private current: WebSocket | null = null;
@@ -77,6 +99,8 @@ export class ReconnectingSocket<Outbound = unknown> {
   private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionallyClosed = false;
   private hasConnected = false;
+  private watchdogStarted = false;
+  private closeInfoValue: SocketCloseInfo | null = null;
   private readonly stateListeners = new Set<Listener<SocketState>>();
   private readonly messageListeners = new Set<Listener<unknown>>();
 
@@ -89,8 +113,19 @@ export class ReconnectingSocket<Outbound = unknown> {
       reconnectCapMs: options.reconnectCapMs ?? SOCKET_TIMING.reconnectCapMs,
       maxReconnectAttempt: options.maxReconnectAttempt ?? 6,
       reconnectDelayMs: options.reconnectDelayMs ?? null,
+      watchdogFrameTypes: options.watchdogFrameTypes ?? ["ping", "alerts.ping"],
+      authorization: options.authorization ?? null,
       random: options.random ?? Math.random,
-      createWebSocket: options.createWebSocket ?? ((url, protocol) => new WebSocket(url, protocol)),
+      createWebSocket:
+        options.createWebSocket ??
+        ((url, protocol, socketOptions) => {
+          const NativeWebSocket = WebSocket as unknown as new (
+            url: string,
+            protocols: string,
+            options: { headers: Record<string, string> },
+          ) => WebSocket;
+          return new NativeWebSocket(url, protocol, socketOptions ?? { headers: {} });
+        }),
     };
     SOCKET_REGISTRY.add(this);
   }
@@ -105,6 +140,10 @@ export class ReconnectingSocket<Outbound = unknown> {
 
   get reconnectAttempt(): number {
     return this.reconnectAttemptValue;
+  }
+
+  get closeInfo(): SocketCloseInfo | null {
+    return this.closeInfoValue;
   }
 
   connect(): void {
@@ -175,8 +214,15 @@ export class ReconnectingSocket<Outbound = unknown> {
     this.setState(reconnecting ? "reconnecting" : "connecting");
 
     let url: string;
+    let token: string | null | undefined;
     try {
-      url = await this.options.url();
+      [url, token] = await Promise.all([
+        this.options.url(),
+        this.options.authorization?.() ?? Promise.resolve(undefined),
+      ]);
+      if (this.options.authorization && token === null) {
+        throw new ApiError(401, "not_authenticated", "No access token");
+      }
     } catch {
       if (generation === this.generationValue && !this.intentionallyClosed) {
         this.setState("failed");
@@ -190,7 +236,11 @@ export class ReconnectingSocket<Outbound = unknown> {
 
     let socket: WebSocket;
     try {
-      socket = this.options.createWebSocket(url, this.options.protocol);
+      socket = this.options.createWebSocket(
+        url,
+        this.options.protocol,
+        token ? { headers: { Authorization: `Bearer ${token}` } } : undefined,
+      );
     } catch {
       this.scheduleReconnect(generation);
       return;
@@ -208,14 +258,18 @@ export class ReconnectingSocket<Outbound = unknown> {
 
       this.hasConnected = true;
       this.reconnectAttemptValue = 0;
+      this.closeInfoValue = null;
+      this.watchdogStarted = false;
       this.setState("open");
-      this.armWatchdog(generation);
     };
     socket.onmessage = (event) => {
       if (!this.isCurrent(socket, generation)) {
         return;
       }
-      this.armWatchdog(generation);
+      if (this.watchdogStarted || this.isWatchdogStartFrame(event.data)) {
+        this.watchdogStarted = true;
+        this.armWatchdog(generation);
+      }
       for (const listener of this.messageListeners) {
         try {
           listener(event.data);
@@ -233,17 +287,42 @@ export class ReconnectingSocket<Outbound = unknown> {
       }
       this.current = null;
       this.clearWatchdog();
+      this.closeInfoValue = { code: event.code, reason: event.reason ?? "" };
       if (this.intentionallyClosed) {
         this.setState("closed");
         return;
       }
       if (event.code === 4003) emitProtocolRequired();
+      if (event.code === 1008) {
+        this.setState("unauthenticated");
+        void reportUnauthenticated();
+        return;
+      }
       if (PERMANENT_CLOSE_CODES.has(event.code)) {
         this.setState("failed");
         return;
       }
+      if (event.code === 4010) {
+        void this.startConnection(true);
+        return;
+      }
       this.scheduleReconnect(generation);
     };
+  }
+
+  private isWatchdogStartFrame(value: unknown): boolean {
+    if (typeof value !== "string") return false;
+    try {
+      const frame = JSON.parse(value) as { type?: unknown };
+      return (
+        typeof frame === "object" &&
+        frame !== null &&
+        typeof frame.type === "string" &&
+        this.options.watchdogFrameTypes.includes(frame.type)
+      );
+    } catch {
+      return false;
+    }
   }
 
   private scheduleReconnect(generation: number): void {
@@ -287,8 +366,10 @@ export class ReconnectingSocket<Outbound = unknown> {
       if (generation !== this.generationValue || this.intentionallyClosed) {
         return;
       }
-      this.retireCurrent();
-      this.intentionallyClosed = false;
+      const socket = this.current;
+      this.current = null;
+      this.generationValue += 1;
+      socket?.close(4008, "keepalive timeout");
       this.scheduleReconnect(this.generationValue);
     }, this.options.watchdogMs);
   }

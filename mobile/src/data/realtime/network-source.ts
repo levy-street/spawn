@@ -7,12 +7,37 @@ export interface ProductionNetworkSource extends NetworkSource {
 
 const INITIAL_NETWORK_TYPE = "socket-observed:0";
 
-/**
- * The frozen Expo dependency set has no native reachability package. This source
- * turns an established socket failure into a network epoch so lifecycle recovery
- * still retires stale generations instead of trusting the old path.
- */
-export function createProductionNetworkSource(): ProductionNetworkSource {
+interface ExpoNetworkModule {
+  addNetworkStateListener(
+    listener: (state: {
+      isConnected?: boolean;
+      isInternetReachable?: boolean;
+      type?: unknown;
+    }) => void,
+  ): { remove?: () => void } | (() => void);
+  getNetworkStateAsync?(): Promise<{
+    isConnected?: boolean;
+    isInternetReachable?: boolean;
+    type?: unknown;
+  }>;
+}
+
+function guardedExpoNetwork(): ExpoNetworkModule | null {
+  try {
+    // This must remain guarded: an OTA can run on the previous native runtime,
+    // where resolving expo-network throws because its native module is absent.
+    return require("expo-network") as ExpoNetworkModule;
+  } catch {
+    return null;
+  }
+}
+
+/** Native reachability when present, socket-observed epochs on older builds. */
+export function createProductionNetworkSource(
+  expoNetworkOverride?: ExpoNetworkModule | null,
+): ProductionNetworkSource {
+  const expoNetwork =
+    expoNetworkOverride === undefined ? guardedExpoNetwork() : expoNetworkOverride;
   const listeners = new Set<(state: NetworkSnapshot) => void>();
   let epoch = 0;
   let failureReported = false;
@@ -26,11 +51,49 @@ export function createProductionNetworkSource(): ProductionNetworkSource {
     for (const listener of listeners) listener(snapshot);
   };
 
+  const adoptNativeState = (state: {
+    isConnected?: boolean;
+    isInternetReachable?: boolean;
+    type?: unknown;
+  }) => {
+    snapshot = {
+      isConnected: typeof state.isConnected === "boolean" ? state.isConnected : null,
+      isInternetReachable:
+        typeof state.isInternetReachable === "boolean" ? state.isInternetReachable : null,
+      type: `native:${String(state.type ?? "unknown")}`,
+    };
+    emit();
+  };
+  let removeNativeSubscription: (() => void) | null = null;
+
   return {
     addEventListener: (listener) => {
       listeners.add(listener);
       listener(snapshot);
-      return () => listeners.delete(listener);
+      if (expoNetwork && removeNativeSubscription === null) {
+        try {
+          const subscription = expoNetwork.addNetworkStateListener(adoptNativeState);
+          removeNativeSubscription =
+            typeof subscription === "function"
+              ? subscription
+              : typeof subscription.remove === "function"
+                ? () => subscription.remove?.()
+                : () => undefined;
+          void expoNetwork
+            .getNetworkStateAsync?.()
+            .then(adoptNativeState)
+            .catch(() => undefined);
+        } catch {
+          removeNativeSubscription = null;
+        }
+      }
+      return () => {
+        listeners.delete(listener);
+        if (listeners.size === 0) {
+          removeNativeSubscription?.();
+          removeNativeSubscription = null;
+        }
+      };
     },
     reportSocketFailure: () => {
       if (failureReported) return;

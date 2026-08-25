@@ -39,7 +39,7 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <base href="https://spawn.local/">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' https: wss: ws:; img-src data:; font-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src data:; font-src 'none'; base-uri 'none'; form-action 'none'">
 <style>${xtermCss}
 html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;padding:0;overflow:hidden;touch-action:none;-webkit-text-size-adjust:none}body{overscroll-behavior:none}
 /* A gutter either side so the first column does not sit on the bezel. FitAddon

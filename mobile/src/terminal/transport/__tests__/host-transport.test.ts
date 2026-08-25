@@ -76,18 +76,32 @@ class FakeBridge implements WorkerEndpoint {
 }
 
 class FakeSignal implements SignalChannelLike {
-  readonly state = "open";
+  state = "open";
+  closeInfo: { code: number; reason: string } | null = null;
+  readonly sent: unknown[] = [];
   readonly listeners = new Set<(frame: unknown) => void>();
-  send(_frame: unknown): void {}
+  readonly stateListeners = new Set<(state: string) => void>();
+  send(frame: unknown): void {
+    this.sent.push(frame);
+  }
   onFrame(listener: (frame: unknown) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
   close(): void {
     this.listeners.clear();
+    this.stateListeners.clear();
   }
   emit(frame: unknown): void {
     for (const listener of this.listeners) listener(frame);
+  }
+  onState(listener: (state: string) => void): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+  emitState(state: string): void {
+    this.state = state;
+    for (const listener of this.stateListeners) listener(state);
   }
 }
 
@@ -174,7 +188,7 @@ async function readyTransport(options?: {
   });
   bridge.emit({ v: 1, type: "state", state: "ready" });
   await opening;
-  return { bridge, transport };
+  return { bridge, signal, transport };
 }
 
 async function beginRead(
@@ -212,6 +226,27 @@ function openTransport(bridge: FakeBridge, signal: FakeSignal) {
 }
 
 describe("HostTransport signalling", () => {
+  test("rejects active requests as retryable and schedules reconnect after channel loss", async () => {
+    const { bridge, transport } = await readyTransport();
+    jest.useFakeTimers();
+    try {
+      const errors: Array<{ code: string; retryable: boolean }> = [];
+      transport.on("error", (error) => errors.push(error));
+      const pending = transport.request("host.metrics", {});
+      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+      await expect(pending).rejects.toMatchObject({ code: "connection_lost" });
+      expect(transport.state).toBe("reconnecting");
+      expect(errors).toContainEqual({
+        code: "connection_lost",
+        retryable: true,
+        message: expect.any(String),
+      });
+      transport.close();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test("passes loaded carried endorsements in the sign response", async () => {
     const loadCarriedEndorsements = jest.fn(async () => [CARRIED_EDGE]);
     const { bridge, transport } = await readyTransport({ loadCarriedEndorsements });
@@ -300,6 +335,16 @@ describe("HostTransport signalling", () => {
     await flush();
 
     expect(transport.state).toBe("connecting");
+    expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(1);
+    signal.emit({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [{ urls: "stun:refreshed.example" }],
+      scope_type: "host",
+      scope_id: HOST_ID,
+      protocol: "spawn.host.ctl",
+      protocol_version: 1,
+    });
     expect(bridge.sent.filter((message) => message.type === "connect")).toHaveLength(1);
     transport.close();
     await settled;

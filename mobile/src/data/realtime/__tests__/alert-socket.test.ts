@@ -1,12 +1,27 @@
 import { ALERT_PROTOCOL, AlertSocketClient, parseAlertFrame } from "@/data/realtime/alert-socket";
 
+jest.mock("@/data/api/auth-token", () => ({
+  authToken: { get: jest.fn(async () => "secret-token") },
+}));
+
 class FakeWebSocket {
   readonly protocol = ALERT_PROTOCOL;
+  readonly url: string;
+  readonly options: { headers: Record<string, string> } | undefined;
   readyState = 0;
   onopen: WebSocket["onopen"] = null;
   onmessage: WebSocket["onmessage"] = null;
   onerror: WebSocket["onerror"] = null;
   onclose: WebSocket["onclose"] = null;
+
+  constructor(
+    url = "wss://spawn.test/ws/alerts",
+    _protocol = ALERT_PROTOCOL,
+    options?: { headers: Record<string, string> },
+  ) {
+    this.url = url;
+    this.options = options;
+  }
 
   open(): void {
     this.readyState = 1;
@@ -169,7 +184,7 @@ describe("AlertSocketClient", () => {
   it("delivers only valid alert frames and isolates malformed input", async () => {
     const sockets: FakeWebSocket[] = [];
     const client = new AlertSocketClient(
-      () => "wss://spawn.test/ws/alerts?token=redacted",
+      () => "wss://spawn.test/ws/alerts",
       () => {
         const socket = new FakeWebSocket();
         sockets.push(socket);
@@ -183,6 +198,7 @@ describe("AlertSocketClient", () => {
 
     client.connect();
     await Promise.resolve();
+    await Promise.resolve();
     sockets[0]?.open();
     sockets[0]?.message("malformed");
     sockets[0]?.message('{"type":"alerts.ping"}');
@@ -193,5 +209,30 @@ describe("AlertSocketClient", () => {
     expect(frames).toEqual(["alerts.ping", "alert"]);
     expect(alerts).toEqual(["agent.finished"]);
     client.close();
+  });
+
+  it("uses the bearer header on the production alert socket", async () => {
+    const original = globalThis.WebSocket;
+    const sockets: FakeWebSocket[] = [];
+    class CapturingWebSocket extends FakeWebSocket {
+      constructor(url: string, protocol: string, options?: { headers: Record<string, string> }) {
+        super(url, protocol, options);
+        sockets.push(this);
+      }
+    }
+    globalThis.WebSocket = CapturingWebSocket as unknown as typeof WebSocket;
+    const client = new AlertSocketClient(() => "wss://spawn.test/ws/alerts");
+    try {
+      client.connect();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(sockets[0]?.url).toBe("wss://spawn.test/ws/alerts");
+      expect(sockets[0]?.options).toEqual({
+        headers: { Authorization: "Bearer secret-token" },
+      });
+    } finally {
+      client.close();
+      globalThis.WebSocket = original;
+    }
   });
 });

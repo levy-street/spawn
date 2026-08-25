@@ -6,6 +6,11 @@ import {
   subscribeProtocolRequired,
 } from "@/data/realtime/socket";
 
+jest.mock("@/data/api/client", () => ({
+  ApiError: class extends Error {},
+  reportUnauthenticated: jest.fn(async () => undefined),
+}));
+
 class FakeWebSocket {
   readonly url: string;
   readonly protocol: string;
@@ -93,6 +98,7 @@ describe("ReconnectingSocket", () => {
     expect(sockets).toHaveLength(1);
 
     sockets[0]?.open();
+    sockets[0]?.message('{"type":"ping","ts":1}');
     expect(socket.state).toBe("open");
     socket.send({ type: "hello" });
     expect(sockets[0]?.sent).toEqual(['{"type":"hello"}']);
@@ -109,6 +115,7 @@ describe("ReconnectingSocket", () => {
     socket.connect();
     await flushPromises();
     sockets[0]?.open();
+    sockets[0]?.message('{"type":"ping","ts":1}');
 
     jest.advanceTimersByTime(SOCKET_TIMING.watchdogMs - 1);
     expect(socket.state).toBe("open");
@@ -132,6 +139,29 @@ describe("ReconnectingSocket", () => {
     expect(socket.state).toBe("open");
     jest.advanceTimersByTime(20_000);
     expect(socket.state).toBe("reconnecting");
+  });
+
+  it("does not arm the watchdog until a new server proves ping support", async () => {
+    const { socket, sockets } = harness();
+    socket.connect();
+    await flushPromises();
+    sockets[0]?.open();
+
+    jest.advanceTimersByTime(SOCKET_TIMING.watchdogMs * 2);
+    expect(socket.state).toBe("open");
+    expect(sockets).toHaveLength(1);
+  });
+
+  it("reconnects immediately when the server loses its subscription", async () => {
+    const { socket, sockets } = harness();
+    socket.connect();
+    await flushPromises();
+    sockets[0]?.serverClose(4010);
+
+    expect(socket.state).toBe("reconnecting");
+    jest.advanceTimersByTime(0);
+    await flushPromises();
+    expect(sockets).toHaveLength(2);
   });
 
   it("uses exponential jitter and resets its attempt after a successful open", async () => {
@@ -207,18 +237,25 @@ describe("ReconnectingSocket", () => {
     expect(socket.state).toBe("failed");
   });
 
-  it.each([1002, 1008, 1009, 4002, 4003])(
-    "does not retry permanent close code %i",
-    async (code) => {
-      const { socket, sockets } = harness();
-      socket.connect();
-      await flushPromises();
-      sockets[0]?.serverClose(code);
-      expect(socket.state).toBe("failed");
-      jest.runAllTimers();
-      expect(sockets).toHaveLength(1);
-    },
-  );
+  it.each([1002, 1009, 4002, 4003])("does not retry permanent close code %i", async (code) => {
+    const { socket, sockets } = harness();
+    socket.connect();
+    await flushPromises();
+    sockets[0]?.serverClose(code);
+    expect(socket.state).toBe("failed");
+    jest.runAllTimers();
+    expect(sockets).toHaveLength(1);
+  });
+
+  it("reports an authentication refusal without reconnecting", async () => {
+    const { socket, sockets } = harness();
+    socket.connect();
+    await flushPromises();
+    sockets[0]?.serverClose(1008);
+    expect(socket.state).toBe("unauthenticated");
+    jest.runAllTimers();
+    expect(sockets).toHaveLength(1);
+  });
 
   it("surfaces a 4003 protocol refusal while keeping it permanent", async () => {
     const listener = jest.fn();
