@@ -16,6 +16,13 @@ export interface PickImageOptions {
    * the terminal widens it, since a session accepts any file at all.
    */
   fileTypes?: string | string[];
+  /**
+   * Lets the operator take several in one visit to the picker. An input that
+   * holds exactly one picture — a workspace icon, a template — leaves this off;
+   * the terminal, which is a queue, turns it on. The camera takes one shot
+   * either way.
+   */
+  multiple?: boolean;
 }
 
 function assetName(asset: ImagePicker.ImagePickerAsset, fallback: string): string {
@@ -27,25 +34,29 @@ function assetName(asset: ImagePicker.ImagePickerAsset, fallback: string): strin
 }
 
 /**
- * Resolves one image, or null when the operator backed out.
+ * Resolves every image the operator chose, or an empty list when they backed out.
  *
  * Permission is asked for at the point of use rather than up front, so a refusal
  * explains itself against the thing that was just tapped. The camera is the
  * app's own overlay (`camera-overlay.tsx`), which stands over the nav bar and
  * every drawer; the system picker sat underneath them.
  */
-export async function pickImage(
+export async function pickImages(
   source: ImageSource,
-  { fileTypes = "image/*" }: PickImageOptions = {},
-): Promise<PickedImage | null> {
+  { fileTypes = "image/*", multiple = false }: PickImageOptions = {},
+): Promise<PickedImage[]> {
   if (source === "files") {
     const result = await DocumentPicker.getDocumentAsync({
       copyToCacheDirectory: true,
-      multiple: false,
+      multiple,
       type: fileTypes,
     });
-    const asset = result.canceled ? undefined : result.assets[0];
-    return asset ? { uri: asset.uri, name: asset.name, mimeType: asset.mimeType ?? null } : null;
+    if (result.canceled) return [];
+    return result.assets.map((asset) => ({
+      uri: asset.uri,
+      name: asset.name,
+      mimeType: asset.mimeType ?? null,
+    }));
   }
 
   if (source === "camera") {
@@ -53,7 +64,9 @@ export async function pickImage(
     // and this module is imported by plain data code.
     const { captureWithCamera } =
       require("@/components/media/camera-host") as typeof import("@/components/media/camera-host");
-    return captureWithCamera();
+    // One shutter press is one picture; "multiple" has nothing to say here.
+    const captured = await captureWithCamera();
+    return captured ? [captured] : [];
   }
 
   const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -62,14 +75,22 @@ export async function pickImage(
   const result = await ImagePicker.launchImageLibraryAsync({
     mediaTypes: ["images"],
     quality: 0.9,
-    selectionLimit: 1,
+    // 0 is the picker's word for "as many as you like".
+    selectionLimit: multiple ? 0 : 1,
   });
-  const asset = result.canceled ? undefined : result.assets[0];
-  return asset
-    ? {
-        uri: asset.uri,
-        name: assetName(asset, "image.jpg"),
-        mimeType: asset.mimeType ?? "image/jpeg",
-      }
-    : null;
+  if (result.canceled) return [];
+  return result.assets.map((asset) => ({
+    uri: asset.uri,
+    name: assetName(asset, "image.jpg"),
+    mimeType: asset.mimeType ?? "image/jpeg",
+  }));
+}
+
+/** The single-image door onto {@link pickImages}, for inputs that hold one. */
+export async function pickImage(
+  source: ImageSource,
+  options: PickImageOptions = {},
+): Promise<PickedImage | null> {
+  const [first] = await pickImages(source, { ...options, multiple: false });
+  return first ?? null;
 }

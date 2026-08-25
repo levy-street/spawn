@@ -1,7 +1,7 @@
 import * as Clipboard from "expo-clipboard";
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert } from "react-native";
-import { type ImageSource, pickImage } from "@/components/media/image-source";
+import { type ImageSource, pickImages } from "@/components/media/image-source";
 import { attachmentPasteSequence } from "@/components/terminal-ui/attachment-paste";
 import {
   LARGE_PASTE_CONFIRM_BYTES,
@@ -16,6 +16,7 @@ import {
 import { haptics } from "@/lib/haptics";
 import type { SessionTransport, UploadProgress } from "@/terminal/transport/types";
 import { type UploadTrack, uploadRatio } from "@/terminal/transport/upload";
+import { duration } from "@/theme";
 
 function confirmLargePaste(): Promise<boolean> {
   return new Promise((resolve) => {
@@ -31,9 +32,12 @@ function confirmLargePaste(): Promise<boolean> {
   });
 }
 
-/** A session takes any file, so its "files" source is not narrowed to images. */
-async function pickAttachment(source: AttachmentSource): Promise<TerminalUploadAsset | null> {
-  return pickImage(source, { fileTypes: "*/*" });
+/**
+ * A session takes any file, so its "files" source is not narrowed to images —
+ * and it takes a queue of them, so every source that can offer several does.
+ */
+async function pickAttachments(source: AttachmentSource): Promise<TerminalUploadAsset[]> {
+  return pickImages(source, { fileTypes: "*/*", multiple: true });
 }
 
 export interface TerminalTransfersOptions {
@@ -62,9 +66,34 @@ export function useTerminalTransfers({
   onInputSent,
   onFocusTerminal,
 }: TerminalTransfersOptions): TerminalTransfers {
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, showNotice] = useState<string | null>(null);
   const [pasteRatio, setPasteRatio] = useState<number | null>(null);
   const [uploadTracks, setUploadTracks] = useState<Record<string, UploadTrack>>({});
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * A notice is a remark, not a state, so it retires itself. One that outstays
+   * what it described — the "Uploading photo.jpg…" card that sat over the
+   * output long after the file had landed — reads as an app that is stuck.
+   */
+  const setNotice = useCallback((message: string | null): void => {
+    if (noticeTimer.current !== null) clearTimeout(noticeTimer.current);
+    noticeTimer.current =
+      message === null
+        ? null
+        : setTimeout(() => {
+            noticeTimer.current = null;
+            showNotice(null);
+          }, duration.toastInfo);
+    showNotice(message);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (noticeTimer.current !== null) clearTimeout(noticeTimer.current);
+    },
+    [],
+  );
 
   const paste = async (): Promise<void> => {
     const transport = getTransport();
@@ -121,6 +150,35 @@ export function useTerminalTransfers({
     });
   };
 
+  /** Sends one picked file and answers with the path it landed on. */
+  const sendOne = async (
+    transport: SessionTransport,
+    asset: TerminalUploadAsset,
+    destination: "attachments" | "cwd",
+  ): Promise<string> => {
+    const request = await prepareTerminalUpload(asset, destination);
+    setUploadTracks((tracks) => ({
+      ...tracks,
+      [request.uploadId]: { sent: 0, total: request.totalBytes },
+    }));
+    const handle = transport.upload(request);
+    const unsubscribe = handle.onProgress(updateUploadTrack);
+    try {
+      const completed = await handle.result;
+      await clearUploadOutcome(completed.uploadId);
+      removeTrack(completed.uploadId);
+      return completed.path;
+    } catch (error) {
+      if (handle.state !== "outcome_unknown") await clearUploadOutcome(handle.uploadId);
+      removeTrack(handle.uploadId);
+      throw handle.state === "outcome_unknown"
+        ? new Error("Upload outcome is unknown. Check the destination before retrying.")
+        : error;
+    } finally {
+      unsubscribe();
+    }
+  };
+
   const attach = async (source: AttachmentSource): Promise<void> => {
     const transport = getTransport();
     if (!transport || !ready) {
@@ -128,60 +186,63 @@ export function useTerminalTransfers({
       haptics.warning();
       return;
     }
+    let assets: TerminalUploadAsset[];
     try {
-      const asset = await pickAttachment(source);
-      if (!asset) return;
-      setNotice("Preparing upload…");
-      // A photo is what the attachments destination exists for; an arbitrary
-      // file belongs beside the work, in the session's directory.
-      const request = await prepareTerminalUpload(
-        asset,
-        source === "files" ? "cwd" : "attachments",
-      );
-      setUploadTracks((tracks) => ({
-        ...tracks,
-        [request.uploadId]: { sent: 0, total: request.totalBytes },
-      }));
-      const handle = transport.upload(request);
-      const unsubscribe = handle.onProgress(updateUploadTrack);
-      setNotice(`Uploading ${request.name}…`);
-      try {
-        const completed = await handle.result;
-        await clearUploadOutcome(completed.uploadId);
-        removeTrack(completed.uploadId);
-        if (source === "files") {
-          // A plain file was saved beside the work; the path is the useful half.
-          setNotice(`Uploaded to ${completed.path}`);
-        } else {
-          // An image is an input, not a saved file. Bracket-pasting its path at
-          // the prompt is what a desktop terminal does when one is dragged onto
-          // it, and what an agent reads as an attached image.
-          // No notice: the pasted path lands in the input, which says it better
-          // than a banner repeating it does.
-          const paste = new TextEncoder().encode(attachmentPasteSequence(completed.path));
-          await writeTerminalInput(transport, paste);
-          onInputSent();
-          onFocusTerminal();
-        }
-        haptics.success();
-      } catch (error) {
-        if (handle.state !== "outcome_unknown") await clearUploadOutcome(handle.uploadId);
-        removeTrack(handle.uploadId);
-        setNotice(
-          handle.state === "outcome_unknown"
-            ? "Upload outcome is unknown. Check the destination before retrying."
-            : error instanceof Error
-              ? error.message
-              : "Upload failed.",
-        );
-        haptics.error();
-      } finally {
-        unsubscribe();
-      }
+      assets = await pickAttachments(source);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "The file could not be prepared.");
       haptics.error();
+      return;
     }
+    if (assets.length === 0) return;
+
+    // A photo is what the attachments destination exists for; an arbitrary
+    // file belongs beside the work, in the session's directory.
+    const destination = source === "files" ? "cwd" : "attachments";
+    // One at a time: the bar reads them as a single sweep, and a phone on a
+    // slow uplink does not fight itself over four sockets.
+    const sent: string[] = [];
+    const failures: string[] = [];
+    setNotice(null);
+    for (const asset of assets) {
+      try {
+        const path = await sendOne(transport, asset, destination);
+        sent.push(path);
+        if (destination === "attachments") {
+          // An image is an input, not a saved file. Bracket-pasting its path at
+          // the prompt is what a desktop terminal does when one is dragged onto
+          // it, and what an agent reads as an attached image.
+          const paste = new TextEncoder().encode(attachmentPasteSequence(path));
+          await writeTerminalInput(transport, paste);
+          onInputSent();
+        }
+      } catch (error) {
+        failures.push(
+          `${asset.name}: ${error instanceof Error ? error.message : "Upload failed."}`,
+        );
+      }
+    }
+
+    if (destination === "attachments" && sent.length > 0) onFocusTerminal();
+    if (failures.length > 0) {
+      // The first failure carries its own words; the rest are counted, since a
+      // banner that lists five of them is a wall nobody reads.
+      setNotice(
+        failures.length === 1
+          ? (failures[0] as string)
+          : `${failures[0] as string} (and ${failures.length - 1} more failed)`,
+      );
+      haptics.error();
+      return;
+    }
+    // The pasted paths land in the input, which says it better than a banner
+    // repeating them does; only a file saved out of sight needs telling.
+    if (destination === "cwd") {
+      setNotice(
+        sent.length === 1 ? `Uploaded to ${sent[0] as string}` : `Uploaded ${sent.length} files.`,
+      );
+    }
+    haptics.success();
   };
 
   return {
