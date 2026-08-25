@@ -3,6 +3,7 @@ import { useEffect, useRef } from "react";
 import { getBaseUrl } from "@/data/api/config";
 import { getMe } from "@/data/api/endpoints/account";
 import { listAgents } from "@/data/api/endpoints/agents";
+import { listBrowserDevices } from "@/data/api/endpoints/devices";
 import {
   deleteHost,
   getHost,
@@ -15,6 +16,7 @@ import {
 } from "@/data/api/endpoints/hosts";
 import { listSessions } from "@/data/api/endpoints/sessions";
 import { listSkills } from "@/data/api/endpoints/skills";
+import { getHostPins } from "@/data/api/endpoints/trust";
 import type {
   HostAgentList,
   HostAgentPolicyOut,
@@ -112,6 +114,23 @@ export function useHostQuery(hostId: string) {
     queryKey: qk.host(hostId),
     queryFn: () => getHost(hostId),
     refetchInterval: HOST_REFRESH_MS,
+    enabled: hostId.length > 0,
+  });
+}
+
+export function useHostPinsQuery(hostId: string) {
+  return useQuery({
+    queryKey: qk.hostPins(hostId),
+    queryFn: () => getHostPins(hostId),
+    enabled: hostId.length > 0,
+    retry: false,
+  });
+}
+
+export function useHostBrowserDevicesQuery(hostId: string) {
+  return useQuery({
+    queryKey: qk.browserDevices(),
+    queryFn: listBrowserDevices,
     enabled: hostId.length > 0,
   });
 }

@@ -22,7 +22,11 @@ export const BrowserDeviceOutSchema = z.object({
   // here made zod reject every response the server sent.
   label: z.string().nullable(),
   created_at: IsoDateTimeSchema,
+  last_seen_at: IsoDateTimeSchema.nullable().optional(),
+  approval_requested_at: IsoDateTimeSchema.nullable().optional(),
   revoked_at: IsoDateTimeSchema.nullable(),
+  revoked_by_device_id: UUIDSchema.nullable().optional(),
+  is_root: z.boolean().optional(),
 });
 export const BrowserDevicePruneResponseSchema = z.object({
   pruned: z.number().int().nonnegative(),

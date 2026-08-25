@@ -11,10 +11,11 @@ import { closeSettings } from "@/components/settings/settings-dialog-store";
 import { EndorseDevicePanel, useDeviceTrustMap } from "@/components/trust/device-endorsement";
 import { IntroductionPanel } from "@/components/trust/introduction-panel";
 import { Button } from "@/components/ui/button";
+import { confirm as confirmAction } from "@/components/ui/confirm";
 import { Input } from "@/components/ui/input";
 import { type AccessPinDetail, deriveAccessView } from "@/lib/access-view";
 import { type BrowserDevice, browserDevices, hosts as hostsApi, trust } from "@/lib/api";
-import { useAuth } from "@/lib/auth";
+import { logout, useAuth } from "@/lib/auth";
 import { loadBrowserDeviceIdentity } from "@/lib/browser-device-identity";
 import {
   type BrowserDeviceRegistrationState,
@@ -23,6 +24,8 @@ import {
   finishBrowserDeviceLocalCleanup,
   useBrowserDeviceRegistration,
 } from "@/lib/browser-device-registration";
+import { browserHostPinServerOrigin } from "@/lib/browser-host-pins";
+import { removeAccountFromThisBrowser } from "@/lib/local-account-hygiene";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { usePasskeyTrust } from "@/lib/trust-passkeys";
 import {
@@ -269,6 +272,35 @@ export function AccessPanel() {
     onError: (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
   });
 
+  const removeLocalAccount = useMutation({
+    mutationFn: async () => {
+      if (!user) throw new Error("not authenticated");
+      return removeAccountFromThisBrowser({
+        accountId: user.id,
+        origin: browserHostPinServerOrigin(),
+      });
+    },
+    onSuccess: () => {
+      // Staying signed in would let the registration hook immediately mint a
+      // replacement identity. End this browser's ordinary session after the
+      // local wipe; logout does not affect any other session.
+      void logout();
+    },
+    onError: (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
+  });
+
+  const requestRemoveLocalAccount = async () => {
+    if (!user) return;
+    const accepted = await confirmAction({
+      title: `Remove ${user.email} from this browser?`,
+      body: "Its device identity, host approvals, and cached keys for this account are deleted here. Removed devices stay removed everywhere.",
+      confirmLabel: "Remove account",
+      cancelLabel: "Cancel",
+      destructive: true,
+    });
+    if (accepted) removeLocalAccount.mutate();
+  };
+
   // Dialog state.
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<BrowserDevice | null>(null);
@@ -514,6 +546,14 @@ export function AccessPanel() {
                         Waiting for approval
                       </span>
                     )}
+                    {vm.staleLabel && (
+                      <span
+                        className="shrink-0 whitespace-nowrap rounded-full border border-amber-500/30 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-300"
+                        data-testid="stale-device-badge"
+                      >
+                        {vm.staleLabel}
+                      </span>
+                    )}
                   </div>
                   {/* The provenance is the audit surface — it wraps rather than
                       truncates on narrow screens, where who/when matters most. */}
@@ -550,6 +590,14 @@ export function AccessPanel() {
                       setOpenMenuId(null);
                       setRemoveTarget(device);
                     }}
+                    onRemoveAccount={
+                      vm.isThisDevice
+                        ? () => {
+                            setOpenMenuId(null);
+                            void requestRemoveLocalAccount();
+                          }
+                        : undefined
+                    }
                   />
                 )}
               </div>
@@ -808,6 +856,9 @@ export function AccessPanel() {
           {revokedRows.length > 0 && (
             <div className="rounded-md border border-border p-3">
               <p className="text-sm font-medium">Removed devices ({revokedRows.length})</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Removal is permanent; this only clears the list.
+              </p>
               <ul className="mt-1 space-y-1">
                 {revokedRows.map((device) => (
                   <li key={device.id} className="text-xs text-muted-foreground">
@@ -990,12 +1041,14 @@ function RowMenu({
   onToggle,
   onRename,
   onRemove,
+  onRemoveAccount,
 }: {
   label: string;
   open: boolean;
   onToggle: () => void;
   onRename: () => void;
   onRemove: () => void;
+  onRemoveAccount?: () => void;
 }) {
   return (
     <>
@@ -1030,6 +1083,17 @@ function RowMenu({
           >
             Remove…
           </button>
+          {onRemoveAccount && (
+            <button
+              type="button"
+              role="menuitem"
+              data-testid="remove-local-account"
+              onClick={onRemoveAccount}
+              className="mt-1 flex w-full items-center border-t border-border px-2 py-2 text-left text-sm text-destructive transition-colors hover:bg-accent"
+            >
+              Remove this account from this browser
+            </button>
+          )}
         </div>
       )}
     </>

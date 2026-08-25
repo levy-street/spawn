@@ -9,6 +9,8 @@ const mockReplace = jest.fn();
 const mockUseAgentsQuery = jest.fn();
 const mockUseAllSessionsQuery = jest.fn();
 const mockUseHostAgentsQuery = jest.fn();
+const mockUseHostBrowserDevicesQuery = jest.fn();
+const mockUseHostPinsQuery = jest.fn();
 const mockUseHostQuery = jest.fn();
 const mockUseHostSessionsQuery = jest.fn();
 const mockUseHostsQuery = jest.fn();
@@ -27,6 +29,8 @@ jest.mock("@/data/queries/hosts", () => ({
   useAllSessionsQuery: () => mockUseAllSessionsQuery(),
   useHostAgentPolicyMutation: () => ({ isPending: false, mutate: jest.fn() }),
   useHostAgentsQuery: () => mockUseHostAgentsQuery(),
+  useHostBrowserDevicesQuery: () => mockUseHostBrowserDevicesQuery(),
+  useHostPinsQuery: () => mockUseHostPinsQuery(),
   useHostQuery: () => mockUseHostQuery(),
   useHostSessionsQuery: () => mockUseHostSessionsQuery(),
   useHostsQuery: () => mockUseHostsQuery(),
@@ -107,6 +111,8 @@ describe("host screen headers", () => {
     mockUseAgentsQuery.mockReturnValue(successfulQuery([]));
     mockUseHostQuery.mockReturnValue(successfulQuery(onlineHost));
     mockUseHostSessionsQuery.mockReturnValue(successfulQuery([]));
+    mockUseHostPinsQuery.mockReturnValue(successfulQuery(null));
+    mockUseHostBrowserDevicesQuery.mockReturnValue(successfulQuery([]));
     mockUseHostAgentsQuery.mockReturnValue(successfulQuery({ agents: [] }));
     mockUseSkillsQuery.mockReturnValue(successfulQuery([]));
   });

@@ -2,8 +2,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, waitFor } from "@testing-library/react-native";
 import { AppState, type AppStateStatus } from "react-native";
 
-import { AlertPresenter } from "@/components/alerts/alert-presenter";
+import { AlertPresenter, pinUndeliveredToast } from "@/components/alerts/alert-presenter";
+import type { HostOut } from "@/data/api/schemas/hosts";
+import { qk } from "@/data/queryKeys";
 import type { AlertEvent } from "@/data/realtime/alert-socket";
+import { publishPinUndeliveredEvent } from "@/data/realtime/pin-undelivered-events";
 import { useAlertStore } from "@/data/stores/alerts";
 
 const mockPush = jest.fn();
@@ -131,5 +134,50 @@ describe("AlertPresenter", () => {
     await waitFor(() => expect(useAlertStore.getState().alerts).toHaveLength(0));
     expect(mockToastShow).toHaveBeenCalledTimes(1);
     expect(mockSchedule).not.toHaveBeenCalled();
+  });
+
+  it("maps an undelivered trust event to the exact host toast", () => {
+    expect(
+      pinUndeliveredToast(
+        {
+          event: "host.pin_undelivered",
+          host_id: "host-1",
+          browser_device_id: "device-1",
+          reason: "invalid_chain",
+        },
+        "office-mac",
+      ),
+    ).toEqual({
+      message: "The approval didn't reach office-mac.",
+      detail:
+        "office-mac could not verify the approval. Approve the device again from a device office-mac already trusts.",
+    });
+  });
+
+  it("turns the alerts-socket undelivered event into a toast", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData<HostOut>(qk.host("host-1"), {
+      id: "host-1",
+      name: "office-mac",
+    } as HostOut);
+    const view = await render(
+      <QueryClientProvider client={queryClient}>
+        <AlertPresenter currentSessionId={null} />
+      </QueryClientProvider>,
+    );
+
+    await act(() => {
+      publishPinUndeliveredEvent({
+        event: "host.pin_undelivered",
+        host_id: "host-1",
+        browser_device_id: "device-1",
+        reason: "other",
+      });
+    });
+
+    expect(mockToastError).toHaveBeenCalledWith("The approval didn't reach office-mac.", {
+      detail: "Try approving again; if it keeps failing, run spawnd doctor on office-mac.",
+    });
+    await view.unmount();
   });
 });

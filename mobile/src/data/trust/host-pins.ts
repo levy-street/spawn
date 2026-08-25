@@ -147,6 +147,19 @@ function copyPin(pin: HostPin): HostPin {
   return { ...pin, hostIds: [...pin.hostIds] };
 }
 
+export function hostPinRecordCounts(pins: readonly Pick<HostPin, "state">[]): {
+  active: number;
+  tombstones: number;
+} {
+  let active = 0;
+  let tombstones = 0;
+  for (const pin of pins) {
+    if (pin.state === "active") active += 1;
+    else tombstones += 1;
+  }
+  return { active, tombstones };
+}
+
 export interface HostPinStore {
   approveExact(input: HostPinApproval): Promise<HostPin>;
   revokeExact(input: Omit<HostPinApproval, "hostId" | "approvedAtMs">): Promise<void>;
@@ -161,7 +174,12 @@ export function createHostPinStore(persistence: HostPinPersistence): HostPinStor
     const origin = parseServerOrigin(serverOrigin);
     try {
       const pins = (await persistence.load(account, origin)).map(parsePin);
-      if (pins.length > MAX_PINS) throw new Error("Host pin limit was exceeded");
+      // Revoked records are permanent local memory. They cannot consume the
+      // active allowance or an account with enough history would be unable to
+      // approve a new host without weakening that memory.
+      if (hostPinRecordCounts(pins).active > MAX_PINS) {
+        throw new Error("Active host approval limit was exceeded");
+      }
       if (pins.some((pin) => pin.accountId !== account || pin.serverOrigin !== origin)) {
         throw new Error("Host pin scope is corrupt");
       }
@@ -180,6 +198,7 @@ export function createHostPinStore(persistence: HostPinPersistence): HostPinStor
       const hostId = input.hostId === undefined ? undefined : parseCanonicalUuid(input.hostId);
       const pins = await load(accountId, serverOrigin);
       const exact = pins.find((pin) => pin.hostPublicKey === input.hostPublicKey);
+      const counts = hostPinRecordCounts(pins);
       if (
         hostId !== undefined &&
         pins.some(
@@ -188,7 +207,7 @@ export function createHostPinStore(persistence: HostPinPersistence): HostPinStor
       ) {
         throw new PinStoreError("PIN_CONFLICT", "Host ID is already bound to another key");
       }
-      if (exact === undefined && pins.length >= MAX_PINS) {
+      if (exact?.state !== "active" && counts.active >= MAX_PINS) {
         throw new PinStoreError("PIN_LIMIT", "Host pin capacity has been reached");
       }
       const approvedAtMs = input.approvedAtMs ?? Date.now();
@@ -343,7 +362,7 @@ const sqlitePersistence: HostPinPersistence = {
 
   async deleteAccount(accountId) {
     const db = await database();
-    await db.runAsync("DELETE FROM host_pins WHERE account_id = ?", accountId);
+    await db.runAsync("DELETE FROM host_pins WHERE account_id = ? AND state = 'active'", accountId);
   },
 };
 

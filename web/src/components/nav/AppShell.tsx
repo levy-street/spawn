@@ -15,6 +15,7 @@ import { AccessCeremonyHost } from "@/components/access/ceremony-host";
 import { HostGossipSync } from "@/components/access/host-gossip-sync";
 import { SessionApprovalGate } from "@/components/access/session-approval-gate";
 import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDeviceRegistrationStatus";
+import { HostPinUndeliveredAlerts } from "@/components/hosts/host-pin-undelivered-alerts";
 import { Wordmark } from "@/components/icons/BrandMark";
 import { Sidebar } from "@/components/nav/Sidebar";
 import { ProfileDialog } from "@/components/profile/ProfileDialog";
@@ -296,6 +297,7 @@ export function AppShell({
       <SessionApprovalGate />
       <HostGossipSync />
       <DeviceApprovalPrompt accountId={user?.id ?? null} />
+      <HostPinUndeliveredAlerts enabled={user !== null} />
     </div>
   );
 }

@@ -251,6 +251,8 @@ export interface AppMockOptions {
   };
   devicePendingError?: { status: number; code?: string; message?: string; detail?: unknown };
   deviceApproveError?: { status: number; code?: string; message?: string; detail?: unknown };
+  /** False models a pre-Phase-D server. */
+  signOutEverywhereAvailable?: boolean;
   agents?: unknown[];
   workspaceTemplates?: JsonRecord[];
   skills?: unknown[];
@@ -908,6 +910,15 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
     if (path === "/api/auth/logout" && method === "POST") {
       store.user = null;
       await route.fulfill({ status: 204, body: "" });
+      return;
+    }
+    if (path === "/api/auth/sign-out-everywhere" && method === "POST") {
+      store.requests.auth.push({ path, ...(await readBody()) });
+      if (options.signOutEverywhereAvailable === false) {
+        await json(route, { detail: "not found" }, 404);
+        return;
+      }
+      await json(route, { access_token: "fresh-session-token" });
       return;
     }
     if (path === "/api/auth/verify-email/request" && method === "POST") {

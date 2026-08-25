@@ -11,6 +11,8 @@ export interface DeviceVM {
   provenance: string;
   /** "Now" | "2h ago" | "Jun 12" */
   lastSeen: string;
+  /** Present only when the server last saw this live device more than 60 days ago. */
+  staleLabel?: string;
   /** Signed in but not yet approved: visible immediately (R4), amber, with Approve. */
   waiting?: boolean;
 }

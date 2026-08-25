@@ -23,6 +23,11 @@ export const TokenResponseSchema = z.object({
   access_token: z.string(),
   user: UserOutSchema,
 });
+export const SessionRenewResponseSchema = z.object({
+  access_token: z.string(),
+  expires_at: IsoDateTimeSchema,
+});
+export const SignOutEverywhereResponseSchema = z.object({ access_token: z.string() });
 export const MeResponseSchema = z.object({ user: UserOutSchema });
 export const PasswordResetRequestSchema = z.object({ email: z.string().email() });
 export const PasswordResetConfirmSchema = z.object({
@@ -54,6 +59,8 @@ export type UserOut = z.infer<typeof UserOutSchema>;
 export type SignupRequest = z.infer<typeof SignupRequestSchema>;
 export type LoginRequest = z.infer<typeof LoginRequestSchema>;
 export type TokenResponse = z.infer<typeof TokenResponseSchema>;
+export type SessionRenewResponse = z.infer<typeof SessionRenewResponseSchema>;
+export type SignOutEverywhereResponse = z.infer<typeof SignOutEverywhereResponseSchema>;
 export type MeResponse = z.infer<typeof MeResponseSchema>;
 export type PasswordResetRequest = z.infer<typeof PasswordResetRequestSchema>;
 export type PasswordResetConfirm = z.infer<typeof PasswordResetConfirmSchema>;

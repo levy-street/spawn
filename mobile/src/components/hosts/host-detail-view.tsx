@@ -4,6 +4,7 @@ import { StyleSheet, View } from "react-native";
 import { HostFacts } from "@/components/hosts/host-facts";
 import { hostConnectionLabel, relativeSeen } from "@/components/hosts/host-model";
 import { HostSessionList } from "@/components/hosts/host-session-list";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Icon, type IconName } from "@/components/ui/icon";
@@ -12,8 +13,10 @@ import { ListRow } from "@/components/ui/list-row";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Text } from "@/components/ui/text";
 import type { AgentOut } from "@/data/api/schemas/agents";
+import type { BrowserDeviceOut } from "@/data/api/schemas/devices";
 import type { HostOut } from "@/data/api/schemas/hosts";
 import type { SessionOut } from "@/data/api/schemas/sessions";
+import type { HostPinCapacity, HostPinsOut } from "@/data/api/schemas/trust";
 import { haptics } from "@/lib/haptics";
 import { opacity, spacing } from "@/theme";
 
@@ -133,9 +136,62 @@ function HostTroubleshootingPanel({ host }: { host: HostOut }): React.JSX.Elemen
   );
 }
 
+export function hostPinCapacityWarning(capacity: HostPinCapacity | null): string | null {
+  if (capacity === null || capacity.used < 28) return null;
+  return `This host is close to its limit of approving devices (${capacity.used} of ${capacity.max}). Remove devices you no longer use under Access.`;
+}
+
+function HostApprovingDevices({
+  devices,
+  hostPins,
+}: {
+  devices: readonly BrowserDeviceOut[];
+  hostPins: HostPinsOut;
+}): React.JSX.Element {
+  const labels = new Map(devices.map((device) => [device.id, device.label ?? "Unnamed device"]));
+  const warning = hostPinCapacityWarning(hostPins.capacity);
+  const title =
+    hostPins.capacity === null
+      ? "Approving devices"
+      : `Approving devices · ${hostPins.capacity.used} of ${hostPins.capacity.max}`;
+
+  return (
+    <View style={styles.approvingDevices} testID="host-approving-devices">
+      <Text variant="label">{title}</Text>
+      {warning ? (
+        <Card style={styles.capacityWarning} testID="host-device-capacity-warning" variant="flat">
+          <Icon color="warning" name="ShieldAlert" size={spacing[5]} />
+          <Text color="mutedForeground" style={styles.capacityCopy}>
+            {warning}
+          </Text>
+        </Card>
+      ) : null}
+      {hostPins.pins.length === 0 ? (
+        <Text color="mutedForeground">No devices are approved for this host.</Text>
+      ) : (
+        <ListGroup openingRule>
+          {hostPins.pins.map((pin) => (
+            <ListRow
+              key={pin.browser_device_id}
+              shape="fullBleed"
+              subtitle={pin.delivered ? "Approved for this host" : "Approval needs attention"}
+              title={labels.get(pin.browser_device_id) ?? "Unknown device"}
+              {...(pin.delivered
+                ? {}
+                : { trailing: <Badge variant="warning">Not delivered</Badge> })}
+            />
+          ))}
+        </ListGroup>
+      )}
+    </View>
+  );
+}
+
 export interface HostDetailViewProps {
   agents: readonly AgentOut[];
+  browserDevices?: readonly BrowserDeviceOut[];
   host: HostOut;
+  hostPins?: HostPinsOut | null;
   sessions: readonly SessionOut[];
   onOpenAgents(): void;
   onOpenFiles(): void;
@@ -144,7 +200,9 @@ export interface HostDetailViewProps {
 
 export function HostDetailView({
   agents,
+  browserDevices = [],
   host,
+  hostPins = null,
   sessions,
   onOpenAgents,
   onOpenFiles,
@@ -186,12 +244,24 @@ export function HostDetailView({
         />
       </ListGroup>
       <HostFacts host={host} />
+      {hostPins ? <HostApprovingDevices devices={browserDevices} hostPins={hostPins} /> : null}
       <HostSessionList agents={agents} onOpen={onOpenSession} sessions={sessions} />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
+  approvingDevices: {
+    gap: spacing[3],
+  },
+  capacityCopy: {
+    flex: 1,
+  },
+  capacityWarning: {
+    alignItems: "flex-start",
+    flexDirection: "row",
+    gap: spacing[3],
+  },
   content: {
     gap: spacing[8],
     padding: spacing[4],

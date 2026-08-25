@@ -7,7 +7,11 @@ import {
   onlineHost,
   runningSession,
 } from "@/components/hosts/__tests__/fixtures";
-import { HostDetailView, hostDoctorPresentation } from "@/components/hosts/host-detail-view";
+import {
+  HostDetailView,
+  hostDoctorPresentation,
+  hostPinCapacityWarning,
+} from "@/components/hosts/host-detail-view";
 import { HostListView } from "@/components/hosts/host-list-screen";
 import { HostOutSchema } from "@/data/api/schemas/hosts";
 import { ThemeProvider } from "@/theme";
@@ -263,5 +267,49 @@ describe("host list and detail rendering", () => {
     );
     expect(screen.queryByText("Something wrong?")).toBeNull();
     expect(screen.getByText(/daemon 1\.4\.2/i)).toBeOnTheScreen();
+  });
+
+  test("warns at 28 approvals and marks a pin the host did not receive", async () => {
+    expect(hostPinCapacityWarning({ used: 27, max: 32 })).toBeNull();
+    expect(hostPinCapacityWarning({ used: 28, max: 32 })).toBe(
+      "This host is close to its limit of approving devices (28 of 32). Remove devices you no longer use under Access.",
+    );
+
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          browserDevices={[
+            {
+              id: "11111111-1111-4111-8111-111111111111",
+              key_algorithm: "ed25519",
+              public_key: "phone-key",
+              label: "Work phone",
+              created_at: "2026-08-01T00:00:00Z",
+              revoked_at: null,
+            },
+          ]}
+          host={onlineHost}
+          hostPins={{
+            capacity: { used: 28, max: 32 },
+            pins: [
+              {
+                browser_device_id: "11111111-1111-4111-8111-111111111111",
+                delivered: false,
+                undelivered_reason: "invalid_chain",
+              },
+            ],
+          }}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Approving devices · 28 of 32")).toBeOnTheScreen();
+    expect(screen.getByText("Not delivered")).toBeOnTheScreen();
+    expect(screen.getByTestId("host-device-capacity-warning")).toBeOnTheScreen();
   });
 });

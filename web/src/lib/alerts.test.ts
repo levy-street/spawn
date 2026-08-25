@@ -140,6 +140,28 @@ describe("parseAlertFrame", () => {
     ).toMatchObject({ event: "host.pair_resolved", outcome: "approved", host_id: "host-id" });
   });
 
+  test("accepts a host approval that the daemon could not adopt", () => {
+    expect(
+      parseAlertFrame(
+        JSON.stringify({
+          type: "trust",
+          event: "host.pin_undelivered",
+          host_id: "host-id",
+          browser_device_id: "browser-device-id",
+          reason: "invalid_chain",
+          at: "2026-08-25T00:00:00Z",
+        }),
+      ),
+    ).toEqual({
+      type: "trust",
+      event: "host.pin_undelivered",
+      host_id: "host-id",
+      browser_device_id: "browser-device-id",
+      reason: "invalid_chain",
+      at: "2026-08-25T00:00:00Z",
+    });
+  });
+
   test("rejects a trust frame this build cannot act on", () => {
     const rejected = [
       JSON.stringify({

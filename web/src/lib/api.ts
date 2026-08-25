@@ -34,6 +34,10 @@ export async function api<T>(
 ): Promise<T> {
   const { schema, headers, ...rest } = init;
   const res = await fetch(`${API_URL}${path}`, {
+    // The browser owns Set-Cookie processing before this promise resolves.
+    // Keeping the native response path and always including credentials lets
+    // an ordinary authenticated response transparently renew spawn_session;
+    // there is deliberately no client-side token or renewal timer here.
     credentials: "include",
     headers: {
       "Content-Type": "application/json",
@@ -546,6 +550,65 @@ export const BrowserDeviceSchema = z.object({
 });
 export type BrowserDevice = z.infer<typeof BrowserDeviceSchema>;
 
+export const HostPinUndeliveredReasonSchema = z.enum(["pin_limit", "invalid_chain", "other"]);
+export type HostPinUndeliveredReason = z.infer<typeof HostPinUndeliveredReasonSchema>;
+
+const HostPinRecordSchema = z
+  .object({
+    browser_device_id: z.string().uuid().optional(),
+    // Accept the display endpoint's older device_id spelling while the server
+    // half rolls out; all consumers see browser_device_id after normalization.
+    device_id: z.string().uuid().optional(),
+    delivered: z.boolean().default(true),
+    undelivered_reason: HostPinUndeliveredReasonSchema.nullable().default(null),
+  })
+  .transform((pin, context) => {
+    const browserDeviceId = pin.browser_device_id ?? pin.device_id;
+    if (browserDeviceId === undefined) {
+      context.addIssue({ code: "custom", message: "host pin has no browser device id" });
+      return z.NEVER;
+    }
+    return {
+      browser_device_id: browserDeviceId,
+      delivered: pin.delivered,
+      undelivered_reason: pin.undelivered_reason,
+    };
+  });
+
+export const HostPinsResponseSchema = z
+  .union([
+    // Pre-Phase-D servers returned only live browser-device ids.
+    z.array(z.string().uuid()),
+    z.object({
+      pins: z.array(z.union([z.string().uuid(), HostPinRecordSchema])),
+      capacity: z.object({
+        used: z.number().int().nonnegative(),
+        max: z.number().int().positive(),
+      }),
+    }),
+  ])
+  .transform((response) => {
+    if (Array.isArray(response)) {
+      return {
+        pins: response.map((browserDeviceId) => ({
+          browser_device_id: browserDeviceId,
+          delivered: true,
+          undelivered_reason: null,
+        })),
+        capacity: null,
+      };
+    }
+    return {
+      pins: response.pins.map((pin) =>
+        typeof pin === "string"
+          ? { browser_device_id: pin, delivered: true, undelivered_reason: null }
+          : pin,
+      ),
+      capacity: response.capacity,
+    };
+  });
+export type HostPinsResponse = z.infer<typeof HostPinsResponseSchema>;
+
 export const DeviceApprovalRequestSchema = z.object({
   id: z.string().uuid(),
   browser_device_id: z.string().uuid(),
@@ -590,6 +653,12 @@ export const auth = {
       schema: AuthResponseSchema,
     }),
   logout: () => api<void>("/api/auth/logout", { method: "POST" }),
+  signOutEverywhere: () =>
+    api("/api/auth/sign-out-everywhere", {
+      method: "POST",
+      body: JSON.stringify({}),
+      schema: z.object({ access_token: z.string() }),
+    }),
   /** Always succeeds, whether or not the address has an account. */
   requestPasswordReset: (email: string) =>
     api<void>("/api/auth/password-reset/request", {
@@ -967,9 +1036,21 @@ export const trust = {
     }),
   removePasskey: (id: string) =>
     api(`/api/trust/passkeys/${id}`, { method: "DELETE", schema: z.unknown() }),
-  /** Browser device IDs a host already trusts. */
-  hostPins: (hostId: string) =>
-    api(`/api/trust/hosts/${hostId}/pins`, { method: "GET", schema: z.array(z.string()) }),
+  /** Delivery and capacity state for every browser approval held by a host. */
+  hostPinStatus: (hostId: string) =>
+    api(`/api/trust/hosts/${hostId}/pins`, {
+      method: "GET",
+      schema: HostPinsResponseSchema,
+    }),
+  /** Browser device IDs the host can actually admit. An undelivered approval
+   * is displayable in hostPinStatus but must not count as trust here. */
+  hostPins: async (hostId: string) => {
+    const response = await api(`/api/trust/hosts/${hostId}/pins`, {
+      method: "GET",
+      schema: HostPinsResponseSchema,
+    });
+    return response.pins.filter((pin) => pin.delivered).map((pin) => pin.browser_device_id);
+  },
   /**
    * Pin records with provenance for the Access screen's host rows: `direct`
    * means the pin came from the possess ceremony itself. Display only —

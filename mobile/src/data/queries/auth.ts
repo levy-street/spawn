@@ -7,6 +7,7 @@ import {
   logIn,
   requestEmailVerification,
   requestPasswordReset,
+  signOutEverywhere,
   signUp,
 } from "@/data/api/endpoints/auth";
 import { listHosts } from "@/data/api/endpoints/hosts";
@@ -101,6 +102,10 @@ export function useOAuthSignInMutation() {
 
 export function usePasswordResetRequestMutation() {
   return useMutation({ mutationFn: requestPasswordReset });
+}
+
+export function useSignOutEverywhereMutation() {
+  return useMutation({ mutationFn: signOutEverywhere });
 }
 
 export function usePasswordResetConfirmMutation() {

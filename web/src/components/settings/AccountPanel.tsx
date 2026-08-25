@@ -3,8 +3,10 @@
 import { useMutation } from "@tanstack/react-query";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { confirm as confirmAction } from "@/components/ui/confirm";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { toast } from "@/components/ui/toast";
 import { ApiError, account, auth, type PasskeyCredential } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 import { UnreadableTrustStateError } from "@/lib/passkey-flows";
@@ -171,6 +173,7 @@ export function AccountPanel() {
   const [error, setError] = useState<string | null>(null);
 
   const [resendNote, setResendNote] = useState<string | null>(null);
+  const [signOutEverywhereAvailable, setSignOutEverywhereAvailable] = useState(true);
   const resend = useMutation({
     mutationFn: () => auth.requestEmailVerification(),
     onSuccess: () => setResendNote("Sent — check your inbox."),
@@ -191,6 +194,32 @@ export function AccountPanel() {
     },
     onError: (cause) => setError(cause instanceof ApiError ? cause.message : String(cause)),
   });
+
+  const signOutEverywhere = useMutation({
+    mutationFn: () => auth.signOutEverywhere(),
+    onSuccess: () => {
+      // The server has already installed this session's replacement cookie.
+      // The account row is unchanged, so no query invalidation is needed.
+      toast("Signed out everywhere else.");
+    },
+    onError: (cause) => {
+      if (cause instanceof ApiError && cause.status === 404) {
+        setSignOutEverywhereAvailable(false);
+        return;
+      }
+      toast.error(cause instanceof ApiError ? cause.message : "Could not sign out everywhere.");
+    },
+  });
+
+  const requestSignOutEverywhere = async () => {
+    const accepted = await confirmAction({
+      title: "Sign out everywhere?",
+      body: "Every other browser and phone signed in to this account will be signed out. This one stays signed in.",
+      confirmLabel: "Sign out everywhere",
+      cancelLabel: "Cancel",
+    });
+    if (accepted) signOutEverywhere.mutate();
+  };
 
   const emailMatches =
     user !== null && confirmEmail.trim().toLowerCase() === user.email.toLowerCase();
@@ -229,14 +258,35 @@ export function AccountPanel() {
       )}
       <PasskeysSection />
 
-      <Button
-        variant="secondary"
-        onClick={() => {
-          void logout();
-        }}
-      >
-        Log out
-      </Button>
+      <div className="space-y-3 rounded-md border border-border p-3">
+        <div>
+          <p className="text-sm font-medium">Sessions</p>
+          <p className="text-sm text-muted-foreground">
+            Sign out here, or end every other browser and phone session while keeping this one.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            variant="secondary"
+            onClick={() => {
+              void logout();
+            }}
+          >
+            Log out
+          </Button>
+          <Button
+            variant="secondary"
+            disabled={!signOutEverywhereAvailable || signOutEverywhere.isPending}
+            onClick={() => void requestSignOutEverywhere()}
+          >
+            {signOutEverywhereAvailable
+              ? signOutEverywhere.isPending
+                ? "Signing out…"
+                : "Sign out everywhere"
+              : "Not available on this server yet."}
+          </Button>
+        </div>
+      </div>
 
       <div className="space-y-3 rounded-md border border-destructive/50 p-3">
         <div>

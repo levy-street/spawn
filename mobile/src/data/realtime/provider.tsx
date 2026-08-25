@@ -24,6 +24,7 @@ import {
   retireRegisteredGenerations,
 } from "@/data/realtime/lifecycle";
 import { createProductionNetworkSource } from "@/data/realtime/network-source";
+import { publishPinUndeliveredEvent } from "@/data/realtime/pin-undelivered-events";
 import { subscribeSessionSignalFrames } from "@/data/realtime/session-signal";
 import { retireAll, type SocketState } from "@/data/realtime/socket";
 import { useAlertStore } from "@/data/stores/alerts";
@@ -117,6 +118,9 @@ export function RealtimeProvider({
       if (frame.type === "alert") {
         const { type: _type, ...alert } = frame;
         useAlertStore.getState().receive(alert);
+      } else if (frame.type === "trust" && frame.event === "host.pin_undelivered") {
+        const { type: _type, ...event } = frame;
+        publishPinUndeliveredEvent(event);
       }
       applyFrame(frame);
     });

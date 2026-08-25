@@ -21,6 +21,8 @@ import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
 import {
   useAgentsQuery,
+  useHostBrowserDevicesQuery,
+  useHostPinsQuery,
   useHostQuery,
   useHostSessionsQuery,
   useRemoveHostMutation,
@@ -36,6 +38,8 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
   const hostQuery = useHostQuery(hostId);
   const sessionsQuery = useHostSessionsQuery(hostId);
   const agentsQuery = useAgentsQuery();
+  const hostPinsQuery = useHostPinsQuery(hostId);
+  const browserDevicesQuery = useHostBrowserDevicesQuery(hostId);
   const rename = useRenameHostMutation();
   const remove = useRemoveHostMutation();
   const [actionsVisible, setActionsVisible] = useState(false);
@@ -68,7 +72,13 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
   };
 
   const refresh = () => {
-    void Promise.all([hostQuery.refetch(), sessionsQuery.refetch(), agentsQuery.refetch()]);
+    void Promise.all([
+      hostQuery.refetch(),
+      sessionsQuery.refetch(),
+      agentsQuery.refetch(),
+      hostPinsQuery.refetch(),
+      browserDevicesQuery.refetch(),
+    ]);
   };
 
   return (
@@ -114,14 +124,21 @@ export function HostDetailScreen({ hostId }: { hostId: string }) {
             refreshControl={
               <RefreshControl
                 onRefresh={refresh}
-                refreshing={hostQuery.isRefetching || sessionsQuery.isRefetching}
+                refreshing={
+                  hostQuery.isRefetching ||
+                  sessionsQuery.isRefetching ||
+                  hostPinsQuery.isRefetching ||
+                  browserDevicesQuery.isRefetching
+                }
                 tintColor={theme.colors.mutedForeground}
               />
             }
           >
             <HostDetailView
               agents={agentsQuery.data ?? []}
+              browserDevices={browserDevicesQuery.data ?? []}
               host={host}
+              hostPins={hostPinsQuery.data ?? null}
               onOpenAgents={() =>
                 router.push({ pathname: "/host/[id]/agents", params: { id: host.id } })
               }
