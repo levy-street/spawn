@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from sqlalchemy import func, select
 
-from spawn_server.config import get_settings
+from spawn_server.config import Settings, get_settings
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import AuthIdentity, User
 from spawn_server.routes import auth_providers
@@ -114,6 +114,38 @@ async def test_provider_start_is_hidden_when_provider_is_not_configured(client):
 
     start = await client.get("/api/auth/oauth/google/start", follow_redirects=False)
     assert start.status_code == 404
+
+
+async def test_native_redirect_default_accepts_mobile_and_desktop_but_rejects_unknown(
+    client, configured_providers, monkeypatch
+):
+    default_redirects = "spawn://auth/oauth,spawn://oauth/callback"
+    assert Settings.model_fields["oauth_native_redirect_uris"].default == default_redirects
+    monkeypatch.setenv("SPAWN_OAUTH_NATIVE_REDIRECT_URIS", default_redirects)
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    for redirect_uri in ("spawn://auth/oauth", "spawn://oauth/callback"):
+        response = await client.get(
+            "/api/auth/oauth/google/start",
+            params={"redirect_uri": redirect_uri},
+            follow_redirects=False,
+        )
+        assert response.status_code == 302
+
+    unknown = await client.get(
+        "/api/auth/oauth/google/start",
+        params={"redirect_uri": "spawn://oauth/callback/extra"},
+        follow_redirects=False,
+    )
+    assert unknown.status_code == 400
+    assert unknown.json()["detail"] == "redirect_uri is not an allowed native redirect"
+
+
+def test_native_redirect_environment_override_replaces_defaults(monkeypatch):
+    monkeypatch.setenv("SPAWN_OAUTH_NATIVE_REDIRECT_URIS", "example-app://oauth/callback")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    assert get_settings().oauth_native_redirect_uri_list == ["example-app://oauth/callback"]
 
 
 async def test_google_login_links_existing_manual_account_by_verified_email(
