@@ -57,6 +57,9 @@ class FakePeerConnection {
   onconnectionstatechange = null;
   channel = null;
   config;
+  restartIceCalls = 0;
+  setConfigurationCalls = [];
+  offerOptions = [];
 
   constructor(config) {
     this.config = config;
@@ -68,7 +71,8 @@ class FakePeerConnection {
     return this.channel;
   }
 
-  async createOffer() {
+  async createOffer(options) {
+    this.offerOptions.push(options);
     return { type: "offer", sdp: "v=0\r\n" };
   }
 
@@ -80,11 +84,22 @@ class FakePeerConnection {
 
   async addIceCandidate() {}
 
+  setConfiguration(config) {
+    this.config = { ...this.config, ...config };
+    this.setConfigurationCalls.push(config);
+  }
+
+  restartIce() {
+    this.restartIceCalls += 1;
+  }
+
   close() {}
 }
 
 class FakeWebSocket {
+  static CONNECTING = 0;
   static OPEN = 1;
+  static CLOSED = 3;
   static instances: FakeWebSocket[] = [];
   readyState = FakeWebSocket.OPEN;
   protocol = "spawn.host.v1";
@@ -93,6 +108,7 @@ class FakeWebSocket {
   onmessage = null;
   onerror = null;
   onclose = null;
+  closeCalls = [];
 
   constructor(
     readonly url: string,
@@ -105,7 +121,8 @@ class FakeWebSocket {
     this.sent.push(value);
   }
 
-  close() {
+  close(code, reason) {
+    this.closeCalls.push({ code, reason });
     this.readyState = 3;
   }
 
@@ -270,6 +287,12 @@ beforeEach(() => {
   FakePeerConnection.instances = [];
   globalThis.WebSocket = FakeWebSocket;
   globalThis.RTCPeerConnection = FakePeerConnection;
+  const fakeWindow = new EventTarget();
+  fakeWindow.location = { protocol: "https:", host: "spawn.test" };
+  globalThis.window = fakeWindow;
+  const fakeDocument = new EventTarget();
+  fakeDocument.visibilityState = "visible";
+  globalThis.document = fakeDocument;
 });
 
 afterEach(() => {
@@ -317,6 +340,7 @@ describe("HostControlClient", () => {
         },
       },
     );
+    const pc = FakePeerConnection.instances.at(-1);
     ws.receive({
       type: "rtc.answer",
       session_id: offer.session_id,
@@ -324,9 +348,8 @@ describe("HostControlClient", () => {
       sdp: rawRelaySdp,
       ...metadata,
     });
-    await Bun.sleep(5);
+    await waitFor(() => pc.remoteDescription !== null);
 
-    const pc = FakePeerConnection.instances.at(-1);
     expect(pc.remoteDescription).toEqual({ type: "answer", sdp: verifiedSdp });
     expect(pc.remoteDescription.sdp).not.toBe(rawRelaySdp);
     client.close();
@@ -651,10 +674,11 @@ describe("HostControlClient", () => {
     }
   });
 
-  test("repeated unavailable attempts increase backoff until a valid hello", async () => {
+  test("the first config frame resets websocket backoff after an unavailable host", async () => {
     const client = new HostControlClient(hostId, {
       connectTimeoutMs: 1000,
       reconnectBaseDelayMs: 20,
+      reconnectRandom: () => 0.5,
     });
     client.connect();
     const firstWs = FakeWebSocket.instances[0];
@@ -696,8 +720,6 @@ describe("HostControlClient", () => {
       status: "unavailable",
       ...metadata,
     });
-    await Bun.sleep(25);
-    expect(FakeWebSocket.instances).toHaveLength(2);
     await Bun.sleep(25);
     expect(FakeWebSocket.instances).toHaveLength(3);
     client.close();
@@ -755,6 +777,132 @@ describe("HostControlClient", () => {
     expect(client.getTerminalReason()).toBe("protocol_required");
     expect(client.getSignedRtcRefusal()).toBeNull();
     client.close();
+  });
+
+  test("a 1008 close is terminal and surfaces the signed-out state", async () => {
+    const client = new HostControlClient(hostId, { reconnectBaseDelayMs: 1 });
+    client.connect();
+    const ws = FakeWebSocket.instances[0];
+    ws.onopen?.();
+    ws.onclose?.({ code: 1008 });
+
+    await Bun.sleep(5);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(client.getState()).toBe("unauthorized");
+    client.close();
+  });
+
+  test("arms the host watchdog only after the first server ping", async () => {
+    const client = new HostControlClient(hostId, { watchdogMs: 5 });
+    client.connect();
+    const ws = FakeWebSocket.instances[0];
+    ws.onopen?.();
+    await Bun.sleep(8);
+    expect(ws.closeCalls).toHaveLength(0);
+
+    ws.receive({ type: "ping", ts: 42 });
+    expect(JSON.parse(ws.sent.at(-1))).toEqual({ type: "pong", ts: 42 });
+    await waitFor(() => ws.closeCalls.some((call) => call.code === 4008));
+    client.close();
+  });
+
+  test("resumes a healthy data channel after signalling reconnect without a new offer", async () => {
+    const first = await readyClient({
+      reconnectBaseDelayMs: 1,
+      reconnectRandom: () => 0.5,
+      resumeTimeoutMs: 10,
+    });
+    const binding = {
+      binding_nonce: "a".repeat(32),
+      binding_generation: 7,
+    };
+    first.ws.receive({
+      type: "rtc.status",
+      session_id: first.offer.session_id,
+      status: "connected",
+      ...binding,
+      ...metadata,
+    });
+    first.ws.onclose?.({ code: 1012 });
+    await waitFor(() => FakeWebSocket.instances.length === 2);
+    const resumedWs = FakeWebSocket.instances[1];
+    resumedWs.onopen?.();
+    resumedWs.receive({
+      type: "rtc.config",
+      enabled: true,
+      ice_servers: [],
+      ice_transport_policy: "all",
+      ...metadata,
+    });
+    const resume = await waitForSentFrame(resumedWs, "rtc.resume");
+    expect(resume).toMatchObject({
+      session_id: first.offer.session_id,
+      ...binding,
+    });
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    resumedWs.receive({
+      type: "rtc.status",
+      session_id: first.offer.session_id,
+      status: "resumed",
+      ...binding,
+      ...metadata,
+    });
+    await Bun.sleep(15);
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    first.client.close();
+  });
+
+  test("falls back to a fresh offer when rtc.resume is ignored", async () => {
+    const first = await readyClient({
+      reconnectBaseDelayMs: 1,
+      reconnectRandom: () => 0.5,
+      resumeTimeoutMs: 5,
+    });
+    first.ws.receive({
+      type: "rtc.status",
+      session_id: first.offer.session_id,
+      status: "connected",
+      binding_nonce: "b".repeat(32),
+      binding_generation: 8,
+      ...metadata,
+    });
+    first.ws.onclose?.({ code: 1012 });
+    await waitFor(() => FakeWebSocket.instances.length === 2);
+    const resumedWs = FakeWebSocket.instances[1];
+    resumedWs.onopen?.();
+    resumedWs.receive({ type: "rtc.config", enabled: true, ice_servers: [], ...metadata });
+    await waitForSentFrame(resumedWs, "rtc.resume");
+    await waitFor(() => FakePeerConnection.instances.length === 2);
+    const freshOffer = await waitForSentFrame(resumedWs, "rtc.offer");
+    expect(freshOffer.session_id).not.toBe(first.offer.session_id);
+    first.client.close();
+  });
+
+  test("wake restarts ICE on the binding, then rebuilds if recovery never connects", async () => {
+    const endpoint = await readyClient({ iceRestartTimeoutMs: 5 });
+    endpoint.ws.receive({
+      type: "rtc.status",
+      session_id: endpoint.offer.session_id,
+      status: "connected",
+      binding_nonce: "c".repeat(32),
+      binding_generation: 9,
+      ...metadata,
+    });
+    endpoint.pc.connectionState = "disconnected";
+    window.dispatchEvent(new Event("online"));
+    await waitFor(() => endpoint.pc.restartIceCalls === 1);
+    const restartOffer = endpoint.ws.sent
+      .map((frame) => JSON.parse(frame))
+      .find((frame) => frame.type === "rtc.offer" && frame.ice_restart === true);
+    expect(restartOffer).toMatchObject({
+      session_id: endpoint.offer.session_id,
+      binding_nonce: "c".repeat(32),
+      binding_generation: 9,
+      ice_restart: true,
+    });
+    expect(endpoint.pc.offerOptions.at(-1)).toEqual({ iceRestart: true });
+    await waitFor(() => FakePeerConnection.instances.length === 2);
+    endpoint.client.close();
   });
 
   test("queued callbacks from a replaced websocket cannot affect the current attempt", async () => {

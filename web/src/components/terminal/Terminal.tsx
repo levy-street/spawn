@@ -13,6 +13,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowDown } from "lucide-react";
 import Image from "next/image";
+import Link from "next/link";
 import {
   type ChangeEvent,
   type ClipboardEvent,
@@ -29,7 +30,7 @@ import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip
 import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
 import { type UploadTrack, uploadRatio } from "@/components/terminal/upload-progress";
 import { UploadProgressBar } from "@/components/terminal/upload-progress-bar";
-import { useSessionSocket } from "@/components/terminal/useSessionSocket";
+import { type SocketState, useSessionSocket } from "@/components/terminal/useSessionSocket";
 // Terminal configuration shared with the conformance harness
 // (tools/term-conformance/); see xterm-config.mjs before changing options.
 import {
@@ -94,6 +95,16 @@ const TOUCH_TAP_SLOP_PX = 8;
 const ALT_ENTER = "\x1b\r";
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
+
+const SOCKET_STATE_COPY: Record<SocketState, string> = {
+  idle: "waiting",
+  connecting: "reconnecting",
+  open: "connected",
+  closed: "reconnecting",
+  error: "connection error",
+  unauthorized: "signed out",
+  disabled: "transport disabled by this server",
+};
 
 type TouchVelocitySample = { time: number; y: number };
 
@@ -414,6 +425,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const viewerPanFrameActiveRef = useRef(false);
   const onDataDisposableRef = useRef<{ dispose: () => void } | null>(null);
   const lastSizeRef = useRef<TerminalGeometry>({ cols: 80, rows: 24 });
+  const lastSentSizeRef = useRef<string | null>(null);
   const uploadStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragDepthRef = useRef(0);
   const rawInputRef = useRef(rawInput);
@@ -1056,6 +1068,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     signalingAccountId !== null &&
     signalingHostId !== null &&
     (hostIdentityQuery.isSuccess || hostIdentityQuery.isError);
+  const accountEndorsementsQuery = useQuery({
+    queryKey: ["account-endorsements", signalingAccountId],
+    queryFn: () => trust.accountEndorsements(),
+    enabled: signalingIdentityKnown,
+    staleTime: 5 * 60_000,
+  });
   const resolveTrust = useCallback(
     (): Promise<SignedRtcTrustDecision> =>
       resolveSignedRtcTrust({
@@ -1069,7 +1087,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   const loadCarriedEndorsements = useCallback(async (): Promise<CarriedEndorsement[]> => {
     const accountId = signalingAccountId;
     if (!accountId) return [];
-    const edges = await trust.accountEndorsements();
+    const edges = accountEndorsementsQuery.data ?? [];
     return edges.map((edge) => ({
       account_id: accountId,
       endorser_public_key: edge.endorser_public_key,
@@ -1077,11 +1095,12 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       endorsed_device_id: edge.endorsed_device_id,
       signature: edge.signature,
     }));
-  }, [signalingAccountId]);
+  }, [accountEndorsementsQuery.data, signalingAccountId]);
 
   const socket = useSessionSocket({
     sessionId,
     enabled: socketInitialSize !== null && signalingIdentityKnown,
+    active,
     resolveSignedRtcTrust: signalingIdentityKnown ? resolveTrust : undefined,
     loadCarriedEndorsements: signalingIdentityKnown ? loadCarriedEndorsements : undefined,
     initialSize: socketInitialSize,
@@ -1154,6 +1173,11 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     onHistory: (bytes, dcOffset, historyAnchor) => {
       const term = termRef.current;
       if (!term) return;
+      // A reconnect seed or pty_gap recovery replaces the prior offset
+      // timeline. Never replay bytes retained against the old anchor on top.
+      recentDcChunksRef.current = [];
+      recentDcChunksSizeRef.current = 0;
+      dcActiveRef.current = typeof dcOffset === "number";
       markPainted();
       clearPrediction();
       if (typeof dcOffset === "number") {
@@ -1362,12 +1386,21 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     const timer = setTimeout(() => setChannelPending(true), 1_500);
     return () => clearTimeout(timer);
   }, [socket.v3, socket.state, socket.dcOpen]);
+  const [showReconnectBanner, setShowReconnectBanner] = useState(false);
+  useEffect(() => {
+    if (!painted || socket.dcOpen) {
+      setShowReconnectBanner(false);
+      return;
+    }
+    const timer = setTimeout(() => setShowReconnectBanner(true), 2_000);
+    return () => clearTimeout(timer);
+  }, [painted, socket.dcOpen]);
   rawInputRef.current = rawInput;
   mobileReturnModeRef.current = mobileReturnMode;
   mobileReturnBytesRef.current = mobileReturnBytes;
 
   const requestSnapshot = useCallback(() => {
-    if (socketRef.current.state !== "open" || scrollbackSnapshotInFlightRef.current) return false;
+    if (!socketRef.current.dcOpen || scrollbackSnapshotInFlightRef.current) return false;
 
     scrollbackSnapshotInFlightRef.current = true;
     scrollbackSnapshotRequestedAtRef.current = Date.now();
@@ -1425,7 +1458,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         // fetch plus hidden-terminal rebuild steals main-thread time from
         // whichever terminal the user is actually typing into. The cache
         // stays dirty and one refresh runs on foregrounding instead.
-        if (!activeRef.current) return;
+        if (!activeRef.current || document.hidden) return;
         if (!requestSnapshot() && scrollbackSnapshotInFlightRef.current) {
           // Another capture is pending; try again once it resolves or times out.
           scheduleScrollbackCacheRefreshRef.current(500);
@@ -1437,11 +1470,30 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
   scheduleScrollbackCacheRefreshRef.current = scheduleScrollbackCacheRefresh;
 
   useEffect(() => {
-    if (socket.state !== "open") return;
+    if (!socket.dcOpen || document.hidden) return;
     if (!scrollbackCachedSnapshotBytesRef.current || scrollbackCacheDirtyRef.current) {
       scheduleScrollbackCacheRefresh(SCROLLBACK_WARM_DELAY_MS);
     }
-  }, [scheduleScrollbackCacheRefresh, socket.state]);
+  }, [scheduleScrollbackCacheRefresh, socket.dcOpen]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (
+        !document.hidden &&
+        activeRef.current &&
+        socketRef.current.dcOpen &&
+        scrollbackCacheDirtyRef.current
+      ) {
+        scheduleScrollbackCacheRefreshRef.current(0);
+      } else if (document.hidden && scrollbackCacheRefreshTimerRef.current) {
+        clearTimeout(scrollbackCacheRefreshTimerRef.current);
+        scrollbackCacheRefreshTimerRef.current = null;
+        scrollbackCacheRefreshDeadlineRef.current = null;
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, []);
 
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
@@ -2780,11 +2832,16 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
 
   // Resend the last known size on (re)connection so the daemon's PTY matches.
   useEffect(() => {
-    if (socket.state === "open" && displayOwnerRef.current === true) {
-      const { cols, rows } = lastSizeRef.current;
-      socket.sendJson({ type: "resize", cols, rows });
+    if (!socket.dcOpen) {
+      lastSentSizeRef.current = null;
+      return;
     }
-  }, [socket.state, socket.sendJson]);
+    if (displayOwnerRef.current !== true) return;
+    const { cols, rows } = lastSizeRef.current;
+    const key = `${cols}x${rows}`;
+    if (lastSentSizeRef.current === key) return;
+    if (socket.sendJson({ type: "resize", cols, rows })) lastSentSizeRef.current = key;
+  }, [socket.dcOpen, socket.sendJson]);
 
   useImperativeHandle(
     ref,
@@ -3187,6 +3244,32 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         hostName={hostIdentityQuery.data?.name ?? null}
         hostOffline={hostIdentityQuery.data?.status === "offline"}
       />
+      {socket.state === "unauthorized" && (
+        <div className="pointer-events-auto absolute inset-x-2 top-2 z-40 flex items-center justify-center gap-3 rounded-md border border-destructive/45 bg-background/95 px-3 py-2 text-xs text-foreground shadow-lg backdrop-blur">
+          <span>You've been signed out.</span>
+          <Link
+            href="/login"
+            className="rounded border border-border bg-card px-2 py-1 font-medium hover:bg-accent"
+          >
+            Sign in
+          </Link>
+        </div>
+      )}
+      {socket.state === "disabled" && (
+        <div className="pointer-events-none absolute inset-x-2 top-2 z-20 rounded-md border border-border bg-background/95 px-3 py-2 text-center text-xs text-foreground shadow-lg backdrop-blur">
+          Transport disabled by this server.
+        </div>
+      )}
+      {showReconnectBanner && socket.state !== "unauthorized" && socket.state !== "disabled" && (
+        <div
+          role="status"
+          data-testid="terminal-reconnect-banner"
+          className="pointer-events-none absolute inset-x-2 top-2 z-20 rounded-md border border-warning/45 bg-background/95 px-3 py-2 text-center text-xs text-foreground shadow-lg backdrop-blur"
+        >
+          Reconnecting to {hostIdentityQuery.data?.name ?? "host"} — keystrokes are sent once the
+          channel is back ({socket.queuedInputCount} queued)
+        </div>
+      )}
       {(uploadReconciliations.length > 0 || uploadReconciliationFault) && (
         <div
           data-testid="upload-reconciliation"
@@ -3352,7 +3435,7 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
         aria-live="polite"
       >
         {[
-          socket.state !== "open" ? socket.state : null,
+          socket.state !== "open" ? SOCKET_STATE_COPY[socket.state] : null,
           channelPending ? "connecting direct channel…" : null,
           exitBanner,
           uploadStatus,

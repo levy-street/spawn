@@ -11,6 +11,9 @@ export const SESSION_CTL_MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 export const SESSION_CTL_UPLOAD_CHUNK_BYTES = 48 * 1024;
 export const SESSION_CTL_UPLOAD_BUFFER_HIGH_WATER = 256 * 1024;
 export const SESSION_CTL_UPLOAD_BUFFER_LOW_WATER = 128 * 1024;
+export const SESSION_PTY_INPUT_CHUNK_BYTES = 16 * 1024;
+export const SESSION_PTY_INPUT_BUFFER_HIGH_WATER = 256 * 1024;
+export const SESSION_PTY_INPUT_BUFFER_LOW_WATER = 128 * 1024;
 
 const CHUNK_HEADER_BYTES = 28;
 const CHUNK_MAGIC = [0x53, 0x50, 0x43, 0x54]; // SPCT
@@ -97,6 +100,15 @@ export interface SessionCtlHistoryGapEvent {
   event: "history_gap";
 }
 
+/** The daemon shed output queued for this slow viewer. The next PTY byte is
+ * anchored at `offset`; clients must replace their local replay first. */
+export interface SessionCtlPtyGapEvent {
+  version: number;
+  kind: "event";
+  event: "pty_gap";
+  offset: number;
+}
+
 export type SessionCtlHistoryEvent =
   | SessionCtlHistoryDeltaEvent
   | SessionCtlHistoryWipeEvent
@@ -106,7 +118,8 @@ export type SessionCtlTextMessage =
   | SessionCtlResponse
   | SessionCtlDisplayEvent
   | SessionCtlReadyEvent
-  | SessionCtlHistoryEvent;
+  | SessionCtlHistoryEvent
+  | SessionCtlPtyGapEvent;
 
 export interface SessionCtlChunk {
   requestId: string;
@@ -147,6 +160,39 @@ export class DirectSessionUploadError extends Error {
 export interface AnchoredPtySlice {
   bytes: Uint8Array | null;
   anchor: number | null;
+}
+
+/** SCTP message boundaries are not PTY boundaries. Keep every browser send
+ * comfortably below the peer's negotiated/default maximum. */
+export function sessionPtyInputChunks(bytes: Uint8Array): Uint8Array[] {
+  const chunks: Uint8Array[] = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += SESSION_PTY_INPUT_CHUNK_BYTES) {
+    chunks.push(bytes.subarray(offset, offset + SESSION_PTY_INPUT_CHUNK_BYTES));
+  }
+  return chunks;
+}
+
+/** Send as many ordered chunks as the channel can currently accept. The
+ * returned byte offset lets the caller queue the exact unsent remainder. */
+export function writeSessionPtyInput(channel: RTCDataChannel, bytes: Uint8Array): number {
+  let offset = 0;
+  for (const chunk of sessionPtyInputChunks(bytes)) {
+    if (
+      channel.readyState !== "open" ||
+      channel.bufferedAmount > SESSION_PTY_INPUT_BUFFER_HIGH_WATER
+    ) {
+      break;
+    }
+    try {
+      channel.send(
+        chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer,
+      );
+    } catch {
+      break;
+    }
+    offset += chunk.byteLength;
+  }
+  return offset;
 }
 
 export type SessionCtlTrackedResult =
@@ -296,25 +342,60 @@ export class OrderedAsyncQueue {
 
 /** Bounded input held for one committed session-effect generation only. */
 export class SessionGenerationInputQueue {
-  readonly #entries: Array<{ generation: number; bytes: Uint8Array }> = [];
+  readonly #entries: Array<{ generation: number; bytes: Uint8Array; enqueuedAt: number }> = [];
   #bytes = 0;
 
   constructor(readonly maxBytes: number) {}
 
-  enqueue(generation: number, bytes: Uint8Array): boolean {
+  enqueue(generation: number, bytes: Uint8Array, enqueuedAt = Date.now()): boolean {
     if (this.#bytes + bytes.byteLength > this.maxBytes) return false;
     const copy = bytes.slice();
-    this.#entries.push({ generation, bytes: copy });
+    this.#entries.push({ generation, bytes: copy, enqueuedAt });
     this.#bytes += copy.byteLength;
     return true;
   }
 
-  drain(generation: number): Uint8Array[] {
+  drain(generation: number, maxAgeMs = Number.POSITIVE_INFINITY, now = Date.now()): Uint8Array[] {
+    return this.take(generation, maxAgeMs, now).map((entry) => entry.bytes);
+  }
+
+  take(
+    generation: number,
+    maxAgeMs = Number.POSITIVE_INFINITY,
+    now = Date.now(),
+  ): Array<{ bytes: Uint8Array; enqueuedAt: number }> {
     const matching = this.#entries
-      .filter((entry) => entry.generation === generation)
-      .map((entry) => entry.bytes);
+      .filter((entry) => entry.generation === generation && now - entry.enqueuedAt <= maxAgeMs)
+      .map((entry) => ({ bytes: entry.bytes, enqueuedAt: entry.enqueuedAt }));
     this.clear();
     return matching;
+  }
+
+  prune(generation: number, maxAgeMs: number, now = Date.now()): void {
+    let write = 0;
+    let bytes = 0;
+    for (const entry of this.#entries) {
+      if (entry.generation !== generation || now - entry.enqueuedAt > maxAgeMs) continue;
+      this.#entries[write] = entry;
+      write += 1;
+      bytes += entry.bytes.byteLength;
+    }
+    this.#entries.length = write;
+    this.#bytes = bytes;
+  }
+
+  count(generation: number): number {
+    return this.#entries.filter((entry) => entry.generation === generation).length;
+  }
+
+  bytes(generation: number): number {
+    return this.#entries
+      .filter((entry) => entry.generation === generation)
+      .reduce((total, entry) => total + entry.bytes.byteLength, 0);
+  }
+
+  oldestEnqueuedAt(generation: number): number | null {
+    return this.#entries.find((entry) => entry.generation === generation)?.enqueuedAt ?? null;
   }
 
   clear(): void {
@@ -587,6 +668,14 @@ export function parseSessionCtlText(raw: string): SessionCtlTextMessage | null {
     }
     if (value.kind === "event" && value.event === "history_gap") {
       return value as unknown as SessionCtlHistoryGapEvent;
+    }
+    if (
+      value.kind === "event" &&
+      value.event === "pty_gap" &&
+      Number.isSafeInteger(value.offset) &&
+      (value.offset as number) >= 0
+    ) {
+      return value as unknown as SessionCtlPtyGapEvent;
     }
     if (
       value.kind === "event" &&
