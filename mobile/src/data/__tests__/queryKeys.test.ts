@@ -17,6 +17,7 @@ describe("query key registry", () => {
     const keys = [
       qk.me(),
       qk.authConfig(),
+      qk.release(),
       qk.hosts(),
       qk.host("host"),
       qk.hostAgents("host"),

@@ -7,6 +7,7 @@ import {
   type HostMetrics,
   pluralize,
 } from "@/components/hosts/host-model";
+import { HostUpdateBadge } from "@/components/hosts/host-update-status";
 import { LiveCapacityProbe } from "@/components/hosts/live-capacity-probe";
 import { RunningAgents } from "@/components/hosts/running-agents";
 import { Badge } from "@/components/ui/badge";
@@ -99,6 +100,7 @@ export function LegionHostCard({
               </Text>
             </View>
             {liveEnabled && metrics !== null ? <Badge variant="success">Live</Badge> : null}
+            <HostUpdateBadge host={host} />
             <Icon color="mutedForeground" name="ChevronRight" />
           </View>
           {host.cpu_cores !== null || host.memory_bytes !== null || host.gpu !== null ? (

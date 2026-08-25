@@ -3,6 +3,7 @@ import {
   retireAll,
   SOCKET_TIMING,
   type SocketState,
+  subscribeProtocolRequired,
 } from "@/data/realtime/socket";
 
 class FakeWebSocket {
@@ -218,4 +219,23 @@ describe("ReconnectingSocket", () => {
       expect(sockets).toHaveLength(1);
     },
   );
+
+  it("surfaces a 4003 protocol refusal while keeping it permanent", async () => {
+    const listener = jest.fn();
+    const unsubscribe = subscribeProtocolRequired(listener);
+    const { socket, sockets } = harness();
+    socket.connect();
+    await flushPromises();
+
+    sockets[0]?.serverClose(4003);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(socket.state).toBe("failed");
+
+    unsubscribe();
+    const second = harness();
+    second.socket.connect();
+    await flushPromises();
+    second.sockets[0]?.serverClose(4003);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
 });

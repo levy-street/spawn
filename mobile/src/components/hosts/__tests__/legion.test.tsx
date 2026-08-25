@@ -88,4 +88,27 @@ describe("Legion fleet surface", () => {
     expect(screen.getByText("1 need you")).toBeOnTheScreen();
     expect(screen.getByText("Codex")).toBeOnTheScreen();
   });
+
+  test("marks hosts whose daemon is updating", async () => {
+    await render(
+      <ThemeProvider>
+        <LegionHostCard
+          agents={[]}
+          host={{
+            ...onlineHost,
+            update: {
+              state: "updating",
+              latest_version: "2.0.0",
+              error: null,
+              requested_at: "2026-08-25T00:00:00Z",
+            },
+          }}
+          liveEnabled={false}
+          onOpen={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+    expect(screen.getByText("updating")).toBeOnTheScreen();
+  });
 });

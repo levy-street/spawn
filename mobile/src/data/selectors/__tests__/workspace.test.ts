@@ -41,6 +41,8 @@ function host(status = "online"): Host {
     os: null,
     arch: null,
     version: null,
+    daemon_tree: null,
+    update: null,
     host_key_algorithm: null,
     host_public_key: null,
     status,

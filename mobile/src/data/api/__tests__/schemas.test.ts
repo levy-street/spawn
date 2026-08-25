@@ -8,6 +8,7 @@ import {
 } from "@/data/api/schemas/devices";
 import { HostOutSchema } from "@/data/api/schemas/hosts";
 import { ProfileOutSchema } from "@/data/api/schemas/legion";
+import { ReleaseSchema } from "@/data/api/schemas/release";
 import { SessionOutSchema } from "@/data/api/schemas/sessions";
 import { SessionAccessOutSchema, SkillOutSchema } from "@/data/api/schemas/skills";
 import { WorkspaceTemplateOutSchema } from "@/data/api/schemas/templates";
@@ -110,7 +111,48 @@ it("round-trips browser-device and pairing response JSON", () => {
 });
 
 it("round-trips host response JSON", () => {
-  expect(HostOutSchema.parse(host)).toEqual(host);
+  expect(HostOutSchema.parse(host)).toEqual({ ...host, daemon_tree: null, update: null });
+  expect(
+    HostOutSchema.parse({
+      ...host,
+      daemon_tree: "9a8b",
+      update: {
+        state: "available",
+        latest_version: "0.1.0+gabc",
+        error: null,
+        requested_at: null,
+      },
+    }),
+  ).toMatchObject({ daemon_tree: "9a8b", update: { state: "available" } });
+});
+
+it("parses the release contract and defaults identities from older servers", () => {
+  expect(ReleaseSchema.parse({})).toEqual({
+    server: { commit: null, dirty: false },
+    web: { build_id: null },
+    daemon: null,
+    mobile: { tree: null, runtime_version: null },
+    protocols: { daemon: null, browser: null, alerts: null },
+  });
+  expect(
+    ReleaseSchema.parse({
+      mobile: { tree: "mobile-tree", runtime_version: "0.1.0" },
+      daemon: {
+        version: "0.1.0+gabc",
+        commit: "commit",
+        tree: "daemon-tree",
+        targets: {
+          "darwin-aarch64": {
+            spawnd_sha256: "spawnd",
+            spawn_worker_sha256: "worker",
+          },
+        },
+      },
+    }),
+  ).toMatchObject({
+    mobile: { tree: "mobile-tree", runtime_version: "0.1.0" },
+    daemon: { tree: "daemon-tree" },
+  });
 });
 
 it("round-trips session and capability response JSON", () => {

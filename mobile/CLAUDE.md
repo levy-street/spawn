@@ -35,8 +35,8 @@ src/
     layout/       persisted layout state
     __tests__/    data-layer tests
   lib/            platform glue: crypto/, oauth, apple-auth, push,
-                  notifications, secure-storage, haptics, linking, motion/,
-                  providers, share, validation
+                  notifications, release-watcher, updates, secure-storage,
+                  haptics, linking, motion/, providers, share, validation
   terminal/       terminal surface components
   theme/          design tokens — every colour, spacing, and type value
 assets/           icons and splash

@@ -30,6 +30,21 @@ let mockData: {
 
 jest.mock("@/terminal/HostTransportSurface", () => ({ HostTransportSurface: () => null }));
 
+function mockHostUpdateDialog({ onNotNow, visible }: { onNotNow?(): void; visible: boolean }) {
+  if (!visible) return null;
+  const React = require("react");
+  const { Pressable, Text } = require("react-native");
+  return React.createElement(
+    Pressable,
+    { onPress: onNotNow, testID: "launcher-host-update-not-now" },
+    React.createElement(Text, null, "Not now"),
+  );
+}
+
+jest.mock("@/components/hosts/host-update-dialog", () => ({
+  HostUpdateDialog: mockHostUpdateDialog,
+}));
+
 jest.mock("@/data/queries/launcher", () => ({
   useLauncherData: () => ({
     ...mockData,
@@ -138,6 +153,32 @@ describe("adding a window", () => {
       path: "/Users/ada/spawn",
     });
     expect(onLaunched).toHaveBeenCalledWith({ session: null, pendingCommand: false });
+  });
+
+  test("pauses an outdated host launch and lets Not now proceed", async () => {
+    const outdated = makeHost({
+      update: {
+        state: "available",
+        latest_version: "2",
+        error: null,
+        requested_at: null,
+      },
+    });
+    mockData.hosts = [outdated];
+    mockData.workspace = makeWorkspace({
+      host_id: outdated.id,
+      cwd: "/Users/ada/spawn",
+      layout: { version: 3, active_tab: "tab-1", tabs: [makeTab(), makeTab({ id: "tab-2" })] },
+    });
+    await renderSheet();
+
+    await fireEvent.press(screen.getByTestId("launcher-choice-shell"));
+    expect(mockLaunch).not.toHaveBeenCalled();
+
+    await act(() => fireEvent.press(screen.getByTestId("launcher-host-update-not-now")));
+    expect(mockLaunch).toHaveBeenCalledWith(
+      expect.objectContaining({ hostId: outdated.id, cwd: "/Users/ada/spawn" }),
+    );
   });
 
   test("says where the one tap will land, and offers the way out of it", async () => {

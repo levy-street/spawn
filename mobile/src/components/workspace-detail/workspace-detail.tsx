@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { useSharedValue } from "react-native-reanimated";
 import { TabPager } from "@/components/gestures/tab-pager";
+import { HostUpdateDialog } from "@/components/hosts/host-update-dialog";
+import { hostNeedsUpdatePrompt } from "@/components/hosts/host-update-status";
 import { LauncherSheet } from "@/components/launcher/launcher-sheet";
 import { AppHeader } from "@/components/layout/app-header";
 import { Screen } from "@/components/layout/screen";
@@ -92,6 +94,10 @@ export function WorkspaceDetail({
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
   const [confirmation, setConfirmation] = useState<ConfirmationState | null>(null);
   const [launcherTabId, setLauncherTabId] = useState<string | null>(null);
+  const [fileUpdatePrompt, setFileUpdatePrompt] = useState<{
+    hostId: string;
+    path: string;
+  } | null>(null);
   const paneDrag = usePaneDragValues();
   const screenRef = useRef<View>(null);
   const [screenOrigin, setScreenOrigin] = useState({ x: 0, y: 0 });
@@ -116,6 +122,18 @@ export function WorkspaceDetail({
     [sessions],
   );
   const hostsById = useMemo(() => new Map(hosts.map((host) => [host.id, host])), [hosts]);
+  const fileUpdateHost = fileUpdatePrompt ? (hostsById.get(fileUpdatePrompt.hostId) ?? null) : null;
+  const requestOpenFiles = useCallback(
+    (hostId: string, path: string) => {
+      const host = hostsById.get(hostId);
+      if (host && hostNeedsUpdatePrompt(host)) {
+        setFileUpdatePrompt({ hostId, path });
+        return;
+      }
+      onOpenFiles(hostId, path);
+    },
+    [hostsById, onOpenFiles],
+  );
 
   const resolvedTabId = workspace
     ? selectActiveTabId(workspace, { deviceTabId: selectedTabId })
@@ -279,7 +297,7 @@ export function WorkspaceDetail({
           draggingPaneId={draggingPane?.tile.session_id ?? null}
           hostsById={hostsById}
           onAddPane={() => presentLauncher(tab.id)}
-          onOpenFiles={onOpenFiles}
+          onOpenFiles={requestOpenFiles}
           onOpenTerminal={onOpenTerminal}
           onPaneActions={(tile) => setPaneTarget({ tabId: tab.id, tile })}
           onRefresh={refreshDetail}
@@ -305,11 +323,11 @@ export function WorkspaceDetail({
       draggingPane,
       dropPane,
       hostsById,
-      onOpenFiles,
       onOpenTerminal,
       paneDrag,
       presentLauncher,
       refreshDetail,
+      requestOpenFiles,
       sessionsById,
       transports,
       workspace,
@@ -558,6 +576,21 @@ export function WorkspaceDetail({
           visible={launcherTabId !== null}
           workspaceId={workspace.id}
         />
+        {fileUpdatePrompt && fileUpdateHost ? (
+          <HostUpdateDialog
+            host={fileUpdateHost}
+            onDismiss={() => setFileUpdatePrompt(null)}
+            onNotNow={() => {
+              onOpenFiles(fileUpdatePrompt.hostId, fileUpdatePrompt.path);
+              setFileUpdatePrompt(null);
+            }}
+            onUpdated={() => {
+              onOpenFiles(fileUpdatePrompt.hostId, fileUpdatePrompt.path);
+              setFileUpdatePrompt(null);
+            }}
+            visible
+          />
+        ) : null}
       </View>
     </Screen>
   );
