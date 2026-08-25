@@ -4,11 +4,16 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, FolderOpen, MoreHorizontal, Pencil, Server, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { HostAgentsPanel } from "@/components/hosts/HostAgentsPanel";
 import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { AppShell } from "@/components/nav/AppShell";
+import {
+  HostUpdateBadge,
+  HostUpdateDialog,
+  useHostUpdate,
+} from "@/components/release/HostUpdateDialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
@@ -78,6 +83,7 @@ function HostDetail() {
     refetchInterval: 5_000,
   });
   const host = hostQ.data;
+  const hostUpdate = useHostUpdate(host ?? null, { autoOpen: true });
   // Displayed fingerprint, derived LOCALLY from the served key (mesh B5): the
   // server no longer serves one, and this page would not show it if it did.
   const hostFingerprintQ = useQuery({
@@ -411,7 +417,19 @@ function HostDetail() {
           <div className="space-y-4">
             <dl className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-xl border border-border p-4 text-sm @lg/shell:grid-cols-4">
               <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
-              <Fact label="Daemon" value={host.version ?? "unknown"} />
+              <Fact
+                label="Daemon"
+                value={
+                  <span className="flex min-w-0 items-center gap-1.5">
+                    <span className="truncate">{host.version ?? "unknown"}</span>
+                    {(host.update.state === "available" || host.update.state === "updating") && (
+                      <button type="button" onClick={() => hostUpdate.openHostUpdate(host)}>
+                        <HostUpdateBadge host={host} />
+                      </button>
+                    )}
+                  </span>
+                }
+              />
               <Fact label="Sessions" value={String(host.session_count)} />
               <Fact
                 label="Connection"
@@ -486,17 +504,19 @@ function HostDetail() {
           </div>
         )}
       </main>
+      <HostUpdateDialog {...hostUpdate.dialogProps} />
     </div>
   );
 }
 
-function Fact({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+function Fact({ label, value, mono = false }: { label: string; value: ReactNode; mono?: boolean }) {
+  const title = typeof value === "string" ? value : undefined;
   return (
     <div className="min-w-0">
       <dt className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
         {label}
       </dt>
-      <dd className={`mt-0.5 truncate ${mono ? "font-mono text-xs leading-5" : ""}`} title={value}>
+      <dd className={`mt-0.5 truncate ${mono ? "font-mono text-xs leading-5" : ""}`} title={title}>
         {value}
       </dd>
     </div>

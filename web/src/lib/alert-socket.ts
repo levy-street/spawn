@@ -57,6 +57,7 @@ let lingerTimer: number | null = null;
 let watchdogTimer: number | null = null;
 let installed = false;
 let stopped = false;
+let protocolRequired = false;
 
 function setState(next: AlertSocketState): void {
   if (state === next) return;
@@ -85,7 +86,7 @@ function armWatchdog(): void {
 }
 
 function scheduleReconnect(): void {
-  if (stopped || !hasSubscribers()) return;
+  if (stopped || protocolRequired || !hasSubscribers()) return;
   reconnectTimer = clearTimer(reconnectTimer);
   // Exponential with a ceiling, jittered so many tabs waking together do not
   // redial in lockstep.
@@ -96,7 +97,7 @@ function scheduleReconnect(): void {
 }
 
 function connect(): void {
-  if (stopped || !hasSubscribers()) return;
+  if (stopped || protocolRequired || !hasSubscribers()) return;
   if (
     socket &&
     (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)
@@ -150,22 +151,32 @@ function connect(): void {
     }
   };
 
-  const onGone = () => {
+  const onGone = (event: Event) => {
     if (socket !== ws) return;
     socket = null;
     watchdogTimer = clearTimer(watchdogTimer);
     setState("closed");
+    if ("code" in event && event.code === 4003) {
+      protocolRequired = true;
+      reconnectTimer = clearTimer(reconnectTimer);
+      window.dispatchEvent(new CustomEvent("spawn:client-stale", { detail: { hard: true } }));
+      return;
+    }
     scheduleReconnect();
   };
   ws.onclose = onGone;
-  ws.onerror = onGone;
+  // The close frame carries the protocol-required code; handling an error
+  // first would throw that information away and start a reconnect too early.
+  ws.onerror = () => {
+    if (socket === ws) setState("closed");
+  };
 }
 
 function wake(): void {
   // Coming back from a hidden tab or a dropped network is the moment a
   // half-open socket gets discovered, so retry immediately rather than
   // waiting out the backoff.
-  if (!hasSubscribers() || stopped) return;
+  if (!hasSubscribers() || stopped || protocolRequired) return;
   if (socket && socket.readyState === WebSocket.OPEN) return;
   attempt = 0;
   connect();

@@ -12,6 +12,11 @@ import {
 } from "react";
 import { flushSync } from "react-dom";
 import { AgentIcon } from "@/components/icons/AgentIcon";
+import {
+  HostUpdateBadge,
+  HostUpdateDialog,
+  useHostUpdate,
+} from "@/components/release/HostUpdateDialog";
 import { toast } from "@/components/ui/toast";
 import {
   type Agent,
@@ -139,6 +144,7 @@ export function LauncherFab({
   const target = tabHome(workspace.layout, tabId, workspace);
   const homeHost = (hostsQ.data ?? []).find((host) => host.id === target?.host_id) ?? null;
   const home = homeHost && target ? { host: homeHost, cwd: target.cwd } : null;
+  const hostUpdate = useHostUpdate(home?.host ?? null);
 
   const createM = useMutation({
     mutationFn: async ({
@@ -269,6 +275,15 @@ export function LauncherFab({
     : home.host.status !== "online"
       ? `${home.host.name} is offline`
       : undefined;
+
+  const launch = (input: {
+    choice: Choice;
+    placement?: Rect;
+    dock?: { targetId: string; zone: DockZone };
+  }) => {
+    if (!home) return;
+    hostUpdate.promptHostUpdate(home.host, () => createM.mutate(input));
+  };
 
   const layoutRef = useRef(workspace.layout);
   layoutRef.current = workspace.layout;
@@ -435,7 +450,7 @@ export function LauncherFab({
       if (!drag) return;
       if (!drag.started) {
         // A tap: create at home, auto-placed in the open tab.
-        createM.mutate({ choice: drag.choice });
+        launch({ choice: drag.choice });
         return;
       }
       // Whatever the outline last promised — deriving it again from the
@@ -445,14 +460,14 @@ export function LauncherFab({
       const drop = drag.drop;
       if (!drop) return;
       if (drop.kind === "opening") {
-        createM.mutate({ choice: drag.choice, placement: drop.rect });
+        launch({ choice: drag.choice, placement: drop.rect });
       } else if (drop.kind === "dock") {
-        createM.mutate({
+        launch({
           choice: drag.choice,
           dock: { targetId: drop.targetId, zone: drop.zone },
         });
       } else {
-        createM.mutate({ choice: drag.choice });
+        launch({ choice: drag.choice });
       }
     };
     const onCancel = () => endDrag();
@@ -548,6 +563,12 @@ export function LauncherFab({
           "[@media(pointer:coarse)]:bottom-[calc(4.5rem+var(--safe-bottom))]",
         )}
       >
+        {home && (
+          <HostUpdateBadge
+            host={home.host}
+            className="absolute -top-7 right-0 shadow-sm shadow-black/10"
+          />
+        )}
         <div
           role="toolbar"
           aria-label="New window launcher"
@@ -580,7 +601,7 @@ export function LauncherFab({
               onKeyDown={(event) => {
                 if (event.key === "Enter" || event.key === " ") {
                   event.preventDefault();
-                  if (!disabled) createM.mutate({ choice: item.choice });
+                  if (!disabled) launch({ choice: item.choice });
                 }
               }}
               className={cn(
@@ -647,6 +668,7 @@ export function LauncherFab({
           {choiceLabel(dragging.choice)}
         </div>
       )}
+      <HostUpdateDialog {...hostUpdate.dialogProps} />
     </>
   );
 }

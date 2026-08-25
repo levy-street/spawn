@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { GridLayout, Tile, TileWidget } from "@/lib/grid";
+import { type ReleaseInfo, ReleaseSchema } from "@/lib/release";
 import type { LayoutV3, WorkspaceTab } from "@/lib/tabs";
 
 /**
@@ -76,12 +77,42 @@ export const UserSchema = z.object({
 });
 export type User = z.infer<typeof UserSchema>;
 
+export const HostUpdateSchema = z.preprocess(
+  (value) => value ?? {},
+  z.object({
+    state: z
+      .enum(["current", "available", "updating", "failed", "unsupported", "unknown"])
+      .catch("unknown"),
+    latest_version: z
+      .string()
+      .nullish()
+      .transform((value) => value ?? null),
+    error: z
+      .string()
+      .nullish()
+      .transform((value) => value ?? null),
+    requested_at: z
+      .string()
+      .nullish()
+      .transform((value) => value ?? null),
+  }),
+);
+export type HostUpdate = z.infer<typeof HostUpdateSchema>;
+
+export const HostUpdateResponseSchema = z.object({ update: HostUpdateSchema });
+export type HostUpdateResponse = z.infer<typeof HostUpdateResponseSchema>;
+
 export const HostSchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
   os: z.string().nullable().optional(),
   arch: z.string().nullable().optional(),
   version: z.string().nullable().optional(),
+  daemon_tree: z
+    .string()
+    .nullish()
+    .transform((value) => value ?? null),
+  update: HostUpdateSchema,
   host_key_algorithm: z.literal("ed25519").nullable().optional(),
   // The key travels alone (mesh B5): any fingerprint shown or compared is
   // derived locally from it, never read off a server response.
@@ -592,6 +623,11 @@ export const hosts = {
       body: JSON.stringify({ name }),
       schema: HostSchema,
     }),
+  update: (id: string) =>
+    api(`/api/hosts/${id}/update`, {
+      method: "POST",
+      schema: HostUpdateResponseSchema,
+    }),
   remove: (id: string) => api<void>(`/api/hosts/${id}`, { method: "DELETE" }),
   /** Availability of every agent definition on this host. */
   agents: (id: string) =>
@@ -753,6 +789,15 @@ export const admin = {
 
 export const profile = {
   get: () => api("/api/profile", { method: "GET", schema: ProfileSchema }),
+};
+
+export const release = {
+  get: (): Promise<ReleaseInfo> =>
+    api("/api/release", {
+      method: "GET",
+      cache: "no-store",
+      schema: ReleaseSchema,
+    }),
 };
 
 export const account = {

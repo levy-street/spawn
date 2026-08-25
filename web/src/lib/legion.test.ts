@@ -32,6 +32,8 @@ function makeHost(id: string, name: string, overrides: Partial<Host> = {}): Host
     os: "linux",
     arch: "x86_64",
     version: "0.1.0",
+    daemon_tree: null,
+    update: { state: "current", latest_version: null, error: null, requested_at: null },
     host_key_algorithm: "ed25519",
     host_public_key: null,
     supports_account_chains: false,

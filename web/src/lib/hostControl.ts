@@ -162,6 +162,7 @@ async function collectStream(stream: ReadableStream<Uint8Array>): Promise<Uint8A
 }
 
 export type HostControlState = "idle" | "connecting" | "open" | "ready" | "closed" | "error";
+export type HostControlTerminalReason = "protocol_required";
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -282,6 +283,9 @@ export class HostControlClient {
   // Non-null when the last attempt was refused because the host identity could
   // not be verified against a local pin. Terminal: blocks auto-reconnect.
   private signedRtcRefusal: SignedRtcRefusalReason | null = null;
+  // A wire-version refusal is terminal too, but it is not a trust refusal and
+  // must never be surfaced as one. The release watcher owns its recovery UI.
+  private terminalReason: HostControlTerminalReason | null = null;
   private stopped = true;
   private pending = new Map<string, PendingRequest>();
   private incomingStreams = new Map<string, IncomingStream>();
@@ -308,6 +312,7 @@ export class HostControlClient {
     if (!this.stopped) return;
     this.stopped = false;
     this.signedRtcRefusal = null;
+    this.terminalReason = null;
     this.openWebSocket();
   }
 
@@ -315,6 +320,10 @@ export class HostControlClient {
    * null. A refusal is terminal until an explicit reconnect. */
   getSignedRtcRefusal(): SignedRtcRefusalReason | null {
     return this.signedRtcRefusal;
+  }
+
+  getTerminalReason(): HostControlTerminalReason | null {
+    return this.terminalReason;
   }
 
   waitUntilReady(timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS): Promise<void> {
@@ -1120,12 +1129,20 @@ export class HostControlClient {
       if (!this.isCurrentWebSocket(ws, attempt)) return;
       this.setState("error");
     };
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       if (!this.isCurrentWebSocket(ws, attempt)) return;
       this.detachWebSocket(ws);
       this.ws = null;
       this.clearConnectDeadline();
       this.cleanupRtc(false);
+      if (event?.code === 4003) {
+        this.terminalReason = "protocol_required";
+        this.setState("error");
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("spawn:client-stale", { detail: { hard: true } }));
+        }
+        return;
+      }
       if (!this.stopped) this.scheduleReconnect();
     };
   }
@@ -1715,7 +1732,13 @@ export class HostControlClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.stopped || this.signedRtcRefusal !== null || this.reconnectTimer) return;
+    if (
+      this.stopped ||
+      this.signedRtcRefusal !== null ||
+      this.terminalReason !== null ||
+      this.reconnectTimer
+    )
+      return;
     this.clearConnectDeadline();
     this.reconnectAttempt += 1;
     const attempt = this.connectionAttempt;

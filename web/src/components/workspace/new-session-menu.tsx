@@ -16,6 +16,11 @@ import {
 } from "react";
 import { AgentIcon } from "@/components/icons/AgentIcon";
 import {
+  HostUpdateBadge,
+  HostUpdateDialog,
+  useHostUpdate,
+} from "@/components/release/HostUpdateDialog";
+import {
   type CascadeItem,
   CascadeMenu,
   type CascadeMenuHandle,
@@ -111,6 +116,7 @@ function useNewSessionChoices(
   const [pickerOpen, setPickerOpen] = useState(false);
   const [workspaceFull, setWorkspaceFull] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const hostUpdate = useHostUpdate(null);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, staleTime: 15_000 });
   const workspaceQ = useQuery({
     queryKey: ["workspace", workspaceId],
@@ -247,7 +253,7 @@ function useNewSessionChoices(
   const createAt = (host: Host, cwd: string, choice: Choice) => {
     if (host.status !== "online" || createM.isPending || workspaceFull) return;
     setErrorMessage(null);
-    createM.mutate({ host, cwd, choice });
+    hostUpdate.promptHostUpdate(host, () => createM.mutate({ host, cwd, choice }));
   };
 
   /** Browse `host` for a folder; picking one creates the choice there. */
@@ -262,10 +268,16 @@ function useNewSessionChoices(
    * no menu of locations to step through — one host opens it straight away,
    * several ask which machine first.
    */
-  const elsewhere = (choice: Choice): Pick<CascadeItem, "disabled" | "onSelect" | "panel"> => {
+  const elsewhere = (
+    choice: Choice,
+  ): Pick<CascadeItem, "disabled" | "onSelect" | "panel" | "trailing"> => {
     const only = hostList.length === 1 ? hostList[0] : null;
     if (only) {
-      return { disabled: only.status !== "online", onSelect: () => browseFolders(only, choice) };
+      return {
+        disabled: only.status !== "online",
+        onSelect: () => browseFolders(only, choice),
+        trailing: <HostUpdateBadge host={only} />,
+      };
     }
     return {
       panel: {
@@ -278,6 +290,7 @@ function useNewSessionChoices(
           icon: <StatusDot tone={hostStatusTone(host.status)} label={host.status} />,
           label: host.name,
           detail: host.status === "offline" ? "offline" : undefined,
+          trailing: <HostUpdateBadge host={host} />,
           disabled: host.status === "offline",
           onSelect: () => browseFolders(host, choice),
         })),
@@ -286,11 +299,14 @@ function useNewSessionChoices(
   };
 
   // What goes in the window; then where it points, unless home answers that.
-  const target = (choice: Choice): Pick<CascadeItem, "disabled" | "onSelect" | "panel"> =>
+  const target = (
+    choice: Choice,
+  ): Pick<CascadeItem, "disabled" | "onSelect" | "panel" | "trailing"> =>
     home
       ? {
           disabled: home.host.status !== "online",
           onSelect: () => createAt(home.host, home.cwd, choice),
+          trailing: <HostUpdateBadge host={home.host} />,
         }
       : elsewhere(choice);
 
@@ -376,6 +392,7 @@ function useNewSessionChoices(
           if (pickerHost) createAt(pickerHost, path, pickerChoice);
         }}
       />
+      <HostUpdateDialog {...hostUpdate.dialogProps} />
     </>
   );
 
@@ -499,6 +516,7 @@ function Lozenge({
         </span>
       )}
       {item.label}
+      {item.trailing}
       {item.panel != null && (
         <ChevronRight className="-mr-1 size-3.5 shrink-0 opacity-50" aria-hidden />
       )}
