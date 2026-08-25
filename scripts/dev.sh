@@ -220,8 +220,8 @@ daemon_watch() {
 }
 
 if SPAWN_CONFIG_DIR="$daemon_config_dir" \
-  daemon/target/debug/spawnd --server "$public_url" status 2>/dev/null \
-  | grep -q '^logged in:[[:space:]]*yes$'; then
+  daemon/target/debug/spawnd --server "$public_url" status --json 2>/dev/null \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if any(i.get("signed_in") for i in d.get("instances", [])) else 1)'; then
   printf '%s\n' '== starting isolated local daemon (Rust changes are watched) =='
   daemon_watch &
   child_pids+=("$!")
