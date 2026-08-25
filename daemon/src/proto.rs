@@ -108,6 +108,10 @@ pub enum Outbound {
         os: String,
         arch: String,
         version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_tree: Option<String>,
+        self_update: bool,
+        self_update_blocked: Option<String>,
         existing_sessions: Vec<Uuid>,
         /// What this machine is — cores, memory, CPU model, GPU. Sent once, on
         /// registration, because none of it changes while the daemon runs.
@@ -136,6 +140,15 @@ pub enum Outbound {
     },
     #[serde(rename = "host.pong")]
     HostPong { request_id: String },
+    #[serde(rename = "daemon.update_result")]
+    DaemonUpdateResult {
+        request_id: String,
+        ok: bool,
+        tree: String,
+        version_before: String,
+        stage: Option<String>,
+        error: Option<String>,
+    },
     #[serde(rename = "session.exit")]
     SessionExit {
         session_id: Uuid,
@@ -258,6 +271,12 @@ pub struct InboundBrowserPin {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonUpdateArtifact {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Inbound {
     Registered {
@@ -300,6 +319,15 @@ pub enum Inbound {
     HostHeartbeat,
     #[serde(rename = "host.ping")]
     HostPing { request_id: String },
+    #[serde(rename = "daemon.update")]
+    DaemonUpdate {
+        request_id: String,
+        version: String,
+        tree: String,
+        target: String,
+        spawnd: DaemonUpdateArtifact,
+        spawn_worker: DaemonUpdateArtifact,
+    },
     #[serde(rename = "host.agents.check")]
     HostAgentsCheck {
         request_id: String,
@@ -566,6 +594,85 @@ pub struct DevicePollResponse {
     pub account_id: Option<String>,
     pub browser_approval_signature: Option<String>,
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod daemon_update_wire_tests {
+    use super::*;
+
+    #[test]
+    fn register_carries_self_update_identity_and_capability() {
+        let value = serde_json::to_value(Outbound::Register {
+            host_name: "workstation".into(),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            version: "0.1.0+g123456789abc".into(),
+            daemon_tree: Some("a".repeat(40)),
+            self_update: true,
+            self_update_blocked: None,
+            existing_sessions: Vec::new(),
+            spec: None,
+            supports_account_chains: true,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "register");
+        assert_eq!(value["daemon_tree"], "a".repeat(40));
+        assert_eq!(value["self_update"], true);
+        assert!(value["self_update_blocked"].is_null());
+
+        let without_tree = serde_json::to_value(Outbound::Register {
+            host_name: "workstation".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            version: "0.1.0".into(),
+            daemon_tree: None,
+            self_update: false,
+            self_update_blocked: Some("worker_missing".into()),
+            existing_sessions: Vec::new(),
+            spec: None,
+            supports_account_chains: true,
+        })
+        .unwrap();
+        assert!(without_tree.get("daemon_tree").is_none());
+        assert_eq!(without_tree["self_update_blocked"], "worker_missing");
+    }
+
+    #[test]
+    fn daemon_update_and_result_match_the_exact_wire_names() {
+        let request: Inbound = serde_json::from_value(serde_json::json!({
+            "type": "daemon.update",
+            "request_id": "11111111-2222-4333-8444-555555555555",
+            "version": "0.1.0+g123456789abc",
+            "tree": "a".repeat(40),
+            "target": "darwin-aarch64",
+            "spawnd": {
+                "path": "/api/install/spawnd/darwin-aarch64",
+                "sha256": "b".repeat(64)
+            },
+            "spawn_worker": {
+                "path": "/api/install/spawn-worker/darwin-aarch64",
+                "sha256": "c".repeat(64)
+            }
+        }))
+        .expect("daemon.update wire parses");
+        assert!(matches!(
+            request,
+            Inbound::DaemonUpdate { ref target, .. } if target == "darwin-aarch64"
+        ));
+
+        let result = serde_json::to_value(Outbound::DaemonUpdateResult {
+            request_id: "11111111-2222-4333-8444-555555555555".into(),
+            ok: false,
+            tree: "a".repeat(40),
+            version_before: "0.1.0+g000000000000".into(),
+            stage: Some("verify".into()),
+            error: Some("sha256_mismatch".into()),
+        })
+        .unwrap();
+        assert_eq!(result["type"], "daemon.update_result");
+        assert_eq!(result["stage"], "verify");
+        assert_eq!(result["error"], "sha256_mismatch");
+    }
 }
 
 #[cfg(test)]

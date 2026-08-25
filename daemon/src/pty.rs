@@ -26,24 +26,68 @@ use crate::activity;
 use crate::proto::Outbound;
 
 #[derive(Clone, Debug)]
-pub struct WsOutbound(String);
+enum WsOutboundKind {
+    Text(String),
+    Close,
+}
+
+#[derive(Clone, Debug)]
+pub struct WsOutbound {
+    kind: WsOutboundKind,
+    flushed: Option<Arc<Notify>>,
+}
 
 impl WsOutbound {
     pub(crate) fn json(text: String) -> Self {
-        Self(text)
+        Self {
+            kind: WsOutboundKind::Text(text),
+            flushed: None,
+        }
     }
 
-    pub(crate) fn into_text(mut self) -> String {
-        std::mem::take(&mut self.0)
+    pub(crate) fn tracked_json(text: String) -> (Self, Arc<Notify>) {
+        let flushed = Arc::new(Notify::new());
+        (
+            Self {
+                kind: WsOutboundKind::Text(text),
+                flushed: Some(Arc::clone(&flushed)),
+            },
+            flushed,
+        )
+    }
+
+    pub(crate) fn tracked_close() -> (Self, Arc<Notify>) {
+        let flushed = Arc::new(Notify::new());
+        (
+            Self {
+                kind: WsOutboundKind::Close,
+                flushed: Some(Arc::clone(&flushed)),
+            },
+            flushed,
+        )
+    }
+
+    pub(crate) fn into_parts(mut self) -> (Option<String>, bool, Option<Arc<Notify>>) {
+        let kind = std::mem::replace(&mut self.kind, WsOutboundKind::Close);
+        let flushed = self.flushed.take();
+        match kind {
+            WsOutboundKind::Text(text) => (Some(text), false, flushed),
+            WsOutboundKind::Close => (None, true, flushed),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        match &self.kind {
+            WsOutboundKind::Text(text) => text,
+            WsOutboundKind::Close => "",
+        }
     }
 
     pub(crate) fn wipe(&mut self) {
-        self.0.zeroize();
+        if let WsOutboundKind::Text(text) = &mut self.kind {
+            text.zeroize();
+        }
     }
 }
 

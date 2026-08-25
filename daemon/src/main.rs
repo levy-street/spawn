@@ -32,6 +32,7 @@ mod run;
 mod service;
 mod session_ctl;
 mod sessions;
+mod update;
 mod upload;
 mod version;
 mod worker_backend;
@@ -50,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_var("SPAWN_CONFIG_DIR", dir);
     }
     init_tracing(cli.verbose);
+    update::cleanup_stale_previous();
 
     match cli.command {
         Command::Possess(args) => possess::possess(cli.server.clone(), args).await,
@@ -64,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
             run::run(cli.server.clone(), cli::RunArgs {}).await
         }
         Command::Run(args) => run::run(cli.server.clone(), args).await,
+        Command::Update => update::run_cli(cli.server.clone()).await,
         Command::Logout => creds::logout().await,
         Command::Status => creds::status(cli.server.clone()).await,
     }
