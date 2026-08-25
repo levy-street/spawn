@@ -2,12 +2,12 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { Plus, Radio, RadioTower } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { AuthGate } from "@/components/auth/AuthGate";
 import { LegionHostCard } from "@/components/legion/LegionHostCard";
 import { Stat } from "@/components/legion/legion-parts";
 import { AppShell } from "@/components/nav/AppShell";
-import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { hosts, sessions } from "@/lib/api";
@@ -34,6 +34,7 @@ export default function LegionPage() {
 }
 
 function LegionBody() {
+  const router = useRouter();
   const [liveMetrics, setLiveMetrics] = useState(false);
   const hostsQ = useQuery({ queryKey: ["hosts"], queryFn: hosts.list, refetchInterval: 15_000 });
   const sessionsQ = useQuery({
@@ -110,7 +111,7 @@ function LegionBody() {
               variant="outline"
               size="sm"
               className="mt-4"
-              onClick={() => openSettings("hosts")}
+              onClick={() => router.push("/device")}
             >
               <Plus className="size-4" aria-hidden />
               Possess a machine
@@ -126,7 +127,7 @@ function LegionBody() {
              * looking at, so the surface that shows it should ask for one more. */}
             <button
               type="button"
-              onClick={() => openSettings("hosts")}
+              onClick={() => router.push("/device")}
               className="group/slot flex min-h-28 flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground"
             >
               <Plus

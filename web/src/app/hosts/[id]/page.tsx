@@ -9,11 +9,6 @@ import { AuthGate } from "@/components/auth/AuthGate";
 import { HostAgentsPanel } from "@/components/hosts/HostAgentsPanel";
 import { AgentIcon, agentDisplayName } from "@/components/icons/AgentIcon";
 import { AppShell } from "@/components/nav/AppShell";
-import {
-  openSettings,
-  type SettingsTab,
-  takeSettingsReturn,
-} from "@/components/settings/settings-dialog-store";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { confirm } from "@/components/ui/confirm";
@@ -64,11 +59,6 @@ function HostDetail() {
   const id = params?.id;
   const router = useRouter();
   const queryClient = useQueryClient();
-  // Read once, on mount, and cleared by the read: the flag describes the
-  // navigation that landed here, not a persistent property of the page.
-  const settingsReturnRef = useRef<SettingsTab | null | undefined>(undefined);
-  if (settingsReturnRef.current === undefined) settingsReturnRef.current = takeSettingsReturn();
-  const settingsReturn = settingsReturnRef.current;
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -159,8 +149,8 @@ function HostDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["hosts"] });
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
-      openSettings("hosts");
-      router.push("/app");
+      // The machine is gone; the fleet it left is the place to land.
+      router.push("/legion");
     },
     onError: (caught) => {
       if (caught instanceof HostDeletionFlowError && caught.localTombstoneWritten) {
@@ -257,18 +247,11 @@ function HostDetail() {
   };
 
   /**
-   * Back means back — always the route you came from. Arriving here from the
-   * settings dialog additionally reopens it on the way, because the dialog is
-   * not URL state and so is the one part of "where I was" that history cannot
-   * restore by itself. Opening it before the navigation is what carries it
-   * across: the store is a module singleton, so the shell that mounts on the
-   * far side finds it already open.
-   *
-   * A page opened cold in a fresh tab has nothing to pop, so it goes to the
-   * legion rather than leaving the arrow dead.
+   * Back means back — the route you came from. A page opened cold in a fresh
+   * tab has nothing to pop, so it goes to the legion rather than leaving the
+   * arrow dead.
    */
   const goBack = () => {
-    if (settingsReturn) openSettings(settingsReturn);
     if (window.history.length > 1) router.back();
     else router.push("/legion");
   };

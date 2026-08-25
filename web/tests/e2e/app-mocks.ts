@@ -1717,7 +1717,6 @@ export async function openSettings(
     | "account"
     | "appearance"
     | "notifications"
-    | "hosts"
     | "agents"
     | "skills"
     | "templates"

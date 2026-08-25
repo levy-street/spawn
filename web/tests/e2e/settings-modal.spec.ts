@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { agent, host, mockApp, openSettings, USER_ID, user } from "./app-mocks";
 
-test("all eight settings tabs open", async ({ page }) => {
+test("all seven settings tabs open", async ({ page }) => {
   await mockApp(page);
   await openSettings(page);
   // "Browser devices" and "Device trust" were two tabs before the mesh; both
@@ -10,7 +10,6 @@ test("all eight settings tabs open", async ({ page }) => {
     ["Account", "Account"],
     ["Appearance", "Appearance"],
     ["Notifications", "Notifications"],
-    ["Hosts", "Hosts"],
     ["Agents", "Agents"],
     ["Skills", "Skills"],
     ["Templates", "Workspace templates"],
@@ -39,13 +38,15 @@ test("switching tabs changes the panel without navigating", async ({ page }) => 
   expect(page.url()).toBe(url);
 });
 
-test("Hosts lists connected machines and offers the connect flow", async ({ page }) => {
+test("Settings has no Hosts tab: machines live on the legion", async ({ page }) => {
   await mockApp(page, { hosts: [host] });
-  await openSettings(page, "hosts");
-  // The sidebar names the host too; assert the panel's own row.
-  const panel = page.getByTestId("settings-dialog");
-  await expect(panel.getByText("Mac", { exact: true })).toBeVisible();
-  await expect(panel.getByText("macos/aarch64 · daemon 0.1.0")).toBeVisible();
+  await openSettings(page);
+  await expect(page.getByRole("button", { name: "Hosts", exact: true })).toHaveCount(0);
+});
+
+test("the connect flow lives on its own page, reached from the legion", async ({ page }) => {
+  await mockApp(page, { hosts: [host] });
+  await page.goto("/device");
   await expect(page.getByRole("heading", { name: "Connect a host" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Copy install command" })).toBeVisible();
   await expect(page.getByLabel("Code from the terminal")).toBeVisible();

@@ -677,7 +677,7 @@ export function Sidebar({
           ? undefined
           : () => {
               onNavigate?.();
-              openSettings("hosts");
+              router.push("/device");
             }
       }
       className={cn(sidebarRowClass(false), "group/new")}
