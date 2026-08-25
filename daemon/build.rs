@@ -7,8 +7,10 @@
 use std::process::Command;
 
 fn main() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
     let pkg_version = std::env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
     let commit = Command::new("git")
+        .current_dir(&manifest_dir)
         .args(["rev-parse", "--short=12", "HEAD"])
         .output()
         .ok()
@@ -25,11 +27,43 @@ fn main() {
     };
     println!("cargo:rustc-env=SPAWND_BUILD_VERSION={version}");
 
+    // A tree identity changes only when daemon/ content changes, unlike the
+    // repository commit stamped into the human-readable version. Dirty builds
+    // are deliberately distinct so release comparison can decline to update
+    // either side while a developer is working locally.
+    let tree = Command::new("git")
+        .current_dir(&manifest_dir)
+        .args(["rev-parse", "HEAD:daemon"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|stdout| stdout.trim().to_string())
+        .unwrap_or_default();
+    let tree = if tree.is_empty() {
+        tree
+    } else {
+        let clean = Command::new("git")
+            .current_dir(&manifest_dir)
+            .args(["diff", "--quiet", "HEAD", "--", "."])
+            .status()
+            .is_ok_and(|status| status.success());
+        if clean {
+            tree
+        } else {
+            format!("{tree}-dirty")
+        }
+    };
+    println!("cargo:rustc-env=SPAWND_DAEMON_TREE={tree}");
+
     // Re-stamp when HEAD moves; .git sits at the repo root, one level up.
     println!("cargo:rerun-if-changed=../.git/HEAD");
     if let Ok(head) = std::fs::read_to_string("../.git/HEAD") {
         if let Some(reference) = head.strip_prefix("ref: ") {
             println!("cargo:rerun-if-changed=../.git/{}", reference.trim());
         }
+    }
+    for path in ["src", "build.rs", "Cargo.toml", "Cargo.lock"] {
+        println!("cargo:rerun-if-changed={path}");
     }
 }

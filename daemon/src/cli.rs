@@ -40,6 +40,8 @@ pub enum Command {
     Login(LoginArgs),
     /// Foreground; connects WSS and services frames.
     Run(RunArgs),
+    /// Check for and apply the latest SPAWN D daemon release once.
+    Update,
     /// Wipe the complete stored credential record, including browser pins.
     Logout,
     /// Print credential state and redacted host/browser fingerprints.

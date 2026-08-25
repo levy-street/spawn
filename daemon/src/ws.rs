@@ -22,6 +22,19 @@ use url::Url;
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const SUBPROTOCOL: &str = "spawn.control.v3";
+const PROTOCOL_REQUIRED_CLOSE_CODE: u16 = 4003;
+
+#[derive(Debug, thiserror::Error)]
+#[error("server did not select the required websocket subprotocol")]
+struct ProtocolRequired;
+
+pub fn is_protocol_required(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ProtocolRequired>())
+}
+
+pub fn protocol_required_error() -> anyhow::Error {
+    ProtocolRequired.into()
+}
 
 /// Open a WS/WSS connection with `Authorization: Bearer <token>` and
 /// `Sec-WebSocket-Protocol: spawn.control.v3`. We TCP-connect manually first so we
@@ -104,11 +117,11 @@ pub async fn connect(ws_url: &Url, token: &str) -> Result<WsStream> {
 fn require_selected_subprotocol(headers: &HeaderMap) -> Result<()> {
     let selected = headers
         .get("Sec-WebSocket-Protocol")
-        .ok_or_else(|| anyhow!("server did not select the required websocket subprotocol"))?
+        .ok_or(ProtocolRequired)?
         .to_str()
         .context("server selected a malformed websocket subprotocol")?;
     if selected != SUBPROTOCOL {
-        anyhow::bail!("server did not select the required websocket subprotocol");
+        return Err(ProtocolRequired.into());
     }
     Ok(())
 }
@@ -140,7 +153,15 @@ pub async fn send_json(stream: &mut WsStream, frame: &Outbound) -> Result<()> {
 pub enum WsInbound {
     Json(Box<Inbound>),
     /// Server closed the connection.
+    Closed {
+        protocol_required: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderOutcome {
     Closed,
+    ProtocolRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +183,11 @@ fn classify(msg: Message) -> std::result::Result<Option<WsInbound>, InboundFrame
             Ok(Some(WsInbound::Json(Box::new(frame))))
         }
         Message::Binary(_) => Err(InboundFrameError::BinaryForbidden),
-        Message::Close(_) => Ok(Some(WsInbound::Closed)),
+        Message::Close(frame) => Ok(Some(WsInbound::Closed {
+            protocol_required: frame
+                .as_ref()
+                .is_some_and(|close| u16::from(close.code) == PROTOCOL_REQUIRED_CLOSE_CODE),
+        })),
         Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(None),
     }
 }
@@ -174,12 +199,27 @@ pub async fn run_sender_loop(
     mut rx: mpsc::Receiver<WsOutbound>,
 ) {
     while let Some(out) = rx.recv().await {
-        let res = stream_tx.send(Message::Text(out.into_text())).await;
+        let (text, close, flushed) = out.into_parts();
+        let res = if close {
+            stream_tx.close().await
+        } else {
+            stream_tx
+                .send(Message::Text(text.expect("text outbound has payload")))
+                .await
+        };
         if res.is_err() {
             // A peer-initiated protocol failure can influence tungstenite's
             // error text. Do not copy it into daemon logs.
             tracing::warn!("daemon control websocket send failed; sender loop exiting");
             break;
+        }
+        if let Some(flushed) = flushed {
+            // notify_one retains a permit if the updater has not started
+            // awaiting yet, so the bounded flush cannot miss a fast send.
+            flushed.notify_one();
+        }
+        if close {
+            return;
         }
     }
     let _ = stream_tx.close().await;
@@ -199,7 +239,7 @@ const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 pub async fn run_reader_loop(
     mut stream_rx: futures_util::stream::SplitStream<WsStream>,
     inbound_tx: mpsc::Sender<WsInbound>,
-) {
+) -> ReaderOutcome {
     use std::time::Instant;
     let mut last_meaningful = Instant::now();
     loop {
@@ -212,7 +252,7 @@ pub async fn run_reader_loop(
                 "ws read idle {:?}; treating as disconnected",
                 READ_IDLE_TIMEOUT
             );
-            break;
+            return ReaderOutcome::Closed;
         }
         let remaining = READ_IDLE_TIMEOUT - elapsed;
         let next = tokio::time::timeout(remaining, stream_rx.next()).await;
@@ -223,28 +263,36 @@ pub async fn run_reader_loop(
                     "ws read idle {:?}; treating as disconnected",
                     READ_IDLE_TIMEOUT
                 );
-                break;
+                return ReaderOutcome::Closed;
             }
         };
-        let Some(msg) = msg_opt else { break };
+        let Some(msg) = msg_opt else {
+            return ReaderOutcome::Closed;
+        };
         let msg = match msg {
             Ok(m) => m,
             Err(_) => {
                 // Tungstenite protocol errors can include peer-controlled
                 // close reasons. Keep the ingress diagnostic content-free.
                 tracing::warn!("daemon control websocket read failed");
-                break;
+                return ReaderOutcome::Closed;
             }
         };
         match classify(msg) {
-            Ok(Some(WsInbound::Closed)) => {
-                let _ = inbound_tx.send(WsInbound::Closed).await;
-                break;
+            Ok(Some(WsInbound::Closed { protocol_required })) => {
+                let _ = inbound_tx
+                    .send(WsInbound::Closed { protocol_required })
+                    .await;
+                return if protocol_required {
+                    ReaderOutcome::ProtocolRequired
+                } else {
+                    ReaderOutcome::Closed
+                };
             }
             Ok(Some(other)) => {
                 last_meaningful = Instant::now();
                 if inbound_tx.send(other).await.is_err() {
-                    break;
+                    return ReaderOutcome::Closed;
                 }
             }
             Ok(None) => {
@@ -267,6 +315,12 @@ pub async fn run_reader_loop(
 pub fn backoff_for_attempt(attempt: u32) -> Duration {
     let secs = 1u64.checked_shl(attempt.min(6)).unwrap_or(60);
     Duration::from_secs(secs.min(60))
+}
+
+/// Protocol refusal needs enough space for an HTTP update attempt and avoids
+/// hammering a server that this binary cannot speak to.
+pub fn self_update_backoff() -> Duration {
+    Duration::from_secs(5 * 60)
 }
 
 #[cfg(test)]
@@ -292,13 +346,15 @@ mod tests {
     #[test]
     fn daemon_control_handshake_requires_exact_selected_subprotocol() {
         let mut headers = HeaderMap::new();
-        assert!(require_selected_subprotocol(&headers).is_err());
+        let missing = require_selected_subprotocol(&headers).unwrap_err();
+        assert!(is_protocol_required(&missing));
 
         headers.insert(
             "Sec-WebSocket-Protocol",
             HeaderValue::from_str(&["spawn.control.v", "1"].concat()).unwrap(),
         );
-        assert!(require_selected_subprotocol(&headers).is_err());
+        let wrong = require_selected_subprotocol(&headers).unwrap_err();
+        assert!(is_protocol_required(&wrong));
 
         headers.insert(
             "Sec-WebSocket-Protocol",
@@ -311,6 +367,99 @@ mod tests {
             HeaderValue::from_static(SUBPROTOCOL),
         );
         require_selected_subprotocol(&headers).expect("exact subprotocol accepted");
+    }
+
+    #[test]
+    fn close_4003_is_preserved_as_a_protocol_update_trigger() {
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+
+        let required = classify(Message::Close(Some(CloseFrame {
+            code: CloseCode::Library(PROTOCOL_REQUIRED_CLOSE_CODE),
+            reason: "server-controlled reason must not be retained".into(),
+        })))
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            required,
+            WsInbound::Closed {
+                protocol_required: true
+            }
+        ));
+
+        let ordinary = classify(Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "ordinary".into(),
+        })))
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            ordinary,
+            WsInbound::Closed {
+                protocol_required: false
+            }
+        ));
+    }
+
+    #[test]
+    fn protocol_update_backoff_is_separate_from_the_normal_ladder() {
+        assert_eq!(backoff_for_attempt(99), Duration::from_secs(60));
+        assert_eq!(self_update_backoff(), Duration::from_secs(5 * 60));
+    }
+
+    #[tokio::test]
+    async fn tracked_sender_frames_ack_flush_then_close_cleanly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tracked sender test");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                tcp,
+                |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        "Sec-WebSocket-Protocol",
+                        HeaderValue::from_static(SUBPROTOCOL),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let text = socket
+                .next()
+                .await
+                .expect("tracked text")
+                .expect("valid tracked text")
+                .into_text()
+                .expect("text frame");
+            assert_eq!(text, r#"{"type":"daemon.update_result","ok":true}"#);
+            assert!(matches!(
+                socket.next().await,
+                Some(Ok(Message::Close(_))) | None
+            ));
+        });
+
+        let url = Url::parse(&format!("ws://{address}/ws/daemon")).unwrap();
+        let stream = connect(&url, "tracked-test-token").await.unwrap();
+        let (write_half, _read_half) = stream.split();
+        let (tx, rx) = mpsc::channel(2);
+        let sender = tokio::spawn(run_sender_loop(write_half, rx));
+        let (frame, frame_flushed) =
+            WsOutbound::tracked_json(r#"{"type":"daemon.update_result","ok":true}"#.to_string());
+        tx.send(frame).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), frame_flushed.notified())
+            .await
+            .expect("tracked text flush");
+        let (close, close_flushed) = WsOutbound::tracked_close();
+        tx.send(close).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), close_flushed.notified())
+            .await
+            .expect("tracked close flush");
+        sender.await.unwrap();
+        server.await.unwrap();
     }
 
     #[test]

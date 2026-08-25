@@ -192,7 +192,7 @@ fn log_dir(dir: &std::path::Path, session_id: Uuid) -> PathBuf {
 
 /// Resolve the spawn-worker binary: `$SPAWND_WORKER_BIN` → sibling of the
 /// running spawnd → bare name (PATH).
-fn worker_bin() -> PathBuf {
+pub(crate) fn worker_bin() -> PathBuf {
     if let Some(bin) = std::env::var_os("SPAWND_WORKER_BIN").filter(|v| !v.is_empty()) {
         return PathBuf::from(bin);
     }

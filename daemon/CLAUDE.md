@@ -19,8 +19,9 @@ src/
   sessiond/      supervisor↔worker shared pieces: wire protocol, terminal
                  emulator, scrollback, worker runtime
   <feature>.rs   one module per concern: run.rs (register + main loop),
-                 ws.rs, rtc.rs, login.rs, creds.rs, host_*.rs, upload.rs,
-                 sessions.rs, service.rs, …
+                 ws.rs, update.rs + update_io.rs (verified daemon self-update;
+                 focused tests live in update_tests.rs), rtc.rs, login.rs,
+                 creds.rs, host_*.rs, upload.rs, sessions.rs, service.rs, …
   version.rs     the version the daemon reports; build.rs stamps the source
                  commit into it (0.1.0+g<commit>)
 tests/           integration tests (worker_e2e.rs)

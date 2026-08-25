@@ -10,7 +10,7 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::sync::Once;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::{stream::FuturesUnordered, StreamExt};
@@ -485,6 +485,7 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     // Ctrl-C closes only this supervisor. Session workers remain alive and
     // are adopted by the next `spawnd` process.
     let mut attempt: u32 = 0;
+    let mut last_protocol_update_error: Option<Instant> = None;
 
     'supervisor: loop {
         // A session close or backoff timer can become ready in the same
@@ -540,20 +541,52 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
             }
             ServeOutcome::SessionEnded(result) => result,
         };
-        match res {
-            Ok(()) => {
-                tracing::info!("ws closed cleanly; reconnecting");
-                attempt = 0;
+        let protocol_required = matches!(&res, Err(error) if ws::is_protocol_required(error));
+        let delay = if protocol_required {
+            let failure = match crate::update::apply_from_release(&server_url).await {
+                Ok(crate::update::HttpUpdateOutcome::Applied(applied)) => {
+                    Some(crate::update::exec(applied))
+                }
+                Ok(crate::update::HttpUpdateOutcome::NoUpdate(reason)) => {
+                    Some(crate::update::UpdateFailure {
+                        stage: crate::update::UpdateStage::Precondition,
+                        error: reason,
+                    })
+                }
+                Err(failure) => Some(failure),
+            };
+            if let Some(failure) = failure {
+                let now = Instant::now();
+                let should_log = last_protocol_update_error
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(60 * 60));
+                if should_log {
+                    last_protocol_update_error = Some(now);
+                    let reinstall = crate::update::reinstall_command(&server_url);
+                    tracing::error!(
+                        stage = failure.stage.as_str(),
+                        error = failure.error,
+                        reinstall = %reinstall,
+                        "SPAWN D daemon cannot satisfy the server protocol; reinstall it"
+                    );
+                }
             }
-            Err(_) => {
-                // Connection/handshake error text can include data supplied
-                // by the remote endpoint. Keep the reconnect diagnostic
-                // class-only at this final WebSocket logging boundary.
-                tracing::warn!("daemon control websocket session ended with error");
-                attempt = attempt.saturating_add(1);
+            ws::self_update_backoff()
+        } else {
+            match res {
+                Ok(()) => {
+                    tracing::info!("ws closed cleanly; reconnecting");
+                    attempt = 0;
+                }
+                Err(_) => {
+                    // Connection/handshake error text can include data supplied
+                    // by the remote endpoint. Keep the reconnect diagnostic
+                    // class-only at this final WebSocket logging boundary.
+                    tracing::warn!("daemon control websocket session ended with error");
+                    attempt = attempt.saturating_add(1);
+                }
             }
-        }
-        let delay = ws::backoff_for_attempt(attempt);
+            ws::backoff_for_attempt(attempt)
+        };
         tracing::info!(?delay, "reconnecting after backoff");
         let reloaded = {
             let sleep_fut = tokio::time::sleep(delay);
@@ -724,11 +757,15 @@ async fn serve_one_connection_with_loader(
     // strictly better than making the connection wait on `nvidia-smi`.
     crate::host_metrics::sampler().probe_gpu();
 
+    let update_capability = crate::update::capability();
     let register = Outbound::Register {
         host_name,
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         version: crate::version::build_version(),
+        daemon_tree: crate::version::daemon_tree().map(str::to_string),
+        self_update: update_capability.self_update,
+        self_update_blocked: update_capability.blocked.map(str::to_string),
         existing_sessions: registry.ids(),
         spec: crate::host_metrics::sampler().spec(),
         supports_account_chains: true,
@@ -778,13 +815,18 @@ async fn serve_one_connection_with_loader(
         );
         tokio::pin!(dispatch_fut);
         tokio::select! {
+            biased;
+            reader = &mut reader_task => {
+                let result = match reader {
+                    Ok(ws::ReaderOutcome::ProtocolRequired) => Err(ws::protocol_required_error()),
+                    Ok(ws::ReaderOutcome::Closed) | Err(_) => Ok(()),
+                };
+                tracing::info!("ws reader task ended; ending session");
+                ActiveSessionEvent::SessionEnded(result)
+            }
             r = &mut dispatch_fut => ActiveSessionEvent::SessionEnded(r),
             _ = &mut sender_task => {
                 tracing::info!("ws sender task ended (write error); ending session");
-                ActiveSessionEvent::SessionEnded(Ok(()))
-            }
-            _ = &mut reader_task => {
-                tracing::info!("ws reader task ended; ending session");
                 ActiveSessionEvent::SessionEnded(Ok(()))
             }
             _ = &mut heartbeat_task => {
@@ -1296,6 +1338,70 @@ fn build_rtc_answer_signer(
     Ok(Some(signer))
 }
 
+async fn handle_daemon_update(
+    server_origin: url::Url,
+    request_id: String,
+    request: crate::update::UpdateRequest,
+    out_tx: mpsc::Sender<WsOutbound>,
+) {
+    let tree = request.tree.clone();
+    let version_before = crate::version::build_version();
+    match crate::update::apply(&server_origin, request).await {
+        Ok(applied) => {
+            let result = Outbound::DaemonUpdateResult {
+                request_id,
+                ok: true,
+                tree,
+                version_before,
+                stage: None,
+                error: None,
+            };
+            if let Ok(serialized) = serde_json::to_string(&result) {
+                let flushed = tokio::time::timeout(Duration::from_secs(2), async {
+                    let (frame, frame_flushed) = WsOutbound::tracked_json(serialized);
+                    out_tx.send(frame).await.map_err(|_| ())?;
+                    frame_flushed.notified().await;
+                    let (close, close_flushed) = WsOutbound::tracked_close();
+                    out_tx.send(close).await.map_err(|_| ())?;
+                    close_flushed.notified().await;
+                    Ok::<(), ()>(())
+                })
+                .await;
+                if !matches!(flushed, Ok(Ok(()))) {
+                    tracing::warn!(
+                        stage = crate::update::UpdateStage::Exec.as_str(),
+                        "self-update result flush exceeded its bounded window"
+                    );
+                }
+            }
+            let failure = crate::update::exec(applied);
+            tracing::error!(
+                stage = failure.stage.as_str(),
+                error = failure.error,
+                "SPAWN D daemon self-update failed"
+            );
+        }
+        Err(failure) => {
+            tracing::warn!(
+                stage = failure.stage.as_str(),
+                error = failure.error,
+                "SPAWN D daemon self-update failed"
+            );
+            let result = Outbound::DaemonUpdateResult {
+                request_id,
+                ok: false,
+                tree,
+                version_before,
+                stage: Some(failure.stage.as_str().to_string()),
+                error: Some(failure.error.to_string()),
+            };
+            if let Ok(serialized) = serde_json::to_string(&result) {
+                let _ = out_tx.send(WsOutbound::json(serialized)).await;
+            }
+        }
+    }
+}
+
 async fn dispatch_loop(
     in_rx: &mut mpsc::Receiver<WsInbound>,
     registry: &SessionRegistry,
@@ -1320,7 +1426,13 @@ async fn dispatch_loop(
     // (R10); this floor removes the in-process half of the P3′ residual.
     while let Some(msg) = in_rx.recv().await {
         match msg {
-            WsInbound::Closed => return Ok(()),
+            WsInbound::Closed { protocol_required } => {
+                return if protocol_required {
+                    Err(ws::protocol_required_error())
+                } else {
+                    Ok(())
+                };
+            }
             WsInbound::Json(frame) => match *frame {
                 Inbound::Registered {
                     host_id,
@@ -1402,6 +1514,32 @@ async fn dispatch_loop(
                     if let Ok(frame) = serde_json::to_string(&Outbound::HostPong { request_id }) {
                         let _ = out_tx.send(WsOutbound::json(frame)).await;
                     }
+                }
+                Inbound::DaemonUpdate {
+                    request_id,
+                    version,
+                    tree,
+                    target,
+                    spawnd,
+                    spawn_worker,
+                } => {
+                    let server_origin = live_credentials
+                        .server_origin
+                        .parse::<url::Url>()
+                        .expect("validated server origin remains a URL");
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(handle_daemon_update(
+                        server_origin,
+                        request_id,
+                        crate::update::UpdateRequest {
+                            version,
+                            tree,
+                            target,
+                            spawnd,
+                            spawn_worker,
+                        },
+                        out_tx,
+                    ));
                 }
                 Inbound::HostAgentsCheck {
                     request_id,
@@ -2974,6 +3112,82 @@ mod tests {
             &url::Url::parse("https://spawn.example/control").unwrap(),
         )
         .expect("live credential snapshot")
+    }
+
+    #[tokio::test]
+    async fn daemon_update_runs_off_dispatch_and_busy_result_keeps_frames_serving() {
+        let host_id = Uuid::from_u128(42);
+        let record = credential_record(
+            1,
+            1,
+            "test-token",
+            host_id,
+            "https://spawn.example/control",
+            7,
+            &[],
+        );
+        let live = live_snapshot(record);
+        let registry = SessionRegistry::new();
+        let rtc_sessions = RtcSessions::new();
+        let mut revoked = RevocationSet::new();
+        let (in_tx, mut in_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let _active_update = crate::update::acquire_update().expect("hold update guard");
+
+        let dispatch = dispatch_loop(
+            &mut in_rx,
+            &registry,
+            &rtc_sessions,
+            &out_tx,
+            &live,
+            &mut revoked,
+        );
+        let exercise = async move {
+            in_tx
+                .send(WsInbound::Json(Box::new(Inbound::DaemonUpdate {
+                    request_id: "update-request".into(),
+                    version: "0.1.0+g123456789abc".into(),
+                    tree: "a".repeat(40),
+                    target: "darwin-aarch64".into(),
+                    spawnd: crate::proto::DaemonUpdateArtifact {
+                        path: "/api/install/spawnd/darwin-aarch64".into(),
+                        sha256: "b".repeat(64),
+                    },
+                    spawn_worker: crate::proto::DaemonUpdateArtifact {
+                        path: "/api/install/spawn-worker/darwin-aarch64".into(),
+                        sha256: "c".repeat(64),
+                    },
+                })))
+                .await
+                .unwrap();
+            let result: serde_json::Value =
+                serde_json::from_str(out_rx.recv().await.expect("busy update result").as_str())
+                    .unwrap();
+            assert_eq!(result["type"], "daemon.update_result");
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["stage"], "precondition");
+            assert_eq!(result["error"], "busy");
+
+            in_tx
+                .send(WsInbound::Json(Box::new(Inbound::HostPing {
+                    request_id: "ping-after-update".into(),
+                })))
+                .await
+                .unwrap();
+            let pong: serde_json::Value =
+                serde_json::from_str(out_rx.recv().await.expect("pong after update").as_str())
+                    .unwrap();
+            assert_eq!(pong["type"], "host.pong");
+            assert_eq!(pong["request_id"], "ping-after-update");
+            drop(in_tx);
+        };
+
+        let (_, dispatch_result) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(exercise, dispatch)
+        })
+        .await
+        .expect("dispatch update test timeout");
+        dispatch_result.unwrap();
     }
 
     #[test]
