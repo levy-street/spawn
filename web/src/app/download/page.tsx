@@ -221,20 +221,29 @@ export default function DownloadPage() {
         <div className="relative z-10 mx-auto w-full max-w-6xl min-w-0 px-5 py-24 sm:px-8">
           <div className="grid min-w-0 gap-14 lg:grid-cols-[1.05fr_0.95fr] lg:items-center">
             <div>
-              <Eyebrow className="mb-5">Servers and Linux</Eyebrow>
+              <Eyebrow className="mb-5">{desktopRelease ? "Servers and Linux" : "Install"}</Eyebrow>
               <h1
                 className={cn(
                   poster.className,
                   "text-[clamp(35px,5.6vw,63px)] leading-[1.02] font-light text-bone uppercase [text-wrap:balance]",
                 )}
               >
-                Possess any machine.{" "}
-                <em className="text-hellfire not-italic">From its terminal.</em>
+                {desktopRelease ? (
+                  <>
+                    Possess any machine.{" "}
+                    <em className="text-hellfire not-italic">From its terminal.</em>
+                  </>
+                ) : (
+                  <>
+                    Install the daemon.{" "}
+                    <em className="text-hellfire not-italic">Possess the host.</em>
+                  </>
+                )}
               </h1>
               <p className="mt-6 max-w-[54ch] text-[17px] leading-8 text-ash">
-                Use the one-line installer for a Linux server, a remote host, or a Mac where you do
-                not want the companion app. It downloads the matching daemon and starts the user
-                service.
+                {desktopRelease
+                  ? "Use the one-line installer for a Linux server, a remote host, or a Mac where you do not want the companion app. It downloads the matching daemon and starts the user service."
+                  : "The installer detects macOS or Linux on the machine where it runs, downloads the matching prebuilt daemon, then starts it as a user service. One line, then the pairing ceremony — consensual, auditable, revocable."}
               </p>
             </div>
 

@@ -320,8 +320,8 @@ test("key substitution cannot retarget an established Host-ID binding", async ({
     .getByRole("dialog")
     .getByRole("button", { name: /^(?:Remove host|Retry deletion)$/u })
     .click();
-  // The overhaul retired the /hosts index; a removed host lands on /app.
-  await page.waitForURL("**/app");
+  // The overhaul retired the /hosts index; a removed host lands on the Legion (8ef696d).
+  await page.waitForURL("**/legion");
   expect(state.deleteCalls).toBe(1);
   const pins = await readHostPins(page);
   expect(pins).toHaveLength(1);
@@ -351,8 +351,8 @@ test("deletion never revokes among multiple active unbound host pins", async ({ 
 
   await requestHostDeletion(page);
 
-  // The overhaul retired the /hosts index; a removed host lands on /app.
-  await page.waitForURL("**/app");
+  // The overhaul retired the /hosts index; a removed host lands on the Legion (8ef696d).
+  await page.waitForURL("**/legion");
   expect(state.deleteCalls).toBe(1);
   expect(JSON.stringify(await readHostPins(page))).toBe(before);
 });
@@ -395,7 +395,7 @@ test("host-detail resolution binds before a legitimate tombstone-first DELETE", 
 
   await requestHostDeletion(page);
 
-  await expect(page).toHaveURL(/\/app$/u);
+  await expect(page).toHaveURL(/\/legion$/u);
   expect(state.deleteCalls).toBe(1);
   expect(pinStateAtDelete).toMatchObject([
     { hostIds: [HOST_ID], hostPublicKey: HOST_PUBLIC_KEY, state: "revoked" },
