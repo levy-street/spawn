@@ -77,6 +77,12 @@ class Settings(BaseSettings):
 
     public_url: str = Field(default="http://localhost:8000")
 
+    # Release identity overrides are stamped by production deploys. Empty
+    # values fall back to the checkout when git is available.
+    release_commit: str | None = None
+    mobile_tree: str | None = None
+    daemon_auto_update: bool = True
+
     # Where password-reset and verification links point. Falls back to
     # public_url; set when the web app is served from a different origin than
     # the API (it is, in this deployment).

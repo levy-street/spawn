@@ -14,7 +14,7 @@ spawn_server/
   routes/       one module per HTTP surface: auth, auth_config,
                 auth_providers, account_recovery, admin, agents,
                 browser_devices, capabilities, device, device_pairing,
-                host_introductions, hosts, install, profile, push,
+                host_introductions, hosts, install, profile, push, release,
                 root_introductions, sessions, trust_bundle,
                 workspace_templates, workspaces
   ws/           websocket handlers: browser.py, daemon.py, host.py,
@@ -24,7 +24,7 @@ spawn_server/
   schemas.py    pydantic request/response shapes
   main.py       app assembly, startup, route registration
   <concern>.py  one module per concern: auth, config, db, redis, mail, push,
-                invites, limits, rate_limit, trust_events, …
+                release, invites, limits, rate_limit, trust_events, …
 alembic/        migrations
 tests/          pytest; test_<module>.py mirrors the module it covers
 ```

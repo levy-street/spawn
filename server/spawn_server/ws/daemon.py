@@ -16,7 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from .. import auth as auth_mod
-from .. import host_capacity, legion
+from .. import host_capacity, legion, release
+from ..config import get_settings
 from ..db import get_sessionmaker
 from ..limits import MAX_SAFE_FENCING_GENERATION
 from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, Session
@@ -199,6 +200,17 @@ async def _prepare_host_activation(
     registration: dict[str, object],
 ) -> bool:
     await _configure_activation_timeouts(session)
+    current = await session.get(Host, host_id, with_for_update=True)
+    if current is None:
+        return False
+    daemon_tree = release.valid_daemon_tree(registration.get("daemon_tree"))
+    self_update_raw = registration.get("self_update")
+    blocked_raw = registration.get("self_update_blocked")
+    self_update_blocked = (
+        blocked_raw.strip()
+        if isinstance(blocked_raw, str) and 0 < len(blocked_raw.strip()) <= 64
+        else None
+    )
     values: dict[str, object] = {
         "daemon_connection_id": connection_id,
         "daemon_generation": generation,
@@ -206,7 +218,26 @@ async def _prepare_host_activation(
         "daemon_pending_generation": None,
         "status": "online",
         "last_seen_at": _utcnow(),
+        # These describe the daemon that is registering now. An old daemon
+        # omits them and must become unsupported, rather than retaining the
+        # capabilities of a newer binary that previously occupied the row.
+        "daemon_tree": daemon_tree,
+        "self_update": self_update_raw if isinstance(self_update_raw, bool) else False,
+        "self_update_blocked": self_update_blocked,
     }
+    if current.update_state == "updating":
+        if daemon_tree is not None and daemon_tree == current.update_tree:
+            values.update(
+                update_state=None,
+                update_tree=None,
+                update_error=None,
+                update_requested_at=None,
+            )
+        else:
+            values.update(
+                update_state="failed",
+                update_error="restarted on the previous binary",
+            )
     for field in ("os", "arch", "version"):
         value = registration.get(field)
         if isinstance(value, str) and value:
@@ -231,6 +262,98 @@ async def _prepare_host_activation(
         .values(**values)
     )
     return result.rowcount == 1
+
+
+async def _auto_update_after_registration(conn: DaemonConn) -> None:
+    if not get_settings().daemon_auto_update:
+        return
+    manifest = release.read_prebuilt_manifest()
+    if manifest is None:
+        return
+
+    payload: dict[str, Any] | None = None
+    async with _bounded_host_ownership_session() as session:
+        host = await session.get(Host, conn.host_id)
+        if host is None or release.host_update_state(host, manifest).state != "available":
+            return
+        payload = release.mark_update_requested(host, manifest)
+        if payload is None:
+            return
+        await session.commit()
+
+    if await get_broker().request_daemon_update(conn, payload):
+        return
+    async with _bounded_host_ownership_session() as session:
+        result = await session.execute(
+            update(Host)
+            .where(
+                Host.id == conn.host_id,
+                Host.daemon_connection_id == conn.id,
+                Host.daemon_generation == conn.host_generation,
+                Host.update_state == "updating",
+                Host.update_tree == manifest.tree,
+            )
+            .values(
+                update_state="failed",
+                update_error="update request could not be delivered",
+            )
+        )
+        if result.rowcount == 1:
+            await session.commit()
+        else:
+            await session.rollback()
+
+
+def _short_update_result_string(value: object, *, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if value and len(value) <= limit else None
+
+
+async def _handle_daemon_update_result(
+    conn: DaemonConn, payload: dict[str, object]
+) -> bool | None:
+    request_id = _short_update_result_string(payload.get("request_id"), limit=128)
+    ok = payload.get("ok")
+    tree = release.valid_daemon_tree(payload.get("tree"))
+    if request_id is None or not isinstance(ok, bool) or tree is None:
+        log.warning("daemon sent invalid update result host=%s", conn.host_id)
+        return None
+    if ok:
+        log.info("daemon update applied host=%s tree=%s request=%s", conn.host_id, tree, request_id)
+        return True
+
+    stage = _short_update_result_string(payload.get("stage"), limit=64)
+    if stage not in {"download", "verify", "swap", "exec", "precondition"}:
+        stage = None
+    error = _short_update_result_string(payload.get("error"), limit=256)
+    async with _bounded_host_ownership_session() as session:
+        result = await session.execute(
+            update(Host)
+            .where(
+                Host.id == conn.host_id,
+                Host.daemon_connection_id == conn.id,
+                Host.daemon_generation == conn.host_generation,
+            )
+            .values(
+                update_state="failed",
+                update_error=release.humanize_update_result_error(stage, error),
+            )
+        )
+        if result.rowcount != 1:
+            await session.rollback()
+            return False
+        await session.commit()
+    log.warning(
+        "daemon update failed host=%s tree=%s stage=%s error=%s request=%s",
+        conn.host_id,
+        tree,
+        stage,
+        error,
+        request_id,
+    )
+    return True
 
 
 async def _configure_activation_timeouts(session: AsyncSession) -> None:
@@ -1475,6 +1598,7 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                             },
                         )
                         registered = True
+                        await _auto_update_after_registration(conn)
                     if not registration_accepted:
                         async with _bounded_host_ownership_session() as session:
                             await _mark_host_offline_if_owner(session, host.id, conn.id, generation)
@@ -1492,6 +1616,12 @@ async def daemon_ws(websocket: WebSocket, token: str | None = Query(default=None
                         ):
                             await _fence_superseded_daemon(conn)
                             break
+
+                elif ftype == "daemon.update_result":
+                    handled = await _handle_daemon_update_result(conn, obj)
+                    if handled is False:
+                        await _fence_superseded_daemon(conn)
+                        break
 
                 elif ftype == "host.pong":
                     request_id = obj.get("request_id")

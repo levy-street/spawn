@@ -593,6 +593,24 @@ class Broker:
         )
         return result == {"type": "host.pong", "request_id": request_id}
 
+    async def request_daemon_update(
+        self,
+        daemon: DaemonConn,
+        payload: dict[str, object],
+        *,
+        timeout: float = 3.0,
+    ) -> bool:
+        """Bounded fire-and-forget delivery to the accepted daemon owner."""
+
+        generation = daemon.host_generation
+        if generation is None or not await self.is_accepted_daemon_owner(daemon, generation):
+            return False
+        try:
+            await asyncio.wait_for(daemon.send_text(payload), timeout=timeout)
+        except Exception:
+            return False
+        return await self.is_accepted_daemon_owner(daemon, generation)
+
     async def resolve_host_pong(
         self,
         request_id: str,

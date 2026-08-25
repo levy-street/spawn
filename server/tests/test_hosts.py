@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from spawn_server.routes import hosts as hosts_routes
 
@@ -129,6 +131,145 @@ async def test_host_scoping(client):
     r = await client.delete(f"/api/hosts/{host_id}", headers={"Authorization": f"Bearer {b_token}"})
     assert r.status_code == 404
 
+
+def _stage_daemon_manifest(tmp_path: Path) -> None:
+    from spawn_server import release
+
+    prebuilt = tmp_path / "daemon" / "target" / "prebuilt"
+    target = prebuilt / "linux-x86_64"
+    target.mkdir(parents=True)
+    spawnd = b"manual-spawnd"
+    worker = b"manual-worker"
+    (target / "spawnd").write_bytes(spawnd)
+    (target / "spawn-worker").write_bytes(worker)
+    (prebuilt / "manifest.json").write_text(
+        json.dumps(
+            {
+                "commit": "c" * 40,
+                "tree": "b" * 40,
+                "version": "0.2.0+gcccccccccccc",
+                "targets": {
+                    "linux-x86_64": {
+                        "spawnd_sha256": hashlib.sha256(spawnd).hexdigest(),
+                        "spawn_worker_sha256": hashlib.sha256(worker).hexdigest(),
+                    }
+                },
+            }
+        )
+    )
+    release.refresh()
+
+
+async def test_host_update_endpoint_sends_and_persists_update(
+    client, tmp_path, monkeypatch
+):
+    from sqlalchemy import select
+
+    from spawn_server import release
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+    from spawn_server.ws.broker import DaemonConn, get_broker
+
+    monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    _stage_daemon_manifest(tmp_path)
+    token = await _signup(client, "manual-daemon-update@example.com")
+    async with get_sessionmaker()() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "manual-daemon-update@example.com"))
+        ).scalar_one()
+        host = Host(
+            owner_user_id=user.id,
+            name="update-box",
+            os="linux",
+            arch="x86_64",
+            version="0.1.0+gaaaaaaaaaaaa",
+            daemon_tree="a" * 40,
+            self_update=True,
+            status="online",
+        )
+        session.add(host)
+        await session.commit()
+        host_id = host.id
+        user_id = user.id
+
+    fake_ws = _FakeWS()
+    daemon = DaemonConn(host_id=host_id, user_id=user_id, websocket=fake_ws)  # type: ignore[arg-type]
+    await get_broker().register_daemon(daemon)
+    await _accept_daemon(daemon)
+
+    response = await client.post(
+        f"/api/hosts/{host_id}/update",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json()["update"]["state"] == "updating"
+    sent = json.loads(fake_ws.sent_text[-1])
+    assert sent["type"] == "daemon.update"
+    assert sent["tree"] == "b" * 40
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.update_state == "updating"
+        assert host.update_tree == "b" * 40
+        assert host.update_requested_at is not None
+
+    limited = await client.post(
+        f"/api/hosts/{host_id}/update",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert limited.status_code == 429
+
+
+async def test_host_update_endpoint_current_is_noop_and_offline_conflicts(
+    client, tmp_path, monkeypatch
+):
+    from sqlalchemy import select
+
+    from spawn_server import release
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.models import Host, User
+
+    monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    _stage_daemon_manifest(tmp_path)
+    token = await _signup(client, "daemon-update-codes@example.com")
+    async with get_sessionmaker()() as session:
+        user = (
+            await session.execute(select(User).where(User.email == "daemon-update-codes@example.com"))
+        ).scalar_one()
+        current = Host(
+            owner_user_id=user.id,
+            name="current-box",
+            os="linux",
+            arch="x86_64",
+            daemon_tree="b" * 40,
+            self_update=True,
+            status="offline",
+        )
+        old = Host(
+            owner_user_id=user.id,
+            name="offline-box",
+            os="linux",
+            arch="x86_64",
+            daemon_tree="a" * 40,
+            self_update=True,
+            status="offline",
+        )
+        session.add_all([current, old])
+        await session.commit()
+        current_id = current.id
+        old_id = old.id
+    headers = {"Authorization": f"Bearer {token}"}
+
+    current_response = await client.post(f"/api/hosts/{current_id}/update", headers=headers)
+    offline_response = await client.post(f"/api/hosts/{old_id}/update", headers=headers)
+
+    assert current_response.status_code == 200
+    assert current_response.json()["update"]["state"] == "current"
+    assert offline_response.status_code == 409
+    assert offline_response.json() == {"detail": "host daemon is offline"}
 
 async def test_host_revocation_closes_daemon_only_after_database_commit(client):
     token = await _signup(client, "post-commit-revocation@example.com")

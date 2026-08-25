@@ -11,6 +11,7 @@ from textwrap import dedent
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, PlainTextResponse
 
+from .. import release
 from ..config import get_settings
 
 router = APIRouter(tags=["install"])
@@ -74,7 +75,20 @@ def _prebuilt_sha256_cases() -> str:
     this server will actually serve, for every prebuilt present. Absent targets
     emit no arm, so the installer skips verification on a source-build host
     (there is nothing to pin against). Templated into `install.sh` at render."""
-    arms: list[str] = []
+    manifest = release.read_prebuilt_manifest(repo_root=_repo_root())
+    if manifest is not None:
+        arms: list[str] = []
+        for target, target_release in manifest.targets.items():
+            arms.append(
+                f"        spawnd:{target}) printf %s {target_release.spawnd_sha256} ;;"
+            )
+            arms.append(
+                "        "
+                f"spawn-worker:{target}) printf %s {target_release.spawn_worker_sha256} ;;"
+            )
+        return "\n".join(arms)
+
+    arms = []
     for target in SUPPORTED_TARGETS:
         for kind in ("spawnd", "spawn-worker"):
             binary = next((p for p in _binary_candidates(target, kind) if p.is_file()), None)

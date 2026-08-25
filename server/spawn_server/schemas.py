@@ -774,6 +774,13 @@ class RootIntroductionOut(BaseModel):
 # ---------- hosts ----------
 
 
+class HostUpdateOut(BaseModel):
+    state: Literal["current", "available", "updating", "failed", "unsupported", "unknown"]
+    latest_version: str | None = None
+    error: str | None = None
+    requested_at: datetime | None = None
+
+
 class HostOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -781,6 +788,8 @@ class HostOut(BaseModel):
     os: str | None = None
     arch: str | None = None
     version: str | None = None
+    daemon_tree: str | None = None
+    update: HostUpdateOut = Field(default_factory=lambda: HostUpdateOut(state="unknown"))
     host_key_algorithm: Literal["ed25519"] | None = None
     # The key travels alone (mesh B5): its display fingerprint is derived
     # locally by the client, never served next to the key it must vouch for.
@@ -804,6 +813,53 @@ class HostOut(BaseModel):
     cpu_bucket: int | None = None
     mem_bucket: int | None = None
     capacity_at: datetime | None = None
+
+
+class HostUpdateResponse(BaseModel):
+    update: HostUpdateOut
+
+
+# ---------- release ----------
+
+
+class ServerReleaseOut(BaseModel):
+    commit: str | None = None
+    dirty: bool
+
+
+class WebReleaseOut(BaseModel):
+    build_id: str | None = None
+
+
+class DaemonTargetOut(BaseModel):
+    spawnd_sha256: str
+    spawn_worker_sha256: str
+
+
+class DaemonReleaseOut(BaseModel):
+    version: str
+    commit: str
+    tree: str
+    targets: dict[str, DaemonTargetOut]
+
+
+class MobileReleaseOut(BaseModel):
+    tree: str | None = None
+    runtime_version: str | None = None
+
+
+class ReleaseProtocolsOut(BaseModel):
+    daemon: str
+    browser: str
+    alerts: str
+
+
+class ReleaseOut(BaseModel):
+    server: ServerReleaseOut
+    web: WebReleaseOut
+    daemon: DaemonReleaseOut | None = None
+    mobile: MobileReleaseOut
+    protocols: ReleaseProtocolsOut
 
 
 class LegionDayOut(BaseModel):

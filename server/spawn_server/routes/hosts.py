@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -18,7 +19,7 @@ from fastapi import (
 from sqlalchemy import delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import auth, schemas
+from .. import auth, release, schemas
 from ..db import get_session, get_sessionmaker
 from ..host_key_claims import lock_host_key_claim
 from ..models import (
@@ -42,6 +43,8 @@ MAX_RECENT_DIRS = 8
 _AUTO_UPDATE_IN_FLIGHT: set[tuple[str, str, str]] = set()
 _AUTO_UPDATE_TASKS: set[asyncio.Task[None]] = set()
 _AUTO_UPDATE_CHECK_TASK: asyncio.Task[None] | None = None
+DAEMON_UPDATE_RATE_SECONDS = 15.0
+_DAEMON_UPDATE_REQUESTED_AT: dict[str, float] = {}
 
 
 def _utcnow() -> datetime:
@@ -63,6 +66,8 @@ def _to_out(host: Host, session_count: int) -> schemas.HostOut:
         os=host.os,
         arch=host.arch,
         version=host.version,
+        daemon_tree=host.daemon_tree,
+        update=release.host_update_state(host),
         host_key_algorithm=host.host_key_algorithm,
         host_public_key=host.host_public_key,
         status=host.status,
@@ -468,6 +473,67 @@ async def patch_host(
     await session.commit()
     await session.refresh(h)
     return _to_out(h, await _session_count(session, h, user))
+
+
+def _enforce_daemon_update_rate(host_id: str) -> None:
+    now = time.monotonic()
+    previous = _DAEMON_UPDATE_REQUESTED_AT.get(host_id)
+    if previous is not None and now - previous < DAEMON_UPDATE_RATE_SECONDS:
+        raise HTTPException(status_code=429, detail="daemon update requested too recently")
+    _DAEMON_UPDATE_REQUESTED_AT[host_id] = now
+    if len(_DAEMON_UPDATE_REQUESTED_AT) > 10_000:
+        cutoff = now - DAEMON_UPDATE_RATE_SECONDS
+        stale = [key for key, requested_at in _DAEMON_UPDATE_REQUESTED_AT.items() if requested_at < cutoff]
+        for key in stale:
+            _DAEMON_UPDATE_REQUESTED_AT.pop(key, None)
+
+
+@router.post(
+    "/{host_id}/update",
+    response_model=schemas.HostUpdateResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def update_host_daemon(
+    host_id: str,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> schemas.HostUpdateResponse:
+    host = await _get_owned_host(session, host_id, user)
+    _enforce_daemon_update_rate(host_id)
+    manifest = release.read_prebuilt_manifest()
+    update_state = release.host_update_state(host, manifest)
+    if update_state.state == "current":
+        response.status_code = status.HTTP_200_OK
+        return schemas.HostUpdateResponse(update=update_state)
+
+    daemon = get_broker().get_daemon_for_host(host_id)
+    if host.status != "online" or daemon is None:
+        raise HTTPException(status_code=409, detail="host daemon is offline")
+    if update_state.state in {"unsupported", "unknown"}:
+        detail = update_state.error or "daemon release information is unavailable"
+        raise HTTPException(status_code=409, detail=detail)
+    if update_state.state == "updating":
+        return schemas.HostUpdateResponse(update=update_state)
+    if manifest is None:
+        raise HTTPException(status_code=409, detail="daemon release information is unavailable")
+
+    payload = release.mark_update_requested(host, manifest)
+    if payload is None:
+        raise HTTPException(
+            status_code=409,
+            detail="no update is available for this daemon target",
+        )
+    await session.commit()
+    await session.refresh(host)
+
+    if not await get_broker().request_daemon_update(daemon, payload):
+        host.update_state = "failed"
+        host.update_error = "update request could not be delivered"
+        await session.commit()
+        raise HTTPException(status_code=409, detail="host daemon is offline")
+
+    return schemas.HostUpdateResponse(update=release.host_update_state(host, manifest))
 
 
 @router.get("/{host_id}/agents", response_model=schemas.HostAgentList)
