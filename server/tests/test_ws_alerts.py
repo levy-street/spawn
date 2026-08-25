@@ -19,6 +19,7 @@ from spawn_server import auth
 from spawn_server.db import get_sessionmaker
 from spawn_server.models import Host, Session, User
 from spawn_server.redis import get_backend, user_alert_channel
+from spawn_server.trust_events import pair_requested_payload, pair_resolved_payload
 from spawn_server.ws.alerts import (
     ALERTS_WS_PROTOCOL,
     QuietWatch,
@@ -392,9 +393,7 @@ async def test_alerts_do_not_cross_owners(client):
 
 async def test_alerts_ws_requires_its_subprotocol(client):
     user_id, access_token = await _signup(client, "alert-proto@example.com")
-    ws = FakeAlertWebSocket(
-        authorization=f"Bearer {access_token}", subprotocols=["spawn.v3"]
-    )
+    ws = FakeAlertWebSocket(authorization=f"Bearer {access_token}", subprotocols=["spawn.v3"])
     await alerts_ws(ws, token=None)  # type: ignore[arg-type]
     assert ws.closed == (4003, "protocol upgrade required")
     assert ws.frames()[0]["type"] == "protocol.required"
@@ -474,12 +473,8 @@ async def test_alerts_ws_forwards_owner_events_only(client):
         "at": "2026-08-21T00:00:00+00:00",
     }
     theirs = {**mine, "session_id": "s-2"}
-    await backend.publish_channel(
-        user_alert_channel(user_id), json.dumps(mine).encode()
-    )
-    await backend.publish_channel(
-        user_alert_channel(other_id), json.dumps(theirs).encode()
-    )
+    await backend.publish_channel(user_alert_channel(user_id), json.dumps(mine).encode())
+    await backend.publish_channel(user_alert_channel(other_id), json.dumps(theirs).encode())
     # Junk on the owner's own channel is dropped rather than forwarded.
     await backend.publish_channel(
         user_alert_channel(user_id),
@@ -494,6 +489,35 @@ async def test_alerts_ws_forwards_owner_events_only(client):
     forwarded = [frame for frame in ws.frames() if frame.get("type") == "alert"]
     assert len(forwarded) == 1, ws.frames()
     assert forwarded[0]["session_id"] == "s-1"
+
+
+async def test_alerts_ws_forwards_pair_requested_and_resolved(client):
+    user_id, access_token = await _signup(client, "alert-pair-events@example.com")
+    ws = FakeAlertWebSocket(authorization=f"Bearer {access_token}")
+    stream = asyncio.create_task(alerts_ws(ws, token=None))  # type: ignore[arg-type]
+    await asyncio.sleep(0.1)
+
+    requested = pair_requested_payload(
+        "approval-ref",
+        "pairing-box",
+        "linux",
+        "SHA256:" + "a" * 16,
+    )
+    resolved = pair_resolved_payload("approval-ref", "approved", "host-id")
+    backend = get_backend()
+    await backend.publish_channel(user_alert_channel(user_id), json.dumps(requested).encode())
+    await backend.publish_channel(user_alert_channel(user_id), json.dumps(resolved).encode())
+    await asyncio.sleep(0.1)
+    ws.queue_disconnect()
+    await asyncio.wait_for(stream, timeout=2.0)
+
+    trust_frames = [frame for frame in ws.frames() if frame.get("type") == "trust"]
+    assert [frame["event"] for frame in trust_frames] == [
+        "host.pair_requested",
+        "host.pair_resolved",
+    ]
+    assert trust_frames[0]["approval_ref"] == "approval-ref"
+    assert trust_frames[1]["outcome"] == "approved"
 
 
 async def test_alerts_ws_delivers_a_live_daemon_transition(client):

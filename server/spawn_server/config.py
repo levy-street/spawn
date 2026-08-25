@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from pydantic import Field
@@ -82,6 +83,9 @@ class Settings(BaseSettings):
     release_commit: str | None = None
     mobile_tree: str | None = None
     daemon_auto_update: bool = True
+    prebuilt_dir: Path = Field(
+        default=Path(__file__).resolve().parents[2] / "daemon" / "target" / "prebuilt"
+    )
 
     # Where password-reset and verification links point. Falls back to
     # public_url; set when the web app is served from a different origin than

@@ -8,7 +8,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from . import auth
 from .agents_builtin import seed_builtin_agents
 from .config import get_settings
 from .db import dispose_engine, get_sessionmaker, init_engine
@@ -32,6 +35,7 @@ from .routes import push as push_routes
 from .routes import release as release_routes
 from .routes import root_introductions as root_introductions_routes
 from .routes import sessions as sessions_routes
+from .routes import setup_claims as setup_claims_routes
 from .routes import trust_bundle as trust_bundle_routes
 from .routes import workspace_templates as workspace_templates_routes
 from .routes import workspaces as workspaces_routes
@@ -43,6 +47,36 @@ from .ws import host as host_ws
 from .ws.broker import get_broker
 
 log = logging.getLogger("spawn.main")
+
+
+class SessionRenewalMiddleware:
+    """Attach a staged sliding cookie without changing endpoint task context.
+
+    A pure ASGI response hook matters here: ``BaseHTTPMiddleware`` moves the
+    downstream application into another task, which breaks request context
+    propagation and can buffer or otherwise interfere with streaming bodies.
+    WebSocket scopes pass straight through.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_renewal(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                state = scope.get("state")
+                token = state.get("session_renewal_token") if isinstance(state, dict) else None
+                if isinstance(token, str):
+                    MutableHeaders(scope=message).append(
+                        "set-cookie", auth.session_cookie_header(token)
+                    )
+            await send(message)
+
+        await self.app(scope, receive, send_with_renewal)
 
 
 @asynccontextmanager
@@ -76,6 +110,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="spawn-server", version="0.1.0", lifespan=lifespan)
 
     settings = get_settings()
+    app.add_middleware(SessionRenewalMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
@@ -100,6 +135,7 @@ def create_app() -> FastAPI:
     app.include_router(push_routes.router)
     app.include_router(release_routes.router)
     app.include_router(sessions_routes.router)
+    app.include_router(setup_claims_routes.router)
     app.include_router(workspace_templates_routes.router)
     app.include_router(workspaces_routes.router)
     app.include_router(agents_routes.router)

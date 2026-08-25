@@ -257,9 +257,7 @@ async def _run_auto_update(*, user_id: str, host_id: str, agent_id: str, target:
         else:
             raw_result = await get_broker().request_agent_install(daemon, target=target)
             result = (
-                schemas.HostAgentInstallResult.model_validate(
-                    raw_result.get("result", raw_result)
-                )
+                schemas.HostAgentInstallResult.model_validate(raw_result.get("result", raw_result))
                 if raw_result is not None
                 else None
             )
@@ -376,8 +374,7 @@ async def run_auto_update_checks_once() -> None:
         checked = schemas.HostAgentList.model_validate(result)
         now = _utcnow()
         by_agent = {
-            agent_id: (policy_id, user_id, target)
-            for policy_id, user_id, agent_id, target in items
+            agent_id: (policy_id, user_id, target) for policy_id, user_id, agent_id, target in items
         }
 
         async with sm() as session:
@@ -501,7 +498,11 @@ def _enforce_daemon_update_rate(host_id: str) -> None:
     _DAEMON_UPDATE_REQUESTED_AT[host_id] = now
     if len(_DAEMON_UPDATE_REQUESTED_AT) > 10_000:
         cutoff = now - DAEMON_UPDATE_RATE_SECONDS
-        stale = [key for key, requested_at in _DAEMON_UPDATE_REQUESTED_AT.items() if requested_at < cutoff]
+        stale = [
+            key
+            for key, requested_at in _DAEMON_UPDATE_REQUESTED_AT.items()
+            if requested_at < cutoff
+        ]
         for key in stale:
             _DAEMON_UPDATE_REQUESTED_AT.pop(key, None)
 
@@ -514,6 +515,7 @@ def _enforce_daemon_update_rate(host_id: str) -> None:
 async def update_host_daemon(
     host_id: str,
     response: Response,
+    body: schemas.HostUpdateRequest | None = None,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> schemas.HostUpdateResponse:
@@ -521,7 +523,7 @@ async def update_host_daemon(
     _enforce_daemon_update_rate(host_id)
     manifest = release.read_prebuilt_manifest()
     update_state = release.host_update_state(host, manifest)
-    if update_state.state == "current":
+    if update_state.state == "current" and not host.worker_mismatch:
         response.status_code = status.HTTP_200_OK
         return schemas.HostUpdateResponse(update=update_state)
 
@@ -536,7 +538,11 @@ async def update_host_daemon(
     if manifest is None:
         raise HTTPException(status_code=409, detail="daemon release information is unavailable")
 
-    payload = release.mark_update_requested(host, manifest)
+    payload = release.mark_update_requested(
+        host,
+        manifest,
+        allow_downgrade=body.allow_downgrade if body is not None else False,
+    )
     if payload is None:
         raise HTTPException(
             status_code=409,
@@ -618,9 +624,7 @@ async def list_recent_dirs(
         .all()
     )
     return schemas.RecentDirList(
-        dirs=[
-            schemas.RecentDirOut(path=row.path, last_used_at=row.last_used_at) for row in rows
-        ]
+        dirs=[schemas.RecentDirOut(path=row.path, last_used_at=row.last_used_at) for row in rows]
     )
 
 
@@ -640,9 +644,7 @@ async def ping_host_control(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post(
-    "/{host_id}/agents/{agent_id}/install", response_model=schemas.HostAgentInstallResult
-)
+@router.post("/{host_id}/agents/{agent_id}/install", response_model=schemas.HostAgentInstallResult)
 async def install_host_agent(
     host_id: str,
     agent_id: str,

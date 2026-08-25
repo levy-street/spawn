@@ -20,9 +20,7 @@ from spawn_server.browser_registration import (
 )
 
 VECTORS_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "proto"
-    / "browser-device-registration-v2-vectors.json"
+    Path(__file__).resolve().parents[2] / "proto" / "browser-device-registration-v2-vectors.json"
 )
 
 
@@ -142,9 +140,7 @@ async def test_root_claim_must_match_the_signed_proof_and_the_stored_row(client)
     # A root claim with a device-flagged (unflagged) proof is refused...
     unflagged = dict(_proof(user_id, key))
     unflagged["is_root"] = True
-    refused = await client.post(
-        "/api/browser-devices/register", json=unflagged, headers=headers
-    )
+    refused = await client.post("/api/browser-devices/register", json=unflagged, headers=headers)
     assert refused.status_code == 422
 
     # ...and a device claim with a root-flagged proof is refused too.
@@ -266,9 +262,7 @@ async def test_revoke_requires_owned_id_and_expected_key_and_never_resurrects(cl
     key = Ed25519PrivateKey.generate()
     proof = _proof(user_id, key)
     headers = {"Authorization": f"Bearer {token}"}
-    registered = await client.post(
-        "/api/browser-devices/register", json=proof, headers=headers
-    )
+    registered = await client.post("/api/browser-devices/register", json=proof, headers=headers)
     device = registered.json()
 
     wrong_key = _proof(user_id, Ed25519PrivateKey.generate())["public_key"]
@@ -302,9 +296,7 @@ async def test_revoke_requires_owned_id_and_expected_key_and_never_resurrects(cl
     assert repeated.status_code == 200
     assert repeated.json()["revoked_at"] == revoked.json()["revoked_at"]
 
-    resurrect_same = await client.post(
-        "/api/browser-devices/register", json=proof, headers=headers
-    )
+    resurrect_same = await client.post("/api/browser-devices/register", json=proof, headers=headers)
     assert resurrect_same.status_code == 409
     resurrect_other = await client.post(
         "/api/browser-devices/register",
@@ -321,9 +313,7 @@ async def test_concurrent_file_sqlite_registration_and_revocation_converge(file_
 
     registrations = await asyncio.gather(
         *[
-            file_sqlite_client.post(
-                "/api/browser-devices/register", json=proof, headers=headers
-            )
+            file_sqlite_client.post("/api/browser-devices/register", json=proof, headers=headers)
             for _ in range(12)
         ]
     )
@@ -388,6 +378,8 @@ async def test_revoking_a_pinned_device_pushes_to_affected_hosts(client, monkeyp
     endorsed -- for as long as it stays connected.
     """
 
+    from sqlalchemy import select
+
     from spawn_server.db import get_sessionmaker
     from spawn_server.models import BrowserDevice, Host, HostBrowserPin
 
@@ -438,7 +430,12 @@ async def test_revoking_a_pinned_device_pushes_to_affected_hosts(client, monkeyp
             ]
         )
         await session.commit()
-        host_a_id, host_b_id, endorser_id = host_a.id, host_b.id, endorser.id
+        host_a_id, host_b_id, endorser_id, endorsed_id = (
+            host_a.id,
+            host_b.id,
+            endorser.id,
+            endorsed.id,
+        )
 
     response = await client.post(
         f"/api/browser-devices/{endorser_id}/revoke",
@@ -450,6 +447,15 @@ async def test_revoking_a_pinned_device_pushes_to_affected_hosts(client, monkeyp
     # Pushed to every host whose pin set the revocation changed: the one that
     # trusted the endorser directly and the one that trusted its endorsee.
     assert set(pushed) == {host_a_id, host_b_id}
+    async with get_sessionmaker()() as session:
+        remaining = (
+            (await session.execute(select(HostBrowserPin).order_by(HostBrowserPin.host_id)))
+            .scalars()
+            .all()
+        )
+    # The direct snapshot is reclaimed. The endorsed row remains as history,
+    # but liveness excludes it because its endorser is now tombstoned.
+    assert [(pin.host_id, pin.browser_device_id) for pin in remaining] == [(host_b_id, endorsed_id)]
 
 
 async def test_prune_deletes_only_this_accounts_tombstones(client):
@@ -475,9 +481,7 @@ async def test_prune_deletes_only_this_accounts_tombstones(client):
     other_headers = {"Authorization": f"Bearer {other_token}"}
     other_proof = _proof(other_id, Ed25519PrivateKey.generate())
     other = (
-        await client.post(
-            "/api/browser-devices/register", json=other_proof, headers=other_headers
-        )
+        await client.post("/api/browser-devices/register", json=other_proof, headers=other_headers)
     ).json()
     other_revoked = await client.post(
         f"/api/browser-devices/{other['id']}/revoke",
@@ -559,9 +563,7 @@ async def test_prune_never_removes_a_revoked_key_from_the_host_deny_list(client)
 
     # And the pruned key can never be quietly re-registered into the account:
     # re-admission takes a fresh ceremony over a NEW key, never un-revoking.
-    resurrect = await client.post(
-        "/api/browser-devices/register", json=proof, headers=headers
-    )
+    resurrect = await client.post("/api/browser-devices/register", json=proof, headers=headers)
     assert resurrect.status_code == 409
 
     # A different account revoking a key never bleeds into this account's
@@ -570,9 +572,7 @@ async def test_prune_never_removes_a_revoked_key_from_the_host_deny_list(client)
     other_headers = {"Authorization": f"Bearer {other_token}"}
     other_proof = _proof(other_id, Ed25519PrivateKey.generate())
     other = (
-        await client.post(
-            "/api/browser-devices/register", json=other_proof, headers=other_headers
-        )
+        await client.post("/api/browser-devices/register", json=other_proof, headers=other_headers)
     ).json()
     await client.post(
         f"/api/browser-devices/{other['id']}/revoke",
@@ -652,16 +652,13 @@ async def test_live_root_uniqueness_is_a_database_invariant(client):
     # A revoked root plus one live successor is the steady state after rotation.
     async with get_sessionmaker()() as session:
         roots = (
-            (
-                await session.execute(
-                    select(BrowserDevice.public_key, BrowserDevice.revoked_at).where(
-                        BrowserDevice.owner_user_id == user_id,
-                        BrowserDevice.is_root.is_(True),
-                    )
+            await session.execute(
+                select(BrowserDevice.public_key, BrowserDevice.revoked_at).where(
+                    BrowserDevice.owner_user_id == user_id,
+                    BrowserDevice.is_root.is_(True),
                 )
             )
-            .all()
-        )
+        ).all()
     assert {(key, revoked is None) for key, revoked in roots} == {
         ("R" * 43, False),
         ("T" * 43, True),

@@ -61,6 +61,7 @@ async def test_release_endpoint_is_public_no_store_and_exact_shape(client, tmp_p
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
+    manifest = {**manifest, "release_counter": None, "signed": False}
     assert response.json() == {
         "server": {"commit": COMMIT, "dirty": False},
         "web": {"build_id": COMMIT},
@@ -81,6 +82,38 @@ async def test_release_has_null_daemon_without_a_manifest(client, tmp_path, monk
 
     assert response.status_code == 200
     assert response.json()["daemon"] is None
+
+
+async def test_release_tolerates_counter_and_key_id_and_reports_signature(
+    client, tmp_path, monkeypatch
+):
+    _configure_release(monkeypatch, tmp_path)
+    manifest = _stage_manifest(tmp_path)
+    prebuilt = tmp_path / "daemon" / "target" / "prebuilt"
+    manifest.update(release_counter=1_725_000_000, signing_key_id="e65c013f")
+    (prebuilt / "manifest.json").write_text(json.dumps(manifest))
+    (prebuilt / "manifest.json.sig").write_bytes(b"signature")
+    release.refresh()
+
+    response = await client.get("/api/release")
+    assert response.status_code == 200
+    assert response.json()["daemon"]["release_counter"] == 1_725_000_000
+    assert response.json()["daemon"]["signed"] is True
+
+    manifest["release_counter"] = -1
+    (prebuilt / "manifest.json").write_text(json.dumps(manifest))
+    release.refresh()
+    assert (await client.get("/api/release")).json()["daemon"] is None
+
+
+def test_prebuilt_dir_setting_selects_manifest_and_binary_root(tmp_path, monkeypatch):
+    settings = release.get_settings()
+    monkeypatch.setattr(settings, "prebuilt_dir", tmp_path)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+
+    assert release.prebuilt_root() == tmp_path
+    assert release.manifest_path() == tmp_path / "manifest.json"
+    assert release.manifest_signature_path() == tmp_path / "manifest.json.sig"
 
 
 async def test_manifest_hash_mismatch_is_not_advertised_and_logs_once(

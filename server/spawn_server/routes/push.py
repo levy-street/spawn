@@ -10,10 +10,10 @@ different account.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, Response, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
@@ -21,6 +21,7 @@ from ..db import get_session
 from ..models import PushDevice, User
 
 router = APIRouter(prefix="/api/notifications", tags=["notifications"])
+DISABLED_PUSH_RETENTION = timedelta(days=90)
 
 
 def _utcnow() -> datetime:
@@ -38,6 +39,12 @@ async def register_push_device(
     session: AsyncSession = Depends(get_session),
 ) -> schemas.PushDeviceOut:
     now = _utcnow()
+    await session.execute(
+        delete(PushDevice).where(
+            PushDevice.disabled_at.is_not(None),
+            PushDevice.disabled_at < now - DISABLED_PUSH_RETENTION,
+        )
+    )
     existing = (
         await session.execute(select(PushDevice).where(PushDevice.token == body.token))
     ).scalar_one_or_none()

@@ -63,6 +63,52 @@ class User(Base):
     host_key_claims: Mapped[list[HostKeyClaim]] = relationship(back_populates="owner")
 
 
+class SetupClaim(Base):
+    """Authenticated routing hint for one possession-proved host ceremony.
+
+    A claim carries no approval authority.  It only lets the account that
+    minted it observe and receive attention for the first ceremony that proves
+    possession while presenting its token.
+    """
+
+    __tablename__ = "setup_claims"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token: Mapped[str] = mapped_column(String(43), unique=True, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    error: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    device_code_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("device_codes.device_code", ondelete="SET NULL"), nullable=True
+    )
+    approval_ref: Mapped[str | None] = mapped_column(String(43), nullable=True)
+    host_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    os: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    host_key_fingerprint: Mapped[str | None] = mapped_column(String(23), nullable=True)
+    host_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("hosts.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'ready', 'approved', 'failed')",
+            name="ck_setup_claims_status",
+        ),
+        CheckConstraint(
+            "error IS NULL OR error IN "
+            "('expired', 'denied', 'key_conflict', 'pin_conflict', 'pin_limit')",
+            name="ck_setup_claims_error",
+        ),
+    )
+
+
 class BrowserDevice(Base):
     """Account-bound browser Ed25519 key, retained after revocation as a tombstone."""
 
@@ -375,6 +421,9 @@ class Host(Base):
         Boolean, default=False, server_default="false", nullable=False
     )
     self_update_blocked: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    worker_mismatch: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
     update_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
     update_tree: Mapped[str | None] = mapped_column(String(64), nullable=True)
     update_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -542,6 +591,11 @@ class HostBrowserPin(Base):
     # browser keys it already trusts instead of believing this row.
     endorser_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     endorsement_signature: Mapped[str | None] = mapped_column(String(86), nullable=True)
+    # Old daemons send neither adoption ack nor nack, so NULL/NULL remains the
+    # backward-compatible optimistic state. A nack writes the reason; a later
+    # ack clears it and stamps delivered_at.
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    undelivered_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -938,6 +992,10 @@ class DeviceCode(Base):
     approval_ref: Mapped[str | None] = mapped_column(
         String(43), unique=True, nullable=True, index=True
     )
+    # Authenticated routing hint only. Unknown or expired tokens are retained
+    # on the ceremony for diagnostics but grant nothing and are ignored when
+    # possession is proved.
+    setup_token: Mapped[str | None] = mapped_column(String(43), nullable=True, index=True)
     # Committed-ephemeral SAS relay fields (docs/TRUST_DEVICE_MESH.md App. A). The
     # server only stores and forwards these; it cannot forge a matching number.
     # sas_commit (Cd) is set by the daemon at start; sas_browser_nonce (Nb) +
@@ -1044,9 +1102,7 @@ class Workspace(Base):
     # Sidebar ordering, contiguous from 0 per owner. Archived rows leave that
     # space entirely — they order by `archived_at` and their `position` is
     # stale until a restore appends them back at the end.
-    position: Mapped[int] = mapped_column(
-        Integer, default=0, server_default="0", nullable=False
-    )
+    position: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     # The workspace's mark: a small square thumbnail as a self-contained
     # `data:image/(png|webp);base64,...` URL, checked on every write by
     # `schemas.validate_workspace_icon`. Null -> the sidebar draws the name's
@@ -1062,9 +1118,7 @@ class Workspace(Base):
     # session in it stopped. Nothing else moves — `layout` still names the same
     # windows and `position` still holds the slot the row will come back to. A
     # timestamp rather than a flag so the UI can say "archived 3 days ago".
-    archived_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -1123,9 +1177,7 @@ class RecentDir(Base):
     last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
-        UniqueConstraint(
-            "owner_user_id", "host_id", "path", name="uq_recent_dirs_owner_host_path"
-        ),
+        UniqueConstraint("owner_user_id", "host_id", "path", name="uq_recent_dirs_owner_host_path"),
     )
 
 

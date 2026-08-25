@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from textwrap import dedent
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from .. import release
@@ -54,7 +54,7 @@ def _binary_candidates(target: str, name: str) -> list[Path]:
     triple = SUPPORTED_TARGETS[target]
     root = _repo_root()
     candidates = [
-        root / "daemon" / "target" / "prebuilt" / target / name,
+        release.prebuilt_root(repo_root=root) / target / name,
         root / "daemon" / "target" / triple / "release" / name,
     ]
     if target == _local_target():
@@ -79,12 +79,9 @@ def _prebuilt_sha256_cases() -> str:
     if manifest is not None:
         arms: list[str] = []
         for target, target_release in manifest.targets.items():
+            arms.append(f"        spawnd:{target}) printf %s {target_release.spawnd_sha256} ;;")
             arms.append(
-                f"        spawnd:{target}) printf %s {target_release.spawnd_sha256} ;;"
-            )
-            arms.append(
-                "        "
-                f"spawn-worker:{target}) printf %s {target_release.spawn_worker_sha256} ;;"
+                f"        spawn-worker:{target}) printf %s {target_release.spawn_worker_sha256} ;;"
             )
         return "\n".join(arms)
 
@@ -107,9 +104,7 @@ async def spawnd_binary(target: str) -> FileResponse:
 
     binary = next((path for path in _binary_candidates(target, "spawnd") if path.is_file()), None)
     if binary is None:
-        raise HTTPException(
-            status_code=404, detail=f"daemon binary is not available for {target}"
-        )
+        raise HTTPException(status_code=404, detail=f"daemon binary is not available for {target}")
 
     return FileResponse(
         binary,
@@ -136,6 +131,38 @@ async def spawn_worker_binary(target: str) -> FileResponse:
         binary,
         media_type="application/octet-stream",
         filename="spawn-worker",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/api/install/manifest.json")
+async def prebuilt_manifest() -> Response:
+    path = release.manifest_path(repo_root=_repo_root())
+    if release.read_prebuilt_manifest(repo_root=_repo_root(), manifest_path=path) is None:
+        raise HTTPException(status_code=404, detail="daemon manifest is not available")
+    try:
+        body = path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="daemon manifest is not available") from exc
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/api/install/manifest.json.sig")
+async def prebuilt_manifest_signature() -> Response:
+    path = release.manifest_signature_path(repo_root=_repo_root())
+    try:
+        body = path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=404, detail="daemon manifest signature is not available"
+        ) from exc
+    return Response(
+        content=body,
+        media_type="text/plain",
         headers={"Cache-Control": "no-store"},
     )
 
@@ -175,6 +202,8 @@ INSTALL_SCRIPT = dedent(
     USE_SERVICE=1
     FOREGROUND=0
     PREBUILT_ONLY=0
+    SETUP_TOKEN=${SPAWN_SETUP_TOKEN:-}
+    NEW_ACCOUNT=0
 
     if [ -z "$INSTALL_ROOT" ]; then
       INSTALL_ROOT="$HOME/.local"
@@ -209,12 +238,15 @@ INSTALL_SCRIPT = dedent(
       --no-service       Do not create a user systemd service; use background run fallback.
       --foreground       Run spawnd in the foreground after login.
       --prebuilt-only    Do not fall back to building from source.
+      --setup TOKEN      Route this possession request back to the setup screen.
+      --new-account      Possess as a separate account on an already-used machine.
       -h, --help         Show this help.
 
     Environment:
       SPAWN_INSTALL_ROOT Install root. Default: ~/.local
       SPAWN_REPO         Same as --repo.
       SPAWN_BRANCH       Same as --branch.
+      SPAWN_SETUP_TOKEN  Same as --setup.
     EOF
     }
 
@@ -269,6 +301,21 @@ INSTALL_SCRIPT = dedent(
           PREBUILT_ONLY=1
           shift
           ;;
+        --setup)
+          [ "$#" -ge 2 ] || die "--setup requires a token"
+          [ -n "$2" ] || die "--setup requires a token"
+          SETUP_TOKEN=$2
+          shift 2
+          ;;
+        --setup=*)
+          SETUP_TOKEN=${1#--setup=}
+          [ -n "$SETUP_TOKEN" ] || die "--setup requires a token"
+          shift
+          ;;
+        --new-account)
+          NEW_ACCOUNT=1
+          shift
+          ;;
         -h|--help)
           usage
           exit 0
@@ -283,6 +330,11 @@ INSTALL_SCRIPT = dedent(
       http://*|https://*) ;;
       *) die "--server must start with http:// or https://" ;;
     esac
+
+    if [ -n "$SETUP_TOKEN" ]; then
+      SPAWN_SETUP_TOKEN=$SETUP_TOKEN
+      export SPAWN_SETUP_TOKEN
+    fi
 
     as_root() {
       if [ "$(id -u)" -eq 0 ]; then
@@ -679,6 +731,9 @@ INSTALL_SCRIPT = dedent(
 
     # Default: possess runs the login flow (if needed) and installs a supervised
     # background service, idempotently — it owns the service lifecycle now.
+    if [ "$NEW_ACCOUNT" = "1" ]; then
+      exec "$BIN" --server "$SERVER" possess --new-account
+    fi
     exec "$BIN" --server "$SERVER" possess
     """
 ).lstrip()

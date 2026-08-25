@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
+import jwt
 import pytest
 from sqlalchemy import select
 from starlette.websockets import WebSocketDisconnect
@@ -19,7 +20,7 @@ from starlette.websockets import WebSocketDisconnect
 from spawn_server import auth
 from spawn_server.db import get_sessionmaker
 from spawn_server.limits import MAX_SAFE_FENCING_GENERATION
-from spawn_server.models import Host, Session, User
+from spawn_server.models import BrowserDevice, Host, HostBrowserPin, Session, User
 from spawn_server.redis import get_backend
 from spawn_server.ws.broker import DaemonConn, HostBrowserConn, get_broker
 from spawn_server.ws.daemon import (
@@ -177,17 +178,17 @@ async def test_daemon_ws_rejects_missing_and_non_daemon_tokens(client):
     missing = FakeDaemonWebSocket()
     await daemon_ws(missing, token=None)  # type: ignore[arg-type]
     assert missing.accepted_subprotocol == "spawn.control.v3"
-    assert missing.closed == (1008, "missing token")
+    assert missing.closed == (1008, "token_invalid")
 
     wrong_kind = FakeDaemonWebSocket(authorization=f"Bearer {access_token}")
     await daemon_ws(wrong_kind, token=None)  # type: ignore[arg-type]
-    assert wrong_kind.closed == (1008, "not a daemon token")
+    assert wrong_kind.closed == (1008, "token_invalid")
 
     wrong_host = FakeDaemonWebSocket(
         authorization=f"Bearer {auth.issue_daemon_token(host_id, 'other-user')}"
     )
     await daemon_ws(wrong_host, token=None)  # type: ignore[arg-type]
-    assert wrong_host.closed == (1008, "host gone")
+    assert wrong_host.closed == (1008, "token_revoked")
     async with get_sessionmaker()() as session:
         rejected_host = await session.get(Host, host_id)
         assert rejected_host is not None
@@ -210,6 +211,64 @@ async def test_daemon_ws_rejects_missing_and_non_daemon_tokens(client):
         }
     ]
     assert old.closed == (4003, "protocol upgrade required")
+
+
+async def test_expired_daemon_token_is_identified_and_recorded(client):
+    user_id, _ = await _signup(client, "ws-daemon-expired@example.com")
+    host_id = await _create_host(user_id)
+    settings = auth.get_settings()
+    now = datetime.now(UTC)
+    expired_token = jwt.encode(
+        {
+            "sub": f"host:{host_id}",
+            "user_id": user_id,
+            "kind": auth.KIND_DAEMON,
+            "iat": int((now - timedelta(days=366)).timestamp()),
+            "exp": int((now - timedelta(seconds=1)).timestamp()),
+        },
+        settings.jwt_secret,
+        algorithm=settings.jwt_algorithm,
+    )
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {expired_token}")
+
+    await daemon_ws(ws, token=None)  # type: ignore[arg-type]
+
+    assert ws.closed == (1008, "token_expired")
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.last_disconnect_reason == "auth_rejected"
+        assert host.last_disconnect_at is not None
+
+
+async def test_registered_rotates_daemon_token_with_under_thirty_days_left(client):
+    user_id, _ = await _signup(client, "ws-daemon-rotation@example.com")
+    host_id = await _create_host(user_id)
+    settings = auth.get_settings()
+    now = datetime.now(UTC)
+    expiring_token = jwt.encode(
+        {
+            "sub": f"host:{host_id}",
+            "user_id": user_id,
+            "kind": auth.KIND_DAEMON,
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(days=29)).timestamp()),
+        },
+        settings.jwt_secret,
+        algorithm=settings.jwt_algorithm,
+    )
+    ws = FakeDaemonWebSocket(authorization=f"Bearer {expiring_token}")
+    ws.queue_text({"type": "register"})
+    ws.queue_disconnect()
+
+    await daemon_ws(ws, token=None)  # type: ignore[arg-type]
+
+    registered = next(frame for frame in _sent_json(ws) if frame["type"] == "registered")
+    rotated = auth.decode_token(registered["access_token"])
+    assert rotated["sub"] == f"host:{host_id}"
+    assert rotated["user_id"] == user_id
+    assert rotated["kind"] == auth.KIND_DAEMON
+    assert datetime.fromtimestamp(rotated["exp"], UTC) > now + timedelta(days=364)
 
 
 async def test_daemon_pre_register_frame_gets_invalid_frame(client):
@@ -238,6 +297,18 @@ async def test_daemon_register_rejects_invalid_capability_shapes(client):
     ws.queue_disconnect()
     await daemon_ws(ws, token=None)  # type: ignore[arg-type]
     assert _sent_json(ws) == [
+        {
+            "type": "error",
+            "code": "invalid_frame",
+            "frame_type": "register",
+        }
+    ]
+
+    mismatch = FakeDaemonWebSocket(authorization=f"Bearer {token}")
+    mismatch.queue_text({"type": "register", "worker_mismatch": "yes"})
+    mismatch.queue_disconnect()
+    await daemon_ws(mismatch, token=None)  # type: ignore[arg-type]
+    assert _sent_json(mismatch) == [
         {
             "type": "error",
             "code": "invalid_frame",
@@ -578,11 +649,8 @@ async def test_register_respects_disabled_daemon_auto_update(client, tmp_path, m
     _stage_update_manifest(tmp_path)
     monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(release, "MANIFEST_PATH", None)
-    monkeypatch.setattr(
-        daemon_module,
-        "get_settings",
-        lambda: SimpleNamespace(daemon_auto_update=False),
-    )
+    settings = daemon_module.get_settings().model_copy(update={"daemon_auto_update": False})
+    monkeypatch.setattr(daemon_module, "get_settings", lambda: settings)
     release.refresh()
     user_id, _ = await _signup(client, "ws-daemon-auto-update-disabled@example.com")
     host_id = await _create_host(user_id)
@@ -607,7 +675,168 @@ async def test_register_respects_disabled_daemon_auto_update(client, tmp_path, m
         assert host.update_state is None
 
 
-async def test_update_result_failure_is_humanized_and_keeps_requested_tree(client):
+async def test_worker_mismatch_register_repairs_same_tree_and_omission_clears_flag(
+    client, tmp_path, monkeypatch
+):
+    from spawn_server import release
+    from spawn_server.ws import daemon as daemon_module
+
+    tree = "b" * 40
+    _stage_update_manifest(tmp_path, tree=tree)
+    monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    settings = daemon_module.get_settings().model_copy(update={"daemon_auto_update": False})
+    monkeypatch.setattr(daemon_module, "get_settings", lambda: settings)
+    release.refresh()
+    user_id, _ = await _signup(client, "ws-daemon-worker-repair@example.com")
+    host_id = await _create_host(user_id)
+
+    mismatch = FakeDaemonWebSocket()
+    mismatch.queue_text(
+        {
+            "type": "register",
+            "os": "linux",
+            "arch": "x86_64",
+            "daemon_tree": tree,
+            "self_update": False,
+            "worker_mismatch": True,
+        }
+    )
+    mismatch.queue_disconnect()
+    await daemon_ws(mismatch, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+
+    frames = _sent_json(mismatch)
+    registered_index = next(i for i, frame in enumerate(frames) if frame["type"] == "registered")
+    update_index = next(i for i, frame in enumerate(frames) if frame["type"] == "daemon.update")
+    assert registered_index < update_index
+    assert frames[update_index]["tree"] == tree
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.worker_mismatch is True
+
+    repaired = FakeDaemonWebSocket()
+    repaired.queue_text(
+        {
+            "type": "register",
+            "os": "linux",
+            "arch": "x86_64",
+            "daemon_tree": tree,
+            "self_update": False,
+        }
+    )
+    repaired.queue_disconnect()
+    await daemon_ws(repaired, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+
+    assert not any(frame["type"] == "daemon.update" for frame in _sent_json(repaired))
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.worker_mismatch is False
+
+
+async def test_pin_adoption_failure_is_validated_persisted_published_and_cleared(
+    client, monkeypatch
+):
+    from spawn_server.ws import daemon as daemon_module
+
+    user_id, _ = await _signup(client, "ws-daemon-pin-adoption@example.com")
+    host_id = await _create_host(user_id)
+    async with get_sessionmaker()() as session:
+        device = BrowserDevice(
+            owner_user_id=user_id,
+            key_algorithm="ed25519",
+            public_key="P" * 43,
+        )
+        session.add(device)
+        await session.flush()
+        pin = HostBrowserPin(
+            host_id=host_id,
+            browser_device_id=device.id,
+            browser_key_algorithm="ed25519",
+            browser_public_key=device.public_key,
+            browser_key_fingerprint="SHA256:" + "p" * 16,
+        )
+        session.add(pin)
+        await session.commit()
+        device_id = device.id
+
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def capture_event(owner_id: str, payload: dict[str, object]) -> None:
+        events.append((owner_id, payload))
+
+    monkeypatch.setattr(daemon_module, "publish_trust_event", capture_event)
+    ws = FakeDaemonWebSocket()
+    ws.queue_text({"type": "register"})
+    task = asyncio.create_task(
+        daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+    )
+    await _wait_until(lambda: any(frame.get("type") == "registered" for frame in _sent_json(ws)))
+
+    ws.queue_text(
+        {
+            "type": "host.pin_adopt_failed",
+            "browser_device_id": device_id,
+            "reason": "pin_limit",
+            "extra": True,
+        }
+    )
+    ws.queue_text(
+        {
+            "type": "host.pin_adopt_failed",
+            "browser_device_id": str(uuid.uuid4()),
+            "reason": "other",
+        }
+    )
+    ws.queue_text(
+        {
+            "type": "host.pin_adopt_failed",
+            "browser_device_id": device_id,
+            "reason": "pin_limit",
+        }
+    )
+    await _wait_until(lambda: len(events) == 1)
+
+    assert events[0][0] == user_id
+    assert events[0][1]["event"] == "host.pin_undelivered"
+    assert events[0][1]["host_id"] == host_id
+    assert events[0][1]["browser_device_id"] == device_id
+    assert events[0][1]["reason"] == "pin_limit"
+    assert [frame for frame in _sent_json(ws) if frame.get("code") == "invalid_frame"] == [
+        {
+            "type": "error",
+            "code": "invalid_frame",
+            "frame_type": "host.pin_adopt_failed",
+        }
+    ]
+    async with get_sessionmaker()() as session:
+        pin = await session.get(HostBrowserPin, (host_id, device_id))
+        assert pin is not None
+        assert pin.delivered_at is None
+        assert pin.undelivered_reason == "pin_limit"
+
+    ws.queue_text({"type": "host.pin_adopted", "browser_device_id": device_id})
+    ws.queue_disconnect()
+    await asyncio.wait_for(task, timeout=1)
+
+    async with get_sessionmaker()() as session:
+        pin = await session.get(HostBrowserPin, (host_id, device_id))
+        assert pin is not None
+        assert pin.delivered_at is not None
+        assert pin.undelivered_reason is None
+
+
+@pytest.mark.parametrize(
+    ("stage", "error", "humanized"),
+    [
+        ("verify", "checksum_mismatch", "verify: checksum mismatch"),
+        ("health", "worker_not_healthy", "health: worker not healthy"),
+    ],
+)
+async def test_update_result_failure_is_humanized_and_keeps_requested_tree(
+    client, stage, error, humanized
+):
     user_id, _ = await _signup(client, "ws-daemon-update-result@example.com")
     host_id = await _create_host(user_id)
     requested_tree = "b" * 40
@@ -633,8 +862,8 @@ async def test_update_result_failure_is_humanized_and_keeps_requested_tree(clien
             "request_id": "request-1",
             "ok": False,
             "tree": requested_tree,
-            "stage": "verify",
-            "error": "checksum_mismatch",
+            "stage": stage,
+            "error": error,
         }
     )
     ws.queue_disconnect()
@@ -646,7 +875,7 @@ async def test_update_result_failure_is_humanized_and_keeps_requested_tree(clien
         assert host is not None
         assert host.update_state == "failed"
         assert host.update_tree == requested_tree
-        assert host.update_error == "verify: checksum mismatch"
+        assert host.update_error == humanized
 
 
 async def test_successful_update_result_stays_updating_until_reregister(client):

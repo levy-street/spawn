@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 log = logging.getLogger("spawn.release")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_REPO_ROOT = REPO_ROOT
 # Tests may point this at an isolated manifest without having to reproduce the
 # whole repository layout. When unset, it follows REPO_ROOT dynamically.
 MANIFEST_PATH: Path | None = None
@@ -194,8 +195,30 @@ def _sha256_file(path: Path) -> str | None:
     return value
 
 
-def _manifest_location(repo_root: Path) -> Path:
-    return MANIFEST_PATH or repo_root / "daemon" / "target" / "prebuilt" / "manifest.json"
+def prebuilt_root(*, repo_root: Path | None = None) -> Path:
+    if MANIFEST_PATH is not None:
+        return MANIFEST_PATH.parent
+    root = repo_root or REPO_ROOT
+    configured = getattr(get_settings(), "prebuilt_dir", None)
+    default = _DEFAULT_REPO_ROOT / "daemon" / "target" / "prebuilt"
+    # Unit tests historically replace REPO_ROOT. Preserve that seam unless a
+    # genuinely custom SPAWN_PREBUILT_DIR was supplied.
+    if configured is not None and Path(configured) != default:
+        return Path(configured)
+    return root / "daemon" / "target" / "prebuilt"
+
+
+def _manifest_path_for_root(*, repo_root: Path | None = None) -> Path:
+    return MANIFEST_PATH or prebuilt_root(repo_root=repo_root) / "manifest.json"
+
+
+def manifest_path(*, repo_root: Path | None = None) -> Path:
+    return _manifest_path_for_root(repo_root=repo_root)
+
+
+def manifest_signature_path(*, repo_root: Path | None = None) -> Path:
+    path = _manifest_path_for_root(repo_root=repo_root)
+    return Path(f"{path}.sig")
 
 
 def read_prebuilt_manifest(
@@ -206,7 +229,7 @@ def read_prebuilt_manifest(
     """Read and fully verify the prebuilt manifest currently on disk."""
 
     root = repo_root or REPO_ROOT
-    path = manifest_path or _manifest_location(root)
+    path = manifest_path or _manifest_path_for_root(repo_root=root)
     try:
         raw = json.loads(path.read_text())
     except FileNotFoundError:
@@ -221,6 +244,8 @@ def read_prebuilt_manifest(
     commit = _clean_hex_40(raw.get("commit") if isinstance(raw.get("commit"), str) else None)
     tree = _clean_hex_40(raw.get("tree") if isinstance(raw.get("tree"), str) else None)
     version = raw.get("version")
+    release_counter = raw.get("release_counter")
+    signing_key_id = raw.get("signing_key_id")
     targets_raw = raw.get("targets")
     if (
         commit is None
@@ -229,6 +254,12 @@ def read_prebuilt_manifest(
         or not version.strip()
         or len(version) > 64
         or not isinstance(targets_raw, dict)
+        or (
+            release_counter is not None
+            and (isinstance(release_counter, bool) or not isinstance(release_counter, int))
+        )
+        or (isinstance(release_counter, int) and release_counter < 0)
+        or (signing_key_id is not None and not isinstance(signing_key_id, str))
     ):
         _log_manifest_error_once(f"{path} has invalid release fields")
         return None
@@ -268,6 +299,8 @@ def read_prebuilt_manifest(
         version=version.strip(),
         commit=commit,
         tree=tree,
+        release_counter=release_counter,
+        signed=Path(f"{path}.sig").is_file(),
         targets=targets,
     )
 
@@ -300,9 +333,7 @@ def _aware_utc(value: datetime | None) -> datetime | None:
 
 
 def daemon_target(os_name: str | None, arch: str | None) -> str | None:
-    os_part = {"darwin": "darwin", "macos": "darwin", "linux": "linux"}.get(
-        (os_name or "").lower()
-    )
+    os_part = {"darwin": "darwin", "macos": "darwin", "linux": "linux"}.get((os_name or "").lower())
     arch_part = {
         "aarch64": "aarch64",
         "arm64": "aarch64",
@@ -332,18 +363,25 @@ def host_update_state(
     *,
     now: datetime | None = None,
 ) -> schemas.HostUpdateOut:
+    def result(value: schemas.HostUpdateOut) -> schemas.HostUpdateOut:
+        if host.worker_mismatch:
+            value.error = "worker_mismatch"
+        return value
+
     if manifest is None:
         manifest = read_prebuilt_manifest()
     if manifest is None or (host.daemon_tree or "").endswith("-dirty"):
-        return schemas.HostUpdateOut(state="unknown")
+        return result(schemas.HostUpdateOut(state="unknown"))
     if host.daemon_tree is None:
-        return schemas.HostUpdateOut(
-            state="unsupported",
-            latest_version=manifest.version,
-            error="This daemon is too old to update itself",
+        return result(
+            schemas.HostUpdateOut(
+                state="unsupported",
+                latest_version=manifest.version,
+                error="This daemon is too old to update itself",
+            )
         )
     if host.daemon_tree == manifest.tree:
-        return schemas.HostUpdateOut(state="current", latest_version=manifest.version)
+        return result(schemas.HostUpdateOut(state="current", latest_version=manifest.version))
 
     requested_at = _aware_utc(host.update_requested_at)
     current_time = now or datetime.now(UTC)
@@ -352,25 +390,31 @@ def host_update_state(
         and requested_at is not None
         and current_time - requested_at <= DAEMON_UPDATE_TIMEOUT
     ):
-        return schemas.HostUpdateOut(
-            state="updating",
-            latest_version=manifest.version,
-            requested_at=requested_at,
+        return result(
+            schemas.HostUpdateOut(
+                state="updating",
+                latest_version=manifest.version,
+                requested_at=requested_at,
+            )
         )
     if host.update_state == "failed" and host.update_tree == manifest.tree:
-        return schemas.HostUpdateOut(
-            state="failed",
-            latest_version=manifest.version,
-            error=host.update_error,
-            requested_at=requested_at,
+        return result(
+            schemas.HostUpdateOut(
+                state="failed",
+                latest_version=manifest.version,
+                error=host.update_error,
+                requested_at=requested_at,
+            )
         )
     if not host.self_update:
-        return schemas.HostUpdateOut(
-            state="unsupported",
-            latest_version=manifest.version,
-            error=humanize_self_update_blocked(host.self_update_blocked),
+        return result(
+            schemas.HostUpdateOut(
+                state="unsupported",
+                latest_version=manifest.version,
+                error=humanize_self_update_blocked(host.self_update_blocked),
+            )
         )
-    return schemas.HostUpdateOut(state="available", latest_version=manifest.version)
+    return result(schemas.HostUpdateOut(state="available", latest_version=manifest.version))
 
 
 def daemon_update_payload(
@@ -378,12 +422,13 @@ def daemon_update_payload(
     manifest: schemas.DaemonReleaseOut,
     *,
     request_id: str | None = None,
+    allow_downgrade: bool = False,
 ) -> dict[str, Any] | None:
     target = daemon_target(host.os, host.arch)
     target_release = manifest.targets.get(target or "")
     if target is None or target_release is None:
         return None
-    return {
+    payload: dict[str, Any] = {
         "type": "daemon.update",
         "request_id": request_id or str(uuid.uuid4()),
         "version": manifest.version,
@@ -398,6 +443,9 @@ def daemon_update_payload(
             "sha256": target_release.spawn_worker_sha256,
         },
     }
+    if allow_downgrade:
+        payload["allow_downgrade"] = True
+    return payload
 
 
 def mark_update_requested(
@@ -405,8 +453,9 @@ def mark_update_requested(
     manifest: schemas.DaemonReleaseOut,
     *,
     now: datetime | None = None,
+    allow_downgrade: bool = False,
 ) -> dict[str, Any] | None:
-    payload = daemon_update_payload(host, manifest)
+    payload = daemon_update_payload(host, manifest, allow_downgrade=allow_downgrade)
     if payload is None:
         return None
     host.update_state = "updating"

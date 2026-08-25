@@ -22,7 +22,20 @@ from .redis import get_backend, user_alert_channel
 log = logging.getLogger("spawn.trust.events")
 
 TRUST_FRAME_TYPE = "trust"
-TRUST_EVENTS = frozenset({"device.approval_requested", "device.approval_resolved"})
+TRUST_EVENTS = frozenset(
+    {
+        "device.approval_requested",
+        "device.approval_resolved",
+        "host.pair_requested",
+        "host.pair_resolved",
+        "host.pin_undelivered",
+    }
+)
+
+PAIR_OUTCOMES = frozenset(
+    {"approved", "denied", "expired", "key_conflict", "pin_conflict", "pin_limit"}
+)
+PIN_UNDELIVERED_REASONS = frozenset({"pin_limit", "invalid_chain", "other"})
 
 
 def approval_requested_payload(
@@ -57,6 +70,53 @@ def approval_resolved_payload(
     }
 
 
+def pair_requested_payload(
+    approval_ref: str,
+    host_name: str,
+    os_name: str | None,
+    fingerprint: str,
+) -> dict[str, object]:
+    return {
+        "type": TRUST_FRAME_TYPE,
+        "event": "host.pair_requested",
+        "approval_ref": approval_ref,
+        "host_name": host_name,
+        "os": os_name,
+        "host_key_fingerprint": fingerprint,
+        "at": datetime.now(UTC).isoformat(),
+    }
+
+
+def pair_resolved_payload(
+    approval_ref: str,
+    outcome: str,
+    host_id: str | None,
+) -> dict[str, object]:
+    return {
+        "type": TRUST_FRAME_TYPE,
+        "event": "host.pair_resolved",
+        "approval_ref": approval_ref,
+        "outcome": outcome,
+        "host_id": host_id,
+        "at": datetime.now(UTC).isoformat(),
+    }
+
+
+def pin_undelivered_payload(
+    host_id: str,
+    browser_device_id: str,
+    reason: str,
+) -> dict[str, object]:
+    return {
+        "type": TRUST_FRAME_TYPE,
+        "event": "host.pin_undelivered",
+        "host_id": host_id,
+        "browser_device_id": browser_device_id,
+        "reason": reason,
+        "at": datetime.now(UTC).isoformat(),
+    }
+
+
 async def publish_trust_event(user_id: str, payload: dict[str, object]) -> None:
     """Best effort. A lost frame costs a device the live prompt, not the ceremony.
 
@@ -78,19 +138,51 @@ def forwardable_trust_frame(event: object) -> dict[str, object] | None:
         return None
     if event.get("type") != TRUST_FRAME_TYPE:
         return None
-    if event.get("event") not in TRUST_EVENTS:
+    event_name = event.get("event")
+    if event_name not in TRUST_EVENTS:
         return None
-    for key in ("request_id", "browser_device_id"):
-        value = event.get(key)
-        if not isinstance(value, str) or not value or len(value) > 64:
+
+    if event_name in {"device.approval_requested", "device.approval_resolved"}:
+        for key in ("request_id", "browser_device_id"):
+            value = event.get(key)
+            if not isinstance(value, str) or not value or len(value) > 64:
+                return None
+        label = event.get("label")
+        if label is not None and (not isinstance(label, str) or len(label) > 64):
             return None
-    label = event.get("label")
-    if label is not None and (not isinstance(label, str) or len(label) > 64):
-        return None
-    fingerprint = event.get("fingerprint")
-    if fingerprint is not None and (not isinstance(fingerprint, str) or len(fingerprint) > 64):
-        return None
-    status = event.get("status")
-    if status is not None and status not in {"approved", "denied"}:
-        return None
+        fingerprint = event.get("fingerprint")
+        if fingerprint is not None and (not isinstance(fingerprint, str) or len(fingerprint) > 64):
+            return None
+        status = event.get("status")
+        if status is not None and status not in {"approved", "denied"}:
+            return None
+    elif event_name == "host.pair_requested":
+        fields = {
+            "approval_ref": 64,
+            "host_name": 128,
+            "host_key_fingerprint": 64,
+        }
+        for key, limit in fields.items():
+            value = event.get(key)
+            if not isinstance(value, str) or not value or len(value) > limit:
+                return None
+        os_name = event.get("os")
+        if os_name is not None and (not isinstance(os_name, str) or len(os_name) > 64):
+            return None
+    elif event_name == "host.pair_resolved":
+        approval_ref = event.get("approval_ref")
+        if not isinstance(approval_ref, str) or not approval_ref or len(approval_ref) > 64:
+            return None
+        if event.get("outcome") not in PAIR_OUTCOMES:
+            return None
+        host_id = event.get("host_id")
+        if host_id is not None and (not isinstance(host_id, str) or len(host_id) > 64):
+            return None
+    else:
+        for key in ("host_id", "browser_device_id"):
+            value = event.get(key)
+            if not isinstance(value, str) or not value or len(value) > 64:
+                return None
+        if event.get("reason") not in PIN_UNDELIVERED_REASONS:
+            return None
     return event

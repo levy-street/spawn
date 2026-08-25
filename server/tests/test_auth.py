@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import update
+
+from spawn_server import auth
+from spawn_server.db import get_sessionmaker
+from spawn_server.models import User
+
 
 async def test_signup_login_me(client):
     r = await client.post(
@@ -49,6 +57,86 @@ async def test_signup_login_me(client):
     assert r5.status_code == 401
 
 
+async def test_session_cookie_slides_only_after_half_life_and_never_after_epoch_revoke(
+    client, monkeypatch
+):
+    signup = await client.post(
+        "/api/auth/signup",
+        json={"email": "slide@example.com", "password": "hunter2hunter"},
+    )
+    user_id = signup.json()["user"]["id"]
+    now = datetime.now(UTC)
+
+    monkeypatch.setattr(auth, "_now", lambda: now - timedelta(days=14))
+    young = auth.issue_session_token(user_id)
+    monkeypatch.setattr(auth, "_now", lambda: now)
+    before = await client.get("/api/me", headers={"Authorization": f"Bearer {young}"})
+    assert before.status_code == 200
+    assert "spawn_session=" not in before.headers.get("set-cookie", "")
+
+    monkeypatch.setattr(auth, "_now", lambda: now - timedelta(days=16))
+    old = auth.issue_session_token(user_id)
+    monkeypatch.setattr(auth, "_now", lambda: now)
+    after = await client.get("/api/me", headers={"Authorization": f"Bearer {old}"})
+    assert after.status_code == 200
+    renewed_cookie = after.headers["set-cookie"]
+    assert renewed_cookie.startswith("spawn_session=")
+    renewed = renewed_cookie.split("spawn_session=", 1)[1].split(";", 1)[0]
+    assert auth.decode_token(renewed)["epoch"] == 0
+
+    async with get_sessionmaker()() as session:
+        await session.execute(
+            update(User).where(User.id == user_id).values(session_epoch=User.session_epoch + 1)
+        )
+        await session.commit()
+    revoked = await client.get("/api/me", headers={"Authorization": f"Bearer {old}"})
+    assert revoked.status_code == 401
+    assert "spawn_session=" not in revoked.headers.get("set-cookie", "")
+
+
+async def test_explicit_session_renewal_and_sign_out_everywhere_keep_only_caller(
+    client, monkeypatch
+):
+    signup = await client.post(
+        "/api/auth/signup",
+        json={"email": "everywhere@example.com", "password": "hunter2hunter"},
+    )
+    user_id = signup.json()["user"]["id"]
+    issued_at = datetime.now(UTC)
+    monkeypatch.setattr(auth, "_now", lambda: issued_at - timedelta(seconds=2))
+    first = auth.issue_session_token(user_id)
+    monkeypatch.setattr(auth, "_now", lambda: issued_at - timedelta(seconds=1))
+    second = auth.issue_session_token(user_id)
+    assert first != second
+
+    renewed = await client.post(
+        "/api/auth/session/renew",
+        headers={"Authorization": f"Bearer {first}"},
+    )
+    assert renewed.status_code == 200, renewed.text
+    assert renewed.json()["expires_at"]
+    assert auth.decode_token(renewed.json()["access_token"])["epoch"] == 0
+    assert renewed.headers["set-cookie"].startswith("spawn_session=")
+
+    everywhere = await client.post(
+        "/api/auth/sign-out-everywhere",
+        json={},
+        headers={"Authorization": f"Bearer {first}"},
+    )
+    assert everywhere.status_code == 200, everywhere.text
+    caller = everywhere.json()["access_token"]
+    assert auth.decode_token(caller)["epoch"] == 1
+    assert (
+        await client.get("/api/me", headers={"Authorization": f"Bearer {caller}"})
+    ).status_code == 200
+    assert (
+        await client.get("/api/me", headers={"Authorization": f"Bearer {first}"})
+    ).status_code == 401
+    assert (
+        await client.get("/api/me", headers={"Authorization": f"Bearer {second}"})
+    ).status_code == 401
+
+
 async def test_account_deletion_confirms_and_cascades(client):
     from sqlalchemy import select
 
@@ -79,9 +167,7 @@ async def test_account_deletion_confirms_and_cascades(client):
             host_key_algorithm="ed25519",
             host_public_key="K" * 43,
         )
-        device = BrowserDevice(
-            owner_user_id=user_id, key_algorithm="ed25519", public_key="B" * 43
-        )
+        device = BrowserDevice(owner_user_id=user_id, key_algorithm="ed25519", public_key="B" * 43)
         claim = HostKeyClaim(
             host_key_algorithm="ed25519",
             host_public_key="K" * 43,
