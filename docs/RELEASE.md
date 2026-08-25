@@ -104,6 +104,45 @@ through `POST /api/hosts/{id}/update` with
 `{"allow_downgrade": true}`. Use that override only when the older signed
 release is the intended recovery; it does not permit unsigned updates.
 
+### Proving the updater
+
+The repeatable local updater proof has three CI scripts, all run by
+`scripts/test-all.sh` after the daemon tests:
+
+- `scripts/test-update-e2e.sh` builds two signed throwaway daemon identities
+  and proves automatic and manual update, same-PID exec, worker-backed PTY
+  survival, pair cleanup, idempotence, request throttling, update
+  preconditions, and the downgrade override.
+- `scripts/test-update-faults.sh` puts the daemon's complete localhost origin
+  behind the standard-library `scripts/fault-proxy.py` and pins download,
+  signature, hash, truncation, throttling, and candidate-version failures to
+  their reported update stages without corrupting the installed pair.
+- `scripts/test-update-probation.sh` runs the daemon under a launchd/systemd-
+  shaped supervisor loop, installs a candidate that fails real startup, and
+  proves pair-atomic health reversion plus the failed-tree no-repush rule.
+
+Before every release that changes `daemon/`, run the previous/new compatibility
+matrix with the commit currently deployed to production supplied explicitly:
+
+```bash
+SPAWN_OLD_REF=<deployed-commit> scripts/test-version-skew.sh
+```
+
+That ritual creates and removes a detached temporary worktree and prints all
+four `{old,new daemon} × {old,new server}` cells after registration and PTY
+smoke. The browser half lives in `web/tests/e2e/version-skew.spec.ts`: the
+old-web/new-server 4003 cell must show the hard reload countdown without a
+reconnect loop, while a soft build mismatch remains snooze-able.
+
+After connection, signalling, keepalive, worker-adoption, ICE, or TURN changes,
+run `SPAWN_ALLOW_SUDO=1 scripts/chaos-drills.sh`. The safe SIGSTOP and local
+uvicorn-loss cases are scripted; pfctl, Network Link Conditioner, sleep/wake,
+and network-interface steps print `MANUAL` markers and their expected
+observations. The script never prompts for sudo (`sudo -n` only) and refuses
+privileged steps without the explicit environment gate. Toxiproxy and
+mitmproxy remain useful optional manual comparators, but neither is a test
+dependency: the committed fault proxy uses Python's standard library.
+
 ## The server and the web app go out together
 
 Deployment is over SSH, from a coding agent, using the script in this repo:

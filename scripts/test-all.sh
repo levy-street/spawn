@@ -32,6 +32,15 @@ scripts/check-durable-data-decision.sh
 printf '%s\n' "== local daemon smoke cleanup guard =="
 scripts/smoke-local-daemon.sh --self-test
 
+printf '%s\n' "== daemon updater harness guards =="
+scripts/update-test-lib.sh --self-test
+scripts/fault-proxy.py --self-test
+scripts/test-update-e2e.sh --self-test
+scripts/test-update-faults.sh --self-test
+scripts/test-update-probation.sh --self-test
+scripts/test-version-skew.sh --self-test
+scripts/chaos-drills.sh --self-test
+
 printf '%s\n' "== no server terminal content guard =="
 scripts/check-no-server-terminal-content.sh
 
@@ -56,6 +65,29 @@ scripts/check-claude-md.sh
 
 printf '%s\n' "== daemon tests =="
 (cd daemon && cargo test --locked)
+
+printf '%s\n' "== daemon updater end-to-end =="
+scripts/test-update-e2e.sh
+
+printf '%s\n' "== daemon updater fault injection =="
+scripts/test-update-faults.sh
+
+printf '%s\n' "== daemon updater probation =="
+scripts/test-update-probation.sh
+
+printf '%s\n' "== pre-release version skew ritual (optional) =="
+if [[ -n "${SPAWN_OLD_REF:-}" ]]; then
+  scripts/test-version-skew.sh
+else
+  printf '%s\n' "set SPAWN_OLD_REF to the last deployed commit to run the four-cell skew matrix"
+fi
+
+printf '%s\n' "== connection chaos ritual (optional) =="
+if [[ "${SPAWN_ALLOW_SUDO:-0}" == "1" ]]; then
+  scripts/chaos-drills.sh
+else
+  printf '%s\n' "set SPAWN_ALLOW_SUDO=1 to run the local connection chaos ritual (sudo remains non-interactive)"
+fi
 
 printf '%s\n' "== prebuilt installer smoke =="
 scripts/smoke-install-prebuilt.sh
