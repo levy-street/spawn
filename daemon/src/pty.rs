@@ -28,6 +28,7 @@ use crate::proto::Outbound;
 #[derive(Clone, Debug)]
 enum WsOutboundKind {
     Text(String),
+    Ping,
     Close,
 }
 
@@ -67,12 +68,20 @@ impl WsOutbound {
         )
     }
 
-    pub(crate) fn into_parts(mut self) -> (Option<String>, bool, Option<Arc<Notify>>) {
+    pub(crate) fn ping() -> Self {
+        Self {
+            kind: WsOutboundKind::Ping,
+            flushed: None,
+        }
+    }
+
+    pub(crate) fn into_parts(mut self) -> (Option<String>, bool, bool, Option<Arc<Notify>>) {
         let kind = std::mem::replace(&mut self.kind, WsOutboundKind::Close);
         let flushed = self.flushed.take();
         match kind {
-            WsOutboundKind::Text(text) => (Some(text), false, flushed),
-            WsOutboundKind::Close => (None, true, flushed),
+            WsOutboundKind::Text(text) => (Some(text), false, false, flushed),
+            WsOutboundKind::Ping => (None, true, false, flushed),
+            WsOutboundKind::Close => (None, false, true, flushed),
         }
     }
 
@@ -80,6 +89,7 @@ impl WsOutbound {
     pub(crate) fn as_str(&self) -> &str {
         match &self.kind {
             WsOutboundKind::Text(text) => text,
+            WsOutboundKind::Ping => "",
             WsOutboundKind::Close => "",
         }
     }
@@ -168,6 +178,8 @@ impl Drop for DirectPayload {
 pub struct DirectSinkReceiver {
     pub receiver: mpsc::Receiver<DirectPayload>,
     pub disconnected: watch::Receiver<bool>,
+    pub gap_offset: Arc<AtomicU64>,
+    pub source_origin: u64,
 }
 
 /// One committed-history event fanned out to a viewer: either a batch of
@@ -314,7 +326,11 @@ fn activity_message(session_id: Uuid, kind: ActivityKind) -> Option<WsOutbound> 
 
 /// Best-effort emission used by the WebRTC input callback. The sink accepts
 /// serialized control-plane JSON only; it has no terminal-byte variant.
-pub(crate) fn try_emit_activity(out_tx: &SessionSink, session_id: Uuid, kind: ActivityKind) -> bool {
+pub(crate) fn try_emit_activity(
+    out_tx: &SessionSink,
+    session_id: Uuid,
+    kind: ActivityKind,
+) -> bool {
     let Some(message) = activity_message(session_id, kind) else {
         return false;
     };
@@ -330,6 +346,7 @@ struct DirectSinkEntry {
     disconnected: watch::Sender<bool>,
     source_origin: u64,
     bytes_sent: Arc<AtomicU64>,
+    gap_offset: Arc<AtomicU64>,
 }
 
 /// Shared between a session's forwarder task and the WS connection lifecycle.
@@ -414,7 +431,9 @@ impl ForwarderControl {
             let now = Instant::now();
             let wait = state
                 .last_emit_at
-                .map(|last| FOREGROUND_MIN_INTERVAL.saturating_sub(now.saturating_duration_since(last)))
+                .map(|last| {
+                    FOREGROUND_MIN_INTERVAL.saturating_sub(now.saturating_duration_since(last))
+                })
                 .unwrap_or(Duration::ZERO);
             if wait.is_zero() {
                 if state.emitted.as_deref() == Some(command.as_str()) {
@@ -638,10 +657,15 @@ impl ForwarderControl {
     /// DataChannel. These sinks receive raw PTY output bytes without the
     /// daemon->server->browser relay hop.
     pub async fn add_direct_sink(&self, id: String) -> DirectSinkReceiver {
+        let source_origin = self.source_offset.load(Ordering::Acquire);
+        self.add_direct_sink_from(id, source_origin).await
+    }
+
+    pub async fn add_direct_sink_from(&self, id: String, source_origin: u64) -> DirectSinkReceiver {
         let (sink, receiver) = mpsc::channel(DIRECT_SINK_QUEUE_DEPTH);
         let (disconnected, disconnected_rx) = watch::channel(false);
+        let gap_offset = Arc::new(AtomicU64::new(0));
         let mut sinks = self.direct_sinks.lock().await;
-        let source_origin = self.source_offset.load(Ordering::Acquire);
         let previous = sinks.insert(
             id,
             DirectSinkEntry {
@@ -649,6 +673,7 @@ impl ForwarderControl {
                 disconnected,
                 source_origin,
                 bytes_sent: Arc::new(AtomicU64::new(0)),
+                gap_offset: Arc::clone(&gap_offset),
             },
         );
         if let Some(previous) = previous {
@@ -659,6 +684,8 @@ impl ForwarderControl {
         DirectSinkReceiver {
             receiver,
             disconnected: disconnected_rx,
+            gap_offset,
+            source_origin,
         }
     }
 
@@ -755,6 +782,10 @@ impl ForwarderControl {
             // safely reconcile this live stream. Disconnect every current
             // sink; reconnect performs a bounded replay from a new origin.
             for entry in sinks.values() {
+                entry.gap_offset.store(
+                    source_end.saturating_sub(entry.source_origin),
+                    Ordering::Release,
+                );
                 let _ = entry.disconnected.send(true);
             }
             sinks.clear();
@@ -770,6 +801,10 @@ impl ForwarderControl {
                     .try_send(DirectPayload::new(part.to_vec()))
                     .is_err()
                 {
+                    entry.gap_offset.store(
+                        source_end.saturating_sub(entry.source_origin),
+                        Ordering::Release,
+                    );
                     let _ = entry.disconnected.send(true);
                     return false;
                 }
@@ -1621,7 +1656,9 @@ mod tests {
         let long = "x".repeat(100);
         control.note_foreground(session_id, &long).await;
         let third = rx.recv().await.unwrap();
-        assert!(third.as_str().contains(&"x".repeat(MAX_FOREGROUND_COMMAND_CHARS)));
+        assert!(third
+            .as_str()
+            .contains(&"x".repeat(MAX_FOREGROUND_COMMAND_CHARS)));
         assert!(!third
             .as_str()
             .contains(&"x".repeat(MAX_FOREGROUND_COMMAND_CHARS + 1)));
@@ -1854,8 +1891,21 @@ mod tests {
             .expect("stalled viewer was not disconnected")
             .expect("disconnect watch closed");
         assert!(*direct.disconnected.borrow());
+        let gap_offset = direct.gap_offset.load(Ordering::Acquire);
+        assert!(gap_offset > 0);
+        assert!(gap_offset <= control.source_offset());
         assert!(direct.receiver.len() <= DIRECT_SINK_QUEUE_DEPTH);
         assert_eq!(control.direct_sink_offset("stalled").await, None);
+
+        let origin = direct.source_origin;
+        let healed = control.add_direct_sink_from("stalled".into(), origin).await;
+        assert_eq!(healed.source_origin, origin);
+        assert_eq!(
+            control
+                .direct_sink_anchor("stalled", control.source_offset())
+                .await,
+            Some(control.source_offset().saturating_sub(origin))
+        );
 
         drop(outbox_tx);
         forwarder.await.unwrap();

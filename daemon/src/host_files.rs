@@ -1210,9 +1210,15 @@ impl HostFileService {
     ) -> FsResult<RangeReadStream> {
         let service = self.clone();
         let input = input.to_string();
-        self.run_blocking(operations, HostOperationKind::ReadRange, move |operations| {
-            service.open_range_read_sync(&input, offset, length, if_version, &cancelled, operations)
-        })
+        self.run_blocking(
+            operations,
+            HostOperationKind::ReadRange,
+            move |operations| {
+                service.open_range_read_sync(
+                    &input, offset, length, if_version, &cancelled, operations,
+                )
+            },
+        )
         .await
     }
 
@@ -1406,7 +1412,10 @@ impl HostFileService {
             let after = rustix::fs::fstat(dir.as_fd())
                 .map_err(|_| FsError::new("io_error", "could not stat the directory"))?;
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) {
-                return Err(FsError::new("file_changed", "target changed during resolution"));
+                return Err(FsError::new(
+                    "file_changed",
+                    "target changed during resolution",
+                ));
             }
             return Ok(LaunchTarget {
                 display,
@@ -1438,7 +1447,10 @@ impl HostFileService {
         let after = rustix::fs::fstat(file.as_fd())
             .map_err(|_| FsError::new("io_error", "could not stat the file"))?;
         if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) {
-            return Err(FsError::new("file_changed", "target changed during resolution"));
+            return Err(FsError::new(
+                "file_changed",
+                "target changed during resolution",
+            ));
         }
 
         let size = before.st_size.max(0) as u64;
@@ -2200,7 +2212,10 @@ fn real_path_of(handle: std::os::fd::BorrowedFd<'_>) -> FsResult<PathBuf> {
         )
     };
     if result == -1 {
-        return Err(FsError::new("io_error", "could not resolve the target path"));
+        return Err(FsError::new(
+            "io_error",
+            "could not resolve the target path",
+        ));
     }
     let end = buffer
         .iter()
@@ -2488,8 +2503,7 @@ mod tests {
         let path = temp.path().join("data.bin");
         let pin_mtime = |nanos: u32| {
             let file = std::fs::File::options().write(true).open(&path).unwrap();
-            let modified =
-                std::time::UNIX_EPOCH + std::time::Duration::new(1_755_000_000, nanos);
+            let modified = std::time::UNIX_EPOCH + std::time::Duration::new(1_755_000_000, nanos);
             file.set_times(std::fs::FileTimes::new().set_modified(modified))
                 .unwrap();
         };
@@ -2553,7 +2567,8 @@ mod tests {
         drop(file);
         let service = HostFileService::rooted_at(temp.path()).await.unwrap();
         assert_eq!(
-            service.open_preview_source("huge.bin")
+            service
+                .open_preview_source("huge.bin")
                 .await
                 .map(|_| ())
                 .unwrap_err()

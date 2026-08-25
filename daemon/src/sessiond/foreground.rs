@@ -212,8 +212,8 @@ mod tests {
 
     #[test]
     fn resolves_a_live_pid_to_a_nonempty_basename() {
-        let name = process_basename(std::process::id() as nix::libc::pid_t)
-            .expect("own pid must resolve");
+        let name =
+            process_basename(std::process::id() as nix::libc::pid_t).expect("own pid must resolve");
         assert!(!name.trim().is_empty());
     }
 

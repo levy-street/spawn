@@ -209,6 +209,7 @@ pub(crate) fn worker_bin() -> PathBuf {
 
 /// Launch a fresh worker for `session.create` and start the login shell inside it.
 pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
+    crate::update::ensure_worker_pair().await?;
     let dir = worker_dir()?;
     let socket = socket_path(&dir, spec.session_id);
     let logs = log_dir(&dir, spec.session_id);
@@ -628,14 +629,12 @@ async fn run_reader(
                     }
                 }
             }
-            Ok(Some((wire::T_FOREGROUND, payload))) => {
-                match wire::decode_foreground(&payload) {
-                    Ok(basename) => control.note_foreground(session_id, basename).await,
-                    Err(error) => {
-                        tracing::warn!(%session_id, %error, "invalid worker foreground frame");
-                    }
+            Ok(Some((wire::T_FOREGROUND, payload))) => match wire::decode_foreground(&payload) {
+                Ok(basename) => control.note_foreground(session_id, basename).await,
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "invalid worker foreground frame");
                 }
-            }
+            },
             Ok(Some((wire::T_EXIT, payload))) => {
                 let payload = Zeroizing::new(payload);
                 let info: wire::ExitInfo = wire::decode_json(&payload).unwrap_or(wire::ExitInfo {

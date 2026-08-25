@@ -128,10 +128,7 @@ impl PreviewService {
         operations: Arc<HostFileOperations>,
     ) -> FsResult<PreviewImage> {
         if !is_supported_size(max_pixels) {
-            return Err(FsError::new(
-                "invalid_request",
-                "unsupported preview size",
-            ));
+            return Err(FsError::new("invalid_request", "unsupported preview size"));
         }
         // Taken before any file-service permit. The other order lets queued
         // previews hold every long-task permit while waiting on this much
@@ -386,7 +383,10 @@ impl PreviewRenderer for QlmanageRenderer {
 /// extension, so the staged name needs one — but nothing else about the
 /// client's filename may survive into a path handed to another process.
 fn sanitized_extension(name: &str) -> Option<String> {
-    let extension = Path::new(name).extension()?.to_string_lossy().to_lowercase();
+    let extension = Path::new(name)
+        .extension()?
+        .to_string_lossy()
+        .to_lowercase();
     if extension.is_empty() || extension.len() > 16 {
         return None;
     }
@@ -434,7 +434,8 @@ fn open_private_dir(path: &Path) -> FsResult<cap_std::fs::Dir> {
 mod tests {
     use super::*;
 
-    const PNG_HEADER: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00\x00\x00\x00\xC0";
+    const PNG_HEADER: &[u8] =
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00\x00\x00\x00\xC0";
 
     #[test]
     fn png_dimensions_are_read_from_the_ihdr() {
@@ -468,9 +469,6 @@ mod tests {
         assert_eq!(sanitized_extension("evil.a/b"), None);
         assert_eq!(sanitized_extension("evil.$(id)"), None);
         assert_eq!(sanitized_extension("noext"), None);
-        assert_eq!(
-            sanitized_extension(&format!("a.{}", "x".repeat(20))),
-            None
-        );
+        assert_eq!(sanitized_extension(&format!("a.{}", "x".repeat(20))), None);
     }
 }

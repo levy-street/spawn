@@ -26,6 +26,8 @@ src/
                  commit into it (0.1.0+g<commit>)
 tests/           integration tests (worker_e2e.rs)
 examples/        golden-vector generators for proto/
+vendor/          exact upstream crate sources for narrowly documented patches;
+                 currently webrtc-sctp 0.17.2 plus the #822 re-admission fix
 ```
 
 ## Where things go
@@ -45,6 +47,21 @@ cargo build --locked && cargo test --locked
 
 Run `cargo clippy` and `cargo fmt` on what you touched. Shipping binaries to
 users goes through the rolling prebuilt release — read `docs/RELEASE.md`.
+
+WebRTC operational notes: `webrtc-ice` 0.17 cannot use TURN over TCP/TLS, so
+the offered ICE list must include a UDP `turn:` URL. Direct LAN ICE uses UDP
+ports 50000–50100; allow that inbound range in the host firewall. For temporary
+SCTP #822 confirmation, use `RUST_LOG=webrtc_sctp=debug` and look for
+`receive buffer full. dropping DATA with tsn=` immediately before an ABORT.
+
+`spawn-worker --version` prints the same build/tree identity stamped into
+`spawnd`. The supervisor checks that pair at startup and before every new
+session; a mismatch is reported as `worker_mismatch` and existing workers keep
+running, but new sessions are refused. Self-updates retain both `.prev`
+binaries and a sibling `spawnd.updating` probation marker until the new daemon
+registers. Two failed startups or five minutes without registration atomically
+restore the pair and report a `health` update failure after the old daemon
+registers.
 
 ## Keeping this file true
 

@@ -535,10 +535,8 @@ impl Context {
                                 let guess = crate::host_mime::classify_by_extension(
                                     std::ffi::OsStr::new(&stat.name),
                                 );
-                                object.insert(
-                                    "content_type".into(),
-                                    Value::from(guess.content_type),
-                                );
+                                object
+                                    .insert("content_type".into(), Value::from(guess.content_type));
                                 object.insert(
                                     "content_type_source".into(),
                                     Value::from(guess.source),
@@ -617,11 +615,8 @@ impl Context {
             "host.metrics" => match crate::host_metrics::sampler().sample() {
                 Some(sample) => {
                     let spec = crate::host_metrics::sampler().spec();
-                    self.response(
-                        request_id,
-                        json!({"sample": sample, "spec": spec}),
-                    )
-                    .await
+                    self.response(request_id, json!({"sample": sample, "spec": spec}))
+                        .await
                 }
                 None => {
                     self.error(

@@ -9,10 +9,11 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::proto::DaemonUpdateArtifact;
@@ -23,11 +24,15 @@ use update_io::*;
 
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(15);
+const PROBATION_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static WORKER_MISMATCH: AtomicBool = AtomicBool::new(false);
+static PROBATION: OnceLock<Arc<Mutex<Option<ProbationRuntime>>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct UpdateRequest {
+    pub request_id: Option<String>,
     pub version: String,
     pub tree: String,
     pub target: String,
@@ -41,6 +46,7 @@ pub enum UpdateStage {
     Verify,
     Swap,
     Exec,
+    Health,
     Precondition,
 }
 
@@ -51,6 +57,7 @@ impl UpdateStage {
             Self::Verify => "verify",
             Self::Swap => "swap",
             Self::Exec => "exec",
+            Self::Health => "health",
             Self::Precondition => "precondition",
         }
     }
@@ -82,6 +89,7 @@ enum BlockReason {
     Unwritable,
     UnsupportedTarget,
     WorkerMissing,
+    WorkerMismatch,
 }
 
 impl BlockReason {
@@ -91,6 +99,7 @@ impl BlockReason {
             Self::Unwritable => "unwritable",
             Self::UnsupportedTarget => "unsupported_target",
             Self::WorkerMissing => "worker_missing",
+            Self::WorkerMismatch => "worker_mismatch",
         }
     }
 }
@@ -111,6 +120,34 @@ struct Preconditions {
     daemon_path: PathBuf,
     worker_path: PathBuf,
     target: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProbationMarker {
+    attempts: u32,
+    old_tree: String,
+    deadline_unix_ms: u64,
+    attempted_tree: String,
+    version_before: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    worker_path: PathBuf,
+    #[serde(default)]
+    reverted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbationDecision {
+    Continue,
+    Revert,
+    ReportRevert,
+}
+
+#[derive(Debug)]
+struct ProbationRuntime {
+    marker_path: PathBuf,
+    marker: ProbationMarker,
+    daemon_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -154,6 +191,12 @@ struct ReleaseTarget {
 }
 
 pub fn capability() -> Capability {
+    if WORKER_MISMATCH.load(Ordering::Acquire) {
+        return Capability {
+            self_update: false,
+            blocked: Some(BlockReason::WorkerMismatch.as_str()),
+        };
+    }
     match evaluate_preconditions() {
         Ok(_) => Capability {
             self_update: true,
@@ -212,6 +255,7 @@ pub async fn apply_from_release(server: &Url) -> Result<HttpUpdateOutcome, Updat
         return Ok(HttpUpdateOutcome::NoUpdate("target_unavailable"));
     };
     let request = UpdateRequest {
+        request_id: None,
         version: daemon.version,
         tree: daemon.tree,
         target: preconditions.target.to_string(),
@@ -281,12 +325,30 @@ async fn apply_guarded(
     }
 
     log_stage(UpdateStage::Swap);
-    swap_binaries(
+    let marker_path = marker_path(&preconditions.daemon_path);
+    let marker = ProbationMarker {
+        attempts: 0,
+        old_tree: crate::version::daemon_tree()
+            .unwrap_or_default()
+            .to_string(),
+        deadline_unix_ms: unix_millis().saturating_add(PROBATION_WINDOW.as_millis() as u64),
+        attempted_tree: request.tree.clone(),
+        version_before: crate::version::build_version(),
+        request_id: request.request_id.clone(),
+        worker_path: preconditions.worker_path.clone(),
+        reverted: false,
+    };
+    write_marker(&marker_path, &marker)
+        .map_err(|_| UpdateFailure::new(UpdateStage::Swap, "marker_write_failed"))?;
+    if let Err(failure) = swap_binaries(
         &preconditions.daemon_path,
         &temporary.daemon,
         &preconditions.worker_path,
         &temporary.worker,
-    )?;
+    ) {
+        let _ = fs::remove_file(&marker_path);
+        return Err(failure);
+    }
     Ok(AppliedUpdate {
         daemon_path: preconditions.daemon_path,
         _permit: permit,
@@ -342,34 +404,259 @@ pub async fn run_cli(server_cli: Option<String>) -> Result<()> {
     }
 }
 
-pub fn cleanup_stale_previous() {
-    let mut directories = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            directories.push(parent.to_path_buf());
+/// Re-check the co-installed worker identity and publish the result through
+/// the existing self-update capability fields on the next register.
+pub async fn refresh_worker_pair_status() -> bool {
+    let (matches, mismatch) = match resolve_program(crate::worker_backend::worker_bin()) {
+        Some(worker) => {
+            let matches = worker_pair_matches(&worker).await;
+            (matches, !matches)
         }
+        None => (false, false),
+    };
+    WORKER_MISMATCH.store(mismatch, Ordering::Release);
+    if mismatch {
+        tracing::error!(
+            "spawn-worker identity does not match spawnd; refusing new sessions until the installed pair is repaired"
+        );
     }
-    if let Some(worker) = resolve_program(crate::worker_backend::worker_bin()) {
-        if let Some(parent) = worker.parent() {
-            directories.push(parent.to_path_buf());
-        }
-    }
-    directories.sort();
-    directories.dedup();
-    cleanup_previous_in(&directories);
+    matches
 }
 
-fn cleanup_previous_in(directories: &[PathBuf]) {
-    for directory in directories {
-        for name in ["spawnd.prev", "spawn-worker.prev"] {
-            match fs::remove_file(directory.join(name)) {
-                Ok(()) => tracing::info!(stage = "cleanup", "removed stale self-update backup"),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => tracing::warn!(
-                    stage = "cleanup",
-                    "could not remove stale self-update backup"
-                ),
+pub async fn ensure_worker_pair() -> Result<()> {
+    if refresh_worker_pair_status().await {
+        Ok(())
+    } else {
+        anyhow::bail!("installed spawn-worker does not match this spawnd build")
+    }
+}
+
+async fn worker_pair_matches(worker: &Path) -> bool {
+    let mut command = tokio::process::Command::new(worker);
+    command.arg("--version").kill_on_drop(true);
+    let Ok(Ok(output)) = tokio::time::timeout(VERSION_TIMEOUT, command.output()).await else {
+        return false;
+    };
+    output.status.success()
+        && std::str::from_utf8(&output.stdout)
+            .is_ok_and(|stdout| stdout.trim_end() == crate::version::worker_identity_line())
+}
+
+fn marker_path(daemon_path: &Path) -> PathBuf {
+    daemon_path.with_file_name("spawnd.updating")
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn probation_decision(marker: &ProbationMarker, now_unix_ms: u64) -> ProbationDecision {
+    if marker.reverted {
+        ProbationDecision::ReportRevert
+    } else if now_unix_ms >= marker.deadline_unix_ms || marker.attempts.saturating_add(1) >= 2 {
+        ProbationDecision::Revert
+    } else {
+        ProbationDecision::Continue
+    }
+}
+
+fn write_marker(path: &Path, marker: &ProbationMarker) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let bytes = serde_json::to_vec(marker).map_err(std::io::Error::other)?;
+    let temporary = path.with_file_name(format!("spawnd.updating.tmp.{}", std::process::id()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn read_marker(path: &Path) -> Result<ProbationMarker> {
+    let bytes = fs::read(path).context("reading self-update probation marker")?;
+    if bytes.len() > 16 * 1024 {
+        anyhow::bail!("self-update probation marker is oversized");
+    }
+    serde_json::from_slice(&bytes).context("decoding self-update probation marker")
+}
+
+/// Enter update probation before a daemon control connection is attempted.
+/// A second startup or an expired deadline restores the complete prior pair.
+pub fn prepare_probation() -> Result<()> {
+    let daemon_path = std::env::current_exe()
+        .ok()
+        .and_then(resolve_file)
+        .context("resolving spawnd for update probation")?;
+    let marker_path = marker_path(&daemon_path);
+    let state = PROBATION.get_or_init(|| Arc::new(Mutex::new(None)));
+    if !marker_path.exists() {
+        return Ok(());
+    }
+
+    let mut marker = read_marker(&marker_path)?;
+    match probation_decision(&marker, unix_millis()) {
+        ProbationDecision::Continue => {
+            marker.attempts = marker.attempts.saturating_add(1);
+            write_marker(&marker_path, &marker)
+                .context("updating self-update probation attempt")?;
+            *state.lock().expect("probation state lock") = Some(ProbationRuntime {
+                marker_path,
+                marker,
+                daemon_path,
+            });
+            Ok(())
+        }
+        ProbationDecision::ReportRevert => {
+            *state.lock().expect("probation state lock") = Some(ProbationRuntime {
+                marker_path,
+                marker,
+                daemon_path,
+            });
+            Ok(())
+        }
+        ProbationDecision::Revert => revert_and_exec(ProbationRuntime {
+            marker_path,
+            marker,
+            daemon_path,
+        }),
+    }
+}
+
+/// Arm the five-minute health deadline. Registration removes this task's
+/// shared state before it wakes, making success and revert mutually exclusive.
+pub fn arm_probation_deadline() {
+    let Some(state) = PROBATION.get().cloned() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let deadline = {
+            let guard = state.lock().expect("probation state lock");
+            guard.as_ref().and_then(|runtime| {
+                (!runtime.marker.reverted).then_some(runtime.marker.deadline_unix_ms)
+            })
+        };
+        let Some(deadline) = deadline else { return };
+        tokio::time::sleep(Duration::from_millis(
+            deadline.saturating_sub(unix_millis()),
+        ))
+        .await;
+        let runtime = state.lock().expect("probation state lock").take();
+        if let Some(runtime) = runtime {
+            if let Err(error) = revert_and_exec(runtime) {
+                tracing::error!(stage = "health", %error, "SPAWN D daemon health revert failed");
             }
+        }
+    });
+}
+
+fn revert_and_exec(mut runtime: ProbationRuntime) -> Result<()> {
+    revert_binaries(&runtime.daemon_path, &runtime.marker.worker_path)
+        .context("restoring previous daemon binaries")?;
+    runtime.marker.reverted = true;
+    write_marker(&runtime.marker_path, &runtime.marker)
+        .context("recording completed daemon health revert")?;
+    tracing::error!(
+        stage = "health",
+        "updated daemon did not register; reverting"
+    );
+    exec_path(&runtime.daemon_path)
+}
+
+#[cfg(unix)]
+fn exec_path(path: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let mut argv = std::env::args_os();
+    let argv0 = argv.next();
+    let mut command = std::process::Command::new(path);
+    if let Some(argv0) = argv0 {
+        command.arg0(argv0);
+    }
+    command.args(argv);
+    let error = command.exec();
+    Err(error).context("execing reverted spawnd")
+}
+
+#[cfg(not(unix))]
+fn exec_path(_path: &Path) -> Result<()> {
+    anyhow::bail!("health revert exec is unsupported on this target")
+}
+
+/// Commit a healthy update after registration, or report a completed revert
+/// before deleting its durable marker.
+pub async fn registered(out_tx: &tokio::sync::mpsc::Sender<crate::pty::WsOutbound>) {
+    let Some(state) = PROBATION.get() else { return };
+    let Some(runtime) = state.lock().expect("probation state lock").take() else {
+        return;
+    };
+    if runtime.marker.reverted {
+        let result = health_failure_result(&runtime.marker);
+        let Ok(frame) = serde_json::to_string(&result) else {
+            return;
+        };
+        let delivered = tokio::time::timeout(Duration::from_secs(2), async {
+            let (frame, flushed) = crate::pty::WsOutbound::tracked_json(frame);
+            out_tx.send(frame).await.map_err(|_| ())?;
+            flushed.notified().await;
+            Ok::<(), ()>(())
+        })
+        .await;
+        if !matches!(delivered, Ok(Ok(()))) {
+            *state.lock().expect("probation state lock") = Some(runtime);
+            return;
+        }
+    }
+
+    if let Err(error) = fs::remove_file(&runtime.marker_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                stage = "health",
+                "could not remove self-update probation marker"
+            );
+            *state.lock().expect("probation state lock") = Some(runtime);
+            return;
+        }
+    }
+    cleanup_previous_paths(&runtime.daemon_path, &runtime.marker.worker_path);
+    tracing::info!(
+        stage = "health",
+        "daemon update passed post-register health gate"
+    );
+}
+
+fn health_failure_result(marker: &ProbationMarker) -> crate::proto::Outbound {
+    crate::proto::Outbound::DaemonUpdateResult {
+        request_id: marker
+            .request_id
+            .clone()
+            .unwrap_or_else(|| format!("health-{}", marker.attempted_tree)),
+        ok: false,
+        tree: marker.attempted_tree.clone(),
+        version_before: marker.version_before.clone(),
+        stage: Some(UpdateStage::Health.as_str().to_string()),
+        error: Some("registration_failed".to_string()),
+    }
+}
+
+fn cleanup_previous_paths(daemon_path: &Path, worker_path: &Path) {
+    for previous in [previous_path(daemon_path), previous_path(worker_path)] {
+        match fs::remove_file(previous) {
+            Ok(()) => tracing::info!(stage = "cleanup", "removed self-update backup"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => tracing::warn!(stage = "cleanup", "could not remove self-update backup"),
         }
     }
 }

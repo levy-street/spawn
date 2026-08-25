@@ -191,7 +191,11 @@ impl SessionRegistry {
 
     /// Apply `f` only when the UUID still resolves to the backend captured in
     /// `binding`. This check and the handle access occur under the same lock.
-    pub fn with_bound_handle<F: FnOnce(&SessionHandle)>(&self, binding: SessionBinding, f: F) -> bool {
+    pub fn with_bound_handle<F: FnOnce(&SessionHandle)>(
+        &self,
+        binding: SessionBinding,
+        f: F,
+    ) -> bool {
         let guard = self.inner.lock().expect("sessions lock");
         if let Some(entry) = guard
             .get(&binding.session_id)

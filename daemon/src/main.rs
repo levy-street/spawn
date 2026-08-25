@@ -51,7 +51,6 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_var("SPAWN_CONFIG_DIR", dir);
     }
     init_tracing(cli.verbose);
-    update::cleanup_stale_previous();
 
     match cli.command {
         Command::Possess(args) => possess::possess(cli.server.clone(), args).await,
@@ -78,15 +77,22 @@ fn init_tracing(verbose: u8) {
     // -v => debug for spawnd, info elsewhere
     // -vv => trace for spawnd, debug elsewhere
     let default = match verbose {
-        0 => "info",
-        1 => "info,spawnd=debug",
-        _ => "debug,spawnd=trace",
+        0 => "info,webrtc=warn,webrtc_sctp=warn,webrtc_ice=warn",
+        1 => "info,spawnd=debug,webrtc=warn,webrtc_sctp=warn,webrtc_ice=warn",
+        _ => "debug,spawnd=trace,webrtc=warn,webrtc_sctp=warn,webrtc_ice=warn",
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
 
-    fmt()
+    let subscriber = fmt()
         .with_env_filter(filter)
         .with_target(false)
         .with_writer(std::io::stderr)
-        .init();
+        .finish();
+    // Install the subscriber before LogTracer: tracing-subscriber's `.init()`
+    // also installs a tracer, so calling both initialization helpers would
+    // make the second one fail. webrtc-rs uses the `log` facade; this explicit
+    // bridge carries its transport warnings into the filtered subscriber.
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("failed to set global tracing subscriber");
+    tracing_log::LogTracer::init().expect("failed to install log-to-tracing bridge");
 }

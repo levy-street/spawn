@@ -112,6 +112,13 @@ pub enum Outbound {
         daemon_tree: Option<String>,
         self_update: bool,
         self_update_blocked: Option<String>,
+        /// New daemons keep established peer-to-peer channels alive while the
+        /// control websocket reconnects. Old servers ignore both additions.
+        keeps_peers_across_reconnect: bool,
+        live_bindings: Vec<LiveRtcBinding>,
+        /// Allows the server to include `ice_transport_policy` on session
+        /// offers without triggering the old host/session discriminator trap.
+        session_ice_policy: bool,
         existing_sessions: Vec<Uuid>,
         /// What this machine is — cores, memory, CPU model, GPU. Sent once, on
         /// registration, because none of it changes while the daemon runs.
@@ -252,6 +259,17 @@ pub enum Outbound {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveRtcBinding {
+    pub session_id: String,
+    pub binding_nonce: String,
+    pub binding_generation: u64,
+    pub scope_type: String,
+    pub scope_id: Uuid,
+    pub protocol: String,
+    pub protocol_version: u16,
+}
+
 // ---------------------------------------------------------------------------
 // Server → daemon
 // ---------------------------------------------------------------------------
@@ -378,15 +396,14 @@ pub enum Inbound {
         /// anchor (device mesh §3). Empty for a directly-pinned browser.
         /// Bounded at the wire: a set larger than the daemon's independent cap
         /// rejects the whole frame (see the deserializer).
-        #[serde(
-            default,
-            deserialize_with = "deserialize_bounded_carried_endorsements"
-        )]
+        #[serde(default, deserialize_with = "deserialize_bounded_carried_endorsements")]
         carried_endorsements: Vec<CarriedEndorsement>,
         #[serde(default)]
         ice_servers: Vec<RtcIceServerConfig>,
         #[serde(default)]
         ice_transport_policy: Option<String>,
+        #[serde(default)]
+        ice_restart: bool,
     },
     #[serde(rename = "rtc.candidate")]
     RtcCandidate {
@@ -610,6 +627,17 @@ mod daemon_update_wire_tests {
             daemon_tree: Some("a".repeat(40)),
             self_update: true,
             self_update_blocked: None,
+            keeps_peers_across_reconnect: true,
+            live_bindings: vec![LiveRtcBinding {
+                session_id: "signal-1".into(),
+                binding_nonce: "a".repeat(32),
+                binding_generation: 7,
+                scope_type: "session".into(),
+                scope_id: Uuid::nil(),
+                protocol: "spawn.pty".into(),
+                protocol_version: 2,
+            }],
+            session_ice_policy: true,
             existing_sessions: Vec::new(),
             spec: None,
             supports_account_chains: true,
@@ -619,6 +647,9 @@ mod daemon_update_wire_tests {
         assert_eq!(value["daemon_tree"], "a".repeat(40));
         assert_eq!(value["self_update"], true);
         assert!(value["self_update_blocked"].is_null());
+        assert_eq!(value["keeps_peers_across_reconnect"], true);
+        assert_eq!(value["session_ice_policy"], true);
+        assert_eq!(value["live_bindings"][0]["binding_generation"], 7);
 
         let without_tree = serde_json::to_value(Outbound::Register {
             host_name: "workstation".into(),
@@ -628,6 +659,9 @@ mod daemon_update_wire_tests {
             daemon_tree: None,
             self_update: false,
             self_update_blocked: Some("worker_missing".into()),
+            keeps_peers_across_reconnect: true,
+            live_bindings: Vec::new(),
+            session_ice_policy: true,
             existing_sessions: Vec::new(),
             spec: None,
             supports_account_chains: true,
@@ -692,7 +726,9 @@ mod signed_rtc_relay_tests {
             "protocol": "spawn.pty",
             "protocol_version": 2,
             "signed_envelope": wire,
-            "ice_servers": []
+            "ice_servers": [],
+            "ice_transport_policy": "relay",
+            "ice_restart": true
         });
         let parsed: Inbound = serde_json::from_value(frame).expect("signed relay shape");
         assert!(matches!(
@@ -700,8 +736,10 @@ mod signed_rtc_relay_tests {
             Inbound::RtcOffer {
                 sdp: None,
                 signed_envelope: Some(ref preserved),
+                ice_transport_policy: Some(ref policy),
+                ice_restart: true,
                 ..
-            } if preserved == wire
+            } if preserved == wire && policy == "relay"
         ));
     }
 
