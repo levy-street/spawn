@@ -22,6 +22,10 @@ export function FileBreadcrumbs({
       horizontal
       keyboardShouldPersistTaps="handled"
       showsHorizontalScrollIndicator={false}
+      // A scroll view grows to fill its column by default; this one is a strip
+      // under the header, and the listing below it is what gets the room.
+      style={styles.strip}
+      testID="file-breadcrumbs"
     >
       {crumbs.map((crumb, index) => (
         <View key={crumb.path} style={styles.crumbGroup}>
@@ -71,5 +75,9 @@ const styles = StyleSheet.create({
   crumbGroup: {
     alignItems: "center",
     flexDirection: "row",
+  },
+  strip: {
+    flexGrow: 0,
+    flexShrink: 0,
   },
 });

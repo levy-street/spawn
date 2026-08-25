@@ -86,10 +86,11 @@ describe("host list and detail rendering", () => {
     // Both fixtures share a spec; the offline one keeps it and loses the meter.
     expect(screen.getAllByText(/12 cores · 24 GiB/)).toHaveLength(2);
 
-    // What is on the machine, not just how many of it.
+    // What is on the machine, not just how many of it — and not who it is
+    // waiting on: a session needing a person is the workspace's to say.
     expect(screen.getByTestId(`host-running-${onlineHost.id}`)).toBeOnTheScreen();
     expect(screen.getByText("Codex")).toBeOnTheScreen();
-    expect(screen.getByTestId(`host-attention-${onlineHost.id}`)).toBeOnTheScreen();
+    expect(screen.queryByText(/need you/)).toBeNull();
 
     // An offline machine reports no capacity, and a stale meter is worse than
     // none — the spec still says what the machine is.

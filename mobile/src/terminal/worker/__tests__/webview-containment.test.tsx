@@ -1,5 +1,6 @@
 import { render } from "@testing-library/react-native";
 import type { ForwardedRef } from "react";
+import { type StyleProp, StyleSheet, type ViewStyle } from "react-native";
 
 import { HostTransportSurface } from "@/terminal/HostTransportSurface";
 import { TerminalSurface } from "@/terminal/TerminalSurface";
@@ -8,6 +9,7 @@ import { isWorkerBootstrapNavigation, WORKER_BASE_URL } from "@/terminal/worker/
 
 type CapturedWebViewProps = Record<string, unknown> & {
   allowsLinkPreview?: boolean;
+  containerStyle?: StyleProp<ViewStyle>;
   javaScriptCanOpenWindowsAutomatically?: boolean;
   onOpenWindow?: (event: { nativeEvent: { targetUrl: string } }) => void;
   onShouldStartLoadWithRequest?: (request: { url: string }) => boolean;
@@ -133,5 +135,8 @@ describe("worker navigation containment", () => {
     expect(props.allowsLinkPreview).toBe(false);
     expect(props.setSupportMultipleWindows).toBe(false);
     expect(props.javaScriptCanOpenWindowsAutomatically).toBe(false);
+    // The library's own container would otherwise grow to fill the column the
+    // worker is mounted in, shoving a screen's toolbar down to meet it.
+    expect(StyleSheet.flatten(props.containerStyle)).toMatchObject({ position: "absolute" });
   });
 });

@@ -22,6 +22,7 @@ jest.mock("react-native-gesture-handler", () => {
         const builder: Record<string, unknown> = {};
         builder["activeOffsetX"] = () => builder;
         builder["failOffsetY"] = () => builder;
+        builder["onStart"] = () => builder;
         builder["onUpdate"] = (handler: MockCapturedPan["onUpdate"]) => {
           mockCapturedPan.onUpdate = handler;
           return builder;

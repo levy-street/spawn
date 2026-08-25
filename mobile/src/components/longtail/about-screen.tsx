@@ -1,8 +1,9 @@
 import * as Clipboard from "expo-clipboard";
 import Constants from "expo-constants";
 import { useEffect, useRef, useState } from "react";
-import { Linking, Share, StyleSheet, View } from "react-native";
+import { Linking, StyleSheet, View } from "react-native";
 
+import { BrandMark } from "@/components/brand/brand-mark";
 import {
   DOWNLOAD_URL,
   installCommandsForBaseUrl,
@@ -19,6 +20,7 @@ import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
 import { getBaseUrl } from "@/data/api/config";
+import { presentShareSheet } from "@/lib/share";
 import { borderWidth, duration, spacing, useTheme } from "@/theme";
 
 const PUBLIC_FALLBACK_ORIGIN = "https://spawnd.dev";
@@ -82,8 +84,8 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
 
   const shareInstructions = async () => {
     try {
-      await Share.share({
-        message: `Install spawn on a Mac or Linux machine you control:\n\n${commands.standard}\n\nAfter installation, run spawnd login on that machine.`,
+      await presentShareSheet({
+        message: `Install spawnd on a Mac or Linux machine you control:\n\n${commands.standard}\n\nAfter installation, run spawnd login on that machine.`,
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : undefined;
@@ -106,7 +108,12 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
         <SettingsBlock>
           <View style={styles.identity}>
             <View style={[styles.mark, { backgroundColor: theme.colors.brandAccentSoft }]}>
-              <Icon color="brandAccent" name="Terminal" size={spacing[6]} />
+              <BrandMark
+                accessibilityLabel="SPAWN D"
+                color={theme.colors.brandAccent}
+                size={spacing[6]}
+                testID="about-brand-mark"
+              />
             </View>
             <View style={styles.identityCopy}>
               <Text variant="title">SPAWN D</Text>
