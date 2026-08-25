@@ -14,7 +14,9 @@ import { spacing } from "@/theme";
  */
 const PANEL_GROUPS = [
   { title: "General", keys: ["account", "appearance", "notifications"] },
-  { title: "Hosts & agents", keys: ["hosts", "agents", "skills", "templates"] },
+  // Machines are the Legion tab's, not a setting: connecting, renaming and
+  // removing one all happen there, so Settings keeps to what runs on them.
+  { title: "Agents", keys: ["agents", "skills", "templates"] },
   { title: "Devices & trust", keys: ["devices", "trust"] },
 ] as const satisfies readonly { title: string; keys: readonly SettingsPanelKey[] }[];
 

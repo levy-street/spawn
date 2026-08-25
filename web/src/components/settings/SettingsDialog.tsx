@@ -17,7 +17,6 @@ import { AccessPanel } from "@/components/settings/AccessPanel";
 import { AccountPanel } from "@/components/settings/AccountPanel";
 import { AgentsPanel } from "@/components/settings/AgentsPanel";
 import { AppearancePanel } from "@/components/settings/AppearancePanel";
-import { HostsPanel } from "@/components/settings/HostsPanel";
 import { NotificationsPanel } from "@/components/settings/NotificationsPanel";
 import { SkillsPanel } from "@/components/settings/SkillsPanel";
 import {
@@ -47,7 +46,6 @@ const TABS: Array<{
   { key: "account", label: "Account", icon: User },
   { key: "appearance", label: "Appearance", icon: Palette },
   { key: "notifications", label: "Notifications", icon: Bell },
-  { key: "hosts", label: "Hosts", icon: Server },
   { key: "agents", label: "Agents", icon: Bot },
   { key: "skills", label: "Skills", icon: Wrench },
   { key: "templates", label: "Templates", icon: LayoutTemplate },
@@ -62,8 +60,7 @@ export function SettingsDialog() {
     <Dialog open={tab !== null} onOpenChange={(open) => (open ? undefined : closeSettings())}>
       <DialogContent size="full-mobile" data-testid="settings-dialog" className="md:flex-row">
         <DialogDescription className="sr-only">
-          Manage your account, appearance, notifications, hosts, agents, skills, templates, and
-          access.
+          Manage your account, appearance, notifications, agents, skills, templates, and access.
         </DialogDescription>
 
         <nav
@@ -112,7 +109,6 @@ export function SettingsDialog() {
             {tab === "account" && <AccountPanel />}
             {tab === "appearance" && <AppearancePanel />}
             {tab === "notifications" && <NotificationsPanel />}
-            {tab === "hosts" && <HostsPanel />}
             {tab === "agents" && <AgentsPanel />}
             {tab === "skills" && <SkillsPanel />}
             {tab === "templates" && <TemplatesPanel />}

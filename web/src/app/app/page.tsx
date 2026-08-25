@@ -6,7 +6,6 @@ import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { Trident } from "@/components/icons/BrandMark";
 import { AppShell } from "@/components/nav/AppShell";
-import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
@@ -157,7 +156,7 @@ export default function AppEntryPage() {
           icon={<Server />}
           title="Connect a host to start a session"
           body="Install the daemon on a machine you control, then approve its pairing code."
-          action={<Button onClick={() => openSettings("hosts")}>Connect a host</Button>}
+          action={<Button onClick={() => router.push("/device")}>Connect a host</Button>}
         />
       </AppShell>
     );
@@ -171,7 +170,7 @@ export default function AppEntryPage() {
           icon={<Server />}
           title="Your host is offline"
           body="Bring a daemon online before creating the first workspace."
-          action={<Button onClick={() => openSettings("hosts")}>View hosts</Button>}
+          action={<Button onClick={() => router.push("/legion")}>View hosts</Button>}
         />
       </AppShell>
     );
