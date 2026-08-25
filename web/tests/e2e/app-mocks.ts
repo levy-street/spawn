@@ -1031,6 +1031,27 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       await json(route, []);
       return;
     }
+    if (path === "/api/trust/pairing" && method === "POST") {
+      // Initiator opens a ceremony; the joiner discovers it by polling.
+      const body = (await request.postDataJSON()) as Record<string, string>;
+      const row = {
+        id: `00000000-0000-4000-8000-${String(pairingRows.length + 700).padStart(12, "0")}`,
+        initiator_device_id: body.initiator_device_id,
+        joiner_device_id: body.joiner_device_id,
+        initiator_public_key: body.initiator_public_key,
+        initiator_commit: body.initiator_commit,
+        joiner_public_key: null,
+        joiner_nonce: null,
+        initiator_nonce: null,
+        introductions: null,
+        device_introductions: null,
+        created_at: CREATED_AT,
+        expires_at: "2099-01-01T00:00:00Z",
+      };
+      pairingRows.push(row);
+      await json(route, { id: row.id, expires_at: row.expires_at });
+      return;
+    }
     if (path === "/api/trust/pairing" && method === "GET") {
       const forDevice = url.searchParams.get("device_id");
       await json(

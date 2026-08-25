@@ -2,6 +2,18 @@ import { z } from "zod";
 import { api } from "@/data/api/client";
 import { jsonBody, pathPart, queryString } from "@/data/api/endpoints/helpers";
 import {
+  type DevicePairingContribute,
+  DevicePairingContributeSchema,
+  type DevicePairingOut,
+  DevicePairingOutSchema,
+  type DevicePairingReveal,
+  DevicePairingRevealSchema,
+  type DevicePairingStart,
+  DevicePairingStartSchema,
+  type DevicePairingState,
+  DevicePairingStateSchema,
+} from "@/data/api/schemas/pairing";
+import {
   type AccountEndorsementCreate,
   AccountEndorsementCreateSchema,
   type AccountEndorsementOut,
@@ -122,4 +134,51 @@ export function denyDeviceApproval(requestId: string): Promise<DeviceApprovalReq
 
 export function listHostPins(hostId: string): Promise<string[]> {
   return api(`/api/trust/hosts/${pathPart(hostId)}/pins`, { schema: z.array(z.string().uuid()) });
+}
+
+// ----- add-device SAS ceremony relay (mesh §4, Appendix A) -----
+
+/** Initiator: open a ceremony toward `joiner_device_id`, committing to a nonce. */
+export function startPairing(body: DevicePairingStart): Promise<DevicePairingOut> {
+  return api("/api/trust/pairing", {
+    method: "POST",
+    body: jsonBody(DevicePairingStartSchema.parse(body)),
+    schema: DevicePairingOutSchema,
+  });
+}
+
+/** Live ceremonies involving `deviceId`, as initiator or joiner. */
+export function listPairings(deviceId: string): Promise<DevicePairingState[]> {
+  return api(`/api/trust/pairing${queryString({ device_id: deviceId })}`, {
+    schema: z.array(DevicePairingStateSchema),
+  });
+}
+
+/** Joiner: its key and fresh nonce, sent before it can learn the opened nonce. */
+export function contributePairing(
+  pairingId: string,
+  body: DevicePairingContribute,
+): Promise<DevicePairingState> {
+  return api(`/api/trust/pairing/${pathPart(pairingId)}/contribute`, {
+    method: "POST",
+    body: jsonBody(DevicePairingContributeSchema.parse(body)),
+    schema: DevicePairingStateSchema,
+  });
+}
+
+/** Initiator: open the commitment once the joiner has contributed. */
+export function revealPairing(
+  pairingId: string,
+  body: DevicePairingReveal,
+): Promise<DevicePairingState> {
+  return api(`/api/trust/pairing/${pathPart(pairingId)}/reveal`, {
+    method: "POST",
+    body: jsonBody(DevicePairingRevealSchema.parse(body)),
+    schema: DevicePairingStateSchema,
+  });
+}
+
+/** Either side tears the ceremony down: a wrong number, a wrong device. */
+export function cancelPairing(pairingId: string): Promise<void> {
+  return api(`/api/trust/pairing/${pathPart(pairingId)}`, { method: "DELETE" });
 }

@@ -19,6 +19,7 @@ import { qk } from "@/data/queryKeys";
 import type { AlertEvent } from "@/data/realtime/alert-socket";
 import { identifyAgent } from "@/data/selectors/agent";
 import { alertEventKey, useAlertStore } from "@/data/stores/alerts";
+import { useAuthenticatedAccount } from "@/lib/auth-gate";
 import { haptics } from "@/lib/haptics";
 import {
   configureLocalNotifications,
@@ -58,9 +59,12 @@ export function AlertPresenter({
       ? currentTerminalSession(pathname)
       : explicitCurrentSessionId;
   // The push token is registered against this install's trust identity so
-  // the server never pushes this device's own knock back to it.
+  // the server never pushes this device's own knock back to it. Nothing here
+  // runs while signed out: the permission prompt belongs after sign-in, not
+  // on the login screen.
+  const { accountId } = useAuthenticatedAccount();
   const me = useMeSettingsQuery();
-  const phone = useRegisteredPhone(me.data?.user.id);
+  const phone = useRegisteredPhone(accountId === null ? undefined : me.data?.user.id);
   const browserDeviceId = phone.data?.id ?? null;
 
   const openSession = useCallback(
@@ -101,11 +105,12 @@ export function AlertPresenter({
   useEffect(() => {
     configureLocalNotifications();
     void hydrateNotificationPreferences();
-    // Re-registered on every mount on purpose: push tokens are reissued on
-    // reinstall, on restore to a new handset and sometimes on an OS upgrade,
-    // and a stale registration fails silently — the alerts simply stop. Runs
-    // again once the trust identity is known, so the token carries it.
-    void registerForPushNotifications({ browserDeviceId });
+    // Re-registered on every signed-in mount on purpose: push tokens are
+    // reissued on reinstall, on restore to a new handset and sometimes on an
+    // OS upgrade, and a stale registration fails silently — the alerts simply
+    // stop. Runs again once the trust identity is known, so the token carries
+    // it. Signed out, it neither asks for permission nor registers.
+    if (accountId !== null) void registerForPushNotifications({ browserDeviceId });
     const lastResponse = consumeLastLocalNotificationResponse();
     if (lastResponse) void handleNotificationTarget(lastResponse);
     else if (consumeLastApprovalNotificationResponse()) surfaceApproval();
@@ -115,7 +120,7 @@ export function AlertPresenter({
       },
       () => surfaceApproval(),
     );
-  }, [handleNotificationTarget, surfaceApproval, browserDeviceId]);
+  }, [handleNotificationTarget, surfaceApproval, browserDeviceId, accountId]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (state) => {
