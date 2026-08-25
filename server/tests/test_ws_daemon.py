@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -239,8 +242,295 @@ async def test_daemon_ws_register_accepts_old_shape_and_heartbeat_query_token(cl
         assert host.os == "linux"
         assert host.arch == "x86_64"
         assert host.version == "0.1.0"
+        assert host.daemon_tree is None
+        assert host.self_update is False
+        assert host.self_update_blocked is None
         assert host.status == "offline"
         assert host.last_seen_at is not None
+
+
+async def test_register_persists_self_update_fields(client):
+    user_id, _ = await _signup(client, "ws-daemon-update-register@example.com")
+    host_id = await _create_host(user_id)
+    tree = "a" * 40
+    ws = FakeDaemonWebSocket()
+    ws.queue_text(
+        {
+            "type": "register",
+            "os": "linux",
+            "arch": "x86_64",
+            "version": "0.1.0+gaaaaaaaaaaaa",
+            "daemon_tree": tree.upper(),
+            "self_update": True,
+            "self_update_blocked": None,
+        }
+    )
+    ws.queue_disconnect()
+
+    await daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_tree == tree
+        assert host.self_update is True
+        assert host.self_update_blocked is None
+
+
+async def test_register_invalid_self_update_fields_are_treated_as_absent(client):
+    user_id, _ = await _signup(client, "ws-daemon-update-register-invalid@example.com")
+    host_id = await _create_host(user_id)
+    ws = FakeDaemonWebSocket()
+    ws.queue_text(
+        {
+            "type": "register",
+            "daemon_tree": "not-a-tree",
+            "self_update": "yes",
+            "self_update_blocked": "x" * 65,
+        }
+    )
+    ws.queue_disconnect()
+
+    await daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.daemon_tree is None
+        assert host.self_update is False
+        assert host.self_update_blocked is None
+
+
+def _stage_update_manifest(tmp_path: Path, *, tree: str = "b" * 40) -> None:
+    root = tmp_path / "daemon" / "target" / "prebuilt"
+    target = root / "linux-x86_64"
+    target.mkdir(parents=True)
+    spawnd = b"new-spawnd"
+    worker = b"new-worker"
+    (target / "spawnd").write_bytes(spawnd)
+    (target / "spawn-worker").write_bytes(worker)
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "commit": "c" * 40,
+                "tree": tree,
+                "version": "0.2.0+gcccccccccccc",
+                "targets": {
+                    "linux-x86_64": {
+                        "spawnd_sha256": hashlib.sha256(spawnd).hexdigest(),
+                        "spawn_worker_sha256": hashlib.sha256(worker).hexdigest(),
+                    }
+                },
+            }
+        )
+    )
+
+
+async def test_register_auto_sends_daemon_update_after_registered(
+    client, tmp_path, monkeypatch
+):
+    from spawn_server import release
+
+    _stage_update_manifest(tmp_path)
+    monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    release.refresh()
+    user_id, _ = await _signup(client, "ws-daemon-auto-update@example.com")
+    host_id = await _create_host(user_id)
+    ws = FakeDaemonWebSocket()
+    ws.queue_text(
+        {
+            "type": "register",
+            "os": "linux",
+            "arch": "x86_64",
+            "version": "0.1.0+gaaaaaaaaaaaa",
+            "daemon_tree": "a" * 40,
+            "self_update": True,
+        }
+    )
+    ws.queue_disconnect()
+
+    await daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+
+    frames = _sent_json(ws)
+    registered_index = next(i for i, frame in enumerate(frames) if frame["type"] == "registered")
+    update_index = next(i for i, frame in enumerate(frames) if frame["type"] == "daemon.update")
+    assert registered_index < update_index
+    update_frame = frames[update_index]
+    assert update_frame["tree"] == "b" * 40
+    assert update_frame["target"] == "linux-x86_64"
+    assert update_frame["spawnd"]["path"] == "/api/install/spawnd/linux-x86_64"
+    assert update_frame["spawn_worker"]["path"] == (
+        "/api/install/spawn-worker/linux-x86_64"
+    )
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.update_state == "updating"
+        assert host.update_tree == "b" * 40
+        assert host.update_requested_at is not None
+
+
+async def test_register_respects_disabled_daemon_auto_update(client, tmp_path, monkeypatch):
+    from spawn_server import release
+    from spawn_server.ws import daemon as daemon_module
+
+    _stage_update_manifest(tmp_path)
+    monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    monkeypatch.setattr(
+        daemon_module,
+        "get_settings",
+        lambda: SimpleNamespace(daemon_auto_update=False),
+    )
+    release.refresh()
+    user_id, _ = await _signup(client, "ws-daemon-auto-update-disabled@example.com")
+    host_id = await _create_host(user_id)
+    ws = FakeDaemonWebSocket()
+    ws.queue_text(
+        {
+            "type": "register",
+            "os": "linux",
+            "arch": "x86_64",
+            "daemon_tree": "a" * 40,
+            "self_update": True,
+        }
+    )
+    ws.queue_disconnect()
+
+    await daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+
+    assert not any(frame["type"] == "daemon.update" for frame in _sent_json(ws))
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.update_state is None
+
+
+async def test_update_result_failure_is_humanized_and_keeps_requested_tree(client):
+    user_id, _ = await _signup(client, "ws-daemon-update-result@example.com")
+    host_id = await _create_host(user_id)
+    requested_tree = "b" * 40
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        host.update_state = "failed"
+        host.update_tree = requested_tree
+        host.update_error = "old error"
+        await session.commit()
+
+    ws = FakeDaemonWebSocket()
+    ws.queue_text(
+        {
+            "type": "register",
+            "daemon_tree": "a" * 40,
+            "self_update": True,
+        }
+    )
+    ws.queue_text(
+        {
+            "type": "daemon.update_result",
+            "request_id": "request-1",
+            "ok": False,
+            "tree": requested_tree,
+            "stage": "verify",
+            "error": "checksum_mismatch",
+        }
+    )
+    ws.queue_disconnect()
+
+    await daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.update_state == "failed"
+        assert host.update_tree == requested_tree
+        assert host.update_error == "verify: checksum mismatch"
+
+
+async def test_successful_update_result_stays_updating_until_reregister(client):
+    user_id, _ = await _signup(client, "ws-daemon-update-result-ok@example.com")
+    host_id = await _create_host(user_id)
+    ws = FakeDaemonWebSocket()
+    ws.queue_text({"type": "register", "daemon_tree": "a" * 40, "self_update": True})
+    task = asyncio.create_task(
+        daemon_ws(ws, token=auth.issue_daemon_token(host_id, user_id))  # type: ignore[arg-type]
+    )
+    await _wait_until(lambda: any(frame.get("type") == "registered" for frame in _sent_json(ws)))
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        host.update_state = "updating"
+        host.update_tree = "b" * 40
+        host.update_requested_at = datetime.now(UTC)
+        await session.commit()
+
+    ws.queue_text(
+        {
+            "type": "daemon.update_result",
+            "request_id": "request-ok",
+            "ok": True,
+            "tree": "b" * 40,
+            "stage": None,
+            "error": None,
+        }
+    )
+    ws.queue_disconnect()
+    await task
+
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.update_state == "updating"
+        assert host.update_tree == "b" * 40
+
+
+async def test_register_reconciles_success_and_previous_binary_failure(client):
+    user_id, _ = await _signup(client, "ws-daemon-update-reconcile@example.com")
+    host_id = await _create_host(user_id)
+    expected_tree = "b" * 40
+
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        host.update_state = "updating"
+        host.update_tree = expected_tree
+        host.update_error = "old"
+        host.update_requested_at = datetime.now(UTC)
+        await session.commit()
+    updated = FakeDaemonWebSocket()
+    updated.queue_text({"type": "register", "daemon_tree": expected_tree, "self_update": True})
+    updated.queue_disconnect()
+    await daemon_ws(
+        updated, token=auth.issue_daemon_token(host_id, user_id)
+    )  # type: ignore[arg-type]
+
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.update_state is None
+        assert host.update_tree is None
+        assert host.update_error is None
+        assert host.update_requested_at is None
+        host.update_state = "updating"
+        host.update_tree = expected_tree
+        host.update_requested_at = datetime.now(UTC)
+        await session.commit()
+
+    previous = FakeDaemonWebSocket()
+    previous.queue_text({"type": "register", "daemon_tree": "a" * 40, "self_update": True})
+    previous.queue_disconnect()
+    await daemon_ws(
+        previous, token=auth.issue_daemon_token(host_id, user_id)
+    )  # type: ignore[arg-type]
+
+    async with get_sessionmaker()() as session:
+        host = await session.get(Host, host_id)
+        assert host is not None
+        assert host.update_state == "failed"
+        assert host.update_tree == expected_tree
+        assert host.update_error == "restarted on the previous binary"
 
 
 async def test_register_ratchets_account_chain_support(client):

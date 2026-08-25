@@ -370,6 +370,17 @@ class Host(Base):
     os: Mapped[str | None] = mapped_column(String(64), nullable=True)
     arch: Mapped[str | None] = mapped_column(String(64), nullable=True)
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    daemon_tree: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    self_update: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    self_update_blocked: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    update_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    update_tree: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    update_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    update_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # The daemon advertises chain admission at register (mesh R9): once true,
     # the legacy per-host device-endorsement path is refused for this host so a
     # hostile server cannot steer admission onto the weaker rail. Ratchets up

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 import subprocess
@@ -411,6 +412,49 @@ async def test_install_script_pins_prebuilt_sha256(client, tmp_path: Path, monke
     assert f"spawnd:darwin-aarch64) printf %s {want_spawnd} ;;" in r.text
     assert f"spawn-worker:darwin-aarch64) printf %s {want_worker} ;;" in r.text
     assert "linux-x86_64) printf" not in r.text  # not staged → not pinned
+
+
+async def test_install_script_uses_valid_manifest_hashes(client, tmp_path: Path, monkeypatch):
+    from spawn_server import release
+
+    repo = tmp_path / "repo-with-manifest"
+    prebuilt = repo / "daemon" / "target" / "prebuilt"
+    target = prebuilt / "linux-x86_64"
+    target.mkdir(parents=True)
+    spawnd = b"manifest-spawnd"
+    worker = b"manifest-worker"
+    (target / "spawnd").write_bytes(spawnd)
+    (target / "spawn-worker").write_bytes(worker)
+    spawnd_sha = hashlib.sha256(spawnd).hexdigest()
+    worker_sha = hashlib.sha256(worker).hexdigest()
+    (prebuilt / "manifest.json").write_text(
+        json.dumps(
+            {
+                "commit": "c" * 40,
+                "tree": "d" * 40,
+                "version": "0.2.0+gcccccccccccc",
+                "targets": {
+                    "linux-x86_64": {
+                        "spawnd_sha256": spawnd_sha,
+                        "spawn_worker_sha256": worker_sha,
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(install_routes, "_repo_root", lambda: repo)
+    monkeypatch.setattr(
+        install_routes,
+        "_sha256_file",
+        lambda path: (_ for _ in ()).throw(AssertionError("fallback hashing used")),
+    )
+    release.refresh()
+
+    response = await client.get("/install.sh")
+
+    assert response.status_code == 200
+    assert f"spawnd:linux-x86_64) printf %s {spawnd_sha} ;;" in response.text
+    assert f"spawn-worker:linux-x86_64) printf %s {worker_sha} ;;" in response.text
 
 
 @pytest.mark.parametrize(
