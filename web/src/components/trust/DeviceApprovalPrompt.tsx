@@ -3,11 +3,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
+import { requestApproval } from "@/components/access/ceremony-store";
 import { Trident } from "@/components/icons/BrandMark";
 import {
   useAccountEndorsementEdges,
   useDeviceTrustMap,
-  useEndorseDevice,
 } from "@/components/trust/device-endorsement";
 import { Button } from "@/components/ui/button";
 import {
@@ -39,6 +39,13 @@ import { hostsTrustingDevice } from "@/lib/trust-roster";
  * honour. Prompting a browser that would only fail is worse than staying
  * quiet. The hosts the approval reaches are named in the dialog, so "approve"
  * never promises more than the hosts anchored on this browser.
+ *
+ * Approving is the number check (mesh §4 add-device, Appendix A), the same
+ * ceremony a browser gets: "Enter its number" starts the committed SAS
+ * toward the asking device, which shows a four-digit number on its screen for
+ * the human to type here. There is no look-and-click approve; a number the
+ * server cannot grind is the whole point. While the ceremony is live this
+ * dialog stands aside for it, and the knock closes when the endorsement lands.
  */
 export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }) {
   const queryClient = useQueryClient();
@@ -103,10 +110,17 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
     setDismissed((current) => new Set(current).add(requestId));
   };
 
-  const endorse = useEndorseDevice(accountId ?? "", () => {
-    if (request) dismiss(request.id);
-    void queryClient.invalidateQueries({ queryKey: ["trust", "device-approvals"] });
+  // The ceremony host drives the relay; this dialog only asks it to start and
+  // then gets out of the way while a ceremony with the asking device is live.
+  const pairings = useQuery({
+    queryKey: ["device-pairings", thisBrowser?.id ?? null],
+    queryFn: () => trust.listPairings(thisBrowser?.id ?? ""),
+    enabled: accountId !== null && thisBrowser !== undefined && request !== undefined,
+    refetchInterval: 1500,
   });
+  const ceremonyLive = (pairings.data ?? []).some(
+    (row) => row.joiner_device_id === request?.browser_device_id,
+  );
 
   const deny = useMutation({
     mutationFn: (requestId: string) => trust.denyDeviceApproval(requestId),
@@ -117,11 +131,17 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
     onError: (error) => setFailure(error instanceof Error ? error.message : String(error)),
   });
 
-  if (accountId === null || request === undefined || target === undefined || !canHelp) {
+  if (
+    accountId === null ||
+    request === undefined ||
+    target === undefined ||
+    !canHelp ||
+    ceremonyLive
+  ) {
     return null;
   }
 
-  const busy = endorse.isPending || deny.isPending;
+  const busy = deny.isPending;
   const label = target.label ?? "A new device";
 
   return (
@@ -137,13 +157,9 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
         </DialogHeader>
 
         <div className="space-y-4 px-6 py-3">
-          <p className="select-all break-all rounded-lg border border-border bg-muted/60 px-4 py-3 text-center font-mono text-base font-semibold tracking-wide">
-            {request.fingerprint}
-          </p>
           <p className="text-sm leading-relaxed text-muted-foreground">
-            {label} is showing a fingerprint on its screen. Approve only if it is exactly the same
-            as the one above. The name can be anything; the fingerprint is what identifies the
-            device.
+            To approve it, type the number it shows on its screen. The number only appears there, so
+            nobody can approve a device they are not holding.
           </p>
           <p className="text-sm leading-relaxed text-muted-foreground">
             This approval covers{" "}
@@ -173,16 +189,10 @@ export function DeviceApprovalPrompt({ accountId }: { accountId: string | null }
             disabled={busy}
             onClick={() => {
               setFailure(null);
-              endorse.mutate(
-                { target, targetFingerprint: request.fingerprint },
-                {
-                  onError: (error) =>
-                    setFailure(error instanceof Error ? error.message : String(error)),
-                },
-              );
+              requestApproval(target.id);
             }}
           >
-            {endorse.isPending ? "Approving" : "Approve"}
+            Enter its number
           </Button>
         </DialogFooter>
       </DialogContent>

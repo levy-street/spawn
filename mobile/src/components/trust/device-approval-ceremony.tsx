@@ -1,9 +1,9 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import * as Clipboard from "expo-clipboard";
 import { useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 
 import { EndorsementOption } from "@/components/onboarding/endorsement-option";
+import { NumberCheck } from "@/components/trust/number-check";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Divider } from "@/components/ui/divider";
@@ -23,8 +23,8 @@ import {
 } from "@/data/queries/pairing";
 import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
+import { useDeviceCeremony } from "@/data/trust/ceremony";
 import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
-import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { haptics } from "@/lib/haptics";
 import { spacing, useTheme } from "@/theme";
 
@@ -34,10 +34,14 @@ type CeremonyPhase = "checking" | "waiting" | "pair-only" | "identity-blocked" |
  * The approval ceremony, shaped for the sheet it rises in.
  *
  * One host refused this device, and the operator is mid-task: this puts the
- * knock, the fingerprint, and the fallback in one column, ordered by how
+ * knock, the number check, and the fallback in one column, ordered by how
  * likely they are to be the next thing pressed. The knock is raised the
  * moment this device has a registered identity — not gated on how many other
  * devices are visible, because the device that answers may sign in later.
+ * When an approving screen answers, it opens the committed SAS ceremony
+ * (mesh §4, Appendix A) toward this phone: the number appears here, the
+ * human types it there, and the endorsement that lands is what admits this
+ * phone. There is no look-and-click approve anywhere in this flow.
  */
 export function DeviceApprovalCeremony({
   hostId,
@@ -60,7 +64,6 @@ export function DeviceApprovalCeremony({
   const approvals = useDeviceHostApprovals(true);
   const [serverOrigin, setServerOrigin] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     void getBaseUrl()
@@ -88,6 +91,10 @@ export function DeviceApprovalCeremony({
   const knockMutate = knock.mutate;
   const deviceId = phone?.id ?? null;
   const awaiting = target !== undefined && target.trust !== "trusted";
+  // The number check, driven from here while this phone is the one being
+  // approved. Polls the relay only while an approval is actually awaited.
+  const ceremony = useDeviceCeremony({ accountId, self: phone, enabled: awaiting });
+  const check = ceremony.ceremonies.find((view) => view.role === "new-device") ?? null;
   useEffect(() => {
     if (!awaiting || deviceId === null || knockedFor.current === deviceId) return;
     knockedFor.current = deviceId;
@@ -133,13 +140,6 @@ export function DeviceApprovalCeremony({
           ? "waiting"
           : "pair-only";
 
-  const copyFingerprint = async (): Promise<void> => {
-    if (!phone) return;
-    await Clipboard.setStringAsync(formatHostFingerprint(phone.public_key));
-    haptics.success();
-    setCopied(true);
-  };
-
   return (
     <View style={[styles.body, { gap: theme.space(5) }]} testID="device-approval-ceremony">
       <Card style={[styles.hero, { gap: theme.space(3) }]}>
@@ -176,7 +176,7 @@ export function DeviceApprovalCeremony({
               : phase === "identity-blocked"
                 ? "It could not register the key that hosts pin, so nothing can vouch for it yet."
                 : phase === "waiting"
-                  ? "A prompt is up on every screen where you are already signed in, including your Mac's browser. Approve it from one this host already trusts."
+                  ? "A prompt is up on every screen where you are already signed in, including your Mac's browser. Approve it from one this host already trusts and a number appears here to type there."
                   : phase === "pair-only"
                     ? "Nothing else is signed in to answer for it. Pair directly with a code from the host."
                     : ""}
@@ -197,35 +197,36 @@ export function DeviceApprovalCeremony({
         </View>
       ) : null}
 
-      {phone && phase !== "done" && phase !== "checking" ? (
+      {check !== null && phase !== "done" ? (
+        <NumberCheck
+          entryError={ceremony.error}
+          mode="show"
+          number={check.number}
+          onCancel={() => ceremony.cancel(check.pairingId)}
+          onDone={() => {
+            ceremony.dismiss(check.pairingId);
+            onRequestClose();
+          }}
+          otherScreen="on the screen that is approving this device"
+          phase={check.phase}
+        />
+      ) : phone && phase === "waiting" ? (
         <View style={[styles.section, { gap: theme.space(2) }]}>
           <Text color="mutedForeground" variant="sigilLabel">
             This device · {phone.label ?? "spawn on iPhone"}
           </Text>
-          <Text selectable style={styles.centered} variant="mono">
-            {formatHostFingerprint(phone.public_key)}
-          </Text>
-          <Text color="mutedForeground" style={styles.centered} variant="caption">
-            The approving screen shows a fingerprint too. Approve only an exact match. That
-            comparison is the whole of what makes this safe.
-          </Text>
           <View style={[styles.actionsRow, { gap: theme.space(2) }]}>
-            <Button onPress={() => void copyFingerprint()} size="sm" variant="outline">
-              {copied ? "Copied" : "Copy fingerprint"}
+            <Button
+              disabled={deviceId === null}
+              loading={knock.isPending}
+              onPress={() => {
+                if (deviceId !== null) knockMutate(deviceId);
+              }}
+              size="sm"
+              variant="outline"
+            >
+              Ask again
             </Button>
-            {phase === "waiting" ? (
-              <Button
-                disabled={deviceId === null}
-                loading={knock.isPending}
-                onPress={() => {
-                  if (deviceId !== null) knockMutate(deviceId);
-                }}
-                size="sm"
-                variant="outline"
-              >
-                Ask again
-              </Button>
-            ) : null}
           </View>
         </View>
       ) : null}
@@ -252,7 +253,7 @@ export function DeviceApprovalCeremony({
         />
       ) : null}
 
-      {phase === "waiting" || phase === "pair-only" ? (
+      {(phase === "waiting" && check === null) || phase === "pair-only" ? (
         <>
           <View style={[styles.orRow, { gap: theme.space(3) }]}>
             <Divider style={styles.orLine} />

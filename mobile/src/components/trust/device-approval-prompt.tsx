@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
 
+import { NumberCheck } from "@/components/trust/number-check";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Text } from "@/components/ui/text";
@@ -10,10 +11,9 @@ import { useDeviceHostApprovals } from "@/data/queries/device-trust";
 import { useAccountDevices, useRegisteredPhone } from "@/data/queries/pairing";
 import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
-import { createAccountDeviceEndorsement, createDeviceEndorsement } from "@/data/trust/endorsement";
-import { formatHostFingerprint } from "@/data/trust/host-pins";
+import { useDeviceCeremony } from "@/data/trust/ceremony";
 import { haptics } from "@/lib/haptics";
-import { fontSize, spacing } from "@/theme";
+import { spacing } from "@/theme";
 
 /**
  * The knock, answered from a phone that already works.
@@ -25,11 +25,12 @@ import { fontSize, spacing } from "@/theme";
  *
  * Renders nothing unless this device can actually help: approving means
  * signing an endorsement, which only a device some host already trusts can do.
- * Prompting a device that could only fail is worse than staying quiet. Toward
- * a host that validates account chains the endorsement is account-wide (one
- * edge the other device carries everywhere this phone is trusted); toward an
- * older host it is per-host, as before. The hosts it reaches are named, so
- * "approve" never promises more than the hosts anchored on this phone.
+ * Prompting a device that could only fail is worse than staying quiet.
+ * Approving is the number check (mesh §4, Appendix A): this phone opens the
+ * committed SAS toward the asking device, that device shows a four-digit
+ * number, and the human types it here. A match signs one account-wide
+ * endorsement the other device carries everywhere this phone is trusted. The
+ * hosts it reaches are named, so "approve" never promises more.
  */
 export function DeviceApprovalPrompt(): React.JSX.Element | null {
   const queryClient = useQueryClient();
@@ -41,6 +42,7 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
   const approvals = useDeviceHostApprovals();
   const [dismissed, setDismissed] = useState<ReadonlySet<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const [engaged, setEngaged] = useState(false);
 
   const pending = useQuery({
     queryKey: qk.deviceApprovals(),
@@ -62,59 +64,20 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
   );
   // Hosts that trust this device are exactly the ones it can vouch for.
   const endorsableHosts = approvals.approved.filter((entry) => entry.host.host_public_key !== null);
-  const chainHosts = endorsableHosts.filter((entry) => entry.host.supports_account_chains);
-  const legacyHosts = endorsableHosts.filter((entry) => !entry.host.supports_account_chains);
+  // The relay is polled only while there is something to answer.
+  const ceremony = useDeviceCeremony({
+    accountId,
+    self: phone,
+    enabled: request !== undefined || engaged,
+  });
+  const check = target
+    ? (ceremony.ceremonies.find((view) => view.peerDeviceId === target.id) ?? null)
+    : null;
 
   const dismiss = (requestId: string): void => {
     setError(null);
     setDismissed((current) => new Set(current).add(requestId));
   };
-
-  const approve = useMutation({
-    mutationFn: async (): Promise<number> => {
-      if (!accountId || !phone || !target || !request) {
-        throw new Error("Device approval is not ready.");
-      }
-      // The fingerprint the operator compared is only meaningful if it is the
-      // fingerprint of the key being signed. Re-derive it locally and refuse
-      // on mismatch, so a substituted key cannot harvest a signature.
-      const derived = formatHostFingerprint(target.public_key);
-      if (derived !== request.fingerprint) {
-        throw new Error(
-          "This device's fingerprint does not match its key. The server may be substituting a key.",
-        );
-      }
-      if (chainHosts.length > 0) {
-        await createAccountDeviceEndorsement({
-          accountId,
-          endorserDeviceId: phone.id,
-          endorsedDeviceId: target.id,
-          endorsedPublicKey: target.public_key,
-        });
-      }
-      for (const { host } of legacyHosts) {
-        if (host.host_public_key === null) continue;
-        await createDeviceEndorsement({
-          accountId,
-          hostId: host.id,
-          hostPublicKey: host.host_public_key,
-          endorserDeviceId: phone.id,
-          endorsedDeviceId: target.id,
-          endorsedPublicKey: target.public_key,
-        });
-      }
-      return endorsableHosts.length;
-    },
-    onSuccess: () => {
-      haptics.success();
-      if (request) dismiss(request.id);
-      void queryClient.invalidateQueries({ queryKey: qk.trust() });
-    },
-    onError: (cause: unknown) => {
-      haptics.error();
-      setError(cause instanceof Error ? cause.message : "This device could not be approved.");
-    },
-  });
 
   const deny = useMutation({
     mutationFn: (requestId: string) => denyDeviceApproval(requestId),
@@ -128,13 +91,48 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
   });
 
   if (!request || !target || endorsableHosts.length === 0) return null;
-  const busy = approve.isPending || deny.isPending;
+  const busy = deny.isPending || ceremony.starting;
+  const label = target.label ?? "this device";
+
+  if (check !== null) {
+    return (
+      <Dialog
+        onDismiss={() => {
+          ceremony.cancel(check.pairingId);
+          setEngaged(false);
+        }}
+        testID="device-approval-prompt"
+        title={`Approve ${label}?`}
+        visible
+      >
+        <NumberCheck
+          entryError={check.entryError ?? ceremony.error}
+          mode="enter"
+          number={check.number}
+          onCancel={() => {
+            ceremony.cancel(check.pairingId);
+            setEngaged(false);
+          }}
+          onDone={() => {
+            haptics.success();
+            ceremony.dismiss(check.pairingId);
+            setEngaged(false);
+            dismiss(request.id);
+            void queryClient.invalidateQueries({ queryKey: qk.trust() });
+          }}
+          onSubmit={(digits) => ceremony.submitDigits(check.pairingId, digits)}
+          otherScreen={`on ${label}`}
+          phase={check.phase}
+        />
+      </Dialog>
+    );
+  }
 
   return (
     <Dialog
       onDismiss={() => dismiss(request.id)}
       testID="device-approval-prompt"
-      title={`Approve ${target.label ?? "this device"}?`}
+      title={`Approve ${label}?`}
       visible
     >
       <View style={styles.body}>
@@ -143,14 +141,8 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
           here.
         </Text>
         <Text variant="body">
-          It is showing a fingerprint on its screen. Check it is exactly this:
-        </Text>
-        <Text selectable style={styles.fingerprint} variant="mono">
-          {request.fingerprint}
-        </Text>
-        <Text color="mutedForeground" variant="caption">
-          The name can be anything; the fingerprint is what identifies the device. If it differs,
-          deny.
+          To approve it, type the number it shows on its screen. The number only appears there, so
+          nobody can approve a device they are not holding.
         </Text>
         <Text color="mutedForeground" variant="caption">
           This approval covers{" "}
@@ -168,8 +160,16 @@ export function DeviceApprovalPrompt(): React.JSX.Element | null {
           <Button disabled={busy} onPress={() => deny.mutate(request.id)} variant="outline">
             Deny
           </Button>
-          <Button loading={approve.isPending} disabled={busy} onPress={() => approve.mutate()}>
-            Approve
+          <Button
+            disabled={busy}
+            loading={ceremony.starting}
+            onPress={() => {
+              setError(null);
+              setEngaged(true);
+              ceremony.start(target);
+            }}
+          >
+            Enter its number
           </Button>
         </View>
       </View>
@@ -191,8 +191,5 @@ const styles = StyleSheet.create({
   },
   body: {
     gap: spacing[3],
-  },
-  fingerprint: {
-    fontSize: fontSize.base,
   },
 });

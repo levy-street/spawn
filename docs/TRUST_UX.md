@@ -177,29 +177,26 @@ terminal state precisely so the residual is a chosen, contained trade.
   actually asks it was a dead end, and it outlived the approval it was nagging about.
   The knock prompt below is the one push path; the roster remains the pull path.)*
 - **the knock prompt** *(as built for the phone, 2026-08-25;
-  `DeviceApprovalPrompt` on web, `DeviceApprovalPrompt` on mobile)*: the phone
-  has no SAS role, so its knock is answered by a fingerprint compare instead of
-  a number — the prompt is a standard modal (the trident, "Approve spawn on
-  iPhone?", the fingerprint as the one thing to check, *Deny* / *Approve*) that
-  shows only on a screen some host trusts, and it names the hosts the approval
-  reaches ("This approval covers dream and minivac. Any other host will ask
-  again from a screen it already trusts."). Plain sentences, no dashes: the
-  copy is read by someone deciding whether to trust a device. Approve signs ONE account endorsement toward
-  chain-capable hosts (`TRUST_DEVICE_MESH.md` §4, *approve-knock*) and the
-  legacy per-host statement toward the rest; the knock closes on either. The
-  asking phone watches for the approval and reconnects on its own (ceremony
-  sheet: "waiting on your say-so"), with the `spawnd login` pairing code kept
-  as the no-other-device fallback. A knock also reaches the phones that are
-  closed: the server pushes "Approve spawn on iPhone?" to every install of the
-  account except the one that asked (push tokens register with their browser
-  device id for exactly this), at most once per two minutes per knock; the tap
-  opens the app, where the prompt takes over. The app asks for notification
-  permission on first launch after sign-in; before 2026-08-25 it only ever
-  read the answer, so no phone had ever registered a token. The web's session
-  gate knocks the same way (beside its roster stamp) and shows its own
-  fingerprint, so a new browser reaches a phone and an open screen alike.
-- With a passkey there is **no flow at all**: signing in with it is the approval.
-  Recovery-after-total-loss is deliberately the *same non-flow*.
+  `DeviceApprovalPrompt` on web and on mobile)*: a knock from any device is
+  answered by the same number check a browser gets. The prompt is a standard
+  modal (the trident, "Approve spawn on iPhone?", plain copy, *Deny* / *Enter
+  its number*) that shows only on a screen some host trusts and names the hosts
+  the approval reaches. *Enter its number* starts the committed SAS toward the
+  asking device; the asking device (the phone's ceremony sheet, or the web's
+  session gate) shows the four-digit number, the approver types it, the mutual
+  endorsement lands, and the knock closes on it. Both roles run on the phone
+  (`data/trust/ceremony.ts`, mirroring `approve-ceremony.ts`). The phone's
+  ceremony sheet keeps *Ask again* and the `spawnd login` pairing code as the
+  no-other-device fallback. A knock also reaches closed phones: the server
+  pushes "Approve spawn on iPhone?" to every install of the account except the
+  one that asked (push tokens register with their browser device id), at most
+  once per two minutes per knock; the tap opens the app, where the prompt takes
+  over. The app asks for notification permission on the first launch after
+  sign-in, never on the login screen; before 2026-08-25 it only ever read the
+  answer, so no phone had ever registered a token. *(The desktop corner toast
+  that offered "Enter its number" for every unapproved sign-in was retired the
+  same day: it outlived the approval it nagged about. The roster remains the
+  pull path; this prompt is the push path.)*
 
 ### 4. Possess a host — `PossessHost` *(revised 2026-08-21: link-carried key check)*
 - **instruction** — "Run this on the host: `spawnd possess`" (one command, one line).

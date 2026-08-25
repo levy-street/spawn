@@ -12,6 +12,8 @@ const PHONE_KEY = "XOCTsSKj9-Z7qRynE70szG_DNBeHiLzEBOCG1clQbz8";
 const mockRequestApproval = jest.fn(async (_deviceId: string) => ({}));
 jest.mock("@/data/api/endpoints/trust", () => ({
   requestDeviceApproval: (deviceId: string) => mockRequestApproval(deviceId),
+  listPairings: async () => [],
+  listAccountEndorsements: async () => [],
 }));
 
 jest.mock("@/data/queries/settings", () => ({
@@ -92,8 +94,9 @@ describe("device approval ceremony", () => {
     expect(mockRequestApproval).toHaveBeenCalledTimes(1);
     expect(mockRequestApproval).toHaveBeenCalledWith(PHONE_ID);
     expect(screen.getByText(/waiting on your say-so/i)).toBeOnTheScreen();
-    // The fingerprint is derived locally from the key, never trusted from data.
-    expect(screen.getByText(/^SHA256:/)).toBeOnTheScreen();
+    // No fingerprint to compare: the approval is the number check now.
+    expect(screen.queryByText(/^SHA256:/)).toBeNull();
+    expect(screen.getByText("Ask again")).toBeOnTheScreen();
   });
 
   test("does not knock for a host that already trusts this device", async () => {
