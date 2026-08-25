@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/verify-release.sh [--ref GIT_REF] [--skip-mobile] <server-url>
+Usage: scripts/verify-release.sh [--ref GIT_REF] [--skip-mobile] [--skip-desktop] <server-url>
 
 Read-only proof that a deployed SPAWN D release matches a git ref.
 
@@ -14,10 +14,12 @@ Checks:
   - the signed manifest counter matches the ref commit's committer timestamp
   - every advertised daemon binary hashes to its advertised sha256
   - the production Expo manifest carries the ref's mobile/ tree
+  - /desktop/latest.json, its artifact signature, and /api/release.desktop match
 
 Options:
   --ref GIT_REF  Expected git ref. Default: origin/master.
   --skip-mobile  Skip the u.expo.dev manifest probe.
+  --skip-desktop Skip the desktop static-manifest and identity probes.
   -h, --help     Show this help.
 
 This command does not fetch git refs, rebuild artifacts, or change production.
@@ -44,6 +46,7 @@ supported_target() {
 
 git_ref="origin/master"
 skip_mobile=0
+skip_desktop=0
 server=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -62,6 +65,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-mobile)
       skip_mobile=1
+      shift
+      ;;
+    --skip-desktop)
+      skip_desktop=1
       shift
       ;;
     --)
@@ -101,6 +108,13 @@ expected_daemon_tree="$(git rev-parse "$git_ref:daemon" 2>/dev/null)" ||
   die "cannot resolve daemon/ at $git_ref"
 expected_mobile_tree="$(git rev-parse "$git_ref:mobile" 2>/dev/null)" ||
   die "cannot resolve mobile/ at $git_ref"
+if [[ "$skip_desktop" != "1" ]]; then
+  expected_desktop_tree="$(git rev-parse "$git_ref:desktop" 2>/dev/null)" ||
+    die "cannot resolve desktop/ at $git_ref (use --skip-desktop for a pre-desktop release)"
+  expected_desktop_version="$(git show "$git_ref:desktop/src-tauri/tauri.conf.json" 2>/dev/null |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')" ||
+    die "cannot read the desktop version at $git_ref"
+fi
 expected_release_counter="$(release_counter_for_commit "$expected_commit")" ||
   die "cannot derive the release counter for $expected_commit"
 
@@ -153,6 +167,44 @@ if isinstance(value, dict):
 ' "$file" "$path"
 }
 
+json_string_list() {
+  local file="$1"
+  local path="$2"
+  python3 -c '
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+for part in sys.argv[2].split("."):
+    if not isinstance(value, dict) or part not in value:
+        raise SystemExit(1)
+    value = value[part]
+if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+    raise SystemExit(1)
+print(",".join(sorted(value)))
+' "$file" "$path"
+}
+
+json_key_list() {
+  local file="$1"
+  local path="$2"
+  python3 -c '
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+for part in sys.argv[2].split("."):
+    if not isinstance(value, dict) or part not in value:
+        raise SystemExit(1)
+    value = value[part]
+if not isinstance(value, dict):
+    raise SystemExit(1)
+print(",".join(sorted(value)))
+' "$file" "$path"
+}
+
 multipart_json_get() {
   local file="$1"
   local path="$2"
@@ -181,6 +233,66 @@ sha256_file() {
   else
     shasum -a 256 "$1" | awk '{print $1}'
   fi
+}
+
+verify_tauri_minisign() {
+  local artifact="$1"
+  local encoded_signature="$2"
+  local encoded_public_key_file="$3"
+  UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/spawn-release-uv-cache}" \
+    uv run --project "$repo_root/server" --frozen python - \
+      "$artifact" "$encoded_signature" "$encoded_public_key_file" <<'PY'
+import base64
+import hashlib
+import sys
+from pathlib import Path
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+
+def decode64(value: str) -> bytes:
+    raw = base64.b64decode(value, validate=True)
+    if base64.b64encode(raw).decode("ascii") != value:
+        raise ValueError("non-canonical base64")
+    return raw
+
+
+try:
+    artifact = Path(sys.argv[1]).read_bytes()
+    signature_text = decode64(sys.argv[2]).decode("ascii")
+    signature_lines = signature_text.splitlines()
+    if len(signature_lines) != 4 or not signature_lines[0].startswith("untrusted comment: "):
+        raise ValueError("invalid minisign signature box")
+    if not signature_lines[2].startswith("trusted comment: "):
+        raise ValueError("invalid trusted comment")
+    signature_blob = decode64(signature_lines[1])
+    global_signature = decode64(signature_lines[3])
+    if len(signature_blob) != 74 or len(global_signature) != 64:
+        raise ValueError("invalid minisign signature lengths")
+    if signature_blob[:2] != b"ED":
+        raise ValueError("desktop updater signatures must be prehashed")
+
+    public_outer = Path(sys.argv[3]).read_text(encoding="ascii").strip()
+    public_text = decode64(public_outer).decode("ascii")
+    public_lines = public_text.splitlines()
+    if len(public_lines) != 2 or not public_lines[0].startswith("untrusted comment: "):
+        raise ValueError("invalid minisign public key")
+    public_blob = decode64(public_lines[1])
+    if len(public_blob) != 42 or public_blob[:2] != b"Ed":
+        raise ValueError("invalid minisign public key body")
+    if signature_blob[2:10] != public_blob[2:10]:
+        raise ValueError("minisign key id mismatch")
+
+    verifier = Ed25519PublicKey.from_public_bytes(public_blob[10:])
+    verifier.verify(signature_blob[10:], hashlib.blake2b(artifact, digest_size=64).digest())
+    verifier.verify(
+        global_signature,
+        signature_blob[10:] + signature_lines[2].encode("ascii"),
+    )
+except (InvalidSignature, OSError, UnicodeError, ValueError):
+    raise SystemExit(1)
+PY
 }
 
 fail=0
@@ -342,6 +454,94 @@ fi
 if [[ "$advertised_targets" -eq 0 ]]; then
   print_row "daemon.targets" ">=1" "0" "FAIL"
   fail=1
+fi
+
+if [[ "$skip_desktop" == "1" ]]; then
+  print_row "desktop.tree" "git desktop tree" "<skipped>" "SKIP"
+  print_row "desktop.latest.version" "tauri.conf.json version" "<skipped>" "SKIP"
+  print_row "desktop artifact signature" "committed updater key" "<skipped>" "SKIP"
+else
+  desktop_public_key_file="$tmp_dir/desktop-updater.pubkey"
+  if ! git show "$git_ref:desktop/updater.pubkey" > "$desktop_public_key_file" 2>/dev/null; then
+    print_row "desktop artifact signature" "desktop/updater.pubkey at $git_ref" \
+      "<public key missing>" "FAIL"
+    fail=1
+  fi
+
+  desktop_latest_file="$tmp_dir/desktop-latest.json"
+  desktop_latest_available=1
+  if ! curl -fsS --max-time 20 "$server/desktop/latest.json" \
+      -o "$desktop_latest_file"; then
+    desktop_latest_available=0
+  fi
+
+  if [[ "$release_available" == "1" ]]; then
+    actual_desktop_tree="$(json_get "$release_file" desktop.tree 2>/dev/null || true)"
+    actual_desktop_release_version="$(json_get "$release_file" desktop.version 2>/dev/null || true)"
+    actual_desktop_release_platforms="$(json_string_list "$release_file" desktop.platforms 2>/dev/null || true)"
+  else
+    actual_desktop_tree="<fetch failed>"
+    actual_desktop_release_version="<fetch failed>"
+    actual_desktop_release_platforms="<fetch failed>"
+  fi
+  check_row "desktop.tree" "$expected_desktop_tree" "$actual_desktop_tree"
+  check_row "desktop.release.version" "$expected_desktop_version" \
+    "$actual_desktop_release_version"
+
+  if [[ "$desktop_latest_available" == "1" ]]; then
+    actual_desktop_latest_version="$(json_get "$desktop_latest_file" version 2>/dev/null || true)"
+    actual_desktop_latest_platforms="$(json_key_list "$desktop_latest_file" platforms 2>/dev/null || true)"
+  else
+    actual_desktop_latest_version="<fetch failed>"
+    actual_desktop_latest_platforms="<fetch failed>"
+  fi
+  check_row "desktop.latest.version" "$expected_desktop_version" \
+    "$actual_desktop_latest_version"
+  expected_desktop_platforms="darwin-aarch64,darwin-x86_64"
+  check_row "desktop.latest.platforms" "$expected_desktop_platforms" \
+    "$actual_desktop_latest_platforms"
+  check_row "desktop.release.platforms" "$expected_desktop_platforms" \
+    "$actual_desktop_release_platforms"
+
+  desktop_platform=""
+  desktop_artifact_url=""
+  desktop_artifact_signature=""
+  if [[ "$desktop_latest_available" == "1" ]]; then
+    desktop_platform="$(json_keys "$desktop_latest_file" platforms 2>/dev/null | head -1 || true)"
+    if [[ -n "$desktop_platform" ]]; then
+      desktop_artifact_url="$(json_get "$desktop_latest_file" \
+        "platforms.$desktop_platform.url" 2>/dev/null || true)"
+      desktop_artifact_signature="$(json_get "$desktop_latest_file" \
+        "platforms.$desktop_platform.signature" 2>/dev/null || true)"
+    fi
+  fi
+
+  desktop_artifact_file="$tmp_dir/desktop-artifact"
+  desktop_signature_result=""
+  case "$desktop_artifact_url" in
+    "$server"/desktop/*)
+      if curl -fsS --max-time 120 "$desktop_artifact_url" -o "$desktop_artifact_file" &&
+        [[ -n "$desktop_artifact_signature" ]] &&
+        [[ -s "$desktop_public_key_file" ]] &&
+        verify_tauri_minisign "$desktop_artifact_file" \
+          "$desktop_artifact_signature" "$desktop_public_key_file" 2>/dev/null; then
+        desktop_signature_result="valid ($desktop_platform)"
+      else
+        desktop_signature_result="invalid or artifact fetch failed ($desktop_platform)"
+      fi
+      ;;
+    *)
+      desktop_signature_result="artifact URL is outside $server/desktop/"
+      ;;
+  esac
+  if [[ "$desktop_signature_result" == "valid ($desktop_platform)" ]]; then
+    print_row "desktop artifact signature" "desktop/updater.pubkey at $git_ref" \
+      "$desktop_signature_result" "OK"
+  else
+    print_row "desktop artifact signature" "desktop/updater.pubkey at $git_ref" \
+      "${desktop_signature_result:-<missing platform>}" "FAIL"
+    fail=1
+  fi
 fi
 
 if [[ "$skip_mobile" == "1" ]]; then

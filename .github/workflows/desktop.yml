@@ -1,0 +1,85 @@
+name: Desktop artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS · ${{ matrix.target }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            platform: darwin-aarch64
+          - target: x86_64-apple-darwin
+            platform: darwin-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Prepare App Store Connect key
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          printf 'APPLE_API_KEY_PATH=%s\n' "$key_path" >> "$GITHUB_ENV"
+
+      - name: Build, sign and notarize SPAWN D
+        uses: tauri-apps/tauri-action@v0
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+        with:
+          projectPath: desktop
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.ci.conf.json
+
+      - name: Assemble unsigned updater payload and release evidence
+        working-directory: desktop
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          bundle="src-tauri/target/$TARGET/release/bundle"
+          output="desktop-artifacts"
+          mkdir -p "$output"
+          tar -czf "$output/SPAWN-D_${version}_${PLATFORM}.app.tar.gz" -C "$bundle/macos" "SPAWN D.app"
+          cp "$bundle/dmg/"*.dmg "$output/SPAWN-D_${version}_${PLATFORM}.dmg"
+          shasum -a 256 "$output/"* > "$output/SHA256SUMS"
+
+      - name: Upload notarized desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPAWN-D-${{ matrix.target }}
+          path: desktop/desktop-artifacts/*
+          if-no-files-found: error
+
+# CI receives Apple signing/notarization credentials only. The offline updater
+# key is deliberately absent: release operators sign the promoted app archives
+# and assemble latest.json locally, after inspecting these artifacts.

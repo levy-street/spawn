@@ -214,6 +214,65 @@ login and runs unattended.
 in the entitlements or removed from the App ID: Apple's API rejects EAS's
 attempt to switch it off, and it should stay on for universal links.
 
+## The desktop app
+
+The desktop companion is piece five of a SPAWN D release. It ships independently
+from the daemon it supervises: the app follows the vendor-owned Tauri updater
+channel, while the daemon continues to update from the server the user chose.
+Stable builds read `https://spawnd.dev/desktop/latest.json`; builds made with the
+beta configuration read `https://spawnd.dev/desktop/beta/latest.json`. A
+self-hosted server never becomes an app-update authority.
+
+`.github/workflows/desktop.yml` is manual-only. It builds, Developer ID signs and
+notarizes the Apple-silicon and Intel apps and DMGs, then uploads the notarized
+DMGs plus `.app.tar.gz` updater payloads. Its Apple credentials are
+`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
+`APPLE_API_PRIVATE_KEY`, `APPLE_API_KEY`, and `APPLE_API_ISSUER`. The workflow
+does not publish a release and it never receives the Tauri updater private key.
+
+Updater promotion is deliberately local and offline:
+
+1. Download both workflow artifacts and verify their checksums, code signatures,
+   notarization tickets and version before promoting either architecture.
+2. With the updater private key exposed only through
+   `SPAWN_DESKTOP_UPDATER_KEY`, run `cargo tauri signer sign -f
+   "$SPAWN_DESKTOP_UPDATER_KEY" <artifact.app.tar.gz>` for each updater payload.
+3. Assemble `latest.json` locally with the exact app version, release notes,
+   publication time and `darwin-aarch64` / `darwin-x86_64` URL-and-signature
+   entries. The detached minisign values produced in step 2 are the signatures
+   embedded in that manifest. Do the same under `desktop/beta/` for a beta.
+4. Publish the payloads first and the locally assembled, signed `latest.json`
+   last. Never assemble or sign this manifest in CI.
+
+The updater public key is committed in `desktop/updater.pubkey` and baked into
+`desktop/src-tauri/tauri.conf.json`. The private key stays on the release
+operator's Mac, outside this repository, with one protected password-manager
+backup. Never place it in GitHub Actions, the production server, a deploy log or
+a shell command line. Losing the private key and its backup strands every
+installed desktop app on its current trust root; there is no in-band recovery,
+so those users must install a newly signed app manually.
+
+The desktop content identity is the version in
+`desktop/src-tauri/tauri.conf.json` plus `git rev-parse <ref>:desktop`.
+Production exposes it from `GET /api/release` only when known and clean:
+
+```json
+{
+  "desktop": {
+    "version": "0.1.0",
+    "tree": "40hex desktop tree",
+    "platforms": ["darwin-aarch64", "darwin-x86_64"]
+  }
+}
+```
+
+Unknown or dirty desktop identities are `null`, as for the other release
+pieces. `scripts/verify-release.sh` compares this block, the served
+`/desktop/latest.json`, one served updater artifact and its minisign signature
+against the public key committed at the selected ref. Use `--skip-desktop` only
+when intentionally verifying a release that predates the app or an environment
+where the static desktop origin is unavailable.
+
 ## The daemon prebuilts
 
 Installers download daemon binaries from the production server, and the server
