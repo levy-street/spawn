@@ -461,25 +461,58 @@ export default function LandingPage() {
 
       {/* ── Specimen strip: scrubbed by the scroll itself ──────── */}
       {/* ── The pocket plate: the app is part of the offer ────── */}
-      <section className="border-line-g border-b">
-        <div className="mx-auto w-full max-w-6xl px-5 py-24 sm:px-8">
-          <p className="mb-5 font-sigil text-[12px] font-medium tracking-[0.3em] text-ash uppercase">
-            The reliquary · carried
-          </p>
-          <h2
-            className={cn(
-              poster.className,
-              "max-w-[19ch] text-[clamp(28px,3.7vw,48px)] leading-[1.04] font-light text-bone uppercase",
-            )}
+      {/* The altar print runs full-bleed behind the plate and breathes, like the
+       * hero — knocked back to 80% against the black ground rather than sat
+       * under a scrim, since the copy has its own black slab anyway. Square
+       * corners, and the slab hugs its contents rather than ruling a column:
+       * a card pressed onto the sheet, not a panel floating above it. */}
+      <section className="border-line-g relative isolate overflow-hidden border-b">
+        <div className="absolute inset-0 opacity-80">
+          <video
+            className="pointer-events-none absolute inset-0 h-full w-full object-cover object-[50%_45%] motion-reduce:hidden"
+            autoPlay
+            muted
+            loop
+            playsInline
+            preload="metadata"
+            onLoadedMetadata={(event) => {
+              // Half speed, as the hero runs: the 13s loop breathes for 26.
+              event.currentTarget.playbackRate = 0.5;
+            }}
+            poster="/brand/ink/altar-ink.png"
+            aria-label="A lone figure before two towering monoliths on a flat plain, printed in red ink on black, gently animated"
           >
-            Every possession, in your pocket.
-          </h2>
-          <p className="mt-6 max-w-[56ch] text-[17px] leading-8 text-ash">
-            The app is the same seance as the browser, not a summary of it. Start a session at the
-            desk and pick it up on the train; approve a host, watch an agent work, end it from the
-            platform. The daemon never leaves your machine — the phone is only a window onto it.
-          </p>
-          <StoreBadges badges={storeBadges()} className="mt-9" />
+            <source src="/brand/ink/altar-ink.mp4" type="video/mp4" />
+          </video>
+          <Image
+            src="/brand/ink/altar-ink.png"
+            alt=""
+            aria-hidden
+            fill
+            sizes="100vw"
+            className="pointer-events-none hidden object-cover object-[50%_45%] motion-reduce:block"
+          />
+        </div>
+        <div className="relative z-10 mx-auto w-full max-w-6xl px-5 py-20 sm:px-8 sm:py-28">
+          <div className="w-fit max-w-full bg-void px-6 py-10 sm:px-10 sm:py-12">
+            <p className="mb-5 font-sigil text-[12px] font-medium tracking-[0.3em] text-ash uppercase">
+              The reliquary · carried
+            </p>
+            <h2
+              className={cn(
+                poster.className,
+                "max-w-[19ch] text-[clamp(28px,3.7vw,48px)] leading-[1.04] font-light text-bone uppercase",
+              )}
+            >
+              Every possession, in your pocket.
+            </h2>
+            <p className="mt-6 max-w-[56ch] text-[17px] leading-8 text-ash">
+              The app is the same seance as the browser, not a summary of it. Start a session at the
+              desk and pick it up on the train; approve a host, watch an agent work, end it from the
+              platform. The daemon never leaves your machine — the phone is only a window onto it.
+            </p>
+            <StoreBadges badges={storeBadges()} className="mt-9" />
+          </div>
         </div>
       </section>
 

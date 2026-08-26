@@ -25,7 +25,7 @@ import { borderWidth, duration, spacing, useTheme } from "@/theme";
 
 const PUBLIC_FALLBACK_ORIGIN = "https://spawnd.dev";
 
-type CopiedCommand = "standard" | "prebuilt" | null;
+type CopiedCommand = "standard" | "windows" | "prebuilt" | null;
 
 export interface AboutScreenProps {
   baseUrl?: string;
@@ -139,7 +139,7 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
       </SettingsSection>
 
       <SettingsSection
-        description="Install spawnd on a Mac or Linux machine you control."
+        description="Install spawnd on a Mac, Linux, or Windows machine you control."
         title="Install a host"
       >
         <SettingsBlock>
@@ -156,9 +156,6 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
           >
             <Text selectable variant="mono">
               {commands.standard}
-            </Text>
-            <Text color="mutedForeground" variant="caption">
-              Already running SPAWN D for another account on that machine? Add --new-account.
             </Text>
           </View>
           <View style={styles.commandActions}>
@@ -180,6 +177,37 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
               Share
             </Button>
           </View>
+        </SettingsBlock>
+
+        <SettingsBlock>
+          <Text variant="label">Windows (via WSL)</Text>
+          <View
+            style={[
+              styles.commandWell,
+              {
+                backgroundColor: theme.colors.muted,
+                borderColor: theme.colors.border,
+                borderRadius: theme.radii.md,
+              },
+            ]}
+          >
+            <Text selectable variant="mono">
+              {commands.windows}
+            </Text>
+          </View>
+          <Button
+            accessibilityLabel="Copy Windows install command"
+            onPress={() => void copyCommand("windows", commands.windows)}
+            size="sm"
+            variant="outline"
+          >
+            <Icon
+              color="foreground"
+              name={copied === "windows" ? "Check" : "Copy"}
+              size={spacing[4]}
+            />
+            {copied === "windows" ? "Copied" : "Copy command"}
+          </Button>
         </SettingsBlock>
 
         <SettingsBlock>

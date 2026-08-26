@@ -17,6 +17,8 @@ import { SignupForm } from "./signup-form";
 import { ONBOARDING_STEPS, type OnboardingStep, resolveStep } from "./step-machine";
 
 const SUCCESS_BEAT_MS = 900;
+/** Hoisted so the host step hands down one array, not a new one per render. */
+const NOTHING_ONLINE_YET: readonly string[] = [];
 
 type SuccessBeat = "verify" | "host" | null;
 type CompletionState =
@@ -52,9 +54,10 @@ export function OnboardingFlow() {
   const configState = useAuthConfig();
   const [storage, setStorage] = useState({ ready: false });
   const _userId = authState.user?.id ?? null;
-  // An approval link that went through signup leaves its ceremony in
-  // sessionStorage. Claiming it here puts `?ref=…#k=…` back on this URL so the
-  // host step can finish the approval in place.
+  // Whether a machine's own approval link brought this visit here — carried on
+  // the URL, or left in sessionStorage by a link that went through signup and
+  // put back on this URL below. Either way the host step finishes the approval
+  // in place rather than starting a second one.
   const [approvalFromLink, setApprovalFromLink] = useState(false);
   // Whether the stash has been looked for yet. The restore must happen in an
   // effect — it writes history and consumes storage — so rendering the host
@@ -72,8 +75,15 @@ export function OnboardingFlow() {
     );
     if (restored !== null) {
       window.history.replaceState(window.history.state, "", restored);
-      setApprovalFromLink(true);
     }
+    // The stash is consumed the first time it is read, so "was there a stash"
+    // answers a different question from "is there a ceremony here": a reload,
+    // or this URL opened a second time, still carries `?ref=` and still has an
+    // approval waiting on it. Asking the URL means the host step never teaches
+    // installation and a pairing code to someone whose machine is already
+    // asking to be let in.
+    const params = new URLSearchParams(window.location.search);
+    setApprovalFromLink(restored !== null || Boolean(params.get("ref") ?? params.get("code")));
     setApprovalChecked(true);
   }, []);
   const [successBeat, setSuccessBeat] = useState<SuccessBeat>(null);
@@ -331,6 +341,17 @@ export function OnboardingFlow() {
                 // same machine.
                 mintSetupClaim={!approvalFromLink && approvedOfflineHost === null}
                 resumeApprovedHost={approvedOfflineHost}
+                // This step is not the end of anything: the approval is
+                // followed by a wait for the machine, and then by the beat that
+                // hands the reader to /app.
+                awaitsHostArrival
+                // This gate is only ever reached with nothing online — that is
+                // what puts the reader on it — so there is no host here that
+                // could belong to some other ceremony, and any machine that
+                // arrives is the one being connected. Saying so is what keeps a
+                // surface that mounts again mid-wait from mistaking the machine
+                // it is waiting for for one that was always there.
+                priorOnlineHostIds={NOTHING_ONLINE_YET}
               />
             ) : (
               <div className="flex min-h-48 items-center justify-center px-6">
