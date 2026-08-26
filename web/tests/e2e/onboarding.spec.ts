@@ -83,12 +83,8 @@ test("returning after login derives the host step instead of restarting", async 
 
 // The terminal-first arrival: `spawnd possess` prints an approval link and the
 // person following it has no account yet. Login stashes the link's `#k=`
-// fragment, signup lands on onboarding, and onboarding claims the stash and
-// finishes the approval in place. What follows the approve click is the part
-// that used to break: the ceremony's own "possessed" card kept the whole
-// screen, and its Done — the only control left on it — swapped the answer for
-// an empty pairing form and instructions to run `spawnd possess`, while the
-// machine was still connecting and nothing said so.
+// fragment and signup carries them back to the ceremony, which finishes in
+// place. None of this had end-to-end coverage before; these walk it.
 const APPROVAL_REF = "wL0aFhZ0S3nQ8yq2m4X1nAmBcDeFgHiJkLmNoPqRsTu";
 const HOST_PUBLIC_KEY = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
 
@@ -108,7 +104,45 @@ async function arriveByApprovalLink(page: Page) {
   await expect(page.getByTestId("possess-approve-screen")).toBeVisible({ timeout: 15_000 });
 }
 
-test("an approval link followed through signup finishes onboarding", async ({ page }) => {
+test("the onboarding host step finishes an approval its URL still carries", async ({ page }) => {
+  // The state the terminal-first path actually lands in: signed in, no host
+  // yet, and a machine's approval handle on the onboarding URL — either put
+  // back there from the sessionStorage stash, or still on it after a reload.
+  //
+  // The stash is spent the first time it is read, so anything that renders this
+  // page a second time has only `?ref=` to go on. Reading only the stash meant
+  // that second render decided nobody had arrived by link, and put the install
+  // command and an empty pairing field in front of someone whose machine was
+  // already asking to be let in.
+  const store = await mockApp(page, { me: user, hosts: [], workspaces: [] });
+  await page.goto(`/onboarding?ref=${APPROVAL_REF}#k=${HOST_PUBLIC_KEY}`);
+
+  await expect(page.getByTestId("possess-approve-screen")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole("button", { name: "Copy install command" })).toHaveCount(0);
+  await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
+
+  await page.getByTestId("possess-approve").click();
+  await expect(page.locator('[data-step="3"]')).toHaveAttribute("data-state", "complete", {
+    timeout: 10_000,
+  });
+
+  // The approval hands the screen to the wait rather than leaving a spent
+  // ceremony — whose Done resets it — as the only thing on the page.
+  await expect(page.getByRole("button", { name: "Done" })).toHaveCount(0);
+  await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
+
+  // The daemon notices the approval and calls home. This surface has to see it
+  // even though it mounted after the ceremony began — the reading that ignores
+  // hosts already online is there to stop it completing someone else's
+  // approval, and on this gate there is no one else's to complete.
+  store.hosts.push({ ...host, status: "online", session_count: 0 });
+  await expect(page.locator('[data-step="4"]')).toHaveAttribute("data-state", "complete", {
+    timeout: 10_000,
+  });
+  await expect(page).toHaveURL("/app", { timeout: 10_000 });
+});
+
+test("an approval link followed through signup finishes on /device", async ({ page }) => {
   const store = await mockApp(page, { me: null, hosts: [], workspaces: [] });
   await arriveByApprovalLink(page);
   // The ceremony is already waiting, so there is nothing to install and no
@@ -116,13 +150,10 @@ test("an approval link followed through signup finishes onboarding", async ({ pa
   await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
   await page.getByTestId("possess-approve").click();
 
-  // The approval hands the screen to the wait, rather than leaving a spent
-  // ceremony — and a Done that empties it — as the only thing on the page.
   await expect(page.locator('[data-step="3"]')).toHaveAttribute("data-state", "complete", {
     timeout: 10_000,
   });
   await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Done" })).toHaveCount(0);
 
   // The daemon notices the approval and calls home.
   store.hosts.push({ ...host, status: "online", session_count: 0 });
@@ -135,12 +166,11 @@ test("an approval link followed through signup finishes onboarding", async ({ pa
   await expect(page).toHaveURL("/app", { timeout: 10_000 });
 });
 
-test("a reloaded approval link finishes the ceremony it still carries", async ({ page }) => {
-  // The stash is spent the first time onboarding reads it, so anything that
-  // mounts this page again — a reload, the URL opened a second time — has only
-  // `?ref=` to go on. Treating that as "arrived cold" put the install command
-  // and a pairing-code field in front of someone whose machine was already
-  // asking to be let in.
+test("a reloaded approval link keeps the ceremony it still carries", async ({ page }) => {
+  // The stash is spent the first time it is read, so anything that mounts the
+  // page again — a reload, the URL opened a second time — has only `?ref=` to
+  // go on. Reading the URL rather than the stash is what keeps a second render
+  // from deciding nobody arrived by link.
   await mockApp(page, { me: null, hosts: [], workspaces: [] });
   await arriveByApprovalLink(page);
 
