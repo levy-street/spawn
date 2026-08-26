@@ -98,6 +98,20 @@ let terminalCommand = "curl -fsSL https://spawnd.dev/install.sh | sh";
 let status: LocalStatus | null = null;
 let statusLoading = false;
 let appUpdate: { available: boolean; version: string | null; endpoint: string } | null = null;
+/* The device gate is only walked when the account already has an approving
+ * device, so the rail below the masthead names it only on runs that need it —
+ * the same "gates this account actually has to pass" rule the web funnel
+ * follows rather than showing a step that will never light. */
+let deviceGateRequired = false;
+
+/** The chosen server's host, for the places a full origin would not fit. */
+function serverHost(): string {
+  try {
+    return new URL(preferences.server_origin).host;
+  } catch {
+    return preferences.server_origin;
+  }
+}
 
 const escapeHtml = (value: unknown): string =>
   String(value)
@@ -107,16 +121,59 @@ const escapeHtml = (value: unknown): string =>
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 
-function shell(content: string, step?: string): string {
+/**
+ * The brand lockup: the trident art in hellfire with the drawn wordmark beside
+ * it, the same pair every web surface wears. The wordmark is a mask filled
+ * with `currentColor`, so it takes the lockup's ink rather than carrying its
+ * own.
+ */
+const LOCKUP = '<div class="lockup"><span class="trident" aria-hidden="true"></span><span class="wordmark" role="img" aria-label="spawnd"></span></div>';
+
+/** The corners of the press bed, struck in hellfire. */
+const REGISTRATION_MARKS =
+  '<span class="marks" aria-hidden="true"><span>+</span><span>+</span><span>+</span><span>+</span></span>';
+
+function shell(content: string, step: string): string {
   return `
     <div class="shell">
-      <header class="mast">
-        <div class="brand"><span class="brand-mark">◉</span> SPAWN D</div>
-        <div class="step">${escapeHtml(step ?? "DESKTOP COMPANION")}</div>
-      </header>
-      <main class="stage">${content}</main>
-      <footer class="foot"><span>LOCAL CLIENT · SIGNED UPDATE CHANNEL</span><span>${escapeHtml(preferences.server_origin)}</span></footer>
+      <div class="mast-block">
+        <header class="mast">
+          ${LOCKUP}
+          <div class="step">${escapeHtml(step)}</div>
+        </header>
+        ${gateRail()}
+      </div>
+      <main class="stage">${REGISTRATION_MARKS}${content}</main>
+      <footer class="foot"><span>Local client · Signed update channel</span><span class="origin">${escapeHtml(preferences.server_origin)}</span></footer>
     </div>`;
+}
+
+/**
+ * The gates as a ladder of rules — struck for the one you are on, inked for
+ * the ones behind you, blank for the ones ahead. Only the wizard wears it;
+ * settings and repair are not steps in a funnel.
+ */
+const GATES: readonly { screen: Screen; label: string }[] = [
+  { screen: "auth", label: "Account" },
+  { screen: "device", label: "Device" },
+  { screen: "server", label: "Server" },
+  { screen: "possess", label: "Host" },
+  { screen: "done", label: "Done" },
+];
+
+function gateRail(): string {
+  const gates = GATES.filter((gate) => gate.screen !== "device" || deviceGateRequired);
+  const here = gates.findIndex((gate) => gate.screen === screen);
+  if (here < 0) return "";
+  return `
+      <ol class="rail" aria-label="Setup progress">
+        ${gates
+          .map(
+            (gate, index) =>
+              `<li class="${index === here ? "here" : index < here ? "done" : ""}"${index === here ? ' aria-current="step"' : ""}>${escapeHtml(gate.label)}</li>`,
+          )
+          .join("")}
+      </ol>`;
 }
 
 function message(): string {
@@ -146,29 +203,33 @@ function render(): void {
   bindActions();
 }
 
+/* The rail below the masthead counts the gates, so this names the surface
+ * rather than numbering it — the landing masthead's zone voice. */
 function progressLabel(): string {
   const labels: Record<Screen, string> = {
-    welcome: "01 · WELCOME",
-    auth: "02 · IDENTITY",
-    device: "03 · NUMBER CHECK",
-    server: "04 · CONTROL PLANE",
-    possess: "05 · THIS MAC",
-    done: "READY",
-    settings: "SETTINGS",
-    repair: "REPAIR",
-    quit: "QUIT",
+    welcome: "Mac companion",
+    auth: "Mac companion",
+    device: "Mac companion",
+    server: "Mac companion",
+    possess: "Mac companion",
+    done: "Mac companion",
+    settings: "Settings",
+    repair: "Repair",
+    quit: "Quit",
   };
   return labels[screen];
 }
 
 function welcomeView(): string {
   return `
-    <section class="welcome-grid">
-      <div class="sigil" aria-hidden="true"><span>SP</span><i>D</i></div>
-      <div class="copy-stack">
-        <p class="eyebrow">FIRST POSSESSION</p>
-        <h1>Possess this Mac.</h1>
-        <p class="lead">Sign in, pick your server, and SPAWN D does the rest — the daemon installed, verified, and kept running. About two minutes.</p>
+    <section class="sheet wide mark-grid">
+      <div class="mark-plate"><span class="trident" aria-hidden="true"></span></div>
+      <div class="sheet">
+        <div class="masthead">
+          <p class="eyebrow">First possession</p>
+          <h1>Possess this Mac</h1>
+          <p class="lead">Sign in, pick your server, and SPAWN D does the rest — the daemon installed, verified, and kept running. About two minutes.</p>
+        </div>
         ${message()}
         <div class="actions"><button class="primary" data-action="get-started">Get started</button></div>
         <details class="installed"><summary>What gets installed?</summary><p>Two binaries in <code>~/.local/bin</code>, one LaunchAgent, nothing else.</p></details>
@@ -176,32 +237,63 @@ function welcomeView(): string {
     </section>`;
 }
 
+/*
+ * The provider's own mark, beside its name on the sign-in button — the same
+ * plates web/ draws. Not decoration: Apple's guidelines require its mark to
+ * accompany "Sign in with Apple", and Google's branding rules say the same for
+ * the G. Apple's is monochrome by rule and takes the button's ink; the rest
+ * are drawn at brand colours, which hold on the void ground.
+ */
+const PROVIDER_MARKS: Record<string, string> = {
+  apple:
+    '<svg aria-hidden="true" class="provider-mark" viewBox="0 0 24 24" fill="currentColor"><path d="M17.05 12.53c-.02-2.2 1.8-3.26 1.88-3.31-1.02-1.5-2.62-1.7-3.19-1.72-1.36-.14-2.65.8-3.34.8-.69 0-1.75-.78-2.88-.76-1.48.02-2.85.86-3.61 2.18-1.54 2.67-.39 6.62 1.11 8.79.73 1.06 1.6 2.25 2.75 2.21 1.1-.05 1.52-.71 2.85-.71 1.33 0 1.71.71 2.88.69 1.19-.02 1.94-1.08 2.67-2.15.84-1.23 1.19-2.42 1.21-2.48-.03-.01-2.32-.89-2.33-3.54zM14.86 5.6c.6-.74 1.01-1.76.9-2.78-.87.04-1.93.58-2.56 1.31-.56.65-1.05 1.7-.92 2.7.97.08 1.97-.49 2.58-1.23z"/></svg>',
+  google:
+    '<svg aria-hidden="true" class="provider-mark" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.76h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.76c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84A11 11 0 0012 23z" fill="#34A853"/><path d="M5.84 14.11a6.6 6.6 0 010-4.22V7.05H2.18a11 11 0 000 9.9l3.66-2.84z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1a11 11 0 00-9.82 6.05l3.66 2.84c.87-2.6 3.3-4.51 6.16-4.51z" fill="#EA4335"/></svg>',
+  github:
+    '<svg aria-hidden="true" class="provider-mark" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.73.5.7 5.57.7 11.86c0 5.03 3.22 9.29 7.69 10.79.56.11.77-.24.77-.54 0-.27-.01-1.16-.02-2.1-3.13.69-3.79-1.34-3.79-1.34-.51-1.31-1.25-1.66-1.25-1.66-1.02-.7.08-.69.08-.69 1.13.08 1.72 1.17 1.72 1.17 1 1.73 2.63 1.23 3.27.94.1-.73.39-1.23.71-1.51-2.5-.29-5.13-1.26-5.13-5.6 0-1.24.44-2.25 1.16-3.04-.12-.29-.5-1.44.11-3 0 0 .95-.31 3.1 1.16a10.6 10.6 0 015.65 0c2.15-1.47 3.09-1.16 3.09-1.16.62 1.56.23 2.71.11 3 .73.79 1.16 1.8 1.16 3.04 0 4.35-2.63 5.31-5.14 5.59.4.35.76 1.04.76 2.1 0 1.52-.01 2.75-.01 3.12 0 .3.2.66.78.54 4.46-1.5 7.68-5.76 7.68-10.79C23.3 5.57 18.27.5 12 .5z"/></svg>',
+  microsoft:
+    '<svg aria-hidden="true" class="provider-mark" viewBox="0 0 24 24"><path d="M2 2h9.5v9.5H2z" fill="#F25022"/><path d="M12.5 2H22v9.5h-9.5z" fill="#7FBA00"/><path d="M2 12.5h9.5V22H2z" fill="#00A4EF"/><path d="M12.5 12.5H22V22h-9.5z" fill="#FFB900"/></svg>',
+};
+
+const PROVIDERS: readonly { id: string; name: string }[] = [
+  { id: "google", name: "Google" },
+  { id: "github", name: "GitHub" },
+  { id: "microsoft", name: "Microsoft" },
+  { id: "apple", name: "Apple" },
+];
+
 function authView(): string {
   const signup = authMode === "signup";
   return `
-    <section class="narrow">
-      <p class="eyebrow">IDENTITY IS A DEVICE</p>
-      <h1>Who summons?</h1>
-      <p class="lead compact">${signup ? "Create the account that will possess this Mac." : "Sign in and this app becomes a revocable device on your account."}</p>
-      <form id="auth-form" class="form-stack">
-        <label>Email<input name="email" type="email" autocomplete="email" required /></label>
-        <label>Password<input name="password" type="password" autocomplete="${signup ? "new-password" : "current-password"}" minlength="${signup ? "8" : "1"}" ${signup ? 'maxlength="256"' : ""} required /></label>
-        ${signup ? '<label>Invite <span>(if your server requires one)</span><input name="invite" type="text" autocomplete="off" maxlength="256" /></label>' : ""}
-        ${message()}
-        <button class="primary" type="submit" ${busy ? "disabled" : ""}>${busy ? "Contacting your server…" : signup ? "Create account" : "Sign in"}</button>
-      </form>
-      <div class="rule"><span>OR</span></div>
-      <div class="providers">
-        ${["Google", "GitHub", "Microsoft", "Apple"]
-          .map(
+    <section class="sheet">
+      <div class="masthead">
+        <p class="eyebrow">Identity is a device</p>
+        <h1>${signup ? "Who summons?" : "Welcome back"}</h1>
+        <p class="lead compact">${signup ? "Create the account that will possess this Mac." : "Sign in and this app becomes a revocable device on your account."}</p>
+      </div>
+      <div class="plate padded form-stack">
+        <div class="providers">
+          ${PROVIDERS.map(
             (provider) =>
-              `<button class="secondary" data-provider="${provider.toLowerCase()}" ${busy ? "disabled" : ""}>Continue with ${provider}<span>↗</span></button>`,
-          )
-          .join("")}
+              `<button class="secondary" data-provider="${provider.id}" ${busy ? "disabled" : ""}>${PROVIDER_MARKS[provider.id]}${
+                /* Apple's guidelines require this exact wording for its
+                   button; every other provider takes the house phrasing. */
+                provider.id === "apple" ? "Sign in with Apple" : `Continue with ${provider.name}`
+              }</button>`,
+          ).join("")}
+        </div>
+        <div class="rule"><span>or use email</span></div>
+        <form id="auth-form" class="form-stack">
+          <label><span>Email</span><input name="email" type="email" autocomplete="email" required /></label>
+          <label><span>Password</span><input name="password" type="password" autocomplete="${signup ? "new-password" : "current-password"}" minlength="${signup ? "8" : "1"}" ${signup ? 'maxlength="256"' : ""} required /></label>
+          ${signup ? '<label><span class="field-head">Invite <span class="optional">if your server requires one</span></span><input name="invite" type="text" autocomplete="off" maxlength="256" /></label>' : ""}
+          ${message()}
+          <button class="primary" type="submit" ${busy ? "disabled" : ""}>${busy ? "Contacting your server…" : signup ? "Create account" : "Sign in"}</button>
+        </form>
       </div>
       <div class="auth-links">
         <button class="text-button" data-action="toggle-auth">${signup ? "Already have an account? Sign in" : "Create an account"}</button>
-        <button class="text-button server-link" data-action="preauth-server">Using ${escapeHtml(preferences.server_origin)} · Change</button>
+        <button class="text-button server-link" data-action="preauth-server" title="${escapeHtml(preferences.server_origin)}">Using ${escapeHtml(serverHost())} · Change</button>
       </div>
     </section>`;
 }
@@ -210,27 +302,31 @@ function deviceView(): string {
   const number = deviceProgress.state === "show_number" ? deviceProgress.number : null;
   const refused = deviceProgress.state === "refused" ? deviceProgress.message : null;
   return `
-    <section class="narrow waiting">
-      <p class="eyebrow">DEVICE APPROVAL</p>
-      <h1>Approve this device</h1>
-      <p class="lead compact">Approve from a device you already use.</p>
-      <div class="number-card ${number ? "ready" : ""}">
-        <span>${number ? "TYPE THIS NUMBER THERE" : "WAITING FOR AN APPROVING DEVICE"}</span>
+    <section class="sheet">
+      <div class="masthead">
+        <p class="eyebrow">Device approval</p>
+        <h1>Approve this device</h1>
+        <p class="lead compact">Approve from a device you already use.</p>
+      </div>
+      <div class="number-card ${number ? "ready" : "waiting"}">
+        <span>${number ? "Type this number there" : "Waiting for an approving device"}</span>
         <strong>${escapeHtml(number ?? "·· ··")}</strong>
         <p>${number ? "The number proves both screens saw the same two device keys." : "A knock is waiting on your other signed-in devices."}</p>
       </div>
       ${refused ? `<div class="message" role="alert">${escapeHtml(refused)}</div>` : message()}
-      <button class="secondary" data-action="ask-again" ${busy ? "disabled" : ""}>Ask again</button>
+      <div class="actions"><button class="secondary" data-action="ask-again" ${busy ? "disabled" : ""}>Ask again</button></div>
       <p class="fine">This check is never skippable. No device key is trusted until the number matches.</p>
     </section>`;
 }
 
 function serverView(): string {
   return `
-    <section class="narrow">
-      <p class="eyebrow">CONTROL PLANE</p>
-      <h1>Whose altar?</h1>
-      <p class="lead compact">Choose the server this app and the daemon answer to.</p>
+    <section class="sheet">
+      <div class="masthead">
+        <p class="eyebrow">Control plane</p>
+        <h1>Whose altar?</h1>
+        <p class="lead compact">Choose the server this app and the daemon answer to.</p>
+      </div>
       <form id="server-form" class="server-options">
         <label class="server-option ${serverChoice === "hosted" ? "selected" : ""}">
           <input type="radio" name="server-kind" value="hosted" ${serverChoice === "hosted" ? "checked" : ""} />
@@ -242,11 +338,11 @@ function serverView(): string {
         </label>
         ${
           serverChoice === "self"
-            ? `<label class="advanced">Server URL<input name="server-url" type="url" value="${escapeHtml(preferences.server_origin === "https://spawnd.dev" ? "" : preferences.server_origin)}" placeholder="Enter a SPAWN D server URL" required /></label>`
+            ? `<label class="advanced"><span>Server URL</span><input name="server-url" type="url" value="${escapeHtml(preferences.server_origin === "https://spawnd.dev" ? "" : preferences.server_origin)}" placeholder="Enter a SPAWN D server URL" required /></label>`
             : ""
         }
         ${message()}
-        <button class="primary" type="submit" ${busy ? "disabled" : ""}>Continue</button>
+        <div class="actions"><button class="primary" type="submit" ${busy ? "disabled" : ""}>Continue</button></div>
       </form>
     </section>`;
 }
@@ -266,10 +362,12 @@ function possessView(): string {
   const serviceFailed = error === "The daemon installed but its service didn't start.";
   const alreadyPossessed = error?.includes("already possessed for") ?? false;
   return `
-    <section class="narrow possess">
-      <p class="eyebrow">LOCAL INSTALL</p>
-      <h1>Possess this Mac.</h1>
-      <p class="lead compact">Both binaries come from ${escapeHtml(preferences.server_origin)} and are checked before installation.</p>
+    <section class="sheet wide">
+      <div class="masthead">
+        <p class="eyebrow">Local install</p>
+        <h1>Possess this Mac</h1>
+        <p class="lead compact">Both binaries come from ${escapeHtml(preferences.server_origin)} and are checked before installation.</p>
+      </div>
       <ol class="progress-list">
         ${steps
           .map(
@@ -288,15 +386,15 @@ function possessView(): string {
       ${
         error
           ? keyMismatch
-            ? '<div class="fallback-actions"><button class="text-button" data-action="learn-key-check">Learn what this means</button></div>'
+            ? '<div class="actions"><button class="text-button" data-action="learn-key-check">Learn what this means</button></div>'
             : serviceFailed
-              ? '<div class="fallback-actions"><button class="secondary" data-action="show-repair">Repair</button></div>'
+              ? '<div class="actions"><button class="secondary" data-action="show-repair">Repair</button></div>'
               : alreadyPossessed
-                ? '<div class="fallback-actions"><button class="secondary" data-action="open-browser">Open SPAWN D</button></div>'
-                : '<div class="fallback-actions"><button class="secondary" data-action="try-again">Try again</button><button class="text-button" data-action="terminal">Use the Terminal instead</button></div>'
+                ? '<div class="actions"><button class="secondary" data-action="open-browser">Open SPAWN D</button></div>'
+                : '<div class="actions"><button class="secondary" data-action="try-again">Try again</button><button class="text-button" data-action="terminal">Use the Terminal instead</button></div>'
           : ""
       }
-      <div class="command-chip"><span>$</span><code>${escapeHtml(terminalCommand)}</code><button data-action="copy-command" aria-label="Copy installer">COPY</button></div>
+      <div class="command-chip"><span class="dollar">$</span><code>${escapeHtml(terminalCommand)}</code><button data-action="copy-command" aria-label="Copy install command">Copy</button></div>
     </section>`;
 }
 
@@ -316,14 +414,14 @@ function approvalReview(review: ApprovalReview): string {
   if (review.exact_key_match) {
     return `
       <div class="approval-review verified">
-        <div><span>LOCAL PIPE CHECK</span><strong>Exact key match</strong></div>
+        <div><span>Local pipe check</span><strong>Exact key match</strong></div>
         <code>${escapeHtml(review.fingerprint)}</code>
         <button class="primary" data-action="approve-host" ${busy ? "disabled" : ""}>Possess this Mac</button>
       </div>`;
   }
   return `
     <div class="approval-review">
-      <div><span>FULL FINGERPRINT CHECK</span><strong>Compare both lines</strong></div>
+      <div><span>Full fingerprint check</span><strong>Compare both lines</strong></div>
       <dl><dt>From the daemon</dt><dd>${escapeHtml(review.local_fingerprint ?? "Not printed")}</dd><dt>From the server</dt><dd>${escapeHtml(review.fingerprint)}</dd></dl>
       <button class="primary" data-action="approve-fingerprint" ${review.local_fingerprint !== review.fingerprint || busy ? "disabled" : ""}>They match — possess this Mac</button>
     </div>`;
@@ -332,12 +430,14 @@ function approvalReview(review: ApprovalReview): string {
 function doneView(): string {
   const host = possession?.claim.host_name ?? preferences.host_name ?? "This Mac";
   return `
-    <section class="done-grid">
-      <div class="done-mark" aria-hidden="true">✓</div>
-      <div>
-        <p class="eyebrow">POSSESSION COMPLETE</p>
-        <h1>${escapeHtml(host)} is possessed.</h1>
-        <p class="lead">All your devices can reach it. SPAWN D lives in your menu bar; the daemon keeps running on its own.</p>
+    <section class="sheet wide mark-grid">
+      <div class="mark-plate"><span class="trident" aria-hidden="true"></span></div>
+      <div class="sheet">
+        <div class="masthead">
+          <p class="eyebrow">Possession complete</p>
+          <h1>${escapeHtml(host)} is possessed</h1>
+          <p class="lead">All your devices can reach it. SPAWN D lives in your menu bar; the daemon keeps running on its own.</p>
+        </div>
         ${message()}
         <div class="actions"><button class="primary" data-action="open-browser">Open SPAWN D</button><button class="secondary" data-action="done">Done</button></div>
       </div>
@@ -349,8 +449,14 @@ function settingsView(): string {
   const instance = Array.isArray(instances) ? instances[0] : null;
   const connected = status?.heartbeat?.connected ?? false;
   return `
-    <section class="wide">
-      <div class="section-head"><div><p class="eyebrow">MENU BAR COMPANION</p><h1>Settings</h1></div><button class="close" data-action="close-window" aria-label="Close">×</button></div>
+    <section class="sheet wide">
+      <div class="section-head">
+        <div class="masthead">
+          <p class="eyebrow">Menu bar companion</p>
+          <h1>Settings</h1>
+        </div>
+        <button class="close" data-action="close-window" aria-label="Close">×</button>
+      </div>
       <div class="status-band"><span class="status-dot ${connected ? "online" : ""}"></span><div><strong>${connected ? "Possessed, online" : "Checking this Mac"}</strong><small>${escapeHtml(preferences.host_name ?? "This Mac")} · ${escapeHtml(preferences.server_origin)}</small></div></div>
       <div class="settings-list">
         <button data-action="open-browser"><span><strong>Open SPAWN D</strong><small>Continue in your system browser</small></span><b>↗</b></button>
@@ -365,25 +471,35 @@ function settingsView(): string {
 
 function repairView(): string {
   return `
-    <section class="wide">
-      <div class="section-head"><div><p class="eyebrow">DELEGATED RECOVERY</p><h1>Repair</h1></div><button class="close" data-action="settings">×</button></div>
+    <section class="sheet wide">
+      <div class="section-head">
+        <div class="masthead">
+          <p class="eyebrow">Delegated recovery</p>
+          <h1>Repair</h1>
+        </div>
+        <button class="close" data-action="settings" aria-label="Back to settings">×</button>
+      </div>
       <p class="lead compact">SPAWN D asks the daemon to repair itself first. Reinstall remains available only if that does not work.</p>
       <div class="repair-order">
         <button class="primary" data-action="repair-resume" ${busy ? "disabled" : ""}>1 · Re-run spawnd possess</button>
         <button class="secondary" data-action="repair-reinstall" ${busy ? "disabled" : ""}>2 · Verified reinstall</button>
       </div>
       ${message()}
-      <div class="log-head"><span>RECENT DAEMON LOGS</span><button class="text-button" data-action="copy-logs">Copy</button></div>
-      <pre class="logs">${escapeHtml(status?.log_tail || "No daemon log lines are available yet.")}</pre>
+      <div class="log-block">
+        <div class="log-head"><span>Recent daemon logs</span><button class="text-button" data-action="copy-logs">Copy</button></div>
+        <pre class="logs">${escapeHtml(status?.log_tail || "No daemon log lines are available yet.")}</pre>
+      </div>
     </section>`;
 }
 
 function quitView(): string {
   return `
-    <section class="narrow quit-view">
-      <p class="eyebrow">LEAVE THE COMPANION</p>
-      <h1>Quit SPAWN D?</h1>
-      <p class="lead">The daemon keeps running while SPAWN D is closed.</p>
+    <section class="sheet">
+      <div class="masthead">
+        <p class="eyebrow">Leave the companion</p>
+        <h1>Quit SPAWN D?</h1>
+        <p class="lead">The daemon keeps running while SPAWN D is closed.</p>
+      </div>
       <div class="actions"><button class="primary" data-action="quit-app">Quit SPAWN D</button><button class="secondary" data-action="settings">Cancel</button></div>
     </section>`;
 }
@@ -520,6 +636,7 @@ async function handleDeepLink(value: string): Promise<void> {
 
 async function finishAuth(result: AuthOutcome): Promise<void> {
   preferences = await invoke<Preferences>("app_preferences");
+  deviceGateRequired = result.approval_required;
   if (result.approval_required) {
     setScreen("device");
     startDevicePoll();

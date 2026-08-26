@@ -21,6 +21,7 @@ describe("about and public content", () => {
   test("builds deployment-specific normal and prebuilt-only commands", () => {
     expect(installCommandsForBaseUrl("https://spawn.example/api")).toEqual({
       standard: "curl -fsSL https://spawn.example/install.sh | sh",
+      windows: 'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
       prebuiltOnly: "curl -fsSL https://spawn.example/install.sh | sh -s -- --prebuilt-only",
     });
   });

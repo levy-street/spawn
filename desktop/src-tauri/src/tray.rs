@@ -1,9 +1,16 @@
 use anyhow::Result;
+use tauri::image::Image;
 use tauri::menu::{
     Menu, MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem, Submenu, SubmenuBuilder,
 };
 use tauri::tray::TrayIconBuilder;
 use tauri::{App, AppHandle, Emitter, Manager, Wry};
+
+/// The menu-bar mark: the brand trident, black on alpha, handed to macOS as a
+/// template image so the system inverts it for a light menu bar and dims it
+/// when the bar is inactive — the only correct way to wear a logo up there.
+/// Bundled at compile time; the tray must be drawn before any file is read.
+const TRAY_ICON: &[u8] = include_bytes!("../icons/tray@2x.png");
 
 pub struct TrayState {
     menu: Menu<Wry>,
@@ -59,7 +66,8 @@ pub fn install(app: &mut App) -> Result<()> {
         ])
         .build()?;
     TrayIconBuilder::with_id("main")
-        .title("●")
+        .icon(Image::from_bytes(TRAY_ICON)?)
+        .icon_as_template(true)
         .tooltip("SPAWN D")
         .menu(&menu)
         .show_menu_on_left_click(true)

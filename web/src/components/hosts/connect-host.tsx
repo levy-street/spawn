@@ -126,6 +126,31 @@ export function ConnectHostSection(props: {
   /** An approval completed before this surface mounted, but its daemon has not
    * connected yet. Resume at Approved instead of teaching installation again. */
   resumeApprovedHost?: Host | null;
+  /**
+   * Whether this surface's job carries on past the approval.
+   *
+   * `/device` and Add a machine end there: the ceremony's own "possessed" card
+   * is the answer, and its Done means "possess another one". Onboarding does
+   * not — the machine still has to arrive before the reader can be moved on —
+   * and leaving that spent form owning the screen made Done, the only control
+   * left on it, replace the answer with an empty code field and instructions
+   * for work already finished, while nothing said the daemon was still
+   * connecting. Where this is set, the approval hands the screen to the wait.
+   */
+  awaitsHostArrival?: boolean;
+  /**
+   * Hosts that were online before this ceremony began, and so cannot be its
+   * result — the reading that stops one surface completing another machine's
+   * approval.
+   *
+   * Left out, the surface takes that reading itself, the first time it hears
+   * back from the server. That is right for a surface opened inside the app and
+   * wrong for one that can mount again mid-ceremony: the hosts cache outlives
+   * the component, so a later mount reads the very machine it is waiting for as
+   * one that was already there, and then waits for it for ever. A caller that
+   * knows the answer up front passes it and is immune to that.
+   */
+  priorOnlineHostIds?: readonly string[];
 }): JSX.Element {
   const {
     onHostOnline,
@@ -134,6 +159,8 @@ export function ConnectHostSection(props: {
     autoLoadFromUrl = false,
     mintSetupClaim = !autoLoadFromUrl,
     resumeApprovedHost = null,
+    awaitsHostArrival = false,
+    priorOnlineHostIds,
   } = props;
   const { user } = useAuth();
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
@@ -181,23 +208,27 @@ export function ConnectHostSection(props: {
 
   /** The confirm-only layout, which lasts exactly as long as the question does. */
   const showLinkConfirm = linkApproval !== false && !locallyApproved;
+  /**
+   * Whether the link ceremony still owns the screen.
+   *
+   * It keeps it for good on a surface that ends at the approval, and hands it
+   * over on one that carries on waiting — see `awaitsHostArrival`.
+   */
+  const linkFormOwnsScreen = linkApproval !== false && !(awaitsHostArrival && locallyApproved);
   /** Nothing can be laid out yet without knowing how this visit arrived. */
   const arrivalUnknown = linkApproval === "unknown";
   const [now, setNow] = useState(() => Date.now());
   const notifiedRef = useRef(false);
-  const initialOnlineIdsRef = useRef<Set<string> | null>(null);
+  const initialOnlineIdsRef = useRef<Set<string> | null>(
+    priorOnlineHostIds === undefined ? null : new Set(priorOnlineHostIds),
+  );
   const progressStartedAtRef = useRef(Date.now());
   const hostsQ = useQuery({
-    // The same cache lane the surrounding page derives its step from, on
-    // purpose. This used to be a private lane so the checklist could tick
-    // Online before the parent moved on — but the parent now polls hosts for
-    // itself (so a reload after an approval is not stranded on "connect your
-    // first host"), and two independent 3 s polls race: the parent could learn
-    // the host was online a full interval before this checklist did, and
-    // replace the screen while the last row still read Connecting.
-    //
-    // One lane, one answer: both see the host in the same render, so the row
-    // ticks over as the parent starts its success beat rather than after it.
+    // A lane of its own, deliberately. This poll is what notices the machine,
+    // and the surface has to paint its last milestone complete before whatever
+    // is around it is told. On the page's own ["hosts"] lane both would see the
+    // host in the same render, and the page would replace this whole surface in
+    // the very frame that row was meant to tick over in.
     queryKey: ["hosts", "setup"],
     queryFn: hosts.list,
     refetchInterval: 3_000,
@@ -533,6 +564,17 @@ export function ConnectHostSection(props: {
             elapsedMs={elapsedMs}
             stalledHint={stalledHint}
           />
+        ) : awaitsHostArrival && locallyApproved ? (
+          // The link path mints no claim and copies no command, so nothing above
+          // ever put a checklist on this screen — and the approval it has just
+          // taken is exactly where the reader needs to watch the last milestone
+          // tick over before the page around it moves on.
+          <SetupChecklist
+            claim={null}
+            completedThrough={checklist.completedThrough}
+            elapsedMs={elapsedMs}
+            stalledHint={stalledHint}
+          />
         ) : waitingForAMachine ? (
           <LegacyWaitingState
             onlineHost={onlineHost}
@@ -549,12 +591,12 @@ export function ConnectHostSection(props: {
           <div className="flex min-h-40 items-center justify-center px-6">
             <PaceBar className="w-full max-w-xs" label="Opening this approval…" />
           </div>
-        ) : linkApproval ? (
-          // Straight to the confirmation the link came here for. It stays
-          // mounted after approval: the form's own "possessed" card is the
-          // confirmation, and unmounting it would replace the answer with an
-          // empty code box. `locallyApproved` brings the progress view back
-          // above it rather than swapping this out.
+        ) : linkFormOwnsScreen ? (
+          // Straight to the confirmation the link came here for. Where nothing
+          // follows the approval it stays mounted and its "possessed" card is
+          // the answer; where something does, `linkFormOwnsScreen` hands the
+          // screen to the wait below rather than leaving a spent ceremony —
+          // and a Done that empties it — as the only thing on the page.
           <PairingCodeForm
             autoLoadFromUrl
             onStartOver={startOver}
