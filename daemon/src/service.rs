@@ -277,11 +277,71 @@ fn service_disabled() -> bool {
     std::env::var_os("SPAWND_NO_SERVICE").is_some_and(|v| !v.is_empty())
 }
 
+/// The server the unit must name: the one this instance registered against.
+///
+/// `spawnd run` refuses to start when its `--server` origin differs from the
+/// origin in the stored credentials. A unit written with any other value is
+/// therefore a service that boots, exits 1, and is restarted for ever by
+/// launchd or systemd — while the terminal has already said "possessed, daemon
+/// running in the background" and the web app waits at Online for a machine
+/// that can never connect. Silent, permanent, and indistinguishable from a
+/// network problem.
+///
+/// The credentials are the only value `run` will accept, so they decide. The
+/// caller's choice stands in only for an instance that has none yet.
+///
+/// Read from `config_dir` rather than through `creds::load`, which resolves
+/// the *ambient* `SPAWN_CONFIG_DIR`: this must describe the dir whose unit is
+/// being written, even when those two have drifted apart.
+fn registered_server(config_dir: &Path, chosen: &str) -> String {
+    let Ok(raw) = std::fs::read_to_string(config_dir.join("credentials.json")) else {
+        return chosen.to_owned();
+    };
+    let stored = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|record| {
+            record
+                .get("server_url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let Some(stored) = stored.filter(|url| !url.is_empty()) else {
+        return chosen.to_owned();
+    };
+    if !same_origin(&stored, chosen) {
+        // Worth saying out loud: the operator asked for one server and gets a
+        // unit pointing at another, which is right but surprising.
+        crate::tui::log_line(&format!(
+            "this instance is registered with {stored}; keeping the background daemon on it \
+             rather than {chosen}. run `spawnd login --server {chosen}` to move it."
+        ));
+    }
+    stored
+}
+
+/// Origin comparison in the same terms `run` uses to accept or refuse a unit.
+fn same_origin(left: &str, right: &str) -> bool {
+    match (
+        crate::creds::canonical_server_origin(left),
+        crate::creds::canonical_server_origin(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        // Unparseable either way: leave the decision to `run`, which will say
+        // so precisely. Claiming a mismatch here would only add noise.
+        _ => true,
+    }
+}
+
 /// Write + enable the background service for `config_dir` against `server`.
+///
+/// The unit is always written for the origin `config_dir` is registered with —
+/// see [`registered_server`] — so no caller can install a daemon that cannot
+/// start.
 pub fn install(config_dir: &Path, server: &str) -> Result<()> {
     if service_disabled() {
         return Ok(());
     }
+    let server = &registered_server(config_dir, server);
     #[cfg(target_os = "macos")]
     {
         return launchd_install(config_dir, server);
@@ -455,5 +515,70 @@ mod tests {
         assert!(plist.contains("&amp;")); // the '&' in the path is escaped
         assert!(!plist.contains(" & ")); // no raw ampersand leaked
         assert!(plist.contains("<key>KeepAlive</key><true/>"));
+    }
+
+    fn instance_with_server(server: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        if let Some(server) = server {
+            std::fs::write(
+                dir.path().join("credentials.json"),
+                format!(r#"{{"server_url":"{server}","host_id":"h"}}"#),
+            )
+            .expect("writing credentials");
+        }
+        dir
+    }
+
+    /// The regression that made a possessed machine never come online: the
+    /// unit named the server the operator picked, the credentials named the
+    /// one the ceremony actually ran against, and `run` exited 1 on every
+    /// restart for ever.
+    #[test]
+    fn the_unit_follows_the_credentials_not_the_caller() {
+        let dir = instance_with_server(Some("http://localhost:3000/"));
+        assert_eq!(
+            registered_server(dir.path(), "https://spawnd.dev"),
+            "http://localhost:3000/"
+        );
+    }
+
+    #[test]
+    fn an_agreeing_caller_is_left_alone_and_a_fresh_instance_keeps_its_choice() {
+        let same = instance_with_server(Some("https://spawnd.dev/"));
+        assert!(same_origin(
+            &registered_server(same.path(), "https://spawnd.dev"),
+            "https://spawnd.dev"
+        ));
+        // No credentials yet: nothing to contradict the caller.
+        let fresh = instance_with_server(None);
+        assert_eq!(
+            registered_server(fresh.path(), "https://spawnd.dev"),
+            "https://spawnd.dev"
+        );
+    }
+
+    #[test]
+    fn unreadable_or_serverless_credentials_fall_back_to_the_caller() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("credentials.json"), "{not json").expect("writing");
+        assert_eq!(
+            registered_server(dir.path(), "https://spawnd.dev"),
+            "https://spawnd.dev"
+        );
+        let empty = instance_with_server(Some(""));
+        assert_eq!(
+            registered_server(empty.path(), "https://spawnd.dev"),
+            "https://spawnd.dev"
+        );
+    }
+
+    /// Origin, not string: a stored URL differing only in trailing slash or
+    /// default port must not print a "keeping it on the other server" notice.
+    #[test]
+    fn origin_comparison_ignores_path_and_trailing_slash() {
+        assert!(same_origin("https://spawnd.dev", "https://spawnd.dev/"));
+        assert!(!same_origin("http://localhost:3000/", "https://spawnd.dev"));
+        // Unparseable inputs defer to `run` rather than guessing.
+        assert!(same_origin("not a url", "https://spawnd.dev"));
     }
 }
