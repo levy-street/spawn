@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { PaceBar } from "@/components/ui/pace-bar";
 import { StatusDot } from "@/components/ui/status";
 import { subscribeToTrustEvents } from "@/lib/alert-socket";
 import {
@@ -37,6 +38,7 @@ import { PAIRING_FAILURE_COPY, pairingFailureCode } from "@/lib/pairing-errors";
 import { detectPlatform, setupInstallCommand, UNDETECTED_PLATFORM } from "@/lib/platform";
 import {
   deriveSetupChecklist,
+  SETUP_CHECKLIST_ACTIVE_LABELS,
   SETUP_CHECKLIST_LABELS,
   setupChecklistStalledHint,
 } from "@/lib/setup-claims";
@@ -144,14 +146,58 @@ export function ConnectHostSection(props: {
   const [mintError, setMintError] = useState<string | null>(null);
   const [mintAttempt, setMintAttempt] = useState(0);
   const [locallyApproved, setLocallyApproved] = useState(false);
+  /**
+   * True when this visit arrived holding a specific approval — `?ref=`/`?code=`
+   * from the link `spawnd possess` printed.
+   *
+   * Everything above the approve card exists to *get* a ceremony started:
+   * install the daemon, wait for it to register, type its code. Arriving by
+   * link, all of that is already done, and showing it turns a one-click
+   * confirmation into a page of instructions for work the reader has finished.
+   * Derived from the URL rather than the prop so a bare `/device` still offers
+   * the code field.
+   */
+  /**
+   * Whether the typed-code fallback is showing.
+   *
+   * Opened by hand, and stays open once opened — someone who went looking for
+   * it is mid-way through using it, and folding it back up under them as the
+   * claim advances would take the field away while they typed.
+   */
+  const [codeEntryOpen, setCodeEntryOpen] = useState(false);
+  const [linkApproval, setLinkApproval] = useState<boolean | "unknown">(
+    // Unknown until the URL can be read, which is an effect — `window` is not
+    // there during the server render. Guessing "no" for that tick paints the
+    // install-and-type-a-code layout and replaces it a frame later: a flash of
+    // exactly the screen a link exists to skip.
+    autoLoadFromUrl ? "unknown" : false,
+  );
+
+  useEffect(() => {
+    if (!autoLoadFromUrl) return;
+    const params = new URLSearchParams(window.location.search);
+    setLinkApproval(Boolean(params.get("ref") ?? params.get("code")));
+  }, [autoLoadFromUrl]);
+
+  /** The confirm-only layout, which lasts exactly as long as the question does. */
+  const showLinkConfirm = linkApproval !== false && !locallyApproved;
+  /** Nothing can be laid out yet without knowing how this visit arrived. */
+  const arrivalUnknown = linkApproval === "unknown";
   const [now, setNow] = useState(() => Date.now());
   const notifiedRef = useRef(false);
   const initialOnlineIdsRef = useRef<Set<string> | null>(null);
   const progressStartedAtRef = useRef(Date.now());
   const hostsQ = useQuery({
-    // Separate cache lane from onboarding's step derivation: this component
-    // gets one render with Online checked before `onHostOnline` advances the
-    // parent into its existing success beat.
+    // The same cache lane the surrounding page derives its step from, on
+    // purpose. This used to be a private lane so the checklist could tick
+    // Online before the parent moved on — but the parent now polls hosts for
+    // itself (so a reload after an approval is not stranded on "connect your
+    // first host"), and two independent 3 s polls race: the parent could learn
+    // the host was online a full interval before this checklist did, and
+    // replace the screen while the last row still read Connecting.
+    //
+    // One lane, one answer: both see the host in the same render, so the row
+    // ticks over as the parent starts its success beat rather than after it.
     queryKey: ["hosts", "setup"],
     queryFn: hosts.list,
     refetchInterval: 3_000,
@@ -265,12 +311,25 @@ export function ConnectHostSection(props: {
       );
     }
     if (claim?.host_id) {
-      return listed.find((host) => host.id === claim.host_id && host.status === "online") ?? null;
+      const claimed = listed.find((host) => host.id === claim.host_id);
+      // Only pin on the claim's host while that host still exists. A ceremony
+      // run on a machine this account had already possessed registers a second
+      // host, binds the claim to it, and the daemon drops it again on adopting
+      // the instance it already had — leaving the claim naming a host that is
+      // gone. Waiting on it would never end, so fall through and let the
+      // general detection below find the machine that is actually here.
+      if (claimed) return claimed.status === "online" ? claimed : null;
     }
     const initial = initialOnlineIdsRef.current;
     if (!initial) return null;
-    return listed.find((host) => host.status === "online" && !initial.has(host.id)) ?? null;
-  }, [claim?.host_id, hostsQ.data, resumeApprovedHost]);
+    const appeared = listed.find((host) => host.status === "online" && !initial.has(host.id));
+    if (appeared) return appeared;
+    // Nothing new appeared, but this surface approved a host in this session —
+    // and on a remount (or a reload after approving) the daemon may already
+    // have connected before the first poll, putting it in the "initial" set
+    // and hiding it forever. Having approved here, an online host is ours.
+    return locallyApproved ? (listed.find((host) => host.status === "online") ?? null) : null;
+  }, [claim?.host_id, hostsQ.data, resumeApprovedHost, locallyApproved]);
 
   useEffect(() => {
     if (!onlineHost || notifiedRef.current) return;
@@ -302,6 +361,36 @@ export function ConnectHostSection(props: {
   }, [checklist.completedThrough, checklist.failed]);
   const elapsedMs = now - progressStartedAtRef.current;
   const stalledHint = setupChecklistStalledHint(checklist, elapsedMs);
+  /**
+   * Whether the machine has reached this account, which is the moment the
+   * install half of this screen stops being useful.
+   *
+   * Until then the command is the whole point. After it, "install on macOS",
+   * the command itself, and "after installation, run spawnd possess" are all
+   * instructions for work the reader has visibly finished — and they were
+   * pushing the one thing left to do, the fingerprint, below the fold.
+   */
+  const machineHasArrived =
+    claim?.status === "ready" || claim?.status === "approved" || locallyApproved;
+
+  /**
+   * Whether the waiting pill has anything true to say.
+   *
+   * It is the fallback for surfaces with no live checklist, and it used to
+   * render unconditionally — which put it in two places it was wrong. On a bare
+   * `/device`, where nothing has been started and the reader is being asked to
+   * type a code, it claimed a ceremony that did not exist above the field for
+   * starting one. And after an approval it sat pulsing "Waiting for your
+   * machine…" directly above this surface's own card saying that machine is
+   * possessed and every device can reach it — two answers to one question, on
+   * one screen, disagreeing.
+   *
+   * So: only while something is genuinely on its way, and only while nothing
+   * else here has already reported the outcome. Once the approval lands, the
+   * confirmation card owns the screen.
+   */
+  const waitingForAMachine =
+    !locallyApproved && (resumeApprovedHost !== null || claim !== null || commandCopied);
 
   const platformName =
     platform.os === "macos"
@@ -317,6 +406,22 @@ export function ConnectHostSection(props: {
       : platform.installCommand;
   const copyDisabled = claimSupport === "loading";
 
+  /**
+   * Back to the beginning: a new setup claim, a new command, an empty
+   * checklist.
+   *
+   * The claim a refused ceremony was bound to is spent — it named one machine
+   * and that machine was not vouched for — so resuming it would offer to
+   * approve the thing just rejected. Minting a fresh one is what makes "start
+   * over" mean the start, rather than an empty code box under a dead approval.
+   */
+  const startOver = () => {
+    setLocallyApproved(false);
+    setCommandCopied(false);
+    setCodeEntryOpen(false);
+    setMintAttempt((attempt) => attempt + 1);
+  };
+
   const copyCommand = async () => {
     setCommandCopied(true);
     try {
@@ -329,7 +434,18 @@ export function ConnectHostSection(props: {
   };
 
   return (
-    <Card className={cn("overflow-hidden shadow-none", frameless && "border-0 bg-transparent")}>
+    <Card
+      className={cn(
+        "shadow-none",
+        // Clipping is what keeps content inside the rounded corners of the
+        // framed card. Frameless there is no border and no background to stay
+        // inside, and the clip only ever reached something it should not: a
+        // focus ring sits *outside* its input's box, so on a full-bleed field
+        // it was sliced flat down both edges — the one affordance that says
+        // "you are typing here", cut off.
+        frameless ? "border-0 bg-transparent" : "overflow-hidden",
+      )}
+    >
       {frameless ? null : (
         <CardHeader>
           <CardTitle>Connect a host</CardTitle>
@@ -340,7 +456,7 @@ export function ConnectHostSection(props: {
         </CardHeader>
       )}
       <CardContent className={cn("space-y-5", frameless && "p-0")}>
-        {resumeApprovedHost ? null : (
+        {resumeApprovedHost || linkApproval !== false || machineHasArrived ? null : (
           <section aria-labelledby="install-daemon-title" className="space-y-2">
             <div className="flex items-center gap-2">
               <Terminal className="size-4 text-muted-foreground" aria-hidden />
@@ -348,8 +464,13 @@ export function ConnectHostSection(props: {
                 Install on {platformName}
               </h3>
             </div>
-            <div className="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-muted p-2">
-              <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap px-1 font-mono text-xs">
+            {/* Wrapped, not clipped. `whitespace-nowrap` with `overflow-x-auto`
+                cut the command off mid-token behind the copy button and offered
+                no scrollbar to find the rest of it — so the one thing on screen
+                the reader has to trust was unreadable, and a setup token is
+                exactly the part that fell off the end. */}
+            <div className="flex min-w-0 items-start gap-2 rounded-lg border border-border bg-muted p-2">
+              <code className="min-w-0 flex-1 px-1 py-1 font-mono text-xs leading-5 break-all whitespace-pre-wrap">
                 {displayedCommand}
               </code>
               <Button
@@ -385,9 +506,11 @@ export function ConnectHostSection(props: {
           </section>
         )}
 
-        {resumeApprovedHost ? null : <div className="h-px bg-border" />}
+        {resumeApprovedHost || linkApproval !== false || machineHasArrived ? null : (
+          <div className="h-px bg-border" />
+        )}
 
-        {resumeApprovedHost ? (
+        {showLinkConfirm ? null : resumeApprovedHost ? (
           <SetupChecklist
             claim={null}
             completedThrough={checklist.completedThrough}
@@ -401,7 +524,7 @@ export function ConnectHostSection(props: {
             elapsedMs={elapsedMs}
             stalledHint={stalledHint}
           />
-        ) : (
+        ) : waitingForAMachine ? (
           <LegacyWaitingState
             onlineHost={onlineHost}
             elapsedMs={elapsedMs}
@@ -409,9 +532,29 @@ export function ConnectHostSection(props: {
               claimSupport === "error" ? () => setMintAttempt((value) => value + 1) : undefined
             }
           />
-        )}
+        ) : null}
 
-        {resumeApprovedHost ? null : claim?.status === "failed" && claim.error ? (
+        {resumeApprovedHost ? null : arrivalUnknown ? (
+          // One tick, before the URL has been read. A spinner says "working";
+          // any real layout here would be a guess shown to the reader.
+          <div className="flex min-h-40 items-center justify-center px-6">
+            <PaceBar className="w-full max-w-xs" label="Opening this approval…" />
+          </div>
+        ) : linkApproval ? (
+          // Straight to the confirmation the link came here for. It stays
+          // mounted after approval: the form's own "possessed" card is the
+          // confirmation, and unmounting it would replace the answer with an
+          // empty code box. `locallyApproved` brings the progress view back
+          // above it rather than swapping this out.
+          <PairingCodeForm
+            autoLoadFromUrl
+            onStartOver={startOver}
+            onApproved={(hostName) => {
+              setLocallyApproved(true);
+              onPairingApproved?.(hostName);
+            }}
+          />
+        ) : claim?.status === "failed" && claim.error ? (
           <PairingFailure failure={claim.error} />
         ) : claim?.status === "ready" && claim.approval_ref ? (
           <section className="space-y-3" aria-labelledby="inline-approve-title">
@@ -419,14 +562,20 @@ export function ConnectHostSection(props: {
               <h3 id="inline-approve-title" className="text-sm font-medium">
                 Approve this machine
               </h3>
+              {/* A claim only reaches "ready" when a ceremony presented this
+               * screen's own setup token, so the machine is one this reader
+               * ran a command on and its terminal is showing this same
+               * fingerprint — not a link to open. Naming a link sent them
+               * hunting for one the terminal no longer prints. */}
               <p className="text-xs leading-5 text-muted-foreground">
-                Fastest: open the link in the machine&apos;s terminal — it verifies the identity
-                automatically. Or compare the fingerprint below against the terminal.
+                The terminal you ran the command in is showing a key. Check it matches the one
+                below, then approve.
               </p>
             </div>
             <PairingCodeForm
               approvalRef={claim.approval_ref}
               inlineReview
+              onStartOver={startOver}
               onApproved={(hostName) => {
                 setLocallyApproved(true);
                 onPairingApproved?.(hostName);
@@ -438,14 +587,43 @@ export function ConnectHostSection(props: {
           <>
             <div className="h-px bg-border" />
 
+            {/* The fallback, folded away. Typing a code is what you do when you
+                cannot open the link the terminal prints — a real path, and a
+                rare one. Open, it put a heading, a labelled field, a paragraph
+                and a button between the reader and the thing they are actually
+                waiting on, for a route most of them will never take. */}
             <section aria-labelledby="pair-host-title" className="space-y-3">
-              <div className="flex items-center gap-2">
-                <KeyRound className="size-4 text-muted-foreground" aria-hidden />
-                <h3 id="pair-host-title" className="text-sm font-medium">
-                  Enter a pairing code
-                </h3>
-              </div>
-              <PairingCodeForm autoLoadFromUrl={autoLoadFromUrl} onApproved={onPairingApproved} />
+              {codeEntryOpen ? (
+                <>
+                  <div className="flex items-center gap-2">
+                    <KeyRound className="size-4 text-muted-foreground" aria-hidden />
+                    <h3 id="pair-host-title" className="text-sm font-medium">
+                      Enter a pairing code
+                    </h3>
+                  </div>
+                  <PairingCodeForm
+                    autoLoadFromUrl={autoLoadFromUrl}
+                    onStartOver={startOver}
+                    onApproved={onPairingApproved}
+                  />
+                </>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  // The press sheet sets every button in small caps, which is
+                  // right for a two-word verb and wrong for a sentence — a
+                  // whole line of it stops reading as a control and starts
+                  // reading as a heading nobody can click.
+                  className="w-full normal-case tracking-normal [font-family:inherit] [font-size:0.8125rem]"
+                  onClick={() => setCodeEntryOpen(true)}
+                  data-testid="reveal-pairing-code"
+                >
+                  <KeyRound className="size-3.5" aria-hidden />
+                  Enter a pairing code instead
+                </Button>
+              )}
             </section>
           </>
         )}
@@ -453,6 +631,16 @@ export function ConnectHostSection(props: {
     </Card>
   );
 }
+
+/**
+ * The milestones a spinner belongs on: the ones spent waiting for the machine
+ * to register, and for it to come online.
+ *
+ * The other two wait on the reader — copying the command, and answering the
+ * fingerprint question right below the list. A spinner there claims the page
+ * is busy when the page is waiting on them, so they wait back at it.
+ */
+const WAITS_ON_THE_MACHINE = new Set<number>([2, 4]);
 
 function SetupChecklist({
   claim,
@@ -484,11 +672,21 @@ function SetupChecklist({
             >
               {complete ? (
                 <CheckCircle2 className="size-4 shrink-0 text-success" aria-hidden />
+              ) : current && WAITS_ON_THE_MACHINE.has(step) ? (
+                // Genuinely working: something on the other machine has to
+                // happen before this row can tick, and an empty ring reads the
+                // same whether it is happening or not.
+                <Loader2
+                  className="size-4 shrink-0 animate-spin text-muted-foreground"
+                  aria-hidden
+                />
+              ) : current ? (
+                <Circle className="size-4 shrink-0 text-muted-foreground" aria-hidden />
               ) : (
                 <Circle className="size-4 shrink-0 text-muted-foreground/50" aria-hidden />
               )}
               <span className={complete ? "text-foreground" : "text-muted-foreground"}>
-                {label}
+                {current ? SETUP_CHECKLIST_ACTIVE_LABELS[index] : label}
               </span>
               {current && elapsedMs >= 30_000 && elapsedMs < 60_000 ? (
                 <span className="ml-auto text-xs text-muted-foreground" role="status">
@@ -504,6 +702,11 @@ function SetupChecklist({
           {stalledHint}
         </p>
       ) : null}
+      {/* Past the approval and still nothing: whatever is wrong is on the other
+          machine, where this page cannot look. That is exactly the stall a
+          crash-looping daemon service produces — approved, never online — and
+          it is invisible from here. */}
+      {stalledHint && completedThrough >= 3 ? <DoctorHint /> : null}
       {claim?.host_name && claim.status !== "pending" ? (
         <p className="text-xs text-muted-foreground" role="status">
           {claim.host_name} registered{claim.os ? ` · ${claim.os}` : ""}
@@ -564,7 +767,27 @@ function PairingFailure({ failure }: { failure: keyof typeof PAIRING_FAILURE_COP
       <p className="whitespace-pre-line text-sm leading-6 text-muted-foreground">
         {PAIRING_FAILURE_COPY[failure]}
       </p>
+      <DoctorHint />
     </div>
+  );
+}
+
+/**
+ * The one thing worth saying when a ceremony fails for a reason this page
+ * cannot see.
+ *
+ * Everything above the failure happens on the reader's own machine — a daemon
+ * that will not start, a service crash-looping against the wrong server, a
+ * clock too far out to verify anything. The browser has no view of any of it,
+ * so "something went wrong" is where its usefulness ends and `spawnd doctor`
+ * begins. Naming the command turns a dead end into a next step.
+ */
+function DoctorHint({ className }: { className?: string }): JSX.Element {
+  return (
+    <p className={cn("text-xs leading-5 text-muted-foreground", className)}>
+      Still stuck? Run <code className="font-mono">spawnd doctor</code> on that machine — it checks
+      the daemon, its service, and the connection back here, and says what is wrong.
+    </p>
   );
 }
 
@@ -573,6 +796,7 @@ export function PairingCodeForm({
   autoLoadFromUrl = false,
   approvalRef = null,
   inlineReview = false,
+  onStartOver,
 }: {
   onApproved?: (hostName: string) => void;
   /**
@@ -587,11 +811,27 @@ export function PairingCodeForm({
   approvalRef?: string | null;
   /** Keep the typed-code fallback below the claim-fed review card. */
   inlineReview?: boolean;
+  /**
+   * The ceremony ended without trust and cannot be resumed — a fingerprint
+   * mismatch, or a link this browser refused. The surface around this form owns
+   * what "begin again" means (a fresh claim, a fresh command), so it is told
+   * rather than left showing a code box for an approval that is now void.
+   */
+  onStartOver?: () => void;
 } = {}) {
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const registration = useBrowserDeviceRegistration(user?.id);
   const [code, setCode] = useState("");
+  /**
+   * Whether the URL carries a ceremony to load, which cannot be known until an
+   * effect can read `window`. Unknown counts as present: showing an empty code
+   * box for that tick asks the reader to type something the page is already
+   * fetching, and then takes the question away again.
+   */
+  const [urlCeremony, setUrlCeremony] = useState<"unknown" | "present" | "absent">(
+    autoLoadFromUrl ? "unknown" : "absent",
+  );
   const [hostName, setHostName] = useState<string | null>(null);
   const [pending, setPending] = useState<DevicePendingApproval | null>(null);
   const [localPinState, setLocalPinState] = useState<BrowserHostPinState | "new" | null>(null);
@@ -743,7 +983,12 @@ export function PairingCodeForm({
     const params = new URLSearchParams(window.location.search);
     const ref = params.get("ref");
     const urlCode = params.get("code");
-    if (!(ref || urlCode) || !user || autoTriedRef.current) return;
+    if (!(ref || urlCode)) {
+      setUrlCeremony("absent");
+      return;
+    }
+    setUrlCeremony("present");
+    if (!user || autoTriedRef.current) return;
     autoTriedRef.current = true;
     const fragment = readFragmentHostKey(window.location.hash);
     if (fragment === "malformed") {
@@ -932,6 +1177,20 @@ export function PairingCodeForm({
   });
   const browserFingerprint = readyBrowserKey === null ? null : (browserFingerprintQ.data ?? "…");
 
+  // Derived from the key itself, never read off `host_key_fingerprint` in the
+  // response (mesh B5). Shown as confirmation that this is the machine whose
+  // terminal is waiting — not as a comparison chore: the `#k=` fragment
+  // already proved the key, and asking twice would teach the habit of
+  // approving whatever is put in front of you.
+  const pendingHostKey = pending?.host_public_key ?? null;
+  const hostFingerprintQ = useQuery({
+    queryKey: ["pending-host-key-fingerprint", pendingHostKey],
+    queryFn: () => ed25519PublicKeyFingerprint(pendingHostKey as string),
+    enabled: pendingHostKey !== null,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const hostFingerprint = pendingHostKey === null ? null : (hostFingerprintQ.data ?? "…");
+
   // A refusal is terminal: the identity check failed, nothing was trusted, and
   // there is deliberately no control here that proceeds anyway.
   if (refusal) {
@@ -944,7 +1203,15 @@ export function PairingCodeForm({
         <p className="text-sm leading-relaxed text-muted-foreground" role="alert">
           {refusal}
         </p>
-        <Button type="button" variant="secondary" onClick={resetCeremony}>
+        <DoctorHint />
+        <Button
+          type="button"
+          variant="secondary"
+          onClick={() => {
+            resetCeremony();
+            onStartOver?.();
+          }}
+        >
           Start over
         </Button>
       </div>
@@ -966,12 +1233,50 @@ export function PairingCodeForm({
   // A server approval that failed AFTER the local pin landed needs a retry
   // surface, not the identity check again — that part already passed.
   const retryable = Boolean(error && localPinCommitted && pending);
+  /**
+   * Whether a ceremony this surface was handed is genuinely on its way.
+   *
+   * Inferring it from "we were handed one and have not got it yet" was wrong in
+   * one important case: after `resetCeremony` — which is what "Close" does on
+   * the mismatch screen, and "Start over" on a refusal — the handle is still
+   * there and the result is gone again, but nothing is loading and nothing will
+   * be, because the one-shot ref has already fired. That left a progress bar
+   * captioned "Looking up that machine…" running for ever over a ceremony that
+   * had been deliberately abandoned.
+   *
+   * So this asks whether an attempt is actually outstanding: the URL not yet
+   * read, an attempt not yet made, or a request in flight right now.
+   */
+  const attemptOutstanding =
+    urlCeremony === "unknown" ||
+    (urlCeremony === "present" && !autoTriedRef.current) ||
+    (approvalRef != null && approvalRefTriedRef.current !== approvalRef);
+  // An error drops out of this so the typed-code fallback is always reachable
+  // when the load does not work.
+  const handedCeremonyLoading =
+    !pending && !hostName && error === null && (attemptOutstanding || submitting);
 
   if (failure) return <PairingFailure failure={failure} />;
 
   return (
     <form className="space-y-3" onSubmit={onReview}>
-      {!inlineReview || (!pending && !hostName) ? (
+      {/* The field is for starting a ceremony by hand. Once one is loaded —
+          typed in, fed by a claim, or carried by the link — it is answered
+          below, and an empty box above the answer just invites re-entering it.
+          A bare page, or one whose auto-load was refused, still shows it so
+          there is always a way in. */}
+      {handedCeremonyLoading ? (
+        // A ceremony was handed to this surface — by the link, or by a bound
+        // setup claim — and is on its way. There is nothing to type and
+        // nothing to confirm yet, so the only honest thing to show is that
+        // something is happening.
+        <div
+          className="flex min-h-32 items-center justify-center px-6"
+          data-testid="pairing-loading"
+        >
+          <PaceBar className="w-full max-w-xs" label="Looking up that machine…" />
+        </div>
+      ) : (!inlineReview && !autoLoadFromUrl) || (!pending && !hostName) ? (
         <div className="space-y-1.5">
           <Label htmlFor={inlineReview ? "inline-host-pairing-code" : "host-pairing-code"}>
             Code from the terminal
@@ -997,9 +1302,12 @@ export function PairingCodeForm({
       ) : null}
 
       {error && !retryable && (
-        <p className="text-sm text-destructive" role="alert">
-          {error}
-        </p>
+        <div className="space-y-1.5">
+          <p className="text-sm text-destructive" role="alert">
+            {error}
+          </p>
+          <DoctorHint />
+        </div>
       )}
       {submitting && !pending && submittingElapsed >= 30_000 ? (
         <div className="flex flex-wrap items-center justify-between gap-2" role="status">
@@ -1094,6 +1402,15 @@ export function PairingCodeForm({
             </p>
           )}
           <div className="space-y-1 border-t border-border pt-2">
+            <p className="text-xs text-muted-foreground">Its terminal printed this host key:</p>
+            <p
+              className="break-all font-mono text-xs text-foreground"
+              data-testid="pending-host-fingerprint"
+            >
+              {hostFingerprint ?? "unavailable"}
+            </p>
+          </div>
+          <div className="space-y-1">
             <p className="text-xs text-muted-foreground">
               Approving as{deviceLabel ? ` ${deviceLabel},` : ""} this browser&apos;s key:
             </p>
@@ -1143,6 +1460,7 @@ export function PairingCodeForm({
             </div>
           )}
           <NumberCheck
+            compact={inlineReview}
             phase={checkPhase}
             mode="enter"
             fingerprint={pending?.host_key_fingerprint}
@@ -1162,12 +1480,30 @@ export function PairingCodeForm({
               setStopped(true);
             }}
             onDone={resetCeremony}
-            onClose={resetCeremony}
+            onClose={() => {
+              resetCeremony();
+              // A mismatch is terminal: the approval it refused is spent, and
+              // dropping the reader on an empty code field asks them to
+              // re-enter a code for a ceremony that no longer exists. Hand back
+              // to the surface, which starts the whole thing again.
+              onStartOver?.();
+            }}
           />
           {inlineReview && pending && !hostName && !stopped ? (
-            <Button type="button" variant="ghost" className="w-full" onClick={resetCeremony}>
-              Enter a pairing code instead
-            </Button>
+            // A rarely-needed escape, sized like one. As a full-width button it
+            // was the third identical bar in a stack, competing with the action
+            // this screen exists for.
+            <div className="flex justify-center">
+              <Button
+                type="button"
+                variant="link"
+                size="sm"
+                className="text-muted-foreground"
+                onClick={resetCeremony}
+              >
+                Enter a pairing code instead
+              </Button>
+            </div>
           ) : null}
         </>
       ) : (

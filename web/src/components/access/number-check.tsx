@@ -1,8 +1,9 @@
 "use client";
 
-import { AlertTriangle, Check, Loader2 } from "lucide-react";
+import { AlertTriangle, Check } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { PaceBar } from "@/components/ui/pace-bar";
 
 export type NumberCheckPhase =
   | "connecting"
@@ -46,6 +47,15 @@ export interface NumberCheckProps {
   /** `half-done`: the honest in-between — this side finished, the other never
    * did. States what worked and the one step that finishes the link. */
   halfDoneText?: string;
+  /**
+   * Drop the reserved height and the standalone heading.
+   *
+   * Full size, this is a screen: it holds its 320px so the ceremony does not
+   * jump between phases, and titles itself. Embedded in a card that has already
+   * introduced the step, both work against it — the reserved height pushes the
+   * action below the fold, and the title repeats the one above it.
+   */
+  compact?: boolean;
   /** `enter` mode: called with the digits once `digits` of them are typed. */
   onSubmit?: (digits: string) => void;
   /** Fingerprint fallback only. */
@@ -79,6 +89,7 @@ export function NumberCheck({
   waitingEscape = false,
   stoppedText,
   halfDoneText,
+  compact = false,
   onSubmit,
   onMatch,
   onNoMatch,
@@ -97,36 +108,54 @@ export function NumberCheck({
   };
 
   return (
-    <div className="flex min-h-[320px] flex-col" data-testid="number-check" data-phase={phase}>
+    <div
+      className={compact ? "flex flex-col" : "flex min-h-[320px] flex-col"}
+      data-testid="number-check"
+      data-phase={phase}
+    >
       {phase === "connecting" && (
-        <div className="flex flex-1 flex-col items-center justify-center gap-4">
-          <Loader2 className="size-6 animate-spin text-muted-foreground" />
-          <p className="text-sm text-muted-foreground">Securing the connection…</p>
+        <div className="flex flex-1 flex-col items-center justify-center">
+          <PaceBar className="w-full max-w-xs" label="Securing the connection…" />
         </div>
       )}
 
       {phase === "compare" && fingerprint !== undefined && (
         <>
           <div className="flex flex-1 flex-col items-center justify-center">
-            <h2 className="text-lg font-medium tracking-tight text-foreground">
-              Check the fingerprint
-            </h2>
+            {compact ? null : (
+              <h2 className="text-lg font-medium tracking-tight text-foreground">
+                Check the fingerprint
+              </h2>
+            )}
             <p
-              className="mt-6 break-all rounded-lg bg-muted px-4 py-3 text-center font-mono text-base tracking-wide text-foreground"
+              className={`${compact ? "mt-1" : "mt-6"} break-all rounded-lg bg-muted px-4 py-3 text-center font-mono text-base tracking-wide text-foreground`}
               data-testid="host-key-fingerprint"
             >
               {fingerprint}
             </p>
-            <p className="mt-6 max-w-[30ch] text-balance text-center text-sm leading-relaxed text-muted-foreground">
+            <p
+              className={`${compact ? "mt-3" : "mt-6"} max-w-[34ch] text-balance text-center text-sm leading-relaxed text-muted-foreground`}
+            >
               {fingerprintHelp ??
                 `This host runs older software, so compare its full fingerprint — shown ${otherScreen}.`}
             </p>
           </div>
-          <div className="flex flex-col gap-2">
+          {/* One action, then the way out of it. Equal-weight full-width
+              buttons made "they don't match" read as a second choice rather
+              than the alarm it is, and put three near-identical bars in a row
+              with nothing to tell them apart. */}
+          <div className={compact ? "mt-6 flex flex-col gap-3" : "flex flex-col gap-3"}>
             <Button className="w-full" data-testid="fingerprint-match" onClick={onMatch}>
               They match
             </Button>
-            <Button className="w-full" variant="ghost" onClick={onNoMatch}>
+            {/* Same width as the action above it: these are the two answers to
+                one question, and the alarm is not a footnote. Weight, not size,
+                is what says which one is the way forward. */}
+            <Button
+              className="w-full text-muted-foreground hover:text-destructive"
+              variant="ghost"
+              onClick={onNoMatch}
+            >
               They don't match
             </Button>
           </div>
@@ -147,11 +176,8 @@ export function NumberCheck({
               Enter this number {otherScreen}.
             </p>
           </div>
-          <div className="flex h-[76px] flex-col items-center justify-center gap-2">
-            <div className="flex items-center gap-3 text-sm text-muted-foreground">
-              <Loader2 className="size-4 animate-spin" />
-              Waiting for the other side…
-            </div>
+          <div className="flex h-[76px] w-full flex-col items-center justify-center gap-2">
+            <PaceBar className="w-full max-w-xs" label="Waiting for the other side…" />
             <button
               type="button"
               onClick={onClose}
@@ -190,7 +216,7 @@ export function NumberCheck({
               </p>
             )}
           </div>
-          <Button className="w-full" variant="ghost" onClick={onNoMatch}>
+          <Button className="mt-6 w-full" variant="ghost" onClick={onNoMatch}>
             I don't see a number
           </Button>
         </>
@@ -209,11 +235,8 @@ export function NumberCheck({
               Confirmed here. Finishing up {otherScreen}.
             </p>
           </div>
-          <div className="flex h-[76px] flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
-            <div className="flex items-center gap-3">
-              <Loader2 className="size-4 animate-spin" />
-              Waiting for the other side…
-            </div>
+          <div className="flex h-[76px] w-full flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
+            <PaceBar className="w-full max-w-xs" label="Waiting for the other side…" />
             {slowHint && (
               <p className="text-xs text-muted-foreground/70">
                 Taking a while? Make sure the other side is still open.
@@ -246,7 +269,7 @@ export function NumberCheck({
               {doneText}
             </p>
           </div>
-          <Button className="w-full" onClick={onDone}>
+          <Button className="mt-6 w-full" onClick={onDone}>
             Done
           </Button>
         </>
@@ -268,7 +291,7 @@ export function NumberCheck({
                 "Approved on this side, but the other device didn't finish. Approve it again from the device list to finish the link."}
             </p>
           </div>
-          <Button className="w-full" variant="secondary" onClick={onClose}>
+          <Button className="mt-6 w-full" variant="secondary" onClick={onClose}>
             Close
           </Button>
         </>
@@ -288,7 +311,9 @@ export function NumberCheck({
                 "This connection isn't safe, so nothing was trusted. Try again on a network you trust."}
             </p>
           </div>
-          <Button className="w-full" variant="secondary" onClick={onClose}>
+          {/* The copy above ends in a refusal; crowding the only way out
+              against it makes the button read as part of the sentence. */}
+          <Button className="mt-6 w-full" variant="secondary" onClick={onClose}>
             Close
           </Button>
         </>

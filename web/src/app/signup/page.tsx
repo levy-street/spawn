@@ -8,6 +8,7 @@ import { SignupForm } from "@/components/onboarding/signup-form";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useAuthConfig } from "@/lib/auth";
+import { safeNext } from "@/lib/safe-next";
 
 /** Display name for a provider id, for copy that names who signed you in. */
 function providerName(id: string): string {
@@ -27,6 +28,16 @@ function SignupPageContent() {
   // deployment is closed and they carried no invite. They are one field away
   // from an account, so say that rather than showing a bare refusal.
   const inviteRequired = searchParams.get("invite_required") === "1";
+  // Someone who followed a host approval link and chose to create an account
+  // must come back to that approval, not to the generic connect-a-host step —
+  // the link already carries which host is asking. Onboarding stays the
+  // default for everyone arriving cold.
+  const requestedNext = safeNext(searchParams.get("next"), "/onboarding");
+  // An approval link resolves to /device, which wears the full app chrome —
+  // dropping a brand-new account into the app and straight back out to
+  // onboarding. Onboarding's own host step consumes the same sessionStorage
+  // stash, so the ceremony is finished in the flow the account is already in.
+  const returnTo = requestedNext.startsWith("/device") ? "/onboarding" : requestedNext;
   const blockedProvider = searchParams.get("provider");
 
   if (loading || config === null) {
@@ -73,8 +84,8 @@ function SignupPageContent() {
         <SignupForm
           config={config}
           initialInvite={invite}
-          oauthReturnTo="/onboarding"
-          onSuccess={() => router.replace("/onboarding")}
+          oauthReturnTo={returnTo}
+          onSuccess={() => router.replace(returnTo)}
         />
         <p className="text-center text-sm text-ash">
           Already have an account?{" "}

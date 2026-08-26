@@ -71,11 +71,18 @@ export function restoreDeviceApproval(
   storage: StorageLike,
   href: string,
   now = Date.now(),
+  /**
+   * Pages allowed to consume a stash. `/device` is the approval page itself;
+   * `/onboarding` claims it too, so someone who just created an account
+   * finishes the approval inside the onboarding flow instead of being sent
+   * through the app chrome and back out again.
+   */
+  allowedPaths: readonly string[] = ["/device"],
 ): string | null {
   const stash = readStash(storage, now);
   if (!stash) return null;
   const url = new URL(href, "https://spawnd.dev");
-  if (url.pathname !== "/device") return null;
+  if (!allowedPaths.includes(url.pathname)) return null;
 
   const currentRef = url.searchParams.get("ref");
   const currentCode = url.searchParams.get("code");

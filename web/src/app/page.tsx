@@ -12,9 +12,18 @@ import {
   InstallCommand,
   Masthead,
   RegistrationMarks,
+  StoreBadges,
 } from "@/components/brand/press";
 import { Wordmark } from "@/components/icons/BrandMark";
 import { poster } from "@/lib/fonts";
+import {
+  detectPlatform,
+  installTargetForOS,
+  installTargets,
+  type PlatformOS,
+  storeBadgeForOS,
+  storeBadges,
+} from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
 /*
@@ -200,12 +209,20 @@ function ScrubVideo({ src, poster, alt }: { src: string; poster: string; alt: st
  */
 export default function LandingPage() {
   const [origin, setOrigin] = useState("https://spawnd.dev");
+  const [detectedOS, setDetectedOS] = useState<PlatformOS>("unknown");
 
   useEffect(() => {
-    setOrigin(window.location.origin);
+    const platform = detectPlatform();
+    setOrigin(platform.origin);
+    setDetectedOS(platform.os);
   }, []);
 
-  const installCommand = `curl -fsSL ${origin}/install.sh | sh`;
+  const targets = installTargets(origin);
+  const defaultTargetId = installTargetForOS(detectedOS);
+  // A phone cannot host the daemon, so the shell line is noise there — the
+  // reader wants the app instead. Detection lands after mount, so the server
+  // render keeps the install chip and a phone swaps to the badge.
+  const phoneBadge = storeBadgeForOS(detectedOS);
 
   return (
     <main className="grimoire min-h-vv overflow-x-clip">
@@ -255,10 +272,14 @@ export default function LandingPage() {
             A daemon on every host <em className="text-hellfire not-italic">you&nbsp;own.</em>
           </h1>
 
-          <div className="mt-auto flex w-full flex-col items-stretch gap-4 pt-16 sm:w-auto sm:flex-row sm:items-center">
-            <InstallCommand command={installCommand} />
-            <Link href="/download" className={CTA_SLAB}>
-              Install the daemon
+          <div className="mt-auto flex w-full flex-col items-stretch gap-5 pt-16 sm:w-auto sm:items-start">
+            {phoneBadge ? (
+              <StoreBadges badges={[phoneBadge]} />
+            ) : (
+              <InstallCommand targets={targets} defaultTargetId={defaultTargetId} />
+            )}
+            <Link href="/download" className={cn(CTA_SLAB, "sm:w-auto")}>
+              Download
               <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
           </div>
@@ -439,6 +460,29 @@ export default function LandingPage() {
       </section>
 
       {/* ── Specimen strip: scrubbed by the scroll itself ──────── */}
+      {/* ── The pocket plate: the app is part of the offer ────── */}
+      <section className="border-line-g border-b">
+        <div className="mx-auto w-full max-w-6xl px-5 py-24 sm:px-8">
+          <p className="mb-5 font-sigil text-[12px] font-medium tracking-[0.3em] text-ash uppercase">
+            The reliquary · carried
+          </p>
+          <h2
+            className={cn(
+              poster.className,
+              "max-w-[19ch] text-[clamp(28px,3.7vw,48px)] leading-[1.04] font-light text-bone uppercase",
+            )}
+          >
+            Every possession, in your pocket.
+          </h2>
+          <p className="mt-6 max-w-[56ch] text-[17px] leading-8 text-ash">
+            The app is the same seance as the browser, not a summary of it. Start a session at the
+            desk and pick it up on the train; approve a host, watch an agent work, end it from the
+            platform. The daemon never leaves your machine — the phone is only a window onto it.
+          </p>
+          <StoreBadges badges={storeBadges()} className="mt-9" />
+        </div>
+      </section>
+
       <section className="border-line-g border-b py-12">
         <ScrubMarquee />
         <p className="mx-auto mt-8 max-w-[64ch] px-5 text-center font-sigil text-[13px] leading-6 tracking-[0.04em] text-ash sm:px-8">
@@ -478,14 +522,18 @@ export default function LandingPage() {
             One line installs the daemon; you approve it against a fingerprint you can see. From
             then on, it answers only to you.
           </p>
-          <InstallCommand command={installCommand} className="mb-9" />
+          {phoneBadge ? (
+            <StoreBadges badges={[phoneBadge]} className="mb-9 justify-center" />
+          ) : (
+            <InstallCommand targets={targets} defaultTargetId={defaultTargetId} className="mb-9" />
+          )}
           <div className="flex flex-col items-center justify-center gap-5 sm:flex-row sm:gap-7">
             <Link href="/signup" className={CTA_SLAB}>
               Sign up
               <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
             <Link href="/download" className={CTA_QUIET}>
-              Install the daemon
+              Download
             </Link>
           </div>
         </div>

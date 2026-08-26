@@ -209,18 +209,144 @@ export function Colophon() {
   );
 }
 
-/** The install one-liner on a paper chip, with a copy button. */
+export interface StoreBadgeItem {
+  id: string;
+  label: string;
+  /** Null while the listing is not public; the badge then reads "Coming soon". */
+  href: string | null;
+}
+
+/**
+ * The official App Store and Google Play badges, served from `public/brand/`
+ * rather than the vendors' CDNs so the page stays self-contained.
+ *
+ * Both are trademarked artwork and must not be recoloured, restyled or
+ * redrawn, so they are rendered as supplied. Apple asks for at least 40px of
+ * badge height; Google ships ~49% of its asset as mandatory clear space, which
+ * is why its box is 60px tall where Apple's is 40 — that renders the two
+ * *visible* badges at the same height.
+ *
+ * A listing that is not live yet keeps the badge intact and adds a caption
+ * beneath instead of dimming it: the artwork stays compliant, and nobody taps
+ * a link that 404s.
+ */
+const STORE_ART: Record<string, { src: string; className: string; alt: string }> = {
+  ios: {
+    src: "/brand/app-store-badge.svg",
+    // Explicit width and `max-w-none`: the preflight's `img { max-width:100% }`
+    // fights a fixed height and squashes the artwork horizontally inside a
+    // narrow flex parent. 56 x 119.66/40 = 167.5.
+    className: "h-14 w-[168px] max-w-none",
+    alt: "Download on the App Store",
+  },
+  android: {
+    // Google ships ~13% of the asset's width and ~33% of its height as
+    // mandatory clear space. The negative margins pull the box in to the
+    // artwork so the two *visible* badges match; the panel padding restores
+    // the clear space. 84 x 646/250 = 217.1.
+    src: "/brand/google-play-badge.png",
+    className: "-mx-3.5 -my-3.5 h-[84px] w-[217px] max-w-none",
+    alt: "Get it on Google Play",
+  },
+};
+
+/**
+ * Just the badge artwork, for callers that supply their own ground — a card,
+ * say, where three platforms have to line up as one row. [`StoreBadges`] is
+ * the standalone version that brings its own panel.
+ */
+export function StoreBadgeMark({ id }: { id: string }) {
+  const art = STORE_ART[id];
+  if (!art) return null;
+  return <StoreBadgeArt art={art} />;
+}
+
+function StoreBadgeArt({ art }: { art: { src: string; className: string; alt: string } }) {
+  // biome-ignore lint/performance/noImgElement: vendor badge artwork, served as supplied
+  return <img src={art.src} alt={art.alt} className={art.className} />;
+}
+
+export function StoreBadges({
+  badges,
+  className,
+}: {
+  badges: StoreBadgeItem[];
+  className?: string;
+}) {
+  return (
+    <div className={cn("flex flex-wrap items-center gap-x-4 gap-y-3", className)}>
+      {badges.map((badge) => {
+        const art = STORE_ART[badge.id];
+        if (!art) return null;
+        return badge.href ? (
+          <a
+            key={badge.id}
+            href={badge.href}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex rounded-[10px] transition-opacity hover:opacity-85"
+          >
+            <StoreBadgeArt art={art} />
+          </a>
+        ) : (
+          // Not a link yet, so the badge sits on a backdrop that carries the
+          // date beneath it — one object rather than a badge with a caption
+          // floating near it, which over the hero artwork read as debris.
+          <span
+            key={badge.id}
+            className="inline-flex flex-col overflow-hidden rounded-[10px] bg-char"
+          >
+            <span className="flex items-center justify-center px-3.5 pt-3 pb-2">
+              <StoreBadgeArt art={art} />
+            </span>
+            <span className="px-3.5 pb-2.5 text-center font-sigil text-[10px] tracking-[0.22em] text-ember uppercase">
+              Coming soon
+            </span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+export interface InstallChipTarget {
+  id: string;
+  label: string;
+  command: string;
+}
+
+/**
+ * The install one-liner on a paper chip, with a copy button.
+ *
+ * Pass `targets` to put an OS switcher above the line: a Windows visitor is
+ * otherwise handed a `sh` pipeline their machine cannot run. With a single
+ * target (or none) the chip renders exactly as it always did.
+ */
 export function InstallCommand({
   command,
+  targets,
+  defaultTargetId,
   className,
   copyLabel = "Copy install command",
 }: {
-  command: string;
+  command?: string;
+  targets?: InstallChipTarget[];
+  /** Usually the detected browser OS; falls back to the first target. */
+  defaultTargetId?: string;
   className?: string;
   /** Overridable so a page can name the button something the copy reads to. */
   copyLabel?: string;
 }) {
   const [copied, setCopied] = useState(false);
+  const [chosen, setChosen] = useState<string | null>(null);
+
+  const tabs = targets ?? [];
+  // Detection lands after mount, so an untouched chip follows it; once the
+  // reader picks a tab themselves, their choice wins.
+  const activeId = chosen ?? defaultTargetId ?? tabs[0]?.id;
+  const active = tabs.find((target) => target.id === activeId) ?? tabs[0];
+  const shown = active?.command ?? command ?? "";
+
   return (
     <div className={cn("max-w-full", className)}>
       <div
@@ -228,32 +354,60 @@ export function InstallCommand({
           // inline-flex so the chip shrinks to its one line of shell wherever it
           // lands; a stretching flex parent (the hero column on mobile) still
           // pulls it full-width.
-          "inline-flex max-w-full items-center gap-3 rounded-sm border border-bone bg-void py-3.5 pr-3 pl-4 font-sigil text-[13px] text-bone",
+          "inline-flex max-w-full flex-col rounded-sm border border-bone bg-void font-sigil text-[13px] text-bone",
         )}
       >
-        <span className="text-ember">$</span>
-        <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{command}</code>
-        <button
-          type="button"
-          aria-label={copyLabel}
-          onClick={() => {
-            void navigator.clipboard?.writeText(command).then(() => {
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 2000);
-            });
-          }}
-          className="ml-1 shrink-0 rounded-sm p-1 text-bone/50 transition-colors hover:text-bone"
-        >
-          {copied ? (
-            <Check className="size-4 text-ember" aria-hidden />
-          ) : (
-            <Copy className="size-4" aria-hidden />
-          )}
-        </button>
+        {tabs.length > 1 && (
+          <div
+            role="tablist"
+            aria-label="Install target"
+            className="flex items-center gap-5 border-b border-bone/25 px-4 py-2.5"
+          >
+            {tabs.map((target) => {
+              const selected = target.id === active?.id;
+              return (
+                <button
+                  key={target.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  onClick={() => {
+                    setChosen(target.id);
+                    setCopied(false);
+                  }}
+                  className={cn(
+                    "text-[11px] tracking-[0.18em] uppercase transition-colors",
+                    selected ? "text-bone" : "text-ash hover:text-bone",
+                  )}
+                >
+                  {target.label}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        <div className="flex max-w-full items-center gap-3 py-3.5 pr-3 pl-4">
+          <span className="text-ember">$</span>
+          <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{shown}</code>
+          <button
+            type="button"
+            aria-label={copyLabel}
+            onClick={() => {
+              void navigator.clipboard?.writeText(shown).then(() => {
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 2000);
+              });
+            }}
+            className="ml-1 shrink-0 rounded-sm p-1 text-bone/50 transition-colors hover:text-bone"
+          >
+            {copied ? (
+              <Check className="size-4 text-ember" aria-hidden />
+            ) : (
+              <Copy className="size-4" aria-hidden />
+            )}
+          </button>
+        </div>
       </div>
-      <p className="mt-2 max-w-[65ch] text-xs leading-5 text-ash">
-        Already running SPAWN D for another account on that machine? Add <code>--new-account</code>.
-      </p>
     </div>
   );
 }

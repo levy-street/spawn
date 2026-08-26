@@ -5,6 +5,22 @@ export const SETUP_CHECKLIST_LABELS = [
   "Online",
 ] as const;
 
+/**
+ * What each milestone is called while it is the one being waited on.
+ *
+ * The completed labels are past tense, which is right for a milestone that has
+ * happened and wrong for the one that hasn't: a row reading "Online" beside a
+ * spinner claims the machine is online while the reader watches it not be.
+ * Naming the wait instead — "Connecting…" — says what is going on and turns
+ * into the past-tense label the moment it is true.
+ */
+export const SETUP_CHECKLIST_ACTIVE_LABELS = [
+  "Copy the command",
+  "Waiting for the machine…",
+  "Waiting for approval…",
+  "Connecting…",
+] as const;
+
 export type SetupClaimStatus = "pending" | "ready" | "approved" | "failed";
 export type SetupClaimError = "expired" | "denied" | "key_conflict" | "pin_conflict" | "pin_limit";
 

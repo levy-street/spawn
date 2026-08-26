@@ -1,24 +1,17 @@
 "use client";
 
-import {
-  AlertTriangle,
-  ArrowRight,
-  Check,
-  CheckCircle2,
-  Copy,
-  Download,
-  Laptop,
-} from "lucide-react";
+import { AlertTriangle, ArrowRight, CheckCircle2, Laptop, Smartphone } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import {
   Colophon,
-  CTA_QUIET,
   CTA_SLAB,
   Eyebrow,
+  InstallCommand,
   Masthead,
   RegistrationMarks,
+  StoreBadgeMark,
 } from "@/components/brand/press";
 import { poster } from "@/lib/fonts";
 import {
@@ -26,7 +19,10 @@ import {
   desktopDownloadUrl,
   desktopReleaseFromPayload,
   detectPlatform,
+  installTargetForOS,
+  installTargets,
   type PlatformOS,
+  storeBadges,
   UNDETECTED_PLATFORM,
 } from "@/lib/platform";
 import { cn } from "@/lib/utils";
@@ -38,7 +34,7 @@ const PLATFORM_COPY: Record<
     title: string;
     recommendation: string;
     service: string;
-    status: "supported" | "unsupported" | "unknown";
+    status: "supported" | "wsl" | "mobile" | "unsupported" | "unknown";
   }
 > = {
   macos: {
@@ -59,11 +55,27 @@ const PLATFORM_COPY: Record<
   },
   windows: {
     label: "Windows",
-    title: "Use a macOS or Linux host",
+    title: "Install through WSL",
     recommendation:
-      "The daemon does not ship a Windows build yet. Install SPAWN D from a Mac, Linux workstation, or Linux server.",
-    service: "Windows service support is not available yet.",
-    status: "unsupported",
+      "There is no native Windows daemon yet. The Windows line runs the Linux build inside WSL2 — install WSL and a distribution, and the installer takes it from there.",
+    service: "Linux user systemd inside WSL, where the distribution provides it.",
+    status: "wsl",
+  },
+  ios: {
+    label: "iPhone or iPad",
+    title: "Get the app, possess a computer",
+    recommendation:
+      "The daemon runs on a Mac, Linux, or Windows machine — never on the phone. Get the app here, then run the installer on the computer you want to possess.",
+    service: "The daemon lives on that computer; the app drives it from here.",
+    status: "mobile",
+  },
+  android: {
+    label: "Android",
+    title: "Get the app, possess a computer",
+    recommendation:
+      "The daemon runs on a Mac, Linux, or Windows machine — never on the phone. Get the app here, then run the installer on the computer you want to possess.",
+    service: "The daemon lives on that computer; the app drives it from here.",
+    status: "mobile",
   },
   unknown: {
     label: "Unknown OS",
@@ -74,6 +86,24 @@ const PLATFORM_COPY: Record<
     status: "unknown",
   },
 };
+
+const PLATFORM_CARDS = [
+  {
+    id: "mac",
+    platform: "Desktop · macOS",
+    body: "Tray-first and signed. It verifies the daemon, possesses this Mac, then gets out of the way.",
+  },
+  {
+    id: "ios",
+    platform: "iPhone and iPad",
+    body: "The same seance as the browser, not a summary of it. Approve a host, watch an agent work, end a session.",
+  },
+  {
+    id: "android",
+    platform: "Android",
+    body: "Every possessed host in your pocket, with the terminal live — the daemon stays on your machine.",
+  },
+] as const;
 
 const OPTIONS = [
   {
@@ -92,13 +122,10 @@ const OPTIONS = [
 
 export default function DownloadPage() {
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
-  const [copied, setCopied] = useState(false);
-  const [canCopy, setCanCopy] = useState(false);
   const [desktopRelease, setDesktopRelease] = useState<DesktopRelease | null>(null);
 
   useEffect(() => {
     setPlatform(detectPlatform());
-    setCanCopy(Boolean(navigator.clipboard));
     const controller = new AbortController();
     void fetch("/api/release", {
       cache: "no-store",
@@ -111,16 +138,11 @@ export default function DownloadPage() {
     return () => controller.abort();
   }, []);
 
-  const command = platform.installCommand;
   const prebuiltCommand = platform.prebuiltInstallCommand;
   const detected = PLATFORM_COPY[platform.os];
   const supported = detected.status === "supported";
-
-  const copyCommand = async () => {
-    await navigator.clipboard?.writeText(command);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1600);
-  };
+  const targets = installTargets(platform.origin);
+  const defaultTargetId = installTargetForOS(platform.os);
 
   // The one dot of colour on the detected plate: the brand ink says "good",
   // hellfire says "not here", ash says "we couldn't tell".
@@ -128,6 +150,8 @@ export default function DownloadPage() {
     if (supported) return <CheckCircle2 className="size-4 text-ember" aria-hidden />;
     if (detected.status === "unsupported")
       return <AlertTriangle className="size-4 text-hellfire" aria-hidden />;
+    if (detected.status === "mobile")
+      return <Smartphone className="size-4 text-ember" aria-hidden />;
     return <Laptop className="size-4 text-ash" aria-hidden />;
   }, [detected.status, supported]);
 
@@ -135,69 +159,7 @@ export default function DownloadPage() {
     <main className="grimoire min-h-vv overflow-x-clip">
       <Masthead current="download" />
 
-      {desktopRelease && (
-        <section className="relative isolate overflow-hidden border-line-g border-b bg-bone text-void">
-          <div
-            aria-hidden
-            className="absolute -top-28 right-[4%] size-[32rem] rotate-[9deg] opacity-[0.07]"
-          >
-            {/* biome-ignore lint/performance/noImgElement: decorative brand stamp */}
-            <img src="/brand/spawnd-icon-black.svg" alt="" className="size-full" />
-          </div>
-          <div className="relative mx-auto grid w-full max-w-6xl gap-10 px-5 py-16 sm:px-8 lg:grid-cols-[1fr_auto] lg:items-end lg:py-20">
-            <div>
-              <p className="mb-5 font-sigil text-[11px] font-medium tracking-[0.28em] uppercase">
-                Native macOS companion
-              </p>
-              <h1
-                className={cn(
-                  poster.className,
-                  "max-w-[15ch] text-[clamp(38px,6vw,68px)] leading-[0.96] font-light uppercase",
-                )}
-              >
-                Get SPAWN D for Mac
-              </h1>
-              <p className="mt-6 max-w-[56ch] text-[16px] leading-7">
-                A tray-first, signed app that verifies the daemon, possesses this Mac, and then gets
-                out of the way.
-              </p>
-              <p className="mt-5 font-sigil text-[11px] tracking-[0.18em] uppercase">
-                Version {desktopRelease.version} · SHA {desktopRelease.tree.slice(0, 12)}
-              </p>
-            </div>
-            <div className="flex min-w-[15rem] flex-col gap-3">
-              {desktopRelease.platforms.includes("darwin-aarch64") && (
-                <a
-                  className={cn(CTA_SLAB, "justify-between border-void bg-void text-bone")}
-                  href={desktopDownloadUrl(
-                    platform.origin,
-                    desktopRelease.version,
-                    "darwin-aarch64",
-                  )}
-                >
-                  Apple silicon
-                  <Download className="size-4" aria-hidden />
-                </a>
-              )}
-              {desktopRelease.platforms.includes("darwin-x86_64") && (
-                <a
-                  className="flex items-center justify-between border border-void px-5 py-3 font-sigil text-[12px] tracking-[0.12em] uppercase transition-colors hover:bg-void hover:text-bone"
-                  href={desktopDownloadUrl(
-                    platform.origin,
-                    desktopRelease.version,
-                    "darwin-x86_64",
-                  )}
-                >
-                  Intel Mac
-                  <Download className="size-4" aria-hidden />
-                </a>
-              )}
-            </div>
-          </div>
-        </section>
-      )}
-
-      {/* ── The hero: the dial-out plate, type ranged left ─────── */}
+      {/* ── The hero: the things you actually download ───────── */}
       <section className="relative isolate overflow-hidden border-line-g border-b">
         <Image
           src="/brand/ink/hosts-ink.png"
@@ -219,32 +181,135 @@ export default function DownloadPage() {
         <RegistrationMarks />
 
         <div className="relative z-10 mx-auto w-full max-w-6xl min-w-0 px-5 py-24 sm:px-8">
-          <div className="grid min-w-0 gap-14 lg:grid-cols-[1.05fr_0.95fr] lg:items-center">
-            <div>
-              <Eyebrow className="mb-5">{desktopRelease ? "Servers and Linux" : "Install"}</Eyebrow>
-              <h1
+          <Eyebrow className="mb-5">Download</Eyebrow>
+          <h1
+            className={cn(
+              poster.className,
+              "max-w-[16ch] text-[clamp(35px,5.6vw,63px)] leading-[1.02] font-light text-bone uppercase [text-wrap:balance]",
+            )}
+          >
+            Take it with you. <em className="text-hellfire not-italic">Every screen.</em>
+          </h1>
+          <p className="mt-6 max-w-[58ch] text-[17px] leading-8 text-ash">
+            One account, three windows onto the same possessed hosts: the companion in your menu
+            bar, the app in your pocket, the browser anywhere. The daemon never leaves your machine
+            — these only look in on it.
+          </p>
+
+          {/* Three platforms, one row: identical cards on solid ground, with
+           * a fixed-height mark well so vendor artwork of different
+           * proportions still lines up. The plate behind is busy, so each card
+           * brings its own ground rather than floating on it. */}
+          <div className="mt-14 grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {PLATFORM_CARDS.map((card) => {
+              const release = card.id === "mac" ? desktopRelease : null;
+              const href =
+                release && card.id === "mac"
+                  ? desktopDownloadUrl(platform.origin, release.version, "darwin-aarch64")
+                  : card.id !== "mac"
+                    ? (storeBadges().find((badge) => badge.id === card.id)?.href ?? null)
+                    : null;
+              return (
+                <div
+                  key={card.id}
+                  className="flex min-w-0 flex-col rounded-[12px] bg-char px-6 pt-6 pb-5"
+                >
+                  <div className="flex h-14 items-center">
+                    {card.id === "mac" ? (
+                      <span className="inline-flex h-14 items-center gap-3 rounded-[10px] border border-bone/70 px-5">
+                        {/* biome-ignore lint/performance/noImgElement: brand mark */}
+                        <img src="/brand/spawnd-icon.svg" alt="" className="size-6" aria-hidden />
+                        <span className="font-sigil text-[13px] tracking-[0.1em] text-bone uppercase">
+                          SPAWN D for Mac
+                        </span>
+                      </span>
+                    ) : (
+                      <StoreBadgeMark id={card.id} />
+                    )}
+                  </div>
+                  <p className="mt-6 font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
+                    {card.platform}
+                  </p>
+                  <p className="mt-3 flex-1 text-[15px] leading-7 text-ash">{card.body}</p>
+                  <p className="mt-6 border-line-g border-t pt-4 font-sigil text-[11px] tracking-[0.22em] uppercase">
+                    {href ? (
+                      <a href={href} className="text-bone transition-colors hover:text-ember">
+                        Download
+                      </a>
+                    ) : (
+                      <span className="text-ember">Coming soon</span>
+                    )}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+
+          {desktopRelease && (
+            <p className="mt-6 font-sigil text-[11px] tracking-[0.18em] text-ash uppercase">
+              Mac build {desktopRelease.version} · SHA {desktopRelease.tree.slice(0, 12)}
+              {desktopRelease.platforms.includes("darwin-x86_64") && (
+                <>
+                  {" · "}
+                  <a
+                    href={desktopDownloadUrl(
+                      platform.origin,
+                      desktopRelease.version,
+                      "darwin-x86_64",
+                    )}
+                    className="text-bone underline decoration-line-strong underline-offset-4 transition-colors hover:text-ember"
+                  >
+                    Intel Mac
+                  </a>
+                </>
+              )}
+            </p>
+          )}
+        </div>
+      </section>
+
+      {/* ── The daemon: what all three windows are looking at ──── */}
+      <section className="border-line-g border-b">
+        <div className="mx-auto w-full max-w-6xl min-w-0 px-5 py-20 sm:px-8">
+          <div className="grid min-w-0 gap-14 lg:grid-cols-[1.05fr_0.95fr] lg:items-start">
+            <div className="min-w-0">
+              <Eyebrow className="mb-5">And the daemon itself</Eyebrow>
+              <h2
                 className={cn(
                   poster.className,
-                  "text-[clamp(35px,5.6vw,63px)] leading-[1.02] font-light text-bone uppercase [text-wrap:balance]",
+                  "max-w-[18ch] text-[clamp(28px,3.7vw,46px)] leading-[1.04] font-light text-bone uppercase",
                 )}
               >
-                {desktopRelease ? (
-                  <>
-                    Possess any machine.{" "}
-                    <em className="text-hellfire not-italic">From its terminal.</em>
-                  </>
-                ) : (
-                  <>
-                    Install the daemon.{" "}
-                    <em className="text-hellfire not-italic">Possess the host.</em>
-                  </>
-                )}
-              </h1>
+                Possess a machine from its terminal.
+              </h2>
               <p className="mt-6 max-w-[54ch] text-[17px] leading-8 text-ash">
-                {desktopRelease
-                  ? "Use the one-line installer for a Linux server, a remote host, or a Mac where you do not want the companion app. It downloads the matching daemon and starts the user service."
-                  : "The installer detects macOS or Linux on the machine where it runs, downloads the matching prebuilt daemon, then starts it as a user service. One line, then the pairing ceremony — consensual, auditable, revocable."}
+                The apps are windows; this is the thing they look at. Run one line on the machine
+                you want to possess — never on the phone — and it downloads the matching prebuilt
+                daemon, then starts it as a user service. Then the pairing ceremony: consensual,
+                auditable, revocable.
               </p>
+
+              <InstallCommand
+                targets={targets}
+                defaultTargetId={defaultTargetId}
+                className="mt-9"
+              />
+
+              {detected.status === "unsupported" && (
+                <p className="mt-8 flex items-start gap-3 border-hellfire border-l-2 bg-char py-4 pr-5 pl-5 text-[15px] leading-7 text-bone">
+                  <AlertTriangle className="mt-1 size-4 shrink-0 text-hellfire" aria-hidden />
+                  <span>
+                    Run this from a supported macOS or Linux terminal, not from this browser OS.
+                  </span>
+                </p>
+              )}
+
+              <div className="mt-9">
+                <Link href="/signup" className={CTA_SLAB}>
+                  Create account
+                  <ArrowRight className="size-4" aria-hidden />
+                </Link>
+              </div>
             </div>
 
             {/* The detected plate, set like the lander's "server's entire view". */}
@@ -260,14 +325,14 @@ export default function DownloadPage() {
               <div className="min-w-0 px-5 py-6 sm:px-6">
                 <div className="flex items-center gap-3">
                   {statusIcon}
-                  <h2
+                  <h3
                     className={cn(
                       poster.className,
                       "text-[28px] leading-none font-light text-bone uppercase",
                     )}
                   >
                     {detected.label}
-                  </h2>
+                  </h3>
                 </div>
                 <p className="mt-4 text-[15px] leading-7 text-ash">{detected.recommendation}</p>
                 <p className="mt-5 border-line-g border-t pt-4 font-sigil text-[12px] leading-6 text-ash">
@@ -275,48 +340,6 @@ export default function DownloadPage() {
                 </p>
               </div>
             </figure>
-          </div>
-
-          {/* The line itself, and the two doors out of the hero — the lander
-           * hangs its install chip and CTA off the foot of the hero the same
-           * way, so the fold always ends on something you can act on. */}
-          <div className="mt-16 min-w-0 border-line-g border-t pt-10">
-            <p className="mb-5 font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
-              Or possess any machine from its terminal: {detected.title}
-            </p>
-            <div className="flex max-w-full min-w-0 items-center gap-3 rounded-sm border border-bone bg-void py-4 pr-3 pl-4 font-sigil text-[13px] text-bone">
-              <span className="text-ember">$</span>
-              <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{command}</code>
-            </div>
-            <p className="mt-2 max-w-[65ch] text-xs leading-5 text-ash">
-              Already running SPAWN D for another account on that machine? Add{" "}
-              <code>--new-account</code>.
-            </p>
-
-            <div className="mt-8 flex flex-col items-stretch gap-5 sm:flex-row sm:items-center sm:gap-7">
-              <button type="button" onClick={copyCommand} disabled={!canCopy} className={CTA_SLAB}>
-                {copied ? (
-                  <Check className="size-4" aria-hidden />
-                ) : (
-                  <Copy className="size-4" aria-hidden />
-                )}
-                {copied ? "Copied" : "Copy command"}
-              </button>
-              <Link href="/signup" className={CTA_QUIET}>
-                Create account
-                <ArrowRight className="size-4" aria-hidden />
-              </Link>
-            </div>
-
-            {!supported && (
-              <p className="mt-8 flex items-start gap-3 border-hellfire border-l-2 bg-char py-4 pr-5 pl-5 text-[15px] leading-7 text-bone">
-                <AlertTriangle className="mt-1 size-4 shrink-0 text-hellfire" aria-hidden />
-                <span>
-                  Use this command from a supported macOS or Linux terminal, not from this browser
-                  OS.
-                </span>
-              </p>
-            )}
           </div>
         </div>
       </section>
