@@ -214,18 +214,24 @@ export function TerminalOverlay({
     };
   }, []);
 
-  const updateFollow = useCallback(
-    (event: Parameters<typeof reduceFollowState>[1]): void => {
-      setFollowState((current) => {
-        const next = reduceFollowState(current, event);
-        const follow = next.mode === "following";
-        surfaceRef.current?.setFollow(follow);
-        setStoredFollow(session.id, follow);
-        return next;
-      });
-    },
-    [session.id, setStoredFollow],
-  );
+  const updateFollow = useCallback((event: Parameters<typeof reduceFollowState>[1]): void => {
+    setFollowState((current) => reduceFollowState(current, event));
+  }, []);
+
+  // The surface and the store follow the state; they are not driven from
+  // inside the updater above.
+  //
+  // A state updater has to be pure — React is free to call it during a render,
+  // and twice in development — so writing to a store from in there updates one
+  // component while another is rendering. That is the
+  // "Cannot update a component (`%s`) while rendering a different component"
+  // warning, and it showed up as soon as anyone tapped through the approval
+  // sheet quickly enough to re-render mid-update.
+  useEffect(() => {
+    const follow = followState.mode === "following";
+    surfaceRef.current?.setFollow(follow);
+    setStoredFollow(session.id, follow);
+  }, [followState.mode, session.id, setStoredFollow]);
 
   const transfers = useTerminalTransfers({
     transport: () => transportRef.current,

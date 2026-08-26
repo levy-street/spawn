@@ -57,6 +57,11 @@ export function DeviceApprovalCeremony({
   const queryClient = useQueryClient();
   const me = useMeSettingsQuery();
   const accountId = me.data?.user.id;
+  // Which account has to do the approving. Every screen that could answer this
+  // prompt is signed in as one particular account, and "approve it from one
+  // this host already trusts" is unhelpful to anyone holding two — they check
+  // the wrong browser, see nothing, and conclude it is broken.
+  const signedInAs = me.data?.user.email ? ` as ${me.data.user.email}` : "";
   const phoneQuery = useRegisteredPhone(accountId);
   const phone = phoneQuery.data;
   const devices = useAccountDevices(phoneQuery.isSuccess);
@@ -176,7 +181,7 @@ export function DeviceApprovalCeremony({
               : phase === "identity-blocked"
                 ? "It could not register the key that hosts pin, so nothing can vouch for it yet."
                 : phase === "waiting"
-                  ? "A prompt is up on every screen where you are already signed in, including your Mac's browser. Approve it from one this host already trusts and a number appears here to type there."
+                  ? `A prompt is up on every screen already signed in${signedInAs} — including your Mac's browser. Approve it from one this host already trusts and a number appears here to type there.`
                   : phase === "pair-only"
                     ? "Nothing else is signed in to answer for it. Pair directly with a code from the host."
                     : ""}

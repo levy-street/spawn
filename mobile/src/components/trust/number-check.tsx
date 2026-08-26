@@ -7,7 +7,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
 import type { CeremonyPhase } from "@/data/trust/ceremony";
 import { CEREMONY_SAS_DIGITS } from "@/lib/crypto/sas";
-import { fontFamily, fontSize, spacing, useTheme } from "@/theme";
+import { fontFamily, fontSize, lineHeight, spacing, useTheme } from "@/theme";
 
 /**
  * The one human check in the whole system (the committed SAS, mesh Appendix
@@ -177,8 +177,18 @@ const styles = StyleSheet.create({
   },
   number: {
     fontSize: fontSize.displayLg,
+    // Without an explicit line box, React Native sizes one from the font's own
+    // metrics — and the mono face's ascenders and descenders overflow it at
+    // this size, so the digits were sliced across the middle. This is the one
+    // thing on the screen the reader has to copy exactly; half a digit is not
+    // a cosmetic problem.
+    lineHeight: Math.round(fontSize.displayLg * lineHeight.tight),
     letterSpacing: spacing[2],
+    paddingVertical: spacing[1],
     textAlign: "center",
+    // Android adds its own padding inside the line box on top of the above,
+    // which re-centres the glyphs off the baseline.
+    includeFontPadding: false,
   },
   textCenter: {
     textAlign: "center",
