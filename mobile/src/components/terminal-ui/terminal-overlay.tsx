@@ -298,23 +298,39 @@ export function TerminalOverlay({
   // Approval is granted somewhere else entirely, so the phone watches for it
   // and reconnects itself. Making the operator walk back here and press Retry
   // is the part of this that used to feel broken.
-  const awaitingApproval =
+  //
+  // The watch latches, because the trust code is not the last word the
+  // transport says: a refused connection goes on to fail plainly ("transport is
+  // in a failed state"), and reading only the newest error called the watch off
+  // mid-approval — the ceremony finished, and the terminal sat on a Retry
+  // button nobody should have had to press.
+  const trustRefusal =
     connectionState === "failed" && connectionError?.code === DEVICE_NOT_TRUSTED_CODE;
+  const [awaitingApproval, setAwaitingApproval] = useState(false);
+  useEffect(() => {
+    if (trustRefusal) setAwaitingApproval(true);
+  }, [trustRefusal]);
+  useEffect(() => {
+    // Connected: whatever the refusal was, it is over.
+    if (connectionState === "ready") setAwaitingApproval(false);
+  }, [connectionState]);
   const hostApproval = useHostApprovalWatch(host.id, awaitingApproval);
   useEffect(() => {
-    if (awaitingApproval && hostApproval === "trusted") {
-      setApprovalVisible(false);
-      retry();
-    }
+    if (!awaitingApproval || hostApproval !== "trusted") return;
+    // Handled: drop the latch first so the watch stops and this cannot loop on
+    // a connection that fails again for some other reason.
+    setAwaitingApproval(false);
+    retry();
   }, [awaitingApproval, hostApproval, retry]);
 
   // The ceremony presents itself: a trust failure is not something Retry can
   // fix, so waiting for the operator to find the right button is a dead end.
-  // Dismissing it keeps it closed for this failure; the error screen's
-  // "Approve this device" reopens it.
+  // It closes itself a beat after the approval lands (the sheet's own dwell) —
+  // dismissing it early keeps it closed for this failure, and the error
+  // screen's "Approve this device" reopens it.
   useEffect(() => {
-    if (awaitingApproval) setApprovalVisible(true);
-  }, [awaitingApproval]);
+    if (trustRefusal) setApprovalVisible(true);
+  }, [trustRefusal]);
 
   const sendAccessoryKey = (sequence: string, _spec: KeySpec): void => {
     surfaceRef.current?.sendKey(sequence);
@@ -496,6 +512,7 @@ export function TerminalOverlay({
         )}
         <UploadProgressBar ratio={transfers.progressRatio} />
         <ConnectionStateOverlay
+          awaitingApproval={awaitingApproval}
           error={connectionError}
           hasEverBeenReady={hasEverBeenReady}
           onDeviceTrust={() => setApprovalVisible(true)}
