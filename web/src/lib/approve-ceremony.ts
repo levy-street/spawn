@@ -373,6 +373,41 @@ export async function planVanishedCeremonyCompletion(input: {
   return theirs ? { kind: "done", signReciprocal: true } : { kind: "stopped" };
 }
 
+/**
+ * How long an approver holds the waiting screen when the relay row is gone but
+ * the reciprocal edge has not turned up in its own poll yet.
+ *
+ * The joiner signs the reciprocal and only then deletes the row, so that edge
+ * is already on the server when the row disappears — the gap is this side's
+ * endorsement poll running a cycle behind. Declaring "not finished" inside it
+ * flashes a failure a second before the success that contradicts it, which is
+ * the one thing a trust screen must never do.
+ */
+export const RECIPROCAL_SETTLE_MS = 8_000;
+
+/** Whether a missing reciprocal is still plausibly in flight rather than absent. */
+export function reciprocalStillSettling(signedAt: number | null, now: number): boolean {
+  return signedAt !== null && now - signedAt < RECIPROCAL_SETTLE_MS;
+}
+
+/**
+ * The screen a ceremony whose relay row is gone deserves. The terminal states
+ * own it; a row that vanished after this side signed is not a verdict at all,
+ * so it holds the waiting screen until the planner settles it either way.
+ * Anything else has nothing left to show.
+ */
+export function vanishedCeremonyScreen(record: {
+  done: boolean;
+  stopped: boolean;
+  halfDone: boolean;
+  signedMine: boolean;
+}): "done" | "stopped" | "half-done" | "waiting" | null {
+  if (record.stopped) return "stopped";
+  if (record.done) return "done";
+  if (record.halfDone) return "half-done";
+  return record.signedMine ? "waiting" : null;
+}
+
 export function useApproveDeviceCeremony({
   accountId,
   currentDevice,
@@ -426,6 +461,30 @@ export function useApproveDeviceCeremony({
 
   const invalidatePairings = () =>
     qc.invalidateQueries({ queryKey: ["device-pairings", deviceId] });
+
+  // One nudge per ceremony held open by the settle window below. Nothing else
+  // would end that wait: with no rows and no new edges, the two polls hand back
+  // structurally-shared data, so neither this effect's deps nor a render change
+  // again on their own.
+  const settleTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  useEffect(() => {
+    const timers = settleTimers.current;
+    return () => {
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
+  const replanAfterSettling = (id: string, signedAt: number | null) => {
+    if (signedAt === null || settleTimers.current.has(id)) return;
+    const wait = Math.max(0, signedAt + RECIPROCAL_SETTLE_MS - Date.now()) + 250;
+    settleTimers.current.set(
+      id,
+      setTimeout(() => {
+        settleTimers.current.delete(id);
+        patch(id, {}); // same record, new reference: the planner runs once more
+      }, wait),
+    );
+  };
 
   /**
    * APPROVER side, after a correct entry: sign one host introduction per host
@@ -975,11 +1034,13 @@ export function useApproveDeviceCeremony({
               edges: edgeSet,
             });
           let plan = await planWith(edges);
-          if (plan.kind === "stopped") {
+          if (plan.kind === "stopped" || plan.kind === "half-done") {
             // The polled edge set can lag the row's disappearance by a cycle,
-            // and "nothing was trusted" is irreversible on screen — one fresh
-            // read closes the lag race before it is declared (same discipline
-            // as the introductions re-read above).
+            // and both of these are alarms on screen — "nothing was trusted"
+            // is irreversible, and "not finished" is a failure the very next
+            // poll may contradict. One fresh read closes the lag race before
+            // either is declared (same discipline as the introductions re-read
+            // above).
             const fresh = await trust.accountEndorsements().catch(() => null);
             if (fresh !== null) plan = await planWith(fresh);
           }
@@ -991,6 +1052,14 @@ export function useApproveDeviceCeremony({
           // pinned peer bytes are human-verified: remember them.
           persistCeremonyPeerKey(id, record, remembered.role, remembered.peerDeviceId);
           if (plan.kind === "half-done") {
+            // Even a fresh read can be a moment early: the peer deletes the row
+            // right after signing, so give the reciprocal its window and keep
+            // the waiting screen up. Every later poll re-plans this, and the
+            // edge landing upgrades it to done without the alarm ever showing.
+            if (reciprocalStillSettling(record.waitingSince, Date.now())) {
+              replanAfterSettling(id, record.waitingSince);
+              return;
+            }
             if (!record.halfDone) patch(id, { halfDone: true });
             return;
           }
@@ -1157,21 +1226,21 @@ export function useApproveDeviceCeremony({
   // role and peer they ran under. Stopped must survive the row's deletion
   // exactly like done: the relay row is gone precisely because the ceremony
   // was aborted. Half-done is the honest in-between (C1) and keeps showing
-  // until dismissed or upgraded to done by a late reciprocal.
+  // until dismissed or upgraded to done by a late reciprocal. A row that
+  // vanished after this side signed but before either verdict is settled is
+  // none of the three: it holds the waiting screen rather than blinking the
+  // dialog out from under a ceremony that is still finishing.
   for (const [id, record] of records) {
-    if (
-      (!record.done && !record.stopped && !record.halfDone) ||
-      views.some((v) => v.pairingId === id)
-    ) {
-      continue;
-    }
+    if (views.some((v) => v.pairingId === id)) continue;
+    const phase = vanishedCeremonyScreen(record);
+    if (phase === null) continue;
     const remembered = rolesRef.current.get(id);
     views.push({
       pairingId: id,
       role: remembered?.role ?? "new-device",
       peerDeviceId: remembered?.peerDeviceId ?? "",
       peerName: remembered ? labelFor(remembered.peerDeviceId) : "the other device",
-      phase: record.stopped ? "stopped" : record.done ? "done" : "half-done",
+      phase,
       number: record.sas,
       entryError: null,
       waitingSince: record.waitingSince,

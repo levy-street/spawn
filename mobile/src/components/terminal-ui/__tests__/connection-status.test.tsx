@@ -37,3 +37,53 @@ describe("the connection banner over a terminal that has been ready", () => {
     expect(style.position).toBe("absolute");
   });
 });
+
+describe("a terminal blocked on this device's approval", () => {
+  // The refusal's code does not survive: once the transport has failed, the
+  // next open throws plainly, and that uncoded message is the newest error the
+  // banner sees. Reading only that dropped the ceremony and left "Connection
+  // failed" in front of someone whose approval was already in flight.
+  const STALE = {
+    code: "transport_open",
+    message: "Terminal transport is in a failed state.",
+    retryable: true,
+  };
+
+  test("keeps the ceremony and says what is actually being waited on", async () => {
+    await render(
+      <ThemeProvider>
+        <ConnectionStateOverlay
+          awaitingApproval
+          error={STALE}
+          hasEverBeenReady={false}
+          onDeviceTrust={jest.fn()}
+          onRetry={jest.fn()}
+          state="failed"
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Waiting for approval")).toBeOnTheScreen();
+    expect(screen.getByText(/reconnects on its own/i)).toBeOnTheScreen();
+    expect(screen.getByText("Approve this device")).toBeOnTheScreen();
+    expect(screen.queryByText("Connection failed")).toBeNull();
+  });
+
+  test("an ordinary failure is still an ordinary failure", async () => {
+    await render(
+      <ThemeProvider>
+        <ConnectionStateOverlay
+          error={STALE}
+          hasEverBeenReady={false}
+          onDeviceTrust={jest.fn()}
+          onRetry={jest.fn()}
+          state="failed"
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Connection failed")).toBeOnTheScreen();
+    expect(screen.getByText(STALE.message)).toBeOnTheScreen();
+    expect(screen.queryByText("Approve this device")).toBeNull();
+  });
+});

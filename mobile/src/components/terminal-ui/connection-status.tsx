@@ -95,6 +95,16 @@ export interface ConnectionStateOverlayProps {
   onRetry: () => void;
   /** Offered only for a trust failure, where retrying cannot help on its own. */
   onDeviceTrust?: () => void;
+  /**
+   * An approval this device is still waiting on, latched by the caller.
+   *
+   * The refusal's code does not survive: a transport that has already failed
+   * throws plainly on the next open ("transport is in a failed state"), and
+   * that message arrives as a fresh, uncoded error. Reading only the newest one
+   * dropped the ceremony button and left "Connection failed" in front of
+   * someone whose only problem was an approval in flight.
+   */
+  awaitingApproval?: boolean;
 }
 
 export function ConnectionStateOverlay({
@@ -103,11 +113,12 @@ export function ConnectionStateOverlay({
   hasEverBeenReady,
   onRetry,
   onDeviceTrust,
+  awaitingApproval = false,
 }: ConnectionStateOverlayProps): React.JSX.Element | null {
   const theme = useTheme();
   if (state === "ready") return null;
   const copy = connectionCopy(state);
-  const untrusted = error?.code === DEVICE_NOT_TRUSTED_CODE;
+  const untrusted = error?.code === DEVICE_NOT_TRUSTED_CODE || awaitingApproval;
   const retryable = state === "failed" || state === "closed" || error?.retryable === true;
   const compact = hasEverBeenReady;
 
@@ -140,13 +151,15 @@ export function ConnectionStateOverlay({
       >
         {compact ? <CompactStateGlyph busy={copy.busy} state={state} /> : null}
         <View style={[styles.copy, { alignItems: compact ? "flex-start" : "center" }]}>
-          <Text variant="label">{copy.title}</Text>
+          <Text variant="label">{awaitingApproval ? "Waiting for approval" : copy.title}</Text>
           <Text
             color="mutedForeground"
             style={compact ? undefined : styles.centeredCopy}
             variant="caption"
           >
-            {error?.message ?? copy.detail}
+            {awaitingApproval
+              ? "This host has not approved this device yet. It reconnects on its own the moment it does."
+              : (error?.message ?? copy.detail)}
           </Text>
         </View>
       </View>

@@ -28,7 +28,16 @@ import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
 import { haptics } from "@/lib/haptics";
 import { spacing, useTheme } from "@/theme";
 
-type CeremonyPhase = "checking" | "waiting" | "pair-only" | "identity-blocked" | "done";
+/** How long the approved card stays up before the sheet closes itself. */
+export const APPROVED_DWELL_MS = 2_000;
+
+type CeremonyPhase =
+  | "checking"
+  | "waiting"
+  | "settling"
+  | "pair-only"
+  | "identity-blocked"
+  | "done";
 
 /**
  * The approval ceremony, shaped for the sheet it rises in.
@@ -135,21 +144,46 @@ export function DeviceApprovalCeremony({
   });
 
   const settled = approvals.resolved && !phoneQuery.isPending && !me.isPending;
+  // The number check is what admits this device; the host probe below only
+  // notices, and it can be a poll behind. In that gap the warning hero would be
+  // contradicting a ceremony that has already succeeded — so the state between
+  // a matched number and a trusted host is a wait, not an alarm.
+  const checkFinished = check !== null && check.phase === "done";
   const phase: CeremonyPhase = !settled
     ? "checking"
     : phoneQuery.isError
       ? "identity-blocked"
       : target !== undefined && target.trust === "trusted"
         ? "done"
-        : otherDeviceCount > 0
-          ? "waiting"
-          : "pair-only";
+        : checkFinished
+          ? "settling"
+          : otherDeviceCount > 0
+            ? "waiting"
+            : "pair-only";
+
+  // Approved is a full stop, not a screen to read: the surface underneath is
+  // already reconnecting, and leaving the sheet up makes the operator dismiss a
+  // dialog whose only news is that they can dismiss it. Long enough to see what
+  // happened, short enough that it never becomes a step.
+  const finished = phase === "done";
+  // Through a ref, because the callers pass an inline closure: a dependency on
+  // the callback itself would restart this timer on every poll-driven render
+  // and the sheet would never close.
+  const close = useRef(onRequestClose);
+  useEffect(() => {
+    close.current = onRequestClose;
+  }, [onRequestClose]);
+  useEffect(() => {
+    if (!finished) return;
+    const timer = setTimeout(() => close.current(), APPROVED_DWELL_MS);
+    return () => clearTimeout(timer);
+  }, [finished]);
 
   return (
     <View style={[styles.body, { gap: theme.space(5) }]} testID="device-approval-ceremony">
       <Card style={[styles.hero, { gap: theme.space(3) }]}>
-        {phase === "checking" ? (
-          <Spinner label="Checking device trust" />
+        {phase === "checking" || phase === "settling" ? (
+          <Spinner label={phase === "checking" ? "Checking device trust" : "Finishing up"} />
         ) : (
           <Icon
             color={
@@ -169,22 +203,26 @@ export function DeviceApprovalCeremony({
               ? "Taking stock…"
               : phase === "done"
                 ? "This device is approved"
-                : phase === "identity-blocked"
-                  ? "This device has no identity yet"
-                  : phase === "waiting"
-                    ? `${hostName} is waiting on your say-so`
-                    : `${hostName} has not approved this device`}
+                : phase === "settling"
+                  ? "Finishing up"
+                  : phase === "identity-blocked"
+                    ? "This device has no identity yet"
+                    : phase === "waiting"
+                      ? `${hostName} is waiting on your say-so`
+                      : `${hostName} has not approved this device`}
           </Text>
           <Text color="mutedForeground" style={styles.centered} variant="caption">
             {phase === "done"
-              ? "The terminal is reconnecting underneath. You can close this."
-              : phase === "identity-blocked"
-                ? "It could not register the key that hosts pin, so nothing can vouch for it yet."
-                : phase === "waiting"
-                  ? `A prompt is up on every screen already signed in${signedInAs} — including your Mac's browser. Approve it from one this host already trusts and a number appears here to type there.`
-                  : phase === "pair-only"
-                    ? "Nothing else is signed in to answer for it. Pair directly with a code from the host."
-                    : ""}
+              ? "The terminal is reconnecting underneath."
+              : phase === "settling"
+                ? `The number matched. ${hostName} is picking up the approval now.`
+                : phase === "identity-blocked"
+                  ? "It could not register the key that hosts pin, so nothing can vouch for it yet."
+                  : phase === "waiting"
+                    ? `A prompt is up on every screen already signed in${signedInAs} — including your Mac's browser. Approve it from one this host already trusts and a number appears here to type there.`
+                    : phase === "pair-only"
+                      ? "Nothing else is signed in to answer for it. Pair directly with a code from the host."
+                      : ""}
           </Text>
         </View>
       </Card>
