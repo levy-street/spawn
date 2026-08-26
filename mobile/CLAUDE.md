@@ -65,6 +65,22 @@ scripts/, docs/   build helpers and app-specific notes
   config plugin, entitlements, icons, `app.json` version — changes what can
   ship over-the-air. Read `docs/RELEASE.md` before touching it.
 
+## Running it against a local server
+
+```bash
+npm run dev --onboarding      # from the repo root: server, web, daemon reset, Metro
+npm run dev --mobile          # Metro alongside a normal dev run
+```
+
+Both print `exp://<this machine's LAN address>:8081` to type into Expo Go. The
+address is the point: `src/data/api/config.ts` derives the dev API URL from the
+Metro host it connected to, because in Expo Go "localhost" is the *phone*. So a
+LAN Metro is what aims the app at the machine running the server, and `--tunnel`
+or a Metro on `127.0.0.1` silently falls back to a localhost the phone cannot
+reach. `scripts/dev.sh` clears `EXPO_PUBLIC_API_URL` before starting Metro for
+the same reason — set, it outranks that derivation and would point a local app
+at production. `SPAWN_DEV_MOBILE=0` leaves Metro out of an onboarding run.
+
 ## Before calling a change done
 
 ```bash
