@@ -60,3 +60,41 @@ describe("device approval session stash", () => {
     expect(stashDeviceApproval(storage, "https://app.example/device#k=key", 1_000)).toBeNull();
   });
 });
+
+describe("who may claim a stash", () => {
+  const stashed = (now = 1_000) => {
+    const storage = memoryStorage();
+    stashDeviceApproval(storage, "https://app.example/device?ref=abc#k=hostkey", now);
+    return storage;
+  };
+
+  test("onboarding can claim one, so a new account finishes in its own flow", () => {
+    const restored = restoreDeviceApproval(stashed(), "https://app.example/onboarding", 2_000, [
+      "/onboarding",
+    ]);
+    expect(restored).toBe("/onboarding?ref=abc#k=hostkey");
+  });
+
+  test("a page that did not ask for it never picks one up", () => {
+    // The default stays /device: widening the list is opt-in, per caller, so a
+    // stray approval cannot be applied on an unrelated screen.
+    expect(restoreDeviceApproval(stashed(), "https://app.example/app", 2_000)).toBeNull();
+    expect(restoreDeviceApproval(stashed(), "https://app.example/onboarding", 2_000)).toBeNull();
+    expect(
+      restoreDeviceApproval(stashed(), "https://app.example/app", 2_000, ["/onboarding"]),
+    ).toBeNull();
+  });
+
+  test("the host key still rides sessionStorage, never the redirect", () => {
+    const storage = stashed();
+    const restored = restoreDeviceApproval(storage, "https://app.example/onboarding", 2_000, [
+      "/onboarding",
+    ]);
+    // It lands in the fragment, which browsers do not send to the server.
+    expect(restored?.split("#")[1]).toBe("k=hostkey");
+    // And it is consumed exactly once.
+    expect(
+      restoreDeviceApproval(storage, "https://app.example/onboarding", 2_000, ["/onboarding"]),
+    ).toBeNull();
+  });
+});

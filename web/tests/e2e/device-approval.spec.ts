@@ -147,6 +147,10 @@ test("device approval shows the locally derived fingerprint before confirmation"
 
   await page.getByRole("button", { name: "They match" }).click();
   await expect(page.getByTestId("ceremony-done")).toContainText("build-host is possessed");
+  // One screen, one answer. The waiting pill used to sit above this card still
+  // pulsing "Waiting for your machine…" — contradicting the card that had just
+  // said the machine was possessed and reachable.
+  await expect(page.getByText("Waiting for your machine…")).toHaveCount(0);
   expect(approved).toBe(true);
   expect(localPinAtServerApproval).toMatchObject([
     {
@@ -212,6 +216,18 @@ test("the bare page instructs — one command, no code to type", async ({ page }
   });
   await page.goto("/device");
 
+  // The install command is the instruction; it leads, unfolded.
+  await expect(page.getByText(/curl -fsSL .*install\.sh/)).toBeVisible();
+  await expect(page.getByText("After installation, run")).toBeVisible();
+
+  // Typing a code is the fallback, so it is folded away behind one control: a
+  // heading, a labelled field, a paragraph and a button, for a route most
+  // readers never take, used to sit between them and that command.
+  await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
+  await expect(page.getByTestId("possess-instructions")).toHaveCount(0);
+
+  await page.getByTestId("reveal-pairing-code").click();
+
   const instructions = page.getByTestId("possess-instructions");
   await expect(instructions).toBeVisible();
   await expect(instructions).toContainText("spawnd possess");
@@ -222,6 +238,10 @@ test("the bare page instructs — one command, no code to type", async ({ page }
   // code is not a weaker path: it runs the same fingerprint-compare ceremony.
   await expect(instructions).toContainText("fallback");
   await expect(page.getByLabel("Code from the terminal")).toBeVisible();
+  // Nothing has been started here, so nothing is on its way. The waiting pill
+  // used to render regardless — a pulsing "Waiting for your machine…" above
+  // the field for starting a ceremony that did not exist yet.
+  await expect(page.getByText("Waiting for your machine…")).toHaveCount(0);
 });
 
 test("blocks first contact when the server fingerprint disagrees with the host key", async ({

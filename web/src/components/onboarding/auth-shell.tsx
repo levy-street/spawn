@@ -89,10 +89,18 @@ export function AuthShell({
       </div>
 
       {layout === "split" ? (
-        // Both columns hang from the same line: 200px down a roomy desktop
-        // page, giving that height back as the window gets shorter, and clear
-        // of the back link on narrow screens.
-        <div className="relative mx-auto flex w-full max-w-6xl flex-col items-center gap-8 px-5 pt-24 pb-12 lg:flex-row lg:items-start lg:justify-between lg:gap-16 lg:px-10 lg:pt-[clamp(88px,22vh,200px)] lg:pb-20">
+        // Centred in what is left of the page, with symmetric padding, rather
+        // than hung from a fixed line near the top.
+        //
+        // These gates carry a panel whose height depends on how far along the
+        // reader is — an install command, a checklist, then a whole fingerprint
+        // ceremony. Pinned 200px down, the tall end of that range ran off the
+        // bottom of the window while 200px of nothing sat above it. `flex-1`
+        // with `justify-center` centres it while it fits and then simply stops
+        // centring: the shell only ever sets a *minimum* height, so a panel
+        // taller than the viewport grows the page and scrolls normally instead
+        // of being centred into a clipped box with its top out of reach.
+        <div className="relative mx-auto flex w-full max-w-6xl flex-1 flex-col items-center justify-center gap-8 px-5 py-12 lg:flex-row lg:items-center lg:justify-between lg:gap-16 lg:px-10 lg:py-16">
           <header className="flex w-full max-w-md min-w-0 flex-col items-center text-center lg:w-[38%] lg:max-w-sm lg:shrink-0 lg:items-start lg:text-left">
             <BrandLockup />
             <h1

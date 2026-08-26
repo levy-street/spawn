@@ -48,9 +48,12 @@ test("setup claim advances inline approval through the existing onboarding done 
   await expect(page.locator('[data-step="2"]')).toHaveAttribute("data-state", "complete", {
     timeout: 5_000,
   });
+  // The command this screen handed over carries a setup token, so the terminal
+  // shows the same fingerprint and no link — the copy must ask for exactly the
+  // comparison the terminal is offering.
   await expect(
     page.getByText(
-      "Fastest: open the link in the machine's terminal — it verifies the identity automatically. Or compare the fingerprint below against the terminal.",
+      "The terminal you ran the command in is showing a key. Check it matches the one below, then approve.",
     ),
   ).toBeVisible();
   await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
@@ -72,8 +75,60 @@ test("setup claim advances inline approval through the existing onboarding done 
   await expect(page.getByText("Your host is online. Building a workspace…")).toBeVisible({
     timeout: 7_000,
   });
-  await expect.poll(() => store.requests.workspaces.length).toBe(1);
-  await expect(page).toHaveURL(/\/w\//);
+  // The ceremony ends at a possessed machine, not at a workspace nobody chose.
+  await expect(page).toHaveURL("/app", { timeout: 7_000 });
+  await expect(page.getByRole("heading", { name: "Create your first workspace" })).toBeVisible();
+  expect(store.requests.workspaces).toHaveLength(0);
+});
+
+test("closing a fingerprint mismatch returns a usable screen, not a forever loader", async ({
+  page,
+}) => {
+  // "They don't match" is terminal, and Close resets the ceremony. The reset
+  // clears the loaded approval while the claim's handle stays on the surface —
+  // which used to read as "handed a ceremony, do not have it yet" and left a
+  // progress bar captioned "Looking up that machine…" running for ever over a
+  // ceremony that had just been deliberately abandoned.
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  const store = await mockApp(page, {
+    hosts: [],
+    workspaces: [],
+    setupClaim: claimFixture(),
+  });
+  await page.goto("/onboarding");
+  await page.getByRole("button", { name: "Copy install command" }).click();
+  Object.assign(store.setupClaim as Record<string, unknown>, {
+    status: "ready",
+    approval_ref: APPROVAL_REF,
+    host_name: "Mac",
+    os: "macos",
+    host_key_fingerprint: "display-only",
+  });
+  await expect(page.getByTestId("host-key-fingerprint")).toBeVisible({ timeout: 5_000 });
+
+  await page.getByRole("button", { name: "They don't match" }).click();
+  await expect(page.getByText("The numbers don't match")).toBeVisible();
+
+  await page.getByRole("button", { name: "Close" }).click();
+
+  // Closing re-mints, and the server answers a fresh claim — this mock holds
+  // one, so put it back to pending the way a new one would arrive.
+  Object.assign(store.setupClaim as Record<string, unknown>, {
+    status: "pending",
+    approval_ref: null,
+    host_name: null,
+    os: null,
+    host_key_fingerprint: null,
+  });
+
+  // Back to the start, not to an empty code box for an approval that is now
+  // void: a refused ceremony spends its claim, so beginning again means a fresh
+  // command to run.
+  await expect(page.getByTestId("pairing-loading")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Copy install command" })).toBeVisible({
+    timeout: 7_000,
+  });
+  await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
 });
 
 test("the checklist adds its exact stalled escape after 60 seconds", async ({ page }) => {

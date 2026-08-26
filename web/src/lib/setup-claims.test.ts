@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   deriveSetupChecklist,
+  SETUP_CHECKLIST_ACTIVE_LABELS,
+  SETUP_CHECKLIST_LABELS,
   type SetupClaimState,
   setupChecklistStalledHint,
 } from "./setup-claims";
@@ -99,6 +101,17 @@ describe("setupChecklistStalledHint", () => {
       "The machine is waiting for your approval below.",
       "Approved. Waiting for the machine to come online — this usually takes a few seconds.",
     ]);
+  });
+
+  test("every milestone has a present-tense name for while it is being waited on", () => {
+    expect(SETUP_CHECKLIST_ACTIVE_LABELS).toHaveLength(SETUP_CHECKLIST_LABELS.length);
+    // The one the reader watches longest, and the reason this exists: a row
+    // reading "Online" beside a spinner asserts the opposite of what is true.
+    expect(SETUP_CHECKLIST_ACTIVE_LABELS[3]).toBe("Connecting…");
+    expect(SETUP_CHECKLIST_ACTIVE_LABELS).not.toContain("Online");
+    for (const [index, label] of SETUP_CHECKLIST_ACTIVE_LABELS.entries()) {
+      expect(label).not.toBe(SETUP_CHECKLIST_LABELS[index]);
+    }
   });
 
   test("terminal and online states never show a stale waiting hint", () => {

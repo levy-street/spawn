@@ -11,7 +11,6 @@ describe("deriveStep", () => {
         user: null,
         config: { email_verification_required: true },
         hosts: [],
-        skippedHost: false,
       }),
     ).toBe("account");
   });
@@ -22,7 +21,6 @@ describe("deriveStep", () => {
         user: unverifiedUser,
         config: { email_verification_required: true },
         hosts: [],
-        skippedHost: false,
       }),
     ).toBe("verify");
     expect(
@@ -30,7 +28,6 @@ describe("deriveStep", () => {
         user: unverifiedUser,
         config: { email_verification_required: false },
         hosts: [],
-        skippedHost: false,
       }),
     ).toBe("host");
   });
@@ -41,28 +38,29 @@ describe("deriveStep", () => {
         user: verifiedUser,
         config: { email_verification_required: true },
         hosts: [],
-        skippedHost: false,
       }),
     ).toBe("host");
   });
 
-  test("finishes when a host exists or the host gate was skipped", () => {
+  test("finishes only once a host is actually online", () => {
     expect(
       deriveStep({
         user: verifiedUser,
         config: { email_verification_required: true },
         hosts: [{ status: "online" }],
-        skippedHost: false,
       }),
     ).toBe("done");
+    // There is no way past this gate but through it. An account with no host
+    // stays on the host step, because the product does nothing without one and
+    // letting someone "skip" only landed them in an app that could not run
+    // anything.
     expect(
       deriveStep({
         user: verifiedUser,
         config: { email_verification_required: true },
         hosts: [],
-        skippedHost: true,
       }),
-    ).toBe("done");
+    ).toBe("host");
   });
 
   test("keeps an approved-but-offline host in the host hand-off instead of reinstalling", () => {
@@ -71,7 +69,6 @@ describe("deriveStep", () => {
         user: verifiedUser,
         config: { email_verification_required: true },
         hosts: [{ status: "offline" }],
-        skippedHost: false,
       }),
     ).toBe("host");
   });
@@ -81,7 +78,6 @@ describe("deriveStep", () => {
       user: unverifiedUser,
       config: { email_verification_required: true },
       hosts: [] as Array<{ status?: string }>,
-      skippedHost: false,
     };
     expect(resolveStep(input, "host")).toBe("verify");
     expect(resolveStep(input, "verify")).toBe("verify");
