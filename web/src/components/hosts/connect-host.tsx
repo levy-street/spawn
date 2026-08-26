@@ -389,6 +389,15 @@ export function ConnectHostSection(props: {
    * else here has already reported the outcome. Once the approval lands, the
    * confirmation card owns the screen.
    */
+  /**
+   * Approved here, and the machine has not appeared yet.
+   *
+   * This is its own state rather than an absence of one: the approve card
+   * unmounts the instant an approval lands, so without something to take its
+   * place the surface simply emptied out while the daemon was still starting.
+   */
+  const approvedAwaitingHost =
+    (locallyApproved || claim?.status === "approved") && onlineHost === null;
   const waitingForAMachine =
     !locallyApproved && (resumeApprovedHost !== null || claim !== null || commandCopied);
 
@@ -556,6 +565,29 @@ export function ConnectHostSection(props: {
           />
         ) : claim?.status === "failed" && claim.error ? (
           <PairingFailure failure={claim.error} />
+        ) : approvedAwaitingHost ? (
+          // The longest wait in the whole flow, and it used to be a spinner the
+          // size of a full stop on one checklist row. Everything else had just
+          // unmounted — the approve card goes the moment the approval lands —
+          // so the screen went quiet at exactly the point the reader most wants
+          // to know something is still happening.
+          //
+          // It also sits ahead of the "ready" branch below on purpose: the
+          // claim stays `ready` until the next poll confirms the approval, and
+          // rendering the approve card again in that window flashed a pairing
+          // code field over an approval already given.
+          <section className="space-y-3" aria-labelledby="connecting-title">
+            <div className="space-y-1">
+              <h3 id="connecting-title" className="text-sm font-medium">
+                Connecting
+              </h3>
+              <p className="text-xs leading-5 text-muted-foreground">
+                Approved. The daemon is starting up and calling home — this usually takes a few
+                seconds.
+              </p>
+            </div>
+            <PaceBar className="w-full" label="Waiting for this machine to come online…" />
+          </section>
         ) : claim?.status === "ready" && claim.approval_ref ? (
           <section className="space-y-3" aria-labelledby="inline-approve-title">
             <div className="space-y-1">
