@@ -147,6 +147,100 @@ fn origin_label(url: &Url) -> String {
     }
 }
 
+/// What to do about a machine that is already possessed.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeAction {
+    /// Leave the accounts alone; just make sure the daemon is running.
+    Keep,
+    /// Run the approval ceremony again, for a new browser or device.
+    Reauthorize,
+    /// Check for and install a newer daemon.
+    Update,
+    /// Sign in again, alongside what is already here.
+    NewAccount,
+}
+
+/// Ask what this run is for, instead of resuming and printing commands.
+///
+/// Everything on this menu used to be a line of prose ending in a command to
+/// copy — "to connect another account run …", "need an approval link? run …".
+/// That is a worse answer than doing it: the reader is already in front of the
+/// program that can, and the command it named did not even match how most of
+/// them arrived (an install one-liner takes `sh -s -- --new-account`).
+///
+/// Unattended installs never see this. With nobody to answer, re-running the
+/// same command should be the no-op it always was.
+fn resume_action(existing: &[PathBuf]) -> ResumeAction {
+    if !std::io::stdin().is_terminal() {
+        return ResumeAction::Keep;
+    }
+    let single = existing.len() == 1;
+    let keep = if single {
+        format!("Keep {}", instance_account(&existing[0]))
+    } else {
+        format!("Keep all {} accounts", existing.len())
+    };
+    // Re-approving targets one instance, so it is only offered when there is no
+    // ambiguity about which. With several, `spawnd login --config-dir` is the
+    // honest answer and the hint below still names it.
+    let mut options: Vec<(&str, &str)> = vec![(keep.as_str(), "already possessed here")];
+    options.extend(resume_options(single));
+    resume_choice(
+        crate::tui::prompt_choice("THIS MACHINE IS ALREADY POSSESSED", &options, 0),
+        single,
+    )
+}
+
+/// Everything after the "keep it" row, which needs the account name and so is
+/// built by the caller. Split out with the mapping below so the menu can be
+/// tested without a terminal to press keys at.
+fn resume_options(single: bool) -> Vec<(&'static str, &'static str)> {
+    let mut options = Vec::new();
+    // Re-approving targets one instance, so it is only offered when there is no
+    // ambiguity about which.
+    if single {
+        options.push(("Approve a new browser or device", "run the sign-in again"));
+    }
+    options.push(("Add another account", "sign in again, alongside this one"));
+    options.push(("Check for a newer SPAWN D", "update the daemon in place"));
+    options
+}
+
+fn resume_choice(picked: usize, single: bool) -> ResumeAction {
+    match (picked, single) {
+        (0, _) => ResumeAction::Keep,
+        (1, true) => ResumeAction::Reauthorize,
+        (1, false) | (2, true) => ResumeAction::NewAccount,
+        _ => ResumeAction::Update,
+    }
+}
+
+/// Leave the accounts as they are and make sure their daemons are running.
+async fn keep_possessed(existing: &[PathBuf], server_cli: Option<String>) -> Result<()> {
+    if existing.len() == 1 {
+        let dir = &existing[0];
+        std::env::set_var("SPAWN_CONFIG_DIR", dir);
+        let stored = creds::load().ok();
+        let server = config::server_url_for_instance(
+            server_cli,
+            stored.as_ref().and_then(|creds| creds.server_url.as_deref()),
+        )?;
+        print_starting_step();
+        service::install(dir, server.as_str())
+            .map_err(|error| login::background_service_error(&error))?;
+        println!("{}", resume_line(&instance_account(dir)));
+        print_auth_note(dir);
+        return Ok(());
+    }
+    let accounts = existing
+        .iter()
+        .map(|dir| instance_account(dir))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("spawn: already possessed for {accounts}.");
+    Ok(())
+}
+
 fn possess_ui() -> crate::tui::Ui {
     crate::tui::Ui::start(&login::ceremony_title(), &POSSESS_STEPS, login::WAITING_HINT)
 }
@@ -166,33 +260,34 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
     let existing = account_dirs_with_creds(&base)?;
     let stage_login =
         staged_login_required(existing.len(), args.new_account, args.setup_token.as_deref());
-    if existing.len() == 1 && !stage_login {
-        let dir = &existing[0];
-        std::env::set_var("SPAWN_CONFIG_DIR", dir);
-        let stored = creds::load().ok();
-        let server = config::server_url_for_instance(
-            server_cli,
-            stored
-                .as_ref()
-                .and_then(|creds| creds.server_url.as_deref()),
-        )?;
-        print_starting_step();
-        service::install(dir, server.as_str())
-            .map_err(|error| login::background_service_error(&error))?;
-        println!("{}", resume_line(&instance_account(dir)));
-        println!("{}", relogin_hint(&server, dir));
-        println!("spawn: already possessed for {}; to connect another account run `spawnd possess --new-account`", instance_account(dir));
-        print_auth_note(dir);
-        return Ok(());
-    }
     if !existing.is_empty() && !stage_login {
-        let accounts = existing
-            .iter()
-            .map(|dir| instance_account(dir))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("spawn: already possessed for {accounts}; to connect another account run `spawnd possess --new-account`");
-        return Ok(());
+        match resume_action(&existing) {
+            ResumeAction::Keep => return keep_possessed(&existing, server_cli).await,
+            ResumeAction::Reauthorize => {
+                let dir = existing[0].clone();
+                std::env::set_var("SPAWN_CONFIG_DIR", &dir);
+                let stored = creds::load().ok();
+                let server = config::server_url_for_instance(
+                    server_cli,
+                    stored.as_ref().and_then(|creds| creds.server_url.as_deref()),
+                )?;
+                login::run(
+                    Some(server.to_string()),
+                    LoginArgs {
+                        host_name: None,
+                        no_run: true,
+                        setup_token: None,
+                        qr: args.qr,
+                        no_qr: args.no_qr,
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            ResumeAction::Update => return crate::update::run_cli(server_cli).await,
+            // Falls through to the ceremony below.
+            ResumeAction::NewAccount => {}
+        }
     }
 
     let server = choose_server(server_cli.clone(), args.setup_token.as_deref())?;
@@ -777,6 +872,32 @@ mod tests {
     fn possess_reuses_the_login_step_prefix_so_indices_mean_one_thing() {
         assert_eq!(&POSSESS_STEPS[..3], &login::LOGIN_STEPS[..]);
         assert_eq!(POSSESS_STEPS[3], "Start background daemon");
+    }
+
+    /// Every row on the already-possessed menu maps to something the program
+    /// does, and the rows shift when re-approval is not offered — so the
+    /// mapping is pinned rather than left to index arithmetic.
+    #[test]
+    fn the_resume_menu_maps_every_row_to_an_action() {
+        assert_eq!(resume_options(true).len(), 3);
+        assert_eq!(resume_choice(0, true), ResumeAction::Keep);
+        assert_eq!(resume_choice(1, true), ResumeAction::Reauthorize);
+        assert_eq!(resume_choice(2, true), ResumeAction::NewAccount);
+        assert_eq!(resume_choice(3, true), ResumeAction::Update);
+
+        // With several accounts there is no single instance to re-approve, so
+        // that row is absent and everything below it moves up one.
+        assert_eq!(resume_options(false).len(), 2);
+        assert_eq!(resume_choice(0, false), ResumeAction::Keep);
+        assert_eq!(resume_choice(1, false), ResumeAction::NewAccount);
+        assert_eq!(resume_choice(2, false), ResumeAction::Update);
+    }
+
+    /// No terminal, no question: a re-run of the same install command with
+    /// nobody watching stays the no-op it always was.
+    #[test]
+    fn an_unattended_run_is_never_asked() {
+        assert_eq!(resume_action(&[PathBuf::from("/tmp/a")]), ResumeAction::Keep);
     }
 
     #[test]

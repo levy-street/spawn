@@ -114,6 +114,18 @@ uses that value:
   spawnd.dev beside it. Only when nothing named a server does the hosted
   service lead and "Host yourself" ask for a URL. `server_offer` makes that
   decision without touching the terminal, so every branch has a test.
+- **Offer the action, do not print the command.** Where there is a terminal,
+  anything the daemon could do for the reader is a `prompt_choice` row they
+  arrow to and press Enter on — not a sentence ending in something to copy.
+  They are already in front of the program that can do it, and a named command
+  often does not even match how they arrived (an install one-liner takes
+  `sh -s -- --new-account`, never `spawnd possess --new-account`). So
+  "already possessed here" is a menu — keep it, approve a new browser, add
+  another account, check for an update — and each row performs the thing.
+  Unattended installs never see it and keep resuming, because a re-run of the
+  same command with nobody watching should be a no-op. Build such a menu from a
+  pure `*_options`/`*_choice` pair so the rows can be tested without a keyboard;
+  `possess::resume_action` is the pattern.
 - A `--setup` token names its own server (it is only redeemable on the origin
   that minted it), so `choose_server` never prompts when one is present. It
   also names an *account*, so it always holds its own ceremony rather than
