@@ -122,7 +122,9 @@ export function NumberCheck({
         <Text color="mutedForeground" style={styles.textCenter} variant="caption">
           Type this number {otherScreen}. It is only ever shown here.
         </Text>
-        <Spinner label="Waiting for the other side" />
+        {/* No spinner: nothing is loading here. This is waiting on a person to
+            type four digits somewhere else, and a spinner over that reads as
+            work in progress that a wait might end on its own. */}
         <Button onPress={onCancel} size="sm" variant="ghost">
           Cancel
         </Button>

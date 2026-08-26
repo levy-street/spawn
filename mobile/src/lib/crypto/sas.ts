@@ -26,7 +26,7 @@ import {
  *   sas([0x01×32],[0x02×32],[0x03×32],[0x04×32]) = "449 728"
  *   sas([0..32],[32..64],[0xaa×32],[0xbb×32])    = "108 396"
  * The device↔device ceremony uses the same digest truncated to four digits:
- * 449728 % 10000 = 9728 → "97 28".
+ * 449728 % 10000 = 9728 → "9728".
  */
 
 const COMMIT_DOMAIN = encodeUtf8("SPAWN-SAS-COMMIT-V1");
@@ -79,6 +79,10 @@ export function sas(
     0;
   const code = n % 10 ** digits;
   const text = code.toString().padStart(digits, "0");
+  // Six digits are grouped ("449 728") — six carried across a room in one run
+  // is where people drop one. Four is short enough to hold whole, and the gap
+  // inside it only invited typing the space, so it stays a single run.
+  if (digits <= 4) return text;
   const half = Math.ceil(digits / 2);
   return `${text.slice(0, half)} ${text.slice(half)}`;
 }
@@ -115,7 +119,7 @@ export function verifyCommitWire(
   }
 }
 
-/** The device↔device number, "NN NN". */
+/** The device↔device number, "NNNN". */
 export function ceremonySas(
   initiatorKeyWire: string,
   joinerKeyWire: string,

@@ -21,7 +21,7 @@ export interface NumberCheckProps {
    * "enter" types the number the other screen is showing.
    */
   mode: "show" | "enter";
-  /** e.g. "97 28" (device, 4 digits) or "923 579" (host, 6) — shown in `show` mode. */
+  /** e.g. "9728" (device, 4 digits) or "923 579" (host, 6) — shown in `show` mode. */
   number?: string;
   /**
    * Legacy hosts (older software) have no number; the check falls back to
@@ -176,8 +176,10 @@ export function NumberCheck({
               Enter this number {otherScreen}.
             </p>
           </div>
+          {/* No pace bar: nothing is loading here. This side is waiting on a
+              person to type four digits on another screen, and a progress bar
+              over that reads as work that might finish on its own. */}
           <div className="flex h-[76px] w-full flex-col items-center justify-center gap-2">
-            <PaceBar className="w-full max-w-xs" label="Waiting for the other side…" />
             <button
               type="button"
               onClick={onClose}
