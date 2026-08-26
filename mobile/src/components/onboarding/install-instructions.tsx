@@ -24,7 +24,6 @@ export function installCommandForBaseUrl(baseUrl: string, setupToken?: string): 
 export interface InstallInstructionsProps {
   command?: string;
   onCommandCopied?: () => void;
-  onContinue: () => void;
   onSkip?: () => void;
   preparing?: boolean;
 }
@@ -32,7 +31,6 @@ export interface InstallInstructionsProps {
 export function InstallInstructions({
   command = DEFAULT_INSTALL_COMMAND,
   onCommandCopied,
-  onContinue,
   onSkip,
   preparing = false,
 }: InstallInstructionsProps) {
@@ -70,7 +68,8 @@ export function InstallInstructions({
           Connect your first host
         </Text>
         <Text color="mutedForeground">
-          Install the daemon on a Mac or Linux machine, then approve its pairing code.
+          Install the daemon on a Mac or Linux machine. When it registers, its approval appears
+          here.
         </Text>
       </View>
 
@@ -144,16 +143,13 @@ export function InstallInstructions({
         </View>
       </View>
 
-      <View style={styles.actions}>
-        <Button onPress={onContinue} style={styles.primaryAction}>
-          Enter pairing code
-        </Button>
-        {onSkip !== undefined ? (
+      {onSkip !== undefined ? (
+        <View style={styles.actions}>
           <Button onPress={onSkip} variant="ghost">
             Skip for now
           </Button>
-        ) : null}
-      </View>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -195,8 +191,5 @@ const styles = StyleSheet.create({
     height: spacing[7],
     justifyContent: "center",
     width: spacing[7],
-  },
-  primaryAction: {
-    width: "100%",
   },
 });

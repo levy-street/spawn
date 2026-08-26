@@ -1,5 +1,4 @@
 import { useQuery } from "@tanstack/react-query";
-import { pairingCodeForRequest } from "@/components/onboarding/pairing-code";
 import { PAIRING_CEREMONY_TTL_MS } from "@/components/onboarding/pairing-countdown";
 import { ApiError } from "@/data/api/client";
 import {
@@ -47,7 +46,7 @@ export type PairingFailureKind =
   | "pin-limit"
   | "link-identity-mismatch"
   | "link-identity-malformed"
-  | "unknown-code"
+  | "approval-not-found"
   | "host-not-ready"
   | "approval-incomplete"
   | "endorsement-invalid"
@@ -133,7 +132,7 @@ export function toPairingFailure(error: unknown): PairingFailure {
   if (error instanceof ApiError) {
     const protocolError = protocolErrorFromApiError(error);
     if (protocolError !== null) return pairingFailureForProtocolError(protocolError);
-    if (error.status === 404) return pairingFailure("unknown-code");
+    if (error.status === 404) return pairingFailure("approval-not-found");
     if (error.status === 409) return pairingFailure("host-not-ready");
     return pairingFailure("pairing-rejected", error.message);
   }
@@ -153,8 +152,7 @@ interface LookupDependencies {
 }
 
 export async function lookupPendingPairing(input: {
-  userCode?: string;
-  approvalRef?: string;
+  approvalRef: string;
   linkHostKey?: string | null;
   accountId: string;
   serverOrigin: string;
@@ -165,10 +163,7 @@ export async function lookupPendingPairing(input: {
     getPendingDevice: input.dependencies?.getPendingDevice ?? getPendingDevice,
     openHostPinStore: input.dependencies?.openHostPinStore ?? openHostPinStore,
   };
-  const identifier: DevicePendingRequest =
-    input.approvalRef === undefined
-      ? { user_code: pairingCodeForRequest(input.userCode ?? "") }
-      : { approval_ref: input.approvalRef };
+  const identifier: DevicePendingRequest = { approval_ref: input.approvalRef };
   let pending: DevicePendingResponse;
   try {
     pending = await dependencies.getPendingDevice(identifier);

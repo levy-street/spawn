@@ -64,13 +64,11 @@ export function SetupChecklist({
   claim,
   commandCopied,
   hosts,
-  onEnterCode,
   onExit,
 }: {
   claim: SetupClaimStatus | null;
   commandCopied: boolean;
   hosts: readonly HostOut[];
-  onEnterCode(): void;
   onExit?: () => void;
 }): React.JSX.Element {
   const state = setupChecklistState({ claim, commandCopied, hosts });
@@ -112,11 +110,7 @@ export function SetupChecklist({
           <Text color="mutedForeground" testID="setup-stalled" variant="caption">
             {stalledHint(state.waitingIndex)}
           </Text>
-          {state.waitingIndex < 3 ? (
-            <Button onPress={onEnterCode} size="sm" variant="outline">
-              Enter pairing code
-            </Button>
-          ) : onExit !== undefined ? (
+          {state.waitingIndex === 3 && onExit !== undefined ? (
             <Button onPress={onExit} size="sm" variant="outline">
               Finish later
             </Button>

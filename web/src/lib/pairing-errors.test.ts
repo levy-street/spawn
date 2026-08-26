@@ -15,11 +15,11 @@ describe("pairing error catalogue", () => {
     }
   });
 
-  test("never leaks the server's raw expired-code string", () => {
+  test("never leaks the server's raw legacy expiry string", () => {
     const error = new ApiError(400, "http_400", "user code is expired");
     expect(pairingFailureCode(error)).toBe("expired");
     expect(pairingFailureMessage(error)).toBe(
-      "That code expired. On the machine, run spawnd possess again.",
+      "That approval expired. On the machine, run spawnd possess again.",
     );
   });
 

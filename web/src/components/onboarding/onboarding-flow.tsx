@@ -80,8 +80,7 @@ export function OnboardingFlow() {
     // answers a different question from "is there a ceremony here": a reload,
     // or this URL opened a second time, still carries `?ref=` and still has an
     // approval waiting on it. Asking the URL means the host step never teaches
-    // installation and a pairing code to someone whose machine is already
-    // asking to be let in.
+    // installation to someone whose machine is already asking to be let in.
     const params = new URLSearchParams(window.location.search);
     setApprovalFromLink(restored !== null || Boolean(params.get("ref") ?? params.get("code")));
     setApprovalChecked(true);

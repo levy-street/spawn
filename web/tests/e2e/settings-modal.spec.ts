@@ -49,7 +49,9 @@ test("the connect flow lives on its own page, reached from the legion", async ({
   await page.goto("/device");
   await expect(page.getByRole("heading", { name: "Connect a host" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Copy install command" })).toBeVisible();
-  await expect(page.getByLabel("Code from the terminal")).toBeVisible();
+  await expect(page.getByText("After installation, run")).toBeVisible();
+  // The link the terminal prints is the one way in; there is no code to type.
+  await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
 });
 
 test("Agents keeps built-ins read-only and round-trips a custom definition", async ({ page }) => {

@@ -186,8 +186,9 @@ terminal state precisely so the residual is a chosen, contained trade.
   session gate) shows the four-digit number, the approver types it, the mutual
   endorsement lands, and the knock closes on it. Both roles run on the phone
   (`data/trust/ceremony.ts`, mirroring `approve-ceremony.ts`). The phone's
-  ceremony sheet keeps *Ask again* and the `spawnd login` pairing code as the
-  no-other-device fallback. A knock also reaches closed phones: the server
+  ceremony sheet keeps *Ask again* and *Connect a host* — possessing a host
+  from this phone, via the setup-claim command — as the no-other-device
+  fallback; there is no pairing code to type any more. A knock also reaches closed phones: the server
   pushes "Approve spawn on iPhone?" to every install of the account except the
   one that asked (push tokens register with their browser device id), at most
   once per two minutes per knock; the tap opens the app, where the prompt takes

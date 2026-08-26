@@ -15,9 +15,8 @@ interface FailureCopy {
 export const FAILURE_COPY: Record<PairingFailureKind, FailureCopy> = {
   "fingerprint-mismatch": {
     title: "Fingerprints do not match",
-    description:
-      "Connection blocked. Recheck the code on the machine and explicitly review its fingerprint again.",
-    action: "Enter a new code",
+    description: "Connection blocked. Nothing was trusted. Start over from the host's terminal.",
+    action: "Back to pairing",
   },
   "identity-missing": {
     title: "Phone identity is missing",
@@ -46,9 +45,9 @@ export const FAILURE_COPY: Record<PairingFailureKind, FailureCopy> = {
     action: "Try again",
   },
   "pairing-expired": {
-    title: "Pairing code expired",
-    description: "That code expired. On the machine, run spawnd possess again.",
-    action: "Enter a new code",
+    title: "Approval expired",
+    description: "That approval expired. On the machine, run spawnd possess again.",
+    action: "Back to pairing",
   },
   "pairing-denied": {
     title: "Approval was declined",
@@ -89,20 +88,20 @@ export const FAILURE_COPY: Record<PairingFailureKind, FailureCopy> = {
       "The identity check in this link (the part after '#') is damaged or cut off, so this host could not be verified. Nothing was trusted. Copy the entire link from the host's terminal and open it again.",
     action: "Back to pairing",
   },
-  "unknown-code": {
-    title: "Code not found",
-    description: "Check the eight characters shown by spawnd possess and try again.",
-    action: "Try another code",
+  "approval-not-found": {
+    title: "Approval not found",
+    description: "That approval is no longer waiting. On the machine, run spawnd possess again.",
+    action: "Back to pairing",
   },
   "host-not-ready": {
     title: "Host proof is still pending",
-    description: "Wait for spawnd possess to finish preparing the code, then retry.",
+    description: "Wait for spawnd possess to finish preparing the approval, then retry.",
     action: "Retry lookup",
   },
   "approval-incomplete": {
     title: "Server approval did not complete",
     description:
-      "The exact host fingerprint is saved locally, but server approval did not complete. Retry the same reviewed approval or enter a new code.",
+      "The exact host fingerprint is saved locally, but server approval did not complete. Retry the same reviewed approval or start again from the host's terminal.",
     action: "Retry approval",
   },
   "endorsement-invalid": {
@@ -159,7 +158,7 @@ export function TrustFailureState({
           <Button onPress={onAction}>{copy.action}</Button>
           {onRestart !== undefined ? (
             <Button onPress={onRestart} variant="ghost">
-              Enter a new code
+              Start over
             </Button>
           ) : null}
           {onSkip !== undefined ? (

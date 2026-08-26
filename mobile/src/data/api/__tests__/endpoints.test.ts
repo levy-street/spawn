@@ -100,10 +100,10 @@ it("serializes the account domain and clears auth after deletion", async () => {
 });
 
 it("serializes the device-pairing domain", async () => {
-  await getPendingDevice({ user_code: "ABCD1234" });
+  await getPendingDevice({ approval_ref: "approval-ref-123" });
   expect(api).toHaveBeenCalledWith(
     "/api/auth/device/pending",
-    expect.objectContaining({ method: "POST", body: '{"user_code":"ABCD1234"}' }),
+    expect.objectContaining({ method: "POST", body: '{"approval_ref":"approval-ref-123"}' }),
   );
 });
 

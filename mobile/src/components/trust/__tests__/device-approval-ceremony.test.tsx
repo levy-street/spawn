@@ -188,7 +188,7 @@ describe("device approval ceremony", () => {
     expect(onRequestClose).not.toHaveBeenCalled();
   });
 
-  test("a chain-capable host is approved from another screen too, with the code as fallback", async () => {
+  test("a chain-capable host is approved from another screen too, with host connect as fallback", async () => {
     // The knock is answered with an account endorsement, which this device
     // carries to every host anchored on the approving screen (mesh §3) — so
     // the promise holds for chain hosts exactly as for per-host ones.
@@ -197,7 +197,6 @@ describe("device approval ceremony", () => {
     expect(mockRequestApproval).toHaveBeenCalledWith(PHONE_ID);
     expect(screen.getByText(/waiting on your say-so/i)).toBeOnTheScreen();
     expect(screen.getByText(/prompt is up on every screen/i)).toBeOnTheScreen();
-    expect(screen.queryByText(/takes a pairing code/i)).toBeNull();
-    expect(screen.getByText("Enter a pairing code")).toBeOnTheScreen();
+    expect(screen.getByText("Connect a host")).toBeOnTheScreen();
   });
 });

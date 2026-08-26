@@ -3,7 +3,6 @@ import { resolve } from "node:path";
 
 const POST_INSTALL_SURFACES = [
   "src/components/onboarding/install-instructions.tsx",
-  "src/components/onboarding/pairing-code-entry.tsx",
   "src/components/onboarding/pairing-success.tsx",
   "src/components/onboarding/trust-failure-state.tsx",
   "src/components/hosts/host-list-screen.tsx",

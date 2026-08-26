@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import { expect, type Page, test } from "@playwright/test";
 
 // The /device approval page on its no-fragment paths: every test here opens
-// the page WITHOUT a `#k=` host-key fragment, which is the fallback lane
-// (older daemons, retyped URLs) — the human compares the full fingerprint
-// against the host's terminal. The fragment lane, and the refusal of a
-// server-substituted host key, live in possess-key-check.spec.ts.
+// the page WITHOUT a `#k=` host-key fragment, including older-server `?code=`
+// links — the human compares the full fingerprint against the host's terminal.
+// The fragment lane, and the refusal of a server-substituted host key, live in
+// possess-key-check.spec.ts.
 
 const USER_ID = "00000000-0000-4000-8000-000000000001";
 const BROWSER_DEVICE_ID = "00000000-0000-4000-8000-000000000009";
@@ -186,7 +186,7 @@ test("device approval shows the locally derived fingerprint before confirmation"
   );
 });
 
-test("the bare page instructs — one command, no code to type", async ({ page }) => {
+test("the bare page keeps installation instructions and has no code entry", async ({ page }) => {
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/me") {
@@ -220,27 +220,11 @@ test("the bare page instructs — one command, no code to type", async ({ page }
   await expect(page.getByText(/curl -fsSL .*install\.sh/)).toBeVisible();
   await expect(page.getByText("After installation, run")).toBeVisible();
 
-  // Typing a code is the fallback, so it is folded away behind one control: a
-  // heading, a labelled field, a paragraph and a button, for a route most
-  // readers never take, used to sit between them and that command.
+  // Approval starts only from a terminal link; the bare route has no ceremony
+  // to load and exposes no manual-entry controls or waiting state.
   await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
   await expect(page.getByTestId("possess-instructions")).toHaveCount(0);
-
-  await page.getByTestId("reveal-pairing-code").click();
-
-  const instructions = page.getByTestId("possess-instructions");
-  await expect(instructions).toBeVisible();
-  await expect(instructions).toContainText("spawnd possess");
-  await expect(instructions).toContainText("single click");
-  // The terminal's link is still the intended entry, but /device is the shared
-  // connect surface after the workspaces overhaul, so code entry stays on the
-  // page as the stated fallback for a host whose link you cannot open. Typing a
-  // code is not a weaker path: it runs the same fingerprint-compare ceremony.
-  await expect(instructions).toContainText("fallback");
-  await expect(page.getByLabel("Code from the terminal")).toBeVisible();
-  // Nothing has been started here, so nothing is on its way. The waiting pill
-  // used to render regardless — a pulsing "Waiting for your machine…" above
-  // the field for starting a ceremony that did not exist yet.
+  await expect(page.getByTestId("reveal-pairing-code")).toHaveCount(0);
   await expect(page.getByText("Waiting for your machine…")).toHaveCount(0);
 });
 

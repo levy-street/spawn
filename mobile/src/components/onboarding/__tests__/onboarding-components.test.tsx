@@ -8,7 +8,6 @@ import {
   InstallInstructions,
   installCommandForBaseUrl,
 } from "@/components/onboarding/install-instructions";
-import { PairingCodeEntry } from "@/components/onboarding/pairing-code-entry";
 import { PairingCountdown } from "@/components/onboarding/pairing-countdown";
 import { PairingSuccess } from "@/components/onboarding/pairing-success";
 import { FAILURE_COPY, TrustFailureState } from "@/components/onboarding/trust-failure-state";
@@ -39,14 +38,14 @@ const FAILURE_TITLES = {
   "identity-storage-unavailable": "Phone identity storage is unavailable",
   "pin-revoked": "This host identity was revoked",
   "pin-storage-unavailable": "Trust storage is unavailable",
-  "pairing-expired": "Pairing code expired",
+  "pairing-expired": "Approval expired",
   "pairing-denied": "Approval was declined",
   "key-conflict": "This machine belongs to another account",
   "pin-conflict": "Earlier approval does not match",
   "pin-limit": "Approval limit reached",
   "link-identity-mismatch": "This host could not be verified",
   "link-identity-malformed": "This host could not be verified",
-  "unknown-code": "Code not found",
+  "approval-not-found": "Approval not found",
   "host-not-ready": "Host proof is still pending",
   "approval-incomplete": "Server approval did not complete",
   "endorsement-invalid": "Endorsement could not be verified",
@@ -54,7 +53,7 @@ const FAILURE_TITLES = {
 } as const satisfies Record<PairingFailureKind, string>;
 
 const CEREMONY: PendingPairingCeremony = {
-  identifier: { user_code: "QZ4K7HMT" },
+  identifier: { approval_ref: "ref-QZ4K7HMT" },
   accountId: "11111111-1111-4111-8111-111111111111",
   serverOrigin: "https://spawn.example.com",
   hostName: "Studio Mac",
@@ -87,7 +86,11 @@ describe("onboarding security states", () => {
   );
 
   it.each([
-    ["expired", "pairing-expired", "That code expired. On the machine, run spawnd possess again."],
+    [
+      "expired",
+      "pairing-expired",
+      "That approval expired. On the machine, run spawnd possess again.",
+    ],
     [
       "denied",
       "pairing-denied",
@@ -119,7 +122,7 @@ describe("onboarding security states", () => {
   });
 
   it("copies the exact install command", async () => {
-    const screen = await render(<InstallInstructions onContinue={jest.fn()} />, { wrapper });
+    const screen = await render(<InstallInstructions />, { wrapper });
 
     await fireEvent.press(screen.getByLabelText("Copy install command"));
     expect(Clipboard.setStringAsync).toHaveBeenCalledWith(DEFAULT_INSTALL_COMMAND);
@@ -128,14 +131,22 @@ describe("onboarding security states", () => {
 
   it("counts sharing the command as the first setup action", async () => {
     const onCommandCopied = jest.fn();
-    const screen = await render(
-      <InstallInstructions onCommandCopied={onCommandCopied} onContinue={jest.fn()} />,
-      { wrapper },
-    );
+    const screen = await render(<InstallInstructions onCommandCopied={onCommandCopied} />, {
+      wrapper,
+    });
 
     await fireEvent.press(screen.getByRole("button", { name: "Share install command" }));
     expect(presentShareSheet).toHaveBeenCalledWith({ message: DEFAULT_INSTALL_COMMAND });
     expect(onCommandCopied).toHaveBeenCalledTimes(1);
+    await screen.unmount();
+  });
+
+  it("does not offer manual approval entry after installation", async () => {
+    const screen = await render(<InstallInstructions />, { wrapper });
+
+    expect(
+      screen.queryByRole("button", { name: ["Enter", "pairing", "code"].join(" ") }),
+    ).toBeNull();
     await screen.unmount();
   });
 
@@ -159,24 +170,6 @@ describe("onboarding security states", () => {
     });
     expect(screen.getByText("0:00")).toBeOnTheScreen();
     expect(onExpired).toHaveBeenCalledTimes(1);
-    await screen.unmount();
-  });
-
-  it("adds an elapsed hint and an explicit escape to a quiet code wait", async () => {
-    jest.useFakeTimers();
-    jest.setSystemTime(0);
-    const onBack = jest.fn();
-    const screen = await render(
-      <PairingCodeEntry busy={false} onBack={onBack} onSubmit={jest.fn()} />,
-      { wrapper },
-    );
-
-    await act(async () => jest.advanceTimersByTime(30_000));
-    expect(screen.getByText("Elapsed 0:30")).toBeOnTheScreen();
-    expect(screen.queryByText("Back to install instructions")).toBeNull();
-    await act(async () => jest.advanceTimersByTime(30_000));
-    await fireEvent.press(screen.getByRole("button", { name: "Back to install instructions" }));
-    expect(onBack).toHaveBeenCalledTimes(1);
     await screen.unmount();
   });
 

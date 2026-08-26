@@ -9,15 +9,9 @@ export const validationCopy = {
   confirmationMismatch: "Both passwords must match.",
   workspaceNameTooLong: "Use 128 characters or fewer.",
   sessionNameTooLong: "Use 128 characters or fewer.",
-  hostPairingCode: "Enter the 8-character code from the terminal.",
 } as const;
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/u;
-const HOST_PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const HOST_PAIRING_PATTERN = new RegExp(
-  `^[${HOST_PAIRING_ALPHABET}]{4}-?[${HOST_PAIRING_ALPHABET}]{4}$`,
-  "iu",
-);
 
 export const SIGNUP_PASSWORD_MIN_LENGTH = 8;
 export const RESET_PASSWORD_MIN_LENGTH = 12;
@@ -71,12 +65,4 @@ export function validateWorkspaceName(value: string): string | null {
 
 export function validateSessionName(value: string): string | null {
   return value.trim().length > SESSION_NAME_MAX_LENGTH ? validationCopy.sessionNameTooLong : null;
-}
-
-export function normalizeHostPairingCode(value: string): string {
-  return value.trim().toUpperCase().replaceAll("-", "");
-}
-
-export function validateHostPairingCode(value: string): string | null {
-  return HOST_PAIRING_PATTERN.test(value.trim()) ? null : validationCopy.hostPairingCode;
 }
