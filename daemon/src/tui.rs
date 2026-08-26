@@ -1408,10 +1408,7 @@ mod tests {
                     dim("open this link on any device:", true),
                     bold("http://localhost:3000/device?ref=dGfl0YzRgEM6YrY9JVVDVPaIRWu8", true),
                     String::new(),
-                    dim("no link? in the app choose \"enter a pairing code\" and type:", true),
-                    format!("    {}", bold("JVG2-BBJ3", true)),
-                    String::new(),
-                    format!("{}  SHA256:61vEOQ4_iawNa8ej", dim("host key", true)),
+                    bold("press Enter to open it here", true),
                 ],
                 terminal_width(),
                 true,
@@ -1420,7 +1417,7 @@ mod tests {
         );
         for elapsed in 0..24 {
             ui.status(&format!(
-                "waiting for approval — {elapsed}s · code expires in 29 min"
+                "waiting for approval — {elapsed}s · link expires in 29 min"
             ));
             if elapsed == 12 {
                 ui.log("opened your browser to approve this host.");

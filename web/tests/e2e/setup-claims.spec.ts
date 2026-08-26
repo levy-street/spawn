@@ -50,14 +50,14 @@ test("setup claim advances inline approval through the existing onboarding done 
   });
   // The command this screen handed over carries a setup token, so the terminal
   // shows the same fingerprint and no link — the copy must ask for exactly the
-  // comparison the terminal is offering.
+  // comparison the terminal is offering, with no manual-entry escape.
   await expect(
     page.getByText(
       "The terminal you ran the command in is showing a key. Check it matches the one below, then approve.",
     ),
   ).toBeVisible();
   await expect(page.getByTestId("host-key-fingerprint")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Enter a pairing code instead" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Enter a pairing code instead" })).toHaveCount(0);
 
   await page.getByRole("button", { name: "They match" }).click();
   await expect(page.locator('[data-step="3"]')).toHaveAttribute("data-state", "complete");
@@ -121,9 +121,8 @@ test("closing a fingerprint mismatch returns a usable screen, not a forever load
     host_key_fingerprint: null,
   });
 
-  // Back to the start, not to an empty code box for an approval that is now
-  // void: a refused ceremony spends its claim, so beginning again means a fresh
-  // command to run.
+  // Back to the start, not to an empty approval surface: a refused ceremony
+  // spends its claim, so beginning again means a fresh command to run.
   await expect(page.getByTestId("pairing-loading")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Copy install command" })).toBeVisible({
     timeout: 7_000,
@@ -144,14 +143,16 @@ test("the checklist adds its exact stalled escape after 60 seconds", async ({ pa
   );
 });
 
-test("expired typed codes use the catalogue instead of the raw server string", async ({ page }) => {
+test("expired approval links use the catalogue instead of the raw server string", async ({
+  page,
+}) => {
   await mockApp(page, {
     devicePendingError: { status: 400, detail: "user code is expired" },
   });
   await page.goto("/device?code=QZ4K-7HMT");
   const failure = page.getByTestId("pairing-failure");
   await expect(failure).toContainText(
-    "That code expired. On the machine, run spawnd possess again.",
+    "That approval expired. On the machine, run spawnd possess again.",
   );
   await expect(failure).not.toContainText("user code is expired");
 });

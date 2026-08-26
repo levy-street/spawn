@@ -64,7 +64,6 @@ describe("setup claim checklist", () => {
         claim={claim(status)}
         commandCopied={commandCopied}
         hosts={[]}
-        onEnterCode={jest.fn()}
         onExit={onExit}
       />,
       { wrapper },
@@ -76,8 +75,11 @@ describe("setup claim checklist", () => {
 
     await act(async () => jest.advanceTimersByTime(30_000));
     expect(screen.getByText(hint)).toBeOnTheScreen();
+    expect(
+      screen.queryByRole("button", { name: ["Enter", "pairing", "code"].join(" ") }),
+    ).toBeNull();
     if (status !== "approved") {
-      expect(screen.getByRole("button", { name: "Enter pairing code" })).toBeOnTheScreen();
+      expect(screen.queryByRole("button", { name: "Finish later" })).toBeNull();
     } else {
       await fireEvent.press(screen.getByRole("button", { name: "Finish later" }));
       expect(onExit).toHaveBeenCalledTimes(1);

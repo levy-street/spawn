@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, waitFor } from "@testing-library/react-native";
+import { fireEvent, render, waitFor } from "@testing-library/react-native";
 import type { PropsWithChildren } from "react";
 
 import { HostPairingStep, INLINE_APPROVE_LEAD } from "@/components/onboarding/host-pairing-step";
@@ -23,6 +23,7 @@ jest.mock("@/data/queries/hosts", () => ({
 
 jest.mock("@/data/queries/setup", () => ({
   useCreateSetupClaimMutation: () => ({
+    isError: mockClaimMintMode === "unsupported",
     isPending: false,
     reset: mockCreateClaimReset,
     mutate: (
@@ -120,7 +121,7 @@ describe("HostPairingStep setup claim", () => {
     await screen.unmount();
   });
 
-  it("falls back to today's bare command when claims return 404", async () => {
+  it("falls back to today's bare command with retry recovery when claims return 404", async () => {
     mockClaimMintMode = "unsupported";
     const screen = await render(
       <HostPairingStep accountId="11111111-1111-4111-8111-111111111111" />,
@@ -131,6 +132,13 @@ describe("HostPairingStep setup claim", () => {
       await screen.findByText("curl -fsSL https://spawn.example/install.sh | sh"),
     ).toBeOnTheScreen();
     expect(screen.queryByTestId("setup-checklist")).toBeNull();
+    expect(
+      screen.getByText(
+        "Live setup progress could not start. The install command still works — approve the host from the link its terminal prints.",
+      ),
+    ).toBeOnTheScreen();
+    await fireEvent.press(screen.getByRole("button", { name: "Try again" }));
+    expect(mockCreateClaimReset).toHaveBeenCalledTimes(2);
     expect(mockLookupPendingPairing).not.toHaveBeenCalled();
     await screen.unmount();
   });

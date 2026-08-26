@@ -10,11 +10,11 @@ import {
   installCommandForBaseUrl,
 } from "@/components/onboarding/install-instructions";
 import { setHostSkipped } from "@/components/onboarding/onboarding-state";
-import { PairingCodeEntry } from "@/components/onboarding/pairing-code-entry";
 import { PairingSuccess } from "@/components/onboarding/pairing-success";
 import { SetupChecklist } from "@/components/onboarding/setup-checklist";
 import { TrustFailureState } from "@/components/onboarding/trust-failure-state";
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
@@ -41,10 +41,9 @@ import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { haptics } from "@/lib/haptics";
 import { spacing } from "@/theme";
 
-type HostStage = "instructions" | "code" | "review" | "failure" | "success";
-type ReviewSource = "typed" | "claim" | "link";
+type HostStage = "instructions" | "review" | "failure" | "success";
+type ReviewSource = "claim" | "link";
 type PairingLookupRequest =
-  | { source: "typed"; userCode: string }
   | { source: "claim"; approvalRef: string }
   | { source: "link"; approvalRef: string; linkHostKey?: string };
 
@@ -85,7 +84,7 @@ export function HostPairingStep({
   const [commandCopied, setCommandCopied] = useState(false);
   const [ceremony, setCeremony] = useState<PendingPairingCeremony | null>(null);
   const [failure, setFailure] = useState<PairingFailure | null>(null);
-  const [reviewSource, setReviewSource] = useState<ReviewSource>("typed");
+  const [reviewSource, setReviewSource] = useState<ReviewSource>("claim");
   const [allowRevokedPin, setAllowRevokedPin] = useState(false);
   const [success, setSuccess] = useState<{
     result: PairingApprovalResult;
@@ -111,8 +110,8 @@ export function HostPairingStep({
     createClaimMutate(undefined, {
       onSuccess: (claim) => setClaimToken(claim.token),
       // A server without Phase C returns 404/405. Network and older-server
-      // failures also keep the established bare-command + typed-code path
-      // usable instead of making setup depend on this additive helper.
+      // failures keep the bare install command usable; the terminal's link
+      // remains the fallback when live setup progress is unavailable.
       onError: () => setClaimToken(null),
     });
   }, [createClaimMutate, createClaimReset]);
@@ -156,9 +155,7 @@ export function HostPairingStep({
       return lookupPendingPairing({
         accountId,
         serverOrigin,
-        ...(request.source === "typed"
-          ? { userCode: request.userCode }
-          : { approvalRef: request.approvalRef }),
+        approvalRef: request.approvalRef,
         ...(request.source === "link" && request.linkHostKey !== undefined
           ? { linkHostKey: request.linkHostKey }
           : {}),
@@ -315,16 +312,25 @@ export function HostPairingStep({
   const acceptingKey = endorsementMutation.variables
     ? `${endorsementMutation.variables.record.host_id}:${endorsementMutation.variables.record.endorser_device_id}`
     : null;
-  const setupChecklist =
-    claimToken === null ? null : (
+  const setupProgress =
+    claimToken !== null ? (
       <SetupChecklist
         claim={claim}
         commandCopied={commandCopied}
         hosts={hostsQuery.data ?? []}
-        onEnterCode={() => setStage("code")}
         {...(onExit === undefined && onSkip === undefined ? {} : { onExit: onExit ?? onSkip })}
       />
-    );
+    ) : createClaim.isError ? (
+      <Card style={styles.claimRecovery} variant="flat">
+        <Text color="mutedForeground" variant="caption">
+          Live setup progress could not start. The install command still works — approve the host
+          from the link its terminal prints.
+        </Text>
+        <Button onPress={beginSetupClaim} size="sm" variant="outline">
+          Try again
+        </Button>
+      </Card>
+    ) : null;
 
   if (stage === "instructions") {
     return (
@@ -332,11 +338,10 @@ export function HostPairingStep({
         <InstallInstructions
           command={installCommand}
           onCommandCopied={() => setCommandCopied(true)}
-          onContinue={() => setStage("code")}
           preparing={createClaim.isPending}
           {...(onSkip === undefined ? {} : { onSkip })}
         />
-        {setupChecklist}
+        {setupProgress}
         <EndorsementOption
           acceptingKey={acceptingKey}
           onAccept={(record, endorserFingerprint) =>
@@ -352,32 +357,16 @@ export function HostPairingStep({
     );
   }
 
-  if (stage === "code") {
-    return (
-      <View style={styles.hostStep}>
-        {setupChecklist}
-        <PairingCodeEntry
-          busy={lookupMutation.isPending || serverOrigin === null}
-          error={
-            lookupMutation.isError ? (toPairingFailure(lookupMutation.error).detail ?? null) : null
-          }
-          onBack={() => setStage("instructions")}
-          onSubmit={(code) => lookupMutation.mutate({ source: "typed", userCode: code })}
-        />
-      </View>
-    );
-  }
-
   if (stage === "review" && ceremony !== null) {
     return (
       <View style={styles.hostStep}>
-        {setupChecklist}
+        {setupProgress}
         <FingerprintReview
           approving={approveMutation.isPending}
           ceremony={ceremony}
           {...(reviewSource === "claim" ? { lead: INLINE_APPROVE_LEAD } : {})}
           onApprove={() => approveMutation.mutate()}
-          onBack={() => setStage("code")}
+          onBack={() => setStage("instructions")}
           onExpired={() => {
             setFailure({ kind: "pairing-expired" });
             setStage("failure");
@@ -405,7 +394,7 @@ export function HostPairingStep({
     if (success.requiresPhoneComparison) {
       return (
         <View style={styles.hostStep}>
-          {setupChecklist}
+          {setupProgress}
           <PairingSuccess
             hostName={success.result.hostName}
             onConfirmed={() => haptics.success()}
@@ -422,7 +411,7 @@ export function HostPairingStep({
     }
     return (
       <View style={styles.hostStep}>
-        {setupChecklist}
+        {setupProgress}
         <EmptyState
           action={
             <Button onPress={pairAnother} variant="outline">
@@ -457,14 +446,18 @@ export function HostPairingStep({
           setStage("instructions");
           return;
         }
-        setStage("code");
+        setStage("instructions");
       }}
-      {...(ceremony === null ? {} : { onRestart: () => setStage("code") })}
+      {...(ceremony === null ? {} : { onRestart: () => setStage("instructions") })}
     />
   );
 }
 
 const styles = StyleSheet.create({
+  claimRecovery: {
+    alignItems: "flex-start",
+    gap: spacing[3],
+  },
   hostStep: {
     gap: spacing[8],
   },

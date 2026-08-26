@@ -95,7 +95,7 @@ export function DeviceApprovalCeremony({
     mutationFn: (deviceId: string) => requestDeviceApproval(deviceId),
     onError: () =>
       setActionError(
-        "The knock did not reach your other devices. Ask again, or pair with a code below.",
+        "The knock did not reach your other devices. Ask again, or connect a host from this phone below.",
       ),
   });
 
@@ -221,7 +221,7 @@ export function DeviceApprovalCeremony({
                   : phase === "waiting"
                     ? `A prompt is up on every screen already signed in${signedInAs} — including your Mac's browser. Approve it from one this host already trusts and a number appears here to type there.`
                     : phase === "pair-only"
-                      ? "Nothing else is signed in to answer for it. Pair directly with a code from the host."
+                      ? "Nothing else is signed in to answer for it. Connect a host from this phone instead."
                       : ""}
           </Text>
         </View>
@@ -307,8 +307,8 @@ export function DeviceApprovalCeremony({
           </View>
           <View style={[styles.section, { gap: theme.space(2) }]}>
             <Text color="mutedForeground" style={styles.centered} variant="caption">
-              Run <Text variant="mono">spawnd possess</Text> on the host and enter the code it
-              prints. That approves this device directly, without another one.
+              Connect a host from this phone: run the command it gives you on the machine, then
+              approve the host here. That trusts this device directly, without another one.
             </Text>
             <Button
               onPress={() => {
@@ -317,7 +317,7 @@ export function DeviceApprovalCeremony({
               }}
               variant={phase === "pair-only" ? "default" : "outline"}
             >
-              Enter a pairing code
+              Connect a host
             </Button>
           </View>
         </>

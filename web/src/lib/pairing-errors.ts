@@ -4,7 +4,7 @@ import type { SetupClaimError } from "@/lib/setup-claims";
 export type PairingFailureCode = SetupClaimError;
 
 export const PAIRING_FAILURE_COPY: Record<PairingFailureCode, string> = {
-  expired: "That code expired. On the machine, run spawnd possess again.",
+  expired: "That approval expired. On the machine, run spawnd possess again.",
   denied: "The approval was declined in the browser. Nothing was registered.",
   key_conflict:
     "This machine was set up before, under a different SPAWN D account, and that account still holds its identity. Nothing was changed.\n" +

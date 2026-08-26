@@ -182,10 +182,10 @@ pub async fn run_with_ui(
     // The attended path — the operator started in the browser, got a
     // `--setup` one-liner and pasted it here — has a browser already open on
     // the setup screen, already watching this ceremony, and already about to
-    // show this host's fingerprint. A link to open, a code to type and an
-    // offer to launch a browser are all instructions for work they have
-    // finished; printing them turns a one-glance comparison into a page to
-    // read past. All this terminal owes them is the fingerprint to compare.
+    // show this host's fingerprint. A link to open and an offer to launch a
+    // browser are both instructions for work they have finished; printing
+    // them turns a one-glance comparison into a page to read past. All this
+    // terminal owes them is the fingerprint to compare.
     if attended {
         ui.block(
             attended_panel(&identity.fingerprint, ui.width()),
@@ -193,21 +193,8 @@ pub async fn run_with_ui(
         );
     } else {
         ui.block(
-            approval_panel(
-                false,
-                &approve_url,
-                &start.user_code,
-                &identity.fingerprint,
-                ui.width(),
-                can_prompt,
-            ),
-            &approval_plain_lines(
-                false,
-                &approve_url,
-                &start.user_code,
-                &identity.fingerprint,
-                qr.as_deref(),
-            ),
+            approval_panel(false, &approve_url, ui.width(), can_prompt),
+            &approval_plain_lines(false, &approve_url, qr.as_deref()),
         );
     }
 
@@ -280,13 +267,13 @@ pub async fn run_with_ui(
                 let remaining = start.expires_in.saturating_sub(elapsed.as_secs());
                 let minutes = remaining.div_ceil(60);
                 println!(
-                    "spawn: still waiting — {} s elapsed (code expires in {minutes} min)",
+                    "spawn: still waiting — {} s elapsed (link expires in {minutes} min)",
                     elapsed.as_secs()
                 );
             }
             if !hint_shown && elapsed >= Duration::from_secs(60) {
                 hint_shown = true;
-                println!("spawn: Still waiting — is the browser open? The link is above; the code works on any device.");
+                println!("spawn: Still waiting — is the browser open? The link is above; it works on any device.");
             }
         }
 
@@ -364,24 +351,10 @@ pub async fn run_with_ui(
                     // and no way to tell which one matters.
                     //
                     // Reveal the way out instead. A closed tab is recoverable
-                    // from a link and a code; a hijacked screen is only
-                    // confusing.
+                    // from a link; a hijacked screen is only confusing.
                     ui.block(
-                        approval_panel(
-                            false,
-                            &approve_url,
-                            &start.user_code,
-                            &identity.fingerprint,
-                            ui.width(),
-                            false,
-                        ),
-                        &approval_plain_lines(
-                            false,
-                            &approve_url,
-                            &start.user_code,
-                            &identity.fingerprint,
-                            None,
-                        ),
+                        approval_panel(false, &approve_url, ui.width(), false),
+                        &approval_plain_lines(false, &approve_url, None),
                     );
                     ui.log("still waiting. closed the setup page? the link above reopens it.");
                 }
@@ -423,19 +396,23 @@ pub async fn run_with_ui(
 /// The live-region panel for the approval: the only thing on screen the
 /// operator has to act on, given its own frame so it stops competing with the
 /// ceremony's commentary for attention.
+///
+/// It offers one thing: the link. There used to be a pairing code to type into
+/// the app and this machine's fingerprint beside it, and together they read as
+/// three ways to approve where there is one. The link carries the host's key
+/// in its fragment, so the browser or phone that opens it checks the identity
+/// itself — there is nothing here for a person to compare or to type.
 fn approval_panel(
     browser_opened: bool,
     approve_url: &str,
-    user_code: &str,
-    fingerprint: &str,
     width: usize,
     interactive: bool,
 ) -> Vec<String> {
     use crate::tui::{bold, dim, hyperlink, render_panel, wrap_plain, wrap_words};
     let inner = width.saturating_sub(4);
-    // Every row is wrapped to the frame's interior: prose by word, opaque runs
-    // (the URL, the fingerprint) by force. An unwrapped row pushes the border
-    // out and the whole panel goes ragged on a narrow terminal.
+    // Every row is wrapped to the frame's interior: prose by word, the URL by
+    // force. An unwrapped row pushes the border out and the whole panel goes
+    // ragged on a narrow terminal.
     let prose = |text: &str| -> Vec<String> {
         wrap_words(text, inner).iter().map(|l| dim(l, true)).collect()
     };
@@ -453,17 +430,6 @@ fn approval_panel(
             .iter()
             .map(|line| hyperlink(approve_url, &bold(line, true), true)),
     );
-    rows.push(String::new());
-    rows.extend(prose(
-        "no link? in the app choose \"enter a pairing code\" and type:",
-    ));
-    rows.push(format!("    {}", bold(user_code, true)));
-    rows.push(String::new());
-    rows.extend(prose("this machine's key — your browser shows it too:"));
-    rows.extend(fingerprint_rows(fingerprint, inner));
-    rows.extend(prose(
-        "the link carries this key, so opening it checks this for you.",
-    ));
     if interactive {
         // The instruction belongs beside the link it acts on, not adrift below
         // the progress frame where the next repaint would sit on top of it.
@@ -570,15 +536,12 @@ fn attended_plain_lines(fingerprint: &str) -> Vec<String> {
     ]
 }
 
-/// Byte-for-byte what this command printed before the live region existed.
-/// Piped output, CI and `NO_COLOR` all still see exactly this.
-fn approval_plain_lines(
-    browser_opened: bool,
-    approve_url: &str,
-    user_code: &str,
-    fingerprint: &str,
-    qr: Option<&str>,
-) -> Vec<String> {
+/// What piped output, CI and `NO_COLOR` see instead of the panel: the same
+/// single offer — the link — with a line saying why there is nothing else to
+/// compare or type. The pairing code used to be printed here too, and the
+/// app's "enter a pairing code" screen existed only because this terminal
+/// was the one place the code was shown; neither is a way in any more.
+fn approval_plain_lines(browser_opened: bool, approve_url: &str, qr: Option<&str>) -> Vec<String> {
     let mut lines: Vec<String> = approval_link_block(browser_opened, approve_url)
         .trim_end_matches('\n')
         .lines()
@@ -594,13 +557,6 @@ fn approval_plain_lines(
     lines.extend([
         "spawn:   the link carries this host's identity key (the part after '#');".to_owned(),
         "spawn:   your browser checks it automatically before asking you to approve.".to_owned(),
-        "spawn:   asked to compare a fingerprint instead? it must be exactly:".to_owned(),
-        format!("spawn:     {fingerprint}"),
-        String::new(),
-        // The "enter a pairing code" fallback only exists if the code is shown
-        // somewhere, and this terminal is that somewhere.
-        "spawn:   can't use the link? in the app, choose \"enter a pairing code\"".to_owned(),
-        format!("spawn:   and type: {user_code}"),
         String::new(),
         "spawn: waiting for approval…".to_owned(),
     ]);
@@ -609,14 +565,15 @@ fn approval_plain_lines(
 
 /// The live status line, rebuilt each tick so elapsed and expiry stay current.
 ///
-/// The attended wording drops the code: that path never showed one, and naming
-/// its expiry would send the reader looking for a code that isn't on screen.
+/// The attended wording drops the expiry: that path never showed a link, and
+/// naming its expiry would send the reader looking for one that isn't on
+/// screen.
 fn waiting_status(attended: bool, elapsed: u64, expires_in: u64) -> String {
     let minutes = expires_in.saturating_sub(elapsed).div_ceil(60);
     if attended {
         format!("connecting — waiting for you to confirm in your browser · {elapsed}s")
     } else {
-        format!("waiting for approval — {elapsed}s · code expires in {minutes} min")
+        format!("waiting for approval — {elapsed}s · link expires in {minutes} min")
     }
 }
 
@@ -1581,7 +1538,7 @@ mod tests {
         );
         assert!(url.len() > 150, "the fixture must actually overflow");
         for width in [crate::tui::MIN_FRAME_COLUMNS, 72, 92] {
-            let panel = approval_panel(false, &url, "JVG2-BBJ3", "SHA256:abc", width, true);
+            let panel = approval_panel(false, &url, width, true);
             let widths: Vec<usize> = panel.iter().map(|l| crate::tui::display_width(l)).collect();
             assert!(
                 widths.iter().all(|w| *w == width),
@@ -1590,7 +1547,7 @@ mod tests {
         }
         // Every character of the URL must survive the wrap — a truncated
         // approval link is worse than an ugly one.
-        let panel = approval_panel(false, &url, "JVG2-BBJ3", "SHA256:abc", 72, true);
+        let panel = approval_panel(false, &url, 72, true);
         let chunks = crate::tui::wrap_plain(&url, 72 - 4);
         assert_eq!(chunks.concat(), url, "wrapping dropped part of the URL");
         for chunk in &chunks {
@@ -1606,17 +1563,11 @@ mod tests {
     }
 
     #[test]
-    fn plain_approval_output_is_byte_identical_to_the_pre_frame_lines() {
+    fn plain_approval_output_offers_the_link_and_nothing_to_type() {
         // The live region is a tty-only affordance. Anything piped — CI, a
-        // smoke script, `NO_COLOR` — must still see exactly the bytes this
-        // command emitted before the frame existed.
-        let lines = approval_plain_lines(
-            false,
-            "https://spawnd.dev/device?ref=x#k=y",
-            "JVG2-BBJ3",
-            "SHA256:abc",
-            None,
-        );
+        // smoke script, `NO_COLOR` — sees the same single offer as the panel,
+        // byte for byte.
+        let lines = approval_plain_lines(false, "https://spawnd.dev/device?ref=x#k=y", None);
         assert_eq!(
             lines,
             vec![
@@ -1625,21 +1576,39 @@ mod tests {
                 "",
                 "spawn:   the link carries this host's identity key (the part after '#');",
                 "spawn:   your browser checks it automatically before asking you to approve.",
-                "spawn:   asked to compare a fingerprint instead? it must be exactly:",
-                "spawn:     SHA256:abc",
-                "",
-                "spawn:   can't use the link? in the app, choose \"enter a pairing code\"",
-                "spawn:   and type: JVG2-BBJ3",
                 "",
                 "spawn: waiting for approval…",
             ]
         );
     }
 
+    /// One way to approve: the link. The pairing code and the fingerprint
+    /// used to sit under it, and the three together read as three routes
+    /// where there is one — the link carries the key, so nothing here is
+    /// for a person to type or compare.
+    #[test]
+    fn the_approval_panel_offers_the_link_and_nothing_else() {
+        let url = "http://localhost:3000/device?ref=dIF2cG14Xj3maek4#k=WsMbPmvzNwEnoPV1I";
+        for interactive in [true, false] {
+            let panel = approval_panel(false, url, 88, interactive);
+            let plain = strip_sgr(&panel.join("\n")).to_lowercase();
+            assert!(plain.contains("open this link on any device"), "{plain}");
+            assert!(plain.contains("device?ref=dif2cg14xj3maek4"), "{plain}");
+            assert!(!plain.contains("pairing code"), "a code to type is a second way in: {plain}");
+            assert!(!plain.contains("sha256"), "a fingerprint to compare is a third: {plain}");
+            assert!(!plain.contains("key"), "{plain}");
+            assert!(!plain.contains("no link"), "{plain}");
+        }
+        let plain = approval_plain_lines(false, url, None).join("\n").to_lowercase();
+        assert!(!plain.contains("pairing code"), "{plain}");
+        assert!(!plain.contains("sha256"), "{plain}");
+        assert!(!plain.contains("type"), "{plain}");
+    }
+
     #[test]
     fn the_approval_link_is_clickable_and_says_how_to_open_it() {
         let url = "http://localhost:3000/device?ref=dIF2cG14Xj3maek4#k=WsMbPmvzNwEnoPV1I";
-        let panel = approval_panel(false, url, "568H-L6FT", "SHA256:6dgqw7", 88, true);
+        let panel = approval_panel(false, url, 88, true);
         let joined = panel.join("\n");
 
         // OSC 8, so the terminal makes the link clickable rather than leaving
@@ -1650,13 +1619,13 @@ mod tests {
         assert!(joined.contains("press Enter to open it here"));
 
         // Without a keyboard there is nothing to press, so the line is absent.
-        let headless = approval_panel(false, url, "568H-L6FT", "SHA256:6dgqw7", 88, false);
+        let headless = approval_panel(false, url, 88, false);
         assert!(!headless.join("\n").contains("press Enter"));
     }
 
     #[test]
     fn the_opened_browser_variant_keeps_its_own_lead_lines() {
-        let lines = approval_plain_lines(true, "https://x/y", "AAAA-BBBB", "SHA256:z", None);
+        let lines = approval_plain_lines(true, "https://x/y", None);
         assert_eq!(lines[0], "spawn: opened your browser to approve this host.");
         assert_eq!(lines[1], "spawn:   didn't open? use this link on any device:");
         assert_eq!(lines[2], "spawn:   https://x/y");
@@ -1664,7 +1633,7 @@ mod tests {
 
     #[test]
     fn a_qr_is_carried_through_the_plain_lines_unaltered() {
-        let lines = approval_plain_lines(false, "https://x/y", "A-B", "SHA256:z", Some("##\n#.\n"));
+        let lines = approval_plain_lines(false, "https://x/y", Some("##\n#.\n"));
         assert!(lines.contains(&"##".to_owned()) && lines.contains(&"#.".to_owned()));
         assert!(lines
             .iter()
@@ -1675,21 +1644,21 @@ mod tests {
     fn the_waiting_status_counts_down_the_real_expiry() {
         assert_eq!(
             waiting_status(false, 0, 1800),
-            "waiting for approval — 0s · code expires in 30 min"
+            "waiting for approval — 0s · link expires in 30 min"
         );
         assert_eq!(
             waiting_status(false, 33, 1800),
-            "waiting for approval — 33s · code expires in 30 min"
+            "waiting for approval — 33s · link expires in 30 min"
         );
         // Past expiry must not underflow into a huge number.
         assert_eq!(
             waiting_status(false, 9_000, 1800),
-            "waiting for approval — 9000s · code expires in 0 min"
+            "waiting for approval — 9000s · link expires in 0 min"
         );
     }
 
-    /// The attended line never names a code expiry: that path shows no code,
-    /// and counting one down sends the reader hunting for it.
+    /// The attended line never names an expiry: that path shows no link, and
+    /// counting one down sends the reader hunting for it.
     #[test]
     fn the_attended_status_says_connecting_and_mentions_no_code() {
         let line = waiting_status(true, 12, 1800);
@@ -1747,7 +1716,6 @@ mod tests {
     #[test]
     fn a_fingerprint_stands_alone_wherever_it_is_shown() {
         for panel in [
-            approval_panel(false, "https://spawnd.dev/device?ref=x", "AAAA-BBBB", "SHA256:zzz", 72, false),
             attended_panel("SHA256:zzz", 72),
             browser_fingerprint_panel("SHA256:zzz", 72),
         ] {

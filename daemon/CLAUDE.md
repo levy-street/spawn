@@ -95,13 +95,15 @@ browser is already watching this ceremony and already showing this host's
 fingerprint.
 
 - **Attended** shows `attended_panel` — the fingerprint and nothing else — and
-  never opens a browser, prints a link, prints a pairing code, or renders a QR.
-  All of those are instructions for work the reader has finished. The web
-  copy on the other side is written to match, so changing one means changing
-  both. After 25 s with no approval the link and code are *revealed* as a
-  fallback (a closed tab has to be recoverable), never auto-opened.
-- **Unattended** — a bare `spawnd possess` — is the old path unchanged: link,
-  code, optional QR, and Enter to open a browser.
+  never opens a browser, prints a link, or renders a QR. All of those are
+  instructions for work the reader has finished. The web copy on the other
+  side is written to match, so changing one means changing both. After 25 s
+  with no approval the link is *revealed* as a fallback (a closed tab has to
+  be recoverable), never auto-opened.
+- **Unattended** — a bare `spawnd possess` — offers the link and nothing
+  else: the link, an optional QR of it, and Enter to open it here. The pairing
+  code and the fingerprint used to be printed beside it and read as three
+  ways to approve; the link carries the key, so the other side checks it.
 
 ## Where a server URL comes from
 

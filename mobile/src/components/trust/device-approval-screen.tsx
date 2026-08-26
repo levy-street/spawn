@@ -94,7 +94,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
     mutationFn: (deviceId: string) => requestDeviceApproval(deviceId),
     onError: () =>
       setError(
-        "Could not tell your other devices that this one is waiting. Approve it from one of them, or use a pairing code below.",
+        "Could not tell your other devices that this one is waiting. Approve it from one of them, or connect a host from this phone below.",
       ),
   });
 
@@ -173,7 +173,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
                 ? "You can go back and open a terminal. This screen keeps watching in case that changes."
                 : waiting
                   ? "Open SPAWN D on a device that already works. A prompt is waiting there."
-                  : "A host only answers devices whose key it has pinned, and no other device is registered to vouch for this one. Use a pairing code below."}
+                  : "A host only answers devices whose key it has pinned, and no other device is registered to vouch for this one. Connect a host from this phone below."}
             </Text>
           </View>
         </View>
@@ -281,11 +281,11 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
           <ListBlock>
             <View style={styles.steps}>
               <Text color="mutedForeground" variant="body">
-                Run <Text variant="mono">spawnd possess</Text> on the host and enter the code it
-                prints. That approves this device directly, without another one.
+                Connect a host from this phone: run the command it gives you on the machine, then
+                approve the host here. That trusts this device directly, without another one.
               </Text>
               <Button onPress={() => router.push("/onboarding/host")} variant="outline">
-                Enter a pairing code
+                Connect a host
               </Button>
             </View>
           </ListBlock>
