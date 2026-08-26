@@ -221,6 +221,16 @@ INSTALL_SCRIPT = dedent(
       exit 1
     }
 
+    # A phase heading, so the installer's lines and the daemon's own frame read
+    # as one sequence. Accented only on a terminal; piped output stays plain.
+    rule() {
+      if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+        printf '\033[31m── %s ──────────────────────────────────────────\033[0m\n' "$1"
+      else
+        printf '%s\n' "-- $1 --"
+      fi
+    }
+
     need() {
       command -v "$1" >/dev/null 2>&1
     }
@@ -533,6 +543,7 @@ INSTALL_SCRIPT = dedent(
       WORKER_URL="${SERVER%/}/api/install/spawn-worker/$TARGET"
       TMP_BIN="$BIN.tmp.$$"
       TMP_WORKER="$WORKER_BIN.tmp.$$"
+      rule "INSTALLING SPAWN D"
       say "downloading prebuilt spawnd + spawn-worker for $TARGET"
       if curl -fsSL "$URL" -o "$TMP_BIN" && curl -fsSL "$WORKER_URL" -o "$TMP_WORKER"; then
         if ! verify_prebuilt "$TMP_BIN" spawnd || ! verify_prebuilt "$TMP_WORKER" spawn-worker; then
@@ -540,6 +551,7 @@ INSTALL_SCRIPT = dedent(
           say "prebuilt checksum verification failed; falling back to source"
           return 1
         fi
+        say "verified both binaries against the server's signed manifest"
         chmod 755 "$TMP_BIN"
         chmod 755 "$TMP_WORKER"
         if "$TMP_BIN" --version >/dev/null 2>&1; then
@@ -688,6 +700,33 @@ INSTALL_SCRIPT = dedent(
       say "logs: tail -f $STATE_DIR/spawnd.log"
     }
 
+    # `curl … | sh` leaves stdin pointing at the pipe the script itself came
+    # down, so a prompt in spawnd would read EOF instead of the operator. Hand
+    # it the controlling terminal where there is one; a headless or CI install
+    # has no /dev/tty and keeps the old non-interactive behaviour.
+    # `[ -r /dev/tty ]` is not the question. The node exists and is readable on
+    # any Unix; what matters is whether this process has a *controlling*
+    # terminal behind it, and opening it is the only way to find out — without
+    # one the open fails with ENXIO ("Device not configured"), which under
+    # `set -e` took the whole install down instead of falling back. So try the
+    # redirect, quietly, and let the answer decide.
+    have_tty() { { : < /dev/tty; } 2>/dev/null; }
+
+    run_attached() {
+      if have_tty; then
+        "$@" < /dev/tty
+      else
+        "$@"
+      fi
+    }
+
+    exec_attached() {
+      if have_tty; then
+        exec "$@" < /dev/tty
+      fi
+      exec "$@"
+    }
+
     mkdir -p "$BIN_DIR"
     if ! install_prebuilt_spawnd; then
       [ "$PREBUILT_ONLY" = "0" ] || die "prebuilt daemon unavailable for this host"
@@ -710,20 +749,20 @@ INSTALL_SCRIPT = dedent(
 
     # --no-start: register the host but do not start it.
     if [ "$START_AFTER_LOGIN" = "0" ]; then
-      "$BIN" --server "$SERVER" login --no-run
+      run_attached "$BIN" --server "$SERVER" login --no-run
       say "login complete; not starting daemon because --no-start was set"
       exit 0
     fi
 
     # --foreground: register, then run in the foreground.
     if [ "$FOREGROUND" = "1" ]; then
-      "$BIN" --server "$SERVER" login --no-run
+      run_attached "$BIN" --server "$SERVER" login --no-run
       exec "$BIN" --server "$SERVER" run
     fi
 
     # --no-service: register, then background without a service manager.
     if [ "$USE_SERVICE" = "0" ]; then
-      "$BIN" --server "$SERVER" login --no-run
+      run_attached "$BIN" --server "$SERVER" login --no-run
       start_background
       say "done"
       exit 0
@@ -732,8 +771,8 @@ INSTALL_SCRIPT = dedent(
     # Default: possess runs the login flow (if needed) and installs a supervised
     # background service, idempotently — it owns the service lifecycle now.
     if [ "$NEW_ACCOUNT" = "1" ]; then
-      exec "$BIN" --server "$SERVER" possess --new-account
+      exec_attached "$BIN" --server "$SERVER" possess --new-account
     fi
-    exec "$BIN" --server "$SERVER" possess
+    exec_attached "$BIN" --server "$SERVER" possess
     """
 ).lstrip()
