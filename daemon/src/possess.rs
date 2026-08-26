@@ -14,6 +14,7 @@
 //! relocated and enumerated without a keyring dependency (headless hosts have
 //! none anyway; macOS already defaults it off).
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,15 +25,135 @@ use url::Url;
 use crate::cli::{ExorciseArgs, LoginArgs, PossessArgs};
 use crate::{config, creds, login, service};
 
+/// `possess` runs the login ceremony's steps and then its own. The shared
+/// prefix must stay aligned with `login::LOGIN_STEPS` — a test pins it — so an
+/// index means the same thing whichever command opened the live region.
+const POSSESS_STEPS: [&str; 4] = [
+    "Register this machine",
+    "Approve in your browser",
+    "Store credentials",
+    "Start background daemon",
+];
+
+/// The hosted service, as the sign-in sheet in both apps names it.
+const HOSTED_SERVER: &str = "https://spawnd.dev";
+
+/// Ask where this machine should report, the way the app's sign-in sheet does.
+///
+/// The offer depends on whether anyone has already named a server. An explicit
+/// `--server` — which `install.sh` always bakes with the origin the one-liner
+/// was fetched from — *is* the choice: someone ran a command from that server
+/// on purpose, and it is the strongest signal there is. So it leads and Enter
+/// accepts it, with the hosted service beside it for anyone who meant to end
+/// up there. Defaulting to spawnd.dev regardless meant a `curl … localhost:3000
+/// | sh` registered against the hosted service on one keypress, which is the
+/// opposite of what running that command said.
+///
+/// With nothing named, there is no such signal, and the hosted service leads —
+/// self-hosting is then the deliberate choice, and the only path that has to
+/// ask for a URL. Non-interactive installs never see any of this.
+fn choose_server(server_cli: Option<String>, setup_token: Option<&str>) -> Result<Url> {
+    let resolved = config::server_url(server_cli.clone())?;
+    let offer = server_offer(
+        server_cli.as_deref(),
+        &resolved,
+        setup_token,
+        std::io::stdin().is_terminal(),
+    );
+    let hosted = hosted_server();
+    match offer {
+        ServerOffer::Settled(server) => Ok(server),
+        ServerOffer::Named(named) => {
+            // Two real answers, no URL to type: this machine reports where the
+            // command came from, or to the hosted service. Any third server is
+            // reached by naming it — `spawnd --server <url> possess` — which
+            // arrives back here as the leading option.
+            let label = origin_label(&named);
+            let picked = crate::tui::prompt_choice(
+                "WHERE THIS MACHINE REPORTS",
+                &[
+                    (label.as_str(), "where this command came from"),
+                    ("spawnd.dev", "the hosted service"),
+                ],
+                0,
+            );
+            Ok(if picked == 0 { named } else { hosted })
+        }
+        ServerOffer::Unnamed => {
+            let picked = crate::tui::prompt_choice(
+                "WHERE THIS MACHINE REPORTS",
+                &[
+                    ("spawnd.dev", "the hosted service"),
+                    ("Host yourself", "a server you run"),
+                ],
+                0,
+            );
+            if picked == 0 {
+                return Ok(hosted);
+            }
+            // Nothing named a server, so there is no origin to prefill — offer
+            // the local dev address and re-ask rather than failing on a typo.
+            loop {
+                let answer = crate::tui::prompt_line("server URL", "http://localhost:3000");
+                match Url::parse(answer.trim()) {
+                    Ok(url) if url.has_host() => return Ok(url),
+                    _ => crate::tui::log_line(&format!("{answer:?} is not a URL — try again")),
+                }
+            }
+        }
+    }
+}
+
+/// What to put in front of the operator — decided without touching the
+/// terminal, so every branch is reachable from a test.
+#[derive(Debug, PartialEq, Eq)]
+enum ServerOffer {
+    /// Already decided; ask nothing.
+    Settled(Url),
+    /// An origin was named for us. It leads; the hosted service is the other answer.
+    Named(Url),
+    /// Nothing named one. The hosted service leads, and self-hosting types a URL.
+    Unnamed,
+}
+
+fn server_offer(
+    server_cli: Option<&str>,
+    resolved: &Url,
+    setup_token: Option<&str>,
+    interactive: bool,
+) -> ServerOffer {
+    // No terminal to ask at, or a token that already answers: take the value.
+    if !interactive || setup_token.is_some() {
+        return ServerOffer::Settled(resolved.clone());
+    }
+    if server_cli.is_some() && resolved.origin() != hosted_server().origin() {
+        return ServerOffer::Named(resolved.clone());
+    }
+    ServerOffer::Unnamed
+}
+
+fn hosted_server() -> Url {
+    Url::parse(HOSTED_SERVER).expect("the hosted URL is a constant")
+}
+
+/// A server as a person would name it: host, and the port when it is not the
+/// scheme's default. `https://spawnd.dev/` → `spawnd.dev`;
+/// `http://localhost:3000/` → `localhost:3000`.
+fn origin_label(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("this server");
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    }
+}
+
+fn possess_ui() -> crate::tui::Ui {
+    crate::tui::Ui::start(&login::ceremony_title(), &POSSESS_STEPS, login::WAITING_HINT)
+}
+
 pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()> {
     force_file_store();
     crate::tui::print_logo();
-    if crate::tui::styled_stdout() {
-        println!(
-            "{}",
-            crate::tui::step_line(1, 2, "Registering this machine")
-        );
-    }
 
     // Explicit --config-dir → that dir is the instance, no per-account derivation.
     if explicit_config_dir() {
@@ -43,7 +164,8 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
     // Silent resume: exactly one existing per-account registration. Unreadable
     // credentials only cost the stored-server fallback, never the resume.
     let existing = account_dirs_with_creds(&base)?;
-    let stage_login = staged_login_required(existing.len(), args.new_account);
+    let stage_login =
+        staged_login_required(existing.len(), args.new_account, args.setup_token.as_deref());
     if existing.len() == 1 && !stage_login {
         let dir = &existing[0];
         std::env::set_var("SPAWN_CONFIG_DIR", dir);
@@ -73,15 +195,27 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
         return Ok(());
     }
 
-    let server = config::server_url(server_cli.clone())?;
+    let server = choose_server(server_cli.clone(), args.setup_token.as_deref())?;
 
     // One auth flow, staged, then promoted to <base>/<account_id>.
     let staging = base.join(".possess-staging");
     let _ = std::fs::remove_dir_all(&staging);
     std::env::set_var("SPAWN_CONFIG_DIR", &staging);
 
-    let outcome = login::run(
-        server_cli.clone(),
+    let ui = possess_ui();
+    // Named before the login consumes it: the closing panel wants to say which
+    // machine this was, and the ceremony resolves the same value.
+    let machine = args
+        .host_name
+        .clone()
+        .unwrap_or_else(login::detect_hostname);
+    let outcome = login::run_with_ui(
+        // The answer to "where does this machine report" is the answer for the
+        // whole command. Passing `server_cli` here instead registered against
+        // the installer's origin while the background service was installed for
+        // the *chosen* one, and a daemon whose unit disagrees with its
+        // credentials never starts — see `service::registered_server`.
+        Some(server.to_string()),
         LoginArgs {
             host_name: args.host_name,
             no_run: true,
@@ -89,6 +223,7 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
             qr: args.qr,
             no_qr: args.no_qr,
         },
+        &ui,
     )
     .await
     .context("registering this host")?;
@@ -119,11 +254,90 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
     }
 
     std::env::set_var("SPAWN_CONFIG_DIR", &final_dir);
-    print_starting_step();
-    service::install(&final_dir, server.as_str())
-        .map_err(|error| login::background_service_error(&error))?;
-    println!("spawn: possessed as {account}. daemon running in the background.");
+    ui.begin(3, "[ RUNNING ]");
+    service::install(&final_dir, server.as_str()).map_err(|error| {
+        ui.fail(3, "not started");
+        login::background_service_error(&error)
+    })?;
+    ui.complete(3, "running");
+    ui.finish();
+    print_possessed(&machine, &account);
     Ok(())
+}
+
+/// The last thing the ceremony says, and the only screen that answers "what
+/// now?".
+///
+/// Everything up to here was a live region the reader watched. When it stops
+/// moving they are left holding a terminal with no idea whether it still
+/// matters — so say the two things they need: this window is finished with,
+/// and here is how to talk to the daemon that is still running.
+fn print_possessed(machine: &str, account: &str) {
+    let width = crate::tui::terminal_width();
+    if !crate::tui::styled_stdout() {
+        for line in possessed_plain_lines(machine, account) {
+            println!("{line}");
+        }
+        return;
+    }
+    for line in possessed_panel(machine, account, width) {
+        println!("{line}");
+    }
+    println!();
+}
+
+fn possessed_panel(machine: &str, account: &str, width: usize) -> Vec<String> {
+    use crate::tui::{dim, render_choice_row, render_panel, wrap_words};
+    let inner = width.saturating_sub(4);
+    let prose = |text: &str| -> Vec<String> {
+        wrap_words(text, inner)
+            .iter()
+            .map(|line| dim(line, true))
+            .collect()
+    };
+    let mut rows = vec![String::new()];
+    rows.extend(prose(&format!(
+        "{machine} is possessed. you can close this terminal — SPAWN D keeps running in the background and comes back with the machine."
+    )));
+    rows.push(String::new());
+    rows.extend(prose("when you need it:"));
+    for (index, (command, blurb)) in POSSESSED_COMMANDS.iter().enumerate() {
+        rows.push(render_choice_row(
+            false,
+            index + 1,
+            command,
+            blurb,
+            inner,
+            true,
+        ));
+    }
+    rows.push(String::new());
+    rows.extend(prose(&format!("signed in as {account}.")));
+    render_panel("POSSESSED", &rows, width, true)
+}
+
+/// The commands worth knowing on day one, in the order someone reaches for
+/// them. Anything rarer is `spawnd --help`, which the last row points at.
+const POSSESSED_COMMANDS: [(&str, &str); 4] = [
+    ("spawnd status", "is it running, and connected?"),
+    ("spawnd reconnect", "restart it after a network change"),
+    ("spawnd login", "approve a new browser or device"),
+    ("spawnd --help", "everything else"),
+];
+
+/// Piped, `NO_COLOR` and CI keep the prefixed-line form.
+fn possessed_plain_lines(machine: &str, account: &str) -> Vec<String> {
+    let mut lines = vec![
+        format!("spawn: {machine} is possessed ({account})."),
+        "spawn: you can close this terminal — SPAWN D runs in the background.".to_owned(),
+        String::new(),
+    ];
+    lines.extend(
+        POSSESSED_COMMANDS
+            .iter()
+            .map(|(command, blurb)| format!("spawn:   {command} — {blurb}")),
+    );
+    lines
 }
 
 async fn possess_dir(server_cli: Option<String>, args: PossessArgs, dir: &Path) -> Result<()> {
@@ -137,32 +351,55 @@ async fn possess_dir(server_cli: Option<String>, args: PossessArgs, dir: &Path) 
             .as_ref()
             .and_then(|creds| creds.server_url.as_deref()),
     )?;
-    if resumed {
-        println!("spawn: already possessed; ensuring the background daemon is running.");
-    } else {
-        login::run(
-            server_cli,
-            LoginArgs {
-                host_name: args.host_name,
-                no_run: true,
-                setup_token: args.setup_token,
-                qr: args.qr,
-                no_qr: args.no_qr,
-            },
-        )
-        .await
-        .context("registering this host")?;
+    // A resume has no ceremony to show, so it keeps the plain step line.
+    let ui = (!resumed).then(possess_ui);
+    let args_host_name = args.host_name.clone();
+    match &ui {
+        Some(ui) => {
+            login::run_with_ui(
+                server_cli,
+                LoginArgs {
+                    host_name: args.host_name,
+                    no_run: true,
+                    setup_token: args.setup_token,
+                    qr: args.qr,
+                    no_qr: args.no_qr,
+                },
+                ui,
+            )
+            .await
+            .context("registering this host")?;
+            ui.begin(3, "[ RUNNING ]");
+        }
+        None => {
+            println!("spawn: already possessed; ensuring the background daemon is running.");
+            print_starting_step();
+        }
     }
-    print_starting_step();
-    service::install(dir, server.as_str())
-        .map_err(|error| login::background_service_error(&error))?;
-    println!(
-        "spawn: possessed. daemon running in the background ({}).",
-        service::instance_name(dir)
-    );
+    service::install(dir, server.as_str()).map_err(|error| {
+        if let Some(ui) = &ui {
+            ui.fail(3, "not started");
+        }
+        login::background_service_error(&error)
+    })?;
+    if let Some(ui) = ui {
+        ui.complete(3, "running");
+        ui.finish();
+    }
     if resumed {
+        crate::tui::log_line(&format!(
+            "possessed. daemon running in the background ({}).",
+            service::instance_name(dir)
+        ));
         println!("{}", relogin_hint(&server, dir));
         print_auth_note(dir);
+    } else {
+        // A ceremony just ran here too, so it ends the same way: this terminal
+        // is done, and here is how to reach the daemon that is not.
+        print_possessed(
+            &args_host_name.unwrap_or_else(login::detect_hostname),
+            &service::instance_name(dir),
+        );
     }
     Ok(())
 }
@@ -361,8 +598,25 @@ fn resume_line(account: &str) -> String {
     format!("spawn: already possessed ({account}); daemon running in the background.")
 }
 
-fn staged_login_required(existing_instances: usize, new_account: bool) -> bool {
-    new_account || existing_instances == 0
+/// Whether this run has to hold its own auth ceremony rather than resuming an
+/// instance already on the machine.
+///
+/// A setup token forces one. It is minted by one signed-in browser for one
+/// account, and presenting it says "this machine, that account" — a request a
+/// machine that happens to hold some *other* account's instance cannot answer
+/// by resuming it. Ignoring the token left the browser's setup screen waiting
+/// for a ceremony that was never going to start, while the terminal cheerfully
+/// reported the unrelated account it had resumed instead.
+///
+/// If the ceremony turns out to name an account already registered here, the
+/// caller adopts that instance — the token is still redeemed, so the screen
+/// that issued it resolves either way.
+fn staged_login_required(
+    existing_instances: usize,
+    new_account: bool,
+    setup_token: Option<&str>,
+) -> bool {
+    new_account || setup_token.is_some() || existing_instances == 0
 }
 
 /// Keep an account id safe as a directory component. Server account ids are
@@ -411,6 +665,120 @@ mod tests {
         assert!(hint.contains("--config-dir \"/Users/x/Library/Application Support/spawn/acct-1\""));
     }
 
+    fn url(raw: &str) -> Url {
+        Url::parse(raw).expect("a test URL")
+    }
+
+    /// A setup token belongs to the server whose signed-in browser minted it.
+    /// Prompting would offer to send it somewhere it cannot be redeemed.
+    #[test]
+    fn a_setup_token_decides_the_server_without_asking() {
+        let local = url("http://localhost:3000");
+        assert_eq!(
+            server_offer(
+                Some("http://localhost:3000"),
+                &local,
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                true,
+            ),
+            ServerOffer::Settled(local)
+        );
+    }
+
+    /// The regression this exists for: `curl … localhost:3000 | sh` used to
+    /// offer spawnd.dev as the default, so one Enter registered the machine
+    /// against the hosted service — the opposite of what that command said.
+    #[test]
+    fn an_installer_origin_leads_the_choice_instead_of_the_hosted_service() {
+        let local = url("http://localhost:3000");
+        assert_eq!(
+            server_offer(Some("http://localhost:3000"), &local, None, true),
+            ServerOffer::Named(local)
+        );
+    }
+
+    /// Installing from spawnd.dev names spawnd.dev, which is not a second
+    /// answer beside itself — that is the plain hosted-or-self-host offer.
+    #[test]
+    fn the_hosted_origin_is_not_offered_twice() {
+        assert_eq!(
+            server_offer(
+                Some("https://spawnd.dev"),
+                &url("https://spawnd.dev"),
+                None,
+                true
+            ),
+            ServerOffer::Unnamed
+        );
+        // Nobody named one: the dev fallback is not a choice anyone made.
+        assert_eq!(
+            server_offer(None, &url("http://localhost:8000"), None, true),
+            ServerOffer::Unnamed
+        );
+    }
+
+    /// No terminal — `curl … | sh` with no /dev/tty, CI, a remote install —
+    /// takes the resolved value rather than blocking on a prompt.
+    #[test]
+    fn a_headless_install_is_never_asked() {
+        let local = url("http://localhost:3000");
+        assert_eq!(
+            server_offer(Some("http://localhost:3000"), &local, None, false),
+            ServerOffer::Settled(local)
+        );
+    }
+
+    #[test]
+    fn an_origin_reads_as_a_person_would_write_it() {
+        assert_eq!(origin_label(&url("https://spawnd.dev/")), "spawnd.dev");
+        assert_eq!(origin_label(&url("http://localhost:3000/")), "localhost:3000");
+        // Default ports stay implicit; a non-default one is part of the name.
+        assert_eq!(origin_label(&url("http://example.test/")), "example.test");
+        assert_eq!(origin_label(&url("https://example.test:8443/")), "example.test:8443");
+    }
+
+    /// The ceremony's last screen has one job: release the reader. Saying the
+    /// terminal can be closed, and how to reach the daemon afterwards, is the
+    /// difference between "done" and "is this still doing something?".
+    #[test]
+    fn the_closing_panel_releases_the_terminal_and_names_the_commands() {
+        let rows = possessed_panel("Charlies-MacBook-Pro.local", "bad19924", 76);
+        let plain: Vec<String> = rows
+            .iter()
+            .map(|row| crate::tui::strip_styles(row))
+            .collect();
+        let text = plain.join("\n");
+        assert!(text.contains("close this terminal"));
+        assert!(text.contains("Charlies-MacBook-Pro.local"));
+        assert!(text.contains("bad19924"));
+        for (command, _) in POSSESSED_COMMANDS {
+            assert!(text.contains(command), "missing {command}");
+        }
+        let widths: Vec<usize> = rows.iter().map(|r| crate::tui::display_width(r)).collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "ragged panel: {widths:?}"
+        );
+    }
+
+    /// Piped and CI output stays the prefixed-line form, and still says the
+    /// two things that matter.
+    #[test]
+    fn the_plain_close_out_says_the_same_thing_without_a_frame() {
+        let lines = possessed_plain_lines("mac.local", "bad19924");
+        let text = lines.join("\n");
+        assert!(text.contains("spawn: mac.local is possessed (bad19924)."));
+        assert!(text.contains("close this terminal"));
+        assert!(text.contains("spawnd status"));
+        assert!(lines.iter().all(|l| l.is_empty() || l.starts_with("spawn:")));
+    }
+
+    #[test]
+    fn possess_reuses_the_login_step_prefix_so_indices_mean_one_thing() {
+        assert_eq!(&POSSESS_STEPS[..3], &login::LOGIN_STEPS[..]);
+        assert_eq!(POSSESS_STEPS[3], "Start background daemon");
+    }
+
     #[test]
     fn plain_resume_line_is_byte_stable() {
         assert_eq!(
@@ -421,11 +789,23 @@ mod tests {
 
     #[test]
     fn new_account_forces_staging_and_plain_possess_never_adds_one_implicitly() {
-        assert!(staged_login_required(0, false));
-        assert!(!staged_login_required(1, false));
-        assert!(!staged_login_required(3, false));
-        assert!(staged_login_required(1, true));
-        assert!(staged_login_required(3, true));
+        assert!(staged_login_required(0, false, None));
+        assert!(!staged_login_required(1, false, None));
+        assert!(!staged_login_required(3, false, None));
+        assert!(staged_login_required(1, true, None));
+        assert!(staged_login_required(3, true, None));
+    }
+
+    /// The regression: signing up a second account in the browser, pasting its
+    /// `--setup` command on a machine that already held a different account,
+    /// silently resumed the old one. The terminal said "already possessed for
+    /// <the other account>" and the browser waited for ever.
+    #[test]
+    fn a_setup_token_always_holds_its_own_ceremony() {
+        let token = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(staged_login_required(1, false, token));
+        assert!(staged_login_required(3, false, token));
+        assert!(staged_login_required(0, false, token));
     }
 
     #[test]
