@@ -11,7 +11,7 @@ import { b64urlEncode } from "./sas";
 // The shared SAS algorithm (daemon/src/sas.rs, web/src/lib/sas.ts) produces
 // "449 728" (six digits) for these vectors. The device↔device ceremony uses the
 // same algorithm truncated to FOUR digits — the last four of the six-digit
-// value, grouped 2+2: 449728 % 10000 = 9728 -> "97 28".
+// value, ungrouped: 449728 % 10000 = 9728 -> "9728".
 const KEY_I = b64urlEncode(new Uint8Array(32).fill(1));
 const KEY_J = b64urlEncode(new Uint8Array(32).fill(2));
 const NONCE_I = b64urlEncode(new Uint8Array(32).fill(3));
@@ -19,7 +19,7 @@ const NONCE_J = b64urlEncode(new Uint8Array(32).fill(4));
 
 describe("add-device ceremony SAS", () => {
   test("derives the four-digit device number from the shared SAS vector", async () => {
-    expect(await ceremonySas(KEY_I, KEY_J, NONCE_I, NONCE_J)).toBe("97 28");
+    expect(await ceremonySas(KEY_I, KEY_J, NONCE_I, NONCE_J)).toBe("9728");
   });
 
   test("a matching revealed nonce opens the commitment", async () => {
@@ -44,6 +44,6 @@ describe("add-device ceremony SAS", () => {
     const initiatorNumber = await ceremonySas(KEY_I, KEY_J, nIWire, nJWire);
     const joinerNumber = await ceremonySas(KEY_I, KEY_J, nIWire, nJWire);
     expect(initiatorNumber).toBe(joinerNumber);
-    expect(initiatorNumber).toMatch(/^\d{2} \d{2}$/);
+    expect(initiatorNumber).toMatch(/^\d{4}$/);
   });
 });

@@ -47,7 +47,7 @@ describe("committed-ephemeral SAS", () => {
         encodeBase64Url(THREES),
         encodeBase64Url(FOURS),
       ),
-    ).toBe("97 28");
+    ).toBe("9728");
   });
 
   test("a matching revealed nonce opens the commitment; a substituted one does not", () => {
@@ -79,6 +79,6 @@ describe("committed-ephemeral SAS", () => {
     const a = ceremonySas(keyI, keyJ, encodeBase64Url(nI), encodeBase64Url(nJ));
     const b = ceremonySas(keyI, keyJ, encodeBase64Url(nI), encodeBase64Url(nJ));
     expect(a).toBe(b);
-    expect(a).toMatch(/^\d{2} \d{2}$/u);
+    expect(a).toMatch(/^\d{4}$/u);
   });
 });
