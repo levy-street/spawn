@@ -7,6 +7,7 @@ import { FolderPicker } from "@/components/launcher/folder-picker";
 import { pathBasename } from "@/components/launcher/folder-picker-logic";
 import { HostStep } from "@/components/launcher/host-step";
 import { type LaunchHome, resolveLaunchHome } from "@/components/launcher/launcher-selection";
+import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
 import { Button } from "@/components/ui/button";
 import { DrawerRow, DrawerSeparator } from "@/components/ui/drawer-row";
 import { Icon } from "@/components/ui/icon";
@@ -96,6 +97,9 @@ export function LauncherSheet({
   const theme = useTheme();
   const data = useLauncherData(workspaceId, visible);
   const launch = useLaunchSession();
+  // Listing a machine's folders needs that machine to have approved this
+  // device, so the approval comes before the browse rather than as its error.
+  const gate = useDeviceApprovalGate();
   const addWidget = useAddFilesWidget();
   const cancelRequested = useRef(false);
   const [step, setStep] = useState<LauncherStep>("choose");
@@ -395,10 +399,12 @@ export function LauncherSheet({
             hosts={data.hosts}
             onSelect={(host) => {
               haptics.selection();
-              setPickerHost(host);
-              setHostTransport(null);
-              setHostTransportState("idle");
-              setStep("folder");
+              gate.guard(host.id, () => {
+                setPickerHost(host);
+                setHostTransport(null);
+                setHostTransportState("idle");
+                setStep("folder");
+              });
             }}
             selectedHostId={pickerHost?.id ?? null}
           />
@@ -478,6 +484,7 @@ export function LauncherSheet({
           />
         ) : null}
       </Sheet>
+      {gate.overlay}
       {updatePrompt ? (
         <HostUpdateDialog
           host={updatePrompt.host}
