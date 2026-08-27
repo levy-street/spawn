@@ -54,7 +54,14 @@ infrastructure, they're looking for a way in.
    diagram / ledger table / numbered steps), custom-JSX escape hatch per page,
    no shared H2 phrasing between siblings.
 7. One primary ICP per page, written in that ICP's register (see table).
-8. GATED = named verification required before the page exists.
+8. **Serve the query before the pitch.** Write for someone who has never
+   heard of spawnd: open with genuinely usable, product-free content — the
+   pattern, the honest comparison, the fix — including what their existing
+   tools (iTerm2, tmux, SSH) already cover. spawnd enters only where the
+   taught approach runs out. A reader who bounces must still leave better
+   off; a reader who stays should feel the product arrive as the obvious
+   next step, not the premise.
+9. GATED = named verification required before the page exists.
 
 ## URL policy
 
@@ -216,10 +223,13 @@ pages targeting category head terms, each racking its spokes.
 templates inherit it:** hero = heavy branding, minimal words — a dimmed
 full-bleed ink print (family-mapped: grid-ink jobs · pocket-ink device ·
 hosts-ink machine · handoff-ink comparisons · hero-ink hubs) under exactly
-the keyword H1 and one subheading, breadcrumb small above, no CTAs; body =
-general capability statements, never one staged demo (a product capture may
-appear once, framed and captioned as an example); one CTA moment ("Start")
-near the end; quiet small-type FAQ; ~350-word budget above the FAQ; single
+the keyword H1 and one subheading (phrased as the page's promise to the
+searcher, not the product's), breadcrumb small above, no CTAs; body = the
+teach-first arc of Rule 8 — the pattern, taught neutrally → where it honestly
+breaks → spawnd as the substrate that holds it (a product capture may appear
+once at that turn, framed and captioned as an example); one CTA moment
+("Start") near the end; quiet small-type FAQ; ~550-word budget above the FAQ
+with the product-free half leading; single
 shared rail and hairline borders. Reference implementation:
 `web/src/components/seo/templates/JobPage.tsx` + `/run-agents-in-parallel`.
 
