@@ -42,8 +42,13 @@ pub fn instance_name(config_dir: &Path) -> String {
     instance_tag(config_dir).trim_start_matches('-').to_string()
 }
 
-#[cfg(not(windows))]
 fn state_dir(tag: &str) -> Result<PathBuf> {
+    #[cfg(windows)]
+    let base = dirs::data_local_dir()
+        .context("cannot resolve the local application data directory")?
+        .join("spawn")
+        .join("state");
+    #[cfg(not(windows))]
     let base = dirs::state_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))
         .context("cannot resolve a state directory")?
@@ -54,6 +59,8 @@ fn state_dir(tag: &str) -> Result<PathBuf> {
         base.join(tag.trim_start_matches('-'))
     };
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(windows)]
+    control::protect_path(&dir)?;
     Ok(dir)
 }
 
@@ -292,6 +299,16 @@ fn launchd_plist_path(config_dir: &Path) -> Result<PathBuf> {
     Ok(dir.join(format!("{}.plist", launchd_label(config_dir))))
 }
 
+#[cfg(unix)]
+fn effective_user_id() -> u32 {
+    nix::unistd::Uid::effective().as_raw()
+}
+
+#[cfg(not(unix))]
+fn effective_user_id() -> u32 {
+    unreachable!("launchd user IDs are unavailable off Unix")
+}
+
 fn launchd_install(config_dir: &Path, server: &str) -> Result<()> {
     let bin = current_bin()?;
     let state = state_dir(&instance_tag(config_dir))?;
@@ -299,7 +316,7 @@ fn launchd_install(config_dir: &Path, server: &str) -> Result<()> {
     std::fs::write(&plist_path, launchd_plist(config_dir, &bin, server, &state))
         .with_context(|| format!("writing {}", plist_path.display()))?;
 
-    let uid = nix::unistd::Uid::effective().as_raw();
+    let uid = effective_user_id();
     let domain = format!("gui/{uid}");
     let label = launchd_label(config_dir);
     let _ = Command::new("launchctl")
@@ -325,7 +342,7 @@ fn launchd_install(config_dir: &Path, server: &str) -> Result<()> {
 }
 
 fn launchd_uninstall(config_dir: &Path) -> Result<()> {
-    let uid = nix::unistd::Uid::effective().as_raw();
+    let uid = effective_user_id();
     let domain = format!("gui/{uid}");
     if let Ok(path) = launchd_plist_path(config_dir) {
         let _ = Command::new("launchctl")

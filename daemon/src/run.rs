@@ -50,6 +50,7 @@ const OUTBOUND_CHANNEL_DEPTH: usize = 1024;
 const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 const TOOL_OUTPUT_LIMIT: usize = 16 * 1024;
+#[cfg(unix)]
 const SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SESSION_COLS: u16 = 120;
 const DEFAULT_SESSION_ROWS: u16 = 32;
@@ -3380,6 +3381,7 @@ async fn shell_path_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
     Vec::new()
 }
 
+#[cfg(unix)]
 async fn probe_shell_path(
     shell: &Path,
     mode: &str,
@@ -3410,6 +3412,7 @@ async fn probe_shell_path(
         .map(str::to_string)
 }
 
+#[cfg(unix)]
 fn candidate_shells(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
