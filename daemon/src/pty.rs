@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use spawnd::sessiond::wire;
+#[cfg(unix)]
 use tokio::net::UnixDatagram;
 use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
@@ -30,6 +31,85 @@ enum WsOutboundKind {
     Text(String),
     Ping,
     Close,
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, PipeMode};
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+    async fn open_silent_client(name: &std::ffi::OsStr) -> NamedPipeClient {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match ClientOptions::new().pipe_mode(PipeMode::Message).open(name) {
+                Ok(client) => return client,
+                Err(error)
+                    if (error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32))
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("opening silent lifecycle client failed: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_shutdown_survives_all_silent_handler_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("workers");
+        spawnd::sessiond::endpoint::ensure_private_dir(&dir).unwrap();
+        let endpoint = spawnd::sessiond::endpoint::endpoint_for(&dir, "", Uuid::new_v4()).unwrap();
+        let reservation = match spawnd::sessiond::endpoint::try_reserve(&endpoint).unwrap() {
+            spawnd::sessiond::endpoint::LockAttempt::Acquired(reservation) => reservation,
+            spawnd::sessiond::endpoint::LockAttempt::Busy => {
+                panic!("new lifecycle reservation was busy")
+            }
+        };
+        let spawnd::sessiond::endpoint::BoundWorkerEndpoints {
+            main: _main,
+            mut lifecycle,
+            identity: _identity,
+        } = spawnd::sessiond::endpoint::bind_worker(&endpoint, &reservation, Uuid::new_v4())
+            .unwrap();
+        let mut silent = Vec::new();
+        for _ in 0..7 {
+            silent.push(open_silent_client(endpoint.lifecycle_arg()).await);
+            tokio::task::yield_now().await;
+        }
+
+        let instance = Uuid::new_v4();
+        let responder = tokio::spawn(async move {
+            let exchange = spawnd::sessiond::endpoint::receive_lifecycle(&mut lifecycle)
+                .await
+                .unwrap();
+            let (request, len) = exchange.request();
+            assert_eq!(len, spawnd::sessiond::wire::LIFECYCLE_REQUEST_LEN);
+            let request: &[u8; spawnd::sessiond::wire::LIFECYCLE_REQUEST_LEN] =
+                request.try_into().unwrap();
+            let (received_instance, signal) =
+                spawnd::sessiond::wire::decode_lifecycle_request(request).unwrap();
+            assert_eq!(received_instance, instance);
+            assert_eq!(signal, spawnd::sessiond::wire::LifecycleSignal::Term);
+            spawnd::sessiond::endpoint::acknowledge_lifecycle(
+                &mut lifecycle,
+                exchange,
+                spawnd::sessiond::wire::LIFECYCLE_ACK_DELIVERED,
+            )
+            .await
+            .unwrap();
+        });
+        let started = tokio::time::Instant::now();
+        SessionLifecycle::new(endpoint, instance)
+            .shutdown(spawnd::sessiond::wire::LifecycleSignal::Term)
+            .await
+            .unwrap();
+        assert!(started.elapsed() <= LIFECYCLE_DELIVERY_TIMEOUT + Duration::from_millis(500));
+        responder.await.unwrap();
+        drop(silent);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -928,14 +1008,34 @@ pub enum WorkerCmd {
 
 #[derive(Clone)]
 pub struct SessionLifecycle {
-    socket: PathBuf,
+    target: SessionLifecycleTarget,
     instance_id: Uuid,
 }
 
+#[derive(Clone)]
+pub(crate) enum SessionLifecycleTarget {
+    Endpoint(spawnd::sessiond::endpoint::Endpoint),
+    // Compatibility for test fixtures outside the endpoint module. Production
+    // connections always carry the complete deterministic Endpoint.
+    LegacyPath(PathBuf),
+}
+
+impl From<spawnd::sessiond::endpoint::Endpoint> for SessionLifecycleTarget {
+    fn from(endpoint: spawnd::sessiond::endpoint::Endpoint) -> Self {
+        Self::Endpoint(endpoint)
+    }
+}
+
+impl From<PathBuf> for SessionLifecycleTarget {
+    fn from(path: PathBuf) -> Self {
+        Self::LegacyPath(path)
+    }
+}
+
 impl SessionLifecycle {
-    pub(crate) fn new(socket: PathBuf, instance_id: Uuid) -> Self {
+    pub(crate) fn new(target: impl Into<SessionLifecycleTarget>, instance_id: Uuid) -> Self {
         Self {
-            socket,
+            target: target.into(),
             instance_id,
         }
     }
@@ -943,70 +1043,95 @@ impl SessionLifecycle {
     pub async fn shutdown(&self, signal: wire::LifecycleSignal) -> Result<()> {
         let deadline = tokio::time::Instant::now() + LIFECYCLE_DELIVERY_TIMEOUT;
         let request = wire::encode_lifecycle_request(self.instance_id, signal);
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("worker lifecycle delivery deadline exceeded");
+        let ack = match &self.target {
+            SessionLifecycleTarget::Endpoint(endpoint) => {
+                spawnd::sessiond::endpoint::send_lifecycle(endpoint, &request, deadline).await?
             }
-            if spawnd::sessiond::endpoint::validate_private_socket(&self.socket).is_err() {
-                anyhow::bail!("worker lifecycle endpoint validation failed");
+            SessionLifecycleTarget::LegacyPath(socket) => {
+                send_lifecycle_legacy(socket, &request, deadline).await?
             }
-            let parent = self
-                .socket
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("worker lifecycle endpoint validation failed"))?;
-            let client_path = parent.join(format!(
-                ".lifecycle-client-{}-{}.sock",
-                std::process::id(),
-                Uuid::new_v4()
-            ));
-            let socket = UnixDatagram::bind(&client_path)
-                .map_err(|_| anyhow::anyhow!("worker lifecycle client unavailable"))?;
-            let _client_identity = spawnd::sessiond::endpoint::secure_bound_socket(&client_path)
-                .map_err(|_| anyhow::anyhow!("worker lifecycle client validation failed"))?;
-            if socket.connect(&self.socket).is_err() {
-                tokio::time::sleep_until(std::cmp::min(
-                    deadline,
-                    tokio::time::Instant::now() + Duration::from_millis(10),
-                ))
-                .await;
-                continue;
+        };
+        match ack {
+            wire::LIFECYCLE_ACK_DELIVERED => Ok(()),
+            wire::LIFECYCLE_ACK_GONE => anyhow::bail!("session process already exited"),
+            wire::LIFECYCLE_ACK_WRONG_INSTANCE => {
+                anyhow::bail!("worker lifecycle instance changed")
             }
-            match tokio::time::timeout_at(deadline, socket.send(&request)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => {
-                    tokio::time::sleep_until(std::cmp::min(
-                        deadline,
-                        tokio::time::Instant::now() + Duration::from_millis(10),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(_) => anyhow::bail!("worker lifecycle delivery deadline exceeded"),
-            }
-            let mut ack = [0u8; 2];
-            let attempt_deadline = std::cmp::min(
-                deadline,
-                tokio::time::Instant::now() + Duration::from_millis(100),
-            );
-            let received = tokio::time::timeout_at(attempt_deadline, socket.recv(&mut ack)).await;
-            let Ok(Ok(1)) = received else {
-                tokio::time::sleep_until(std::cmp::min(
-                    deadline,
-                    tokio::time::Instant::now() + Duration::from_millis(10),
-                ))
-                .await;
-                continue;
-            };
-            return match ack[0] {
-                wire::LIFECYCLE_ACK_DELIVERED => Ok(()),
-                wire::LIFECYCLE_ACK_GONE => anyhow::bail!("session process already exited"),
-                wire::LIFECYCLE_ACK_WRONG_INSTANCE => {
-                    anyhow::bail!("worker lifecycle instance changed")
-                }
-                _ => anyhow::bail!("worker lifecycle delivery failed"),
-            };
+            _ => anyhow::bail!("worker lifecycle delivery failed"),
         }
     }
+}
+
+#[cfg(unix)]
+async fn send_lifecycle_legacy(
+    socket_path: &std::path::Path,
+    request: &[u8; wire::LIFECYCLE_REQUEST_LEN],
+    deadline: tokio::time::Instant,
+) -> Result<u8> {
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("worker lifecycle delivery deadline exceeded");
+        }
+        if spawnd::sessiond::endpoint::validate_private_socket(socket_path).is_err() {
+            anyhow::bail!("worker lifecycle endpoint validation failed");
+        }
+        let parent = socket_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("worker lifecycle endpoint validation failed"))?;
+        let client_path = parent.join(format!(
+            ".lifecycle-client-{}-{}.sock",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let socket = UnixDatagram::bind(&client_path)
+            .map_err(|_| anyhow::anyhow!("worker lifecycle client unavailable"))?;
+        let _client_identity = spawnd::sessiond::endpoint::secure_bound_socket(&client_path)
+            .map_err(|_| anyhow::anyhow!("worker lifecycle client validation failed"))?;
+        if socket.connect(socket_path).is_err() {
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + Duration::from_millis(10),
+            ))
+            .await;
+            continue;
+        }
+        match tokio::time::timeout_at(deadline, socket.send(request)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + Duration::from_millis(10),
+                ))
+                .await;
+                continue;
+            }
+            Err(_) => anyhow::bail!("worker lifecycle delivery deadline exceeded"),
+        }
+        let mut ack = [0u8; 2];
+        let attempt_deadline = std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        );
+        let received = tokio::time::timeout_at(attempt_deadline, socket.recv(&mut ack)).await;
+        let Ok(Ok(1)) = received else {
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + Duration::from_millis(10),
+            ))
+            .await;
+            continue;
+        };
+        return Ok(ack[0]);
+    }
+}
+
+#[cfg(windows)]
+async fn send_lifecycle_legacy(
+    _socket_path: &std::path::Path,
+    _request: &[u8; wire::LIFECYCLE_REQUEST_LEN],
+    _deadline: tokio::time::Instant,
+) -> Result<u8> {
+    anyhow::bail!("legacy lifecycle paths are unavailable on Windows")
 }
 
 /// Per-session runtime handle.
@@ -1259,7 +1384,7 @@ async fn wait_for_idle(idle_timer: &mut Option<IdleResolutionTimer>) -> u64 {
     timer.generation
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixDatagram as StdUnixDatagram;
@@ -1300,7 +1425,10 @@ mod tests {
         for _ in 0..1024 {
             match flood.send(&payload) {
                 Ok(size) => assert_eq!(size, payload.len()),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(nix::libc::ENOBUFS) =>
+                {
                     saturated = true;
                     break;
                 }
@@ -1313,7 +1441,10 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_shutdown_send_obeys_the_absolute_deadline() {
-        let dir = tempfile::tempdir().expect("lifecycle timeout tempdir");
+        let dir = tempfile::Builder::new()
+            .prefix("spawn-lc-")
+            .tempdir_in("/tmp")
+            .expect("short lifecycle timeout tempdir");
         let server_path = dir.path().join("lifecycle.sock");
         let (_server, _flood, _identity) = saturate_lifecycle_endpoint(dir.path(), &server_path);
         let mut unrelated = ChildCleanup(

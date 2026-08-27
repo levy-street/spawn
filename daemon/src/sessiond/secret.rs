@@ -3,6 +3,7 @@
 //! What this module guarantees (docs/SESSIOND.md "Memory hygiene"):
 //! - key bytes are zeroized on drop,
 //! - key pages are `mlock(2)`ed (never swapped) where the RLIMIT permits,
+//!   or `VirtualLock`ed on Windows within the process working-set limit,
 //! - on Linux, key pages are marked `MADV_DONTDUMP` so they stay out of
 //!   core dumps.
 //!
@@ -14,8 +15,8 @@
 
 use zeroize::Zeroize;
 
-/// Fixed-size secret held in heap memory that is locked and excluded from
-/// dumps on a best-effort basis, and zeroized on drop.
+/// Fixed-size secret held in heap memory, page-locked on a best-effort basis,
+/// excluded from dumps where the platform supports it, and zeroized on drop.
 pub struct SecretBytes {
     buf: Box<[u8]>,
     locked: bool,
@@ -35,9 +36,9 @@ impl SecretBytes {
         &self.buf
     }
 
-    /// Whether mlock succeeded. Callers may log (not fail) when false: the
-    /// scrollback log is still encrypted; only the swap-residency guarantee
-    /// for the key weakens.
+    /// Whether the platform page-lock call succeeded. Callers may log (not
+    /// fail) when false: the scrollback log is still encrypted; only the
+    /// swap-residency guarantee for the key weakens.
     pub fn is_locked(&self) -> bool {
         self.locked
     }
@@ -84,9 +85,14 @@ fn lock_region(region: &[u8]) -> bool {
         }
         locked
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        false
+        // SAFETY: region describes a live allocation owned by the caller for
+        // the lifetime of the lock; Drop unlocks the same address and length.
+        unsafe {
+            windows_sys::Win32::System::Memory::VirtualLock(region.as_ptr().cast(), region.len())
+                != 0
+        }
     }
 }
 
@@ -98,6 +104,13 @@ fn unlock_region(region: &[u8]) {
             // SAFETY: region was locked by lock_region on the same allocation.
             let _ = unsafe { nix::sys::mman::munlock(ptr, region.len()) };
         }
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: this is the same still-live allocation passed to VirtualLock.
+        let _ = unsafe {
+            windows_sys::Win32::System::Memory::VirtualUnlock(region.as_ptr().cast(), region.len())
+        };
     }
 }
 
@@ -134,5 +147,10 @@ mod tests {
         wipe(&mut buf);
         assert!(buf.iter().all(|&b| b == 0));
         wipe_vec(b"more plaintext".to_vec());
+    }
+
+    #[test]
+    fn empty_regions_are_not_locked() {
+        assert!(!lock_region(&[]));
     }
 }

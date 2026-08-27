@@ -4927,6 +4927,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn saturate_test_lifecycle_endpoint(
         dir: &std::path::Path,
         lifecycle_path: &std::path::Path,
@@ -4955,7 +4956,10 @@ mod tests {
         for _ in 0..1024 {
             match flood.send(&payload) {
                 Ok(size) => assert_eq!(size, payload.len()),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(nix::libc::ENOBUFS) =>
+                {
                     saturated = true;
                     break;
                 }
@@ -4969,6 +4973,7 @@ mod tests {
         (server, flood, identity)
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_cleanup_guard_drop_is_bounded_on_a_nonwritable_endpoint() {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
@@ -4981,7 +4986,7 @@ mod tests {
             .expect("bind persistent fake worker endpoint");
         let ordinary_identity = spawnd::sessiond::endpoint::secure_bound_socket(&ordinary_path)
             .expect("secure persistent fake worker endpoint");
-        let lifecycle_path = spawnd::sessiond::wire::lifecycle_socket_path(&ordinary_path);
+        let lifecycle_path = ordinary_path.with_extension("lifecycle.sock");
         let (_lifecycle, _flood, _lifecycle_identity) =
             saturate_test_lifecycle_endpoint(env.path(), &lifecycle_path);
         let mut unrelated = TestChildCleanup(
@@ -5022,6 +5027,119 @@ mod tests {
         );
         drop(ordinary_identity);
         drop(ordinary);
+    }
+
+    #[cfg(windows)]
+    async fn open_silent_lifecycle_client(
+        name: &std::ffi::OsStr,
+    ) -> tokio::net::windows::named_pipe::NamedPipeClient {
+        use tokio::net::windows::named_pipe::{ClientOptions, PipeMode};
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match ClientOptions::new().pipe_mode(PipeMode::Message).open(name) {
+                Ok(client) => return client,
+                Err(error)
+                    if (error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32))
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("opening silent lifecycle client failed: {error}"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_cleanup_guard_drop_is_bounded_when_all_pipe_handlers_are_silent() {
+        struct EnvRestore(Option<std::ffi::OsString>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("SPAWND_WORKER_DIR", value),
+                    None => std::env::remove_var("SPAWND_WORKER_DIR"),
+                }
+            }
+        }
+
+        let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().expect("guard pipe tempdir");
+        let dir = temp.path().join("workers");
+        spawnd::sessiond::endpoint::ensure_private_dir(&dir)
+            .expect("secure guard pipe directory");
+        let _env = EnvRestore(std::env::var_os("SPAWND_WORKER_DIR"));
+        std::env::set_var("SPAWND_WORKER_DIR", &dir);
+
+        let session_id = Uuid::new_v4();
+        let endpoint = spawnd::sessiond::endpoint::endpoint_for(
+            &dir,
+            &spawnd::sessiond::endpoint::config_root_tag(),
+            session_id,
+        )
+        .expect("guard endpoint");
+        let reservation = match spawnd::sessiond::endpoint::try_reserve(&endpoint).unwrap() {
+            spawnd::sessiond::endpoint::LockAttempt::Acquired(reservation) => reservation,
+            spawnd::sessiond::endpoint::LockAttempt::Busy => {
+                panic!("new guard endpoint reservation was busy")
+            }
+        };
+        let spawnd::sessiond::endpoint::BoundWorkerEndpoints {
+            main: _main,
+            lifecycle: _lifecycle,
+            identity: _identity,
+        } = spawnd::sessiond::endpoint::bind_worker(
+            &endpoint,
+            &reservation,
+            Uuid::new_v4(),
+        )
+        .expect("bind guard pipe endpoints");
+        let mut silent = Vec::new();
+        for _ in 0..7 {
+            silent.push(open_silent_lifecycle_client(endpoint.lifecycle_arg()).await);
+            tokio::task::yield_now().await;
+        }
+
+        let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+        let mut unrelated = TestChildCleanup(
+            std::process::Command::new(comspec)
+                .args(["/d", "/c", "ping -n 30 127.0.0.1 >NUL"])
+                .spawn()
+                .expect("spawn guard sentinel process"),
+        );
+        let (cmd_tx, _cmd_rx) = mpsc::channel(crate::pty::WORKER_COMMAND_QUEUE_DEPTH);
+        let (outbox_tx, _outbox_rx) = mpsc::channel(crate::pty::WORKER_OUTPUT_QUEUE_DEPTH);
+        let handle = crate::pty::SessionHandle::new_worker(crate::pty::WorkerHandleParts {
+            session_id,
+            cwd: "C:\\".into(),
+            cmd_tx,
+            lifecycle: crate::pty::SessionLifecycle::new(endpoint.clone(), Uuid::new_v4()),
+            alive: Arc::new(AtomicBool::new(true)),
+            cols: 80,
+            rows: 24,
+            outbox_tx,
+            control: crate::pty::ForwarderControl::new(),
+        });
+        let guard = WorkerCleanupGuard::new(session_id, &handle);
+        drop(handle);
+
+        let started = std::time::Instant::now();
+        drop(guard);
+        assert!(
+            started.elapsed() <= WORKER_TEST_CLEANUP_TIMEOUT + Duration::from_millis(500),
+            "worker cleanup guard exceeded its advertised bound"
+        );
+        assert!(
+            spawnd::sessiond::endpoint::endpoint_exists(&endpoint),
+            "test did not retain the deliberately stuck worker endpoint"
+        );
+        assert!(
+            unrelated.0.try_wait().unwrap().is_none(),
+            "worker cleanup guard touched an unrelated process"
+        );
+        drop(silent);
     }
 
     async fn request_history(client: &mut RtcTestClient) -> Vec<u8> {
