@@ -317,7 +317,7 @@ wait_for_login() {
 wait_for_login
 
 grep -F "/device?ref=" "$login_out" >/dev/null
-grep -F "logged in. host_id =" "$login_out" >/dev/null
+grep -F "browser approval proof verified" "$login_out" >/dev/null
 
 printf '%s\n' "smoke-local-login: re-running login in the same scoped keyring namespace"
 env \
@@ -364,7 +364,7 @@ printf '%s\n' "smoke-local-login: approving second device code"
 approve_device_code "$user_code_2" "$approved_browser_2"
 wait_for_login
 grep -F "/device?ref=" "$login_out_2" >/dev/null
-grep -F "logged in. host_id =" "$login_out_2" >/dev/null
+grep -F "browser approval proof verified" "$login_out_2" >/dev/null
 
 printf '%s\n' "smoke-local-login: verifying stored credentials and host"
 env \
