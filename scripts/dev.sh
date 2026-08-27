@@ -122,6 +122,31 @@ desktop_app_is_stale() {
   [[ -n "$newest" ]]
 }
 
+# Eject any SPAWN D disk image still mounted from a previous build or download.
+#
+# `bundle_dmg.sh` mounts the image it is building at `/Volumes/SPAWN D` and
+# fails outright when that name is taken, saying only "failed to run
+# bundle_dmg.sh". Every image opened to try a download leaves one mounted and
+# macOS numbers the next, so a machine that has tested a few builds quietly
+# accumulates `SPAWN D 1` … `SPAWN D 11` and then cannot build one at all.
+# These are read-only mounts of a `.dmg` that is still on disk: ejecting one
+# costs a double-click to get back.
+eject_stale_desktop_volumes() {
+  local volume device
+  for volume in "/Volumes/SPAWN D" /Volumes/SPAWN\ D\ *; do
+    [[ -d "$volume" ]] || continue
+    device="$(df "$volume" 2>/dev/null | awk 'NR == 2 { print $1 }' || true)"
+    [[ -n "$device" ]] || continue
+    if hdiutil detach "$device" -quiet 2>/dev/null ||
+      hdiutil detach "$device" -force -quiet 2>/dev/null; then
+      printf 'ejected %s\n' "$volume"
+    else
+      printf 'spawn dev: %s will not eject; eject it in Finder and try again\n' "$volume" >&2
+      return 1
+    fi
+  done
+}
+
 # Build the app and stage its disk image where the web app serves /desktop/
 # from — the same path nginx serves in production, so the download button on
 # the local site hands over this checkout's app.
@@ -138,6 +163,7 @@ prepare_desktop_app() {
   # The full production path — Developer ID, notarized, stapled — when it is
   # the download itself being tested. It is minutes slower and needs Apple, so
   # it is asked for rather than assumed.
+  eject_stale_desktop_volumes || return 1
   if [[ "${SPAWN_DEV_DESKTOP_SIGNED:-}" == "1" ]]; then
     printf '%s\n' '== preparing the Mac app (signed and notarized; Apple is in the loop) =='
     scripts/dev-desktop-signed.sh
