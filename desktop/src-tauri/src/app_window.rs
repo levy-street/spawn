@@ -69,10 +69,11 @@ fn create(app: &AppHandle, origin: &Url) -> Result<tauri::WebviewWindow> {
     warm.set_path("/healthz");
     let allowed = origin.clone();
     let opener = app.clone();
+    let (width, height) = window_size(app);
     let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::External(warm))
         .title("SPAWN D")
-        .inner_size(1280.0, 820.0)
-        .min_inner_size(900.0, 600.0)
+        .inner_size(width, height)
+        .min_inner_size(MIN_WIDTH, MIN_HEIGHT)
         .center()
         .visible(false)
         // The window is the web app and nothing else. A link to anywhere
@@ -96,6 +97,28 @@ fn create(app: &AppHandle, origin: &Url) -> Result<tauri::WebviewWindow> {
         }
     });
     Ok(window)
+}
+
+const MIN_WIDTH: f64 = 1100.0;
+const MIN_HEIGHT: f64 = 720.0;
+
+/// Most of the screen, never more than it: a wall of terminals wants room,
+/// so the window takes the work area less a margin, capped so a large
+/// display gets a large window rather than a wall-to-wall one.
+fn window_size(app: &AppHandle) -> (f64, f64) {
+    const SHARE: f64 = 0.92;
+    let Ok(Some(monitor)) = app.primary_monitor() else {
+        return (1440.0, 900.0);
+    };
+    let scale = monitor.scale_factor();
+    let area = monitor.work_area().size;
+    fit(area.width as f64 / scale, area.height as f64 / scale, SHARE)
+}
+
+fn fit(available_width: f64, available_height: f64, share: f64) -> (f64, f64) {
+    let width = (available_width * share).clamp(MIN_WIDTH.min(available_width), 1680.0);
+    let height = (available_height * share).clamp(MIN_HEIGHT.min(available_height), 1050.0);
+    (width.round(), height.round())
 }
 
 fn same_origin(url: &Url, origin: &Url) -> bool {
@@ -130,6 +153,18 @@ fn session_cookie(header: &str, origin: &Url) -> Result<Cookie<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_takes_most_of_the_screen_and_never_more() {
+        // A 14-inch MacBook Pro's work area, in points.
+        assert_eq!(fit(1512.0, 945.0, 0.92), (1391.0, 869.0));
+        // A small external display: the minimums win, and still fit.
+        assert_eq!(fit(1280.0, 800.0, 0.92), (1178.0, 736.0));
+        // A screen smaller than the minimums gets the screen.
+        assert_eq!(fit(1024.0, 640.0, 0.92), (1024.0, 640.0));
+        // A big display is capped rather than wall-to-wall.
+        assert_eq!(fit(2560.0, 1415.0, 0.92), (1680.0, 1050.0));
+    }
 
     #[test]
     fn only_the_chosen_origin_stays_inside_the_window() {
