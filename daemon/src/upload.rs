@@ -1612,6 +1612,34 @@ fn extension_for_mime(mime_type: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    struct BlockingPauseReleaseGuard<'a> {
+        pause: &'a BlockingPause,
+        released: bool,
+    }
+
+    impl<'a> BlockingPauseReleaseGuard<'a> {
+        fn arm(pause: &'a BlockingPause) -> Self {
+            pause.arm();
+            Self {
+                pause,
+                released: false,
+            }
+        }
+
+        fn release(&mut self) {
+            if !self.released {
+                self.pause.release();
+                self.released = true;
+            }
+        }
+    }
+
+    impl Drop for BlockingPauseReleaseGuard<'_> {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
     fn manifest(bytes: &[u8], name: &str, destination: UploadDestination) -> UploadManifest {
         let sha256 = Sha256::digest(bytes)
             .iter()
@@ -2004,119 +2032,141 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_different_owner_start_conflicts_without_replacing_the_inserted_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let hub = UploadHub::default();
-        let hooks = hub.lifecycle_hooks();
-        hooks.arm_admit_barrier(2);
-        hooks.prepare.arm();
-        let session = SessionBinding::new(Uuid::new_v4(), 82);
-        let capability = Uuid::new_v4();
-        let other_capability = Uuid::new_v4();
-        let upload_id = Uuid::new_v4();
-        let cwd = tmp.path().to_string_lossy().into_owned();
-        let upload_manifest = manifest(b"owner", "owner.bin", UploadDestination::Cwd);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let tmp = tempfile::tempdir().unwrap();
+            let hub = UploadHub::default();
+            let hooks = hub.lifecycle_hooks();
+            hooks.arm_admit_barrier(2);
+            let mut prepare_pause = BlockingPauseReleaseGuard::arm(&hooks.prepare);
+            let session = SessionBinding::new(Uuid::new_v4(), 82);
+            let capability = Uuid::new_v4();
+            let other_capability = Uuid::new_v4();
+            let upload_id = Uuid::new_v4();
+            let cwd = tmp.path().to_string_lossy().into_owned();
+            let upload_manifest = manifest(b"owner", "owner.bin", UploadDestination::Cwd);
 
-        let first_hub = hub.clone();
-        let first_cwd = cwd.clone();
-        let first_manifest = upload_manifest.clone();
-        let first = tokio::spawn(async move {
-            first_hub
-                .start(
-                    session,
-                    "viewer-a",
-                    capability,
-                    upload_id,
-                    &first_cwd,
-                    first_manifest,
+            let first_hub = hub.clone();
+            let first_cwd = cwd.clone();
+            let first_manifest = upload_manifest.clone();
+            let first = tokio::spawn(async move {
+                first_hub
+                    .start(
+                        session,
+                        "viewer-a",
+                        capability,
+                        upload_id,
+                        &first_cwd,
+                        first_manifest,
+                    )
+                    .await
+            });
+            let second_hub = hub.clone();
+            let second_cwd = cwd.clone();
+            let second_manifest = upload_manifest.clone();
+            let second = tokio::spawn(async move {
+                second_hub
+                    .start(
+                        session,
+                        "viewer-b",
+                        other_capability,
+                        upload_id,
+                        &second_cwd,
+                        second_manifest,
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), hooks.prepare.wait_until_entered())
+                .await
+                .expect("winning upload start did not reach the prepare pause within 10 seconds");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !first.is_finished() && !second.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("conflicting-owner upload start did not resolve within 10 seconds");
+            assert_ne!(first.is_finished(), second.is_finished());
+            assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
+            assert_eq!(hub.retained_counts().await.0, 1);
+
+            prepare_pause.release();
+            let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(first, second)
+            })
+            .await
+            .expect(
+                "competing upload starts did not finish within 10 seconds after prepare resumed",
+            );
+            let first = first.unwrap();
+            let second = second.unwrap();
+            let is_ready = |result: &UploadOpResult<UploadStartOutcome>| {
+                matches!(
+                    result,
+                    Ok(UploadStartOutcome::Ready {
+                        next_sequence: 0,
+                        received_bytes: 0
+                    })
+                )
+            };
+            assert_ne!(is_ready(&first), is_ready(&second));
+            let conflict = if is_ready(&first) {
+                second.as_ref().unwrap_err()
+            } else {
+                first.as_ref().unwrap_err()
+            };
+            assert!(conflict.detail.contains("another manifest or capability"));
+            let (winner_session, winner_capability) = if is_ready(&first) {
+                ("viewer-a", capability)
+            } else {
+                ("viewer-b", other_capability)
+            };
+            assert!(matches!(
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    hub.start(
+                        session,
+                        winner_session,
+                        winner_capability,
+                        upload_id,
+                        &cwd,
+                        upload_manifest,
+                    )
                 )
                 .await
-        });
-        let second_hub = hub.clone();
-        let second_cwd = cwd.clone();
-        let second_manifest = upload_manifest.clone();
-        let second = tokio::spawn(async move {
-            second_hub
-                .start(
-                    session,
-                    "viewer-b",
-                    other_capability,
-                    upload_id,
-                    &second_cwd,
-                    second_manifest,
-                )
-                .await
-        });
-        hooks.prepare.wait_until_entered().await;
-        for _ in 0..100 {
-            if first.is_finished() || second.is_finished() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_ne!(first.is_finished(), second.is_finished());
-        assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
-        assert_eq!(hub.retained_counts().await.0, 1);
-
-        hooks.prepare.release();
-        let (first, second) = tokio::join!(first, second);
-        let first = first.unwrap();
-        let second = second.unwrap();
-        let is_ready = |result: &UploadOpResult<UploadStartOutcome>| {
-            matches!(
-                result,
-                Ok(UploadStartOutcome::Ready {
+                .expect("winner retry did not finish within 10 seconds")
+                .unwrap(),
+                UploadStartOutcome::Ready {
                     next_sequence: 0,
                     received_bytes: 0
-                })
-            )
-        };
-        assert_ne!(is_ready(&first), is_ready(&second));
-        let conflict = if is_ready(&first) {
-            second.as_ref().unwrap_err()
-        } else {
-            first.as_ref().unwrap_err()
-        };
-        assert!(conflict.detail.contains("another manifest or capability"));
-        let (winner_session, winner_capability) = if is_ready(&first) {
-            ("viewer-a", capability)
-        } else {
-            ("viewer-b", other_capability)
-        };
-        assert!(matches!(
-            hub.start(
-                session,
-                winner_session,
-                winner_capability,
-                upload_id,
-                &cwd,
-                upload_manifest,
-            )
-            .await
-            .unwrap(),
-            UploadStartOutcome::Ready {
-                next_sequence: 0,
-                received_bytes: 0
-            }
-        ));
-        assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
-        let private_temps = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().contains("spawn-upload"))
-            .count();
-        assert_eq!(private_temps, 1);
+                }
+            ));
+            assert_eq!(hooks.prepare_count.load(Ordering::Acquire), 1);
+            let private_temps = std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("spawn-upload"))
+                .count();
+            assert_eq!(private_temps, 1);
 
-        assert!(hub
-            .cancel(session, winner_session, winner_capability, upload_id)
+            assert!(tokio::time::timeout(
+                Duration::from_secs(10),
+                hub.cancel(session, winner_session, winner_capability, upload_id),
+            )
             .await
+            .expect("winner cancellation did not finish within 10 seconds")
             .unwrap());
-        wait_for_upload_drain(&hub).await;
-        assert_eq!(hub.retained_counts().await, (0, 0));
-        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("spawn-upload")));
+            tokio::time::timeout(Duration::from_secs(10), wait_for_upload_drain(&hub))
+                .await
+                .expect("winner cleanup did not drain within 10 seconds");
+            assert_eq!(hub.retained_counts().await, (0, 0));
+            assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("spawn-upload")));
+        })
+        .await
+        .expect("different-owner upload concurrency fixture exceeded 30 seconds");
     }
 
     #[tokio::test]
