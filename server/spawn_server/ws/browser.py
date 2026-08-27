@@ -122,15 +122,25 @@ def _valid_rtc_candidate(value: object) -> dict[str, object] | None:
     if not isinstance(candidate, str) or len(candidate) > 1024:
         return None
     sanitized: dict[str, object] = {"candidate": candidate}
+    # `null` is how both peers say "this optional field has no value", and it
+    # is not the same as a field of the wrong type. webrtc-rs serializes every
+    # member of RTCIceCandidateInit whether or not it is set, so every single
+    # candidate the daemon sends carries `"usernameFragment": null`; browsers
+    # do the same for `sdpMid` on a candidate that belongs to no m-line.
+    # Treating that as a malformed frame refused every ICE candidate the daemon
+    # ever sent — the browser received none of them, sent no connectivity
+    # checks, and the host-control DataChannel never opened, which is a folder
+    # picker that never fills and a file explorer that never loads. Absent and
+    # null mean the same thing here; a wrong type is still refused.
     optional_strings = {"sdpMid": 64, "usernameFragment": 256}
     for field, limit in optional_strings.items():
         item = value.get(field)
-        if field in value:
+        if field in value and item is not None:
             if not isinstance(item, str) or len(item) > limit:
                 return None
             sanitized[field] = item
-    if "sdpMLineIndex" in value:
-        line_index = value.get("sdpMLineIndex")
+    line_index = value.get("sdpMLineIndex")
+    if "sdpMLineIndex" in value and line_index is not None:
         if (
             not isinstance(line_index, int)
             or isinstance(line_index, bool)
@@ -291,9 +301,7 @@ async def browser_ws(
     async with sm() as session:
         session_row = await session.get(Session, pty_session_id)
         if session_row is None or session_row.owner_user_id != user.id:
-            await websocket.close(
-                code=status.WS_1008_POLICY_VIOLATION, reason="session not found"
-            )
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="session not found")
             return
         host_id = session_row.host_id
         session_status = session_row.status
