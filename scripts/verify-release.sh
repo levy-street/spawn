@@ -14,7 +14,7 @@ Checks:
   - the signed manifest counter matches the ref commit's committer timestamp
   - every advertised daemon binary hashes to its advertised sha256
   - the production Expo manifest carries the ref's mobile/ tree
-  - /desktop/latest.json, its artifact signature, and /api/release.desktop match
+  - /desktop/latest.json, every artifact signature, and /api/release.desktop match
 
 Options:
   --ref GIT_REF  Expected git ref. Default: origin/master.
@@ -500,51 +500,49 @@ else
   fi
   check_row "desktop.latest.version" "$expected_desktop_version" \
     "$actual_desktop_latest_version"
-  expected_desktop_platforms="darwin-aarch64,darwin-x86_64"
+  expected_desktop_platforms="darwin-aarch64,darwin-x86_64,windows-x86_64"
   check_row "desktop.latest.platforms" "$expected_desktop_platforms" \
     "$actual_desktop_latest_platforms"
   check_row "desktop.release.platforms" "$expected_desktop_platforms" \
     "$actual_desktop_release_platforms"
 
-  desktop_platform=""
-  desktop_artifact_url=""
-  desktop_artifact_signature=""
-  if [[ "$desktop_latest_available" == "1" ]]; then
-    desktop_platform="$(json_keys "$desktop_latest_file" platforms 2>/dev/null | head -1 || true)"
-    if [[ -n "$desktop_platform" ]]; then
+  for desktop_platform in darwin-aarch64 darwin-x86_64 windows-x86_64; do
+    case "$desktop_platform" in
+      darwin-*) desktop_suffix=".app.tar.gz" ;;
+      windows-x86_64) desktop_suffix="-setup.exe" ;;
+      *) die "internal desktop platform map is incomplete" ;;
+    esac
+    expected_desktop_name="SPAWN-D_${expected_desktop_version}_${desktop_platform}${desktop_suffix}"
+    expected_desktop_url="$server/desktop/$expected_desktop_name"
+    desktop_artifact_url=""
+    desktop_artifact_signature=""
+    if [[ "$desktop_latest_available" == "1" ]]; then
       desktop_artifact_url="$(json_get "$desktop_latest_file" \
         "platforms.$desktop_platform.url" 2>/dev/null || true)"
       desktop_artifact_signature="$(json_get "$desktop_latest_file" \
         "platforms.$desktop_platform.signature" 2>/dev/null || true)"
     fi
-  fi
 
-  desktop_artifact_file="$tmp_dir/desktop-artifact"
-  desktop_signature_result=""
-  case "$desktop_artifact_url" in
-    "$server"/desktop/*)
-      if curl -fsS --max-time 120 "$desktop_artifact_url" -o "$desktop_artifact_file" &&
-        [[ -n "$desktop_artifact_signature" ]] &&
-        [[ -s "$desktop_public_key_file" ]] &&
-        verify_tauri_minisign "$desktop_artifact_file" \
-          "$desktop_artifact_signature" "$desktop_public_key_file" 2>/dev/null; then
-        desktop_signature_result="valid ($desktop_platform)"
-      else
-        desktop_signature_result="invalid or artifact fetch failed ($desktop_platform)"
-      fi
-      ;;
-    *)
-      desktop_signature_result="artifact URL is outside $server/desktop/"
-      ;;
-  esac
-  if [[ "$desktop_signature_result" == "valid ($desktop_platform)" ]]; then
-    print_row "desktop artifact signature" "desktop/updater.pubkey at $git_ref" \
-      "$desktop_signature_result" "OK"
-  else
-    print_row "desktop artifact signature" "desktop/updater.pubkey at $git_ref" \
-      "${desktop_signature_result:-<missing platform>}" "FAIL"
-    fail=1
-  fi
+    check_row "desktop.$desktop_platform.url" "$expected_desktop_url" \
+      "$desktop_artifact_url"
+    desktop_artifact_file="$tmp_dir/desktop-$desktop_platform"
+    if [[ "$desktop_artifact_url" == "$expected_desktop_url" ]] &&
+      curl -fsS --max-time 120 "$desktop_artifact_url" -o "$desktop_artifact_file" &&
+      [[ -n "$desktop_artifact_signature" ]] &&
+      [[ -s "$desktop_public_key_file" ]] &&
+      verify_tauri_minisign "$desktop_artifact_file" \
+        "$desktop_artifact_signature" "$desktop_public_key_file" 2>/dev/null; then
+      print_row "desktop.$desktop_platform signature" \
+        "desktop/updater.pubkey at $git_ref" "valid" "OK"
+    else
+      print_row "desktop.$desktop_platform signature" \
+        "desktop/updater.pubkey at $git_ref" \
+        "invalid, missing, or artifact fetch failed" "FAIL"
+      fail=1
+    fi
+  done
+  print_row "desktop.windows Authenticode" "Valid inner EXE and setup EXE" \
+    "verify in Windows CI/manual QA" "MANUAL"
 fi
 
 if [[ "$skip_mobile" == "1" ]]; then

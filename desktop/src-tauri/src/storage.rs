@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use keyring::Entry;
@@ -10,10 +11,13 @@ use zeroize::Zeroizing;
 use crate::models::DesktopPreferences;
 
 const KEYRING_SERVICE: &str = "spawn";
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_CREDENTIAL_BLOB_BYTES: usize = 2_560;
+static CREDENTIAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn state_path() -> Result<PathBuf> {
     let base =
-        dirs::config_dir().context("the macOS application-support directory is unavailable")?;
+        dirs::config_dir().context("the application configuration directory is unavailable")?;
     Ok(base.join("dev.spawnd.desktop").join("state.json"))
 }
 
@@ -79,41 +83,76 @@ fn scoped_keyring_user(prefix: &str, scope: &str) -> String {
 
 fn entry(prefix: &str, scope: &str) -> Result<Entry> {
     Entry::new(KEYRING_SERVICE, &scoped_keyring_user(prefix, scope))
-        .context("opening the SPAWN D keychain item")
+        .context("opening the SPAWN D secure credential-store item")
+}
+
+fn with_credential<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _guard = CREDENTIAL_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the secure credential store lock is unavailable"))?;
+    operation()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn validate_windows_credential(value: &str) -> Result<()> {
+    if value.encode_utf16().count().saturating_mul(2) > WINDOWS_CREDENTIAL_BLOB_BYTES {
+        anyhow::bail!("credential is too large for Windows Credential Manager")
+    }
+    Ok(())
+}
+
+fn validate_credential(value: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    validate_windows_credential(value)?;
+    #[cfg(not(target_os = "windows"))]
+    let _ = value;
+    Ok(())
 }
 
 pub fn set_token(origin: &str, token: &str) -> Result<()> {
-    entry("token", origin)?
-        .set_password(token)
-        .context("saving the SPAWN D session in Keychain")
+    validate_credential(token)?;
+    with_credential(|| {
+        entry("token", origin)?
+            .set_password(token)
+            .context("saving the SPAWN D session in the secure credential store")
+    })
 }
 
 pub fn token(origin: &str) -> Result<Zeroizing<String>> {
-    entry("token", origin)?
-        .get_password()
-        .map(Zeroizing::new)
-        .context("reading the SPAWN D session from Keychain")
+    with_credential(|| {
+        entry("token", origin)?
+            .get_password()
+            .map(Zeroizing::new)
+            .context("reading the SPAWN D session from the secure credential store")
+    })
 }
 
 pub fn clear_token(origin: &str) -> Result<()> {
-    match entry("token", origin)?.delete_credential() {
+    with_credential(|| match entry("token", origin)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(error).context("removing the SPAWN D session from Keychain"),
-    }
+        Err(error) => {
+            Err(error).context("removing the SPAWN D session from the secure credential store")
+        }
+    })
 }
 
 pub fn set_device_seed(account_id: &str, seed_wire: &str) -> Result<()> {
-    entry("device", account_id)?
-        .set_password(seed_wire)
-        .context("saving the SPAWN D device identity in Keychain")
+    validate_credential(seed_wire)?;
+    with_credential(|| {
+        entry("device", account_id)?
+            .set_password(seed_wire)
+            .context("saving the SPAWN D device identity in the secure credential store")
+    })
 }
 
 pub fn device_seed(account_id: &str) -> Result<Option<Zeroizing<String>>> {
-    match entry("device", account_id)?.get_password() {
+    with_credential(|| match entry("device", account_id)?.get_password() {
         Ok(value) => Ok(Some(Zeroizing::new(value))),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(error).context("reading the SPAWN D device identity from Keychain"),
-    }
+        Err(error) => Err(error)
+            .context("reading the SPAWN D device identity from the secure credential store"),
+    })
 }
 
 #[cfg(test)]
@@ -144,5 +183,13 @@ mod tests {
         assert!(normalize_server_url("file:///tmp/spawn")
             .unwrap_err()
             .contains("http or https"));
+    }
+
+    #[test]
+    fn windows_credential_limit_counts_encoded_utf16_bytes() {
+        assert!(validate_windows_credential(&"a".repeat(1_280)).is_ok());
+        assert!(validate_windows_credential(&"a".repeat(1_281)).is_err());
+        assert!(validate_windows_credential(&"🜏".repeat(640)).is_ok());
+        assert!(validate_windows_credential(&"🜏".repeat(641)).is_err());
     }
 }

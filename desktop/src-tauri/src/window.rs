@@ -1,6 +1,6 @@
 //! The one window.
 //!
-//! SPAWN D has a single window with two faces. Until this Mac is possessed the
+//! SPAWN D has a single window with two faces. Until this computer is possessed the
 //! window is the wizard: the bundled sign-in and possession pages, with IPC.
 //! After that it is the product: the web app from the chosen server, loaded
 //! into the same window, signed in by way of the cookie the server sets when
@@ -20,6 +20,9 @@ use tauri::{
 use tauri_plugin_opener::OpenerExt;
 
 use crate::{auth, storage};
+
+#[cfg(target_os = "windows")]
+mod windows;
 
 pub const LABEL: &str = "main";
 const SESSION_COOKIE: &str = "spawn_session";
@@ -63,11 +66,13 @@ pub fn create(app: &App) -> Result<WebviewWindow> {
         })
         .build()
         .context("creating the SPAWN D window")?;
+    #[cfg(target_os = "windows")]
+    windows::append_user_agent(&window);
     app.manage(WizardHome(home));
     let handle = app.handle().clone();
     window.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
-            // Closing leaves SPAWN D in the menu bar; no Dock tile meanwhile.
+            // Closing leaves SPAWN D in the platform's tray surface.
             api.prevent_close();
             if let Some(window) = handle.get_webview_window(LABEL) {
                 let _ = window.hide();
@@ -79,7 +84,7 @@ pub fn create(app: &App) -> Result<WebviewWindow> {
     Ok(window)
 }
 
-/// Whatever this Mac is up to: the product once it is possessed, else the
+/// Whatever this computer is up to: the product once it is possessed, else the
 /// wizard where it was left.
 pub async fn surface(app: &AppHandle) -> Result<()> {
     let possessed = storage::load_preferences()
@@ -177,7 +182,15 @@ fn wizard_home(app: &App) -> Url {
             return url;
         }
     }
-    Url::parse("tauri://localhost/").expect("a fixed URL parses")
+    packaged_wizard_home()
+}
+
+fn packaged_wizard_home() -> Url {
+    #[cfg(target_os = "windows")]
+    const WIZARD_HOME: &str = "http://tauri.localhost/";
+    #[cfg(not(target_os = "windows"))]
+    const WIZARD_HOME: &str = "tauri://localhost/";
+    Url::parse(WIZARD_HOME).expect("the fixed wizard origin parses")
 }
 
 /// Most of the screen, never more than it: a wall of terminals wants room,
@@ -258,9 +271,13 @@ mod tests {
 
     #[test]
     fn only_the_wizard_and_the_chosen_origin_share_the_window() {
-        let home = Url::parse("tauri://localhost/").unwrap();
+        let home = packaged_wizard_home();
+        #[cfg(target_os = "macos")]
+        assert_eq!(home.as_str(), "tauri://localhost/");
+        #[cfg(target_os = "windows")]
+        assert_eq!(home.as_str(), "http://tauri.localhost/");
         assert!(same_origin(
-            &Url::parse("tauri://localhost/index.html#settings").unwrap(),
+            &home.join("index.html#settings").unwrap(),
             &home
         ));
         let origin = Url::parse("https://spawnd.dev").unwrap();

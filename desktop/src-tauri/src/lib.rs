@@ -3,6 +3,7 @@ mod auth;
 mod crypto;
 mod install;
 mod models;
+mod platform;
 mod storage;
 mod supervision;
 mod tray;
@@ -234,6 +235,9 @@ async fn install_app_update(app: tauri::AppHandle) -> Result<bool, String> {
         .download_and_install(|_, _| {}, || {})
         .await
         .map_err(command_error)?;
+    #[cfg(target_os = "windows")]
+    app.restart();
+    #[cfg(not(target_os = "windows"))]
     Ok(true)
 }
 
@@ -263,7 +267,8 @@ pub fn run() {
         // First, so a second copy — launched from a still-mounted disk image,
         // say — hands over to this one and exits before it can register as a
         // rival: a sign-in returning on spawn:// must reach the instance that
-        // started it, and the icon macOS shows for the scheme must be ours.
+        // started it. The deep-link feature relays Windows protocol argv to
+        // this first process before the callback fronts its one window.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             window::front(app);
         }))
@@ -273,6 +278,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppServices::default())
         .setup(|app| {
+            #[cfg(all(target_os = "windows", debug_assertions))]
+            app.deep_link().register_all()?;
             tray::install(app)?;
             window::create(app)?;
             // A sign-in that went out to the system browser comes back on the
@@ -281,7 +288,7 @@ pub fn run() {
             let handle = app.handle().clone();
             app.deep_link()
                 .on_open_url(move |_event| window::front(&handle));
-            // Launch is the product, like any app: the web app if this Mac is
+            // Launch is the product, like any app: the web app if this computer is
             // possessed, else the wizard where it left off.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -323,8 +330,8 @@ pub fn run() {
         .expect("error while building SPAWN D desktop");
     app.run(|handle, event| {
         // Explicit Quit SPAWN D exits; closing the window only hides it and
-        // leaves SPAWN D in the menu bar. Opening the app again from
-        // Launchpad or the Dock then brings the window back as it was.
+        // leaves SPAWN D in the platform tray. Reopening brings the window
+        // back as it was.
         if let RunEvent::Reopen {
             has_visible_windows: false,
             ..

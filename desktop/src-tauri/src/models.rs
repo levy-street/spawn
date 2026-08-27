@@ -199,7 +199,7 @@ pub struct LocalStatus {
     pub status: serde_json::Value,
     pub doctor: Option<serde_json::Value>,
     pub heartbeat: Option<HeartbeatState>,
-    pub launchctl: String,
+    pub service: String,
     pub hosts: serde_json::Value,
     pub release: serde_json::Value,
     pub log_tail: String,

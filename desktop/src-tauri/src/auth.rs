@@ -13,8 +13,8 @@ use crate::storage;
 
 /// The one native redirect every SPAWN D server release admits. It is the
 /// same address the phone app hands back to, so a server configured for the
-/// phone already accepts this app; on macOS only this app claims the `spawn://`
-/// scheme, so nothing else can receive what comes back.
+/// phone already accepts this app; the installed desktop companion claims the
+/// `spawn://` scheme, so nothing else should receive what comes back.
 pub const OAUTH_REDIRECT_URI: &str = "spawn://auth/oauth";
 
 /// The providers a server can enable. Which of them actually appear comes from
@@ -170,14 +170,19 @@ async fn finish_auth(origin: &str, response: TokenResponse) -> Result<AuthOutcom
             Method::POST,
             "/api/browser-devices/register",
             &json!({
-                "label": "SPAWN D on Mac",
+                "label": crate::platform::DEVICE_LABEL,
                 "key_algorithm": "ed25519",
                 "public_key": public_key,
                 "signature": signature
             }),
         )
         .await
-        .context("registering this Mac as a SPAWN D device")?;
+        .with_context(|| {
+            format!(
+                "registering {} as a SPAWN D device",
+                crate::platform::THIS_COMPUTER
+            )
+        })?;
     if registered.key_algorithm != "ed25519"
         || registered.public_key != public_key
         || registered.revoked_at.is_some()
@@ -195,7 +200,12 @@ async fn finish_auth(origin: &str, response: TokenResponse) -> Result<AuthOutcom
                 &json!({ "browser_device_id": registered.id }),
             )
             .await
-            .context("asking an existing device to approve this Mac")?;
+            .with_context(|| {
+                format!(
+                    "asking an existing device to approve {}",
+                    crate::platform::THIS_COMPUTER
+                )
+            })?;
     }
     let renewal: SessionRenewResponse = api
         .authenticated_post("/api/auth/session/renew")
