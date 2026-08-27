@@ -759,3 +759,41 @@ def test_host_signal_envelopes_reject_unbounded_or_unbound_routes():
         )
         is None
     )
+
+
+class ClosedTransportWS(FakeWS):
+    """The socket uvloop hands a handler whose peer left before the first write."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+
+    async def send_text(self, s: str) -> None:
+        raise self.error
+
+
+@pytest.mark.asyncio
+async def test_a_send_on_a_closed_transport_reads_as_the_peer_disconnecting():
+    from fastapi import WebSocketDisconnect
+
+    gone = RuntimeError(
+        "unable to perform operation on <TCPTransport closed=True reading=False 0x1>; "
+        "the handler is closed"
+    )
+    reset = ConnectionResetError("Connection reset by peer")
+    for error in (gone, reset):
+        for conn in (
+            DaemonConn("host-1", "owner", ClosedTransportWS(error)),  # type: ignore[arg-type]
+            BrowserConn("owner", "session-1", ClosedTransportWS(error)),  # type: ignore[arg-type]
+            HostBrowserConn("owner", "host-1", ClosedTransportWS(error)),  # type: ignore[arg-type]
+        ):
+            with pytest.raises(WebSocketDisconnect) as raised:
+                await conn.send_text({"type": "ping"})
+            assert raised.value.code == 1006
+            assert raised.value.__cause__ is error
+
+    # Only the transport's own refusals are a disconnect; anything else is a bug
+    # and stays loud.
+    conn = HostBrowserConn("owner", "host-1", ClosedTransportWS(ValueError("boom")))  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        await conn.send_text({"type": "ping"})

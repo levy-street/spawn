@@ -9,6 +9,8 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
+from fastapi import WebSocketDisconnect
+
 from ..redis import get_backend
 from .close_codes import WS_CLOSE_SUPERSEDED
 from .owner_dispatch import (
@@ -23,6 +25,24 @@ if TYPE_CHECKING:
     from fastapi import WebSocket
 
     from .host_signal import RedisBrowserConn
+
+
+async def _send_or_disconnect(websocket: WebSocket, text: str) -> None:
+    """Send one frame, or say the peer is gone.
+
+    A peer that closes between ``accept`` and the first frame — a page torn
+    down while its socket was still opening, a daemon killed mid-handshake —
+    leaves a transport that refuses the write rather than a disconnect event
+    the handler has read yet: uvloop raises ``RuntimeError`` ("the handler is
+    closed"), the asyncio stack ``ClientDisconnected`` (an ``OSError``), and
+    Starlette a ``RuntimeError`` once a close frame has gone out. None of them
+    is a fault in this server, and every handler already knows what to do with
+    a peer that has left, so that is what they arrive as.
+    """
+    try:
+        await websocket.send_text(text)
+    except (OSError, RuntimeError) as exc:
+        raise WebSocketDisconnect(code=1006, reason=str(exc)) from exc
 
 
 @dataclass(eq=False)
@@ -43,8 +63,9 @@ class DaemonConn:
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
-            await self.websocket.send_text(
-                json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
+            await _send_or_disconnect(
+                self.websocket,
+                json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload),
             )
 
 
@@ -58,8 +79,9 @@ class BrowserConn:
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
-            await self.websocket.send_text(
-                json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
+            await _send_or_disconnect(
+                self.websocket,
+                json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload),
             )
 
     @property
@@ -77,8 +99,9 @@ class HostBrowserConn:
 
     async def send_text(self, payload: dict) -> None:
         async with self.send_lock:
-            await self.websocket.send_text(
-                json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload)
+            await _send_or_disconnect(
+                self.websocket,
+                json.dumps(payload, ensure_ascii=SIGNED_ENVELOPE_FIELD not in payload),
             )
 
     @property
@@ -757,9 +780,7 @@ class Broker:
             and len(self._retired_rtc_bindings) >= MAX_RTC_BINDING_IDENTITIES
         ):
             return False
-        self._retired_rtc_bindings[identity] = (
-            timestamp + RTC_BINDING_TOMBSTONE_TTL_SECONDS
-        )
+        self._retired_rtc_bindings[identity] = timestamp + RTC_BINDING_TOMBSTONE_TTL_SECONDS
         self._schedule_rtc_tombstone_cleanup_locked()
         return True
 
@@ -772,10 +793,7 @@ class Broker:
             self._retired_rtc_bindings.pop(identity, None)
 
     def _schedule_rtc_tombstone_cleanup_locked(self) -> None:
-        if (
-            self._rtc_tombstone_cleanup_task is None
-            or self._rtc_tombstone_cleanup_task.done()
-        ):
+        if self._rtc_tombstone_cleanup_task is None or self._rtc_tombstone_cleanup_task.done():
             self._rtc_tombstone_cleanup_task = asyncio.create_task(
                 self._rtc_tombstone_cleanup_loop()
             )
