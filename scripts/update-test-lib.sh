@@ -26,6 +26,21 @@ update_test_need() {
   command -v "$1" >/dev/null 2>&1 || update_test_die "missing required command: $1"
 }
 
+update_test_resolve_scratch_root() {
+  local requested_root
+  requested_root="${SPAWN_UPDATE_TEST_ROOT:-${SPAWN_UPDATE_TMP_ROOT:-${TMPDIR:-/tmp}}}"
+  if [[ ! -d "$requested_root" ]]; then
+    update_test_die "scratch root does not exist: $requested_root"
+    return 1
+  fi
+  local resolved_root
+  if ! resolved_root="$(cd -P -- "$requested_root" && pwd -P)"; then
+    update_test_die "could not resolve scratch root: $requested_root"
+    return 1
+  fi
+  printf '%s\n' "$resolved_root"
+}
+
 update_test_is_local_url() {
   python3 - "$1" <<'PY'
 import ipaddress
@@ -99,13 +114,12 @@ update_test_init() {
     *) update_test_die "unsupported local build target: $(uname -s)/$(uname -m)" ;;
   esac
 
-  local scratch_root="${SPAWN_UPDATE_TMP_ROOT:-/private/tmp}"
-  [[ -d "$scratch_root" ]] || update_test_die "scratch root does not exist: $scratch_root"
-  UPDATE_SCRATCH="$(mktemp -d "$scratch_root/spawn-${label}.XXXXXX")"
+  UPDATE_SCRATCH_ROOT="$(update_test_resolve_scratch_root)"
+  UPDATE_SCRATCH="$(mktemp -d "$UPDATE_SCRATCH_ROOT/spawn-${label}.XXXXXX")"
   UPDATE_ARTIFACTS="$UPDATE_SCRATCH/artifacts"
   UPDATE_PREBUILT="$UPDATE_SCRATCH/prebuilt"
   UPDATE_KEY_FILE="$UPDATE_SCRATCH/release-signing.key"
-  UPDATE_CARGO_ROOT="${SPAWN_TEST_CARGO_TARGET_DIR:-/private/tmp/spawn-t2-cargo}"
+  UPDATE_CARGO_ROOT="${SPAWN_TEST_CARGO_TARGET_DIR:-$UPDATE_SCRATCH_ROOT/spawn-t2-cargo}"
   case "$UPDATE_CARGO_ROOT" in
     /|"$UPDATE_REPO_ROOT"|"$UPDATE_REPO_ROOT"/)
       update_test_die "unsafe SPAWN_TEST_CARGO_TARGET_DIR: $UPDATE_CARGO_ROOT" ;;
@@ -212,8 +226,15 @@ update_test_new_fixture() {
   UPDATE_DAEMON_HOME="$UPDATE_FIXTURE/daemon-home"
   UPDATE_BIN_DIR="$UPDATE_FIXTURE/bin"
   # macOS limits Unix-domain socket paths to 103 bytes. Session IDs consume
-  # most of that budget, so keep worker state in a deliberately short path.
-  UPDATE_WORKER_DIR="$(mktemp -d /private/tmp/su.XXXXXX)"
+  # most of that budget, so keep worker state under canonical /tmp rather than
+  # a potentially long per-user TMPDIR. The resolver removes platform-specific
+  # symlink components while retaining that short path.
+  local worker_scratch_root
+  worker_scratch_root="$(
+    SPAWN_UPDATE_TEST_ROOT=/tmp SPAWN_UPDATE_TMP_ROOT= TMPDIR= \
+      update_test_resolve_scratch_root
+  )"
+  UPDATE_WORKER_DIR="$(mktemp -d "$worker_scratch_root/su.XXXXXX")"
   UPDATE_SESSION_CWD="$UPDATE_FIXTURE/session-cwd"
   UPDATE_SHELL="$UPDATE_FIXTURE/update-shell"
   UPDATE_TOKEN=""
@@ -932,6 +953,24 @@ update_test_cleanup_all() {
 }
 
 update_test_lib_self_test() {
+  local expected_root resolved_root
+  expected_root="$(cd -P -- /tmp && pwd -P)"
+  resolved_root="$(
+    SPAWN_UPDATE_TEST_ROOT= SPAWN_UPDATE_TMP_ROOT= TMPDIR=/tmp \
+      update_test_resolve_scratch_root
+  )"
+  [[ "$resolved_root" == "$expected_root" ]] \
+    || update_test_die "scratch root was not canonical: $resolved_root"
+  resolved_root="$(
+    SPAWN_UPDATE_TEST_ROOT=/tmp SPAWN_UPDATE_TMP_ROOT=/ TMPDIR=/ \
+      update_test_resolve_scratch_root
+  )"
+  [[ "$resolved_root" == "$expected_root" ]] \
+    || update_test_die "SPAWN_UPDATE_TEST_ROOT did not take precedence: $resolved_root"
+  if SPAWN_UPDATE_TEST_ROOT=/definitely/missing/spawn-update-test-root \
+    update_test_resolve_scratch_root >/dev/null 2>&1; then
+    update_test_die "missing scratch root passed the directory guard"
+  fi
   update_test_is_local_url "http://127.0.0.1:1234"
   update_test_is_local_url "ws://localhost:1234"
   if update_test_is_local_url "https://spawnd.dev"; then
