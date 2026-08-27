@@ -1305,6 +1305,32 @@ fn credentials_touched_notify() -> &'static tokio::sync::Notify {
     CREDENTIALS_TOUCHED.get_or_init(tokio::sync::Notify::new)
 }
 
+/// The account chained endorsements are scoped to (device mesh §3).
+///
+/// The server names one on every `registered` / `host.browser_pins` frame,
+/// and that used to be taken as read. This host's own pins hold a better
+/// answer: the account id each browser approval was signed over, re-verified
+/// on load (`StoredCreds::proven_account_id`). A wrong account could only
+/// ever deny the chain path — it matches no legitimate chain — never grant
+/// one, so nothing here was exploitable; but a server-controlled input to a
+/// trust decision is one thing fewer to reason about when the local copy
+/// wins. The server's value fills in only while no pin carries a proof.
+fn resolve_daemon_account(proven: Option<[u8; 16]>, reported: Option<&str>) -> Option<[u8; 16]> {
+    let reported = reported.and_then(|value| account_id_bytes(value).ok());
+    match (proven, reported) {
+        (Some(local), Some(server)) => {
+            if local != server {
+                tracing::warn!(
+                    "server named a different account for this host than its own approval proofs do; keeping the proven one"
+                );
+            }
+            Some(local)
+        }
+        (Some(local), None) => Some(local),
+        (None, server) => server,
+    }
+}
+
 fn require_signed_rtc_offers() -> bool {
     // Enforcement is the default: an unsigned offer to a daemon that has never
     // pinned the offering browser is exactly the attack signed signaling
@@ -1666,11 +1692,17 @@ async fn dispatch_loop(
     registered_at: Arc<StdMutex<Option<Instant>>>,
 ) -> Result<()> {
     let mut rtc_tasks: HashMap<String, mpsc::UnboundedSender<RtcSignalJob>> = HashMap::new();
-    // This host's account, as canonical UUID bytes, learned from registration.
-    // Used to scope carried endorsement chains at connect (device mesh §3). A
-    // wrong/absent value only denies the chain path — it never grants — so a
-    // lying server can at most withhold chained admission, not forge it.
-    let mut daemon_account: Option<[u8; 16]> = None;
+    // This host's account, as canonical UUID bytes. Used to scope carried
+    // endorsement chains at connect (device mesh §3). A wrong/absent value only
+    // denies the chain path — it never grants — so a lying server can at most
+    // withhold chained admission, not forge it. Even so, the local pins carry
+    // the answer (`resolve_daemon_account`), so the server's word is only
+    // used while no pin carries an approval proof.
+    let proven_account = live_credentials
+        .record
+        .proven_account_id()
+        .and_then(|value| account_id_bytes(&value).ok());
+    let mut daemon_account: Option<[u8; 16]> = proven_account;
     // `daemon_revoked` is the account deny-list (device mesh §3): keys the
     // server reports as revoked, subtracted from acceptance. Fail-closed and
     // subtract-only — it can only reject a connection, never admit one, so
@@ -1721,7 +1753,7 @@ async fn dispatch_loop(
                         }
                     }
                     rtc_sessions.reannounce_live_statuses().await;
-                    daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
+                    daemon_account = resolve_daemon_account(proven_account, account_id.as_deref());
                     let newly_revoked = daemon_revoked
                         .absorb(revocation_set_from_wire(revoked_browser_keys.as_deref()));
                     reconcile_browser_pins(
@@ -1753,7 +1785,7 @@ async fn dispatch_loop(
                     // Pushed when the set changes, so endorsing OR revoking a
                     // device takes effect immediately instead of waiting for the
                     // daemon to happen to reconnect -- which could be hours.
-                    daemon_account = account_id.as_deref().and_then(|a| account_id_bytes(a).ok());
+                    daemon_account = resolve_daemon_account(proven_account, account_id.as_deref());
                     // Union, never replace: a shorter or absent pushed list must
                     // not un-revoke (the deny-list is add-only end to end, R10;
                     // a shrinking frame can only mean a withholding server).
@@ -3380,6 +3412,23 @@ mod tests {
     use futures_util::SinkExt;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
+
+    /// Chain scope comes from this host's own approval proofs first; the
+    /// server's account only fills in while no pin carries one, and never
+    /// displaces a proven value.
+    #[test]
+    fn the_proven_account_outranks_the_servers_word_for_chain_scope() {
+        let local = account_id_bytes("9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f").expect("uuid");
+        let server = "1f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
+        assert_eq!(resolve_daemon_account(Some(local), Some(server)), Some(local));
+        assert_eq!(resolve_daemon_account(Some(local), None), Some(local));
+        assert_eq!(
+            resolve_daemon_account(None, Some(server)),
+            account_id_bytes(server).ok()
+        );
+        assert_eq!(resolve_daemon_account(None, Some("not-a-uuid")), None);
+        assert_eq!(resolve_daemon_account(None, None), None);
+    }
 
     const TEST_BROWSER_KEY_ONE: &str = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
     const TEST_BROWSER_KEY_TWO: &str = "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw";
