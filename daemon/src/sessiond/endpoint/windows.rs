@@ -896,7 +896,14 @@ fn start_lifecycle_listener(name: OsString, first: NamedPipeServer) -> Lifecycle
                     Ok(Err(error)) if error.raw_os_error() == Some(ERROR_MORE_DATA as i32) => {
                         request.len()
                     }
-                    _ => return,
+                    _ => {
+                        // A client handle alone keeps a named-pipe instance
+                        // alive. Explicitly disconnect timed-out/failed clients
+                        // so seven silent peers cannot retain every instance
+                        // slot after their server handles are closed.
+                        let _ = server.disconnect();
+                        return;
+                    }
                 };
                 let exchange = LifecycleExchange {
                     server,
@@ -1546,6 +1553,10 @@ mod tests {
         assert_eq!(frame_type, wire::T_REDRAW);
         assert_eq!(payload, b"roll");
 
+        // Disconnect is the documented server teardown before CloseHandle;
+        // it releases the client from this instance before the test proves a
+        // fresh first-instance reservation can take the same name.
+        server.disconnect().unwrap();
         drop(client);
         drop(server);
         drop(listener);

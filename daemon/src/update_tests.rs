@@ -13,6 +13,7 @@ fn test_executable(directory: &Path, stem: &str) -> PathBuf {
 fn test_executable_variant(directory: &Path, stem: &str, tag: &str) -> PathBuf {
     crate::platform::executable_variant(&test_executable(directory, stem), tag).unwrap()
 }
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn manifest_request() -> UpdateRequest {
@@ -682,6 +683,7 @@ async fn downloads_verifies_and_swaps_both_fake_binaries() {
     serving.await.unwrap();
 }
 
+#[cfg(unix)]
 async fn serve_responses(responses: Vec<Vec<u8>>) -> (Url, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

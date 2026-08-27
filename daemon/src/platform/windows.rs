@@ -30,9 +30,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
-    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
-    VOLUME_NAME_DOS,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
+    READ_CONTROL, SYNCHRONIZE, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::Com::{
     CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
@@ -321,13 +321,24 @@ fn open_handle(path: &Path, directory: bool, write: bool) -> io::Result<File> {
         } else {
             FILE_ATTRIBUTE_NORMAL
         };
+    let share = FILE_SHARE_READ
+        | FILE_SHARE_WRITE
+        | if directory {
+            // Directory capabilities deliberately pin their containing path.
+            0
+        } else {
+            // Verified file handles may outlive the path operation that
+            // follows. Windows requires every extant handle to share delete
+            // access for either an atomic rename or an unlink to succeed.
+            FILE_SHARE_DELETE
+        };
     // SAFETY: path is NUL-terminated, optional pointers are null, and the
     // returned owned handle is immediately transferred to File.
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            share,
             null(),
             OPEN_EXISTING,
             flags,
@@ -352,7 +363,10 @@ fn create_file_new(path: &Path) -> io::Result<File> {
             CreateFileW(
                 path.as_ptr(),
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | READ_CONTROL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                // Match Rust's ordinary OpenOptions sharing contract: secret
+                // publication and scrollback eviction must remain possible
+                // while this validated handle is live.
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 attributes,
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,

@@ -1748,7 +1748,7 @@ fn keyring_entry(user: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, user).context("constructing keyring entry")
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn keyring_get_for_user(user: &str) -> Result<Option<String>> {
     let entry = keyring_entry(user)?;
     match entry.get_password() {
@@ -1945,7 +1945,7 @@ where
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn keyring_delete_for_user(user: &str) -> Result<()> {
     let entry = keyring_entry(user)?;
     match entry.delete_credential() {
@@ -2204,7 +2204,9 @@ mod tests {
     const LOCK_HELPER_PATH_ENV: &str = "SPAWN_TEST_CREDENTIAL_LOCK_PATH";
     const LOCK_HELPER_READY_ENV: &str = "SPAWN_TEST_CREDENTIAL_LOCK_READY";
     const LOCK_HELPER_ACQUIRED_ENV: &str = "SPAWN_TEST_CREDENTIAL_LOCK_ACQUIRED";
+    #[cfg(unix)]
     const FALLBACK_HELPER_PATH_ENV: &str = "SPAWN_TEST_NO_KEYRING_LOGIN_PATH";
+    #[cfg(unix)]
     const FALLBACK_HELPER_EVIDENCE_ENV: &str = "SPAWN_TEST_NO_KEYRING_LOGIN_EVIDENCE";
 
     fn fixed_creds() -> StoredCreds {

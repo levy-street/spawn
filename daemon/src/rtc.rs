@@ -4830,6 +4830,7 @@ mod tests {
             }
         }
 
+        #[cfg(unix)]
         fn path(&self) -> &std::path::Path {
             self._dir.path()
         }

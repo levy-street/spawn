@@ -2998,9 +2998,10 @@ mod tests {
             r"\\?\UNC\server\share\folder",
             r"\\.\C:\folder",
         ] {
-            let error = open_capability_root(root)
-                .err()
-                .expect("UNC/device root must be unavailable");
+            let error = match open_capability_root(root) {
+                Ok(_) => panic!("UNC/device root must be unavailable"),
+                Err(error) => error,
+            };
             assert!(
                 error.to_string().contains("UNC") || error.to_string().contains("device"),
                 "unexpected error for {root:?}: {error:#}"
