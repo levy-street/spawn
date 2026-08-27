@@ -9,15 +9,15 @@ import {
   CTA_SLAB,
   Eyebrow,
   InstallCommand,
+  MacDownloadButton,
   Masthead,
   RegistrationMarks,
   StoreBadgeMark,
 } from "@/components/brand/press";
+import { useDesktopRelease } from "@/hooks/useDesktopRelease";
 import { poster } from "@/lib/fonts";
 import {
-  type DesktopRelease,
   desktopDownloadUrl,
-  desktopReleaseFromPayload,
   detectPlatform,
   installTargetForOS,
   installTargets,
@@ -122,20 +122,14 @@ const OPTIONS = [
 
 export default function DownloadPage() {
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
-  const [desktopRelease, setDesktopRelease] = useState<DesktopRelease | null>(null);
+  const {
+    release: desktopRelease,
+    settled: releaseSettled,
+    url: macBuildUrl,
+  } = useDesktopRelease(platform.origin);
 
   useEffect(() => {
     setPlatform(detectPlatform());
-    const controller = new AbortController();
-    void fetch("/api/release", {
-      cache: "no-store",
-      headers: { Accept: "application/json" },
-      signal: controller.signal,
-    })
-      .then((response) => (response.ok ? response.json() : null))
-      .then((payload: unknown) => setDesktopRelease(desktopReleaseFromPayload(payload)))
-      .catch(() => undefined);
-    return () => controller.abort();
   }, []);
 
   const prebuiltCommand = platform.prebuiltInstallCommand;
@@ -202,27 +196,29 @@ export default function DownloadPage() {
            * brings its own ground rather than floating on it. */}
           <div className="mt-14 grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {PLATFORM_CARDS.map((card) => {
-              const release = card.id === "mac" ? desktopRelease : null;
-              const href =
-                release && card.id === "mac"
-                  ? desktopDownloadUrl(platform.origin, release.version, "darwin-aarch64")
-                  : card.id !== "mac"
-                    ? (storeBadges().find((badge) => badge.id === card.id)?.href ?? null)
-                    : null;
+              const mac = card.id === "mac";
+              const href = mac
+                ? macBuildUrl
+                : (storeBadges().find((badge) => badge.id === card.id)?.href ?? null);
+              // The Mac build is named by a manifest that has not answered on
+              // the first paint. That is not "coming soon" — the card presses
+              // and waits, the way the slab does.
+              const waitingOnManifest = mac && !releaseSettled;
               return (
                 <div
                   key={card.id}
                   className="flex min-w-0 flex-col rounded-[12px] bg-char px-6 pt-6 pb-5"
                 >
                   <div className="flex h-14 items-center">
-                    {card.id === "mac" ? (
-                      <span className="inline-flex h-14 items-center gap-3 rounded-[10px] border border-bone/70 px-5">
-                        {/* biome-ignore lint/performance/noImgElement: brand mark */}
-                        <img src="/brand/spawnd-icon.svg" alt="" className="size-6" aria-hidden />
-                        <span className="font-sigil text-[13px] tracking-[0.1em] text-bone uppercase">
-                          SPAWN D for Mac
-                        </span>
-                      </span>
+                    {mac ? (
+                      // The same shape the two stores hand out, so the row
+                      // reads as three downloads rather than two badges and a
+                      // nameplate.
+                      <MacDownloadButton
+                        href={href}
+                        pending={waitingOnManifest}
+                        className="h-14 px-6"
+                      />
                     ) : (
                       <StoreBadgeMark id={card.id} />
                     )}
@@ -233,9 +229,15 @@ export default function DownloadPage() {
                   <p className="mt-3 flex-1 text-[15px] leading-7 text-ash">{card.body}</p>
                   <p className="mt-6 border-line-g border-t pt-4 font-sigil text-[11px] tracking-[0.22em] uppercase">
                     {href ? (
-                      <a href={href} className="text-bone transition-colors hover:text-ember">
+                      <a
+                        href={href}
+                        download
+                        className="text-bone transition-colors hover:text-ember"
+                      >
                         Download
                       </a>
+                    ) : waitingOnManifest ? (
+                      <span className="text-ash">Checking for a build…</span>
                     ) : (
                       <span className="text-ember">Coming soon</span>
                     )}

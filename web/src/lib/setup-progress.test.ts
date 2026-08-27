@@ -4,6 +4,7 @@ import {
   SETUP_PROGRESS_ACTIVE_LABELS,
   SETUP_PROGRESS_LABELS,
   setupProgressStalledHint,
+  visibleSetupSteps,
 } from "./setup-progress";
 
 describe("deriveSetupProgress", () => {
@@ -71,5 +72,45 @@ describe("setupProgressStalledHint", () => {
 
   test("keeps active and completed labels aligned", () => {
     expect(SETUP_PROGRESS_ACTIVE_LABELS).toHaveLength(SETUP_PROGRESS_LABELS.length);
+  });
+});
+
+describe("visibleSetupSteps", () => {
+  test("drops a copy step this browser never witnessed", () => {
+    // The terminal-first arrival: the command was run before the account
+    // existed, so the row can never tick and is not a chore anyone skipped.
+    const byLink = deriveSetupProgress({
+      commandCopied: false,
+      locallyApproved: true,
+      resumeApprovedHost: false,
+      onlineHost: false,
+    });
+    expect(visibleSetupSteps(byLink)).toEqual([2, 3]);
+
+    const resumed = deriveSetupProgress({
+      commandCopied: false,
+      locallyApproved: false,
+      resumeApprovedHost: true,
+      onlineHost: false,
+    });
+    expect(visibleSetupSteps(resumed)).toEqual([2, 3]);
+  });
+
+  test("keeps all three where the copy is the step being waited on", () => {
+    const waiting = deriveSetupProgress({
+      commandCopied: false,
+      locallyApproved: false,
+      resumeApprovedHost: false,
+      onlineHost: false,
+    });
+    expect(visibleSetupSteps(waiting)).toEqual([1, 2, 3]);
+
+    const copied = deriveSetupProgress({
+      commandCopied: true,
+      locallyApproved: false,
+      resumeApprovedHost: false,
+      onlineHost: false,
+    });
+    expect(visibleSetupSteps(copied)).toEqual([1, 2, 3]);
   });
 });

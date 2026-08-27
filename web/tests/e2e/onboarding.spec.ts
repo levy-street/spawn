@@ -64,6 +64,9 @@ test("the host gate notices a newly online host and moves on", async ({ page }) 
   await expect(progress).toBeVisible();
   await expect(progress.locator('[data-step="1"]')).toHaveAttribute("data-state", "complete");
   await expect(progress.locator('[data-step="2"]')).toHaveAttribute("data-state", "current");
+  // Waiting for the approval waits on the person — they have the command and
+  // have still to run it. A spinner there claimed the browser was working.
+  await expect(progress.locator('[data-step="2"] .animate-spin')).toHaveCount(0);
 
   store.hosts.push({ ...host });
   await page.clock.fastForward(3_100);
@@ -158,6 +161,11 @@ test("the onboarding host step finishes an approval its URL still carries", asyn
   await expect(page.locator('[data-step="2"]')).toHaveAttribute("data-state", "complete", {
     timeout: 10_000,
   });
+  // The command was copied in a terminal, before this account existed. The row
+  // for it can never tick here, and listing it unchecked above two checked ones
+  // reads as a step the reader skipped.
+  await expect(page.getByTestId("setup-progress")).not.toContainText("Command copied");
+  await expect(page.locator('[data-step="1"]')).toHaveCount(0);
 
   // The approval hands the screen to the wait rather than leaving a spent
   // ceremony — whose Done resets it — as the only thing on the page.
@@ -175,20 +183,28 @@ test("the onboarding host step finishes an approval its URL still carries", asyn
   await expect(page).toHaveURL("/app", { timeout: 10_000 });
 });
 
-test("an approval link followed through signup finishes on /device", async ({ page }) => {
-  await mockApp(page, { me: null, hosts: [], workspaces: [] });
+test("an approval link followed through signup finishes inside onboarding", async ({ page }) => {
+  // A brand-new account has not finished setting up, so its machine's approval
+  // belongs to the flow it is already in. Finishing it on /device meant the
+  // ceremony ran inside the app chrome of a product this person had not set up
+  // yet, ending on a "Continue setup" button back out to onboarding.
+  const store = await mockApp(page, { me: null, hosts: [], workspaces: [] });
   await arriveByApprovalLink(page);
+  await expect(page).toHaveURL(/\/onboarding/);
   // The ceremony is already waiting, so there is nothing to install and no
   // code to type.
   await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
   await page.getByTestId("possess-approve").click();
 
-  await expect(page.getByTestId("ceremony-done")).toContainText("is possessed", {
+  // No spent ceremony left owning the screen, and no Done that would empty it:
+  // the approval hands over to the wait for the machine.
+  await expect(page.locator('[data-step="2"]')).toHaveAttribute("data-state", "complete", {
     timeout: 10_000,
   });
-  await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
-  await page.getByRole("button", { name: "Done" }).click();
-  await expect(page.getByRole("button", { name: "Copy install command" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Done" })).toHaveCount(0);
+
+  store.hosts.push({ ...host, status: "online", session_count: 0 });
+  await expect(page).toHaveURL("/app", { timeout: 15_000 });
 });
 
 test("a reloaded approval link keeps the ceremony it still carries", async ({ page }) => {

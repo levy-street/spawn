@@ -185,9 +185,16 @@ button, input { font: inherit; color: inherit; }
 .stacked .lockup { margin-inline: auto; }
 
 /* `split` ranges the masthead against a wider plate — what the onboarding
-   gates need, since they carry a checklist and then a whole ceremony. Below
-   the browser's desktop breakpoint, which this window always is, it stacks:
-   masthead centred, then the plate, and it centres only while it fits. */
+   gates need, since they carry a checklist and then a whole ceremony. Narrow,
+   it stacks: masthead centred, then the plate, centred while it fits.
+
+   At the browser's own desktop breakpoint it does what the browser does and
+   ranges them side by side (web/src/components/onboarding/auth-shell.tsx,
+   `layout="split"`): the masthead left and ragged-right at 38%, the rail a
+   column under it, the plate taking the rest. The window is resizable, and
+   assuming it never gets there left a wide window running one narrow column
+   down the middle of a lot of nothing — the same gate, set differently from
+   the web page it is a print of. */
 .split {
   position: relative; z-index: 1;
   display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; gap: 32px;
@@ -197,6 +204,19 @@ button, input { font: inherit; color: inherit; }
 .split-head { display: flex; flex-direction: column; align-items: center; width: 100%; max-width: 448px; min-width: 0; text-align: center; }
 .split-head h1 { margin-top: 28px; font-size: clamp(30px, 5.4vw, 48px); line-height: 1.02; }
 .split-head .lead { margin-top: 16px; line-height: 28px; }
+
+@media (min-width: 1024px) {
+  .split {
+    flex-direction: row; align-items: center; justify-content: space-between; gap: 64px;
+    padding: 64px 40px;
+  }
+  .split-head {
+    flex: 0 0 auto; width: 38%; max-width: 384px;
+    align-items: flex-start; text-align: left;
+  }
+  .split-head .rail { flex-direction: column; align-items: flex-start; justify-content: flex-start; gap: 14px; }
+  .split > .plate { flex: 1 1 auto; max-width: 576px; }
+}
 
 h1 {
   margin: 0;

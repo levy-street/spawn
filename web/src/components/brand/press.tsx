@@ -1,6 +1,6 @@
 "use client";
 
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, Loader2 } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode, RefObject } from "react";
 import { useEffect, useRef, useState } from "react";
@@ -26,6 +26,15 @@ export const GITHUB_URL = "https://github.com/levy-street/spawn";
  */
 export const CTA_SLAB =
   "group inline-flex items-center justify-center gap-2 rounded-sm bg-bone px-7 py-[15px] font-sigil text-[13px] font-medium tracking-[0.14em] text-void uppercase transition-colors hover:bg-white";
+
+/**
+ * The second action where the first one is a slab and they share a plate: the
+ * same shape and measure, drawn in the plate's own ground until it is pointed
+ * at. Two slabs would argue; a bare rule next to a slab disappeared into the
+ * print behind it.
+ */
+export const CTA_GHOST =
+  "group inline-flex items-center justify-center gap-2 rounded-sm px-7 py-[15px] font-sigil text-[13px] font-medium tracking-[0.14em] text-bone uppercase transition-colors hover:bg-bone/12";
 
 /** The second action: sigil caps on an ember rule, never a competing slab. */
 export const CTA_QUIET =
@@ -176,7 +185,7 @@ export function Masthead({ current }: { current?: "security" | "download" }) {
                 Log&nbsp;in
               </Link>
               <Link href="/signup" className="text-ember transition-colors hover:text-hellfire">
-                Sign&nbsp;up&nbsp;→
+                Sign&nbsp;up
               </Link>
             </>
           )}
@@ -206,6 +215,144 @@ export function Colophon() {
         <span>Open source · MIT / Apache-2.0</span>
       </div>
     </footer>
+  );
+}
+
+/**
+ * Apple's mark, monochrome by rule, taking the ink of whatever it sits on.
+ * Required beside "Download for macOS" the same way it is beside "Sign in with
+ * Apple" (`components/onboarding/oauth-buttons`).
+ */
+function AppleMark({ className }: { className?: string }) {
+  return (
+    <svg
+      aria-hidden="true"
+      className={cn("size-[26px] shrink-0 -translate-y-px fill-current", className)}
+      viewBox="0 0 24 24"
+    >
+      <path d="M17.05 12.53c-.02-2.2 1.8-3.26 1.88-3.31-1.02-1.5-2.62-1.7-3.19-1.72-1.36-.14-2.65.8-3.34.8-.69 0-1.75-.78-2.88-.76-1.48.02-2.85.86-3.61 2.18-1.54 2.67-.39 6.62 1.11 8.79.73 1.06 1.6 2.25 2.75 2.21 1.1-.05 1.52-.71 2.85-.71 1.33 0 1.71.71 2.88.69 1.19-.02 1.94-1.08 2.67-2.15.84-1.23 1.19-2.42 1.21-2.48-.03-.01-2.32-.89-2.33-3.54zM14.86 5.6c.6-.74 1.01-1.76.9-2.78-.87.04-1.93.58-2.56 1.31-.56.65-1.05 1.7-.92 2.7.97.08 1.97-.49 2.58-1.23z" />
+    </svg>
+  );
+}
+
+/** Microsoft's four panes, monochrome so the slab keeps one ink. */
+function WindowsMark({ className }: { className?: string }) {
+  return (
+    <svg
+      aria-hidden="true"
+      className={cn("size-[22px] shrink-0 fill-current", className)}
+      viewBox="0 0 24 24"
+    >
+      <path d="M2.5 4.7 11 3.5v8.1H2.5zM12.2 3.3 21.5 2v9.6h-9.3zM2.5 12.7H11v8L2.5 19.4zM12.2 12.7h9.3V22l-9.3-1.3z" />
+    </svg>
+  );
+}
+
+/**
+ * Hand a file over without leaving the page: a download, not a navigation.
+ * Used for the press made before the build's name was known, which arrives
+ * with no click of its own left to ride on.
+ */
+function startDownload(url: string): void {
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "";
+  link.rel = "noopener";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
+/**
+ * The Mac download, set the way the phone stores set theirs: the platform's
+ * own mark, then the words, as one object you press — not a caption with a
+ * link somewhere under it.
+ *
+ * It is Apple's shape, not Apple's blue. Every download on this site is the
+ * bone slab on the void, and hellfire is never a button ground, so borrowing
+ * the vendor's colour would put a second "click me" ink on the page and break
+ * the one rule the palette carries.
+ *
+ * Three states, and only the first two are ordinary:
+ *
+ * - a `href`: the file, handed over on the press.
+ * - `pending`: the release manifest has not answered yet, which is the
+ *   ordinary first paint. The slab presses like any other and holds the press
+ *   — spinner in place of the mark — until the name arrives, then downloads.
+ *   Sending that press to /download instead made the button a detour on every
+ *   cold load, which is the one thing a download button must not be.
+ * - neither: nothing to hand out here, so /download, where the builds are
+ *   listed with their versions.
+ */
+export function MacDownloadButton({
+  href,
+  pending = false,
+  className,
+  label = "Download for macOS",
+  platform = "mac",
+}: {
+  href: string | null;
+  /** The release manifest has not answered yet; a press waits on it. */
+  pending?: boolean;
+  className?: string;
+  label?: string;
+  /** Which machine is being handed a download — the mark and the words follow. */
+  platform?: "mac" | "windows";
+}) {
+  const [waiting, setWaiting] = useState(false);
+  const shell = cn(
+    "group inline-flex h-14 items-center justify-center gap-2.5 rounded-sm bg-bone px-7 font-sigil text-[13px] font-medium tracking-[0.14em] text-void uppercase transition-colors hover:bg-white",
+    className,
+  );
+  const mark = platform === "windows" ? <WindowsMark /> : <AppleMark />;
+  const words =
+    platform === "windows" && label === "Download for macOS" ? "Download for Windows" : label;
+
+  useEffect(() => {
+    if (!waiting) return;
+    if (href !== null) {
+      setWaiting(false);
+      startDownload(href);
+      return;
+    }
+    // The manifest answered, and the answer was that there is no build here.
+    if (!pending) {
+      setWaiting(false);
+      window.location.assign("/download");
+    }
+  }, [waiting, href, pending]);
+
+  if (href === null && pending) {
+    return (
+      <button
+        type="button"
+        onClick={() => setWaiting(true)}
+        aria-busy={waiting}
+        className={shell}
+        data-testid="mac-download"
+      >
+        {waiting ? (
+          <Loader2 className="size-[22px] shrink-0 animate-spin" aria-hidden="true" />
+        ) : (
+          mark
+        )}
+        {waiting ? "Preparing download" : words}
+      </button>
+    );
+  }
+  if (href === null) {
+    return (
+      <Link href="/download" className={shell}>
+        {mark}
+        {words}
+      </Link>
+    );
+  }
+  return (
+    <a href={href} download className={shell} data-testid="mac-download">
+      {mark}
+      {words}
+    </a>
   );
 }
 
@@ -328,6 +475,8 @@ export function InstallCommand({
   defaultTargetId,
   className,
   copyLabel = "Copy install command",
+  onTargetChange,
+  boxClassName,
 }: {
   command?: string;
   targets?: InstallChipTarget[];
@@ -336,6 +485,19 @@ export function InstallCommand({
   className?: string;
   /** Overridable so a page can name the button something the copy reads to. */
   copyLabel?: string;
+  /**
+   * Told which target the reader picked, so a caller can follow it. The chip
+   * and the download button beside it are one answer to "what do I run on this
+   * machine"; switching the chip to Windows and leaving a Mac download under it
+   * made them two.
+   */
+  onTargetChange?: (id: string) => void;
+  /**
+   * Classes for the chip itself, for a caller that sets it inside a panel of
+   * its own — where the chip's border would be a second line drawn a hair
+   * inside the first.
+   */
+  boxClassName?: string;
 }) {
   const [copied, setCopied] = useState(false);
   const [chosen, setChosen] = useState<string | null>(null);
@@ -354,14 +516,18 @@ export function InstallCommand({
           // inline-flex so the chip shrinks to its one line of shell wherever it
           // lands; a stretching flex parent (the hero column on mobile) still
           // pulls it full-width.
-          "inline-flex max-w-full flex-col rounded-sm border border-bone bg-void font-sigil text-[13px] text-bone",
+          "inline-flex max-w-full flex-col rounded-[16px] border border-bone bg-void font-sigil text-[13px] text-bone",
+          boxClassName,
         )}
       >
         {tabs.length > 1 && (
           <div
             role="tablist"
             aria-label="Install target"
-            className="flex items-center gap-5 border-b border-bone/25 px-4 py-2.5"
+            // The rule under the tabs is set in from both sides, like every
+            // other divider inside a panel — an edge-to-edge line here read as
+            // the chip's own border rather than a division inside it.
+            className="relative flex items-center gap-5 px-4 pt-4 pb-2.5 after:absolute after:inset-x-4 after:bottom-0 after:h-px after:bg-bone/25 after:content-['']"
           >
             {tabs.map((target) => {
               const selected = target.id === active?.id;
@@ -374,6 +540,7 @@ export function InstallCommand({
                   onClick={() => {
                     setChosen(target.id);
                     setCopied(false);
+                    onTargetChange?.(target.id);
                   }}
                   className={cn(
                     "text-[11px] tracking-[0.18em] uppercase transition-colors",
