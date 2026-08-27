@@ -212,6 +212,17 @@ pages targeting category head terms, each racking its spokes.
 
 ## Templates
 
+**Baseline recipe (owner-approved on the job prototype, 2026-08-27), all
+templates inherit it:** hero = heavy branding, minimal words — a dimmed
+full-bleed ink print (family-mapped: grid-ink jobs · pocket-ink device ·
+hosts-ink machine · handoff-ink comparisons · hero-ink hubs) under exactly
+the keyword H1 and one subheading, breadcrumb small above, no CTAs; body =
+general capability statements, never one staged demo (a product capture may
+appear once, framed and captioned as an example); one CTA moment ("Start")
+near the end; quiet small-type FAQ; ~350-word budget above the FAQ; single
+shared rail and hairline borders. Reference implementation:
+`web/src/components/seo/templates/JobPage.tsx` + `/run-agents-in-parallel`.
+
 | template | serves | signature section | schema | status |
 |---|---|---|---|---|
 | hub | 4 hubs | intro essay + spoke rack | Organization, SoftwareApplication, Breadcrumb | exists as bare card rack; needs content upgrade |
