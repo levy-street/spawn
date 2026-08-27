@@ -74,15 +74,9 @@ pub struct PossessArgs {
     #[arg(long)]
     pub host_name: Option<String>,
 
-    /// Claim minted by an already-open setup screen. It routes the approval
-    /// prompt but grants no authority.
-    #[arg(
-        long,
-        env = "SPAWN_SETUP_TOKEN",
-        hide_env_values = true,
-        value_name = "TOKEN"
-    )]
-    pub setup_token: Option<String>,
+    /// Print the approval link but never open a browser for it.
+    #[arg(long)]
+    pub no_browser: bool,
 
     /// Register another isolated account even when this machine already has
     /// a SPAWN D instance.
@@ -122,14 +116,9 @@ pub struct LoginArgs {
     #[arg(long)]
     pub no_run: bool,
 
-    /// Claim minted by an already-open setup screen.
-    #[arg(
-        long,
-        env = "SPAWN_SETUP_TOKEN",
-        hide_env_values = true,
-        value_name = "TOKEN"
-    )]
-    pub setup_token: Option<String>,
+    /// Print the approval link but never open a browser for it.
+    #[arg(long)]
+    pub no_browser: bool,
 
     /// Always render the approval URL as a terminal QR code.
     #[arg(long, conflicts_with = "no_qr")]

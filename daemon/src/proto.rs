@@ -566,8 +566,6 @@ pub struct DeviceStartRequest<'a> {
     pub version: &'a str,
     pub host_key_algorithm: &'a str,
     pub host_public_key: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub setup_token: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -600,7 +598,9 @@ pub struct DevicePossessionRequest<'a> {
 pub struct DevicePossessionResponse {
     pub verified: bool,
     pub version: u8,
+    // A pre-0065 server still answers this field; it is ignored.
     #[serde(default)]
+    #[allow(dead_code)]
     pub attended: bool,
 }
 
@@ -1092,10 +1092,10 @@ mod device_pair_response_tests {
             serde_json::from_str(r#"{"verified":true,"version":1}"#).unwrap();
         assert!(body.verified);
         assert_eq!(body.version, 1);
-        assert!(!body.attended, "old servers default to unattended");
-        let attended: DevicePossessionResponse =
+        assert!(!body.attended, "current servers omit the legacy field");
+        let pre_0065: DevicePossessionResponse =
             serde_json::from_str(r#"{"verified":true,"version":1,"attended":true}"#).unwrap();
-        assert!(attended.attended);
+        assert!(pre_0065.attended, "the pre-0065 field remains tolerated");
 
         for rejected in [
             r#"{"verified":true,"version":1,"error":"denied"}"#,

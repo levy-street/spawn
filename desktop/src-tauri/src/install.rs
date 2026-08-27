@@ -11,24 +11,25 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use futures_util::StreamExt;
 use reqwest::Method;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::api::ApiClient;
 use crate::crypto::{key_fingerprint, DeviceIdentity};
 use crate::models::{
-    ApprovalReview, DeviceApproveResponse, DevicePending, PossessionProgress, SetupClaim,
-    SetupClaimMint,
+    ApprovalReview, DeviceApproveResponse, DevicePending, PossessionProgress, PossessionStatus,
 };
 use crate::storage;
 
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_BINARY_BYTES: usize = 256 * 1024 * 1024;
 const RELEASE_SIGNING_PUBLIC_KEYS: &[&str] = &["8nE_rD4eVv8QFuNMbBQ3023vuU7V-OWxRl70ni4WOf0"];
+const VERIFICATION_REFUSAL: &str = "This host could not be verified.";
 
 #[derive(Debug, Deserialize)]
 struct SignedManifest {
@@ -41,14 +42,40 @@ struct TargetManifest {
     spawn_worker_sha256: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ApprovalIdentifier {
+    ApprovalRef(String),
+    UserCode(String),
+}
+
+impl ApprovalIdentifier {
+    fn request_body(&self) -> Value {
+        match self {
+            Self::ApprovalRef(value) => json!({ "approval_ref": value }),
+            Self::UserCode(value) => json!({ "user_code": value }),
+        }
+    }
+
+    fn insert_into(&self, body: &mut Value) {
+        let (field, value) = match self {
+            Self::ApprovalRef(value) => ("approval_ref", value),
+            Self::UserCode(value) => ("user_code", value),
+        };
+        body.as_object_mut()
+            .expect("approval request body is an object")
+            .insert(field.into(), Value::String(value.clone()));
+    }
+}
+
 #[derive(Clone, Default)]
 struct PossessRun {
-    approval_url_seen: bool,
+    approval_identifier: Option<ApprovalIdentifier>,
     local_key: Option<String>,
-    local_approval_ref: Option<String>,
-    key_fragment_invalid: bool,
-    local_fingerprint: Option<String>,
-    host_public_key: Option<String>,
+    approved: bool,
+    online: bool,
+    error: Option<String>,
+    host_name: Option<String>,
+    host_id: Option<String>,
     child_finished: bool,
     child_error: Option<String>,
     output: Vec<String>,
@@ -67,11 +94,6 @@ impl PossessionManager {
             bail!("Approve this device before possessing this Mac")
         }
         let api = ApiClient::new(&preferences.server_origin)?;
-        let claim: SetupClaimMint = api
-            .authenticated_json(Method::POST, "/api/setup/claims", &json!({}))
-            .await
-            .context("minting the attended setup claim")?;
-        emit_step(app, 0, "Downloading the daemon");
         let pair = download_verified_pair(&api).await.map_err(|error| {
             let detail = error.to_string();
             if detail.contains("doesn't serve a build for this Mac") {
@@ -80,29 +102,28 @@ impl PossessionManager {
                 anyhow::anyhow!("The daemon didn't verify. Nothing was installed.")
             }
         })?;
-        emit_step(app, 1, "Verifying — hashes match the server's manifest");
         let bin_dir = install_pair(pair)?;
-        emit_step(app, 2, "Starting the service");
+        let run_id = new_run_id()?;
         self.runs
             .lock()
             .await
-            .insert(claim.token.clone(), PossessRun::default());
+            .insert(run_id.clone(), PossessRun::default());
         self.spawn_possess(
             app.clone(),
-            claim.token.clone(),
+            run_id.clone(),
             bin_dir.join("spawnd"),
             preferences.server_origin,
         )
         .await
         .map_err(|_| anyhow::anyhow!("The daemon installed but its service didn't start."))?;
-        emit_step(app, 3, "Registering this Mac");
-        Ok(claim.token)
+        emit_step(app, 0, "Daemon downloaded and verified");
+        Ok(run_id)
     }
 
     async fn spawn_possess(
         &self,
         app: AppHandle,
-        claim_token: String,
+        run_id: String,
         spawnd: PathBuf,
         origin: String,
     ) -> Result<()> {
@@ -110,8 +131,7 @@ impl PossessionManager {
             .arg("--server")
             .arg(origin)
             .arg("possess")
-            .arg("--setup-token")
-            .arg(&claim_token)
+            .arg("--no-browser")
             .arg("--no-qr")
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
@@ -122,22 +142,22 @@ impl PossessionManager {
         let stdout = child.stdout.take().context("capturing spawnd output")?;
         let stderr = child.stderr.take().context("capturing spawnd errors")?;
         let stdout_runs = self.runs.clone();
-        let stdout_token = claim_token.clone();
+        let stdout_run_id = run_id.clone();
         let stdout_app = app.clone();
         tauri::async_runtime::spawn(async move {
-            read_child_lines(stdout, &stdout_runs, &stdout_token, &stdout_app).await;
+            read_child_lines(stdout, &stdout_runs, &stdout_run_id, &stdout_app).await;
         });
         let stderr_runs = self.runs.clone();
-        let stderr_token = claim_token.clone();
+        let stderr_run_id = run_id.clone();
         let stderr_app = app.clone();
         tauri::async_runtime::spawn(async move {
-            read_child_lines(stderr, &stderr_runs, &stderr_token, &stderr_app).await;
+            read_child_lines(stderr, &stderr_runs, &stderr_run_id, &stderr_app).await;
         });
         let runs = self.runs.clone();
         tauri::async_runtime::spawn(async move {
             let result = child.wait().await;
             let mut locked = runs.lock().await;
-            if let Some(run) = locked.get_mut(&claim_token) {
+            if let Some(run) = locked.get_mut(&run_id) {
                 run.child_finished = true;
                 run.child_error = match result {
                     Ok(status) if status.success() => None,
@@ -150,140 +170,148 @@ impl PossessionManager {
         Ok(())
     }
 
-    pub async fn poll(&self, app: &AppHandle, claim_token: &str) -> Result<PossessionProgress> {
+    pub async fn poll(&self, app: &AppHandle, run_id: &str) -> Result<PossessionProgress> {
         let preferences = storage::load_preferences()?;
         let api = ApiClient::new(&preferences.server_origin)?;
-        let claim: SetupClaim = api
-            .authenticated_get(&format!("/api/setup/claims/{claim_token}"))
-            .await?;
-        let snapshot = self
-            .runs
-            .lock()
-            .await
-            .get(claim_token)
-            .cloned()
-            .context("this possession run is no longer available")?;
-        let review = if claim.status == "ready" {
-            match claim.approval_ref.as_deref() {
-                Some(reference) => self.review(&api, reference, &snapshot).await?,
-                None => None,
-            }
-        } else {
-            None
-        };
-        if claim.status == "approved" {
-            emit_step(app, 4, "Approved — key verified on this machine");
-            let mut updated = preferences;
-            updated.first_run_complete = true;
-            updated.host_name.clone_from(&claim.host_name);
-            storage::save_preferences(&updated)?;
-            if let (Some(host_id), Some(host_key), Some(host_name)) = (
-                claim.host_id.as_deref(),
-                snapshot.host_public_key.as_deref(),
-                claim.host_name.as_deref(),
-            ) {
-                self.publish_introduction(&api, claim_token, host_id, host_name, host_key)
-                    .await;
+        let mut snapshot = self.snapshot(run_id).await?;
+        let mut review = None;
+
+        if matches!(progress_status(&snapshot), PossessionStatus::Registered) {
+            match self.review(&api, &snapshot).await {
+                Ok(pending_review) => {
+                    if let Some(pending_review) = pending_review {
+                        if let Some(run) = self.runs.lock().await.get_mut(run_id) {
+                            run.host_name = Some(pending_review.host_name.clone());
+                        }
+                        review = Some(pending_review);
+                    }
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    if detail == VERIFICATION_REFUSAL || known_possession_failure(&detail) {
+                        self.fail_run(run_id, detail).await;
+                        snapshot = self.snapshot(run_id).await?;
+                        return Ok(possession_progress(run_id, snapshot, None));
+                    }
+                    return Err(error);
+                }
             }
         }
-        Ok(PossessionProgress {
-            claim_token: claim_token.into(),
-            claim,
-            review,
-            child_finished: snapshot.child_finished,
-            child_error: snapshot.child_error,
-        })
+
+        snapshot = self.snapshot(run_id).await?;
+        if snapshot.approved {
+            let hosts: Value = api.authenticated_get("/api/hosts").await?;
+            let observed = match observe_pinned_host(
+                &hosts,
+                snapshot.host_id.as_deref(),
+                snapshot
+                    .local_key
+                    .as_deref()
+                    .context(VERIFICATION_REFUSAL)?,
+            ) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    self.fail_run(run_id, error.to_string()).await;
+                    snapshot = self.snapshot(run_id).await?;
+                    return Ok(possession_progress(run_id, snapshot, None));
+                }
+            };
+            if let Some(host) = observed {
+                if let Some(run) = self.runs.lock().await.get_mut(run_id) {
+                    run.host_id = Some(host.id.clone());
+                    run.host_name = Some(host.name.clone());
+                    run.online = host.online;
+                }
+                self.publish_introduction(
+                    &api,
+                    run_id,
+                    &host.id,
+                    &host.name,
+                    snapshot
+                        .local_key
+                        .as_deref()
+                        .context(VERIFICATION_REFUSAL)?,
+                )
+                .await;
+                if host.online {
+                    emit_step(app, 3, "Online and ready");
+                    let mut updated = preferences;
+                    updated.first_run_complete = true;
+                    updated.host_name = Some(host.name);
+                    storage::save_preferences(&updated)?;
+                }
+            }
+        }
+
+        snapshot = self.snapshot(run_id).await?;
+        Ok(possession_progress(run_id, snapshot, review))
     }
 
-    async fn review(
-        &self,
-        api: &ApiClient,
-        approval_ref: &str,
-        run: &PossessRun,
-    ) -> Result<Option<ApprovalReview>> {
-        if !run.approval_url_seen {
+    async fn review(&self, api: &ApiClient, run: &PossessRun) -> Result<Option<ApprovalReview>> {
+        let (Some(identifier), Some(local_key)) =
+            (run.approval_identifier.as_ref(), run.local_key.as_deref())
+        else {
             return Ok(None);
-        }
-        if run.key_fragment_invalid || run.local_approval_ref.as_deref() != Some(approval_ref) {
-            bail!("This host could not be verified.")
-        }
+        };
         let pending: DevicePending = api
             .authenticated_json(
                 Method::POST,
                 "/api/auth/device/pending",
-                &json!({ "approval_ref": approval_ref }),
+                &identifier.request_body(),
             )
             .await?;
         let derived = key_fingerprint(&pending.host_public_key)?;
-        if derived != pending.host_key_fingerprint {
-            bail!("This host could not be verified.")
-        }
-        let exact_key_match = run
-            .local_key
-            .as_deref()
-            .is_some_and(|local| local == pending.host_public_key);
-        if run.local_key.is_some() && !exact_key_match {
-            bail!("This host could not be verified.")
+        let exact_key_match = local_key == pending.host_public_key;
+        if derived != pending.host_key_fingerprint || !exact_key_match {
+            bail!(VERIFICATION_REFUSAL)
         }
         Ok(Some(ApprovalReview {
-            approval_ref: approval_ref.into(),
             host_name: pending.host_name,
-            host_public_key: pending.host_public_key,
-            fingerprint: pending.host_key_fingerprint,
-            local_fingerprint: run.local_fingerprint.clone(),
             exact_key_match,
-            needs_fingerprint_compare: run.local_key.is_none(),
         }))
     }
 
-    pub async fn approve(
-        &self,
-        app: &AppHandle,
-        claim_token: &str,
-        fingerprint_confirmed: bool,
-    ) -> Result<String> {
+    pub async fn approve(&self, app: &AppHandle, run_id: &str) -> Result<String> {
         let preferences = storage::load_preferences()?;
         let account_id = preferences.account_id.context("Sign in before approval")?;
         let device_id = preferences
             .device_id
             .context("Device registration is unavailable")?;
         let api = ApiClient::new(&preferences.server_origin)?;
-        let claim: SetupClaim = api
-            .authenticated_get(&format!("/api/setup/claims/{claim_token}"))
-            .await?;
-        let approval_ref = claim
-            .approval_ref
+        let snapshot = self.snapshot(run_id).await?;
+        if let Some(error) = snapshot.error.as_deref() {
+            bail!("{error}")
+        }
+        let identifier = snapshot
+            .approval_identifier
+            .as_ref()
             .context("The daemon is not ready for approval")?;
-        let pending: DevicePending = api
+        let local_key = snapshot
+            .local_key
+            .as_deref()
+            .context(VERIFICATION_REFUSAL)?;
+        let pending_result: Result<DevicePending> = api
             .authenticated_json(
                 Method::POST,
                 "/api/auth/device/pending",
-                &json!({ "approval_ref": approval_ref }),
+                &identifier.request_body(),
             )
-            .await?;
-        let snapshot = self
-            .runs
-            .lock()
-            .await
-            .get(claim_token)
-            .cloned()
-            .context("this possession run is no longer available")?;
-        if snapshot.key_fragment_invalid
-            || snapshot.local_approval_ref.as_deref() != Some(approval_ref.as_str())
-        {
-            bail!("This host could not be verified.")
-        }
+            .await;
+        let pending = match pending_result {
+            Ok(pending) => pending,
+            Err(error) => {
+                if known_possession_failure(&error.to_string()) {
+                    self.fail_run(run_id, error.to_string()).await;
+                }
+                return Err(error);
+            }
+        };
         let derived_fingerprint = key_fingerprint(&pending.host_public_key)?;
-        if derived_fingerprint != pending.host_key_fingerprint {
-            bail!("This host could not be verified.")
-        }
-        match snapshot.local_key.as_deref() {
-            Some(local_key) if local_key == pending.host_public_key => {}
-            Some(_) => bail!("This host could not be verified."),
-            None if fingerprint_confirmed
-                && snapshot.local_fingerprint.as_deref()
-                    == Some(pending.host_key_fingerprint.as_str()) => {}
-            None => bail!("Compare the full fingerprint before approving this host"),
+        if derived_fingerprint != pending.host_key_fingerprint
+            || local_key != pending.host_public_key
+        {
+            self.fail_run(run_id, VERIFICATION_REFUSAL.into()).await;
+            bail!(VERIFICATION_REFUSAL)
         }
         let identity = DeviceIdentity::load_or_create(&account_id)?;
         let browser_public_key = identity.public_key_wire();
@@ -293,24 +321,30 @@ impl PossessionManager {
             &pending.approval_nonce,
             &pending.host_public_key,
         )?;
-        let response: DeviceApproveResponse = api
-            .authenticated_json(
-                Method::POST,
-                "/api/auth/device/approve",
-                &json!({
-                    "approval_ref": approval_ref,
-                    "approval_nonce": pending.approval_nonce,
-                    "host_key_algorithm": pending.host_key_algorithm,
-                    "host_public_key": pending.host_public_key,
-                    "host_key_fingerprint": pending.host_key_fingerprint,
-                    "browser_device_id": device_id,
-                    "browser_key_algorithm": "ed25519",
-                    "browser_public_key": browser_public_key,
-                    "browser_key_fingerprint": browser_fingerprint,
-                    "signature": signature
-                }),
-            )
-            .await?;
+        let mut approve_body = json!({
+            "approval_nonce": pending.approval_nonce,
+            "host_key_algorithm": pending.host_key_algorithm,
+            "host_public_key": pending.host_public_key,
+            "host_key_fingerprint": pending.host_key_fingerprint,
+            "browser_device_id": device_id,
+            "browser_key_algorithm": "ed25519",
+            "browser_public_key": browser_public_key,
+            "browser_key_fingerprint": browser_fingerprint,
+            "signature": signature
+        });
+        identifier.insert_into(&mut approve_body);
+        let response_result: Result<DeviceApproveResponse> = api
+            .authenticated_json(Method::POST, "/api/auth/device/approve", &approve_body)
+            .await;
+        let response = match response_result {
+            Ok(response) => response,
+            Err(error) => {
+                if known_possession_failure(&error.to_string()) {
+                    self.fail_run(run_id, error.to_string()).await;
+                }
+                return Err(error);
+            }
+        };
         if response.host_name != pending.host_name
             || response.approval_nonce != pending.approval_nonce
             || response.host_key_algorithm != pending.host_key_algorithm
@@ -319,16 +353,20 @@ impl PossessionManager {
             || response.browser_key_algorithm != "ed25519"
             || response.browser_public_key != browser_public_key
         {
-            bail!("The approval response changed the reviewed host or device identity")
+            let error = "The approval response changed the reviewed host or device identity";
+            self.fail_run(run_id, error.into()).await;
+            bail!(error)
         }
-        if let Some(run) = self.runs.lock().await.get_mut(claim_token) {
-            run.host_public_key = Some(pending.host_public_key.clone());
+        if let Some(run) = self.runs.lock().await.get_mut(run_id) {
+            run.approved = true;
+            run.host_name = Some(response.host_name.clone());
+            run.host_id.clone_from(&response.host_id);
         }
-        emit_step(app, 4, "Approved — key verified on this machine");
+        emit_step(app, 2, "Approved — key verified on this machine");
         if let Some(host_id) = response.host_id.as_deref() {
             self.publish_introduction(
                 &api,
-                claim_token,
+                run_id,
                 host_id,
                 &response.host_name,
                 &pending.host_public_key,
@@ -341,7 +379,7 @@ impl PossessionManager {
     async fn publish_introduction(
         &self,
         api: &ApiClient,
-        claim_token: &str,
+        run_id: &str,
         host_id: &str,
         host_name: &str,
         host_public_key: &str,
@@ -350,7 +388,7 @@ impl PossessionManager {
             .runs
             .lock()
             .await
-            .get(claim_token)
+            .get(run_id)
             .is_some_and(|run| run.introduction_published);
         if already_published {
             return;
@@ -378,22 +416,139 @@ impl PossessionManager {
         }
         .await;
         if result.is_ok() {
-            if let Some(run) = self.runs.lock().await.get_mut(claim_token) {
+            if let Some(run) = self.runs.lock().await.get_mut(run_id) {
                 run.introduction_published = true;
             }
         }
-        // Best-effort here; polling an approved claim retries publication while
+        // Best-effort here; polling the approved run retries publication while
         // this desktop run remains active.
     }
 
-    pub async fn log_tail(&self, claim_token: &str) -> String {
+    pub async fn log_tail(&self, run_id: &str) -> String {
         self.runs
             .lock()
             .await
-            .get(claim_token)
+            .get(run_id)
             .map(|run| run.output.join("\n"))
             .unwrap_or_default()
     }
+
+    async fn snapshot(&self, run_id: &str) -> Result<PossessRun> {
+        self.runs
+            .lock()
+            .await
+            .get(run_id)
+            .cloned()
+            .context("this possession run is no longer available")
+    }
+
+    async fn fail_run(&self, run_id: &str, error: String) {
+        if let Some(run) = self.runs.lock().await.get_mut(run_id) {
+            run.error = Some(error);
+        }
+    }
+}
+
+fn new_run_id() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes).context("generating a possession run id")?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(Uuid::from_bytes(bytes).to_string())
+}
+
+fn known_possession_failure(detail: &str) -> bool {
+    matches!(
+        detail,
+        "expired" | "denied" | "key_conflict" | "pin_conflict" | "pin_limit"
+    )
+}
+
+fn progress_status(run: &PossessRun) -> PossessionStatus {
+    if run.online {
+        PossessionStatus::Online
+    } else if run.error.is_some() || run.child_error.is_some() {
+        PossessionStatus::Failed
+    } else if run.approved {
+        PossessionStatus::Approved
+    } else if run.approval_identifier.is_some() && run.local_key.is_some() {
+        PossessionStatus::Registered
+    } else {
+        PossessionStatus::Starting
+    }
+}
+
+fn possession_progress(
+    run_id: &str,
+    run: PossessRun,
+    review: Option<ApprovalReview>,
+) -> PossessionProgress {
+    let status = progress_status(&run);
+    let error = run.error.clone().or_else(|| run.child_error.clone());
+    PossessionProgress {
+        run_id: run_id.into(),
+        status,
+        error,
+        host_name: run.host_name,
+        host_id: run.host_id,
+        review,
+        child_finished: run.child_finished,
+        child_error: run.child_error,
+    }
+}
+
+struct ObservedHost {
+    id: String,
+    name: String,
+    online: bool,
+}
+
+fn observe_pinned_host(
+    hosts: &Value,
+    expected_id: Option<&str>,
+    expected_key: &str,
+) -> Result<Option<ObservedHost>> {
+    let Some(entries) = hosts
+        .as_array()
+        .or_else(|| hosts.get("hosts").and_then(Value::as_array))
+    else {
+        return Ok(None);
+    };
+
+    for entry in entries {
+        let Some(id) = string_field(entry, &["id", "host_id"]) else {
+            continue;
+        };
+        let public_key = string_field(entry, &["public_key", "host_public_key"]);
+        let id_matches = expected_id.is_some_and(|expected| expected == id);
+        let key_matches = public_key.is_some_and(|key| key == expected_key);
+        if id_matches && public_key.is_some() && !key_matches {
+            bail!(VERIFICATION_REFUSAL)
+        }
+        if !(id_matches || (expected_id.is_none() && key_matches)) || !key_matches {
+            continue;
+        }
+        let name = string_field(entry, &["name", "host_name"])
+            .unwrap_or("This Mac")
+            .to_owned();
+        let online = entry
+            .get("online")
+            .and_then(Value::as_bool)
+            .or_else(|| entry.get("connected").and_then(Value::as_bool))
+            .unwrap_or_else(|| entry.get("status").and_then(Value::as_str) == Some("online"));
+        return Ok(Some(ObservedHost {
+            id: id.to_owned(),
+            name,
+            online,
+        }));
+    }
+    Ok(None)
+}
+
+fn string_field<'a>(value: &'a Value, fields: &[&str]) -> Option<&'a str> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
 }
 
 fn emit_step(app: &AppHandle, index: usize, label: &str) {
@@ -403,19 +558,20 @@ fn emit_step(app: &AppHandle, index: usize, label: &str) {
 async fn read_child_lines<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     runs: &std::sync::Arc<Mutex<HashMap<String, PossessRun>>>,
-    claim_token: &str,
+    run_id: &str,
     app: &AppHandle,
 ) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let parsed = parse_possess_line(&line);
         let mut locked = runs.lock().await;
-        if let Some(run) = locked.get_mut(claim_token) {
+        let mut registered_now = false;
+        if let Some(run) = locked.get_mut(run_id) {
             if let Some(url) = parsed.approval_url {
+                let was_registered = run.approval_identifier.is_some() && run.local_key.is_some();
                 apply_approval_url(run, &url);
-            }
-            if let Some(fingerprint) = parsed.fingerprint {
-                run.local_fingerprint = Some(fingerprint);
+                registered_now =
+                    !was_registered && run.approval_identifier.is_some() && run.local_key.is_some();
             }
             run.output.push(line.clone());
             if run.output.len() > 200 {
@@ -423,53 +579,47 @@ async fn read_child_lines<R: tokio::io::AsyncRead + Unpin>(
             }
         }
         drop(locked);
+        if registered_now {
+            emit_step(app, 1, "Host registered — approval ready");
+        }
         let _ = app.emit("possess-output", line);
     }
 }
 
 fn apply_approval_url(run: &mut PossessRun, url: &url::Url) {
-    run.approval_url_seen = true;
-    run.local_approval_ref = url
+    run.approval_identifier = url
         .query_pairs()
-        .find_map(|(key, value)| (key == "ref").then(|| value.into_owned()));
-    match url.fragment() {
-        None => {
-            run.local_key = None;
-            run.key_fragment_invalid = false;
-        }
-        Some(fragment) => {
-            let candidate = fragment.strip_prefix("k=");
-            run.local_key = candidate
-                .filter(|value| {
-                    value.len() == 43 && spawnd::signed_signal::public_key_from_wire(value).is_ok()
+        .find_map(|(key, value)| (key == "ref" && !value.is_empty()).then(|| value.into_owned()))
+        .map(ApprovalIdentifier::ApprovalRef)
+        .or_else(|| {
+            url.query_pairs()
+                .find_map(|(key, value)| {
+                    (key == "code" && !value.is_empty()).then(|| value.into_owned())
                 })
-                .map(str::to_owned);
-            run.key_fragment_invalid = run.local_key.is_none();
-        }
+                .map(ApprovalIdentifier::UserCode)
+        });
+    run.local_key = url
+        .fragment()
+        .and_then(|fragment| fragment.strip_prefix("k="))
+        .filter(|value| {
+            value.len() == 43 && spawnd::signed_signal::public_key_from_wire(value).is_ok()
+        })
+        .map(str::to_owned);
+    if run.approval_identifier.is_none() || run.local_key.is_none() {
+        run.error = Some(VERIFICATION_REFUSAL.into());
     }
 }
 
 struct ParsedPossessLine {
     approval_url: Option<url::Url>,
-    fingerprint: Option<String>,
 }
 
 fn parse_possess_line(line: &str) -> ParsedPossessLine {
-    let trimmed = line.trim();
-    let approval_url = trimmed
-        .strip_prefix("spawn:")
-        .map(str::trim)
+    let approval_url = line
+        .strip_prefix("spawn:   ")
         .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
         .and_then(|value| url::Url::parse(value).ok());
-    let fingerprint = trimmed
-        .strip_prefix("spawn:")
-        .map(str::trim)
-        .filter(|value| value.starts_with("SHA256:") && value.len() == 23)
-        .map(str::to_owned);
-    ParsedPossessLine {
-        approval_url,
-        fingerprint,
-    }
+    ParsedPossessLine { approval_url }
 }
 
 struct DownloadedPair {
@@ -667,16 +817,15 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
-    fn parses_only_the_stable_plain_url_and_fingerprint_lines() {
+    fn parses_only_the_stable_plain_url_line() {
         let parsed = parse_possess_line(
             "spawn:   https://spawnd.dev/device?ref=opaque#k=abcdefghijklmnopqrstuvwxyzABCDEFG0123456789_",
         );
         assert!(parsed.approval_url.is_some());
-        assert_eq!(
-            parse_possess_line("spawn:     SHA256:Yr0kQmVd12345678")
-                .fingerprint
-                .as_deref(),
-            Some("SHA256:Yr0kQmVd12345678")
+        assert!(
+            parse_possess_line("spawn: https://spawnd.dev/device?ref=opaque#k=key")
+                .approval_url
+                .is_none()
         );
         assert!(parse_possess_line("debug https://example.test/#k=bad")
             .approval_url
@@ -684,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_url_distinguishes_missing_and_malformed_key_fragments() {
+    fn approval_url_requires_a_valid_key_fragment() {
         let key = URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[5; 32]).verifying_key());
         let mut exact = PossessRun::default();
         apply_approval_url(
@@ -692,8 +841,11 @@ mod tests {
             &url::Url::parse(&format!("https://spawnd.dev/device?ref=local-ref#k={key}")).unwrap(),
         );
         assert_eq!(exact.local_key.as_deref(), Some(key.as_str()));
-        assert_eq!(exact.local_approval_ref.as_deref(), Some("local-ref"));
-        assert!(!exact.key_fragment_invalid);
+        assert_eq!(
+            exact.approval_identifier,
+            Some(ApprovalIdentifier::ApprovalRef("local-ref".into()))
+        );
+        assert!(exact.error.is_none());
 
         let mut malformed = PossessRun::default();
         apply_approval_url(
@@ -701,15 +853,52 @@ mod tests {
             &url::Url::parse("https://spawnd.dev/device?ref=local-ref#k=damaged").unwrap(),
         );
         assert!(malformed.local_key.is_none());
-        assert!(malformed.key_fragment_invalid);
+        assert_eq!(malformed.error.as_deref(), Some(VERIFICATION_REFUSAL));
 
-        let mut fallback = PossessRun::default();
+        let mut missing = PossessRun::default();
         apply_approval_url(
-            &mut fallback,
+            &mut missing,
             &url::Url::parse("https://spawnd.dev/device?ref=local-ref").unwrap(),
         );
-        assert!(fallback.local_key.is_none());
-        assert!(!fallback.key_fragment_invalid);
+        assert!(missing.local_key.is_none());
+        assert_eq!(missing.error.as_deref(), Some(VERIFICATION_REFUSAL));
+    }
+
+    #[test]
+    fn pre_0029_code_url_sends_user_code() {
+        let key = URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[9; 32]).verifying_key());
+        let mut run = PossessRun::default();
+        apply_approval_url(
+            &mut run,
+            &url::Url::parse(&format!("https://spawnd.dev/device?code=ABCD-EFGH#k={key}")).unwrap(),
+        );
+        assert_eq!(
+            run.approval_identifier,
+            Some(ApprovalIdentifier::UserCode("ABCD-EFGH".into()))
+        );
+        assert_eq!(
+            run.approval_identifier.unwrap().request_body(),
+            json!({ "user_code": "ABCD-EFGH" })
+        );
+    }
+
+    #[test]
+    fn hosts_must_match_the_pinned_key_before_online() {
+        let key = URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[11; 32]).verifying_key());
+        let hosts = json!([{
+            "id": "host-1",
+            "name": "altar",
+            "host_public_key": key,
+            "online": true
+        }]);
+        let observed = observe_pinned_host(&hosts, Some("host-1"), &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.id, "host-1");
+        assert_eq!(observed.name, "altar");
+        assert!(observed.online);
+
+        assert!(observe_pinned_host(&hosts, Some("host-1"), &"A".repeat(43)).is_err());
     }
 
     #[test]

@@ -63,23 +63,6 @@ pub struct BrowserDevice {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct SetupClaimMint {
-    pub token: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SetupClaim {
-    pub status: String,
-    pub approval_ref: Option<String>,
-    pub host_name: Option<String>,
-    pub os: Option<String>,
-    pub host_key_fingerprint: Option<String>,
-    pub host_id: Option<String>,
-    pub error: Option<String>,
-    pub expires_at: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
 pub struct DevicePending {
     pub host_name: String,
     pub approval_nonce: String,
@@ -132,19 +115,27 @@ pub enum DeviceApprovalProgress {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ApprovalReview {
-    pub approval_ref: String,
     pub host_name: String,
-    pub host_public_key: String,
-    pub fingerprint: String,
-    pub local_fingerprint: Option<String>,
     pub exact_key_match: bool,
-    pub needs_fingerprint_compare: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PossessionStatus {
+    Starting,
+    Registered,
+    Approved,
+    Online,
+    Failed,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PossessionProgress {
-    pub claim_token: String,
-    pub claim: SetupClaim,
+    pub run_id: String,
+    pub status: PossessionStatus,
+    pub error: Option<String>,
+    pub host_name: Option<String>,
+    pub host_id: Option<String>,
     pub review: Option<ApprovalReview>,
     pub child_finished: bool,
     pub child_error: Option<String>,
