@@ -147,7 +147,7 @@ export function JobSection({
       >
         <div className={aside ? undefined : "max-w-3xl"}>
           <Eyebrow className="mb-5">
-            № {index} · {eyebrow}
+            {index} · {eyebrow}
           </Eyebrow>
           <PosterHeading
             as="h2"
@@ -180,7 +180,7 @@ export function JobPlate({
     <section className="relative overflow-hidden bg-plate text-void">
       <div className="relative mx-auto w-full max-w-6xl px-5 py-20 sm:px-8 sm:py-24">
         <p className="mb-5 font-sigil text-[12px] font-medium tracking-[0.3em] uppercase">
-          № {index} · {eyebrow}
+          {index} · {eyebrow}
         </p>
         <h2
           className={cn(
@@ -198,20 +198,13 @@ export function JobPlate({
         )}
         <div className="grid min-w-0 gap-y-12 sm:grid-cols-2 sm:gap-x-12 lg:gap-x-16">
           {items.map((item, itemIndex) => (
-            <div key={item.title} className="border-t-2 border-void pt-6">
-              <div className="mb-3 flex items-baseline gap-3">
-                <span aria-hidden className="font-sigil text-[11px] tracking-[0.22em]">
+            <div key={item.title} className="border-t-2 border-void pt-5">
+              <h3 className="mb-3 flex items-baseline gap-3 font-sigil text-[12px] font-medium tracking-[0.22em] uppercase">
+                <span aria-hidden className="opacity-60">
                   {String(itemIndex + 1).padStart(2, "0")}
                 </span>
-                <h3
-                  className={cn(
-                    poster.className,
-                    "text-[23px] leading-[1.08] font-light uppercase",
-                  )}
-                >
-                  {item.title}
-                </h3>
-              </div>
+                {item.title}
+              </h3>
               <p className="max-w-[46ch] text-[15px] leading-7">{item.body}</p>
             </div>
           ))}
@@ -235,11 +228,6 @@ export function JobShellFigure({
     <figure className={cn("min-w-0 border border-line-strong bg-char", className)}>
       <figcaption className="flex items-center justify-between gap-4 border-line-g border-b px-5 py-3.5 font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
         <span>{title}</span>
-        <span aria-hidden className="flex items-center gap-1.5">
-          <span className="size-2 rounded-full bg-hellfire" />
-          <span className="size-2 rounded-full bg-blood" />
-          <span className="size-2 rounded-full bg-line-strong" />
-        </span>
       </figcaption>
       <div className="min-w-0 overflow-x-auto px-5 py-5 font-sigil text-[12px] leading-7 text-bone sm:px-6 sm:text-[13px]">
         {children}
@@ -261,7 +249,7 @@ function FaqSection({
   return (
     <section className="border-line-g border-b px-5 py-20 sm:px-8 sm:py-24">
       <div className="mx-auto w-full max-w-6xl">
-        <Eyebrow className="mb-5">№ {index} · FAQ</Eyebrow>
+        <Eyebrow className="mb-5">{index} · FAQ</Eyebrow>
         <PosterHeading
           as="h2"
           text={heading}
@@ -314,7 +302,7 @@ function RelatedRack({ related }: { related: JobRelatedLink[] }) {
 
 function ClosingSheet({ heading, body }: { heading: JobHeading; body: string }) {
   return (
-    <section className="border-t-4 border-hellfire bg-bone text-void">
+    <section className="border-t-2 border-hellfire bg-bone text-void">
       <div className="mx-auto flex w-full max-w-3xl flex-col items-center px-5 py-24 text-center sm:px-8">
         <PosterHeading
           as="h2"
@@ -347,10 +335,8 @@ export function JobPage({
   crumbs,
   pageName,
   canonicalPath,
-  eyebrow,
   heading,
   lede,
-  kicker,
   vignette,
   children,
   faq,
@@ -362,11 +348,8 @@ export function JobPage({
   crumbs: JobCrumb[];
   pageName: string;
   canonicalPath: string;
-  eyebrow: string;
   heading: JobHeading;
   lede: ReactNode;
-  /** Short sigil-caps fragments under the lede — the power user's scan line. */
-  kicker?: string[];
   vignette: ReactNode;
   children: ReactNode;
   faq: JobFaqItem[];
@@ -416,28 +399,13 @@ export function JobPage({
               </li>
             </ol>
           </nav>
-          <Eyebrow className="mb-5">{eyebrow}</Eyebrow>
           <PosterHeading
             as="h1"
             text={heading}
             className="mb-7 max-w-[24ch] text-[clamp(33px,5.3vw,58px)] leading-[1.04] text-bone"
           />
-          <div className="max-w-[62ch] space-y-5 text-[17px] leading-8 text-ash">{lede}</div>
-          {kicker && kicker.length > 0 ? (
-            <p className="mt-8 flex flex-wrap items-center gap-x-3 gap-y-2 font-sigil text-[11px] tracking-[0.18em] text-bone/80 uppercase">
-              {kicker.map((fragment, index) => (
-                <span key={fragment} className="flex items-center gap-3">
-                  {index > 0 ? (
-                    <span aria-hidden className="text-hellfire">
-                      ·
-                    </span>
-                  ) : null}
-                  {fragment}
-                </span>
-              ))}
-            </p>
-          ) : null}
-          <div className="mt-9 flex flex-col items-start gap-6 sm:flex-row sm:items-center sm:gap-9">
+          <div className="max-w-[60ch] space-y-5 text-[17px] leading-8 text-ash">{lede}</div>
+          <div className="mt-10 flex flex-col items-start gap-6 sm:flex-row sm:items-center sm:gap-9">
             <Link href="/signup" className={CTA_SLAB}>
               Sign up free
               <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
