@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
@@ -26,13 +24,20 @@ use crate::models::{
 };
 use crate::storage;
 
+#[cfg(target_os = "macos")]
+#[path = "install/macos.rs"]
+mod platform_install;
+#[cfg(target_os = "windows")]
+#[path = "install/windows.rs"]
+mod platform_install;
+
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_BINARY_BYTES: usize = 256 * 1024 * 1024;
 const RELEASE_SIGNING_PUBLIC_KEYS: &[&str] = &["8nE_rD4eVv8QFuNMbBQ3023vuU7V-OWxRl70ni4WOf0"];
 const VERIFICATION_REFUSAL: &str = "This host could not be verified.";
-/// This Mac already runs SPAWN D for the account signed in here.
+/// This computer already runs SPAWN D for the account signed in here.
 const ALREADY_POSSESSED_HERE: &str = "already_possessed_here";
-/// This Mac already runs SPAWN D, for some other account.
+/// This computer already runs SPAWN D, for some other account.
 const ALREADY_POSSESSED_OTHER: &str = "already_possessed_other";
 /// The child ended without a ceremony and without saying why.
 const NO_CEREMONY: &str = "no_ceremony";
@@ -97,18 +102,18 @@ impl PossessionManager {
     pub async fn begin(&self, app: &AppHandle) -> Result<String> {
         let preferences = storage::load_preferences()?;
         if !preferences.device_approved {
-            bail!("Approve this device before possessing this Mac")
+            bail!("Approve this device before possessing this computer")
         }
         let api = ApiClient::new(&preferences.server_origin)?;
         let pair = download_verified_pair(&api).await.map_err(|error| {
             let detail = error.to_string();
-            if detail.contains("doesn't serve a build for this Mac") {
+            if detail.contains("doesn't serve a build for this computer") {
                 anyhow::anyhow!(detail)
             } else {
                 anyhow::anyhow!("The daemon didn't verify. Nothing was installed.")
             }
         })?;
-        let bin_dir = install_pair(pair)?;
+        let bin_dir = platform_install::install_pair(pair, &preferences.server_origin)?;
         let run_id = new_run_id()?;
         self.runs
             .lock()
@@ -117,7 +122,7 @@ impl PossessionManager {
         self.spawn_possess(
             app.clone(),
             run_id.clone(),
-            bin_dir.join("spawnd"),
+            bin_dir.join(binary_filename("spawnd")),
             preferences.server_origin,
         )
         .await
@@ -602,7 +607,7 @@ fn observe_pinned_host(
             continue;
         }
         let name = string_field(entry, &["name", "host_name"])
-            .unwrap_or("This Mac")
+            .unwrap_or(crate::platform::THIS_COMPUTER_CAPITALIZED)
             .to_owned();
         let online = entry
             .get("online")
@@ -695,9 +700,12 @@ fn parse_possess_line(line: &str) -> ParsedPossessLine {
     ParsedPossessLine { approval_url }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 struct DownloadedPair {
     spawnd: Vec<u8>,
     worker: Vec<u8>,
+    spawnd_sha256: String,
+    worker_sha256: String,
 }
 
 async fn download_verified_pair(api: &ApiClient) -> Result<DownloadedPair> {
@@ -707,7 +715,7 @@ async fn download_verified_pair(api: &ApiClient) -> Result<DownloadedPair> {
             .pointer(&format!("/daemon/targets/{target}"))
             .is_none()
         {
-            bail!("{} doesn't serve a build for this Mac", api.origin())
+            bail!("{} doesn't serve a build for this computer", api.origin())
         }
     }
     let manifest_url = api.url("/api/install/manifest.json")?;
@@ -721,7 +729,7 @@ async fn download_verified_pair(api: &ApiClient) -> Result<DownloadedPair> {
     let hashes = manifest
         .targets
         .get(target)
-        .with_context(|| format!("{} doesn't serve a build for this Mac", api.origin()))?;
+        .with_context(|| format!("{} doesn't serve a build for this computer", api.origin()))?;
     validate_sha256(&hashes.spawnd_sha256)?;
     validate_sha256(&hashes.spawn_worker_sha256)?;
     let spawnd = download_bounded(
@@ -738,7 +746,12 @@ async fn download_verified_pair(api: &ApiClient) -> Result<DownloadedPair> {
     .await?;
     verify_sha256(&spawnd, &hashes.spawnd_sha256, "spawnd")?;
     verify_sha256(&worker, &hashes.spawn_worker_sha256, "spawn-worker")?;
-    Ok(DownloadedPair { spawnd, worker })
+    Ok(DownloadedPair {
+        spawnd,
+        worker,
+        spawnd_sha256: hashes.spawnd_sha256.clone(),
+        worker_sha256: hashes.spawn_worker_sha256.clone(),
+    })
 }
 
 async fn download_bounded(
@@ -793,17 +806,15 @@ fn verify_manifest_signature(manifest: &[u8], signature_file: &[u8]) -> Result<(
 }
 
 fn current_target() -> Result<&'static str> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        Ok("darwin-aarch64")
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        Ok("darwin-x86_64")
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        bail!("this Mac architecture is not supported")
+    target_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn target_for(os: &str, arch: &str) -> Result<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Ok("darwin-aarch64"),
+        ("macos", "x86_64") => Ok("darwin-x86_64"),
+        ("windows", "x86_64") => Ok("windows-x86_64"),
+        _ => bail!("unsupported SPAWN D platform: {os}-{arch}"),
     }
 }
 
@@ -826,62 +837,28 @@ fn verify_sha256(bytes: &[u8], expected: &str, _name: &str) -> Result<()> {
     Ok(())
 }
 
-fn install_pair(pair: DownloadedPair) -> Result<PathBuf> {
-    let home = dirs::home_dir().context("the home directory is unavailable")?;
-    let bin_dir = home.join(".local/bin");
-    fs::create_dir_all(&bin_dir)?;
-    let spawnd = bin_dir.join("spawnd");
-    let worker = bin_dir.join("spawn-worker");
-    let staged_spawnd = bin_dir.join(format!(".spawnd.desktop.{}", std::process::id()));
-    let staged_worker = bin_dir.join(format!(".spawn-worker.desktop.{}", std::process::id()));
-    write_executable(&staged_spawnd, &pair.spawnd)?;
-    if let Err(error) = write_executable(&staged_worker, &pair.worker) {
-        let _ = fs::remove_file(&staged_spawnd);
-        return Err(error);
-    }
-    let backup_spawnd = bin_dir.join(".spawnd.desktop-prev");
-    let backup_worker = bin_dir.join(".spawn-worker.desktop-prev");
-    let had_spawnd = move_if_exists(&spawnd, &backup_spawnd)?;
-    let had_worker = move_if_exists(&worker, &backup_worker)?;
-    let install = (|| -> Result<()> {
-        fs::rename(&staged_spawnd, &spawnd)?;
-        fs::rename(&staged_worker, &worker)?;
-        Ok(())
-    })();
-    if let Err(error) = install {
-        let _ = fs::remove_file(&spawnd);
-        let _ = fs::remove_file(&worker);
-        if had_spawnd {
-            let _ = fs::rename(&backup_spawnd, &spawnd);
-        }
-        if had_worker {
-            let _ = fs::rename(&backup_worker, &worker);
-        }
-        let _ = fs::remove_file(&staged_spawnd);
-        let _ = fs::remove_file(&staged_worker);
-        return Err(error).context("installing the verified daemon pair");
-    }
-    let _ = fs::remove_file(backup_spawnd);
-    let _ = fs::remove_file(backup_worker);
-    Ok(bin_dir)
-}
-
-fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
-    fs::write(path, bytes)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
-    Ok(())
-}
-
-fn move_if_exists(source: &Path, target: &Path) -> Result<bool> {
-    match fs::rename(source, target) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
+fn binary_filename(name: &str) -> String {
+    binary_filename_for(name, std::env::consts::OS)
 }
 
 pub fn installer_command(origin: &str) -> String {
-    format!("curl -fsSL {origin}/install.sh | sh")
+    installer_command_for(origin, std::env::consts::OS)
+}
+
+fn binary_filename_for(name: &str, os: &str) -> String {
+    if os == "windows" {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    }
+}
+
+fn installer_command_for(origin: &str, os: &str) -> String {
+    if os == "windows" {
+        format!("irm {origin}/install.ps1 | iex")
+    } else {
+        format!("curl -fsSL {origin}/install.sh | sh")
+    }
 }
 
 #[cfg(test)]
@@ -1037,5 +1014,28 @@ mod tests {
         verify_sha256(bytes, &digest, "fixture").unwrap();
         assert!(validate_sha256(&digest.to_uppercase()).is_err());
         assert!(verify_sha256(bytes, &"0".repeat(64), "fixture").is_err());
+    }
+
+    #[test]
+    fn platform_contract_covers_both_desktop_operating_systems() {
+        assert_eq!(target_for("macos", "aarch64").unwrap(), "darwin-aarch64");
+        assert_eq!(target_for("macos", "x86_64").unwrap(), "darwin-x86_64");
+        assert_eq!(target_for("windows", "x86_64").unwrap(), "windows-x86_64");
+        assert!(target_for("windows", "aarch64").is_err());
+        assert!(target_for("linux", "x86_64").is_err());
+        assert_eq!(binary_filename_for("spawnd", "macos"), "spawnd");
+        assert_eq!(binary_filename_for("spawnd", "windows"), "spawnd.exe");
+        assert_eq!(
+            binary_filename_for("spawn-worker", "windows"),
+            "spawn-worker.exe"
+        );
+        assert_eq!(
+            installer_command_for("https://spawnd.dev", "macos"),
+            "curl -fsSL https://spawnd.dev/install.sh | sh"
+        );
+        assert_eq!(
+            installer_command_for("https://spawnd.dev", "windows"),
+            "irm https://spawnd.dev/install.ps1 | iex"
+        );
     }
 }

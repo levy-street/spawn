@@ -1,11 +1,12 @@
 # Working agreements for desktop/
 
-The macOS SPAWN D app. It is a Tauri v2 app with one window and two faces
+The macOS and Windows SPAWN D desktop companion. It is a Tauri v2 app with one window and two faces
 for it: a local wizard that signs you in, installs the daemon and possesses
-this Mac, and then the product itself — the web app from the chosen server,
+this computer, and then the product itself — the web app from the chosen server,
 loaded into that same window, already signed in. Launching the app opens
 whichever face is current, like any app; closing the window leaves SPAWN D
-in the menu bar. Read the repo root `CLAUDE.md` first.
+in the menu bar on macOS or the system tray on Windows. Read the repo root
+`CLAUDE.md` first.
 
 ## Layout
 
@@ -16,14 +17,19 @@ src/             bundled vanilla HTML, TypeScript and CSS; never remote code
 src-tauri/
   src/           Rust commands, API client, trust ceremonies, the one window
                  and its two faces (window.rs) and the tray shell
+    install/      OS-specific verified daemon installation and update handoff
+    supervision/ OS-specific launchd / Task Scheduler diagnostics and log tail
+    window/       Windows WebView2 integration; common navigation stays in window.rs
   capabilities/  least-privilege Tauri capability declarations; they name the
                  window, never a remote URL, so the product page has no IPC
   dmg/           the disk image's window: background.html is the source,
                  render.mjs prints it to background.png at 2× / 144 dpi
-  icons/         icon.icns / icon.png (bundle) and tray.png / tray@2x.png
+  icons/         cross-platform master/generated bundle and tray artwork;
+                 render.mjs emits multi-size Windows ICO/PNG assets
   Cargo.toml     standalone crate; links ../../daemon as a library
   tauri.conf.json
   tauri.ci.conf.json  release-only DMG target override
+  tauri.windows.conf.json  automatic Windows NSIS/current-user override
 ```
 
 ## The wizard is the browser's funnel, printed locally
@@ -51,7 +57,7 @@ not a cousin of it:
   masthead for the gates, the bone slab, the hairline plate. When one of those
   changes, this follows.
 
-Once this Mac is possessed the product is the web app, and the window becomes
+Once this computer is possessed the product is the web app, and the window becomes
 it (`src-tauri/src/window.rs`): the same window navigates to the chosen
 origin, the wizard's session becomes the browser session by way of the cookie
 the server sets on renewal, the page gets no IPC, and any navigation off the
@@ -76,11 +82,13 @@ the trident is painted hellfire, and the wordmark is unpainted and worn as a
 CSS mask so it takes its call site's ink. Both faces and the altar plate are
 vendored beside them — the app never fetches a font or an image.
 
-`src-tauri/icons/` is generated from that same trident: `icon.icns` /
+`src-tauri/icons/` is generated from that same trident. `icon.icns` /
 `icon.png` are the mark on its hellfire ground, cut to the macOS icon grid;
 `tray.png` / `tray@2x.png` are black-on-alpha and handed to macOS with
-`icon_as_template(true)`, which is the only correct way to wear a logo in the
-menu bar.
+`icon_as_template(true)`. `npm run icons` reads the 1024 px `icon.png` master
+and emits the multi-size `icon.ico`, colored `tray-windows.ico`, the Windows
+tray size layers, and the 32/64 px runtime tray PNGs. `npm run icons:check`
+proves committed outputs are current without rewriting them.
 
 ## Where things go
 
@@ -89,13 +97,16 @@ menu bar.
 - Network, process, keychain, filesystem and cryptographic work belongs in
   Rust commands under `src-tauri/src/`. Pure contract logic gets a Rust unit
   test beside it.
-- The app token and Ed25519 seed use the macOS keychain (`keyring`, service
-  `spawn`). Non-secret preferences may use the local desktop state file.
+- The app token and Ed25519 seed use the platform secure store (`keyring`,
+  service `spawn`): Keychain on macOS and Credential Manager on Windows.
+  Non-secret preferences may use the local desktop state file.
 - The chosen control-plane origin applies to auth, daemon install and daemon
   status. App updates always use the independently signed spawnd.dev channel.
 - Never bundle or load `spawnd` in the app. Download and verify both daemon
-  binaries from the chosen server, install them to `~/.local/bin`, then let
-  the daemon own its service and updates.
+  binaries from the chosen server. Fresh installs go to `~/.local/bin` on
+  macOS or `%LOCALAPPDATA%\spawn\bin` on Windows. Any existing Windows install
+  is handed to `spawnd update`; the app must never rename or overwrite a live
+  `spawnd.exe`. The daemon owns launchd / Task Scheduler and its own updates.
 
 ## Commands
 
@@ -104,8 +115,28 @@ npm install
 cargo tauri dev
 cargo tauri build
 npm run dmg:background      # after editing src-tauri/dmg/background.html
+npm run icons               # after editing the Windows icon master/workflow
+npm run icons:check
 cd src-tauri && cargo fmt && cargo build && cargo test && cargo clippy -- -D warnings
 ```
+
+`tauri.ci.conf.json` is macOS-only (`app` + `dmg`). On Windows,
+`tauri.windows.conf.json` is merged automatically and produces only the
+English, per-user NSIS installer with the WebView2 download bootstrapper:
+
+```powershell
+npm ci
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc
+npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
+# CI Authenticode-signs spawn-desktop.exe here, then:
+npm run tauri -- bundle --bundles nsis --target x86_64-pc-windows-msvc
+```
+
+The public Windows artifact is exactly
+`SPAWN-D_<version>_windows-x86_64-setup.exe`. Azure Artifact Signing covers
+the inner EXE before NSIS and the final installer after bundling. The offline
+Tauri updater signature covers the final, canonically named setup EXE last.
 
 The wizard can be driven in a plain browser by faking the Tauri bridge
 (`window.__TAURI_INTERNALS__`) under Vite with `root` set to this folder — the

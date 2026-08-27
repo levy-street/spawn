@@ -7,8 +7,8 @@
 # The updater private key never touches this script. Payloads arrive already
 # signed (`cargo tauri signer sign`, offline) and latest.json already
 # assembled, so all this does is refuse a bad set and then upload in the one
-# order that can never strand an installed app: payloads and DMGs first, the
-# manifest last, and the manifest atomically.
+# order that can never strand an installed app: updater payloads and public
+# downloads first, the manifest last, and the manifest atomically.
 set -euo pipefail
 
 usage() {
@@ -20,10 +20,12 @@ Usage: scripts/publish-desktop.sh [ssh-host] <artifact-dir>
   SPAWN-D_V_darwin-aarch64.dmg                SPAWN-D_V_darwin-x86_64.dmg
   SPAWN-D_V_darwin-aarch64.app.tar.gz         SPAWN-D_V_darwin-x86_64.app.tar.gz
   SPAWN-D_V_darwin-aarch64.app.tar.gz.sig     SPAWN-D_V_darwin-x86_64.app.tar.gz.sig
+  SPAWN-D_V_windows-x86_64-setup.exe
+  SPAWN-D_V_windows-x86_64-setup.exe.sig
   latest.json
 
 Before anything is uploaded the script proves that latest.json names exactly
-that version and both platforms, that every URL points into this origin's
+that version and all three platforms, that every URL points into this origin's
 desktop tree at the payload being uploaded, that each embedded signature is the
 matching .sig file, and that each signature verifies its payload against the
 committed desktop/updater.pubkey. Then the payloads and DMGs go up, latest.json
@@ -74,14 +76,34 @@ version="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["ver
   "$repo_root/desktop/src-tauri/tauri.conf.json")" || die "could not read the desktop version"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || die "unexpected desktop version: $version"
 
-platforms="darwin-aarch64 darwin-x86_64"
+platform_specs=(
+  "darwin-aarch64:dmg:app.tar.gz"
+  "darwin-x86_64:dmg:app.tar.gz"
+  "windows-x86_64:-setup.exe:-setup.exe"
+)
+
+artifact_name() {
+  local platform="$1"
+  local suffix="$2"
+  if [[ "$suffix" == -* ]]; then
+    printf 'SPAWN-D_%s_%s%s' "$version" "$platform" "$suffix"
+  else
+    printf 'SPAWN-D_%s_%s.%s' "$version" "$platform" "$suffix"
+  fi
+}
+
 payloads=()
-for platform in $platforms; do
-  for suffix in dmg app.tar.gz app.tar.gz.sig; do
-    file="$artifact_dir/SPAWN-D_${version}_${platform}.${suffix}"
-    [[ -s "$file" ]] || die "missing or empty: $file"
-  done
-  payloads+=("SPAWN-D_${version}_${platform}.dmg" "SPAWN-D_${version}_${platform}.app.tar.gz")
+for spec in "${platform_specs[@]}"; do
+  IFS=: read -r platform download_suffix updater_suffix <<< "$spec"
+  download_name="$(artifact_name "$platform" "$download_suffix")"
+  updater_name="$(artifact_name "$platform" "$updater_suffix")"
+  [[ -s "$artifact_dir/$download_name" ]] || die "missing or empty: $artifact_dir/$download_name"
+  [[ -s "$artifact_dir/$updater_name" ]] || die "missing or empty: $artifact_dir/$updater_name"
+  [[ -s "$artifact_dir/$updater_name.sig" ]] || die "missing or empty: $artifact_dir/$updater_name.sig"
+  payloads+=("$download_name")
+  if [[ "$updater_name" != "$download_name" ]]; then
+    payloads+=("$updater_name")
+  fi
 done
 manifest="$artifact_dir/latest.json"
 [[ -s "$manifest" ]] || die "missing or empty: $manifest"
@@ -105,7 +127,12 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 manifest_path, version, url_base, artifact_dir, pubkey_path = sys.argv[1:6]
-expected_platforms = ("darwin-aarch64", "darwin-x86_64")
+expected_platforms = ("darwin-aarch64", "darwin-x86_64", "windows-x86_64")
+updater_suffixes = {
+    "darwin-aarch64": ".app.tar.gz",
+    "darwin-x86_64": ".app.tar.gz",
+    "windows-x86_64": "-setup.exe",
+}
 
 
 def fail(message: str) -> None:
@@ -166,7 +193,7 @@ if not isinstance(platforms, dict) or tuple(sorted(platforms)) != expected_platf
 public_outer = Path(pubkey_path).read_text(encoding="ascii").strip()
 for platform in expected_platforms:
     entry = platforms[platform]
-    name = f"SPAWN-D_{version}_{platform}.app.tar.gz"
+    name = f"SPAWN-D_{version}_{platform}{updater_suffixes[platform]}"
     if not isinstance(entry, dict):
         fail(f"{platform}: entry must be an object")
     if entry.get("url") != f"{url_base}/{name}":
@@ -196,7 +223,7 @@ else
     die "$remote_dir is missing or not writable on $host; set up the nginx static origin first (docs/RELEASE.md, The desktop app)"
 fi
 
-printf 'publish-desktop: uploading payloads and DMGs to %s:%s\n' "$host" "$remote_dir"
+printf 'publish-desktop: uploading updater payloads and public downloads to %s:%s\n' "$host" "$remote_dir"
 upload_paths=()
 for name in "${payloads[@]}"; do
   upload_paths+=("$artifact_dir/$name")

@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   macos:
@@ -98,6 +99,126 @@ jobs:
           path: desktop/desktop-artifacts/*
           if-no-files-found: error
 
-# CI receives Apple signing/notarization credentials only. The offline updater
+  windows:
+    name: Windows · x86_64-pc-windows-msvc
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Check generated icons and build the wizard
+        working-directory: desktop
+        run: |
+          npm run icons:check
+          npm run build
+
+      - name: Test the Windows desktop crate
+        working-directory: desktop
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc
+
+      # Build once without bundling, then sign that exact inner executable.
+      # `tauri bundle` below consumes the existing release output and does not
+      # rebuild it, so NSIS contains these already Authenticode-signed bytes.
+      - name: Build the unbundled Windows application
+        working-directory: desktop
+        run: npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
+
+      - name: Authenticate to Azure Artifact Signing
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign SPAWN D executable
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify the signed inner executable
+        shell: pwsh
+        run: |
+          $path = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe'
+          $signature = Get-AuthenticodeSignature $path
+          if ($signature.Status -ne 'Valid') { throw "Inner SPAWN D signature is $($signature.Status): $($signature.StatusMessage)" }
+          if ($null -eq $signature.TimeStamperCertificate) { throw 'Inner SPAWN D signature has no RFC 3161 timestamp' }
+          $publisher = '${{ vars.AZURE_ARTIFACT_SIGNING_PUBLISHER }}'
+          if ([string]::IsNullOrWhiteSpace($publisher)) { throw 'AZURE_ARTIFACT_SIGNING_PUBLISHER is not configured' }
+          if ($signature.SignerCertificate.Subject -notlike "*$publisher*") { throw "Unexpected signer $($signature.SignerCertificate.Subject)" }
+
+      - name: Bundle the signed executable with NSIS
+        working-directory: desktop
+        run: npm run tauri -- bundle --bundles nsis --target x86_64-pc-windows-msvc
+
+      - name: Locate NSIS installer
+        id: nsis
+        shell: pwsh
+        run: |
+          $bundle = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis'
+          $files = @(Get-ChildItem $bundle -Filter '*-setup.exe')
+          if ($files.Count -ne 1) { throw "Expected one NSIS installer, found $($files.Count)" }
+          "installer=$($files[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Sign NSIS installer
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ steps.nsis.outputs.installer }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify, canonically name and checksum Windows artifacts
+        shell: pwsh
+        run: |
+          $inner = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe'
+          $installer = '${{ steps.nsis.outputs.installer }}'
+          foreach ($path in @($inner, $installer)) {
+            $signature = Get-AuthenticodeSignature $path
+            if ($signature.Status -ne 'Valid') { throw "$path signature is $($signature.Status): $($signature.StatusMessage)" }
+            if ($null -eq $signature.TimeStamperCertificate) { throw "$path has no RFC 3161 timestamp" }
+            $publisher = '${{ vars.AZURE_ARTIFACT_SIGNING_PUBLISHER }}'
+            if ($signature.SignerCertificate.Subject -notlike "*$publisher*") { throw "Unexpected signer $($signature.SignerCertificate.Subject)" }
+          }
+          $version = (Get-Content '${{ github.workspace }}\desktop\src-tauri\tauri.conf.json' | ConvertFrom-Json).version
+          $output = '${{ github.workspace }}\desktop\desktop-artifacts'
+          New-Item -ItemType Directory -Force $output | Out-Null
+          $name = "SPAWN-D_${version}_windows-x86_64-setup.exe"
+          $canonical = Join-Path $output $name
+          Move-Item $installer $canonical
+          $hash = (Get-FileHash -Algorithm SHA256 $canonical).Hash.ToLowerInvariant()
+          Set-Content -Encoding utf8NoBOM (Join-Path $output 'SHA256SUMS') "$hash  $name"
+
+      - name: Upload Authenticode-signed Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPAWN-D-x86_64-pc-windows-msvc
+          path: desktop/desktop-artifacts/*
+          if-no-files-found: error
+
+# CI receives platform code-signing credentials only. The offline Tauri updater
 # key is deliberately absent: release operators sign the promoted app archives
-# and assemble latest.json locally, after inspecting these artifacts.
+# and Windows setup EXE, then assemble latest.json locally after inspecting the
+# Authenticode/notarization evidence.
