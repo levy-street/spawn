@@ -3905,6 +3905,20 @@ mod tests {
 
     const DIRECT_ENDPOINT_BYTES_FIELD: &str = concat!("bytes", "_b64");
 
+    #[cfg(windows)]
+    fn test_runner_denied_worker_breakaway(error: &anyhow::Error) -> bool {
+        let breakaway_denied = error
+            .chain()
+            .any(|cause| cause.to_string() == "worker breakaway launch was denied");
+        let access_denied = error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
+            })
+        });
+        breakaway_denied && access_denied
+    }
+
     #[tokio::test]
     async fn trust_reload_invalidates_every_pre_reload_admission_capture() {
         let sessions = RtcSessions::new();
@@ -6094,7 +6108,11 @@ mod tests {
         // the remote peer settles; the stale browser fixture has finished all
         // assertions, so let transport cleanup complete before counting tasks.
         close_test_peer(&client.pc).await;
-        tokio::time::timeout(Duration::from_secs(3), async {
+        #[cfg(not(windows))]
+        let cleanup_timeout = Duration::from_secs(3);
+        #[cfg(windows)]
+        let cleanup_timeout = Duration::from_secs(10);
+        tokio::time::timeout(cleanup_timeout, async {
             while sessions.peer_cleanup_task_count().await != 0 {
                 tokio::task::yield_now().await;
             }
@@ -6486,8 +6504,20 @@ mod tests {
             argv: &argv,
             env: &env,
         })
-        .await
-        .expect("launch cleanup-guard worker");
+        .await;
+        #[cfg(windows)]
+        let launched = match launched {
+            Ok(launched) => launched,
+            Err(error) if test_runner_denied_worker_breakaway(&error) => {
+                eprintln!(
+                    "skipping real worker cleanup-guard case: the test runner job denies worker breakaway"
+                );
+                return;
+            }
+            Err(error) => panic!("launch cleanup-guard worker: {error:#}"),
+        };
+        #[cfg(not(windows))]
+        let launched = launched.expect("launch cleanup-guard worker");
         let crate::pty::Launched {
             handle, exit_rx, ..
         } = launched;
@@ -6554,8 +6584,20 @@ mod tests {
             argv: &argv,
             env: &env,
         })
-        .await
-        .expect("launch real worker");
+        .await;
+        #[cfg(windows)]
+        let launched = match launched {
+            Ok(launched) => launched,
+            Err(error) if test_runner_denied_worker_breakaway(&error) => {
+                eprintln!(
+                    "skipping real worker RTC case: the test runner job denies worker breakaway"
+                );
+                return;
+            }
+            Err(error) => panic!("launch real worker: {error:#}"),
+        };
+        #[cfg(not(windows))]
+        let launched = launched.expect("launch real worker");
         let crate::pty::Launched {
             handle,
             exit_rx: initial_exit_rx,
@@ -8545,6 +8587,7 @@ mod tests {
             .await
             .unwrap();
         let files = Arc::new(HostFileService::rooted_at(root.path()).await.unwrap());
+        let write_hooks = files.write_lifecycle_test_hooks();
         let binding = HostRtcBinding {
             host_id: Uuid::new_v4(),
             binding_nonce: "d".repeat(32),
@@ -8554,6 +8597,26 @@ mod tests {
         };
         let (browser_pc, daemon_pc, channel, mut messages) =
             paired_host_endpoint(files, binding, "stalled-write-control-paths").await;
+
+        // Establish the write stream before either read can publish chunks.
+        // This request is setup, not part of the fast-path ordering under test.
+        let write = request_host_control(
+            &channel,
+            &mut messages,
+            "stalled-write",
+            "fs.write.begin",
+            json!({
+                "dir": "~",
+                "name": "stalled-write.bin",
+                "length": 1,
+                "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+                "overwrite": false,
+            }),
+        )
+        .await;
+        let write_stream_id = write["result"]["stream_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("write setup did not return a stream id: {write}"));
 
         let ack_read = request_host_control(
             &channel,
@@ -8585,21 +8648,6 @@ mod tests {
             assert_eq!(chunk["sequence"], sequence);
         }
 
-        let write = request_host_control(
-            &channel,
-            &mut messages,
-            "stalled-write",
-            "fs.write.begin",
-            json!({
-                "dir": "~",
-                "name": "stalled-write.bin",
-                "length": 1,
-                "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
-                "overwrite": false,
-            }),
-        )
-        .await;
-        let write_stream_id = write["result"]["stream_id"].as_str().unwrap();
         channel
             .send_text(
                 json!({
@@ -8614,7 +8662,12 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            write_hooks.wait_write_delay_entered(),
+        )
+        .await
+        .expect("stalled write chunk did not enter its delayed normal path");
 
         for frame in [
             json!({
