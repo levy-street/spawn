@@ -471,9 +471,9 @@ fn validate_security(info: &SecurityInfo, expected_sid: PSID) -> io::Result<()> 
     } else {
         0
     };
-    // SAFETY: ace_sid points inside the live ACCESS_ALLOWED_ACE and current
-    // owns a valid current-token SID.
-    let ace_matches_current = unsafe { EqualSid(ace_sid, current.as_ptr()) } != 0;
+    // SAFETY: ace_sid points inside the live ACCESS_ALLOWED_ACE and
+    // expected_sid is the current-token SID held by validate_handle_acl.
+    let ace_matches_current = unsafe { EqualSid(ace_sid, expected_sid) } != 0;
     if ace.Header.AceType != 0
         || ace.Header.AceFlags != expected_flags
         || ace.Header.AceFlags & INHERITED_ACE as u8 != 0
