@@ -251,8 +251,27 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// Front whatever the person is using: the product if it is open, else the
+/// wizard.
+fn bring_forward(app: &tauri::AppHandle) {
+    let window = app
+        .get_webview_window(app_window::LABEL)
+        .or_else(|| app.get_webview_window("main"));
+    if let Some(window) = window {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
+        // First, so a second copy — launched from a still-mounted disk image,
+        // say — hands over to this one and exits before it can register as a
+        // rival: a sign-in returning on spawn:// must reach the instance that
+        // started it, and the icon macOS shows for the scheme must be ours.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            bring_forward(app);
+        }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())

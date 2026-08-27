@@ -1,6 +1,6 @@
 [package]
 name = "spawn-desktop"
-version = "0.1.0"
+version = "0.1.1"
 description = "SPAWN D desktop companion"
 authors = ["SPAWN D"]
 edition = "2021"
@@ -35,6 +35,7 @@ tauri = { version = "2", features = ["tray-icon", "macos-private-api", "image-pn
 tauri-plugin-deep-link = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tempfile = "3"
 thiserror = "2"
