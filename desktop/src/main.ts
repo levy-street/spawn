@@ -135,6 +135,8 @@ let preferences: Preferences = {
 let screen: Screen = "auth";
 let authMode: "login" | "signup" = "login";
 let config: AuthConfig | null = null;
+/** Whether the chosen server is new enough for this app; null while unknown. */
+let serverSupported: boolean | null = null;
 let configState: "loading" | "ready" | "error" = "loading";
 let configOrigin: string | null = null;
 /** The provider that got as far as the callback on an invite-only server. */
@@ -405,6 +407,17 @@ function authView(): string {
   const description = signup
     ? "Start with an account, then connect the machine where your agents work."
     : "Sign in to reach the shells running across your machines.";
+
+  if (serverSupported === false) {
+    return sheet(
+      hatchServer(),
+      stacked(
+        "That server is out of date",
+        `${escapeHtml(serverHost())} is running an older SPAWN D than this app needs.`,
+        `<div class="stack"><div class="inset"><p class="muted">Signing in here needs an endpoint this server does not have yet, and this Mac could not be possessed by it. Update the server to the current release, or point SPAWN D at another one.</p></div>${errorLine()}<div class="actions"><button class="btn btn-primary" data-action="choose-server">Choose another server</button><button class="btn btn-ghost" data-action="retry-config">Try again</button></div></div>`,
+      ),
+    );
+  }
 
   if (signup && configState === "error") {
     return sheet(
@@ -888,6 +901,12 @@ async function loadConfig(force = false): Promise<void> {
   configState = "loading";
   configOrigin = preferences.server_origin;
   render();
+  // What the server can do, before what it offers: one too old to finish a
+  // sign-in should say so here, not with a bare error halfway through one. An
+  // unreachable server leaves this unknown and blocks nothing.
+  serverSupported = await invoke<boolean>("server_supported", {
+    origin: preferences.server_origin,
+  }).catch(() => null);
   try {
     config = await invoke<AuthConfig>("auth_config", { origin: preferences.server_origin });
     configState = "ready";

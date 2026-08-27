@@ -59,6 +59,18 @@ impl ApiClient {
         self.send_json(method, path, body, Some(&token)).await
     }
 
+    /// The status a path answers with, treating a non-2xx as an answer rather
+    /// than a failure — for asking whether a server has an endpoint at all.
+    pub async fn probe(&self, method: Method, path: &str) -> Result<reqwest::StatusCode> {
+        let response = self
+            .client
+            .request(method, self.url(path)?)
+            .send()
+            .await
+            .context("reaching the SPAWN D server")?;
+        Ok(response.status())
+    }
+
     pub async fn anonymous_get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         self.send::<T>(self.client.get(self.url(path)?)).await
     }

@@ -57,6 +57,13 @@ async fn auth_config(origin: &str) -> Result<AuthConfig, String> {
 }
 
 #[tauri::command]
+async fn server_supported(origin: String) -> Result<bool, String> {
+    auth::server_is_supported(&origin)
+        .await
+        .map_err(command_error)
+}
+
+#[tauri::command]
 async fn account_state() -> Result<AccountState, String> {
     auth::account_state().await.map_err(command_error)
 }
@@ -288,6 +295,7 @@ pub fn run() {
             app_preferences,
             choose_server,
             auth_config,
+            server_supported,
             account_state,
             request_email_verification,
             password_login,
