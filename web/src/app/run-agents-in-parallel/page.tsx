@@ -50,7 +50,7 @@ const FAQ = [
   },
   {
     q: "How do parallel Claude Code sessions stay out of each other’s way?",
-    a: "Give each one its own directory — one git worktree per session is the clean version. A session starts your login shell in the directory you choose, so the isolation is the filesystem’s, not a sandbox’s. Each CLI authenticates itself on the host; spawnd never holds your provider keys.",
+    a: "By default they just do — each session is its own process in whatever directory you start it, so separate projects are naturally separate. For several sessions inside one repo, give each a git worktree. Either way the isolation is the filesystem’s, and each CLI authenticates itself on the host; spawnd never holds your provider keys.",
   },
   {
     q: "Do I still need tmux underneath?",
@@ -113,33 +113,35 @@ export default function RunAgentsInParallelPage() {
           <JobH2>Starting several sessions is easy. Managing them is the job.</JobH2>
           <div className="mt-8 space-y-5">
             <p>
-              Claude&nbsp;Code runs one session per invocation, so parallel is just more
-              invocations: give each session its own directory — one git worktree per branch keeps
-              them out of each other’s way — and open a pane per session in iTerm2, tmux, or
-              whatever you already drive.
+              Claude&nbsp;Code sessions are fully independent, so parallel is just more
+              invocations. Run one in the API repo, one in the side project, one in the client’s
+              codebase — a pane per session in iTerm2, tmux, or whatever you already drive, and
+              you’re parallel. (Several sessions inside one repo? A git worktree per branch keeps
+              them out of each other’s way.)
             </p>
           </div>
           <div className="mt-10">
-            <JobCodeFigure caption="The lanes, cut in three commands.">
+            <JobCodeFigure caption="Three projects, three sessions.">
               <p className="whitespace-nowrap">
-                <span className="text-ash">$</span> git worktree add ../wt/auth -b agents/auth
+                <span className="text-ash">$</span> cd ~/work/api && claude
               </p>
               <p className="whitespace-nowrap">
-                <span className="text-ash">$</span> git worktree add ../wt/importer -b
-                agents/importer
+                <span className="text-ash">$</span> cd ~/side/game && claude
               </p>
               <p className="whitespace-nowrap">
-                <span className="text-ash">$</span> git worktree add ../wt/perf -b agents/perf
+                <span className="text-ash">$</span> cd ~/oss/spawn && claude
               </p>
-              <p className="whitespace-nowrap pt-2 text-ash"># one pane per lane, claude in each</p>
+              <p className="whitespace-nowrap pt-2 text-ash">
+                # each in its own pane — nothing shared, nothing to coordinate
+              </p>
             </JobCodeFigure>
           </div>
           <p className="mt-10">
             What you’ve really built, though, is a second job: window manager for a small team of
-            agents. The work of parallel work isn’t writing code — it’s dispatching a task, noticing
-            the pane that stopped, answering it, and remembering which lane was doing what. At one
-            machine, with the lid open, that loop is manageable — and it needs nothing you don’t
-            already have.
+            agents. The work of parallel work isn’t writing code — it’s dispatching a task,
+            noticing the pane that stopped, answering it, and remembering which session was doing
+            what for which project. At one machine, with the lid open, that loop is manageable —
+            and it needs nothing you don’t already have.
           </p>
         </JobProse>
       </JobSection>
@@ -156,7 +158,7 @@ export default function RunAgentsInParallelPage() {
                 },
                 {
                   title: "Mortal sessions",
-                  body: "Close the laptop and every pane dies mid-edit. tmux keeps the shells alive — if you remembered to start every lane inside it, on every machine, every time.",
+                  body: "Close the laptop and every pane dies mid-edit. tmux keeps the shells alive — if you remembered to start every session inside it, on every machine, every time.",
                 },
                 {
                   title: "Silent prompts",
@@ -179,14 +181,14 @@ export default function RunAgentsInParallelPage() {
           </p>
         </JobProse>
         <div className="mx-auto mt-12 w-full max-w-5xl sm:mt-14">
-          <FleetCapture caption="A workspace: six sessions across three machines." />
+          <FleetCapture caption="A workspace: six sessions — four projects, three machines." />
         </div>
         <JobProse className="mt-12 sm:mt-16">
           <JobPoints
             items={[
               {
                 title: "The whole fleet at a glance",
-                body: "Every session is a live tile, and the grid is the roster: what’s running, what’s finished, what’s stuck — across the dev box, the rig, and a five-dollar VPS, with no SSH juggling between them.",
+                body: "Every session is a live tile, and the grid is the roster: what’s running, what’s finished, what’s stuck — across every project and every machine, from the dev box to a five-dollar VPS, with no SSH juggling between them.",
               },
               {
                 title: "The one that needs you is marked",
