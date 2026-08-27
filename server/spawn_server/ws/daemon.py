@@ -1421,6 +1421,37 @@ async def _close_real_supersession(conn: DaemonConn) -> None:
     await _fence_superseded_daemon(conn)
 
 
+async def _close_host_signal_ownership_loss(conn: DaemonConn) -> None:
+    """Distinguish an activated successor from an indeterminate fence failure.
+
+    A signal can arrive after another worker promoted a newer host generation
+    but before this worker consumes the explicit revocation event.  Treating
+    that exact state as a generic consistency failure stops the signal pump
+    without revoking its established RTC bindings, so the following revocation
+    event can no longer clean them up.  The active Redis lease is the observable
+    proof that a newer generation really won; a pending-only claimant or a
+    missing/malformed lease still fails closed as a consistency error.
+    """
+
+    generation = conn.host_generation
+    replacement: HostPresenceOwner | None = None
+    try:
+        replacement = decode_host_presence_owner(
+            await get_backend().get_ephemeral(host_presence_key(conn.host_id))
+        )
+    except Exception:
+        pass
+    if (
+        generation is not None
+        and replacement is not None
+        and replacement.daemon_connection_id != conn.id
+        and replacement.generation > generation
+    ):
+        await _close_real_supersession(conn)
+        return
+    await _close_daemon_consistency_failure(conn)
+
+
 async def _expire_host_rtc_binding(
     binding: RtcSessionBinding,
     daemon: DaemonConn,
@@ -1509,7 +1540,7 @@ async def _process_host_rtc_signal(
         )
         return True
     if not durable_owner or not await _redis_owner_is_current(conn):
-        await _close_daemon_consistency_failure(conn)
+        await _close_host_signal_ownership_loss(conn)
         return False
     signal = envelope.signal
     scope_id = signal.get("scope_id")
@@ -1688,7 +1719,7 @@ async def _process_host_rtc_signal(
         expiry_task.add_done_callback(expiry_tasks.discard)
         if not await _redis_owner_is_current(conn):
             await broker.unregister_rtc_session(session_id, remote_browser)
-            await _close_daemon_consistency_failure(conn)
+            await _close_host_signal_ownership_loss(conn)
             return False
         await _bounded_send_text(conn, signal)
         return True
@@ -1703,7 +1734,7 @@ async def _process_host_rtc_signal(
     ):
         return True
     if not await _redis_owner_is_current(conn):
-        await _close_daemon_consistency_failure(conn)
+        await _close_host_signal_ownership_loss(conn)
         return False
     if frame_type == "rtc.candidate":
         if _valid_rtc_candidate(signal.get("candidate")) is not None:

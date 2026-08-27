@@ -411,6 +411,98 @@ async def test_durable_owner_cache_skips_db_and_transient_timeout_drops_one_fram
     assert daemon.durable_owner_valid_until == 0
 
 
+async def test_stale_host_offer_after_active_takeover_revokes_existing_binding(app, monkeypatch):
+    """Lease fencing must not consume the revocation cleanup opportunity."""
+
+    import spawn_server.ws.daemon as daemon_mod
+    from spawn_server.ws.host_signal import HostSignalEnvelope
+
+    broker = get_broker()
+    backend = get_backend()
+    host_id = "stale-offer-takeover-host"
+    old_socket = FakeDaemonWebSocket()
+    old = DaemonConn(
+        host_id=host_id,
+        user_id="owner",
+        websocket=old_socket,  # type: ignore[arg-type]
+        id="a" * 32,
+        host_generation=1,
+    )
+    assert await broker.accept_daemon_owner(old, 1)
+
+    browser_route = browser_signal_channel("c" * 32)
+    binding_nonce = "d" * 32
+    remote_browser = RedisBrowserConn(
+        "owner",
+        host_id,
+        browser_route,
+        old.id,
+        1,
+        binding_nonce,
+    )
+    session_id = "established-before-takeover"
+    assert await broker.register_rtc_session(
+        session_id,
+        remote_browser,
+        daemon=old,
+        scope_type="host",
+        scope_id=host_id,
+        protocol="spawn.host.ctl",
+        protocol_version=1,
+        binding_nonce=binding_nonce,
+        ttl_seconds=60,
+    )
+
+    async def cached_durable_owner(_conn):
+        return True
+
+    monkeypatch.setattr(daemon_mod, "_validate_durable_host_owner", cached_durable_owner)
+    replacement = HostPresenceOwner("b" * 32, 2)
+    await backend.set_ephemeral(
+        host_presence_key(host_id),
+        encode_host_presence_owner(replacement),
+        ttl_seconds=60,
+    )
+    stale_offer = HostSignalEnvelope(
+        old.id,
+        1,
+        browser_route,
+        {
+            "type": "rtc.offer",
+            "session_id": "stale-after-takeover",
+            "binding_nonce": "e" * 32,
+            "scope_type": "host",
+            "scope_id": host_id,
+            "protocol": "spawn.host.ctl",
+            "protocol_version": 1,
+            "sdp": "v=0\r\n",
+        },
+    )
+
+    try:
+        async with backend.subscribe_channel(browser_route) as responses:
+            assert not await daemon_mod._process_host_rtc_signal(old, stale_offer, set())
+            raw = await asyncio.wait_for(anext(responses), timeout=1)
+        dispatch = decode_rtc_signal_dispatch(raw)
+        assert dispatch is not None
+        assert dispatch.session_connection_id == old.id
+        assert dispatch.session_generation == 1
+        assert dispatch.binding_nonce == binding_nonce
+        assert dispatch.dispatch_connection_id == replacement.daemon_connection_id
+        assert dispatch.dispatch_generation == replacement.generation
+        assert dispatch.signal["type"] == "rtc.status"
+        assert dispatch.signal["session_id"] == session_id
+        assert dispatch.signal["status"] == "unavailable"
+        assert old_socket.closed == (4000, "superseded")
+        assert any(
+            frame.get("type") == "rtc.close" and frame.get("session_id") == session_id
+            for frame in _sent_json(old_socket)
+        )
+        assert await broker.rtc_session_for(session_id) is None
+    finally:
+        await broker.unregister_daemon(old)
+
+
 def test_live_bindings_are_validated_field_by_field_and_capped():
     valid = {
         "session_id": "session",
