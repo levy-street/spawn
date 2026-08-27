@@ -33,19 +33,25 @@ const paths = {
 
 const appSizes = [32, 16, 24, 48, 64, 256];
 const windowsTraySizes = [32, 16, 20, 24, 40, 48, 64];
+// Exactly the members `iconutil` writes, and no others. The 16 and 32 px
+// slots are `ic04` / `ic05` in Apple's ARGB run-length form: IconServices reads
+// a PNG in those two slots as raw pixels, so the `icp4` / `icp5` PNG members
+// this once emitted drew as coloured noise everywhere macOS shows an icon at
+// 16 px — Login Items, the Dock's menu, Force Quit — while AppKit, which skips
+// them, drew the mark. `iconutil -c iconset` on such a file reproduces the
+// noise. There is no 64 px member: 32@2x (`ic12`) is what macOS reads there.
 const icnsTypes = [
-  [16, "icp4"],
-  [32, "icp5"],
-  [64, "icp6"],
-  [128, "ic07"],
-  [256, "ic08"],
-  [512, "ic09"],
-  [1024, "ic10"],
+  [16, "ic04", "argb"],
+  [32, "ic05", "argb"],
+  [128, "ic07", "png"],
+  [256, "ic08", "png"],
+  [512, "ic09", "png"],
+  [1024, "ic10", "png"],
   // Retina aliases: 16@2x, 32@2x, 128@2x, and 256@2x.
-  [32, "ic11"],
-  [64, "ic12"],
-  [256, "ic13"],
-  [512, "ic14"],
+  [32, "ic11", "png"],
+  [64, "ic12", "png"],
+  [256, "ic13", "png"],
+  [512, "ic14", "png"],
 ];
 
 function cssPixels(name) {
@@ -150,16 +156,76 @@ async function renderMacPngs() {
   return { png, tray, tray2x };
 }
 
+/**
+ * Apple's `ic04` / `ic05` payload: the literal `ARGB`, then four planes — every
+ * pixel's alpha, then every red, green and blue, straight (never premultiplied)
+ * bytes — run-length packed the way the classic `is32` members were: a byte
+ * under 0x80 copies the next n+1 bytes, a byte of 0x80 or more repeats the
+ * next byte n−125 times. Decoded from what `iconutil` writes for the same PNG
+ * and matched plane for plane.
+ */
+function packArgb(rgba, width, height) {
+  const pixels = width * height;
+  const planes = Buffer.alloc(pixels * 4);
+  for (let index = 0; index < pixels; index += 1) {
+    planes[index] = rgba[index * 4 + 3];
+    planes[pixels + index] = rgba[index * 4];
+    planes[pixels * 2 + index] = rgba[index * 4 + 1];
+    planes[pixels * 3 + index] = rgba[index * 4 + 2];
+  }
+  return Buffer.concat([Buffer.from("ARGB", "ascii"), packBits(planes)]);
+}
+
+function packBits(bytes) {
+  const out = [];
+  const runAt = (at) =>
+    at + 2 < bytes.length && bytes[at] === bytes[at + 1] && bytes[at] === bytes[at + 2];
+  let index = 0;
+  while (index < bytes.length) {
+    if (runAt(index)) {
+      let run = 3;
+      while (run < 130 && index + run < bytes.length && bytes[index + run] === bytes[index]) {
+        run += 1;
+      }
+      out.push(0x80 + (run - 3), bytes[index]);
+      index += run;
+      continue;
+    }
+    let literal = 1;
+    while (literal < 128 && index + literal < bytes.length && !runAt(index + literal)) {
+      literal += 1;
+    }
+    out.push(literal - 1, ...bytes.subarray(index, index + literal));
+    index += literal;
+  }
+  return Buffer.from(out);
+}
+
+async function argbMember(master, size) {
+  const { data, info } = await sharp(master)
+    .resize(size, size, { fit: "fill", kernel: sharp.kernel.lanczos3 })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  return packArgb(data, info.width, info.height);
+}
+
 async function buildIcns(master) {
-  const pngs = new Map();
+  const members = new Map();
   const entries = [];
-  for (const [size, type] of icnsTypes) {
-    if (!pngs.has(size)) pngs.set(size, await resized(master, size));
-    const png = pngs.get(size);
+  for (const [size, type, form] of icnsTypes) {
+    const key = `${form}:${size}`;
+    if (!members.has(key)) {
+      members.set(
+        key,
+        form === "argb" ? await argbMember(master, size) : await resized(master, size),
+      );
+    }
+    const payload = members.get(key);
     const header = Buffer.alloc(8);
     header.write(type, 0, 4, "ascii");
-    header.writeUInt32BE(png.length + header.length, 4);
-    entries.push(header, png);
+    header.writeUInt32BE(payload.length + header.length, 4);
+    entries.push(header, payload);
   }
   const body = Buffer.concat(entries);
   const header = Buffer.alloc(8);
