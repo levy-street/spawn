@@ -308,7 +308,10 @@ export interface BroadcastAcceptancePlan {
 export async function planBroadcastIntroductionAcceptance(input: {
   accountId: string;
   ownPublicKey: string;
-  /** Firsthand peer device keys (wire form) — the ONLY acceptable signers. */
+  /**
+   * Firsthand peer device keys (wire form) — the only acceptable signers
+   * besides this device itself.
+   */
   trustedPeerKeys: ReadonlySet<string>;
   claimed: readonly ClaimedBroadcastIntroduction[];
 }): Promise<BroadcastAcceptancePlan> {
@@ -317,8 +320,14 @@ export async function planBroadcastIntroductionAcceptance(input: {
   let unknownPublisher = 0;
   for (const item of input.claimed) {
     const name = typeof item.host_name === "string" && item.host_name ? item.host_name : "a host";
-    if (item.publisher_public_key === input.ownPublicKey) continue; // our own rows
-    if (!input.trustedPeerKeys.has(item.publisher_public_key)) {
+    // A row under this device's OWN key is firsthand by construction: only
+    // its private key could have signed it, and that key is checked against
+    // the local identity, never the row. The desktop app publishes the hosts
+    // it possessed under the very key it then hands to the page it hosts
+    // (desktop-device-handover.ts), so those rows are how that page learns
+    // its own computer.
+    const own = item.publisher_public_key === input.ownPublicKey;
+    if (!own && !input.trustedPeerKeys.has(item.publisher_public_key)) {
       unknownPublisher += 1;
       continue;
     }

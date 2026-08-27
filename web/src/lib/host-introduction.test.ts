@@ -327,7 +327,7 @@ describe("planBroadcastIntroductionAcceptance", () => {
     expect(plan.rejected).toHaveLength(0); // not an error — just never trusted
   });
 
-  test("a tampered host key is rejected; own rows are skipped", async () => {
+  test("a tampered host key is rejected; a row under this device's own key is honoured", async () => {
     const publisher = await keyPair();
     const publisherWire = await wire(publisher.publicKey);
     const host = await keyPair();
@@ -339,7 +339,7 @@ describe("planBroadcastIntroductionAcceptance", () => {
     const plan = await planBroadcastIntroductionAcceptance({
       accountId: ACCOUNT,
       ownPublicKey: ownWire,
-      trustedPeerKeys: new Set([publisherWire, ownWire]),
+      trustedPeerKeys: new Set([publisherWire]),
       claimed: [
         {
           publisher_device_id: "d-1",
@@ -350,17 +350,56 @@ describe("planBroadcastIntroductionAcceptance", () => {
           signature,
         },
         {
+          // This device's own row — the desktop app published it under the
+          // key it then handed to this page. Nothing else could have signed it.
           publisher_device_id: "d-me",
           publisher_public_key: ownWire,
           host_id: HOST_ID,
           host_name: "mine",
           host_public_key: hostWire,
+          signature: await signBroadcast(own, hostWire),
+        },
+        {
+          // The same claim wearing somebody else's signature is still refused.
+          publisher_device_id: "d-me",
+          publisher_public_key: ownWire,
+          host_id: HOST_ID,
+          host_name: "forged mine",
+          host_public_key: hostWire,
           signature,
         },
       ],
     });
-    expect(plan.accepted).toHaveLength(0);
-    expect(plan.rejected).toHaveLength(1);
+    expect(plan.accepted.map((intro) => intro.hostName)).toEqual(["mine"]);
+    expect(plan.accepted[0]?.hostPublicKey).toBe(hostWire);
+    expect(plan.rejected).toHaveLength(2);
+    expect(plan.unknownPublisher).toBe(0);
+  });
+
+  test("an own-key row needs no firsthand peers at all (the desktop window's first open)", async () => {
+    const host = await keyPair();
+    const hostWire = await wire(host.publicKey);
+    const own = await keyPair();
+    const ownWire = await wire(own.publicKey);
+    const plan = await planBroadcastIntroductionAcceptance({
+      accountId: ACCOUNT,
+      ownPublicKey: ownWire,
+      trustedPeerKeys: new Set(),
+      claimed: [
+        {
+          publisher_device_id: "d-me",
+          publisher_public_key: ownWire,
+          host_id: HOST_ID,
+          host_name: "this Mac",
+          host_public_key: hostWire,
+          signature: await signBroadcast(own, hostWire),
+        },
+      ],
+    });
+    expect(plan.accepted).toHaveLength(1);
+    expect(plan.accepted[0]?.hostFingerprint).toBe(await ed25519PublicKeyFingerprint(hostWire));
+    expect(plan.rejected).toHaveLength(0);
+    expect(plan.unknownPublisher).toBe(0);
   });
 
   test("a wrong-account signature is rejected", async () => {

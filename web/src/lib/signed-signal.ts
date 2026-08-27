@@ -8,6 +8,7 @@ export const SIGNED_SIGNAL_MAGIC = textEncoder.encode("SPAWN-RTC-SIGNAL-SIG-V1")
 // unchanged). Revision-1 envelopes fail closed with unsupported_version.
 export const SIGNED_SIGNAL_VERSION = 2;
 export const ED25519_PUBLIC_KEY_BYTES = 32;
+export const ED25519_PRIVATE_KEY_SEED_BYTES = 32;
 export const ED25519_SIGNATURE_BYTES = 64;
 export const ED25519_PUBLIC_KEY_WIRE_CHARS = 43;
 export const ED25519_SIGNATURE_WIRE_CHARS = 86;
@@ -363,6 +364,57 @@ export async function importEd25519PublicKey(raw: Uint8Array): Promise<CryptoKey
   } catch (error) {
     if (error instanceof CryptoUnavailableError) throw error;
     throw new SignedSignalError("invalid_key", "invalid Ed25519 public key");
+  }
+}
+
+/** PKCS#8 around a raw Ed25519 seed (RFC 8410 §7): a fixed 16-byte prefix. */
+const ED25519_PKCS8_PREFIX = Uint8Array.of(
+  0x30,
+  0x2e,
+  0x02,
+  0x01,
+  0x00,
+  0x30,
+  0x05,
+  0x06,
+  0x03,
+  0x2b,
+  0x65,
+  0x70,
+  0x04,
+  0x22,
+  0x04,
+  0x20,
+);
+
+/**
+ * A signing key from a raw seed, non-extractable from the moment it exists.
+ *
+ * The one way a private key ever enters this runtime from outside it: the
+ * desktop app handing its own device identity to the page it hosts. The seed
+ * is not zeroed here — it is the caller's, and the caller zeroes it on every
+ * path (browser-device-identity.ts); the PKCS#8 copy made for the import is.
+ */
+export async function importEd25519PrivateKeySeed(seed: Uint8Array): Promise<CryptoKey> {
+  ensureBytes(seed, "seed", ED25519_PRIVATE_KEY_SEED_BYTES);
+  const pkcs8 = new Uint8Array(ED25519_PKCS8_PREFIX.byteLength + seed.byteLength);
+  pkcs8.set(ED25519_PKCS8_PREFIX);
+  pkcs8.set(seed, ED25519_PKCS8_PREFIX.byteLength);
+  try {
+    const key = await subtleCrypto().importKey(
+      "pkcs8",
+      ownedArrayBuffer(pkcs8),
+      { name: "Ed25519" },
+      false,
+      ["sign"],
+    );
+    assertEd25519Key(key, "private", "sign");
+    return key;
+  } catch (error) {
+    if (error instanceof CryptoUnavailableError) throw error;
+    throw new SignedSignalError("invalid_key", "invalid Ed25519 private key seed");
+  } finally {
+    pkcs8.fill(0);
   }
 }
 

@@ -4,11 +4,13 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { ApiError, type BrowserDevice, browserDevices } from "./api";
 import {
+  adoptBrowserDeviceIdentity,
   createBrowserDeviceRegistrationProof,
   deleteBrowserDeviceIdentity,
   loadBrowserDeviceIdentity,
   loadOrCreateBrowserDeviceIdentity,
 } from "./browser-device-identity";
+import { takeDesktopDeviceHandover } from "./desktop-device-handover";
 
 const REVOCATION_MARKER_PREFIX = "spawn.browser-device.revocation.v1.";
 
@@ -161,7 +163,12 @@ async function registerBrowserDevice(
     allowExplicitBrowserIdentityReplacement(userId, marker.publicKey);
   }
 
-  const identity = await loadOrCreateBrowserDeviceIdentity(userId);
+  // Inside the desktop app's window this page IS the app's device: the app
+  // leaves its identity on the way in, and it replaces whatever this page
+  // minted for itself before (desktop-device-handover.ts).
+  const carried = takeDesktopDeviceHandover(userId);
+  const adopted = carried === null ? null : await adoptBrowserDeviceIdentity(userId, carried);
+  const identity = adopted?.identity ?? (await loadOrCreateBrowserDeviceIdentity(userId));
   const signature = await createBrowserDeviceRegistrationProof(identity, userId);
   let device: BrowserDevice;
   try {
@@ -205,7 +212,33 @@ async function registerBrowserDevice(
   ) {
     throw new Error("browser registration response did not match the submitted active key");
   }
+  if (adopted?.replacedPublicKeyWire) {
+    void retireSupersededDevice(adopted.replacedPublicKeyWire, device.id);
+  }
   return { status: "ready", device, publicKey: identity.publicKeyWire };
+}
+
+/**
+ * Revoke the roster row of the key this page just stopped being: a device
+ * nobody can use any more, which would otherwise sit in every roster as a
+ * stranger waiting to be approved. Best effort — the row is cosmetic once
+ * its key is gone from here — and never the account root, which only a
+ * passkey ceremony may replace.
+ */
+async function retireSupersededDevice(publicKey: string, revokedByDeviceId: string): Promise<void> {
+  try {
+    const rows = await browserDevices.list();
+    const row = rows.find(
+      (device) => device.public_key === publicKey && device.revoked_at === null,
+    );
+    if (row === undefined || row.is_root) return;
+    await browserDevices.revoke(row.id, publicKey, revokedByDeviceId);
+  } catch (cause) {
+    console.warn(
+      "spawn: the device this page used to be could not be retired:",
+      cause instanceof Error ? cause.message : cause,
+    );
+  }
 }
 
 export function browserIdentityConnectionsAllowed(

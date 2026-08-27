@@ -265,7 +265,7 @@ mod tests {
         );
         assert_eq!(params.get("return_to").map(String::as_str), Some("/"));
         assert_eq!(parsed.path(), "/api/auth/oauth/google/start");
-        assert!(params.get("invite").is_none());
+        assert!(!params.contains_key("invite"));
     }
 
     #[test]
