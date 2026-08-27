@@ -1,9 +1,9 @@
 //! The session worker runtime: one process per session, owning the session's PTY.
 //!
 //! Lifecycle:
-//! 1. `spawn-worker --socket <p> --session-id <uuid> --log-dir <p>` binds the
-//!    ordinary unix socket and an independent lifecycle socket, then waits
-//!    for the supervising `spawnd` to connect.
+//! 1. `spawn-worker` adopts its inherited endpoint reservation, binds the
+//!    platform's ordinary and independent lifecycle endpoints, then waits for
+//!    the supervising `spawnd` to connect.
 //! 2. Every accepted connection is greeted with a `Hello` frame carrying the
 //!    worker's state, so a freshly restarted `spawnd` can adopt a running
 //!    worker with no persistent handshake state.
@@ -19,27 +19,32 @@
 //!    dies with the process anyway), unlinks its socket, and exits.
 //!
 //! The session's fate is tied to the worker (the worker holds the PTY master),
-//! but NOT to spawnd: the worker runs in its own process group and keeps
-//! serving across spawnd restarts/upgrades without an intermediate terminal
-//! multiplexer.
+//! but NOT to spawnd: the worker owns an independent process group on Unix or
+//! a detached breakaway Job Object on Windows and keeps serving across spawnd
+//! restarts/upgrades without an intermediate terminal multiplexer.
 
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{bail, Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tokio::io::AsyncWriteExt;
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::{UnixDatagram, UnixListener};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
 use super::emulator::{Emulator, HistoryEvent};
+use super::endpoint;
 use super::scrollback::{geometry_marker, ScrollbackLog, REPLAY_HISTORY_SENTINEL};
 use super::secret::{self, SecretBytes};
 use super::wire;
@@ -159,7 +164,7 @@ fn inbound_frame_size_allowed(frame_type: u8, len: usize) -> bool {
 async fn persist_events(
     log: &mut ScrollbackLog,
     events: Vec<HistoryEvent>,
-    conn_write: &mut Option<OwnedWriteHalf>,
+    conn_write: &mut Option<endpoint::WorkerWriteHalf>,
     anchor: &mut wire::HistoryAnchor,
     subscribed: bool,
 ) -> bool {
@@ -228,50 +233,78 @@ const AWAIT_START_TIMEOUT: Duration = Duration::from_secs(120);
 const EXIT_LINGER: Duration = Duration::from_secs(60);
 
 pub struct WorkerArgs {
+    #[cfg(unix)]
     pub socket: PathBuf,
+    #[cfg(windows)]
+    pub pipe_name: std::ffi::OsString,
     pub session_id: Uuid,
     pub log_dir: PathBuf,
     pub segment_bytes: u64,
     pub max_log_bytes: u64,
+    #[cfg(unix)]
     pub lock_fd: Option<RawFd>,
+    #[cfg(windows)]
+    pub reservation_handle: Option<usize>,
 }
 
 pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs> {
+    #[cfg(unix)]
     let mut socket = None;
+    #[cfg(windows)]
+    let mut pipe_name = None;
     let mut session_id = None;
     let mut log_dir = None;
     let mut segment_bytes = super::scrollback::DEFAULT_SEGMENT_BYTES;
     let mut max_log_bytes = super::scrollback::DEFAULT_MAX_LOG_BYTES;
+    #[cfg(unix)]
     let mut lock_fd = None;
+    #[cfg(windows)]
+    let mut reservation_handle = None;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| -> Result<String> {
             args.next()
                 .ok_or_else(|| anyhow::anyhow!("missing value for {name}"))
         };
         match arg.as_str() {
+            #[cfg(unix)]
             "--socket" => socket = Some(PathBuf::from(value("--socket")?)),
+            #[cfg(windows)]
+            "--pipe-name" => pipe_name = Some(std::ffi::OsString::from(value("--pipe-name")?)),
             "--session-id" => {
                 session_id = Some(Uuid::parse_str(&value("--session-id")?).context("session id")?)
             }
             "--log-dir" => log_dir = Some(PathBuf::from(value("--log-dir")?)),
             "--segment-bytes" => segment_bytes = value("--segment-bytes")?.parse()?,
             "--max-log-bytes" => max_log_bytes = value("--max-log-bytes")?.parse()?,
+            #[cfg(unix)]
             "--lock-fd" => lock_fd = Some(value("--lock-fd")?.parse()?),
+            #[cfg(windows)]
+            "--reservation-handle" => {
+                reservation_handle = Some(value("--reservation-handle")?.parse()?)
+            }
             other => bail!("unknown argument {other:?}"),
         }
     }
     Ok(WorkerArgs {
+        #[cfg(unix)]
         socket: socket.context("--socket is required")?,
+        #[cfg(windows)]
+        pipe_name: pipe_name.context("--pipe-name is required")?,
         session_id: session_id.context("--session-id is required")?,
         log_dir: log_dir.context("--log-dir is required")?,
         segment_bytes,
         max_log_bytes,
+        #[cfg(unix)]
         lock_fd,
+        #[cfg(windows)]
+        reservation_handle,
     })
 }
 
 /// Entry point for the `spawn-worker` binary.
 pub fn main() -> Result<()> {
+    let args = parse_args(std::env::args().skip(1))?;
+    #[cfg(unix)]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -280,7 +313,19 @@ pub fn main() -> Result<()> {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
-    let args = parse_args(std::env::args().skip(1))?;
+    #[cfg(windows)]
+    {
+        let log =
+            endpoint::open_worker_log(&args.log_dir).context("opening detached worker log")?;
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_target(false)
+            .with_writer(std::sync::Mutex::new(log))
+            .init();
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -302,13 +347,43 @@ struct Pty {
     child: SharedChild,
     /// Desired size; jiggles always restore to this.
     size: Arc<Mutex<(u16, u16)>>,
+    #[cfg(windows)]
+    input_wake: std::thread::Thread,
 }
 
 type SharedChild = Arc<Mutex<ChildState>>;
 
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct LifecyclePlatform;
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct LifecyclePlatform {
+    priority_input: SharedPriorityInput,
+    job: endpoint::WorkerJob,
+}
+
+#[cfg(windows)]
+type SharedPriorityInput = Arc<Mutex<Option<PriorityInput>>>;
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct PriorityInput {
+    sender: std::sync::mpsc::SyncSender<PriorityWrite>,
+    wake: std::thread::Thread,
+}
+
+#[cfg(windows)]
+struct PriorityWrite {
+    cancelled: Arc<AtomicBool>,
+    completed: oneshot::Sender<bool>,
+}
+
 /// The unreaped child handle is the stable process identity. Lifecycle
 /// signaling and the exit monitor both hold this same lock, so the PID cannot
-/// be reused between validation and `killpg` and reaping cannot race a signal.
+/// be reused between validation and platform tree termination, and reaping
+/// cannot race a signal.
 enum ChildState {
     AwaitingStart,
     Running {
@@ -338,7 +413,10 @@ struct LogSetup {
 pub async fn run(args: WorkerArgs) -> Result<()> {
     let key = SecretBytes::random(32).context("generating scrollback key")?;
     if !key.is_locked() {
+        #[cfg(unix)]
         tracing::warn!("mlock failed for scrollback key; key may be swappable (RLIMIT_MEMLOCK?)");
+        #[cfg(windows)]
+        tracing::warn!("VirtualLock failed for scrollback key; key may be swappable");
     }
     let setup = LogSetup {
         dir: args.log_dir.clone(),
@@ -350,39 +428,66 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut emulator: Option<Emulator> = None;
 
     let parent = args
-        .socket
+        .log_dir
         .parent()
-        .context("worker socket has no parent directory")?;
+        .context("worker log directory has no parent")?;
     super::endpoint::ensure_private_dir(parent)?;
-    let _endpoint_lock = match args.lock_fd {
-        Some(fd) => {
-            // SAFETY: production launch passes an owned descriptor inherited
-            // across exec. Identity and lock ownership are revalidated before
-            // either endpoint is touched.
-            unsafe { super::endpoint::WorkerLock::from_inherited(fd, &args.socket) }?
-        }
-        None => match super::endpoint::try_reserve(&args.socket)? {
-            super::endpoint::LockAttempt::Acquired(lock) => lock,
-            super::endpoint::LockAttempt::Busy => bail!("worker endpoint is already owned"),
-        },
+    let worker_endpoint = {
+        #[cfg(unix)]
+        let supplied = args.socket.as_os_str();
+        #[cfg(windows)]
+        let supplied = args.pipe_name.as_os_str();
+        endpoint::endpoint_from_worker_arg(
+            parent,
+            &endpoint::config_root_tag(),
+            args.session_id,
+            supplied,
+        )?
     };
-    let lifecycle_socket = wire::lifecycle_socket_path(&args.socket);
-    super::endpoint::remove_stale_socket(&args.socket)?;
-    super::endpoint::remove_stale_socket(&lifecycle_socket)?;
-    let listener = UnixListener::bind(&args.socket).context("binding ordinary worker endpoint")?;
-    let ordinary_identity = super::endpoint::secure_bound_socket(&args.socket)?;
-    let lifecycle_listener =
-        UnixDatagram::bind(&lifecycle_socket).context("binding lifecycle worker endpoint")?;
-    let lifecycle_identity = super::endpoint::secure_bound_socket(&lifecycle_socket)?;
+
+    let endpoint_lock = {
+        #[cfg(unix)]
+        let inherited = args.lock_fd;
+        #[cfg(windows)]
+        let inherited = args.reservation_handle;
+        match inherited {
+            Some(fd) => {
+                // SAFETY: production launch passes an owned descriptor inherited
+                // across exec. Identity and lock ownership are revalidated before
+                // either endpoint is touched.
+                unsafe { endpoint::adopt_reservation(fd, &worker_endpoint) }?
+            }
+            None => match endpoint::try_reserve(&worker_endpoint)? {
+                super::endpoint::LockAttempt::Acquired(lock) => lock,
+                super::endpoint::LockAttempt::Busy => bail!("worker endpoint is already owned"),
+            },
+        }
+    };
+    #[cfg(unix)]
+    let lifecycle_platform = LifecyclePlatform;
+    #[cfg(windows)]
+    let lifecycle_platform = LifecyclePlatform {
+        priority_input: Arc::new(Mutex::new(None)),
+        // The inherited reservation is validated before this process joins
+        // its own kill-on-close job, and both precede endpoint publication.
+        job: endpoint::create_worker_job()?,
+    };
     let instance_id = Uuid::new_v4();
+    endpoint::remove_stale(&worker_endpoint, &endpoint_lock)?;
+    let endpoint::BoundWorkerEndpoints {
+        mut main,
+        lifecycle,
+        identity,
+    } = endpoint::bind_worker(&worker_endpoint, &endpoint_lock, instance_id)?;
     let child_state = Arc::new(Mutex::new(ChildState::AwaitingStart));
     let lifecycle_task = tokio::spawn(run_lifecycle_listener(
-        lifecycle_listener,
+        lifecycle,
         instance_id,
         Arc::clone(&child_state),
         args.session_id,
+        lifecycle_platform.clone(),
     ));
-    tracing::info!(session_id = %args.session_id, socket = %args.socket.display(), "worker listening");
+    tracing::info!(session_id = %args.session_id, endpoint = ?worker_endpoint.main_arg(), "worker listening");
 
     let (frame_tx, mut frame_rx) = mpsc::channel::<ConnFrame>(CONNECTION_FRAME_QUEUE_DEPTH);
     let (pty_tx, mut pty_rx) = pty_output_channel();
@@ -392,7 +497,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
 
     let mut state = State::AwaitingStart;
     let mut pty: Option<Pty> = None;
-    let mut conn_write: Option<OwnedWriteHalf> = None;
+    let mut conn_write: Option<endpoint::WorkerWriteHalf> = None;
     let mut conn_reader: Option<JoinHandle<()>> = None;
     let mut generation: u64 = 0;
     let mut pty_open = false;
@@ -447,13 +552,13 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         };
 
         tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted.context("accepting connection")?;
-                if super::endpoint::validate_stream_peer(&stream).is_err() {
+            accepted = endpoint::accept_main(&mut main) => {
+                let stream = accepted?;
+                if endpoint::validate_worker_peer(&stream).is_err() {
                     tracing::warn!("rejecting worker supervisor with invalid peer ownership");
                     continue;
                 }
-                let (read_half, mut write_half) = stream.into_split();
+                let (read_half, mut write_half) = endpoint::split_worker(stream);
                 let hello = wire::Hello {
                     version: wire::PROTO_VERSION,
                     session_id: args.session_id,
@@ -523,6 +628,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     pty_source_offset,
                     &mut history_anchor,
                     &mut history_sub,
+                    &lifecycle_platform,
                 ).await {
                     Ok(LoopAction::Continue) => {}
                     Ok(LoopAction::PtyStarted) => {
@@ -612,13 +718,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 if !matches!(state, State::Running) {
                     continue;
                 }
-                let master_fd = pty
-                    .as_ref()
-                    .and_then(|p| p.master.lock().ok().and_then(|master| master.as_raw_fd()));
-                let Some(master_fd) = master_fd else {
-                    continue;
-                };
-                let Some(name) = super::foreground::foreground_basename(master_fd) else {
+                let Some(name) = foreground_name(pty.as_ref()) else {
                     continue;
                 };
                 if foreground_sent.as_deref() == Some(name.as_str()) {
@@ -655,8 +755,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     }
     lifecycle_task.abort();
     let _ = lifecycle_task.await;
-    ordinary_identity.cleanup()?;
-    lifecycle_identity.cleanup()?;
+    identity.cleanup()?;
     Ok(())
 }
 
@@ -672,7 +771,7 @@ async fn handle_frame(
     payload: PlaintextChunk,
     state: &mut State,
     pty: &mut Option<Pty>,
-    conn_write: &mut Option<OwnedWriteHalf>,
+    conn_write: &mut Option<endpoint::WorkerWriteHalf>,
     log: &mut Option<ScrollbackLog>,
     emulator: &mut Option<Emulator>,
     setup: &LogSetup,
@@ -683,6 +782,7 @@ async fn handle_frame(
     pty_source_offset: u64,
     history_anchor: &mut wire::HistoryAnchor,
     history_sub: &mut bool,
+    lifecycle_platform: &LifecyclePlatform,
 ) -> Result<LoopAction> {
     match frame_type {
         wire::T_START => {
@@ -714,8 +814,14 @@ async fn handle_frame(
             *emulator = Some(Emulator::new(cols, rows));
             let out_tx = pty_tx.take().context("pty channel already consumed")?;
             let ex_tx = exit_tx.take().context("exit channel already consumed")?;
-            let started = spawn_pty(&spec, out_tx, ex_tx, Arc::clone(child_state))
-                .context("spawning session PTY")?;
+            let started = spawn_pty(
+                &spec,
+                out_tx,
+                ex_tx,
+                Arc::clone(child_state),
+                lifecycle_platform,
+            )
+            .context("spawning session PTY")?;
             let pid = started.pid;
             *session_cwd = Some(spec.cwd.clone());
             *pty = Some(started);
@@ -740,6 +846,8 @@ async fn handle_frame(
                     .send(payload)
                     .await
                     .map_err(|_| anyhow::anyhow!("session PTY input channel closed"))?;
+                #[cfg(windows)]
+                p.input_wake.unpark();
             }
             Ok(LoopAction::Continue)
         }
@@ -839,7 +947,7 @@ async fn handle_frame(
             match pty {
                 Some(p) => {
                     let signal = shutdown.signal.unwrap_or(wire::LifecycleSignal::Term);
-                    match signal_owned_child(&p.child, signal) {
+                    match deliver_signal(&p.child, signal, lifecycle_platform).await {
                         LifecycleOutcome::Delivered | LifecycleOutcome::Gone => {}
                         LifecycleOutcome::Failed => bail!("worker lifecycle delivery failed"),
                     }
@@ -868,7 +976,7 @@ fn state_name(state: &State) -> &'static str {
 }
 
 async fn close_supervisor_connection(
-    writer: &mut Option<OwnedWriteHalf>,
+    writer: &mut Option<endpoint::WorkerWriteHalf>,
     reader: &mut Option<JoinHandle<()>>,
 ) {
     if let Some(mut writer) = writer.take() {
@@ -881,7 +989,7 @@ async fn close_supervisor_connection(
 }
 
 fn spawn_conn_reader(
-    mut read_half: tokio::net::unix::OwnedReadHalf,
+    mut read_half: endpoint::WorkerReadHalf,
     generation: u64,
     frame_tx: mpsc::Sender<ConnFrame>,
 ) -> JoinHandle<()> {
@@ -930,12 +1038,177 @@ fn spawn_conn_reader(
     })
 }
 
+#[cfg(unix)]
+fn command_for_start(spec: &wire::StartSpec) -> Result<(CommandBuilder, String)> {
+    let mut command = CommandBuilder::new(&spec.argv[0]);
+    command.args(&spec.argv[1..]);
+    let basename = std::path::Path::new(&spec.argv[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&spec.argv[0])
+        .to_owned();
+    Ok((command, basename))
+}
+
+#[cfg(windows)]
+fn command_for_start(spec: &wire::StartSpec) -> Result<(CommandBuilder, String)> {
+    let resolved = resolve_windows_start_program(spec)?;
+    let basename = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("resolved session command basename is not UTF-8")?
+        .to_owned();
+    let extension = resolved
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
+        let comspec = env_value_case_insensitive(&spec.env, "ComSpec")
+            .unwrap_or_else(|| "cmd.exe".to_owned());
+        let command_line = batch_command_string(&resolved, &spec.argv[1..])?;
+        let mut command = CommandBuilder::new(comspec);
+        command.args(["/e:ON", "/v:OFF", "/d", "/s", "/c"]);
+        command.arg(command_line);
+        Ok((command, basename))
+    } else {
+        let mut command = CommandBuilder::new(&resolved);
+        command.args(&spec.argv[1..]);
+        Ok((command, basename))
+    }
+}
+
+#[cfg(windows)]
+fn resolve_windows_start_program(spec: &wire::StartSpec) -> Result<PathBuf> {
+    let requested = std::path::Path::new(&spec.argv[0]);
+    let path_ext = env_value_case_insensitive(&spec.env, "PATHEXT")
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_owned());
+    let extensions: Vec<&str> = path_ext
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .collect();
+
+    let mut bases = Vec::new();
+    if requested.is_absolute() {
+        bases.push(requested.to_path_buf());
+    } else if requested.components().count() > 1 {
+        bases.push(std::path::Path::new(&spec.cwd).join(requested));
+    } else {
+        bases.push(std::path::Path::new(&spec.cwd).join(requested));
+        if let Some(path) = env_value_case_insensitive(&spec.env, "PATH") {
+            bases.extend(
+                std::env::split_paths(&OsString::from(path)).map(|dir| dir.join(requested)),
+            );
+        }
+    }
+
+    for base in bases {
+        if base.is_file() {
+            return Ok(base);
+        }
+        if base.extension().is_none() {
+            for extension in &extensions {
+                let extension = extension.strip_prefix('.').unwrap_or(extension);
+                let candidate = base.with_extension(extension);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    bail!("session command was not found in START PATH/PATHEXT")
+}
+
+#[cfg(windows)]
+fn env_value_case_insensitive(
+    env: &std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    env.iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.clone())
+}
+
+#[cfg(windows)]
+fn batch_command_string(script: &std::path::Path, args: &[String]) -> Result<String> {
+    let script = script.to_str().context("batch command path is not UTF-8")?;
+    let script = if let Some(unc) = script.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(dos) = script.strip_prefix(r"\\?\") {
+        dos.to_owned()
+    } else {
+        script.to_owned()
+    };
+    if script.contains('"') || script.ends_with('\\') {
+        bail!("batch command path is invalid");
+    }
+    let mut command = String::from("\"");
+    append_batch_arg(&mut command, &script, true)?;
+    for arg in args {
+        command.push(' ');
+        append_batch_arg(&mut command, arg, false)?;
+    }
+    command.push('"');
+    Ok(command)
+}
+
+#[cfg(windows)]
+fn append_batch_arg(command: &mut String, arg: &str, mut quote: bool) -> Result<()> {
+    if arg
+        .chars()
+        .any(|character| matches!(character, '\0' | '\r' | '\n'))
+    {
+        bail!("batch command argument is invalid");
+    }
+    if arg.is_empty() || arg.ends_with('\\') {
+        quote = true;
+    }
+    const SAFE_PUNCTUATION: &str = r"#$*+-./:?@\_";
+    if arg.chars().any(|character| {
+        (character.is_ascii()
+            && !(character.is_ascii_alphanumeric() || SAFE_PUNCTUATION.contains(character)))
+            || character.is_control()
+    }) {
+        quote = true;
+    }
+    if quote {
+        command.push('"');
+    }
+    let mut backslashes = 0usize;
+    for character in arg.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if character == '"' {
+            command.extend(std::iter::repeat_n('\\', backslashes * 2));
+            command.push('"');
+        } else {
+            command.extend(std::iter::repeat_n('\\', backslashes));
+            if character == '%' || character == '\r' {
+                command.push_str("%%cd:~,");
+            }
+        }
+        backslashes = 0;
+        command.push(character);
+    }
+    if quote {
+        command.extend(std::iter::repeat_n('\\', backslashes * 2));
+        command.push('"');
+    } else {
+        command.extend(std::iter::repeat_n('\\', backslashes));
+    }
+    Ok(())
+}
+
 fn spawn_pty(
     spec: &wire::StartSpec,
     out_tx: mpsc::Sender<PlaintextChunk>,
     exit_tx: oneshot::Sender<wire::ExitInfo>,
     child_state: SharedChild,
+    lifecycle_platform: &LifecyclePlatform,
 ) -> Result<Pty> {
+    #[cfg(unix)]
+    let _ = lifecycle_platform;
     if spec.argv.is_empty() {
         bail!("argv is empty");
     }
@@ -949,8 +1222,7 @@ fn spawn_pty(
         })
         .context("openpty")?;
 
-    let mut cmd = CommandBuilder::new(&spec.argv[0]);
-    cmd.args(&spec.argv[1..]);
+    let (mut cmd, _root_foreground) = command_for_start(spec)?;
     // The daemon computes and ships the *complete* environment; do not leak
     // the worker's own env (it may differ after upgrades).
     cmd.env_clear();
@@ -988,6 +1260,7 @@ fn spawn_pty(
     // Blocking writer thread: PTY input can block when the session's process stops
     // reading; keep that off the async loop.
     let (input_tx, mut input_rx) = mpsc::channel::<PlaintextChunk>(PTY_INPUT_QUEUE_DEPTH);
+    #[cfg(unix)]
     std::thread::spawn(move || {
         while let Some(bytes) = input_rx.blocking_recv() {
             if writer.write_all(&bytes).is_err() {
@@ -996,6 +1269,58 @@ fn spawn_pty(
             let _ = writer.flush();
         }
     });
+    #[cfg(windows)]
+    let input_wake = {
+        let (priority_tx, priority_rx) = std::sync::mpsc::sync_channel::<PriorityWrite>(1);
+        let thread = std::thread::spawn(move || {
+            let mut ordinary_closed = false;
+            loop {
+                match priority_rx.try_recv() {
+                    Ok(control) => {
+                        let delivered = if control.cancelled.load(Ordering::Acquire) {
+                            false
+                        } else {
+                            writer.write_all(&[0x03]).is_ok() && writer.flush().is_ok()
+                        };
+                        let _ = control.completed.send(delivered);
+                        continue;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) if ordinary_closed => break,
+                    Err(_) => {}
+                }
+                if ordinary_closed {
+                    std::thread::park_timeout(Duration::from_millis(10));
+                    continue;
+                }
+                match input_rx.try_recv() {
+                    Ok(bytes) => {
+                        if writer.write_all(&bytes).is_err() {
+                            break;
+                        }
+                        let _ = writer.flush();
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        std::thread::park_timeout(Duration::from_millis(10));
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        ordinary_closed = true;
+                        std::thread::park_timeout(Duration::from_millis(10));
+                    }
+                }
+            }
+        });
+        let wake = thread.thread().clone();
+        *lifecycle_platform
+            .priority_input
+            .lock()
+            .map_err(|_| anyhow::anyhow!("priority PTY input lock poisoned"))? =
+            Some(PriorityInput {
+                sender: priority_tx,
+                wake: wake.clone(),
+            });
+        drop(thread);
+        wake
+    };
 
     // Blocking reader thread: PTY output -> async loop. Child reaping is
     // intentionally separate so it can share stable ownership with the
@@ -1027,6 +1352,8 @@ fn spawn_pty(
         pid,
         child: child_state,
         size: Arc::new(Mutex::new((spec.cols, spec.rows))),
+        #[cfg(windows)]
+        input_wake,
     })
 }
 
@@ -1048,7 +1375,8 @@ enum LifecycleOutcome {
     Failed,
 }
 
-fn signal_owned_child(
+#[cfg(unix)]
+fn signal_owned_child_unix(
     child_state: &SharedChild,
     signal: wire::LifecycleSignal,
 ) -> LifecycleOutcome {
@@ -1080,6 +1408,95 @@ fn signal_owned_child(
             LifecycleOutcome::Failed
         }
     }
+}
+
+fn validate_owned_child(child_state: &SharedChild) -> LifecycleOutcome {
+    let Ok(mut state) = child_state.lock() else {
+        return LifecycleOutcome::Failed;
+    };
+    let ChildState::Running { child, pid } = &mut *state else {
+        return LifecycleOutcome::Gone;
+    };
+    if child.process_id() != Some(*pid) {
+        return LifecycleOutcome::Failed;
+    }
+    LifecycleOutcome::Delivered
+}
+
+async fn deliver_signal(
+    child_state: &SharedChild,
+    signal: wire::LifecycleSignal,
+    platform: &LifecyclePlatform,
+) -> LifecycleOutcome {
+    #[cfg(unix)]
+    {
+        let _ = platform;
+        signal_owned_child_unix(child_state, signal)
+    }
+    #[cfg(windows)]
+    {
+        match signal {
+            wire::LifecycleSignal::Term => deliver_windows_term(child_state, platform).await,
+            wire::LifecycleSignal::Kill => {
+                let outcome = validate_owned_child(child_state);
+                if outcome == LifecycleOutcome::Delivered && platform.job.terminate().is_err() {
+                    return LifecycleOutcome::Failed;
+                }
+                outcome
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn deliver_windows_term(
+    child_state: &SharedChild,
+    platform: &LifecyclePlatform,
+) -> LifecycleOutcome {
+    let outcome = validate_owned_child(child_state);
+    if outcome != LifecycleOutcome::Delivered {
+        return outcome;
+    }
+    let priority = match platform.priority_input.lock() {
+        Ok(priority) => priority.clone(),
+        Err(_) => return LifecycleOutcome::Failed,
+    };
+    let Some(priority) = priority else {
+        return LifecycleOutcome::Gone;
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (completed, response) = oneshot::channel();
+    if priority
+        .sender
+        .try_send(PriorityWrite {
+            cancelled: Arc::clone(&cancelled),
+            completed,
+        })
+        .is_err()
+    {
+        return LifecycleOutcome::Failed;
+    }
+    priority.wake.unpark();
+    match tokio::time::timeout(Duration::from_millis(100), response).await {
+        Ok(Ok(true)) => LifecycleOutcome::Delivered,
+        Ok(_) => LifecycleOutcome::Failed,
+        Err(_) => {
+            cancelled.store(true, Ordering::Release);
+            LifecycleOutcome::Failed
+        }
+    }
+}
+
+#[cfg(unix)]
+fn foreground_name(pty: Option<&Pty>) -> Option<String> {
+    let master_fd =
+        pty.and_then(|pty| pty.master.lock().ok().and_then(|master| master.as_raw_fd()))?;
+    super::foreground::foreground_basename(master_fd)
+}
+
+#[cfg(windows)]
+fn foreground_name(pty: Option<&Pty>) -> Option<String> {
+    pty.and_then(|pty| super::foreground::foreground_basename(pty.pid))
 }
 
 async fn monitor_child_exit(child_state: SharedChild, exit_tx: oneshot::Sender<wire::ExitInfo>) {
@@ -1121,19 +1538,22 @@ async fn monitor_child_exit(child_state: SharedChild, exit_tx: oneshot::Sender<w
 }
 
 async fn run_lifecycle_listener(
-    socket: UnixDatagram,
+    mut listener: endpoint::LifecycleListener,
     instance_id: Uuid,
     child_state: SharedChild,
     session_id: Uuid,
+    platform: LifecyclePlatform,
 ) {
-    // One fixed buffer and one task serve atomic datagrams. Partial writers
-    // cannot retain a connection, handler slot, fd, or allocation, and the
-    // kernel receive queue provides the hard resource bound under floods.
-    let mut request = [0u8; wire::LIFECYCLE_REQUEST_LEN + 1];
+    // The endpoint owns the fixed-size receive buffers and platform resource
+    // bounds: one atomic datagram task on Unix, or seven expiring message-pipe
+    // handlers on Windows. This loop allocates nothing per request.
     loop {
-        let Ok((len, peer)) = socket.recv_from(&mut request).await else {
+        let Ok(exchange) = endpoint::receive_lifecycle(&mut listener).await else {
             break;
         };
+        let (request, len) = exchange.request();
+        #[cfg(windows)]
+        let mut terminate_after_ack = false;
         let ack = if len != wire::LIFECYCLE_REQUEST_LEN {
             wire::LIFECYCLE_ACK_FAILED
         } else {
@@ -1144,27 +1564,47 @@ async fn run_lifecycle_listener(
                 Ok((requested_instance, _)) if requested_instance != instance_id => {
                     wire::LIFECYCLE_ACK_WRONG_INSTANCE
                 }
-                Ok((_, signal)) => match signal_owned_child(&child_state, signal) {
-                    LifecycleOutcome::Delivered => wire::LIFECYCLE_ACK_DELIVERED,
-                    LifecycleOutcome::Gone => wire::LIFECYCLE_ACK_GONE,
-                    LifecycleOutcome::Failed => wire::LIFECYCLE_ACK_FAILED,
-                },
+                Ok((_, signal)) => {
+                    #[cfg(windows)]
+                    let defer_kill = signal == wire::LifecycleSignal::Kill;
+                    #[cfg(unix)]
+                    let defer_kill = false;
+                    let outcome = if defer_kill {
+                        validate_owned_child(&child_state)
+                    } else {
+                        deliver_signal(&child_state, signal, &platform).await
+                    };
+                    #[cfg(windows)]
+                    if defer_kill && outcome == LifecycleOutcome::Delivered {
+                        terminate_after_ack = true;
+                    }
+                    match outcome {
+                        LifecycleOutcome::Delivered => wire::LIFECYCLE_ACK_DELIVERED,
+                        LifecycleOutcome::Gone => wire::LIFECYCLE_ACK_GONE,
+                        LifecycleOutcome::Failed => wire::LIFECYCLE_ACK_FAILED,
+                    }
+                }
                 Err(_) => wire::LIFECYCLE_ACK_FAILED,
             }
         };
-        let Some(peer_path) = peer.as_pathname() else {
-            continue;
-        };
-        if socket.try_send_to(&[ack], peer_path).is_err() {
+        if endpoint::acknowledge_lifecycle(&mut listener, exchange, ack)
+            .await
+            .is_err()
+        {
             tracing::debug!(%session_id, "lifecycle requester closed before acknowledgement");
+        }
+        #[cfg(windows)]
+        if terminate_after_ack && ack == wire::LIFECYCLE_ACK_DELIVERED {
+            let _ = platform.job.terminate();
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::net::UnixDatagram;
 
     #[test]
     fn parse_args_requires_the_essentials() {
@@ -1287,7 +1727,7 @@ mod tests {
             .expect("unrelated sentinel");
 
         assert_eq!(
-            signal_owned_child(&child_state, wire::LifecycleSignal::Kill),
+            signal_owned_child_unix(&child_state, wire::LifecycleSignal::Kill),
             LifecycleOutcome::Gone
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1323,6 +1763,7 @@ mod tests {
             current_instance,
             Arc::clone(&child_state),
             Uuid::new_v4(),
+            LifecyclePlatform,
         ));
 
         let client_path = dir.path().join("client.sock");
@@ -1346,7 +1787,7 @@ mod tests {
             assert!(child.try_wait().unwrap().is_none());
         }
         assert_eq!(
-            signal_owned_child(&child_state, wire::LifecycleSignal::Kill),
+            signal_owned_child_unix(&child_state, wire::LifecycleSignal::Kill),
             LifecycleOutcome::Delivered
         );
         let mut owned =
@@ -1382,6 +1823,7 @@ mod tests {
             instance,
             Arc::clone(&child_state),
             Uuid::new_v4(),
+            LifecyclePlatform,
         ));
 
         let attacker_path = dir.path().join("attacker.sock");
@@ -1450,5 +1892,44 @@ mod tests {
         owned.wait().expect("reap killed child");
         flood.await.unwrap();
         server.abort();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn batch_wrapper_quotes_spaces_and_neutralizes_metacharacters() {
+        let command = batch_command_string(
+            std::path::Path::new(r"C:\Program Files\SPAWN D\claude.cmd"),
+            &["two words".into(), "a&b|c<d>e^f(g)h%i!j".into()],
+        )
+        .unwrap();
+        assert!(command.starts_with(r#"""C:\Program Files\SPAWN D\claude.cmd""#));
+        assert!(command.contains(r#""two words""#));
+        assert!(command.contains("%%cd:~,%"));
+        assert!(!command.contains("%%cd:~,%%"));
+        assert!(command.ends_with('"'));
+    }
+
+    #[test]
+    fn batch_wrapper_rejects_line_break_injection() {
+        assert!(batch_command_string(
+            std::path::Path::new(r"C:\spawn\claude.cmd"),
+            &["safe\r\nwhoami".into()],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn batch_wrapper_converts_verbatim_unc_paths_for_cmd() {
+        let command = batch_command_string(
+            std::path::Path::new(r"\\?\UNC\server\share\claude.cmd"),
+            &[],
+        )
+        .unwrap();
+        assert!(command.contains(r"\\server\share\claude.cmd"));
+        assert!(!command.contains(r"\\?\UNC"));
     }
 }

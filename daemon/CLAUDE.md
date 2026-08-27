@@ -16,8 +16,9 @@ src/
                  private to the binary
   bin/           spawn-worker.rs and cross-runtime-crypto.rs (vector
                  generator)
-  sessiond/      supervisor↔worker shared pieces: wire protocol, terminal
-                 emulator, scrollback, worker runtime
+  sessiond/      supervisor↔worker shared pieces: `endpoint/` contains the
+                 Unix-socket and Windows named-pipe transports; wire protocol,
+                 terminal emulator, scrollback, worker runtime
   <feature>.rs   one module per concern: run.rs (register + main loop),
                  ws.rs, update.rs + update_io.rs (verified daemon self-update;
                  focused tests live in update_tests.rs), release_key.rs (pinned
@@ -40,8 +41,9 @@ vendor/          exact upstream crate sources for narrowly documented patches;
 ## Where things go
 
 - A new host capability: its own `src/<name>.rs`, registered in `main.rs`.
-- Anything both binaries need: `sessiond/`; anything tests or the browser
-  need too: the `lib.rs` surface.
+- Anything both binaries need: `sessiond/`; endpoint changes keep Unix socket
+  semantics and Windows named-pipe/handle-transfer semantics covered together.
+  Anything tests or the browser need too: the `lib.rs` surface.
 - Wire changes: daemon frames must stay compatible with
   `server/spawn_server/ws/daemon.py` — change both sides in the same commit,
   and regenerate the `proto/` vectors when signed material changes.
