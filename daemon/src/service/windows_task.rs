@@ -419,6 +419,7 @@ pub(super) fn prepare_background_log(config_dir: &Path) -> Result<()> {
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .append(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(&path)

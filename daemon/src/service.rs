@@ -745,10 +745,10 @@ pub fn diagnostic(config_dir: &Path) -> Option<String> {
                     .into(),
             );
         }
-        return match preferred_mode(config_dir) {
+        match preferred_mode(config_dir) {
             ServiceMode::Task => windows_task::diagnostic(config_dir),
             ServiceMode::Run => windows_run::diagnostic(config_dir),
-        };
+        }
     }
     #[cfg(not(windows))]
     {
@@ -804,10 +804,10 @@ pub fn refresh_user_path() -> Result<()> {
 pub fn relaunch_after_update(config_dir: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        return match preferred_mode(config_dir) {
+        match preferred_mode(config_dir) {
             ServiceMode::Task => windows_task::run_registered(config_dir),
             ServiceMode::Run => windows_run::signal_update_ready(config_dir),
-        };
+        }
     }
     #[cfg(not(windows))]
     {

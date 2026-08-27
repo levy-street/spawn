@@ -70,12 +70,12 @@ impl Location {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     fn relative(self) -> &'static str {
         self.label()
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", test))]
     fn path(self, home: &std::path::Path) -> PathBuf {
         home.join(self.relative())
     }

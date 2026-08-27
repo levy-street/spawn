@@ -426,6 +426,7 @@ impl SecretFile {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .with_context(|| format!("opening lock {}", path.display()))
     }

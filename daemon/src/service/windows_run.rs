@@ -382,6 +382,7 @@ fn acquire_watchdog_lock(record_path: &Path) -> Result<()> {
     let lock_path = record_path.with_file_name("watchdog.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .share_mode(0)
         .open(&lock_path)
@@ -401,6 +402,7 @@ fn watchdog_lock_is_free(config_dir: &Path) -> bool {
     };
     std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .share_mode(0)
         .open(path.with_file_name("watchdog.lock"))
@@ -662,7 +664,7 @@ fn registry_get_string(path: &str, name: &str) -> Result<Option<String>> {
 
 #[cfg(windows)]
 fn decode_registry_string(bytes: &[u8]) -> Result<String> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         bail!("registry string has an odd byte length");
     }
     let mut words = bytes
