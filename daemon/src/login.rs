@@ -74,6 +74,7 @@ pub async fn run_with_ui(
     ui.begin(0, "[ RUNNING ]");
     let force_qr = args.qr;
     let no_qr = args.no_qr;
+    let no_browser = args.no_browser;
     // Persist before starting the ceremony so retries and interrupted logins
     // never rotate identity. A corrupt existing seed fails closed.
     let mut stored = creds::load().context("loading stored credentials")?;
@@ -102,7 +103,6 @@ pub async fn run_with_ui(
         version: &version,
         host_key_algorithm: identity.algorithm,
         host_public_key: &identity.public_key,
-        setup_token: args.setup_token.as_deref(),
     };
     let start_response = client
         .post(start_url.as_str())
@@ -155,98 +155,67 @@ pub async fn run_with_ui(
     // why that is the ceremony's out-of-band host-key check.
     let approve_url = approval_url(&server, &start, &identity.public_key)?;
     let opener_available = browser_opener_available();
-    let attended = possession.attended;
-    let open_decision = browser_open_decision(attended);
-    ui.begin(
-        1,
-        if attended {
-            "[ CONFIRM IN YOUR BROWSER ]"
-        } else {
-            "[ WAITING FOR YOU ]"
-        },
+    let browser_behavior = browser_behavior(
+        std::io::stdin().is_terminal(),
+        opener_available,
+        no_browser,
     );
+    ui.begin(1, "[ WAITING FOR YOU ]");
 
-    // Whether there is anyone at a keyboard to press Enter. install.sh hands
-    // over /dev/tty; a headless or CI install has none.
-    let can_prompt = std::io::stdin().is_terminal() && opener_available;
     // The QR carries the full URL including the locally-appended #k= fragment.
     // A camera transfers it out of band; fragments never reach the HTTP server.
     //
     // The browser is no longer opened before this point, so the old
     // "did opening fail?" input is gone: the question is simply whether this
     // machine has a browser to offer at all. Headless hosts get the QR.
-    let qr = (!attended && !no_qr && (force_qr || !opener_available))
+    let qr = (!no_qr && (force_qr || !opener_available))
         .then(|| render_qr(&approve_url).ok())
         .flatten();
 
-    // The attended path — the operator started in the browser, got a
-    // `--setup` one-liner and pasted it here — has a browser already open on
-    // the setup screen, already watching this ceremony, and already about to
-    // show this host's fingerprint. A link to open and an offer to launch a
-    // browser are both instructions for work they have finished; printing
-    // them turns a one-glance comparison into a page to read past. All this
-    // terminal owes them is the fingerprint to compare.
-    if attended {
-        ui.block(
-            attended_panel(&identity.fingerprint, ui.width()),
-            &attended_plain_lines(&identity.fingerprint),
-        );
-    } else {
-        ui.block(
-            approval_panel(false, &approve_url, ui.width(), can_prompt),
-            &approval_plain_lines(false, &approve_url, qr.as_deref()),
-        );
-    }
+    ui.block(
+        approval_panel(
+            false,
+            &approve_url,
+            ui.width(),
+            browser_behavior.offer_enter,
+        ),
+        &approval_plain_lines(false, &approve_url, qr.as_deref()),
+    );
 
-    // Ask before taking over the screen. An unattended install (no /dev/tty)
-    // gets the old behaviour: open it, because nobody is here to press a key.
-    let browser_opened = if can_prompt {
-        if open_decision == BrowserOpenDecision::Immediate
-            // The panel above already carries the instruction, so the prompt
-            // itself prints nothing — it only waits for the key.
-            && crate::tui::press_enter("")
-        {
-            let opened = open_browser(&approve_url);
-            if opened {
-                ui.log("opened your browser.");
-            }
-            opened
-        } else {
-            false
+    // A keyboard gets an explicit Enter offer; without one, launch immediately.
+    // `--no-browser` suppresses both paths while leaving the link and QR rules
+    // unchanged.
+    if browser_behavior.offer_enter {
+        // The panel above already carries the instruction, so the prompt
+        // itself prints nothing — it only waits for the key.
+        if crate::tui::press_enter("") && open_browser(&approve_url) {
+            ui.log("opened your browser.");
         }
-    } else {
-        open_decision == BrowserOpenDecision::Immediate && open_browser(&approve_url)
-    };
-    let _ = browser_opened;
+    } else if browser_behavior.open_immediately {
+        open_browser(&approve_url);
+    }
     if ui.is_rich() {
         if let Some(qr) = &qr {
             ui.block(qr.lines().map(str::to_owned).collect(), &[]);
         }
     }
-    ui.status(&waiting_status(attended, 0, start.expires_in));
+    ui.status(&waiting_status(0, start.expires_in));
 
     // 2. poll
     let poll_url = config::api_url(&server, "/api/auth/device/poll")?;
     let mut interval = Duration::from_secs(start.interval.max(1));
     let started_waiting = tokio::time::Instant::now();
-    let attended_open_at = (open_decision == BrowserOpenDecision::AfterPendingTimeout)
-        .then(|| started_waiting + Duration::from_secs(25));
     let poll_body = DevicePollRequest {
         device_code: &start.device_code,
         host_key_algorithm: identity.algorithm,
         host_public_key: &identity.public_key,
     };
 
-    let mut attended_fallback_attempted = false;
     let mut elapsed_shown = false;
     let mut hint_shown = false;
     loop {
-        let sleep_for = attended_open_at
-            .filter(|_| !attended_fallback_attempted)
-            .map(|open_at| open_at.saturating_duration_since(tokio::time::Instant::now()))
-            .map_or(interval, |until_fallback| interval.min(until_fallback));
         tokio::select! {
-            _ = tokio::time::sleep(sleep_for) => {}
+            _ = tokio::time::sleep(interval) => {}
             interrupted = tokio::signal::ctrl_c() => {
                 interrupted.context("ctrl-c handler")?;
                 ui.fail(1, "approval stopped");
@@ -260,7 +229,7 @@ pub async fn run_with_ui(
         // so the periodic reminders would only repeat what is already on screen.
         // Plain mode has no live line and keeps them, unchanged.
         if ui.is_rich() {
-            ui.status(&waiting_status(attended, elapsed.as_secs(), start.expires_in));
+            ui.status(&waiting_status(elapsed.as_secs(), start.expires_in));
         } else {
             if !elapsed_shown && elapsed >= Duration::from_secs(30) {
                 elapsed_shown = true;
@@ -336,29 +305,7 @@ pub async fn run_with_ui(
         }
 
         match body.error.as_deref() {
-            Some("authorization_pending") | None => {
-                if should_open_attended_fallback(
-                    open_decision,
-                    attended_fallback_attempted,
-                    elapsed,
-                    body.error.as_deref(),
-                ) {
-                    attended_fallback_attempted = true;
-                    // The setup screen has had its chance and nothing has
-                    // come back. It used to be opened again here, which
-                    // seizes the operator's screen and lands a second tab on
-                    // top of the one already waiting — the same page twice,
-                    // and no way to tell which one matters.
-                    //
-                    // Reveal the way out instead. A closed tab is recoverable
-                    // from a link; a hijacked screen is only confusing.
-                    ui.block(
-                        approval_panel(false, &approve_url, ui.width(), false),
-                        &approval_plain_lines(false, &approve_url, None),
-                    );
-                    ui.log("still waiting. closed the setup page? the link above reopens it.");
-                }
-            }
+            Some("authorization_pending") | None => {}
             Some("slow_down") => {
                 interval += Duration::from_secs(5);
                 tracing::debug!(?interval, "server requested slow_down");
@@ -494,48 +441,6 @@ fn browser_fingerprint_plain_lines(fingerprint: &str) -> Vec<String> {
     ]
 }
 
-/// The attended panel: one fingerprint and what to do about it.
-///
-/// This is a comparison, not an instruction list. The browser is already
-/// asking "is this the machine you just ran that command on?" and showing a
-/// fingerprint; the only thing it cannot do is prove the fingerprint came from
-/// this terminal. So this panel holds exactly the value being compared, and
-/// says what each answer means — including that a mismatch is a reason to stop,
-/// which is the whole point of showing it at all.
-fn attended_panel(fingerprint: &str, width: usize) -> Vec<String> {
-    use crate::tui::{dim, render_panel, wrap_words};
-    let inner = width.saturating_sub(4);
-    let prose = |text: &str| -> Vec<String> {
-        wrap_words(text, inner).iter().map(|l| dim(l, true)).collect()
-    };
-    let mut rows = vec![String::new()];
-    rows.extend(prose(
-        "your browser is asking you to confirm this machine. does the key it shows match this one?",
-    ));
-    rows.extend(fingerprint_rows(fingerprint, inner));
-    rows.extend(prose("it matches — approve there and this continues on its own."));
-    rows.extend(prose(
-        "it doesn't — approve nothing, and press ctrl-c here.",
-    ));
-    render_panel("CONFIRM THIS FINGERPRINT", &rows, width, true)
-}
-
-/// The attended panel for pipes, CI and `NO_COLOR` — the same comparison,
-/// in the prefixed line style every other plain message uses.
-fn attended_plain_lines(fingerprint: &str) -> Vec<String> {
-    vec![
-        "spawn: your browser is asking you to confirm this machine.".to_owned(),
-        "spawn:   does the key it shows match this one?".to_owned(),
-        String::new(),
-        format!("spawn:     {fingerprint}"),
-        String::new(),
-        "spawn:   it matches — approve there and this continues on its own.".to_owned(),
-        "spawn:   it doesn't — approve nothing, and press ctrl-c here.".to_owned(),
-        String::new(),
-        "spawn: waiting for you to confirm…".to_owned(),
-    ]
-}
-
 /// What piped output, CI and `NO_COLOR` see instead of the panel: the same
 /// single offer — the link — with a line saying why there is nothing else to
 /// compare or type. The pairing code used to be printed here too, and the
@@ -564,17 +469,9 @@ fn approval_plain_lines(browser_opened: bool, approve_url: &str, qr: Option<&str
 }
 
 /// The live status line, rebuilt each tick so elapsed and expiry stay current.
-///
-/// The attended wording drops the expiry: that path never showed a link, and
-/// naming its expiry would send the reader looking for one that isn't on
-/// screen.
-fn waiting_status(attended: bool, elapsed: u64, expires_in: u64) -> String {
+fn waiting_status(elapsed: u64, expires_in: u64) -> String {
     let minutes = expires_in.saturating_sub(elapsed).div_ceil(60);
-    if attended {
-        format!("connecting — waiting for you to confirm in your browser · {elapsed}s")
-    } else {
-        format!("waiting for approval — {elapsed}s · link expires in {minutes} min")
-    }
+    format!("waiting for approval — {elapsed}s · link expires in {minutes} min")
 }
 
 fn approval_link_block(browser_opened: bool, approve_url: &str) -> String {
@@ -593,29 +490,32 @@ fn approval_link_block(browser_opened: bool, approve_url: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BrowserOpenDecision {
-    Immediate,
-    AfterPendingTimeout,
+struct BrowserBehavior {
+    offer_enter: bool,
+    open_immediately: bool,
 }
 
-fn browser_open_decision(attended: bool) -> BrowserOpenDecision {
-    if attended {
-        BrowserOpenDecision::AfterPendingTimeout
+fn browser_behavior(
+    interactive: bool,
+    opener_available: bool,
+    no_browser: bool,
+) -> BrowserBehavior {
+    if no_browser || !opener_available {
+        BrowserBehavior {
+            offer_enter: false,
+            open_immediately: false,
+        }
+    } else if interactive {
+        BrowserBehavior {
+            offer_enter: true,
+            open_immediately: false,
+        }
     } else {
-        BrowserOpenDecision::Immediate
+        BrowserBehavior {
+            offer_enter: false,
+            open_immediately: true,
+        }
     }
-}
-
-fn should_open_attended_fallback(
-    decision: BrowserOpenDecision,
-    attempted: bool,
-    elapsed: Duration,
-    poll_error: Option<&str>,
-) -> bool {
-    decision == BrowserOpenDecision::AfterPendingTimeout
-        && !attempted
-        && elapsed >= Duration::from_secs(25)
-        && matches!(poll_error, Some("authorization_pending") | None)
 }
 
 /// Build the browser approval URL for this ceremony.
@@ -1489,30 +1389,30 @@ mod tests {
     }
 
     #[test]
-    fn attended_handoff_delays_the_browser_and_legacy_opens_immediately() {
-        assert_eq!(browser_open_decision(false), BrowserOpenDecision::Immediate);
+    fn browser_opening_respects_interactivity_and_no_browser() {
         assert_eq!(
-            browser_open_decision(true),
-            BrowserOpenDecision::AfterPendingTimeout
+            browser_behavior(true, true, false),
+            BrowserBehavior {
+                offer_enter: true,
+                open_immediately: false,
+            }
         );
-        assert!(!should_open_attended_fallback(
-            BrowserOpenDecision::AfterPendingTimeout,
-            false,
-            Duration::from_secs(24),
-            Some("authorization_pending")
-        ));
-        assert!(should_open_attended_fallback(
-            BrowserOpenDecision::AfterPendingTimeout,
-            false,
-            Duration::from_secs(25),
-            Some("authorization_pending")
-        ));
-        assert!(!should_open_attended_fallback(
-            BrowserOpenDecision::AfterPendingTimeout,
-            false,
-            Duration::from_secs(25),
-            Some("denied")
-        ));
+        assert_eq!(
+            browser_behavior(false, true, false),
+            BrowserBehavior {
+                offer_enter: false,
+                open_immediately: true,
+            }
+        );
+        for interactive in [true, false] {
+            assert_eq!(
+                browser_behavior(interactive, true, true),
+                BrowserBehavior {
+                    offer_enter: false,
+                    open_immediately: false,
+                }
+            );
+        }
     }
 
     #[test]
@@ -1582,6 +1482,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plain_approval_url_line_is_byte_stable() {
+        let url = "https://spawnd.dev/device?ref=x#k=y";
+        assert_eq!(
+            approval_plain_lines(false, url, None)[1],
+            format!("spawn:   {url}")
+        );
+    }
+
     /// One way to approve: the link. The pairing code and the fingerprint
     /// used to sit under it, and the three together read as three routes
     /// where there is one — the link carries the key, so nothing here is
@@ -1643,53 +1552,17 @@ mod tests {
     #[test]
     fn the_waiting_status_counts_down_the_real_expiry() {
         assert_eq!(
-            waiting_status(false, 0, 1800),
+            waiting_status(0, 1800),
             "waiting for approval — 0s · link expires in 30 min"
         );
         assert_eq!(
-            waiting_status(false, 33, 1800),
+            waiting_status(33, 1800),
             "waiting for approval — 33s · link expires in 30 min"
         );
         // Past expiry must not underflow into a huge number.
         assert_eq!(
-            waiting_status(false, 9_000, 1800),
+            waiting_status(9_000, 1800),
             "waiting for approval — 9000s · link expires in 0 min"
-        );
-    }
-
-    /// The attended line never names an expiry: that path shows no link, and
-    /// counting one down sends the reader hunting for it.
-    #[test]
-    fn the_attended_status_says_connecting_and_mentions_no_code() {
-        let line = waiting_status(true, 12, 1800);
-        assert_eq!(
-            line,
-            "connecting — waiting for you to confirm in your browser · 12s"
-        );
-        assert!(!line.contains("code"));
-    }
-
-    /// The attended panel is a comparison. It must carry the fingerprint and
-    /// must not reprint the link, the pairing code, or an offer to open a
-    /// browser that is already open on this ceremony.
-    #[test]
-    fn the_attended_panel_shows_only_the_fingerprint_to_compare() {
-        let panel = attended_panel("SHA256:6dgqw7", 72).join("\n");
-        let plain = strip_sgr(&panel);
-        assert!(plain.contains("SHA256:6dgqw7"));
-        assert!(plain.contains("match"));
-        assert!(plain.contains("ctrl-c"));
-        assert!(!plain.contains("http"));
-        assert!(!plain.to_lowercase().contains("pairing code"));
-        assert!(!plain.to_lowercase().contains("press enter"));
-        // Square, like every other panel, at a real terminal width.
-        let widths: Vec<usize> = attended_panel("SHA256:6dgqw7", 72)
-            .iter()
-            .map(|line| crate::tui::display_width(line))
-            .collect();
-        assert!(
-            widths.iter().all(|width| *width == widths[0]),
-            "ragged panel: {widths:?}"
         );
     }
 
@@ -1715,29 +1588,15 @@ mod tests {
     /// line, with air, never buried in a run of dim prose.
     #[test]
     fn a_fingerprint_stands_alone_wherever_it_is_shown() {
-        for panel in [
-            attended_panel("SHA256:zzz", 72),
-            browser_fingerprint_panel("SHA256:zzz", 72),
-        ] {
-            let plain: Vec<String> = panel.iter().map(|r| strip_sgr(r)).collect();
-            let row = plain
-                .iter()
-                .find(|r| r.contains("SHA256:zzz"))
-                .expect("the fingerprint is on some row");
-            // Nothing else shares the row it is on.
-            let content = row.trim_matches(|c| c == '│' || c == ' ');
-            assert_eq!(content, "SHA256:zzz", "fingerprint shares its row: {row:?}");
-        }
-    }
-
-    #[test]
-    fn the_attended_plain_lines_carry_the_fingerprint_and_no_link() {
-        let lines = attended_plain_lines("SHA256:6dgqw7");
-        assert!(lines.iter().any(|line| line.contains("SHA256:6dgqw7")));
-        assert!(lines.iter().all(|line| !line.contains("http")));
-        assert!(lines
+        let panel = browser_fingerprint_panel("SHA256:zzz", 72);
+        let plain: Vec<String> = panel.iter().map(|r| strip_sgr(r)).collect();
+        let row = plain
             .iter()
-            .any(|line| line.contains("waiting for you to confirm")));
+            .find(|r| r.contains("SHA256:zzz"))
+            .expect("the fingerprint is on some row");
+        // Nothing else shares the row it is on.
+        let content = row.trim_matches(|c| c == '│' || c == ' ');
+        assert_eq!(content, "SHA256:zzz", "fingerprint shares its row: {row:?}");
     }
 
     #[test]
@@ -1760,7 +1619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_server_observes_setup_token_and_marks_the_handoff_attended() {
+    async fn fake_server_observes_current_start_and_possession_shapes() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1770,9 +1629,7 @@ mod tests {
             let mut request = vec![0u8; 4096];
             let read = first.read(&mut request).await.unwrap();
             let request = String::from_utf8_lossy(&request[..read]);
-            assert!(
-                request.contains(r#""setup_token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa""#)
-            );
+            assert!(!request.contains("setup_token"));
             let start = r#"{"device_code":"code","user_code":"ABCD-EFGH","approval_nonce":"nonce","verification_uri":"http://127.0.0.1/device","interval":1,"expires_in":1800}"#;
             first
                 .write_all(
@@ -1788,7 +1645,7 @@ mod tests {
             let (mut second, _) = listener.accept().await.unwrap();
             let mut second_request = vec![0u8; 4096];
             let _ = second.read(&mut second_request).await.unwrap();
-            let possession = r#"{"verified":true,"version":1,"attended":true}"#;
+            let possession = r#"{"verified":true,"version":1}"#;
             second
                 .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{possession}", possession.len()).as_bytes())
                 .await
@@ -1806,7 +1663,6 @@ mod tests {
                 version: "0.1.0",
                 host_key_algorithm: "ed25519",
                 host_public_key: "host-key",
-                setup_token: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             })
             .send()
             .await
@@ -1823,11 +1679,8 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert!(possession.attended);
-        assert_eq!(
-            browser_open_decision(possession.attended),
-            BrowserOpenDecision::AfterPendingTimeout
-        );
+        assert!(possession.verified);
+        assert_eq!(possession.version, 1);
         server.await.unwrap();
     }
 }

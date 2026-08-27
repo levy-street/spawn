@@ -105,11 +105,11 @@ async fn begin_possession(
 async fn poll_possession(
     app: tauri::AppHandle,
     services: tauri::State<'_, AppServices>,
-    claim_token: &str,
+    run_id: &str,
 ) -> Result<PossessionProgress, String> {
     services
         .possession
-        .poll(&app, claim_token)
+        .poll(&app, run_id)
         .await
         .map_err(command_error)
 }
@@ -118,12 +118,11 @@ async fn poll_possession(
 async fn approve_possession(
     app: tauri::AppHandle,
     services: tauri::State<'_, AppServices>,
-    claim_token: &str,
-    fingerprint_confirmed: bool,
+    run_id: &str,
 ) -> Result<String, String> {
     services
         .possession
-        .approve(&app, claim_token, fingerprint_confirmed)
+        .approve(&app, run_id)
         .await
         .map_err(command_error)
 }
@@ -146,9 +145,9 @@ async fn local_status(app: tauri::AppHandle, include_doctor: bool) -> Result<Loc
 #[tauri::command]
 async fn possession_log_tail(
     services: tauri::State<'_, AppServices>,
-    claim_token: &str,
+    run_id: &str,
 ) -> Result<String, String> {
-    Ok(services.possession.log_tail(claim_token).await)
+    Ok(services.possession.log_tail(run_id).await)
 }
 
 #[tauri::command]

@@ -39,22 +39,16 @@ type DeviceProgress =
   | { state: "refused"; message: string };
 
 interface ApprovalReview {
-  approval_ref: string;
   host_name: string;
-  host_public_key: string;
-  fingerprint: string;
-  local_fingerprint: string | null;
   exact_key_match: boolean;
-  needs_fingerprint_compare: boolean;
 }
 
 interface PossessionProgress {
-  claim_token: string;
-  claim: {
-    status: "pending" | "ready" | "approved" | "failed";
-    host_name: string | null;
-    error: string | null;
-  };
+  run_id: string;
+  status: "starting" | "registered" | "approved" | "online" | "failed";
+  error: string | null;
+  host_name: string | null;
+  host_id: string | null;
   review: ApprovalReview | null;
   child_finished: boolean;
   child_error: string | null;
@@ -90,7 +84,7 @@ let error: string | null = null;
 let busy = false;
 let deviceProgress: DeviceProgress = { state: "waiting" };
 let devicePoll: number | null = null;
-let claimToken: string | null = null;
+let runId: string | null = null;
 let possession: PossessionProgress | null = null;
 let possessionPoll: number | null = null;
 const completedSteps = new Set<number>();
@@ -348,19 +342,19 @@ function serverView(): string {
 }
 
 const steps = [
-  "Downloading the daemon",
-  "Verifying — hashes match the server's manifest",
-  "Starting the service",
-  "Registering this Mac",
+  "Daemon downloaded and verified",
+  "Host registered — approval ready",
   "Approved — key verified on this machine",
+  "Online and ready",
 ];
 
 function possessView(): string {
   const review = possession?.review;
-  const failed = possession?.claim.status === "failed";
-  const keyMismatch = error === "This host could not be verified.";
-  const serviceFailed = error === "The daemon installed but its service didn't start.";
-  const alreadyPossessed = error?.includes("already possessed for") ?? false;
+  const failed = possession?.status === "failed";
+  const failure = error ?? (failed ? possession?.error : null);
+  const keyMismatch = failure === "This host could not be verified.";
+  const serviceFailed = failure === "The daemon installed but its service didn't start.";
+  const alreadyPossessed = failure?.includes("already possessed for") ?? false;
   return `
     <section class="sheet wide">
       <div class="masthead">
@@ -371,20 +365,24 @@ function possessView(): string {
       <ol class="progress-list">
         ${steps
           .map(
-            (step, index) => `<li class="${completedSteps.has(index) ? "complete" : claimToken && index === Math.min(completedSteps.size, 4) ? "active" : ""}"><span>${completedSteps.has(index) ? "✓" : String(index + 1).padStart(2, "0")}</span><p>${escapeHtml(step)}</p></li>`,
+            (step, index) => `<li class="${completedSteps.has(index) ? "complete" : runId && index === Math.min(completedSteps.size, steps.length - 1) ? "active" : ""}"><span>${completedSteps.has(index) ? "✓" : String(index + 1).padStart(2, "0")}</span><p>${escapeHtml(step)}</p></li>`,
           )
           .join("")}
       </ol>
       ${
         review
           ? approvalReview(review)
-          : !claimToken
+          : !runId
             ? `<button class="primary possess-button" data-action="possess" ${busy ? "disabled" : ""}>Possess this Mac</button>`
-            : '<div class="inline-wait"><span class="spinner"></span> The daemon is preparing its identity…</div>'
+            : failed
+              ? ""
+              : possession?.status === "approved"
+                ? '<div class="inline-wait"><span class="spinner"></span> Approval complete. Waiting for the daemon to come online…</div>'
+                : '<div class="inline-wait"><span class="spinner"></span> The daemon is preparing its identity…</div>'
       }
-      ${failed ? `<div class="message" role="alert">${escapeHtml(claimErrorCopy(possession?.claim.error))}</div>` : message()}
+      ${failed ? `<div class="message" role="alert">${escapeHtml(possessionErrorCopy(possession?.error))}</div>` : message()}
       ${
-        error
+        failure
           ? keyMismatch
             ? '<div class="actions"><button class="text-button" data-action="learn-key-check">Learn what this means</button></div>'
             : serviceFailed
@@ -398,7 +396,8 @@ function possessView(): string {
     </section>`;
 }
 
-function claimErrorCopy(reason: string | null | undefined): string {
+function possessionErrorCopy(reason: string | null | undefined): string {
+  if (reason === "This host could not be verified.") return reason;
   if (reason === "expired") return "That code expired. On the machine, run spawnd possess again.";
   if (reason === "denied") return "Possession was denied. Nothing was changed.";
   if (reason === "key_conflict")
@@ -411,24 +410,15 @@ function claimErrorCopy(reason: string | null | undefined): string {
 }
 
 function approvalReview(review: ApprovalReview): string {
-  if (review.exact_key_match) {
-    return `
-      <div class="approval-review verified">
-        <div><span>Local pipe check</span><strong>Exact key match</strong></div>
-        <code>${escapeHtml(review.fingerprint)}</code>
-        <button class="primary" data-action="approve-host" ${busy ? "disabled" : ""}>Possess this Mac</button>
-      </div>`;
-  }
   return `
-    <div class="approval-review">
-      <div><span>Full fingerprint check</span><strong>Compare both lines</strong></div>
-      <dl><dt>From the daemon</dt><dd>${escapeHtml(review.local_fingerprint ?? "Not printed")}</dd><dt>From the server</dt><dd>${escapeHtml(review.fingerprint)}</dd></dl>
-      <button class="primary" data-action="approve-fingerprint" ${review.local_fingerprint !== review.fingerprint || busy ? "disabled" : ""}>They match — possess this Mac</button>
+    <div class="approval-review verified">
+      <div><span>${escapeHtml(review.host_name)}</span><strong>Exact key match</strong></div>
+      <button class="primary" data-action="approve-host" ${!review.exact_key_match || busy ? "disabled" : ""}>Possess this Mac</button>
     </div>`;
 }
 
 function doneView(): string {
-  const host = possession?.claim.host_name ?? preferences.host_name ?? "This Mac";
+  const host = possession?.host_name ?? preferences.host_name ?? "This Mac";
   return `
     <section class="sheet wide mark-grid">
       <div class="mark-plate"><span class="trident" aria-hidden="true"></span></div>
@@ -539,12 +529,11 @@ async function act(action: string): Promise<void> {
   } else if (action === "ask-again") await guarded(async () => invoke("ask_for_device_approval"));
   else if (action === "possess" || action === "repair-reinstall") await startPossession();
   else if (action === "try-again") {
-    claimToken = null;
+    runId = null;
     possession = null;
     completedSteps.clear();
     render();
-  } else if (action === "approve-host") await approveHost(false);
-  else if (action === "approve-fingerprint") await approveHost(true);
+  } else if (action === "approve-host") await approveHost();
   else if (action === "terminal") await navigator.clipboard.writeText(terminalCommand);
   else if (action === "learn-key-check")
     await openUrl("https://spawnd.dev/docs/trust#possess-a-host");
@@ -682,9 +671,9 @@ async function submitServer(data: FormData): Promise<void> {
 }
 
 async function startPossession(): Promise<void> {
-  const token = await guarded(() => invoke<string>("begin_possession"));
-  if (!token) return;
-  claimToken = token;
+  const id = await guarded(() => invoke<string>("begin_possession"));
+  if (!id) return;
+  runId = id;
   possession = null;
   setScreen("possess");
   startPossessionPoll();
@@ -693,18 +682,21 @@ async function startPossession(): Promise<void> {
 function startPossessionPoll(): void {
   if (possessionPoll !== null) window.clearInterval(possessionPoll);
   const poll = async (): Promise<void> => {
-    if (!claimToken) return;
+    if (!runId) return;
     try {
-      possession = await invoke<PossessionProgress>("poll_possession", { claimToken });
-      if (possession.claim.status === "approved") {
+      possession = await invoke<PossessionProgress>("poll_possession", { runId });
+      error = null;
+      syncPossessionSteps(possession.status);
+      if (possession.status === "online") {
         if (possessionPoll !== null) window.clearInterval(possessionPoll);
         possessionPoll = null;
         preferences = await invoke<Preferences>("app_preferences");
         setScreen("done");
         return;
       }
-      if (possession.child_error) {
-        error = possession.child_error;
+      if (possession.status === "failed") {
+        if (possessionPoll !== null) window.clearInterval(possessionPoll);
+        possessionPoll = null;
       }
       render();
     } catch (cause) {
@@ -719,12 +711,16 @@ function startPossessionPoll(): void {
   possessionPoll = window.setInterval(() => void poll(), 1500);
 }
 
-async function approveHost(fingerprintConfirmed: boolean): Promise<void> {
-  if (!claimToken) return;
-  const result = await guarded(() =>
-    invoke<string>("approve_possession", { claimToken, fingerprintConfirmed }),
-  );
-  if (result) completedSteps.add(4);
+function syncPossessionSteps(state: PossessionProgress["status"]): void {
+  const count = state === "online" ? 4 : state === "approved" ? 3 : state === "registered" ? 2 : 1;
+  if (state === "failed") return;
+  for (let index = 0; index < count; index += 1) completedSteps.add(index);
+}
+
+async function approveHost(): Promise<void> {
+  if (!runId) return;
+  const result = await guarded(() => invoke<string>("approve_possession", { runId }));
+  if (result) completedSteps.add(2);
 }
 
 async function refreshStatus(includeDoctor: boolean): Promise<void> {

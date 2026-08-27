@@ -86,24 +86,17 @@ fixed-height live region pinned below normal scrollback; plain emits the
   a time. `Spinner` is for commands with no step list (`doctor`, `update`)
   and owns its single line — `finish` it before printing anything else.
 
-### The ceremony has two shapes, and they say different things
+### The ceremony has one shape
 
-`device/possession` answers `attended`, which is true exactly when the request
-carried a `--setup` token. That token is minted by a signed-in browser sitting
-on the setup screen, so on that path the reader started in the browser and the
-browser is already watching this ceremony and already showing this host's
-fingerprint.
-
-- **Attended** shows `attended_panel` — the fingerprint and nothing else — and
-  never opens a browser, prints a link, or renders a QR. All of those are
-  instructions for work the reader has finished. The web copy on the other
-  side is written to match, so changing one means changing both. After 25 s
-  with no approval the link is *revealed* as a fallback (a closed tab has to
-  be recoverable), never auto-opened.
-- **Unattended** — a bare `spawnd possess` — offers the link and nothing
-  else: the link, an optional QR of it, and Enter to open it here. The pairing
-  code and the fingerprint used to be printed beside it and read as three
-  ways to approve; the link carries the key, so the other side checks it.
+A fresh `spawnd possess` or `spawnd login` prints the approval link and offers
+Enter to open it when both a terminal and a browser opener are available. With
+no terminal but an available opener it opens the browser immediately.
+`--no-browser` still prints the link but never launches a browser or offers
+Enter; embedders such as the desktop companion use it. When no opener is
+available the daemon also renders a QR unless `--no-qr` was given, and `--qr`
+forces one. The link carries the host key, so the browser or phone checks the
+machine identity itself; there is no pairing code or terminal fingerprint to
+compare.
 
 ## Where a server URL comes from
 
@@ -124,16 +117,10 @@ uses that value:
   `sh -s -- --new-account`, never `spawnd possess --new-account`). So
   "already possessed here" is a menu — keep it, approve a new browser, add
   another account, check for an update — and each row performs the thing.
-  Unattended installs never see it and keep resuming, because a re-run of the
+  Non-interactive installs never see it and keep resuming, because a re-run of the
   same command with nobody watching should be a no-op. Build such a menu from a
   pure `*_options`/`*_choice` pair so the rows can be tested without a keyboard;
   `possess::resume_action` is the pattern.
-- A `--setup` token names its own server (it is only redeemable on the origin
-  that minted it), so `choose_server` never prompts when one is present. It
-  also names an *account*, so it always holds its own ceremony rather than
-  resuming an instance already on the machine — see `staged_login_required`.
-  Resuming instead answered "put this machine on that account" by reporting
-  some unrelated account, and left the browser that issued the token waiting.
 - The answer `choose_server` returns is passed to `login::run_with_ui`, not the
   raw `--server` argument. Registering against one origin while installing a
   service for another produces a daemon that cannot start.

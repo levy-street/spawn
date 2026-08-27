@@ -52,12 +52,11 @@ const HOSTED_SERVER: &str = "https://spawnd.dev";
 /// With nothing named, there is no such signal, and the hosted service leads —
 /// self-hosting is then the deliberate choice, and the only path that has to
 /// ask for a URL. Non-interactive installs never see any of this.
-fn choose_server(server_cli: Option<String>, setup_token: Option<&str>) -> Result<Url> {
+fn choose_server(server_cli: Option<String>) -> Result<Url> {
     let resolved = config::server_url(server_cli.clone())?;
     let offer = server_offer(
         server_cli.as_deref(),
         &resolved,
-        setup_token,
         std::io::stdin().is_terminal(),
     );
     let hosted = hosted_server();
@@ -119,11 +118,10 @@ enum ServerOffer {
 fn server_offer(
     server_cli: Option<&str>,
     resolved: &Url,
-    setup_token: Option<&str>,
     interactive: bool,
 ) -> ServerOffer {
-    // No terminal to ask at, or a token that already answers: take the value.
-    if !interactive || setup_token.is_some() {
+    // No terminal to ask at: take the resolved value.
+    if !interactive {
         return ServerOffer::Settled(resolved.clone());
     }
     if server_cli.is_some() && resolved.origin() != hosted_server().origin() {
@@ -258,8 +256,7 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
     // Silent resume: exactly one existing per-account registration. Unreadable
     // credentials only cost the stored-server fallback, never the resume.
     let existing = account_dirs_with_creds(&base)?;
-    let stage_login =
-        staged_login_required(existing.len(), args.new_account, args.setup_token.as_deref());
+    let stage_login = staged_login_required(existing.len(), args.new_account);
     if !existing.is_empty() && !stage_login {
         match resume_action(&existing) {
             ResumeAction::Keep => return keep_possessed(&existing, server_cli).await,
@@ -276,7 +273,7 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
                     LoginArgs {
                         host_name: None,
                         no_run: true,
-                        setup_token: None,
+                        no_browser: args.no_browser,
                         qr: args.qr,
                         no_qr: args.no_qr,
                     },
@@ -290,7 +287,7 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
         }
     }
 
-    let server = choose_server(server_cli.clone(), args.setup_token.as_deref())?;
+    let server = choose_server(server_cli.clone())?;
 
     // One auth flow, staged, then promoted to <base>/<account_id>.
     let staging = base.join(".possess-staging");
@@ -314,7 +311,7 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
         LoginArgs {
             host_name: args.host_name,
             no_run: true,
-            setup_token: args.setup_token,
+            no_browser: args.no_browser,
             qr: args.qr,
             no_qr: args.no_qr,
         },
@@ -456,7 +453,7 @@ async fn possess_dir(server_cli: Option<String>, args: PossessArgs, dir: &Path) 
                 LoginArgs {
                     host_name: args.host_name,
                     no_run: true,
-                    setup_token: args.setup_token,
+                    no_browser: args.no_browser,
                     qr: args.qr,
                     no_qr: args.no_qr,
                 },
@@ -695,23 +692,8 @@ fn resume_line(account: &str) -> String {
 
 /// Whether this run has to hold its own auth ceremony rather than resuming an
 /// instance already on the machine.
-///
-/// A setup token forces one. It is minted by one signed-in browser for one
-/// account, and presenting it says "this machine, that account" — a request a
-/// machine that happens to hold some *other* account's instance cannot answer
-/// by resuming it. Ignoring the token left the browser's setup screen waiting
-/// for a ceremony that was never going to start, while the terminal cheerfully
-/// reported the unrelated account it had resumed instead.
-///
-/// If the ceremony turns out to name an account already registered here, the
-/// caller adopts that instance — the token is still redeemed, so the screen
-/// that issued it resolves either way.
-fn staged_login_required(
-    existing_instances: usize,
-    new_account: bool,
-    setup_token: Option<&str>,
-) -> bool {
-    new_account || setup_token.is_some() || existing_instances == 0
+fn staged_login_required(existing_instances: usize, new_account: bool) -> bool {
+    new_account || existing_instances == 0
 }
 
 /// Keep an account id safe as a directory component. Server account ids are
@@ -764,22 +746,6 @@ mod tests {
         Url::parse(raw).expect("a test URL")
     }
 
-    /// A setup token belongs to the server whose signed-in browser minted it.
-    /// Prompting would offer to send it somewhere it cannot be redeemed.
-    #[test]
-    fn a_setup_token_decides_the_server_without_asking() {
-        let local = url("http://localhost:3000");
-        assert_eq!(
-            server_offer(
-                Some("http://localhost:3000"),
-                &local,
-                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                true,
-            ),
-            ServerOffer::Settled(local)
-        );
-    }
-
     /// The regression this exists for: `curl … localhost:3000 | sh` used to
     /// offer spawnd.dev as the default, so one Enter registered the machine
     /// against the hosted service — the opposite of what that command said.
@@ -787,7 +753,7 @@ mod tests {
     fn an_installer_origin_leads_the_choice_instead_of_the_hosted_service() {
         let local = url("http://localhost:3000");
         assert_eq!(
-            server_offer(Some("http://localhost:3000"), &local, None, true),
+            server_offer(Some("http://localhost:3000"), &local, true),
             ServerOffer::Named(local)
         );
     }
@@ -800,14 +766,13 @@ mod tests {
             server_offer(
                 Some("https://spawnd.dev"),
                 &url("https://spawnd.dev"),
-                None,
                 true
             ),
             ServerOffer::Unnamed
         );
         // Nobody named one: the dev fallback is not a choice anyone made.
         assert_eq!(
-            server_offer(None, &url("http://localhost:8000"), None, true),
+            server_offer(None, &url("http://localhost:8000"), true),
             ServerOffer::Unnamed
         );
     }
@@ -818,7 +783,7 @@ mod tests {
     fn a_headless_install_is_never_asked() {
         let local = url("http://localhost:3000");
         assert_eq!(
-            server_offer(Some("http://localhost:3000"), &local, None, false),
+            server_offer(Some("http://localhost:3000"), &local, false),
             ServerOffer::Settled(local)
         );
     }
@@ -910,23 +875,11 @@ mod tests {
 
     #[test]
     fn new_account_forces_staging_and_plain_possess_never_adds_one_implicitly() {
-        assert!(staged_login_required(0, false, None));
-        assert!(!staged_login_required(1, false, None));
-        assert!(!staged_login_required(3, false, None));
-        assert!(staged_login_required(1, true, None));
-        assert!(staged_login_required(3, true, None));
-    }
-
-    /// The regression: signing up a second account in the browser, pasting its
-    /// `--setup` command on a machine that already held a different account,
-    /// silently resumed the old one. The terminal said "already possessed for
-    /// <the other account>" and the browser waited for ever.
-    #[test]
-    fn a_setup_token_always_holds_its_own_ceremony() {
-        let token = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert!(staged_login_required(1, false, token));
-        assert!(staged_login_required(3, false, token));
-        assert!(staged_login_required(0, false, token));
+        assert!(staged_login_required(0, false));
+        assert!(!staged_login_required(1, false));
+        assert!(!staged_login_required(3, false));
+        assert!(staged_login_required(1, true));
+        assert!(staged_login_required(3, true));
     }
 
     #[test]
