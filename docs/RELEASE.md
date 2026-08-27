@@ -70,6 +70,35 @@ published target. `deploy-prod.sh` publishes the manifest atomically and then
 the signature atomically, last; a daemon never installs from an unsigned or
 badly signed manifest.
 
+Windows adds a separate, layered publisher proof. CI uses Microsoft Artifact
+Signing through GitHub OIDC to Authenticode-sign and RFC 3161 timestamp
+`spawnd-x86_64-pc-windows-msvc.exe` and
+`spawn-worker-x86_64-pc-windows-msvc.exe` before `SHA256SUMS` is created.
+Authenticode proves the Windows publisher and PE integrity; it does not
+authorize a daemon update. The detached Ed25519 manifest still authorizes the
+exact version, targets and post-Authenticode hashes accepted by `spawnd`.
+Artifact Signing keeps its private key in Microsoft's HSM and CI receives only
+a short-lived OIDC authorization for the certificate profile. The offline
+daemon release key and offline Tauri updater key never enter CI.
+
+Protect the `windows-code-signing` GitHub environment to `master`, scope the
+federated credential to that environment, and grant its service principal only
+`Artifact Signing Certificate Profile Signer` on the chosen profile. The named
+secrets are `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and
+`AZURE_SUBSCRIPTION_ID`; the variables are
+`AZURE_ARTIFACT_SIGNING_ENDPOINT`, `AZURE_ARTIFACT_SIGNING_ACCOUNT`,
+`AZURE_ARTIFACT_SIGNING_PROFILE`, and `WINDOWS_SIGNING_SUBJECT` (the complete
+expected distinguished name). Revoke the federated credential/profile quickly
+if a permitted CI run is compromised: it still cannot mint the offline
+Ed25519 manifest, but it can request publisher-valid PE signatures.
+
+The Windows prebuilt job deliberately remains buildable while Artifact Signing
+is being provisioned: when all three Azure secrets are absent it uploads an
+unsigned Actions artifact, while a partial signing configuration is a hard
+failure. An unsigned Windows pair must not be treated as release-ready or
+promoted in Windows-facing UI. Once credentials exist, signing, exact subject,
+timestamp and SignTool verification are hard gates before artifact upload.
+
 The private key is a 32-byte Ed25519 seed stored as one line of unpadded
 base64url at
 `${SPAWN_RELEASE_SIGNING_KEY:-$HOME/.config/spawn/release-signing.key}` on the
@@ -90,6 +119,44 @@ Never remove the old key in the release that first introduces the new one.
 If the private seed is lost and the password-manager backup is also gone,
 there is no signed recovery path for installed daemons: rotate the key and do
 one fleet reinstall wave with the install one-liner.
+
+The native Windows emergency reinstall is:
+
+```powershell
+irm https://spawnd.dev/install.ps1 | iex
+```
+
+The pipeline form cannot pass switches. The PowerShell equivalent of
+`sh -s -- --new-account` is:
+
+```powershell
+& ([scriptblock]::Create((irm https://spawnd.dev/install.ps1))) -NewAccount
+```
+
+For `cmd.exe`, use a process-scoped execution-policy override:
+
+```bat
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod 'https://spawnd.dev/install.ps1' | Invoke-Expression"
+```
+
+That override applies only to the new PowerShell process. It does not bypass
+MachinePolicy/UserPolicy Group Policy, WDAC/AppLocker, or Constrained Language
+Mode; use `Invoke-Expression` only with the fixed HTTPS SPAWN D origin.
+
+For an inspect-then-run recovery, download the fixed HTTPS origin, read the
+file, then run it under the user's policy:
+
+```powershell
+Invoke-WebRequest https://spawnd.dev/install.ps1 -OutFile .\install.ps1
+Get-Content .\install.ps1
+& .\install.ps1
+```
+
+Keep the Unix recovery unchanged:
+
+```bash
+curl -fsSL https://spawnd.dev/install.sh | sh
+```
 
 `scripts/verify-release.sh https://spawnd.dev` fetches the manifest and
 signature through the public origin, verifies them against the public-key list
@@ -263,11 +330,23 @@ beta configuration read `https://spawnd.dev/desktop/beta/latest.json`. A
 self-hosted server never becomes an app-update authority.
 
 `.github/workflows/desktop.yml` is manual-only. It builds, Developer ID signs and
-notarizes the Apple-silicon and Intel apps and DMGs, then uploads the notarized
-DMGs plus `.app.tar.gz` updater payloads. Its Apple credentials are
+notarizes the Apple-silicon and Intel apps and DMGs, and builds and Authenticode
+signs the x86-64 Windows app and NSIS installer. The Mac artifacts are the
+notarized DMGs plus `.app.tar.gz` updater payloads. The Windows artifact is the
+canonical `SPAWN-D_<version>_windows-x86_64-setup.exe`; the same EXE is both the
+public download and updater payload. The workflow produces no MSI.
+
+The Apple credentials are
 `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
 `APPLE_API_PRIVATE_KEY`, `APPLE_API_KEY`, and `APPLE_API_ISSUER`. The workflow
-does not publish a release and it never receives the Tauri updater private key.
+uses GitHub OIDC for Azure Artifact Signing with secrets `AZURE_CLIENT_ID`,
+`AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID`, plus repository variables
+`AZURE_ARTIFACT_SIGNING_ENDPOINT`, `AZURE_ARTIFACT_SIGNING_ACCOUNT`, and
+`AZURE_ARTIFACT_SIGNING_PROFILE`, plus the expected certificate-subject fragment
+`AZURE_ARTIFACT_SIGNING_PUBLISHER`. It signs and RFC 3161 timestamps the inner
+`spawn-desktop.exe`, bundles that exact file with per-user NSIS, then signs and
+timestamps the final setup EXE. The workflow does not publish a release and it
+never receives `SPAWN_DESKTOP_UPDATER_KEY`.
 
 `workflow_dispatch` only lists workflows that exist on the default branch, so
 until `desktop.yml` has been merged the run has to be made locally with the
@@ -279,25 +358,41 @@ then in `desktop/`, for `aarch64-apple-darwin` and `x86_64-apple-darwin`:
 `xcrun notarytool submit --wait` and `xcrun stapler staple` on the DMG (Tauri
 signs it but does not notarize it), and
 `COPYFILE_DISABLE=1 tar -czf SPAWN-D_<version>_<platform>.app.tar.gz -C <bundle>/macos "SPAWN D.app"`.
-Then continue from step 1 below. Note that `spctl --assess` reports a
+Windows release artifacts must come from the `windows-latest` workflow job so
+both Authenticode signatures and their timestamps are proved on Windows. Then
+continue from step 1 below. Note that `spctl --assess` reports a
 notarized, stapled build as "rejected" on some Macs; `syspolicy_check
 distribution` and `xcrun stapler validate` are the checks to trust.
 
 Updater promotion is deliberately local and offline:
 
-1. Download both workflow artifacts and verify their checksums, code signatures,
-   notarization tickets and version before promoting either architecture.
+1. Download all three workflow artifacts and verify their checksums, versions,
+   both Mac code signatures/notarization tickets, and the Windows Authenticode
+   evidence for both the inner app and outer setup EXE. On Windows,
+   `Get-AuthenticodeSignature` must report `Valid` and a timestamp certificate
+   for each signed file. Never alter or Authenticode-sign the setup EXE after
+   this point.
 2. With the updater private key exposed only through
-   `SPAWN_DESKTOP_UPDATER_KEY`, run `cargo tauri signer sign -f
-   "$SPAWN_DESKTOP_UPDATER_KEY" <artifact.app.tar.gz>` for each updater payload.
+   `SPAWN_DESKTOP_UPDATER_KEY`, create the three detached Tauri signatures:
+
+   ```bash
+   cargo tauri signer sign -f "$SPAWN_DESKTOP_UPDATER_KEY" SPAWN-D_<version>_darwin-aarch64.app.tar.gz
+   cargo tauri signer sign -f "$SPAWN_DESKTOP_UPDATER_KEY" SPAWN-D_<version>_darwin-x86_64.app.tar.gz
+   cargo tauri signer sign -f "$SPAWN_DESKTOP_UPDATER_KEY" SPAWN-D_<version>_windows-x86_64-setup.exe
+   ```
+
+   The resulting `.sig` files stay local; their text is embedded in the
+   manifest. The Windows Tauri signature must cover the already Authenticode-
+   signed, canonically named EXE.
 3. Assemble `latest.json` locally with the exact app version, release notes,
-   publication time and `darwin-aarch64` / `darwin-x86_64` URL-and-signature
-   entries. The detached minisign values produced in step 2 are the signatures
-   embedded in that manifest. Do the same under `desktop/beta/` for a beta.
+   publication time and exactly `darwin-aarch64`, `darwin-x86_64`, and
+   `windows-x86_64` URL-and-signature entries. Mac updater URLs end in
+   `.app.tar.gz`; the Windows updater URL is the canonical `-setup.exe`. Do the
+   same under `desktop/beta/` for a beta.
 4. Publish with `scripts/publish-desktop.sh <ssh-host> <artifact-dir>`. It
    refuses the set unless `latest.json` names the committed version and both
-   platforms, every URL points at the payload beside it under this origin's
-   `/desktop/` tree, and every signature verifies against
+   Mac platforms plus Windows, every URL points at the payload beside it under
+   this origin's `/desktop/` tree, and every signature verifies against
    `desktop/updater.pubkey`; then it uploads the payloads and DMGs first and
    the manifest last, through a rename, and reads every URL back. Set
    `SPAWN_DESKTOP_CHANNEL=beta` to publish under `desktop/beta/`. Never
@@ -308,12 +403,14 @@ The static origin behind those URLs is nginx, not the server or Next: the
 `/var/www/spawnd/desktop/` directly (`SPAWN_DESKTOP_DIR` for the script), so
 the updater and the download page never depend on the app being up. It holds
 the DMGs the download page links to (`SPAWN-D_<version>_<platform>.dmg`), the
-`.app.tar.gz` updater payloads, and `latest.json`.
+`.app.tar.gz` updater payloads, the one Windows setup EXE, and `latest.json`.
+Detached `.sig` files are not public objects.
 
 Publish before deploying a commit whose `desktop/` tree is new. `GET
 /api/release` reports the `desktop` block — and the download page lights its
-Mac link — from the deployed checkout alone, without checking that the DMG at
-that URL exists, so a deploy that precedes the publish hands out a 404.
+platform links — from the deployed checkout alone, without checking that a DMG
+or EXE at that URL exists, so a deploy that precedes the publish hands out a
+404.
 
 The updater public key is committed in `desktop/updater.pubkey` and baked into
 `desktop/src-tauri/tauri.conf.json`. The private key stays on the release
@@ -332,15 +429,18 @@ Production exposes it from `GET /api/release` only when known and clean:
   "desktop": {
     "version": "0.1.0",
     "tree": "40hex desktop tree",
-    "platforms": ["darwin-aarch64", "darwin-x86_64"]
+    "platforms": ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"]
   }
 }
 ```
 
 Unknown or dirty desktop identities are `null`, as for the other release
 pieces. `scripts/verify-release.sh` compares this block, the served
-`/desktop/latest.json`, one served updater artifact and its minisign signature
-against the public key committed at the selected ref. Use `--skip-desktop` only
+`/desktop/latest.json`, all three served updater artifacts and their Tauri
+signatures against the public key committed at the selected ref. Authenticode
+chain/SmartScreen validation remains a Windows CI and release-QA check; the
+Unix verifier proves byte identity and the offline updater trust root. Use
+`--skip-desktop` only
 when intentionally verifying a release that predates the app or an environment
 where the static desktop origin is unavailable.
 
@@ -354,9 +454,36 @@ change to master, the deploy verifies the release's `COMMIT` still matches the
 daemon tree being deployed and its `TREE` is exactly
 `git rev-parse <deployed-ref>:daemon`, and nothing more is needed.
 
+The release has five public targets:
+
+| Public target | Rust triple |
+| --- | --- |
+| `darwin-aarch64` | `aarch64-apple-darwin` |
+| `darwin-x86_64` | `x86_64-apple-darwin` |
+| `linux-aarch64` | `aarch64-unknown-linux-gnu` |
+| `linux-x86_64` | `x86_64-unknown-linux-gnu` |
+| `windows-x86_64` | `x86_64-pc-windows-msvc` |
+
+Unix filenames remain extensionless. The Windows release assets and
+`SHA256SUMS` entries are exactly
+`spawnd-x86_64-pc-windows-msvc.exe` and
+`spawn-worker-x86_64-pc-windows-msvc.exe`; their canonical server files are
+`prebuilt/windows-x86_64/spawnd.exe` and `spawn-worker.exe`. The HTTP API paths
+remain logical and extensionless at `/api/install/spawnd/windows-x86_64` and
+`/api/install/spawn-worker/windows-x86_64`, with `.exe` in each response's
+download filename. Windows is required; unlike the existing best-effort Linux
+ARM target, a missing half of its pair blocks release preparation.
+
+Signing and hashing order is immutable: stage both Windows PEs, Authenticode-
+sign and timestamp both, verify the exact publisher and timestamp with
+`Get-AuthenticodeSignature` and SignTool, then construct `SHA256SUMS`. Only
+after all five pairs are staged does the operator render and sign the offline
+Ed25519 manifest. Never modify a PE after Authenticode signing or construct the
+manifest from pre-signing hashes.
+
 When CI cannot run (out of credits, broken runner), the release goes stale and
 the deploy will refuse — correctly. Refresh it by hand from the **pushed**
-master commit:
+master commit. Build Darwin and Linux as before:
 
 ```bash
 cd daemon
@@ -372,10 +499,72 @@ docker run --rm --platform linux/amd64 -v "$(git rev-parse --show-toplevel)":/sr
   bash -c 'git config --global --add safe.directory /src && cd /src/daemon && cargo build --release --locked --bin spawnd --bin spawn-worker'
 ```
 
+Build Windows on a real x86_64 Windows 11 or Server machine with Visual Studio
+Build Tools' “Desktop development with C++” workload and stable Rust MSVC:
+
+```powershell
+rustup target add x86_64-pc-windows-msvc
+Set-Location daemon
+cargo check --locked --target x86_64-pc-windows-msvc --bin spawnd --bin spawn-worker
+cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+cargo test --locked --target x86_64-pc-windows-msvc
+cargo build --release --locked --target x86_64-pc-windows-msvc --bin spawnd --bin spawn-worker
+```
+
+Stage the two exact `.exe` asset names, sign them through Artifact Signing (or
+the pre-approved HSM fallback), and run the same subject, timestamp, SignTool,
+hash, and `scripts/smoke-install-prebuilt.ps1` gates as CI. There is no
+project-supported Docker or Wine substitute for native Windows runtime,
+locking, service and installer validation. `cargo-xwin` is an emergency
+compilation aid only; its output must still pass through a real Windows signing
+and validation host before publication.
+
+When only GitHub runner capacity is unavailable and Artifact Signing itself is
+healthy, use Microsoft's local SignTool/dlib integration on that Windows host:
+
+```powershell
+winget install -e --id Microsoft.Azure.ArtifactSigningClientTools
+winget install -e --id Microsoft.AzureCLI
+az login
+
+@'
+{
+  "Endpoint": "https://<region>.codesigning.azure.net/",
+  "CodeSigningAccountName": "<account>",
+  "CertificateProfileName": "<profile>"
+}
+'@ | Set-Content -LiteralPath .\metadata.json -Encoding ascii
+
+$signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+  -Filter signtool.exe -File -Recurse | Where-Object FullName -Match '\\x64\\' |
+  Sort-Object FullName -Descending | Select-Object -First 1
+$dlib = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft\ArtifactSigningClientTools" `
+  -Filter Azure.CodeSigning.Dlib.dll -File -Recurse |
+  Where-Object FullName -Match '\\x64\\' | Select-Object -First 1
+if (-not $signTool -or -not $dlib) { throw 'Artifact Signing SignTool/dlib was not found' }
+
+foreach ($file in @(
+  '.\spawnd-x86_64-pc-windows-msvc.exe',
+  '.\spawn-worker-x86_64-pc-windows-msvc.exe'
+)) {
+  & $signTool.FullName sign /v /debug /fd SHA256 `
+    /tr http://timestamp.acs.microsoft.com /td SHA256 `
+    /dlib $dlib.FullName /dmdf .\metadata.json $file
+  if ($LASTEXITCODE -ne 0) { throw "Artifact Signing failed for $file" }
+}
+Remove-Item .\metadata.json
+```
+
+The local identity needs the same certificate-profile Signer role. Use Windows
+SDK SignTool 10.0.2261.755 or later, .NET 8, and the matching x64 dlib; then run
+the configured-subject/timestamp verifier and smoke before uploading. If
+Artifact Signing itself is unavailable, use the pre-approved HSM vendor—never
+an ad-hoc or self-signed production certificate.
+
 Then assemble the assets the way the workflow's single publish job does — the
-four `spawnd-<triple>` + four `spawn-worker-<triple>` binaries, plus
+five `spawnd-<triple>[.exe]` plus five `spawn-worker-<triple>[.exe]` binaries,
 `SHA256SUMS`, `COMMIT`, `TREE`, and `VERSION`. From the repository root, after
-placing the binaries in `out/`:
+placing the already-signed binaries in `out/`:
 
 ```bash
 (cd out && sha256sum $(ls spawnd-* spawn-worker-* | sort) > SHA256SUMS)
@@ -398,8 +587,9 @@ gh release create prebuilt-latest out/* --repo levy-street/spawn \
 
 `spawnd --version` prints `0.1.0+g<commit>`, so a running daemon can always be
 matched to its source. `deploy-prod.sh` converts these release files into the
-host manifest, signs it locally, and refuses to publish a partial target pair
-or to publish without the readable release-signing key. For a focused
+host manifest, installs Windows payloads on the Linux API host as mode `0644`,
+signs the manifest locally, and refuses to publish a partial required Windows
+pair or to publish without the readable release-signing key. For a focused
 diagnostic, compare the served signature and bytes with the rolling release:
 
 ```bash
@@ -432,6 +622,27 @@ Migrations run before the new server starts, so a release is safe only when the
 old code tolerates the new schema. Add columns and backfill in one release,
 then start depending on them in the next.
 
+For a Windows launch or any release that changes the native Windows handoff,
+ship in this order:
+
+1. Observe a successful native `windows-check` lane. Build the Windows daemon
+   pair and desktop app on `windows-latest`; Authenticode-sign and timestamp
+   every PE, including the final NSIS setup EXE, and verify the configured
+   publisher before upload.
+2. Download the already-signed daemon assets, verify their release identity,
+   construct `SHA256SUMS`, render the five-target daemon manifest, and sign its
+   exact bytes with the offline Ed25519 key.
+3. Publish the desktop payloads and updater manifest, then deploy the server
+   and all five daemon prebuilt pairs. Manifests are published last through an
+   atomic rename.
+4. Verify the public manifest signature, public binary bytes/hashes and Windows
+   `.exe` response filenames. On Windows, independently verify Authenticode and
+   run the public PowerShell installer.
+5. Only then deploy web/mobile copy or controls that hand users
+   `irm https://spawnd.dev/install.ps1 | iex`. A native Windows handoff must
+   never point at an unsigned/missing daemon pair or a missing signed desktop
+   installer.
+
 Server config lives in the environment on the production host, not in this repo
 and not in EAS. EAS environment variables are build inputs for the app;
 `EXPO_PUBLIC_API_URL` is committed in `eas.json` for **builds**, while the
@@ -455,23 +666,67 @@ examples. Two constraints are release blockers:
 `turns:` on 443 is recommended for browser/phone fallback after it has its own
 IP or an SNI/TURN-aware router; it is not enabled in current production.
 
+On Windows, `spawnd.exe` is the program that binds UDP 50000–50100. The
+per-user installer does not elevate or silently create a firewall exception.
+Windows Firewall, Defender/SmartScreen, and Smart App Control are independent
+validation surfaces; Authenticode does not remove the firewall prompt. If
+inbound ICE is blocked, ordinary outbound UDP TURN remains the fallback.
+
+An administrator who explicitly wants direct candidates on a Private network
+may add a program-scoped rule for the installed binary:
+
+```powershell
+$spawnd = Join-Path $env:LOCALAPPDATA 'spawn\bin\spawnd.exe'
+New-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)' `
+  -Direction Inbound -Action Allow -Profile Private -Program $spawnd `
+  -Protocol UDP -LocalPort 50000-50100
+
+# Uninstall or rollback:
+Remove-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)'
+```
+
+Do not broaden this to any program or the Public profile. Test both direct ICE
+and TURN fallback, and inspect the actual allow/block rules created when the
+first-listen prompt is accepted, declined, or dismissed by administrator and
+standard-user accounts.
+
 ## Release checklist
 
-1. Confirm the checkout is clean, the intended commit is pushed, daemon CI has
-   finished when `daemon/` changed, and the local release-signing key is
-   present and readable when prebuilts will be published.
-2. Run `scripts/deploy-prod.sh <ssh-host>`. Do not continue past a hard gate by
+1. Confirm the checkout is clean and pushed. When daemon or Windows code
+   changed, require the native `windows-check` check/clippy/test and PowerShell
+   smoke to pass, plus the existing Unix suite. Confirm the local offline
+   daemon release-signing key is present and readable.
+2. Confirm the rolling release contains all five target pairs. For both Windows
+   daemon files, verify `Get-AuthenticodeSignature` is `Valid`, its subject is
+   exactly `WINDOWS_SIGNING_SUBJECT`, an RFC 3161 timestamp is present, and
+   `signtool verify /pa /all /v` exits zero. Confirm their post-signing hashes
+   are the `.exe` lines in `SHA256SUMS` and the offline-signed five-target
+   manifest.
+3. For a desktop release, apply the same Authenticode subject/timestamp gates
+   to the inner desktop executable and final NSIS setup EXE, then complete the
+   offline Tauri signing/publish procedure in “The desktop app”.
+4. On a clean Windows 11 x64 VM, test the public installer from Windows
+   PowerShell 5.1 and PowerShell 7 as a standard user. Complete possession in
+   the attached console, prove `%LOCALAPPDATA%\spawn\bin\{spawnd,spawn-worker}.exe`,
+   User PATH persistence and Scheduled Task health, then re-run and prove the
+   pair's hashes/timestamps are unchanged. Exercise the documented switches.
+5. Test Windows failure and policy surfaces: corrupt hash/download, locked
+   worker rollback, clean recovery, expected enterprise-policy failure,
+   SmartScreen/Defender/Smart App Control behavior, first-listen firewall
+   choices, direct WebRTC, the optional Private program rule, and TURN fallback.
+6. Run `scripts/deploy-prod.sh <ssh-host>`. Do not continue past a hard gate by
    habit; fix the release or record why the emergency prebuilt override is safe.
-3. If `mobile/` changed, run
+7. If `mobile/` changed, run
    `scripts/update-mobile-prod.sh -m "<same summary as the deploy>"`. If native
    code, configuration, entitlements, or the runtime version changed, publish a
    real store build as well.
-4. Exercise the changed user flow. For network or signalling changes, also run
+8. Exercise the changed user flow. For network or signalling changes, also run
    `scripts/health-check.sh` with the production `SPAWN_TURN_URLS`; this checks
    the public WebSocket upgrade and the configured UDP TURN listener. Keep the
    migration compatibility rule above in mind while the previous processes are
    still draining.
-5. Last, prove the independently shipped identities and served daemon bytes:
+9. Last, prove the independently shipped identities and all five served daemon
+   target pairs:
 
    ```bash
    scripts/verify-release.sh https://spawnd.dev

@@ -1,8 +1,9 @@
 name: prebuilt
 
-# Build + test the daemon on real macOS and Linux and publish signed-by-toolchain
-# (ad-hoc) binaries for every supported target as a single rolling prerelease
-# that deploy-prod.sh pulls onto the server. One workflow owns the rolling
+# Build + test the daemon on real macOS, Linux, and Windows runners and publish
+# every supported target as a single rolling prerelease that deploy-prod.sh
+# pulls onto the server. Windows PEs are Authenticode-signed when the protected
+# Artifact Signing identity is configured. One workflow owns the rolling
 # `prebuilt-latest` release: the per-platform build jobs upload artifacts and a
 # single publish job assembles them, so the jobs never race to delete+recreate
 # the same release. Gated to daemon changes so it rarely spends macOS/arm minutes
@@ -171,13 +172,164 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  windows-x86_64:
+    if: github.ref == 'refs/heads/master'
+    runs-on: windows-latest
+    environment: windows-code-signing
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            daemon/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('daemon/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build x86_64 (x86_64-pc-windows-msvc)
+        working-directory: daemon
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --bin spawnd --bin spawn-worker
+
+      - name: Stage binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item daemon/target/x86_64-pc-windows-msvc/release/spawnd.exe `
+            out/spawnd-x86_64-pc-windows-msvc.exe
+          Copy-Item daemon/target/x86_64-pc-windows-msvc/release/spawn-worker.exe `
+            out/spawn-worker-x86_64-pc-windows-msvc.exe
+
+      # An entirely absent credential set intentionally leaves branch-protected
+      # builds unsigned while Artifact Signing is being provisioned. A partial
+      # configuration is an error; once provisioned, signing and verification
+      # below are hard gates and happen before checksums are constructed.
+      - name: Configure Authenticode signing
+        id: signing-config
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          AZURE_ARTIFACT_SIGNING_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
+          WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+        run: |
+          $secrets = @(
+            $env:AZURE_CLIENT_ID,
+            $env:AZURE_TENANT_ID,
+            $env:AZURE_SUBSCRIPTION_ID
+          )
+          $required = $secrets + @(
+            $env:AZURE_ARTIFACT_SIGNING_ENDPOINT,
+            $env:AZURE_ARTIFACT_SIGNING_ACCOUNT,
+            $env:AZURE_ARTIFACT_SIGNING_PROFILE,
+            $env:WINDOWS_SIGNING_SUBJECT
+          )
+          if (($secrets | Where-Object { $_ }).Count -eq 0) {
+            'enabled=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host 'Azure credentials are absent; keeping the Windows pair unsigned.'
+          } elseif (($required | Where-Object { $_ }).Count -ne $required.Count) {
+            throw 'Windows signing is partially configured; provide all Azure secrets and signing variables.'
+          } else {
+            'enabled=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Azure login
+        if: steps.signing-config.outputs.enabled == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Authenticode-sign daemon pair
+        if: steps.signing-config.outputs.enabled == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
+          files: |
+            ${{ github.workspace }}\out\spawnd-x86_64-pc-windows-msvc.exe
+            ${{ github.workspace }}\out\spawn-worker-x86_64-pc-windows-msvc.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Verify Authenticode signatures
+        if: steps.signing-config.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
+        run: |
+          $files = @(
+            'out\spawnd-x86_64-pc-windows-msvc.exe',
+            'out\spawn-worker-x86_64-pc-windows-msvc.exe'
+          )
+          $expectedSubject = $env:WINDOWS_SIGNING_SUBJECT
+          if (-not $expectedSubject) { throw 'WINDOWS_SIGNING_SUBJECT is empty' }
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Filter signtool.exe -File -Recurse |
+            Where-Object FullName -Match '\\x64\\' |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signTool) { throw 'Windows SDK signtool.exe was not found' }
+
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file
+            if ($signature.Status -ne 'Valid') {
+              throw "$file Authenticode status is $($signature.Status): $($signature.StatusMessage)"
+            }
+            if ($signature.SignerCertificate.Subject -ne $expectedSubject) {
+              throw "$file publisher is '$($signature.SignerCertificate.Subject)', expected '$expectedSubject'"
+            }
+            if (-not $signature.TimeStamperCertificate) {
+              throw "$file has no Authenticode timestamp certificate"
+            }
+            & $signTool.FullName verify /pa /all /v $file
+            if ($LASTEXITCODE -ne 0) { throw "signtool verification failed for $file" }
+          }
+
+      - name: Upload windows-x86_64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-windows-x86_64
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+
   # Assemble every platform's binaries into one checksummed rolling prerelease.
   # deploy always pulls `prebuilt-latest`; since it only changes when the daemon
   # changes, it always reflects current daemon code. The single SHA256SUMS here
   # is the source of truth: deploy verifies against it before scp'ing to prod,
   # and the installer pins the same hashes — so the bytes CI built, prod serves.
   publish:
-    needs: [macos, linux-x86_64, linux-aarch64]
+    needs: [macos, linux-x86_64, linux-aarch64, windows-x86_64]
     # The rolling release is the PROD install channel (deploy-prod.sh and the
     # installer both pull it), so only master may move it. A workflow_dispatch
     # on any other ref still builds and uploads run artifacts — the way to get
