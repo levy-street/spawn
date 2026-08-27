@@ -57,7 +57,7 @@
       "active": true,
       "endpoints": ["https://spawnd.dev/desktop/latest.json"],
       "dialog": false,
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM2RjcyN0IxNUVDRjEzQzIKUldUQ0U4OWVzU2YzTnVOTFZRSnpGQ21MRlVWU2lYUk1RRlgxQ2lzc2JTR1duMGQ0Qk5qdC9OWVYK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg4MjU4MDE2RERBQUY2QkIKUldTNzlxcmRGb0FsaU9sOWRjM3IxZFY2QjM0eWpGeUV6bUVYemxpYzI3TVhlOCtzVWcwcnl0bWcK"
     }
   }
 }
