@@ -261,7 +261,7 @@ impl SessionRegistry {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::pty::{self, WorkerHandleParts};

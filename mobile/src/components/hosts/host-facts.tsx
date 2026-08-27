@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { StyleSheet, View } from "react-native";
-import { hostConnectionLabel, pluralize } from "@/components/hosts/host-model";
+import { formatHostPlatform, hostConnectionLabel, pluralize } from "@/components/hosts/host-model";
 import { HostUpdateChip } from "@/components/hosts/host-update-status";
 import { ListGroup } from "@/components/ui/list-group";
 import { SectionHeader } from "@/components/ui/section-header";
@@ -43,7 +43,7 @@ export function HostFacts({ host }: { host: HostOut }) {
     <View style={styles.section} testID="host-facts">
       <SectionHeader style={styles.sectionHeader} title="Details" />
       <ListGroup>
-        <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
+        <Fact label="System" value={formatHostPlatform(host)} />
         <Fact label="Daemon" value={host.version ?? "unknown"} />
         {hostUpdateLabelForFacts(host) ? (
           <Fact label="Daemon update" value={<HostUpdateChip host={host} />} />

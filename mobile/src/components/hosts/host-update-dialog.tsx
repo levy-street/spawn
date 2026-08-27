@@ -1,6 +1,7 @@
 import * as Clipboard from "expo-clipboard";
 import { useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
+import { installCommandForHostOS } from "@/components/longtail/public-content";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Icon } from "@/components/ui/icon";
@@ -36,7 +37,7 @@ export function HostUpdateDialog({
   const currentHost = polling.data ?? host;
   const update = currentHost.update;
   const state = update?.state ?? "unknown";
-  const installCommand = `curl -fsSL ${origin}/install.sh | sh`;
+  const installCommand = installCommandForHostOS(origin, currentHost.os);
 
   useEffect(() => {
     let active = true;

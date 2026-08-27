@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
 import { ApiError, type Host, hosts } from "@/lib/api";
+import { installCommandForHostOS } from "@/lib/host-platform";
 import { cn } from "@/lib/utils";
 
 const POLL_INTERVAL_MS = 2_000;
@@ -192,7 +193,7 @@ export function HostUpdateDialog({
   if (!currentHost || currentHost.update.state === "current" || !open) return null;
 
   const state = currentHost.update.state;
-  const installCommand = `curl -fsSL ${origin}/install.sh | sh`;
+  const installCommand = installCommandForHostOS(currentHost.os, origin);
   const close = () => onOpenChange(false);
   const retry = () => updateM.mutate();
 

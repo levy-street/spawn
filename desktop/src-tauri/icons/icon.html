@@ -15,6 +15,11 @@
        centre it sits. Both are measured back out of the render. */
     --mark-height: 552px;
     --mark-drop: 16px;
+    /* The macOS template tray canvases are 44 / 88 px. Its mark uses this
+       1× ink height, doubled for @2x, and is centred without the app-icon
+       plate's optical drop. render.mjs reads these values too. */
+    --tray-canvas: 44px;
+    --tray-mark-height: 40px;
   }
   html, body { margin: 0; background: transparent; }
   .icon {

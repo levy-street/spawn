@@ -3,6 +3,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -49,6 +50,7 @@ const OUTBOUND_CHANNEL_DEPTH: usize = 1024;
 const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 const TOOL_OUTPUT_LIMIT: usize = 16 * 1024;
+#[cfg(unix)]
 const SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_SESSION_COLS: u16 = 120;
 const DEFAULT_SESSION_ROWS: u16 = 32;
@@ -462,6 +464,8 @@ async fn wait_for_credential_change_with(
 
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     install_sighup_handler();
+    #[cfg(windows)]
+    crate::service::refresh_user_path()?;
     crate::update::prepare_probation()?;
     crate::update::arm_probation_deadline();
     crate::update::refresh_worker_pair_status().await;
@@ -477,9 +481,16 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
     let registry = SessionRegistry::new();
-    let state_store = Arc::new(crate::state::StateStore::new(
-        &crate::config::config_dir()?,
+    let config_dir = crate::config::config_dir()?;
+    #[cfg(windows)]
+    crate::service::instance_state_dir(&config_dir)?;
+    #[cfg(windows)]
+    crate::service::start_control_listener(&config_dir, reconnect_notify(), shutdown_notify())?;
+    let task_breakaway_denied = crate::service::probe_task_breakaway(&config_dir);
+    let state_store = Arc::new(crate::state::StateStore::new_with_breakaway(
+        &config_dir,
         server_url.as_str(),
+        task_breakaway_denied,
     ));
     crate::state::install_active(Arc::clone(&state_store));
     state_store.heartbeat(0);
@@ -557,6 +568,10 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 r = tokio::signal::ctrl_c() => {
                     r.context("ctrl-c handler")?;
                     tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
+                    return Ok(());
+                }
+                _ = shutdown_signal() => {
+                    tracing::info!("graceful service shutdown requested; exiting (session workers are preserved)");
                     return Ok(());
                 }
             }
@@ -712,6 +727,10 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                     tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
                     return Ok(());
                 }
+                _ = shutdown_signal() => {
+                    tracing::info!("graceful service shutdown requested; exiting (session workers are preserved)");
+                    return Ok(());
+                }
             }
         };
         if let Some(reloaded) = reloaded {
@@ -735,6 +754,11 @@ fn reconnect_notify() -> &'static tokio::sync::Notify {
     RECONNECT.get_or_init(tokio::sync::Notify::new)
 }
 
+fn shutdown_notify() -> &'static tokio::sync::Notify {
+    static SHUTDOWN: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    SHUTDOWN.get_or_init(tokio::sync::Notify::new)
+}
+
 #[cfg(unix)]
 fn install_sighup_handler() {
     tokio::spawn(async {
@@ -753,6 +777,10 @@ fn install_sighup_handler() {}
 
 async fn sighup_signal() {
     reconnect_notify().notified().await;
+}
+
+async fn shutdown_signal() {
+    shutdown_notify().notified().await;
 }
 
 async fn serve_one_connection(
@@ -2535,23 +2563,97 @@ async fn install_host_agent(target: HostAgentTarget) -> HostAgentInstallResult {
 }
 
 async fn binary_path(bin: &str, env: &BTreeMap<String, String>) -> Option<String> {
-    let output = Command::new("which")
-        .arg(bin)
-        .envs(env)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    resolve_program_in_env(Path::new(bin), env)
+        .map(|resolved| resolved.path.to_string_lossy().into_owned())
+}
+
+fn env_get_ci<'a>(env: &'a BTreeMap<String, String>, name: &str) -> Option<&'a String> {
+    env.iter()
+        .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value))
+}
+
+fn env_key_ci(env: &BTreeMap<String, String>, name: &str) -> Option<String> {
+    env.keys()
+        .find(|key| key.eq_ignore_ascii_case(name))
+        .cloned()
+}
+
+fn env_remove_ci(env: &mut BTreeMap<String, String>, name: &str) {
+    let keys = env
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in keys {
+        env.remove(&key);
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path)
+}
+
+fn env_insert_ci(env: &mut BTreeMap<String, String>, name: &str, value: String) {
+    let key = env_key_ci(env, name).unwrap_or_else(|| name.to_string());
+    env_remove_ci(env, name);
+    env.insert(key, value);
+}
+
+fn resolve_program_in_env(
+    path: &Path,
+    env: &BTreeMap<String, String>,
+) -> Option<crate::platform::ResolvedProgram> {
+    fn classify(candidate: PathBuf) -> Option<crate::platform::ResolvedProgram> {
+        let path = fs::canonicalize(candidate).ok()?;
+        if !path.is_file() {
+            return None;
+        }
+        #[cfg(windows)]
+        let kind = match path.extension().and_then(|extension| extension.to_str()) {
+            Some(extension)
+                if extension.eq_ignore_ascii_case("cmd")
+                    || extension.eq_ignore_ascii_case("bat") =>
+            {
+                crate::platform::ProgramKind::CmdShim
+            }
+            _ => crate::platform::ProgramKind::Native,
+        };
+        #[cfg(unix)]
+        let kind = crate::platform::ProgramKind::Native;
+        Some(crate::platform::ResolvedProgram { path, kind })
     }
+
+    #[cfg(unix)]
+    let candidates = |base: &Path| vec![base.to_path_buf()];
+    #[cfg(windows)]
+    let candidates = |base: &Path| {
+        if base.extension().is_some() {
+            return vec![base.to_path_buf()];
+        }
+        env_get_ci(env, "PATHEXT")
+            .map(String::as_str)
+            .unwrap_or(".COM;.EXE;.BAT;.CMD")
+            .split(';')
+            .filter_map(|extension| {
+                let extension = extension.trim();
+                if extension.is_empty() {
+                    return None;
+                }
+                let mut name = base.as_os_str().to_os_string();
+                if !extension.starts_with('.') {
+                    name.push(".");
+                }
+                name.push(extension);
+                Some(PathBuf::from(name))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if path.is_absolute() || path.components().count() > 1 {
+        return candidates(path).into_iter().find_map(classify);
+    }
+    let search = env_get_ci(env, "PATH")?;
+    std::env::split_paths(search).find_map(|directory| {
+        candidates(&directory.join(path))
+            .into_iter()
+            .find_map(classify)
+    })
 }
 
 async fn read_tool_version(
@@ -2780,9 +2882,59 @@ async fn run_program_capture(
     output_limit: usize,
     env: Option<&BTreeMap<String, String>>,
 ) -> CommandCapture {
-    let mut command = Command::new(program);
+    let process_env;
+    let resolution_env = match env {
+        Some(env) => env,
+        None => {
+            process_env = std::env::vars().collect::<BTreeMap<_, _>>();
+            &process_env
+        }
+    };
+    let Some(resolved) = resolve_program_in_env(Path::new(program), resolution_env) else {
+        return CommandCapture {
+            success: false,
+            exit_code: None,
+            output: String::new(),
+            error: Some(format!("{program} was not found on PATH")),
+        };
+    };
+    #[cfg(windows)]
+    if resolved.kind == crate::platform::ProgramKind::CmdShim
+        && cmd_shim_command_line(args).is_none()
+    {
+        return CommandCapture {
+            success: false,
+            exit_code: None,
+            output: String::new(),
+            error: Some("refusing non-fixed arguments through a cmd shim".into()),
+        };
+    }
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new(&resolved.path);
+        command.args(args);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = match resolved.kind {
+        crate::platform::ProgramKind::Native => {
+            let mut command = Command::new(&resolved.path);
+            command.args(args);
+            command
+        }
+        crate::platform::ProgramKind::CmdShim => {
+            let comspec = env_get_ci(resolution_env, "COMSPEC")
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+            let mut command = Command::new(comspec);
+            command.env("SPAWN_CMD_SHIM", &resolved.path);
+            command.args(["/d", "/s", "/c"]);
+            command.arg(cmd_shim_command_line(args).expect("fixed shim arguments were checked"));
+            command
+        }
+    };
     command
-        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -2825,13 +2977,22 @@ async fn run_program_capture(
     }
 }
 
+#[cfg(windows)]
+fn cmd_shim_command_line(args: &[&str]) -> Option<String> {
+    args.iter()
+        .all(|arg| matches!(*arg, "--version" | "version" | "-V" | "-v" | "update"))
+        .then(|| format!("\"\"%SPAWN_CMD_SHIM%\" {}\"", args.join(" ")))
+}
+
 async fn run_shell_capture(
     command: &str,
     timeout: Duration,
     output_limit: usize,
     env: Option<&BTreeMap<String, String>>,
 ) -> CommandCapture {
+    #[cfg(unix)]
     let mut shell = Command::new("bash");
+    #[cfg(unix)]
     shell
         .arg("-c")
         .arg(format!("exec 2>&1; {command}"))
@@ -2839,6 +3000,37 @@ async fn run_shell_capture(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    let mut shell = {
+        let process_env;
+        let resolution_env = match env {
+            Some(env) => env,
+            None => {
+                process_env = std::env::vars().collect::<BTreeMap<_, _>>();
+                &process_env
+            }
+        };
+        let resolved = ["pwsh.exe", "powershell.exe"]
+            .into_iter()
+            .find_map(|name| resolve_program_in_env(Path::new(name), resolution_env));
+        let Some(resolved) = resolved else {
+            return CommandCapture {
+                success: false,
+                exit_code: None,
+                output: String::new(),
+                error: Some("PowerShell is unavailable".into()),
+            };
+        };
+        let mut shell = Command::new(resolved.path);
+        shell
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        shell
+    };
     if let Some(env) = env {
         shell.envs(env);
     }
@@ -2928,10 +3120,13 @@ fn expand_host_path(input: &str) -> PathBuf {
     let trimmed = input.trim();
     let home = daemon_home_dir();
     let path = if trimmed.is_empty() {
-        home.unwrap_or_else(|| PathBuf::from("/"))
+        fallback_host_root(home)
     } else if trimmed == "~" {
         home.unwrap_or_else(|| PathBuf::from(trimmed))
-    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+    } else if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
         home.map(|h| h.join(rest))
             .unwrap_or_else(|| PathBuf::from(trimmed))
     } else {
@@ -2939,21 +3134,34 @@ fn expand_host_path(input: &str) -> PathBuf {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
-            home.unwrap_or_else(|| PathBuf::from("/")).join(path)
+            fallback_host_root(home).join(path)
         }
     };
     lexical_normalize(path)
 }
 
+fn fallback_host_root(home: Option<PathBuf>) -> PathBuf {
+    #[cfg(unix)]
+    {
+        home.unwrap_or_else(|| PathBuf::from("/"))
+    }
+    #[cfg(windows)]
+    {
+        home.or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+}
+
 fn lexical_normalize(path: PathBuf) -> PathBuf {
     let mut normalized = PathBuf::new();
+    let rooted = path.is_absolute();
     for component in path.components() {
         match component {
             Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(Path::new("/")),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
             Component::CurDir => {}
             Component::ParentDir => {
-                if normalized.as_os_str() != "/" && !normalized.pop() {
+                if !normalized.pop() && !rooted {
                     normalized.push("..");
                 }
             }
@@ -2961,7 +3169,11 @@ fn lexical_normalize(path: PathBuf) -> PathBuf {
         }
     }
     if normalized.as_os_str().is_empty() {
-        PathBuf::from("/")
+        if rooted {
+            PathBuf::from(std::path::MAIN_SEPARATOR_STR)
+        } else {
+            PathBuf::from(".")
+        }
     } else {
         normalized
     }
@@ -3004,7 +3216,7 @@ async fn handle_session_create(
     // A session is always the user's login shell; agents are commands typed
     // into it. The frame carries no argv, env, or install command.
     let shell = resolve_login_shell(&env);
-    let argv = vec![shell, "-l".to_string()];
+    let argv = login_shell_argv(shell);
 
     let launch_cwd = if create.create_cwd {
         match ensure_session_cwd(&create.cwd).await {
@@ -3120,14 +3332,34 @@ async fn prime_macos_permissions_once() {
 /// The user's login shell: `$SHELL` from the daemon's environment when it
 /// names an executable file, else the platform default.
 fn resolve_login_shell(env: &BTreeMap<String, String>) -> String {
-    if let Some(shell) = env.get("SHELL").map(|value| value.trim()) {
+    #[cfg(unix)]
+    if let Some(shell) = env_get_ci(env, "SHELL").map(|value| value.trim()) {
         if is_executable_file(Path::new(shell)) {
             return shell.to_string();
         }
     }
-    default_login_shell().to_string()
+    #[cfg(unix)]
+    return default_login_shell().to_string();
+
+    #[cfg(windows)]
+    {
+        for shell in ["pwsh.exe", "powershell.exe"] {
+            if let Some(resolved) = resolve_program_in_env(Path::new(shell), env) {
+                return resolved.path.to_string_lossy().into_owned();
+            }
+        }
+        if let Some(comspec) = env_get_ci(env, "COMSPEC").filter(|value| !value.trim().is_empty()) {
+            if is_executable_file(Path::new(comspec)) {
+                return comspec.to_string();
+            }
+        }
+        resolve_program_in_env(Path::new("cmd.exe"), env)
+            .map(|resolved| resolved.path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "cmd.exe".to_string())
+    }
 }
 
+#[cfg(unix)]
 fn default_login_shell() -> &'static str {
     if cfg!(target_os = "macos") {
         "/bin/zsh"
@@ -3136,12 +3368,38 @@ fn default_login_shell() -> &'static str {
     }
 }
 
+#[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.is_absolute()
         && std::fs::metadata(path)
             .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_absolute() && path.is_file()
+}
+
+fn login_shell_argv(shell: String) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        vec![shell, "-l".to_string()]
+    }
+    #[cfg(windows)]
+    {
+        let is_powershell = Path::new(&shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("pwsh.exe") || name.eq_ignore_ascii_case("powershell.exe")
+            });
+        vec![
+            shell,
+            if is_powershell { "-NoLogo" } else { "/d" }.to_string(),
+        ]
+    }
 }
 
 async fn resolved_command_env() -> BTreeMap<String, String> {
@@ -3151,10 +3409,12 @@ async fn resolved_command_env() -> BTreeMap<String, String> {
 }
 
 async fn normalize_session_env(env: &mut BTreeMap<String, String>) {
-    env.remove("NO_COLOR");
-    env.insert("TERM".into(), "xterm-256color".into());
-    env.insert("COLORTERM".into(), "truecolor".into());
-    env.entry("CLICOLOR".into()).or_insert_with(|| "1".into());
+    env_remove_ci(env, "NO_COLOR");
+    env_insert_ci(env, "TERM", "xterm-256color".into());
+    env_insert_ci(env, "COLORTERM", "truecolor".into());
+    if env_get_ci(env, "CLICOLOR").is_none() {
+        env_insert_ci(env, "CLICOLOR", "1".into());
+    }
     enrich_path_from_user_shell(env).await;
 }
 
@@ -3165,6 +3425,12 @@ async fn enrich_path_from_user_shell(env: &mut BTreeMap<String, String>) {
 }
 
 async fn shell_path_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let _ = env;
+        return Vec::new();
+    }
+    #[cfg(unix)]
     for shell in candidate_shells(env) {
         let mut entries = Vec::new();
         for mode in ["-ic", "-lc"] {
@@ -3179,6 +3445,7 @@ async fn shell_path_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
     Vec::new()
 }
 
+#[cfg(unix)]
 async fn probe_shell_path(
     shell: &Path,
     mode: &str,
@@ -3209,6 +3476,7 @@ async fn probe_shell_path(
         .map(str::to_string)
 }
 
+#[cfg(unix)]
 fn candidate_shells(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
@@ -3222,7 +3490,7 @@ fn candidate_shells(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
         }
     };
 
-    if let Some(shell) = env.get("SHELL").filter(|value| !value.trim().is_empty()) {
+    if let Some(shell) = env_get_ci(env, "SHELL").filter(|value| !value.trim().is_empty()) {
         push(PathBuf::from(shell));
     }
     for shell in [
@@ -3240,37 +3508,81 @@ fn candidate_shells(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
 }
 
 fn common_user_bin_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
-    let Some(home) = env.get("HOME").filter(|value| !value.is_empty()) else {
+    #[cfg(unix)]
+    let Some(home) = env_get_ci(env, "HOME").filter(|value| !value.is_empty()) else {
         return Vec::new();
     };
+    #[cfg(unix)]
     let home = PathBuf::from(home);
-    [
-        home.join(".local/bin"),
-        home.join("bin"),
-        home.join(".bun/bin"),
-        home.join(".cargo/bin"),
-    ]
-    .into_iter()
-    .collect()
+    #[cfg(unix)]
+    {
+        [
+            home.join(".local/bin"),
+            home.join("bin"),
+            home.join(".bun/bin"),
+            home.join(".cargo/bin"),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[cfg(windows)]
+    {
+        let mut paths = Vec::new();
+        if let Some(local) = env_get_ci(env, "LOCALAPPDATA").filter(|value| !value.is_empty()) {
+            let local = PathBuf::from(local);
+            paths.push(local.join("spawn/bin"));
+            paths.push(local.join("pnpm"));
+            paths.push(local.join("Programs/Git/cmd"));
+        }
+        if let Some(roaming) = env_get_ci(env, "APPDATA").filter(|value| !value.is_empty()) {
+            paths.push(PathBuf::from(roaming).join("npm"));
+        }
+        if let Some(pnpm) = env_get_ci(env, "PNPM_HOME").filter(|value| !value.is_empty()) {
+            paths.push(PathBuf::from(pnpm));
+        }
+        if let Some(profile) = env_get_ci(env, "USERPROFILE").filter(|value| !value.is_empty()) {
+            let profile = PathBuf::from(profile);
+            paths.push(profile.join(".cargo/bin"));
+            paths.push(profile.join(".bun/bin"));
+            paths.push(profile.join(".local/bin"));
+        }
+        if let Some(program_files) =
+            env_get_ci(env, "ProgramFiles").filter(|value| !value.is_empty())
+        {
+            paths.push(PathBuf::from(program_files).join("Git/cmd"));
+        }
+        paths
+    }
 }
 
 fn prepend_path_entries(env: &mut BTreeMap<String, String>, preferred: Vec<PathBuf>) {
-    let existing = env
-        .get("PATH")
+    let existing = env_get_ci(env, "PATH")
         .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
         .unwrap_or_default();
     let mut merged = Vec::new();
     let mut seen = HashSet::new();
 
     for entry in preferred.into_iter().chain(existing) {
-        if entry.as_os_str().is_empty() || !seen.insert(entry.clone()) {
+        if entry.as_os_str().is_empty() || !seen.insert(path_comparison_key(&entry)) {
             continue;
         }
         merged.push(entry);
     }
 
     if let Ok(joined) = std::env::join_paths(merged) {
-        env.insert("PATH".into(), joined.to_string_lossy().into_owned());
+        env_insert_ci(env, "PATH", joined.to_string_lossy().into_owned());
+    }
+}
+
+fn path_comparison_key(path: &Path) -> OsString {
+    #[cfg(unix)]
+    {
+        path.as_os_str().to_os_string()
+    }
+    #[cfg(windows)]
+    {
+        OsString::from(path.to_string_lossy().to_ascii_lowercase())
     }
 }
 
@@ -3288,23 +3600,25 @@ fn materialize_session_capabilities(
     if root.exists() {
         fs::remove_dir_all(&root).with_context(|| format!("clearing {}", root.display()))?;
     }
-    fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+    crate::platform::create_private_dir_all(&root)
+        .with_context(|| format!("creating {}", root.display()))?;
 
     let skills_file = root.join("skills.json");
     let skills_dir = root.join("skills");
-    fs::create_dir_all(&skills_dir)
+    crate::platform::create_private_dir_all(&skills_dir)
         .with_context(|| format!("creating {}", skills_dir.display()))?;
 
-    fs::write(&skills_file, serde_json::to_vec_pretty(&create.skills)?)
+    write_private_file(&skills_file, &serde_json::to_vec_pretty(&create.skills)?)
         .with_context(|| format!("writing {}", skills_file.display()))?;
 
     for skill in &create.skills {
         let dir = skills_dir.join(safe_file_component(&skill.name));
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        crate::platform::create_private_dir_all(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join("SKILL.md");
-        fs::write(
+        write_private_file(
             &path,
-            skill_markdown(&skill.name, &skill.description, &skill.content),
+            skill_markdown(&skill.name, &skill.description, &skill.content).as_bytes(),
         )
         .with_context(|| format!("writing {}", path.display()))?;
     }
@@ -3326,7 +3640,7 @@ fn materialize_session_capabilities(
     // projection is materialized for every skilled session: if the user types
     // (or clicks) `codex`, it inherits this CODEX_HOME and sees the skills.
     let codex_home = root.join("codex-home");
-    fs::create_dir_all(&codex_home)
+    crate::platform::create_private_dir_all(&codex_home)
         .with_context(|| format!("creating {}", codex_home.display()))?;
     write_codex_projection(&codex_home, &skills_dir, create)?;
     link_codex_auth_state(&codex_home)?;
@@ -3358,7 +3672,8 @@ fn write_codex_projection(
         config.push_str("]\ntrust_level = \"trusted\"\n");
     }
     let path = codex_home.join("config.toml");
-    fs::write(&path, config).with_context(|| format!("writing {}", path.display()))?;
+    write_private_file(&path, config.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -3393,7 +3708,17 @@ fn link_or_copy(source: &Path, dest: &Path) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn link_or_copy(source: &Path, dest: &Path) -> std::io::Result<()> {
-    fs::copy(source, dest).map(|_| ())
+    let mut reader = fs::File::open(source)?;
+    let mut writer = crate::platform::create_private_file_new(dest)?;
+    std::io::copy(&mut reader, &mut writer)?;
+    writer.sync_all()
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = crate::platform::create_private_file_new(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn skill_markdown(name: &str, description: &str, content: &str) -> String {
@@ -5921,6 +6246,7 @@ mod tests {
         assert!(!markdown.contains("stdio-secret"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn path_enrichment_prefers_shell_path_and_keeps_service_path() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5951,6 +6277,7 @@ mod tests {
         assert!(entries.iter().any(|entry| entry == &fallback_bin));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn path_enrichment_reads_interactive_shell_startup_path() {
         let bash = PathBuf::from("/bin/bash");
@@ -5986,6 +6313,102 @@ mod tests {
             .position(|entry| entry == &PathBuf::from("/usr/bin"))
             .expect("service path entry");
         assert!(shell_pos < service_pos);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolver_honors_case_insensitive_env_and_pathext_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let exe = temp.path().join("agent.EXE");
+        let shim = temp.path().join("agent.CMD");
+        fs::write(&exe, b"fixture").unwrap();
+        fs::write(&shim, b"@echo off\r\n").unwrap();
+        let mut env = BTreeMap::new();
+        env.insert("Path".into(), temp.path().to_string_lossy().into_owned());
+        env.insert("PathExt".into(), ".EXE;.CMD".into());
+
+        let resolved = resolve_program_in_env(Path::new("agent"), &env).unwrap();
+        assert_eq!(resolved.path, fs::canonicalize(exe).unwrap());
+        assert_eq!(resolved.kind, crate::platform::ProgramKind::Native);
+
+        env.insert("PathExt".into(), ".CMD;.EXE".into());
+        let resolved = resolve_program_in_env(Path::new("agent"), &env).unwrap();
+        assert_eq!(resolved.path, fs::canonicalize(shim).unwrap());
+        assert_eq!(resolved.kind, crate::platform::ProgramKind::CmdShim);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_enrichment_keeps_one_case_insensitive_path_key() {
+        let mut env = BTreeMap::new();
+        env.insert("Path".into(), r"C:\Windows\System32".into());
+        env.insert("PATH".into(), r"C:\duplicate".into());
+        env.insert(
+            "LOCALAPPDATA".into(),
+            r"C:\Users\Case Test\AppData\Local".into(),
+        );
+        env.insert(
+            "APPDATA".into(),
+            r"C:\Users\Case Test\AppData\Roaming".into(),
+        );
+        env.insert("USERPROFILE".into(), r"C:\Users\Case Test".into());
+
+        let preferred = common_user_bin_entries(&env);
+        prepend_path_entries(&mut env, preferred);
+        assert_eq!(
+            env.keys()
+                .filter(|key| key.eq_ignore_ascii_case("PATH"))
+                .count(),
+            1
+        );
+        let entries = std::env::split_paths(env_get_ci(&env, "PATH").unwrap()).collect::<Vec<_>>();
+        assert_eq!(
+            entries.first().unwrap(),
+            &PathBuf::from(r"C:\Users\Case Test\AppData\Local\spawn\bin")
+        );
+        assert!(entries
+            .iter()
+            .any(|entry| entry == &PathBuf::from(r"C:\Users\Case Test\.local\bin")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_resolution_and_arguments_follow_platform_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pwsh = temp.path().join("pwsh.exe");
+        let powershell = temp.path().join("powershell.exe");
+        let cmd = temp.path().join("cmd.exe");
+        for path in [&pwsh, &powershell, &cmd] {
+            fs::write(path, b"fixture").unwrap();
+        }
+        let mut env = BTreeMap::new();
+        env.insert("PATH".into(), temp.path().to_string_lossy().into_owned());
+        env.insert("COMSPEC".into(), cmd.to_string_lossy().into_owned());
+
+        let shell = resolve_login_shell(&env);
+        assert_eq!(PathBuf::from(&shell), fs::canonicalize(&pwsh).unwrap());
+        assert_eq!(login_shell_argv(shell)[1], "-NoLogo");
+        fs::remove_file(&pwsh).unwrap();
+        let shell = resolve_login_shell(&env);
+        assert_eq!(
+            PathBuf::from(&shell),
+            fs::canonicalize(&powershell).unwrap()
+        );
+        fs::remove_file(&powershell).unwrap();
+        let shell = resolve_login_shell(&env);
+        assert_eq!(PathBuf::from(&shell), cmd);
+        assert_eq!(login_shell_argv(shell)[1], "/d");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_shim_builder_accepts_only_fixed_code_owned_tokens() {
+        assert_eq!(
+            cmd_shim_command_line(&["--version"]).as_deref(),
+            Some("\"\"%SPAWN_CMD_SHIM%\" --version\"")
+        );
+        assert!(cmd_shim_command_line(&["update", "&whoami"]).is_none());
+        assert!(cmd_shim_command_line(&["--version", "user supplied"]).is_none());
     }
 }
 

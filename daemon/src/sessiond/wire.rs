@@ -215,10 +215,6 @@ pub fn decode_lifecycle_request(
     Ok((instance_id, LifecycleSignal::from_code(request[16])?))
 }
 
-pub fn lifecycle_socket_path(socket: &std::path::Path) -> std::path::PathBuf {
-    socket.with_extension("lifecycle.sock")
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Shutdown {
     #[serde(default)]

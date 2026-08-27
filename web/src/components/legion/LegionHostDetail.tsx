@@ -2,6 +2,7 @@
 import { CapacityBar, LegionDot } from "@/components/legion/legion-parts";
 import { SessionStatusDot } from "@/components/ui/status";
 import { hostHealthPanel } from "@/lib/host-health";
+import { formatHostPlatform } from "@/lib/host-platform";
 import type { LegionHostRow } from "@/lib/legion";
 import { bucketFill, capacityLabel, specLine } from "@/lib/legion";
 import { relativeTime, sessionActivityLabel, sessionTitle } from "@/lib/sessions";
@@ -48,7 +49,7 @@ export function LegionHostDetail({ row }: { row: LegionHostRow }) {
 
       {(spec || host.cpu_model) && (
         <p className="mt-1.5 font-mono text-[10.5px] leading-4 text-muted-foreground">
-          {[host.os, spec].filter(Boolean).join(" · ")}
+          {[formatHostPlatform(host), spec].filter(Boolean).join(" · ")}
           {host.cpu_model && (
             <>
               <br />

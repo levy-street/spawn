@@ -60,7 +60,7 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
     let version = crate::version::build_version();
     let config_dir = crate::config::config_dir().ok();
     let credentials = crate::creds::load();
-    let mut checks = Vec::with_capacity(14);
+    let mut checks = Vec::with_capacity(if cfg!(windows) { 15 } else { 14 });
 
     checks.push(match &credentials {
         Ok(_) => ok(1, "credentials", "readable"),
@@ -134,7 +134,27 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
     let service_status = config_dir.as_deref().map(crate::service::status);
     checks.push(match service_status.as_ref() {
         Some(status) => {
-            if status.running {
+            if let Some(issue) = config_dir
+                .as_deref()
+                .and_then(crate::service::diagnostic)
+            {
+                fail(
+                    7,
+                    "background service",
+                    issue,
+                    if config_dir.as_deref().is_some_and(|dir| {
+                        crate::service::needs_fallback_offer(dir)
+                            || (cfg!(windows)
+                                && crate::service::preferred_mode(dir)
+                                    == crate::service::ServiceMode::Task)
+                    })
+                    {
+                        "re-run spawnd possess; it will confirm Task Scheduler or offer the Run watchdog fallback"
+                    } else {
+                        "spawnd reconnect (reinstalls the selected service manager)"
+                    },
+                )
+            } else if status.running {
                 if crate::service::user_linger_enabled() == Some(false) {
                     warning(
                         7,
@@ -180,7 +200,7 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
                 .and_then(|dir| crate::state::read(dir).ok().flatten())
             {
                 Some(state)
-                    if crate::state::pid_is_alive(state.pid)
+                    if crate::state::daemon_state_is_live(&state)
                         && state_file_fresh(config_dir.as_deref().unwrap()) =>
                 {
                     ok(8, "daemon heartbeat", format!("fresh (pid {})", state.pid))
@@ -208,7 +228,13 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
             let reinstall = server
                 .as_ref()
                 .map(crate::update::reinstall_command)
-                .unwrap_or_else(|| "curl -fsSL <server>/install.sh | sh".into());
+                .unwrap_or_else(|| {
+                    if cfg!(windows) {
+                        "irm '<server>/install.ps1' | iex".into()
+                    } else {
+                        "curl -fsSL <server>/install.sh | sh".into()
+                    }
+                });
             fail(
                 10,
                 "worker binary",
@@ -244,6 +270,8 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
         None => skip(13, "file permissions", "config unavailable"),
     });
     checks.push(probe_udp().await);
+    #[cfg(windows)]
+    checks.push(windows_agent_shell_check());
 
     let problems = checks
         .iter()
@@ -255,6 +283,82 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
         checks,
         problems,
     }
+}
+
+#[cfg(windows)]
+fn windows_agent_shell_check() -> Check {
+    let claude = crate::platform::resolve_program(Path::new("claude")).is_some()
+        || std::env::var_os("APPDATA").is_some_and(|base| {
+            Path::new(&base).join("npm/claude.cmd").is_file()
+                || Path::new(&base).join("npm/claude.exe").is_file()
+        })
+        || dirs::home_dir().is_some_and(|home| {
+            home.join(".local/bin/claude.exe").is_file()
+                || home.join(".local/bin/claude.cmd").is_file()
+        });
+    let powershell = ["pwsh.exe", "powershell.exe"]
+        .into_iter()
+        .any(|program| crate::platform::resolve_program(Path::new(program)).is_some())
+        || std::env::var_os("SystemRoot").is_some_and(|root| {
+            Path::new(&root)
+                .join("System32/WindowsPowerShell/v1.0/powershell.exe")
+                .is_file()
+        });
+    let comspec = std::env::var_os("COMSPEC")
+        .filter(|path| !path.is_empty())
+        .is_some_and(|path| Path::new(&path).is_file());
+    let git_bash = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH")
+        .filter(|path| !path.is_empty())
+        .is_some_and(|path| Path::new(&path).is_file())
+        || ["LOCALAPPDATA", "ProgramFiles"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .any(|base| Path::new(&base).join("Git/bin/bash.exe").is_file());
+    windows_agent_shell_check_for(claude, powershell, comspec, git_bash)
+}
+
+#[cfg(windows)]
+fn windows_agent_shell_check_for(
+    claude: bool,
+    powershell: bool,
+    comspec: bool,
+    git_bash: bool,
+) -> Check {
+    if claude && !powershell && !git_bash {
+        return fail(
+            15,
+            "agent shell",
+            "Claude Code has neither PowerShell nor Git Bash",
+            "install PowerShell or Git for Windows, then run spawnd doctor again",
+        );
+    }
+    if !powershell && !comspec {
+        return fail(
+            15,
+            "agent shell",
+            "no PowerShell or COMSPEC shell is available",
+            "repair Windows PowerShell or install PowerShell 7",
+        );
+    }
+    if claude && !git_bash {
+        return warn(
+            15,
+            "agent shell",
+            "Claude Code can use PowerShell, but Bash-tool functionality is degraded",
+            "install Git for Windows for full Claude Code tool compatibility",
+        );
+    }
+    ok(
+        15,
+        "agent shell",
+        if claude {
+            "Claude Code shell dependencies available"
+        } else if powershell {
+            "PowerShell available"
+        } else {
+            "COMSPEC fallback available"
+        },
+    )
 }
 
 struct HealthProbe {
@@ -481,11 +585,7 @@ async fn probe_version(server: &url::Url) -> Check {
 }
 
 fn state_file_fresh(config_dir: &Path) -> bool {
-    std::fs::metadata(crate::state::state_path(config_dir))
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age < Duration::from_secs(90))
+    crate::state::heartbeat_is_fresh(config_dir, Duration::from_secs(90))
 }
 
 fn permissions_check(config_dir: &Path) -> Check {
@@ -506,7 +606,34 @@ fn permissions_check(config_dir: &Path) -> Check {
             Err(_) => skip(13, "file permissions", "credentials file missing"),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if !credentials.exists() {
+            return skip(13, "file permissions", "credentials file missing");
+        }
+        if let Err(error) = crate::platform::validate_private_dir(config_dir) {
+            return fail(
+                13,
+                "file permissions",
+                format!("credential directory security failed: {error}"),
+                "move the directory aside, then run spawnd possess again",
+            );
+        }
+        match crate::platform::open_private_file(&credentials, false) {
+            Ok(_) => ok(
+                13,
+                "file permissions",
+                "credentials have a protected owner-only DACL",
+            ),
+            Err(error) => fail(
+                13,
+                "file permissions",
+                format!("credential file security failed: {error}"),
+                "move the file aside, then run spawnd login again",
+            ),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = credentials;
         skip(13, "file permissions", "not available on this platform")
@@ -686,7 +813,7 @@ mod tests {
 
     #[test]
     fn check_order_is_exact() {
-        let names = [
+        let names = vec![
             "credentials",
             "signed in",
             "server reachable",
@@ -702,10 +829,41 @@ mod tests {
             "file permissions",
             "media path",
         ];
+        #[cfg(windows)]
+        let names = {
+            let mut names = names;
+            names.push("agent shell");
+            names
+        };
         for (index, name) in names.into_iter().enumerate() {
             assert_eq!(index + 1, usize::from((index + 1) as u8));
             assert!(!name.is_empty());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_shell_diagnostic_distinguishes_failure_warning_and_fallback() {
+        assert_eq!(
+            windows_agent_shell_check_for(true, false, true, false).status,
+            CheckStatus::Fail
+        );
+        assert_eq!(
+            windows_agent_shell_check_for(true, true, true, false).status,
+            CheckStatus::Warn
+        );
+        assert_eq!(
+            windows_agent_shell_check_for(true, false, true, true).status,
+            CheckStatus::Ok
+        );
+        assert_eq!(
+            windows_agent_shell_check_for(false, false, true, false).status,
+            CheckStatus::Ok
+        );
+        assert_eq!(
+            windows_agent_shell_check_for(false, false, false, true).status,
+            CheckStatus::Fail
+        );
     }
 
     #[test]

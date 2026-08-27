@@ -3,6 +3,7 @@ mod auth;
 mod crypto;
 mod install;
 mod models;
+mod platform;
 mod storage;
 mod supervision;
 mod tray;
@@ -15,7 +16,7 @@ use models::{
     PossessionProgress,
 };
 use serde::Serialize;
-use tauri::{Manager, RunEvent};
+use tauri::RunEvent;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -30,34 +31,6 @@ struct AppServices {
 /// credentials" rather than one half or the other.
 fn command_error(error: impl std::fmt::Display) -> String {
     format!("{error:#}")
-}
-
-/// How long the keychain sweep waits for a window to exist before giving up on
-/// one. Long enough for a cold launch on a slow disk, short enough that a
-/// machine which never shows a window still gets its (brief) sweep attempt.
-const WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// Whether any window is actually on screen — not merely created.
-///
-/// `window::create` makes a window long before `surface` shows it, and macOS
-/// will not render a sheet on one that is not visible. Polled at a coarse
-/// interval because nothing here is racing: the caller is a detached thread
-/// whose only job is to wait.
-fn window_is_visible_within(app: &tauri::AppHandle, bound: std::time::Duration) -> bool {
-    let deadline = std::time::Instant::now() + bound;
-    loop {
-        if app
-            .webview_windows()
-            .values()
-            .any(|window| window.is_visible().unwrap_or(false))
-        {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
 }
 
 /// Whether to show the permissions screen — and, when the answer is yes, hold
@@ -307,6 +280,9 @@ async fn install_app_update(app: tauri::AppHandle) -> Result<bool, String> {
         .download_and_install(|_, _| {}, || {})
         .await
         .map_err(command_error)?;
+    #[cfg(target_os = "windows")]
+    app.restart();
+    #[cfg(not(target_os = "windows"))]
     Ok(true)
 }
 
@@ -336,7 +312,8 @@ pub fn run() {
         // First, so a second copy — launched from a still-mounted disk image,
         // say — hands over to this one and exits before it can register as a
         // rival: a sign-in returning on spawn:// must reach the instance that
-        // started it, and the icon macOS shows for the scheme must be ours.
+        // started it. The deep-link feature relays Windows protocol argv to
+        // this first process before the callback fronts its one window.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             window::front(app);
         }))
@@ -346,31 +323,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppServices::default())
         .setup(|app| {
-            // Empty the keychain into the credential file at a moment that is
-            // the same every time, rather than from whichever secret read
-            // happens to land first — which could be mid-possession.
-            //
-            // **It waits for a window first, and that is the whole point.** A
-            // keychain prompt is a sheet, and a sheet needs something to attach
-            // to: with no visible window macOS never renders it and the read
-            // never returns — not slowly, never. Doing this in `setup` shipped
-            // an app that launched to nothing at all, no window and no error,
-            // because the sweep blocked before anything could be shown.
-            //
-            // So: wait for the window, then read with enough patience for a
-            // person to answer the sheet that can now actually appear. If no
-            // window arrives, sweep briefly anyway — it costs seconds and still
-            // succeeds on every machine where the ACL matches, which is every
-            // ordinary upgrade.
-            let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                let patience = if window_is_visible_within(&handle, WINDOW_WAIT) {
-                    storage::PATIENT
-                } else {
-                    storage::BRIEF
-                };
-                storage::run_keychain_migration(patience);
-            });
+            #[cfg(all(target_os = "windows", debug_assertions))]
+            app.deep_link().register_all()?;
             tray::install(app)?;
             window::create(app)?;
             // A sign-in that went out to the system browser comes back on the
@@ -379,7 +333,7 @@ pub fn run() {
             let handle = app.handle().clone();
             app.deep_link()
                 .on_open_url(move |_event| window::front(&handle));
-            // Launch is the product, like any app: the web app if this Mac is
+            // Launch is the product, like any app: the web app if this computer is
             // possessed, else the wizard where it left off.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -423,8 +377,8 @@ pub fn run() {
         .expect("error while building SPAWN D desktop");
     app.run(|handle, event| {
         // Explicit Quit SPAWN D exits; closing the window only hides it and
-        // leaves SPAWN D in the menu bar. Opening the app again from
-        // Launchpad or the Dock then brings the window back as it was.
+        // leaves SPAWN D in the platform tray. Reopening brings the window
+        // back as it was.
         if let RunEvent::Reopen {
             has_visible_windows: false,
             ..

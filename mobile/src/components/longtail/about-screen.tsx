@@ -7,6 +7,7 @@ import { BrandMark } from "@/components/brand/brand-mark";
 import {
   DOWNLOAD_URL,
   installCommandsForBaseUrl,
+  nativeWindowsAvailableFromRelease,
   SECURITY_URL,
   SOURCE_URL,
 } from "@/components/longtail/public-content";
@@ -20,26 +21,41 @@ import { Icon } from "@/components/ui/icon";
 import { Text } from "@/components/ui/text";
 import { useToast } from "@/components/ui/toast";
 import { getBaseUrl } from "@/data/api/config";
+import { useRelease } from "@/data/queries/release";
 import { presentShareSheet } from "@/lib/share";
 import { borderWidth, duration, spacing, useTheme } from "@/theme";
 
 const PUBLIC_FALLBACK_ORIGIN = "https://spawnd.dev";
 
-type CopiedCommand = "standard" | "windows" | "prebuilt" | null;
+type CopiedCommand =
+  | "standard"
+  | "windows"
+  | "windows-wsl"
+  | "prebuilt"
+  | "windows-wsl-prebuilt"
+  | null;
 
 export interface AboutScreenProps {
   baseUrl?: string;
+  nativeWindowsAvailable?: boolean;
   version?: string;
 }
 
-export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.Element {
+export function AboutScreen({
+  baseUrl,
+  nativeWindowsAvailable,
+  version,
+}: AboutScreenProps): React.JSX.Element {
   const theme = useTheme();
   const toast = useToast();
+  const releaseQuery = useRelease(nativeWindowsAvailable === undefined);
   const [resolvedBaseUrl, setResolvedBaseUrl] = useState(baseUrl ?? PUBLIC_FALLBACK_ORIGIN);
   const [copied, setCopied] = useState<CopiedCommand>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const appVersion = version ?? Constants.expoConfig?.version ?? "Unknown";
   const commands = installCommandsForBaseUrl(resolvedBaseUrl);
+  const hasNativeWindows =
+    nativeWindowsAvailable ?? nativeWindowsAvailableFromRelease(releaseQuery.data);
 
   useEffect(() => {
     if (baseUrl !== undefined) {
@@ -85,7 +101,9 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
   const shareInstructions = async () => {
     try {
       await presentShareSheet({
-        message: `Install spawnd on a Mac or Linux machine you control:\n\n${commands.standard}\n\nAfter installation, run spawnd possess on that machine.`,
+        message: hasNativeWindows
+          ? `Install spawnd on a machine you control.\n\nmacOS / Linux:\n${commands.standard}\n\nWindows:\n${commands.windows}\n\nWindows (WSL):\n${commands.windowsWsl}\n\nAfter installation, run spawnd possess on that machine.`
+          : `Install spawnd on a machine you control.\n\nmacOS / Linux:\n${commands.standard}\n\nWindows (WSL):\n${commands.windowsWsl}\n\nAfter installation, run spawnd possess on that machine.`,
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : undefined;
@@ -139,11 +157,15 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
       </SettingsSection>
 
       <SettingsSection
-        description="Install spawnd on a Mac, Linux, or Windows machine you control."
+        description={
+          hasNativeWindows
+            ? "Install spawnd on a Mac, Linux, or Windows machine you control."
+            : "Install spawnd on a Mac or Linux machine you control, or on Windows through WSL."
+        }
         title="Install a host"
       >
         <SettingsBlock>
-          <Text variant="label">Install command</Text>
+          <Text variant="label">macOS / Linux</Text>
           <View
             style={[
               styles.commandWell,
@@ -179,8 +201,41 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
           </View>
         </SettingsBlock>
 
+        {hasNativeWindows ? (
+          <SettingsBlock>
+            <Text variant="label">Windows</Text>
+            <View
+              style={[
+                styles.commandWell,
+                {
+                  backgroundColor: theme.colors.muted,
+                  borderColor: theme.colors.border,
+                  borderRadius: theme.radii.md,
+                },
+              ]}
+            >
+              <Text selectable variant="mono">
+                {commands.windows}
+              </Text>
+            </View>
+            <Button
+              accessibilityLabel="Copy Windows install command"
+              onPress={() => void copyCommand("windows", commands.windows)}
+              size="sm"
+              variant="outline"
+            >
+              <Icon
+                color="foreground"
+                name={copied === "windows" ? "Check" : "Copy"}
+                size={spacing[4]}
+              />
+              {copied === "windows" ? "Copied" : "Copy command"}
+            </Button>
+          </SettingsBlock>
+        ) : null}
+
         <SettingsBlock>
-          <Text variant="label">Windows (via WSL)</Text>
+          <Text variant="label">{hasNativeWindows ? "Windows (WSL)" : "Windows (via WSL)"}</Text>
           <View
             style={[
               styles.commandWell,
@@ -192,26 +247,26 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
             ]}
           >
             <Text selectable variant="mono">
-              {commands.windows}
+              {commands.windowsWsl}
             </Text>
           </View>
           <Button
-            accessibilityLabel="Copy Windows install command"
-            onPress={() => void copyCommand("windows", commands.windows)}
+            accessibilityLabel="Copy Windows WSL install command"
+            onPress={() => void copyCommand("windows-wsl", commands.windowsWsl)}
             size="sm"
             variant="outline"
           >
             <Icon
               color="foreground"
-              name={copied === "windows" ? "Check" : "Copy"}
+              name={copied === "windows-wsl" ? "Check" : "Copy"}
               size={spacing[4]}
             />
-            {copied === "windows" ? "Copied" : "Copy command"}
+            {copied === "windows-wsl" ? "Copied" : "Copy command"}
           </Button>
         </SettingsBlock>
 
         <SettingsBlock>
-          <Text variant="label">Prebuilt-only smoke test</Text>
+          <Text variant="label">Prebuilt-only smoke test · macOS / Linux</Text>
           <View
             style={[
               styles.commandWell,
@@ -238,6 +293,39 @@ export function AboutScreen({ baseUrl, version }: AboutScreenProps): React.JSX.E
               size={spacing[4]}
             />
             {copied === "prebuilt" ? "Copied" : "Copy command"}
+          </Button>
+        </SettingsBlock>
+
+        <SettingsBlock>
+          <Text variant="label">Prebuilt-only smoke test · Windows (WSL)</Text>
+          <View
+            style={[
+              styles.commandWell,
+              {
+                backgroundColor: theme.colors.muted,
+                borderColor: theme.colors.border,
+                borderRadius: theme.radii.md,
+              },
+            ]}
+          >
+            <Text selectable variant="mono">
+              {commands.windowsWslPrebuiltOnly}
+            </Text>
+          </View>
+          <Button
+            accessibilityLabel="Copy Windows WSL prebuilt-only command"
+            onPress={() =>
+              void copyCommand("windows-wsl-prebuilt", commands.windowsWslPrebuiltOnly)
+            }
+            size="sm"
+            variant="outline"
+          >
+            <Icon
+              color="foreground"
+              name={copied === "windows-wsl-prebuilt" ? "Check" : "Copy"}
+              size={spacing[4]}
+            />
+            {copied === "windows-wsl-prebuilt" ? "Copied" : "Copy command"}
           </Button>
         </SettingsBlock>
       </SettingsSection>

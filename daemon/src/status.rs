@@ -96,7 +96,7 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
 }
 
 fn connection_text(state: Option<&crate::state::StateFile>) -> String {
-    let Some(state) = state.filter(|state| crate::state::pid_is_alive(state.pid)) else {
+    let Some(state) = state.filter(|state| crate::state::daemon_state_is_live(state)) else {
         return "not running — start with: spawnd reconnect".into();
     };
     if state.connected {
@@ -246,6 +246,8 @@ mod tests {
     fn auth_heartbeat_has_the_exact_status_remedy() {
         let state = crate::state::StateFile {
             pid: std::process::id(),
+            process_started_100ns: None,
+            task_breakaway_denied: None,
             version: "0.1.0".into(),
             connected: false,
             connected_at: None,
@@ -277,6 +279,9 @@ mod tests {
                     installed: true,
                     running: true,
                     name: "launchd app.spawn.spawnd.3f9ac3e1".into(),
+                    manager: None,
+                    stdout_log: None,
+                    stderr_log: None,
                 },
                 sessions: 2,
                 version: "0.4.2".into(),
@@ -296,5 +301,22 @@ mod tests {
         assert_eq!(json["instances"][0]["sessions"], 2);
         assert_eq!(json["instances"][0]["service"]["running"], true);
         assert_eq!(json["instances"][0]["browser_pins"], 3);
+    }
+
+    #[test]
+    fn windows_service_diagnostics_keep_exact_manager_name_and_log_fields() {
+        let service = crate::service::ServiceStatus {
+            installed: true,
+            running: true,
+            name: "SPAWN D spawnd-deadbeef".into(),
+            manager: Some("task-scheduler".into()),
+            stdout_log: Some(r"C:\Users\alice\AppData\Local\spawn\logs\deadbeef\spawnd.log".into()),
+            stderr_log: Some(r"C:\Users\alice\AppData\Local\spawn\logs\deadbeef\spawnd.log".into()),
+        };
+
+        let json = serde_json::to_value(service).unwrap();
+        assert_eq!(json["manager"], "task-scheduler");
+        assert_eq!(json["name"], "SPAWN D spawnd-deadbeef");
+        assert_eq!(json["stdout_log"], json["stderr_log"]);
     }
 }

@@ -42,6 +42,14 @@ export const host = {
   home_dir: "/Users/tester",
 };
 
+export const windowsHost = {
+  ...host,
+  name: "Windows PC",
+  os: "windows",
+  arch: "x86_64",
+  home_dir: "C:\\Users\\tester",
+};
+
 export const agentDefinition = {
   id: AGENT_ID,
   owner_user_id: null,
@@ -254,6 +262,10 @@ export interface AppMockOptions {
   hostAgents?: Record<string, Array<Record<string, unknown>>>;
   sessionSkills?: Record<string, string[]>;
   workspaceFull?: boolean;
+  /** Additive `/api/release.desktop` block exposed to download surfaces. */
+  releaseDesktop?: JsonRecord | null;
+  /** Verified daemon target IDs exposed by the release manifest. */
+  releaseDaemonTargets?: string[];
   updateWorkspace?: (
     id: string,
     body: unknown,
@@ -1199,11 +1211,21 @@ export async function mockApp(page: Page, options: AppMockOptions = {}): Promise
       return;
     }
     if (path === "/api/release" && method === "GET") {
+      const releaseTargets = options.releaseDaemonTargets ?? [];
       await json(route, {
         server: { commit: null, dirty: false },
         web: { build_id: null },
-        daemon: null,
+        daemon:
+          releaseTargets.length > 0
+            ? {
+                commit: "1".repeat(40),
+                tree: "2".repeat(40),
+                version: "0.2.0",
+                targets: Object.fromEntries(releaseTargets.map((target) => [target, {}])),
+              }
+            : null,
         mobile: { tree: null, runtime_version: null },
+        desktop: options.releaseDesktop ?? null,
         protocols: { daemon: null, browser: null, alerts: null },
       });
       return;

@@ -173,9 +173,9 @@ printf '%s\n' "== mobile typecheck + lint + tests =="
 (cd mobile && npm run ci)
 
 printf '%s\n' "== desktop typecheck + lint + tests =="
-# macOS only: the app is a Tauri v2 bundle and its crate links the daemon, so
-# it neither builds nor means anything elsewhere. Skipping loudly beats a green
-# run that silently checked nothing.
+# This local lane exercises the macOS Tauri bundle and daemon linkage. Native
+# Windows daemon, desktop, and PowerShell installer checks run on
+# `windows-latest` in `.github/workflows/windows.yml`.
 if [[ "$(uname -s)" == "Darwin" ]]; then
   (
     cd desktop
@@ -186,7 +186,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     cargo test --locked
   )
 else
-  printf '%s\n' "not macOS — the desktop app is not built or checked here"
+  printf '%s\n' "not macOS — native Windows checks run in .github/workflows/windows.yml"
 fi
 
 printf '%s\n' "== diff hygiene =="

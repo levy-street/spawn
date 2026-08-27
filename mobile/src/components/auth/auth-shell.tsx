@@ -140,7 +140,7 @@ function AuthRailAction({
 function BrandLockup() {
   const theme = useTheme();
   return (
-    <View accessibilityLabel="spawnd" accessible style={styles.brandLockup}>
+    <View accessibilityLabel="SPAWN D" accessible style={styles.brandLockup}>
       <BrandMark color={theme.colors.brandAccent} size={spacing[9]} testID="auth-brand-mark" />
       <Wordmark color={theme.colors.brandAccent} height={spacing[7]} testID="auth-wordmark" />
     </View>

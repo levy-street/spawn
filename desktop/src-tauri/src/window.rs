@@ -1,6 +1,6 @@
 //! The one window.
 //!
-//! SPAWN D has a single window with two faces. Until this Mac is possessed the
+//! SPAWN D has a single window with two faces. Until this computer is possessed the
 //! window is the wizard: the bundled sign-in and possession pages, with IPC.
 //! After that it is the product: the web app from the chosen server, loaded
 //! into the same window, signed in by way of the cookie the server sets when
@@ -14,7 +14,9 @@
 //!
 //! The webview also wears a user agent the web app can recognise, so the
 //! product face can drop the chrome that would walk someone out of the app and
-//! into a website ([`USER_AGENT`]).
+//! into a website. WKWebView gets the fixed Safari-shaped agent below;
+//! WebView2 keeps its live Edge agent and has the same product token appended
+//! by the Windows helper module.
 
 use std::sync::Mutex;
 
@@ -28,6 +30,9 @@ use tauri::{
 use tauri_plugin_opener::OpenerExt;
 
 use crate::{auth, storage};
+
+#[cfg(target_os = "windows")]
+mod windows;
 
 pub const LABEL: &str = "main";
 const SESSION_COOKIE: &str = "spawn_session";
@@ -56,7 +61,8 @@ const LOG: &str = "spawn-d window";
 /// stated rather than detected because the agent is fixed when the webview is
 /// built, and there is no way to read WebKit's own first. Behind by a release
 /// is harmless; the token that matters is the last one.
-const USER_AGENT: &str = concat!(
+#[cfg(not(target_os = "windows"))]
+const MACOS_USER_AGENT: &str = concat!(
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ",
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.2 Safari/605.1.15 ",
     "SpawnDesktop/",
@@ -84,13 +90,17 @@ pub fn create(app: &App) -> Result<WebviewWindow> {
     let allowed_home = home.clone();
     let opener = app.handle().clone();
     let popup_opener = app.handle().clone();
-    let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
+    let builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
         .title("SPAWN D")
         .inner_size(WIZARD_SIZE.0, WIZARD_SIZE.1)
         .min_inner_size(WIZARD_MIN_SIZE.0, WIZARD_MIN_SIZE.1)
         .center()
-        .visible(false)
-        .user_agent(USER_AGENT)
+        .visible(false);
+    // WebView2 must keep the runtime's real Edge identity. Its platform helper
+    // reads that live agent and appends our token after the webview exists.
+    #[cfg(not(target_os = "windows"))]
+    let builder = builder.user_agent(MACOS_USER_AGENT);
+    let window = builder
         // The window is the wizard or the web app and nothing else. A link to
         // anywhere else — docs, GitHub, a provider's sign-in — belongs in the
         // system browser, which also keeps third-party pages out of this view.
@@ -141,12 +151,14 @@ pub fn create(app: &App) -> Result<WebviewWindow> {
         })
         .build()
         .context("creating the SPAWN D window")?;
+    #[cfg(target_os = "windows")]
+    windows::append_user_agent(&window);
     app.manage(WizardHome(home));
     app.manage(PendingHandover(Mutex::new(Handover::Idle)));
     let handle = app.handle().clone();
     window.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
-            // Closing leaves SPAWN D in the menu bar; no Dock tile meanwhile.
+            // Closing leaves SPAWN D in the platform's tray surface.
             api.prevent_close();
             if let Some(window) = handle.get_webview_window(LABEL) {
                 let _ = window.hide();
@@ -158,7 +170,7 @@ pub fn create(app: &App) -> Result<WebviewWindow> {
     Ok(window)
 }
 
-/// Whatever this Mac is up to: the product once it is possessed, else the
+/// Whatever this computer is up to: the product once it is possessed, else the
 /// wizard where it was left.
 pub async fn surface(app: &AppHandle) -> Result<()> {
     let possessed = storage::load_preferences()
@@ -218,7 +230,10 @@ pub async fn show_product(app: &AppHandle) -> Result<()> {
             Err(error) => eprintln!("{LOG}: continuing without a browser session: {error:#}"),
         }
     } else {
-        eprintln!("{LOG}: no account on this Mac; opening the product signed out");
+        eprintln!(
+            "{LOG}: no account on {}; opening the product signed out",
+            crate::platform::THIS_COMPUTER
+        );
     }
     let (width, height) = product_size(app);
     let _ = window.set_size(LogicalSize::new(width, height));
@@ -456,7 +471,15 @@ fn wizard_home(app: &App) -> Url {
             return url;
         }
     }
-    Url::parse("tauri://localhost/").expect("a fixed URL parses")
+    packaged_wizard_home()
+}
+
+fn packaged_wizard_home() -> Url {
+    #[cfg(target_os = "windows")]
+    const WIZARD_HOME: &str = "http://tauri.localhost/";
+    #[cfg(not(target_os = "windows"))]
+    const WIZARD_HOME: &str = "tauri://localhost/";
+    Url::parse(WIZARD_HOME).expect("the fixed wizard origin parses")
 }
 
 /// Most of the screen, never more than it: a wall of terminals wants room,
@@ -551,9 +574,13 @@ mod tests {
 
     #[test]
     fn only_the_wizard_and_the_chosen_origin_share_the_window() {
-        let home = Url::parse("tauri://localhost/").unwrap();
+        let home = packaged_wizard_home();
+        #[cfg(target_os = "macos")]
+        assert_eq!(home.as_str(), "tauri://localhost/");
+        #[cfg(target_os = "windows")]
+        assert_eq!(home.as_str(), "http://tauri.localhost/");
         assert!(same_origin(
-            &Url::parse("tauri://localhost/index.html#settings").unwrap(),
+            &home.join("index.html#settings").unwrap(),
             &home
         ));
         let origin = Url::parse("https://spawnd.dev").unwrap();
@@ -740,16 +767,18 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_says_which_app_this_is_without_lying_about_the_engine() {
+    #[cfg(not(target_os = "windows"))]
+    fn the_macos_agent_says_which_app_this_is_without_lying_about_the_engine() {
         // Still a WKWebView on a Mac, which is what it is: every surface that
         // reads the platform has to keep working inside the app.
-        assert!(USER_AGENT.starts_with("Mozilla/5.0 (Macintosh; Intel Mac OS X"));
-        assert!(USER_AGENT.contains("AppleWebKit/605.1.15"));
-        assert!(USER_AGENT.contains("Safari/605.1.15"));
+        assert!(MACOS_USER_AGENT.starts_with("Mozilla/5.0 (Macintosh; Intel Mac OS X"));
+        assert!(MACOS_USER_AGENT.contains("AppleWebKit/605.1.15"));
+        assert!(MACOS_USER_AGENT.contains("Safari/605.1.15"));
         // The product token is last, and carries this build's version. The web
         // app matches on exactly this prefix (`web/src/lib/platform.ts`).
-        let token = USER_AGENT.rsplit(' ').next().unwrap();
+        let token = MACOS_USER_AGENT.rsplit(' ').next().unwrap();
         assert_eq!(token, format!("SpawnDesktop/{}", env!("CARGO_PKG_VERSION")));
         assert!(token.starts_with("SpawnDesktop/"));
+        assert_eq!(MACOS_USER_AGENT.matches("SpawnDesktop/").count(), 1);
     }
 }

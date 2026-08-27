@@ -40,6 +40,14 @@ export const offlineHost: HostOut = {
   mem_bucket: null,
 };
 
+export const windowsHost: HostOut = {
+  ...onlineHost,
+  id: "77777777-7777-4777-8777-777777777777",
+  name: "studio-pc",
+  os: "windows",
+  arch: "x86_64",
+};
+
 export const codexAgent: AgentOut = {
   id: AGENT_ID,
   owner_user_id: null,

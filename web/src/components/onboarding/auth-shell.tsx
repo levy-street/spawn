@@ -184,7 +184,7 @@ function BrandLockup({ className }: { className?: string }) {
   return (
     <Link
       href="/"
-      aria-label="spawnd home"
+      aria-label="SPAWN D home"
       className={cn(
         shape,
         "transition-colors hover:text-ember focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ember",

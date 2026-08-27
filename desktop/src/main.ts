@@ -91,7 +91,7 @@ interface LocalStatus {
   status: Record<string, unknown>;
   doctor: Record<string, unknown> | null;
   heartbeat: { connected: boolean; sessions: number; last_error: unknown } | null;
-  launchctl: string;
+  service: string;
   hosts: unknown;
   release: unknown;
   log_tail: string;
@@ -123,6 +123,20 @@ const STALLED_MS = 60_000;
 const COPIED_MS = 1_500;
 const STATUS_REFRESH_MS = 15_000;
 const SESSION_RENEW_MS = 12 * 60 * 60_000;
+const WINDOWS = /Windows/i.test(navigator.userAgent);
+const OS_COPY = WINDOWS
+  ? {
+      thisComputer: "this PC",
+      thisComputerCapitalized: "This PC",
+      shell: "PowerShell",
+      tray: "system tray",
+    }
+  : {
+      thisComputer: "this Mac",
+      thisComputerCapitalized: "This Mac",
+      shell: "Terminal",
+      tray: "menu bar",
+    };
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (root === null) throw new Error("SPAWN D window root is unavailable");
@@ -163,7 +177,7 @@ let waitStartedAt: number | null = null;
 let ticker: number | null = null;
 let copiedUntil = 0;
 /**
- * The reader's own answer to the host gate's Terminal panel, or null while
+ * The reader's own answer to the host gate's shell panel, or null while
  * they have not given one and the screen decides for them (a failure or a
  * stalled run opens it).
  *
@@ -192,7 +206,9 @@ let hostRunStarted = false;
  */
 let permissionsError: string | null = null;
 const completedSteps = new Set<number>();
-let terminalCommand = `curl -fsSL ${HOSTED_ORIGIN}/install.sh | sh`;
+let terminalCommand = WINDOWS
+  ? `irm ${HOSTED_ORIGIN}/install.ps1 | iex`
+  : `curl -fsSL ${HOSTED_ORIGIN}/install.sh | sh`;
 let status: LocalStatus | null = null;
 let statusLoading = false;
 let appUpdate: AppUpdate | null = null;
@@ -239,8 +255,7 @@ const PROVIDER_MARKS: Record<string, string> = {
 const PAIRING_FAILURES: Record<string, string> = {
   expired: "That approval expired. Try again — SPAWN D runs the ceremony afresh.",
   denied: "The approval was declined. Nothing was registered.",
-  key_conflict:
-    "This machine was set up before, under a different SPAWN D account, and that account still holds its identity. Nothing was changed.\n• To use it under that account: sign in there and approve as usual.\n• To hand it to this account: remove the host from the old account's Hosts page first, then try again.\n• To keep both accounts on this machine: run spawnd possess --new-account in Terminal.",
+  key_conflict: `This machine was set up before, under a different SPAWN D account, and that account still holds its identity. Nothing was changed.\n• To use it under that account: sign in there and approve as usual.\n• To hand it to this account: remove the host from the old account's Hosts page first, then try again.\n• To keep both accounts on this machine: run spawnd possess --new-account in ${OS_COPY.shell}.`,
   pin_conflict:
     "The browser that approved this machine doesn't match its earlier approval. Approve again from a browser you've used with this host before — or remove the host on the web and start fresh.",
   pin_limit:
@@ -258,26 +273,25 @@ const VERIFICATION_REFUSAL = "This host could not be verified.";
  */
 const RESUMED: Record<string, { title: string; body: string; action: string }> = {
   already_possessed_here: {
-    title: "This Mac is already possessed",
+    title: `${OS_COPY.thisComputerCapitalized} is already possessed`,
     body: "It already runs SPAWN D for this account, so nothing was changed — its daemon is running in the background and every device you own can reach it.",
     action: '<button class="btn btn-primary" data-action="open-app">Open SPAWN D</button>',
   },
   already_possessed_other: {
-    title: "This Mac already runs SPAWN D",
-    body: "It is signed in to a different account, and nothing was changed. To run it for this account as well, use the Terminal line below with --new-account — the two instances stay separate.",
+    title: `${OS_COPY.thisComputerCapitalized} already runs SPAWN D`,
+    body: `It is signed in to a different account, and nothing was changed. To run it for this account as well, use the ${OS_COPY.shell} line below with --new-account — the two instances stay separate.`,
     action: '<button class="btn btn-outline" data-action="try-again">Try again</button>',
   },
   no_ceremony: {
     title: "Nothing to approve",
-    body: "The daemon finished without asking for approval, and nothing was changed. Try again, or run the Terminal line below and approve from the link it prints.",
+    body: `The daemon finished without asking for approval, and nothing was changed. Try again, or run the ${OS_COPY.shell} line below and approve from the link it prints.`,
     action: '<button class="btn btn-outline" data-action="try-again">Try again</button>',
   },
 };
 const REFUSAL_MISMATCH =
   "This host's identity could not be verified: the server presented a different identity key than the one in your host's link. Nothing was trusted and no access was granted. This can mean the connection is being tampered with — start over on a network you trust.";
 const STALLED_HINT = "Having trouble? Try again — it's safe to repeat.";
-const DOCTOR_HINT =
-  "Still stuck? Run spawnd doctor in Terminal on this Mac — it checks the daemon, its service, and the connection back here, and says what is wrong.";
+const DOCTOR_HINT = `Still stuck? Run spawnd doctor in ${OS_COPY.shell} on ${OS_COPY.thisComputer} — it checks the daemon, its service, and the connection back here, and says what is wrong.`;
 
 /**
  * Setup progress, one row per step the daemon reports (`possess-step`).
@@ -285,7 +299,7 @@ const DOCTOR_HINT =
  * Three labels, because a row means three different things. Before the button
  * is pressed nothing is happening, and the active labels read there as four
  * things already under way — a download that has not started, over a button
- * that starts it. `todo` is what this Mac is about to be put through; `active`
+ * that starts it. `todo` is what this computer is about to be put through; `active`
  * is the one row actually running; `done` is what it left behind.
  */
 const HOST_STEPS: readonly { todo: string; active: string; done: string }[] = [
@@ -294,8 +308,16 @@ const HOST_STEPS: readonly { todo: string; active: string; done: string }[] = [
     active: "Downloading the daemon…",
     done: "Daemon downloaded and verified",
   },
-  { todo: "Register this Mac", active: "Registering this Mac…", done: "Registered" },
-  { todo: "Approve this Mac", active: "Waiting for approval…", done: "Approved" },
+  {
+    todo: `Register ${OS_COPY.thisComputer}`,
+    active: `Registering ${OS_COPY.thisComputer}…`,
+    done: "Registered",
+  },
+  {
+    todo: `Approve ${OS_COPY.thisComputer}`,
+    active: "Waiting for approval…",
+    done: "Approved",
+  },
   { todo: "Come online", active: "Connecting…", done: "Online" },
 ];
 /** The one row that waits on the person, not the machine. */
@@ -587,9 +609,9 @@ function unsupportedServerView(): string {
   if (!settled) {
     channel = paceBar("Checking for a newer SPAWN D…");
   } else if (ready) {
-    channel = `<div class="inset" role="status"><p><strong>SPAWN D ${escapeHtml(appUpdate?.version ?? "")} is ready</strong></p><p class="muted">A newer app may already know the way round this. It comes from the signed app channel and restarts itself; the daemon on this Mac is not touched.</p></div>`;
+    channel = `<div class="inset" role="status"><p><strong>SPAWN D ${escapeHtml(appUpdate?.version ?? "")} is ready</strong></p><p class="muted">A newer app may already know the way round this. It comes from the signed app channel and restarts itself; the daemon on ${OS_COPY.thisComputer} is not touched.</p></div>`;
   } else if (updateCheck === "failed") {
-    channel = `<p class="status-line" role="status">${escapeHtml("The signed app channel couldn’t be reached, so whether a newer SPAWN D exists is unknown. Nothing on this Mac has changed.")}</p>`;
+    channel = `<p class="status-line" role="status">${escapeHtml(`The signed app channel couldn’t be reached, so whether a newer SPAWN D exists is unknown. Nothing on ${OS_COPY.thisComputer} has changed.`)}</p>`;
   } else {
     channel = `<p class="status-line" role="status">${escapeHtml("SPAWN D is already the current release — this server is the half that is behind.")}</p>`;
   }
@@ -607,7 +629,7 @@ function unsupportedServerView(): string {
     stacked(
       "That server is out of date",
       `${escapeHtml(serverHost())} is running an older SPAWN D than this app needs.`,
-      `<div class="stack"><div class="inset"><p class="muted">Signing in here needs an endpoint this server does not have yet, and this Mac could not be possessed by it. Update the server to the current release, point SPAWN D at another one — or update this app, in case it is the half that is behind.</p></div>${channel}${errorLine()}<div class="actions">${actions}</div></div>`,
+      `<div class="stack"><div class="inset"><p class="muted">Signing in here needs an endpoint this server does not have yet, and ${OS_COPY.thisComputer} could not be possessed by it. Update the server to the current release, point SPAWN D at another one — or update this app, in case it is the half that is behind.</p></div>${channel}${errorLine()}<div class="actions">${actions}</div></div>`,
     ),
   );
 }
@@ -633,7 +655,11 @@ function serverView(): string {
     </form>`;
   return sheet(
     hatchBack(),
-    stacked("Choose your server", "The server this app and the daemon on this Mac answer to.", body),
+    stacked(
+      "Choose your server",
+      `The server this app and the daemon on ${OS_COPY.thisComputer} answer to.`,
+      body,
+    ),
   );
 }
 
@@ -754,7 +780,7 @@ function hostView(): string {
       }</div>`;
   } else if (review && !review.exact_key_match) {
     // The one review that is still a question — and the answer is no. The key
-    // the server presented is not the one this Mac's daemon printed, so there
+    // the server presented is not the one this computer's daemon printed, so there
     // is nothing to approve here, only something to walk away from.
     action = `
       <div class="failure" data-testid="possess-refusal"><h3>This host could not be verified</h3><p>${escapeHtml(REFUSAL_MISMATCH)}</p></div>
@@ -767,11 +793,11 @@ function hostView(): string {
     action = `
       <div class="inset" role="status" data-testid="possess-approve-screen">
         <p><strong>Approving ${escapeHtml(review.host_name)}</strong></p>
-        <p class="muted">SPAWN D matched this Mac’s identity against the link its daemon printed. All your devices get access to it.</p>
+        <p class="muted">SPAWN D matched ${OS_COPY.thisComputer}’s identity against the link its daemon printed. All your devices get access to it.</p>
         ${paceBar(`Approving ${review.host_name}…`)}
       </div>`;
   } else if (possession?.status === "approved") {
-    action = `<div class="inset"><p>Connecting</p><p class="muted">Approved. The daemon is starting up and calling home — this usually takes a few seconds.</p>${paceBar("Waiting for this Mac to come online…")}</div>`;
+    action = `<div class="inset"><p>Connecting</p><p class="muted">Approved. The daemon is starting up and calling home — this usually takes a few seconds.</p>${paceBar(`Waiting for ${OS_COPY.thisComputer} to come online…`)}</div>`;
   } else {
     action = "";
   }
@@ -786,11 +812,11 @@ function hostView(): string {
   const copied = Date.now() < copiedUntil;
   const terminal = `
     <details ${(terminalOpen ?? ((failure && !refused && failure !== "already_possessed_here") || stalled)) ? "open" : ""} data-panel="terminal">
-      <summary>Use the Terminal instead</summary>
+      <summary>Use ${OS_COPY.shell} instead</summary>
       <div class="stack-tight">
         <div class="chip"><span class="dollar">$</span><code>${escapeHtml(terminalCommand)}</code><button type="button" class="${copied ? "done" : ""}" data-action="copy-command" aria-label="Copy install command">${copied ? "Copied" : "Copy"}</button></div>
-        <p class="note">After installation, run <code>spawnd possess</code> on this Mac.</p>
-        <p class="note">Already running SPAWN D for another account on this Mac? Add <code>--new-account</code>.</p>
+        <p class="note">After installation, run <code>spawnd possess</code> on ${OS_COPY.thisComputer}.</p>
+        <p class="note">Already running SPAWN D for another account on ${OS_COPY.thisComputer}? Add <code>--new-account</code>.</p>
       </div>
     </details>`;
 
@@ -805,7 +831,7 @@ function hostView(): string {
     hatchAccount(),
     split(
       "host",
-      "Possess this Mac",
+      `Possess ${OS_COPY.thisComputer}`,
       `SPAWN D installs the daemon from ${escapeHtml(serverHost())}, verifies it, and approves it here — the same ceremony the terminal link runs, without the terminal.`,
       body,
     ),
@@ -863,15 +889,15 @@ function permissionsView(): string {
  * is the one that appears if the opening fails.
  */
 function doneView(): string {
-  const host = possession?.host_name ?? preferences.host_name ?? "This Mac";
+  const host = possession?.host_name ?? preferences.host_name ?? OS_COPY.thisComputerCapitalized;
   const body = `
     <div class="stack">
       <div class="inset">
         <p><strong>${escapeHtml(host)}</strong> is online. All your devices can reach it.</p>
         <p class="muted">${
           error
-            ? "The window couldn’t open the app — that is this app, not this Mac. Your host stays online and the daemon keeps running either way."
-            : "SPAWN D opens in a moment. It stays in your menu bar; the daemon keeps running on its own."
+            ? `The window couldn’t open the app — that is this app, not ${OS_COPY.thisComputer}. Your host stays online and the daemon keeps running either way.`
+            : `SPAWN D opens in a moment. It stays in your ${OS_COPY.tray}; the daemon keeps running on its own.`
         }</p>
         ${busy ? paceBar("Opening SPAWN D…") : ""}
       </div>
@@ -895,19 +921,19 @@ function settingsView(): string {
   const connected = status?.heartbeat?.connected ?? false;
   const body = `
     <div class="stack">
-      <div class="status-band"><span class="status-dot ${connected ? "online" : ""}"></span><div><strong>${connected ? "Possessed, online" : status ? "Possessed, offline" : "Checking this Mac…"}</strong><small>${escapeHtml(preferences.host_name ?? "This Mac")} · ${escapeHtml(serverHost())}${preferences.account_email ? ` · ${escapeHtml(preferences.account_email)}` : ""}</small></div></div>
+      <div class="status-band"><span class="status-dot ${connected ? "online" : ""}"></span><div><strong>${connected ? "Possessed, online" : status ? "Possessed, offline" : `Checking ${OS_COPY.thisComputer}…`}</strong><small>${escapeHtml(preferences.host_name ?? OS_COPY.thisComputerCapitalized)} · ${escapeHtml(serverHost())}${preferences.account_email ? ` · ${escapeHtml(preferences.account_email)}` : ""}</small></div></div>
       <div class="menu">
         <button data-action="open-app"><span><strong>Open SPAWN D</strong><small>Your workspaces and terminals, in this app</small></span><b>↗</b></button>
         <button data-action="show-repair"><span><strong>Repair…</strong><small>Run the daemon’s own recovery path</small></span><b>›</b></button>
         <button data-action="check-update"><span><strong>Update SPAWN D…</strong><small>${appUpdate?.available ? `Version ${escapeHtml(appUpdate.version)} is ready` : "Check the signed app channel"}</small></span><b>${appUpdate?.available ? "↓" : "↻"}</b></button>
-        <button class="danger" data-action="confirm-stop"><span><strong>Stop possessing this Mac…</strong><small>Removes the daemon service and this Mac’s registration</small></span><b>—</b></button>
+        <button class="danger" data-action="confirm-stop"><span><strong>Stop possessing ${OS_COPY.thisComputer}…</strong><small>Removes the daemon service and ${OS_COPY.thisComputer}’s registration</small></span><b>—</b></button>
       </div>
       ${errorLine()}
       <details class="diagnostics"><summary>Daemon details</summary><pre>${escapeHtml(JSON.stringify(instance ?? status?.status ?? {}, null, 2))}</pre></details>
     </div>`;
   return sheet(
     "",
-    `<div class="stacked">${LOCKUP}<section class="plate"><header class="plate-head with-close"><div><h1>Settings</h1><p class="lead">SPAWN D lives in your menu bar.</p></div><button class="close" data-action="close-window" aria-label="Back to SPAWN D">×</button></header><div class="plate-body">${body}</div></section></div>`,
+    `<div class="stacked">${LOCKUP}<section class="plate"><header class="plate-head with-close"><div><h1>Settings</h1><p class="lead">SPAWN D lives in your ${OS_COPY.tray}.</p></div><button class="close" data-action="close-window" aria-label="Back to SPAWN D">×</button></header><div class="plate-body">${body}</div></section></div>`,
   );
 }
 
@@ -934,11 +960,18 @@ function repairView(): string {
 function stopView(): string {
   const body = `
     <div class="stack">
-      <p class="note">This runs <code>spawnd exorcise</code>: the daemon service and this Mac’s registration are removed. Your account and the app stay.</p>
+      <p class="note">This runs <code>spawnd exorcise</code>: the daemon service and ${OS_COPY.thisComputer}’s registration are removed. Your account and the app stay.</p>
       ${errorLine()}
       <div class="actions"><button class="btn btn-outline danger" data-action="stop-possessing" ${busy ? "disabled" : ""}>${busy ? "Stopping…" : "Stop possessing"}</button><button class="btn btn-ghost" data-action="settings">Cancel</button></div>
     </div>`;
-  return sheet("", stacked("Stop possessing this Mac?", "The daemon stops answering for this Mac. Nothing else is touched.", body));
+  return sheet(
+    "",
+    stacked(
+      `Stop possessing ${OS_COPY.thisComputer}?`,
+      `The daemon stops answering for ${OS_COPY.thisComputer}. Nothing else is touched.`,
+      body,
+    ),
+  );
 }
 
 function updateView(): string {
@@ -1062,8 +1095,8 @@ async function act(action: string): Promise<void> {
       await guarded(() => invoke("open_app"));
       break;
     case "close-window":
-      // Once this Mac is possessed the window is the product; leaving a
-      // wizard surface means going back to it, not to the menu bar.
+      // Once this computer is possessed the window is the product; leaving a
+      // wizard surface means going back to it, not to the tray.
       if (preferences.first_run_complete) await guarded(() => invoke("open_app"));
       else window.close();
       break;
@@ -1388,7 +1421,7 @@ function resetPossession(): void {
 }
 
 /**
- * Possess this Mac.
+ * Possess this computer.
  *
  * The gate is on screen before the daemon is even asked for, so the wait for
  * `begin_possession` is reported by the checklist's first row rather than by
@@ -1581,12 +1614,6 @@ async function initialize(): Promise<void> {
     for (const url of urls) void handleDeepLink(url);
   });
 
-  // The move out of the keychain (`storage.rs`) is deliberately not announced
-  // here. It cannot know whether macOS will actually ask — finding that out
-  // means probing the keychain, which *is* the dialog — so a screen would have
-  // shown to everyone while only builds whose signature changed ever see a
-  // prompt. The sweep runs from the Rust `setup` hook at launch, so nothing
-  // here needs to call it.
   if (preferences.first_run_complete) {
     // The window is only the wizard here because the tray asked for one of
     // its surfaces by name while the product had it; the hash says which.

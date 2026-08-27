@@ -5,6 +5,14 @@ use std::sync::atomic::AtomicBool;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
+
+fn test_executable(directory: &Path, stem: &str) -> PathBuf {
+    directory.join(crate::platform::executable_name(stem))
+}
+
+fn test_executable_variant(directory: &Path, stem: &str, tag: &str) -> PathBuf {
+    crate::platform::executable_variant(&test_executable(directory, stem), tag).unwrap()
+}
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn manifest_request() -> UpdateRequest {
@@ -232,7 +240,7 @@ fn sha256_comparison_rejects_mismatch_and_malformed_values() {
 #[tokio::test]
 async fn version_check_requires_success_and_expected_suffix() {
     let directory = tempdir().unwrap();
-    let binary = directory.path().join("spawnd.tmp");
+    let binary = test_executable_variant(directory.path(), "spawnd", "tmp");
     fs::write(
         &binary,
         b"#!/bin/sh\nprintf 'spawnd 0.1.0+g123456789abc\\n'\n",
@@ -250,11 +258,40 @@ async fn version_check_requires_success_and_expected_suffix() {
     assert_eq!(failure.error, "version_mismatch");
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn version_check_executes_a_real_pe_fixture() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("version-fixture.rs");
+    let binary = test_executable_variant(directory.path(), "spawnd", "tmp");
+    fs::write(
+        &source,
+        r#"fn main() { println!("spawnd 0.1.0+gwindowsfixture"); }"#,
+    )
+    .unwrap();
+    let status = std::process::Command::new("rustc.exe")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .status()
+        .expect("rustc.exe must be available on Windows CI");
+    assert!(status.success(), "building PE fixture failed with {status}");
+
+    verify_version(&binary, "0.1.0+gwindowsfixture")
+        .await
+        .expect("matching native PE version");
+    let failure = verify_version(&binary, "0.1.0+gwrong")
+        .await
+        .expect_err("wrong expected version must fail");
+    assert_eq!(failure.stage, UpdateStage::Verify);
+    assert_eq!(failure.error, "version_mismatch");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn worker_pair_check_requires_the_exact_shared_tree_stamp() {
     let directory = tempdir().unwrap();
-    let worker = directory.path().join("spawn-worker");
+    let worker = test_executable(directory.path(), "spawn-worker");
     fs::write(
         &worker,
         format!(
@@ -277,8 +314,8 @@ async fn worker_pair_check_requires_the_exact_shared_tree_stamp() {
 #[test]
 fn swap_rolls_back_when_the_second_rename_fails() {
     let directory = tempdir().unwrap();
-    let live = directory.path().join("spawnd");
-    let missing_temporary = directory.path().join("spawnd.tmp");
+    let live = test_executable(directory.path(), "spawnd");
+    let missing_temporary = test_executable_variant(directory.path(), "spawnd", "tmp");
     fs::write(&live, b"old").unwrap();
 
     swap_one(&live, &missing_temporary).expect_err("missing replacement must fail");
@@ -289,10 +326,10 @@ fn swap_rolls_back_when_the_second_rename_fails() {
 #[test]
 fn worker_swap_failure_rolls_back_the_completed_daemon_swap() {
     let directory = tempdir().unwrap();
-    let daemon = directory.path().join("spawnd");
-    let daemon_temporary = directory.path().join("spawnd.tmp");
-    let worker = directory.path().join("spawn-worker");
-    let missing_worker_temporary = directory.path().join("spawn-worker.tmp");
+    let daemon = test_executable(directory.path(), "spawnd");
+    let daemon_temporary = test_executable_variant(directory.path(), "spawnd", "tmp");
+    let worker = test_executable(directory.path(), "spawn-worker");
+    let missing_worker_temporary = test_executable_variant(directory.path(), "spawn-worker", "tmp");
     fs::write(&daemon, b"old daemon").unwrap();
     fs::write(&daemon_temporary, b"new daemon").unwrap();
     fs::write(&worker, b"old worker").unwrap();
@@ -315,8 +352,8 @@ fn worker_swap_failure_rolls_back_the_completed_daemon_swap() {
 
 #[test]
 fn precondition_reasons_are_short_stable_classes() {
-    let daemon = PathBuf::from("/daemon/spawnd");
-    let worker = PathBuf::from("/worker/spawn-worker");
+    let daemon = PathBuf::from("/daemon").join(crate::platform::executable_name("spawnd"));
+    let worker = PathBuf::from("/worker").join(crate::platform::executable_name("spawn-worker"));
     let writable = |_: &Path| true;
 
     assert_eq!(
@@ -401,8 +438,87 @@ fn target_mapping_covers_only_published_platforms() {
     assert_eq!(target_for("macos", "x86_64"), Some("darwin-x86_64"));
     assert_eq!(target_for("linux", "aarch64"), Some("linux-aarch64"));
     assert_eq!(target_for("linux", "x86_64"), Some("linux-x86_64"));
-    assert_eq!(target_for("windows", "x86_64"), None);
+    assert_eq!(target_for("windows", "x86_64"), Some("windows-x86_64"));
     assert_eq!(target_for("linux", "riscv64"), None);
+}
+
+#[test]
+fn executable_update_names_keep_the_target_suffix_last() {
+    let directory = tempdir().unwrap();
+    let suffix = std::env::consts::EXE_SUFFIX;
+    for stem in ["spawnd", "spawn-worker"] {
+        let live = test_executable(directory.path(), stem);
+        assert_eq!(
+            live.file_name().unwrap().to_string_lossy(),
+            format!("{stem}{suffix}")
+        );
+        for tag in ["prev", "tmp.123", "failed.123"] {
+            assert_eq!(
+                crate::platform::executable_variant(&live, tag)
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy(),
+                format!("{stem}.{tag}{suffix}")
+            );
+        }
+    }
+    assert_eq!(
+        marker_path(&test_executable(directory.path(), "spawnd"))
+            .file_name()
+            .unwrap(),
+        "spawnd.updating"
+    );
+}
+
+#[test]
+fn signed_manifest_accepts_the_windows_target_and_rejects_target_substitution() {
+    use ed25519_dalek::Signer;
+
+    let key = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
+    let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes());
+    let key_id = digest_hex(&Sha256::digest(key.verifying_key().to_bytes()))[..8].to_string();
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "commit": "a".repeat(40),
+        "tree": "b".repeat(40),
+        "version": "0.1.0+gnew",
+        "release_counter": 2_000,
+        "signing_key_id": key_id,
+        "targets": {
+            "windows-x86_64": {
+                "spawnd_sha256": "c".repeat(64),
+                "spawn_worker_sha256": "d".repeat(64)
+            }
+        }
+    }))
+    .unwrap();
+    let signature = URL_SAFE_NO_PAD.encode(key.sign(&manifest).to_bytes());
+    let mut request = manifest_request();
+    request.target = "windows-x86_64".into();
+    request.spawnd.path = "/api/install/spawnd/windows-x86_64".into();
+    request.spawn_worker.path = "/api/install/spawn-worker/windows-x86_64".into();
+
+    verify_manifest_bytes(
+        &manifest,
+        Some(signature.as_bytes()),
+        &request,
+        "windows-x86_64",
+        false,
+        &[&public_key],
+        Some(1_000),
+    )
+    .unwrap();
+    let failure = verify_manifest_bytes(
+        &manifest,
+        Some(signature.as_bytes()),
+        &request,
+        "linux-x86_64",
+        false,
+        &[&public_key],
+        Some(1_000),
+    )
+    .unwrap_err();
+    assert_eq!(failure.error, "manifest_mismatch");
 }
 
 #[test]
@@ -419,10 +535,10 @@ fn update_guard_is_single_flight_and_releases_on_drop() {
 #[test]
 fn post_register_cleanup_removes_only_the_installed_pair_backups() {
     let directory = tempdir().unwrap();
-    let daemon = directory.path().join("spawnd");
-    let worker = directory.path().join("spawn-worker");
-    let daemon_previous = directory.path().join("spawnd.prev");
-    let worker_previous = directory.path().join("spawn-worker.prev");
+    let daemon = test_executable(directory.path(), "spawnd");
+    let worker = test_executable(directory.path(), "spawn-worker");
+    let daemon_previous = test_executable_variant(directory.path(), "spawnd", "prev");
+    let worker_previous = test_executable_variant(directory.path(), "spawn-worker", "prev");
     let unrelated = directory.path().join("notes.prev");
     fs::write(&daemon_previous, b"old daemon").unwrap();
     fs::write(&worker_previous, b"old worker").unwrap();
@@ -443,7 +559,7 @@ fn test_marker(attempts: u32, deadline_unix_ms: u64, reverted: bool) -> Probatio
         attempted_tree: "b".repeat(40),
         version_before: "0.1.0+gold".into(),
         request_id: Some("request-1".into()),
-        worker_path: PathBuf::from("/bin/spawn-worker"),
+        worker_path: PathBuf::from("/bin").join(crate::platform::executable_name("spawn-worker")),
         reverted,
     }
 }
@@ -489,8 +605,8 @@ fn reverted_probation_reports_a_stable_health_failure() {
 #[test]
 fn health_revert_restores_both_fake_binaries() {
     let directory = tempdir().unwrap();
-    let daemon = directory.path().join("spawnd");
-    let worker = directory.path().join("spawn-worker");
+    let daemon = test_executable(directory.path(), "spawnd");
+    let worker = test_executable(directory.path(), "spawn-worker");
     fs::write(&daemon, b"bad daemon").unwrap();
     fs::write(&worker, b"bad worker").unwrap();
     fs::write(previous_path(&daemon), b"old daemon").unwrap();
@@ -507,8 +623,8 @@ fn health_revert_restores_both_fake_binaries() {
 #[test]
 fn corrupt_marker_recovery_requires_both_previous_binaries() {
     let directory = tempdir().unwrap();
-    let daemon = directory.path().join("spawnd");
-    let worker = directory.path().join("spawn-worker");
+    let daemon = test_executable(directory.path(), "spawnd");
+    let worker = test_executable(directory.path(), "spawn-worker");
     fs::write(previous_path(&daemon), b"old daemon").unwrap();
     assert!(!complete_previous_pair(&daemon, &worker));
     fs::write(previous_path(&worker), b"old worker").unwrap();
@@ -530,10 +646,10 @@ async fn downloads_verifies_and_swaps_both_fake_binaries() {
     let (server, serving) = serve_responses(vec![daemon_bytes.clone(), worker_bytes.clone()]).await;
 
     let directory = tempdir().unwrap();
-    let live_daemon = directory.path().join("spawnd");
-    let live_worker = directory.path().join("spawn-worker");
-    let temp_daemon = directory.path().join("spawnd.tmp.test");
-    let temp_worker = directory.path().join("spawn-worker.tmp.test");
+    let live_daemon = test_executable(directory.path(), "spawnd");
+    let live_worker = test_executable(directory.path(), "spawn-worker");
+    let temp_daemon = test_executable_variant(directory.path(), "spawnd", "tmp.test");
+    let temp_worker = test_executable_variant(directory.path(), "spawn-worker", "tmp.test");
     fs::write(&live_daemon, b"old daemon").unwrap();
     fs::write(&live_worker, b"old worker").unwrap();
 

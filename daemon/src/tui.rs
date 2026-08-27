@@ -532,6 +532,7 @@ pub struct Ui {
     state: Option<Arc<Mutex<UiState>>>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    _vt: Option<crate::platform::VtOutputGuard>,
 }
 
 impl Ui {
@@ -545,8 +546,17 @@ impl Ui {
                 state: None,
                 stop: Arc::new(AtomicBool::new(true)),
                 thread: None,
+                _vt: None,
             };
         }
+        let Some(vt) = crate::platform::enable_vt_output() else {
+            return Self {
+                state: None,
+                stop: Arc::new(AtomicBool::new(true)),
+                thread: None,
+                _vt: None,
+            };
+        };
         let state = Arc::new(Mutex::new(UiState {
             title: title.to_owned(),
             steps: steps
@@ -595,6 +605,7 @@ impl Ui {
             state: Some(state),
             stop,
             thread: Some(thread),
+            _vt: Some(vt),
         }
     }
 
@@ -1000,34 +1011,6 @@ pub fn render_choice_row(
     )
 }
 
-/// Put the terminal in raw mode for the duration, and restore it on every exit
-/// path — including a panic, since `Drop` still runs while unwinding.
-///
-/// Leaving a terminal raw is worse than any prompt failing: the shell that
-/// comes back has no echo and no line editing.
-struct RawMode {
-    saved: nix::sys::termios::Termios,
-}
-
-impl RawMode {
-    fn enter() -> Option<Self> {
-        use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
-        let stdin = std::io::stdin();
-        let saved = tcgetattr(&stdin).ok()?;
-        let mut raw = saved.clone();
-        cfmakeraw(&mut raw);
-        tcsetattr(&stdin, SetArg::TCSANOW, &raw).ok()?;
-        Some(Self { saved })
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        use nix::sys::termios::{tcsetattr, SetArg};
-        let _ = tcsetattr(std::io::stdin(), SetArg::TCSANOW, &self.saved);
-    }
-}
-
 /// A pick list driven by the arrow keys, with Enter to confirm.
 ///
 /// Falls back to typing a number when raw mode is unavailable, and to
@@ -1037,10 +1020,13 @@ pub fn prompt_choice(title: &str, options: &[(&str, &str)], default_index: usize
     if !std::io::stdin().is_terminal() || options.is_empty() {
         return default_index;
     }
-    match RawMode::enter() {
-        Some(raw) => arrow_choice(title, options, default_index, raw),
-        None => numbered_choice(title, options, default_index),
-    }
+    let Some(raw) = crate::platform::enable_raw_mode() else {
+        return numbered_choice(title, options, default_index);
+    };
+    let Some(vt) = crate::platform::enable_vt_output() else {
+        return numbered_choice(title, options, default_index);
+    };
+    arrow_choice(title, options, default_index, raw, vt)
 }
 
 fn choice_frame(
@@ -1074,7 +1060,8 @@ fn arrow_choice(
     title: &str,
     options: &[(&str, &str)],
     default_index: usize,
-    raw: RawMode,
+    raw: crate::platform::RawModeGuard,
+    vt: crate::platform::VtOutputGuard,
 ) -> usize {
     use std::io::Read;
     let styled = styled_stdout();
@@ -1116,6 +1103,7 @@ fn arrow_choice(
             // Raw mode suppresses signal generation, so ^C arrives as a byte.
             b"\x03" => {
                 drop(raw);
+                drop(vt);
                 let mut out = anstream::stdout();
                 let _ = writeln!(out);
                 let _ = out.flush();
@@ -1133,6 +1121,7 @@ fn arrow_choice(
         }
     }
     drop(raw);
+    drop(vt);
     selected
 }
 
@@ -1176,18 +1165,8 @@ pub const MIN_FRAME_COLUMNS: usize = 60;
 /// Above this a frame stops reading as a unit on a wide monitor.
 const MAX_FRAME_COLUMNS: usize = 92;
 
-#[cfg(unix)]
 fn ioctl_columns() -> Option<usize> {
-    // COLUMNS is a shell variable and usually is not exported, so ask the tty.
-    use nix::libc;
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
-    (ok == 0 && size.ws_col > 0).then_some(size.ws_col as usize)
-}
-
-#[cfg(not(unix))]
-fn ioctl_columns() -> Option<usize> {
-    None
+    crate::platform::terminal_size().map(|(columns, _)| columns as usize)
 }
 
 fn utf8_locale() -> bool {

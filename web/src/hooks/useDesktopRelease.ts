@@ -7,62 +7,61 @@ import {
   desktopDownloadUrl,
   desktopReleaseFromPayload,
   localDesktopBuildFromPayload,
+  nativeWindowsAvailableFromPayload,
 } from "@/lib/platform";
 
 export interface DesktopReleaseState {
-  /**
-   * The manifest's desktop block — release *identity*, so a version and the
-   * tree that proves it. Null where this deployment can prove none, which is
-   * not the same as having nothing to hand out; see `url`.
-   */
+  /** The signed manifest's desktop block, or null where this deployment ships none. */
   release: DesktopRelease | null;
-  /**
-   * Whether the asking is over — including by failing. "We have not asked yet"
-   * is not the same answer as "there is nothing to hand out", and a download
-   * pressed during that window waits for the real one rather than being sent
-   * somewhere else.
-   */
+  /** The exact platform this caller asked the deployment to hand over. */
+  platform: DesktopPlatform | null;
+  /** Whether discovery — including a development fallback — has settled. */
   settled: boolean;
-  /** The Apple Silicon disk image to hand over, once something names one. */
+  /** A URL only when the corresponding artifact was actually advertised. */
   url: string | null;
-  /** That build's version, whichever source named it. */
+  /** The resolved artifact version, whichever source named it. */
   version: string | null;
-  /**
-   * What identifies *this* build rather than its version: the desktop tree the
-   * manifest proves, or the digest of the image on disk. A development rebuild
-   * keeps its version and changes this, which is the only way a page can tell
-   * that the thing it offers is not the thing you already have.
-   */
+  /** Release tree or local artifact digest, used to distinguish same-version rebuilds. */
   buildId: string | null;
+  /** Whether verified release metadata proves the native Windows daemon exists. */
+  nativeWindowsAvailable: boolean;
 }
 
+type ResolvedBuild = {
+  version: string;
+  platforms: DesktopPlatform[];
+  buildId: string;
+};
+
 /**
- * The Mac build this deployment can hand over.
+ * The desktop build this deployment can prove for one requested platform.
  *
- * Two sources, asked in order of authority:
+ * Two sources are asked in order of authority:
  *
- * 1. `/api/release`, the release manifest. It names a version only when the
- *    checkout can prove one, so it is silent on any host with uncommitted
- *    work in `desktop/` — the ordinary state of a development machine.
- * 2. `/desktop-build`, which reports the disk image actually sitting in
- *    `public/desktop/`. Development only, by design: in production `/desktop/`
- *    is nginx's static alias and Next cannot see what is in it.
+ * 1. `/api/release`, whose desktop block carries the signed release identity.
+ * 2. `/desktop-build`, which reports artifacts actually present under
+ *    `public/desktop/` on a development checkout that cannot prove a clean
+ *    release. Production never consults this route.
  *
- * Both public download surfaces — the lander's hero and /download — hand out
- * the same file and both have to tell waiting apart from nothing, so the
- * question is asked in one place.
+ * A release response also independently proves whether native Windows daemon
+ * setup is available. That fact must survive when the desktop EXE is absent.
  */
-export function useDesktopRelease(origin: string): DesktopReleaseState {
+export function useDesktopRelease(
+  origin: string,
+  requestedPlatform: DesktopPlatform | null,
+): DesktopReleaseState {
   const [release, setRelease] = useState<DesktopRelease | null>(null);
-  const [local, setLocal] = useState<{ version: string; build: string } | null>(null);
+  const [resolvedBuild, setResolvedBuild] = useState<ResolvedBuild | null>(null);
   const [settled, setSettled] = useState(false);
+  const [nativeWindowsAvailable, setNativeWindowsAvailable] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
-    // Each ask absorbs its own failure: a server that cannot answer has still
-    // answered, as far as the button is concerned — and it must not take the
-    // next source down with it, which is exactly the case on a development
-    // machine with no API running behind the dev server.
+    setResolvedBuild(null);
+    setSettled(false);
+
+    // Each source absorbs its own failure. A development server with no API
+    // behind it may still have a freshly built companion in public/desktop/.
     const ask = async (path: string): Promise<unknown> => {
       try {
         const response = await fetch(path, {
@@ -77,27 +76,56 @@ export function useDesktopRelease(origin: string): DesktopReleaseState {
     };
 
     void (async () => {
-      const named = desktopReleaseFromPayload(await ask("/api/release"));
-      if (named) {
-        setRelease(named);
-      } else {
-        const built = localDesktopBuildFromPayload(await ask("/desktop-build"));
-        if (built) setLocal({ version: built.version, build: built.build });
+      const payload = await ask("/api/release");
+      if (controller.signal.aborted) return;
+
+      const manifestRelease = desktopReleaseFromPayload(payload);
+      setRelease(manifestRelease);
+      setNativeWindowsAvailable(nativeWindowsAvailableFromPayload(payload));
+
+      let resolved: ResolvedBuild | null = manifestRelease
+        ? {
+            version: manifestRelease.version,
+            platforms: manifestRelease.platforms,
+            buildId: manifestRelease.tree,
+          }
+        : null;
+
+      if (
+        requestedPlatform !== null &&
+        !manifestRelease?.platforms.includes(requestedPlatform) &&
+        process.env.NODE_ENV !== "production"
+      ) {
+        const local = localDesktopBuildFromPayload(await ask("/desktop-build"));
+        if (controller.signal.aborted) return;
+        if (local?.platforms.includes(requestedPlatform)) {
+          resolved = {
+            version: local.version,
+            platforms: local.platforms,
+            buildId: local.build,
+          };
+        }
       }
-      // An abort is this effect being torn down, not an answer.
-      if (!controller.signal.aborted) setSettled(true);
+
+      setResolvedBuild(resolved);
+      setSettled(true);
     })();
 
     return () => controller.abort();
-  }, []);
+  }, [requestedPlatform]);
 
-  const version = release?.version ?? local?.version ?? null;
-  const platform: DesktopPlatform = "darwin-aarch64";
+  const available =
+    requestedPlatform !== null && resolvedBuild?.platforms.includes(requestedPlatform);
   return {
     release,
+    platform: requestedPlatform,
     settled,
-    version,
-    buildId: release?.tree ?? local?.build ?? null,
-    url: version === null ? null : desktopDownloadUrl(origin, version, platform),
+    url:
+      available && requestedPlatform !== null && resolvedBuild
+        ? desktopDownloadUrl(origin, resolvedBuild.version, requestedPlatform)
+        : null,
+    version: available && resolvedBuild ? resolvedBuild.version : null,
+    buildId: available && resolvedBuild ? resolvedBuild.buildId : null,
+    nativeWindowsAvailable,
   };
 }

@@ -13,7 +13,14 @@ pub fn configured_endpoint() -> &'static str {
 #[derive(Debug, serde::Deserialize)]
 struct LatestManifest {
     version: String,
-    platforms: serde_json::Map<String, serde_json::Value>,
+    platforms: std::collections::BTreeMap<String, LatestPlatform>,
+}
+
+#[cfg(test)]
+#[derive(Debug, serde::Deserialize)]
+struct LatestPlatform {
+    signature: String,
+    url: String,
 }
 
 #[cfg(test)]
@@ -52,11 +59,41 @@ mod tests {
     }
 
     #[test]
+    fn updater_manifest_keeps_all_three_platform_payload_contracts() {
+        let bytes = br#"{
+          "version":"0.2.0",
+          "notes":"Windows support",
+          "pub_date":"2026-08-27T00:00:00Z",
+          "platforms":{
+            "darwin-aarch64":{"signature":"arm-sig","url":"https://spawnd.dev/desktop/SPAWN-D_0.2.0_darwin-aarch64.app.tar.gz"},
+            "darwin-x86_64":{"signature":"intel-sig","url":"https://spawnd.dev/desktop/SPAWN-D_0.2.0_darwin-x86_64.app.tar.gz"},
+            "windows-x86_64":{"signature":"win-sig","url":"https://spawnd.dev/desktop/SPAWN-D_0.2.0_windows-x86_64-setup.exe"}
+          }
+        }"#;
+        let manifest: LatestManifest = serde_json::from_slice(bytes).unwrap();
+        let mut platforms = manifest.platforms.keys().cloned().collect::<Vec<_>>();
+        platforms.sort();
+        assert_eq!(
+            platforms,
+            ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"]
+        );
+        let windows = &manifest.platforms["windows-x86_64"];
+        assert_eq!(windows.signature, "win-sig");
+        assert_eq!(
+            windows.url,
+            "https://spawnd.dev/desktop/SPAWN-D_0.2.0_windows-x86_64-setup.exe"
+        );
+        assert!(!windows.url.ends_with(".zip"));
+    }
+
+    #[test]
     fn tauri_configs_pin_the_committed_key_and_both_vendor_channels() {
         let stable: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let beta: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.beta.conf.json")).unwrap();
+        let windows: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.windows.conf.json")).unwrap();
         assert_eq!(
             stable.pointer("/plugins/updater/endpoints/0"),
             Some(&serde_json::Value::String(STABLE_ENDPOINT.into()))
@@ -70,6 +107,18 @@ mod tests {
                 .pointer("/plugins/updater/pubkey")
                 .and_then(|value| value.as_str()),
             Some(include_str!("../../updater.pubkey").trim())
+        );
+        assert_eq!(
+            windows.pointer("/bundle/windows/nsis/installMode"),
+            Some(&serde_json::Value::String("currentUser".into()))
+        );
+        assert_eq!(
+            windows.pointer("/bundle/windows/webviewInstallMode/type"),
+            Some(&serde_json::Value::String("downloadBootstrapper".into()))
+        );
+        assert_eq!(
+            windows.pointer("/plugins/updater/windows/installMode"),
+            Some(&serde_json::Value::String("passive".into()))
         );
     }
 }

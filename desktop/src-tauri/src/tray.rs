@@ -6,11 +6,13 @@ use tauri::menu::{
 use tauri::tray::TrayIconBuilder;
 use tauri::{App, AppHandle, Manager, Wry};
 
-/// The menu-bar mark: the brand trident, black on alpha, handed to macOS as a
-/// template image so the system inverts it for a light menu bar and dims it
-/// when the bar is inactive — the only correct way to wear a logo up there.
-/// Bundled at compile time; the tray must be drawn before any file is read.
+/// The macOS menu-bar mark remains a template image so the system can invert
+/// it. Windows receives the full-color mark and must never treat it as a
+/// template. Both are bundled so the tray is drawn before any file is read.
+#[cfg(target_os = "macos")]
 const TRAY_ICON: &[u8] = include_bytes!("../icons/tray@2x.png");
+#[cfg(target_os = "windows")]
+const TRAY_ICON: &[u8] = include_bytes!("../icons/tray-windows@2x.png");
 
 pub struct TrayState {
     menu: Menu<Wry>,
@@ -25,7 +27,10 @@ pub fn install(app: &mut App) -> Result<()> {
     let status_text = if preferences.first_run_complete {
         format!(
             "● {} — possessed, checking…",
-            preferences.host_name.as_deref().unwrap_or("This Mac")
+            preferences
+                .host_name
+                .as_deref()
+                .unwrap_or(crate::platform::THIS_COMPUTER_CAPITALIZED)
         )
     } else {
         "SPAWN D — setup needed".into()
@@ -65,9 +70,8 @@ pub fn install(app: &mut App) -> Result<()> {
             &quit,
         ])
         .build()?;
-    TrayIconBuilder::with_id("main")
+    let tray = TrayIconBuilder::with_id("main")
         .icon(Image::from_bytes(TRAY_ICON)?)
-        .icon_as_template(true)
         .tooltip("SPAWN D")
         .menu(&menu)
         .show_menu_on_left_click(true)
@@ -85,8 +89,10 @@ pub fn install(app: &mut App) -> Result<()> {
             "app-update" => show_surface(app, "update"),
             "quit" => show_surface(app, "quit"),
             _ => {}
-        })
-        .build(app)?;
+        });
+    #[cfg(target_os = "macos")]
+    let tray = tray.icon_as_template(true);
+    tray.build(app)?;
     app.manage(TrayState {
         menu,
         status,
@@ -120,7 +126,7 @@ pub fn update(app: &AppHandle, local: &crate::models::LocalStatus) {
         .status
         .get("host")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("This Mac");
+        .unwrap_or(crate::platform::THIS_COMPUTER_CAPITALIZED);
     let instance = local.status.pointer("/instances/0");
     let connection = instance
         .and_then(|value| value.get("connection"))

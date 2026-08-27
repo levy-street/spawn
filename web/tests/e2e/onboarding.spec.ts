@@ -117,6 +117,28 @@ test("returning after login derives the host step instead of restarting", async 
   await expect(page.getByLabel("Email")).toHaveCount(0);
 });
 
+test("Windows onboarding copies the WSL wrapper before native artifacts exist", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "platform", { get: () => "Win32" });
+  });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await mockApp(page, { me: user, hosts: [], workspaces: [] });
+  await page.goto("/onboarding");
+  const origin = new URL(page.url()).origin;
+  const expected = `wsl -- bash -c "curl -fsSL ${origin}/install.sh | sh"`;
+
+  await expect(page.getByRole("tab", { name: "Windows (WSL)" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await page.getByRole("button", { name: "Copy install command" }).click();
+  await expect
+    .poll(() => page.evaluate(() => window.navigator.clipboard.readText()))
+    .toBe(expected);
+});
+
 // The terminal-first arrival: `spawnd possess` prints an approval link and the
 // person following it has no account yet. Login stashes the link's `#k=`
 // fragment and signup carries them back to the ceremony, which finishes in

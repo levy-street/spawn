@@ -19,6 +19,10 @@ pub struct LastError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StateFile {
     pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_started_100ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_breakaway_denied: Option<bool>,
     pub version: String,
     pub connected: bool,
     pub connected_at: Option<String>,
@@ -69,11 +73,22 @@ pub fn connection_error_class(class: &str) -> (&'static str, &'static str) {
 }
 
 impl StateStore {
+    #[allow(dead_code)]
     pub fn new(config_dir: &Path, server: &str) -> Self {
+        Self::new_with_breakaway(config_dir, server, None)
+    }
+
+    pub fn new_with_breakaway(
+        config_dir: &Path,
+        server: &str,
+        task_breakaway_denied: Option<bool>,
+    ) -> Self {
         Self {
             path: state_path(config_dir),
             state: Mutex::new(StateFile {
                 pid: std::process::id(),
+                process_started_100ns: current_process_started_100ns(),
+                task_breakaway_denied,
                 version: crate::version::build_version(),
                 connected: false,
                 connected_at: None,
@@ -120,7 +135,16 @@ impl StateStore {
 }
 
 pub fn state_path(config_dir: &Path) -> PathBuf {
-    config_dir.join("state.json")
+    #[cfg(windows)]
+    {
+        return crate::service::instance_state_path(config_dir)
+            .expect("Windows local application data directory must resolve")
+            .join("state.json");
+    }
+    #[cfg(not(windows))]
+    {
+        config_dir.join("state.json")
+    }
 }
 
 pub fn read(config_dir: &Path) -> Result<Option<StateFile>> {
@@ -138,6 +162,14 @@ pub fn read(config_dir: &Path) -> Result<Option<StateFile>> {
         .map(Some)
 }
 
+pub fn heartbeat_is_fresh(config_dir: &Path, max_age: std::time::Duration) -> bool {
+    fs::metadata(state_path(config_dir))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < max_age)
+}
+
 fn write_atomic(path: &Path, state: &StateFile) -> Result<()> {
     let parent = path.parent().context("state path has no parent")?;
     fs::create_dir_all(parent)?;
@@ -151,7 +183,7 @@ fn write_atomic(path: &Path, state: &StateFile) -> Result<()> {
         let bytes = serde_json::to_vec(state)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
+        crate::platform::durable_replace(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -161,22 +193,139 @@ fn write_atomic(path: &Path, state: &StateFile) -> Result<()> {
 }
 
 pub fn pid_is_alive(pid: u32) -> bool {
-    #[cfg(unix)]
+    crate::platform::process_alive(pid)
+}
+
+/// Stronger Windows daemon check used by status and doctor: the process is
+/// live, is the expected running `spawnd.exe`, and (when recorded) has the
+/// same creation time so a recycled PID cannot satisfy the heartbeat.
+pub fn pid_matches_current_daemon(pid: u32, expected_started_100ns: Option<u64>) -> bool {
+    #[cfg(windows)]
     {
-        let Ok(pid) = i32::try_from(pid) else {
+        let Some(process) = open_live_process(pid) else {
             return false;
         };
-        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-            Ok(()) => true,
-            Err(nix::errno::Errno::EPERM) => true,
-            Err(_) => false,
+        if expected_started_100ns
+            .is_some_and(|expected| process_started_100ns(process.0) != Some(expected))
+        {
+            return false;
         }
+        let Some(actual) = process_image_path(process.0) else {
+            return false;
+        };
+        let Ok(expected) = std::env::current_exe() else {
+            return false;
+        };
+        same_windows_path(&actual, &expected)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(windows))]
     {
-        let _ = pid;
-        false
+        let _ = expected_started_100ns;
+        pid_is_alive(pid)
     }
+}
+
+pub fn daemon_state_is_live(state: &StateFile) -> bool {
+    pid_matches_current_daemon(state.pid, state.process_started_100ns)
+}
+
+#[cfg(windows)]
+struct OwnedProcess(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper uniquely owns the OpenProcess handle.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn open_live_process(pid: u32) -> Option<OwnedProcess> {
+    use windows_sys::Win32::Foundation::{STILL_ACTIVE, WAIT_TIMEOUT};
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: OpenProcess returns an owned handle or null. No PID-directed
+    // action occurs; this handle is used only for identity and liveness.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let process = OwnedProcess(handle);
+    // SAFETY: process owns a valid process handle used for a nonblocking wait.
+    if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_TIMEOUT {
+        return None;
+    }
+    let mut exit_code = 0_u32;
+    // SAFETY: process owns a valid process handle and exit_code is writable.
+    if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0
+        || exit_code != STILL_ACTIVE as u32
+    {
+        return None;
+    }
+    Some(process)
+}
+
+#[cfg(windows)]
+fn process_started_100ns(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    let mut created = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    // SAFETY: all FILETIME output slots are live for this call.
+    if unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+#[cfg(windows)]
+fn current_process_started_100ns() -> Option<u64> {
+    // SAFETY: GetCurrentProcess returns a process-lifetime pseudo-handle which
+    // must not be closed.
+    process_started_100ns(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() })
+}
+
+#[cfg(not(windows))]
+fn current_process_started_100ns() -> Option<u64> {
+    None
+}
+
+#[cfg(windows)]
+fn process_image_path(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<PathBuf> {
+    use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+
+    let mut buffer = vec![0_u16; 32_768];
+    let mut length = buffer.len() as u32;
+    // SAFETY: buffer and length describe writable storage; handle is live.
+    if unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) } == 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(PathBuf::from(String::from_utf16(&buffer).ok()?))
+}
+
+#[cfg(windows)]
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    fn normalized(path: &Path) -> String {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string()
+            .trim_start_matches(r"\\?\")
+            .replace('/', "\\")
+            .to_lowercase()
+    }
+    normalized(left) == normalized(right)
 }
 
 pub fn now_rfc3339() -> String {
@@ -295,5 +444,18 @@ mod tests {
             parse_rfc3339_seconds("2000-02-29T00:00:00Z"),
             Some(951_782_400)
         );
+    }
+
+    #[test]
+    fn old_state_json_without_windows_identity_fields_stays_readable() {
+        let state: StateFile = serde_json::from_str(
+            r#"{"pid":7,"version":"0.1.0","connected":false,"connected_at":null,"server":"https://spawnd.dev","last_error":null,"sessions":0}"#,
+        )
+        .unwrap();
+        assert_eq!(state.process_started_100ns, None);
+        assert_eq!(state.task_breakaway_denied, None);
+        let value = serde_json::to_value(state).unwrap();
+        assert!(value.get("process_started_100ns").is_none());
+        assert!(value.get("task_breakaway_denied").is_none());
     }
 }

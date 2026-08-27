@@ -4,7 +4,7 @@ import { StyleSheet, View } from "react-native";
 import { HostUpdateDialog } from "@/components/hosts/host-update-dialog";
 import { hostNeedsUpdatePrompt } from "@/components/hosts/host-update-status";
 import { FolderPicker } from "@/components/launcher/folder-picker";
-import { pathBasename } from "@/components/launcher/folder-picker-logic";
+import { pathBasename, pathFlavorForHostOS } from "@/components/launcher/folder-picker-logic";
 import { HostStep } from "@/components/launcher/host-step";
 import { type LaunchHome, resolveLaunchHome } from "@/components/launcher/launcher-selection";
 import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
@@ -73,7 +73,7 @@ function choiceLabel(choice: Choice): string {
 function homeDetail(home: LaunchHome | null): string | null {
   if (!home) return null;
   if (home.host.status !== "online") return `${home.host.name} is offline — pick somewhere else`;
-  return `Opens in ${pathBasename(home.cwd) || home.cwd} on ${home.host.name}`;
+  return `Opens in ${pathBasename(home.cwd, pathFlavorForHostOS(home.host.os)) || home.cwd} on ${home.host.name}`;
 }
 
 /**
@@ -425,6 +425,7 @@ export function LauncherSheet({
             }}
             recentError={recents.error?.message ?? null}
             recentDirectories={recents.data}
+            pathFlavor={pathFlavorForHostOS(pickerHost?.os)}
             transport={hostTransport}
             transportState={hostTransportState}
           />

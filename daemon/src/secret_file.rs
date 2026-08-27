@@ -2,22 +2,23 @@
 //!
 //! Two programs in this product keep long-lived secrets in the user's own
 //! files: the daemon (`creds.rs` — its token, its Ed25519 host seed, its
-//! browser pins) and the macOS companion (`desktop/src-tauri/src/storage.rs` —
+//! browser pins) and the desktop companion (`desktop/src-tauri/src/storage.rs` —
 //! its session token and device seed). They keep very different *records*, and
 //! nothing here knows or cares what those records contain. What they must not
-//! differ on is the handling: the bytes are written atomically at mode 0600,
-//! reread only from a regular file this user owns with no group or other bits,
-//! opened `NOFOLLOW` so a swapped symlink cannot redirect it, and serialised
-//! across processes by a lock file held for the whole read-modify-write.
+//! differ on is the handling: the bytes are written atomically with access only
+//! for the current user (mode 0600 on Unix, a protected owner-only DACL on
+//! Windows), reread only from a regular non-reparse file that identity owns,
+//! opened without following links, and serialised across processes by a lock
+//! file held for the whole read-modify-write.
 //!
 //! Every one of those is a thing that is easy to get subtly wrong and hard to
 //! notice when you have: a non-atomic write loses the token on a crash between
-//! truncate and flush, a missing parent-directory fsync loses the *rename* on
-//! power loss, a forgotten `NOFOLLOW` lets anything that can create a file in
-//! the directory choose what gets read, and a missing lock lets two processes
-//! each write a whole record over the other's. One implementation of that is
-//! worth more than two correct ones, because there is only one to audit and
-//! only one place a fix has to land.
+//! truncate and flush, a missing durable replacement loses the *rename* on
+//! power loss, following a link or reparse point lets anything that can create
+//! a file in the directory choose what gets read, and a missing lock lets two
+//! processes each write a whole record over the other's. One implementation of
+//! that is worth more than two correct ones, because there is only one to audit
+//! and only one place a fix has to land.
 //!
 //! The caller supplies the vocabulary — what to call the file in an error, what
 //! to name its temporaries, how large it may be — so error text stays in the
@@ -82,7 +83,7 @@ impl SecretFile {
         let metadata = file
             .metadata()
             .with_context(|| format!("inspecting {}", path.display()))?;
-        self.validate_metadata(path, &metadata, rustix::process::geteuid().as_raw())?;
+        self.validate_open(path, &file)?;
         if metadata.len() > self.max_bytes as u64 {
             bail!("{} is too large: {}", self.noun, path.display())
         }
@@ -102,28 +103,28 @@ impl SecretFile {
         Ok(Some(raw))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     pub fn read(&self, path: &Path) -> Result<Option<Vec<u8>>> {
-        let metadata = match std::fs::metadata(path) {
-            Ok(metadata) => metadata,
+        let mut file = match crate::platform::open_private_file(path, false) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error).with_context(|| format!("inspecting {}", path.display()))
-            }
+            Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
         };
-        if !metadata.is_file() {
-            bail!("{} is not a regular file: {}", self.noun, path.display())
-        }
+        self.validate_open(path, &file)?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("inspecting {}", path.display()))?;
         if metadata.len() > self.max_bytes as u64 {
             bail!("{} is too large: {}", self.noun, path.display())
         }
         let mut raw = Vec::with_capacity(metadata.len() as usize);
-        let read_result = std::fs::File::open(path)?
+        let read_result = Read::by_ref(&mut file)
             .take((self.max_bytes + 1) as u64)
-            .read_to_end(&mut raw);
+            .read_to_end(&mut raw)
+            .with_context(|| format!("reading {}", path.display()));
         if let Err(error) = read_result {
             raw.zeroize();
-            return Err(error.into());
+            return Err(error);
         }
         if raw.len() > self.max_bytes {
             raw.zeroize();
@@ -132,9 +133,69 @@ impl SecretFile {
         Ok(Some(raw))
     }
 
+    #[cfg(not(any(unix, windows)))]
+    pub fn read(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
+        };
+        self.validate_open(path, &file)?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("inspecting {}", path.display()))?;
+        if metadata.len() > self.max_bytes as u64 {
+            bail!("{} is too large: {}", self.noun, path.display())
+        }
+        let mut raw = Vec::with_capacity(metadata.len() as usize);
+        let read_result = Read::by_ref(&mut file)
+            .take((self.max_bytes + 1) as u64)
+            .read_to_end(&mut raw)
+            .with_context(|| format!("reading {}", path.display()));
+        if let Err(error) = read_result {
+            raw.zeroize();
+            return Err(error);
+        }
+        if raw.len() > self.max_bytes {
+            raw.zeroize();
+            bail!("{} is too large: {}", self.noun, path.display())
+        }
+        Ok(Some(raw))
+    }
+
+    /// Validate the already-open file against the current process identity.
+    ///
+    /// The caller must keep `file` open while using it. Validation is through
+    /// that handle so a path swap cannot make the checked object differ from
+    /// the object subsequently read.
+    #[cfg(unix)]
+    pub fn validate_open(&self, path: &Path, file: &std::fs::File) -> Result<()> {
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("inspecting {}", path.display()))?;
+        self.validate_metadata(path, &metadata, rustix::process::geteuid().as_raw())
+    }
+
+    #[cfg(windows)]
+    pub fn validate_open(&self, path: &Path, file: &std::fs::File) -> Result<()> {
+        crate::platform::validate_private_file(file)
+            .with_context(|| format!("validating {} {}", self.noun, path.display()))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub fn validate_open(&self, path: &Path, file: &std::fs::File) -> Result<()> {
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("inspecting {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("{} is not a regular file: {}", self.noun, path.display())
+        }
+        Ok(())
+    }
+
     /// A regular file, owned by this user, with nothing readable by anyone else.
     #[cfg(unix)]
-    pub fn validate_metadata(
+    fn validate_metadata(
         &self,
         path: &Path,
         metadata: &std::fs::Metadata,
@@ -162,17 +223,17 @@ impl SecretFile {
         Ok(())
     }
 
-    #[cfg(not(unix))]
-    pub fn validate_metadata(
+    /// Test seam for proving owner mismatch without requiring a privileged
+    /// `chown`. Production callers validate through `validate_open`.
+    #[cfg(unix)]
+    #[doc(hidden)]
+    pub fn validate_metadata_for_test(
         &self,
         path: &Path,
         metadata: &std::fs::Metadata,
-        _expected_uid: u32,
+        expected_uid: u32,
     ) -> Result<()> {
-        if !metadata.is_file() {
-            bail!("{} is not a regular file: {}", self.noun, path.display())
-        }
-        Ok(())
+        self.validate_metadata(path, metadata, expected_uid)
     }
 
     /// Replace the file's contents atomically.
@@ -197,14 +258,22 @@ impl SecretFile {
         let mut tmp = parent.to_path_buf();
         tmp.push(format!("{}{}.tmp", self.temp_prefix, Uuid::new_v4()));
         let result = (|| {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
             #[cfg(unix)]
-            {
+            let mut f = {
                 use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut f = options.open(&tmp)?;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&tmp)?
+            };
+            #[cfg(windows)]
+            let mut f = crate::platform::create_private_file_new(&tmp)?;
+            #[cfg(not(any(unix, windows)))]
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
             std::io::Write::write_all(&mut f, data)?;
             f.sync_all()?;
             durable_replace(&tmp, path)?;
@@ -274,6 +343,12 @@ impl SecretFile {
                     continue;
                 }
             }
+            #[cfg(windows)]
+            if crate::platform::open_private_file(&path, false).is_err() {
+                // Never remove an attacker-controlled reparse point or a file
+                // whose current-user-only DACL cannot be proved.
+                continue;
+            }
             std::fs::remove_file(&path)
                 .with_context(|| format!("removing stale temporary {}", path.display()))?;
             removed = true;
@@ -291,6 +366,8 @@ impl SecretFile {
     /// replaced by rename and a lock on a replaced inode protects nothing.
     pub fn lock<T>(&self, path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         let file = self.open_lock(path)?;
+        // `File::lock` is the standard library's blocking exclusive lock:
+        // flock on Unix and LockFileEx(LOCKFILE_EXCLUSIVE_LOCK) on Windows.
         file.lock()
             .with_context(|| format!("locking {}", path.display()))?;
         let outcome = operation();
@@ -330,7 +407,20 @@ impl SecretFile {
         Ok(file)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn open_lock(&self, path: &Path) -> Result<std::fs::File> {
+        let file = match crate::platform::create_private_file_new(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                crate::platform::open_private_file(path, true)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.validate_open(path, &file)?;
+        Ok(file)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn open_lock(&self, path: &Path) -> Result<std::fs::File> {
         std::fs::OpenOptions::new()
             .read(true)
@@ -347,11 +437,16 @@ pub fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
     {
         std::fs::File::open(path)?.sync_all()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // The Windows replacement primitive below requests write-through. Some
-        // other platforms cannot open directories as files, so there is no
-        // additional portable directory handle to flush here.
+        // `MoveFileExW(MOVEFILE_WRITE_THROUGH)` carries the replacement's
+        // durability on Windows; directory handles have no documented extra
+        // FlushFileBuffers contract.
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         let _ = path;
         Ok(())
     }
@@ -364,27 +459,7 @@ fn durable_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn durable_replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: both inputs are stable, NUL-terminated UTF-16 buffers for the
-    // duration of the call. Flags request atomic replacement and write-through.
-    let replaced = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if replaced == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    crate::platform::durable_replace(from, to)
 }
 
 #[cfg(test)]
@@ -493,7 +568,7 @@ mod tests {
         FIXTURE.write(&path, b"secret").expect("write");
         let metadata = std::fs::metadata(&path).expect("stat");
         let error = FIXTURE
-            .validate_metadata(&path, &metadata, metadata.uid().wrapping_add(1))
+            .validate_metadata_for_test(&path, &metadata, metadata.uid().wrapping_add(1))
             .expect_err("wrong owner must be refused");
         assert!(format!("{error:#}").contains("not owned by the current user"));
     }
@@ -509,6 +584,28 @@ mod tests {
         assert!(
             FIXTURE.read(&link).is_err(),
             "reading through a symlink lets whoever made it choose the file"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_is_never_followed_to_a_secret() {
+        let temporary = tempfile::tempdir().expect("temp dir");
+        let private = temporary.path().join("private");
+        let target = temporary.path().join("target");
+        crate::platform::create_private_dir_all(&private).expect("private dir");
+        crate::platform::create_private_dir_all(&target).expect("target dir");
+        let junction = private.join("junction");
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .status()
+            .expect("cmd.exe must be available on Windows CI");
+        assert!(status.success(), "mklink /J failed with {status}");
+        assert!(
+            FIXTURE.read(&junction).is_err(),
+            "reading a junction would let its creator choose the target"
         );
     }
 
