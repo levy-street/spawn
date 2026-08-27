@@ -183,8 +183,13 @@ install_desktop_app() {
   local installed="/Applications/SPAWN D.app"
   local built_id installed_id
   [[ -d "$app" ]] || return 0
-  built_id="$(shasum -a 256 "$app/Contents/MacOS/spawn-desktop" 2>/dev/null | cut -c1-16)"
-  installed_id="$(shasum -a 256 "$installed/Contents/MacOS/spawn-desktop" 2>/dev/null | cut -c1-16)"
+  # `|| true` inside the substitutions: under `set -euo pipefail` a missing
+  # binary — no app installed yet, the very case an onboarding run is for —
+  # fails the pipeline, and a failed substitution in an assignment ends the
+  # whole script silently, right after "staged", with no app installed and no
+  # servers started.
+  built_id="$(shasum -a 256 "$app/Contents/MacOS/spawn-desktop" 2>/dev/null | cut -c1-16 || true)"
+  installed_id="$(shasum -a 256 "$installed/Contents/MacOS/spawn-desktop" 2>/dev/null | cut -c1-16 || true)"
   [[ -n "$built_id" && "$built_id" == "$installed_id" ]] && return 0
   if pgrep -u "$(id -u)" -f 'SPAWN D\.app/Contents/MacOS' >/dev/null 2>&1; then
     osascript -e 'quit app "SPAWN D"' >/dev/null 2>&1 || true
