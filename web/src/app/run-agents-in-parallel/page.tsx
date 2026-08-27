@@ -35,7 +35,7 @@ export const metadata: Metadata = {
 const FAQ = [
   {
     q: "How many agent sessions can one workspace hold?",
-    a: "There’s no product cap — a workspace is a grid, and the grid packs. The real limit is the hosts: every session is a login shell plus whatever its agent burns, running on your machine. When one box gets hot, add tiles from another host to the same grid instead of stacking deeper.",
+    a: "There’s no product cap. The real limit is the hosts: every session is a login shell plus whatever its agent burns, running on your machine. When one box gets hot, add tiles from another host to the same grid.",
   },
   {
     q: "Do I still need tmux underneath?",
@@ -92,20 +92,18 @@ export default function RunAgentsInParallelPage() {
       crumbs={[{ name: "Use cases", href: "/use" }]}
       pageName="Run agents in parallel"
       canonicalPath={PATH}
-      eyebrow="The job · agents in parallel"
       heading={{ plain: "Run multiple Claude Code sessions", accent: "in parallel." }}
       lede={
         <>
           <p>
-            Six worktrees, six agents, three machines. Claude&nbsp;Code is reworking auth in one
-            tile and grinding the test suite in another; Codex has the importer on the rig. The auth
-            tile just asked permission to edit — it glows, the rest keep streaming. You answer from
-            the kitchen, on a phone, and nothing else stops.
+            Six agents, three machines, one grid. Claude&nbsp;Code reworks auth in the first tile
+            and grinds the test suite in the third; Codex has the importer on the rig. When a tile
+            needs a yes, it glows. Everything else keeps running.
           </p>
           <p>
-            This is the job spawnd is shaped around: run multiple Claude&nbsp;Code sessions in
-            parallel — or Codex, opencode, aider, any coding agent that runs in a terminal — as one
-            workspace grid of real PTYs on hosts you own.
+            spawnd runs parallel Claude&nbsp;Code sessions — or Codex, opencode, aider, any CLI
+            agent — as one workspace of live terminals: real shells on machines you own, reachable
+            from any browser you’ve approved.
           </p>
         </>
       }
@@ -114,7 +112,7 @@ export default function RunAgentsInParallelPage() {
       related={RELATED}
       closing={{
         heading: { plain: "Your agents are already parallel.", accent: "See them." },
-        body: "One line possesses a host; a workspace holds the fleet. Open source under MIT and Apache-2.0 — and the server that introduces your devices can’t read a single tile.",
+        body: "One command possesses a host; one workspace holds the fleet. Open source, MIT and Apache-2.0 — and the server that introduces your devices can’t read a single tile.",
       }}
     >
       <JobSection
@@ -150,20 +148,19 @@ export default function RunAgentsInParallelPage() {
         }
       >
         <p>
-          Parallel agents fail at the filesystem before they fail anywhere else: two
-          Claude&nbsp;Code sessions in one checkout will fight over the same index and the same
-          build directory. Worktrees end it — one checkout per branch, every branch off one clone.
-          spawnd doesn’t wrap the workflow, and that’s the point: a session is your login shell,
-          started in the directory you name, so “one worktree per tile” is just what naming
-          directories gets you.
+          Parallel agents fail at the filesystem first: two sessions in one checkout fight over the
+          same index and the same build directory. Worktrees end it — one checkout per branch, all
+          off one clone. spawnd doesn’t wrap that workflow. A session is your login shell, started
+          in the directory you name, so one worktree per tile is just what naming directories gets
+          you.
         </p>
         <p>
           Dispatch is typing. Open a session per lane and hit the claude shortcut in each — it types
-          the visible command into the shell, no managed process, no hidden flags. The same tile
-          takes <code className="font-sigil text-[14px] text-bone">git diff</code>,{" "}
+          the visible command, nothing more. The same tile takes{" "}
+          <code className="font-sigil text-[14px] text-bone">git diff</code>,{" "}
           <code className="font-sigil text-[14px] text-bone">bun test</code>, and a hand-driven vim
-          rescue afterward, because a tile isn’t a viewer pointed at the agent. It’s the shell the
-          agent runs in.
+          rescue, because a tile isn’t a viewer pointed at the agent. It’s the shell the agent runs
+          in.
         </p>
       </JobSection>
 
@@ -175,19 +172,19 @@ export default function RunAgentsInParallelPage() {
         items={[
           {
             title: "Workers own the PTYs",
-            body: "Every session’s PTY belongs to a worker process on the host, not to a browser tab. Close the laptop, lose the train’s wifi, restart the daemon itself — the shell keeps running, and the tile comes back with scrollback intact.",
+            body: "Each session’s PTY belongs to a worker process on the host, not to a browser tab. Close the laptop, lose the wifi, restart the daemon itself — the shell keeps running, and the tile comes back with scrollback intact.",
           },
           {
             title: "Hosts mix in one grid",
-            body: "A workspace is a named grid of session tiles, and a tile doesn’t care where it lives. The dev box, the GPU rig, and a five-dollar VPS sit side by side; every tile talks directly to its own host.",
+            body: "A tile doesn’t care where it lives. The dev box, the GPU rig, and a five-dollar VPS sit side by side in one workspace, and every tile talks directly to its own host.",
           },
           {
             title: "The ask finds you",
-            body: "A stalled agent marks its tile and the sidebar, and alerts can follow you to a phone. Any device you’ve approved opens the same grid, mid-scrollback — answering a prompt from the couch is typing, not remoting in.",
+            body: "A stalled agent marks its tile and the sidebar, and alerts can reach your phone. Any approved device opens the same grid, mid-scrollback — answering is typing, not remoting in.",
           },
           {
             title: "The wire stays sealed",
-            body: "Terminal bytes run browser to daemon, end-to-end encrypted; the server carries signaling and cannot read a tile. A forced relay forwards ciphertext. Hosts dial out — ten agents deep, you still have zero open ports.",
+            body: "Terminal bytes run browser to daemon, end-to-end encrypted; the server cannot read a tile, and a forced relay forwards only ciphertext. Hosts dial out — ten agents deep, zero open ports.",
           },
         ]}
       />
@@ -214,13 +211,13 @@ export default function RunAgentsInParallelPage() {
       >
         <p>
           The ceiling on a fleet was never compute — it’s how long a question waits for you. An
-          agent stalled on a permission prompt is a serial agent with extra steps, and a fleet you
-          have to poll is a part-time job. The grid inverts it: the session raises the event, the
-          event finds whichever device you’re holding, you answer, it runs on.
+          agent stalled on a permission prompt is a serial agent with extra steps. The grid inverts
+          it: the session raises the event, the event finds whichever device you’re holding, you
+          answer, it runs on.
         </p>
         <p>
-          Those three event kinds are the product’s entire telemetry ambition. The server that
-          routes them sees that an agent stirred, never what it said — terminal content isn’t in the
+          Those three events are the product’s entire telemetry ambition. The server that routes
+          them sees that an agent stirred, never what it said — terminal content isn’t in its
           vocabulary, by construction.
         </p>
       </JobSection>

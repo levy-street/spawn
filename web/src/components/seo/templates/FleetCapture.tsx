@@ -8,8 +8,8 @@ import Image from "next/image";
  * the video attributes do all the work.
  */
 
-const WIDTH = 1600;
-const HEIGHT = 1020;
+const WIDTH = 1540;
+const HEIGHT = 950;
 
 export function FleetCapture({ caption = "the-fleet — six sessions · dream / rig / mini" }) {
   return (
