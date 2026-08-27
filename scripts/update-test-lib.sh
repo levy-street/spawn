@@ -125,7 +125,7 @@ update_test_init() {
       update_test_die "unsafe SPAWN_TEST_CARGO_TARGET_DIR: $UPDATE_CARGO_ROOT" ;;
   esac
   mkdir -p "$UPDATE_ARTIFACTS/old" "$UPDATE_ARTIFACTS/new" \
-    "$UPDATE_PREBUILT/$UPDATE_TARGET" "$UPDATE_CARGO_ROOT/old" "$UPDATE_CARGO_ROOT/new"
+    "$UPDATE_PREBUILT/$UPDATE_TARGET" "$UPDATE_CARGO_ROOT"
 
   "$UPDATE_REPO_ROOT/server/.venv/bin/python" - "$UPDATE_KEY_FILE" <<'PY'
 import base64
@@ -157,18 +157,23 @@ update_test_build_pair() {
   local name="$1"
   local tree="$2"
   local counter="$3"
-  local cargo_dir="$UPDATE_CARGO_ROOT/$name"
+  local cargo_dir="$UPDATE_CARGO_ROOT"
   local started=$SECONDS
-  update_test_log "building $name daemon identity tree=$tree counter=$counter"
+  update_test_log "building release $name daemon identity tree=$tree counter=$counter"
+  # The updater consumes stripped release binaries in production. Debug
+  # binaries with full debuginfo can exceed its bounded-download guard on
+  # Linux, and do not represent the artifacts this end-to-end harness proves.
+  # Reuse one target directory so dependencies are optimized only once; the
+  # build script tracks every identity override and relinks the pair.
   env \
     CARGO_TARGET_DIR="$cargo_dir" \
     SPAWND_DAEMON_TREE_OVERRIDE="$tree" \
     SPAWND_BUILD_COUNTER_OVERRIDE="$counter" \
     SPAWND_RELEASE_PUBLIC_KEYS_OVERRIDE="$UPDATE_PUBLIC_KEY" \
-    cargo build --manifest-path "$UPDATE_REPO_ROOT/daemon/Cargo.toml" --locked \
+    cargo build --manifest-path "$UPDATE_REPO_ROOT/daemon/Cargo.toml" --locked --release \
       --bin spawnd --bin spawn-worker >/dev/null
-  cp "$cargo_dir/debug/spawnd" "$UPDATE_ARTIFACTS/$name/spawnd"
-  cp "$cargo_dir/debug/spawn-worker" "$UPDATE_ARTIFACTS/$name/spawn-worker"
+  cp "$cargo_dir/release/spawnd" "$UPDATE_ARTIFACTS/$name/spawnd"
+  cp "$cargo_dir/release/spawn-worker" "$UPDATE_ARTIFACTS/$name/spawn-worker"
   chmod 755 "$UPDATE_ARTIFACTS/$name/spawnd" "$UPDATE_ARTIFACTS/$name/spawn-worker"
   update_test_log "built $name identity in $((SECONDS - started))s"
 }
