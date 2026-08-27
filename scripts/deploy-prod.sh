@@ -274,7 +274,7 @@ else
     fi
   fi
   if [[ "$prebuilt_stale" == "1" ]]; then
-    die "$prebuilt_reason; wait for the prebuilt workflow. To override only in an emergency, set SPAWN_DEPLOY_PREBUILTS=0; daemons will not auto-update and users must reinstall with curl -fsSL https://spawnd.dev/install.sh | sh"
+    die "$prebuilt_reason; wait for the prebuilt workflow. To override only in an emergency, set SPAWN_DEPLOY_PREBUILTS=0; daemons will not auto-update and users must reinstall with curl -fsSL https://spawnd.dev/install.sh | sh (Unix) or irm https://spawnd.dev/install.ps1 | iex (PowerShell)"
   fi
 fi
 
@@ -284,7 +284,8 @@ if tree_changed_but_cannot_publish \
   Wait for prebuilt-latest to contain verified COMMIT, TREE, VERSION, and
   SHA256SUMS assets, or use SPAWN_DEPLOY_PREBUILTS=0 only as an emergency
   override. Without prebuilts, daemons cannot auto-update; users must reinstall:
-    curl -fsSL https://spawnd.dev/install.sh | sh"
+    curl -fsSL https://spawnd.dev/install.sh | sh
+    irm https://spawnd.dev/install.ps1 | iex"
 fi
 
 if [[ "$prebuilt_setting" == "1" && "$prebuilt_ready" != "1" ]]; then
@@ -480,16 +481,24 @@ publish_prebuilts() {
     return
   fi
 
-  local pair target triple dest
+  local pair target triple dest spawnd_asset worker_asset
+  local spawnd_name worker_name spawnd_tmp worker_tmp mode
   for pair in "${PREBUILT_TARGETS[@]}"; do
     target="${pair%%:*}"
     triple="${pair##*:}"
     dest="$remote_path/daemon/target/prebuilt/$target"
-    if [[ -f "$prebuilt_tmp/spawnd-$triple" && -f "$prebuilt_tmp/spawn-worker-$triple" ]]; then
+    spawnd_asset="$(prebuilt_asset_name "$target" "$triple" spawnd)"
+    worker_asset="$(prebuilt_asset_name "$target" "$triple" spawn-worker)"
+    spawnd_name="$(prebuilt_installed_name "$target" spawnd)"
+    worker_name="$(prebuilt_installed_name "$target" spawn-worker)"
+    spawnd_tmp="$spawnd_name.tmp"
+    worker_tmp="$worker_name.tmp"
+    mode="$(prebuilt_file_mode "$target")"
+    if [[ -f "$prebuilt_tmp/$spawnd_asset" && -f "$prebuilt_tmp/$worker_asset" ]]; then
       ssh "$host" "mkdir -p '$dest'"
-      scp -q "$prebuilt_tmp/spawnd-$triple" "$host:$dest/spawnd.tmp"
-      scp -q "$prebuilt_tmp/spawn-worker-$triple" "$host:$dest/spawn-worker.tmp"
-      ssh "$host" "chmod 755 '$dest/spawnd.tmp' '$dest/spawn-worker.tmp' && mv '$dest/spawnd.tmp' '$dest/spawnd' && mv '$dest/spawn-worker.tmp' '$dest/spawn-worker'"
+      scp -q "$prebuilt_tmp/$spawnd_asset" "$host:$dest/$spawnd_tmp"
+      scp -q "$prebuilt_tmp/$worker_asset" "$host:$dest/$worker_tmp"
+      ssh "$host" "chmod '$mode' '$dest/$spawnd_tmp' '$dest/$worker_tmp' && mv '$dest/$spawnd_tmp' '$dest/$spawnd_name' && mv '$dest/$worker_tmp' '$dest/$worker_name'"
       printf 'deploy-prod: published %s prebuilt to %s\n' "$target" "$host"
     fi
   done

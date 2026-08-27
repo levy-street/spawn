@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { agent, host, mockApp, openSettings, USER_ID, user } from "./app-mocks";
+import { agent, host, mockApp, openSettings, USER_ID, user, windowsHost } from "./app-mocks";
 
 test("all seven settings tabs open", async ({ page }) => {
   await mockApp(page);
@@ -65,6 +65,69 @@ test("the legion add-machine flow waits after copying the plain command", async 
   await expect(dialog.getByText("After installation, run")).toContainText("spawnd possess");
   await dialog.getByRole("button", { name: "Copy install command" }).click();
   await expect(dialog.getByText("Waiting for your machine…")).toBeVisible();
+});
+
+test("Windows defaults the shared device and legion gates to the WSL wrapper", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "platform", { get: () => "Win32" });
+  });
+  await mockApp(page, { hosts: [host] });
+
+  await page.goto("/device");
+  const expected = `wsl -- bash -c "curl -fsSL ${new URL(page.url()).origin}/install.sh | sh"`;
+  await expect(page.getByRole("tab", { name: "Windows (WSL)" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await expect(page.locator("code").filter({ hasText: "wsl -- bash" }).first()).toContainText(
+    expected,
+  );
+
+  await page.goto("/legion");
+  await page.getByRole("button", { name: "Add a machine", exact: true }).first().click();
+  const dialog = page.getByRole("dialog", { name: "Add a machine" });
+  await expect(dialog.getByRole("tab", { name: "Windows (WSL)" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await expect(dialog.locator("code").filter({ hasText: "wsl -- bash" })).toContainText(expected);
+});
+
+test("Windows defaults the shared gate to native after release proof is complete", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "platform", { get: () => "Win32" });
+  });
+  await mockApp(page, {
+    hosts: [host],
+    releaseDaemonTargets: ["windows-x86_64"],
+    releaseDesktop: {
+      version: "0.2.0",
+      tree: "a".repeat(40),
+      platforms: ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"],
+    },
+  });
+
+  await page.goto("/device");
+  const expected = `irm ${new URL(page.url()).origin}/install.ps1 | iex`;
+  await expect(page.getByRole("tab", { name: "Windows", exact: true })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await expect(page.locator("code").filter({ hasText: "install.ps1" }).first()).toContainText(
+    expected,
+  );
+  await expect(page.getByRole("tab", { name: "Windows (WSL)" })).toBeVisible();
+});
+
+test("the legion formats a Windows x64 host without changing its generic fleet row", async ({
+  page,
+}) => {
+  await mockApp(page, { hosts: [windowsHost] });
+  await page.goto("/legion");
+  await expect(page.getByText("Windows · x64", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Windows PC", exact: true })).toBeVisible();
 });
 
 test("Agents keeps built-ins read-only and round-trips a custom definition", async ({ page }) => {

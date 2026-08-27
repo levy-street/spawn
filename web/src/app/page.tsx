@@ -10,8 +10,8 @@ import {
   CTA_GHOST,
   CTA_QUIET,
   CTA_SLAB,
+  DesktopDownloadButton,
   InstallCommand,
-  MacDownloadButton,
   Masthead,
   RegistrationMarks,
   StoreBadges,
@@ -20,12 +20,15 @@ import { Wordmark } from "@/components/icons/BrandMark";
 import { useDesktopRelease } from "@/hooks/useDesktopRelease";
 import { poster } from "@/lib/fonts";
 import {
+  type DesktopPlatform,
   detectPlatform,
+  type InstallTargetId,
   installTargetForOS,
   installTargets,
   type PlatformOS,
   storeBadgeForOS,
   storeBadges,
+  WINDOWS_DESKTOP_PLATFORM,
 } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
@@ -213,21 +216,34 @@ function ScrubVideo({ src, poster, alt }: { src: string; poster: string; alt: st
 export default function LandingPage() {
   const [origin, setOrigin] = useState("https://spawnd.dev");
   const [detectedOS, setDetectedOS] = useState<PlatformOS>("unknown");
-  // The Mac build the hero hands out, named by the release manifest rather
-  // than guessed at. Until it answers, the slab holds a press instead of
-  // sending it to /download — see `MacDownloadButton`.
-  const {
-    settled: releaseSettled,
-    url: macBuildUrl,
-    version: macBuildVersion,
-    buildId: macBuildId,
-  } = useDesktopRelease(origin);
   /**
    * The install target the reader picked on the chip, once they have picked
    * one. The chip and the download beside it answer the same question, so
    * switching the chip to Windows switches the button with it.
    */
-  const [chosenTarget, setChosenTarget] = useState<string | null>(null);
+  const [chosenTarget, setChosenTarget] = useState<InstallTargetId | null>(null);
+  // The selected install target owns the adjacent desktop action. Before the
+  // reader chooses, detected Windows asks for its EXE and macOS/unknown keeps
+  // the historical Apple Silicon handoff on the hydration-safe first render.
+  const discoveryPlatform: DesktopPlatform | null =
+    chosenTarget === "windows"
+      ? WINDOWS_DESKTOP_PLATFORM
+      : chosenTarget === "windows-wsl"
+        ? null
+        : (chosenTarget === "unix" || chosenTarget === null) &&
+            (detectedOS === "macos" || detectedOS === "unknown")
+          ? "darwin-aarch64"
+          : chosenTarget === null && detectedOS === "windows"
+            ? WINDOWS_DESKTOP_PLATFORM
+            : null;
+  const {
+    settled: releaseSettled,
+    url: discoveredBuildUrl,
+    version: discoveredBuildVersion,
+    buildId: discoveredBuildId,
+    platform: discoveredPlatform,
+    nativeWindowsAvailable,
+  } = useDesktopRelease(origin, discoveryPlatform);
   /**
    * Whether the panel's two sections step apart, measured rather than assumed:
    * the shell line grows and shrinks with the target, and the buttons wrap on a
@@ -271,19 +287,21 @@ export default function LandingPage() {
     setDetectedOS(platform.os);
   }, []);
 
-  const targets = installTargets(origin);
-  const defaultTargetId = installTargetForOS(detectedOS);
+  const targets = installTargets(origin, nativeWindowsAvailable);
+  const defaultTargetId = installTargetForOS(detectedOS, nativeWindowsAvailable);
   // A phone cannot host the daemon, so the shell line is noise there — the
   // reader wants the app instead. Detection lands after mount, so the server
   // render keeps the install chip and a phone swaps to the badge.
   const phoneBadge = storeBadgeForOS(detectedOS);
-  // The app itself is Mac-only, so a detected Linux or Windows reader keeps
-  // the plain slab to /download rather than being handed a build their machine
-  // cannot open. Undetected (the server render, and any browser we cannot
-  // read) gets the Mac slab: it is the download this site is here to hand out,
-  // and /download is one press away either way.
+  // Linux and WSL targets do not have a native desktop artifact. Undetected
+  // browsers keep the Mac slab on the hydration-safe first render; the full
+  // inventory remains one press away on /download.
   const installTarget = chosenTarget ?? defaultTargetId;
   const windowsChosen = installTarget === "windows";
+  const windowsWslChosen = installTarget === "windows-wsl";
+  const requestedDownloadPlatform = discoveryPlatform;
+  const selectedBuildUrl =
+    requestedDownloadPlatform === discoveredPlatform ? discoveredBuildUrl : null;
 
   return (
     <main className="grimoire min-h-vv overflow-x-clip">
@@ -376,7 +394,7 @@ export default function LandingPage() {
                   <InstallCommand
                     targets={targets}
                     defaultTargetId={defaultTargetId}
-                    onTargetChange={setChosenTarget}
+                    onTargetChange={(id) => setChosenTarget(id as InstallTargetId)}
                     className={cn(!stepped && "w-full")}
                     boxClassName={cn(
                       // Opaque, and with no bottom edge of its own: the white
@@ -418,14 +436,14 @@ export default function LandingPage() {
                   // badge is the download button on those platforms, and neither
                   // may be redrawn in someone else's house style.
                   <StoreBadges badges={[phoneBadge]} />
-                ) : windowsChosen ? (
-                  // No Windows build to hand over — the line above runs inside
-                  // WSL — so the button goes where that is explained.
-                  <MacDownloadButton
-                    href={null}
-                    platform="windows"
-                    className="h-14 grow rounded-[11px] whitespace-nowrap"
-                  />
+                ) : windowsWslChosen ? (
+                  <Link href="/download" className={cn(CTA_QUIET, "h-14 grow whitespace-nowrap")}>
+                    Windows setup through WSL →
+                  </Link>
+                ) : windowsChosen && releaseSettled && selectedBuildUrl === null ? (
+                  <Link href="/download" className={cn(CTA_QUIET, "h-14 grow whitespace-nowrap")}>
+                    Windows desktop build not published yet
+                  </Link>
                 ) : detectedOS === "linux" ? (
                   <Link
                     href="/download"
@@ -435,28 +453,31 @@ export default function LandingPage() {
                     <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
                   </Link>
                 ) : (
-                  <MacDownloadButton
-                    href={macBuildUrl}
-                    version={macBuildVersion}
-                    buildId={macBuildId}
+                  <DesktopDownloadButton
+                    href={selectedBuildUrl}
+                    version={discoveredBuildVersion}
+                    buildId={discoveredBuildId}
                     pending={!releaseSettled}
+                    platform={requestedDownloadPlatform ?? "darwin-aarch64"}
                     className="h-14 grow rounded-[11px] whitespace-nowrap"
                   />
                 )}
-                <Link
-                  href="/download"
-                  className={cn(
-                    CTA_GHOST,
-                    // A ground of its own, faint but always there: beside a
-                    // bone slab, a shape painted only on hover reads as the
-                    // smaller of the two even when the boxes match to the
-                    // pixel.
-                    "h-14 grow rounded-[11px] bg-bone/[0.06] whitespace-nowrap hover:bg-bone/12",
-                  )}
-                >
-                  More download options
-                  <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
-                </Link>
+                {!windowsWslChosen && !(windowsChosen && releaseSettled && !selectedBuildUrl) && (
+                  <Link
+                    href="/download"
+                    className={cn(
+                      CTA_GHOST,
+                      // A ground of its own, faint but always there: beside a
+                      // bone slab, a shape painted only on hover reads as the
+                      // smaller of the two even when the boxes match to the
+                      // pixel.
+                      "h-14 grow rounded-[11px] bg-bone/[0.06] whitespace-nowrap hover:bg-bone/12",
+                    )}
+                  >
+                    More download options
+                    <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+                  </Link>
+                )}
               </div>
             </div>
           </div>

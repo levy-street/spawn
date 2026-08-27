@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { fileEntry, fileListing, HOST_ID, host, mockApp, session } from "./app-mocks";
+import { fileEntry, fileListing, HOST_ID, host, mockApp, session, windowsHost } from "./app-mocks";
 
 const OTHER_HOST_ID = "00000000-0000-4000-8000-000000000009";
 const otherHost = {
@@ -170,6 +170,85 @@ test("inline new folder, rename, and delete round-trip", async ({ page }) => {
   await expect
     .poll(() => deletes.at(-1))
     .toMatchObject({ path: "/Users/tester/projects/readme.md", recursive: false });
+});
+
+test("Windows file operations preserve native drive paths", async ({ page }) => {
+  const listed: Array<string | null> = [];
+  const mkdirs: unknown[] = [];
+  const renames: unknown[] = [];
+  const deletes: unknown[] = [];
+  await mockApp(page, {
+    hosts: [windowsHost],
+    files: (_hostId, path) => {
+      listed.push(path);
+      if (path === "C:\\Users\\tester\\Work") {
+        return fileListing({
+          path,
+          home_dir: "C:\\Users\\tester",
+          parent: "C:\\Users\\tester",
+          entries: [fileEntry({ name: "readme.md", path: `${path}\\readme.md`, size: 512 })],
+        });
+      }
+      return fileListing({
+        path: "C:\\Users\\tester",
+        home_dir: "C:\\Users\\tester",
+        parent: "C:\\Users",
+        entries: [
+          fileEntry({
+            name: "Work",
+            path: "C:\\Users\\tester\\Work",
+            is_dir: true,
+            size: null,
+          }),
+          fileEntry({ name: "notes.txt", path: "C:\\Users\\tester\\notes.txt" }),
+        ],
+      });
+    },
+    fileMkdir: async (_hostId, body, route) => {
+      mkdirs.push(body);
+      await route.fulfill({ status: 200, json: body });
+    },
+    fileRename: async (_hostId, body, route) => {
+      renames.push(body);
+      await route.fulfill({ status: 200, json: body });
+    },
+    fileDelete: async (_hostId, body, route) => {
+      deletes.push(body);
+      await route.fulfill({ status: 200, json: body });
+    },
+  });
+
+  const deepPath = "C:\\Users\\tester\\Work\\readme.md";
+  await page.goto(`/hosts/${HOST_ID}/files?path=${encodeURIComponent(deepPath)}`);
+  await expect(row(page, "readme.md")).toHaveAttribute("aria-selected", "true");
+
+  await page.getByRole("button", { name: "New folder" }).click();
+  await page.getByLabel("Folder name").fill("scratch");
+  await page.getByLabel("Folder name").press("Enter");
+  await expect.poll(() => mkdirs.at(-1)).toMatchObject({ path: "C:\\Users\\tester\\scratch" });
+
+  const notes = row(page, "notes.txt");
+  await notes.hover();
+  await notes.getByRole("button", { name: "notes.txt actions" }).click();
+  await page.getByRole("menuitem", { name: "Rename" }).click();
+  await page.getByLabel("Rename entry").fill("renamed.txt");
+  await page.getByLabel("Rename entry").press("Enter");
+  await expect
+    .poll(() => renames.at(-1))
+    .toMatchObject({
+      path: "C:\\Users\\tester\\notes.txt",
+      name: "renamed.txt",
+    });
+
+  page.on("dialog", (dialog) => dialog.accept());
+  const readme = row(page, "readme.md");
+  await readme.hover();
+  await readme.getByRole("button", { name: "readme.md actions" }).click();
+  await page.getByRole("menuitem", { name: "Delete" }).click();
+  await expect.poll(() => deletes.at(-1)).toMatchObject({ path: deepPath, recursive: false });
+
+  expect(listed).toContain("C:\\Users\\tester\\Work");
+  expect(listed.some((path) => path?.startsWith("/C:"))).toBe(false);
 });
 
 test("right-click opens a context menu with download and send to host", async ({ page }) => {

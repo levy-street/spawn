@@ -1,15 +1,16 @@
 "use client";
 
-import { AlertTriangle, ArrowRight, CheckCircle2, Laptop, Smartphone } from "lucide-react";
+import { ArrowRight, CheckCircle2, Laptop, Smartphone } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import {
   Colophon,
+  CTA_QUIET,
   CTA_SLAB,
+  DesktopDownloadButton,
   Eyebrow,
   InstallCommand,
-  MacDownloadButton,
   Masthead,
   RegistrationMarks,
   StoreBadgeMark,
@@ -17,13 +18,17 @@ import {
 import { useDesktopRelease } from "@/hooks/useDesktopRelease";
 import { poster } from "@/lib/fonts";
 import {
+  type DesktopPlatform,
   desktopDownloadUrl,
+  desktopPlatformForOS,
   detectPlatform,
+  type InstallTargetId,
   installTargetForOS,
   installTargets,
   type PlatformOS,
   storeBadges,
   UNDETECTED_PLATFORM,
+  WINDOWS_DESKTOP_PLATFORM,
 } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
@@ -34,7 +39,7 @@ const PLATFORM_COPY: Record<
     title: string;
     recommendation: string;
     service: string;
-    status: "supported" | "wsl" | "mobile" | "unsupported" | "unknown";
+    status: "supported" | "wsl" | "mobile" | "unknown";
   }
 > = {
   macos: {
@@ -55,11 +60,11 @@ const PLATFORM_COPY: Record<
   },
   windows: {
     label: "Windows",
-    title: "Install through WSL",
+    title: "Install on this Windows PC",
     recommendation:
-      "There is no native Windows daemon yet. The Windows line runs the Linux build inside WSL2 — install WSL and a distribution, and the installer takes it from there.",
-    service: "Linux user systemd inside WSL, where the distribution provides it.",
-    status: "wsl",
+      "Run the installer in PowerShell. It downloads the Windows daemon build and registers SPAWN D to start when you sign in.",
+    service: "Scheduled task: SPAWN D, runs at sign-in",
+    status: "supported",
   },
   ios: {
     label: "iPhone or iPad",
@@ -79,19 +84,49 @@ const PLATFORM_COPY: Record<
   },
   unknown: {
     label: "Unknown OS",
-    title: "Run from a host terminal",
+    title: "Choose the host platform",
     recommendation:
-      "The browser could not identify this OS. The installer supports macOS and Linux, and will detect the actual host when it runs.",
-    service: "macOS LaunchAgent or Linux user systemd, depending on the host.",
+      "The browser could not identify this OS. Choose macOS / Linux, Windows, or Windows (WSL) below.",
+    service:
+      "SPAWN D starts with a LaunchAgent, user systemd service, or Windows scheduled task, depending on the host.",
     status: "unknown",
   },
 };
+
+const WINDOWS_WSL_COPY = {
+  label: "Windows",
+  title: "Run SPAWN D through WSL",
+  recommendation:
+    "Native Windows support is not available yet. Install WSL2 and a Linux distribution, enable systemd, then run the Windows (WSL) command.",
+  service:
+    "Inside WSL: systemd user service spawnd.service. Windows must start the distribution at sign-in.",
+  status: "wsl" as const,
+};
+
+const UNKNOWN_WSL_COPY = {
+  label: "Unknown OS",
+  title: "Choose the host platform",
+  recommendation:
+    "The browser could not identify this OS. Choose macOS / Linux or Windows (WSL) below.",
+  service: "SPAWN D starts with a LaunchAgent or user systemd service, depending on the host.",
+  status: "unknown" as const,
+};
+
+const WSL_PHONE_COPY =
+  "The daemon runs on a Mac or Linux machine (or on Windows through WSL) — never on the phone. Get the app here, then run the installer on the computer you want to possess.";
+const NATIVE_PHONE_COPY =
+  "The daemon runs on macOS, Linux, or Windows — never on the phone. Get the app here, then install SPAWN D on the computer you want to possess.";
 
 const PLATFORM_CARDS = [
   {
     id: "mac",
     platform: "Desktop · macOS",
     body: "Tray-first and signed. It verifies the daemon, possesses this Mac, then gets out of the way.",
+  },
+  {
+    id: "windows",
+    platform: "Desktop · Windows",
+    body: "Tray-first and signed. It verifies the daemon, possesses this PC, then gets out of the way.",
   },
   {
     id: "ios",
@@ -115,6 +150,10 @@ const OPTIONS = [
     body: "Downloads an x86_64 or arm64 Linux build, then starts user systemd when available.",
   },
   {
+    title: "Windows",
+    body: "Downloads the x86_64 Windows build, then registers SPAWN D as a scheduled task at sign-in.",
+  },
+  {
     title: "Remote hosts",
     body: "SSH into the machine that should run agents, then run the same command there.",
   },
@@ -122,30 +161,66 @@ const OPTIONS = [
 
 export default function DownloadPage() {
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
+  const [chosenTarget, setChosenTarget] = useState<InstallTargetId | null>(null);
+  const requestedDesktopPlatform = desktopPlatformForOS(platform.os);
   const {
     release: desktopRelease,
     settled: releaseSettled,
-    url: macBuildUrl,
-    version: macBuildVersion,
-    buildId: macBuildId,
-  } = useDesktopRelease(platform.origin);
+    platform: discoveredPlatform,
+    url: discoveredBuildUrl,
+    version: discoveredBuildVersion,
+    buildId: discoveredBuildId,
+    nativeWindowsAvailable,
+  } = useDesktopRelease(platform.origin, requestedDesktopPlatform);
 
   useEffect(() => {
     setPlatform(detectPlatform());
   }, []);
 
-  const prebuiltCommand = platform.prebuiltInstallCommand;
-  const detected = PLATFORM_COPY[platform.os];
+  const baseDetected =
+    platform.os === "windows" && !nativeWindowsAvailable
+      ? WINDOWS_WSL_COPY
+      : platform.os === "unknown" && !nativeWindowsAvailable
+        ? UNKNOWN_WSL_COPY
+        : PLATFORM_COPY[platform.os];
+  const detected =
+    (platform.os === "ios" || platform.os === "android") && baseDetected.status === "mobile"
+      ? {
+          ...baseDetected,
+          recommendation: nativeWindowsAvailable ? NATIVE_PHONE_COPY : WSL_PHONE_COPY,
+        }
+      : baseDetected;
   const supported = detected.status === "supported";
-  const targets = installTargets(platform.origin);
-  const defaultTargetId = installTargetForOS(platform.os);
+  const targets = installTargets(platform.origin, nativeWindowsAvailable);
+  const defaultTargetId = installTargetForOS(platform.os, nativeWindowsAvailable);
+  const activeTarget =
+    targets.find((target) => target.id === (chosenTarget ?? defaultTargetId)) ?? targets[0];
+  const prebuiltCommand = activeTarget?.prebuiltCommand ?? platform.prebuiltInstallCommand;
+  const showWslCaveats = activeTarget?.id === "windows-wsl";
+
+  const artifactUrl = (desktopPlatform: DesktopPlatform): string | null => {
+    if (desktopRelease?.platforms.includes(desktopPlatform)) {
+      return desktopDownloadUrl(platform.origin, desktopRelease.version, desktopPlatform);
+    }
+    return discoveredPlatform === desktopPlatform ? discoveredBuildUrl : null;
+  };
+  const artifactIdentity = (
+    desktopPlatform: DesktopPlatform,
+  ): { version: string | null; buildId: string | null } => {
+    if (desktopRelease?.platforms.includes(desktopPlatform)) {
+      return { version: desktopRelease.version, buildId: desktopRelease.tree };
+    }
+    return discoveredPlatform === desktopPlatform
+      ? { version: discoveredBuildVersion, buildId: discoveredBuildId }
+      : { version: null, buildId: null };
+  };
+  const macBuildUrl = artifactUrl("darwin-aarch64");
+  const windowsBuildUrl = artifactUrl(WINDOWS_DESKTOP_PLATFORM);
 
   // The one dot of colour on the detected plate: the brand ink says "good",
   // hellfire says "not here", ash says "we couldn't tell".
   const statusIcon = useMemo(() => {
     if (supported) return <CheckCircle2 className="size-4 text-ember" aria-hidden />;
-    if (detected.status === "unsupported")
-      return <AlertTriangle className="size-4 text-hellfire" aria-hidden />;
     if (detected.status === "mobile")
       return <Smartphone className="size-4 text-ember" aria-hidden />;
     return <Laptop className="size-4 text-ash" aria-hidden />;
@@ -187,42 +262,52 @@ export default function DownloadPage() {
             Take it with you. <em className="text-hellfire not-italic">Every screen.</em>
           </h1>
           <p className="mt-6 max-w-[58ch] text-[17px] leading-8 text-ash">
-            One account, three windows onto the same possessed hosts: the companion in your menu
-            bar, the app in your pocket, the browser anywhere. The daemon never leaves your machine
-            — these only look in on it.
+            One account, three windows onto the same possessed hosts: the companion on your desktop,
+            the app in your pocket, the browser anywhere. The daemon never leaves your machine —
+            these only look in on it.
           </p>
 
-          {/* Three platforms, one row: identical cards on solid ground, with
+          {/* Four platforms: identical cards on solid ground, with
            * a fixed-height mark well so vendor artwork of different
            * proportions still lines up. The plate behind is busy, so each card
            * brings its own ground rather than floating on it. */}
-          <div className="mt-14 grid min-w-0 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="mt-14 grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-4">
             {PLATFORM_CARDS.map((card) => {
               const mac = card.id === "mac";
+              const windows = card.id === "windows";
+              const desktopPlatform: DesktopPlatform | null = mac
+                ? "darwin-aarch64"
+                : windows
+                  ? WINDOWS_DESKTOP_PLATFORM
+                  : null;
               const href = mac
                 ? macBuildUrl
-                : (storeBadges().find((badge) => badge.id === card.id)?.href ?? null);
-              // The Mac build is named by a manifest that has not answered on
-              // the first paint. That is not "coming soon" — the card presses
-              // and waits, the way the slab does.
-              const waitingOnManifest = mac && !releaseSettled;
+                : windows
+                  ? windowsBuildUrl
+                  : (storeBadges().find((badge) => badge.id === card.id)?.href ?? null);
+              const waitingOnManifest = desktopPlatform !== null && !releaseSettled;
+              const identity = desktopPlatform
+                ? artifactIdentity(desktopPlatform)
+                : { version: null, buildId: null };
               return (
                 <div
                   key={card.id}
                   className="flex min-w-0 flex-col rounded-[12px] bg-char px-6 pt-6 pb-5"
                 >
                   <div className="flex h-14 items-center">
-                    {mac ? (
-                      // The same shape the two stores hand out, so the row
-                      // reads as three downloads rather than two badges and a
-                      // nameplate.
-                      <MacDownloadButton
+                    {desktopPlatform && (href || waitingOnManifest || mac) ? (
+                      <DesktopDownloadButton
                         href={href}
-                        version={mac ? macBuildVersion : null}
-                        buildId={mac ? macBuildId : null}
+                        version={identity.version}
+                        buildId={identity.buildId}
                         pending={waitingOnManifest}
+                        platform={desktopPlatform}
                         className="h-14 px-6"
                       />
+                    ) : windows ? (
+                      <Link href="/download" className={CTA_QUIET}>
+                        Windows desktop build not published yet
+                      </Link>
                     ) : (
                       <StoreBadgeMark id={card.id} />
                     )}
@@ -242,6 +327,10 @@ export default function DownloadPage() {
                       </a>
                     ) : waitingOnManifest ? (
                       <span className="text-ash">Checking for a build…</span>
+                    ) : windows ? (
+                      <Link href="/download" className="text-ash transition-colors hover:text-bone">
+                        Windows desktop build not published yet
+                      </Link>
                     ) : (
                       <span className="text-ember">Coming soon</span>
                     )}
@@ -253,7 +342,7 @@ export default function DownloadPage() {
 
           {desktopRelease && (
             <p className="mt-6 font-sigil text-[11px] tracking-[0.18em] text-ash uppercase">
-              Mac build {desktopRelease.version} · SHA {desktopRelease.tree.slice(0, 12)}
+              Desktop build {desktopRelease.version} · SHA {desktopRelease.tree.slice(0, 12)}
               {desktopRelease.platforms.includes("darwin-x86_64") && (
                 <>
                   {" · "}
@@ -266,6 +355,21 @@ export default function DownloadPage() {
                     className="text-bone underline decoration-line-strong underline-offset-4 transition-colors hover:text-ember"
                   >
                     Intel Mac
+                  </a>
+                </>
+              )}
+              {desktopRelease.platforms.includes(WINDOWS_DESKTOP_PLATFORM) && (
+                <>
+                  {" · "}
+                  <a
+                    href={desktopDownloadUrl(
+                      platform.origin,
+                      desktopRelease.version,
+                      WINDOWS_DESKTOP_PLATFORM,
+                    )}
+                    className="text-bone underline decoration-line-strong underline-offset-4 transition-colors hover:text-ember"
+                  >
+                    Windows x64
                   </a>
                 </>
               )}
@@ -286,29 +390,21 @@ export default function DownloadPage() {
                   "max-w-[18ch] text-[clamp(28px,3.7vw,46px)] leading-[1.04] font-light text-bone uppercase",
                 )}
               >
-                Possess a machine from its terminal.
+                Possess a machine with one line.
               </h2>
               <p className="mt-6 max-w-[54ch] text-[17px] leading-8 text-ash">
                 The apps are windows; this is the thing they look at. Run one line on the machine
                 you want to possess — never on the phone — and it downloads the matching prebuilt
-                daemon, then starts it as a user service. Then the pairing ceremony: consensual,
+                daemon, then starts it for your account. Then the pairing ceremony: consensual,
                 auditable, revocable.
               </p>
 
               <InstallCommand
                 targets={targets}
                 defaultTargetId={defaultTargetId}
+                onTargetChange={(id) => setChosenTarget(id as InstallTargetId)}
                 className="mt-9"
               />
-
-              {detected.status === "unsupported" && (
-                <p className="mt-8 flex items-start gap-3 border-hellfire border-l-2 bg-char py-4 pr-5 pl-5 text-[15px] leading-7 text-bone">
-                  <AlertTriangle className="mt-1 size-4 shrink-0 text-hellfire" aria-hidden />
-                  <span>
-                    Run this from a supported macOS or Linux terminal, not from this browser OS.
-                  </span>
-                </p>
-              )}
 
               <div className="mt-9">
                 <Link href="/signup" className={CTA_SLAB}>
@@ -340,11 +436,43 @@ export default function DownloadPage() {
                     {detected.label}
                   </h3>
                 </div>
+                <p className="mt-4 font-sigil text-[12px] tracking-[0.12em] text-bone uppercase">
+                  {detected.title}
+                </p>
                 <p className="mt-4 text-[15px] leading-7 text-ash">{detected.recommendation}</p>
                 <p className="mt-5 border-line-g border-t pt-4 font-sigil text-[12px] leading-6 text-ash">
                   {detected.service}
                 </p>
               </div>
+              {showWslCaveats && (
+                <div className="grid gap-6 border-line-g border-t px-5 py-6 text-[14px] leading-7 text-ash sm:px-6">
+                  <div className="grid gap-3">
+                    <h4 className="font-sigil text-[12px] tracking-[0.14em] text-bone uppercase">
+                      Enable the service manager
+                    </h4>
+                    <p>
+                      In WSL, add this to <code>/etc/wsl.conf</code>:
+                    </p>
+                    <pre className="overflow-x-auto rounded-sm bg-void px-4 py-3 font-mono text-[13px] text-bone">
+                      <code>{`[boot]\nsystemd=true`}</code>
+                    </pre>
+                    <p>
+                      Then run <code>wsl --shutdown</code> from PowerShell and reopen the
+                      distribution.
+                    </p>
+                  </div>
+                  <div className="grid gap-3">
+                    <h4 className="font-sigil text-[12px] tracking-[0.14em] text-bone uppercase">
+                      Keep it online after sign-in
+                    </h4>
+                    <p>
+                      WSL does not start a distribution at Windows sign-in. Create a logon task
+                      whose action is <code>wsl -d &lt;distro&gt; --exec true</code>. Without that
+                      task, SPAWN D remains offline until the distribution starts.
+                    </p>
+                  </div>
+                </div>
+              )}
             </figure>
           </div>
         </div>
@@ -366,7 +494,7 @@ export default function DownloadPage() {
           <p className="mb-14 font-sigil text-[12px] font-medium tracking-[0.3em] uppercase">
             Where it can run
           </p>
-          <div className="grid min-w-0 gap-y-14 md:grid-cols-3 md:gap-x-12 md:gap-y-0">
+          <div className="grid min-w-0 gap-y-14 md:grid-cols-2 md:gap-x-12 xl:grid-cols-4 xl:gap-y-0">
             {OPTIONS.map((option) => (
               <div key={option.title} className="border-t-2 border-void pt-6">
                 <h3
@@ -403,7 +531,7 @@ export default function DownloadPage() {
             </p>
           </div>
           <div className="flex max-w-full min-w-0 items-center gap-3 rounded-sm border border-line-strong bg-char py-4 pr-3 pl-4 font-sigil text-[13px] text-bone">
-            <span className="text-ember">$</span>
+            <span className="text-ember">{activeTarget?.prompt ?? "$"}</span>
             <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">
               {prebuiltCommand}
             </code>

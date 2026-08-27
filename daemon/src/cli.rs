@@ -64,6 +64,12 @@ pub enum Command {
     Reset(ResetArgs),
     /// Print credential state and redacted host/browser fingerprints.
     Status(StatusArgs),
+    /// Internal HKCU Run watchdog entry point.
+    #[command(name = "__watchdog", hide = true)]
+    Watchdog(WatchdogArgs),
+    /// Internal post-update service-manager handoff.
+    #[command(name = "__update-handoff", hide = true)]
+    UpdateHandoff(UpdateHandoffArgs),
 }
 
 #[derive(Debug, Args)]
@@ -90,6 +96,10 @@ pub struct PossessArgs {
     /// Never render a terminal QR code.
     #[arg(long, conflicts_with = "qr")]
     pub no_qr: bool,
+
+    /// Select the Windows background manager for this account instance.
+    #[arg(long, value_name = "task|run")]
+    pub service_mode: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -130,7 +140,23 @@ pub struct LoginArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct RunArgs {}
+pub struct RunArgs {
+    /// Internal marker for a Task Scheduler or Run-watchdog launch.
+    #[arg(long, hide = true)]
+    pub background_service: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WatchdogArgs {
+    #[arg(long, value_name = "8HEX")]
+    pub instance: String,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateHandoffArgs {
+    #[arg(long)]
+    pub parent_pid: u32,
+}
 
 #[derive(Debug, Args)]
 #[command(after_help = "Examples:\n  spawnd status\n  spawnd status --json")]

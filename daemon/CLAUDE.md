@@ -16,24 +16,35 @@ src/
                  vectors — everything else stays private to the binary
   permissions.rs the one macOS consent moment, and the on-disk handshake the
                  desktop app uses to put a screen in front of it
-  secret_file.rs how a secret is put on disk: atomic 0600 write, owner and
-                 permission checks, NOFOLLOW open, cross-process lock. Used by
-                 creds.rs here and by the macOS app's storage.rs, which keeps a
-                 different record under identical handling
+  secret_file.rs how a secret is put on disk: atomic current-user-only write
+                 (0600 on Unix, a protected owner-only DACL on Windows), owner
+                 and permission checks through a no-follow handle, and a
+                 cross-process lock. Used by creds.rs here and by the desktop
+                 app's storage.rs, which keeps a different record under
+                 identical handling
   bin/           spawn-worker.rs and cross-runtime-crypto.rs (vector
                  generator)
+  platform/      OS leaf operations shared by daemon features: private files,
+                 atomic moves, executable names, console modes, browser launch,
+                 process liveness, and file identity
   sessiond/      supervisor↔worker shared pieces: wire protocol, terminal
                  emulator, scrollback, worker runtime
+    endpoint/    platform transport boundary: mod.rs is the common facade,
+                 unix.rs owns stream/datagram sockets, and windows.rs owns
+                 named pipes plus reservation-handle transfer
   <feature>.rs   one module per concern: run.rs (register + main loop),
                  ws.rs, update.rs + update_io.rs (verified daemon self-update;
                  focused tests live in update_tests.rs), release_key.rs (pinned
                  release trust roots), login.rs, creds.rs, rtc.rs, host_*.rs,
-                 upload.rs, sessions.rs, service.rs, …
+                 upload.rs, sessions.rs, service.rs + service/ (launchd/systemd
+                 dispatch, Windows Task Scheduler/Run watchdog and control
+                 pipe), …
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame
                  (`Ui`), panels, logo, and the single-line `Spinner`
   state.rs       atomic local daemon heartbeat contract (`state.json`)
   status.rs      human/JSON status across local account instances
-  doctor.rs      the ordered 14-check local health report
+  doctor.rs      the ordered 14-check local health report, plus the Windows
+                 agent-shell dependency diagnostic
   lifecycle.rs   reconnect, disconnect, logout, and local reset commands
   version.rs     the version the daemon reports; build.rs stamps the source
                  commit into it (0.1.0+g<commit>)
@@ -58,6 +69,60 @@ vendor/          exact upstream crate sources for narrowly documented patches;
   old name could not survive, and read "The wire protocols" in
   `docs/RELEASE.md` first — a bump is a fleet-wide cutover with a forced
   release order.
+
+## Platform boundaries and Windows paths
+
+OS syscalls and security policy that a feature module should not have to
+understand live in `src/platform/`. Unix implementations preserve the existing
+mode, uid, nofollow, terminal, and rename contracts. Windows `unsafe` Win32
+calls stay concentrated in `platform/windows.rs`; feature modules operate on
+verified files/directories and opaque identities instead of raw handles.
+
+Windows storage is local, not roaming:
+
+- config and the default single instance: `%LOCALAPPDATA%\spawn`
+- account instances: `%LOCALAPPDATA%\spawn\<account_id>`
+- service state/runtime files: `%LOCALAPPDATA%\spawn\state\<instance>`
+- daemon/worker logs: `%LOCALAPPDATA%\spawn\logs\<instance>`
+- installed command shims/binaries: `%LOCALAPPDATA%\spawn\bin`
+- user-home expansion: `%USERPROFILE%`
+- upload and preview staging: unique owner-DACL-protected children below
+  `%TEMP%`, held through verified directory capabilities
+
+`SPAWN_CONFIG_DIR` remains an exact override on every OS. Never fall back from
+`dirs::state_dir() == None` to `%USERPROFILE%\.local\state` on Windows, and
+reserve Roaming AppData for data deliberately designed to roam. Private
+Windows directories/files use a protected, canonical current-user-only DACL;
+existing objects are validated and never silently repaired, and reparse points
+or filesystems where ownership/DACLs cannot be proved fail closed.
+
+Windows worker discovery metadata lives below
+`%LOCALAPPDATA%\spawn\state\<instance>\workers`; encrypted scrollback and
+detached worker stderr live below
+`%LOCALAPPDATA%\spawn\logs\<instance>\workers`. The worker receives the
+metadata directory explicitly rather than deriving it from the log path.
+Named endpoints are flat owner-only pipes named
+`\\.\pipe\spawn-<user-SID>[-<8hex-config-tag>]-<session-uuid>` with `-lc`
+for lifecycle delivery. `spawnd` reserves the session with an exclusive file
+handle and transfers only that handle plus NUL standard handles to the worker.
+
+Paths sent over daemon frames remain native strings. Windows drive roots
+(`C:\`) and UNC roots (`\\server\share\`) are accepted where that feature is
+supported, compared case-insensitively for containment, and never converted by
+prepending `/`. Upload roots deliberately reject UNC and device namespaces in
+the first Windows release because their reparse, identity, hard-link, and
+atomic-move guarantees have not been established.
+
+Construct every installed binary name with `std::env::consts::EXE_SUFFIX` via
+the platform helpers. Tags precede the suffix: `spawnd.prev.exe`,
+`spawnd.tmp.<pid>.exe`, and `spawnd.failed.<pid>.exe`; `spawnd.updating` is data
+and has no executable suffix. Do not use `with_extension` for these names.
+
+Windows v1 intentionally does not provide host-side desktop reveal/open,
+Quick Look-style preview rendering, or Linux systemd/cgroup CPU focus scopes.
+Their advertised capabilities stay false/no-op. These are product limits, not
+reasons to make shared file staging, metrics, emulator, or crypto code
+Windows-incompatible.
 
 ## Terminal output
 
@@ -203,6 +268,28 @@ cargo build --locked
 cargo test --locked --bin spawnd <module>::
 ```
 
+Native Windows CI additionally gates every binary, test/example target, and
+cfg-specific lint path:
+
+```bash
+cargo check --locked --target x86_64-pc-windows-msvc --bins
+cargo check --locked --target x86_64-pc-windows-msvc --all-targets
+cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+```
+
+Windows installs one persisted per-instance background mode: the primary
+least-privilege interactive-token Task Scheduler task, or the HKCU Run
+watchdog fallback when Scheduler denies worker breakaway. The task action is
+always an absolute `spawnd.exe` path and invokes the hidden
+`run --background-service` mode; the Run registration invokes the hidden
+`__watchdog --instance <8hex>` mode. Those internal flags are service-owned and
+are not ordinary foreground commands. The owner-only named control pipe handles
+ping/reconnect/graceful shutdown; Unix SIGHUP and systemd `KillMode=process`
+stay unchanged. `possess --service-mode task|run` explicitly changes the
+persisted manager, and an interactive `possess` offers the safe Run fallback
+after a denied Task Scheduler breakaway probe. Windows CI must run `cargo test --locked --target
+x86_64-pc-windows-msvc` and the standard-user breakaway integration probe.
+
 Run `cargo clippy` and `cargo fmt` on what you touched. Shipping binaries to
 users goes through the rolling prebuilt release — read `docs/RELEASE.md`.
 
@@ -235,7 +322,11 @@ checks, emits one warning, and must never be used by production tooling.
 The user-facing command set is `possess` (`setup`), `exorcise` (`remove`),
 `status`, `doctor`, `reconnect`, `disconnect`, `update`, `login`, `logout`,
 `reset`, and foreground-only `run`. `possess --new-account` creates another
-isolated account instance. `run` writes `<config_dir>/state.json` atomically on
+isolated account instance. On Windows, `possess --service-mode task|run`
+selects and persists the instance's background manager; a denied task
+breakaway is offered as a switch to the Run watchdog on the next `possess`.
+`run` writes `state.json` atomically (`<config_dir>` on Unix,
+`%LOCALAPPDATA%\spawn\state\<instance>` on Windows) on
 connection/session transitions and every 30 seconds; SIGHUP requests an
 immediate reconnect without terminating session workers.
 

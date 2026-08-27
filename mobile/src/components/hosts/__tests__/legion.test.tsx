@@ -5,6 +5,7 @@ import {
   offlineHost,
   onlineHost,
   runningSession,
+  windowsHost,
 } from "@/components/hosts/__tests__/fixtures";
 import { CapacityMeter } from "@/components/hosts/capacity-meter";
 import { LegionHostCard } from "@/components/hosts/legion-host-card";
@@ -113,6 +114,23 @@ describe("Legion fleet surface", () => {
       </ThemeProvider>,
     );
     expect(screen.getByText("updating")).toBeOnTheScreen();
+  });
+
+  test("formats a live Windows host while retaining the generic fleet card", async () => {
+    await render(
+      <ThemeProvider>
+        <LegionHostCard
+          agents={[]}
+          host={windowsHost}
+          liveEnabled={false}
+          onOpen={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Windows · x64")).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Open studio-pc" })).toBeOnTheScreen();
   });
 
   test("pauses a live-capacity probe while its card is outside the viewport", async () => {

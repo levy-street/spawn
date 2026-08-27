@@ -26,6 +26,7 @@ mod host_preview;
 mod host_signal;
 mod lifecycle;
 mod login;
+mod platform;
 mod possess;
 mod proto;
 mod pty;
@@ -61,6 +62,16 @@ async fn main() -> anyhow::Result<()> {
         // — so --config-dir and the env var are one mechanism.
         std::env::set_var("SPAWN_CONFIG_DIR", dir);
     }
+    match &cli.command {
+        Command::Run(args) if args.background_service => {
+            service::prepare_background_log(&config::config_dir()?)?;
+        }
+        Command::Watchdog(args) => service::prepare_watchdog_log(&args.instance)?,
+        Command::UpdateHandoff(_) => {
+            service::prepare_background_log(&config::config_dir()?)?;
+        }
+        _ => {}
+    }
     init_tracing(cli.verbose);
 
     let result = match cli.command {
@@ -73,7 +84,13 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             tracing::info!("login complete; transitioning to run");
-            run::run(cli.server.clone(), cli::RunArgs {}).await
+            run::run(
+                cli.server.clone(),
+                cli::RunArgs {
+                    background_service: false,
+                },
+            )
+            .await
         }
         Command::Run(args) => run::run(cli.server.clone(), args).await,
         Command::Update => update::run_cli(cli.server.clone()).await,
@@ -85,6 +102,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Status(args) => {
             status::run(cli.server.clone(), args, explicit_config, cli.verbose).await
         }
+        Command::Watchdog(args) => service::run_watchdog(&args.instance).await,
+        Command::UpdateHandoff(args) => update::relaunch_after_parent_exit(args.parent_pid),
     };
     if result
         .as_ref()

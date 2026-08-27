@@ -2,15 +2,13 @@ import { createHash } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
+import { type DesktopPlatform, desktopArtifactFromFilename } from "@/lib/platform";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** The name `scripts/publish-desktop.sh` gives every disk image it uploads. */
-const DMG = /^SPAWN-D_(?<version>[^_/\\]+)_(?<platform>darwin-(?:aarch64|x86_64))\.dmg$/u;
-
 /**
- * The disk image this checkout can hand over right now, for development.
+ * The desktop artifact this checkout can hand over right now, for development.
  *
  * `/api/release` answers a different question: what release identity this
  * checkout can *prove*. It refuses to name a desktop version while `desktop/`
@@ -40,14 +38,14 @@ export async function GET(): Promise<NextResponse> {
   // Newest wins: several builds can pile up here, and the one you just made
   // is the one you are trying to press the button on.
   let newest: { version: string; at: number } | null = null;
-  const platformsByVersion = new Map<string, Set<string>>();
+  const artifactsByVersion = new Map<string, Array<{ name: string; platform: DesktopPlatform }>>();
   for (const name of names) {
-    const match = DMG.exec(name);
-    if (!match?.groups) continue;
-    const { version, platform } = match.groups;
-    const set = platformsByVersion.get(version) ?? new Set<string>();
-    set.add(platform);
-    platformsByVersion.set(version, set);
+    const artifact = desktopArtifactFromFilename(name);
+    if (!artifact) continue;
+    const { version, platform } = artifact;
+    const artifacts = artifactsByVersion.get(version) ?? [];
+    artifacts.push({ name, platform });
+    artifactsByVersion.set(version, artifacts);
     const at = await stat(path.join(dir, name))
       .then((info) => info.mtimeMs)
       .catch(() => 0);
@@ -56,15 +54,23 @@ export async function GET(): Promise<NextResponse> {
   if (!newest) return new NextResponse(null, { status: 404 });
 
   // The version is not an identity here. `npm run dev --onboarding` rebuilds
-  // the same version every time it runs, so a page that recognises builds by
-  // version would call every one of them the build you already have. The
-  // digest of the file is what actually changed.
-  const platforms = [...(platformsByVersion.get(newest.version) ?? [])].sort();
-  const image = path.join(dir, `SPAWN-D_${newest.version}_${platforms[0]}.dmg`);
-  const build = createHash("sha256")
-    .update(await readFile(image))
-    .digest("hex")
-    .slice(0, 16);
+  // the same version every time it runs, so hash the exact local inventory.
+  // Including every artifact makes the identity platform-neutral while still
+  // changing when either a DMG or setup EXE is rebuilt in place.
+  const artifacts = (artifactsByVersion.get(newest.version) ?? []).sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
+  const platforms = [...new Set(artifacts.map(({ platform }) => platform))].sort();
+  const digest = createHash("sha256");
+  try {
+    for (const artifact of artifacts) {
+      digest.update(artifact.name);
+      digest.update(await readFile(path.join(dir, artifact.name)));
+    }
+  } catch {
+    return new NextResponse(null, { status: 404 });
+  }
+  const build = digest.digest("hex").slice(0, 16);
 
   return NextResponse.json(
     { version: newest.version, platforms, build },

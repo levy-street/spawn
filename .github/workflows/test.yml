@@ -70,6 +70,10 @@ jobs:
         working-directory: web
         run: bun install --frozen-lockfile
 
+      - name: Install mobile dependencies
+        working-directory: mobile
+        run: npm ci
+
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:

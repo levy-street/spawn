@@ -26,4 +26,23 @@ describe("FileBreadcrumbs", () => {
     await fireEvent.press(screen.getByRole("button", { name: "Open Home" }));
     expect(onNavigate).toHaveBeenCalledWith("/Users/charlie");
   });
+
+  test("sends native Windows breadcrumb paths back to the daemon model", async () => {
+    const onNavigate = jest.fn();
+    await render(
+      <ThemeProvider>
+        <FileBreadcrumbs
+          homeDir="C:\\Users\\Ada"
+          onNavigate={onNavigate}
+          path="C:/Users/Ada/Work/src"
+          pathFlavor="windows"
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Work")).toBeOnTheScreen();
+    expect(screen.getByText("src")).toBeOnTheScreen();
+    await fireEvent.press(screen.getByRole("button", { name: "Open Work" }));
+    expect(onNavigate).toHaveBeenCalledWith("C:\\Users\\Ada\\Work");
+  });
 });

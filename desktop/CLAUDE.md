@@ -1,11 +1,12 @@
 # Working agreements for desktop/
 
-The macOS SPAWN D app. It is a Tauri v2 app with one window and two faces
+The macOS and Windows SPAWN D desktop companion. It is a Tauri v2 app with one window and two faces
 for it: a local wizard that signs you in, installs the daemon and possesses
-this Mac, and then the product itself — the web app from the chosen server,
+this computer, and then the product itself — the web app from the chosen server,
 loaded into that same window, already signed in. Launching the app opens
 whichever face is current, like any app; closing the window leaves SPAWN D
-in the menu bar. Read the repo root `CLAUDE.md` first.
+in the menu bar on macOS or the system tray on Windows. Read the repo root
+`CLAUDE.md` first.
 
 ## Layout
 
@@ -16,17 +17,20 @@ src/             bundled vanilla HTML, TypeScript and CSS; never remote code
 src-tauri/
   src/           Rust commands, API client, trust ceremonies, the one window
                  and its two faces (window.rs) and the tray shell
+    install/      OS-specific verified daemon installation and update handoff
+    supervision/ OS-specific launchd / Task Scheduler diagnostics and log tail
+    window/       Windows WebView2 integration; common navigation stays in window.rs
   capabilities/  least-privilege Tauri capability declarations; they name the
                  window, never a remote URL, so the product page has no IPC
   dmg/           the disk image's window: background.html is the source,
                  render.mjs prints it to background.png at 2× / 144 dpi
-  icons/         icon.icns / icon.png (bundle) and tray.png / tray@2x.png;
-                 icon.html is the source and render.mjs prints both bundle
-                 forms from it
+  icons/         icon.html is the macOS bundle-art source; render.mjs emits
+                 icon.png / icon.icns plus multi-size Windows ICO/PNG assets
   Cargo.toml     standalone crate; links ../../daemon as a library
   tauri.conf.json
   tauri.ci.conf.json  release-only DMG target override
-  tauri.dev.conf.json the same targets, signed ad-hoc, for local runs
+  tauri.dev.conf.json ad-hoc-signed macOS targets for local runs
+  tauri.windows.conf.json  automatic Windows NSIS/current-user override
 ```
 
 ## The wizard is the browser's funnel, printed locally
@@ -44,12 +48,9 @@ not a cousin of it:
   does something the browser cannot (install the daemon itself), the words say
   so.
 - A screen earns its place by preceding something the person will otherwise
-  meet unexplained. The permissions gate does: three system dialogs follow it,
-  every time. The keychain move does not, and used to have one — it cannot
-  know whether macOS will ask, because finding out means probing the keychain,
-  which *is* the dialog, so it would have shown to everyone while only builds
-  whose signature changed ever see a prompt. It migrates in silence instead.
-  Do not add a screen for something most people will never see.
+  meet unexplained. The permissions gate does: three system dialogs follow it
+  on macOS. Secret storage does not prompt on either platform and is not a
+  wizard step. Do not add a screen for something nobody has to answer.
 - Where the browser has to ask, this app already knows, so it does not ask
   twice. The host gate possesses on arrival rather than offering a button — it
   holds the account, it runs the install, and it matches the daemon's key
@@ -69,7 +70,7 @@ not a cousin of it:
   masthead for the gates, the bone slab, the hairline plate. When one of those
   changes, this follows.
 
-Once this Mac is possessed the product is the web app, and the window becomes
+Once this computer is possessed the product is the web app, and the window becomes
 it (`src-tauri/src/window.rs`): the same window navigates to the chosen
 origin, the wizard's session becomes the browser session by way of the cookie
 the server sets on renewal, the page gets no IPC, and any navigation off the
@@ -119,82 +120,43 @@ vendored beside them — the app never fetches a font or an image.
 and `npm run icons` prints both from `icons/icon.html` — the plate's geometry
 and the mark's fit live there, in CSS, and the mark is fitted by its *ink*
 rather than its viewBox, so it can be resized or shifted without hand-editing
-a PNG. `tray.png` / `tray@2x.png` are black-on-alpha and handed to macOS with
+a PNG. The newly rendered 1024 px `icon.png` is also the Windows colour
+master: the same command emits the black-on-alpha macOS `tray.png` /
+`tray@2x.png`, multi-size `icon.ico`, `tray-windows.ico`, the Windows tray
+layers and the 32/64 px runtime tray PNGs. `npm run icons:check` proves every
+committed output is current without rewriting it. The macOS tray images use
 `icon_as_template(true)`, which is the only correct way to wear a logo in the
-menu bar.
+menu bar; Windows uses the generated colour tray and never template mode.
 
 ## Where things go
 
 - UI state and rendering stay in `src/`; keep dependencies to the vanilla
   Tauri template and do not add a component framework.
-- Network, process, keychain, filesystem and cryptographic work belongs in
+- Network, process, secret storage, filesystem and cryptographic work belongs in
   Rust commands under `src-tauri/src/`. Pure contract logic gets a Rust unit
   test beside it.
-- **This app never asks for the macOS keychain.** The session token and the
-  Ed25519 device seed live in a mode-0600 `credentials.json` beside the
+- **This app never uses Keychain, Credential Manager or `keyring`.** The
+  session token and Ed25519 device seed live in `credentials.json` beside the
   preferences, written through `spawnd::secret_file` — the same atomic write,
-  ownership and permission checks, `NOFOLLOW` open and cross-process lock the
-  daemon's `creds.rs` uses for its own token and host seed. Non-secret
-  preferences stay in the state file.
+  no-follow open, cross-process lock and platform access checks the daemon uses
+  for its own, more powerful credentials. Unix gets a user-owned mode-0600
+  file; Windows gets a current-user-only DACL. `dirs::config_dir` maps the same
+  `dev.spawnd.desktop` support directory to Application Support on macOS and
+  `%APPDATA%` on Windows. Non-secret preferences stay in `state.json`.
 
   The trade is real and is argued in the `storage.rs` module comment rather
-  than assumed: a keychain item's ACL keeps *other processes running as this
-  user* out, and a 0600 file does not. It is worth giving up because the
-  daemon's strictly more powerful credentials — the host key that possesses
-  this Mac — already live in exactly such a file, so the stronger door is on
-  the lesser prize; and because "SPAWN D wants to use your confidential
-  information stored in your keychain" reads to most people as *passwords*,
-  which is the last thing a product that runs agents on your machine can afford
-  to ask for. If you are tempted to put a secret back in the keychain, read that
-  comment first and update it if you disagree — do not leave it stale.
+  than assumed. If you are tempted to put a secret back in an OS vault, read
+  and update that comment first — do not leave it stale. There is deliberately
+  no vault migration or launch-time vault read: the app must never prompt for
+  one, block on one, or inherit a platform-specific credential size limit.
 
-  `keyring` remains as a dependency for one reason: a one-time migration that
-  moves items older builds wrote into the file and deletes them. It runs from
-  the `setup` hook in `lib.rs`, on its own thread — a fixed moment beats
-  whichever secret read lands first, which could be mid-possession, and a
-  thread because it can sit on a dialog for as long as a person takes. Nothing
-  in the launch path reads a secret (`window::surface` reads preferences only),
-  so there is nothing for it to race. Whether that
-  migration is silent is decided by the signature, not by us — a notarized app
-  reading items a notarized app wrote satisfies the ACL and nobody is asked
-  anything, while a build whose signature changed since the item was written
-  gets one dialog per item, at most twice, once, ever.
-
-  **A macOS keychain read can block for ever, and `keyring` has no timeout.**
-  When an item's ACL does not match the running signature macOS wants to
-  prompt — and a prompt is a sheet, which needs a visible window to attach to.
-  With no window it never renders and the call never returns. Not slowly:
-  never. Running the sweep from `setup` shipped an app that launched to
-  nothing at all — no window, no error, no log line, because nothing had
-  failed yet. So: every keychain read happens on a detached thread behind
-  `recv_timeout` (`PATIENT` when a window is up for the sheet to land on,
-  `BRIEF` otherwise), the boot sweep waits for a *visible* window before it
-  reads, and a reader that finds the sweep busy answers from the file rather
-  than queueing behind it. The `try_lock` in `sweep_once` is load-bearing: a
-  `OnceLock` there made every secret read wait on the boot sweep, which is how
-  one stuck call took the whole app. A stuck reader thread is never joined and
-  lives until the process exits — deliberate, and the cheaper half of the
-  trade. Verify a change here by running the built app and checking
-  `CGWindowListCopyWindowInfo` reports the window `onscreen=true`; no unit test
-  can see this.
-
-  **Never collapse a refused keychain read into an absent one.** `.ok()` on
-  `get_password()` makes "there is nothing here" and "I will not tell you" the
-  same value, and the sweep then marks itself complete having rescued nothing.
-  The token is replaceable; the device seed is not — it *is* what made this
-  device approved, so one accidental Deny signs the person out and leaves them
-  re-approving a device the account already trusted, with nothing anywhere
-  saying why. `KeychainRead` keeps the three answers apart and
-  `sweep_is_complete` refuses to finish on a refusal, so the next launch tries
-  again; a repeated dialog is a far smaller harm than an identity destroyed
-  permanently. Only people on a signature that cannot satisfy the ACL reach
-  that branch at all. `daemon/src/creds.rs` gets this right already
-  (`NoEntry` → `Ok(None)`, every other error propagates) — match it.
 - The chosen control-plane origin applies to auth, daemon install and daemon
   status. App updates always use the independently signed spawnd.dev channel.
 - Never bundle or load `spawnd` in the app. Download and verify both daemon
-  binaries from the chosen server, install them to `~/.local/bin`, then let
-  the daemon own its service and updates.
+  binaries from the chosen server. Fresh installs go to `~/.local/bin` on
+  macOS or `%LOCALAPPDATA%\spawn\bin` on Windows. Any existing Windows install
+  is handed to `spawnd update`; the app must never rename or overwrite a live
+  `spawnd.exe`. The daemon owns launchd / Task Scheduler and its own updates.
 
 ## Commands
 
@@ -204,6 +166,7 @@ cargo tauri dev
 cargo tauri build
 npm run dmg:background      # after editing src-tauri/dmg/background.html
 npm run icons               # after editing src-tauri/icons/icon.html
+npm run icons:check
 cd src-tauri && cargo fmt && cargo build && cargo test && cargo clippy -- -D warnings
 ```
 
@@ -245,6 +208,24 @@ daemon asks after the screen instead of over the top of it. Without that hold
 there is a real race — the service registers within seconds of approval, so the
 dialogs would routinely beat the screen onto the display. See "What macOS asks,
 and when" in `daemon/CLAUDE.md`.
+
+`tauri.ci.conf.json` is macOS-only (`app` + `dmg`). On Windows,
+`tauri.windows.conf.json` is merged automatically and produces only the
+English, per-user NSIS installer with the WebView2 download bootstrapper:
+
+```powershell
+npm ci
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc
+npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
+# CI Authenticode-signs spawn-desktop.exe here, then:
+npm run tauri -- bundle --bundles nsis --target x86_64-pc-windows-msvc
+```
+
+The public Windows artifact is exactly
+`SPAWN-D_<version>_windows-x86_64-setup.exe`. Azure Artifact Signing covers
+the inner EXE before NSIS and the final installer after bundling. The offline
+Tauri updater signature covers the final, canonically named setup EXE last.
 
 The wizard can be driven in a plain browser by faking the Tauri bridge
 (`window.__TAURI_INTERNALS__`) under Vite with `root` set to this folder — the

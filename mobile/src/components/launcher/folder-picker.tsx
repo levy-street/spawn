@@ -12,8 +12,10 @@ import {
   listAllEntries,
   normalizeAbsolutePath,
   normalizeCwdForHost,
+  type PathFlavor,
   parentWithinHome,
   pathBasename,
+  pathEquals,
   visibleDirectories,
 } from "@/components/launcher/folder-picker-logic";
 import { Button } from "@/components/ui/button";
@@ -35,6 +37,7 @@ export interface FolderPickerProps {
   transport: HostTransport | null;
   transportState: TransportState;
   initialPath?: string | null;
+  pathFlavor?: PathFlavor;
   recentError?: string | null;
   recentDirectories: readonly RecentDirOut[];
   onSelect(path: string): void;
@@ -44,6 +47,7 @@ export function FolderPicker({
   transport,
   transportState,
   initialPath,
+  pathFlavor = "posix",
   recentError,
   recentDirectories,
   onSelect,
@@ -79,8 +83,8 @@ export function FolderPicker({
       .request<{ home_dir: string }>("fs.home")
       .then(({ home_dir }) => {
         if (!active) return;
-        const root = homeRoot(home_dir);
-        const nextPath = normalizeCwdForHost(initialPath ?? root, root);
+        const root = homeRoot(home_dir, pathFlavor);
+        const nextPath = normalizeCwdForHost(initialPath ?? root, root, pathFlavor);
         setHomeDir(root);
         setCurrentPath(nextPath);
         setTypedPath(nextPath);
@@ -94,7 +98,7 @@ export function FolderPicker({
     return () => {
       active = false;
     };
-  }, [initialPath, transport, transportState]);
+  }, [initialPath, pathFlavor, transport, transportState]);
 
   const loadPath = useCallback(
     async (path: string) => {
@@ -128,9 +132,11 @@ export function FolderPicker({
 
   const navigate = (path: string) => {
     if (!homeDir) return;
-    const nextPath = normalizeAbsolutePath(path);
-    if (!isWithinHome(nextPath, homeDir)) {
-      setError("That folder sits above your home folder, which is as far up as Spawn can browse.");
+    const nextPath = normalizeAbsolutePath(path, pathFlavor);
+    if (!isWithinHome(nextPath, homeDir, pathFlavor)) {
+      setError(
+        "That folder sits above your home folder, which is as far up as SPAWN D can browse.",
+      );
       return;
     }
     haptics.selection();
@@ -140,14 +146,17 @@ export function FolderPicker({
     setTypedPath(nextPath);
   };
 
-  const parent = homeDir ? parentWithinHome(currentPath, homeDir) : null;
-  const crumbs = homeDir ? breadcrumbParts(currentPath, homeDir) : [];
+  const parent = homeDir ? parentWithinHome(currentPath, homeDir, pathFlavor) : null;
+  const crumbs = homeDir ? breadcrumbParts(currentPath, homeDir, pathFlavor) : [];
   const visible = useMemo(
     () => visibleDirectories(entries, { filter, showHidden }),
     [entries, filter, showHidden],
   );
   const recentAtHome = Boolean(
-    homeDir && currentPath === homeDir && filter.length === 0 && recentDirectories.length > 0,
+    homeDir &&
+      pathEquals(currentPath, homeDir, pathFlavor) &&
+      filter.length === 0 &&
+      recentDirectories.length > 0,
   );
   const canSelect = Boolean(homeDir && currentPath && !isLoading && !error);
 
@@ -203,7 +212,7 @@ export function FolderPicker({
           containerStyle={styles.pathInput}
           onChangeText={setTypedPath}
           onSubmitEditing={() => navigate(typedPath)}
-          placeholder="/path/to/folder"
+          placeholder={pathFlavor === "windows" ? "C:\\path\\to\\folder" : "/path/to/folder"}
           purpose="path"
           value={typedPath}
         />
@@ -266,7 +275,7 @@ export function FolderPicker({
         </View>
       ) : null}
 
-      {homeDir && currentPath === homeDir && recentError ? (
+      {homeDir && pathEquals(currentPath, homeDir, pathFlavor) && recentError ? (
         <Text color="warning" variant="caption">
           Recent folders are unavailable. You can still browse this host.
         </Text>
@@ -295,7 +304,7 @@ export function FolderPicker({
             <Pressable
               accessibilityLabel={`Open folder ${item.name}`}
               accessibilityRole="button"
-              onPress={() => navigate(joinDirectory(currentPath, item.name))}
+              onPress={() => navigate(joinDirectory(currentPath, item.name, pathFlavor))}
               style={({ pressed }) => [
                 styles.folderRow,
                 {
@@ -322,7 +331,7 @@ export function FolderPicker({
       ) : null}
 
       <Button disabled={!canSelect} onPress={() => onSelect(currentPath)}>
-        {`Choose “${pathBasename(currentPath)}”`}
+        {`Choose “${pathBasename(currentPath, pathFlavor)}”`}
       </Button>
     </View>
   );

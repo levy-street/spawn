@@ -705,7 +705,7 @@ export function Sidebar({
           {/* The whole lockup goes home, not just the trident: the wordmark
            * carries a second link to the same place, hovering either lights
            * the trident's plate, and only the trident is in the tab order and
-           * the accessibility tree — two stops reading "spawnd home" back to
+           * the accessibility tree — two stops reading "SPAWN D home" back to
            * back is noise, and the wordmark is the redundant one. */}
           <div className="group/home flex min-w-0 flex-1 items-center">
             {collapsed ? (
@@ -741,7 +741,7 @@ export function Sidebar({
                 href="/"
                 onClick={onNavigate}
                 className="grid size-9 shrink-0 place-items-center rounded-lg text-foreground transition-colors group-hover/home:bg-accent/50"
-                aria-label="spawnd home"
+                aria-label="SPAWN D home"
               >
                 <Trident className="size-5.5" />
               </Link>

@@ -2,7 +2,13 @@ import { fireEvent, render, waitFor } from "@testing-library/react-native";
 import * as Clipboard from "expo-clipboard";
 
 import { AboutScreen } from "@/components/longtail/about-screen";
-import { installCommandsForBaseUrl } from "@/components/longtail/public-content";
+import {
+  installCommandsForBaseUrl,
+  installTargetsForBaseUrl,
+  nativeWindowsAvailableFromRelease,
+  WINDOWS_PLATFORM_ID,
+} from "@/components/longtail/public-content";
+import { presentShareSheet } from "@/lib/share";
 import { ThemeProvider } from "@/theme";
 
 const mockToastError = jest.fn();
@@ -15,21 +21,56 @@ jest.mock("expo-clipboard", () => ({
   setStringAsync: jest.fn(async () => undefined),
 }));
 
+jest.mock("@/data/queries/release", () => ({
+  useRelease: () => ({ data: undefined }),
+}));
+
+jest.mock("@/lib/share", () => ({
+  presentShareSheet: jest.fn(async () => ({ action: "sharedAction" })),
+}));
+
 describe("about and public content", () => {
   beforeEach(() => jest.clearAllMocks());
 
-  test("builds deployment-specific normal and prebuilt-only commands", () => {
+  test("builds every deployment-specific command from one origin", () => {
     expect(installCommandsForBaseUrl("https://spawn.example/api")).toEqual({
       standard: "curl -fsSL https://spawn.example/install.sh | sh",
-      windows: 'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
+      windows: "irm https://spawn.example/install.ps1 | iex",
+      windowsWsl: 'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
       prebuiltOnly: "curl -fsSL https://spawn.example/install.sh | sh -s -- --prebuilt-only",
+      windowsWslPrebuiltOnly:
+        'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh -s -- --prebuilt-only"',
     });
   });
 
-  test("shows version, legal, security, and copies the install command", async () => {
+  test("stages native Windows from the published daemon target", () => {
+    expect(WINDOWS_PLATFORM_ID).toBe("windows-x86_64");
+    expect(nativeWindowsAvailableFromRelease(undefined)).toBe(false);
+    expect(
+      nativeWindowsAvailableFromRelease({
+        daemon: { targets: { [WINDOWS_PLATFORM_ID]: {} } },
+      }),
+    ).toBe(true);
+    expect(
+      installTargetsForBaseUrl("https://spawn.example/api", false).map((target) => target.label),
+    ).toEqual(["macOS / Linux", "Windows (WSL)"]);
+    expect(
+      installTargetsForBaseUrl("https://spawn.example/api", true).map((target) => [
+        target.id,
+        target.label,
+        target.prompt,
+      ]),
+    ).toEqual([
+      ["unix", "macOS / Linux", "$"],
+      ["windows", "Windows", "PS>"],
+      ["windows-wsl", "Windows (WSL)", "PS>"],
+    ]);
+  });
+
+  test("shows native targets and shares all install routes", async () => {
     const screen = await render(
       <ThemeProvider>
-        <AboutScreen baseUrl="https://spawn.example" version="2.4.0" />
+        <AboutScreen baseUrl="https://spawn.example" nativeWindowsAvailable version="2.4.0" />
       </ThemeProvider>,
     );
 
@@ -44,5 +85,78 @@ describe("about and public content", () => {
         "curl -fsSL https://spawn.example/install.sh | sh",
       ),
     );
+    await fireEvent.press(screen.getByRole("button", { name: "Copy Windows install command" }));
+    await waitFor(() =>
+      expect(Clipboard.setStringAsync).toHaveBeenCalledWith(
+        "irm https://spawn.example/install.ps1 | iex",
+      ),
+    );
+    await fireEvent.press(screen.getByRole("button", { name: "Copy Windows WSL install command" }));
+    await waitFor(() =>
+      expect(Clipboard.setStringAsync).toHaveBeenCalledWith(
+        'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
+      ),
+    );
+    await fireEvent.press(
+      screen.getByRole("button", { name: "Copy Windows WSL prebuilt-only command" }),
+    );
+    await waitFor(() =>
+      expect(Clipboard.setStringAsync).toHaveBeenCalledWith(
+        'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh -s -- --prebuilt-only"',
+      ),
+    );
+    await fireEvent.press(screen.getByRole("button", { name: "Share" }));
+    expect(presentShareSheet).toHaveBeenCalledWith({
+      message: [
+        "Install spawnd on a machine you control.",
+        "",
+        "macOS / Linux:",
+        "curl -fsSL https://spawn.example/install.sh | sh",
+        "",
+        "Windows:",
+        "irm https://spawn.example/install.ps1 | iex",
+        "",
+        "Windows (WSL):",
+        'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
+        "",
+        "After installation, run spawnd possess on that machine.",
+      ].join("\n"),
+    });
+    await screen.unmount();
+  });
+
+  test("keeps the WSL-only About state truthful before native availability", async () => {
+    const screen = await render(
+      <ThemeProvider>
+        <AboutScreen
+          baseUrl="https://spawn.example"
+          nativeWindowsAvailable={false}
+          version="2.4.0"
+        />
+      </ThemeProvider>,
+    );
+
+    expect(
+      screen.getByText(
+        "Install spawnd on a Mac or Linux machine you control, or on Windows through WSL.",
+      ),
+    ).toBeOnTheScreen();
+    expect(screen.getByText("Windows (via WSL)")).toBeOnTheScreen();
+    expect(screen.queryByText("irm https://spawn.example/install.ps1 | iex")).toBeNull();
+    await fireEvent.press(screen.getByRole("button", { name: "Share" }));
+    expect(presentShareSheet).toHaveBeenCalledWith({
+      message: [
+        "Install spawnd on a machine you control.",
+        "",
+        "macOS / Linux:",
+        "curl -fsSL https://spawn.example/install.sh | sh",
+        "",
+        "Windows (WSL):",
+        'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
+        "",
+        "After installation, run spawnd possess on that machine.",
+      ].join("\n"),
+    });
+    await screen.unmount();
   });
 });

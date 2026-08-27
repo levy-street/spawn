@@ -38,7 +38,7 @@ const STEP_COPY: Record<OnboardingStep, { title: string; description: string }> 
   host: {
     title: "Connect your first host",
     description:
-      "Install the daemon on a Mac or Linux machine, then approve it from the link its terminal prints.",
+      "Install the daemon on a machine you control, then approve it from the link spawnd possess prints. It appears here once it’s online.",
   },
   done: {
     title: "Your machine is possessed",

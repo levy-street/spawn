@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { useAuth } from "@/lib/auth";
+import { type DesktopPlatform, WINDOWS_DESKTOP_PLATFORM } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
 /*
@@ -165,7 +166,7 @@ export function Masthead({ current }: { current?: "security" | "download" }) {
         </div>
         <Link
           href={inShell ? "/app" : "/"}
-          aria-label={inShell ? "Back to SPAWN D" : "spawnd home"}
+          aria-label={inShell ? "Back to SPAWN D" : "SPAWN D home"}
           ref={brandRef}
           className="flex flex-col items-center gap-2 text-hellfire"
         >
@@ -307,20 +308,20 @@ function filenameOf(url: string): string {
 type DownloadPhase =
   | { at: "offer" }
   /** Pressed before the build was named: the press is held, not spent. */
-  | { at: "waiting" }
+  | { at: "waiting"; platform: DesktopPlatform }
   | { at: "running"; received: number; total: number | null }
   | { at: "done" }
   | { at: "failed" };
 
 /**
- * The Mac download, set the way the phone stores set theirs: the platform's
+ * The desktop download, set the way the phone stores set theirs: the platform's
  * own mark, then the words, as one object you press — not a caption with a
  * link somewhere under it.
  *
- * It is Apple's shape, not Apple's blue. Every download on this site is the
- * bone slab on the void, and hellfire is never a button ground, so borrowing
- * the vendor's colour would put a second "click me" ink on the page and break
- * the one rule the palette carries.
+ * It uses the platform mark, not the vendor colour. Every download on this
+ * site is the bone slab on the void, and hellfire is never a button ground,
+ * so borrowing a vendor colour would put a second "click me" ink on the page
+ * and break the one rule the palette carries.
  *
  * It is also a *download button*, which means it answers for the download and
  * not merely for the press: it fills as the file arrives, says when the file
@@ -341,14 +342,14 @@ type DownloadPhase =
  * - neither: nothing to hand out here, so /download, where the builds are
  *   listed with their versions.
  */
-export function MacDownloadButton({
+export function DesktopDownloadButton({
   href,
   version = null,
   buildId = null,
   pending = false,
   className,
-  label = "Download for macOS",
-  platform = "mac",
+  label,
+  platform,
 }: {
   href: string | null;
   /** The build's version, for the words. */
@@ -363,24 +364,24 @@ export function MacDownloadButton({
   pending?: boolean;
   className?: string;
   label?: string;
-  /** Which machine is being handed a download — the mark and the words follow. */
-  platform?: "mac" | "windows";
+  /** Exact artifact requested — the pending press is stamped with this value. */
+  platform: DesktopPlatform;
 }) {
   const [phase, setPhase] = useState<DownloadPhase>({ at: "offer" });
   const [had, setHad] = useState<string | null>(null);
   // Read after mount, never during render: the server has no localStorage, and
   // a first paint that disagreed with it would be a hydration mismatch.
   useEffect(() => setHad(rememberedDownload()), []);
-
   const shell = cn(
     "group relative isolate inline-flex h-14 items-center justify-center gap-2.5 overflow-hidden rounded-sm bg-bone px-7 font-sigil text-[13px] font-medium tracking-[0.14em] text-void uppercase transition-colors hover:bg-white",
     className,
   );
-  const mark = platform === "windows" ? <WindowsMark /> : <AppleMark />;
-  const words =
-    platform === "windows" && label === "Download for macOS" ? "Download for Windows" : label;
+  const windows = platform === WINDOWS_DESKTOP_PLATFORM;
+  const mark = windows ? <WindowsMark /> : <AppleMark />;
+  const words = label ?? (windows ? "Download for Windows" : "Download for macOS");
+  const testId = windows ? "windows-download" : "mac-download";
   /** This browser already has exactly this build — not merely its version. */
-  const stamp = buildId === null ? null : `${version ?? "?"}@${buildId}`;
+  const stamp = buildId === null ? null : `${platform}:${version ?? "?"}@${buildId}`;
   const alreadyHas = stamp !== null && had === stamp;
 
   const fetchIt = useCallback(
@@ -425,16 +426,23 @@ export function MacDownloadButton({
   // The held press, spent as soon as there is something to spend it on.
   useEffect(() => {
     if (phase.at !== "waiting") return;
+    if (phase.platform !== platform) {
+      setPhase({ at: "offer" });
+      window.location.assign("/download");
+      return;
+    }
     if (href !== null) {
       void fetchIt(href);
       return;
     }
-    // The manifest answered, and the answer was that there is no build here.
+    // The manifest answered without that exact artifact, or the surrounding
+    // target changed while the request was held. Deliberately cancel to the
+    // inventory page; never reinterpret the old press as another platform.
     if (!pending) {
       setPhase({ at: "offer" });
       window.location.assign("/download");
     }
-  }, [phase, href, pending, fetchIt]);
+  }, [phase, href, pending, fetchIt, platform]);
 
   useEffect(() => {
     if (phase.at !== "done" && phase.at !== "failed") return;
@@ -493,10 +501,10 @@ export function MacDownloadButton({
     return (
       <button
         type="button"
-        onClick={() => setPhase({ at: "waiting" })}
+        onClick={() => setPhase({ at: "waiting", platform })}
         aria-busy={phase.at === "waiting" || phase.at === "running"}
         className={shell}
-        data-testid="mac-download"
+        data-testid={testId}
       >
         {inner}
       </button>
@@ -504,7 +512,7 @@ export function MacDownloadButton({
   }
   if (href === null) {
     return (
-      <Link href="/download" className={shell}>
+      <Link href="/download" className={shell} data-testid={testId}>
         {mark}
         {words}
       </Link>
@@ -524,7 +532,7 @@ export function MacDownloadButton({
       }}
       aria-busy={phase.at === "running"}
       className={shell}
-      data-testid="mac-download"
+      data-testid={testId}
     >
       {inner}
     </a>
@@ -635,6 +643,7 @@ export interface InstallChipTarget {
   id: string;
   label: string;
   command: string;
+  prompt?: "$" | "PS>";
 }
 
 /**
@@ -702,7 +711,7 @@ export function InstallCommand({
             // The rule under the tabs is set in from both sides, like every
             // other divider inside a panel — an edge-to-edge line here read as
             // the chip's own border rather than a division inside it.
-            className="relative flex items-center gap-5 px-4 pt-4 pb-2.5 after:absolute after:inset-x-4 after:bottom-0 after:h-px after:bg-bone/25 after:content-['']"
+            className="relative flex flex-wrap items-center gap-x-5 gap-y-2 px-4 pt-4 pb-2.5 after:absolute after:inset-x-4 after:bottom-0 after:h-px after:bg-bone/25 after:content-['']"
           >
             {tabs.map((target) => {
               const selected = target.id === active?.id;
@@ -729,7 +738,7 @@ export function InstallCommand({
           </div>
         )}
         <div className="flex max-w-full items-center gap-3 py-3.5 pr-3 pl-4">
-          <span className="text-ember">$</span>
+          <span className="shrink-0 text-ember">{active?.prompt ?? "$"}</span>
           <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{shown}</code>
           <button
             type="button"

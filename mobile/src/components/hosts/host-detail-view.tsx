@@ -2,7 +2,11 @@ import * as Clipboard from "expo-clipboard";
 import { useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { HostFacts } from "@/components/hosts/host-facts";
-import { hostConnectionLabel, relativeSeen } from "@/components/hosts/host-model";
+import {
+  formatHostPlatform,
+  hostConnectionLabel,
+  relativeSeen,
+} from "@/components/hosts/host-model";
 import { HostSessionList } from "@/components/hosts/host-session-list";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -223,7 +227,7 @@ export function HostDetailView({
           </Text>
         </View>
         <Text color="mutedForeground" variant="body">
-          {host.os ?? "unknown"} · {host.arch ?? "unknown"} · daemon {host.version ?? "unknown"}
+          {formatHostPlatform(host)} · daemon {host.version ?? "unknown"}
         </Text>
       </View>
       <HostTroubleshootingPanel host={host} />

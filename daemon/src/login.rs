@@ -572,7 +572,13 @@ fn approval_url(
 /// launcher was started. Never blocks and never fails login — on a headless host
 /// (no display) or where no opener exists, the caller prints the URL instead.
 fn open_browser(url: &str) -> bool {
+    #[cfg(windows)]
+    {
+        return crate::platform::open_url(url).is_ok();
+    }
+    #[cfg(not(windows))]
     use std::process::{Command, Stdio};
+    #[cfg(not(windows))]
     let mut _cmd: Option<Command> = None;
     #[cfg(target_os = "macos")]
     {
@@ -585,6 +591,7 @@ fn open_browser(url: &str) -> bool {
             _cmd = Some(Command::new("xdg-open"));
         }
     }
+    #[cfg(not(windows))]
     match _cmd {
         Some(mut cmd) => cmd
             .arg(url)
@@ -598,6 +605,10 @@ fn open_browser(url: &str) -> bool {
 }
 
 fn browser_opener_available() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
     #[cfg(target_os = "macos")]
     {
         std::path::Path::new("/usr/bin/open").is_file()
@@ -607,7 +618,7 @@ fn browser_opener_available() -> bool {
         (std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some())
             && command_on_path("xdg-open")
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         false
     }

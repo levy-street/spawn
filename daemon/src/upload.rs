@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -10,10 +9,9 @@ use std::time::{Duration, Instant as StdInstant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use nix::errno::Errno;
-use nix::fcntl::{open, openat, OFlag};
-use nix::sys::stat::{fchmod, mkdirat, Mode};
-use nix::unistd::{fsync, linkat, unlinkat, UnlinkatFlags};
+use cap_fs_ext::DirExt;
+use cap_std::fs::Dir;
+use cap_std::{ambient_authority, fs::Dir as CapDir};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use tokio::fs;
@@ -217,7 +215,7 @@ struct ActiveUpload {
     owner: UploadOwner,
     manifest: UploadManifest,
     root_path: PathBuf,
-    directory: Arc<OwnedFd>,
+    directory: Arc<Dir>,
     temp_name: String,
     final_name: String,
     file: Option<std::fs::File>,
@@ -1277,14 +1275,8 @@ fn prepare_upload(cwd: &str, owner: UploadOwner, manifest: UploadManifest) -> Re
         }
     };
     let temp_name = format!(".spawn-upload-{}.part", Uuid::new_v4().simple());
-    let raw = openat(
-        Some(directory.as_raw_fd()),
-        temp_name.as_str(),
-        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::from_bits_truncate(0o600),
-    )
-    .context("creating private upload temporary file")?;
-    let file = unsafe { std::fs::File::from_raw_fd(raw) };
+    let file = crate::platform::create_private_file_new_at(&directory, Path::new(&temp_name))
+        .context("creating private upload temporary file")?;
     Ok(ActiveUpload {
         owner,
         manifest,
@@ -1370,22 +1362,19 @@ fn cleanup_active_sync(active: &mut ActiveUpload, hooks: &UploadLifecycleHooks) 
     if hooks.fail_unlink() {
         anyhow::bail!("injected upload temporary unlink failure");
     }
-    match unlinkat(
-        Some(active.directory.as_raw_fd()),
-        active.temp_name.as_str(),
-        UnlinkatFlags::NoRemoveDir,
-    ) {
-        Ok(()) | Err(Errno::ENOENT) => {}
+    match active.directory.remove_file(&active.temp_name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("removing upload temporary file"),
     }
     if hooks.fail_fsync() {
         anyhow::bail!("injected upload directory fsync failure");
     }
-    fsync(active.directory.as_raw_fd()).context("syncing upload directory cleanup")?;
+    crate::platform::fsync_dir(&active.directory).context("syncing upload directory cleanup")?;
     Ok(())
 }
 
-fn link_no_clobber(directory: &OwnedFd, temp_name: &str, desired_name: &str) -> Result<String> {
+fn link_no_clobber(directory: &Dir, temp_name: &str, desired_name: &str) -> Result<String> {
     let file_path = Path::new(desired_name);
     let stem = file_path
         .file_stem()
@@ -1407,15 +1396,14 @@ fn link_no_clobber(directory: &OwnedFd, temp_name: &str, desired_name: &str) -> 
             }
         };
         validate_leaf_name(&candidate)?;
-        match linkat(
-            Some(directory.as_raw_fd()),
-            temp_name,
-            Some(directory.as_raw_fd()),
-            candidate.as_str(),
-            nix::fcntl::AtFlags::empty(),
+        match crate::platform::hard_link_noreplace_at(
+            directory,
+            Path::new(temp_name),
+            directory,
+            Path::new(&candidate),
         ) {
             Ok(()) => return Ok(candidate),
-            Err(Errno::EEXIST) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error).context("committing upload without clobber"),
         }
     }
@@ -1430,7 +1418,7 @@ fn upload_close_timeout() -> Duration {
     }
 }
 
-fn open_capability_root(cwd: &str) -> Result<(PathBuf, OwnedFd)> {
+fn open_capability_root(cwd: &str) -> Result<(PathBuf, Dir)> {
     if cwd.is_empty() || cwd.len() > MAX_UPLOAD_PATH_BYTES {
         anyhow::bail!("session cwd is outside upload path limits");
     }
@@ -1438,25 +1426,41 @@ fn open_capability_root(cwd: &str) -> Result<(PathBuf, OwnedFd)> {
     if !path.is_absolute() {
         anyhow::bail!("session cwd is not an absolute capability root");
     }
-    let mut current = owned_fd(open(
-        Path::new("/"),
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::empty(),
-    )?);
-    let mut normalized = PathBuf::from("/");
+    #[cfg(unix)]
+    let (mut normalized, mut current) = (
+        PathBuf::from("/"),
+        CapDir::open_ambient_dir(Path::new("/"), ambient_authority())?,
+    );
+    #[cfg(windows)]
+    let (mut normalized, mut current) = {
+        use std::path::Prefix;
+        let mut components = path.components();
+        let Component::Prefix(prefix) = components
+            .next()
+            .context("Windows upload root has no drive prefix")?
+        else {
+            anyhow::bail!("Windows upload root has no drive prefix");
+        };
+        match prefix.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
+            _ => anyhow::bail!("UNC and device upload roots are unavailable in this release"),
+        }
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            anyhow::bail!("Windows upload root is not drive-absolute");
+        }
+        let mut root = PathBuf::new();
+        root.push(prefix.as_os_str());
+        root.push("\\");
+        let current = CapDir::open_ambient_dir(&root, ambient_authority())?;
+        (root, current)
+    };
     for component in path.components() {
         match component {
-            Component::RootDir => continue,
+            Component::Prefix(_) | Component::RootDir => continue,
             Component::Normal(name) if !name.is_empty() => {
-                current = owned_fd(
-                    openat(
-                        Some(current.as_raw_fd()),
-                        name,
-                        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-                        Mode::empty(),
-                    )
-                    .context("opening session cwd capability component")?,
-                );
+                current = current
+                    .open_dir_nofollow(name)
+                    .context("opening session cwd capability component")?;
                 normalized.push(name);
             }
             _ => anyhow::bail!("session cwd contains an ambiguous component"),
@@ -1465,27 +1469,10 @@ fn open_capability_root(cwd: &str) -> Result<(PathBuf, OwnedFd)> {
     Ok((normalized, current))
 }
 
-fn open_or_create_private_dir(parent: &OwnedFd, name: &str) -> Result<OwnedFd> {
+fn open_or_create_private_dir(parent: &Dir, name: &str) -> Result<Dir> {
     validate_leaf_name(name)?;
-    match mkdirat(
-        Some(parent.as_raw_fd()),
-        name,
-        Mode::from_bits_truncate(0o700),
-    ) {
-        Ok(()) | Err(Errno::EEXIST) => {}
-        Err(error) => return Err(error).context("creating private upload directory"),
-    }
-    let directory = openat(
-        Some(parent.as_raw_fd()),
-        name,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
-        Mode::empty(),
-    )
-    .context("opening private upload directory without following links")?;
-    let directory = owned_fd(directory);
-    fchmod(directory.as_raw_fd(), Mode::from_bits_truncate(0o700))
-        .context("enforcing private upload directory permissions")?;
-    Ok(directory)
+    crate::platform::open_or_create_private_dir_at(parent, Path::new(name))
+        .context("opening private upload directory without following links")
 }
 
 fn validate_leaf_name(name: &str) -> Result<()> {
@@ -1503,11 +1490,26 @@ fn validate_leaf_name(name: &str) -> Result<()> {
     {
         anyhow::bail!("upload name is not one unambiguous relative component");
     }
+    #[cfg(windows)]
+    {
+        let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+        let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || base
+                .strip_prefix("COM")
+                .or_else(|| base.strip_prefix("LPT"))
+                .is_some_and(|suffix| {
+                    suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9')
+                });
+        if name.ends_with(['.', ' '])
+            || name
+                .chars()
+                .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+            || reserved
+        {
+            anyhow::bail!("upload name is not a valid Windows file name");
+        }
+    }
     Ok(())
-}
-
-fn owned_fd(raw: std::os::fd::RawFd) -> OwnedFd {
-    unsafe { OwnedFd::from_raw_fd(raw) }
 }
 
 fn unique_file_name(name: &str, mime_type: &str) -> String {
@@ -1746,12 +1748,15 @@ mod tests {
         )
         .await;
         assert_eq!(std::fs::read(&result.path).unwrap(), bytes);
-        let mode = std::fs::metadata(&result.path).unwrap().permissions();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&result.path).unwrap().permissions();
             assert_eq!(mode.mode() & 0o777, 0o600);
         }
+        #[cfg(windows)]
+        crate::platform::open_private_file(&result.path, false)
+            .expect("uploaded file has a protected owner-only DACL");
         assert!(matches!(
             hub.start(
                 session,
@@ -2983,5 +2988,95 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("without following links"));
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_upload_roots_and_names_reject_ambiguous_native_shapes() {
+        for root in [
+            r"\\server\share\folder",
+            r"\\?\UNC\server\share\folder",
+            r"\\.\C:\folder",
+        ] {
+            let error = open_capability_root(root)
+                .err()
+                .expect("UNC/device root must be unavailable");
+            assert!(
+                error.to_string().contains("UNC") || error.to_string().contains("device"),
+                "unexpected error for {root:?}: {error:#}"
+            );
+        }
+        for name in [
+            "CON",
+            "con.txt",
+            "LPT9.log",
+            "trailing.",
+            "trailing ",
+            "colon:name",
+            "question?.txt",
+        ] {
+            let error = manifest(b"inside", name, UploadDestination::Cwd)
+                .validate()
+                .unwrap_err();
+            assert!(error.to_string().contains("Windows file name"), "{name:?}");
+        }
+        for name in ["", ".", "..", r"..\escape", r"C:\absolute", "a/b", r"a\b"] {
+            let error = manifest(b"inside", name, UploadDestination::Cwd)
+                .validate()
+                .unwrap_err();
+            assert!(error.to_string().contains("unambiguous"), "{name:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_upload_refuses_file_and_directory_reparse_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        std::fs::write(&outside_file, b"outside").unwrap();
+        let destination_link = tmp.path().join("note.txt");
+        match std::os::windows::fs::symlink_file(&outside_file, &destination_link) {
+            Ok(()) => {
+                let result = complete(
+                    &UploadHub::default(),
+                    CompleteUpload {
+                        session: SessionBinding::new(Uuid::new_v4(), 1),
+                        viewer: "viewer",
+                        capability: Uuid::new_v4(),
+                        upload_id: Uuid::new_v4(),
+                        cwd: tmp.path().to_str().unwrap(),
+                        bytes: b"inside",
+                        manifest: manifest(b"inside", "note.txt", UploadDestination::Cwd),
+                    },
+                )
+                .await;
+                assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside");
+                assert_ne!(Path::new(&result.path), destination_link);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => panic!("creating file symlink failed unexpectedly: {error}"),
+        }
+
+        let escape = tmp.path().join("escape");
+        match std::os::windows::fs::symlink_dir(outside.path(), &escape) {
+            Ok(()) => {
+                let error = UploadHub::default()
+                    .start(
+                        SessionBinding::new(Uuid::new_v4(), 1),
+                        "viewer",
+                        Uuid::new_v4(),
+                        Uuid::new_v4(),
+                        escape.to_str().unwrap(),
+                        manifest(b"inside", "note.txt", UploadDestination::Cwd),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("capability component"));
+                assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => panic!("creating directory symlink failed unexpectedly: {error}"),
+        }
     }
 }

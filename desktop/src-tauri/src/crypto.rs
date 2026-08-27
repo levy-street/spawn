@@ -26,10 +26,10 @@ impl DeviceIdentity {
             Some(encoded) => {
                 let mut seed: [u8; 32] = URL_SAFE_NO_PAD
                     .decode(encoded.as_bytes())
-                    .context("decoding the Keychain device identity")?
+                    .context("decoding the credential-file device identity")?
                     .try_into()
                     .map_err(|_| {
-                        anyhow::anyhow!("the Keychain device identity has the wrong length")
+                        anyhow::anyhow!("the credential-file device identity has the wrong length")
                     })?;
                 let key = SigningKey::from_bytes(&seed);
                 seed.zeroize();

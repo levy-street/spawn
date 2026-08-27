@@ -169,8 +169,9 @@ class Settings(BaseSettings):
     prebuilt_dir: Path = Field(
         default=Path(__file__).resolve().parents[2] / "daemon" / "target" / "prebuilt"
     )
-    # Where the notarized desktop disk images actually live. Not derivable
-    # from the checkout: `/desktop/` is nginx's alias over a static root
+    # Where the published desktop artifacts actually live: notarized Mac disk
+    # images and the signed Windows setup EXE. Not derivable from the checkout:
+    # `/desktop/` is nginx's alias over a static root
     # (`infra/nginx-spawnd.conf.example`), and the server has to look in the
     # same place to know whether the version it advertises was ever published.
     # The name matches `scripts/publish-desktop.sh`'s own SPAWN_DESKTOP_DIR on

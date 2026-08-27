@@ -35,6 +35,10 @@ tests/          pytest; test_<module>.py mirrors the module it covers
 
 - A new endpoint: the matching `routes/<area>.py` (or a new one), request and
   response shapes in `schemas.py`, tests in `tests/test_<area>.py`.
+- Hosted daemon installers are rendered by `routes/install.py` at `/install.sh`
+  and `/install.ps1`. Prebuilt API paths stay extensionless; canonical Windows
+  files and download filenames keep `.exe` (`spawnd.exe`,
+  `spawn-worker.exe`).
 - A new websocket frame: the matching `ws/` module — daemon frames in
   `ws/daemon.py`, browser frames in `ws/browser.py`. The daemon side of the
   wire lives in `daemon/src/`; change both sides in the same commit. The

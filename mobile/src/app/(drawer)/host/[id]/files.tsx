@@ -80,6 +80,7 @@ export default function HostFilesRoute() {
       hostId={host.data.id}
       hostIdentityPublicKey={host.data.host_public_key}
       hostName={host.data.name}
+      hostOS={host.data.os}
       onBack={router.back}
       {...(initialPath === undefined ? {} : { initialPath })}
     />

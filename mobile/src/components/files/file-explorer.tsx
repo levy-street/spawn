@@ -9,7 +9,12 @@ import { FileRow } from "@/components/files/file-row";
 import { FileViewer } from "@/components/files/file-viewer";
 import { NameDialog } from "@/components/files/name-dialog";
 import { retainDirectoryPages } from "@/components/files/pagination";
-import { breadcrumbParts, visibleEntries } from "@/components/files/paths";
+import {
+  breadcrumbParts,
+  normalizeCwdForHost,
+  pathFlavorForHostOS,
+  visibleEntries,
+} from "@/components/files/paths";
 import { hasHostFileStreams } from "@/components/files/stream-adapter";
 import type { HostDirEntry } from "@/components/files/types";
 import { AppHeader } from "@/components/layout/app-header";
@@ -40,6 +45,7 @@ export interface FileExplorerProps {
   hostId: string;
   hostName: string;
   hostIdentityPublicKey: string;
+  hostOS?: string | null;
   initialPath?: string;
   /** Leaves the explorer. It owns its own header, since the header's controls are its state. */
   onBack(): void;
@@ -56,11 +62,13 @@ export function FileExplorer({
   hostId,
   hostName,
   hostIdentityPublicKey,
+  hostOS,
   initialPath,
   onBack,
 }: FileExplorerProps) {
   const theme = useTheme();
   const queryClient = useQueryClient();
+  const pathFlavor = pathFlavorForHostOS(hostOS);
   const [transport, setTransport] = useState<HostTransport | null>(null);
   const [transportState, setTransportState] = useState<TransportState>("idle");
   const [path, setPath] = useState("");
@@ -78,11 +86,8 @@ export function FileExplorer({
 
   useEffect(() => {
     if (!home.data || path) return;
-    const requested = initialPath?.startsWith(home.data.home_dir)
-      ? initialPath
-      : home.data.home_dir;
-    setPath(requested ?? home.data.home_dir);
-  }, [home.data, initialPath, path]);
+    setPath(normalizeCwdForHost(initialPath, home.data.home_dir, pathFlavor));
+  }, [home.data, initialPath, path, pathFlavor]);
 
   const listing = useHostDirectory(hostId, path, transport, ready && Boolean(home.data));
   const retained = useMemo(
@@ -164,7 +169,9 @@ export function FileExplorer({
 
   const browsing = ready && Boolean(home.data) && Boolean(path);
   const folderLabel =
-    home.data && path ? breadcrumbParts(path, home.data.home_dir).at(-1)?.label : undefined;
+    home.data && path
+      ? breadcrumbParts(path, home.data.home_dir, pathFlavor).at(-1)?.label
+      : undefined;
   const folderActions: ActionSheetAction[] = [
     {
       id: "create-folder",
@@ -233,7 +240,12 @@ export function FileExplorer({
           onTransport={setTransport}
         />
         {home.data && path ? (
-          <FileBreadcrumbs homeDir={home.data.home_dir} onNavigate={setPath} path={path} />
+          <FileBreadcrumbs
+            homeDir={home.data.home_dir}
+            onNavigate={setPath}
+            path={path}
+            pathFlavor={pathFlavor}
+          />
         ) : null}
         {operationError ? (
           <View style={[styles.notice, { backgroundColor: theme.colors.destructiveSoft }]}>
@@ -324,12 +336,13 @@ export function FileExplorer({
             void runMutation(
               () =>
                 nameMode.kind === "create"
-                  ? createHostFolder(transport, path, name)
+                  ? createHostFolder(transport, path, name, pathFlavor)
                   : renameHostEntry(transport, nameMode.entry.path, name),
               nameMode.kind === "create" ? "write" : "rename",
             );
           }}
           onDismiss={() => setNameMode(null)}
+          pathFlavor={pathFlavor}
           pending={operationPending}
           title={nameMode?.kind === "rename" ? "Rename item" : "New folder"}
           visible={nameMode !== null}

@@ -25,11 +25,12 @@
     "createUpdaterArtifacts": false,
     "icon": [
       "icons/icon.icns",
-      "icons/icon.png"
+      "icons/icon.png",
+      "icons/icon.ico"
     ],
     "category": "Utility",
-    "shortDescription": "Possess and supervise this Mac with SPAWN D",
-    "longDescription": "A menu-bar companion that installs, verifies and supervises the SPAWN D daemon on this Mac.",
+    "shortDescription": "Possess and supervise this computer with SPAWN D",
+    "longDescription": "A desktop companion that installs, verifies and supervises the SPAWN D daemon on this computer.",
     "macOS": {
       "minimumSystemVersion": "12.0",
       "hardenedRuntime": true,

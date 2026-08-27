@@ -31,8 +31,9 @@ SUPPORTED_DAEMON_TARGETS = (
     "darwin-x86_64",
     "linux-x86_64",
     "linux-aarch64",
+    "windows-x86_64",
 )
-DESKTOP_PLATFORMS = ("darwin-aarch64", "darwin-x86_64")
+DESKTOP_PLATFORMS = ("darwin-aarch64", "darwin-x86_64", "windows-x86_64")
 
 #: The one every download surface links to. `useDesktopRelease` in
 #: `web/src/hooks/useDesktopRelease.ts` builds the primary button's URL for
@@ -45,7 +46,6 @@ PRIMARY_DESKTOP_PLATFORM = "darwin-aarch64"
 #: `SPAWN_DESKTOP_DIR` default, and the same one
 #: `infra/nginx-spawnd.conf.example` tells the operator to create.
 DEFAULT_DESKTOP_DIR = Path("/var/www/spawnd/desktop")
-
 DAEMON_UPDATE_TIMEOUT = timedelta(minutes=3)
 
 _HEX_40 = re.compile(r"^[0-9a-f]{40}$")
@@ -270,6 +270,11 @@ def manifest_signature_path(*, repo_root: Path | None = None) -> Path:
     return Path(f"{path}.sig")
 
 
+def _daemon_binary_filename(kind: str, target: str) -> str:
+    suffix = ".exe" if target.startswith("windows-") else ""
+    return f"{kind}{suffix}"
+
+
 def read_prebuilt_manifest(
     *,
     repo_root: Path | None = None,
@@ -331,8 +336,14 @@ def read_prebuilt_manifest(
             return None
 
         binaries = (
-            (prebuilt_root / target / "spawnd", spawnd_sha),
-            (prebuilt_root / target / "spawn-worker", worker_sha),
+            (
+                prebuilt_root / target / _daemon_binary_filename("spawnd", target),
+                spawnd_sha,
+            ),
+            (
+                prebuilt_root / target / _daemon_binary_filename("spawn-worker", target),
+                worker_sha,
+            ),
         )
         for binary, expected in binaries:
             actual = _sha256_file(binary)
@@ -358,6 +369,8 @@ def desktop_image_name(version: str, platform: str) -> str:
     """The filename `scripts/publish-desktop.sh` uploads, and the one
     `desktopDownloadUrl` in `web/src/lib/platform.ts` builds a URL to. Held in
     one place on this side so the check and the link cannot disagree."""
+    if platform == "windows-x86_64":
+        return f"SPAWN-D_{version}_{platform}-setup.exe"
     return f"SPAWN-D_{version}_{platform}.dmg"
 
 
@@ -375,7 +388,7 @@ def desktop_release_dir() -> Path:
 
 
 def published_desktop_platforms(version: str, *, root: Path | None = None) -> list[str] | None:
-    """Which Mac images this deployment can actually hand over.
+    """Which desktop images this deployment can actually hand over.
 
     `None` and `[]` are different answers and the distinction is the whole
     point. `[]` means the release directory is right there and this version is
@@ -389,10 +402,18 @@ def published_desktop_platforms(version: str, *, root: Path | None = None) -> li
         return [
             platform
             for platform in DESKTOP_PLATFORMS
-            if (directory / desktop_image_name(version, platform)).is_file()
+            if _published_desktop_artifact_exists(directory / desktop_image_name(version, platform))
         ]
     except OSError:
         return None
+
+
+def _published_desktop_artifact_exists(path: Path) -> bool:
+    """A zero-byte placeholder is not a published desktop build."""
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def _warn_missing_desktop_dir_once(directory: Path) -> None:
@@ -407,7 +428,7 @@ def _warn_missing_desktop_dir_once(directory: Path) -> None:
     _desktop_dir_warned = True
     log.error(
         "desktop release directory %s does not exist, so /api/release advertises a "
-        "desktop version without proof that its disk image was ever published. Set "
+        "desktop version without proof that its images were ever published. Set "
         "SPAWN_DESKTOP_DIR to the static root nginx serves at /desktop/ "
         "(docs/RELEASE.md, The desktop app).",
         directory,
@@ -421,7 +442,7 @@ def desktop_release(identity: _ReleaseIdentity | None = None) -> schemas.Release
     a daemon only when `manifest.json` validates and every binary it lists is
     on disk with the advertised hash. The desktop block was not, and the gap
     had teeth — the version here is computed from the deployed checkout's
-    `tauri.conf.json`, `web/src/lib/platform.ts` builds the Mac download URL
+    `tauri.conf.json`, `web/src/lib/platform.ts` builds each download URL
     straight out of it, and a deploy that lands before
     `scripts/publish-desktop.sh` therefore points the download button at a
     file that does not exist.
@@ -449,9 +470,7 @@ def desktop_release(identity: _ReleaseIdentity | None = None) -> schemas.Release
     published = published_desktop_platforms(version, root=directory)
     if published is None:
         _warn_missing_desktop_dir_once(directory)
-        return schemas.ReleaseDesktop(
-            version=version, tree=tree, platforms=list(DESKTOP_PLATFORMS)
-        )
+        return schemas.ReleaseDesktop(version=version, tree=tree, platforms=list(DESKTOP_PLATFORMS))
     if PRIMARY_DESKTOP_PLATFORM not in published:
         return None
     # Narrowed to what is on disk, so the Intel link on /download appears only
@@ -489,7 +508,12 @@ def _aware_utc(value: datetime | None) -> datetime | None:
 
 
 def daemon_target(os_name: str | None, arch: str | None) -> str | None:
-    os_part = {"darwin": "darwin", "macos": "darwin", "linux": "linux"}.get((os_name or "").lower())
+    os_part = {
+        "darwin": "darwin",
+        "macos": "darwin",
+        "linux": "linux",
+        "windows": "windows",
+    }.get((os_name or "").lower())
     arch_part = {
         "aarch64": "aarch64",
         "arm64": "aarch64",
@@ -505,6 +529,9 @@ def humanize_self_update_blocked(reason: str | None) -> str:
         "unwritable": "The daemon install directory is not writable",
         "unsupported_target": "This daemon target is unsupported",
         "worker_missing": "The SPAWN D worker binary is missing",
+        "task_breakaway_unconfirmed": (
+            "Task Scheduler has not confirmed that session workers survive updates"
+        ),
     }
     if reason in messages:
         return messages[reason]
