@@ -854,7 +854,7 @@ mod tests {
         for index in 0..4096u16 {
             let byte = b'a' + (index % 26) as u8;
             log.append_history(&[byte]).unwrap();
-            if index % 127 == 0 {
+            if index.is_multiple_of(127) {
                 assert!(log.segment_count() <= MAX_SEGMENTS);
                 assert!(log.budget_bytes() <= max);
                 assert!(log.allocated_disk_bytes() <= max);
@@ -883,7 +883,7 @@ mod tests {
         let mut log = new_log(dir.path(), 64, 16 * 1024);
         for i in 0..512u16 {
             log.append_history(format!("l{i}\r\n").as_bytes()).unwrap();
-            if i % 3 == 0 {
+            if i.is_multiple_of(3) {
                 log.truncate_all().unwrap();
             }
         }

@@ -137,9 +137,9 @@ impl StateStore {
 pub fn state_path(config_dir: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        return crate::service::instance_state_path(config_dir)
+        crate::service::instance_state_path(config_dir)
             .expect("Windows local application data directory must resolve")
-            .join("state.json");
+            .join("state.json")
     }
     #[cfg(not(windows))]
     {

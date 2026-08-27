@@ -115,6 +115,7 @@ fn try_reserve_path(socket: &Path) -> Result<LockAttempt> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(&path)

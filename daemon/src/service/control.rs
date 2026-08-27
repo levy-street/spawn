@@ -318,7 +318,7 @@ pub fn current_user_sid() -> Result<String> {
     if needed < size_of::<TOKEN_USER>() as u32 {
         bail!("Windows returned an invalid current-token SID size");
     }
-    let words = (needed as usize + size_of::<usize>() - 1) / size_of::<usize>();
+    let words = (needed as usize).div_ceil(size_of::<usize>());
     let mut buffer = vec![0_usize; words];
     // SAFETY: the usize-backed buffer is suitably aligned and `needed` bytes
     // long; TOKEN_USER contains a SID pointer valid while the buffer lives.

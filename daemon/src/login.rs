@@ -574,7 +574,7 @@ fn approval_url(
 fn open_browser(url: &str) -> bool {
     #[cfg(windows)]
     {
-        return crate::platform::open_url(url).is_ok();
+        crate::platform::open_url(url).is_ok()
     }
     #[cfg(not(windows))]
     use std::process::{Command, Stdio};

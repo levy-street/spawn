@@ -1211,7 +1211,7 @@ pub(crate) fn load_for_live_reload() -> Result<StoredCreds> {
 fn load_unlocked_with_keyring_warning(_warn_unix_keyring_unavailable: bool) -> Result<StoredCreds> {
     #[cfg(windows)]
     {
-        return load_without_keyring(load_file_record()?);
+        load_without_keyring(load_file_record()?)
     }
 
     #[cfg(unix)]
