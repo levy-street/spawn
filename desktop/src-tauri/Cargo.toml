@@ -1,6 +1,6 @@
 [package]
 name = "spawn-desktop"
-version = "0.1.1"
+version = "0.1.2"
 description = "SPAWN D desktop companion"
 authors = ["SPAWN D"]
 edition = "2021"

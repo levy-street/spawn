@@ -111,6 +111,27 @@ pub async fn browser_session_cookie() -> Result<Option<String>> {
         .map(str::to_owned))
 }
 
+/// Whether this server is new enough for this app.
+///
+/// The app rides its own updater channel, so it can meet a server that
+/// predates something it needs — a self-hosted one, or a hosted one that has
+/// not been deployed yet. `POST /api/auth/session/renew` is the sentinel: it
+/// is the last step of every sign-in here, it answers 401 unauthenticated
+/// where it exists and 404 where it does not, so the question can be asked
+/// before anyone has typed a password.
+pub async fn server_is_supported(origin: &str) -> Result<bool> {
+    let api = ApiClient::new(origin)?;
+    let status = api.probe(Method::POST, "/api/auth/session/renew").await?;
+    Ok(endpoint_exists(status))
+}
+
+fn endpoint_exists(status: reqwest::StatusCode) -> bool {
+    !matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+    )
+}
+
 /// The verify gate's poll: the server is the only authority on whether the
 /// address has been confirmed, so nothing about it is cached locally.
 pub async fn account_state() -> Result<AccountState> {
@@ -211,6 +232,17 @@ async fn finish_auth(origin: &str, response: TokenResponse) -> Result<AuthOutcom
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_without_the_endpoint_is_the_one_that_answers_404() {
+        // Present: the route is there and simply wants an account.
+        assert!(endpoint_exists(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(endpoint_exists(reqwest::StatusCode::FORBIDDEN));
+        assert!(endpoint_exists(reqwest::StatusCode::OK));
+        // Absent: an older server routes nothing at this path.
+        assert!(!endpoint_exists(reqwest::StatusCode::NOT_FOUND));
+        assert!(!endpoint_exists(reqwest::StatusCode::METHOD_NOT_ALLOWED));
+    }
 
     #[test]
     fn oauth_hands_back_to_the_redirect_every_server_release_allows() {
