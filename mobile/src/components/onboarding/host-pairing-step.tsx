@@ -1,13 +1,14 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
+import {
+  DEFAULT_INSTALL_ORIGIN,
+  installTargetsForBaseUrl,
+  nativeWindowsAvailableFromRelease,
+} from "@/components/longtail/public-content";
 import { EndorsementOption } from "@/components/onboarding/endorsement-option";
 import { FingerprintReview } from "@/components/onboarding/fingerprint-review";
-import {
-  DEFAULT_INSTALL_COMMAND,
-  InstallInstructions,
-  installCommandForBaseUrl,
-} from "@/components/onboarding/install-instructions";
+import { InstallInstructions } from "@/components/onboarding/install-instructions";
 import { MachineWait } from "@/components/onboarding/machine-wait";
 import { setHostSkipped } from "@/components/onboarding/onboarding-state";
 import { PairingSuccess } from "@/components/onboarding/pairing-success";
@@ -32,6 +33,7 @@ import {
   usePendingEndorsements,
   useRegisteredPhone,
 } from "@/data/queries/pairing";
+import { useRelease } from "@/data/queries/release";
 import { qk } from "@/data/queryKeys";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { haptics } from "@/lib/haptics";
@@ -62,6 +64,7 @@ export function HostPairingStep({
   const devicesQuery = useAccountDevices(phoneQuery.isSuccess);
   const endorsementsQuery = usePendingEndorsements(accountId, phoneQuery.data?.id ?? null);
   const hostsQuery = useHostsQuery();
+  const releaseQuery = useRelease();
   const [stage, setStage] = useState<HostStage>("instructions");
   const [baseUrl, setBaseUrl] = useState<string | null>(null);
   const [serverOrigin, setServerOrigin] = useState<string | null>(null);
@@ -75,8 +78,10 @@ export function HostPairingStep({
   } | null>(null);
   const initialLookupStarted = useRef(false);
   const waitingHostIds = useRef<Set<string> | null>(null);
-  const installCommand =
-    baseUrl === null ? DEFAULT_INSTALL_COMMAND : installCommandForBaseUrl(baseUrl);
+  const installTargets = installTargetsForBaseUrl(
+    baseUrl ?? DEFAULT_INSTALL_ORIGIN,
+    nativeWindowsAvailableFromRelease(releaseQuery.data),
+  );
 
   useEffect(() => {
     let active = true;
@@ -266,11 +271,11 @@ export function HostPairingStep({
     return (
       <View style={styles.hostStep}>
         <InstallInstructions
-          command={installCommand}
           onCommandCopied={() => {
             waitingHostIds.current ??= new Set(hostsQuery.data?.map((host) => host.id) ?? []);
             setCommandCopied(true);
           }}
+          targets={installTargets}
           {...(onSkip === undefined ? {} : { onSkip })}
         />
         {machineWait}

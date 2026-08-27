@@ -1,6 +1,7 @@
 import { FlashList } from "@shopify/flash-list";
 import { router } from "expo-router";
 import { Pressable, StyleSheet, View } from "react-native";
+import { formatHostPlatform } from "@/components/hosts/host-model";
 import { useDeviceApprovalGate } from "@/components/trust/device-approval-gate";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Icon } from "@/components/ui/icon";
@@ -118,7 +119,7 @@ function HostFileRow({ host, onOpen }: { host: Host; onOpen: () => void }) {
           {host.name}
         </Text>
         <Text color="mutedForeground" numberOfLines={1} variant="caption">
-          {[host.os, host.arch].filter(Boolean).join(" · ") || "Host"}
+          {formatHostPlatform(host)}
         </Text>
       </View>
       <StatusDot

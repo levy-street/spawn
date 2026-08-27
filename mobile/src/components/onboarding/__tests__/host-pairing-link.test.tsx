@@ -25,6 +25,12 @@ jest.mock("@/data/queries/hosts", () => ({
   useHostsQuery: () => ({ data: mockHosts, isPending: false, isError: false }),
 }));
 
+jest.mock("@/data/queries/release", () => ({
+  useRelease: () => ({
+    data: { daemon: { targets: { "windows-x86_64": {} } } },
+  }),
+}));
+
 jest.mock("@/data/queries/pairing", () => ({
   ...jest.requireActual("@/data/queries/pairing"),
   lookupPendingPairing: (...args: unknown[]) => mockLookupPendingPairing(...args),
@@ -130,6 +136,24 @@ describe("HostPairingStep link and machine wait", () => {
 
     expect(Clipboard.setStringAsync).toHaveBeenCalledWith(
       "curl -fsSL https://spawn.example/install.sh | sh",
+    );
+    expect(await screen.findByText("Waiting for your machine…")).toBeOnTheScreen();
+
+    await screen.unmount();
+  });
+
+  it("copies the native Windows command from the resolved server origin", async () => {
+    const screen = await render(<HostPairingStep accountId={ACCOUNT_ID} />, { wrapper });
+
+    expect(
+      await screen.findByText("curl -fsSL https://spawn.example/install.sh | sh"),
+    ).toBeOnTheScreen();
+    await fireEvent.press(screen.getByRole("radio", { name: "Windows" }));
+    expect(screen.getByText("Open PowerShell on your PC")).toBeOnTheScreen();
+    await fireEvent.press(screen.getByRole("button", { name: "Copy install command" }));
+
+    expect(Clipboard.setStringAsync).toHaveBeenCalledWith(
+      "irm https://spawn.example/install.ps1 | iex",
     );
     expect(await screen.findByText("Waiting for your machine…")).toBeOnTheScreen();
 

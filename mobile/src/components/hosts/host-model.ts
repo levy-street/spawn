@@ -36,6 +36,46 @@ export type CapacityPresentation =
 
 const CAPACITY_LABELS = ["Idle", "Light", "Working", "Busy", "Heavy", "Pinned"] as const;
 
+function trimmedValue(value: string | null | undefined): string | null {
+  const trimmed = value?.trim() ?? "";
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+export function formatHostOS(value: string | null | undefined): string {
+  const trimmed = trimmedValue(value);
+  if (trimmed === null) return "Unknown OS";
+  switch (trimmed.toLocaleLowerCase()) {
+    case "darwin":
+    case "macos":
+      return "macOS";
+    case "linux":
+      return "Linux";
+    case "windows":
+      return "Windows";
+    default:
+      return trimmed;
+  }
+}
+
+export function formatHostArch(value: string | null | undefined): string {
+  const trimmed = trimmedValue(value);
+  if (trimmed === null) return "Unknown architecture";
+  switch (trimmed.toLocaleLowerCase()) {
+    case "aarch64":
+    case "arm64":
+      return "ARM64";
+    case "x86_64":
+    case "amd64":
+      return "x64";
+    default:
+      return trimmed;
+  }
+}
+
+export function formatHostPlatform(host: Pick<HostOut, "arch" | "os">): string {
+  return `${formatHostOS(host.os)} · ${formatHostArch(host.arch)}`;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

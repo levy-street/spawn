@@ -104,7 +104,7 @@ describe("host selectors", () => {
   it("sorts online hosts first and returns copied session order", () => {
     const machines = [
       host("z", "Zulu", "offline"),
-      host("b", "beta", "online"),
+      host("b", "beta", "online", { os: "windows", arch: "x86_64" }),
       host("a", "Alpha", "online"),
     ];
     expect(sortHosts(machines).map((item) => item.id)).toEqual(["a", "b", "z"]);

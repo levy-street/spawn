@@ -26,7 +26,7 @@ export function fileErrorMessage(error: unknown, context: FileErrorContext): str
   switch (errorCode(error)) {
     case "outside_root":
     case "traversal_rejected":
-      return "That folder sits above your home folder, which is as far up as Spawn can browse.";
+      return "That folder sits above your home folder, which is as far up as SPAWN D can browse.";
     case "permission_denied":
       return context === "list"
         ? "You do not have permission to open this folder."
@@ -38,7 +38,7 @@ export function fileErrorMessage(error: unknown, context: FileErrorContext): str
     case "not_file":
       return "That is a folder, not a file.";
     case "symlink_rejected":
-      return "This is a symbolic link, which Spawn does not follow.";
+      return "This is a symbolic link, which SPAWN D does not follow.";
     case "file_too_large":
       return "This file is too large to transfer.";
     case "already_exists":

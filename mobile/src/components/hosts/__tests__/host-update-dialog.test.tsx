@@ -131,4 +131,53 @@ describe("HostUpdateDialog", () => {
       "curl -fsSL https://spawn.example.com/install.sh | sh",
     );
   });
+
+  it("uses the host OS for Windows recovery even when the controlling phone is not Windows", async () => {
+    mockPollingHost = availableHost({
+      os: "windows",
+      arch: "x86_64",
+      update: {
+        state: "unsupported",
+        latest_version: null,
+        error: "self-update unavailable",
+        requested_at: null,
+      },
+    });
+    await render(
+      <ThemeProvider>
+        <HostUpdateDialog host={mockPollingHost} onDismiss={jest.fn()} visible />
+      </ThemeProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText("irm https://spawn.example.com/install.ps1 | iex")).toBeOnTheScreen(),
+    );
+    await fireEvent.press(screen.getByLabelText("Copy install command"));
+    expect(Clipboard.setStringAsync).toHaveBeenCalledWith(
+      "irm https://spawn.example.com/install.ps1 | iex",
+    );
+  });
+
+  it("keeps WSL hosts on the Linux installer fallback", async () => {
+    mockPollingHost = availableHost({
+      os: "linux",
+      update: {
+        state: "unsupported",
+        latest_version: null,
+        error: "self-update unavailable",
+        requested_at: null,
+      },
+    });
+    await render(
+      <ThemeProvider>
+        <HostUpdateDialog host={mockPollingHost} onDismiss={jest.fn()} visible />
+      </ThemeProvider>,
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("curl -fsSL https://spawn.example.com/install.sh | sh"),
+      ).toBeOnTheScreen(),
+    );
+  });
 });

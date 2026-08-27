@@ -1,13 +1,12 @@
 import { act, fireEvent, render } from "@testing-library/react-native";
 import * as Clipboard from "expo-clipboard";
 import type { PropsWithChildren } from "react";
-
-import { FingerprintReview } from "@/components/onboarding/fingerprint-review";
 import {
   DEFAULT_INSTALL_COMMAND,
-  InstallInstructions,
-  installCommandForBaseUrl,
-} from "@/components/onboarding/install-instructions";
+  installTargetsForBaseUrl,
+} from "@/components/longtail/public-content";
+import { FingerprintReview } from "@/components/onboarding/fingerprint-review";
+import { InstallInstructions } from "@/components/onboarding/install-instructions";
 import { PairingCountdown } from "@/components/onboarding/pairing-countdown";
 import { PairingSuccess } from "@/components/onboarding/pairing-success";
 import { FAILURE_COPY, TrustFailureState } from "@/components/onboarding/trust-failure-state";
@@ -129,6 +128,49 @@ describe("onboarding security states", () => {
     await screen.unmount();
   });
 
+  it("offers the truthful WSL target before native availability", async () => {
+    const screen = await render(<InstallInstructions />, { wrapper });
+
+    expect(screen.queryByRole("radio", { name: "Windows" })).toBeNull();
+    await fireEvent.press(screen.getByRole("radio", { name: "Windows (WSL)" }));
+    expect(screen.getByText("Open PowerShell on your PC")).toBeOnTheScreen();
+    await fireEvent.press(screen.getByLabelText("Copy install command"));
+    expect(Clipboard.setStringAsync).toHaveBeenLastCalledWith(
+      'wsl -- bash -c "curl -fsSL https://spawnd.dev/install.sh | sh"',
+    );
+    await screen.unmount();
+  });
+
+  it("selects native Windows and WSL with contextual PowerShell copy", async () => {
+    const onCommandCopied = jest.fn();
+    const targets = installTargetsForBaseUrl("https://spawn.example/api", true);
+    const screen = await render(
+      <InstallInstructions onCommandCopied={onCommandCopied} targets={targets} />,
+      { wrapper },
+    );
+
+    expect(screen.getByText("Choose the computer you're installing on.")).toBeOnTheScreen();
+    expect(screen.getByRole("radio", { name: "macOS / Linux" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "Windows" })).not.toBeChecked();
+    expect(screen.getByRole("radio", { name: "Windows (WSL)" })).not.toBeChecked();
+
+    await fireEvent.press(screen.getByRole("radio", { name: "Windows" }));
+    expect(screen.getByText("Open PowerShell on your PC")).toBeOnTheScreen();
+    expect(screen.getByText("irm https://spawn.example/install.ps1 | iex")).toBeOnTheScreen();
+    await fireEvent.press(screen.getByLabelText("Copy install command"));
+    expect(Clipboard.setStringAsync).toHaveBeenLastCalledWith(
+      "irm https://spawn.example/install.ps1 | iex",
+    );
+
+    await fireEvent.press(screen.getByRole("radio", { name: "Windows (WSL)" }));
+    await fireEvent.press(screen.getByRole("button", { name: "Share install command" }));
+    expect(presentShareSheet).toHaveBeenLastCalledWith({
+      message: 'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
+    });
+    expect(onCommandCopied).toHaveBeenCalledTimes(2);
+    await screen.unmount();
+  });
+
   it("counts sharing the command as the first setup action", async () => {
     const onCommandCopied = jest.fn();
     const screen = await render(<InstallInstructions onCommandCopied={onCommandCopied} />, {
@@ -146,11 +188,16 @@ describe("onboarding security states", () => {
 
     expect(
       screen.getByText(
-        "Install the daemon on a Mac or Linux machine, then approve it from the link its terminal prints. It appears here once it's online.",
+        "Install the daemon on a machine you control, then approve it from the link spawnd possess prints. It appears here once it's online.",
       ),
     ).toBeOnTheScreen();
     expect(
       screen.getByText("After installation, run spawnd possess on that machine."),
+    ).toBeOnTheScreen();
+    expect(
+      screen.getByText(
+        "Already running SPAWN D for another account on that machine? Run spawnd possess --new-account instead.",
+      ),
     ).toBeOnTheScreen();
     expect(
       screen.queryByRole("button", { name: ["Enter", "pairing", "code"].join(" ") }),
@@ -158,10 +205,14 @@ describe("onboarding security states", () => {
     await screen.unmount();
   });
 
-  it("builds the plain install command for the configured server", () => {
-    expect(installCommandForBaseUrl("https://spawn.example/api")).toBe(
+  it("builds all available install targets for the configured server", () => {
+    expect(
+      installTargetsForBaseUrl("https://spawn.example/api", true).map((target) => target.command),
+    ).toEqual([
       "curl -fsSL https://spawn.example/install.sh | sh",
-    );
+      "irm https://spawn.example/install.ps1 | iex",
+      'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
+    ]);
   });
 
   it("transitions the countdown into the expired state", async () => {
