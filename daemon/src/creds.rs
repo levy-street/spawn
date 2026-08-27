@@ -159,6 +159,21 @@ impl BrowserPin {
         Ok(true)
     }
 
+    /// The account this pin's retained approval proof names, once that proof
+    /// re-verifies against this host's key. `None` for a pin with no proof
+    /// (created before proofs were retained, or by a server that supplied
+    /// none) and for one that does not verify — a verdict is re-derived from
+    /// the evidence here, never read back from a stored flag.
+    pub fn proven_account_id(&self, host_public_key: &str) -> Option<&str> {
+        match self.verify_approval(host_public_key) {
+            Ok(true) => self
+                .approval_proof
+                .as_ref()
+                .map(|proof| proof.account_id.as_str()),
+            _ => None,
+        }
+    }
+
     #[allow(dead_code)] // Retained for credential/status golden tests.
     pub fn key_algorithm(&self) -> &str {
         &self.browser_key_algorithm
@@ -211,6 +226,19 @@ impl StoredCreds {
 
     pub fn browser_pins(&self) -> &[BrowserPin] {
         &self.browser_pins
+    }
+
+    /// This host's account as its own pins prove it: the account id each
+    /// retained browser approval was signed over, re-verified against this
+    /// host's key. It is the one locally anchored answer to "whose host is
+    /// this", so the server's claim about it is checked against this rather
+    /// than taken. `None` while no pin carries a proof.
+    pub fn proven_account_id(&self) -> Option<String> {
+        let identity = host_identity(self).ok().flatten()?;
+        self.browser_pins
+            .iter()
+            .find_map(|pin| pin.proven_account_id(&identity.public_key))
+            .map(str::to_owned)
     }
 
     #[allow(dead_code)] // Consumed by the later signed-wire verification hook.
@@ -2500,6 +2528,21 @@ mod tests {
         let proven = attach_browser_approval_proof(pin, account, &nonce, &signature)
             .expect("attaching a valid proof");
         (proven, host_wire, signature)
+    }
+
+    /// The account a pin names is re-derived from its proof each time, so it
+    /// is only ever claimed for the host key the proof was signed over.
+    #[test]
+    fn a_proven_pin_names_its_account_and_a_plain_pin_names_none() {
+        let (pin, host_wire, _) = proven_browser_pin(5);
+        assert_eq!(
+            pin.proven_account_id(&host_wire),
+            Some("9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f")
+        );
+        let other_host = public_key_to_wire(&SigningKey::from_bytes(&[7; 32]).verifying_key());
+        assert_eq!(pin.proven_account_id(&other_host), None);
+        let plain = browser_pin(Uuid::from_u128(99), pin.public_key());
+        assert_eq!(plain.proven_account_id(&host_wire), None);
     }
 
     #[test]
