@@ -27,8 +27,8 @@ use anyhow::{Context, Result};
 use tauri::webview::cookie::Cookie;
 use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{
-    App, AppHandle, Emitter, LogicalSize, Manager, Url, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder, WindowEvent,
+    App, AppHandle, Emitter, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    WindowEvent,
 };
 use tauri_plugin_opener::OpenerExt;
 use zeroize::Zeroizing;
