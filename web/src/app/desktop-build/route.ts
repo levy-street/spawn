@@ -1,15 +1,13 @@
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
+import { type DesktopPlatform, desktopArtifactFromFilename } from "@/lib/platform";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** The name `scripts/publish-desktop.sh` gives every disk image it uploads. */
-const DMG = /^SPAWN-D_(?<version>[^_/\\]+)_(?<platform>darwin-(?:aarch64|x86_64))\.dmg$/u;
-
 /**
- * The disk image this checkout can hand over right now, for development.
+ * The desktop artifact this checkout can hand over right now, for development.
  *
  * `/api/release` answers a different question: what release identity this
  * checkout can *prove*. It refuses to name a desktop version while `desktop/`
@@ -39,12 +37,12 @@ export async function GET(): Promise<NextResponse> {
   // Newest wins: several builds can pile up here, and the one you just made
   // is the one you are trying to press the button on.
   let newest: { version: string; at: number } | null = null;
-  const platformsByVersion = new Map<string, Set<string>>();
+  const platformsByVersion = new Map<string, Set<DesktopPlatform>>();
   for (const name of names) {
-    const match = DMG.exec(name);
-    if (!match?.groups) continue;
-    const { version, platform } = match.groups;
-    const set = platformsByVersion.get(version) ?? new Set<string>();
+    const artifact = desktopArtifactFromFilename(name);
+    if (!artifact) continue;
+    const { version, platform } = artifact;
+    const set = platformsByVersion.get(version) ?? new Set<DesktopPlatform>();
     set.add(platform);
     platformsByVersion.set(version, set);
     const at = await stat(path.join(dir, name))

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from spawn_server import release
+from spawn_server import release, schemas
 
 COMMIT = "1" * 40
 DAEMON_TREE = "2" * 40
@@ -43,6 +43,7 @@ def _stage_manifest(tmp_path, *, corrupt_worker: bool = False) -> dict:
 def _configure_release(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    monkeypatch.setattr(release, "DESKTOP_ARTIFACT_ROOT", tmp_path / "published-desktop")
     monkeypatch.setattr(
         release,
         "get_settings",
@@ -107,6 +108,7 @@ def _configure_computed_desktop(
 ) -> None:
     monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    monkeypatch.setattr(release, "DESKTOP_ARTIFACT_ROOT", tmp_path / "published-desktop")
     monkeypatch.setattr(
         release,
         "get_settings",
@@ -143,6 +145,72 @@ async def test_release_includes_desktop_identity_when_checkout_is_clean(
         "tree": DESKTOP_TREE,
         "platforms": ["darwin-aarch64", "darwin-x86_64"],
     }
+
+
+async def test_release_advertises_windows_desktop_only_after_artifact_exists(
+    client, tmp_path, monkeypatch
+):
+    _configure_release(monkeypatch, tmp_path)
+
+    response = await client.get("/api/release")
+    assert response.json()["desktop"]["platforms"] == ["darwin-aarch64", "darwin-x86_64"]
+
+    artifact_root = tmp_path / "published-desktop"
+    artifact_root.mkdir()
+    artifact = artifact_root / f"SPAWN-D_{DESKTOP_VERSION}_windows-x86_64-setup.exe"
+    artifact.touch()
+    release.refresh()
+    response = await client.get("/api/release")
+    assert response.json()["desktop"]["platforms"] == ["darwin-aarch64", "darwin-x86_64"]
+
+    artifact.write_bytes(b"published setup")
+    release.refresh()
+
+    response = await client.get("/api/release")
+    assert response.json()["desktop"]["platforms"] == [
+        "darwin-aarch64",
+        "darwin-x86_64",
+        "windows-x86_64",
+    ]
+
+
+@pytest.mark.parametrize("arch", ["x86_64", "amd64", "X86_64", "AMD64"])
+def test_daemon_target_maps_windows_x64_aliases(arch):
+    assert release.daemon_target("windows", arch) == "windows-x86_64"
+
+
+def test_windows_is_a_supported_daemon_manifest_target():
+    assert "windows-x86_64" in release.SUPPORTED_DAEMON_TARGETS
+
+
+def test_windows_host_update_state_and_payload_use_the_windows_target():
+    target = schemas.DaemonTargetOut(
+        spawnd_sha256="a" * 64,
+        spawn_worker_sha256="b" * 64,
+    )
+    manifest = schemas.DaemonReleaseOut(
+        version="0.2.0",
+        commit=COMMIT,
+        tree=DAEMON_TREE,
+        targets={"windows-x86_64": target},
+    )
+    host = SimpleNamespace(
+        os="windows",
+        arch="amd64",
+        daemon_tree="5" * 40,
+        worker_mismatch=False,
+        update_requested_at=None,
+        update_state=None,
+        update_tree=None,
+        self_update=True,
+    )
+
+    assert release.host_update_state(host, manifest).state == "available"
+    payload = release.daemon_update_payload(host, manifest, request_id="windows-update")
+    assert payload is not None
+    assert payload["target"] == "windows-x86_64"
+    assert payload["spawnd"]["path"] == "/api/install/spawnd/windows-x86_64"
+    assert payload["spawn_worker"]["path"] == "/api/install/spawn-worker/windows-x86_64"
 
 
 async def test_release_hides_desktop_identity_when_checkout_is_dirty(client, tmp_path, monkeypatch):

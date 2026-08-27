@@ -31,8 +31,11 @@ SUPPORTED_DAEMON_TARGETS = (
     "darwin-x86_64",
     "linux-x86_64",
     "linux-aarch64",
+    "windows-x86_64",
 )
 DESKTOP_PLATFORMS = ("darwin-aarch64", "darwin-x86_64")
+WINDOWS_DESKTOP_PLATFORM = "windows-x86_64"
+DESKTOP_ARTIFACT_ROOT = Path("/var/www/spawnd/desktop")
 DAEMON_UPDATE_TIMEOUT = timedelta(minutes=3)
 
 _HEX_40 = re.compile(r"^[0-9a-f]{40}$")
@@ -137,6 +140,20 @@ def _read_web_build_id() -> str | None:
     return value or None
 
 
+def _desktop_platforms(version: str) -> list[str]:
+    """Advertise Windows only after nginx's mounted artifact is non-empty."""
+
+    platforms = list(DESKTOP_PLATFORMS)
+    filename = f"SPAWN-D_{version}_{WINDOWS_DESKTOP_PLATFORM}-setup.exe"
+    try:
+        artifact = DESKTOP_ARTIFACT_ROOT / filename
+        if artifact.is_file() and artifact.stat().st_size > 0:
+            platforms.append(WINDOWS_DESKTOP_PLATFORM)
+    except OSError:
+        pass
+    return platforms
+
+
 def _compute_identity() -> _ReleaseIdentity:
     settings = get_settings()
     if settings.release_commit is not None:
@@ -170,7 +187,7 @@ def _compute_identity() -> _ReleaseIdentity:
         desktop = schemas.ReleaseDesktop(
             version=desktop_version,
             tree=desktop_tree,
-            platforms=list(DESKTOP_PLATFORMS),
+            platforms=_desktop_platforms(desktop_version),
         )
 
     return _ReleaseIdentity(
@@ -371,7 +388,12 @@ def _aware_utc(value: datetime | None) -> datetime | None:
 
 
 def daemon_target(os_name: str | None, arch: str | None) -> str | None:
-    os_part = {"darwin": "darwin", "macos": "darwin", "linux": "linux"}.get((os_name or "").lower())
+    os_part = {
+        "darwin": "darwin",
+        "macos": "darwin",
+        "linux": "linux",
+        "windows": "windows",
+    }.get((os_name or "").lower())
     arch_part = {
         "aarch64": "aarch64",
         "arm64": "aarch64",

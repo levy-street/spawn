@@ -19,7 +19,13 @@ import { type MenuPlacement, measureMenu, placeMenu } from "@/components/ui/menu
 import { useHostControl } from "@/hooks/useHostControl";
 import type { Host } from "@/lib/api";
 import { HostControlError } from "@/lib/hostControl";
-import { normalizeCwdForHost } from "@/lib/paths";
+import {
+  isAbsolutePath,
+  isValidPathLeafName,
+  normalizeCwdForHost,
+  pathFlavorForHostOS,
+  pathsEqual,
+} from "@/lib/paths";
 import { cn } from "@/lib/utils";
 import { FolderColumn, type FolderColumnEmpty } from "./folder-picker-column";
 import { CrumbDrillMenu } from "./folder-picker-crumbs";
@@ -85,6 +91,7 @@ export function FolderPicker({
   onSelect: (path: string) => void;
 }) {
   const { client, state } = useHostControl(host?.id ?? null, open && host?.status === "online");
+  const pathFlavor = pathFlavorForHostOS(host?.os);
   const [path, setPath] = useState(initialPath || "~");
   const [filter, setFilter] = useState("");
   const [showHidden, setShowHidden] = useState(false);
@@ -128,15 +135,21 @@ export function FolderPicker({
   // above the root the host will serve.
   useEffect(() => {
     if (!open || !homeDir) return;
-    const next = normalizeCwdForHost(path, homeDir);
-    const clamped = isWithinHome(next, homeDir) ? next : normalizeCwdForHost("~", homeDir);
+    const next = normalizeCwdForHost(path, homeDir, pathFlavor);
+    const clamped = isWithinHome(next, homeDir, pathFlavor)
+      ? next
+      : normalizeCwdForHost("~", homeDir, pathFlavor);
     if (clamped !== path) setPath(clamped);
-  }, [homeDir, open, path]);
+  }, [homeDir, open, path, pathFlavor]);
 
-  const resolvedPath = homeDir && path.startsWith("~") ? normalizeCwdForHost(path, homeDir) : path;
-  const listedPath = resolvedPath.startsWith("/") ? resolvedPath : "/";
-  const breadcrumbs = breadcrumbParts(listedPath, homeDir ?? "/");
-  const columns = folderColumns(listedPath, homeDir ?? "/");
+  const fallbackRoot = pathFlavor === "windows" ? "\\" : "/";
+  const resolvedPath =
+    homeDir && path.startsWith("~") ? normalizeCwdForHost(path, homeDir, pathFlavor) : path;
+  const listedPath = isAbsolutePath(resolvedPath, pathFlavor)
+    ? resolvedPath
+    : (homeDir ?? fallbackRoot);
+  const breadcrumbs = breadcrumbParts(listedPath, homeDir ?? fallbackRoot, pathFlavor);
+  const columns = folderColumns(listedPath, homeDir ?? fallbackRoot, pathFlavor);
   const leafIndex = columns.length - 1;
   // The column holding the current selection: one left of the trailing column,
   // and absent entirely at the home root where nothing is selected yet.
@@ -151,7 +164,7 @@ export function FolderPicker({
         state === "ready" &&
         client !== null &&
         Boolean(homeDir) &&
-        column.path.startsWith("/"),
+        isAbsolutePath(column.path, pathFlavor),
       staleTime: 5_000,
     })),
   });
@@ -174,8 +187,12 @@ export function FolderPicker({
   // an error screen with no way down.
   const navigate = (value: string) => {
     if (!homeDir) return;
-    const next = normalizeCwdForHost(value, homeDir);
-    setPath(isWithinHome(next, homeDir) ? next : normalizeCwdForHost("~", homeDir));
+    const next = normalizeCwdForHost(value, homeDir, pathFlavor);
+    setPath(
+      isWithinHome(next, homeDir, pathFlavor)
+        ? next
+        : normalizeCwdForHost("~", homeDir, pathFlavor),
+    );
     setFilter("");
   };
 
@@ -303,7 +320,7 @@ export function FolderPicker({
   }, [open, homeDir, listedPath]);
 
   const mkdirM = useMutation({
-    mutationFn: (name: string) => client!.mkdir(joinDirectory(listedPath, name)),
+    mutationFn: (name: string) => client!.mkdir(joinDirectory(listedPath, name, pathFlavor)),
     onSuccess: () => {
       setCreatingFolder(false);
       setFolderName("");
@@ -314,8 +331,8 @@ export function FolderPicker({
   });
 
   const submitFolder = () => {
-    const name = folderName.trim();
-    if (!name || name === "." || name === ".." || name.includes("/")) return;
+    const name = pathFlavor === "windows" ? folderName : folderName.trim();
+    if (!isValidPathLeafName(name, pathFlavor)) return;
     mkdirM.mutate(name);
   };
 
@@ -324,22 +341,26 @@ export function FolderPicker({
   // type a `cd` into a live shell, write a workspace setting — and in the shell
   // case that means an "interrupt the agent?" prompt for a move to where the
   // window already is. Closing is the whole of the right answer.
-  const startedAt = homeDir && initialPath ? normalizeCwdForHost(initialPath, homeDir) : null;
+  const startedAt =
+    homeDir && initialPath ? normalizeCwdForHost(initialPath, homeDir, pathFlavor) : null;
   const commit = () => {
-    if (startedAt !== listedPath) onSelect(listedPath);
+    if (startedAt === null || !pathsEqual(startedAt, listedPath, pathFlavor)) onSelect(listedPath);
     onOpenChange(false);
   };
 
   // Null at the home root: there is no rung above it.
-  const parentPath = homeDir === null ? null : parentWithinHome(listedPath, homeDir);
-  const selectable = homeDir !== null && isWithinHome(listedPath, homeDir);
+  const parentPath = homeDir === null ? null : parentWithinHome(listedPath, homeDir, pathFlavor);
+  const selectable = homeDir !== null && isWithinHome(listedPath, homeDir, pathFlavor);
   const chrome = state !== "ready" || homeQ.isLoading;
 
   /** Move the selection among its siblings — the column view's up/down. */
   const step = (delta: 1 | -1) => {
     const siblings = columnEntries[Math.max(0, trailIndex)] ?? [];
     if (siblings.length === 0) return;
-    const current = trailIndex < 0 ? -1 : siblings.findIndex((e) => e.path === listedPath);
+    const current =
+      trailIndex < 0
+        ? -1
+        : siblings.findIndex((entry) => pathsEqual(entry.path, listedPath, pathFlavor));
     const next =
       current < 0
         ? delta === 1
@@ -642,7 +663,15 @@ export function FolderPicker({
                 if (event.key === "Escape") setCreatingFolder(false);
               }}
             />
-            <Button type="submit" disabled={!folderName.trim() || mkdirM.isPending}>
+            <Button
+              type="submit"
+              disabled={
+                !isValidPathLeafName(
+                  pathFlavor === "windows" ? folderName : folderName.trim(),
+                  pathFlavor,
+                ) || mkdirM.isPending
+              }
+            >
               Create
             </Button>
           </form>
@@ -687,7 +716,7 @@ function listErrorMessage(error: unknown): string {
     switch (error.code) {
       case "outside_root":
       case "traversal_rejected":
-        return "That folder sits above your home folder, which is as far up as Spawn can browse.";
+        return "That folder sits above your home folder, which is as far up as SPAWN D can browse.";
       case "permission_denied":
         return "You do not have permission to open this folder.";
       case "not_found":
@@ -695,7 +724,7 @@ function listErrorMessage(error: unknown): string {
       case "not_directory":
         return "That is a file, not a folder.";
       case "symlink_rejected":
-        return "This is a symbolic link, which Spawn does not follow.";
+        return "This is a symbolic link, which SPAWN D does not follow.";
     }
   }
   return error instanceof Error ? error.message : "Could not list this folder.";

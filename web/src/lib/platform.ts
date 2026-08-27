@@ -1,9 +1,8 @@
 /**
- * Browser-side platform detection and daemon install commands.
+ * Browser-side platform detection, install targets, and desktop artifacts.
  *
- * Shared by the download page, onboarding's connect-a-host step, and
- * Settings ▸ Hosts (`components/hosts/connect-host.tsx`) so the OS sniffing
- * and the install one-liner live in exactly one place.
+ * Shared by the public download surfaces and every connect-a-host gate so the
+ * platform facts and one-liners each live in exactly one place.
  */
 
 export type PlatformOS = "macos" | "linux" | "windows" | "ios" | "android" | "unknown";
@@ -11,21 +10,52 @@ export type PlatformOS = "macos" | "linux" | "windows" | "ios" | "android" | "un
 export interface PlatformInfo {
   os: PlatformOS;
   origin: string;
-  /** One-line daemon install for the current deployment origin. */
+  /** POSIX install line retained for older consumers. */
   installCommand: string;
-  /** Variant that refuses the source-build fallback (deploy smoke tests). */
+  /** POSIX prebuilt-only line retained for deploy smoke tests. */
   prebuiltInstallCommand: string;
 }
 
 /** Used until the real origin is known (SSR render, tests). */
 export const FALLBACK_ORIGIN = "https://spawnd.dev";
 
-export type DesktopPlatform = "darwin-aarch64" | "darwin-x86_64";
+export const WINDOWS_DESKTOP_PLATFORM = "windows-x86_64" as const;
+
+export type DesktopPlatform = "darwin-aarch64" | "darwin-x86_64" | typeof WINDOWS_DESKTOP_PLATFORM;
+
+const DESKTOP_PLATFORMS = new Set<DesktopPlatform>([
+  "darwin-aarch64",
+  "darwin-x86_64",
+  WINDOWS_DESKTOP_PLATFORM,
+]);
+const DESKTOP_ARTIFACT = new RegExp(
+  `^SPAWN-D_(?<version>[^_/\\\\]+)_(?<platform>darwin-(?:aarch64|x86_64)|${WINDOWS_DESKTOP_PLATFORM})(?<suffix>\\.dmg|-setup\\.exe)$`,
+  "u",
+);
 
 export interface DesktopRelease {
   version: string;
   tree: string;
   platforms: DesktopPlatform[];
+}
+
+export interface LocalDesktopBuild {
+  version: string;
+  platforms: DesktopPlatform[];
+}
+
+export function originWithoutTrailingSlash(origin: string): string {
+  return origin.replace(/\/+$/u, "");
+}
+
+function parseDesktopPlatforms(value: unknown): DesktopPlatform[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const platforms: DesktopPlatform[] = [];
+  for (const item of value) {
+    if (typeof item !== "string" || !DESKTOP_PLATFORMS.has(item as DesktopPlatform)) return null;
+    platforms.push(item as DesktopPlatform);
+  }
+  return [...new Set(platforms)];
 }
 
 /** Strictly feature-detect the additive /api/release.desktop block. */
@@ -36,12 +66,40 @@ export function desktopReleaseFromPayload(payload: unknown): DesktopRelease | nu
   const value = desktop as Record<string, unknown>;
   if (typeof value.version !== "string" || value.version.trim() === "") return null;
   if (typeof value.tree !== "string" || !/^[0-9a-f]{40}$/u.test(value.tree)) return null;
-  if (!Array.isArray(value.platforms)) return null;
-  const platforms = value.platforms.filter(
-    (item): item is DesktopPlatform => item === "darwin-aarch64" || item === "darwin-x86_64",
+  const platforms = parseDesktopPlatforms(value.platforms);
+  return platforms ? { version: value.version, tree: value.tree, platforms } : null;
+}
+
+/** Parse the development route's deliberately smaller identity. */
+export function localDesktopBuildFromPayload(payload: unknown): LocalDesktopBuild | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const value = payload as Record<string, unknown>;
+  if (typeof value.version !== "string" || value.version.trim() === "") return null;
+  const platforms = parseDesktopPlatforms(value.platforms);
+  return platforms ? { version: value.version, platforms } : null;
+}
+
+/**
+ * Native daemon setup is available only when the verified daemon manifest
+ * names Windows. Desktop availability is deliberately independent: a
+ * deployment may offer PowerShell setup before it publishes the companion EXE.
+ */
+export function nativeWindowsAvailableFromPayload(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  const daemon = (payload as Record<string, unknown>).daemon;
+  if (typeof daemon !== "object" || daemon === null) return false;
+  const targets = (daemon as Record<string, unknown>).targets;
+  return (
+    typeof targets === "object" &&
+    targets !== null &&
+    Object.hasOwn(targets, WINDOWS_DESKTOP_PLATFORM)
   );
-  if (platforms.length === 0 || platforms.length !== value.platforms.length) return null;
-  return { version: value.version, tree: value.tree, platforms: [...new Set(platforms)] };
+}
+
+/** The one filename rule used by public URLs and the local build route. */
+export function desktopArtifactFilename(version: string, platform: DesktopPlatform): string {
+  const stem = `SPAWN-D_${encodeURIComponent(version)}_${platform}`;
+  return platform === WINDOWS_DESKTOP_PLATFORM ? `${stem}-setup.exe` : `${stem}.dmg`;
 }
 
 export function desktopDownloadUrl(
@@ -49,58 +107,112 @@ export function desktopDownloadUrl(
   version: string,
   platform: DesktopPlatform,
 ): string {
-  return `${origin.replace(/\/$/u, "")}/desktop/SPAWN-D_${encodeURIComponent(version)}_${platform}.dmg`;
+  return `${originWithoutTrailingSlash(origin)}/desktop/${desktopArtifactFilename(version, platform)}`;
+}
+
+/** Strict inverse of desktopArtifactFilename for local artifact discovery. */
+export function desktopArtifactFromFilename(
+  filename: string,
+): { version: string; platform: DesktopPlatform } | null {
+  const match = DESKTOP_ARTIFACT.exec(filename);
+  if (!match?.groups) return null;
+  const platform = match.groups.platform as DesktopPlatform;
+  let version: string;
+  try {
+    version = decodeURIComponent(match.groups.version);
+  } catch {
+    return null;
+  }
+  return desktopArtifactFilename(version, platform) === filename ? { version, platform } : null;
+}
+
+export function desktopPlatformForOS(os: PlatformOS): DesktopPlatform | null {
+  if (os === "windows") return WINDOWS_DESKTOP_PLATFORM;
+  if (os === "macos") return "darwin-aarch64";
+  return null;
 }
 
 export function installCommand(origin: string): string {
-  return `curl -fsSL ${origin}/install.sh | sh`;
-}
-
-/**
- * The Windows line.
- *
- * There is no native Windows daemon: the installer's `SUPPORTED_TARGETS` is
- * darwin/linux only, `install.sh` is POSIX sh, and `spawnd` cannot even compile
- * for Windows while `nix` is an unconditional dependency. The Linux build under
- * WSL2 is the path that actually works, so that is what the Windows tab hands
- * over rather than a command that cannot run.
- */
-export function windowsInstallCommand(origin: string): string {
-  return `wsl -- bash -c "curl -fsSL ${origin}/install.sh | sh"`;
-}
-
-export type InstallTargetId = "unix" | "windows";
-
-export interface InstallTarget {
-  id: InstallTargetId;
-  label: string;
-  command: string;
-}
-
-/** The tabs behind the install chip, in display order. */
-export function installTargets(origin: string): InstallTarget[] {
-  return [
-    { id: "unix", label: "macOS / Linux", command: installCommand(origin) },
-    { id: "windows", label: "Windows", command: windowsInstallCommand(origin) },
-  ];
-}
-
-/** Which tab a detected browser OS should land on. */
-export function installTargetForOS(os: PlatformOS): InstallTargetId {
-  return os === "windows" ? "windows" : "unix";
+  return `curl -fsSL ${originWithoutTrailingSlash(origin)}/install.sh | sh`;
 }
 
 export function prebuiltInstallCommand(origin: string): string {
-  return `curl -fsSL ${origin}/install.sh | sh -s -- --prebuilt-only`;
+  return `curl -fsSL ${originWithoutTrailingSlash(origin)}/install.sh | sh -s -- --prebuilt-only`;
+}
+
+/** The native PowerShell line. */
+export function windowsInstallCommand(origin: string): string {
+  return `irm ${originWithoutTrailingSlash(origin)}/install.ps1 | iex`;
+}
+
+/** The explicit WSL migration/fallback line. */
+export function windowsWslInstallCommand(origin: string): string {
+  return `wsl -- bash -c "curl -fsSL ${originWithoutTrailingSlash(origin)}/install.sh | sh"`;
+}
+
+function windowsWslPrebuiltInstallCommand(origin: string): string {
+  return `wsl -- bash -c "curl -fsSL ${originWithoutTrailingSlash(origin)}/install.sh | sh -s -- --prebuilt-only"`;
+}
+
+export type InstallTargetId = "unix" | "windows" | "windows-wsl";
+
+export interface InstallTarget {
+  id: InstallTargetId;
+  label: "macOS / Linux" | "Windows" | "Windows (WSL)";
+  command: string;
+  prebuiltCommand: string;
+  prompt: "$" | "PS>";
+}
+
+/**
+ * Install tabs in display order. Until release metadata proves the complete
+ * Windows handoff, the immediate WSL-only stage remains the honest model.
+ */
+export function installTargets(origin: string, nativeWindowsAvailable = false): InstallTarget[] {
+  const targets: InstallTarget[] = [
+    {
+      id: "unix",
+      label: "macOS / Linux",
+      command: installCommand(origin),
+      prebuiltCommand: prebuiltInstallCommand(origin),
+      prompt: "$",
+    },
+  ];
+  if (nativeWindowsAvailable) {
+    const command = windowsInstallCommand(origin);
+    targets.push({
+      id: "windows",
+      label: "Windows",
+      command,
+      // The Windows installer only hands over a hosted build; there is no
+      // source-build fallback or unconfirmed PowerShell parameter to invent.
+      prebuiltCommand: command,
+      prompt: "PS>",
+    });
+  }
+  targets.push({
+    id: "windows-wsl",
+    label: "Windows (WSL)",
+    command: windowsWslInstallCommand(origin),
+    prebuiltCommand: windowsWslPrebuiltInstallCommand(origin),
+    prompt: "PS>",
+  });
+  return targets;
+}
+
+/** Which tab a detected browser OS should land on. */
+export function installTargetForOS(
+  os: PlatformOS,
+  nativeWindowsAvailable = false,
+): InstallTargetId {
+  if (os !== "windows") return "unix";
+  return nativeWindowsAvailable ? "windows" : "windows-wsl";
 }
 
 /**
  * Pure OS classifier over `navigator.platform` + `navigator.userAgent`.
- *
- * Phones are classified before desktops on purpose. Android's UA contains
- * "linux", and iPadOS Safari reports `MacIntel` — indistinguishable from a
- * desktop Mac except that it reports touch points, which is why
- * `maxTouchPoints` is taken as well.
+ * Phones are classified first because Android's UA contains "linux" and an
+ * iPad may masquerade as a Mac.
  */
 export function detectOS(platform: string, userAgent: string, maxTouchPoints = 0): PlatformOS {
   const ua = userAgent.toLowerCase();
@@ -108,7 +220,6 @@ export function detectOS(platform: string, userAgent: string, maxTouchPoints = 0
 
   if (ua.includes("android")) return "android";
   if (/iphone|ipad|ipod/u.test(ua) || /iphone|ipad|ipod/u.test(plat)) return "ios";
-  // An iPad on iPadOS 13+ masquerades as a Mac; only touch gives it away.
   if ((plat.includes("mac") || ua.includes("mac os x")) && maxTouchPoints > 1) return "ios";
 
   if (plat.includes("mac") || ua.includes("mac os x")) return "macos";
@@ -117,27 +228,16 @@ export function detectOS(platform: string, userAgent: string, maxTouchPoints = 0
   return "unknown";
 }
 
-/** The phones, where the daemon install line is meaningless. */
 export function isMobileOS(os: PlatformOS): os is "ios" | "android" {
   return os === "ios" || os === "android";
 }
 
-/**
- * Public store listings.
- *
- * `mobile/eas.json` carries an App Store Connect id and an Android package,
- * but a Connect record is not a published listing — neither store resolves
- * yet. Keep these null until the listing is live: a badge that 404s on the
- * lander is worse than one that says it is coming. Filling them in is the
- * only change needed to turn the badges into links.
- */
 export const APP_STORE_URL: string | null = null;
 export const PLAY_STORE_URL: string | null = null;
 
 export interface StoreBadge {
   id: "ios" | "android";
   label: string;
-  /** Null until the listing is public; the badge then reads "Coming soon". */
   href: string | null;
 }
 
@@ -148,13 +248,11 @@ export function storeBadges(): StoreBadge[] {
   ];
 }
 
-/** The badge matching a detected phone, or null on a desktop. */
 export function storeBadgeForOS(os: PlatformOS): StoreBadge | null {
   if (!isMobileOS(os)) return null;
   return storeBadges().find((badge) => badge.id === os) ?? null;
 }
 
-/** What a server render (or a browser we can't identify) gets. */
 export const UNDETECTED_PLATFORM: PlatformInfo = {
   os: "unknown",
   origin: FALLBACK_ORIGIN,
@@ -162,12 +260,7 @@ export const UNDETECTED_PLATFORM: PlatformInfo = {
   prebuiltInstallCommand: prebuiltInstallCommand(FALLBACK_ORIGIN),
 };
 
-/**
- * Detect the current browser's OS and build install commands against the
- * current origin. SSR-safe: without a `window` it returns
- * {@link UNDETECTED_PLATFORM}, so call it from an effect and keep the
- * fallback as initial state to stay hydration-consistent.
- */
+/** SSR-safe current-browser platform and same-origin install commands. */
 export function detectPlatform(): PlatformInfo {
   if (typeof window === "undefined") return UNDETECTED_PLATFORM;
   const origin = window.location.origin;

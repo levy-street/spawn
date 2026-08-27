@@ -1,102 +1,177 @@
 import { describe, expect, test } from "bun:test";
 import {
+  desktopArtifactFilename,
+  desktopArtifactFromFilename,
+  desktopDownloadUrl,
+  desktopPlatformForOS,
+  desktopReleaseFromPayload,
   detectOS,
   installCommand,
   installTargetForOS,
   installTargets,
   isMobileOS,
+  localDesktopBuildFromPayload,
+  nativeWindowsAvailableFromPayload,
   storeBadgeForOS,
   storeBadges,
+  WINDOWS_DESKTOP_PLATFORM,
   windowsInstallCommand,
+  windowsWslInstallCommand,
 } from "./platform";
 
+const TREE = "a".repeat(40);
+
 describe("install targets", () => {
-  test("the unix line is unchanged and the windows line goes through WSL", () => {
-    const origin = "https://spawnd.dev";
-    expect(installCommand(origin)).toBe("curl -fsSL https://spawnd.dev/install.sh | sh");
-    // There is no native Windows daemon, so the Windows tab must not hand over
-    // a bare `sh` pipeline — Windows has no shell to run it in.
-    expect(windowsInstallCommand(origin)).toBe(
+  test("the immediate stage is explicit macOS/Linux plus Windows WSL", () => {
+    const targets = installTargets("https://spawnd.dev/");
+    expect(targets.map(({ id, label, prompt }) => ({ id, label, prompt }))).toEqual([
+      { id: "unix", label: "macOS / Linux", prompt: "$" },
+      { id: "windows-wsl", label: "Windows (WSL)", prompt: "PS>" },
+    ]);
+    expect(targets[0]?.command).toBe("curl -fsSL https://spawnd.dev/install.sh | sh");
+    expect(targets[1]?.command).toBe(
       'wsl -- bash -c "curl -fsSL https://spawnd.dev/install.sh | sh"',
+    );
+    expect(installTargetForOS("windows")).toBe("windows-wsl");
+  });
+
+  test("the proven native stage inserts Windows and defaults Windows browsers to it", () => {
+    const targets = installTargets("https://spawnd.dev///", true);
+    expect(targets.map(({ id, label, prompt }) => ({ id, label, prompt }))).toEqual([
+      { id: "unix", label: "macOS / Linux", prompt: "$" },
+      { id: "windows", label: "Windows", prompt: "PS>" },
+      { id: "windows-wsl", label: "Windows (WSL)", prompt: "PS>" },
+    ]);
+    expect(installTargetForOS("windows", true)).toBe("windows");
+    expect(targets[1]?.command).toBe("irm https://spawnd.dev/install.ps1 | iex");
+    expect(targets[2]?.command).toContain("wsl --");
+  });
+
+  test("every command uses the supplied origin with trailing slashes removed", () => {
+    expect(installCommand("http://localhost:3000/")).toBe(
+      "curl -fsSL http://localhost:3000/install.sh | sh",
+    );
+    expect(windowsInstallCommand("http://localhost:3000/")).toBe(
+      "irm http://localhost:3000/install.ps1 | iex",
+    );
+    expect(windowsWslInstallCommand("http://localhost:3000/")).toBe(
+      'wsl -- bash -c "curl -fsSL http://localhost:3000/install.sh | sh"',
     );
   });
 
-  test("every target carries a runnable command and a label", () => {
-    const targets = installTargets("https://spawnd.dev");
-    expect(targets.map((target) => target.id)).toEqual(["unix", "windows"]);
-    for (const target of targets) {
-      expect(target.label.length).toBeGreaterThan(0);
-      expect(target.command).toContain("spawnd.dev/install.sh");
-    }
-    // The command is the whole payload — a tab carries no prose of its own.
-    expect(targets.find((target) => target.id === "windows")?.command).toContain("wsl --");
-    expect(targets.find((target) => target.id === "unix")?.command).not.toContain("wsl");
+  test("unknown and mobile browsers do not imply a phone can host", () => {
+    expect(installTargetForOS("macos", true)).toBe("unix");
+    expect(installTargetForOS("linux", true)).toBe("unix");
+    expect(installTargetForOS("ios", true)).toBe("unix");
+    expect(installTargetForOS("android", true)).toBe("unix");
+    expect(installTargetForOS("unknown", true)).toBe("unix");
+  });
+});
+
+describe("desktop artifacts", () => {
+  test("uses exact platform-specific filenames and URLs", () => {
+    expect(desktopArtifactFilename("0.2.0", "darwin-aarch64")).toBe(
+      "SPAWN-D_0.2.0_darwin-aarch64.dmg",
+    );
+    expect(desktopArtifactFilename("0.2.0", WINDOWS_DESKTOP_PLATFORM)).toBe(
+      "SPAWN-D_0.2.0_windows-x86_64-setup.exe",
+    );
+    expect(desktopDownloadUrl("https://spawnd.dev/", "0.2.0", WINDOWS_DESKTOP_PLATFORM)).toBe(
+      "https://spawnd.dev/desktop/SPAWN-D_0.2.0_windows-x86_64-setup.exe",
+    );
   });
 
-  test("a detected OS picks its tab, and anything unidentified falls to unix", () => {
-    expect(installTargetForOS("windows")).toBe("windows");
-    expect(installTargetForOS("macos")).toBe("unix");
-    expect(installTargetForOS("linux")).toBe("unix");
-    // The installer detects the real host when it runs, so an unknown browser
-    // OS is better served the line that works on both supported systems.
-    expect(installTargetForOS("unknown")).toBe("unix");
+  test("parses only filename/suffix combinations the URL generator creates", () => {
+    expect(desktopArtifactFromFilename("SPAWN-D_0.2.0_windows-x86_64-setup.exe")).toEqual({
+      version: "0.2.0",
+      platform: WINDOWS_DESKTOP_PLATFORM,
+    });
+    expect(desktopArtifactFromFilename("SPAWN-D_0.2.0_darwin-aarch64.dmg")).toEqual({
+      version: "0.2.0",
+      platform: "darwin-aarch64",
+    });
+    expect(desktopArtifactFromFilename("SPAWN-D_0.2.0_windows-x86_64.dmg")).toBeNull();
+    expect(desktopArtifactFromFilename("SPAWN-D_0.2.0_darwin-aarch64-setup.exe")).toBeNull();
   });
 
-  test("a Windows browser lands on the Windows tab end to end", () => {
-    const os = detectOS("Win32", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-    expect(os).toBe("windows");
-    const targets = installTargets("https://spawnd.dev");
-    const chosen = targets.find((target) => target.id === installTargetForOS(os));
-    expect(chosen?.command).toContain("wsl --");
+  test("release parsing accepts exact values, de-duplicates, and rejects mixed unknowns", () => {
+    expect(
+      desktopReleaseFromPayload({
+        desktop: {
+          version: "0.2.0",
+          tree: TREE,
+          platforms: ["darwin-aarch64", WINDOWS_DESKTOP_PLATFORM, WINDOWS_DESKTOP_PLATFORM],
+        },
+      }),
+    ).toEqual({
+      version: "0.2.0",
+      tree: TREE,
+      platforms: ["darwin-aarch64", WINDOWS_DESKTOP_PLATFORM],
+    });
+    expect(
+      desktopReleaseFromPayload({
+        desktop: {
+          version: "0.2.0",
+          tree: TREE,
+          platforms: ["darwin-aarch64", "windows-arm64"],
+        },
+      }),
+    ).toBeNull();
+    expect(
+      desktopReleaseFromPayload({ desktop: { version: "0.2.0", tree: TREE, platforms: [] } }),
+    ).toBeNull();
   });
 
-  test("the command tracks the deployment origin, not a hardcoded host", () => {
-    for (const target of installTargets("http://localhost:3000")) {
-      expect(target.command).toContain("http://localhost:3000/install.sh");
-      expect(target.command).not.toContain("spawnd.dev");
-    }
+  test("local payload parsing needs a version and at least one exact platform", () => {
+    expect(
+      localDesktopBuildFromPayload({
+        version: "0.2.0",
+        platforms: ["darwin-x86_64", WINDOWS_DESKTOP_PLATFORM],
+      }),
+    ).toEqual({ version: "0.2.0", platforms: ["darwin-x86_64", WINDOWS_DESKTOP_PLATFORM] });
+    expect(
+      localDesktopBuildFromPayload({ version: "0.2.0", platforms: ["linux-x86_64"] }),
+    ).toBeNull();
+  });
+
+  test("native setup follows the daemon artifact independently of the desktop EXE", () => {
+    const payload = {
+      desktop: { version: "0.2.0", tree: TREE, platforms: [WINDOWS_DESKTOP_PLATFORM] },
+      daemon: { targets: { [WINDOWS_DESKTOP_PLATFORM]: {} } },
+    };
+    expect(nativeWindowsAvailableFromPayload(payload)).toBe(true);
+    expect(nativeWindowsAvailableFromPayload({ ...payload, daemon: { targets: {} } })).toBe(false);
+    expect(nativeWindowsAvailableFromPayload({ daemon: payload.daemon, desktop: null })).toBe(true);
+    expect(nativeWindowsAvailableFromPayload({ desktop: payload.desktop, daemon: null })).toBe(
+      false,
+    );
+  });
+
+  test("browser OS maps only native desktop operating systems", () => {
+    expect(desktopPlatformForOS("windows")).toBe(WINDOWS_DESKTOP_PLATFORM);
+    expect(desktopPlatformForOS("macos")).toBe("darwin-aarch64");
+    expect(desktopPlatformForOS("linux")).toBeNull();
+    expect(desktopPlatformForOS("ios")).toBeNull();
+    expect(desktopPlatformForOS("unknown")).toBeNull();
   });
 });
 
 describe("phones", () => {
-  test("an iPhone, an iPad and an Android are all recognised as phones", () => {
+  test("recognises iPhone, iPad and Android before desktop classifiers", () => {
     expect(detectOS("iPhone", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)")).toBe(
       "ios",
     );
     expect(detectOS("Linux armv8l", "Mozilla/5.0 (Linux; Android 14; Pixel 8)")).toBe("android");
-    // Android's UA says "linux"; the phone check has to win.
-    expect(isMobileOS(detectOS("Linux armv8l", "Mozilla/5.0 (Linux; Android 14)"))).toBe(true);
+    const ipadUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/17.0 Safari/605.1.15";
+    expect(detectOS("MacIntel", ipadUA, 5)).toBe("ios");
+    expect(detectOS("MacIntel", ipadUA, 0)).toBe("macos");
+    expect(isMobileOS(detectOS("Win32", "Mozilla/5.0 (Windows NT 10.0)"))).toBe(false);
   });
 
-  test("an iPad masquerading as a Mac is caught by its touch points", () => {
-    const ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/17.0 Safari/605.1.15";
-    // iPadOS 13+ reports MacIntel and a desktop UA; only touch separates them.
-    expect(detectOS("MacIntel", ua, 5)).toBe("ios");
-    expect(detectOS("MacIntel", ua, 0)).toBe("macos");
-  });
-
-  test("a real desktop is never mistaken for a phone", () => {
-    expect(
-      isMobileOS(detectOS("MacIntel", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")),
-    ).toBe(false);
-    expect(isMobileOS(detectOS("Win32", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"))).toBe(false);
-    expect(isMobileOS(detectOS("Linux x86_64", "Mozilla/5.0 (X11; Linux x86_64)"))).toBe(false);
-  });
-
-  test("a phone gets its own store badge and a desktop gets none", () => {
+  test("phone badges stay linkless until their listings are public", () => {
     expect(storeBadgeForOS("ios")?.label).toBe("App Store");
     expect(storeBadgeForOS("android")?.label).toBe("Google Play");
     expect(storeBadgeForOS("macos")).toBeNull();
-    expect(storeBadgeForOS("unknown")).toBeNull();
-  });
-
-  test("badges stay linkless until a listing is actually published", () => {
-    // Neither store resolves yet — eas.json holds an App Store Connect record
-    // and an internal Play track, which are not public listings. A badge that
-    // 404s on the lander is worse than one that says "coming soon".
-    for (const badge of storeBadges()) {
-      expect(badge.href).toBeNull();
-      expect(badge.label.length).toBeGreaterThan(0);
-    }
+    for (const badge of storeBadges()) expect(badge.href).toBeNull();
   });
 });
