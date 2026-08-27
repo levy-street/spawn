@@ -6175,17 +6175,13 @@ mod tests {
                     .await,
                 "original upload operations did not drain within 5 seconds"
             );
-            #[cfg(windows)]
-            // Windows webrtc-rs retains the server's graceful SCTP close until
-            // the remote peer settles; the stale browser fixture has finished all
+            // webrtc-rs may retain the server's graceful SCTP close until the
+            // remote peer settles. The stale browser fixture has finished all
             // assertions, so let transport cleanup complete before counting tasks.
             tokio::time::timeout(Duration::from_secs(10), close_test_peer(&client.pc))
                 .await
-                .expect("original Windows RTC peer did not close within 10 seconds");
-            #[cfg(not(windows))]
-            let cleanup_timeout = Duration::from_secs(3);
-            #[cfg(windows)]
-            let cleanup_timeout = Duration::from_secs(10);
+                .expect("original RTC peer did not close within 10 seconds");
+            let cleanup_timeout = Duration::from_secs(15);
             tokio::time::timeout(cleanup_timeout, async {
                 while sessions.peer_cleanup_task_count().await != 0 {
                     tokio::task::yield_now().await;
@@ -6240,10 +6236,9 @@ mod tests {
         assert!(!tmp.path().join("once.bin").exists());
 
         stale.ctl.close().await.expect("close stale real spawn.ctl");
-        #[cfg(windows)]
         let stale_peer_close = {
             // webrtc-rs can serialize the remote DataChannel close callback
-            // behind the deliberately paused message callback on Windows.
+            // behind the deliberately paused message callback.
             // Closing the peer supplies the independent endpoint-loss signal
             // while retaining the test's paused final-commit race.
             let pc = Arc::clone(&stale.pc);
@@ -6268,7 +6263,6 @@ mod tests {
         .await;
         sessions.uploads.release_commit_pause_for_test();
         stale_disabled.expect("stale control close did not disable endpoint effects");
-        #[cfg(windows)]
         stale_peer_close.await.expect("close stale RTC peer");
         wait_for_resident_sessions(&sessions, 0).await;
         assert!(
