@@ -1,28 +1,20 @@
-import { ArrowRight } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import type { ReactNode } from "react";
-import {
-  Colophon,
-  CTA_QUIET,
-  CTA_SLAB,
-  Masthead,
-  RegistrationMarks,
-} from "@/components/brand/press";
+import { Colophon, Masthead } from "@/components/brand/press";
 import { InstallOneLiner } from "@/components/seo/InstallOneLiner";
 import { HeroInkVideo } from "@/components/seo/templates/HeroInkVideo";
-import { poster } from "@/lib/fonts";
 import { cn } from "@/lib/utils";
 
 /*
- * The job template — the recipe every landing page reuses.
+ * The job template — the editorial recipe every landing page reuses.
  *
- * Hero: heavy branding, minimal words. A dimmed full-bleed ink print under
- * exactly two text elements (the keyword H1 and one subheading sentence),
- * with the breadcrumb kept small above. No CTAs, no captures, no kickers.
- * The body earns one rich visual (the product capture), one CTA moment, and
- * a quiet FAQ; whitespace is the ornament. Every section shares the same
- * rail (max-w-5xl) and the same hairline borders.
+ * Discipline over decoration: sentence case everywhere, whitespace instead of
+ * borders, one media jewel per section, hellfire held back to the H1 accent
+ * and the links. The hero is a dimmed full-bleed ink print under a date line,
+ * the H1, and one subheading sentence; the body flows in a centered ~68ch
+ * article column, with figures allowed to break wider. No section markers,
+ * no eyebrows, no rules between sections — vertical air does the separating.
  */
 
 const SITE = "https://spawnd.dev";
@@ -38,7 +30,6 @@ export interface JobFaqItem {
 }
 
 export interface JobRelatedLink {
-  family: string;
   title: string;
   blurb: string;
   href: string;
@@ -54,19 +45,13 @@ export interface JobHeroInk {
   poster: string;
 }
 
-function HeadingText({ text }: { text: JobHeading }) {
-  return (
-    <>
-      {text.plain}
-      {text.accent ? (
-        <>
-          {" "}
-          <em className="text-hellfire not-italic">{text.accent}</em>
-        </>
-      ) : null}
-    </>
-  );
-}
+/** The heading voice of the page: the grimoire sans carrying weight, not caps. */
+const H2_CLASS =
+  "max-w-[26ch] text-[clamp(24px,3vw,32px)] leading-[1.15] font-semibold tracking-[-0.015em] text-bone [text-wrap:balance]";
+
+/** An inline link: ember (the AA-safe hellfire) with a quiet underline. */
+export const JOB_LINK =
+  "text-ember underline decoration-ember/40 underline-offset-4 transition-colors hover:text-hellfire hover:decoration-hellfire";
 
 /** BreadcrumbList + FAQPage, serialized and escaped at build time. */
 function StructuredData({
@@ -119,232 +104,157 @@ function StructuredData({
   );
 }
 
-/** The small sigil label that opens a body section. */
-function Marker({ children, className }: { children: ReactNode; className?: string }) {
-  return (
-    <p
-      className={cn(
-        "font-sigil text-[11px] font-medium tracking-[0.3em] text-hellfire uppercase",
-        className,
-      )}
-    >
-      {children}
-    </p>
-  );
+/**
+ * One body section: horizontal padding and generous vertical air, nothing
+ * else. No borders, no markers — the whitespace is the separator.
+ */
+export function JobSection({ children, className }: { children: ReactNode; className?: string }) {
+  return <section className={cn("px-5 py-14 sm:px-8 sm:py-24", className)}>{children}</section>;
 }
 
 /**
- * One body section on the shared rail: hairline border below, generous
- * vertical air, an optional marker naming the plate.
+ * The article column: ~68ch, centered. Sets the prose voice so bare
+ * paragraphs inside it need no classes of their own.
  */
-export function JobSection({
-  marker,
-  children,
-  className,
-}: {
-  marker?: string;
-  children: ReactNode;
-  className?: string;
-}) {
+export function JobProse({ children, className }: { children: ReactNode; className?: string }) {
   return (
-    <section className={cn("border-line-g border-b px-5 py-20 sm:px-8 sm:py-28", className)}>
-      <div className="mx-auto w-full max-w-5xl">
-        {marker ? <Marker className="mb-10">{marker}</Marker> : null}
-        {children}
-      </div>
-    </section>
+    <div className={cn("mx-auto w-full max-w-[68ch] text-[16px] leading-8 text-ash", className)}>
+      {children}
+    </div>
   );
 }
 
-/** A section heading in the poster face. */
-export function JobH2({ text, className }: { text: JobHeading; className?: string }) {
-  return (
-    <h2
-      className={cn(
-        poster.className,
-        "max-w-[24ch] text-[clamp(26px,3.6vw,42px)] leading-[1.06] font-light text-bone uppercase [text-wrap:balance]",
-        className,
-      )}
-    >
-      <HeadingText text={text} />
-    </h2>
-  );
+/** A section heading: sentence case, sized by hierarchy, no ceremony. */
+export function JobH2({ children, className }: { children: ReactNode; className?: string }) {
+  return <h2 className={cn(H2_CLASS, className)}>{children}</h2>;
 }
 
-/** Three problems, three columns: a rule, a word, a claim. */
-export function JobTrio({ items }: { items: { title: string; body: ReactNode }[] }) {
+/**
+ * Compact sub-blocks in the column — a short bone lead, a claim under it.
+ * No cards, no rules; space alone groups them.
+ */
+export function JobPoints({ items }: { items: { title: string; body: ReactNode }[] }) {
   return (
-    <div className="grid gap-12 md:grid-cols-3 md:gap-8 lg:gap-12">
+    <div className="space-y-9">
       {items.map((item) => (
-        <div key={item.title} className="border-t border-line-strong pt-6">
-          <h3
-            className={cn(
-              poster.className,
-              "mb-4 text-[21px] leading-[1.1] font-light text-bone uppercase",
-            )}
-          >
-            {item.title}
-          </h3>
-          <p className="max-w-[46ch] text-[15px] leading-7 text-ash">{item.body}</p>
+        <div key={item.title}>
+          <h3 className="mb-1.5 text-[16px] leading-7 font-semibold text-bone">{item.title}</h3>
+          <p>{item.body}</p>
         </div>
       ))}
     </div>
   );
 }
 
-/** Mechanics in one breath: a single quiet strip of fragments, one link out. */
-export function JobMechanics({
-  fragments,
-  link,
-}: {
-  fragments: string[];
-  link: { label: string; href: string };
-}) {
+/**
+ * A code figure: rounded, char ground, clean mono. No title bar, no chrome —
+ * one quiet caption under it if the commands need naming.
+ */
+export function JobCodeFigure({ caption, children }: { caption?: string; children: ReactNode }) {
   return (
-    <section className="border-line-g border-b px-5 py-14 sm:px-8 sm:py-16">
-      <div className="mx-auto w-full max-w-5xl">
-        <p className="flex flex-wrap items-baseline gap-x-4 gap-y-2.5 font-sigil text-[12px] tracking-[0.14em] text-bone uppercase sm:text-[13px]">
-          {fragments.map((fragment, index) => (
-            <span key={fragment} className="flex items-baseline gap-x-4">
-              {index > 0 ? (
-                <span aria-hidden className="text-hellfire">
-                  ·
-                </span>
-              ) : null}
-              <span>{fragment}</span>
-            </span>
-          ))}
-        </p>
-        <Link
-          href={link.href}
-          className="mt-6 inline-block font-sigil text-[11px] tracking-[0.18em] text-ash uppercase underline decoration-line-strong underline-offset-8 transition-colors hover:text-bone hover:decoration-ember"
-        >
-          {link.label}
-        </Link>
-      </div>
-    </section>
-  );
-}
-
-/** A small shell figure — commands the page vouches for, set quietly. */
-export function JobShellAside({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <figure className="min-w-0 border border-line-g bg-char">
-      <figcaption className="border-line-g border-b px-5 py-3 font-sigil text-[10px] tracking-[0.22em] text-ash uppercase">
-        {title}
-      </figcaption>
-      <div className="min-w-0 overflow-x-auto px-5 py-4 font-sigil text-[12px] leading-7 text-bone">
+    <figure className="min-w-0">
+      <div className="overflow-x-auto rounded-xl bg-char px-6 py-5 font-sigil text-[13px] leading-7 text-bone">
         {children}
       </div>
+      {caption ? (
+        <figcaption className="mt-3 text-[13px] leading-6 text-ash">{caption}</figcaption>
+      ) : null}
     </figure>
   );
 }
 
-/** The page's single CTA moment: the one-liner, the slab, the quiet door. */
-export function JobStart({ heading, aside }: { heading: JobHeading; aside?: ReactNode }) {
+/**
+ * The page's single CTA moment, kept calm: a soft panel, the install
+ * one-liner, one small primary pill and one quiet door.
+ */
+export function JobStart({ heading }: { heading: string }) {
   return (
-    <JobSection marker="Start">
-      <div
-        className={cn(
-          "grid gap-14",
-          aside ? "lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] lg:items-center" : "",
-        )}
-      >
-        <div>
-          <JobH2 text={heading} />
-          <InstallOneLiner className="mt-10" />
-          <div className="mt-9 flex flex-col items-start gap-6 sm:flex-row sm:items-center sm:gap-9">
-            <Link href="/signup" className={CTA_SLAB}>
-              Sign up free
-              <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
-            </Link>
-            <Link href="/download" className={CTA_QUIET}>
-              Install the daemon
-            </Link>
-          </div>
+    <JobSection>
+      <div className="mx-auto w-full max-w-3xl rounded-2xl bg-char px-7 py-10 sm:px-12 sm:py-12">
+        <h2 className={H2_CLASS}>{heading}</h2>
+        <InstallOneLiner className="mt-8 rounded-lg border-line-strong" />
+        <div className="mt-8 flex flex-col items-start gap-5 sm:flex-row sm:items-center sm:gap-7">
+          <Link
+            href="/signup"
+            className="inline-flex items-center justify-center rounded-full bg-bone px-6 py-2.5 text-[14px] leading-6 font-medium text-void transition-colors hover:bg-white"
+          >
+            Sign up free
+          </Link>
+          <Link
+            href="/download"
+            className="text-[14px] leading-6 text-ash underline decoration-line-strong underline-offset-4 transition-colors hover:text-bone hover:decoration-bone"
+          >
+            Install the daemon
+          </Link>
         </div>
-        {aside ? <div className="min-w-0">{aside}</div> : null}
       </div>
     </JobSection>
   );
 }
 
-/** The FAQ, kept visually quiet: small type, generous space, no ceremony. */
+/** The FAQ, visually quiet in the column: small sentence-case questions. */
 function FaqQuiet({ faq }: { faq: JobFaqItem[] }) {
   if (faq.length === 0) return null;
   return (
-    <section className="border-line-g border-b px-5 py-20 sm:px-8 sm:py-24">
-      <div className="mx-auto w-full max-w-5xl">
-        <p className="mb-12 font-sigil text-[11px] font-medium tracking-[0.3em] text-ash uppercase">
-          Questions
-        </p>
-        <dl className="max-w-[72ch] space-y-10">
+    <JobSection>
+      <JobProse>
+        <h2 className={H2_CLASS}>Questions</h2>
+        <dl className="mt-10 space-y-9">
           {faq.map((item) => (
             <div key={item.q}>
-              <dt className="mb-2.5 text-[15px] font-medium text-bone">{item.q}</dt>
-              <dd className="text-[14px] leading-7 text-ash">{item.a}</dd>
+              <dt className="mb-1.5 text-[16px] leading-7 font-semibold text-bone">{item.q}</dt>
+              <dd className="text-[15px] leading-7">{item.a}</dd>
             </div>
           ))}
         </dl>
-      </div>
-    </section>
+      </JobProse>
+    </JobSection>
   );
 }
 
-function RelatedRack({ related }: { related: JobRelatedLink[] }) {
+/** Related pages as plain text links: a title, a dash, one line of blurb. */
+function RelatedQuiet({ related }: { related: JobRelatedLink[] }) {
   if (related.length === 0) return null;
   return (
-    <section className="border-line-g border-b px-5 py-16 sm:px-8 sm:py-20">
-      <div className="mx-auto w-full max-w-5xl">
-        <p className="mb-8 font-sigil text-[11px] font-medium tracking-[0.3em] text-ash uppercase">
-          Related
-        </p>
-        <div className="border-line-g border-t">
+    <JobSection className="pb-24 sm:pb-32">
+      <JobProse>
+        <h2 className={H2_CLASS}>Related</h2>
+        <ul className="mt-8 space-y-4">
           {related.map((entry) => (
-            <Link
-              key={entry.href}
-              href={entry.href}
-              className="group grid gap-1 border-line-g border-b py-5 pr-1 transition-colors hover:bg-char/60 sm:grid-cols-[9rem_minmax(0,1fr)_auto] sm:items-baseline sm:gap-6"
-            >
-              <span className="font-sigil text-[10px] tracking-[0.22em] text-hellfire uppercase">
-                {entry.family}
-              </span>
-              <span className="min-w-0">
-                <span className="font-medium text-[15px] text-bone">{entry.title}</span>{" "}
-                <span className="text-[14px] text-ash">— {entry.blurb}</span>
-              </span>
-              <ArrowRight
-                aria-hidden
-                className="hidden size-4 self-center text-ash transition-transform group-hover:translate-x-0.5 group-hover:text-bone sm:block"
-              />
-            </Link>
+            <li key={entry.href} className="text-[15px] leading-7">
+              <Link
+                href={entry.href}
+                className="font-medium text-bone underline decoration-line-strong underline-offset-4 transition-colors hover:decoration-ember"
+              >
+                {entry.title}
+              </Link>{" "}
+              <span>— {entry.blurb}</span>
+            </li>
           ))}
-        </div>
-      </div>
-    </section>
+        </ul>
+      </JobProse>
+    </JobSection>
   );
 }
 
 /**
- * The hero: a full-bleed ink print, dimmed hard, under exactly two text
- * elements. The breadcrumb stays small at the top; the type hangs at the
- * bottom of the frame so the print breathes through the middle.
+ * The hero: the full-bleed ink print dimmed hard enough to read over, under
+ * three text elements only — a small grey date line, the sentence-case H1,
+ * and one subheading sentence. No breadcrumb UI, no CTAs.
  */
 function HeroInk({
-  crumbs,
-  pageName,
   title,
   sub,
+  date,
   ink,
 }: {
-  crumbs: JobCrumb[];
-  pageName: string;
   title: JobHeading;
   sub: string;
+  date: string;
   ink: JobHeroInk;
 }) {
   return (
-    <header className="relative isolate overflow-hidden border-line-g border-b">
+    <header className="relative isolate overflow-hidden">
       <div aria-hidden className="absolute inset-0">
         <HeroInkVideo video={ink.video} poster={ink.poster} />
         <Image
@@ -356,70 +266,31 @@ function HeroInk({
           sizes="100vw"
           className="pointer-events-none hidden object-cover motion-reduce:block"
         />
-        {/* The dim: hard everywhere the type lives, easing only through the
-         * upper-middle band so the print shows without competing. */}
+        {/* The dim: darkest through the middle band where the type sits, so
+         * the print breathes at the edges without competing with it. */}
         <div
           className="absolute inset-0"
           style={{
             background:
-              "linear-gradient(180deg, rgba(0,0,0,.95) 0%, rgba(0,0,0,.72) 30%, rgba(0,0,0,.68) 48%, rgba(0,0,0,.9) 74%, rgba(0,0,0,.97) 100%)",
-          }}
-        />
-        {/* The hellfire glow, rising under the headline. */}
-        <div
-          className="absolute inset-0"
-          style={{
-            background:
-              "radial-gradient(ellipse 64% 58% at 16% 100%, rgba(225,30,21,.32), transparent 66%)",
+              "linear-gradient(180deg, rgba(0,0,0,.82) 0%, rgba(0,0,0,.86) 34%, rgba(0,0,0,.86) 66%, rgba(0,0,0,.8) 84%, rgba(0,0,0,.92) 100%)",
           }}
         />
       </div>
-      <RegistrationMarks />
 
-      <div className="relative z-10 mx-auto flex min-h-[84svh] w-full max-w-[1440px] flex-col items-start px-5 pt-5 pb-16 sm:px-8 sm:pt-7 sm:pb-20">
-        <nav aria-label="Breadcrumb">
-          <ol className="flex flex-wrap items-center gap-x-2.5 gap-y-1 font-sigil text-[11px] tracking-[0.18em] text-ash uppercase">
-            <li>
-              <Link href="/" className="transition-colors hover:text-bone">
-                spawnd
-              </Link>
-            </li>
-            {crumbs.map((crumb) => (
-              <li key={crumb.href} className="flex items-center gap-2.5">
-                <span aria-hidden className="text-line-strong">
-                  /
-                </span>
-                <Link href={crumb.href} className="transition-colors hover:text-bone">
-                  {crumb.name}
-                </Link>
-              </li>
-            ))}
-            <li aria-current="page" className="flex items-center gap-2.5">
-              <span aria-hidden className="text-line-strong">
-                /
-              </span>
-              <span className="text-ember">{pageName}</span>
-            </li>
-          </ol>
-        </nav>
-
-        <div className="mt-auto pt-28">
-          <h1
-            className={cn(
-              poster.className,
-              "max-w-[19ch] text-[clamp(34px,5.4vw,72px)] leading-[1.06] font-light text-bone uppercase [text-wrap:balance]",
-            )}
-          >
-            {title.plain}
-            {title.accent ? (
-              // The accent takes its own line: the keyword lands as the punch.
-              <em className="block text-hellfire not-italic">{title.accent}</em>
-            ) : null}
-          </h1>
-          <p className="mt-6 max-w-[52ch] text-[clamp(16px,1.7vw,19px)] leading-8 text-ash">
-            {sub}
-          </p>
-        </div>
+      <div className="relative z-10 mx-auto flex min-h-[72svh] w-full max-w-5xl flex-col items-center justify-center px-5 py-24 text-center sm:px-8 sm:py-28">
+        <p className="text-[13px] leading-6 tracking-[0.01em] text-ash">{date}</p>
+        <h1 className="mt-5 max-w-[30ch] text-[clamp(34px,4.8vw,60px)] leading-[1.08] font-semibold tracking-[-0.02em] text-bone [text-wrap:balance]">
+          {title.plain}
+          {title.accent ? (
+            <>
+              {" "}
+              <em className="text-hellfire not-italic">{title.accent}</em>
+            </>
+          ) : null}
+        </h1>
+        <p className="mt-6 max-w-[54ch] text-[clamp(16px,1.6vw,18px)] leading-8 text-ash [text-wrap:balance]">
+          {sub}
+        </p>
       </div>
     </header>
   );
@@ -437,7 +308,7 @@ export function JobPage({
   crumbs: JobCrumb[];
   pageName: string;
   canonicalPath: string;
-  hero: { title: JobHeading; sub: string; ink: JobHeroInk };
+  hero: { title: JobHeading; sub: string; date: string; ink: JobHeroInk };
   children: ReactNode;
   faq: JobFaqItem[];
   related: JobRelatedLink[];
@@ -446,16 +317,10 @@ export function JobPage({
     <main className="grimoire min-h-vv overflow-x-clip">
       <StructuredData crumbs={crumbs} pageName={pageName} canonicalPath={canonicalPath} faq={faq} />
       <Masthead />
-      <HeroInk
-        crumbs={crumbs}
-        pageName={pageName}
-        title={hero.title}
-        sub={hero.sub}
-        ink={hero.ink}
-      />
+      <HeroInk title={hero.title} sub={hero.sub} date={hero.date} ink={hero.ink} />
       {children}
       <FaqQuiet faq={faq} />
-      <RelatedRack related={related} />
+      <RelatedQuiet related={related} />
       <Colophon />
     </main>
   );

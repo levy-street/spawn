@@ -1,13 +1,15 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { FleetCapture } from "@/components/seo/templates/FleetCapture";
 import {
+  JOB_LINK,
+  JobCodeFigure,
   JobH2,
-  JobMechanics,
   JobPage,
+  JobPoints,
+  JobProse,
   JobSection,
-  JobShellAside,
   JobStart,
-  JobTrio,
 } from "@/components/seo/templates/JobPage";
 
 /*
@@ -70,25 +72,21 @@ const FAQ = [
 
 const RELATED = [
   {
-    family: "Use cases",
     title: "Keep agents running",
     blurb: "what happens to the fleet when the laptop closes",
     href: "/use/keep-agents-running",
   },
   {
-    family: "Use cases",
     title: "AI agents on your own GPU",
     blurb: "the rig as a first-class host in the grid",
     href: "/use/ai-agents-on-your-own-gpu",
   },
   {
-    family: "Agents",
     title: "Claude Code",
     blurb: "the pillar page for the CLI itself",
     href: "/for/claude-code",
   },
   {
-    family: "Use cases",
     title: "Claude Code on your phone",
     blurb: "the device that answers the permission prompt",
     href: "/use/claude-code-on-your-phone",
@@ -102,17 +100,18 @@ export default function RunAgentsInParallelPage() {
       pageName="Run agents in parallel"
       canonicalPath={PATH}
       hero={{
-        title: { plain: "Run multiple Claude Code sessions", accent: "in parallel." },
+        title: { plain: "Run multiple Claude\u00A0Code sessions", accent: "in parallel" },
         sub: "How to run a fleet of coding agents side by side — the worktree pattern, the terminal setup, and what it takes to keep the fleet alive after you stand up.",
+        date: "spawnd · August 2026",
         ink: { video: "/brand/ink/grid-ink.mp4", poster: "/brand/ink/grid-ink.png" },
       }}
       faq={FAQ}
       related={RELATED}
     >
-      <JobSection marker="The pattern">
-        <JobH2 text={{ plain: "One agent per worktree.", accent: "One worktree per pane." }} />
-        <div className="mt-12 grid gap-12 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] lg:items-start lg:gap-16">
-          <div className="space-y-5 text-[16px] leading-8 text-ash">
+      <JobSection className="pt-20 sm:pt-28">
+        <JobProse>
+          <JobH2>One agent per worktree. One worktree per pane.</JobH2>
+          <div className="mt-8 space-y-5">
             <p>
               Claude&nbsp;Code runs one session per invocation, so parallelism is yours to arrange —
               and the arrangement that matters is on the filesystem. Two agents in one checkout will
@@ -122,61 +121,69 @@ export default function RunAgentsInParallelPage() {
             <p>
               Then give each worktree a terminal of its own. Split panes in iTerm2, tmux, or
               whatever you already drive; start <span className="text-bone">claude</span> in each
-              lane. That’s a working fleet — three agents, three lanes, one screen — and it needs
-              nothing you don’t already have. At one machine, with the lid open, it’s genuinely
-              enough.
+              lane.
             </p>
           </div>
-          <JobShellAside title="The lanes, cut in three commands">
-            <p className="whitespace-nowrap">
-              <span className="text-ember">$</span> git worktree add ../wt/auth -b agents/auth
-            </p>
-            <p className="whitespace-nowrap">
-              <span className="text-ember">$</span> git worktree add ../wt/importer -b
-              agents/importer
-            </p>
-            <p className="whitespace-nowrap">
-              <span className="text-ember">$</span> git worktree add ../wt/perf -b agents/perf
-            </p>
-            <p className="whitespace-nowrap pt-2 text-ash"># one pane per lane, claude in each</p>
-          </JobShellAside>
-        </div>
+          <div className="mt-10">
+            <JobCodeFigure caption="The lanes, cut in three commands.">
+              <p className="whitespace-nowrap">
+                <span className="text-ash">$</span> git worktree add ../wt/auth -b agents/auth
+              </p>
+              <p className="whitespace-nowrap">
+                <span className="text-ash">$</span> git worktree add ../wt/importer -b
+                agents/importer
+              </p>
+              <p className="whitespace-nowrap">
+                <span className="text-ash">$</span> git worktree add ../wt/perf -b agents/perf
+              </p>
+              <p className="whitespace-nowrap pt-2 text-ash"># one pane per lane, claude in each</p>
+            </JobCodeFigure>
+          </div>
+          <p className="mt-10">
+            That’s a working fleet — three agents, three lanes, one screen — and it needs nothing
+            you don’t already have. At one machine, with the lid open, it’s genuinely enough.
+          </p>
+        </JobProse>
       </JobSection>
 
-      <JobSection marker="Where it breaks">
-        <JobH2 text={{ plain: "The splits work", accent: "until you stand up." }} />
-        <div className="mt-14">
-          <JobTrio
-            items={[
-              {
-                title: "One screen",
-                body: "The panes live in one terminal app on one machine. The GPU box’s agents need an SSH session and a second set of splits; a third machine, a third. The fleet has no single place to be.",
-              },
-              {
-                title: "Mortal sessions",
-                body: "Close the laptop and every pane dies mid-edit. tmux keeps the shells alive — if you remembered to start every lane inside it, on every machine, every time.",
-              },
-              {
-                title: "Silent prompts",
-                body: "An agent waiting for permission in pane four doesn’t tell you. A fleet you have to poll is a serial job with more windows — the ceiling isn’t compute, it’s how long a question waits.",
-              },
-            ]}
-          />
-        </div>
+      <JobSection>
+        <JobProse>
+          <JobH2>The splits work until you stand up.</JobH2>
+          <div className="mt-10">
+            <JobPoints
+              items={[
+                {
+                  title: "One screen",
+                  body: "The panes live in one terminal app on one machine. The GPU box’s agents need an SSH session and a second set of splits; a third machine, a third. The fleet has no single place to be.",
+                },
+                {
+                  title: "Mortal sessions",
+                  body: "Close the laptop and every pane dies mid-edit. tmux keeps the shells alive — if you remembered to start every lane inside it, on every machine, every time.",
+                },
+                {
+                  title: "Silent prompts",
+                  body: "An agent waiting for permission in pane four doesn’t tell you. A fleet you have to poll is a serial job with more windows — the ceiling isn’t compute, it’s how long a question waits.",
+                },
+              ]}
+            />
+          </div>
+        </JobProse>
       </JobSection>
 
-      <JobSection marker="The optimal setup">
-        <JobH2 text={{ plain: "The same pattern,", accent: "held by infrastructure." }} />
-        <p className="mt-8 max-w-[58ch] text-[16px] leading-8 text-ash">
-          spawnd keeps the workflow — worktrees, one real login shell per agent — and replaces what
-          carries it. A small daemon on each of your machines owns the sessions; your browser holds
-          them as one grid.
-        </p>
-        <div className="mt-14">
-          <FleetCapture caption="A workspace: six sessions across three machines" />
+      <JobSection>
+        <JobProse>
+          <JobH2>The same pattern, held by infrastructure.</JobH2>
+          <p className="mt-8">
+            spawnd keeps the workflow — worktrees, one real login shell per agent — and replaces
+            what carries it. A small daemon on each of your machines owns the sessions; your browser
+            holds them as one grid.
+          </p>
+        </JobProse>
+        <div className="mx-auto mt-12 w-full max-w-5xl sm:mt-14">
+          <FleetCapture caption="A workspace: six sessions across three machines." />
         </div>
-        <div className="mt-16">
-          <JobTrio
+        <JobProse className="mt-12 sm:mt-16">
+          <JobPoints
             items={[
               {
                 title: "Every machine, one grid",
@@ -192,20 +199,23 @@ export default function RunAgentsInParallelPage() {
               },
             ]}
           />
-        </div>
+        </JobProse>
       </JobSection>
 
-      <JobMechanics
-        fragments={[
-          "Real PTYs owned by host workers",
-          "Hosts dial out — zero open ports",
-          "End-to-end encrypted past our own server",
-          "Open source, MIT / Apache-2.0",
-        ]}
-        link={{ label: "Read the threat model", href: "/security" }}
-      />
+      <JobSection className="py-8 sm:py-10">
+        <JobProse>
+          <p className="text-[15px] leading-7">
+            Real PTYs owned by host workers. Hosts dial out — zero open ports. End-to-end encrypted
+            past our own server. Open source, MIT / Apache-2.0.{" "}
+            <Link href="/security" className={JOB_LINK}>
+              Read the threat model
+            </Link>
+            .
+          </p>
+        </JobProse>
+      </JobSection>
 
-      <JobStart heading={{ plain: "One line on any host", accent: "you own." }} />
+      <JobStart heading="One line on any host you own." />
     </JobPage>
   );
 }
