@@ -6212,9 +6212,18 @@ mod tests {
         fs::create_dir_all(skills_dir.join("spawn-control")).expect("spawn skill dir");
         fs::create_dir_all(skills_dir.join("repo-notes")).expect("notes skill dir");
 
+        #[cfg(unix)]
+        let cwd = "/work/repo".to_string();
+        #[cfg(windows)]
+        let cwd = temp
+            .path()
+            .join("work")
+            .join("repo")
+            .to_string_lossy()
+            .into_owned();
         let create = SessionCreate {
             session_id: Uuid::new_v4(),
-            cwd: "/work/repo".to_string(),
+            cwd: cwd.clone(),
             skills: vec![
                 SkillConfig {
                     id: "skill-1".to_string(),
@@ -6236,10 +6245,18 @@ mod tests {
         let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
 
         assert!(config.contains("[[skills.config]]"));
-        assert!(config.contains("spawn-control/SKILL.md"));
-        assert!(config.contains("repo-notes/SKILL.md"));
+        for name in ["spawn-control", "repo-notes"] {
+            let path = skills_dir.join(name).join("SKILL.md");
+            assert!(config.contains(&format!(
+                "path = {}\nenabled = true",
+                toml_string(&path.to_string_lossy())
+            )));
+        }
         assert!(!config.contains("unselected"));
-        assert!(config.contains("[projects.\"/work/repo\"]\ntrust_level = \"trusted\""));
+        assert!(config.contains(&format!(
+            "[projects.{}]\ntrust_level = \"trusted\"",
+            toml_quoted_key(&cwd)
+        )));
     }
 
     #[test]
