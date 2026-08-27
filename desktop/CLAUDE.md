@@ -124,7 +124,11 @@ a PNG. The newly rendered 1024 px `icon.png` is also the Windows colour
 master: the same command emits the black-on-alpha macOS `tray.png` /
 `tray@2x.png`, multi-size `icon.ico`, `tray-windows.ico`, the Windows tray
 layers and the 32/64 px runtime tray PNGs. `npm run icons:check` proves every
-committed output is current without rewriting it. The macOS tray images use
+committed output is current without rewriting it. The ICNS holds exactly the
+members `iconutil` writes — PNG from 128 px up, Apple's ARGB run-length form at
+16 and 32 px. IconServices reads a PNG in those two slots as raw pixels, which
+is how the app once wore coloured noise in Login Items and the Dock's menu while
+Finder's big icon looked right; `iconutil -c iconset` on the file is the check. The macOS tray images use
 `icon_as_template(true)`, which is the only correct way to wear a logo in the
 menu bar; Windows uses the generated colour tray and never template mode.
 
