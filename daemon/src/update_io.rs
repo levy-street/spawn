@@ -16,6 +16,7 @@ pub(super) fn target_for(os: &str, arch: &str) -> Option<&'static str> {
         ("macos", "x86_64") => Some("darwin-x86_64"),
         ("linux", "aarch64") => Some("linux-aarch64"),
         ("linux", "x86_64") => Some("linux-x86_64"),
+        ("windows", "x86_64") => Some("windows-x86_64"),
         _ => None,
     }
 }
@@ -26,14 +27,7 @@ pub(super) fn resolve_file(path: PathBuf) -> Option<PathBuf> {
 }
 
 pub(super) fn resolve_program(path: PathBuf) -> Option<PathBuf> {
-    if path.is_absolute() || path.components().count() > 1 {
-        return resolve_file(path);
-    }
-    std::env::var_os("PATH").and_then(|search| {
-        std::env::split_paths(&search)
-            .map(|directory| directory.join(&path))
-            .find_map(resolve_file)
-    })
+    crate::platform::resolve_program(&path).map(|resolved| resolved.path)
 }
 
 pub(super) fn probe_writable(directory: &Path) -> bool {
@@ -131,6 +125,9 @@ pub(super) async fn download_to(
     file.flush()
         .await
         .map_err(|_| UpdateFailure::new(UpdateStage::Download, "write_failed"))?;
+    file.sync_all()
+        .await
+        .map_err(|_| UpdateFailure::new(UpdateStage::Download, "write_failed"))?;
     Ok(digest_hex(&digest.finalize()))
 }
 
@@ -152,19 +149,9 @@ pub(super) fn sha_matches(bytes: &[u8], expected: &str) -> bool {
     valid_sha256(expected) && digest_hex(&Sha256::digest(bytes)).eq_ignore_ascii_case(expected)
 }
 
-#[cfg(unix)]
 pub(super) fn chmod_executable(path: &Path) -> Result<(), UpdateFailure> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+    crate::platform::set_executable(path)
         .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "chmod_failed"))
-}
-
-#[cfg(not(unix))]
-pub(super) fn chmod_executable(_path: &Path) -> Result<(), UpdateFailure> {
-    Err(UpdateFailure::new(
-        UpdateStage::Precondition,
-        "unsupported_target",
-    ))
 }
 
 pub(super) async fn verify_version(path: &Path, expected: &str) -> Result<(), UpdateFailure> {
@@ -193,16 +180,12 @@ pub(super) struct TempFiles {
 impl TempFiles {
     pub(super) fn new(preconditions: &Preconditions) -> Result<Self, UpdateFailure> {
         let pid = std::process::id();
-        let daemon = preconditions
-            .daemon_path
-            .parent()
-            .ok_or_else(|| UpdateFailure::new(UpdateStage::Precondition, "unwritable"))?
-            .join(format!("spawnd.tmp.{pid}"));
-        let worker = preconditions
-            .worker_path
-            .parent()
-            .ok_or_else(|| UpdateFailure::new(UpdateStage::Precondition, "unwritable"))?
-            .join(format!("spawn-worker.tmp.{pid}"));
+        let daemon =
+            crate::platform::executable_variant(&preconditions.daemon_path, &format!("tmp.{pid}"))
+                .map_err(|_| UpdateFailure::new(UpdateStage::Precondition, "unwritable"))?;
+        let worker =
+            crate::platform::executable_variant(&preconditions.worker_path, &format!("tmp.{pid}"))
+                .map_err(|_| UpdateFailure::new(UpdateStage::Precondition, "unwritable"))?;
         Ok(Self { daemon, worker })
     }
 }
@@ -215,7 +198,8 @@ impl Drop for TempFiles {
 }
 
 pub(super) fn previous_path(live: &Path) -> PathBuf {
-    live.with_extension("prev")
+    crate::platform::executable_variant(live, "prev")
+        .expect("installed binary path must have a file name and target suffix")
 }
 
 pub(super) fn swap_one(live: &Path, temporary: &Path) -> std::io::Result<()> {
@@ -226,9 +210,9 @@ pub(super) fn swap_one(live: &Path, temporary: &Path) -> std::io::Result<()> {
             "previous binary still exists",
         ));
     }
-    fs::rename(live, &previous)?;
-    if let Err(error) = fs::rename(temporary, live) {
-        let _ = fs::rename(&previous, live);
+    crate::platform::rename_noreplace(live, &previous)?;
+    if let Err(error) = crate::platform::rename_noreplace(temporary, live) {
+        let _ = crate::platform::rename_noreplace(&previous, live);
         return Err(error);
     }
     Ok(())
@@ -236,8 +220,8 @@ pub(super) fn swap_one(live: &Path, temporary: &Path) -> std::io::Result<()> {
 
 fn rollback_swapped(live: &Path, temporary: &Path) {
     let previous = previous_path(live);
-    if fs::rename(live, temporary).is_ok() {
-        let _ = fs::rename(previous, live);
+    if crate::platform::rename_noreplace(live, temporary).is_ok() {
+        let _ = crate::platform::rename_noreplace(&previous, live);
     }
 }
 
@@ -267,8 +251,10 @@ pub(super) fn revert_binaries(daemon: &Path, worker: &Path) -> std::io::Result<(
             "complete previous daemon pair is unavailable",
         ));
     }
-    let daemon_failed = daemon.with_extension(format!("failed.{}", std::process::id()));
-    let worker_failed = worker.with_extension(format!("failed.{}", std::process::id()));
+    let daemon_failed =
+        crate::platform::executable_variant(daemon, &format!("failed.{}", std::process::id()))?;
+    let worker_failed =
+        crate::platform::executable_variant(worker, &format!("failed.{}", std::process::id()))?;
     if daemon_failed.exists() || worker_failed.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -276,24 +262,34 @@ pub(super) fn revert_binaries(daemon: &Path, worker: &Path) -> std::io::Result<(
         ));
     }
 
-    fs::rename(daemon, &daemon_failed)?;
-    if let Err(error) = fs::rename(&daemon_previous, daemon) {
-        let _ = fs::rename(&daemon_failed, daemon);
+    crate::platform::rename_noreplace(daemon, &daemon_failed)?;
+    if let Err(error) = crate::platform::rename_noreplace(&daemon_previous, daemon) {
+        let _ = crate::platform::rename_noreplace(&daemon_failed, daemon);
         return Err(error);
     }
-    if let Err(error) = fs::rename(worker, &worker_failed) {
-        let _ = fs::rename(daemon, &daemon_previous);
-        let _ = fs::rename(&daemon_failed, daemon);
+    if let Err(error) = crate::platform::rename_noreplace(worker, &worker_failed) {
+        let _ = crate::platform::rename_noreplace(daemon, &daemon_previous);
+        let _ = crate::platform::rename_noreplace(&daemon_failed, daemon);
         return Err(error);
     }
-    if let Err(error) = fs::rename(&worker_previous, worker) {
-        let _ = fs::rename(&worker_failed, worker);
-        let _ = fs::rename(daemon, &daemon_previous);
-        let _ = fs::rename(&daemon_failed, daemon);
+    if let Err(error) = crate::platform::rename_noreplace(&worker_previous, worker) {
+        let _ = crate::platform::rename_noreplace(&worker_failed, worker);
+        let _ = crate::platform::rename_noreplace(daemon, &daemon_previous);
+        let _ = crate::platform::rename_noreplace(&daemon_failed, daemon);
         return Err(error);
     }
 
-    let _ = fs::remove_file(daemon_failed);
-    let _ = fs::remove_file(worker_failed);
+    #[cfg(not(windows))]
+    {
+        let _ = fs::remove_file(daemon_failed);
+        let _ = fs::remove_file(worker_failed);
+    }
+    #[cfg(windows)]
+    {
+        // The failed daemon image is still mapped by this process. The
+        // replacement removes both suffix-preserving failed images after it
+        // registers successfully.
+        let _ = (daemon_failed, worker_failed);
+    }
     Ok(())
 }

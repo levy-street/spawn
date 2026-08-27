@@ -15,30 +15,43 @@
 //! drops the bookkeeping. `SPAWND_NO_CPU_SCOPES=1` disables the whole
 //! feature.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
+#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use tokio::process::Command;
+#[cfg(target_os = "linux")]
 use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
 use tokio::time::Instant;
 use uuid::Uuid;
 
 /// Baseline weight for an enrolled session scope (systemd's own default).
+#[cfg(target_os = "linux")]
 const DEFAULT_WEIGHT: u32 = 100;
 /// Weight while the session is receiving input. 5× siblings: decisive under
 /// contention, irrelevant when idle.
+#[cfg(target_os = "linux")]
 const FOCUS_WEIGHT: u32 = 500;
 /// How long after the last keystroke the boost is retained. Long enough to
 /// cover the response the keystrokes provoked (the session streaming output),
 /// short enough that a parked session stops outranking an active one.
+#[cfg(target_os = "linux")]
 const FOCUS_IDLE_DECAY: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
 const DECAY_SWEEP: Duration = Duration::from_secs(5);
 /// Bounded queue: a typing burst coalesces; dropped notes only delay a boost
 /// by one sweep at worst.
+#[cfg(target_os = "linux")]
 const NOTE_QUEUE_DEPTH: usize = 64;
 
+#[cfg(target_os = "linux")]
 pub fn enabled() -> bool {
     // Unit tests launch real workers and forward real input; without this
     // gate they would create genuine scopes on the developer's user manager
@@ -49,6 +62,13 @@ pub fn enabled() -> bool {
     std::env::var_os("SPAWND_NO_CPU_SCOPES").is_none()
 }
 
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)] // Kept as the platform capability query; public callers are Linux-only today.
+pub fn enabled() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
 fn scope_unit(session_id: Uuid) -> String {
     format!("spawn-session-{session_id}.scope")
 }
@@ -57,6 +77,7 @@ fn scope_unit(session_id: Uuid) -> String {
 /// shell itself is spawned (`T_START`), so the whole session process tree
 /// inherits the scope's cgroup. A scope surviving from a previous spawnd
 /// (worker relaunch reusing the id) makes the create fail benignly.
+#[cfg(target_os = "linux")]
 pub async fn enroll_worker(session_id: Uuid, pid: u32) {
     if !enabled() {
         return;
@@ -102,8 +123,12 @@ pub async fn enroll_worker(session_id: Uuid, pid: u32) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+pub async fn enroll_worker(_session_id: Uuid, _pid: u32) {}
+
 /// Record input activity for a session. Cheap enough for the per-keystroke
 /// path: one bounded `try_send`; the scheduler task does the rest.
+#[cfg(target_os = "linux")]
 pub fn note_input(session_id: Uuid) {
     if !enabled() {
         return;
@@ -116,8 +141,13 @@ pub fn note_input(session_id: Uuid) {
     let _ = sender.try_send(session_id);
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn note_input(_session_id: Uuid) {}
+
+#[cfg(target_os = "linux")]
 static NOTE_TX: OnceLock<mpsc::Sender<Uuid>> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
 async fn run_focus_scheduler(mut notes: mpsc::Receiver<Uuid>) {
     let mut focused: HashMap<Uuid, Instant> = HashMap::new();
     let mut sweep = tokio::time::interval(DECAY_SWEEP);
@@ -147,6 +177,7 @@ async fn run_focus_scheduler(mut notes: mpsc::Receiver<Uuid>) {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn set_scope_weight(session_id: Uuid, weight: u32) {
     let unit = scope_unit(session_id);
     let result = Command::new("systemctl")
@@ -176,6 +207,7 @@ async fn set_scope_weight(session_id: Uuid, weight: u32) {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn scope_names_are_deterministic_and_unit_safe() {
         let id = Uuid::parse_str("5068ede1-ee21-43b4-b43f-908a3c4f9c8b").unwrap();
@@ -183,5 +215,11 @@ mod tests {
             scope_unit(id),
             "spawn-session-5068ede1-ee21-43b4-b43f-908a3c4f9c8b.scope"
         );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn cpu_scopes_are_disabled_off_linux() {
+        assert!(!enabled());
     }
 }

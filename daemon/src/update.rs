@@ -554,9 +554,36 @@ pub fn exec(applied: AppliedUpdate) -> UpdateFailure {
     }
     #[cfg(not(unix))]
     {
-        drop(applied);
-        UpdateFailure::new(UpdateStage::Exec, "unsupported_target")
+        #[cfg(windows)]
+        {
+            let AppliedUpdate {
+                daemon_path,
+                _permit: permit,
+            } = applied;
+            let result = spawn_replacement(&daemon_path);
+            drop(permit);
+            if result.is_ok() {
+                std::process::exit(0);
+            }
+            UpdateFailure::new(UpdateStage::Exec, "exec_failed")
+        }
+        #[cfg(not(windows))]
+        {
+            drop(applied);
+            UpdateFailure::new(UpdateStage::Exec, "unsupported_target")
+        }
     }
+}
+
+#[cfg(windows)]
+fn spawn_replacement(path: &Path) -> std::io::Result<()> {
+    let mut argv = std::env::args_os();
+    let _argv0 = argv.next();
+    // std::process::Command uses non-inheritable process/thread handles and
+    // passes only the configured stdio handles to the child on Windows.
+    let child = std::process::Command::new(path).args(argv).spawn()?;
+    drop(child);
+    Ok(())
 }
 
 fn log_stage(stage: UpdateStage) {
@@ -666,7 +693,7 @@ fn write_marker(path: &Path, marker: &ProbationMarker) -> std::io::Result<()> {
             .open(&temporary)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
+        crate::platform::durable_replace(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -767,7 +794,7 @@ fn previous_worker_path_for_recovery(daemon_path: &Path) -> Option<PathBuf> {
     let configured = crate::worker_backend::worker_bin();
     let mut candidates = Vec::new();
     if let Some(parent) = daemon_path.parent() {
-        candidates.push(parent.join("spawn-worker"));
+        candidates.push(parent.join(crate::platform::executable_name("spawn-worker")));
     }
     if configured.is_absolute() {
         candidates.push(configured.clone());
@@ -836,7 +863,13 @@ fn exec_path(path: &Path) -> Result<()> {
     Err(error).context("execing reverted spawnd")
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn exec_path(path: &Path) -> Result<()> {
+    spawn_replacement(path).context("spawning reverted spawnd")?;
+    std::process::exit(0)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn exec_path(_path: &Path) -> Result<()> {
     anyhow::bail!("health revert exec is unsupported on this target")
 }
@@ -877,6 +910,7 @@ pub async fn registered(out_tx: &tokio::sync::mpsc::Sender<crate::pty::WsOutboun
         }
     }
     cleanup_previous_paths(&runtime.daemon_path, &runtime.marker.worker_path);
+    cleanup_failed_paths(&runtime.daemon_path, &runtime.marker.worker_path);
     tracing::info!(
         stage = "health",
         "daemon update passed post-register health gate"
@@ -907,10 +941,47 @@ fn cleanup_previous_paths(daemon_path: &Path, worker_path: &Path) {
     }
 }
 
+fn cleanup_failed_paths(daemon_path: &Path, worker_path: &Path) {
+    #[cfg(windows)]
+    for live in [daemon_path, worker_path] {
+        let Some(parent) = live.parent() else {
+            continue;
+        };
+        let Some(name) = live.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let prefix = format!("{name}.failed.");
+        let Ok(entries) = fs::read_dir(parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_name = entry.file_name();
+            let entry_name = entry_name.to_string_lossy();
+            if entry_name.starts_with(&prefix)
+                && entry_name.ends_with(std::env::consts::EXE_SUFFIX)
+                && entry_name[prefix.len()..entry_name.len() - std::env::consts::EXE_SUFFIX.len()]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (daemon_path, worker_path);
+}
+
 pub fn reinstall_command(server: &Url) -> String {
-    let install = crate::config::api_url(server, "/install.sh")
+    #[cfg(windows)]
+    let install_path = "/install.ps1";
+    #[cfg(not(windows))]
+    let install_path = "/install.sh";
+    let install = crate::config::api_url(server, install_path)
         .map(|url| url.to_string())
         .unwrap_or_else(|_| server.to_string());
+    #[cfg(windows)]
+    return format!("irm '{install}' | iex");
+    #[cfg(not(windows))]
     format!("curl -fsSL {install} | sh")
 }
 

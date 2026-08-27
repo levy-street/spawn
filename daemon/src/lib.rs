@@ -10,6 +10,8 @@ pub mod browser_endorsement;
 pub mod endorsement_chain;
 pub mod host_pair_approval;
 pub mod host_pair_possession;
+#[doc(hidden)]
+pub mod platform;
 pub mod sas;
 pub mod sessiond;
 pub mod signed_signal;
