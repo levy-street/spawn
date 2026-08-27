@@ -1,8 +1,6 @@
 use anyhow::Result;
 use tauri::image::Image;
-use tauri::menu::{
-    Menu, MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem, Submenu, SubmenuBuilder,
-};
+use tauri::menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{App, AppHandle, Manager, Wry};
 
@@ -17,7 +15,7 @@ const TRAY_ICON: &[u8] = include_bytes!("../icons/tray-windows@2x.png");
 pub struct TrayState {
     menu: Menu<Wry>,
     status: MenuItem<Wry>,
-    sessions: Submenu<Wry>,
+    sessions: MenuItem<Wry>,
     daemon: MenuItem<Wry>,
     app_update: MenuItem<Wry>,
 }
@@ -39,13 +37,16 @@ pub fn install(app: &mut App) -> Result<()> {
         .enabled(false)
         .build(app)?;
     let open = MenuItemBuilder::with_id("open", "Open SPAWN D").build(app)?;
-    let inspect_sessions =
-        MenuItemBuilder::with_id("inspect-sessions", "Open SPAWN D to inspect sessions")
-            .enabled(false)
-            .build(app)?;
-    let sessions = SubmenuBuilder::with_id(app, "sessions", "Sessions — checking…")
-        .item(&inspect_sessions)
-        .build()?;
+    // What this computer is running, said in one line beside what it is
+    // running it with. It was a submenu whose only child was a disabled "Open
+    // SPAWN D to inspect sessions" — a control that opened to reveal a
+    // sentence telling you to do what the item directly above it already does,
+    // and which stayed on "checking…" until the first status arrived. The tray
+    // is for reading while the window is closed; the count is the thing worth
+    // reading, and "Open SPAWN D" is already the way in.
+    let sessions = MenuItemBuilder::with_id("sessions", "Sessions — checking…")
+        .enabled(false)
+        .build(app)?;
     let daemon = MenuItemBuilder::with_id("daemon", "Daemon — checking…")
         .enabled(false)
         .build(app)?;
@@ -61,8 +62,8 @@ pub fn install(app: &mut App) -> Result<()> {
             &status,
             &separator_one,
             &open,
-            &sessions,
             &separator_two,
+            &sessions,
             &daemon,
             &repair,
             &settings,
@@ -143,9 +144,11 @@ pub fn update(app: &AppHandle, local: &crate::models::LocalStatus) {
     };
     let _ = state.status.set_text(format!("● {host} — {status}"));
     let sessions = local.heartbeat.as_ref().map_or(0, |value| value.sessions);
-    let _ = state
-        .sessions
-        .set_text(format!("Sessions — {sessions} running"));
+    let _ = state.sessions.set_text(if sessions == 0 {
+        "No sessions running".to_owned()
+    } else {
+        format!("Sessions — {sessions} running")
+    });
     let version = instance
         .and_then(|value| value.get("version"))
         .and_then(serde_json::Value::as_str)
