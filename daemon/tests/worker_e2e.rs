@@ -1165,6 +1165,8 @@ mod windows {
             OsString::from(session_id.to_string()),
             OsString::from("--log-dir"),
             log_dir.as_os_str().to_os_string(),
+            OsString::from("--metadata-dir"),
+            worker_dir.as_os_str().to_os_string(),
             OsString::from("--reservation-handle"),
             OsString::from(reservation.raw_value().to_string()),
         ];
@@ -1190,6 +1192,8 @@ mod windows {
             "00000000-0000-0000-0000-000000000001",
             "--log-dir",
             r"C:\spawn\workers\session.scrollback",
+            "--metadata-dir",
+            r"C:\spawn\state\instance\workers",
             "--reservation-handle",
             "256",
         ];

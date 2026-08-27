@@ -19,6 +19,8 @@ pub const MAX_BASENAME_CHARS: usize = 64;
 pub fn foreground_basename(master_fd: RawFd) -> Option<String> {
     // The foreground process-group id doubles as the pid of the group leader:
     // shells make each job's leader its own process group.
+    // SAFETY: `master_fd` is the live PTY master retained by the worker; this
+    // query neither closes nor transfers it.
     let pgid = unsafe { nix::libc::tcgetpgrp(master_fd) };
     if pgid <= 0 {
         return None;
@@ -28,6 +30,7 @@ pub fn foreground_basename(master_fd: RawFd) -> Option<String> {
     // foreground. That is this very worker process (its pid under a
     // production `process_group(0)` launch, its inherited group otherwise);
     // reporting "spawn-worker" would be an artifact, not session state.
+    // SAFETY: getpgrp has no pointer arguments and only queries this process.
     if pgid == unsafe { nix::libc::getpgrp() } || pgid == std::process::id() as nix::libc::pid_t {
         return None;
     }
@@ -167,6 +170,8 @@ extern "C" {
 #[cfg(target_os = "macos")]
 fn libproc_name(pid: nix::libc::pid_t) -> Option<String> {
     let mut buf = [0u8; 128];
+    // SAFETY: `buf` is writable for the supplied length and remains live for
+    // the synchronous libproc call.
     let len = unsafe { proc_name(pid as _, buf.as_mut_ptr().cast(), buf.len() as u32) };
     if len <= 0 {
         return None;
@@ -181,6 +186,8 @@ fn libproc_name(pid: nix::libc::pid_t) -> Option<String> {
 #[cfg(target_os = "macos")]
 fn process_exe_path(pid: nix::libc::pid_t) -> Option<std::path::PathBuf> {
     let mut buf = [0u8; 4096];
+    // SAFETY: `buf` is writable for the supplied length and remains live for
+    // the synchronous libproc call.
     let len = unsafe { proc_pidpath(pid as _, buf.as_mut_ptr().cast(), buf.len() as u32) };
     if len <= 0 {
         return None;
@@ -339,6 +346,8 @@ fn snapshot_windows_processes() -> Option<Vec<ProcessNode>> {
         return None;
     }
     let snapshot = Snapshot(snapshot);
+    // SAFETY: PROCESSENTRY32W is a plain Win32 output structure whose required
+    // size field is initialized immediately below.
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
     entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
     // SAFETY: entry has the documented size and writable lifetime.
@@ -383,6 +392,8 @@ fn snapshot_windows_processes() -> Option<Vec<ProcessNode>> {
                 let mut exited = created;
                 let mut kernel = created;
                 let mut user = created;
+                // SAFETY: the process handle and all four FILETIME output
+                // slots remain live for the synchronous call.
                 if unsafe {
                     GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user)
                 } != 0
@@ -399,6 +410,9 @@ fn snapshot_windows_processes() -> Option<Vec<ProcessNode>> {
                 if is_version_name(basename_without_suffix) {
                     let mut path = vec![0_u16; 32_768];
                     let mut length = path.len() as u32;
+                    // SAFETY: the process handle is live, `path` is writable
+                    // for `length` UTF-16 units, and length is a valid in/out
+                    // pointer.
                     if unsafe {
                         QueryFullProcessImageNameW(process.0, 0, path.as_mut_ptr(), &mut length)
                     } != 0

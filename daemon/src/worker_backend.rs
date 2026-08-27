@@ -60,9 +60,10 @@ fn worker_frame_limit(frame_type: u8) -> Option<usize> {
 #[cfg(test)]
 pub(crate) static WORKER_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Directory holding worker sockets and scrollback dirs:
-/// `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers` → config dir — with
-/// one hard constraint: the unix-socket paths it hands out must fit the
+/// Directory holding worker sockets or Windows endpoint metadata:
+/// `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers` → config dir on
+/// Unix, or `%LOCALAPPDATA%/spawn/state/<instance>/workers` on Windows. Unix
+/// has one hard constraint: the socket paths it hands out must fit the
 /// platform's `sun_path` limit (104 bytes on macOS). macOS has no
 /// `XDG_RUNTIME_DIR`, so the fallback lands in
 /// `~/Library/Application Support/spawn/workers`; the `<uuid>.lifecycle.sock`
@@ -88,7 +89,7 @@ pub fn worker_dir() -> Result<PathBuf> {
         }
         #[cfg(windows)]
         {
-            config::config_dir()?.join("workers")
+            crate::service::instance_state_dir(&config::config_dir()?)?.join("workers")
         }
     };
     endpoint::ensure_private_dir(&dir)?;
@@ -178,6 +179,20 @@ fn log_dir(dir: &std::path::Path, session_id: Uuid) -> PathBuf {
     dir.join(format!("{session_id}.scrollback"))
 }
 
+/// Preserve the explicit worker-directory override as a complete test/operator
+/// fixture. The default Windows layout separates transient endpoint metadata
+/// from encrypted scrollback and detached stderr logs.
+#[cfg(windows)]
+fn windows_log_dir(worker_dir: &std::path::Path, session_id: Uuid) -> Result<PathBuf> {
+    let root = if std::env::var_os("SPAWND_WORKER_DIR").is_some_and(|value| !value.is_empty()) {
+        worker_dir.to_path_buf()
+    } else {
+        crate::service::instance_log_dir(&config::config_dir()?)?.join("workers")
+    };
+    endpoint::ensure_private_dir(&root)?;
+    Ok(log_dir(&root, session_id))
+}
+
 /// Resolve the spawn-worker binary: `$SPAWND_WORKER_BIN` → sibling of the
 /// running spawnd → bare name (PATH).
 pub(crate) fn worker_bin() -> PathBuf {
@@ -186,13 +201,13 @@ pub(crate) fn worker_bin() -> PathBuf {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sibling = dir.join(format!("spawn-worker{}", std::env::consts::EXE_SUFFIX));
+            let sibling = dir.join(crate::platform::executable_name("spawn-worker"));
             if sibling.exists() {
                 return sibling;
             }
         }
     }
-    PathBuf::from(format!("spawn-worker{}", std::env::consts::EXE_SUFFIX))
+    PathBuf::from(crate::platform::executable_name("spawn-worker"))
 }
 
 /// Launch a fresh worker for `session.create` and start the login shell inside it.
@@ -200,7 +215,10 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
     crate::update::ensure_worker_pair().await?;
     let dir = worker_dir()?;
     let worker_endpoint = session_endpoint(&dir, spec.session_id)?;
+    #[cfg(unix)]
     let logs = log_dir(&dir, spec.session_id);
+    #[cfg(windows)]
+    let logs = windows_log_dir(&dir, spec.session_id)?;
     let reservation = match endpoint::try_reserve(&worker_endpoint)? {
         LockAttempt::Acquired(lock) => lock,
         LockAttempt::Busy => bail!("worker endpoint is already owned"),
@@ -227,9 +245,9 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
             // for this to survive `systemctl restart` (docs/SESSIOND.md).
             cmd.process_group(0);
             let lock_fd = reservation.raw_fd();
-            // Clear CLOEXEC only in the post-fork child. The multithreaded
-            // supervisor never exposes this reservation to unrelated concurrent
-            // child launches.
+            // SAFETY: Clear CLOEXEC only in the post-fork child. The
+            // multithreaded supervisor never exposes this reservation to
+            // unrelated concurrent child launches.
             unsafe {
                 cmd.pre_exec(move || {
                     let flags = nix::libc::fcntl(lock_fd, nix::libc::F_GETFD);
@@ -261,6 +279,8 @@ pub async fn launch(spec: pty::LaunchSpec<'_>) -> Result<pty::Launched> {
             std::ffi::OsString::from(spec.session_id.to_string()),
             std::ffi::OsString::from("--log-dir"),
             logs.as_os_str().to_os_string(),
+            std::ffi::OsString::from("--metadata-dir"),
+            dir.as_os_str().to_os_string(),
             std::ffi::OsString::from("--reservation-handle"),
             std::ffi::OsString::from(reservation.raw_value().to_string()),
         ];
@@ -990,7 +1010,7 @@ mod tests {
         let exe = std::env::current_exe().expect("current_exe");
         exe.parent()
             .and_then(|deps| deps.parent())
-            .map(|debug| debug.join("spawn-worker"))
+            .map(|debug| debug.join(crate::platform::executable_name("spawn-worker")))
             .expect("worker bin path")
     }
 

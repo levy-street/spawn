@@ -100,12 +100,12 @@ spawnd (host supervisor, one per host)
   scrollback log, serves replay.
 - On Unix the worker is spawned with `process_group(0)`. Under systemd,
   spawnd's unit needs `KillMode=process` or workers are killed with the cgroup
-  on restart. On Windows it is launched with `DETACHED_PROCESS`,
-  `CREATE_NEW_PROCESS_GROUP`, and `CREATE_BREAKAWAY_FROM_JOB`; failure to break
-  away is fatal rather than silently weakening session survival. It then puts
-  itself and subsequently created ConPTY descendants in an unnamed
-  kill-on-close Job Object. On both platforms its fate is tied to the session
-  PTY, **not** to spawnd, so supervisor restarts leave the session running.
+  on restart. On Windows it is launched with `CREATE_BREAKAWAY_FROM_JOB` and
+  `CREATE_NO_WINDOW`; failure to break away is fatal rather than silently
+  weakening session survival. It then puts itself and subsequently created
+  ConPTY descendants in an unnamed kill-on-close Job Object. On both platforms
+  its fate is tied to the session PTY, **not** to spawnd, so supervisor restarts
+  leave the session running.
 - Worker runtime cost is scoped per session: a tokio runtime pinned to 2 threads,
   two blocking PTY I/O threads, and headless primary/alternate screen grids
   whose size follows the current terminal geometry. It does not retain a
@@ -140,16 +140,24 @@ scrollback key is process-ephemeral anyway (§7).
 
 ### Windows endpoint and metadata layout
 
-Windows uses `$SPAWND_WORKER_DIR` when set, otherwise
-`<config_dir>\workers`. Protected current-user-only DACLs are applied to the
-directory and its metadata:
+Windows uses `$SPAWND_WORKER_DIR` as an exact combined test/operator override.
+Without that override, endpoints and logs have separate non-roaming roots;
+the worker receives the metadata directory explicitly and never infers it from
+the log directory. Protected current-user-only DACLs are applied throughout:
 
 ```text
-workers\
+%LOCALAPPDATA%\spawn\state\<instance>\workers\
   <session-id>.lock          # exclusive-open lifetime reservation
   <session-id>.endpoint      # protected discovery marker, not proof of liveness
+
+%LOCALAPPDATA%\spawn\logs\<instance>\workers\
   <session-id>.scrollback\   # ciphertext segments plus detached worker.log
 ```
+
+`<instance>` is the stable eight-hex tag derived from the canonical config
+root. Endpoint discovery scans only the state tree; encrypted scrollback and
+detached stderr stay in the log tree. With `$SPAWND_WORKER_DIR`, both sets of
+files retain the earlier single-directory layout beneath the supplied path.
 
 The supervisor opens `.lock` with share mode zero and transfers that exact
 HANDLE through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; the worker validates its

@@ -4806,7 +4806,7 @@ mod tests {
         let exe = std::env::current_exe().expect("current_exe");
         exe.parent()
             .and_then(|deps| deps.parent())
-            .map(|debug| debug.join("spawn-worker"))
+            .map(|debug| debug.join(crate::platform::executable_name("spawn-worker")))
             .expect("worker bin path")
     }
 
@@ -5068,8 +5068,7 @@ mod tests {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("guard pipe tempdir");
         let dir = temp.path().join("workers");
-        spawnd::sessiond::endpoint::ensure_private_dir(&dir)
-            .expect("secure guard pipe directory");
+        spawnd::sessiond::endpoint::ensure_private_dir(&dir).expect("secure guard pipe directory");
         let _env = EnvRestore(std::env::var_os("SPAWND_WORKER_DIR"));
         std::env::set_var("SPAWND_WORKER_DIR", &dir);
 
@@ -5090,12 +5089,8 @@ mod tests {
             main: _main,
             lifecycle: _lifecycle,
             identity: _identity,
-        } = spawnd::sessiond::endpoint::bind_worker(
-            &endpoint,
-            &reservation,
-            Uuid::new_v4(),
-        )
-        .expect("bind guard pipe endpoints");
+        } = spawnd::sessiond::endpoint::bind_worker(&endpoint, &reservation, Uuid::new_v4())
+            .expect("bind guard pipe endpoints");
         let mut silent = Vec::new();
         for _ in 0..7 {
             silent.push(open_silent_lifecycle_client(endpoint.lifecycle_arg()).await);

@@ -239,6 +239,8 @@ pub struct WorkerArgs {
     pub pipe_name: std::ffi::OsString,
     pub session_id: Uuid,
     pub log_dir: PathBuf,
+    #[cfg(windows)]
+    pub metadata_dir: PathBuf,
     pub segment_bytes: u64,
     pub max_log_bytes: u64,
     #[cfg(unix)]
@@ -254,6 +256,8 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
     let mut pipe_name = None;
     let mut session_id = None;
     let mut log_dir = None;
+    #[cfg(windows)]
+    let mut metadata_dir = None;
     let mut segment_bytes = super::scrollback::DEFAULT_SEGMENT_BYTES;
     let mut max_log_bytes = super::scrollback::DEFAULT_MAX_LOG_BYTES;
     #[cfg(unix)]
@@ -274,6 +278,8 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
                 session_id = Some(Uuid::parse_str(&value("--session-id")?).context("session id")?)
             }
             "--log-dir" => log_dir = Some(PathBuf::from(value("--log-dir")?)),
+            #[cfg(windows)]
+            "--metadata-dir" => metadata_dir = Some(PathBuf::from(value("--metadata-dir")?)),
             "--segment-bytes" => segment_bytes = value("--segment-bytes")?.parse()?,
             "--max-log-bytes" => max_log_bytes = value("--max-log-bytes")?.parse()?,
             #[cfg(unix)]
@@ -292,6 +298,8 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<WorkerArgs>
         pipe_name: pipe_name.context("--pipe-name is required")?,
         session_id: session_id.context("--session-id is required")?,
         log_dir: log_dir.context("--log-dir is required")?,
+        #[cfg(windows)]
+        metadata_dir: metadata_dir.context("--metadata-dir is required")?,
         segment_bytes,
         max_log_bytes,
         #[cfg(unix)]
@@ -427,18 +435,21 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let mut log: Option<ScrollbackLog> = None;
     let mut emulator: Option<Emulator> = None;
 
-    let parent = args
+    #[cfg(unix)]
+    let metadata_dir = args
         .log_dir
         .parent()
         .context("worker log directory has no parent")?;
-    super::endpoint::ensure_private_dir(parent)?;
+    #[cfg(windows)]
+    let metadata_dir = args.metadata_dir.as_path();
+    super::endpoint::ensure_private_dir(metadata_dir)?;
     let worker_endpoint = {
         #[cfg(unix)]
         let supplied = args.socket.as_os_str();
         #[cfg(windows)]
         let supplied = args.pipe_name.as_os_str();
         endpoint::endpoint_from_worker_arg(
-            parent,
+            metadata_dir,
             &endpoint::config_root_tag(),
             args.session_id,
             supplied,
