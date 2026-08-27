@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
+import { FleetCapture } from "@/components/seo/templates/FleetCapture";
 import { JobPage, JobPlate, JobSection, JobShellFigure } from "@/components/seo/templates/JobPage";
-import { WorkspaceGridVignette } from "@/components/seo/templates/WorkspaceGridVignette";
 
 /*
  * The flagship job page: the person who runs three to ten agent sessions as a
@@ -97,10 +97,10 @@ export default function RunAgentsInParallelPage() {
       lede={
         <>
           <p>
-            Six worktrees, six agents, two machines. Claude&nbsp;Code is reworking auth in one tile
-            and grinding the test suite in another; Codex has the importer on the GPU rig. The third
-            tile just asked to edit twelve files — it glows, the rest keep streaming. You answer
-            from the kitchen, on a phone, and nothing else stops.
+            Six worktrees, six agents, three machines. Claude&nbsp;Code is reworking auth in one
+            tile and grinding the test suite in another; Codex has the importer on the rig. The auth
+            tile just asked permission to edit — it glows, the rest keep streaming. You answer from
+            the kitchen, on a phone, and nothing else stops.
           </p>
           <p>
             This is the job spawnd is shaped around: run multiple Claude&nbsp;Code sessions in
@@ -109,8 +109,7 @@ export default function RunAgentsInParallelPage() {
           </p>
         </>
       }
-      kicker={["one tile per session", "hosts mixed in one grid", "nothing stops when you leave"]}
-      vignette={<WorkspaceGridVignette />}
+      vignette={<FleetCapture />}
       faq={FAQ}
       related={RELATED}
       closing={{
@@ -207,7 +206,7 @@ export default function RunAgentsInParallelPage() {
               <span className="text-bone">codex · rig</span>
               <span className="text-ash">the run ended; the diff is ready</span>
               <span className="text-ember">session.died</span>
-              <span className="text-bone">aider · pi</span>
+              <span className="text-bone">aider · mini</span>
               <span className="text-ash">exit 137 now — not tomorrow morning</span>
             </div>
           </JobShellFigure>
