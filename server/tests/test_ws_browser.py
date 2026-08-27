@@ -242,6 +242,45 @@ def test_rtc_candidate_allowlist_and_bounds():
     assert _valid_rtc_candidate({"candidate": "ok", "sdpMLineIndex": 65536}) is None
 
 
+def test_a_null_optional_field_reads_as_absent_not_as_malformed():
+    """The shape every peer actually sends.
+
+    webrtc-rs serializes every member of RTCIceCandidateInit whether or not it
+    is set, so each candidate the daemon sends carries
+    ``"usernameFragment": null``; browsers send ``"sdpMid": null`` for a
+    candidate belonging to no m-line. Refusing those refused every ICE
+    candidate the daemon ever sent: the browser received none, sent no
+    connectivity checks, and the host-control DataChannel never opened.
+    """
+    from spawn_server.ws.daemon import _valid_rtc_candidate as daemon_valid
+
+    for validate in (_valid_rtc_candidate, daemon_valid):
+        assert validate(
+            {
+                "candidate": "candidate:1 1 udp 2130706431 192.168.1.165 50123 typ host",
+                "sdpMid": "0",
+                "sdpMLineIndex": 0,
+                "usernameFragment": None,
+            }
+        ) == {
+            "candidate": "candidate:1 1 udp 2130706431 192.168.1.165 50123 typ host",
+            "sdpMid": "0",
+            "sdpMLineIndex": 0,
+        }
+        assert validate({"candidate": "candidate:1", "sdpMid": None}) == {
+            "candidate": "candidate:1"
+        }
+        assert validate({"candidate": "candidate:1", "sdpMLineIndex": None}) == {
+            "candidate": "candidate:1"
+        }
+        # Null is the absence of a value, never a licence for the wrong one.
+        assert validate({"candidate": "candidate:1", "sdpMid": 7}) is None
+        assert validate({"candidate": "candidate:1", "usernameFragment": "x" * 257}) is None
+        assert validate({"candidate": "candidate:1", "sdpMLineIndex": True}) is None
+        assert validate({"candidate": "candidate:1", "sdpMLineIndex": 65536}) is None
+        assert validate({"candidate": None}) is None
+
+
 def test_query_token_deprecation_warns_once_per_process(monkeypatch, caplog):
     from spawn_server.ws import reliability
 
