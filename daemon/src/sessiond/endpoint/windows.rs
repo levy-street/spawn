@@ -52,10 +52,9 @@ use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPip
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
     InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken, TerminateProcess,
-    UpdateProcThreadAttribute, CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP,
-    CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
+    UpdateProcThreadAttribute, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW,
+    EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 use super::{Endpoint, LockAttempt};
@@ -1181,11 +1180,7 @@ pub fn spawn_worker(
     startup.StartupInfo.hStdError = raw_handle(&nul_err);
     startup.lpAttributeList = attribute_list;
     let mut process = PROCESS_INFORMATION::default();
-    let flags = CREATE_NEW_PROCESS_GROUP
-        | DETACHED_PROCESS
-        | CREATE_BREAKAWAY_FROM_JOB
-        | EXTENDED_STARTUPINFO_PRESENT
-        | CREATE_UNICODE_ENVIRONMENT;
+    let flags = CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
     // SAFETY: application/command-line buffers and STARTUPINFOEX (including
     // its handle list) remain live and writable for the complete call.
     let created = unsafe {

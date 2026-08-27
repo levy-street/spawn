@@ -7,8 +7,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
 
-use cap_fs_ext::DirExt;
-use cap_std::fs::Dir;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions};
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS,
     ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -617,7 +617,9 @@ pub fn durable_replace_at(parent: &Dir, from: &Path, to: &Path) -> io::Result<()
 }
 
 fn move_file_at_verified(parent: &Dir, from: &Path, to: &Path, replace: bool) -> io::Result<()> {
-    let source = parent.open_file_nofollow(from)?.into_std();
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let source = parent.open_with(from, &options)?.into_std();
     let expected = file_identity(&source)?;
     // cap-std opens ordinary files with FILE_SHARE_DELETE, while the parent
     // directory capability deliberately omits it. Holding both pins the file
@@ -627,7 +629,7 @@ fn move_file_at_verified(parent: &Dir, from: &Path, to: &Path, replace: bool) ->
         &leaf_under(parent, to)?,
         replace,
     )?;
-    let destination = parent.open_file_nofollow(to)?.into_std();
+    let destination = parent.open_with(to, &options)?.into_std();
     if file_identity(&destination)? != expected {
         return Err(io::Error::other(
             "published file identity changed during Windows rename",
@@ -1175,9 +1177,14 @@ mod tests {
         let destination_file = create_private_file_new(&destination).unwrap();
         let parent_dir = open_private_dir(&parent).unwrap();
         assert_eq!(
-            hard_link_noreplace_at(&parent_dir, Path::new("source"), Path::new("destination"))
-                .unwrap_err()
-                .kind(),
+            hard_link_noreplace_at(
+                &parent_dir,
+                Path::new("source"),
+                &parent_dir,
+                Path::new("destination"),
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_ne!(
@@ -1186,7 +1193,13 @@ mod tests {
         );
         drop(destination_file);
         std::fs::remove_file(&destination).unwrap();
-        hard_link_noreplace_at(&parent_dir, Path::new("source"), Path::new("destination")).unwrap();
+        hard_link_noreplace_at(
+            &parent_dir,
+            Path::new("source"),
+            &parent_dir,
+            Path::new("destination"),
+        )
+        .unwrap();
         let linked = open_private_file(&destination, false).unwrap();
         assert_eq!(
             file_identity(&source_file).unwrap(),

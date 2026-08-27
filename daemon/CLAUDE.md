@@ -21,6 +21,9 @@ src/
                  process liveness, and file identity
   sessiond/      supervisor↔worker shared pieces: wire protocol, terminal
                  emulator, scrollback, worker runtime
+    endpoint/    platform transport boundary: mod.rs is the common facade,
+                 unix.rs owns stream/datagram sockets, and windows.rs owns
+                 named pipes plus reservation-handle transfer
   <feature>.rs   one module per concern: run.rs (register + main loop),
                  ws.rs, update.rs + update_io.rs (verified daemon self-update;
                  focused tests live in update_tests.rs), release_key.rs (pinned
@@ -77,6 +80,16 @@ reserve Roaming AppData for data deliberately designed to roam. Private
 Windows directories/files use a protected, canonical current-user-only DACL;
 existing objects are validated and never silently repaired, and reparse points
 or filesystems where ownership/DACLs cannot be proved fail closed.
+
+Windows worker discovery metadata lives below
+`%LOCALAPPDATA%\spawn\state\<instance>\workers`; encrypted scrollback and
+detached worker stderr live below
+`%LOCALAPPDATA%\spawn\logs\<instance>\workers`. The worker receives the
+metadata directory explicitly rather than deriving it from the log path.
+Named endpoints are flat owner-only pipes named
+`\\.\pipe\spawn-<user-SID>[-<8hex-config-tag>]-<session-uuid>` with `-lc`
+for lifecycle delivery. `spawnd` reserves the session with an exclusive file
+handle and transfers only that handle plus NUL standard handles to the worker.
 
 Paths sent over daemon frames remain native strings. Windows drive roots
 (`C:\`) and UNC roots (`\\server\share\`) are accepted where that feature is
@@ -193,6 +206,15 @@ script -q /dev/null cargo test --bin spawnd render_demo -- --ignored --nocapture
 ```bash
 cargo build --locked
 cargo test --locked --bin spawnd <module>::
+```
+
+Native Windows CI additionally gates every binary, test/example target, and
+cfg-specific lint path:
+
+```bash
+cargo check --locked --target x86_64-pc-windows-msvc --bins
+cargo check --locked --target x86_64-pc-windows-msvc --all-targets
+cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 ```
 
 Windows installs one persisted per-instance background mode: the primary
