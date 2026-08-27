@@ -134,7 +134,27 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
     let service_status = config_dir.as_deref().map(crate::service::status);
     checks.push(match service_status.as_ref() {
         Some(status) => {
-            if status.running {
+            if let Some(issue) = config_dir
+                .as_deref()
+                .and_then(crate::service::diagnostic)
+            {
+                fail(
+                    7,
+                    "background service",
+                    issue,
+                    if config_dir.as_deref().is_some_and(|dir| {
+                        crate::service::needs_fallback_offer(dir)
+                            || (cfg!(windows)
+                                && crate::service::preferred_mode(dir)
+                                    == crate::service::ServiceMode::Task)
+                    })
+                    {
+                        "re-run spawnd possess; it will confirm Task Scheduler or offer the Run watchdog fallback"
+                    } else {
+                        "spawnd reconnect (reinstalls the selected service manager)"
+                    },
+                )
+            } else if status.running {
                 if crate::service::user_linger_enabled() == Some(false) {
                     warning(
                         7,
@@ -180,7 +200,7 @@ async fn inspect(server_cli: Option<String>) -> DoctorOutput {
                 .and_then(|dir| crate::state::read(dir).ok().flatten())
             {
                 Some(state)
-                    if crate::state::pid_is_alive(state.pid)
+                    if crate::state::daemon_state_is_live(&state)
                         && state_file_fresh(config_dir.as_deref().unwrap()) =>
                 {
                     ok(8, "daemon heartbeat", format!("fresh (pid {})", state.pid))
@@ -481,11 +501,7 @@ async fn probe_version(server: &url::Url) -> Check {
 }
 
 fn state_file_fresh(config_dir: &Path) -> bool {
-    std::fs::metadata(crate::state::state_path(config_dir))
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age < Duration::from_secs(90))
+    crate::state::heartbeat_is_fresh(config_dir, Duration::from_secs(90))
 }
 
 fn permissions_check(config_dir: &Path) -> Check {

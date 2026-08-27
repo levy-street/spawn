@@ -462,6 +462,8 @@ async fn wait_for_credential_change_with(
 
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     install_sighup_handler();
+    #[cfg(windows)]
+    crate::service::prepare_background_log(&crate::config::config_dir()?)?;
     crate::update::prepare_probation()?;
     crate::update::arm_probation_deadline();
     crate::update::refresh_worker_pair_status().await;
@@ -477,9 +479,16 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     let mut live_credentials = LiveCredentialSnapshot::initial(stored, &server_url)?;
 
     let registry = SessionRegistry::new();
-    let state_store = Arc::new(crate::state::StateStore::new(
-        &crate::config::config_dir()?,
+    let config_dir = crate::config::config_dir()?;
+    #[cfg(windows)]
+    crate::service::instance_state_dir(&config_dir)?;
+    #[cfg(windows)]
+    crate::service::start_control_listener(&config_dir, reconnect_notify(), shutdown_notify())?;
+    let task_breakaway_denied = crate::service::probe_task_breakaway(&config_dir);
+    let state_store = Arc::new(crate::state::StateStore::new_with_breakaway(
+        &config_dir,
         server_url.as_str(),
+        task_breakaway_denied,
     ));
     crate::state::install_active(Arc::clone(&state_store));
     state_store.heartbeat(0);
@@ -557,6 +566,10 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                 r = tokio::signal::ctrl_c() => {
                     r.context("ctrl-c handler")?;
                     tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
+                    return Ok(());
+                }
+                _ = shutdown_signal() => {
+                    tracing::info!("graceful service shutdown requested; exiting (session workers are preserved)");
                     return Ok(());
                 }
             }
@@ -712,6 +725,10 @@ pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
                     tracing::info!("Ctrl-C received; exiting (session workers are preserved)");
                     return Ok(());
                 }
+                _ = shutdown_signal() => {
+                    tracing::info!("graceful service shutdown requested; exiting (session workers are preserved)");
+                    return Ok(());
+                }
             }
         };
         if let Some(reloaded) = reloaded {
@@ -735,6 +752,11 @@ fn reconnect_notify() -> &'static tokio::sync::Notify {
     RECONNECT.get_or_init(tokio::sync::Notify::new)
 }
 
+fn shutdown_notify() -> &'static tokio::sync::Notify {
+    static SHUTDOWN: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    SHUTDOWN.get_or_init(tokio::sync::Notify::new)
+}
+
 #[cfg(unix)]
 fn install_sighup_handler() {
     tokio::spawn(async {
@@ -753,6 +775,10 @@ fn install_sighup_handler() {}
 
 async fn sighup_signal() {
     reconnect_notify().notified().await;
+}
+
+async fn shutdown_signal() {
+    shutdown_notify().notified().await;
 }
 
 async fn serve_one_connection(
@@ -3420,7 +3446,10 @@ mod tests {
     fn the_proven_account_outranks_the_servers_word_for_chain_scope() {
         let local = account_id_bytes("9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f").expect("uuid");
         let server = "1f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
-        assert_eq!(resolve_daemon_account(Some(local), Some(server)), Some(local));
+        assert_eq!(
+            resolve_daemon_account(Some(local), Some(server)),
+            Some(local)
+        );
         assert_eq!(resolve_daemon_account(Some(local), None), Some(local));
         assert_eq!(
             resolve_daemon_account(None, Some(server)),

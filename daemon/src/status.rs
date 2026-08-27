@@ -96,7 +96,7 @@ async fn inspect_instance(dir: &Path, server_cli: Option<String>) -> Result<Inst
 }
 
 fn connection_text(state: Option<&crate::state::StateFile>) -> String {
-    let Some(state) = state.filter(|state| crate::state::pid_is_alive(state.pid)) else {
+    let Some(state) = state.filter(|state| crate::state::daemon_state_is_live(state)) else {
         return "not running — start with: spawnd reconnect".into();
     };
     if state.connected {
@@ -246,6 +246,8 @@ mod tests {
     fn auth_heartbeat_has_the_exact_status_remedy() {
         let state = crate::state::StateFile {
             pid: std::process::id(),
+            process_started_100ns: None,
+            task_breakaway_denied: None,
             version: "0.1.0".into(),
             connected: false,
             connected_at: None,
