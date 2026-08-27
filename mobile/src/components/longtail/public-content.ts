@@ -2,24 +2,108 @@ export const SECURITY_URL = "https://spawnd.dev/security";
 export const DOWNLOAD_URL = "https://spawnd.dev/download";
 export const SOURCE_URL = "https://github.com/levy-street/spawn";
 
+export const DEFAULT_INSTALL_ORIGIN = "https://spawnd.dev";
+export const WINDOWS_PLATFORM_ID = "windows-x86_64";
+
+export type InstallTargetId = "unix" | "windows" | "windows-wsl";
+
 export interface InstallCommands {
   standard: string;
-  /**
-   * Windows has no native daemon build, and `install.sh` is POSIX sh, so the
-   * Linux build inside WSL2 is the path that works. Mobile never installs onto
-   * the phone itself — the target is always another machine — so this is
-   * offered outright rather than detected, unlike on the web.
-   */
   windows: string;
+  windowsWsl: string;
   prebuiltOnly: string;
+  windowsWslPrebuiltOnly: string;
+}
+
+export interface InstallTarget {
+  id: InstallTargetId;
+  label: "macOS / Linux" | "Windows" | "Windows (WSL)";
+  command: string;
+  prompt: "$" | "PS>";
+  commandAccessibilityLabel: "Terminal command" | "PowerShell command";
+  stepHeading: "Open Terminal on your machine" | "Open PowerShell on your PC";
+  stepDescription: string;
+}
+
+function originForBaseUrl(baseUrl: string): string {
+  return new URL(baseUrl).origin;
+}
+
+export function standardInstallCommand(origin: string): string {
+  return `curl -fsSL ${originForBaseUrl(origin)}/install.sh | sh`;
+}
+
+export function windowsInstallCommand(origin: string): string {
+  return `irm ${originForBaseUrl(origin)}/install.ps1 | iex`;
+}
+
+export function windowsWslInstallCommand(origin: string): string {
+  return `wsl -- bash -c "curl -fsSL ${originForBaseUrl(origin)}/install.sh | sh"`;
+}
+
+export function windowsWslPrebuiltInstallCommand(origin: string): string {
+  return `wsl -- bash -c "curl -fsSL ${originForBaseUrl(origin)}/install.sh | sh -s -- --prebuilt-only"`;
 }
 
 export function installCommandsForBaseUrl(baseUrl: string): InstallCommands {
-  const origin = new URL(baseUrl).origin;
-  const standard = `curl -fsSL ${origin}/install.sh | sh`;
+  const standard = standardInstallCommand(baseUrl);
   return {
     standard,
-    windows: `wsl -- bash -c "${standard}"`,
+    windows: windowsInstallCommand(baseUrl),
+    windowsWsl: windowsWslInstallCommand(baseUrl),
     prebuiltOnly: `${standard} -s -- --prebuilt-only`,
+    windowsWslPrebuiltOnly: windowsWslPrebuiltInstallCommand(baseUrl),
   };
 }
+
+export function installCommandForHostOS(
+  baseUrl: string,
+  hostOS: string | null | undefined,
+): string {
+  const commands = installCommandsForBaseUrl(baseUrl);
+  return hostOS?.trim().toLocaleLowerCase() === "windows" ? commands.windows : commands.standard;
+}
+
+export function installTargetsForBaseUrl(
+  baseUrl: string,
+  nativeWindowsAvailable: boolean,
+): InstallTarget[] {
+  const commands = installCommandsForBaseUrl(baseUrl);
+  const unix: InstallTarget = {
+    id: "unix",
+    label: "macOS / Linux",
+    command: commands.standard,
+    prompt: "$",
+    commandAccessibilityLabel: "Terminal command",
+    stepHeading: "Open Terminal on your machine",
+    stepDescription: "On a Mac or Linux machine you control, open Terminal and run:",
+  };
+  const windows: InstallTarget = {
+    id: "windows",
+    label: "Windows",
+    command: commands.windows,
+    prompt: "PS>",
+    commandAccessibilityLabel: "PowerShell command",
+    stepHeading: "Open PowerShell on your PC",
+    stepDescription: "On a Windows PC you control, open PowerShell and run:",
+  };
+  const windowsWsl: InstallTarget = {
+    id: "windows-wsl",
+    label: "Windows (WSL)",
+    command: commands.windowsWsl,
+    prompt: "PS>",
+    commandAccessibilityLabel: "PowerShell command",
+    stepHeading: "Open PowerShell on your PC",
+    stepDescription: "On a Windows PC with WSL, open PowerShell and run:",
+  };
+  return nativeWindowsAvailable ? [unix, windows, windowsWsl] : [unix, windowsWsl];
+}
+
+export function nativeWindowsAvailableFromRelease(
+  release: { daemon?: { targets?: Readonly<Record<string, unknown>> } | null } | null | undefined,
+): boolean {
+  return release?.daemon?.targets?.[WINDOWS_PLATFORM_ID] !== undefined;
+}
+
+export const DEFAULT_INSTALL_COMMAND = standardInstallCommand(DEFAULT_INSTALL_ORIGIN);
+export const DEFAULT_INSTALL_TARGETS = installTargetsForBaseUrl(DEFAULT_INSTALL_ORIGIN, false);

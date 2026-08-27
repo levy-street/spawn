@@ -4,6 +4,7 @@ import { CapacityMeter } from "@/components/hosts/capacity-meter";
 import {
   capacityPresentation,
   formatBytes,
+  formatHostPlatform,
   type HostMetrics,
   pluralize,
 } from "@/components/hosts/host-model";
@@ -98,7 +99,7 @@ export function LegionHostCard({
                 {host.name}
               </Text>
               <Text color="mutedForeground" variant="caption">
-                {online ? (host.os ?? "unknown") : "Offline"}
+                {online ? formatHostPlatform(host) : "Offline"}
               </Text>
             </View>
             {liveEnabled && metrics !== null ? <Badge variant="success">Live</Badge> : null}

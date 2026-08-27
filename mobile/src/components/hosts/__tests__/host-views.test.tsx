@@ -6,6 +6,7 @@ import {
   offlineHost,
   onlineHost,
   runningSession,
+  windowsHost,
 } from "@/components/hosts/__tests__/fixtures";
 import {
   HostDetailView,
@@ -121,7 +122,7 @@ describe("host list and detail rendering", () => {
     );
 
     for (const value of [
-      "macOS/arm64",
+      "macOS · ARM64",
       "1.4.2",
       "ed25519",
       "XOCTsSKj9-Z7qRynE70szG_DNBeHiLzEBOCG1clQbz8",
@@ -135,6 +136,24 @@ describe("host list and detail rendering", () => {
     expect(screen.queryByText(/restart daemon/i)).not.toBeOnTheScreen();
     expect(screen.queryByText(/update daemon/i)).not.toBeOnTheScreen();
     expect(screen.queryByText(/daemon logs/i)).not.toBeOnTheScreen();
+  });
+
+  test("formats Windows consistently without changing the generic host UI", async () => {
+    await render(
+      <ThemeProvider>
+        <HostDetailView
+          agents={[]}
+          host={windowsHost}
+          onOpenAgents={jest.fn()}
+          onOpenFiles={jest.fn()}
+          onOpenSession={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Windows · x64")).toBeOnTheScreen();
+    expect(screen.getByText("Windows · x64 · daemon 1.4.2")).toBeOnTheScreen();
   });
 
   test("surfaces daemon update state on host rows and facts", async () => {
