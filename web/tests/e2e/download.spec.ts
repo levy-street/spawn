@@ -157,3 +157,91 @@ test("download page does not overflow on desktop or mobile", async ({ browser })
     await context.close();
   }
 });
+
+/**
+ * The hero slab is painted before `/api/release` names the build, and a press
+ * in that window used to be spent walking to /download. It now waits and then
+ * hands the file over — see `MacDownloadButton`.
+ */
+async function landingWithHeldRelease(
+  browser: Browser,
+  payload: Record<string, unknown>,
+): Promise<{
+  context: Awaited<ReturnType<Browser["newContext"]>>;
+  page: Page;
+  answer: () => void;
+}> {
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "MacIntel",
+    userAgent: MAC_USER_AGENT,
+  });
+  await page.route("**/api/me", (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "not authenticated" }),
+    }),
+  );
+  const gate = { open: () => {} };
+  const answered = new Promise<void>((resolve) => {
+    gate.open = resolve;
+  });
+  await page.route("**/api/release", async (route) => {
+    await answered;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(payload),
+    });
+  });
+  await page.route("**/desktop/*.dmg", (route) =>
+    route.fulfill({
+      status: 200,
+      headers: {
+        "content-type": "application/octet-stream",
+        "content-disposition": 'attachment; filename="SPAWN-D_9.9.9_darwin-aarch64.dmg"',
+      },
+      body: "not really a disk image",
+    }),
+  );
+  await page.goto("/");
+  return { context, page, answer: () => gate.open() };
+}
+
+test("the Mac slab holds a press made before the build is named, then downloads it", async ({
+  browser,
+}) => {
+  const { context, page, answer } = await landingWithHeldRelease(browser, {
+    desktop: { version: "9.9.9", tree: "a".repeat(40), platforms: ["darwin-aarch64"] },
+  });
+
+  const slab = page.getByTestId("mac-download").first();
+  await expect(slab).toHaveText(/Download for macOS/i);
+  await slab.click();
+  await expect(slab).toHaveText(/Preparing download/i);
+
+  // The browser hands downloads to its own machinery rather than the page, so
+  // the evidence that the press landed is the download event, not a request.
+  const started = page.waitForEvent("download");
+  answer();
+  expect((await started).url()).toContain("/desktop/SPAWN-D_9.9.9_darwin-aarch64.dmg");
+  // The file came to the reader; the reader did not go to a page about it.
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByTestId("mac-download").first()).toHaveText(/Download for macOS/i);
+
+  await context.close();
+});
+
+test("a held press falls through to the download page when there is no build", async ({
+  browser,
+}) => {
+  const { context, page, answer } = await landingWithHeldRelease(browser, {});
+
+  await page.getByTestId("mac-download").first().click();
+  await expect(page.getByTestId("mac-download").first()).toHaveText(/Preparing download/i);
+  answer();
+
+  await expect(page).toHaveURL(/\/download$/);
+
+  await context.close();
+});

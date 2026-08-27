@@ -157,6 +157,17 @@ let possessionPoll: number | null = null;
 let waitStartedAt: number | null = null;
 let ticker: number | null = null;
 let copiedUntil = 0;
+/**
+ * The reader's own answer to the host gate's Terminal panel, or null while
+ * they have not given one and the screen decides for them (a failure or a
+ * stalled run opens it).
+ *
+ * Kept here rather than left to the element: the whole screen is re-rendered
+ * from `innerHTML` on every poll and every tick, so a `<details>` the reader
+ * opened was thrown away and re-created shut about a second later — the panel
+ * appeared to close itself the moment they went to read the command.
+ */
+let terminalOpen: boolean | null = null;
 const completedSteps = new Set<number>();
 let terminalCommand = `curl -fsSL ${HOSTED_ORIGIN}/install.sh | sh`;
 let status: LocalStatus | null = null;
@@ -212,18 +223,56 @@ const PAIRING_FAILURES: Record<string, string> = {
     "This host has reached its limit of approving browsers (32). Remove old devices under Access, then try again.",
 };
 const VERIFICATION_REFUSAL = "This host could not be verified.";
+
+/**
+ * The ends that are not failures.
+ *
+ * `spawnd possess` resumes a machine that already carries an instance rather
+ * than possessing it twice, and exits without ever minting an approval. The
+ * app used to sit on a spinner waiting for one; these say what happened and
+ * what the next move is.
+ */
+const RESUMED: Record<string, { title: string; body: string; action: string }> = {
+  already_possessed_here: {
+    title: "This Mac is already possessed",
+    body: "It already runs SPAWN D for this account, so nothing was changed — its daemon is running in the background and every device you own can reach it.",
+    action: '<button class="btn btn-primary" data-action="open-app">Open SPAWN D</button>',
+  },
+  already_possessed_other: {
+    title: "This Mac already runs SPAWN D",
+    body: "It is signed in to a different account, and nothing was changed. To run it for this account as well, use the Terminal line below with --new-account — the two instances stay separate.",
+    action: '<button class="btn btn-outline" data-action="try-again">Try again</button>',
+  },
+  no_ceremony: {
+    title: "Nothing to approve",
+    body: "The daemon finished without asking for approval, and nothing was changed. Try again, or run the Terminal line below and approve from the link it prints.",
+    action: '<button class="btn btn-outline" data-action="try-again">Try again</button>',
+  },
+};
 const REFUSAL_MISMATCH =
   "This host's identity could not be verified: the server presented a different identity key than the one in your host's link. Nothing was trusted and no access was granted. This can mean the connection is being tampered with — start over on a network you trust.";
 const STALLED_HINT = "Having trouble? Try again — it's safe to repeat.";
 const DOCTOR_HINT =
   "Still stuck? Run spawnd doctor in Terminal on this Mac — it checks the daemon, its service, and the connection back here, and says what is wrong.";
 
-/** Setup progress, one row per step the daemon reports (`possess-step`). */
-const HOST_STEPS: readonly { done: string; active: string }[] = [
-  { done: "Daemon downloaded and verified", active: "Downloading the daemon…" },
-  { done: "Registered", active: "Registering this Mac…" },
-  { done: "Approved", active: "Waiting for approval…" },
-  { done: "Online", active: "Connecting…" },
+/**
+ * Setup progress, one row per step the daemon reports (`possess-step`).
+ *
+ * Three labels, because a row means three different things. Before the button
+ * is pressed nothing is happening, and the active labels read there as four
+ * things already under way — a download that has not started, over a button
+ * that starts it. `todo` is what this Mac is about to be put through; `active`
+ * is the one row actually running; `done` is what it left behind.
+ */
+const HOST_STEPS: readonly { todo: string; active: string; done: string }[] = [
+  {
+    todo: "Download the daemon",
+    active: "Downloading the daemon…",
+    done: "Daemon downloaded and verified",
+  },
+  { todo: "Register this Mac", active: "Registering this Mac…", done: "Registered" },
+  { todo: "Approve this Mac", active: "Waiting for approval…", done: "Approved" },
+  { todo: "Come online", active: "Connecting…", done: "Online" },
 ];
 /** The one row that waits on the person, not the machine. */
 const APPROVAL_STEP = 2;
@@ -553,22 +602,27 @@ function elapsedMs(): number {
 
 function hostChecklist(): string {
   const failed = possession?.status === "failed";
+  // Nothing has been started: the list is a plan, not a report. Every row is
+  // idle, none of them is "current", and the heading says which it is.
+  const idle = !runId;
   const current = runId && !failed ? Math.min(completedSteps.size, HOST_STEPS.length - 1) : -1;
   const waitsOnPerson = current === APPROVAL_STEP && possession?.review !== null && possession?.review !== undefined;
   const elapsed = elapsedMs();
+  const heading = idle ? "What this does" : "Setup progress";
   return `
     <div>
-      <p class="checklist-head">Setup progress</p>
-      <ol class="checklist" aria-label="Setup progress">
+      <p class="checklist-head">${heading}</p>
+      <ol class="checklist${idle ? " idle" : ""}" aria-label="${heading}">
         ${HOST_STEPS.map((step, index) => {
           const complete = completedSteps.has(index);
           const state = complete ? "complete" : index === current ? "current" : "pending";
           const icon = complete ? ICON_CHECK : state === "current" && !waitsOnPerson ? ICON_SPINNER : ICON_CIRCLE;
+          const label = complete ? step.done : state === "current" ? step.active : step.todo;
           const aside =
             state === "current" && !waitsOnPerson && elapsed >= STILL_WAITING_MS && elapsed < STALLED_MS
               ? '<span class="aside">Still waiting…</span>'
               : "<span></span>";
-          return `<li class="${state}" data-state="${state}"><span class="mark" aria-hidden="true">${icon}</span><span>${escapeHtml(complete ? step.done : step.active)}</span>${aside}</li>`;
+          return `<li class="${state}" data-state="${state}"><span class="mark" aria-hidden="true">${icon}</span><span>${escapeHtml(label)}</span>${aside}</li>`;
         }).join("")}
       </ol>
     </div>`;
@@ -588,6 +642,11 @@ function hostView(): string {
     action = `
       <div class="failure" data-testid="possess-refusal"><h3>This host could not be verified</h3><p>${escapeHtml(REFUSAL_MISMATCH)}</p></div>
       <div class="actions"><button class="btn btn-outline" data-action="try-again">Start over</button></div>`;
+  } else if (failure && RESUMED[failure]) {
+    const resumed = RESUMED[failure];
+    action = `
+      <div class="inset" role="status"><p><strong>${escapeHtml(resumed.title)}</strong></p><p class="muted">${escapeHtml(resumed.body)}</p></div>
+      <div class="actions">${resumed.action}</div>`;
   } else if (failure) {
     action = `
       <div class="failure" role="alert"><h3>This machine was not approved</h3><p>${escapeHtml(pairingFailureCopy(failure))}</p></div>
@@ -611,13 +670,16 @@ function hostView(): string {
     action = "";
   }
 
+  // A run that has gone quiet for a minute is not progress. Say so, offer the
+  // way out of it, and stop pretending the next row is about to tick.
   const hints = stalled
-    ? `<p class="note">${escapeHtml(STALLED_HINT)}</p><p class="note">${escapeHtml(DOCTOR_HINT)}</p>`
+    ? `<p class="note">${escapeHtml(STALLED_HINT)}</p><p class="note">${escapeHtml(DOCTOR_HINT)}</p>
+       <div class="actions"><button class="btn btn-outline" data-action="try-again">Start over</button></div>`
     : "";
 
   const copied = Date.now() < copiedUntil;
   const terminal = `
-    <details ${failure && !refused ? "open" : ""}>
+    <details ${(terminalOpen ?? ((failure && !refused && failure !== "already_possessed_here") || stalled)) ? "open" : ""} data-panel="terminal">
       <summary>Use the Terminal instead</summary>
       <div class="stack-tight">
         <div class="chip"><span class="dollar">$</span><code>${escapeHtml(terminalCommand)}</code><button type="button" class="${copied ? "done" : ""}" data-action="copy-command" aria-label="Copy install command">${copied ? "Copied" : "Copy"}</button></div>
@@ -774,6 +836,11 @@ function bindActions(): void {
     event.preventDefault();
     void submitServer(new FormData(event.currentTarget as HTMLFormElement));
   });
+  document
+    .querySelector<HTMLDetailsElement>('details[data-panel="terminal"]')
+    ?.addEventListener("toggle", (event) => {
+      terminalOpen = (event.currentTarget as HTMLDetailsElement).open;
+    });
 }
 
 async function act(action: string): Promise<void> {
@@ -1099,6 +1166,7 @@ function startDevicePoll(): void {
 /* ── Host ─────────────────────────────────────────────────────────────── */
 
 function resetPossession(): void {
+  terminalOpen = null;
   possessionPoll = clearTimer(possessionPoll);
   ticker = clearTimer(ticker);
   runId = null;

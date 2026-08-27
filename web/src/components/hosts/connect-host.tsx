@@ -30,6 +30,7 @@ import {
   SETUP_PROGRESS_LABELS,
   type SetupProgressState,
   setupProgressStalledHint,
+  visibleSetupSteps,
 } from "@/lib/setup-progress";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { cn } from "@/lib/utils";
@@ -342,10 +343,13 @@ export function ConnectHostSection(props: {
                 Install on {platformName}
               </h3>
             </div>
-            {/* Wrapped, not clipped. The command must stay readable beside the
-                copy button, including on a narrow onboarding sheet. */}
-            <div className="flex min-w-0 items-start gap-2 rounded-lg border border-border bg-muted p-2">
-              <code className="min-w-0 flex-1 px-1 py-1 font-mono text-xs leading-5 break-all whitespace-pre-wrap">
+            {/* One line, as it will be typed. Wrapping broke a shell pipeline
+                across two rows mid-word on any narrow sheet, which reads as two
+                commands and hides the copy button below the fold of the chip;
+                the line scrolls sideways instead, the way the pressroom's own
+                install chip does. */}
+            <div className="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-muted p-2">
+              <code className="min-w-0 flex-1 overflow-x-auto px-1 py-1 font-mono text-xs leading-5 whitespace-nowrap">
                 {displayedCommand}
               </code>
               <Button
@@ -431,10 +435,15 @@ export function ConnectHostSection(props: {
 }
 
 /**
- * The milestones a spinner belongs on: approval in the link and the daemon
- * coming online. Copying the command waits on the reader, not the machine.
+ * The one milestone a spinner belongs on: the daemon coming online, which is
+ * the only wait here that something else is working through.
+ *
+ * The two before it wait on the reader — copying the command, then running it
+ * and approving from the link its terminal prints. A spinner on those claims
+ * this page is busy when it is the person who has the next move, and the row
+ * spins for as long as they take to make it.
  */
-const WAITS_ON_THE_MACHINE = new Set<number>([2, 3]);
+const WAITS_ON_THE_MACHINE = new Set<number>([3]);
 
 function SetupProgress({
   progress,
@@ -451,8 +460,9 @@ function SetupProgress({
         Setup progress
       </h3>
       <ol className="space-y-2" data-testid="setup-progress">
-        {SETUP_PROGRESS_LABELS.map((label, index) => {
-          const step = (index + 1) as 1 | 2 | 3;
+        {visibleSetupSteps(progress).map((step) => {
+          const index = step - 1;
+          const label = SETUP_PROGRESS_LABELS[index];
           const complete = progress.completed[index];
           const current = progress.current === step;
           return (

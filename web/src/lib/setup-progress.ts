@@ -13,6 +13,20 @@ export interface SetupProgressState {
   current: SetupProgressStep | null;
 }
 
+/**
+ * The milestones worth drawing, in order.
+ *
+ * Copying the command is a step this browser can only witness when it happened
+ * here. Arriving on a machine's own approval link — the terminal-first path,
+ * where the command was run before this account existed — the ceremony is
+ * already past it, and the row can never tick: an unchecked chore, above two
+ * checked ones, for work that was finished in another window.
+ */
+export function visibleSetupSteps(state: SetupProgressState): readonly SetupProgressStep[] {
+  if (state.completed[0] || state.current === 1) return [1, 2, 3];
+  return [2, 3];
+}
+
 /** Derive the onboarding milestones from facts the browser can observe. */
 export function deriveSetupProgress(input: {
   commandCopied: boolean;

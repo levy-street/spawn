@@ -7,14 +7,17 @@ import type { ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Colophon,
+  CTA_GHOST,
   CTA_QUIET,
   CTA_SLAB,
   InstallCommand,
+  MacDownloadButton,
   Masthead,
   RegistrationMarks,
   StoreBadges,
 } from "@/components/brand/press";
 import { Wordmark } from "@/components/icons/BrandMark";
+import { useDesktopRelease } from "@/hooks/useDesktopRelease";
 import { poster } from "@/lib/fonts";
 import {
   detectPlatform,
@@ -210,6 +213,52 @@ function ScrubVideo({ src, poster, alt }: { src: string; poster: string; alt: st
 export default function LandingPage() {
   const [origin, setOrigin] = useState("https://spawnd.dev");
   const [detectedOS, setDetectedOS] = useState<PlatformOS>("unknown");
+  // The Mac build the hero hands out, named by the release manifest rather
+  // than guessed at. Until it answers, the slab holds a press instead of
+  // sending it to /download — see `MacDownloadButton`.
+  const { settled: releaseSettled, url: macBuildUrl } = useDesktopRelease(origin);
+  /**
+   * The install target the reader picked on the chip, once they have picked
+   * one. The chip and the download beside it answer the same question, so
+   * switching the chip to Windows switches the button with it.
+   */
+  const [chosenTarget, setChosenTarget] = useState<string | null>(null);
+  /**
+   * Whether the panel's two sections step apart, measured rather than assumed:
+   * the shell line grows and shrinks with the target, and the buttons wrap on a
+   * narrow window.
+   *
+   * A step is either worth the name or it is not there at all. Below the
+   * threshold the line above is grown to the row's width instead, because a
+   * five-pixel overhang with square corners is not a shape — it is a slip.
+   */
+  const commandRef = useRef<HTMLDivElement>(null);
+  const actionsRef = useRef<HTMLDivElement>(null);
+  // Stepped until measured otherwise: the common case (and the one the server
+  // renders) is the buttons running wider than the shell line, and starting
+  // flush meant the panel painted square and then stepped a frame later.
+  const [stepped, setStepped] = useState(true);
+
+  useEffect(() => {
+    const measure = () => {
+      const command = commandRef.current;
+      const actions = actionsRef.current;
+      if (!command || !actions) return;
+      // Measured off the stretch, not through it: once the line above is grown
+      // to match, its rendered width would answer "flush" for ever, however the
+      // row changed underneath it.
+      const stretched = command.style.width;
+      command.style.width = "auto";
+      const intrinsic = command.getBoundingClientRect().width;
+      command.style.width = stretched;
+      setStepped(intrinsic > 0 && actions.getBoundingClientRect().width - intrinsic >= 32);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (commandRef.current) observer.observe(commandRef.current);
+    if (actionsRef.current) observer.observe(actionsRef.current);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     const platform = detectPlatform();
@@ -223,6 +272,13 @@ export default function LandingPage() {
   // reader wants the app instead. Detection lands after mount, so the server
   // render keeps the install chip and a phone swaps to the badge.
   const phoneBadge = storeBadgeForOS(detectedOS);
+  // The app itself is Mac-only, so a detected Linux or Windows reader keeps
+  // the plain slab to /download rather than being handed a build their machine
+  // cannot open. Undetected (the server render, and any browser we cannot
+  // read) gets the Mac slab: it is the download this site is here to hand out,
+  // and /download is one press away either way.
+  const installTarget = chosenTarget ?? defaultTargetId;
+  const windowsChosen = installTarget === "windows";
 
   return (
     <main className="grimoire min-h-vv overflow-x-clip">
@@ -273,15 +329,129 @@ export default function LandingPage() {
           </h1>
 
           <div className="mt-auto flex w-full flex-col items-stretch gap-5 pt-16 sm:w-auto sm:items-start">
-            {phoneBadge ? (
-              <StoreBadges badges={[phoneBadge]} />
-            ) : (
-              <InstallCommand targets={targets} defaultTargetId={defaultTargetId} />
-            )}
-            <Link href="/download" className={cn(CTA_SLAB, "sm:w-auto")}>
-              Download
-              <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
-            </Link>
+            {/* One panel, one answer to "what do I run on this machine": the
+             * line to paste, and the downloads, inside a single border that
+             * closes around both. The hero is full-bleed ink, and a control set
+             * straight on it falls into the print — so the panel is the ground
+             * everything here stands on, and the slab is the only thing that
+             * brings its own.
+             *
+             * A phone cannot host the daemon, so the shell line is left out
+             * there and the store badge is the whole answer. */}
+            <div className="inline-flex max-w-full flex-col items-start">
+              {phoneBadge ? null : (
+                // The seam between the two sections is a divider, not an edge:
+                // a short grey rule set in from both sides, laid over the white
+                // outline that runs unbroken around the panel behind it.
+                <div
+                  ref={commandRef}
+                  className={cn(
+                    "relative z-10 max-w-full after:absolute after:inset-x-4 after:bottom-0 after:h-px after:bg-line-strong after:content-['']",
+                    !stepped && "w-full",
+                  )}
+                >
+                  {/* The outer corner where this line meets the wider row
+                   * below. A 270° turn cannot be rounded by rounding a box —
+                   * that cuts the corner away rather than filling it — so the
+                   * fillet is drawn: a quarter of the row's own ground laid
+                   * into the crook, clipped to its own square, with the white
+                   * edge running round the arc. */}
+                  {stepped ? (
+                    <span
+                      aria-hidden
+                      // Pulled a pixel left so its own left edge lands exactly
+                      // on this section's right one: side by side they drew
+                      // that edge twice, and the doubled line read as a white
+                      // seam running down into the corner.
+                      className="pointer-events-none absolute bottom-0 left-full -ml-px size-[14px] overflow-hidden"
+                    >
+                      <span className="block size-full rounded-bl-[14px] border-b border-l border-bone shadow-[-14px_14px_0_14px_rgb(18_15_14_/_0.9)]" />
+                    </span>
+                  ) : null}
+                  <InstallCommand
+                    targets={targets}
+                    defaultTargetId={defaultTargetId}
+                    onTargetChange={setChosenTarget}
+                    className={cn(!stepped && "w-full")}
+                    boxClassName={cn(
+                      // Opaque, and with no bottom edge of its own: the white
+                      // outline belongs to the panel, and this section's own
+                      // ground is what hides the length of it running beneath.
+                      "rounded-b-none border-bone border-b-0 bg-void",
+                      !stepped && "w-full",
+                    )}
+                  />
+                </div>
+              )}
+              {/* The row runs wider than the line above it, and the outline
+               * follows rather than boxing both into the widest rectangle: one
+               * shape that steps out where the buttons need the room, with the
+               * shared edge left drawn as the rule between them.
+               *
+               * It wraps as a row before either label wraps inside its own
+               * button — two words on two lines inside a slab reads as damage,
+               * where a stacked pair of buttons reads as a narrow window. */}
+              <div
+                ref={actionsRef}
+                className={cn(
+                  // The white edge runs unbroken around the whole shape,
+                  // including the length of this section's top that juts out
+                  // past the line above — and it always fills the panel, so
+                  // that line can never be the wider of the two and the step
+                  // only ever turns one way.
+                  // The actions wrap only when they genuinely do not fit, and
+                  // whichever of them ends up alone on a line fills it: a
+                  // breakpoint instead put them in a column while there was
+                  // still room for both, which is neither of the two states
+                  // this panel has.
+                  "-mt-px flex w-full max-w-full flex-wrap items-center gap-3 rounded-[16px] rounded-t-none border border-bone bg-char/90 p-4 backdrop-blur-sm",
+                  stepped && "rounded-tr-[16px]",
+                )}
+              >
+                {phoneBadge ? (
+                  // The vendors' own artwork, as supplied: an App Store or Play
+                  // badge is the download button on those platforms, and neither
+                  // may be redrawn in someone else's house style.
+                  <StoreBadges badges={[phoneBadge]} />
+                ) : windowsChosen ? (
+                  // No Windows build to hand over — the line above runs inside
+                  // WSL — so the button goes where that is explained.
+                  <MacDownloadButton
+                    href={null}
+                    platform="windows"
+                    className="h-14 grow rounded-[11px] whitespace-nowrap"
+                  />
+                ) : detectedOS === "linux" ? (
+                  <Link
+                    href="/download"
+                    className={cn(CTA_SLAB, "h-14 grow rounded-[11px] whitespace-nowrap")}
+                  >
+                    Download
+                    <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+                  </Link>
+                ) : (
+                  <MacDownloadButton
+                    href={macBuildUrl}
+                    pending={!releaseSettled}
+                    className="h-14 grow rounded-[11px] whitespace-nowrap"
+                  />
+                )}
+                <Link
+                  href="/download"
+                  className={cn(
+                    CTA_GHOST,
+                    // A ground of its own, faint but always there: beside a
+                    // bone slab, a shape painted only on hover reads as the
+                    // smaller of the two even when the boxes match to the
+                    // pixel.
+                    "h-14 grow rounded-[11px] bg-bone/[0.06] whitespace-nowrap hover:bg-bone/12",
+                  )}
+                >
+                  More download options
+                  <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+                </Link>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -563,7 +733,6 @@ export default function LandingPage() {
           <div className="flex flex-col items-center justify-center gap-5 sm:flex-row sm:gap-7">
             <Link href="/signup" className={CTA_SLAB}>
               Sign up
-              <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
             </Link>
             <Link href="/download" className={CTA_QUIET}>
               Download

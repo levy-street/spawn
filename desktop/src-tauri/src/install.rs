@@ -30,6 +30,12 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_BINARY_BYTES: usize = 256 * 1024 * 1024;
 const RELEASE_SIGNING_PUBLIC_KEYS: &[&str] = &["8nE_rD4eVv8QFuNMbBQ3023vuU7V-OWxRl70ni4WOf0"];
 const VERIFICATION_REFUSAL: &str = "This host could not be verified.";
+/// This Mac already runs SPAWN D for the account signed in here.
+const ALREADY_POSSESSED_HERE: &str = "already_possessed_here";
+/// This Mac already runs SPAWN D, for some other account.
+const ALREADY_POSSESSED_OTHER: &str = "already_possessed_other";
+/// The child ended without a ceremony and without saying why.
+const NO_CEREMONY: &str = "no_ceremony";
 
 #[derive(Debug, Deserialize)]
 struct SignedManifest {
@@ -175,6 +181,23 @@ impl PossessionManager {
         let api = ApiClient::new(&preferences.server_origin)?;
         let mut snapshot = self.snapshot(run_id).await?;
         let mut review = None;
+
+        // The child is gone and never asked for anything to be approved. That
+        // is not "still registering", and a run left in it waits for ever: the
+        // one spinner on the gate spun on a machine where nothing at all was
+        // happening any more. Say which of the two things happened and stop.
+        if snapshot.child_finished
+            && !snapshot.approved
+            && snapshot.approval_identifier.is_none()
+            && snapshot.error.is_none()
+            && snapshot.child_error.is_none()
+        {
+            let detail =
+                finished_without_ceremony(&snapshot.output, preferences.account_id.as_deref());
+            self.fail_run(run_id, detail).await;
+            snapshot = self.snapshot(run_id).await?;
+            return Ok(possession_progress(run_id, snapshot, None));
+        }
 
         if matches!(progress_status(&snapshot), PossessionStatus::Registered) {
             match self.review(&api, &snapshot).await {
@@ -455,6 +478,56 @@ fn new_run_id() -> Result<String> {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(Uuid::from_bytes(bytes).to_string())
+}
+
+/// Why `spawnd possess` came back with nothing to approve.
+///
+/// A machine that already carries an instance is *resumed*, not possessed
+/// again: with no terminal to ask (the app gives the child no stdin), keeping
+/// what is there is the only safe answer, so the daemon makes sure its service
+/// is running, prints which account it belongs to, and exits. Nothing is wrong
+/// — there is simply no ceremony here to wait for, and which account it named
+/// decides what to offer next.
+fn finished_without_ceremony(output: &[String], account_id: Option<&str>) -> String {
+    let Some(account) = resumed_account(output) else {
+        return NO_CEREMONY.into();
+    };
+    match account_id {
+        Some(ours) if sanitize_account(ours) == account => ALREADY_POSSESSED_HERE.into(),
+        _ => ALREADY_POSSESSED_OTHER.into(),
+    }
+}
+
+/// The account named by the daemon's own resume line, which is the instance
+/// directory it kept — `spawn: already possessed (<account>); …`.
+fn resumed_account(output: &[String]) -> Option<String> {
+    output.iter().rev().find_map(|line| {
+        let rest = line.split_once("already possessed (")?.1;
+        let account = rest.split_once(')')?.0.trim();
+        (!account.is_empty()).then(|| account.to_string())
+    })
+}
+
+/// The daemon's own instance-directory naming (`possess::sanitize_account`),
+/// restated here because the comparison happens on this side of the process
+/// boundary and the daemon keeps its copy private.
+fn sanitize_account(account: &str) -> String {
+    let cleaned: String = account
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches('_').to_string();
+    if cleaned.is_empty() {
+        "account".into()
+    } else {
+        cleaned
+    }
 }
 
 fn known_possession_failure(detail: &str) -> bool {
@@ -815,6 +888,42 @@ pub fn installer_command(origin: &str) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn a_resumed_run_is_told_apart_by_the_account_it_named() {
+        let ours = vec![
+            "spawn: starting the background daemon".to_string(),
+            "spawn: already possessed (9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f); daemon running in the background.".to_string(),
+        ];
+        assert_eq!(
+            finished_without_ceremony(&ours, Some("9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f")),
+            ALREADY_POSSESSED_HERE
+        );
+        assert_eq!(
+            finished_without_ceremony(&ours, Some("11111111-2222-3333-4444-555555555555")),
+            ALREADY_POSSESSED_OTHER
+        );
+        // Signed out of the app, or a line that never named an account: there
+        // is nothing to claim about whose machine this is.
+        assert_eq!(
+            finished_without_ceremony(&ours, None),
+            ALREADY_POSSESSED_OTHER
+        );
+        assert_eq!(
+            finished_without_ceremony(&["spawn: something else entirely".to_string()], Some("a")),
+            NO_CEREMONY
+        );
+    }
+
+    #[test]
+    fn account_sanitizing_matches_the_daemons_instance_directories() {
+        assert_eq!(
+            sanitize_account("9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"),
+            "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f"
+        );
+        assert_eq!(sanitize_account("../../etc/passwd"), "etc_passwd");
+        assert_eq!(sanitize_account("///"), "account");
+    }
 
     #[test]
     fn parses_only_the_stable_plain_url_line() {
