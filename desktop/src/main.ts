@@ -109,6 +109,10 @@ const CEREMONY_POLL_MS = 1_500;
 const POSSESSION_POLL_MS = 1_500;
 /** The browser's SUCCESS_BEAT_MS: a gate lingers this long after it passes. */
 const SUCCESS_BEAT_MS = 900;
+/** The done gate reads for this long, then the window becomes the product. */
+const DONE_BEAT_MS = 1800;
+/** Wizard surfaces the tray can ask for by name, carried in the URL hash. */
+const SURFACES = new Set<Screen>(["settings", "repair", "update", "quit"]);
 const STILL_WAITING_MS = 30_000;
 const STALLED_MS = 60_000;
 const COPIED_MS = 1_500;
@@ -637,10 +641,10 @@ function doneView(): string {
     <div class="stack">
       <div class="inset">
         <p><strong>${escapeHtml(host)}</strong> is online. All your devices can reach it.</p>
-        <p class="muted">Open SPAWN D to pick a folder and start working. It stays in your menu bar; the daemon keeps running on its own.</p>
+        <p class="muted">SPAWN D opens in a moment. It stays in your menu bar; the daemon keeps running on its own.</p>
       </div>
       ${errorLine()}
-      <div class="actions"><button class="btn btn-primary" data-action="open-app">Open SPAWN D</button><button class="btn btn-outline" data-action="close-window">Done</button></div>
+      <div class="actions"><button class="btn btn-primary" data-action="open-app">Open SPAWN D</button></div>
     </div>`;
   return sheet(
     hatchAccount(),
@@ -671,7 +675,7 @@ function settingsView(): string {
     </div>`;
   return sheet(
     "",
-    `<div class="stacked">${LOCKUP}<section class="plate"><header class="plate-head with-close"><div><h1>Settings</h1><p class="lead">SPAWN D lives in your menu bar.</p></div><button class="close" data-action="close-window" aria-label="Close">×</button></header><div class="plate-body">${body}</div></section></div>`,
+    `<div class="stacked">${LOCKUP}<section class="plate"><header class="plate-head with-close"><div><h1>Settings</h1><p class="lead">SPAWN D lives in your menu bar.</p></div><button class="close" data-action="close-window" aria-label="Back to SPAWN D">×</button></header><div class="plate-body">${body}</div></section></div>`,
   );
 }
 
@@ -806,11 +810,14 @@ async function act(action: string): Promise<void> {
       window.setTimeout(render, COPIED_MS + 50);
       break;
     case "open-app":
-      // The product itself, in its own window inside this app, signed in.
+      // The product itself: this window becomes the web app, signed in.
       await guarded(() => invoke("open_app"));
       break;
     case "close-window":
-      window.close();
+      // Once this Mac is possessed the window is the product; leaving a
+      // wizard surface means going back to it, not to the menu bar.
+      if (preferences.first_run_complete) await guarded(() => invoke("open_app"));
+      else window.close();
       break;
     case "settings":
       setScreen("settings");
@@ -1113,7 +1120,12 @@ function startPossessionPoll(): void {
         preferences = await invoke<Preferences>("app_preferences");
         notice = "Your host is online.";
         render();
-        window.setTimeout(() => setScreen("done"), SUCCESS_BEAT_MS);
+        window.setTimeout(() => {
+          setScreen("done");
+          // The product is the point: the window becomes it once the
+          // gate has been read.
+          window.setTimeout(() => void guarded(() => invoke("open_app")), DONE_BEAT_MS);
+        }, SUCCESS_BEAT_MS);
         return;
       }
       if (possession.status === "failed") {
@@ -1197,10 +1209,17 @@ async function initialize(): Promise<void> {
   });
 
   if (preferences.first_run_complete) {
-    screen = "settings";
+    // The window is only the wizard here because the tray asked for one of
+    // its surfaces by name while the product had it; the hash says which.
+    const requested = window.location.hash.slice(1) as Screen;
+    screen = SURFACES.has(requested) ? requested : "settings";
     render();
-    await refreshStatus(false);
-    void checkUpdate();
+    if (screen === "update") {
+      await checkUpdate();
+    } else {
+      await refreshStatus(screen === "repair");
+      void checkUpdate();
+    }
   } else if (preferences.account_id) {
     // Signed in but not finished: pick the gate up where it was left, from
     // what the server says rather than from anything remembered locally.

@@ -12,22 +12,7 @@
   "app": {
     "macOSPrivateApi": true,
     "withGlobalTauri": false,
-    "windows": [
-      {
-        "label": "main",
-        "title": "SPAWN D",
-        "width": 960,
-        "height": 840,
-        "minWidth": 760,
-        "minHeight": 640,
-        "center": true,
-        "resizable": true,
-        "visible": false,
-        "fullscreen": false,
-        "decorations": true,
-        "transparent": false
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'"
     }

@@ -1,10 +1,11 @@
 # Working agreements for desktop/
 
-The macOS SPAWN D app. It is a Tauri v2 app with two faces: a local wizard
-that signs you in, installs the daemon and possesses this Mac, and then the
-product itself — the web app from the chosen server, opened in a window this
-app owns, already signed in. Between uses it lives in the menu bar. Read the
-repo root `CLAUDE.md` first.
+The macOS SPAWN D app. It is a Tauri v2 app with one window and two faces
+for it: a local wizard that signs you in, installs the daemon and possesses
+this Mac, and then the product itself — the web app from the chosen server,
+loaded into that same window, already signed in. Launching the app opens
+whichever face is current, like any app; closing the window leaves SPAWN D
+in the menu bar. Read the repo root `CLAUDE.md` first.
 
 ## Layout
 
@@ -13,10 +14,10 @@ src/             bundled vanilla HTML, TypeScript and CSS; never remote code
   assets/        vendored brand art and the two brand faces
     fonts/       IBM Plex Sans and Rowdies, latin subsets, with their OFL
 src-tauri/
-  src/           Rust commands, API client, trust ceremonies, the app window
-                 (app_window.rs) and the tray shell
-  capabilities/  least-privilege Tauri capability declarations; the main
-                 window only — the app window gets no IPC at all
+  src/           Rust commands, API client, trust ceremonies, the one window
+                 and its two faces (window.rs) and the tray shell
+  capabilities/  least-privilege Tauri capability declarations; they name the
+                 window, never a remote URL, so the product page has no IPC
   dmg/           the disk image's window: background.html is the source,
                  render.mjs prints it to background.png at 2× / 144 dpi
   icons/         icon.icns / icon.png (bundle) and tray.png / tray@2x.png
@@ -50,12 +51,16 @@ not a cousin of it:
   masthead for the gates, the bone slab, the hairline plate. When one of those
   changes, this follows.
 
-Once this Mac is possessed the product is the web app, and the app opens it in
-its own window (`src-tauri/src/app_window.rs`) from the chosen origin: the
-wizard's session becomes the browser session by way of the cookie the server
-sets on renewal, the page gets no IPC, and any navigation off the origin opens
-in the system browser. Nothing of the web build is bundled here, so the app
-can never drift from the server it talks to.
+Once this Mac is possessed the product is the web app, and the window becomes
+it (`src-tauri/src/window.rs`): the same window navigates to the chosen
+origin, the wizard's session becomes the browser session by way of the cookie
+the server sets on renewal, the page gets no IPC, and any navigation off the
+origin — or any `window.open` — goes to the system browser. Settings, repair
+and update turn the window back into the wizard, carrying the surface in the
+URL hash, and leaving them turns it back into the product. There is never a
+second window; a second copy of the app (single-instance) fronts the first
+and exits. Nothing of the web build is bundled here, so the app can never
+drift from the server it talks to.
 
 The rules that palette carries are load-bearing:
 
