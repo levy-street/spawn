@@ -21,6 +21,8 @@ VERIFY_SCRIPT = REPO_ROOT / "scripts" / "verify-release.sh"
 EXPECTED_COMMIT = "1" * 40
 EXPECTED_DAEMON_TREE = "2" * 40
 EXPECTED_MOBILE_TREE = "3" * 40
+EXPECTED_DESKTOP_TREE = "4" * 40
+EXPECTED_DESKTOP_VERSION = "0.1.0"
 EXPECTED_COUNTER = 1_700_000_000
 
 
@@ -33,7 +35,43 @@ def _b64url(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def _run_verifier(tmp_path: Path, *, manifest_counter: int) -> subprocess.CompletedProcess[str]:
+def _minisign_fixture(artifact: bytes) -> tuple[str, str]:
+    """A public key and signature in the exact shape `tauri signer` produces.
+
+    Both are the base64 of a minisign text file. The payload signature is
+    Ed25519 over the BLAKE2b-512 prehash of the artifact ("ED"), and the global
+    signature covers the raw signature followed by the trusted comment text —
+    without its "trusted comment: " label, which is where a hand-rolled
+    verifier most easily goes wrong.
+    """
+    private_key = Ed25519PrivateKey.generate()
+    public_raw = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+    key_id = hashlib.sha256(public_raw).digest()[:8]
+    public_text = (
+        "untrusted comment: minisign public key\n"
+        + base64.b64encode(b"Ed" + key_id + public_raw).decode("ascii")
+        + "\n"
+    )
+    signature = private_key.sign(hashlib.blake2b(artifact, digest_size=64).digest())
+    trusted_comment = "timestamp:1700000000\tfile:SPAWN-D.app.tar.gz"
+    global_signature = private_key.sign(signature + trusted_comment.encode("ascii"))
+    signature_text = (
+        "untrusted comment: signature from tauri secret key\n"
+        + base64.b64encode(b"ED" + key_id + signature).decode("ascii")
+        + f"\ntrusted comment: {trusted_comment}\n"
+        + base64.b64encode(global_signature).decode("ascii")
+        + "\n"
+    )
+    encode = lambda text: base64.b64encode(text.encode("ascii")).decode("ascii")  # noqa: E731
+    return encode(public_text), encode(signature_text)
+
+
+def _run_verifier(
+    tmp_path: Path, *, manifest_counter: int, include_desktop: bool = False
+) -> subprocess.CompletedProcess[str]:
     private_key = Ed25519PrivateKey.generate()
     public_raw = private_key.public_key().public_bytes(
         serialization.Encoding.Raw,
@@ -60,13 +98,22 @@ def _run_verifier(tmp_path: Path, *, manifest_counter: int) -> subprocess.Comple
     }
     manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
     signature = (_b64url(private_key.sign(manifest_bytes)) + "\n").encode("ascii")
-    release = {
+    release: dict[str, object] = {
         "server": {"commit": EXPECTED_COMMIT},
         "daemon": {
             "tree": EXPECTED_DAEMON_TREE,
             "targets": manifest["targets"],
         },
     }
+    desktop_platforms = ["darwin-aarch64", "darwin-x86_64"]
+    desktop_artifact = b"throwaway SPAWN D.app.tar.gz\n"
+    desktop_public_key, desktop_signature = _minisign_fixture(desktop_artifact)
+    if include_desktop:
+        release["desktop"] = {
+            "version": EXPECTED_DESKTOP_VERSION,
+            "tree": EXPECTED_DESKTOP_TREE,
+            "platforms": desktop_platforms,
+        }
     payloads = {
         "/api/release": json.dumps(release).encode("utf-8"),
         "/api/install/manifest.json": manifest_bytes,
@@ -92,18 +139,45 @@ def _run_verifier(tmp_path: Path, *, manifest_counter: int) -> subprocess.Comple
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    origin = f"http://127.0.0.1:{server.server_port}"
+    if include_desktop:
+        # The manifest's URLs must point back into this origin's /desktop/
+        # tree, so it can only be assembled once the port is known.
+        artifact_names = {
+            platform: f"SPAWN-D_{EXPECTED_DESKTOP_VERSION}_{platform}.app.tar.gz"
+            for platform in desktop_platforms
+        }
+        latest = {
+            "version": EXPECTED_DESKTOP_VERSION,
+            "notes": "throwaway",
+            "pub_date": "2026-01-01T00:00:00Z",
+            "platforms": {
+                platform: {
+                    "url": f"{origin}/desktop/{name}",
+                    "signature": desktop_signature,
+                }
+                for platform, name in artifact_names.items()
+            },
+        }
+        payloads["/desktop/latest.json"] = json.dumps(latest).encode("utf-8")
+        for name in artifact_names.values():
+            payloads[f"/desktop/{name}"] = desktop_artifact
 
     fakebin = tmp_path / "bin"
     fakebin.mkdir()
+    tauri_conf = json.dumps({"version": EXPECTED_DESKTOP_VERSION})
     _write_executable(
         fakebin / "git",
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
-        "case \"$*\" in\n"
+        'case "$*" in\n'
         f"  'rev-parse --show-toplevel') printf '%s\\n' {shlex.quote(str(REPO_ROOT))} ;;\n"
         f"  'rev-parse HEAD^{{commit}}') printf '%s\\n' {EXPECTED_COMMIT} ;;\n"
         f"  'rev-parse HEAD:daemon') printf '%s\\n' {EXPECTED_DAEMON_TREE} ;;\n"
         f"  'rev-parse HEAD:mobile') printf '%s\\n' {EXPECTED_MOBILE_TREE} ;;\n"
+        f"  'rev-parse HEAD:desktop') printf '%s\\n' {EXPECTED_DESKTOP_TREE} ;;\n"
+        f"  'show HEAD:desktop/src-tauri/tauri.conf.json') printf '%s\\n' {shlex.quote(tauri_conf)} ;;\n"
+        f"  'show HEAD:desktop/updater.pubkey') printf '%s\\n' {desktop_public_key} ;;\n"
         f"  'show -s --format=%ct {EXPECTED_COMMIT}') printf '%s\\n' {EXPECTED_COUNTER} ;;\n"
         "  'show HEAD:daemon/src/release_key.rs') exit 1 ;;\n"
         "  *) printf 'unexpected fake git call: %s\\n' \"$*\" >&2; exit 99 ;;\n"
@@ -120,8 +194,8 @@ def _run_verifier(tmp_path: Path, *, manifest_counter: int) -> subprocess.Comple
                 "--ref",
                 "HEAD",
                 "--skip-mobile",
-                "--skip-desktop",
-                f"http://127.0.0.1:{server.server_port}",
+                *([] if include_desktop else ["--skip-desktop"]),
+                origin,
             ],
             cwd=REPO_ROOT,
             env=env,
@@ -144,6 +218,17 @@ def test_verify_release_accepts_throwaway_signed_manifest(tmp_path: Path):
     assert "SPAWN_RELEASE_PUBLIC_KEY fallback" in result.stdout
     assert "daemon release counter" in result.stdout
     assert "valid (key " in result.stdout
+
+
+def test_verify_release_accepts_desktop_minisign_manifest(tmp_path: Path):
+    result = _run_verifier(tmp_path, manifest_counter=EXPECTED_COUNTER, include_desktop=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    signature_row = next(
+        line for line in result.stdout.splitlines() if "desktop artifact signature" in line
+    )
+    assert "valid (darwin-aarch64)" in signature_row
+    assert "OK" in signature_row
 
 
 def test_verify_release_rejects_wrong_release_counter(tmp_path: Path):

@@ -286,9 +286,12 @@ try:
 
     verifier = Ed25519PublicKey.from_public_bytes(public_blob[10:])
     verifier.verify(signature_blob[10:], hashlib.blake2b(artifact, digest_size=64).digest())
+    # minisign's global signature covers the raw signature plus the trusted
+    # comment text, without its "trusted comment: " label.
+    trusted_comment = signature_lines[2][len("trusted comment: "):]
     verifier.verify(
         global_signature,
-        signature_blob[10:] + signature_lines[2].encode("ascii"),
+        signature_blob[10:] + trusted_comment.encode("ascii"),
     )
 except (InvalidSignature, OSError, UnicodeError, ValueError):
     raise SystemExit(1)
