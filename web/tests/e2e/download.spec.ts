@@ -49,10 +49,9 @@ test("macOS detection recommends LaunchAgent and copies the current-origin comma
   const origin = new URL(page.url()).origin;
   const command = `curl -fsSL ${origin}/install.sh | sh`;
 
-  await expect(page.getByText("Detected browser OS")).toBeVisible();
-  await expect(
-    page.locator("section").first().getByRole("heading", { name: "macOS" }),
-  ).toBeVisible();
+  const detectedPlate = page.getByRole("figure", { name: "Detected browser OS" });
+  await expect(detectedPlate).toBeVisible();
+  await expect(detectedPlate.getByRole("heading", { name: "macOS" })).toBeVisible();
   await expect(page.getByText("LaunchAgent: app.spawn.spawnd")).toBeVisible();
   await expect(page.locator("code").first()).toHaveText(command);
 
@@ -71,9 +70,8 @@ test("Linux detection recommends the user systemd service", async ({ browser }) 
 
   await page.goto("/download");
 
-  await expect(
-    page.locator("section").first().getByRole("heading", { name: "Linux" }),
-  ).toBeVisible();
+  const detectedPlate = page.getByRole("figure", { name: "Detected browser OS" });
+  await expect(detectedPlate.getByRole("heading", { name: "Linux" })).toBeVisible();
   await expect(page.getByText("systemd user service: spawnd.service")).toBeVisible();
   await expect(page.getByText("Install on this Linux host")).toBeVisible();
 
@@ -93,9 +91,8 @@ test("Windows without native artifacts defaults to the truthful WSL plate", asyn
   await page.goto("/download");
   const origin = new URL(page.url()).origin;
 
-  await expect(
-    page.locator("section").first().getByRole("heading", { name: "Windows" }),
-  ).toBeVisible();
+  const detectedPlate = page.getByRole("figure", { name: "Detected browser OS" });
+  await expect(detectedPlate.getByRole("heading", { name: "Windows" })).toBeVisible();
   await expect(page.getByText("Run SPAWN D through WSL")).toBeVisible();
   await expect(
     page.getByText(
@@ -287,16 +284,15 @@ test("unknown browser OS explains that the installer detects the actual host", a
 
   await page.goto("/download");
 
-  await expect(
-    page.locator("section").first().getByRole("heading", { name: "Unknown OS" }),
-  ).toBeVisible();
+  const detectedPlate = page.getByRole("figure", { name: "Detected browser OS" });
+  await expect(detectedPlate.getByRole("heading", { name: "Unknown OS" })).toBeVisible();
   await expect(page.getByText("Choose the host platform")).toBeVisible();
   await expect(page.getByText("Choose macOS / Linux or Windows (WSL) below.")).toBeVisible();
 
   await context.close();
 });
 
-test("landing page install CTA opens the download page", async ({ page }) => {
+test("landing page download CTA opens the download page", async ({ page }) => {
   await page.route("**/api/me", async (route) => {
     await route.fulfill({
       status: 401,
@@ -306,7 +302,10 @@ test("landing page install CTA opens the download page", async ({ page }) => {
   });
   await page.goto("/");
 
-  await page.getByRole("link", { name: "Install the daemon" }).first().click();
+  const closingPoster = page.locator("section").filter({
+    has: page.getByRole("heading", { name: "Bring a host online." }),
+  });
+  await closingPoster.getByRole("link", { name: "Download", exact: true }).click();
 
   await expect(page).toHaveURL(/\/download$/);
   await expect(
@@ -433,11 +432,14 @@ test("changing install targets deliberately cancels a held desktop press", async
 
   await page.getByTestId("mac-download").first().click();
   await expect(page.getByTestId("mac-download").first()).toHaveText(/Preparing download/i);
-  await page.getByRole("tab", { name: "Windows (WSL)" }).click();
-  await expect(page.getByRole("link", { name: "Windows setup through WSL →" })).toBeVisible();
+  const hero = page.locator("section").filter({
+    has: page.getByRole("heading", { name: "A daemon on every host you own.", level: 1 }),
+  });
+  await hero.getByRole("tab", { name: "Windows (WSL)" }).click();
+  await expect(hero.getByRole("link", { name: "Windows setup through WSL →" })).toBeVisible();
 
   answer();
-  await expect(page.getByRole("link", { name: "Windows setup through WSL →" })).toBeVisible();
+  await expect(hero.getByRole("link", { name: "Windows setup through WSL →" })).toBeVisible();
   expect(desktopRequests).toEqual([]);
 
   await context.close();

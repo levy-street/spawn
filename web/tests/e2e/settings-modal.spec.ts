@@ -127,7 +127,7 @@ test("the legion formats a Windows x64 host without changing its generic fleet r
   await mockApp(page, { hosts: [windowsHost] });
   await page.goto("/legion");
   await expect(page.getByText("Windows · x64", { exact: true })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Windows PC" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Windows PC", exact: true })).toBeVisible();
 });
 
 test("Agents keeps built-ins read-only and round-trips a custom definition", async ({ page }) => {
