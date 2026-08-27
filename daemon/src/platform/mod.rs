@@ -52,9 +52,8 @@ mod tests {
     #[test]
     fn directory_sync_accepts_a_capability_directory_handle() {
         let temporary = tempfile::tempdir().unwrap();
-        let directory =
-            cap_std::fs::Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority())
-                .unwrap();
+        create_private_dir_all(temporary.path()).unwrap();
+        let directory = open_private_dir(temporary.path()).unwrap();
 
         fsync_dir(&directory).unwrap();
     }

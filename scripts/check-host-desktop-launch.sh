@@ -20,6 +20,9 @@
 #      the host-file home root, the cfg-exclusive Unix/Windows upload roots, and
 #      the validated private-directory platform helper used for preview staging.
 #      Any other site would be a new escape from the capability sandbox.
+#      The one raw openat is separately pinned through its capability anchor,
+#      relative path, and flags: it only reopens an already-held directory for
+#      fsync and must never become an ambient CWD-relative open.
 #
 # Deliberately a literal-source check, per docs/GUARD_POLICY.md: it greps for
 # markers, never prose.
@@ -97,6 +100,29 @@ if [[ "$ambient" != "$expected_ambient" ]]; then
   fail "ambient directory authority escaped its reviewed inventory"
 fi
 
+# cap-std holds Linux directories with O_PATH, which fsync rejects. The Unix
+# platform leaf therefore reopens `.` relative to the held capability. Pin the
+# complete raw openat shape as well as its inventory: changing `dir` to CWD or
+# changing `.` to an ambient path would otherwise create a new authority root.
+raw_directory_opens="$(
+  while IFS= read -r file; do
+    awk '
+      /rustix::fs::openat\(/ { remaining = 6 }
+      remaining > 0 { print FILENAME ":" $0; remaining-- }
+    ' "$file"
+  done < <(rg -l --color never 'rustix::fs::openat\(' daemon/src --glob '*.rs' | sort)
+)"
+expected_raw_directory_opens='daemon/src/platform/unix.rs:    let sync_handle = rustix::fs::openat(
+daemon/src/platform/unix.rs:        dir,
+daemon/src/platform/unix.rs:        Path::new("."),
+daemon/src/platform/unix.rs:        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+daemon/src/platform/unix.rs:        rustix::fs::Mode::empty(),
+daemon/src/platform/unix.rs:    )'
+if [[ "$raw_directory_opens" != "$expected_raw_directory_opens" ]]; then
+  printf 'host-desktop-launch: unexpected raw directory opens:\n%s\n' "$raw_directory_opens" >&2
+  fail "raw directory open escaped its reviewed capability-relative shape"
+fi
+
 # 5. The gates on `desktop.open` are all still present.
 for gate in 'not_file' 'open_not_permitted' 'launch_rate_limited' '0o111'; do
   grep -qF "$gate" "$DESKTOP" || fail "missing open gate: $gate"
@@ -118,6 +144,12 @@ self_test() {
     >"$fixture/daemon/src/upload.rs"
   printf '%s\n' \
     '    Dir::open_ambient_dir(path, ambient_authority())' \
+    '    let sync_handle = rustix::fs::openat(' \
+    '        dir,' \
+    '        Path::new("."),' \
+    '        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,' \
+    '        rustix::fs::Mode::empty(),' \
+    '    )' \
     >"$fixture/daemon/src/platform/unix.rs"
 
   HOST_DESKTOP_LAUNCH_ROOT="$fixture" "$script_path" >/dev/null ||
@@ -143,6 +175,16 @@ self_test() {
     fail "self-test: payload parsing in a launch module passed"
   fi
   printf '%s\n' "$original" >"$fixture/daemon/src/host_desktop.rs"
+
+  local original_unix
+  original_unix="$(cat "$fixture/daemon/src/platform/unix.rs")"
+  sed 's/^        dir,$/        rustix::fs::CWD,/' \
+    "$fixture/daemon/src/platform/unix.rs" >"$fixture/unsafe-openat"
+  mv "$fixture/unsafe-openat" "$fixture/daemon/src/platform/unix.rs"
+  if HOST_DESKTOP_LAUNCH_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
+    fail "self-test: an ambient raw directory open passed"
+  fi
+  printf '%s\n' "$original_unix" >"$fixture/daemon/src/platform/unix.rs"
 
   # Removing a gate must fail closed.
   grep -v '0o111' "$fixture/daemon/src/host_desktop.rs" >"$fixture/stripped"
