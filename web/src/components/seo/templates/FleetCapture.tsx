@@ -18,7 +18,7 @@ const ALT =
 export function FleetCapture({ caption }: { caption: string }) {
   return (
     <figure className="min-w-0">
-      <div className="border border-line-strong bg-void">
+      <div className="overflow-hidden rounded-xl bg-void ring-1 ring-line-g">
         {/* Motion-safe: the recording. Reduced motion: the identical still. */}
         <video
           className="block h-auto w-full motion-reduce:hidden"
@@ -42,9 +42,7 @@ export function FleetCapture({ caption }: { caption: string }) {
           alt={ALT}
         />
       </div>
-      <figcaption className="mt-4 font-sigil text-[11px] tracking-[0.18em] text-ash uppercase">
-        {caption}
-      </figcaption>
+      <figcaption className="mt-3 text-[13px] leading-6 text-ash">{caption}</figcaption>
     </figure>
   );
 }

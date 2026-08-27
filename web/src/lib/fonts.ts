@@ -16,11 +16,13 @@ export const poster = Rowdies({
  * The grimoire body face: IBM Plex Sans, self-hosted the same way. Exposed as
  * a CSS variable, mounted on <html> in the root layout, so the `.grimoire`
  * skin's --font-grimoire token (defined at :root) can resolve to it. 400/500
- * are the only weights marketing copy requests.
+ * carry marketing copy; 600 exists for the editorial job pages, whose
+ * sentence-case headings are the grimoire sans at weight rather than the
+ * poster face at size.
  */
 export const grimoire = IBM_Plex_Sans({
   subsets: ["latin"],
-  weight: ["400", "500"],
+  weight: ["400", "500", "600"],
   display: "swap",
   variable: "--font-plex-sans",
 });
