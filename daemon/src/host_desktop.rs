@@ -12,10 +12,11 @@
 //! plus one path the daemon resolved itself. Nothing a client sends can name a
 //! program.
 
+#[cfg(target_os = "macos")]
 use std::path::Path;
-use std::sync::Arc;
 
-use crate::host_files::{FsError, FsResult};
+#[cfg(target_os = "macos")]
+use crate::host_files::FsResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DesktopAction {
@@ -36,6 +37,7 @@ impl DesktopAction {
 
 /// Indirection so tests can assert what *would* have been launched without
 /// opening windows on the machine running them.
+#[cfg(target_os = "macos")]
 pub(crate) trait Launcher: Send + Sync + 'static {
     fn launch(&self, action: DesktopAction, path: &Path) -> FsResult<()>;
 }
@@ -312,7 +314,6 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::Launcher;
     use crate::host_files::{FsError, FsResult, HostFileOperations, HostFileService};
     use std::sync::Arc;
 
@@ -324,10 +325,6 @@ mod imp {
 
     impl DesktopService {
         pub(crate) fn new() -> Self {
-            Self
-        }
-
-        pub(crate) fn with_launcher(_launcher: Arc<dyn Launcher>) -> Self {
             Self
         }
 
@@ -362,11 +359,3 @@ pub(crate) use imp::DesktopService;
 
 /// Whether this build advertises the desktop operations at all.
 pub(crate) const DESKTOP_SUPPORTED: bool = cfg!(target_os = "macos");
-
-#[allow(dead_code)]
-fn _assert_error_type(error: FsError) -> FsError {
-    error
-}
-
-#[allow(dead_code)]
-fn _assert_launcher(_launcher: Arc<dyn Launcher>) {}

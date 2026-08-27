@@ -1117,7 +1117,7 @@ mod tests {
             panic!("expected text gap event")
         };
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&frame).unwrap(),
+            serde_json::from_str::<serde_json::Value>(frame).unwrap(),
             serde_json::json!({"type": "pty_gap", "offset": 42})
         );
     }

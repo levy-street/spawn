@@ -3424,12 +3424,13 @@ async fn enrich_path_from_user_shell(env: &mut BTreeMap<String, String>) {
     prepend_path_entries(env, preferred);
 }
 
+#[cfg(windows)]
+async fn shell_path_entries(_env: &BTreeMap<String, String>) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
 async fn shell_path_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
-    #[cfg(windows)]
-    {
-        let _ = env;
-        return Vec::new();
-    }
     #[cfg(unix)]
     for shell in candidate_shells(env) {
         let mut entries = Vec::new();
@@ -3442,6 +3443,8 @@ async fn shell_path_entries(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
             return entries;
         }
     }
+    #[cfg(not(unix))]
+    let _ = env;
     Vec::new()
 }
 
@@ -3802,6 +3805,26 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_tungstenite::tungstenite::http::{header::SEC_WEBSOCKET_PROTOCOL, HeaderValue};
 
+    #[derive(Clone, Copy)]
+    struct SelectDaemonSubprotocol;
+
+    impl tokio_tungstenite::tungstenite::handshake::server::Callback for SelectDaemonSubprotocol {
+        fn on_request(
+            self,
+            _request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+            mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+        ) -> std::result::Result<
+            tokio_tungstenite::tungstenite::handshake::server::Response,
+            tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+        > {
+            response.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_static("spawn.control.v3"),
+            );
+            Ok(response)
+        }
+    }
+
     /// Chain scope comes from this host's own approval proofs first; the
     /// server's account only fills in while no pin carries one, and never
     /// displaces a proven value.
@@ -4094,7 +4117,7 @@ mod tests {
         let signer = build_rtc_answer_signer(&record, &verified)
             .unwrap()
             .expect("answer signer");
-        let answer_wire = (&signer)("v=0\r\no=daemon\r\n").expect("sign answer");
+        let answer_wire = signer("v=0\r\no=daemon\r\n").expect("sign answer");
         let browser_peer = public_key_from_wire(&browser_pub_wire).unwrap();
         let answer = verify_rtc_signal_wire(&answer_wire, &host_peer, &browser_peer)
             .expect("browser verifies the daemon answer");
@@ -6050,19 +6073,9 @@ mod tests {
         let ws_url = config::ws_url(&server_url).unwrap();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_hdr_async(
-                tcp,
-                |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                    response.headers_mut().insert(
-                        SEC_WEBSOCKET_PROTOCOL,
-                        HeaderValue::from_static("spawn.control.v3"),
-                    );
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(tcp, SelectDaemonSubprotocol)
+                .await
+                .unwrap();
             socket.next().await.unwrap().unwrap();
             socket.close(None).await.unwrap();
         });

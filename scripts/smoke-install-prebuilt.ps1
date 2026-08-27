@@ -148,6 +148,12 @@ try {
     $installerResponse = Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/install.ps1"
     Assert-Equal $installerResponse.StatusCode 200 'install.ps1 status'
     $source = [string] $installerResponse.Content
+    if ($source -match '(?i)\$iswindows\b') {
+        throw 'smoke-install-prebuilt: install.ps1 assigns PowerShell automatic variable $IsWindows'
+    }
+    if ($source -notmatch '\$spawnPlatformIsWindows\b') {
+        throw 'smoke-install-prebuilt: install.ps1 is missing its collision-safe platform check'
+    }
     $tokens = $null
     $parseErrors = $null
     [Management.Automation.Language.Parser]::ParseInput(

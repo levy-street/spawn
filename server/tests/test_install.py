@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import threading
@@ -966,6 +967,40 @@ async def test_install_powershell_renders_hash_pinned_script(client, monkeypatch
     assert "& $spawndPath --server $Server possess" in response.text
     assert "Unblock-File -LiteralPath $stagedSpawnd" in response.text
     assert "[Environment]::SetEnvironmentVariable('Path', $newPath, 'User')" in response.text
+    assert "$spawnPlatformIsWindows" in response.text
+    assigned_variables = {
+        match.group(1).casefold()
+        for match in re.finditer(
+            r"(?mi)^\s*\$([a-z_][a-z0-9_]*)\s*=", response.text
+        )
+    }
+    readonly_automatic_variables = {
+        "args",
+        "error",
+        "foreach",
+        "home",
+        "host",
+        "input",
+        "iscoreclr",
+        "islinux",
+        "ismacos",
+        "iswindows",
+        "matches",
+        "myinvocation",
+        "nestedpromptlevel",
+        "null",
+        "pid",
+        "psedition",
+        "pshome",
+        "psversiontable",
+        "pwd",
+        "shellid",
+        "stacktrace",
+        "this",
+        "true",
+        "false",
+    }
+    assert assigned_variables.isdisjoint(readonly_automatic_variables)
     assert f"spawnd:windows-x86_64) printf %s {spawnd_sha.lower()} ;;" in shell.text
     assert f"spawn-worker:windows-x86_64) printf %s {worker_sha.lower()} ;;" in shell.text
 

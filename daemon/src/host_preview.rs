@@ -33,6 +33,7 @@ pub(crate) const PREVIEW_PIXEL_SIZES: [u32; 4] = [128, 256, 512, 1024];
 pub(crate) const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
 /// Concurrent renders. Deliberately small and separate from the file-service
 /// long-task budget.
+#[cfg(target_os = "macos")]
 pub(crate) const PREVIEW_RENDER_PERMITS: usize = 2;
 
 pub(crate) struct PreviewImage {
@@ -100,6 +101,7 @@ impl PreviewService {
     /// daemon. It is safe in a way the home root is not: the client can never
     /// name this directory, never list it, and never remove anything from it,
     /// because it lives outside the capability root entirely.
+    #[cfg(target_os = "macos")]
     pub(crate) fn new(renderer: Arc<dyn PreviewRenderer>) -> FsResult<Self> {
         let base = std::env::temp_dir().join(format!("spawn-preview-{}", uuid::Uuid::new_v4()));
         let stage_display = base.join("in");
@@ -388,12 +390,14 @@ fn sanitized_extension(name: &str) -> Option<String> {
     Some(extension)
 }
 
+#[cfg(target_os = "macos")]
 fn create_private_dir(path: &Path) -> FsResult<()> {
     crate::platform::create_private_dir_all(path)
         .map_err(|_| FsError::new("io_error", "could not create the preview staging directory"))
 }
 
 /// Open the staging directory and prove it is ours before trusting it.
+#[cfg(target_os = "macos")]
 fn open_private_dir(path: &Path) -> FsResult<cap_std::fs::Dir> {
     crate::platform::open_private_dir(path)
         .map_err(|_| FsError::new("io_error", "could not open the preview staging directory"))

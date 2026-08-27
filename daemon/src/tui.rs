@@ -1484,10 +1484,12 @@ mod tests {
         );
         // A narrow terminal must report its real width, not a padded one, or
         // every frame line wraps and the rewind math drifts.
-        assert!(
-            MIN_FRAME_COLUMNS > 20,
-            "the stand-down threshold must bite first"
-        );
+        const {
+            assert!(
+                MIN_FRAME_COLUMNS > 20,
+                "the stand-down threshold must bite first"
+            );
+        }
     }
 
     #[test]

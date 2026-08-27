@@ -37,6 +37,7 @@ use spawnd::signed_signal_wire::{sign_rtc_signal_wire, RtcProtocol};
 const KEYRING_SERVICE: &str = "spawn";
 /// Pre-scoping releases used this global account. Only the canonical default
 /// config directory may probe it for a one-time, conflict-checked migration.
+#[cfg(any(not(windows), test))]
 const KEYRING_USER: &str = "daemon";
 const KEYRING_SCOPED_USER_PREFIX: &str = "daemon:";
 
@@ -889,6 +890,7 @@ pub(crate) fn validate_live_record(creds: &StoredCreds) -> Result<()> {
     validate_complete_current_record(creds)
 }
 
+#[cfg(any(not(windows), test))]
 fn reconcile_backend_records(
     from_file: Option<StoredCreds>,
     from_keyring: Option<StoredCreds>,
@@ -975,6 +977,7 @@ fn record_is_empty(creds: &StoredCreds) -> bool {
         && creds.browser_pins.is_empty()
 }
 
+#[cfg(any(not(windows), test))]
 fn choose_complete_record(
     mut file: StoredCreds,
     mut keyring: StoredCreds,
@@ -993,6 +996,7 @@ fn choose_complete_record(
     Ok(file)
 }
 
+#[cfg(any(not(windows), test))]
 fn reconcile_legacy_records(
     mut file: StoredCreds,
     mut keyring: StoredCreds,
@@ -1039,6 +1043,7 @@ fn reconcile_legacy_records(
 /// account into the canonical default directory's scoped account. Unlike
 /// ordinary Unix reconciliation, migration never silently prefers one side:
 /// every overlapping field and pin must agree.
+#[cfg(any(not(windows), test))]
 fn legacy_migration_record(
     from_file: Option<StoredCreds>,
     mut legacy_keyring: StoredCreds,
@@ -1100,6 +1105,7 @@ fn legacy_migration_record(
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn legacy_record_is_subset(subset: &StoredCreds, complete: &StoredCreds) -> bool {
     fn field_is_subset<T: PartialEq>(subset: &Option<T>, complete: &Option<T>) -> bool {
         subset
@@ -1119,6 +1125,7 @@ fn legacy_record_is_subset(subset: &StoredCreds, complete: &StoredCreds) -> bool
             .all(|pin| complete.browser_pins.contains(pin))
 }
 
+#[cfg(any(not(windows), test))]
 fn reconcile_legacy_records_strict(
     mut file: StoredCreds,
     mut keyring: StoredCreds,
@@ -1150,6 +1157,7 @@ fn reconcile_legacy_records_strict(
     Ok(file)
 }
 
+#[cfg(any(not(windows), test))]
 fn merge_legacy_field<T: PartialEq>(
     target: &mut Option<T>,
     source: &mut Option<T>,
@@ -1439,6 +1447,7 @@ fn save_file_for_platform(creds: &StoredCreds) -> Result<()> {
     result
 }
 
+#[cfg(any(not(windows), test))]
 fn file_creds_without_private_seed(creds: &StoredCreds) -> StoredCreds {
     // Construct this field-by-field: cloning the whole value would transiently
     // copy the private seed before replacing it with None.
@@ -1739,6 +1748,7 @@ fn keyring_entry(user: &str) -> Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, user).context("constructing keyring entry")
 }
 
+#[cfg(any(not(windows), test))]
 fn keyring_get_for_user(user: &str) -> Result<Option<String>> {
     let entry = keyring_entry(user)?;
     match entry.get_password() {
@@ -1748,6 +1758,7 @@ fn keyring_get_for_user(user: &str) -> Result<Option<String>> {
     }
 }
 
+#[cfg(any(not(windows), test))]
 #[derive(Debug)]
 struct KeyringReadFailure {
     error: anyhow::Error,
@@ -1756,6 +1767,7 @@ struct KeyringReadFailure {
     unavailable: bool,
 }
 
+#[cfg(not(windows))]
 fn read_scoped_keyring_record(
     scope: &KeyringScope,
     from_file: Option<&StoredCreds>,
@@ -1771,6 +1783,7 @@ fn read_scoped_keyring_record(
     )
 }
 
+#[cfg(any(not(windows), test))]
 fn read_scoped_keyring_record_with<G, S, D>(
     scope: &KeyringScope,
     from_file: Option<&StoredCreds>,
@@ -1835,6 +1848,7 @@ where
     Ok(Some(migrated))
 }
 
+#[cfg(any(not(windows), test))]
 fn decode_keyring_value(value: &str) -> Result<StoredCreds> {
     if value.len() > MAX_CREDENTIALS_FILE_BYTES {
         bail!("stored keyring credential bundle is too large")
@@ -1864,6 +1878,7 @@ fn decode_keyring_value(value: &str) -> Result<StoredCreds> {
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn decode_keyring_value_and_wipe(value: &mut String) -> Result<StoredCreds> {
     let decoded = decode_keyring_value(value);
     value.zeroize();
@@ -1909,6 +1924,7 @@ fn keyring_delete() -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(not(windows), test))]
 fn delete_keyring_scope_with<D>(scope: &KeyringScope, mut delete: D) -> Result<()>
 where
     D: FnMut(&str) -> Result<()>,
@@ -1929,6 +1945,7 @@ where
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn keyring_delete_for_user(user: &str) -> Result<()> {
     let entry = keyring_entry(user)?;
     match entry.delete_credential() {
@@ -2117,13 +2134,14 @@ fn zeroize_stored_creds(creds: &mut StoredCreds) {
     creds.wipe_sensitive_fields();
 }
 
+#[cfg(windows)]
 fn validate_credential_directory(path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        return crate::platform::validate_private_dir(path)
-            .with_context(|| format!("validating credential directory {}", path.display()));
-    }
+    crate::platform::validate_private_dir(path)
+        .with_context(|| format!("validating credential directory {}", path.display()))
+}
 
+#[cfg(not(windows))]
+fn validate_credential_directory(path: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("inspecting credential directory {}", path.display()))?;
     if !metadata.file_type().is_dir() {
@@ -4285,7 +4303,7 @@ mod tests {
         .unwrap();
 
         assert!(!keyring_called.get());
-        assert_eq!(load_file_at(&path).unwrap(), creds);
+        assert!(load_file_at(&path).unwrap() == creds);
         assert_eq!(creds.browser_pins().len(), 2);
         crate::platform::open_private_file(&path, false).unwrap();
     }
