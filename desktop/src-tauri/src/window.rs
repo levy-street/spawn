@@ -76,17 +76,21 @@ const MACOS_USER_AGENT: &str = concat!(
     "SpawnDesktop/",
     env!("CARGO_PKG_VERSION"),
 );
-// The gates are two columns — masthead ranged against the plate — from 1024px
-// up (`src/styles.css`), which is the web's own breakpoint. Below it they
-// stack, so a window narrower than that silently gave the app a layout the
-// browser never shows. 384 head + 576 plate + 64 gap + 80 padding = 1104.
-const WIZARD_SIZE: (f64, f64) = (1120.0, 840.0);
-const WIZARD_MIN_SIZE: (f64, f64) = (760.0, 640.0);
+// One window, one size. The wizard used to open at a fixed 1120×840 and the
+// product then resized it on the way in, so possession ended with the window
+// jumping to another shape — two apps' worth of furniture for one app. Both
+// faces now open at [`window_size`], and neither resizes the other's window.
+//
+// The floor is the wizard's, which is the lower of the two: its gates are two
+// columns from 1024px up (`src/styles.css`, the web's own breakpoint) and
+// stack below it, so it survives being made small in a way the product's
+// preferred width does not have to.
+const WINDOW_MIN_SIZE: (f64, f64) = (760.0, 640.0);
 const PRODUCT_MIN_WIDTH: f64 = 1100.0;
 const PRODUCT_MIN_HEIGHT: f64 = 720.0;
 const PRODUCT_MAX_WIDTH: f64 = 1680.0;
 const PRODUCT_MAX_HEIGHT: f64 = 1050.0;
-/// The share of the screen's work area the product takes.
+/// The share of the screen's work area the window takes.
 const PRODUCT_SHARE: f64 = 0.92;
 
 /// Where the wizard lives — `tauri://localhost` in a build, the dev server
@@ -98,10 +102,11 @@ pub fn create(app: &App) -> Result<WebviewWindow> {
     let allowed_home = home.clone();
     let opener = app.handle().clone();
     let popup_opener = app.handle().clone();
+    let (width, height) = window_size(app.handle());
     let builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
         .title("SPAWN D")
-        .inner_size(WIZARD_SIZE.0, WIZARD_SIZE.1)
-        .min_inner_size(WIZARD_MIN_SIZE.0, WIZARD_MIN_SIZE.1)
+        .inner_size(width, height)
+        .min_inner_size(WINDOW_MIN_SIZE.0, WINDOW_MIN_SIZE.1)
         .center()
         .visible(false);
     // WebView2 must keep the runtime's real Edge identity. Its platform helper
@@ -243,9 +248,9 @@ pub async fn show_product(app: &AppHandle) -> Result<()> {
             crate::platform::THIS_COMPUTER
         );
     }
-    let (width, height) = product_size(app);
-    let _ = window.set_size(LogicalSize::new(width, height));
-    let _ = window.center();
+    // Deliberately no resize and no re-centre: the window is already the size
+    // both faces open at, and moving it out from under someone who put it
+    // where they wanted it is not a thing an app should do on a navigation.
     let mut target = origin.clone();
     let carried = Carried {
         session: carry_in_page,
@@ -577,8 +582,6 @@ pub fn show_wizard(app: &AppHandle, surface: Option<&str>) -> Result<()> {
         // surface in the hash for the page to read on load.
         let mut target = home;
         target.set_fragment(surface);
-        let _ = window.set_size(LogicalSize::new(WIZARD_SIZE.0, WIZARD_SIZE.1));
-        let _ = window.center();
         window
             .navigate(target)
             .context("returning to the SPAWN D wizard")?;
@@ -614,10 +617,11 @@ fn packaged_wizard_home() -> Url {
     Url::parse(WIZARD_HOME).expect("the fixed wizard origin parses")
 }
 
-/// Most of the screen, never more than it: a wall of terminals wants room,
-/// so the product takes the work area less a margin, capped so a large
-/// display gets a large window rather than a wall-to-wall one.
-fn product_size(app: &AppHandle) -> (f64, f64) {
+/// Most of the screen, never more than it: a wall of terminals wants room, so
+/// the window takes the work area less a margin, capped so a large display
+/// gets a large window rather than a wall-to-wall one. Both faces open at
+/// this size — see [`WINDOW_MIN_SIZE`].
+fn window_size(app: &AppHandle) -> (f64, f64) {
     let Ok(Some(monitor)) = app.primary_monitor() else {
         return (1440.0, 900.0);
     };
@@ -693,7 +697,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_product_takes_most_of_the_screen_and_never_more() {
+    fn the_window_takes_most_of_the_screen_and_never_more() {
         // A 14-inch MacBook Pro's work area, in points.
         assert_eq!(fit(1512.0, 945.0), (1391.0, 869.0));
         // A small external display: the minimums win, and still fit.
