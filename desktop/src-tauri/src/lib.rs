@@ -1,4 +1,5 @@
 mod api;
+mod app_window;
 mod auth;
 mod crypto;
 mod install;
@@ -10,10 +11,12 @@ mod trust;
 mod updater_config;
 
 use models::{
-    AuthOutcome, DesktopPreferences, DeviceApprovalProgress, LocalStatus, PossessionProgress,
+    AccountState, AuthConfig, AuthOutcome, DesktopPreferences, DeviceApprovalProgress, LocalStatus,
+    PossessionProgress,
 };
 use serde::Serialize;
 use tauri::{Manager, RunEvent, WindowEvent};
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_updater::UpdaterExt;
 
 #[derive(Default)]
@@ -22,8 +25,11 @@ struct AppServices {
     possession: install::PossessionManager,
 }
 
+/// The whole chain, outermost context first, so the window can show both what
+/// the app was doing and what the server said: "checking your account: invalid
+/// credentials" rather than one half or the other.
 fn command_error(error: impl std::fmt::Display) -> String {
-    error.to_string()
+    format!("{error:#}")
 }
 
 #[tauri::command]
@@ -43,6 +49,23 @@ fn choose_server(server_url: &str) -> Result<String, String> {
     }
     storage::save_preferences(&preferences).map_err(command_error)?;
     Ok(normalized)
+}
+
+#[tauri::command]
+async fn auth_config(origin: &str) -> Result<AuthConfig, String> {
+    auth::auth_config(origin).await.map_err(command_error)
+}
+
+#[tauri::command]
+async fn account_state() -> Result<AccountState, String> {
+    auth::account_state().await.map_err(command_error)
+}
+
+#[tauri::command]
+async fn request_email_verification() -> Result<(), String> {
+    auth::request_email_verification()
+        .await
+        .map_err(command_error)
 }
 
 #[tauri::command]
@@ -219,6 +242,11 @@ fn sign_out() -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn open_app(app: tauri::AppHandle) -> Result<(), String> {
+    app_window::open(&app).await.map_err(command_error)
+}
+
+#[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
@@ -234,6 +262,16 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             tray::install(app)?;
+            // A sign-in that went out to the system browser comes back on the
+            // `spawn://` scheme while this window may well be hidden; surface it
+            // so the person sees the wizard pick up, not a silent menu-bar app.
+            let handle = app.handle().clone();
+            app.deep_link().on_open_url(move |_event| {
+                if let Some(window) = handle.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            });
             if let Some(window) = app.get_webview_window("main") {
                 let close_window = window.clone();
                 window.on_window_event(move |event| {
@@ -242,10 +280,19 @@ pub fn run() {
                         let _ = close_window.hide();
                     }
                 });
-                if !storage::load_preferences()
+                if storage::load_preferences()
                     .unwrap_or_default()
                     .first_run_complete
                 {
+                    // This Mac is possessed: the product opens, the wizard
+                    // stays in the menu bar for settings and repair.
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(error) = app_window::open(&handle).await {
+                            eprintln!("app window: {error:#}");
+                        }
+                    });
+                } else {
                     window.show()?;
                     window.set_focus()?;
                 }
@@ -255,6 +302,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_preferences,
             choose_server,
+            auth_config,
+            account_state,
+            request_email_verification,
             password_login,
             password_signup,
             oauth_start_url,
@@ -273,6 +323,7 @@ pub fn run() {
             check_app_update,
             install_app_update,
             sign_out,
+            open_app,
             quit_app
         ])
         .build(tauri::generate_context!())

@@ -30,6 +30,10 @@ impl Default for DesktopPreferences {
 pub struct UserOut {
     pub id: String,
     pub email: String,
+    /// Set once the address is confirmed. `None` on a server that predates
+    /// verification, which is also what "not required" looks like.
+    #[serde(default)]
+    pub email_verified_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -39,8 +43,30 @@ pub struct TokenResponse {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+pub struct MeResponse {
+    pub user: UserOut,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct SessionRenewResponse {
     pub access_token: String,
+}
+
+/// `GET /api/auth/config`: the sign-in surface's one-shot configuration, the
+/// same shape the browser and the phone read. Every field defaults so an older
+/// server that omits one reads as "off" rather than as a decode failure.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    pub providers: Vec<AuthProvider>,
+    pub email_verification_required: bool,
+    pub invite_only: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AuthProvider {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -49,6 +75,15 @@ pub struct AuthOutcome {
     pub email: String,
     pub device_id: String,
     pub approval_required: bool,
+    pub email_verified: bool,
+}
+
+/// What the wizard needs to know about the signed-in account when it resumes:
+/// enough to pick the gate, nothing it would have to store.
+#[derive(Clone, Debug, Serialize)]
+pub struct AccountState {
+    pub email: String,
+    pub email_verified: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

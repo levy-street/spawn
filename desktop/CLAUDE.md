@@ -1,8 +1,10 @@
 # Working agreements for desktop/
 
-The macOS SPAWN D companion. It is a Tauri v2, menu-bar-only app: a small
-local wizard installs and possesses the current Mac, while the browser remains
-the place where people run sessions. Read the repo root `CLAUDE.md` first.
+The macOS SPAWN D app. It is a Tauri v2 app with two faces: a local wizard
+that signs you in, installs the daemon and possesses this Mac, and then the
+product itself — the web app from the chosen server, opened in a window this
+app owns, already signed in. Between uses it lives in the menu bar. Read the
+repo root `CLAUDE.md` first.
 
 ## Layout
 
@@ -11,22 +13,49 @@ src/             bundled vanilla HTML, TypeScript and CSS; never remote code
   assets/        vendored brand art and the two brand faces
     fonts/       IBM Plex Sans and Rowdies, latin subsets, with their OFL
 src-tauri/
-  src/           Rust commands, API client, trust ceremonies and tray shell
-  capabilities/  least-privilege Tauri capability declarations
+  src/           Rust commands, API client, trust ceremonies, the app window
+                 (app_window.rs) and the tray shell
+  capabilities/  least-privilege Tauri capability declarations; the main
+                 window only — the app window gets no IPC at all
+  dmg/           the disk image's window: background.html is the source,
+                 render.mjs prints it to background.png at 2× / 144 dpi
   icons/         icon.icns / icon.png (bundle) and tray.png / tray@2x.png
   Cargo.toml     standalone crate; links ../../daemon as a library
   tauri.conf.json
   tauri.ci.conf.json  release-only DMG target override
 ```
 
-## The app wears the product's brand, not its own
+## The wizard is the browser's funnel, printed locally
 
 Someone signs up in the browser and installs this app an hour later. It has to
-read as one product, so `src/styles.css` is the web's brand system restated in
-plain CSS, not an approximation of it: the grimoire palette and the pressroom's
-control voice from `web/src/app/globals.css`, and the altar plate and press
-furniture from `web/src/components/onboarding/auth-shell.tsx` and
-`web/src/components/brand/press.tsx`. When one of those changes, this follows.
+read as one product, so the wizard is the web's own account surface restated,
+not a cousin of it:
+
+- The screens are `/login` and `/signup` (`web/src/app/{login,signup}`), then
+  the onboarding gates in the browser's order — account, verify, host, done
+  (`web/src/components/onboarding/{step-machine,onboarding-flow}.tsx`) — with
+  one gate the browser never needs, the device approval, slotted in only when
+  the account already has a device. Copy is the web's copy; where this app does
+  something the browser cannot (install the daemon itself), the words say so.
+- Sign-in options come from `GET /api/auth/config` at sign-in time, never from
+  a list in the app: providers in the server's order, the invite field only on
+  an invite-only server, the verify gate only when the server will enforce it.
+- OAuth goes out to the system browser and comes back on `spawn://auth/oauth`,
+  the one native redirect every server release admits (the phone uses the same
+  one). A native `error=invite_required` shows the invite field, as the browser
+  does.
+- `src/styles.css` is `web/src/components/onboarding/auth-shell.tsx` and the
+  `.pressroom` rules in `web/src/app/globals.css` in plain CSS — the altar
+  plate under the same scrim, the stacked column for sign-in, the split
+  masthead for the gates, the bone slab, the hairline plate. When one of those
+  changes, this follows.
+
+Once this Mac is possessed the product is the web app, and the app opens it in
+its own window (`src-tauri/src/app_window.rs`) from the chosen origin: the
+wizard's session becomes the browser session by way of the cookie the server
+sets on renewal, the page gets no IPC, and any navigation off the origin opens
+in the system browser. Nothing of the web build is bundled here, so the app
+can never drift from the server it talks to.
 
 The rules that palette carries are load-bearing:
 
@@ -69,8 +98,14 @@ menu bar.
 npm install
 cargo tauri dev
 cargo tauri build
+npm run dmg:background      # after editing src-tauri/dmg/background.html
 cd src-tauri && cargo fmt && cargo build && cargo test && cargo clippy -- -D warnings
 ```
+
+The wizard can be driven in a plain browser by faking the Tauri bridge
+(`window.__TAURI_INTERNALS__`) under Vite with `root` set to this folder — the
+way its screens are reviewed without a build; see the memory note on the
+desktop screenshot harness.
 
 For the beta updater channel, build with
 `cargo tauri build --features beta-updates --config

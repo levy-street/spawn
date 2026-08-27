@@ -59,6 +59,59 @@ impl ApiClient {
         self.send_json(method, path, body, Some(&token)).await
     }
 
+    pub async fn anonymous_get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.send::<T>(self.client.get(self.url(path)?)).await
+    }
+
+    /// A POST whose success is `204 No Content`; only a failure carries a body.
+    pub async fn authenticated_post_no_content(&self, path: &str) -> Result<()> {
+        let token = storage::token(self.origin.as_str().trim_end_matches('/'))?;
+        let response = self
+            .client
+            .post(self.url(path)?)
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .context("reaching the SPAWN D server")?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .context("reading the SPAWN D response")?;
+        bail!("{}", error_detail(status, &bytes))
+    }
+
+    /// A POST whose response headers matter as much as its body — the one
+    /// place that is the session renewal, whose `Set-Cookie` seeds the app
+    /// window.
+    pub async fn authenticated_post_with_headers<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<(T, reqwest::header::HeaderMap)> {
+        let token = storage::token(self.origin.as_str().trim_end_matches('/'))?;
+        let response = self
+            .client
+            .post(self.url(path)?)
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .context("reaching the SPAWN D server")?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response
+            .bytes()
+            .await
+            .context("reading the SPAWN D response")?;
+        if !status.is_success() {
+            bail!("{}", error_detail(status, &bytes))
+        }
+        let body = serde_json::from_slice(&bytes).context("decoding the SPAWN D response")?;
+        Ok((body, headers))
+    }
+
     pub async fn authenticated_get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
         let token = storage::token(self.origin.as_str().trim_end_matches('/'))?;
         self.send::<T>(self.client.get(self.url(path)?).bearer_auth(token.as_str()))
@@ -100,15 +153,7 @@ impl ApiClient {
             .await
             .context("reading the SPAWN D response")?;
         if !status.is_success() {
-            let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|value| value.get("detail").cloned())
-                .map(|value| match value {
-                    serde_json::Value::String(text) => text,
-                    other => other.to_string(),
-                })
-                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            bail!("{detail}")
+            bail!("{}", error_detail(status, &bytes))
         }
         serde_json::from_slice(&bytes).context("decoding the SPAWN D response")
     }
@@ -133,5 +178,32 @@ impl ApiClient {
             bail!("SPAWN D server returned HTTP {status}")
         }
         Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+}
+
+/// The server's own words for a failure, so the window can show the same
+/// message the browser would. A rate limit is the one status the wizard
+/// treats differently from every other refusal, so it stays recognisable.
+fn error_detail(status: StatusCode, bytes: &[u8]) -> String {
+    let detail = serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| value.get("detail").cloned())
+        .map(|value| match value {
+            serde_json::Value::String(text) => text,
+            other => other.to_string(),
+        })
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| {
+            let raw = String::from_utf8_lossy(bytes).trim().to_owned();
+            if raw.is_empty() {
+                format!("SPAWN D server returned HTTP {status}")
+            } else {
+                raw
+            }
+        });
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        format!("too many requests: {detail}")
+    } else {
+        detail
     }
 }
