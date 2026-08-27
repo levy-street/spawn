@@ -1136,6 +1136,19 @@ mod windows {
     const WORKER_BIN: &str = env!("CARGO_BIN_EXE_spawn-worker");
     const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
+    fn test_runner_denied_worker_breakaway(error: &anyhow::Error) -> bool {
+        let breakaway_denied = error
+            .chain()
+            .any(|cause| cause.to_string() == "worker breakaway launch was denied");
+        let access_denied = error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
+            })
+        });
+        breakaway_denied && access_denied
+    }
+
     async fn read_frame(stream: &mut endpoint::SupervisorSideStream) -> (u8, Vec<u8>) {
         tokio::time::timeout(STEP_TIMEOUT, wire::read_frame(stream))
             .await
@@ -1147,11 +1160,11 @@ mod windows {
     async fn launch_and_connect(
         worker_dir: &Path,
         session_id: Uuid,
-    ) -> (
+    ) -> anyhow::Result<(
         endpoint::SpawnedWorker,
         endpoint::Endpoint,
         endpoint::SupervisorSideStream,
-    ) {
+    )> {
         let worker_endpoint = endpoint::endpoint_for(worker_dir, "", session_id).unwrap();
         let reservation = match endpoint::try_reserve(&worker_endpoint).unwrap() {
             endpoint::LockAttempt::Acquired(reservation) => reservation,
@@ -1170,7 +1183,7 @@ mod windows {
             OsString::from("--reservation-handle"),
             OsString::from(reservation.raw_value().to_string()),
         ];
-        let worker = endpoint::spawn_worker(Path::new(WORKER_BIN), &args, &reservation).unwrap();
+        let worker = endpoint::spawn_worker(Path::new(WORKER_BIN), &args, &reservation)?;
         drop(reservation);
         let stream =
             endpoint::connect_main(&worker_endpoint, tokio::time::Instant::now() + STEP_TIMEOUT)
@@ -1180,7 +1193,7 @@ mod windows {
             endpoint::try_reserve(&worker_endpoint).unwrap(),
             endpoint::LockAttempt::Busy
         ));
-        (worker, worker_endpoint, stream)
+        Ok((worker, worker_endpoint, stream))
     }
 
     #[test]
@@ -1235,8 +1248,17 @@ mod windows {
         .unwrap();
 
         let session_id = Uuid::new_v4();
-        let (_worker, worker_endpoint, mut stream) =
-            launch_and_connect(&worker_dir, session_id).await;
+        let launched = launch_and_connect(&worker_dir, session_id).await;
+        let (_worker, worker_endpoint, mut stream) = match launched {
+            Ok(launched) => launched,
+            Err(error) if test_runner_denied_worker_breakaway(&error) => {
+                eprintln!(
+                    "skipping real worker end-to-end case: the test runner job denies worker breakaway"
+                );
+                return;
+            }
+            Err(error) => panic!("launch worker fixture: {error:#}"),
+        };
         let (frame_type, payload) = read_frame(&mut stream).await;
         assert_eq!(frame_type, wire::T_HELLO);
         let hello: wire::Hello = wire::decode_json(&payload).unwrap();
