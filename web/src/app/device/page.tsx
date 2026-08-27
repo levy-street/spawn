@@ -51,11 +51,7 @@ function DeviceApprovalBody() {
   return (
     <main className="mx-auto w-full max-w-xl space-y-4 p-4 @md/shell:p-6">
       {restored ? (
-        <ConnectHostSection
-          autoLoadFromUrl
-          mintSetupClaim={false}
-          onPairingApproved={() => setApproved(true)}
-        />
+        <ConnectHostSection autoLoadFromUrl onPairingApproved={() => setApproved(true)} />
       ) : (
         <div className="flex min-h-40 items-center justify-center text-sm text-muted-foreground">
           Restoring approval…

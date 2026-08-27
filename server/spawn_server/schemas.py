@@ -74,23 +74,6 @@ class SessionTokenResponse(BaseModel):
     access_token: str
 
 
-class SetupClaimCreateResponse(BaseModel):
-    token: str
-    expires_in: int
-    expires_at: datetime
-
-
-class SetupClaimOut(BaseModel):
-    status: Literal["pending", "ready", "approved", "failed"]
-    approval_ref: str | None = None
-    host_name: str | None = None
-    os: str | None = None
-    host_key_fingerprint: str | None = None
-    host_id: str | None = None
-    error: Literal["expired", "denied", "key_conflict", "pin_conflict", "pin_limit"] | None = None
-    expires_at: datetime
-
-
 # ---------- browser devices ----------
 
 
@@ -352,28 +335,13 @@ class DeviceStartRequest(BaseModel):
     # Committed-ephemeral SAS: the daemon's commitment Cd = H(domain ‖ H ‖ Nd),
     # opaque to the server. Absent from a pre-SAS daemon.
     sas_commit: str | None = Field(default=None, min_length=43, max_length=43)
-    setup_token: str | None = Field(default=None, min_length=43, max_length=43)
+    # Accepted and ignored for compatibility with older daemons.
+    setup_token: str | None = None
 
     @field_validator("host_public_key")
     @classmethod
     def validate_public_key(cls, value: str) -> str:
         decode_host_public_key("ed25519", value)
-        return value
-
-    @field_validator("setup_token")
-    @classmethod
-    def validate_setup_token(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        try:
-            import base64
-
-            decoded = base64.b64decode(value + "=", altchars=b"-_", validate=True)
-        except (ValueError, TypeError):
-            raise ValueError("setup_token must be unpadded base64url") from None
-        canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
-        if len(decoded) != 32 or canonical != value:
-            raise ValueError("setup_token must encode 32 bytes")
         return value
 
 
@@ -428,7 +396,6 @@ class DevicePossessionRequest(BaseModel):
 class DevicePossessionResponse(BaseModel):
     verified: Literal[True]
     version: Literal[1]
-    attended: bool = False
 
 
 class DevicePollRequest(BaseModel):

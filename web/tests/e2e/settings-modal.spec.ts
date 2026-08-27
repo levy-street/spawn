@@ -54,6 +54,19 @@ test("the connect flow lives on its own page, reached from the legion", async ({
   await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
 });
 
+test("the legion add-machine flow waits after copying the plain command", async ({ page }) => {
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await mockApp(page, { hosts: [host] });
+  await page.goto("/legion");
+  await page.getByRole("button", { name: "Add a machine", exact: true }).first().click();
+
+  const dialog = page.getByRole("dialog", { name: "Add a machine" });
+  await expect(dialog.getByText(/curl -fsSL .*install\.sh \| sh$/)).toBeVisible();
+  await expect(dialog.getByText("After installation, run")).toContainText("spawnd possess");
+  await dialog.getByRole("button", { name: "Copy install command" }).click();
+  await expect(dialog.getByText("Waiting for your machine…")).toBeVisible();
+});
+
 test("Agents keeps built-ins read-only and round-trips a custom definition", async ({ page }) => {
   const store = await mockApp(page, {
     agents: [

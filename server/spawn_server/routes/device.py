@@ -18,14 +18,8 @@ from ..host_identity import host_key_fingerprint
 from ..host_key_claims import create_or_lock_host_key_claim, lock_host_key_claim
 from ..host_pair_approval import verify_host_pair_approval_proof
 from ..host_pair_possession import verify_host_pair_possession_proof
-from ..models import BrowserDevice, DeviceCode, Host, HostBrowserPin, SetupClaim, User
+from ..models import BrowserDevice, DeviceCode, Host, HostBrowserPin, User
 from ..pin_liveness import live_browser_device_id_set
-from ..push import schedule_pairing_push
-from ..trust_events import (
-    pair_requested_payload,
-    pair_resolved_payload,
-    publish_trust_event,
-)
 
 router = APIRouter(prefix="/api/auth/device", tags=["device"])
 
@@ -93,113 +87,7 @@ async def _expire_device_code(
         .values(status="expired", last_polled_at=now)
         .execution_options(synchronize_session=False)
     )
-    await _commit_setup_resolution(session, device_code, "expired", now=now)
-
-
-async def _resolve_setup_claim(
-    session: AsyncSession,
-    device_code: str,
-    outcome: str,
-    *,
-    host_id: str | None = None,
-    now: datetime | None = None,
-) -> tuple[str, dict[str, object]] | None:
-    """Resolve the routing claim bound to a terminal ceremony, if any."""
-
-    resolved_at = now or _utcnow()
-    claim = (
-        await session.execute(
-            select(SetupClaim)
-            .where(
-                SetupClaim.device_code_id == device_code,
-                SetupClaim.status.in_(("pending", "ready")),
-            )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if claim is None or claim.approval_ref is None:
-        return None
-    if outcome == "approved":
-        claim.status = "approved"
-        claim.error = None
-        claim.host_id = host_id
-    else:
-        claim.status = "failed"
-        claim.error = outcome
-        claim.host_id = None
-    claim.resolved_at = resolved_at
-    return (
-        claim.user_id,
-        pair_resolved_payload(claim.approval_ref, outcome, host_id),
-    )
-
-
-async def _commit_setup_resolution(
-    session: AsyncSession,
-    device_code: str,
-    outcome: str,
-    *,
-    host_id: str | None = None,
-    now: datetime | None = None,
-) -> None:
-    event = await _resolve_setup_claim(
-        session,
-        device_code,
-        outcome,
-        host_id=host_id,
-        now=now,
-    )
     await session.commit()
-    if event is not None:
-        await publish_trust_event(*event)
-
-
-async def _bind_setup_claim(
-    session: AsyncSession,
-    *,
-    device_code: str,
-    setup_token: str | None,
-    approval_ref: str | None,
-    host_name: str | None,
-    os_name: str | None,
-    host_key_algorithm: str,
-    host_public_key: str,
-    now: datetime,
-) -> tuple[str, dict[str, object], str, str] | None:
-    """Bind only the first possession-proved ceremony for a live token."""
-
-    if setup_token is None or approval_ref is None:
-        return None
-    fingerprint = host_key_fingerprint(host_key_algorithm, host_public_key)
-    result = await session.execute(
-        update(SetupClaim)
-        .where(
-            SetupClaim.token == setup_token,
-            SetupClaim.status == "pending",
-            SetupClaim.device_code_id.is_(None),
-            SetupClaim.expires_at > now,
-        )
-        .values(
-            status="ready",
-            device_code_id=device_code,
-            approval_ref=approval_ref,
-            host_name=host_name or "host",
-            os=os_name,
-            host_key_fingerprint=fingerprint,
-        )
-        .returning(SetupClaim.user_id)
-        .execution_options(synchronize_session=False)
-    )
-    user_id = result.scalar_one_or_none()
-    if user_id is None:
-        return None
-    display_name = host_name or "host"
-    return (
-        user_id,
-        pair_requested_payload(approval_ref, display_name, os_name, fingerprint),
-        approval_ref,
-        display_name,
-    )
 
 
 @router.post(
@@ -239,7 +127,6 @@ async def device_start(
         device_code=_gen_device_code(),
         user_code=user_code,
         approval_ref=_gen_approval_ref(),
-        setup_token=body.setup_token,
         sas_commit=body.sas_commit,
         host_name=body.host_name,
         os=body.os,
@@ -314,13 +201,7 @@ async def device_possession(
                     host_possession_version=1,
                     host_possession_verified_at=now,
                 )
-                .returning(
-                    DeviceCode.device_code,
-                    DeviceCode.setup_token,
-                    DeviceCode.approval_ref,
-                    DeviceCode.host_name,
-                    DeviceCode.os,
-                )
+                .returning(DeviceCode.device_code)
                 .execution_options(synchronize_session=False)
             )
         )
@@ -328,27 +209,8 @@ async def device_possession(
         .one_or_none()
     )
     if verified is not None:
-        claim = await _bind_setup_claim(
-            session,
-            device_code=verified["device_code"],
-            setup_token=verified["setup_token"],
-            approval_ref=verified["approval_ref"],
-            host_name=verified["host_name"],
-            os_name=verified["os"],
-            host_key_algorithm=body.host_key_algorithm,
-            host_public_key=body.host_public_key,
-            now=now,
-        )
         await session.commit()
-        if claim is not None:
-            user_id, payload, approval_ref, display_name = claim
-            await publish_trust_event(user_id, payload)
-            schedule_pairing_push(user_id, approval_ref, display_name)
-        return schemas.DevicePossessionResponse(
-            verified=True,
-            version=1,
-            attended=claim is not None,
-        )
+        return schemas.DevicePossessionResponse(verified=True, version=1)
 
     # Release any claim/row lock before diagnosing a lost conditional update.
     # An exact already-verified tuple is the sole idempotent retry case.
@@ -364,7 +226,6 @@ async def device_possession(
                     DeviceCode.host_possession_verified_at,
                     DeviceCode.status,
                     DeviceCode.expires_at,
-                    DeviceCode.setup_token,
                 ).where(DeviceCode.device_code == body.device_code)
             )
         )
@@ -386,23 +247,7 @@ async def device_possession(
         snapshot["host_possession_version"] == 1
         and snapshot["host_possession_verified_at"] is not None
     ):
-        attended = False
-        if snapshot["setup_token"] is not None:
-            attended = (
-                await session.execute(
-                    select(SetupClaim.id).where(
-                        SetupClaim.token == snapshot["setup_token"],
-                        SetupClaim.device_code_id == body.device_code,
-                        SetupClaim.status.in_(("ready", "approved")),
-                        SetupClaim.expires_at > now,
-                    )
-                )
-            ).scalar_one_or_none() is not None
-        return schemas.DevicePossessionResponse(
-            verified=True,
-            version=1,
-            attended=attended,
-        )
+        return schemas.DevicePossessionResponse(verified=True, version=1)
     raise HTTPException(status_code=409, detail="device ceremony is no longer provable")
 
 
@@ -527,12 +372,6 @@ async def device_poll(
 
         if snapshot["status"] in {"denied", "pin_conflict", "pin_limit"}:
             terminal_error = snapshot["status"]
-            event = await _resolve_setup_claim(
-                session,
-                body.device_code,
-                terminal_error,
-                now=now,
-            )
             await session.execute(
                 update(DeviceCode)
                 .where(
@@ -543,8 +382,6 @@ async def device_poll(
                 .execution_options(synchronize_session=False)
             )
             await session.commit()
-            if event is not None:
-                await publish_trust_event(*event)
             return {"error": terminal_error}
 
         last = _aware(snapshot["last_polled_at"])
@@ -589,7 +426,7 @@ async def device_poll(
             .values(status="denied")
             .execution_options(synchronize_session=False)
         )
-        await _commit_setup_resolution(session, body.device_code, "key_conflict")
+        await session.commit()
         return {"error": "key_conflict"}
 
     browser_active = (
@@ -649,7 +486,7 @@ async def device_poll(
             .values(status="denied")
             .execution_options(synchronize_session=False)
         )
-        await _commit_setup_resolution(session, body.device_code, "key_conflict")
+        await session.commit()
         return {"error": "key_conflict"}
 
     if claimed_owner is None:
@@ -666,7 +503,7 @@ async def device_poll(
                 .values(status="denied")
                 .execution_options(synchronize_session=False)
             )
-            await _commit_setup_resolution(session, body.device_code, "key_conflict")
+            await session.commit()
             return {"error": "key_conflict"}
 
     if host is None:
@@ -707,7 +544,7 @@ async def device_poll(
                     .values(status="denied")
                     .execution_options(synchronize_session=False)
                 )
-                await _commit_setup_resolution(session, body.device_code, "key_conflict")
+                await session.commit()
                 return {"error": "key_conflict"}
             if host.owner_user_id != user_id:
                 await session.execute(
@@ -716,7 +553,7 @@ async def device_poll(
                     .values(status="denied")
                     .execution_options(synchronize_session=False)
                 )
-                await _commit_setup_resolution(session, body.device_code, "key_conflict")
+                await session.commit()
                 return {"error": "key_conflict"}
     else:
         # Re-login preserves both host identity and any user-assigned name.
@@ -743,7 +580,7 @@ async def device_poll(
                 .values(status="pin_conflict")
                 .execution_options(synchronize_session=False)
             )
-            await _commit_setup_resolution(session, body.device_code, "pin_conflict")
+            await session.commit()
             return {"error": "pin_conflict"}
     else:
         pin_count = len(await live_browser_device_id_set(session, host.id))
@@ -754,7 +591,7 @@ async def device_poll(
                 .values(status="pin_limit")
                 .execution_options(synchronize_session=False)
             )
-            await _commit_setup_resolution(session, body.device_code, "pin_limit")
+            await session.commit()
             return {"error": "pin_limit"}
         session.add(
             HostBrowserPin(
@@ -769,13 +606,6 @@ async def device_poll(
 
     token = auth.issue_daemon_token(host.id, user_id)
     fingerprint = host_key_fingerprint(body.host_key_algorithm, body.host_public_key)
-    event = await _resolve_setup_claim(
-        session,
-        body.device_code,
-        "approved",
-        host_id=host.id,
-        now=now,
-    )
     await session.execute(
         delete(DeviceCode)
         .where(
@@ -794,10 +624,8 @@ async def device_poll(
             .values(status="denied")
             .execution_options(synchronize_session=False)
         )
-        await _commit_setup_resolution(session, body.device_code, "key_conflict")
+        await session.commit()
         return {"error": "key_conflict"}
-    if event is not None:
-        await publish_trust_event(*event)
     return {
         "access_token": token,
         "host_id": host.id,
@@ -849,7 +677,7 @@ async def _pending_device_code(
         raise HTTPException(status_code=404, detail="unknown device code")
     expires = _aware(dc.expires_at)
     if expires is not None and expires <= _utcnow():
-        await _commit_setup_resolution(session, dc.device_code, "expired")
+        await session.commit()
         raise HTTPException(status_code=400, detail="user code expired")
     if dc.status != "pending":
         raise HTTPException(status_code=400, detail=f"user code is {dc.status}")
@@ -1010,11 +838,8 @@ async def device_approve(
         host_public_key=body.host_public_key,
     )
     if claimed_owner is not None and claimed_owner != user_id:
-        event = await _resolve_setup_claim(session, device_code, "key_conflict")
         await session.execute(delete(DeviceCode).where(DeviceCode.device_code == device_code))
         await session.commit()
-        if event is not None:
-            await publish_trust_event(*event)
         raise HTTPException(status_code=409, detail="host key is retained by another account")
 
     browser_claim = (
@@ -1048,11 +873,8 @@ async def device_approve(
         )
     ).scalar_one_or_none()
     if pinned_host is not None and pinned_host.owner_user_id != user_id:
-        event = await _resolve_setup_claim(session, device_code, "key_conflict")
         await session.execute(delete(DeviceCode).where(DeviceCode.device_code == device_code))
         await session.commit()
-        if event is not None:
-            await publish_trust_event(*event)
         raise HTTPException(status_code=409, detail="host key is already paired")
 
     approved = await session.execute(

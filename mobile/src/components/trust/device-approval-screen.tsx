@@ -281,8 +281,9 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
           <ListBlock>
             <View style={styles.steps}>
               <Text color="mutedForeground" variant="body">
-                Connect a host from this phone: run the command it gives you on the machine, then
-                approve the host here. That trusts this device directly, without another one.
+                Possess a host directly: run the command it gives you on that machine, then open the
+                link its terminal prints on this phone — scan the QR it can show, or open the link
+                here. Approving from this phone trusts it without another device.
               </Text>
               <Button onPress={() => router.push("/onboarding/host")} variant="outline">
                 Connect a host

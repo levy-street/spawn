@@ -13,7 +13,6 @@ import type {
   DevicePendingRequest,
   DevicePendingResponse,
 } from "@/data/api/schemas/devices";
-import type { SetupClaimError } from "@/data/api/schemas/setup";
 import type { BrowserEndorsementRecord } from "@/data/api/schemas/trust";
 import { qk } from "@/data/queryKeys";
 import { acceptVerifiedEndorsement, verifyEndorsementIntroduction } from "@/data/trust/endorsement";
@@ -57,6 +56,13 @@ export interface PairingFailure {
   detail?: string;
 }
 
+export type PairingProtocolError =
+  | "expired"
+  | "denied"
+  | "key_conflict"
+  | "pin_conflict"
+  | "pin_limit";
+
 export class PairingFlowError extends Error {
   constructor(readonly failure: PairingFailure) {
     super(failure.detail ?? failure.kind);
@@ -87,7 +93,7 @@ function pairingFailure(kind: PairingFailureKind, detail?: string): PairingFailu
   return detail === undefined ? { kind } : { kind, detail };
 }
 
-export function pairingFailureForProtocolError(error: SetupClaimError): PairingFailure {
+export function pairingFailureForProtocolError(error: PairingProtocolError): PairingFailure {
   if (error === "expired") return pairingFailure("pairing-expired");
   if (error === "denied") return pairingFailure("pairing-denied");
   if (error === "key_conflict") return pairingFailure("key-conflict");
@@ -95,7 +101,7 @@ export function pairingFailureForProtocolError(error: SetupClaimError): PairingF
   return pairingFailure("pin-limit");
 }
 
-function protocolErrorFromApiError(error: ApiError): SetupClaimError | null {
+function protocolErrorFromApiError(error: ApiError): PairingProtocolError | null {
   const detailCandidates =
     typeof error.detail === "object" && error.detail !== null
       ? Object.values(error.detail).filter((value): value is string => typeof value === "string")

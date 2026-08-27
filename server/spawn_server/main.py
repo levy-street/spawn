@@ -35,7 +35,6 @@ from .routes import push as push_routes
 from .routes import release as release_routes
 from .routes import root_introductions as root_introductions_routes
 from .routes import sessions as sessions_routes
-from .routes import setup_claims as setup_claims_routes
 from .routes import trust_bundle as trust_bundle_routes
 from .routes import workspace_templates as workspace_templates_routes
 from .routes import workspaces as workspaces_routes
@@ -135,7 +134,6 @@ def create_app() -> FastAPI:
     app.include_router(push_routes.router)
     app.include_router(release_routes.router)
     app.include_router(sessions_routes.router)
-    app.include_router(setup_claims_routes.router)
     app.include_router(workspace_templates_routes.router)
     app.include_router(workspaces_routes.router)
     app.include_router(agents_routes.router)

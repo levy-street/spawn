@@ -63,52 +63,6 @@ class User(Base):
     host_key_claims: Mapped[list[HostKeyClaim]] = relationship(back_populates="owner")
 
 
-class SetupClaim(Base):
-    """Authenticated routing hint for one possession-proved host ceremony.
-
-    A claim carries no approval authority.  It only lets the account that
-    minted it observe and receive attention for the first ceremony that proves
-    possession while presenting its token.
-    """
-
-    __tablename__ = "setup_claims"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
-    user_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    token: Mapped[str] = mapped_column(String(43), unique=True, nullable=False, index=True)
-    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
-    error: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    device_code_id: Mapped[str | None] = mapped_column(
-        String(64), ForeignKey("device_codes.device_code", ondelete="SET NULL"), nullable=True
-    )
-    approval_ref: Mapped[str | None] = mapped_column(String(43), nullable=True)
-    host_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    os: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    host_key_fingerprint: Mapped[str | None] = mapped_column(String(23), nullable=True)
-    host_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("hosts.id", ondelete="SET NULL"), nullable=True
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, nullable=False
-    )
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-    __table_args__ = (
-        CheckConstraint(
-            "status IN ('pending', 'ready', 'approved', 'failed')",
-            name="ck_setup_claims_status",
-        ),
-        CheckConstraint(
-            "error IS NULL OR error IN "
-            "('expired', 'denied', 'key_conflict', 'pin_conflict', 'pin_limit')",
-            name="ck_setup_claims_error",
-        ),
-    )
-
-
 class BrowserDevice(Base):
     """Account-bound browser Ed25519 key, retained after revocation as a tombstone."""
 
@@ -992,10 +946,6 @@ class DeviceCode(Base):
     approval_ref: Mapped[str | None] = mapped_column(
         String(43), unique=True, nullable=True, index=True
     )
-    # Authenticated routing hint only. Unknown or expired tokens are retained
-    # on the ceremony for diagnostics but grant nothing and are ignored when
-    # possession is proved.
-    setup_token: Mapped[str | None] = mapped_column(String(43), nullable=True, index=True)
     # Committed-ephemeral SAS relay fields (docs/TRUST_DEVICE_MESH.md App. A). The
     # server only stores and forwards these; it cannot forge a matching number.
     # sas_commit (Cd) is set by the daemon at start; sas_browser_nonce (Nb) +

@@ -123,7 +123,7 @@ export function OnboardingFlow() {
     retry: 1,
     staleTime: 3_000,
     // Deliberately not polled. ConnectHostSection below polls for the host and
-    // owns the moment it arrives: it paints its last checklist row complete,
+    // owns the moment it arrives: it paints its Online row complete,
     // then calls `onHostOnline` a beat later, and that callback is what moves
     // this page on. A poll here would race it — this page would learn the host
     // was online first and swap the whole surface for the success beat while
@@ -335,10 +335,6 @@ export function OnboardingFlow() {
                   // this visit arrived, and the layout keyed off it must not
                   // change under the reader mid-flow.
                 }}
-                // A link-borne ceremony is already waiting to be approved; minting
-                // a second setup claim beside it would offer two ways to pair the
-                // same machine.
-                mintSetupClaim={!approvalFromLink && approvedOfflineHost === null}
                 resumeApprovedHost={approvedOfflineHost}
                 // This step is not the end of anything: the approval is
                 // followed by a wait for the machine, and then by the beat that

@@ -102,15 +102,6 @@ def approval_push_message(request_id: str, label: str | None) -> PushMessage:
     )
 
 
-def pairing_push_message(approval_ref: str, host_name: str) -> PushMessage:
-    subject = host_name.strip() if host_name.strip() else "A machine"
-    return PushMessage(
-        title="SPAWN D",
-        body=f"{subject} is ready to join your account",
-        data={"event": "host.pair_requested", "approvalRef": approval_ref},
-    )
-
-
 async def _live_tokens(session: AsyncSession, user_id: str) -> list[PushDevice]:
     rows = await session.execute(
         select(PushDevice).where(
@@ -194,29 +185,6 @@ async def send_approval_push(
     )
 
 
-async def send_pairing_push(
-    *,
-    session: AsyncSession,
-    user_id: str,
-    approval_ref: str,
-    host_name: str,
-    client: httpx.AsyncClient | None = None,
-    settings: Settings | None = None,
-) -> int:
-    """Tell every phone that a possession-proved host is ready for review."""
-
-    settings = settings or get_settings()
-    if not settings.push_enabled:
-        return 0
-    return await _send_push(
-        session=session,
-        user_id=user_id,
-        message=pairing_push_message(approval_ref, host_name),
-        client=client,
-        settings=settings,
-    )
-
-
 _push_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -242,33 +210,6 @@ def schedule_approval_push(
                 )
         except Exception as e:  # noqa: BLE001
             log.warning("approval push failed: %s", e)
-
-    try:
-        task = asyncio.create_task(deliver())
-    except RuntimeError:
-        return
-    _push_tasks.add(task)
-    task.add_done_callback(_push_tasks.discard)
-
-
-def schedule_pairing_push(
-    user_id: str,
-    approval_ref: str,
-    host_name: str,
-) -> None:
-    """Fire-and-forget pairing attention after the claim transition commits."""
-
-    async def deliver() -> None:
-        try:
-            async with get_sessionmaker()() as session:
-                await send_pairing_push(
-                    session=session,
-                    user_id=user_id,
-                    approval_ref=approval_ref,
-                    host_name=host_name,
-                )
-        except Exception as e:  # noqa: BLE001
-            log.warning("pairing push failed: %s", e)
 
     try:
         task = asyncio.create_task(deliver())

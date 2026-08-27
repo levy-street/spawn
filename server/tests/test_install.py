@@ -673,9 +673,13 @@ async def test_installer_default_runs_possess_on_macos(client, tmp_path: Path):
     assert _log(logs, "launchctl.log") == ""
 
 
-async def test_installer_passes_setup_environment_and_new_account_flag(client, tmp_path: Path):
+async def test_installer_accepts_and_ignores_legacy_setup_flags(client, tmp_path: Path):
     script = await _install_script_file(client, tmp_path)
     token = "S" * 43
+    notice = (
+        "spawn: the --setup flag is no longer needed; "
+        "approval happens through the link spawnd prints"
+    )
 
     default, logs, _home, _install_root = _run_installer(
         script,
@@ -683,23 +687,24 @@ async def test_installer_passes_setup_environment_and_new_account_flag(client, t
         os_name="Linux",
         arch="x86_64",
         args=["--setup", token, "--new-account"],
+        extra_env={"SPAWN_SETUP_TOKEN": token},
     )
     assert default.returncode == 0, default.stderr
+    assert notice in default.stdout
     assert "--server http://spawn.test possess --new-account" in _log(logs, "spawnd.log")
-    setup_lines = _log(logs, "setup-token.log")
-    assert f"{token}|--server http://spawn.test possess --new-account" in setup_lines
+    assert _log(logs, "setup-token.log") == ""
 
-    no_start, no_start_logs, _home, _install_root = _run_installer(
+    equals, equals_logs, _home, _install_root = _run_installer(
         script,
-        tmp_path / "claimed-no-start",
+        tmp_path / "claimed-equals",
         os_name="Linux",
         arch="x86_64",
-        args=[f"--setup={token}", "--no-start"],
+        args=[f"--setup={token}"],
     )
-    assert no_start.returncode == 0, no_start.stderr
-    assert f"{token}|--server http://spawn.test login --no-run" in _log(
-        no_start_logs, "setup-token.log"
-    )
+    assert equals.returncode == 0, equals.stderr
+    assert notice in equals.stdout
+    assert "--server http://spawn.test possess" in _log(equals_logs, "spawnd.log")
+    assert _log(equals_logs, "setup-token.log") == ""
 
     empty, _logs, _home, _install_root = _run_installer(
         script,
