@@ -36,8 +36,9 @@ everything else.
 
 ## 2. Design principles
 
-1. **The session terminal path is endpoint-owned.** The worker protocol stays on a Unix
-   socket in a `0700` directory, and the browser's low-latency copy travels over
+1. **The session terminal path is endpoint-owned.** The worker protocol stays on a
+   protected local endpoint — a Unix socket in a `0700` directory or an
+   owner-only Windows named pipe — and the browser's low-latency copy travels over
    mandatory WebRTC DataChannels. `spawnd` sends only content-free activity and
    signaling/lifecycle JSON over its server control socket.
 2. **User-facing terminal rendering lives in the browser.** xterm.js in
@@ -77,14 +78,14 @@ spawnd (host supervisor, one per host)
  ├── ws/rtc: content-free signaling/lifecycle; WebRTC peer connections
  ├── worker_backend: launch / adopt / signal workers
  │
- ├── spawn-worker --session-id A … (one process per session, own process group)
+ ├── spawn-worker --session-id A … (one process per session, independent tree)
  │    ├── owns the PTY master (portable-pty)
  │    ├── session process — the user's login shell (session leader on the PTY slave)
  │    ├── headless emulator (grid state + bounded history drain window)
  │    ├── encrypted scrollback log (ChaCha20-Poly1305, segmented)
- │    ├── lifetime flock: $WORKER_DIR/<session-id>.lock
- │    ├── supervisor listener: $WORKER_DIR/<session-id>.sock
- │    └── lifecycle datagram: $WORKER_DIR/<session-id>.lifecycle.sock
+ │    ├── lifetime reservation: flocked fd (Unix) / exclusive HANDLE (Windows)
+ │    ├── supervisor endpoint: Unix stream / byte-mode Windows named pipe
+ │    └── lifecycle endpoint: Unix datagram / message-mode Windows named pipe
  └── spawn-worker --session-id B …
 ```
 
@@ -97,17 +98,20 @@ spawnd (host supervisor, one per host)
   with portable-pty,
   and from then on: streams output, accepts input/resize, maintains the
   scrollback log, serves replay.
-- The worker is spawned with `process_group(0)`: its fate is tied to the
-  session (it holds the PTY master), **not** to spawnd. spawnd dying, being
-  upgraded, or being restarted leaves workers and their sessions running.
-  Deployment note: under systemd, spawnd's unit needs `KillMode=process`
-  or workers get killed with the cgroup on `systemctl restart`.
+- On Unix the worker is spawned with `process_group(0)`. Under systemd,
+  spawnd's unit needs `KillMode=process` or workers are killed with the cgroup
+  on restart. On Windows it is launched with `DETACHED_PROCESS`,
+  `CREATE_NEW_PROCESS_GROUP`, and `CREATE_BREAKAWAY_FROM_JOB`; failure to break
+  away is fatal rather than silently weakening session survival. It then puts
+  itself and subsequently created ConPTY descendants in an unnamed
+  kill-on-close Job Object. On both platforms its fate is tied to the session
+  PTY, **not** to spawnd, so supervisor restarts leave the session running.
 - Worker runtime cost is scoped per session: a tokio runtime pinned to 2 threads,
   two blocking PTY I/O threads, and headless primary/alternate screen grids
   whose size follows the current terminal geometry. It does not retain a
   session-length plaintext grid history.
 
-### Filesystem layout
+### Unix filesystem layout
 
 `worker_dir()` resolves `$SPAWND_WORKER_DIR` → `$XDG_RUNTIME_DIR/spawn/workers`
 → `<config_dir>/workers`, created `0700`:
@@ -134,9 +138,57 @@ Preferring `XDG_RUNTIME_DIR` puts sockets and ciphertext on tmpfs where
 available: gone on reboot, never on spinning rust. That is a feature — the
 scrollback key is process-ephemeral anyway (§7).
 
+### Windows endpoint and metadata layout
+
+Windows uses `$SPAWND_WORKER_DIR` when set, otherwise
+`<config_dir>\workers`. Protected current-user-only DACLs are applied to the
+directory and its metadata:
+
+```text
+workers\
+  <session-id>.lock          # exclusive-open lifetime reservation
+  <session-id>.endpoint      # protected discovery marker, not proof of liveness
+  <session-id>.scrollback\   # ciphertext segments plus detached worker.log
+```
+
+The supervisor opens `.lock` with share mode zero and transfers that exact
+HANDLE through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; the worker validates its
+final path, file ID, type, owner, and protected DACL, clears inheritance, and
+retains it for life. Only that reservation plus three NUL standard handles are
+inherited. A crash leaves `.endpoint` but releases the reservation; a new owner
+may remove the stale marker only after it acquires the reservation. Cleanup is
+guarded by volume serial plus 128-bit `FILE_ID_INFO`, so an old worker cannot
+delete a replacement marker.
+
+Each worker owns two flat local names because Windows pipe-name components
+cannot contain backslashes:
+
+```text
+\\.\pipe\spawn-<current-user-SID>[-<8hex-config-tag>]-<session-uuid>
+\\.\pipe\spawn-<current-user-SID>[-<8hex-config-tag>]-<session-uuid>-lc
+```
+
+Both pipes reject remote clients, use `first_pipe_instance` for their bootstrap
+instance, carry a protected DACL whose only allow ACE is the current user, and
+validate the peer process token's user SID before protocol I/O. The main pipe
+is byte mode and retains the framing below. Its listener rolls a replacement
+instance before serving the connected candidate. The lifecycle pipe is message
+mode with eight instances: one listener and at most seven fixed-size handlers;
+silent clients expire after 100 ms.
+
+Windows PTYs use portable-pty's ConPTY backend for I/O and resize. START
+resolution uses the complete supplied `PATH` and `PATHEXT`; resolved `.cmd` and
+`.bat` programs are wrapped through `%ComSpec%` (`cmd.exe` fallback) with
+command extensions enabled, delayed expansion disabled, and batch arguments
+quoted against cmd metacharacters. Native `.exe`/`.com` programs launch
+directly. ConPTY's UTF-8/VT output is fed unchanged through the existing live,
+emulator, and encrypted-history path—host-generated clear, cursor, title, wrap,
+and mode sequences are not stripped or normalized.
+
 ## 4. spawnd ↔ worker wire protocol
 
-`daemon/src/sessiond/wire.rs`. Length-prefixed frames on the unix socket:
+`daemon/src/sessiond/wire.rs`. Length-prefixed frames on the Unix stream or
+Windows byte-mode named pipe:
 
 ```
 +-----------+------+-----------------+
@@ -172,13 +224,14 @@ guessed at.
 | `T_FOREGROUND` 0x11 | w→d | raw UTF-8 basename, ≤ 256 bytes | foreground process report (§4.1). Sent when the polled value changes and once per new supervisor connection. Additive at `PROTO_VERSION` 5: old workers never send it |
 
 Connection semantics: the worker serves **one live supervisor connection**.
-It validates the candidate peer's effective UID and sends that candidate its
+It validates the candidate peer's effective UID on Unix or process-token user
+SID on Windows and sends that candidate its
 `Hello`; only then does it close the old writer, abort and await the old reader,
 and install one new reader. Thus only one task/fd can feed the bounded command
 queue. Generation tags also discard anything the old peer queued immediately
 before cancellation. A restarted spawnd connects and wins without leaving a
 stale reader able to flood the worker. `spawnd` verifies that
-`Hello.session_id` matches the session implied by the socket path before trusting
+`Hello.session_id` matches the session implied by the endpoint before trusting
 the instance token. Unknown frame types are rejected. The five-byte header is
 parsed before allocation and a strict per-type cap is applied (`T_INPUT` is at
 most 64 KiB; fixed commands require their exact size); a command never inherits
@@ -187,26 +240,30 @@ the generic 32 MiB replay ceiling.
 Lifecycle timers: a worker that never receives `Start` exits after 120 s; a
 worker whose session exited lingers 60 s to deliver `T_EXIT` to a reconnecting
 spawnd, then cleans up regardless. On exit the worker deletes its scrollback
-(the key dies with it anyway), unlinks its socket, and terminates.
+(the key dies with it anyway), identity-checks its endpoint metadata, and
+terminates.
 
-The lifecycle socket is a separate adoptable **Unix datagram** IPC path, not
-another command in the ordinary frame queue. A request is one atomic datagram
-of exactly 17 bytes: the 16-byte random `Hello.instance_id` plus a one-byte
-`TERM`/`KILL` enum. The worker replies with one content-free status-byte
-datagram only after the signal syscall. It rejects stale instance IDs, unknown
-codes, and non-exact datagrams. There are no accepted stream fds or per-request
-tasks for partial peers to retain: one task, one fixed 18-byte receive buffer,
-and the bounded kernel datagram queue are the complete server-side resource
-surface. The client retries idempotent delivery within one absolute two-second
-deadline, so a datagram flood cannot reserve all lifecycle capacity. The worker retains the
-unreaped portable-pty `Child` handle behind the same lock used by its exit
-monitor; while holding that stable ownership it validates the child and calls
-`killpg` only. `ESRCH` means safely gone. There is deliberately no fallback to
-`kill(pid)`, so PID reuse can never redirect a delayed request.
+The lifecycle endpoint is separate and adoptable, not another command in the
+ordinary frame queue. A request is exactly 17 bytes: the 16-byte random
+`Hello.instance_id` plus a one-byte `TERM`/`KILL` enum. Unix sends one atomic
+datagram and serves it with one task plus one fixed 18-byte buffer. Windows
+sends one message on the `-lc` pipe and admits at most seven fixed-buffer
+handlers; a connected client that writes nothing expires after 100 ms. Both
+clients retry idempotently within one absolute two-second deadline and reject
+stale instances, unknown codes, malformed lengths, and malformed one-byte
+acknowledgements.
+
+The worker retains the unreaped portable-pty `Child` handle as stable process
+identity. Unix validates it under the exit-monitor lock and calls `killpg`
+only; `ESRCH` is safely gone, with no bare-PID fallback. Windows TERM is an ETX
+(`Ctrl+C`) priority write to ConPTY input, independent of the ordinary bounded
+input queue, and may be cooperatively ignored. Windows KILL flushes the
+lifecycle acknowledgement first and then terminates the worker Job Object,
+removing the worker and its complete descendant tree.
 
 ### 4.1 Foreground reporting (`T_FOREGROUND`)
 
-Once per second, while its session is running, the worker asks the kernel
+On Unix, once per second while its session is running, the worker asks the kernel
 which process group owns the PTY foreground — `tcgetpgrp` on the PTY master
 fd — and resolves that group's leader to an executable basename:
 `/proc/<pgid>/comm` on Linux, libproc `proc_name` (falling back to
@@ -224,6 +281,13 @@ output, no titles. This is a documented content-free-design exception
 shell is in the foreground. Old workers (pre-rename) simply never send the
 frame; their sessions report no foreground command.
 
+ConPTY has no public `tcgetpgrp` equivalent. Windows therefore uses an
+advisory Toolhelp snapshot rooted at the retained START-process PID: it walks
+the descendant tree and reports the newest live descendant's executable
+basename (falling back to the root). PID reuse, snapshot races, and background
+descendants can produce false positives; this is display metadata, never an
+authorization or lifecycle identity.
+
 ## 5. Data path — where bytes flow, who can read them
 
 ```
@@ -232,7 +296,7 @@ session process (login shell + whatever it runs)
   ▼
 spawn-worker: read buffer ── encrypt → scrollback log (ciphertext, disk)
   │                └─ zeroized after each hop
-  ▼ T_OUTPUT (unix socket, 0700 dir, same host)
+  ▼ T_OUTPUT (protected Unix socket / local named pipe, same host)
 spawnd: bounded per-session outbox → forwarder ──→ DataChannel direct sinks
   ▼ WebRTC DataChannel (DTLS, peer-to-peer; TURN sees ciphertext)
 browser: xterm.js — the user-facing terminal renderer and scrollback owner
@@ -240,9 +304,9 @@ browser: xterm.js — the user-facing terminal renderer and scrollback owner
 
 `pty::run_forwarder` and `ForwarderControl` provide bounded outbox → direct-sink
 routing. `SessionHandle` has one implementation: `write_stdin`, `resize`, and
-`replay` dispatch bounded `WorkerCmd`s over the worker socket. Shutdown binds a
-short-lived `0600` datagram endpoint in the same private directory and sends to
-the separate worker-owned lifecycle socket with the instance ID captured from
+`replay` dispatch bounded `WorkerCmd`s over the worker endpoint. Shutdown binds a
+short-lived `0600` Unix datagram endpoint or connects to the bounded Windows
+lifecycle pipe and sends to the separate worker-owned endpoint with the instance ID captured from
 the same `Hello`; one absolute deadline covers validation, fixed-size delivery,
 retries, and acknowledgement. It therefore cannot sit behind queued or
 partially written PTY input. Registry delivery also revalidates the immutable
@@ -251,7 +315,7 @@ Restart checks TERM delivery and deterministically escalates to KILL. `spawnd`
 does not hold a local session PTY, a child process handle, or a backend
 discriminator.
 
-The Unix-socket hop adds no control-plane exposure. P2-AGENT-02 removed daemon
+The protected same-user local hop adds no control-plane exposure. P2-AGENT-02 removed daemon
 WS terminal binary frames, browser relay/history/snapshot frames, transcripts,
 and content pubsub. `spawn.ctl` replay carries a stream-position watermark
 directly to the browser. Session uploads now use that direct channel, and host
@@ -326,10 +390,12 @@ also retains its independent 12 MiB response rejection ceiling.
 
 **Covered:**
 - Key bytes are generated from `getrandom`, held in heap pages that are
-  `mlock(2)`ed (no swap) and `MADV_DONTDUMP`ed (no core dumps, Linux), and
+  `mlock(2)`ed on Unix or best-effort `VirtualLock`ed within the Windows
+  working-set limit, `MADV_DONTDUMP`ed on Linux (no core dumps), and
   **zeroized on drop**. mlock failure (e.g. `RLIMIT_MEMLOCK=0` containers) is
   logged, not fatal: the at-rest encryption stands; only the key's
-  swap-residency guarantee weakens.
+  swap-residency guarantee weakens. Windows has no per-allocation
+  `MADV_DONTDUMP` equivalent, so no dump-exclusion claim is made there.
 - Owned plaintext is explicitly wiped on drop across the implemented handoff:
   worker PTY read chunks and reader/writer scratch, queued input and worker
   frame payloads, serialized committed lines, and worker replay buffers. spawnd's
@@ -351,13 +417,13 @@ also retains its independent 12 MiB response rejection ceiling.
   charge accounts conservatively for retained disk records, the returned
   replay, and decryption/framing scratch within its 8 MiB default; the
   control-channel response ceiling is an independent outer bound.
-- Kernel-side copies (PTY line discipline, unix socket buffers) and copies
+- Kernel-side copies (PTY line discipline, local endpoint buffers) and copies
   inside webrtc/DTLS layers in spawnd are outside our control.
 - spawnd still handles plaintext in flight (worker socket → bounded outbox →
   DataChannel). The outbox, worker-command channel, direct-viewer queues, and
   control responses are bounded; a lagging direct viewer is detached, and
   reconnect catch-up comes from worker replay. Owned queued payloads wipe on
-  drop. Copies inside kernel unix/WebRTC/DTLS stacks are not owned or wiped by
+  drop. Copies inside kernel endpoint/WebRTC/DTLS stacks are not owned or wiped by
   this code, so this is not a claim of complete system-wide zeroization.
 - The guarantee here is **ciphertext-only scrollback segment files on the
   user's own host**, with best-effort wiping of transient buffers — not the
@@ -530,14 +596,15 @@ scrollback/selection lives in xterm.js.
 **Flow control / backpressure — current, honest status.** The PTY reader's
 handoff to the worker loop holds at most eight queued chunks of at most 8 KiB
 each. The worker logs and forwards each chunk it consumes. If the supervisor
-socket stalls, those eight slots fill, the PTY reader blocks, and the kernel
+endpoint stalls, those eight slots fill, the PTY reader blocks, and the kernel
 PTY backpressures the session instead of accumulating an unbounded worker `Vec`
 queue. Downstream, spawnd holds at most 32 worker-output chunks and 32 ordinary
 worker commands; each input command is capped at 64 KiB before spawnd copies
-the caller's slice. The worker's separate lifecycle datagram endpoint accepts
-only one atomic fixed 17-byte request into one fixed buffer and is independent
-of the ordinary socket task, so TERM/KILL cannot be starved by the ordinary
-queue, partial stream peers, or a stalled worker socket. The forwarder serves
+the caller's slice. The worker's separate lifecycle endpoint is independent of
+the ordinary command task: Unix accepts one atomic request into one fixed
+buffer, while Windows caps message-pipe handlers at seven and expires silent
+clients after 100 ms. TERM/KILL therefore remain bounded when the ordinary
+queue or supervisor endpoint stalls. The forwarder serves
 only bounded direct-viewer sinks; a lagging viewer is disconnected instead of
 accumulating plaintext. A new direct connection re-seeds from the worker replay
 watermark. The replay log uses the conservative total resource budget
@@ -547,17 +614,21 @@ described in §6.2, including checkpoint and framing charges.
 
 | Event | Outcome |
 |---|---|
-| **Session exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, identity-checks and unlinks both sockets, releases its lifetime lock, and exits; spawnd forwards `session.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit. |
-| **Worker crashes** | the session process tree dies with it (the worker held the PTY master) — identical blast radius to "tmux server crashed" but scoped to **one** session instead of every session on the host. spawnd's connection reader reports `worker_lost`. The kernel releases the lifetime flock; the next launch, or a failed adoption that can acquire that lock, ownership-checks and removes the crashed worker's stale endpoints. Restart policy is user-driven `session.restart`; blind auto-respawn of stateful work inside the shell is not a recovery. |
-| **spawnd restarts / upgrades** | workers keep running in their own process groups. On startup `rediscover_existing_sessions` scans the socket directory via `discover_ids`, connects, verifies `Hello.session_id`, and adopts from `Hello` (instance identity, state, pid, geometry, cwd) — no persistent supervisor state. The same lazy path (`ensure_session_attached`) recovers a session on first use if startup discovery raced. A reconnect displaces no session state; viewers re-seed from emulator-synthesized snapshots on demand. `Hello` accepts the former identity-key spelling as an adoption-only serde alias. |
+| **Session exits** | worker reports `T_EXIT` (real exit code), destroys its scrollback, identity-checks and removes Unix sockets or the Windows marker, releases its lifetime reservation, and exits; spawnd forwards `session.exit`. If spawnd is down at that moment, the worker lingers 60 s so a restarted spawnd can collect the exit. |
+| **Worker crashes** | the session process tree dies with it (PTY ownership on Unix; kill-on-close Job Object on Windows) — identical blast radius to "tmux server crashed" but scoped to **one** session instead of every session on the host. spawnd's connection reader reports `worker_lost`. The kernel releases the flock/exclusive HANDLE; the next launch, or a failed adoption that acquires that reservation, ownership-checks and removes stale endpoint metadata. Restart policy is user-driven `session.restart`; blind auto-respawn of stateful work inside the shell is not a recovery. |
+| **spawnd restarts / upgrades** | workers keep running in independent Unix process groups or detached Windows breakaway trees. On startup `rediscover_existing_sessions` scans protected `.sock` entries or `.endpoint` markers via `discover_ids`, connects, verifies `Hello.session_id`, and adopts from `Hello` (instance identity, state, pid, geometry, cwd) — no persistent supervisor state. The same lazy path (`ensure_session_attached`) recovers a session on first use if startup discovery raced. A reconnect displaces no session state; viewers re-seed from emulator-synthesized snapshots on demand. `Hello` accepts the former identity-key spelling as an adoption-only serde alias. |
 | **spawnd upgrade + protocol change** | `Hello.version` gates adoption; private worker protocol version 5 additionally requires the worker's retained canonical cwd capability root for direct session uploads. A mismatched or cwd-less worker is left untouched (its session keeps running) and surfaced in logs rather than driven with a protocol it does not speak or falling back to a server upload path. Old workers drain away as their sessions exit. |
-| **Worker binary upgrade** | applies to newly launched sessions only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`. |
-| **Host reboot** | workers and their session process trees die. Runtime-dir sockets/ciphertext evaporate with tmpfs. |
+| **Worker binary upgrade** | applies to newly launched sessions only; running workers are never hot-swapped. `worker_bin()` resolves `$SPAWND_WORKER_BIN` → sibling of the running spawnd binary → `PATH`, using the platform executable suffix. |
+| **Host reboot** | workers and their session process trees die. Unix runtime-dir sockets/ciphertext evaporate with tmpfs; Windows named pipes disappear and stale protected markers are recoverable under the released reservation. |
 
-The only launch-time fd inheritance is the already-locked reservation, exposed
-to that one post-fork child and immediately restored to close-on-exec inside
-the worker. PTY and socket fds are never handed off: the **worker** owns them
-and survives on its own. Adoption-by-reconnect has no listener handoff window.
+On Unix, the only launch-time fd inheritance is the already-flocked
+reservation, exposed to that one post-fork child and immediately restored to
+close-on-exec. On Windows, `STARTUPINFOEXW` and an explicit
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` transfer only the exclusive reservation
+and three NUL standard handles; the worker clears reservation inheritance and
+logs to its protected `worker.log`. PTY and endpoint handles are never handed
+off: the **worker** owns them and survives on its own. Adoption-by-reconnect has
+no listener handoff window.
 
 ## 11. Worker-only cutover
 
