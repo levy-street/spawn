@@ -454,6 +454,71 @@ pub enum Inbound {
         #[serde(default)]
         protocol_version: Option<u16>,
     },
+    /// The server refusing a frame this daemon sent
+    /// (`spawn_server.ws.reliability.ErrorFrameSender`).
+    ///
+    /// Without this variant the frame did not parse at all and was discarded
+    /// as malformed, content-free and unattributed — so a daemon whose
+    /// signalling the server was rejecting on every connection said only
+    /// "discarding malformed JSON daemon control frame" and there was no way,
+    /// from a running system, to learn which frame or why. That is the whole
+    /// value here: both fields are short server-authored constants, and
+    /// [`BoundedServerText`] keeps them that way in the log.
+    #[serde(rename = "error")]
+    Error {
+        code: BoundedServerText,
+        #[serde(default)]
+        frame_type: Option<BoundedServerText>,
+    },
+}
+
+/// A short string from the server, safe to put in a log line.
+///
+/// The daemon deliberately never logs a server frame's contents — an SDP, a
+/// token, or serde's own error text quoting either (see `ws::classify`). These
+/// two fields are the exception the protocol allows: a refusal code and the
+/// name of the frame it refers to, both protocol constants. They are still
+/// server-authored, so they are bounded and stripped of anything that is not
+/// an ordinary identifier character before they are believed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundedServerText(String);
+
+impl BoundedServerText {
+    const MAX_CHARS: usize = 48;
+
+    fn sanitize(raw: &str) -> Self {
+        let text: String = raw
+            .chars()
+            .take(Self::MAX_CHARS)
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                    character
+                } else {
+                    '?'
+                }
+            })
+            .collect();
+        Self(text)
+    }
+}
+
+impl std::fmt::Display for BoundedServerText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedServerText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::sanitize(&raw))
+    }
+}
+
+impl Serialize for BoundedServerText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1158,5 +1223,81 @@ mod device_poll_tests {
             r#"{"browser_device_id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","browser_device_id":"11111111-2222-4333-8444-555555555555"}"#
         )
         .is_err());
+    }
+
+    /// The server's refusal frame, exactly as
+    /// `spawn_server.ws.reliability.ErrorFrameSender` writes it.
+    ///
+    /// Before this variant existed the daemon could not parse this frame at
+    /// all: a server refusing every `rtc.answer` produced nothing in the
+    /// daemon's log but "discarding malformed JSON daemon control frame", with
+    /// no code, no frame name, and no way to tell it apart from a frame the
+    /// server had no business sending.
+    #[test]
+    fn the_servers_refusal_frame_parses_and_stays_bounded() {
+        let frame = r#"{"type": "error", "code": "invalid_frame", "frame_type": "rtc.answer"}"#;
+        match serde_json::from_str::<Inbound>(frame).expect("the server's own error frame parses") {
+            Inbound::Error { code, frame_type } => {
+                assert_eq!(code.to_string(), "invalid_frame");
+                assert_eq!(
+                    frame_type.map(|kind| kind.to_string()).as_deref(),
+                    Some("rtc.answer")
+                );
+            }
+            other => panic!("the server's error frame parsed as {other:?}"),
+        }
+
+        // `frame_type` is null whenever the refused frame had no usable type.
+        let untyped = r#"{"type": "error", "code": "invalid_frame", "frame_type": null}"#;
+        match serde_json::from_str::<Inbound>(untyped).expect("a null frame_type parses") {
+            Inbound::Error { frame_type, .. } => assert!(frame_type.is_none()),
+            other => panic!("parsed as {other:?}"),
+        }
+
+        // Both fields reach a log line, so a hostile server may not use them to
+        // write one: everything but an ordinary identifier character is
+        // replaced, and the length is capped.
+        let hostile = format!(
+            r#"{{"type": "error", "code": {}, "frame_type": {}}}"#,
+            serde_json::to_string(&"x".repeat(500)).unwrap(),
+            serde_json::to_string("a\nb\u{1b}[31m").unwrap(),
+        );
+        match serde_json::from_str::<Inbound>(&hostile).expect("a hostile error frame parses") {
+            Inbound::Error { code, frame_type } => {
+                assert_eq!(code.to_string().len(), BoundedServerText::MAX_CHARS);
+                let kind = frame_type.expect("present").to_string();
+                assert_eq!(kind, "a?b??31m");
+                assert!(!kind.contains('\n') && !kind.contains('\u{1b}'));
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// The exact host-scope candidate frame the server relays, byte for byte
+    /// as `spawn_server.ws.host._signal_payload` builds it around a candidate
+    /// `spawn_server.ws.browser._valid_rtc_candidate` has sanitized.
+    ///
+    /// A frame this daemon cannot parse is discarded content-free — the log
+    /// says only "discarding malformed JSON daemon control frame" and there is
+    /// no way to tell from a running system whether the server sent something
+    /// new or something it sends on every connection. This test is that
+    /// answer, kept next to the parser it protects.
+    #[test]
+    fn the_servers_host_candidate_frame_parses() {
+        let frame = r#"{"type": "rtc.candidate", "session_id": "1aeaea29-1880-4c9f-9b7e-7b0d9627af15", "scope_type": "host", "scope_id": "d3914d3d-2d62-47f7-9d88-85d84e1ef79c", "protocol": "spawn.host.ctl", "protocol_version": 1, "binding_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "binding_generation": 1, "candidate": {"candidate": "candidate:842163049 1 udp 1677729535 33cde59c-1be0-47b5-9ae5-786881bd0089.local 50123 typ host generation 0 ufrag Xk4b network-cost 999", "sdpMid": "0", "usernameFragment": "Xk4b", "sdpMLineIndex": 0}}"#;
+        let parsed: Inbound = serde_json::from_str(frame).expect("the server's own frame parses");
+        match parsed {
+            Inbound::RtcCandidate {
+                session_id,
+                scope_type,
+                candidate,
+                ..
+            } => {
+                assert_eq!(session_id, "1aeaea29-1880-4c9f-9b7e-7b0d9627af15");
+                assert_eq!(scope_type.as_deref(), Some("host"));
+                assert!(candidate.get("candidate").is_some());
+            }
+            other => panic!("the server's candidate frame parsed as {other:?}"),
+        }
     }
 }

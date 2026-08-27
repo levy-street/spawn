@@ -1846,6 +1846,22 @@ async fn dispatch_loop(
                         rtc_sessions.invalidate_trust_and_close_all().await;
                     }
                 }
+                Inbound::Error { code, frame_type } => {
+                    // The server refusing something this daemon sent. It used
+                    // to arrive as an unparseable frame and vanish into
+                    // "discarding malformed JSON daemon control frame", which
+                    // is how a daemon whose every RTC answer was being refused
+                    // still looked, from its own log, like a daemon with
+                    // nothing to say.
+                    tracing::warn!(
+                        %code,
+                        frame_type = %frame_type
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        "the server refused a frame this daemon sent"
+                    );
+                }
                 Inbound::HostHeartbeat => {
                     tracing::trace!("host heartbeat ack");
                 }
