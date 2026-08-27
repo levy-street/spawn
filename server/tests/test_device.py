@@ -6,7 +6,6 @@ import asyncio
 import base64
 import json
 import os
-import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -399,7 +398,7 @@ async def test_host_possession_is_required_before_review_approval_or_token_issue
 
     proof = await _prove_possession(client, start, host_private_key)
     assert proof.status_code == 200, proof.text
-    assert proof.json() == {"verified": True, "version": 1, "attended": False}
+    assert proof.json() == {"verified": True, "version": 1}
     retry = await _prove_possession(client, start, host_private_key)
     assert retry.status_code == 200, retry.text
     assert retry.json() == proof.json()
@@ -538,7 +537,7 @@ async def _assert_concurrent_possession_retries_are_idempotent(
         *(_prove_possession(client, start, host_private_key) for _ in range(16))
     )
     assert [(response.status_code, response.json()) for response in responses] == [
-        (200, {"verified": True, "version": 1, "attended": False})
+        (200, {"verified": True, "version": 1})
     ] * 16
     async with get_sessionmaker()() as session:
         dc = await session.get(DeviceCode, start["device_code"])
@@ -2172,89 +2171,29 @@ async def test_revoking_the_browser_clears_the_retained_approval_proof(client):
         assert row.browser_approval_signature is None
 
 
-async def test_setup_token_attends_only_the_bound_live_claim_and_notifies_once(client, monkeypatch):
-    user_id, user_auth = await _signup(client, "attended-claim@example.com")
-    minted = await client.post("/api/setup/claims", json={}, headers=user_auth)
-    assert minted.status_code == 201, minted.text
-    token = minted.json()["token"]
-
-    published: list[tuple[str, dict[str, object]]] = []
-    pushed: list[tuple[str, str, str]] = []
-
-    async def capture_event(owner_id: str, payload: dict[str, object]) -> None:
-        published.append((owner_id, payload))
-
-    monkeypatch.setattr(device_routes, "publish_trust_event", capture_event)
-    monkeypatch.setattr(
-        device_routes,
-        "schedule_pairing_push",
-        lambda owner_id, approval_ref, host_name: pushed.append(
-            (owner_id, approval_ref, host_name)
-        ),
-    )
-
+async def test_device_start_accepts_and_ignores_legacy_setup_token(client):
+    user_id, auth = await _signup(client, "legacy-setup-token@example.com")
+    browser = await _register_browser(client, user_id, auth)
     host_key = Ed25519PrivateKey.generate()
     host_public = _wire(host_key.public_key().public_bytes_raw())
     start = await _start(
         client,
         host_public,
-        name="attended-box",
+        name="legacy-setup-token-box",
         proved=False,
-        setup_token=token,
+        setup_token="accepted-and-ignored",
     )
+
     possession = await _prove_possession(client, start, host_key)
     assert possession.status_code == 200, possession.text
-    assert possession.json()["attended"] is True
-    assert published[0][0] == user_id
-    assert published[0][1]["event"] == "host.pair_requested"
-    assert "setup_token" not in published[0][1]
-    assert pushed == [(user_id, start["approval_ref"], "attended-box")]
+    assert possession.json() == {"verified": True, "version": 1}
 
-    # The possession proof is idempotent, but attention is not duplicated.
-    retry = await _prove_possession(client, start, host_key)
-    assert retry.status_code == 200
-    assert retry.json()["attended"] is True
-    assert len(published) == 1
-    assert len(pushed) == 1
-
-    unknown_key = Ed25519PrivateKey.generate()
-    unknown_public = _wire(unknown_key.public_key().public_bytes_raw())
-    unknown = await _start(
-        client,
-        unknown_public,
-        proved=False,
-        setup_token=secrets.token_urlsafe(32),
-    )
-    ignored = await _prove_possession(client, unknown, unknown_key)
-    assert ignored.status_code == 200
-    assert ignored.json()["attended"] is False
-
-    bare_key = Ed25519PrivateKey.generate()
-    bare_public = _wire(bare_key.public_key().public_bytes_raw())
-    bare = await _start(client, bare_public, proved=False)
-    unattended = await _prove_possession(client, bare, bare_key)
-    assert unattended.status_code == 200
-    assert unattended.json()["attended"] is False
-
-
-async def test_device_start_rejects_noncanonical_setup_token(client):
-    private_key = Ed25519PrivateKey.generate()
-    public_key = _wire(private_key.public_key().public_bytes_raw())
-
-    response = await client.post(
-        "/api/auth/device/start",
-        json={
-            "host_name": "bad-setup-token",
-            "os": "linux",
-            "arch": "x86_64",
-            "version": "0.1.0",
-            "host_key_algorithm": "ed25519",
-            "host_public_key": public_key,
-            "setup_token": "+" + "A" * 42,
-        },
-    )
-
-    assert response.status_code == 422
+    review = await _review(client, start, auth)
+    approval = await _approve(client, start, user_id, auth, review, browser)
+    assert approval.status_code == 200, approval.text
+    poll = await _poll(client, start, host_public)
+    assert poll.status_code == 200, poll.text
+    assert "access_token" in poll.json()
 
 
 async def test_sas_relay_forwards_nonces_and_enforces_commit_reveal_order(client):

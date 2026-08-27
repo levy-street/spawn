@@ -12,10 +12,8 @@ from spawn_server.models import PushDevice
 from spawn_server.push import (
     alert_push_message,
     approval_push_message,
-    pairing_push_message,
     send_alert_push,
     send_approval_push,
-    send_pairing_push,
 )
 from spawn_server.routes import push as push_routes
 
@@ -438,16 +436,6 @@ class TestApprovalPush:
         assert "SHA256" not in message.title + message.body
         assert approval_push_message("req-2", "  ").title == "Approve A new device?"
 
-    def test_pairing_push_routes_to_the_claim_without_exposing_key_material(self):
-        message = pairing_push_message("approval-ref", "workstation")
-        assert message.title == "SPAWN D"
-        assert message.body == "workstation is ready to join your account"
-        assert message.data == {
-            "event": "host.pair_requested",
-            "approvalRef": "approval-ref",
-        }
-        assert "SHA256" not in message.title + message.body
-
     async def _register(self, client, headers, token: str, browser_device_id: str | None) -> None:
         body: dict[str, object] = {"token": token, "platform": "ios"}
         if browser_device_id is not None:
@@ -489,38 +477,6 @@ class TestApprovalPush:
         assert [message["to"] for message in seen[0]] == [OTHER_TOKEN]
         assert seen[0][0]["title"] == "Approve spawn on iPhone?"
         assert seen[0][0]["data"]["requestId"] == "req-1"
-
-    async def test_pairing_push_reaches_every_install_including_the_knocking_phone(self, client):
-        user_id, headers = await _account(client, "pairing-push@example.com")
-        await self._register(client, headers, TOKEN, "00000000-0000-4000-8000-000000000aaa")
-        await self._register(client, headers, OTHER_TOKEN, "00000000-0000-4000-8000-000000000bbb")
-        seen: list[list[dict]] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            import json
-
-            seen.append(json.loads(request.content))
-            return httpx.Response(
-                200,
-                json={"data": [{"status": "ok"}, {"status": "ok"}]},
-            )
-
-        async with (
-            get_sessionmaker()() as session,
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http,
-        ):
-            sent = await send_pairing_push(
-                session=session,
-                user_id=user_id,
-                approval_ref="approval-ref",
-                host_name="workstation",
-                client=http,
-                settings=Settings(),
-            )
-
-        assert sent == 2
-        assert {message["to"] for message in seen[0]} == {TOKEN, OTHER_TOKEN}
-        assert {message["data"]["approvalRef"] for message in seen[0]} == {"approval-ref"}
 
     async def test_an_older_app_with_no_device_id_is_still_told(self, client):
         user_id, headers = await _account(client, "knock-legacy@example.com")

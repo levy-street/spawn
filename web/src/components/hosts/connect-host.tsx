@@ -8,17 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PaceBar } from "@/components/ui/pace-bar";
 import { StatusDot } from "@/components/ui/status";
-import { subscribeToTrustEvents } from "@/lib/alert-socket";
-import {
-  ApiError,
-  auth,
-  type DevicePendingApproval,
-  type Host,
-  hosts,
-  type SetupClaim,
-  type SetupClaimMint,
-  setupClaims,
-} from "@/lib/api";
+import { ApiError, auth, type DevicePendingApproval, type Host, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
   createHostPairApprovalProof,
@@ -33,13 +23,14 @@ import {
 } from "@/lib/browser-host-pins";
 import { publishHostIntroductionBroadcast } from "@/lib/host-gossip";
 import { PAIRING_FAILURE_COPY, pairingFailureCode } from "@/lib/pairing-errors";
-import { detectPlatform, setupInstallCommand, UNDETECTED_PLATFORM } from "@/lib/platform";
+import { detectPlatform, UNDETECTED_PLATFORM } from "@/lib/platform";
 import {
-  deriveSetupChecklist,
-  SETUP_CHECKLIST_ACTIVE_LABELS,
-  SETUP_CHECKLIST_LABELS,
-  setupChecklistStalledHint,
-} from "@/lib/setup-claims";
+  deriveSetupProgress,
+  SETUP_PROGRESS_ACTIVE_LABELS,
+  SETUP_PROGRESS_LABELS,
+  type SetupProgressState,
+  setupProgressStalledHint,
+} from "@/lib/setup-progress";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
 import { cn } from "@/lib/utils";
 
@@ -118,9 +109,6 @@ export function ConnectHostSection(props: {
   /** Forwarded to {@link HostApprovalForm}: read the possession handle and the
    * `#k=` identity fragment from the URL. Only `/device` sets this. */
   autoLoadFromUrl?: boolean;
-  /** `/device` approves a ceremony it was handed; onboarding and Add a
-   * machine mint attended setup claims. */
-  mintSetupClaim?: boolean;
   /** An approval completed before this surface mounted, but its daemon has not
    * connected yet. Resume at Approved instead of teaching installation again. */
   resumeApprovedHost?: Host | null;
@@ -155,21 +143,13 @@ export function ConnectHostSection(props: {
     onPairingApproved,
     frameless = false,
     autoLoadFromUrl = false,
-    mintSetupClaim = !autoLoadFromUrl,
     resumeApprovedHost = null,
     awaitsHostArrival = false,
     priorOnlineHostIds,
   } = props;
-  const { user } = useAuth();
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
   const [copyPulse, setCopyPulse] = useState(false);
   const [commandCopied, setCommandCopied] = useState(false);
-  const [minted, setMinted] = useState<SetupClaimMint | null>(null);
-  const [claimSupport, setClaimSupport] = useState<
-    "idle" | "loading" | "supported" | "unsupported" | "error"
-  >("idle");
-  const [mintError, setMintError] = useState<string | null>(null);
-  const [mintAttempt, setMintAttempt] = useState(0);
   const [locallyApproved, setLocallyApproved] = useState(false);
   /**
    * True when this visit arrived holding a specific approval — `?ref=`/`?code=`
@@ -234,111 +214,12 @@ export function ConnectHostSection(props: {
     setPlatform(detectPlatform());
   }, []);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: mintAttempt is an explicit retry/remint trigger
-  useEffect(() => {
-    if (!mintSetupClaim || !user) {
-      setClaimSupport("idle");
-      setMinted(null);
-      return;
-    }
-    let cancelled = false;
-    setClaimSupport("loading");
-    setMintError(null);
-    setMinted(null);
-    void setupClaims
-      .mint()
-      .then((response) => {
-        if (cancelled) return;
-        setMinted(response);
-        setClaimSupport("supported");
-      })
-      .catch((caught) => {
-        if (cancelled) return;
-        if (caught instanceof ApiError && (caught.status === 404 || caught.status === 405)) {
-          setClaimSupport("unsupported");
-          return;
-        }
-        setClaimSupport("error");
-        setMintError(
-          caught instanceof Error ? caught.message : "Live setup progress is unavailable",
-        );
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [mintAttempt, mintSetupClaim, user]);
-
-  // A visible setup surface must never leave an expired token in the command.
-  // Hidden tabs pause the timer and re-check immediately when shown again.
-  useEffect(() => {
-    if (!minted) return;
-    let timer: number | null = null;
-    const expiration = Date.parse(minted.expires_at);
-    const remint = () => setMintAttempt((value) => value + 1);
-    const arm = () => {
-      if (document.hidden || !Number.isFinite(expiration)) return;
-      const remaining = expiration - Date.now();
-      if (remaining <= 0) {
-        remint();
-        return;
-      }
-      timer = window.setTimeout(remint, remaining);
-    };
-    const onVisibility = () => {
-      if (timer !== null) window.clearTimeout(timer);
-      timer = null;
-      if (!document.hidden) arm();
-    };
-    arm();
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      if (timer !== null) window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisibility);
-    };
-  }, [minted]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: a new token starts a fresh visible checklist
-  useEffect(() => {
-    setCommandCopied(false);
-    setLocallyApproved(false);
-  }, [minted?.token]);
-
-  const claimQ = useQuery({
-    queryKey: ["setup-claim", minted?.token ?? null],
-    queryFn: () => setupClaims.get(minted?.token as string),
-    enabled: claimSupport === "supported" && minted !== null,
-    retry: (count, caught) =>
-      !(caught instanceof ApiError && (caught.status === 404 || caught.status === 405)) &&
-      count < 2,
-    refetchInterval: () => (typeof document !== "undefined" && document.hidden ? false : 2_000),
-  });
-  const claim = claimQ.data ?? null;
-
-  useEffect(() => {
-    if (!minted) return;
-    return subscribeToTrustEvents((event) => {
-      if (event.event !== "host.pair_requested" && event.event !== "host.pair_resolved") return;
-      if (claim?.approval_ref && event.approval_ref !== claim.approval_ref) return;
-      void claimQ.refetch();
-    });
-  }, [claim?.approval_ref, claimQ.refetch, minted]);
-
   const onlineHost = useMemo(() => {
     const listed = hostsQ.data ?? [];
     if (resumeApprovedHost) {
       return (
         listed.find((host) => host.id === resumeApprovedHost.id && host.status === "online") ?? null
       );
-    }
-    if (claim?.host_id) {
-      const claimed = listed.find((host) => host.id === claim.host_id);
-      // Only pin on the claim's host while that host still exists. A ceremony
-      // run on a machine this account had already possessed registers a second
-      // host, binds the claim to it, and the daemon drops it again on adopting
-      // the instance it already had — leaving the claim naming a host that is
-      // gone. Waiting on it would never end, so fall through and let the
-      // general detection below find the machine that is actually here.
-      if (claimed) return claimed.status === "online" ? claimed : null;
     }
     const initial = initialOnlineIdsRef.current;
     if (!initial) return null;
@@ -349,7 +230,7 @@ export function ConnectHostSection(props: {
     // have connected before the first poll, putting it in the "initial" set
     // and hiding it forever. Having approved here, an online host is ours.
     return locallyApproved ? (listed.find((host) => host.status === "online") ?? null) : null;
-  }, [claim?.host_id, hostsQ.data, resumeApprovedHost, locallyApproved]);
+  }, [hostsQ.data, resumeApprovedHost, locallyApproved]);
 
   useEffect(() => {
     if (!onlineHost || notifiedRef.current) return;
@@ -362,52 +243,25 @@ export function ConnectHostSection(props: {
     return () => window.clearTimeout(timer);
   }, [onlineHost, onHostOnline]);
 
-  const checklist = deriveSetupChecklist({
-    copied: commandCopied,
-    claim,
-    locallyApproved: locallyApproved || resumeApprovedHost !== null,
-    hostOnline: onlineHost !== null,
+  const progress = deriveSetupProgress({
+    commandCopied,
+    locallyApproved,
+    resumeApprovedHost: resumeApprovedHost !== null,
+    onlineHost: onlineHost !== null,
   });
-  const progressKey = `${minted?.token ?? "fallback"}:${checklist.completedThrough}:${checklist.failed ?? "ok"}`;
+  const progressKey = `${progress.completed.join(":")}:${progress.current ?? "done"}`;
   // biome-ignore lint/correctness/useExhaustiveDependencies: progressKey intentionally resets elapsed time on a milestone transition
   useEffect(() => {
     progressStartedAtRef.current = Date.now();
     setNow(Date.now());
   }, [progressKey]);
   useEffect(() => {
-    if (checklist.completedThrough === 4 || checklist.failed) return;
+    if (progress.current === null) return;
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, [checklist.completedThrough, checklist.failed]);
+  }, [progress.current]);
   const elapsedMs = now - progressStartedAtRef.current;
-  const stalledHint = setupChecklistStalledHint(checklist, elapsedMs);
-  /**
-   * Whether the machine has reached this account, which is the moment the
-   * install half of this screen stops being useful.
-   *
-   * Until then the command is the whole point. After it, "install on macOS",
-   * the command itself, and "after installation, run spawnd possess" are all
-   * instructions for work the reader has visibly finished — and they were
-   * pushing the one thing left to do, the fingerprint, below the fold.
-   */
-  const machineHasArrived =
-    claim?.status === "ready" || claim?.status === "approved" || locallyApproved;
-
-  /**
-   * Whether the waiting pill has anything true to say.
-   *
-   * It is the fallback for surfaces with no live checklist, and it used to
-   * render unconditionally — which put it in two places it was wrong. On a bare
-   * `/device`, where nothing has been started, it claimed a ceremony that did
-   * not exist. And after an approval it sat pulsing "Waiting for your machine…"
-   * directly above this surface's own card saying that machine is possessed
-   * and every device can reach it — two answers to one question, on one screen,
-   * disagreeing.
-   *
-   * So: only while something is genuinely on its way, and only while nothing
-   * else here has already reported the outcome. Once the approval lands, the
-   * confirmation card owns the screen.
-   */
+  const stalledHint = setupProgressStalledHint(progress, elapsedMs);
   /**
    * Approved here, and the machine has not appeared yet.
    *
@@ -415,10 +269,13 @@ export function ConnectHostSection(props: {
    * unmounts the instant an approval lands, so without something to take its
    * place the surface simply emptied out while the daemon was still starting.
    */
-  const approvedAwaitingHost =
-    (locallyApproved || claim?.status === "approved") && onlineHost === null;
-  const waitingForAMachine =
-    !locallyApproved && (resumeApprovedHost !== null || claim !== null || commandCopied);
+  const approvedAwaitingHost = locallyApproved && onlineHost === null;
+  const showOnboardingProgress =
+    !showLinkConfirm &&
+    awaitsHostArrival &&
+    (commandCopied || locallyApproved || resumeApprovedHost !== null);
+  const showWaitingForMachine =
+    !showLinkConfirm && !awaitsHostArrival && commandCopied && !linkFormOwnsScreen;
 
   const platformName =
     platform.os === "macos"
@@ -428,25 +285,11 @@ export function ConnectHostSection(props: {
         : platform.os === "windows"
           ? "Windows"
           : "your machine";
-  const displayedCommand =
-    minted && typeof window !== "undefined"
-      ? setupInstallCommand(window.location.origin, minted.token)
-      : platform.installCommand;
-  const copyDisabled = claimSupport === "loading";
+  const displayedCommand = platform.installCommand;
 
-  /**
-   * Back to the beginning: a new setup claim, a new command, an empty
-   * checklist.
-   *
-   * The claim a refused ceremony was bound to is spent — it named one machine
-   * and that machine was not vouched for — so resuming it would offer to
-   * approve the thing just rejected. Minting a fresh one is what makes "start
-   * over" mean the start, rather than an empty surface under a dead approval.
-   */
   const startOver = () => {
     setLocallyApproved(false);
     setCommandCopied(false);
-    setMintAttempt((attempt) => attempt + 1);
     // On `/device` the ceremony came in on the URL, and "start over" means
     // possess another machine: drop the spent handle so the install
     // instructions come back instead of an empty card. The approval it
@@ -491,7 +334,7 @@ export function ConnectHostSection(props: {
         </CardHeader>
       )}
       <CardContent className={cn("space-y-5", frameless && "p-0")}>
-        {resumeApprovedHost || linkApproval !== false || machineHasArrived ? null : (
+        {resumeApprovedHost || linkApproval !== false || locallyApproved ? null : (
           <section aria-labelledby="install-daemon-title" className="space-y-2">
             <div className="flex items-center gap-2">
               <Terminal className="size-4 text-muted-foreground" aria-hidden />
@@ -499,11 +342,8 @@ export function ConnectHostSection(props: {
                 Install on {platformName}
               </h3>
             </div>
-            {/* Wrapped, not clipped. `whitespace-nowrap` with `overflow-x-auto`
-                cut the command off mid-token behind the copy button and offered
-                no scrollbar to find the rest of it — so the one thing on screen
-                the reader has to trust was unreadable, and a setup token is
-                exactly the part that fell off the end. */}
+            {/* Wrapped, not clipped. The command must stay readable beside the
+                copy button, including on a narrow onboarding sheet. */}
             <div className="flex min-w-0 items-start gap-2 rounded-lg border border-border bg-muted p-2">
               <code className="min-w-0 flex-1 px-1 py-1 font-mono text-xs leading-5 break-all whitespace-pre-wrap">
                 {displayedCommand}
@@ -514,12 +354,9 @@ export function ConnectHostSection(props: {
                 size="icon"
                 className="size-8 shrink-0"
                 aria-label="Copy install command"
-                disabled={copyDisabled}
                 onClick={() => void copyCommand()}
               >
-                {claimSupport === "loading" ? (
-                  <Loader2 className="size-4 animate-spin" aria-hidden />
-                ) : copyPulse ? (
+                {copyPulse ? (
                   <Check className="size-4 text-success" aria-hidden />
                 ) : (
                   <Copy className="size-4" aria-hidden />
@@ -533,54 +370,20 @@ export function ConnectHostSection(props: {
               Already running SPAWN D for another account on that machine? Add{" "}
               <code>--new-account</code>.
             </p>
-            {mintError && (
-              <p className="text-xs leading-5 text-muted-foreground" role="status">
-                Live setup progress could not start ({mintError}). The install command still works.
-              </p>
-            )}
           </section>
         )}
 
-        {resumeApprovedHost ||
-        linkApproval !== false ||
-        machineHasArrived ||
-        !((claimSupport === "supported" && minted) || waitingForAMachine) ? null : (
+        {(showOnboardingProgress || showWaitingForMachine) &&
+        resumeApprovedHost === null &&
+        linkApproval === false &&
+        !locallyApproved ? (
           <div className="h-px bg-border" />
-        )}
+        ) : null}
 
-        {showLinkConfirm ? null : resumeApprovedHost ? (
-          <SetupChecklist
-            claim={null}
-            completedThrough={checklist.completedThrough}
-            elapsedMs={elapsedMs}
-            stalledHint={stalledHint}
-          />
-        ) : claimSupport === "supported" && minted ? (
-          <SetupChecklist
-            claim={claim}
-            completedThrough={checklist.completedThrough}
-            elapsedMs={elapsedMs}
-            stalledHint={stalledHint}
-          />
-        ) : awaitsHostArrival && locallyApproved ? (
-          // The link path mints no claim and copies no command, so nothing above
-          // ever put a checklist on this screen — and the approval it has just
-          // taken is exactly where the reader needs to watch the last milestone
-          // tick over before the page around it moves on.
-          <SetupChecklist
-            claim={null}
-            completedThrough={checklist.completedThrough}
-            elapsedMs={elapsedMs}
-            stalledHint={stalledHint}
-          />
-        ) : waitingForAMachine ? (
-          <LegacyWaitingState
-            onlineHost={onlineHost}
-            elapsedMs={elapsedMs}
-            onRetryClaims={
-              claimSupport === "error" ? () => setMintAttempt((value) => value + 1) : undefined
-            }
-          />
+        {showOnboardingProgress ? (
+          <SetupProgress progress={progress} elapsedMs={elapsedMs} stalledHint={stalledHint} />
+        ) : showWaitingForMachine ? (
+          <WaitingForMachine onlineHost={onlineHost} elapsedMs={elapsedMs} />
         ) : null}
 
         {resumeApprovedHost ? null : arrivalUnknown ? (
@@ -603,19 +406,12 @@ export function ConnectHostSection(props: {
               onPairingApproved?.(hostName);
             }}
           />
-        ) : claim?.status === "failed" && claim.error ? (
-          <PairingFailure failure={claim.error} />
         ) : approvedAwaitingHost ? (
           // The longest wait in the whole flow, and it used to be a spinner the
           // size of a full stop on one checklist row. Everything else had just
           // unmounted — the approve card goes the moment the approval lands —
           // so the screen went quiet at exactly the point the reader most wants
           // to know something is still happening.
-          //
-          // It also sits ahead of the "ready" branch below on purpose: the
-          // claim stays `ready` until the next poll confirms the approval, and
-          // rendering the approve card again in that window flashed a spent
-          // approval surface over an approval already given.
           <section className="space-y-3" aria-labelledby="connecting-title">
             <div className="space-y-1">
               <h3 id="connecting-title" className="text-sm font-medium">
@@ -628,33 +424,6 @@ export function ConnectHostSection(props: {
             </div>
             <PaceBar className="w-full" label="Waiting for this machine to come online…" />
           </section>
-        ) : claim?.status === "ready" && claim.approval_ref ? (
-          <section className="space-y-3" aria-labelledby="inline-approve-title">
-            <div className="space-y-1">
-              <h3 id="inline-approve-title" className="text-sm font-medium">
-                Approve this machine
-              </h3>
-              {/* A claim only reaches "ready" when a ceremony presented this
-               * screen's own setup token, so the machine is one this reader
-               * ran a command on and its terminal is showing this same
-               * fingerprint — not a link to open. Naming a link sent them
-               * hunting for one the terminal no longer prints. */}
-              <p className="text-xs leading-5 text-muted-foreground">
-                The terminal you ran the command in is showing a key. Check it matches the one
-                below, then approve.
-              </p>
-            </div>
-            <HostApprovalForm
-              approvalRef={claim.approval_ref}
-              inlineReview
-              onStartOver={startOver}
-              onApproved={(hostName) => {
-                setLocallyApproved(true);
-                onPairingApproved?.(hostName);
-                void claimQ.refetch();
-              }}
-            />
-          </section>
         ) : null}
       </CardContent>
     </Card>
@@ -662,23 +431,17 @@ export function ConnectHostSection(props: {
 }
 
 /**
- * The milestones a spinner belongs on: the ones spent waiting for the machine
- * to register, and for it to come online.
- *
- * The other two wait on the reader — copying the command, and answering the
- * fingerprint question right below the list. A spinner there claims the page
- * is busy when the page is waiting on them, so they wait back at it.
+ * The milestones a spinner belongs on: approval in the link and the daemon
+ * coming online. Copying the command waits on the reader, not the machine.
  */
-const WAITS_ON_THE_MACHINE = new Set<number>([2, 4]);
+const WAITS_ON_THE_MACHINE = new Set<number>([2, 3]);
 
-function SetupChecklist({
-  claim,
-  completedThrough,
+function SetupProgress({
+  progress,
   elapsedMs,
   stalledHint,
 }: {
-  claim: SetupClaim | null;
-  completedThrough: 0 | 1 | 2 | 3 | 4;
+  progress: SetupProgressState;
   elapsedMs: number;
   stalledHint: string | null;
 }) {
@@ -687,11 +450,11 @@ function SetupChecklist({
       <h3 id="setup-progress-title" className="text-sm font-medium">
         Setup progress
       </h3>
-      <ol className="space-y-2" data-testid="setup-checklist">
-        {SETUP_CHECKLIST_LABELS.map((label, index) => {
-          const step = (index + 1) as 1 | 2 | 3 | 4;
-          const complete = completedThrough >= step;
-          const current = !complete && completedThrough + 1 === step;
+      <ol className="space-y-2" data-testid="setup-progress">
+        {SETUP_PROGRESS_LABELS.map((label, index) => {
+          const step = (index + 1) as 1 | 2 | 3;
+          const complete = progress.completed[index];
+          const current = progress.current === step;
           return (
             <li
               key={label}
@@ -715,7 +478,7 @@ function SetupChecklist({
                 <Circle className="size-4 shrink-0 text-muted-foreground/50" aria-hidden />
               )}
               <span className={complete ? "text-foreground" : "text-muted-foreground"}>
-                {current ? SETUP_CHECKLIST_ACTIVE_LABELS[index] : label}
+                {current ? SETUP_PROGRESS_ACTIVE_LABELS[index] : label}
               </span>
               {current && elapsedMs >= 30_000 && elapsedMs < 60_000 ? (
                 <span className="ml-auto text-xs text-muted-foreground" role="status">
@@ -731,28 +494,17 @@ function SetupChecklist({
           {stalledHint}
         </p>
       ) : null}
-      {/* Past the approval and still nothing: whatever is wrong is on the other
-          machine, where this page cannot look. That is exactly the stall a
-          crash-looping daemon service produces — approved, never online — and
-          it is invisible from here. */}
-      {stalledHint && completedThrough >= 3 ? <DoctorHint /> : null}
-      {claim?.host_name && claim.status !== "pending" ? (
-        <p className="text-xs text-muted-foreground" role="status">
-          {claim.host_name} registered{claim.os ? ` · ${claim.os}` : ""}
-        </p>
-      ) : null}
+      {stalledHint ? <DoctorHint /> : null}
     </section>
   );
 }
 
-function LegacyWaitingState({
+function WaitingForMachine({
   onlineHost,
   elapsedMs,
-  onRetryClaims,
 }: {
   onlineHost: Host | null;
   elapsedMs: number;
-  onRetryClaims?: () => void;
 }) {
   return (
     <div className="space-y-2">
@@ -770,15 +522,11 @@ function LegacyWaitingState({
         </p>
       ) : null}
       {!onlineHost && elapsedMs >= 60_000 ? (
-        <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="space-y-2">
           <p className="text-xs leading-5 text-muted-foreground">
             Having trouble? Re-run the install command — it&apos;s safe to repeat.
           </p>
-          {onRetryClaims ? (
-            <Button type="button" variant="outline" size="sm" onClick={onRetryClaims}>
-              Retry live progress
-            </Button>
-          ) : null}
+          <DoctorHint />
         </div>
       ) : null}
     </div>
@@ -821,15 +569,12 @@ function DoctorHint({ className }: { className?: string }): JSX.Element {
 }
 
 /**
- * Loads and approves a ceremony handed to this surface by the possession link
- * (`autoLoadFromUrl`) or an attended setup claim (`approvalRef`). Approval
- * identifiers are never entered by hand here.
+ * Loads and approves a ceremony handed to this surface by the possession link.
+ * Approval identifiers are never entered by hand here.
  */
 export function HostApprovalForm({
   onApproved,
   autoLoadFromUrl = false,
-  approvalRef = null,
-  inlineReview = false,
   onStartOver,
 }: {
   onApproved?: (hostName: string) => void;
@@ -839,15 +584,10 @@ export function HostApprovalForm({
    * which the daemon's own link opens) arrives with those.
    */
   autoLoadFromUrl?: boolean;
-  /** Setup-claim inline review. It has no `#k=` channel, so this deliberately
-   * enters the full-fingerprint compare frame. */
-  approvalRef?: string | null;
-  /** Render a setup-claim fingerprint review in its compact inline layout. */
-  inlineReview?: boolean;
   /**
    * The ceremony ended without trust and cannot be resumed — a fingerprint
    * mismatch, or a link this browser refused. The surface around this form owns
-   * what "begin again" means (a fresh claim, a fresh command), so it is told
+   * what "begin again" means (the plain install command), so it is told
    * rather than left showing an empty approval surface.
    */
   onStartOver?: () => void;
@@ -1025,15 +765,6 @@ export function HostApprovalForm({
     fragmentKeyRef.current = fragment;
     void review(ref ? { approval_ref: ref } : { user_code: urlCode ?? undefined });
   }, [user, autoLoadFromUrl]);
-
-  const approvalRefTriedRef = useRef<string | null>(null);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: review is the ceremony operation; the ref makes this one-shot per approval_ref
-  useEffect(() => {
-    if (!approvalRef || !user || approvalRefTriedRef.current === approvalRef) return;
-    approvalRefTriedRef.current = approvalRef;
-    fragmentKeyRef.current = null;
-    void review({ approval_ref: approvalRef });
-  }, [approvalRef, user]);
 
   const onApprove = async () => {
     if (!pending || !user || registration.data?.status !== "ready") return;
@@ -1277,9 +1008,7 @@ export function HostApprovalForm({
    * read, an attempt not yet made, or a request in flight right now.
    */
   const attemptOutstanding =
-    urlCeremony === "unknown" ||
-    (urlCeremony === "present" && !autoTriedRef.current) ||
-    (approvalRef != null && approvalRefTriedRef.current !== approvalRef);
+    urlCeremony === "unknown" || (urlCeremony === "present" && !autoTriedRef.current);
   const handedCeremonyLoading =
     !pending && !hostName && error === null && (attemptOutstanding || submitting);
 
@@ -1289,10 +1018,8 @@ export function HostApprovalForm({
   return (
     <div className="space-y-3">
       {handedCeremonyLoading ? (
-        // A ceremony was handed to this surface — by the link, or by a bound
-        // setup claim — and is on its way. There is nothing to type and
-        // nothing to confirm yet, so the only honest thing to show is that
-        // something is happening.
+        // The link's ceremony is on its way. There is nothing to type or
+        // confirm yet, so the only honest thing to show is that lookup.
         <div
           className="flex min-h-32 items-center justify-center px-6"
           data-testid="pairing-loading"
@@ -1445,9 +1172,9 @@ export function HostApprovalForm({
           </div>
         </div>
       ) : pending || hostName ? (
-        // No fragment (an older link or an attended setup claim): the human
-        // compares the full fingerprint. Also owns the done/stopped screens,
-        // so a fragment-verified approval lands here once hostName is set.
+        // No fragment (an older link): the human compares the full fingerprint.
+        // Also owns the done/stopped screens, so a fragment-verified approval
+        // lands here once hostName is set.
         <>
           {/* NumberCheck deliberately shows no host name — it is one shared
               ceremony surface. Name the host above it so the operator knows
@@ -1460,15 +1187,9 @@ export function HostApprovalForm({
             </div>
           )}
           <NumberCheck
-            compact={inlineReview}
             phase={checkPhase}
             mode="enter"
             fingerprint={pending?.host_key_fingerprint}
-            fingerprintHelp={
-              inlineReview
-                ? "Compare this full fingerprint against the one shown in the machine's terminal."
-                : undefined
-            }
             slowHint={submitting && submittingElapsed >= 30_000}
             waitingEscape={submitting && submittingElapsed >= 60_000}
             otherScreen="in the host's terminal"

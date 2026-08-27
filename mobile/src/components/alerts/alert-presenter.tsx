@@ -27,11 +27,9 @@ import {
   configureLocalNotifications,
   consumeLastApprovalNotificationResponse,
   consumeLastLocalNotificationResponse,
-  consumeLastPairingNotificationResponse,
   getNotificationPreferences,
   hydrateNotificationPreferences,
   type NotificationNavigationTarget,
-  type NotificationPairingTarget,
   scheduleLocalAlertNotification,
   subscribeToLocalNotificationResponses,
 } from "@/lib/notifications";
@@ -134,16 +132,6 @@ export function AlertPresenter({
     void queryClient.invalidateQueries({ queryKey: qk.deviceApprovals() });
   }, [queryClient]);
 
-  const openPairingReview = useCallback(
-    (target: NotificationPairingTarget) => {
-      router.push({
-        pathname: "/onboarding/device",
-        params: { approvalRef: target.approvalRef },
-      });
-    },
-    [router],
-  );
-
   useEffect(() => {
     configureLocalNotifications();
     void hydrateNotificationPreferences();
@@ -164,16 +152,11 @@ export function AlertPresenter({
     const lastResponse = consumeLastLocalNotificationResponse();
     if (lastResponse) void handleNotificationTarget(lastResponse);
     else if (consumeLastApprovalNotificationResponse()) surfaceApproval();
-    else {
-      const pairing = consumeLastPairingNotificationResponse();
-      if (pairing) openPairingReview(pairing);
-    }
     const unsubscribeResponses = subscribeToLocalNotificationResponses(
       (target) => {
         void handleNotificationTarget(target);
       },
       () => surfaceApproval(),
-      (target) => openPairingReview(target),
     );
     // The notifications panel asks for this once permission has been granted
     // from there, so the token goes out at that moment rather than next launch.
@@ -188,7 +171,7 @@ export function AlertPresenter({
       unsubscribeRequests();
       foreground.remove();
     };
-  }, [handleNotificationTarget, openPairingReview, surfaceApproval, browserDeviceId, accountId]);
+  }, [handleNotificationTarget, surfaceApproval, browserDeviceId, accountId]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener("change", (state) => {

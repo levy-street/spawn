@@ -49,23 +49,6 @@ export interface DeviceTrustEvent {
   at: string;
 }
 
-export interface HostPairRequestedEvent {
-  event: "host.pair_requested";
-  approval_ref: string;
-  host_name: string;
-  os: string | null;
-  host_key_fingerprint: string;
-  at: string;
-}
-
-export interface HostPairResolvedEvent {
-  event: "host.pair_resolved";
-  approval_ref: string;
-  outcome: "approved" | "denied" | "expired" | "key_conflict" | "pin_conflict" | "pin_limit";
-  host_id: string | null;
-  at: string;
-}
-
 export interface HostPinUndeliveredEvent {
   event: "host.pin_undelivered";
   host_id: string;
@@ -74,11 +57,7 @@ export interface HostPinUndeliveredEvent {
   at: string;
 }
 
-export type TrustEvent =
-  | DeviceTrustEvent
-  | HostPairRequestedEvent
-  | HostPairResolvedEvent
-  | HostPinUndeliveredEvent;
+export type TrustEvent = DeviceTrustEvent | HostPinUndeliveredEvent;
 
 /** Frames the socket can deliver. `alerts.ping` is an idle keepalive. */
 export type AlertFrame =
@@ -89,59 +68,12 @@ export type AlertFrame =
 const TRUST_EVENT_KINDS = new Set<string>([
   "device.approval_requested",
   "device.approval_resolved",
-  "host.pair_requested",
-  "host.pair_resolved",
   "host.pin_undelivered",
 ]);
 
 function parseTrustFrame(record: Record<string, unknown>): AlertFrame | null {
   const event = record.event;
   if (typeof event !== "string" || !TRUST_EVENT_KINDS.has(event)) return null;
-  if (event === "host.pair_requested") {
-    if (
-      typeof record.approval_ref !== "string" ||
-      !record.approval_ref ||
-      typeof record.host_name !== "string" ||
-      typeof record.host_key_fingerprint !== "string"
-    ) {
-      return null;
-    }
-    return {
-      type: "trust",
-      event,
-      approval_ref: record.approval_ref,
-      host_name: record.host_name,
-      os: typeof record.os === "string" ? record.os : null,
-      host_key_fingerprint: record.host_key_fingerprint,
-      at: typeof record.at === "string" ? record.at : "",
-    };
-  }
-  if (event === "host.pair_resolved") {
-    const outcomes = new Set([
-      "approved",
-      "denied",
-      "expired",
-      "key_conflict",
-      "pin_conflict",
-      "pin_limit",
-    ]);
-    if (
-      typeof record.approval_ref !== "string" ||
-      !record.approval_ref ||
-      typeof record.outcome !== "string" ||
-      !outcomes.has(record.outcome)
-    ) {
-      return null;
-    }
-    return {
-      type: "trust",
-      event,
-      approval_ref: record.approval_ref,
-      outcome: record.outcome as HostPairResolvedEvent["outcome"],
-      host_id: typeof record.host_id === "string" ? record.host_id : null,
-      at: typeof record.at === "string" ? record.at : "",
-    };
-  }
   if (event === "host.pin_undelivered") {
     if (
       typeof record.host_id !== "string" ||

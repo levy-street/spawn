@@ -7,7 +7,6 @@ export const qk = {
   host: (hostId: string) => ["host", hostId] as const,
   hostPins: (hostId: string) => ["trust", "host-pins", hostId] as const,
   hostAgents: (hostId: string) => ["host-agents", hostId] as const,
-  setupClaim: (token: string) => ["setup-claim", token] as const,
 
   sessions: () => ["sessions"] as const,
   sessionsForHost: (hostId: string) => ["sessions", { host_id: hostId }] as const,

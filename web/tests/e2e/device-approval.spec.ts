@@ -187,6 +187,7 @@ test("device approval shows the locally derived fingerprint before confirmation"
 });
 
 test("the bare page keeps installation instructions and has no code entry", async ({ page }) => {
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/me") {
@@ -217,8 +218,11 @@ test("the bare page keeps installation instructions and has no code entry", asyn
   await page.goto("/device");
 
   // The install command is the instruction; it leads, unfolded.
-  await expect(page.getByText(/curl -fsSL .*install\.sh/)).toBeVisible();
-  await expect(page.getByText("After installation, run")).toBeVisible();
+  await expect(page.getByText(/curl -fsSL .*install\.sh \| sh$/)).toBeVisible();
+  await expect(page.getByText("After installation, run")).toContainText("spawnd possess");
+  await expect(page.getByText("Already running SPAWN D for another account")).toContainText(
+    "--new-account",
+  );
 
   // Approval starts only from a terminal link; the bare route has no ceremony
   // to load and exposes no manual-entry controls or waiting state.
@@ -226,6 +230,9 @@ test("the bare page keeps installation instructions and has no code entry", asyn
   await expect(page.getByTestId("possess-instructions")).toHaveCount(0);
   await expect(page.getByTestId("reveal-pairing-code")).toHaveCount(0);
   await expect(page.getByText("Waiting for your machine…")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Copy install command" }).click();
+  await expect(page.getByText("Waiting for your machine…")).toBeVisible();
 });
 
 test("blocks first contact when the server fingerprint disagrees with the host key", async ({

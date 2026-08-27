@@ -202,8 +202,8 @@ INSTALL_SCRIPT = dedent(
     USE_SERVICE=1
     FOREGROUND=0
     PREBUILT_ONLY=0
-    SETUP_TOKEN=${SPAWN_SETUP_TOKEN:-}
     NEW_ACCOUNT=0
+    unset SPAWN_SETUP_TOKEN
 
     if [ -z "$INSTALL_ROOT" ]; then
       INSTALL_ROOT="$HOME/.local"
@@ -248,7 +248,7 @@ INSTALL_SCRIPT = dedent(
       --no-service       Do not create a user systemd service; use background run fallback.
       --foreground       Run spawnd in the foreground after login.
       --prebuilt-only    Do not fall back to building from source.
-      --setup TOKEN      Route this possession request back to the setup screen.
+      --setup TOKEN      Ignored (older apps); approval uses the printed link.
       --new-account      Possess as a separate account on an already-used machine.
       -h, --help         Show this help.
 
@@ -256,7 +256,6 @@ INSTALL_SCRIPT = dedent(
       SPAWN_INSTALL_ROOT Install root. Default: ~/.local
       SPAWN_REPO         Same as --repo.
       SPAWN_BRANCH       Same as --branch.
-      SPAWN_SETUP_TOKEN  Same as --setup.
     EOF
     }
 
@@ -314,12 +313,12 @@ INSTALL_SCRIPT = dedent(
         --setup)
           [ "$#" -ge 2 ] || die "--setup requires a token"
           [ -n "$2" ] || die "--setup requires a token"
-          SETUP_TOKEN=$2
+          say "the --setup flag is no longer needed; approval happens through the link spawnd prints"
           shift 2
           ;;
         --setup=*)
-          SETUP_TOKEN=${1#--setup=}
-          [ -n "$SETUP_TOKEN" ] || die "--setup requires a token"
+          [ -n "${1#--setup=}" ] || die "--setup requires a token"
+          say "the --setup flag is no longer needed; approval happens through the link spawnd prints"
           shift
           ;;
         --new-account)
@@ -340,11 +339,6 @@ INSTALL_SCRIPT = dedent(
       http://*|https://*) ;;
       *) die "--server must start with http:// or https://" ;;
     esac
-
-    if [ -n "$SETUP_TOKEN" ]; then
-      SPAWN_SETUP_TOKEN=$SETUP_TOKEN
-      export SPAWN_SETUP_TOKEN
-    fi
 
     as_root() {
       if [ "$(id -u)" -eq 0 ]; then

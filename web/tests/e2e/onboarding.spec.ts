@@ -48,17 +48,50 @@ test("a step deep link cannot skip an unsatisfied verification gate", async ({ p
 
 test("the host gate notices a newly online host and moves on", async ({ page }) => {
   await page.clock.install();
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
   const store = await mockApp(page, { hosts: [], workspaces: [] });
   await page.goto("/onboarding");
   await expect(page.getByRole("heading", { name: "Connect your first host" })).toBeVisible();
+  const command = page.getByText(/curl -fsSL .*install\.sh \| sh$/);
+  await expect(command).toBeVisible();
+  await expect(page.getByText("After installation, run")).toContainText("spawnd possess");
+  await expect(page.getByText("Already running SPAWN D for another account")).toContainText(
+    "--new-account",
+  );
+
+  await page.getByRole("button", { name: "Copy install command" }).click();
+  const progress = page.getByTestId("setup-progress");
+  await expect(progress).toBeVisible();
+  await expect(progress.locator('[data-step="1"]')).toHaveAttribute("data-state", "complete");
+  await expect(progress.locator('[data-step="2"]')).toHaveAttribute("data-state", "current");
+
   store.hosts.push({ ...host });
   await page.clock.fastForward(3_100);
+  await expect(progress.locator('[data-step="2"]')).toHaveAttribute("data-state", "complete");
+  await expect(progress.locator('[data-step="3"]')).toHaveAttribute("data-state", "complete");
+  await page.clock.fastForward(400);
   await expect(page.getByRole("status")).toContainText("host is online");
   await page.clock.fastForward(2_000);
   // Onboarding hands over rather than building: no workspace is created here,
   // and /app decides where this account's work is.
   await expect(page).toHaveURL("/app");
   expect(store.requests.workspaces).toHaveLength(0);
+});
+
+test("the host wait keeps its 30 and 60 second recovery hints", async ({ page }) => {
+  await page.clock.install();
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await mockApp(page, { hosts: [], workspaces: [] });
+  await page.goto("/onboarding");
+  await page.getByRole("button", { name: "Copy install command" }).click();
+
+  await page.clock.fastForward(30_100);
+  await expect(page.getByText("Still waiting…")).toBeVisible();
+  await page.clock.fastForward(30_100);
+  await expect(page.getByTestId("setup-stalled-hint")).toHaveText(
+    "Having trouble? Re-run the install command — it's safe to repeat.",
+  );
+  await expect(page.getByText(/spawnd doctor/)).toBeVisible();
 });
 
 test("done creates nothing and hands the reader to the first-workspace state", async ({ page }) => {
@@ -122,7 +155,7 @@ test("the onboarding host step finishes an approval its URL still carries", asyn
   await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
 
   await page.getByTestId("possess-approve").click();
-  await expect(page.locator('[data-step="3"]')).toHaveAttribute("data-state", "complete", {
+  await expect(page.locator('[data-step="2"]')).toHaveAttribute("data-state", "complete", {
     timeout: 10_000,
   });
 
@@ -136,34 +169,26 @@ test("the onboarding host step finishes an approval its URL still carries", asyn
   // hosts already online is there to stop it completing someone else's
   // approval, and on this gate there is no one else's to complete.
   store.hosts.push({ ...host, status: "online", session_count: 0 });
-  await expect(page.locator('[data-step="4"]')).toHaveAttribute("data-state", "complete", {
+  await expect(page.locator('[data-step="3"]')).toHaveAttribute("data-state", "complete", {
     timeout: 10_000,
   });
   await expect(page).toHaveURL("/app", { timeout: 10_000 });
 });
 
 test("an approval link followed through signup finishes on /device", async ({ page }) => {
-  const store = await mockApp(page, { me: null, hosts: [], workspaces: [] });
+  await mockApp(page, { me: null, hosts: [], workspaces: [] });
   await arriveByApprovalLink(page);
   // The ceremony is already waiting, so there is nothing to install and no
   // code to type.
   await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
   await page.getByTestId("possess-approve").click();
 
-  await expect(page.locator('[data-step="3"]')).toHaveAttribute("data-state", "complete", {
+  await expect(page.getByTestId("ceremony-done")).toContainText("is possessed", {
     timeout: 10_000,
   });
   await expect(page.getByLabel("Code from the terminal")).toHaveCount(0);
-
-  // The daemon notices the approval and calls home.
-  store.hosts.push({ ...host, status: "online", session_count: 0 });
-  // Online is painted here before the page around it is told, exactly as on the
-  // setup-claim path.
-  await expect(page.locator('[data-step="4"]')).toHaveAttribute("data-state", "complete", {
-    timeout: 10_000,
-  });
-  await expect(page.getByRole("status")).toContainText("host is online", { timeout: 10_000 });
-  await expect(page).toHaveURL("/app", { timeout: 10_000 });
+  await page.getByRole("button", { name: "Done" }).click();
+  await expect(page.getByRole("button", { name: "Copy install command" })).toBeVisible();
 });
 
 test("a reloaded approval link keeps the ceremony it still carries", async ({ page }) => {

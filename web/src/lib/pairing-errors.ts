@@ -1,7 +1,11 @@
 import { ApiError } from "@/lib/api";
-import type { SetupClaimError } from "@/lib/setup-claims";
 
-export type PairingFailureCode = SetupClaimError;
+export type PairingFailureCode =
+  | "expired"
+  | "denied"
+  | "key_conflict"
+  | "pin_conflict"
+  | "pin_limit";
 
 export const PAIRING_FAILURE_COPY: Record<PairingFailureCode, string> = {
   expired: "That approval expired. On the machine, run spawnd possess again.",

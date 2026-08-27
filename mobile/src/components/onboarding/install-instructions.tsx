@@ -13,26 +13,22 @@ import { chrome, duration, spacing, useTheme } from "@/theme";
 export const DEFAULT_INSTALL_ORIGIN = "https://spawnd.dev";
 export const DEFAULT_INSTALL_COMMAND = `curl -fsSL ${DEFAULT_INSTALL_ORIGIN}/install.sh | sh`;
 
-export function installCommandForBaseUrl(baseUrl: string, setupToken?: string): string {
-  const command =
-    baseUrl === apiConfig.defaultBaseUrl
-      ? DEFAULT_INSTALL_COMMAND
-      : `curl -fsSL ${new URL(baseUrl).origin}/install.sh | sh`;
-  return setupToken === undefined ? command : `${command} -s -- --setup ${setupToken}`;
+export function installCommandForBaseUrl(baseUrl: string): string {
+  return baseUrl === apiConfig.defaultBaseUrl
+    ? DEFAULT_INSTALL_COMMAND
+    : `curl -fsSL ${new URL(baseUrl).origin}/install.sh | sh`;
 }
 
 export interface InstallInstructionsProps {
   command?: string;
   onCommandCopied?: () => void;
   onSkip?: () => void;
-  preparing?: boolean;
 }
 
 export function InstallInstructions({
   command = DEFAULT_INSTALL_COMMAND,
   onCommandCopied,
   onSkip,
-  preparing = false,
 }: InstallInstructionsProps) {
   const theme = useTheme();
   const [copied, setCopied] = useState(false);
@@ -68,8 +64,8 @@ export function InstallInstructions({
           Connect your first host
         </Text>
         <Text color="mutedForeground">
-          Install the daemon on a Mac or Linux machine. When it registers, its approval appears
-          here.
+          Install the daemon on a Mac or Linux machine, then approve it from the link its terminal
+          prints. It appears here once it's online.
         </Text>
       </View>
 
@@ -99,8 +95,6 @@ export function InstallInstructions({
         <View style={styles.commandActions}>
           <Button
             accessibilityLabel={copied ? "Install command copied" : "Copy install command"}
-            disabled={preparing}
-            loading={preparing}
             onPress={() => void copyCommand()}
             size="sm"
             variant="outline"
@@ -110,7 +104,6 @@ export function InstallInstructions({
           </Button>
           <Button
             accessibilityLabel="Share install command"
-            disabled={preparing}
             onPress={() => void shareCommand()}
             size="sm"
             variant="outline"

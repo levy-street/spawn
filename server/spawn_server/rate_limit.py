@@ -96,13 +96,7 @@ async def enforce(request: Request, rule: RateLimit) -> None:
 
 
 async def enforce_identifier(identifier: str, rule: RateLimit) -> None:
-    """Count a trusted caller identifier against ``rule``.
-
-    Most public auth routes can identify only an IP and use :func:`enforce`.
-    Authenticated setup claims are account-scoped instead: rotating addresses
-    must not create extra claim capacity, and two users behind one proxy must
-    not consume each other's bucket.
-    """
+    """Count a trusted caller identifier against ``rule``."""
 
     if not get_settings().rate_limit_enabled:
         return
@@ -137,4 +131,3 @@ LOGIN = RateLimit("login", limit=20, window_seconds=900)
 PASSWORD_RESET = RateLimit("password_reset", limit=5, window_seconds=3600)
 VERIFY_RESEND = RateLimit("verify_resend", limit=5, window_seconds=3600)
 DEVICE_PAIRING = RateLimit("device_pairing", limit=30, window_seconds=3600)
-SETUP_CLAIM = RateLimit("setup_claim", limit=10, window_seconds=60)

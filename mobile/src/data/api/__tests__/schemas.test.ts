@@ -11,7 +11,6 @@ import { HostOutSchema } from "@/data/api/schemas/hosts";
 import { ProfileOutSchema } from "@/data/api/schemas/legion";
 import { ReleaseSchema } from "@/data/api/schemas/release";
 import { SessionOutSchema } from "@/data/api/schemas/sessions";
-import { SetupClaimCreateResponseSchema, SetupClaimStatusSchema } from "@/data/api/schemas/setup";
 import { SessionAccessOutSchema, SkillOutSchema } from "@/data/api/schemas/skills";
 import { WorkspaceTemplateOutSchema } from "@/data/api/schemas/templates";
 import {
@@ -117,28 +116,6 @@ it("round-trips browser-device and pairing response JSON", () => {
   expect(DevicePollResponseSchema.parse({ error: "authorization_pending" })).toEqual({
     error: "authorization_pending",
   });
-});
-
-it("round-trips setup claim responses", () => {
-  expect(
-    SetupClaimCreateResponseSchema.parse({
-      token: "t".repeat(43),
-      expires_in: 1800,
-      expires_at: NOW,
-    }),
-  ).toMatchObject({ token: "t".repeat(43), expires_in: 1800 });
-  expect(
-    SetupClaimStatusSchema.parse({
-      status: "ready",
-      approval_ref: "approval-ref-123",
-      host_name: "macbook",
-      os: "macos",
-      host_key_fingerprint: "SHA256:host",
-      host_id: null,
-      error: null,
-      expires_at: NOW,
-    }),
-  ).toMatchObject({ status: "ready", approval_ref: "approval-ref-123" });
 });
 
 it("round-trips host response JSON", () => {

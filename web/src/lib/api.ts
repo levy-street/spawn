@@ -163,25 +163,6 @@ export const HostSchema = z.object({
 });
 export type Host = z.infer<typeof HostSchema>;
 
-export const SetupClaimMintSchema = z.object({
-  token: z.string().length(43),
-  expires_in: z.number().int().positive(),
-  expires_at: z.string(),
-});
-export type SetupClaimMint = z.infer<typeof SetupClaimMintSchema>;
-
-export const SetupClaimSchema = z.object({
-  status: z.enum(["pending", "ready", "approved", "failed"]),
-  approval_ref: z.string().nullable(),
-  host_name: z.string().nullable(),
-  os: z.string().nullable(),
-  host_key_fingerprint: z.string().nullable(),
-  host_id: z.string().uuid().nullable(),
-  error: z.enum(["expired", "denied", "key_conflict", "pin_conflict", "pin_limit"]).nullable(),
-  expires_at: z.string(),
-});
-export type SetupClaim = z.infer<typeof SetupClaimSchema>;
-
 /** One UTC day of fleet activity. Sparse — quiet days are simply absent. */
 export const LegionDaySchema = z.object({
   day: z.string(),
@@ -764,20 +745,6 @@ export const hosts = {
     api(`/api/hosts/${id}/recent-dirs`, {
       method: "GET",
       schema: RecentDirsSchema,
-    }),
-};
-
-export const setupClaims = {
-  mint: () =>
-    api("/api/setup/claims", {
-      method: "POST",
-      body: JSON.stringify({}),
-      schema: SetupClaimMintSchema,
-    }),
-  get: (token: string) =>
-    api(`/api/setup/claims/${encodeURIComponent(token)}`, {
-      method: "GET",
-      schema: SetupClaimSchema,
     }),
 };
 

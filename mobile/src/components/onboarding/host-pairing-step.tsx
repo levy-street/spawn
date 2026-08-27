@@ -1,7 +1,6 @@
-import { useIsFocused } from "@react-navigation/native";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { AppState, StyleSheet, View } from "react-native";
+import { useEffect, useRef, useState } from "react";
+import { StyleSheet, View } from "react-native";
 import { EndorsementOption } from "@/components/onboarding/endorsement-option";
 import { FingerprintReview } from "@/components/onboarding/fingerprint-review";
 import {
@@ -9,12 +8,11 @@ import {
   InstallInstructions,
   installCommandForBaseUrl,
 } from "@/components/onboarding/install-instructions";
+import { MachineWait } from "@/components/onboarding/machine-wait";
 import { setHostSkipped } from "@/components/onboarding/onboarding-state";
 import { PairingSuccess } from "@/components/onboarding/pairing-success";
-import { SetupChecklist } from "@/components/onboarding/setup-checklist";
 import { TrustFailureState } from "@/components/onboarding/trust-failure-state";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
@@ -28,27 +26,19 @@ import {
   type PairingApprovalResult,
   type PairingFailure,
   type PendingPairingCeremony,
-  pairingFailureForProtocolError,
   serverOriginFromBaseUrl,
   toPairingFailure,
   useAccountDevices,
   usePendingEndorsements,
   useRegisteredPhone,
 } from "@/data/queries/pairing";
-import { useCreateSetupClaimMutation, useSetupClaimQuery } from "@/data/queries/setup";
 import { qk } from "@/data/queryKeys";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { haptics } from "@/lib/haptics";
 import { spacing } from "@/theme";
 
 type HostStage = "instructions" | "review" | "failure" | "success";
-type ReviewSource = "claim" | "link";
-type PairingLookupRequest =
-  | { source: "claim"; approvalRef: string }
-  | { source: "link"; approvalRef: string; linkHostKey?: string };
-
-export const INLINE_APPROVE_LEAD =
-  "Fastest: open the link in the machine's terminal — it verifies the identity automatically. Or compare the fingerprint below against the terminal.";
+type PairingLookupRequest = { approvalRef: string; linkHostKey?: string };
 
 export interface HostPairingStepProps {
   accountId: string;
@@ -68,53 +58,25 @@ export function HostPairingStep({
   onSkip,
 }: HostPairingStepProps) {
   const queryClient = useQueryClient();
-  const focused = useIsFocused();
   const phoneQuery = useRegisteredPhone(accountId);
   const devicesQuery = useAccountDevices(phoneQuery.isSuccess);
   const endorsementsQuery = usePendingEndorsements(accountId, phoneQuery.data?.id ?? null);
   const hostsQuery = useHostsQuery();
-  const createClaim = useCreateSetupClaimMutation();
   const [stage, setStage] = useState<HostStage>("instructions");
-  const [appActive, setAppActive] = useState(
-    AppState.currentState !== "background" && AppState.currentState !== "inactive",
-  );
   const [baseUrl, setBaseUrl] = useState<string | null>(null);
   const [serverOrigin, setServerOrigin] = useState<string | null>(null);
-  const [claimToken, setClaimToken] = useState<string | null>(null);
   const [commandCopied, setCommandCopied] = useState(false);
   const [ceremony, setCeremony] = useState<PendingPairingCeremony | null>(null);
   const [failure, setFailure] = useState<PairingFailure | null>(null);
-  const [reviewSource, setReviewSource] = useState<ReviewSource>("claim");
   const [allowRevokedPin, setAllowRevokedPin] = useState(false);
   const [success, setSuccess] = useState<{
     result: PairingApprovalResult;
     requiresPhoneComparison: boolean;
   } | null>(null);
-  const claimMintStarted = useRef(false);
-  const claimLookupRef = useRef<string | null>(null);
   const initialLookupStarted = useRef(false);
-  const claimQuery = useSetupClaimQuery(claimToken, focused && appActive);
+  const waitingHostIds = useRef<Set<string> | null>(null);
   const installCommand =
-    baseUrl === null
-      ? DEFAULT_INSTALL_COMMAND
-      : installCommandForBaseUrl(baseUrl, claimToken ?? undefined);
-  const createClaimMutate = createClaim.mutate;
-  const createClaimReset = createClaim.reset;
-
-  const beginSetupClaim = useCallback(() => {
-    claimMintStarted.current = true;
-    claimLookupRef.current = null;
-    setClaimToken(null);
-    setCommandCopied(false);
-    createClaimReset();
-    createClaimMutate(undefined, {
-      onSuccess: (claim) => setClaimToken(claim.token),
-      // A server without Phase C returns 404/405. Network and older-server
-      // failures keep the bare install command usable; the terminal's link
-      // remains the fallback when live setup progress is unavailable.
-      onError: () => setClaimToken(null),
-    });
-  }, [createClaimMutate, createClaimReset]);
+    baseUrl === null ? DEFAULT_INSTALL_COMMAND : installCommandForBaseUrl(baseUrl);
 
   useEffect(() => {
     let active = true;
@@ -134,31 +96,14 @@ export function HostPairingStep({
     };
   }, []);
 
-  useEffect(() => {
-    const subscription = AppState.addEventListener("change", (state) => {
-      setAppActive(state === "active");
-    });
-    return () => subscription.remove();
-  }, []);
-
-  useEffect(() => {
-    if (baseUrl === null || initialApprovalRef !== undefined || claimMintStarted.current) {
-      return;
-    }
-    beginSetupClaim();
-  }, [baseUrl, beginSetupClaim, initialApprovalRef]);
-
   const lookupMutation = useMutation({
     mutationFn: (request: PairingLookupRequest) => {
       if (serverOrigin === null) throw new Error("Server address is not ready");
-      setReviewSource(request.source);
       return lookupPendingPairing({
         accountId,
         serverOrigin,
         approvalRef: request.approvalRef,
-        ...(request.source === "link" && request.linkHostKey !== undefined
-          ? { linkHostKey: request.linkHostKey }
-          : {}),
+        ...(request.linkHostKey === undefined ? {} : { linkHostKey: request.linkHostKey }),
       });
     },
     onSuccess: (nextCeremony) => {
@@ -189,31 +134,10 @@ export function HostPairingStep({
     if (initialApprovalRef === undefined) return;
     initialLookupStarted.current = true;
     lookupMutate({
-      source: "link",
       approvalRef: initialApprovalRef,
       ...(initialHostKey === undefined ? {} : { linkHostKey: initialHostKey }),
     });
   }, [initialApprovalRef, initialHostKey, initialLinkMalformed, lookupMutate, serverOrigin]);
-
-  const claim = claimQuery.data ?? null;
-  useEffect(() => {
-    if (!focused || !appActive) return;
-    if (claim?.status === "failed") {
-      if (claim.error !== null) setFailure(pairingFailureForProtocolError(claim.error));
-      else setFailure({ kind: "pairing-rejected" });
-      setStage("failure");
-      return;
-    }
-    if (
-      claim?.status !== "ready" ||
-      claim.approval_ref === null ||
-      claimLookupRef.current === claim.approval_ref
-    ) {
-      return;
-    }
-    claimLookupRef.current = claim.approval_ref;
-    lookupMutate({ source: "claim", approvalRef: claim.approval_ref });
-  }, [appActive, claim, focused, lookupMutate]);
 
   const approveMutation = useMutation({
     mutationFn: () => {
@@ -235,9 +159,6 @@ export function HostPairingStep({
       void setHostSkipped(false);
       void queryClient.invalidateQueries({ queryKey: qk.hosts() });
       void queryClient.invalidateQueries({ queryKey: qk.trustLocalPins(accountId) });
-      if (claimToken !== null) {
-        void queryClient.invalidateQueries({ queryKey: qk.setupClaim(claimToken) });
-      }
     },
     onError: (error) => {
       setFailure(toPairingFailure(error));
@@ -312,36 +233,47 @@ export function HostPairingStep({
   const acceptingKey = endorsementMutation.variables
     ? `${endorsementMutation.variables.record.host_id}:${endorsementMutation.variables.record.endorser_device_id}`
     : null;
-  const setupProgress =
-    claimToken !== null ? (
-      <SetupChecklist
-        claim={claim}
-        commandCopied={commandCopied}
-        hosts={hostsQuery.data ?? []}
-        {...(onExit === undefined && onSkip === undefined ? {} : { onExit: onExit ?? onSkip })}
-      />
-    ) : createClaim.isError ? (
-      <Card style={styles.claimRecovery} variant="flat">
-        <Text color="mutedForeground" variant="caption">
-          Live setup progress could not start. The install command still works — approve the host
-          from the link its terminal prints.
-        </Text>
-        <Button onPress={beginSetupClaim} size="sm" variant="outline">
-          Try again
-        </Button>
-      </Card>
-    ) : null;
+  const newHost =
+    commandCopied && waitingHostIds.current !== null
+      ? (hostsQuery.data?.find((host) => !waitingHostIds.current?.has(host.id)) ?? null)
+      : null;
+  const machineWait = commandCopied ? <MachineWait host={newHost} /> : null;
+  const pairAnother = () => {
+    waitingHostIds.current = null;
+    setCommandCopied(false);
+    setCeremony(null);
+    setSuccess(null);
+    setStage("instructions");
+  };
 
   if (stage === "instructions") {
+    if (newHost !== null && onExit !== undefined) {
+      return (
+        <View style={styles.hostStep}>
+          <EmptyState
+            action={
+              <Button onPress={pairAnother} variant="outline">
+                Connect another host
+              </Button>
+            }
+            description={`${newHost.name} is connected. It will appear as soon as its daemon comes online.`}
+            icon="ShieldCheck"
+            title="Host approved"
+          />
+        </View>
+      );
+    }
     return (
       <View style={styles.hostStep}>
         <InstallInstructions
           command={installCommand}
-          onCommandCopied={() => setCommandCopied(true)}
-          preparing={createClaim.isPending}
+          onCommandCopied={() => {
+            waitingHostIds.current ??= new Set(hostsQuery.data?.map((host) => host.id) ?? []);
+            setCommandCopied(true);
+          }}
           {...(onSkip === undefined ? {} : { onSkip })}
         />
-        {setupProgress}
+        {machineWait}
         <EndorsementOption
           acceptingKey={acceptingKey}
           onAccept={(record, endorserFingerprint) =>
@@ -360,11 +292,10 @@ export function HostPairingStep({
   if (stage === "review" && ceremony !== null) {
     return (
       <View style={styles.hostStep}>
-        {setupProgress}
+        {machineWait}
         <FingerprintReview
           approving={approveMutation.isPending}
           ceremony={ceremony}
-          {...(reviewSource === "claim" ? { lead: INLINE_APPROVE_LEAD } : {})}
           onApprove={() => approveMutation.mutate()}
           onBack={() => setStage("instructions")}
           onExpired={() => {
@@ -384,17 +315,10 @@ export function HostPairingStep({
   }
 
   if (stage === "success" && success !== null) {
-    const pairAnother = () => {
-      setCeremony(null);
-      setSuccess(null);
-      setStage("instructions");
-      claimMintStarted.current = false;
-      beginSetupClaim();
-    };
     if (success.requiresPhoneComparison) {
       return (
         <View style={styles.hostStep}>
-          {setupProgress}
+          {machineWait}
           <PairingSuccess
             hostName={success.result.hostName}
             onConfirmed={() => haptics.success()}
@@ -411,7 +335,7 @@ export function HostPairingStep({
     }
     return (
       <View style={styles.hostStep}>
-        {setupProgress}
+        {machineWait}
         <EmptyState
           action={
             <Button onPress={pairAnother} variant="outline">
@@ -454,10 +378,6 @@ export function HostPairingStep({
 }
 
 const styles = StyleSheet.create({
-  claimRecovery: {
-    alignItems: "flex-start",
-    gap: spacing[3],
-  },
   hostStep: {
     gap: spacing[8],
   },

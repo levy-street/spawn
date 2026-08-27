@@ -145,14 +145,22 @@ describe("onboarding security states", () => {
     const screen = await render(<InstallInstructions />, { wrapper });
 
     expect(
+      screen.getByText(
+        "Install the daemon on a Mac or Linux machine, then approve it from the link its terminal prints. It appears here once it's online.",
+      ),
+    ).toBeOnTheScreen();
+    expect(
+      screen.getByText("After installation, run spawnd possess on that machine."),
+    ).toBeOnTheScreen();
+    expect(
       screen.queryByRole("button", { name: ["Enter", "pairing", "code"].join(" ") }),
     ).toBeNull();
     await screen.unmount();
   });
 
-  it("embeds a setup claim token in the displayed shell command", () => {
-    expect(installCommandForBaseUrl("https://spawn.example/api", "t".repeat(43))).toBe(
-      `curl -fsSL https://spawn.example/install.sh | sh -s -- --setup ${"t".repeat(43)}`,
+  it("builds the plain install command for the configured server", () => {
+    expect(installCommandForBaseUrl("https://spawn.example/api")).toBe(
+      "curl -fsSL https://spawn.example/install.sh | sh",
     );
   });
 
