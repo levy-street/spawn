@@ -12,13 +12,15 @@ ceremony, a download page) says so in the commit message.
 ```
 src/
   app/            one directory per route (App Router)
-                  admin/ app/ device/ download/ forgot-password/ hosts/
+                  admin/ app/ device/ download/ for/ forgot-password/ hosts/
                   legion/ login/ onboarding/ reset-password/ security/
-                  sessions/ signup/ trust-ux-demo/ verify-email/ w/
+                  sessions/ signup/ trust-ux-demo/ use/ verify-email/ vs/ w/
+                  (for/, use/, vs/ are the SEO landing-page families, rendered
+                  from the registry in lib/seo/ — see "SEO landing pages")
   components/     UI grouped by product area
                   access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/
-                  onboarding/ profile/ session/ settings/ terminal/ trust/
-                  ui/ workspace/
+                  onboarding/ profile/ seo/ session/ settings/ terminal/
+                  trust/ ui/ workspace/
   hooks/          React hooks shared across areas (useHostControl, …)
   lib/            framework-free logic: API client, crypto, ceremonies,
                   alerts — with colocated *.test.ts files
@@ -50,6 +52,18 @@ public/           static assets
   `SPAWN_API_PROXY_TARGET`. `scripts/next-with-proxy-target.mjs` wraps
   build/start and refuses a silent default outside `dev`. Never call the API
   cross-origin.
+
+## SEO landing pages
+
+Public landing pages (`/use/*`, `/for/*`, `/vs/*`) are data, not JSX: one
+typed entry per page in `src/lib/seo/{use-cases,agents,comparisons}.ts`,
+rendered by `src/components/seo/SeoLandingPage.tsx` in the pressroom
+vocabulary (`components/brand/press.tsx`). Adding a page = adding an entry;
+the sitemap (`app/sitemap.ts`), family indexes, and cross-links follow from
+the registry. `src/lib/seo/registry.test.ts` holds the invariants (unique
+slugs, snippet-length budgets, resolvable cross-links). Titles and H1s stay
+plain-language for search; the demon voice lives in body copy. Every claim
+must survive a diff against `docs/TRUST.md`.
 
 ## Before calling a change done
 
