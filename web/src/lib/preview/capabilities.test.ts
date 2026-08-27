@@ -25,14 +25,18 @@ describe("deriveFileCapabilities", () => {
     expect(caps.quicklook).toBe(false);
     expect(caps.range).toBe(false);
     expect(caps.stat).toBe(true);
-    expect(caps.unavailableReason).toContain("older agent");
+    expect(caps.unavailableReason).toBe(
+      "This host cannot render previews with its current daemon.",
+    );
   });
 
-  test("a Linux host explains that rendering is macOS-only", () => {
+  test("a Linux host gets the same capability-neutral explanation", () => {
     const caps = deriveFileCapabilities(new Set(["fs.read.range", "fs.stat"]), "linux");
     expect(caps.quicklook).toBe(false);
     expect(caps.range).toBe(true);
-    expect(caps.unavailableReason).toContain("macOS");
+    expect(caps.unavailableReason).toBe(
+      "This host cannot render previews with its current daemon.",
+    );
   });
 
   test("labels follow the host platform, not the browser", () => {

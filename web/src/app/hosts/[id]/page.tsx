@@ -36,6 +36,7 @@ import {
   resolveActiveBrowserHostPin,
   revokeBrowserHostPin,
 } from "@/lib/browser-host-pins";
+import { formatHostPlatform } from "@/lib/host-platform";
 import { relativeTime, sessionActivityDetail, sessionTitle } from "@/lib/sessions";
 import { SIGNED_RTC_REFUSAL_DETAIL, SIGNED_RTC_REFUSAL_NEXT_STEP } from "@/lib/signed-rtc-trust";
 import { ed25519PublicKeyFingerprint } from "@/lib/signed-signal";
@@ -418,7 +419,7 @@ function HostDetail() {
         {host && (
           <div className="space-y-4">
             <dl className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-xl border border-border p-4 text-sm @lg/shell:grid-cols-4">
-              <Fact label="System" value={`${host.os ?? "?"}/${host.arch ?? "?"}`} />
+              <Fact label="System" value={formatHostPlatform(host)} />
               <Fact
                 label="Daemon"
                 value={

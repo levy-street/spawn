@@ -235,6 +235,56 @@ test("the bare page keeps installation instructions and has no code entry", asyn
   await expect(page.getByText("Waiting for your machine…")).toBeVisible();
 });
 
+test("the bare Windows page copies the explicit WSL install command", async ({ page }) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window.navigator, "platform", { get: () => "Win32" });
+  });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.route("**/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === "/api/me") {
+      await route.fulfill({
+        status: 200,
+        json: {
+          user: { id: USER_ID, email: "owner@example.com", created_at: "2026-07-17T00:00:00Z" },
+        },
+      });
+      return;
+    }
+    if (path === "/api/release") {
+      await route.fulfill({ status: 200, json: {} });
+      return;
+    }
+    if (path === "/api/browser-devices/register") {
+      const body = route.request().postDataJSON() as { public_key: string };
+      await route.fulfill({
+        status: 200,
+        json: {
+          id: BROWSER_DEVICE_ID,
+          key_algorithm: "ed25519",
+          public_key: body.public_key,
+          created_at: "2026-07-17T00:00:00Z",
+          revoked_at: null,
+        },
+      });
+      return;
+    }
+    await route.fulfill({ status: 404, json: { detail: "not mocked" } });
+  });
+
+  await page.goto("/device");
+  const origin = new URL(page.url()).origin;
+  const expected = `wsl -- bash -c "curl -fsSL ${origin}/install.sh | sh"`;
+  await expect(page.getByRole("tab", { name: "Windows (WSL)" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  await page.getByRole("button", { name: "Copy install command" }).click();
+  await expect
+    .poll(() => page.evaluate(() => window.navigator.clipboard.readText()))
+    .toBe(expected);
+});
+
 test("blocks first contact when the server fingerprint disagrees with the host key", async ({
   page,
 }) => {

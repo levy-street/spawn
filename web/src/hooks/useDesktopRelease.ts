@@ -1,57 +1,108 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { type DesktopRelease, desktopDownloadUrl, desktopReleaseFromPayload } from "@/lib/platform";
+import {
+  type DesktopPlatform,
+  type DesktopRelease,
+  desktopDownloadUrl,
+  desktopReleaseFromPayload,
+  localDesktopBuildFromPayload,
+  nativeWindowsAvailableFromPayload,
+} from "@/lib/platform";
 
 export interface DesktopReleaseState {
-  /** The manifest's desktop block, or null where this deployment ships none. */
+  /** The signed manifest's desktop block, or null where this deployment ships none. */
   release: DesktopRelease | null;
-  /**
-   * Whether `/api/release` has answered — including by failing. "We have not
-   * asked yet" is not the same answer as "there is nothing to hand out", and a
-   * download pressed during that window waits for the real one rather than
-   * being sent somewhere else.
-   */
+  /** The platform this caller asked the deployment to hand over. */
+  platform: DesktopPlatform | null;
+  /** Whether release discovery (including a development fallback) has settled. */
   settled: boolean;
-  /** The Apple Silicon build to hand over, once the manifest names it. */
+  /** A URL only when the corresponding artifact was actually advertised. */
   url: string | null;
+  /** The verified Windows daemon artifact is present in release metadata. */
+  nativeWindowsAvailable: boolean;
 }
 
+type ResolvedBuild = { version: string; platforms: DesktopPlatform[] };
+
 /**
- * The Mac build this deployment publishes.
+ * The desktop build this deployment can prove for one requested platform.
  *
- * Both public download surfaces — the lander's hero and /download — hand out
- * the same file and both have to tell waiting apart from nothing, so the
- * question is asked in one place.
+ * Production trusts only `/api/release`. Development may use the local
+ * `/desktop-build` inventory when the signed release does not contain the
+ * requested artifact. Linux, phones, and the initial hydration-safe unknown
+ * render request no desktop platform and therefore never receive a URL.
  */
-export function useDesktopRelease(origin: string): DesktopReleaseState {
+export function useDesktopRelease(
+  origin: string,
+  requestedPlatform: DesktopPlatform | null,
+): DesktopReleaseState {
   const [release, setRelease] = useState<DesktopRelease | null>(null);
+  const [resolvedBuild, setResolvedBuild] = useState<ResolvedBuild | null>(null);
   const [settled, setSettled] = useState(false);
+  const [nativeWindowsAvailable, setNativeWindowsAvailable] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
-    void fetch("/api/release", {
-      cache: "no-store",
-      headers: { Accept: "application/json" },
-      signal: controller.signal,
-    })
-      .then((response) => (response.ok ? response.json() : null))
-      .then((payload: unknown) => {
-        setRelease(desktopReleaseFromPayload(payload));
+    setSettled(false);
+    setResolvedBuild(null);
+
+    const discover = async () => {
+      try {
+        const response = await fetch("/api/release", {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
+        });
+        const payload: unknown = response.ok ? await response.json() : null;
+        const manifestRelease = desktopReleaseFromPayload(payload);
+        if (controller.signal.aborted) return;
+        setRelease(manifestRelease);
+        setNativeWindowsAvailable(nativeWindowsAvailableFromPayload(payload));
+
+        if (
+          requestedPlatform === null ||
+          manifestRelease?.platforms.includes(requestedPlatform) ||
+          process.env.NODE_ENV === "production"
+        ) {
+          setResolvedBuild(manifestRelease);
+          setSettled(true);
+          return;
+        }
+
+        const localResponse = await fetch("/desktop-build", {
+          cache: "no-store",
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
+        });
+        const localPayload: unknown = localResponse.ok ? await localResponse.json() : null;
+        if (controller.signal.aborted) return;
+        const local = localDesktopBuildFromPayload(localPayload);
+        setResolvedBuild(local?.platforms.includes(requestedPlatform) ? local : manifestRelease);
         setSettled(true);
-      })
-      .catch(() => {
-        // A server that cannot answer has still answered, as far as the button
-        // is concerned: a spinner that never stops is worse than /download.
-        // An abort has not — that is this effect being torn down.
-        if (!controller.signal.aborted) setSettled(true);
-      });
+      } catch {
+        if (controller.signal.aborted) return;
+        setRelease(null);
+        setResolvedBuild(null);
+        setNativeWindowsAvailable(false);
+        setSettled(true);
+      }
+    };
+
+    void discover();
     return () => controller.abort();
-  }, []);
+  }, [requestedPlatform]);
+
+  const url =
+    requestedPlatform !== null && resolvedBuild?.platforms.includes(requestedPlatform)
+      ? desktopDownloadUrl(origin, resolvedBuild.version, requestedPlatform)
+      : null;
 
   return {
     release,
+    platform: requestedPlatform,
     settled,
-    url: release ? desktopDownloadUrl(origin, release.version, "darwin-aarch64") : null,
+    url,
+    nativeWindowsAvailable,
   };
 }

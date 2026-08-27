@@ -105,7 +105,7 @@ def _run_verifier(
             "targets": manifest["targets"],
         },
     }
-    desktop_platforms = ["darwin-aarch64", "darwin-x86_64"]
+    desktop_platforms = ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"]
     desktop_artifact = b"throwaway SPAWN D.app.tar.gz\n"
     desktop_public_key, desktop_signature = _minisign_fixture(desktop_artifact)
     if include_desktop:
@@ -144,7 +144,11 @@ def _run_verifier(
         # The manifest's URLs must point back into this origin's /desktop/
         # tree, so it can only be assembled once the port is known.
         artifact_names = {
-            platform: f"SPAWN-D_{EXPECTED_DESKTOP_VERSION}_{platform}.app.tar.gz"
+            platform: (
+                f"SPAWN-D_{EXPECTED_DESKTOP_VERSION}_{platform}-setup.exe"
+                if platform == "windows-x86_64"
+                else f"SPAWN-D_{EXPECTED_DESKTOP_VERSION}_{platform}.app.tar.gz"
+            )
             for platform in desktop_platforms
         }
         latest = {
@@ -224,11 +228,10 @@ def test_verify_release_accepts_desktop_minisign_manifest(tmp_path: Path):
     result = _run_verifier(tmp_path, manifest_counter=EXPECTED_COUNTER, include_desktop=True)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    signature_row = next(
-        line for line in result.stdout.splitlines() if "desktop artifact signature" in line
-    )
-    assert "valid (darwin-aarch64)" in signature_row
-    assert "OK" in signature_row
+    rows = [line for line in result.stdout.splitlines() if "desktop." in line]
+    assert any("desktop.darwin-aarch64 signature" in line and "valid" in line for line in rows)
+    assert any("desktop.windows-x86_64.url" in line and "-setup.exe" in line for line in rows)
+    assert any("desktop.windows-x86_64 signature" in line and "valid" in line for line in rows)
 
 
 def test_verify_release_rejects_wrong_release_counter(tmp_path: Path):

@@ -6,6 +6,7 @@ import type { ReactNode, RefObject } from "react";
 import { useEffect, useRef, useState } from "react";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { useAuth } from "@/lib/auth";
+import { type DesktopPlatform, WINDOWS_DESKTOP_PLATFORM } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
 /*
@@ -156,7 +157,7 @@ export function Masthead({ current }: { current?: "security" | "download" }) {
         </div>
         <Link
           href="/"
-          aria-label="spawnd home"
+          aria-label="SPAWN D home"
           ref={brandRef}
           className="flex flex-col items-center gap-2 text-hellfire"
         >
@@ -172,7 +173,7 @@ export function Masthead({ current }: { current?: "security" | "download" }) {
             <Link
               href="/app"
               className="text-ember transition-colors hover:text-hellfire"
-              aria-label="Open spawnd"
+              aria-label="Open SPAWN D"
             >
               Enter&nbsp;→
             </Link>
@@ -264,14 +265,14 @@ function startDownload(url: string): void {
 }
 
 /**
- * The Mac download, set the way the phone stores set theirs: the platform's
+ * The desktop download, set the way the phone stores set theirs: the platform's
  * own mark, then the words, as one object you press — not a caption with a
  * link somewhere under it.
  *
- * It is Apple's shape, not Apple's blue. Every download on this site is the
- * bone slab on the void, and hellfire is never a button ground, so borrowing
- * the vendor's colour would put a second "click me" ink on the page and break
- * the one rule the palette carries.
+ * It uses the platform mark, not the vendor colour. Every download on this
+ * site is the bone slab on the void, and hellfire is never a button ground,
+ * so borrowing a vendor colour would put a second "click me" ink on the page
+ * and break the one rule the palette carries.
  *
  * Three states, and only the first two are ordinary:
  *
@@ -284,59 +285,62 @@ function startDownload(url: string): void {
  * - neither: nothing to hand out here, so /download, where the builds are
  *   listed with their versions.
  */
-export function MacDownloadButton({
+export function DesktopDownloadButton({
   href,
   pending = false,
   className,
-  label = "Download for macOS",
-  platform = "mac",
+  label,
+  platform,
 }: {
   href: string | null;
   /** The release manifest has not answered yet; a press waits on it. */
   pending?: boolean;
   className?: string;
   label?: string;
-  /** Which machine is being handed a download — the mark and the words follow. */
-  platform?: "mac" | "windows";
+  /** Exact artifact requested — the pending press is stamped with this value. */
+  platform: DesktopPlatform;
 }) {
-  const [waiting, setWaiting] = useState(false);
+  const [rememberedDownload, setRememberedDownload] = useState<DesktopPlatform | null>(null);
   const shell = cn(
     "group inline-flex h-14 items-center justify-center gap-2.5 rounded-sm bg-bone px-7 font-sigil text-[13px] font-medium tracking-[0.14em] text-void uppercase transition-colors hover:bg-white",
     className,
   );
-  const mark = platform === "windows" ? <WindowsMark /> : <AppleMark />;
-  const words =
-    platform === "windows" && label === "Download for macOS" ? "Download for Windows" : label;
+  const windows = platform === WINDOWS_DESKTOP_PLATFORM;
+  const mark = windows ? <WindowsMark /> : <AppleMark />;
+  const words = label ?? (windows ? "Download for Windows" : "Download for macOS");
+  const testId = windows ? "windows-download" : "mac-download";
 
   useEffect(() => {
-    if (!waiting) return;
-    if (href !== null) {
-      setWaiting(false);
+    if (rememberedDownload === null) return;
+    if (platform === rememberedDownload && href !== null) {
+      setRememberedDownload(null);
       startDownload(href);
       return;
     }
-    // The manifest answered, and the answer was that there is no build here.
+    // The manifest answered without that exact artifact, or the surrounding
+    // target changed while the request was held. Deliberately cancel to the
+    // inventory page; never reinterpret the old press as another platform.
     if (!pending) {
-      setWaiting(false);
+      setRememberedDownload(null);
       window.location.assign("/download");
     }
-  }, [waiting, href, pending]);
+  }, [rememberedDownload, href, pending, platform]);
 
   if (href === null && pending) {
     return (
       <button
         type="button"
-        onClick={() => setWaiting(true)}
-        aria-busy={waiting}
+        onClick={() => setRememberedDownload(platform)}
+        aria-busy={rememberedDownload !== null}
         className={shell}
-        data-testid="mac-download"
+        data-testid={testId}
       >
-        {waiting ? (
+        {rememberedDownload !== null ? (
           <Loader2 className="size-[22px] shrink-0 animate-spin" aria-hidden="true" />
         ) : (
           mark
         )}
-        {waiting ? "Preparing download" : words}
+        {rememberedDownload !== null ? "Preparing download" : words}
       </button>
     );
   }
@@ -349,7 +353,7 @@ export function MacDownloadButton({
     );
   }
   return (
-    <a href={href} download className={shell} data-testid="mac-download">
+    <a href={href} download className={shell} data-testid={testId}>
       {mark}
       {words}
     </a>
@@ -460,6 +464,7 @@ export interface InstallChipTarget {
   id: string;
   label: string;
   command: string;
+  prompt?: "$" | "PS>";
 }
 
 /**
@@ -527,7 +532,7 @@ export function InstallCommand({
             // The rule under the tabs is set in from both sides, like every
             // other divider inside a panel — an edge-to-edge line here read as
             // the chip's own border rather than a division inside it.
-            className="relative flex items-center gap-5 px-4 pt-4 pb-2.5 after:absolute after:inset-x-4 after:bottom-0 after:h-px after:bg-bone/25 after:content-['']"
+            className="relative flex flex-wrap items-center gap-x-5 gap-y-2 px-4 pt-4 pb-2.5 after:absolute after:inset-x-4 after:bottom-0 after:h-px after:bg-bone/25 after:content-['']"
           >
             {tabs.map((target) => {
               const selected = target.id === active?.id;
@@ -554,7 +559,7 @@ export function InstallCommand({
           </div>
         )}
         <div className="flex max-w-full items-center gap-3 py-3.5 pr-3 pl-4">
-          <span className="text-ember">$</span>
+          <span className="shrink-0 text-ember">{active?.prompt ?? "$"}</span>
           <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{shown}</code>
           <button
             type="button"

@@ -1,5 +1,5 @@
 import { expect, type Page, test } from "@playwright/test";
-import { fileEntry, fileListing, mockApp, WORKSPACE_ID, workspace } from "./app-mocks";
+import { fileEntry, fileListing, mockApp, WORKSPACE_ID, windowsHost, workspace } from "./app-mocks";
 
 const listings: Record<string, ReturnType<typeof fileListing>> = {
   "/Users": fileListing({
@@ -98,4 +98,47 @@ test("a crumb steps back up, and there is none above home", async ({ page }) => 
   await dialog.getByRole("button", { name: "Home", exact: true }).click();
   await expect(dialog.getByRole("listbox", { name: "Folders in /Users/tester" })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "Users", exact: true })).toHaveCount(0);
+});
+
+test("a Windows host keeps drive paths native through folder navigation", async ({ page }) => {
+  const seen: Array<string | null> = [];
+  await mockApp(page, {
+    hosts: [windowsHost],
+    workspaces: [workspace()],
+    sessions: [],
+    files: (_hostId, path) => {
+      seen.push(path);
+      if (path === "C:\\Users\\tester\\Work") {
+        return fileListing({
+          path,
+          home_dir: "C:\\Users\\tester",
+          parent: "C:\\Users\\tester",
+          entries: [],
+        });
+      }
+      return fileListing({
+        path: "C:\\Users\\tester",
+        home_dir: "C:\\Users\\tester",
+        parent: "C:\\Users",
+        entries: [
+          fileEntry({
+            name: "Work",
+            path: "C:\\Users\\tester\\Work",
+            is_dir: true,
+            size: null,
+          }),
+        ],
+      });
+    },
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  await page.getByRole("button", { name: /Choose this tab.s folder/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Select a folder on Windows PC" });
+  await dialog.getByRole("option", { name: "Work" }).click();
+
+  await expect(
+    dialog.getByRole("listbox", { name: "Folders in C:\\Users\\tester\\Work" }),
+  ).toBeVisible();
+  expect(seen).toContain("C:\\Users\\tester\\Work");
+  expect(seen.some((path) => path?.startsWith("/C:"))).toBe(false);
 });

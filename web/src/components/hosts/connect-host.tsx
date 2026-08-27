@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PaceBar } from "@/components/ui/pace-bar";
 import { StatusDot } from "@/components/ui/status";
+import { useDesktopRelease } from "@/hooks/useDesktopRelease";
 import { ApiError, auth, type DevicePendingApproval, type Host, hosts } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
@@ -23,7 +24,13 @@ import {
 } from "@/lib/browser-host-pins";
 import { publishHostIntroductionBroadcast } from "@/lib/host-gossip";
 import { PAIRING_FAILURE_COPY, pairingFailureCode } from "@/lib/pairing-errors";
-import { detectPlatform, UNDETECTED_PLATFORM } from "@/lib/platform";
+import {
+  detectPlatform,
+  type InstallTargetId,
+  installTargetForOS,
+  installTargets,
+  UNDETECTED_PLATFORM,
+} from "@/lib/platform";
 import {
   deriveSetupProgress,
   SETUP_PROGRESS_ACTIVE_LABELS,
@@ -149,6 +156,8 @@ export function ConnectHostSection(props: {
     priorOnlineHostIds,
   } = props;
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
+  const [chosenTarget, setChosenTarget] = useState<InstallTargetId | null>(null);
+  const { nativeWindowsAvailable } = useDesktopRelease(platform.origin, null);
   const [copyPulse, setCopyPulse] = useState(false);
   const [commandCopied, setCommandCopied] = useState(false);
   const [locallyApproved, setLocallyApproved] = useState(false);
@@ -278,15 +287,11 @@ export function ConnectHostSection(props: {
   const showWaitingForMachine =
     !showLinkConfirm && !awaitsHostArrival && commandCopied && !linkFormOwnsScreen;
 
-  const platformName =
-    platform.os === "macos"
-      ? "macOS"
-      : platform.os === "linux"
-        ? "Linux"
-        : platform.os === "windows"
-          ? "Windows"
-          : "your machine";
-  const displayedCommand = platform.installCommand;
+  const targetRows = installTargets(platform.origin, nativeWindowsAvailable);
+  const defaultTarget = installTargetForOS(platform.os, nativeWindowsAvailable);
+  const activeTarget =
+    targetRows.find((target) => target.id === (chosenTarget ?? defaultTarget)) ?? targetRows[0];
+  const displayedCommand = activeTarget?.command ?? "";
 
   const startOver = () => {
     setLocallyApproved(false);
@@ -329,8 +334,8 @@ export function ConnectHostSection(props: {
         <CardHeader>
           <CardTitle>Connect a host</CardTitle>
           <CardDescription>
-            Install the daemon on the machine where your sessions should run, then approve it from
-            the link its terminal prints.
+            Install the daemon on a machine you control, then approve it from the link{" "}
+            <code>spawnd possess</code> prints. It appears here once it&apos;s online.
           </CardDescription>
         </CardHeader>
       )}
@@ -340,8 +345,34 @@ export function ConnectHostSection(props: {
             <div className="flex items-center gap-2">
               <Terminal className="size-4 text-muted-foreground" aria-hidden />
               <h3 id="install-daemon-title" className="text-sm font-medium">
-                Install on {platformName}
+                Install on {activeTarget?.label ?? "macOS / Linux"}
               </h3>
+            </div>
+            <div
+              role="tablist"
+              aria-label="Install target"
+              className="flex flex-wrap gap-1 rounded-lg bg-muted/60 p-1"
+            >
+              {targetRows.map((target) => {
+                const selected = target.id === activeTarget?.id;
+                return (
+                  <Button
+                    key={target.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    variant={selected ? "secondary" : "ghost"}
+                    size="sm"
+                    className="h-8 flex-1 whitespace-nowrap px-2 text-xs"
+                    onClick={() => {
+                      setChosenTarget(target.id);
+                      setCopyPulse(false);
+                    }}
+                  >
+                    {target.label}
+                  </Button>
+                );
+              })}
             </div>
             {/* One line, as it will be typed. Wrapping broke a shell pipeline
                 across two rows mid-word on any narrow sheet, which reads as two
@@ -349,7 +380,13 @@ export function ConnectHostSection(props: {
                 the line scrolls sideways instead, the way the pressroom's own
                 install chip does. */}
             <div className="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-muted p-2">
+              <span className="shrink-0 px-1 font-mono text-xs text-muted-foreground">
+                {activeTarget?.prompt ?? "$"}
+              </span>
               <code className="min-w-0 flex-1 overflow-x-auto px-1 py-1 font-mono text-xs leading-5 whitespace-nowrap">
+                <span className="sr-only">
+                  {activeTarget?.prompt === "PS>" ? "PowerShell command: " : "Terminal command: "}
+                </span>
                 {displayedCommand}
               </code>
               <Button
@@ -371,8 +408,8 @@ export function ConnectHostSection(props: {
               After installation, run <code>spawnd possess</code> on that machine.
             </p>
             <p className="text-xs leading-5 text-muted-foreground">
-              Already running SPAWN D for another account on that machine? Add{" "}
-              <code>--new-account</code>.
+              Already running SPAWN D for another account on that machine? Run{" "}
+              <code>spawnd possess --new-account</code> instead.
             </p>
           </section>
         )}
