@@ -2968,7 +2968,15 @@ fn install_control_data_channel(
         let close = Arc::clone(&close);
         let uploads = uploads.clone();
         let viewer_id = viewer_id.clone();
+        // webrtc-rs close delivery differs by platform. Establish the Unix
+        // deadline synchronously at callback invocation, before returning the
+        // future whose polling may be independently scheduled.
+        #[cfg(not(windows))]
+        let upload_deadline = close.initiate();
         Box::pin(async move {
+            // Windows serializes this path differently; preserve its observed
+            // first-poll ordering.
+            #[cfg(windows)]
             let upload_deadline = close.initiate();
             uploads.cancel_viewer_now(session, &viewer_id);
             if let Some(close_tx) = close_tx.lock().await.take() {
@@ -4205,6 +4213,34 @@ mod tests {
         ctl_messages: mpsc::Receiver<(bool, Vec<u8>)>,
         upload_capability: Option<Uuid>,
         agent_generation: Option<u64>,
+    }
+
+    struct UploadCleanupPauseGuard {
+        uploads: crate::upload::UploadHub,
+        armed: bool,
+    }
+
+    impl UploadCleanupPauseGuard {
+        fn arm(uploads: crate::upload::UploadHub) -> Self {
+            uploads.arm_cleanup_pause_for_test();
+            Self {
+                uploads,
+                armed: true,
+            }
+        }
+
+        fn release(&mut self) {
+            if self.armed {
+                self.uploads.release_cleanup_pause_for_test();
+                self.armed = false;
+            }
+        }
+    }
+
+    impl Drop for UploadCleanupPauseGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -6035,103 +6071,154 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_control_close_uses_one_upload_deadline_and_isolates_replacement() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session_id = Uuid::new_v4();
-        let registry = SessionRegistry::new();
-        let (old_session, _old_worker_commands) =
-            insert_test_worker_at(&registry, session_id, tmp.path());
-        let sessions = RtcSessions::new();
-        let mut client =
-            connect_rtc_session(&sessions, &registry, session_id, "rtc-close-stall", "old").await;
-        let abandoned_id = Uuid::new_v4();
-        let abandoned = b"must-not-publish";
-        let ready = start_real_upload(&mut client, abandoned_id, "abandoned.bin", abandoned).await;
-        assert_eq!(ready["state"], "ready");
-        sessions.uploads.arm_cleanup_pause_for_test();
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let tmp = tempfile::tempdir().unwrap();
+            let session_id = Uuid::new_v4();
+            let registry = SessionRegistry::new();
+            let (old_session, _old_worker_commands) =
+                insert_test_worker_at(&registry, session_id, tmp.path());
+            let sessions = RtcSessions::new();
+            let mut client = tokio::time::timeout(
+                Duration::from_secs(10),
+                connect_rtc_session(&sessions, &registry, session_id, "rtc-close-stall", "old"),
+            )
+            .await
+            .expect("initial RTC session did not connect within 10 seconds");
+            let abandoned_id = Uuid::new_v4();
+            let abandoned = b"must-not-publish";
+            let ready = tokio::time::timeout(
+                Duration::from_secs(10),
+                start_real_upload(&mut client, abandoned_id, "abandoned.bin", abandoned),
+            )
+            .await
+            .expect("abandoned upload did not become ready within 10 seconds");
+            assert_eq!(ready["state"], "ready");
+            let mut cleanup_pause = UploadCleanupPauseGuard::arm(sessions.uploads.clone());
 
-        client.ctl.close().await.expect("close real spawn.ctl");
-        sessions.uploads.wait_cleanup_pause_for_test().await;
-        assert_eq!(sessions.uploads.retained_counts().await, (1, 0));
-        assert!(sessions.uploads.operation_count() >= 1);
-        let closed = tokio::time::timeout(Duration::from_millis(150), async {
-            while sessions.resident_session_count().await != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        if closed.is_err() {
-            sessions.uploads.release_cleanup_pause_for_test();
-            panic!("control close consumed more than one upload teardown deadline");
-        }
-        assert!(!tmp.path().join("abandoned.bin").exists());
-
-        let (replacement, _replacement_worker_commands) =
-            insert_test_worker_at(&registry, session_id, tmp.path());
-        assert_ne!(old_session, replacement);
-        let mut replacement_client = connect_rtc_session(
-            &sessions,
-            &registry,
-            session_id,
-            "rtc-close-stall",
-            "replacement",
-        )
-        .await;
-        let replacement_id = Uuid::new_v4();
-        let replacement_bytes = b"replacement-only";
-        let replacement_ready = start_real_upload(
-            &mut replacement_client,
-            replacement_id,
-            "replacement.bin",
-            replacement_bytes,
-        )
-        .await;
-        assert_eq!(replacement_ready["state"], "ready");
-        send_real_upload_chunks(&replacement_client, replacement_id, replacement_bytes).await;
-        let replacement_complete =
-            next_ctl_json_for(&mut replacement_client.ctl_messages, replacement_id).await;
-        assert_eq!(replacement_complete["state"], "complete");
-        assert_eq!(
-            std::fs::read(tmp.path().join("replacement.bin")).unwrap(),
-            replacement_bytes
-        );
-        assert_eq!(sessions.uploads.retained_counts().await, (1, 1));
-
-        sessions.uploads.release_cleanup_pause_for_test();
-        assert!(
-            sessions
-                .uploads
-                .wait_for_operations(tokio::time::Instant::now() + Duration::from_secs(5))
+            tokio::time::timeout(Duration::from_secs(10), client.ctl.close())
                 .await
-        );
-        #[cfg(windows)]
-        // Windows webrtc-rs retains the server's graceful SCTP close until
-        // the remote peer settles; the stale browser fixture has finished all
-        // assertions, so let transport cleanup complete before counting tasks.
-        close_test_peer(&client.pc).await;
-        #[cfg(not(windows))]
-        let cleanup_timeout = Duration::from_secs(3);
-        #[cfg(windows)]
-        let cleanup_timeout = Duration::from_secs(10);
-        tokio::time::timeout(cleanup_timeout, async {
-            while sessions.peer_cleanup_task_count().await != 0 {
-                tokio::task::yield_now().await;
+                .expect("closing the original spawn.ctl exceeded 10 seconds")
+                .expect("close real spawn.ctl");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                sessions.uploads.wait_cleanup_pause_for_test(),
+            )
+            .await
+            .expect("control close did not reach the upload cleanup pause within 10 seconds");
+            assert_eq!(sessions.uploads.retained_counts().await, (1, 0));
+            assert!(sessions.uploads.operation_count() >= 1);
+            let closed = tokio::time::timeout(Duration::from_millis(150), async {
+                while sessions.resident_session_count().await != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            if closed.is_err() {
+                cleanup_pause.release();
+                panic!("control close consumed more than one upload teardown deadline");
             }
+            assert!(!tmp.path().join("abandoned.bin").exists());
+
+            let (replacement, _replacement_worker_commands) =
+                insert_test_worker_at(&registry, session_id, tmp.path());
+            assert_ne!(old_session, replacement);
+            let mut replacement_client = tokio::time::timeout(
+                Duration::from_secs(10),
+                connect_rtc_session(
+                    &sessions,
+                    &registry,
+                    session_id,
+                    "rtc-close-stall",
+                    "replacement",
+                ),
+            )
+            .await
+            .expect("replacement RTC session did not connect within 10 seconds");
+            let replacement_id = Uuid::new_v4();
+            let replacement_bytes = b"replacement-only";
+            let replacement_ready = tokio::time::timeout(
+                Duration::from_secs(10),
+                start_real_upload(
+                    &mut replacement_client,
+                    replacement_id,
+                    "replacement.bin",
+                    replacement_bytes,
+                ),
+            )
+            .await
+            .expect("replacement upload did not become ready within 10 seconds");
+            assert_eq!(replacement_ready["state"], "ready");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                send_real_upload_chunks(&replacement_client, replacement_id, replacement_bytes),
+            )
+            .await
+            .expect("replacement upload chunks did not send within 10 seconds");
+            let replacement_complete = tokio::time::timeout(
+                Duration::from_secs(10),
+                next_ctl_json_for(&mut replacement_client.ctl_messages, replacement_id),
+            )
+            .await
+            .expect("replacement upload did not complete within 10 seconds");
+            assert_eq!(replacement_complete["state"], "complete");
+            assert_eq!(
+                std::fs::read(tmp.path().join("replacement.bin")).unwrap(),
+                replacement_bytes
+            );
+            assert_eq!(sessions.uploads.retained_counts().await, (1, 1));
+
+            cleanup_pause.release();
+            assert!(
+                sessions
+                    .uploads
+                    .wait_for_operations(tokio::time::Instant::now() + Duration::from_secs(5))
+                    .await,
+                "original upload operations did not drain within 5 seconds"
+            );
+            #[cfg(windows)]
+            // Windows webrtc-rs retains the server's graceful SCTP close until
+            // the remote peer settles; the stale browser fixture has finished all
+            // assertions, so let transport cleanup complete before counting tasks.
+            tokio::time::timeout(Duration::from_secs(10), close_test_peer(&client.pc))
+                .await
+                .expect("original Windows RTC peer did not close within 10 seconds");
+            #[cfg(not(windows))]
+            let cleanup_timeout = Duration::from_secs(3);
+            #[cfg(windows)]
+            let cleanup_timeout = Duration::from_secs(10);
+            tokio::time::timeout(cleanup_timeout, async {
+                while sessions.peer_cleanup_task_count().await != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("tracked peer cleanup task did not drain");
+            assert_eq!(sessions.uploads.retained_counts().await, (0, 1));
+            assert!(!tmp.path().join("abandoned.bin").exists());
+            assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("spawn-upload")));
+
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                sessions.close("rtc-close-stall", "replacement", session_id),
+            )
+            .await
+            .expect("replacement server peer did not close within 10 seconds");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                close_test_peer(&replacement_client.pc),
+            )
+            .await
+            .expect("replacement client peer did not close within 10 seconds");
+            tokio::time::timeout(Duration::from_secs(10), close_test_peer(&client.pc))
+                .await
+                .expect("original client peer did not close within 10 seconds");
         })
         .await
-        .expect("tracked peer cleanup task did not drain");
-        assert_eq!(sessions.uploads.retained_counts().await, (0, 1));
-        assert!(!tmp.path().join("abandoned.bin").exists());
-        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("spawn-upload")));
-
-        sessions
-            .close("rtc-close-stall", "replacement", session_id)
-            .await;
-        close_test_peer(&replacement_client.pc).await;
-        close_test_peer(&client.pc).await;
+        .expect("real control-close fixture exceeded its 45-second overall deadline");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
