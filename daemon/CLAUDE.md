@@ -25,7 +25,8 @@ src/
                  ws.rs, update.rs + update_io.rs (verified daemon self-update;
                  focused tests live in update_tests.rs), release_key.rs (pinned
                  release trust roots), login.rs, creds.rs, rtc.rs, host_*.rs,
-                 upload.rs, sessions.rs, service.rs, …
+                 upload.rs, sessions.rs, service.rs + service/ (Unix manager
+                 dispatch, Windows task/Run watchdog, control pipe), …
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame
                  (`Ui`), panels, logo, and the single-line `Spinner`
   state.rs       atomic local daemon heartbeat contract (`state.json`)
@@ -192,6 +193,14 @@ cargo build --locked
 cargo test --locked --bin spawnd <module>::
 ```
 
+Windows installs one persisted per-instance background mode: the primary
+least-privilege interactive-token Task Scheduler task, or the HKCU Run
+watchdog fallback when Scheduler denies worker breakaway. The task action is
+always an absolute `spawnd.exe` path. Its owner-only named control pipe handles
+ping/reconnect/graceful shutdown; Unix SIGHUP and systemd `KillMode=process`
+stay unchanged. Windows CI must run `cargo test --locked --target
+x86_64-pc-windows-msvc` and the standard-user breakaway integration probe.
+
 Run `cargo clippy` and `cargo fmt` on what you touched. Shipping binaries to
 users goes through the rolling prebuilt release — read `docs/RELEASE.md`.
 
@@ -224,7 +233,11 @@ checks, emits one warning, and must never be used by production tooling.
 The user-facing command set is `possess` (`setup`), `exorcise` (`remove`),
 `status`, `doctor`, `reconnect`, `disconnect`, `update`, `login`, `logout`,
 `reset`, and foreground-only `run`. `possess --new-account` creates another
-isolated account instance. `run` writes `<config_dir>/state.json` atomically on
+isolated account instance. On Windows, `possess --service-mode task|run`
+selects and persists the instance's background manager; a denied task
+breakaway is offered as a switch to the Run watchdog on the next `possess`.
+`run` writes `state.json` atomically (`<config_dir>` on Unix,
+`%LOCALAPPDATA%\spawn\state\<instance>` on Windows) on
 connection/session transitions and every 30 seconds; SIGHUP requests an
 immediate reconnect without terminating session workers.
 

@@ -9,10 +9,13 @@ use crate::cli::{LogoutArgs, ResetArgs};
 pub async fn reconnect(server_cli: Option<String>, explicit_config: bool) -> Result<()> {
     for dir in selected_dirs(explicit_config)? {
         let _guard = ConfigDirGuard::set(&dir);
-        if let Some(state) = crate::state::read(&dir).ok().flatten() {
-            if crate::state::pid_is_alive(state.pid) && send_sighup(state.pid) {
-                println!("spawn: reconnect requested for {}.", instance_name(&dir));
-                continue;
+        #[cfg(unix)]
+        {
+            if let Some(state) = crate::state::read(&dir).ok().flatten() {
+                if crate::state::pid_is_alive(state.pid) && send_sighup(state.pid) {
+                    println!("spawn: reconnect requested for {}.", instance_name(&dir));
+                    continue;
+                }
             }
         }
         let stored = crate::creds::load().context("loading stored credentials")?;
@@ -127,6 +130,7 @@ pub async fn reset(args: ResetArgs, explicit_config: bool) -> Result<()> {
         let _guard = ConfigDirGuard::set(&dir);
         let _ = crate::service::uninstall(&dir);
         crate::creds::reset_local_credentials()?;
+        crate::service::purge_local_instance_data(&dir)?;
         if let Err(error) = std::fs::remove_dir_all(&dir) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return Err(error).with_context(|| format!("removing {}", dir.display()));
@@ -166,11 +170,6 @@ fn send_sighup(pid: u32) -> bool {
         )
         .is_ok()
     })
-}
-
-#[cfg(not(unix))]
-fn send_sighup(_pid: u32) -> bool {
-    false
 }
 
 struct ConfigDirGuard(Option<std::ffi::OsString>);
