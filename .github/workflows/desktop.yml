@@ -59,11 +59,29 @@ jobs:
           projectPath: desktop
           args: --target ${{ matrix.target }} --config src-tauri/tauri.ci.conf.json
 
+      # tauri-action notarizes and staples the .app; the disk image around it is
+      # only signed. Gatekeeper judges the DMG first, so it needs its own ticket.
+      - name: Notarize and staple the disk image
+        working-directory: desktop
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_PATH: ${{ env.APPLE_API_KEY_PATH }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          dmg="$(ls src-tauri/target/$TARGET/release/bundle/dmg/*.dmg)"
+          xcrun notarytool submit "$dmg" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+
       - name: Assemble unsigned updater payload and release evidence
         working-directory: desktop
         env:
           PLATFORM: ${{ matrix.platform }}
           TARGET: ${{ matrix.target }}
+          # No AppleDouble ._ entries: the updater unpacks this archive as-is,
+          # and a stray file inside the bundle breaks its signature.
+          COPYFILE_DISABLE: "1"
         run: |
           version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
           bundle="src-tauri/target/$TARGET/release/bundle"
