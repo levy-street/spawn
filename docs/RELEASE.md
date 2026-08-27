@@ -280,8 +280,26 @@ Updater promotion is deliberately local and offline:
    publication time and `darwin-aarch64` / `darwin-x86_64` URL-and-signature
    entries. The detached minisign values produced in step 2 are the signatures
    embedded in that manifest. Do the same under `desktop/beta/` for a beta.
-4. Publish the payloads first and the locally assembled, signed `latest.json`
-   last. Never assemble or sign this manifest in CI.
+4. Publish with `scripts/publish-desktop.sh <ssh-host> <artifact-dir>`. It
+   refuses the set unless `latest.json` names the committed version and both
+   platforms, every URL points at the payload beside it under this origin's
+   `/desktop/` tree, and every signature verifies against
+   `desktop/updater.pubkey`; then it uploads the payloads and DMGs first and
+   the manifest last, through a rename, and reads every URL back. Set
+   `SPAWN_DESKTOP_CHANNEL=beta` to publish under `desktop/beta/`. Never
+   assemble or sign this manifest in CI.
+
+The static origin behind those URLs is nginx, not the server or Next: the
+`location /desktop/` block in `infra/nginx-spawnd.conf.example` serves
+`/var/www/spawnd/desktop/` directly (`SPAWN_DESKTOP_DIR` for the script), so
+the updater and the download page never depend on the app being up. It holds
+the DMGs the download page links to (`SPAWN-D_<version>_<platform>.dmg`), the
+`.app.tar.gz` updater payloads, and `latest.json`.
+
+Publish before deploying a commit whose `desktop/` tree is new. `GET
+/api/release` reports the `desktop` block — and the download page lights its
+Mac link — from the deployed checkout alone, without checking that the DMG at
+that URL exists, so a deploy that precedes the publish hands out a 404.
 
 The updater public key is committed in `desktop/updater.pubkey` and baked into
 `desktop/src-tauri/tauri.conf.json`. The private key stays on the release
