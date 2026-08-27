@@ -73,7 +73,12 @@ pub fn install(app: &mut App) -> Result<()> {
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => {
-                let _ = app.emit("tray-open-browser", ());
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = crate::app_window::open(&handle).await {
+                        eprintln!("app window: {error:#}");
+                    }
+                });
             }
             "repair" => show_surface(app, "repair"),
             "settings" => show_surface(app, "settings"),

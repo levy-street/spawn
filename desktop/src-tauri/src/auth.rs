@@ -6,11 +6,27 @@ use url::Url;
 use crate::api::ApiClient;
 use crate::crypto::DeviceIdentity;
 use crate::models::{
-    AuthOutcome, BrowserDevice, DesktopPreferences, SessionRenewResponse, TokenResponse,
+    AccountState, AuthConfig, AuthOutcome, BrowserDevice, DesktopPreferences, MeResponse,
+    SessionRenewResponse, TokenResponse,
 };
 use crate::storage;
 
-pub const OAUTH_REDIRECT_URI: &str = "spawn://oauth/callback";
+/// The one native redirect every SPAWN D server release admits. It is the
+/// same address the phone app hands back to, so a server configured for the
+/// phone already accepts this app; on macOS only this app claims the `spawn://`
+/// scheme, so nothing else can receive what comes back.
+pub const OAUTH_REDIRECT_URI: &str = "spawn://auth/oauth";
+
+/// The providers a server can enable. Which of them actually appear comes from
+/// `GET /api/auth/config` at sign-in time, never from this list.
+pub const OAUTH_PROVIDERS: &[&str] = &["google", "microsoft", "github", "apple"];
+
+pub async fn auth_config(origin: &str) -> Result<AuthConfig> {
+    let api = ApiClient::new(origin)?;
+    api.anonymous_get("/api/auth/config")
+        .await
+        .context("reading the server's sign-in options")
+}
 
 pub async fn password_login(origin: &str, email: &str, password: &str) -> Result<AuthOutcome> {
     let api = ApiClient::new(origin)?;
@@ -42,7 +58,7 @@ pub async fn password_signup(
 }
 
 pub fn oauth_start_url(origin: &str, provider: &str, invite: Option<&str>) -> Result<String> {
-    if !matches!(provider, "google" | "github" | "microsoft" | "apple") {
+    if !OAUTH_PROVIDERS.contains(&provider) {
         bail!("unsupported OAuth provider")
     }
     let mut url = Url::parse(origin)?.join(&format!("/api/auth/oauth/{provider}/start"))?;
@@ -75,6 +91,46 @@ pub async fn renew_session() -> Result<()> {
         .await
         .context("renewing the SPAWN D session")?;
     storage::set_token(&preferences.server_origin, &response.access_token)
+}
+
+/// Renew the app session and hand back the browser session cookie the server
+/// sets alongside it, so the app window opens already signed in.
+pub async fn browser_session_cookie() -> Result<Option<String>> {
+    let preferences = storage::load_preferences()?;
+    let api = ApiClient::new(&preferences.server_origin)?;
+    let (response, headers): (SessionRenewResponse, _) = api
+        .authenticated_post_with_headers("/api/auth/session/renew")
+        .await
+        .context("renewing the SPAWN D session")?;
+    storage::set_token(&preferences.server_origin, &response.access_token)?;
+    Ok(headers
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.trim_start().starts_with("spawn_session="))
+        .map(str::to_owned))
+}
+
+/// The verify gate's poll: the server is the only authority on whether the
+/// address has been confirmed, so nothing about it is cached locally.
+pub async fn account_state() -> Result<AccountState> {
+    let preferences = storage::load_preferences()?;
+    let api = ApiClient::new(&preferences.server_origin)?;
+    let me: MeResponse = api
+        .authenticated_get("/api/me")
+        .await
+        .context("checking your account")?;
+    Ok(AccountState {
+        email: me.user.email,
+        email_verified: me.user.email_verified_at.is_some(),
+    })
+}
+
+pub async fn request_email_verification() -> Result<()> {
+    let preferences = storage::load_preferences()?;
+    let api = ApiClient::new(&preferences.server_origin)?;
+    api.authenticated_post_no_content("/api/auth/verify-email/request")
+        .await
 }
 
 async fn finish_auth(origin: &str, response: TokenResponse) -> Result<AuthOutcome> {
@@ -148,6 +204,7 @@ async fn finish_auth(origin: &str, response: TokenResponse) -> Result<AuthOutcom
         email: response.user.email,
         device_id: registered.id,
         approval_required,
+        email_verified: response.user.email_verified_at.is_some(),
     })
 }
 
@@ -156,15 +213,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oauth_uses_the_one_registered_desktop_redirect() {
-        let value = oauth_start_url("https://spawnd.dev", "github", None).unwrap();
+    fn oauth_hands_back_to_the_redirect_every_server_release_allows() {
+        let value = oauth_start_url("https://spawnd.dev", "google", None).unwrap();
         let parsed = Url::parse(&value).unwrap();
         let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(
             params.get("redirect_uri").map(String::as_str),
-            Some(OAUTH_REDIRECT_URI)
+            Some("spawn://auth/oauth")
         );
         assert_eq!(params.get("return_to").map(String::as_str), Some("/"));
-        assert_eq!(parsed.path(), "/api/auth/oauth/github/start");
+        assert_eq!(parsed.path(), "/api/auth/oauth/google/start");
+        assert!(params.get("invite").is_none());
+    }
+
+    #[test]
+    fn oauth_carries_an_invite_only_when_one_was_typed() {
+        let value = oauth_start_url("https://spawnd.dev", "apple", Some("  ")).unwrap();
+        assert!(!value.contains("invite="));
+        let value = oauth_start_url("https://spawnd.dev", "apple", Some(" ABC-123 ")).unwrap();
+        let parsed = Url::parse(&value).unwrap();
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(params.get("invite").map(String::as_str), Some("ABC-123"));
+        assert!(oauth_start_url("https://spawnd.dev", "facebook", None).is_err());
+    }
+
+    #[test]
+    fn auth_config_defaults_every_field_an_older_server_omits() {
+        let parsed: AuthConfig = serde_json::from_str("{}").unwrap();
+        assert!(parsed.providers.is_empty());
+        assert!(!parsed.email_verification_required);
+        assert!(!parsed.invite_only);
+        let parsed: AuthConfig = serde_json::from_str(
+            r#"{"providers":[{"id":"google","name":"Google"},{"id":"apple","name":"Apple"}],"email_verification_required":true,"invite_only":true}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.providers.len(), 2);
+        assert_eq!(parsed.providers[1].id, "apple");
+        assert!(parsed.email_verification_required && parsed.invite_only);
+    }
+
+    #[test]
+    fn a_user_without_a_verified_at_reads_as_unverified() {
+        let user: TokenResponse = serde_json::from_str(
+            r#"{"access_token":"t","user":{"id":"u1","email":"a@b.c","created_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        assert!(user.user.email_verified_at.is_none());
     }
 }

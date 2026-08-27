@@ -4,16 +4,30 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./styles.css";
 
+/*
+ * The wizard is the browser's funnel, printed locally: the same sign-in and
+ * sign-up sheets as /login and /signup, then the same gates the browser's
+ * onboarding walks — account, verify, host, done — with one more that only a
+ * second device needs, the device approval. Copy, order and rules come from
+ * web/src/app/{login,signup}, web/src/components/onboarding/* and
+ * web/src/components/hosts/connect-host.tsx; where this app does something the
+ * browser cannot (install the daemon itself), the words say so.
+ */
+
 type Screen =
-  | "welcome"
   | "auth"
-  | "device"
   | "server"
-  | "possess"
+  | "verify"
+  | "device"
+  | "host"
   | "done"
   | "settings"
   | "repair"
+  | "stop"
+  | "update"
   | "quit";
+
+type Gate = "account" | "verify" | "device" | "host" | "done";
 
 interface Preferences {
   server_origin: string;
@@ -30,6 +44,23 @@ interface AuthOutcome {
   email: string;
   device_id: string;
   approval_required: boolean;
+  email_verified: boolean;
+}
+
+interface AuthProvider {
+  id: string;
+  name: string;
+}
+
+interface AuthConfig {
+  providers: AuthProvider[];
+  email_verification_required: boolean;
+  invite_only: boolean;
+}
+
+interface AccountState {
+  email: string;
+  email_verified: boolean;
 }
 
 type DeviceProgress =
@@ -64,12 +95,32 @@ interface LocalStatus {
   log_tail: string;
 }
 
+interface AppUpdate {
+  available: boolean;
+  version: string | null;
+  endpoint: string;
+}
+
+const HOSTED_ORIGIN = "https://spawnd.dev";
+/** The native redirect the server hands a finished sign-in back to. */
+const OAUTH_CALLBACK = { host: "auth", path: "/oauth" } as const;
+const VERIFY_POLL_MS = 5_000;
+const CEREMONY_POLL_MS = 1_500;
+const POSSESSION_POLL_MS = 1_500;
+/** The browser's SUCCESS_BEAT_MS: a gate lingers this long after it passes. */
+const SUCCESS_BEAT_MS = 900;
+const STILL_WAITING_MS = 30_000;
+const STALLED_MS = 60_000;
+const COPIED_MS = 1_500;
+const STATUS_REFRESH_MS = 15_000;
+const SESSION_RENEW_MS = 12 * 60 * 60_000;
+
 const root = document.querySelector<HTMLDivElement>("#app");
 if (root === null) throw new Error("SPAWN D window root is unavailable");
 const app: HTMLDivElement = root;
 
 let preferences: Preferences = {
-  server_origin: "https://spawnd.dev",
+  server_origin: HOSTED_ORIGIN,
   account_id: null,
   account_email: null,
   device_id: null,
@@ -77,159 +128,51 @@ let preferences: Preferences = {
   first_run_complete: false,
   host_name: null,
 };
-let screen: Screen = "welcome";
+let screen: Screen = "auth";
 let authMode: "login" | "signup" = "login";
+let config: AuthConfig | null = null;
+let configState: "loading" | "ready" | "error" = "loading";
+let configOrigin: string | null = null;
+/** The provider that got as far as the callback on an invite-only server. */
+let inviteRequiredFor: string | null = null;
+let lastProvider: string | null = null;
 let serverChoice: "hosted" | "self" = "hosted";
 let error: string | null = null;
+let notice: string | null = null;
 let busy = false;
+let emailVerified = true;
+let deviceGateRequired = false;
 let deviceProgress: DeviceProgress = { state: "waiting" };
 let devicePoll: number | null = null;
+let verifyPoll: number | null = null;
 let runId: string | null = null;
 let possession: PossessionProgress | null = null;
 let possessionPoll: number | null = null;
+let waitStartedAt: number | null = null;
+let ticker: number | null = null;
+let copiedUntil = 0;
 const completedSteps = new Set<number>();
-let terminalCommand = "curl -fsSL https://spawnd.dev/install.sh | sh";
+let terminalCommand = `curl -fsSL ${HOSTED_ORIGIN}/install.sh | sh`;
 let status: LocalStatus | null = null;
 let statusLoading = false;
-let appUpdate: { available: boolean; version: string | null; endpoint: string } | null = null;
-/* The device gate is only walked when the account already has an approving
- * device, so the rail below the masthead names it only on runs that need it —
- * the same "gates this account actually has to pass" rule the web funnel
- * follows rather than showing a step that will never light. */
-let deviceGateRequired = false;
+let appUpdate: AppUpdate | null = null;
 
-/** The chosen server's host, for the places a full origin would not fit. */
-function serverHost(): string {
-  try {
-    return new URL(preferences.server_origin).host;
-  } catch {
-    return preferences.server_origin;
-  }
-}
+/* ── Copy ─────────────────────────────────────────────────────────────── */
 
-const escapeHtml = (value: unknown): string =>
-  String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+const GATE_LABELS: Record<Gate, string> = {
+  account: "Account",
+  verify: "Verify",
+  device: "Device",
+  host: "Host",
+  done: "Done",
+};
 
-/**
- * The brand lockup: the trident art in hellfire with the drawn wordmark beside
- * it, the same pair every web surface wears. The wordmark is a mask filled
- * with `currentColor`, so it takes the lockup's ink rather than carrying its
- * own.
- */
-const LOCKUP = '<div class="lockup"><span class="trident" aria-hidden="true"></span><span class="wordmark" role="img" aria-label="spawnd"></span></div>';
-
-/** The corners of the press bed, struck in hellfire. */
-const REGISTRATION_MARKS =
-  '<span class="marks" aria-hidden="true"><span>+</span><span>+</span><span>+</span><span>+</span></span>';
-
-function shell(content: string, step: string): string {
-  return `
-    <div class="shell">
-      <div class="mast-block">
-        <header class="mast">
-          ${LOCKUP}
-          <div class="step">${escapeHtml(step)}</div>
-        </header>
-        ${gateRail()}
-      </div>
-      <main class="stage">${REGISTRATION_MARKS}${content}</main>
-      <footer class="foot"><span>Local client · Signed update channel</span><span class="origin">${escapeHtml(preferences.server_origin)}</span></footer>
-    </div>`;
-}
-
-/**
- * The gates as a ladder of rules — struck for the one you are on, inked for
- * the ones behind you, blank for the ones ahead. Only the wizard wears it;
- * settings and repair are not steps in a funnel.
- */
-const GATES: readonly { screen: Screen; label: string }[] = [
-  { screen: "auth", label: "Account" },
-  { screen: "device", label: "Device" },
-  { screen: "server", label: "Server" },
-  { screen: "possess", label: "Host" },
-  { screen: "done", label: "Done" },
-];
-
-function gateRail(): string {
-  const gates = GATES.filter((gate) => gate.screen !== "device" || deviceGateRequired);
-  const here = gates.findIndex((gate) => gate.screen === screen);
-  if (here < 0) return "";
-  return `
-      <ol class="rail" aria-label="Setup progress">
-        ${gates
-          .map(
-            (gate, index) =>
-              `<li class="${index === here ? "here" : index < here ? "done" : ""}"${index === here ? ' aria-current="step"' : ""}>${escapeHtml(gate.label)}</li>`,
-          )
-          .join("")}
-      </ol>`;
-}
-
-function message(): string {
-  return error ? `<div class="message" role="alert">${escapeHtml(error)}</div>` : "";
-}
-
-function render(): void {
-  const content =
-    screen === "welcome"
-      ? welcomeView()
-      : screen === "auth"
-        ? authView()
-        : screen === "device"
-          ? deviceView()
-          : screen === "server"
-            ? serverView()
-            : screen === "possess"
-              ? possessView()
-              : screen === "done"
-                ? doneView()
-                : screen === "settings"
-                  ? settingsView()
-                  : screen === "repair"
-                    ? repairView()
-                    : quitView();
-  app.innerHTML = shell(content, progressLabel());
-  bindActions();
-}
-
-/* The rail below the masthead counts the gates, so this names the surface
- * rather than numbering it — the landing masthead's zone voice. */
-function progressLabel(): string {
-  const labels: Record<Screen, string> = {
-    welcome: "Mac companion",
-    auth: "Mac companion",
-    device: "Mac companion",
-    server: "Mac companion",
-    possess: "Mac companion",
-    done: "Mac companion",
-    settings: "Settings",
-    repair: "Repair",
-    quit: "Quit",
-  };
-  return labels[screen];
-}
-
-function welcomeView(): string {
-  return `
-    <section class="sheet wide mark-grid">
-      <div class="mark-plate"><span class="trident" aria-hidden="true"></span></div>
-      <div class="sheet">
-        <div class="masthead">
-          <p class="eyebrow">First possession</p>
-          <h1>Possess this Mac</h1>
-          <p class="lead">Sign in, pick your server, and SPAWN D does the rest — the daemon installed, verified, and kept running. About two minutes.</p>
-        </div>
-        ${message()}
-        <div class="actions"><button class="primary" data-action="get-started">Get started</button></div>
-        <details class="installed"><summary>What gets installed?</summary><p>Two binaries in <code>~/.local/bin</code>, one LaunchAgent, nothing else.</p></details>
-      </div>
-    </section>`;
-}
+const PROVIDER_NAMES: Record<string, string> = {
+  apple: "Apple",
+  google: "Google",
+  github: "GitHub",
+  microsoft: "Microsoft",
+};
 
 /*
  * The provider's own mark, beside its name on the sign-in button — the same
@@ -249,250 +192,547 @@ const PROVIDER_MARKS: Record<string, string> = {
     '<svg aria-hidden="true" class="provider-mark" viewBox="0 0 24 24"><path d="M2 2h9.5v9.5H2z" fill="#F25022"/><path d="M12.5 2H22v9.5h-9.5z" fill="#7FBA00"/><path d="M2 12.5h9.5V22H2z" fill="#00A4EF"/><path d="M12.5 12.5H22V22h-9.5z" fill="#FFB900"/></svg>',
 };
 
-const PROVIDERS: readonly { id: string; name: string }[] = [
-  { id: "google", name: "Google" },
-  { id: "github", name: "GitHub" },
-  { id: "microsoft", name: "Microsoft" },
-  { id: "apple", name: "Apple" },
+/** The browser's pairing-failure copy, word for word where the action is the
+ * same, and "try again" where the browser says "run spawnd possess again"
+ * because here the app runs it. */
+const PAIRING_FAILURES: Record<string, string> = {
+  expired: "That approval expired. Try again — SPAWN D runs the ceremony afresh.",
+  denied: "The approval was declined. Nothing was registered.",
+  key_conflict:
+    "This machine was set up before, under a different SPAWN D account, and that account still holds its identity. Nothing was changed.\n• To use it under that account: sign in there and approve as usual.\n• To hand it to this account: remove the host from the old account's Hosts page first, then try again.\n• To keep both accounts on this machine: run spawnd possess --new-account in Terminal.",
+  pin_conflict:
+    "The browser that approved this machine doesn't match its earlier approval. Approve again from a browser you've used with this host before — or remove the host on the web and start fresh.",
+  pin_limit:
+    "This host has reached its limit of approving browsers (32). Remove old devices under Access, then try again.",
+};
+const VERIFICATION_REFUSAL = "This host could not be verified.";
+const REFUSAL_MISMATCH =
+  "This host's identity could not be verified: the server presented a different identity key than the one in your host's link. Nothing was trusted and no access was granted. This can mean the connection is being tampered with — start over on a network you trust.";
+const STALLED_HINT = "Having trouble? Try again — it's safe to repeat.";
+const DOCTOR_HINT =
+  "Still stuck? Run spawnd doctor in Terminal on this Mac — it checks the daemon, its service, and the connection back here, and says what is wrong.";
+
+/** Setup progress, one row per step the daemon reports (`possess-step`). */
+const HOST_STEPS: readonly { done: string; active: string }[] = [
+  { done: "Daemon downloaded and verified", active: "Downloading the daemon…" },
+  { done: "Registered", active: "Registering this Mac…" },
+  { done: "Approved", active: "Waiting for approval…" },
+  { done: "Online", active: "Connecting…" },
 ];
+/** The one row that waits on the person, not the machine. */
+const APPROVAL_STEP = 2;
+
+const ICON_CHECK =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>';
+const ICON_CIRCLE =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/></svg>';
+const ICON_SPINNER =
+  '<svg class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>';
+const ICON_MAIL =
+  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>';
+const ICON_ARROW = '<span class="arrow" aria-hidden="true">←</span>';
+
+/* ── Helpers ──────────────────────────────────────────────────────────── */
+
+const escapeHtml = (value: unknown): string =>
+  String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+
+/** The chosen server's host, for the places a full origin would not fit. */
+function serverHost(): string {
+  try {
+    return new URL(preferences.server_origin).host;
+  } catch {
+    return preferences.server_origin;
+  }
+}
+
+function providerName(id: string | null): string {
+  if (!id) return "your provider";
+  return config?.providers.find((provider) => provider.id === id)?.name ?? PROVIDER_NAMES[id] ?? id;
+}
+
+const describe = (cause: unknown): string =>
+  cause instanceof Error ? cause.message : String(cause);
+
+function clearTimer(id: number | null): null {
+  if (id !== null) window.clearInterval(id);
+  return null;
+}
+
+/* ── The sheet ────────────────────────────────────────────────────────── */
+
+const LOCKUP =
+  '<div class="lockup"><span class="trident" aria-hidden="true"></span><span class="wordmark" role="img" aria-label="SPAWN D"></span></div>';
+
+const REGISTRATION_MARKS =
+  '<span class="marks" aria-hidden="true"><span>+</span><span>+</span><span>+</span><span>+</span></span>';
+
+function sheet(hatch: string, inner: string): string {
+  return `<div class="sheet">${REGISTRATION_MARKS}<div class="hatch">${hatch}</div>${inner}</div>`;
+}
+
+/** One centred column — the right measure for a sign-in form. */
+function stacked(title: string, description: string | null, body: string): string {
+  return `
+    <div class="stacked">
+      ${LOCKUP}
+      <section class="plate">
+        <header class="plate-head">
+          <h1>${title}</h1>
+          ${description ? `<p class="lead">${description}</p>` : ""}
+        </header>
+        <div class="plate-body">${body}</div>
+      </section>
+    </div>`;
+}
+
+/** The masthead ranged against a wider plate — the onboarding gates. */
+function split(gate: Gate, title: string, description: string, body: string): string {
+  return `
+    <div class="split">
+      <header class="split-head">
+        ${LOCKUP}
+        <h1>${title}</h1>
+        <p class="lead">${description}</p>
+        ${rail(gate)}
+      </header>
+      <section class="plate plate-padded">${body}</section>
+    </div>`;
+}
+
+/** The gates this account actually has to pass, in the browser's order, with
+ * the device gate slotted in only on runs that need it. */
+function gates(): Gate[] {
+  const list: Gate[] = ["account"];
+  if (config?.email_verification_required) list.push("verify");
+  if (deviceGateRequired) list.push("device");
+  list.push("host", "done");
+  return list;
+}
+
+function rail(current: Gate): string {
+  const list = gates();
+  const here = list.indexOf(current);
+  return `
+    <ol class="rail" aria-label="Onboarding progress">
+      ${list
+        .map(
+          (gate, index) =>
+            `<li class="${index === here ? "here" : index < here ? "done" : ""}"${index === here ? ' aria-current="step"' : ""}>${GATE_LABELS[gate]}</li>`,
+        )
+        .join("")}
+    </ol>`;
+}
+
+function hatchServer(): string {
+  return `<button class="hatch-link" data-action="choose-server" title="${escapeHtml(preferences.server_origin)}"><span class="host">Using ${escapeHtml(serverHost())}</span><span>· Change</span></button>`;
+}
+
+function hatchBack(): string {
+  return `<button class="hatch-link" data-action="back-to-auth">${ICON_ARROW} Back</button>`;
+}
+
+function hatchAccount(): string {
+  const email = preferences.account_email ?? "";
+  return `<span class="hatch-link" style="cursor:default"><span class="host">${escapeHtml(email)}</span></span><button class="hatch-link" data-action="sign-out">Sign out</button>`;
+}
+
+function errorLine(): string {
+  return error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : "";
+}
+
+function noticeLine(): string {
+  return notice ? `<p class="status-line" role="status">${escapeHtml(notice)}</p>` : "";
+}
+
+function paceBar(label: string): string {
+  return `<div class="pace" role="status" aria-label="${escapeHtml(label)}"><div class="pace-track"><div class="pace-run"></div></div><span class="pace-label">${escapeHtml(label)}</span></div>`;
+}
+
+/* ── Screens ──────────────────────────────────────────────────────────── */
+
+function render(): void {
+  const views: Record<Screen, () => string> = {
+    auth: authView,
+    server: serverView,
+    verify: verifyView,
+    device: deviceView,
+    host: hostView,
+    done: doneView,
+    settings: settingsView,
+    repair: repairView,
+    stop: stopView,
+    update: updateView,
+    quit: quitView,
+  };
+  app.innerHTML = views[screen]();
+  bindActions();
+}
+
+function providerButtons(): string {
+  const providers = config?.providers ?? [];
+  if (configState !== "ready" || providers.length === 0) return "";
+  return `
+    <div class="stack-tight">
+      <div class="providers">
+        ${providers
+          .map(
+            (provider) =>
+              `<button class="btn btn-outline btn-block" data-provider="${escapeHtml(provider.id)}" ${busy ? "disabled" : ""}>${PROVIDER_MARKS[provider.id] ?? ""}${
+                /* Apple's guidelines require this exact wording for its
+                   button; every other provider takes the house phrasing. */
+                provider.id === "apple" ? "Sign in with Apple" : `Continue with ${escapeHtml(provider.name)}`
+              }</button>`,
+          )
+          .join("")}
+      </div>
+      <div class="or-rule"><span>or use email</span></div>
+    </div>`;
+}
 
 function authView(): string {
   const signup = authMode === "signup";
-  return `
-    <section class="sheet">
-      <div class="masthead">
-        <p class="eyebrow">Identity is a device</p>
-        <h1>${signup ? "Who summons?" : "Welcome back"}</h1>
-        <p class="lead compact">${signup ? "Create the account that will possess this Mac." : "Sign in and this app becomes a revocable device on your account."}</p>
-      </div>
-      <div class="plate padded form-stack">
-        <div class="providers">
-          ${PROVIDERS.map(
-            (provider) =>
-              `<button class="secondary" data-provider="${provider.id}" ${busy ? "disabled" : ""}>${PROVIDER_MARKS[provider.id]}${
-                /* Apple's guidelines require this exact wording for its
-                   button; every other provider takes the house phrasing. */
-                provider.id === "apple" ? "Sign in with Apple" : `Continue with ${provider.name}`
-              }</button>`,
-          ).join("")}
-        </div>
-        <div class="rule"><span>or use email</span></div>
-        <form id="auth-form" class="form-stack">
-          <label><span>Email</span><input name="email" type="email" autocomplete="email" required /></label>
-          <label><span>Password</span><input name="password" type="password" autocomplete="${signup ? "new-password" : "current-password"}" minlength="${signup ? "8" : "1"}" ${signup ? 'maxlength="256"' : ""} required /></label>
-          ${signup ? '<label><span class="field-head">Invite <span class="optional">if your server requires one</span></span><input name="invite" type="text" autocomplete="off" maxlength="256" /></label>' : ""}
-          ${message()}
-          <button class="primary" type="submit" ${busy ? "disabled" : ""}>${busy ? "Contacting your server…" : signup ? "Create account" : "Sign in"}</button>
-        </form>
-      </div>
-      <div class="auth-links">
-        <button class="text-button" data-action="toggle-auth">${signup ? "Already have an account? Sign in" : "Create an account"}</button>
-        <button class="text-button server-link" data-action="preauth-server" title="${escapeHtml(preferences.server_origin)}">Using ${escapeHtml(serverHost())} · Change</button>
-      </div>
-    </section>`;
-}
+  const title = signup ? "Create your account" : "Welcome back";
+  const description = signup
+    ? "Start with an account, then connect the machine where your agents work."
+    : "Sign in to reach the shells running across your machines.";
 
-function deviceView(): string {
-  const number = deviceProgress.state === "show_number" ? deviceProgress.number : null;
-  const refused = deviceProgress.state === "refused" ? deviceProgress.message : null;
-  return `
-    <section class="sheet">
-      <div class="masthead">
-        <p class="eyebrow">Device approval</p>
-        <h1>Approve this device</h1>
-        <p class="lead compact">Approve from a device you already use.</p>
-      </div>
-      <div class="number-card ${number ? "ready" : "waiting"}">
-        <span>${number ? "Type this number there" : "Waiting for an approving device"}</span>
-        <strong>${escapeHtml(number ?? "·· ··")}</strong>
-        <p>${number ? "The number proves both screens saw the same two device keys." : "A knock is waiting on your other signed-in devices."}</p>
-      </div>
-      ${refused ? `<div class="message" role="alert">${escapeHtml(refused)}</div>` : message()}
-      <div class="actions"><button class="secondary" data-action="ask-again" ${busy ? "disabled" : ""}>Ask again</button></div>
-      <p class="fine">This check is never skippable. No device key is trusted until the number matches.</p>
-    </section>`;
+  if (signup && configState === "error") {
+    return sheet(
+      hatchServer(),
+      stacked(
+        "Couldn’t load signup",
+        "The server’s signup settings are unavailable.",
+        `<div class="stack">${errorLine()}<div class="actions"><button class="btn btn-outline" data-action="retry-config">Try again</button></div></div>`,
+      ),
+    );
+  }
+
+  const inviteBanner =
+    signup && inviteRequiredFor
+      ? `<p class="banner" role="status">${escapeHtml(providerName(inviteRequiredFor))} signed you in, but SPAWN D is invite only right now. Enter your invite code below and continue with ${escapeHtml(providerName(inviteRequiredFor))} again to finish.</p>`
+      : "";
+  const configNotice =
+    !signup && configState === "error"
+      ? '<p class="status-line" role="status">Social sign-in is temporarily unavailable. Email sign-in still works.</p>'
+      : "";
+  const inviteField =
+    signup && config?.invite_only
+      ? `<label class="field"><span class="label">Invite code</span><input name="invite" type="text" class="code" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="256" required ${busy ? "disabled" : ""} /></label>`
+      : "";
+
+  const body = `
+    <div class="stack">
+      ${inviteBanner}
+      ${providerButtons()}
+      ${configNotice}
+      <form id="auth-form" class="form" novalidate>
+        <label class="field"><span class="label">Email</span><input name="email" type="email" autocomplete="email" autofocus required ${busy ? "disabled" : ""} /></label>
+        <div class="field">
+          <div class="label-row"><label class="label" for="auth-password">Password</label>${signup ? "" : '<button type="button" class="tiny-link" data-action="forgot-password">Forgot password?</button>'}</div>
+          <input id="auth-password" name="password" type="password" autocomplete="${signup ? "new-password" : "current-password"}" ${signup ? 'minlength="8"' : ""} required ${busy ? "disabled" : ""} />
+          ${signup ? '<p class="hint">Use at least 8 characters.</p>' : ""}
+        </div>
+        ${inviteField}
+        ${errorLine()}
+        <button class="btn btn-primary btn-block" type="submit" ${busy ? "disabled" : ""}>${
+          busy ? (signup ? "Creating account…" : "Signing in…") : signup ? "Create account" : "Sign in"
+        }</button>
+      </form>
+      <p class="foot-note">${
+        signup
+          ? 'Already have an account? <button type="button" class="link" data-action="toggle-auth">Log in</button>'
+          : 'No account? <button type="button" class="link" data-action="toggle-auth">Create one</button>'
+      }</p>
+    </div>`;
+  return sheet(hatchServer(), stacked(title, description, body));
 }
 
 function serverView(): string {
-  return `
-    <section class="sheet">
-      <div class="masthead">
-        <p class="eyebrow">Control plane</p>
-        <h1>Whose altar?</h1>
-        <p class="lead compact">Choose the server this app and the daemon answer to.</p>
-      </div>
-      <form id="server-form" class="server-options">
-        <label class="server-option ${serverChoice === "hosted" ? "selected" : ""}">
-          <input type="radio" name="server-kind" value="hosted" ${serverChoice === "hosted" ? "checked" : ""} />
-          <span><strong>spawnd.dev</strong><small>Hosted. Fastest start.</small></span>
-        </label>
-        <label class="server-option ${serverChoice === "self" ? "selected" : ""}">
-          <input type="radio" name="server-kind" value="self" ${serverChoice === "self" ? "checked" : ""} />
-          <span><strong>A server you run</strong><small>Self-hosting is the strongest trust stance — the server only ever relays.</small></span>
-        </label>
-        ${
-          serverChoice === "self"
-            ? `<label class="advanced"><span>Server URL</span><input name="server-url" type="url" value="${escapeHtml(preferences.server_origin === "https://spawnd.dev" ? "" : preferences.server_origin)}" placeholder="Enter a SPAWN D server URL" required /></label>`
-            : ""
-        }
-        ${message()}
-        <div class="actions"><button class="primary" type="submit" ${busy ? "disabled" : ""}>Continue</button></div>
-      </form>
-    </section>`;
-}
-
-const steps = [
-  "Daemon downloaded and verified",
-  "Host registered — approval ready",
-  "Approved — key verified on this machine",
-  "Online and ready",
-];
-
-function possessView(): string {
-  const review = possession?.review;
-  const failed = possession?.status === "failed";
-  const failure = error ?? (failed ? possession?.error : null);
-  const keyMismatch = failure === "This host could not be verified.";
-  const serviceFailed = failure === "The daemon installed but its service didn't start.";
-  const alreadyPossessed = failure?.includes("already possessed for") ?? false;
-  return `
-    <section class="sheet wide">
-      <div class="masthead">
-        <p class="eyebrow">Local install</p>
-        <h1>Possess this Mac</h1>
-        <p class="lead compact">Both binaries come from ${escapeHtml(preferences.server_origin)} and are checked before installation.</p>
-      </div>
-      <ol class="progress-list">
-        ${steps
-          .map(
-            (step, index) => `<li class="${completedSteps.has(index) ? "complete" : runId && index === Math.min(completedSteps.size, steps.length - 1) ? "active" : ""}"><span>${completedSteps.has(index) ? "✓" : String(index + 1).padStart(2, "0")}</span><p>${escapeHtml(step)}</p></li>`,
-          )
-          .join("")}
-      </ol>
+  const body = `
+    <form id="server-form" class="stack">
+      <label class="option ${serverChoice === "hosted" ? "selected" : ""}">
+        <input type="radio" name="server-kind" value="hosted" ${serverChoice === "hosted" ? "checked" : ""} />
+        <span><strong>spawnd.dev</strong><small>Hosted. Fastest start.</small></span>
+      </label>
+      <label class="option ${serverChoice === "self" ? "selected" : ""}">
+        <input type="radio" name="server-kind" value="self" ${serverChoice === "self" ? "checked" : ""} />
+        <span><strong>Self-hosted</strong><small>A server you run. The strongest trust stance — the server only ever relays.</small></span>
+      </label>
       ${
-        review
-          ? approvalReview(review)
-          : !runId
-            ? `<button class="primary possess-button" data-action="possess" ${busy ? "disabled" : ""}>Possess this Mac</button>`
-            : failed
-              ? ""
-              : possession?.status === "approved"
-                ? '<div class="inline-wait"><span class="spinner"></span> Approval complete. Waiting for the daemon to come online…</div>'
-                : '<div class="inline-wait"><span class="spinner"></span> The daemon is preparing its identity…</div>'
-      }
-      ${failed ? `<div class="message" role="alert">${escapeHtml(possessionErrorCopy(possession?.error))}</div>` : message()}
-      ${
-        failure
-          ? keyMismatch
-            ? '<div class="actions"><button class="text-button" data-action="learn-key-check">Learn what this means</button></div>'
-            : serviceFailed
-              ? '<div class="actions"><button class="secondary" data-action="show-repair">Repair</button></div>'
-              : alreadyPossessed
-                ? '<div class="actions"><button class="secondary" data-action="open-browser">Open SPAWN D</button></div>'
-                : '<div class="actions"><button class="secondary" data-action="try-again">Try again</button><button class="text-button" data-action="terminal">Use the Terminal instead</button></div>'
+        serverChoice === "self"
+          ? `<label class="field"><span class="label">Server URL</span><input name="server-url" type="url" value="${escapeHtml(preferences.server_origin === HOSTED_ORIGIN ? "" : preferences.server_origin)}" placeholder="https://spawn.example.com" autocomplete="url" spellcheck="false" required /></label>`
           : ""
       }
-      <div class="command-chip"><span class="dollar">$</span><code>${escapeHtml(terminalCommand)}</code><button data-action="copy-command" aria-label="Copy install command">Copy</button></div>
-    </section>`;
+      ${errorLine()}
+      <div class="actions"><button class="btn btn-primary" type="submit" ${busy ? "disabled" : ""}>Continue</button><button class="btn btn-ghost" type="button" data-action="back-to-auth">Cancel</button></div>
+    </form>`;
+  return sheet(
+    hatchBack(),
+    stacked("Choose your server", "The server this app and the daemon on this Mac answer to.", body),
+  );
 }
 
-function possessionErrorCopy(reason: string | null | undefined): string {
-  if (reason === "This host could not be verified.") return reason;
-  if (reason === "expired") return "That code expired. On the machine, run spawnd possess again.";
-  if (reason === "denied") return "Possession was denied. Nothing was changed.";
-  if (reason === "key_conflict")
-    return "This machine was set up before, under a different SPAWN D account, and that account still holds its identity. Nothing was changed.\n• To use it under that account: sign in there and approve as usual.\n• To hand it to this account: remove the host from the old account's Hosts page first, then run spawnd possess again.\n• To keep both accounts on this machine: spawnd possess --new-account";
-  if (reason === "pin_conflict")
-    return "The browser that approved this machine doesn't match its earlier approval. Approve again from a browser you've used with this host before — or remove the host on the web and start fresh.";
-  if (reason === "pin_limit")
-    return "This host has reached its limit of approving browsers (32). Remove old devices under Access, then try again.";
-  return "Possession failed. Nothing was changed.";
-}
-
-function approvalReview(review: ApprovalReview): string {
-  return `
-    <div class="approval-review verified">
-      <div><span>${escapeHtml(review.host_name)}</span><strong>Exact key match</strong></div>
-      <button class="primary" data-action="approve-host" ${!review.exact_key_match || busy ? "disabled" : ""}>Possess this Mac</button>
+function verifyView(): string {
+  const email = preferences.account_email ?? "your address";
+  const body = `
+    <div class="stack">
+      <div class="inset">
+        <span aria-hidden="true" style="color: var(--ember)">${ICON_MAIL}</span>
+        <p>We sent a link to <strong>${escapeHtml(email)}</strong>.</p>
+        <p class="muted">Open it in any tab. This app checks every five seconds and will continue automatically.</p>
+      </div>
+      ${noticeLine()}
+      ${errorLine()}
+      <div class="actions"><button class="btn btn-outline" data-action="resend-verification" ${busy ? "disabled" : ""}>${busy ? "Sending…" : "Resend email"}</button></div>
     </div>`;
+  return sheet(
+    hatchAccount(),
+    split("verify", "Check your inbox", "Confirm this address before connecting a machine.", body),
+  );
+}
+
+function deviceView(): string {
+  const progress = deviceProgress;
+  let body: string;
+  if (progress.state === "show_number") {
+    body = `
+      <div class="inset centered">
+        <p class="number-title">Your number</p>
+        <p class="number">${escapeHtml(progress.number)}</p>
+        <p class="number-help">Enter this number on the device you already use.</p>
+      </div>`;
+  } else if (progress.state === "refused") {
+    body = `<div class="failure"><h3>The number wasn’t right</h3><p>${escapeHtml(progress.message)}</p></div>`;
+  } else {
+    body = `
+      <div class="inset">
+        <p>Waiting for approval…</p>
+        <p class="muted">Your other devices have been asked. This closes on its own once one approves.</p>
+        ${paceBar("Waiting for a device you already use")}
+      </div>`;
+  }
+  const plate = `
+    <div class="stack">
+      ${body}
+      ${errorLine()}
+      <div class="actions"><button class="btn btn-outline" data-action="ask-again" ${busy ? "disabled" : ""}>Ask again</button></div>
+      <p class="note">The number only appears here, so nobody can approve a device they are not holding. A mismatch is terminal — nothing is trusted until it matches.</p>
+    </div>`;
+  return sheet(
+    hatchAccount(),
+    split("device", "Approve this device", "Approve it from a device you already use.", plate),
+  );
+}
+
+function elapsedMs(): number {
+  return waitStartedAt === null ? 0 : Date.now() - waitStartedAt;
+}
+
+function hostChecklist(): string {
+  const failed = possession?.status === "failed";
+  const current = runId && !failed ? Math.min(completedSteps.size, HOST_STEPS.length - 1) : -1;
+  const waitsOnPerson = current === APPROVAL_STEP && possession?.review !== null && possession?.review !== undefined;
+  const elapsed = elapsedMs();
+  return `
+    <div>
+      <p class="checklist-head">Setup progress</p>
+      <ol class="checklist" aria-label="Setup progress">
+        ${HOST_STEPS.map((step, index) => {
+          const complete = completedSteps.has(index);
+          const state = complete ? "complete" : index === current ? "current" : "pending";
+          const icon = complete ? ICON_CHECK : state === "current" && !waitsOnPerson ? ICON_SPINNER : ICON_CIRCLE;
+          const aside =
+            state === "current" && !waitsOnPerson && elapsed >= STILL_WAITING_MS && elapsed < STALLED_MS
+              ? '<span class="aside">Still waiting…</span>'
+              : "<span></span>";
+          return `<li class="${state}" data-state="${state}"><span class="mark" aria-hidden="true">${icon}</span><span>${escapeHtml(complete ? step.done : step.active)}</span>${aside}</li>`;
+        }).join("")}
+      </ol>
+    </div>`;
+}
+
+function hostView(): string {
+  const review = possession?.review ?? null;
+  const failed = possession?.status === "failed";
+  const failure = error ?? (failed ? possession?.error : null) ?? null;
+  const refused = failure === VERIFICATION_REFUSAL;
+  const serviceFailed = failure === "The daemon installed but its service didn't start.";
+  const elapsed = elapsedMs();
+  const stalled = runId && !failed && !review && elapsed >= STALLED_MS;
+
+  let action: string;
+  if (refused) {
+    action = `
+      <div class="failure" data-testid="possess-refusal"><h3>This host could not be verified</h3><p>${escapeHtml(REFUSAL_MISMATCH)}</p></div>
+      <div class="actions"><button class="btn btn-outline" data-action="try-again">Start over</button></div>`;
+  } else if (failure) {
+    action = `
+      <div class="failure" role="alert"><h3>This machine was not approved</h3><p>${escapeHtml(pairingFailureCopy(failure))}</p></div>
+      <div class="actions">${
+        serviceFailed
+          ? '<button class="btn btn-outline" data-action="show-repair">Repair</button>'
+          : '<button class="btn btn-outline" data-action="try-again">Try again</button>'
+      }</div>`;
+  } else if (review) {
+    action = `
+      <div class="approve" data-testid="possess-approve-screen">
+        <h3>Approve ${escapeHtml(review.host_name)}</h3>
+        <p>SPAWN D verified this Mac’s identity against the link its daemon printed. Approving grants all your devices access to it.</p>
+        <div class="actions"><button class="btn btn-primary" data-action="approve-host" ${!review.exact_key_match || busy ? "disabled" : ""}>${busy ? "Approving…" : `Approve ${escapeHtml(review.host_name)}`}</button></div>
+      </div>`;
+  } else if (!runId) {
+    action = `<button class="btn btn-primary btn-block" data-action="possess" ${busy ? "disabled" : ""}>${busy ? "Starting…" : "Possess this Mac"}</button>`;
+  } else if (possession?.status === "approved") {
+    action = `<div class="inset"><p>Connecting</p><p class="muted">Approved. The daemon is starting up and calling home — this usually takes a few seconds.</p>${paceBar("Waiting for this Mac to come online…")}</div>`;
+  } else {
+    action = "";
+  }
+
+  const hints = stalled
+    ? `<p class="note">${escapeHtml(STALLED_HINT)}</p><p class="note">${escapeHtml(DOCTOR_HINT)}</p>`
+    : "";
+
+  const copied = Date.now() < copiedUntil;
+  const terminal = `
+    <details ${failure && !refused ? "open" : ""}>
+      <summary>Use the Terminal instead</summary>
+      <div class="stack-tight">
+        <div class="chip"><span class="dollar">$</span><code>${escapeHtml(terminalCommand)}</code><button type="button" class="${copied ? "done" : ""}" data-action="copy-command" aria-label="Copy install command">${copied ? "Copied" : "Copy"}</button></div>
+        <p class="note">After installation, run <code>spawnd possess</code> on this Mac.</p>
+        <p class="note">Already running SPAWN D for another account on this Mac? Add <code>--new-account</code>.</p>
+      </div>
+    </details>`;
+
+  const body = `
+    <div class="stack-loose">
+      ${hostChecklist()}
+      ${action}
+      ${hints}
+      ${terminal}
+    </div>`;
+  return sheet(
+    hatchAccount(),
+    split(
+      "host",
+      "Possess this Mac",
+      `SPAWN D installs the daemon from ${escapeHtml(serverHost())}, verifies it, and approves it here — the same ceremony the terminal link runs, without the terminal.`,
+      body,
+    ),
+  );
+}
+
+function pairingFailureCopy(reason: string): string {
+  return PAIRING_FAILURES[reason] ?? reason;
 }
 
 function doneView(): string {
   const host = possession?.host_name ?? preferences.host_name ?? "This Mac";
-  return `
-    <section class="sheet wide mark-grid">
-      <div class="mark-plate"><span class="trident" aria-hidden="true"></span></div>
-      <div class="sheet">
-        <div class="masthead">
-          <p class="eyebrow">Possession complete</p>
-          <h1>${escapeHtml(host)} is possessed</h1>
-          <p class="lead">All your devices can reach it. SPAWN D lives in your menu bar; the daemon keeps running on its own.</p>
-        </div>
-        ${message()}
-        <div class="actions"><button class="primary" data-action="open-browser">Open SPAWN D</button><button class="secondary" data-action="done">Done</button></div>
+  const body = `
+    <div class="stack">
+      <div class="inset">
+        <p><strong>${escapeHtml(host)}</strong> is online. All your devices can reach it.</p>
+        <p class="muted">Open SPAWN D to pick a folder and start working. It stays in your menu bar; the daemon keeps running on its own.</p>
       </div>
-    </section>`;
+      ${errorLine()}
+      <div class="actions"><button class="btn btn-primary" data-action="open-app">Open SPAWN D</button><button class="btn btn-outline" data-action="close-window">Done</button></div>
+    </div>`;
+  return sheet(
+    hatchAccount(),
+    split(
+      "done",
+      "Your machine is possessed",
+      "Pick a folder on it and summon your first wall of terminals.",
+      body,
+    ),
+  );
 }
 
 function settingsView(): string {
   const instances = status?.status.instances;
   const instance = Array.isArray(instances) ? instances[0] : null;
   const connected = status?.heartbeat?.connected ?? false;
-  return `
-    <section class="sheet wide">
-      <div class="section-head">
-        <div class="masthead">
-          <p class="eyebrow">Menu bar companion</p>
-          <h1>Settings</h1>
-        </div>
-        <button class="close" data-action="close-window" aria-label="Close">×</button>
+  const body = `
+    <div class="stack">
+      <div class="status-band"><span class="status-dot ${connected ? "online" : ""}"></span><div><strong>${connected ? "Possessed, online" : status ? "Possessed, offline" : "Checking this Mac…"}</strong><small>${escapeHtml(preferences.host_name ?? "This Mac")} · ${escapeHtml(serverHost())}${preferences.account_email ? ` · ${escapeHtml(preferences.account_email)}` : ""}</small></div></div>
+      <div class="menu">
+        <button data-action="open-app"><span><strong>Open SPAWN D</strong><small>Your workspaces and terminals, in this app</small></span><b>↗</b></button>
+        <button data-action="show-repair"><span><strong>Repair…</strong><small>Run the daemon’s own recovery path</small></span><b>›</b></button>
+        <button data-action="check-update"><span><strong>Update SPAWN D…</strong><small>${appUpdate?.available ? `Version ${escapeHtml(appUpdate.version)} is ready` : "Check the signed app channel"}</small></span><b>${appUpdate?.available ? "↓" : "↻"}</b></button>
+        <button class="danger" data-action="confirm-stop"><span><strong>Stop possessing this Mac…</strong><small>Removes the daemon service and this Mac’s registration</small></span><b>—</b></button>
       </div>
-      <div class="status-band"><span class="status-dot ${connected ? "online" : ""}"></span><div><strong>${connected ? "Possessed, online" : "Checking this Mac"}</strong><small>${escapeHtml(preferences.host_name ?? "This Mac")} · ${escapeHtml(preferences.server_origin)}</small></div></div>
-      <div class="settings-list">
-        <button data-action="open-browser"><span><strong>Open SPAWN D</strong><small>Continue in your system browser</small></span><b>↗</b></button>
-        <button data-action="show-repair"><span><strong>Repair…</strong><small>Run the daemon's own recovery path</small></span><b>›</b></button>
-        <button data-action="check-update"><span><strong>Update SPAWN D…</strong><small>${appUpdate?.available ? `Version ${escapeHtml(appUpdate.version)} is ready` : "Check the independently signed app channel"}</small></span><b>${appUpdate?.available ? "↓" : "↻"}</b></button>
-        <button class="danger" data-action="confirm-stop"><span><strong>Stop possessing this Mac…</strong><small>Runs spawnd exorcise --yes after confirmation</small></span><b>—</b></button>
-      </div>
-      ${message()}
+      ${errorLine()}
       <details class="diagnostics"><summary>Daemon details</summary><pre>${escapeHtml(JSON.stringify(instance ?? status?.status ?? {}, null, 2))}</pre></details>
-    </section>`;
+    </div>`;
+  return sheet(
+    "",
+    `<div class="stacked">${LOCKUP}<section class="plate"><header class="plate-head with-close"><div><h1>Settings</h1><p class="lead">SPAWN D lives in your menu bar.</p></div><button class="close" data-action="close-window" aria-label="Close">×</button></header><div class="plate-body">${body}</div></section></div>`,
+  );
 }
 
 function repairView(): string {
-  return `
-    <section class="sheet wide">
-      <div class="section-head">
-        <div class="masthead">
-          <p class="eyebrow">Delegated recovery</p>
-          <h1>Repair</h1>
-        </div>
-        <button class="close" data-action="settings" aria-label="Back to settings">×</button>
+  const body = `
+    <div class="stack">
+      <div class="actions stacked-actions">
+        <button class="btn btn-primary" data-action="repair-resume" ${busy ? "disabled" : ""}>${busy ? "Working…" : "1 · Re-run spawnd possess"}</button>
+        <button class="btn btn-outline" data-action="repair-reinstall" ${busy ? "disabled" : ""}>2 · Verified reinstall</button>
       </div>
-      <p class="lead compact">SPAWN D asks the daemon to repair itself first. Reinstall remains available only if that does not work.</p>
-      <div class="repair-order">
-        <button class="primary" data-action="repair-resume" ${busy ? "disabled" : ""}>1 · Re-run spawnd possess</button>
-        <button class="secondary" data-action="repair-reinstall" ${busy ? "disabled" : ""}>2 · Verified reinstall</button>
-      </div>
-      ${message()}
-      <div class="log-block">
-        <div class="log-head"><span>Recent daemon logs</span><button class="text-button" data-action="copy-logs">Copy</button></div>
+      ${noticeLine()}
+      ${errorLine()}
+      <div class="stack-tight">
+        <div class="log-head"><span class="label">Recent daemon logs</span><button class="tiny-link" data-action="copy-logs">Copy</button></div>
         <pre class="logs">${escapeHtml(status?.log_tail || "No daemon log lines are available yet.")}</pre>
       </div>
-    </section>`;
+    </div>`;
+  return sheet(
+    "",
+    `<div class="stacked">${LOCKUP}<section class="plate"><header class="plate-head with-close"><div><h1>Repair</h1><p class="lead">SPAWN D asks the daemon to repair itself first. A verified reinstall stays available if that does not work.</p></div><button class="close" data-action="settings" aria-label="Back to settings">×</button></header><div class="plate-body">${body}</div></section></div>`,
+  );
+}
+
+function stopView(): string {
+  const body = `
+    <div class="stack">
+      <p class="note">This runs <code>spawnd exorcise</code>: the daemon service and this Mac’s registration are removed. Your account and the app stay.</p>
+      ${errorLine()}
+      <div class="actions"><button class="btn btn-outline danger" data-action="stop-possessing" ${busy ? "disabled" : ""}>${busy ? "Stopping…" : "Stop possessing"}</button><button class="btn btn-ghost" data-action="settings">Cancel</button></div>
+    </div>`;
+  return sheet("", stacked("Stop possessing this Mac?", "The daemon stops answering for this Mac. Nothing else is touched.", body));
+}
+
+function updateView(): string {
+  const available = appUpdate?.available ?? false;
+  const body = available
+    ? `
+    <div class="stack">
+      <p class="note">SPAWN D ${escapeHtml(appUpdate?.version ?? "")} is ready from the signed app channel. The app restarts after installing; the daemon is not touched.</p>
+      ${errorLine()}
+      <div class="actions"><button class="btn btn-primary" data-action="install-update" ${busy ? "disabled" : ""}>${busy ? "Installing…" : "Install and restart"}</button><button class="btn btn-ghost" data-action="settings">Not now</button></div>
+    </div>`
+    : `
+    <div class="stack">
+      <p class="note">${busy ? "Checking the signed app channel…" : "SPAWN D is up to date."}</p>
+      ${errorLine()}
+      <div class="actions"><button class="btn btn-outline" data-action="settings">Close</button></div>
+    </div>`;
+  return sheet("", stacked("Update SPAWN D", null, body));
 }
 
 function quitView(): string {
-  return `
-    <section class="sheet">
-      <div class="masthead">
-        <p class="eyebrow">Leave the companion</p>
-        <h1>Quit SPAWN D?</h1>
-        <p class="lead">The daemon keeps running while SPAWN D is closed.</p>
-      </div>
-      <div class="actions"><button class="primary" data-action="quit-app">Quit SPAWN D</button><button class="secondary" data-action="settings">Cancel</button></div>
-    </section>`;
+  const body = `
+    <div class="stack">
+      <p class="note">The daemon keeps running while SPAWN D is closed. Your hosts stay reachable.</p>
+      <div class="actions"><button class="btn btn-primary" data-action="quit-app">Quit SPAWN D</button><button class="btn btn-ghost" data-action="settings">Cancel</button></div>
+    </div>`;
+  return sheet("", stacked("Quit SPAWN D?", null, body));
 }
+
+/* ── Actions ──────────────────────────────────────────────────────────── */
 
 function bindActions(): void {
   document.querySelectorAll<HTMLElement>("[data-action]").forEach((element) => {
@@ -503,7 +743,9 @@ function bindActions(): void {
   });
   document.querySelector<HTMLFormElement>("#auth-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
-    void submitAuth(new FormData(event.currentTarget as HTMLFormElement));
+    const form = event.currentTarget as HTMLFormElement;
+    if (!form.reportValidity()) return;
+    void submitAuth(new FormData(form));
   });
   document.querySelectorAll<HTMLInputElement>('input[name="server-kind"]').forEach((radio) => {
     radio.addEventListener("change", () => {
@@ -519,49 +761,101 @@ function bindActions(): void {
 
 async function act(action: string): Promise<void> {
   error = null;
-  if (action === "get-started") setScreen("auth");
-  else if (action === "toggle-auth") {
-    authMode = authMode === "login" ? "signup" : "login";
-    render();
-  } else if (action === "preauth-server") {
-    serverChoice = preferences.server_origin === "https://spawnd.dev" ? "hosted" : "self";
-    setScreen("server");
-  } else if (action === "ask-again") await guarded(async () => invoke("ask_for_device_approval"));
-  else if (action === "possess" || action === "repair-reinstall") await startPossession();
-  else if (action === "try-again") {
-    runId = null;
-    possession = null;
-    completedSteps.clear();
-    render();
-  } else if (action === "approve-host") await approveHost();
-  else if (action === "terminal") await navigator.clipboard.writeText(terminalCommand);
-  else if (action === "learn-key-check")
-    await openUrl("https://spawnd.dev/docs/trust#possess-a-host");
-  else if (action === "copy-command") await navigator.clipboard.writeText(terminalCommand);
-  else if (action === "open-browser") await openUrl(preferences.server_origin);
-  else if (action === "done" || action === "close-window") window.close();
-  else if (action === "settings") {
-    setScreen("settings");
-    await refreshStatus(false);
-  } else if (action === "show-repair") {
-    setScreen("repair");
-    await refreshStatus(true);
-  } else if (action === "repair-resume") {
-    await guarded(async () => invoke<string>("repair_resume"));
-    await refreshStatus(true);
-  } else if (action === "copy-logs") await navigator.clipboard.writeText(status?.log_tail ?? "");
-  else if (action === "check-update") await checkUpdate(true);
-  else if (action === "confirm-stop") {
-    if (window.confirm("Stop possessing this Mac? This removes the daemon service and local registration.")) {
-      await guarded(async () => invoke<string>("stop_possessing"));
+  switch (action) {
+    case "toggle-auth":
+      authMode = authMode === "login" ? "signup" : "login";
+      render();
+      break;
+    case "choose-server":
+      serverChoice = preferences.server_origin === HOSTED_ORIGIN ? "hosted" : "self";
+      setScreen("server");
+      break;
+    case "back-to-auth":
+      setScreen("auth");
+      break;
+    case "retry-config":
+      await loadConfig(true);
+      break;
+    case "forgot-password":
+      await openUrl(`${preferences.server_origin}/forgot-password`);
+      break;
+    case "sign-out":
+      await signOut();
+      break;
+    case "resend-verification":
+      await resendVerification();
+      break;
+    case "ask-again":
+      await guarded(() => invoke("ask_for_device_approval"));
+      break;
+    case "possess":
+    case "repair-reinstall":
+      await startPossession();
+      break;
+    case "try-again":
+      resetPossession();
+      render();
+      break;
+    case "approve-host":
+      await approveHost();
+      break;
+    case "copy-command":
+      await navigator.clipboard.writeText(terminalCommand);
+      copiedUntil = Date.now() + COPIED_MS;
+      render();
+      window.setTimeout(render, COPIED_MS + 50);
+      break;
+    case "open-app":
+      // The product itself, in its own window inside this app, signed in.
+      await guarded(() => invoke("open_app"));
+      break;
+    case "close-window":
+      window.close();
+      break;
+    case "settings":
+      setScreen("settings");
+      await refreshStatus(false);
+      break;
+    case "show-repair":
+      setScreen("repair");
       await refreshStatus(true);
-    }
-  } else if (action === "quit-app") await invoke("quit_app");
+      break;
+    case "repair-resume":
+      notice = null;
+      if ((await guarded(() => invoke<string>("repair_resume"))) !== null) notice = "The daemon re-ran its possession. Check the logs below.";
+      await refreshStatus(true);
+      break;
+    case "copy-logs":
+      await navigator.clipboard.writeText(status?.log_tail ?? "");
+      break;
+    case "check-update":
+      setScreen("update");
+      await checkUpdate();
+      break;
+    case "install-update":
+      await guarded(() => invoke<boolean>("install_app_update"));
+      break;
+    case "confirm-stop":
+      setScreen("stop");
+      break;
+    case "stop-possessing":
+      if ((await guarded(() => invoke<string>("stop_possessing"))) !== null) {
+        setScreen("settings");
+        await refreshStatus(true);
+      }
+      break;
+    case "quit-app":
+      await invoke("quit_app");
+      break;
+    default:
+      break;
+  }
 }
 
 function setScreen(next: Screen): void {
   screen = next;
   error = null;
+  notice = null;
   render();
 }
 
@@ -572,7 +866,7 @@ async function guarded<T>(operation: () => Promise<T>): Promise<T | null> {
   try {
     return await operation();
   } catch (cause) {
-    error = cause instanceof Error ? cause.message : String(cause);
+    error = describe(cause);
     return null;
   } finally {
     busy = false;
@@ -580,8 +874,27 @@ async function guarded<T>(operation: () => Promise<T>): Promise<T | null> {
   }
 }
 
+/* ── Sign-in ──────────────────────────────────────────────────────────── */
+
+async function loadConfig(force = false): Promise<void> {
+  if (!force && configOrigin === preferences.server_origin && configState === "ready") return;
+  configState = "loading";
+  configOrigin = preferences.server_origin;
+  render();
+  try {
+    config = await invoke<AuthConfig>("auth_config", { origin: preferences.server_origin });
+    configState = "ready";
+  } catch (cause) {
+    config = null;
+    configState = "error";
+    error = null;
+    console.warn("auth config unavailable:", describe(cause));
+  }
+  render();
+}
+
 async function submitAuth(data: FormData): Promise<void> {
-  const email = String(data.get("email") ?? "");
+  const email = String(data.get("email") ?? "").trim();
   const password = String(data.get("password") ?? "");
   const invite = String(data.get("invite") ?? "").trim() || null;
   const result = await guarded(() =>
@@ -596,69 +909,91 @@ async function submitAuth(data: FormData): Promise<void> {
 }
 
 async function beginOAuth(provider: string): Promise<void> {
+  lastProvider = provider;
+  const inviteInput = document.querySelector<HTMLInputElement>('input[name="invite"]');
+  const invite = inviteInput?.value.trim() || null;
   const url = await guarded(() =>
-    invoke<string>("oauth_start_url", {
-      origin: preferences.server_origin,
-      provider,
-      invite: null,
-    }),
+    invoke<string>("oauth_start_url", { origin: preferences.server_origin, provider, invite }),
   );
   if (url) await openUrl(url);
 }
 
 async function handleDeepLink(value: string): Promise<void> {
-  const url = new URL(value);
-  if (url.protocol !== "spawn:" || url.hostname !== "oauth" || url.pathname !== "/callback") return;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return;
+  }
+  if (url.protocol !== "spawn:" || url.hostname !== OAUTH_CALLBACK.host || url.pathname !== OAUTH_CALLBACK.path) return;
   const oauthError = url.searchParams.get("error");
+  if (oauthError === "invite_required") {
+    // The provider signed the person in, but the server wants a code before it
+    // will create the account. Show the field and let them go again.
+    authMode = "signup";
+    inviteRequiredFor = lastProvider;
+    setScreen("auth");
+    return;
+  }
   if (oauthError) {
-    error = oauthError;
+    setScreen("auth");
+    error = oauthError === "access_denied" ? `${providerName(lastProvider)} sign-in was cancelled.` : oauthError;
     render();
     return;
   }
   const code = url.searchParams.get("code");
   if (!code) return;
+  setScreen("auth");
   const result = await guarded(() =>
     invoke<AuthOutcome>("exchange_oauth_code", { origin: preferences.server_origin, code }),
   );
-  if (result) await finishAuth(result);
+  if (result) {
+    inviteRequiredFor = null;
+    await finishAuth(result);
+  }
 }
 
 async function finishAuth(result: AuthOutcome): Promise<void> {
   preferences = await invoke<Preferences>("app_preferences");
   deviceGateRequired = result.approval_required;
-  if (result.approval_required) {
-    setScreen("device");
-    startDevicePoll();
-  } else {
-    setScreen("server");
-  }
+  emailVerified = result.email_verified;
+  await advance();
 }
 
-function startDevicePoll(): void {
-  if (devicePoll !== null) window.clearInterval(devicePoll);
-  const poll = async (): Promise<void> => {
-    try {
-      deviceProgress = await invoke<DeviceProgress>("poll_device_approval");
-      if (deviceProgress.state === "approved") {
-        if (devicePoll !== null) window.clearInterval(devicePoll);
-        devicePoll = null;
-        preferences = await invoke<Preferences>("app_preferences");
-        setScreen("server");
-        return;
-      }
-      render();
-    } catch (cause) {
-      error = cause instanceof Error ? cause.message : String(cause);
-      render();
-    }
-  };
-  void poll();
-  devicePoll = window.setInterval(() => void poll(), 1500);
+/** The gate after this one, by the browser's rule: verify before anything
+ * that consumes a host, then the device ceremony, then the host itself. */
+async function advance(): Promise<void> {
+  if (!preferences.account_id) {
+    setScreen("auth");
+    return;
+  }
+  if (config?.email_verification_required && !emailVerified) {
+    setScreen("verify");
+    startVerifyPoll();
+    return;
+  }
+  if (deviceGateRequired && !preferences.device_approved) {
+    setScreen("device");
+    startDevicePoll();
+    return;
+  }
+  setScreen("host");
+}
+
+async function signOut(): Promise<void> {
+  stopPolls();
+  resetPossession();
+  await guarded(() => invoke("sign_out"));
+  preferences = await invoke<Preferences>("app_preferences");
+  deviceGateRequired = false;
+  emailVerified = true;
+  inviteRequiredFor = null;
+  authMode = "login";
+  setScreen("auth");
 }
 
 async function submitServer(data: FormData): Promise<void> {
-  const origin =
-    serverChoice === "hosted" ? "https://spawnd.dev" : String(data.get("server-url") ?? "");
+  const origin = serverChoice === "hosted" ? HOSTED_ORIGIN : String(data.get("server-url") ?? "");
   if (origin !== preferences.server_origin && preferences.account_id) {
     await invoke("sign_out");
   }
@@ -666,62 +1001,152 @@ async function submitServer(data: FormData): Promise<void> {
   if (!normalized) return;
   preferences = await invoke<Preferences>("app_preferences");
   terminalCommand = await invoke<string>("terminal_install_command");
-  if (!preferences.account_id) setScreen("auth");
-  else setScreen("possess");
+  inviteRequiredFor = null;
+  setScreen("auth");
+  await loadConfig(true);
+}
+
+/* ── Verify ───────────────────────────────────────────────────────────── */
+
+function startVerifyPoll(): void {
+  verifyPoll = clearTimer(verifyPoll);
+  const poll = async (): Promise<void> => {
+    if (screen !== "verify") return;
+    try {
+      const state = await invoke<AccountState>("account_state");
+      if (state.email_verified) {
+        verifyPoll = clearTimer(verifyPoll);
+        emailVerified = true;
+        notice = "Email verified. Moving on…";
+        error = null;
+        render();
+        window.setTimeout(() => void advance(), SUCCESS_BEAT_MS);
+      }
+    } catch (cause) {
+      error = describe(cause);
+      render();
+    }
+  };
+  void poll();
+  verifyPoll = window.setInterval(() => void poll(), VERIFY_POLL_MS);
+}
+
+async function resendVerification(): Promise<void> {
+  notice = null;
+  const sent = await guarded(() => invoke("request_email_verification"));
+  if (sent !== null) {
+    notice = "A fresh verification link is on its way.";
+  } else if (error?.includes("too many requests")) {
+    error = "You’ve requested several links already. Please wait a while before trying again.";
+  } else if (error) {
+    error = "Could not send another link. Please try again.";
+  }
+  render();
+}
+
+/* ── Device approval ──────────────────────────────────────────────────── */
+
+function startDevicePoll(): void {
+  devicePoll = clearTimer(devicePoll);
+  const poll = async (): Promise<void> => {
+    if (screen !== "device") return;
+    try {
+      deviceProgress = await invoke<DeviceProgress>("poll_device_approval");
+      if (deviceProgress.state === "approved") {
+        devicePoll = clearTimer(devicePoll);
+        preferences = await invoke<Preferences>("app_preferences");
+        notice = "This device is approved. Moving on…";
+        render();
+        window.setTimeout(() => void advance(), SUCCESS_BEAT_MS);
+        return;
+      }
+      render();
+    } catch (cause) {
+      error = describe(cause);
+      render();
+    }
+  };
+  void poll();
+  devicePoll = window.setInterval(() => void poll(), CEREMONY_POLL_MS);
+}
+
+/* ── Host ─────────────────────────────────────────────────────────────── */
+
+function resetPossession(): void {
+  possessionPoll = clearTimer(possessionPoll);
+  ticker = clearTimer(ticker);
+  runId = null;
+  possession = null;
+  waitStartedAt = null;
+  completedSteps.clear();
 }
 
 async function startPossession(): Promise<void> {
+  resetPossession();
   const id = await guarded(() => invoke<string>("begin_possession"));
   if (!id) return;
   runId = id;
-  possession = null;
-  setScreen("possess");
+  waitStartedAt = Date.now();
+  setScreen("host");
   startPossessionPoll();
+  ticker = window.setInterval(() => {
+    if (screen === "host" && runId) render();
+  }, 1_000);
 }
 
 function startPossessionPoll(): void {
-  if (possessionPoll !== null) window.clearInterval(possessionPoll);
+  possessionPoll = clearTimer(possessionPoll);
+  let lastStatus: PossessionProgress["status"] | null = null;
   const poll = async (): Promise<void> => {
     if (!runId) return;
     try {
       possession = await invoke<PossessionProgress>("poll_possession", { runId });
       error = null;
+      if (possession.status !== lastStatus) {
+        lastStatus = possession.status;
+        waitStartedAt = Date.now();
+      }
       syncPossessionSteps(possession.status);
       if (possession.status === "online") {
-        if (possessionPoll !== null) window.clearInterval(possessionPoll);
-        possessionPoll = null;
+        possessionPoll = clearTimer(possessionPoll);
+        ticker = clearTimer(ticker);
         preferences = await invoke<Preferences>("app_preferences");
-        setScreen("done");
+        notice = "Your host is online.";
+        render();
+        window.setTimeout(() => setScreen("done"), SUCCESS_BEAT_MS);
         return;
       }
       if (possession.status === "failed") {
-        if (possessionPoll !== null) window.clearInterval(possessionPoll);
-        possessionPoll = null;
+        possessionPoll = clearTimer(possessionPoll);
+        ticker = clearTimer(ticker);
       }
       render();
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : String(cause);
-      if (error.includes("This host could not be verified")) {
-        error = "This host could not be verified.";
-      }
+      error = describe(cause);
+      if (error.includes(VERIFICATION_REFUSAL)) error = VERIFICATION_REFUSAL;
       render();
     }
   };
   void poll();
-  possessionPoll = window.setInterval(() => void poll(), 1500);
+  possessionPoll = window.setInterval(() => void poll(), POSSESSION_POLL_MS);
 }
 
 function syncPossessionSteps(state: PossessionProgress["status"]): void {
-  const count = state === "online" ? 4 : state === "approved" ? 3 : state === "registered" ? 2 : 1;
   if (state === "failed") return;
+  const count = state === "online" ? 4 : state === "approved" ? 3 : state === "registered" ? 2 : 1;
   for (let index = 0; index < count; index += 1) completedSteps.add(index);
 }
 
 async function approveHost(): Promise<void> {
   if (!runId) return;
   const result = await guarded(() => invoke<string>("approve_possession", { runId }));
-  if (result) completedSteps.add(2);
+  if (result !== null) {
+    completedSteps.add(APPROVAL_STEP);
+    waitStartedAt = Date.now();
+  }
 }
+
+/* ── Menu-bar surfaces ────────────────────────────────────────────────── */
 
 async function refreshStatus(includeDoctor: boolean): Promise<void> {
   if (statusLoading) return;
@@ -729,61 +1154,86 @@ async function refreshStatus(includeDoctor: boolean): Promise<void> {
   try {
     status = await invoke<LocalStatus>("local_status", { includeDoctor });
   } catch (cause) {
-    error = cause instanceof Error ? cause.message : String(cause);
+    error = describe(cause);
   } finally {
     statusLoading = false;
     render();
   }
 }
 
-async function checkUpdate(prompt: boolean): Promise<void> {
-  const result = await guarded(() =>
-    invoke<{ available: boolean; version: string | null; endpoint: string }>("check_app_update"),
-  );
-  if (!result) return;
-  appUpdate = result;
-  if (
-    prompt &&
-    result.available &&
-    window.confirm(`Install SPAWN D ${result.version ?? "update"} now?`)
-  ) {
-    await guarded(() => invoke<boolean>("install_app_update"));
-  }
+async function checkUpdate(): Promise<void> {
+  const result = await guarded(() => invoke<AppUpdate>("check_app_update"));
+  if (result) appUpdate = result;
   render();
 }
+
+function stopPolls(): void {
+  verifyPoll = clearTimer(verifyPoll);
+  devicePoll = clearTimer(devicePoll);
+}
+
+/* ── Start ────────────────────────────────────────────────────────────── */
 
 async function initialize(): Promise<void> {
   preferences = await invoke<Preferences>("app_preferences");
   terminalCommand = await invoke<string>("terminal_install_command");
-  screen = preferences.first_run_complete ? "settings" : "welcome";
-  serverChoice = preferences.server_origin === "https://spawnd.dev" ? "hosted" : "self";
+  serverChoice = preferences.server_origin === HOSTED_ORIGIN ? "hosted" : "self";
   await listen<{ index: number }>("possess-step", (event) => {
     completedSteps.add(event.payload.index);
     render();
   });
   await listen<string>("tray-surface", (event) => {
-    screen = event.payload === "repair" ? "repair" : event.payload === "quit" ? "quit" : "settings";
-    render();
-    void refreshStatus(screen === "repair");
-    if (event.payload === "update") void checkUpdate(true);
+    const surface = event.payload;
+    if (surface === "update") {
+      setScreen("update");
+      void checkUpdate();
+      return;
+    }
+    setScreen(surface === "repair" ? "repair" : surface === "quit" ? "quit" : "settings");
+    void refreshStatus(surface === "repair");
   });
-  await listen("tray-open-browser", () => void openUrl(preferences.server_origin));
   await onOpenUrl((urls) => {
     for (const url of urls) void handleDeepLink(url);
   });
+
+  if (preferences.first_run_complete) {
+    screen = "settings";
+    render();
+    await refreshStatus(false);
+    void checkUpdate();
+  } else if (preferences.account_id) {
+    // Signed in but not finished: pick the gate up where it was left, from
+    // what the server says rather than from anything remembered locally.
+    render();
+    await loadConfig(true);
+    try {
+      const state = await invoke<AccountState>("account_state");
+      emailVerified = state.email_verified;
+      deviceGateRequired = !preferences.device_approved;
+      await advance();
+    } catch (cause) {
+      await invoke("sign_out").catch(() => undefined);
+      preferences = await invoke<Preferences>("app_preferences");
+      setScreen("auth");
+      error = `Sign in again to continue (${describe(cause)}).`;
+      render();
+    }
+  } else {
+    render();
+    await loadConfig();
+  }
+
   for (const url of (await getCurrent()) ?? []) void handleDeepLink(url);
-  render();
-  if (preferences.first_run_complete) await refreshStatus(false);
-  if (preferences.first_run_complete) void checkUpdate(false);
+
   window.setInterval(() => {
-    if (preferences.first_run_complete) void refreshStatus(false);
-  }, 15_000);
+    if (preferences.first_run_complete && screen === "settings") void refreshStatus(false);
+  }, STATUS_REFRESH_MS);
   window.setInterval(() => {
     if (preferences.account_id) void invoke("renew_session").catch(() => undefined);
-  }, 12 * 60 * 60_000);
+  }, SESSION_RENEW_MS);
 }
 
 void initialize().catch((cause) => {
-  error = cause instanceof Error ? cause.message : String(cause);
+  error = describe(cause);
   render();
 });

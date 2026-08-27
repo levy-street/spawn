@@ -34,9 +34,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
+    "targets": [
+      "app"
+    ],
     "createUpdaterArtifacts": false,
-    "icon": ["icons/icon.icns", "icons/icon.png"],
+    "icon": [
+      "icons/icon.icns",
+      "icons/icon.png"
+    ],
     "category": "Utility",
     "shortDescription": "Possess and supervise this Mac with SPAWN D",
     "longDescription": "A menu-bar companion that installs, verifies and supervises the SPAWN D daemon on this Mac.",
@@ -44,18 +49,37 @@
       "minimumSystemVersion": "12.0",
       "hardenedRuntime": true,
       "entitlements": null,
-      "signingIdentity": null
+      "signingIdentity": null,
+      "dmg": {
+        "background": "dmg/background.png",
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
+      }
     }
   },
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["spawn"]
+        "schemes": [
+          "spawn"
+        ]
       }
     },
     "updater": {
       "active": true,
-      "endpoints": ["https://spawnd.dev/desktop/latest.json"],
+      "endpoints": [
+        "https://spawnd.dev/desktop/latest.json"
+      ],
       "dialog": false,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg4MjU4MDE2RERBQUY2QkIKUldTNzlxcmRGb0FsaU9sOWRjM3IxZFY2QjM0eWpGeUV6bUVYemxpYzI3TVhlOCtzVWcwcnl0bWcK"
     }
