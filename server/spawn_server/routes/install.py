@@ -1045,7 +1045,7 @@ INSTALL_SCRIPT = dedent(
     # one the open fails with ENXIO ("Device not configured"), which under
     # `set -e` took the whole install down instead of falling back. So try the
     # redirect, quietly, and let the answer decide.
-    have_tty() { { : < /dev/tty; } 2>/dev/null; }
+    have_tty() { ( : < /dev/tty ) 2>/dev/null; }
 
     run_attached() {
       if have_tty; then

@@ -44,10 +44,10 @@ server {
         proxy_buffering off;
     }
 
-    # Static desktop release origin: the notarized DMGs, updater payloads and
-    # latest.json that scripts/publish-desktop.sh uploads (docs/RELEASE.md, The
-    # desktop app). Kept above `/` so the app updater and the download page
-    # never reach Next for these files. Create the directory once:
+    # Static desktop release origin: the notarized DMGs, Mac updater payloads,
+    # signed Windows setup EXE, and latest.json that publish-desktop.sh uploads
+    # (docs/RELEASE.md, The desktop app). Kept above `/` so the app updater and
+    # the download page never reach Next for these files. Create the directory once:
     #   sudo mkdir -p /var/www/spawnd/desktop && sudo chown -R <deploy-user> /var/www/spawnd
     location /desktop/ {
         alias /var/www/spawnd/desktop/;
