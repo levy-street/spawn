@@ -210,6 +210,26 @@ pages targeting category head terms, each racking its spokes.
   total. Template: diagnosis → general fixes → the structural fix. Lead with
   the honest cause, not the pitch.
 
+## Templates
+
+| template | serves | signature section | schema | status |
+|---|---|---|---|---|
+| hub | 4 hubs | intro essay + spoke rack | Organization, SoftwareApplication, Breadcrumb | exists as bare card rack; needs content upgrade |
+| device | phone pages, iPad, Chromebook | phone-frame terminal vignette (an agent moment: permission prompt, diff) | Breadcrumb, FAQ | new |
+| vibe | vibe row | device template base, softer chrome; jargon-free register enforced editorially | Breadcrumb, FAQ | new (variant) |
+| machine | machine row | outbound-only network diagram | Breadcrumb, FAQ | new |
+| job | job pages | workspace-grid vignette (the parallel fleet, live) | Breadcrumb, FAQ | new |
+| pillar | agent pillars | agent fact card + spoke rack | Breadcrumb, FAQ | new |
+| comparison | /spawnd-vs-* | ledger table + honest verdict | Breadcrumb, FAQ, **no Review** | exists; rework to copy bar |
+| listicle | /{x}-alternatives | ranked options w/ mini-ledgers, real tools listed honestly | Breadcrumb, FAQ | new |
+| guide | /how-to-* | numbered steps, code blocks, troubleshooting | HowTo, Article (honest dates), Breadcrumb | new |
+| fix | symptom pages | diagnosis → general fixes → structural fix | Breadcrumb, FAQ | new |
+
+Shared parts under all ten: the flat `[slug]` router + denylist, the
+signature-section components (phone vignette, network diagram, grid vignette),
+JSON-LD builders, per-ICP closing CTAs, related-pages rack, automated OG
+images, Lighthouse CI budgets.
+
 ## Arithmetic
 
 hubs+tier0 7 · device ~30 · vibe ~10 · machine ~25 · jobs ~14 · pillars ~30 ·
