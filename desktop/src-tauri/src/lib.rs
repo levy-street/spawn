@@ -1,5 +1,4 @@
 mod api;
-mod app_window;
 mod auth;
 mod crypto;
 mod install;
@@ -9,13 +8,14 @@ mod supervision;
 mod tray;
 mod trust;
 mod updater_config;
+mod window;
 
 use models::{
     AccountState, AuthConfig, AuthOutcome, DesktopPreferences, DeviceApprovalProgress, LocalStatus,
     PossessionProgress,
 };
 use serde::Serialize;
-use tauri::{Manager, RunEvent, WindowEvent};
+use tauri::RunEvent;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -243,24 +243,12 @@ fn sign_out() -> Result<(), String> {
 
 #[tauri::command]
 async fn open_app(app: tauri::AppHandle) -> Result<(), String> {
-    app_window::open(&app).await.map_err(command_error)
+    window::show_product(&app).await.map_err(command_error)
 }
 
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
-}
-
-/// Front whatever the person is using: the product if it is open, else the
-/// wizard.
-fn bring_forward(app: &tauri::AppHandle) {
-    let window = app
-        .get_webview_window(app_window::LABEL)
-        .or_else(|| app.get_webview_window("main"));
-    if let Some(window) = window {
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
 }
 
 pub fn run() {
@@ -270,7 +258,7 @@ pub fn run() {
         // rival: a sign-in returning on spawn:// must reach the instance that
         // started it, and the icon macOS shows for the scheme must be ours.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            bring_forward(app);
+            window::front(app);
         }))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
@@ -278,44 +266,22 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppServices::default())
         .setup(|app| {
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             tray::install(app)?;
+            window::create(app)?;
             // A sign-in that went out to the system browser comes back on the
-            // `spawn://` scheme while this window may well be hidden; surface it
+            // `spawn://` scheme while the window may well be hidden; surface it
             // so the person sees the wizard pick up, not a silent menu-bar app.
             let handle = app.handle().clone();
-            app.deep_link().on_open_url(move |_event| {
-                if let Some(window) = handle.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
+            app.deep_link()
+                .on_open_url(move |_event| window::front(&handle));
+            // Launch is the product, like any app: the web app if this Mac is
+            // possessed, else the wizard where it left off.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = window::surface(&handle).await {
+                    eprintln!("window: {error:#}");
                 }
             });
-            if let Some(window) = app.get_webview_window("main") {
-                let close_window = window.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = close_window.hide();
-                    }
-                });
-                if storage::load_preferences()
-                    .unwrap_or_default()
-                    .first_run_complete
-                {
-                    // This Mac is possessed: the product opens, the wizard
-                    // stays in the menu bar for settings and repair.
-                    let handle = app.handle().clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(error) = app_window::open(&handle).await {
-                            eprintln!("app window: {error:#}");
-                        }
-                    });
-                } else {
-                    window.show()?;
-                    window.set_focus()?;
-                }
-            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -347,10 +313,21 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building SPAWN D desktop");
-    app.run(|_handle, event| {
-        if matches!(event, RunEvent::ExitRequested { .. }) {
-            // Explicit Quit SPAWN D exits. Closing the only window is handled
-            // above and leaves the menu-bar companion running.
+    app.run(|handle, event| {
+        // Explicit Quit SPAWN D exits; closing the window only hides it and
+        // leaves SPAWN D in the menu bar. Opening the app again from
+        // Launchpad or the Dock then brings the window back as it was.
+        if let RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } = event
+        {
+            let handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = window::surface(&handle).await {
+                    eprintln!("window: {error:#}");
+                }
+            });
         }
     });
 }

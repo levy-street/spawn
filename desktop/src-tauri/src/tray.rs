@@ -4,7 +4,7 @@ use tauri::menu::{
     Menu, MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem, Submenu, SubmenuBuilder,
 };
 use tauri::tray::TrayIconBuilder;
-use tauri::{App, AppHandle, Emitter, Manager, Wry};
+use tauri::{App, AppHandle, Manager, Wry};
 
 /// The menu-bar mark: the brand trident, black on alpha, handed to macOS as a
 /// template image so the system inverts it for a light menu bar and dims it
@@ -75,8 +75,8 @@ pub fn install(app: &mut App) -> Result<()> {
             "open" => {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(error) = crate::app_window::open(&handle).await {
-                        eprintln!("app window: {error:#}");
+                    if let Err(error) = crate::window::surface(&handle).await {
+                        eprintln!("window: {error:#}");
                     }
                 });
             }
@@ -109,10 +109,8 @@ pub fn set_app_update_available(app: &AppHandle, available: bool) {
 }
 
 fn show_surface(app: &AppHandle, surface: &str) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = app.emit("tray-surface", surface);
+    if let Err(error) = crate::window::show_wizard(app, Some(surface)) {
+        eprintln!("window: {error:#}");
     }
 }
 
