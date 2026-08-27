@@ -15,6 +15,7 @@ import {
   exportEd25519PublicKey,
   exportEd25519PublicKeyWire,
   generateEd25519IdentityKeyPair,
+  importEd25519PrivateKeySeed,
   importEd25519PublicKeyWire,
   type SignedSignalTranscript,
   signSignedSignalTranscript,
@@ -46,6 +47,19 @@ export interface BrowserDeviceIdentity {
   readonly publicKey: CryptoKey;
   readonly publicKeyWire: string;
   sign(transcript: SignedSignalTranscript): Promise<string>;
+}
+
+/** An identity minted elsewhere on this machine, offered to this page. */
+export interface CarriedBrowserDeviceIdentity {
+  /** The raw 32-byte Ed25519 seed. Zeroed once looked at, whatever the outcome. */
+  readonly seed: Uint8Array;
+  readonly publicKeyWire: string;
+}
+
+export interface AdoptedBrowserDeviceIdentity {
+  readonly identity: BrowserDeviceIdentity;
+  /** The key this account's record held before, when that was a different one. */
+  readonly replacedPublicKeyWire: string | null;
 }
 
 export interface BrowserDeviceIdentityStorageOptions {
@@ -386,6 +400,54 @@ async function addCandidateOrLoadWinner(
     if (error instanceof BrowserDeviceIdentityError) throw error;
     throw storageFailure("browser device identity write failed");
   }
+}
+
+/**
+ * Write the record for this account whatever it holds now, and say what it
+ * held. One readwrite transaction, so the read and the write cannot straddle
+ * another tab's first creation.
+ */
+async function replaceRecord(
+  database: IDBDatabase,
+  accountId: string,
+  candidate: StoredDeviceIdentityV1,
+): Promise<unknown | undefined> {
+  let transaction: IDBTransaction;
+  try {
+    transaction = database.transaction(BROWSER_DEVICE_IDENTITY_STORE_NAME, "readwrite");
+  } catch {
+    throw storageFailure("browser device identity write transaction could not start");
+  }
+  const completion = transactionResult(transaction);
+  try {
+    const store = transaction.objectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME);
+    const previous = await requestResult(store.get(accountId));
+    if (previous === undefined) {
+      const count = await requestResult(store.count());
+      if (count >= BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS) {
+        const error = new BrowserDeviceIdentityError(
+          "capacity_exceeded",
+          `browser device identity storage is limited to ${BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS} accounts`,
+        );
+        await abortTransaction(transaction, completion);
+        throw error;
+      }
+    }
+    await requestResult(store.put(candidate));
+    await completion;
+    return previous;
+  } catch (error) {
+    await completion.catch(() => undefined);
+    if (error instanceof BrowserDeviceIdentityError) throw error;
+    throw storageFailure("browser device identity write failed");
+  }
+}
+
+/** The public key a stored record claims, whatever else is wrong with it. */
+function claimedPublicKeyWire(stored: unknown): string | null {
+  if (typeof stored !== "object" || stored === null) return null;
+  const value = (stored as { publicKeyWire?: unknown }).publicKeyWire;
+  return typeof value === "string" && value.length === ED25519_PUBLIC_KEY_WIRE_CHARS ? value : null;
 }
 
 function publicIdentity(record: StoredDeviceIdentityV1): BrowserDeviceIdentity {
@@ -744,6 +806,72 @@ export async function loadOrCreateBrowserDeviceIdentity(
     const candidate = await createCandidate(accountId);
     const winner = await addCandidateOrLoadWinner(database, accountId, candidate);
     return publicIdentity(await validateStoredRecord(winner, accountId));
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * Take on an identity minted elsewhere on this same machine: the desktop
+ * app's, handed to the page it hosts (desktop-device-handover.ts). One
+ * computer is one device, so the page runs as the device that possessed it
+ * rather than as a stranger the account has to be asked about.
+ *
+ * The seed goes in non-extractable and the pair is proven to correspond
+ * before anything is written; the seed bytes are zeroed on every path. A
+ * record already holding this key is left exactly as it is. A record holding
+ * another key is replaced — the page was a device of its own until now, and
+ * is that device no longer — and the caller is told which key died, so the
+ * roster row it registered can be retired.
+ */
+export async function adoptBrowserDeviceIdentity(
+  accountId: string,
+  carried: CarriedBrowserDeviceIdentity,
+  options: BrowserDeviceIdentityStorageOptions = {},
+): Promise<AdoptedBrowserDeviceIdentity> {
+  assertAccountId(accountId);
+  let candidate: StoredDeviceIdentityV1;
+  try {
+    const privateKey = await importEd25519PrivateKeySeed(carried.seed);
+    const publicKey = await importEd25519PublicKeyWire(carried.publicKeyWire);
+    candidate = await validateStoredRecord(
+      {
+        accountId,
+        privateKey,
+        publicKey,
+        publicKeyWire: carried.publicKeyWire,
+        version: BROWSER_DEVICE_IDENTITY_STORAGE_VERSION,
+      },
+      accountId,
+    );
+  } catch (error) {
+    if (error instanceof BrowserDeviceIdentityError && error.code !== "corrupt_record") {
+      throw error;
+    }
+    throw new BrowserDeviceIdentityError(
+      "key_mismatch",
+      "the carried device identity is not a corresponding Ed25519 pair",
+    );
+  } finally {
+    carried.seed.fill(0);
+  }
+
+  const factory = resolveIndexedDB(options);
+  const database = await openDatabase(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME);
+  try {
+    const stored = await getStoredRecord(database, accountId);
+    if (stored !== undefined) {
+      const existing = await validateStoredRecord(stored, accountId).catch(() => null);
+      if (existing !== null && existing.publicKeyWire === candidate.publicKeyWire) {
+        return { identity: publicIdentity(existing), replacedPublicKeyWire: null };
+      }
+    }
+    const previous = await replaceRecord(database, accountId, candidate);
+    const replaced = claimedPublicKeyWire(previous);
+    return {
+      identity: publicIdentity(candidate),
+      replacedPublicKeyWire: replaced === candidate.publicKeyWire ? null : replaced,
+    };
   } finally {
     database.close();
   }

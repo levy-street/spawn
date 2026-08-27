@@ -73,7 +73,8 @@ not a cousin of it:
 Once this computer is possessed the product is the web app, and the window becomes
 it (`src-tauri/src/window.rs`): the same window navigates to the chosen
 origin, the wizard's session becomes the browser session by way of the cookie
-the server sets on renewal, the page gets no IPC, and any navigation off the
+the server sets on renewal, the wizard's device becomes the page's device (the
+third contract below), the page gets no IPC, and any navigation off the
 origin — or any `window.open` — goes to the system browser. Settings, repair
 and update turn the window back into the wizard, carrying the surface in the
 URL hash, and leaving them turns it back into the product. There is never a
@@ -81,7 +82,7 @@ second window; a second copy of the app (single-instance) fronts the first
 and exits. Nothing of the web build is bundled here, so the app can never
 drift from the server it talks to.
 
-Two things about that face are contracts with `web/`, not implementation
+Three things about that face are contracts with `web/`, not implementation
 details:
 
 - The webview's user agent ends in `SpawnDesktop/<version>`, and the web app
@@ -100,6 +101,20 @@ details:
   through on `localhost`. If a session still will not land, `window.rs` clears
   the stored one — a page cannot overwrite an `HttpOnly` cookie — and has the
   page carry it instead.
+- The page is this app's device. One computer is one device: this app
+  registered as "SPAWN D on Mac", it possessed this computer — the daemon
+  pins its key — and it published the hosts it possessed under that key. A
+  web app minting a device of its own inside this window would be a stranger
+  to all of that, unapproved in every roster and refused by the host. So on
+  the way into the product `window.rs` leaves the app's Ed25519 identity —
+  account, device id, public key, seed — in the origin's `sessionStorage`
+  under `spawn.desktop-device.v1`, and the web app takes it exactly once,
+  under this user agent only, before it registers as anything
+  (`web/src/lib/desktop-device-handover.ts`), replacing any identity the page
+  minted for itself and retiring that device's roster row. The hosts this app
+  possessed then arrive trusted on the app's own signed introductions. The key
+  travels in-process only; the server never sees it and could not have forged
+  the handover.
 
 The rules that palette carries are load-bearing:
 

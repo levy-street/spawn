@@ -62,7 +62,12 @@ public/           static assets
   will not match the HTML it hydrates. Inside that window there is no address
   bar and no way back, so anything that leads to the marketing site is a dead
   end: a link to `/`, the masthead, the colophon, a brand mark that goes home.
-  New chrome that leaves the product has to answer for itself there.
+  New chrome that leaves the product has to answer for itself there. That
+  window is also the app's own device: on the way in the app leaves its
+  Ed25519 identity in `sessionStorage` and `src/lib/desktop-device-handover.ts`
+  takes it (once, only under that user agent) before the page registers as
+  anything, so the product runs as "SPAWN D on Mac" — the device that
+  possessed the computer — and never as a second device of its own.
 
 ## Before calling a change done
 

@@ -13,6 +13,9 @@
  *  - CONSUME: rows whose publisher key this device holds FIRSTHAND (its peer
  *    device-key store, seeded only inside ceremonies) are verified against
  *    that firsthand key and pinned locally, exactly as a hand-run possession.
+ *    Rows under this device's OWN key count as firsthand too — nothing but
+ *    its private key could have signed them; the desktop app's window
+ *    inherits the app's key and the hosts the app possessed with it.
  *
  * The server is the mailbox: it can withhold rows (denial, which it always
  * could) but cannot forge one — substituting any field kills the signature,
@@ -190,9 +193,10 @@ export function useHostGossipSync(): void {
           peers.filter((peer) => !revokedKeys.has(peer.publicKey)).map((peer) => peer.publicKey),
         );
 
-        // CONSUME: verify + pin rows from firsthand-known publishers.
+        // CONSUME: verify + pin rows from firsthand-known publishers — peers
+        // met in a ceremony, and this device itself.
         const fresh = allRows.filter((row) => !consumedRef.current.has(row.id));
-        if (fresh.length > 0 && trustedPeerKeys.size > 0) {
+        if (fresh.length > 0) {
           const plan = await planBroadcastIntroductionAcceptance({
             accountId,
             ownPublicKey: ownDevice.public_key,
@@ -238,7 +242,10 @@ export function useHostGossipSync(): void {
           // all. Unknown-publisher rows stay fresh — the peer key may arrive
           // in a later ceremony and make them honorable.
           for (const row of fresh) {
-            if (trustedPeerKeys.has(row.publisher_public_key)) {
+            if (
+              trustedPeerKeys.has(row.publisher_public_key) ||
+              row.publisher_public_key === ownDevice.public_key
+            ) {
               consumedRef.current.add(row.id);
             }
           }

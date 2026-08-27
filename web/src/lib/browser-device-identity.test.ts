@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { IDBFactory } from "fake-indexeddb";
 import {
+  adoptBrowserDeviceIdentity,
   BROWSER_DEVICE_IDENTITY_DATABASE_NAME,
   BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS,
   BROWSER_DEVICE_IDENTITY_STORAGE_VERSION,
@@ -8,12 +9,14 @@ import {
   BrowserDeviceIdentityError,
   createBrowserDeviceRegistrationProof,
   deleteBrowserDeviceIdentity,
+  loadBrowserDeviceIdentity,
   loadOrCreateBrowserDeviceIdentity,
 } from "./browser-device-identity";
 import { verifyBrowserDeviceRegistrationProof } from "./browser-device-registration-transcript";
 import {
   decodeBase64Url,
   ED25519_PUBLIC_KEY_BYTES,
+  encodeBase64Url,
   type SignedSignalTranscript,
   verifySignedSignalTranscript,
 } from "./signed-signal";
@@ -426,6 +429,100 @@ describe("browser device identity", () => {
     await expectIdentityError(
       loadOrCreateBrowserDeviceIdentity(accountUuid(200), storage),
       "capacity_exceeded",
+    );
+  });
+});
+
+/** A seed and its public key, the way the desktop app holds them. */
+async function carriedIdentity(): Promise<{ seed: Uint8Array; publicKeyWire: string }> {
+  const pair = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const pkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", pair.privateKey));
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  return { seed: pkcs8.slice(pkcs8.byteLength - 32), publicKeyWire: encodeBase64Url(raw) };
+}
+
+describe("adopting the desktop app's identity", () => {
+  test("adopts a carried identity into an empty store, non-extractable, and zeroes the seed", async () => {
+    const factory = new IDBFactory();
+    const accountId = accountUuid(41);
+    const carried = await carriedIdentity();
+    const expectedKey = carried.publicKeyWire;
+    const adopted = await adoptBrowserDeviceIdentity(accountId, carried, options(factory));
+    expect(adopted.replacedPublicKeyWire).toBeNull();
+    expect(adopted.identity.publicKeyWire).toBe(expectedKey);
+    expect(carried.seed.every((byte) => byte === 0)).toBe(true);
+
+    const stored = await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, accountId);
+    expect(stored?.privateKey.extractable).toBe(false);
+    expect(stored?.privateKey.usages).toEqual(["sign"]);
+    expect(stored?.publicKeyWire).toBe(expectedKey);
+
+    // It signs as that device from now on, and reloads as it.
+    const signature = await adopted.identity.sign(transcript(expectedKey));
+    expect(
+      await verifySignedSignalTranscript(
+        adopted.identity.publicKey,
+        transcript(expectedKey),
+        signature,
+      ),
+    ).toBe(true);
+    const reloaded = await loadBrowserDeviceIdentity(accountId, options(factory));
+    expect(reloaded?.publicKeyWire).toBe(expectedKey);
+  });
+
+  test("replaces the identity this page minted for itself and names the key that died", async () => {
+    const factory = new IDBFactory();
+    const accountId = accountUuid(42);
+    const minted = await loadOrCreateBrowserDeviceIdentity(accountId, options(factory));
+    const carried = await carriedIdentity();
+    const expectedKey = carried.publicKeyWire;
+    // Only the desktop app still has the seed after an adoption zeroes it;
+    // this test keeps a copy the way the app keeps its credential file.
+    const seedAgain = carried.seed.slice();
+    const adopted = await adoptBrowserDeviceIdentity(accountId, carried, options(factory));
+    expect(adopted.replacedPublicKeyWire).toBe(minted.publicKeyWire);
+    expect(adopted.identity.publicKeyWire).toBe(expectedKey);
+    expect((await rawRecords(factory)).length).toBe(1);
+    const reloaded = await loadBrowserDeviceIdentity(accountId, options(factory));
+    expect(reloaded?.publicKeyWire).toBe(expectedKey);
+
+    // The same identity offered again — every open of the desktop window —
+    // is already here: nothing is replaced and nothing is reported dead.
+    const same = await adoptBrowserDeviceIdentity(
+      accountId,
+      { seed: seedAgain, publicKeyWire: expectedKey },
+      options(factory),
+    );
+    expect(same.replacedPublicKeyWire).toBeNull();
+    expect(same.identity.publicKeyWire).toBe(expectedKey);
+    expect(seedAgain.every((byte) => byte === 0)).toBe(true);
+    expect((await rawRecords(factory)).length).toBe(1);
+  });
+
+  test("a seed and a public key that do not correspond are refused and leave the store alone", async () => {
+    const factory = new IDBFactory();
+    const accountId = accountUuid(43);
+    const minted = await loadOrCreateBrowserDeviceIdentity(accountId, options(factory));
+    const one = await carriedIdentity();
+    const other = await carriedIdentity();
+    const mismatched = { seed: one.seed, publicKeyWire: other.publicKeyWire };
+    await expectIdentityError(
+      adoptBrowserDeviceIdentity(accountId, mismatched, options(factory)),
+      "key_mismatch",
+    );
+    expect(mismatched.seed.every((byte) => byte === 0)).toBe(true);
+    const reloaded = await loadBrowserDeviceIdentity(accountId, options(factory));
+    expect(reloaded?.publicKeyWire).toBe(minted.publicKeyWire);
+    await expectIdentityError(
+      adoptBrowserDeviceIdentity(
+        accountId,
+        { seed: new Uint8Array(31), publicKeyWire: other.publicKeyWire },
+        options(factory),
+      ),
+      "key_mismatch",
     );
   });
 });

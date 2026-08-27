@@ -8,7 +8,10 @@
 //! gets no IPC because no capability names a remote URL. Whether that cookie
 //! is one the webview will actually send is a question with a sharp edge on
 //! macOS; see [`session_cookie`], and [`handover_step`] for what happens when
-//! the answer is no. Any navigation off the chosen origin, and any
+//! the answer is no. The page is also this app's own device, not a second one
+//! for the same computer: on the way in it is handed the app's device
+//! identity, and it runs as that from then on — see [`device_handover`].
+//! Any navigation off the chosen origin, and any
 //! `window.open`, goes to the system browser. Settings and repair turn the
 //! window back into the wizard; the product is one click away again.
 //!
@@ -28,8 +31,10 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_opener::OpenerExt;
+use zeroize::Zeroizing;
 
-use crate::{auth, storage};
+use crate::models::DesktopPreferences;
+use crate::{auth, crypto, storage};
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -42,6 +47,9 @@ const SESSION_MAX_AGE: u32 = 60 * 60 * 24 * 7;
 const DOOR_PATH: &str = "/login";
 /// The product's own path on the chosen origin.
 const APP_PATH: &str = "/app";
+/// Where the page finds this app's device identity on its way in — the one
+/// key `web/src/lib/desktop-device-handover.ts` reads, and deletes.
+const DEVICE_HANDOVER_KEY: &str = "spawn.desktop-device.v1";
 /// What this file says when it says anything, so a run can be read back out of
 /// `RUST_LOG`-less stderr with one grep.
 const LOG: &str = "spawn-d window";
@@ -239,16 +247,24 @@ pub async fn show_product(app: &AppHandle) -> Result<()> {
     let _ = window.set_size(LogicalSize::new(width, height));
     let _ = window.center();
     let mut target = origin.clone();
-    if let Some(token) = carry_in_page {
+    let carried = Carried {
+        session: carry_in_page,
+        device: device_handover(&preferences),
+    };
+    if carried.session.is_some() || carried.device.is_some() {
         match app.state::<PendingHandover>().0.lock() {
-            Ok(mut held) => *held = Handover::Waiting(token),
-            Err(_) => eprintln!("{LOG}: the handover lock is poisoned; opening signed out"),
+            Ok(mut held) => *held = Handover::Waiting(carried.clone()),
+            Err(_) => eprintln!("{LOG}: the handover lock is poisoned; opening as a browser"),
         }
+    }
+    if carried.session.is_some() {
         // Land on the origin's own sign-in page rather than /app: it is the
         // lightest document there, and it is where this ends up anyway if the
         // handover cannot be completed — so nothing flashes backwards.
         target.set_path(DOOR_PATH);
     } else {
+        // The device alone goes straight to the product, which takes it on
+        // the way in — before it has registered as anything.
         target.set_path(APP_PATH);
     }
     eprintln!("{LOG}: opening {target}");
@@ -257,14 +273,37 @@ pub async fn show_product(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-/// A session this webview's cookie store would not carry, and how far the page
+/// What a page on the chosen origin is handed on its way in.
+#[derive(Clone, PartialEq, Eq)]
+struct Carried {
+    /// The session, when the cookie store would not keep it.
+    session: Option<String>,
+    /// This app's device identity, as the page stores it — whenever there is
+    /// an account. See [`device_handover`].
+    device: Option<Zeroizing<String>>,
+}
+
+impl Carried {
+    /// What is being handed over, for the log — never what it is.
+    fn name(&self) -> &'static str {
+        match (&self.session, &self.device) {
+            (Some(_), Some(_)) => "cookie and device",
+            (Some(_), None) => "cookie",
+            (None, Some(_)) => "device",
+            (None, None) => "nothing",
+        }
+    }
+}
+
+/// What this webview could not be given any other way — a session its cookie
+/// store would not carry, this app's device identity — and how far the page
 /// itself has got with it (see [`handover_step`]).
 #[derive(PartialEq, Eq)]
 enum Handover {
     /// Nothing to hand over.
     Idle,
-    /// Waiting for a page on the chosen origin to take the session.
-    Waiting(String),
+    /// Waiting for a page on the chosen origin to take what is carried.
+    Waiting(Carried),
     /// The page holds the cookie; it still has to be sent to the product.
     Seeded,
     /// Handed over, and the page sent on its way.
@@ -272,8 +311,9 @@ enum Handover {
 }
 
 impl std::fmt::Debug for Handover {
-    /// Redacted by hand: `Waiting` holds a live session, and a derived `{:?}`
-    /// anywhere near a log or an assertion message would print it.
+    /// Redacted by hand: `Waiting` holds a live session and a private key, and
+    /// a derived `{:?}` anywhere near a log or an assertion message would
+    /// print them.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Handover::Idle => "Idle",
@@ -289,19 +329,27 @@ struct PendingHandover(Mutex<Handover>);
 /// What a page on the chosen origin is told at this beat of its load, and what
 /// the handover becomes as a result.
 ///
-/// Two beats, because they want two different moments. The cookie goes in as
-/// soon as the document exists — `Started` is WebKit's `didCommitNavigation`,
-/// the same beat wry injects its own scripts at — and the jump to the product
-/// waits for the load to finish, which is the one moment a `location.replace`
-/// is certain not to cut a navigation still in flight. A `Started` that never
-/// arrives is not a dead end: `Finished` then does both.
+/// Two beats, because they want two different moments. The cookie and the
+/// device go in as soon as the document exists — `Started` is WebKit's
+/// `didCommitNavigation`, the same beat wry injects its own scripts at — and
+/// the jump to the product waits for the load to finish, which is the one
+/// moment a `location.replace` is certain not to cut a navigation still in
+/// flight. A `Started` that never arrives is not a dead end: `Finished` then
+/// does both.
+///
+/// Only a carried session needs the second beat: it went in at the door and
+/// has to be sent on to the product. The device alone lands on the product
+/// itself, and is simply taken there.
 fn handover_step(state: &Handover, event: PageLoadEvent) -> (Step, Handover) {
     match (state, event) {
-        (Handover::Waiting(token), PageLoadEvent::Started) => {
-            (Step::Seed(token.clone()), Handover::Seeded)
+        (Handover::Waiting(carried), PageLoadEvent::Started) if carried.session.is_some() => {
+            (Step::Seed(carried.clone()), Handover::Seeded)
         }
-        (Handover::Waiting(token), PageLoadEvent::Finished) => {
-            (Step::SeedAndEnter(token.clone()), Handover::Done)
+        (Handover::Waiting(carried), PageLoadEvent::Started) => {
+            (Step::Seed(carried.clone()), Handover::Done)
+        }
+        (Handover::Waiting(carried), PageLoadEvent::Finished) => {
+            (Step::SeedAndEnter(carried.clone()), Handover::Done)
         }
         (Handover::Seeded, PageLoadEvent::Finished) => (Step::Enter, Handover::Done),
         (Handover::Seeded, PageLoadEvent::Started) => (Step::Nothing, Handover::Seeded),
@@ -314,20 +362,21 @@ fn handover_step(state: &Handover, event: PageLoadEvent) -> (Step, Handover) {
 #[derive(PartialEq, Eq)]
 enum Step {
     Nothing,
-    Seed(String),
+    Seed(Carried),
     Enter,
-    SeedAndEnter(String),
+    SeedAndEnter(Carried),
 }
 
 impl Step {
-    /// A name for the log. The token is a live session — it is never printed,
-    /// which is also why this type carries no `Debug`.
-    fn name(&self) -> &'static str {
+    /// A name for the log. What is carried is a live session and a private
+    /// key — neither is ever printed, which is also why this type carries no
+    /// `Debug`.
+    fn name(&self) -> String {
         match self {
-            Step::Nothing => "nothing",
-            Step::Seed(_) => "cookie",
-            Step::Enter => "enter",
-            Step::SeedAndEnter(_) => "cookie and enter",
+            Step::Nothing => "nothing".to_owned(),
+            Step::Seed(carried) => carried.name().to_owned(),
+            Step::Enter => "enter".to_owned(),
+            Step::SeedAndEnter(carried) => format!("{} and enter", carried.name()),
         }
     }
 }
@@ -413,10 +462,24 @@ fn handover_script(step: &Step) -> Option<String> {
     let enter = format!("location.replace('{APP_PATH}');");
     match step {
         Step::Nothing => None,
-        Step::Seed(token) => Some(cookie_script(token)),
+        Step::Seed(carried) => Some(seed_script(carried)),
         Step::Enter => Some(enter),
-        Step::SeedAndEnter(token) => Some(format!("{}{enter}", cookie_script(token))),
+        Step::SeedAndEnter(carried) => Some(format!("{}{enter}", seed_script(carried))),
     }
+}
+
+/// The device first, then the cookie: the page takes its identity before it
+/// registers as anything, and registration is the first thing a session lets
+/// it do.
+fn seed_script(carried: &Carried) -> String {
+    let mut script = String::new();
+    if let Some(device) = &carried.device {
+        script.push_str(&device_script(device));
+    }
+    if let Some(token) = &carried.session {
+        script.push_str(&cookie_script(token));
+    }
+    script
 }
 
 fn cookie_script(token: &str) -> String {
@@ -426,6 +489,75 @@ fn cookie_script(token: &str) -> String {
     ))
     .unwrap_or_else(|_| "\"\"".to_owned());
     format!("document.cookie = {quoted};")
+}
+
+/// The script that leaves this app's device identity for the page.
+///
+/// `sessionStorage`, because it is this window's alone and dies with it, and
+/// because the page can take it and delete it in one breath
+/// (`web/src/lib/desktop-device-handover.ts`): it is read exactly once, on the
+/// way in, before the page registers as anything. Guarded, so a store that
+/// will not take it costs the page nothing but an identity of its own.
+fn device_script(record: &str) -> String {
+    let key = serde_json::to_string(DEVICE_HANDOVER_KEY).unwrap_or_else(|_| "\"\"".to_owned());
+    let quoted = serde_json::to_string(record).unwrap_or_else(|_| "\"\"".to_owned());
+    format!("try{{sessionStorage.setItem({key},{quoted});}}catch(_){{}}")
+}
+
+/// This app's device identity, as the page it hosts will store it: the
+/// account, the server's id for the device, its public key and its seed.
+///
+/// One computer is one device. This app registered as "SPAWN D on Mac", it
+/// possessed this computer — the daemon pins its key — and it published the
+/// hosts it possessed under that key. A web app minting a device of its own
+/// inside this window would be a stranger to all of that: unapproved in every
+/// roster, refused by the host, and asking the account to be introduced to a
+/// computer it is sitting on. So the page runs as this device, and the hosts
+/// arrive already trusted on the app's own signed introductions. The key
+/// travels in-process only; the server never sees it and could not have made
+/// the handover up.
+///
+/// `None` before there is an account or a registered device — the page is
+/// simply a browser then.
+fn device_handover(preferences: &DesktopPreferences) -> Option<Zeroizing<String>> {
+    let account_id = preferences.account_id.as_deref()?;
+    let device_id = preferences.device_id.as_deref()?;
+    let seed = match storage::device_seed(account_id) {
+        Ok(Some(seed)) => seed,
+        Ok(None) => {
+            eprintln!("{LOG}: no device identity to hand to the page");
+            return None;
+        }
+        Err(error) => {
+            eprintln!("{LOG}: could not read the device identity: {error:#}");
+            return None;
+        }
+    };
+    let public_key = match crypto::DeviceIdentity::load_or_create(account_id) {
+        Ok(identity) => identity.public_key_wire(),
+        Err(error) => {
+            eprintln!("{LOG}: could not load the device identity: {error:#}");
+            return None;
+        }
+    };
+    Some(Zeroizing::new(device_record(
+        account_id,
+        device_id,
+        &public_key,
+        seed.as_str(),
+    )))
+}
+
+/// The record `web/src/lib/desktop-device-handover.ts` parses, field for field.
+fn device_record(account_id: &str, device_id: &str, public_key: &str, seed: &str) -> String {
+    serde_json::json!({
+        "version": 1,
+        "account_id": account_id,
+        "device_id": device_id,
+        "public_key": public_key,
+        "seed": seed,
+    })
+    .to_string()
 }
 
 /// The bundled wizard in this window, on the surface asked for (settings,
@@ -717,13 +849,27 @@ mod tests {
         ));
     }
 
+    fn session(token: &str) -> Carried {
+        Carried {
+            session: Some(token.to_owned()),
+            device: None,
+        }
+    }
+
+    fn device(record: &str) -> Carried {
+        Carried {
+            session: None,
+            device: Some(Zeroizing::new(record.to_owned())),
+        }
+    }
+
     #[test]
     fn the_page_takes_the_cookie_first_and_the_product_after() {
         // The ordinary run: the document commits, takes the cookie, and is
         // sent on once it has finished loading.
-        let waiting = Handover::Waiting("tok".to_owned());
+        let waiting = Handover::Waiting(session("tok"));
         let (step, next) = handover_step(&waiting, PageLoadEvent::Started);
-        assert!(matches!(step, Step::Seed(ref token) if token == "tok"));
+        assert!(matches!(step, Step::Seed(ref c) if c.session.as_deref() == Some("tok")));
         assert_eq!(next, Handover::Seeded);
         let (step, next) = handover_step(&next, PageLoadEvent::Finished);
         assert!(step == Step::Enter);
@@ -734,7 +880,7 @@ mod tests {
         assert!(handover_step(&next, PageLoadEvent::Finished).0 == Step::Nothing);
         // A missed `Started` is not a dead end.
         let (step, next) = handover_step(&waiting, PageLoadEvent::Finished);
-        assert!(matches!(step, Step::SeedAndEnter(ref token) if token == "tok"));
+        assert!(matches!(step, Step::SeedAndEnter(ref c) if c.session.as_deref() == Some("tok")));
         assert_eq!(next, Handover::Done);
         // A second commit before the first load finished must not spend it.
         assert!(handover_step(&Handover::Seeded, PageLoadEvent::Started).0 == Step::Nothing);
@@ -743,9 +889,34 @@ mod tests {
     }
 
     #[test]
+    fn the_device_alone_is_taken_where_the_product_already_is() {
+        // No cookie to carry: the window opens on /app itself, the device goes
+        // in as the document commits, and there is nowhere further to send it.
+        let waiting = Handover::Waiting(device("{}"));
+        let (step, next) = handover_step(&waiting, PageLoadEvent::Started);
+        assert!(matches!(step, Step::Seed(ref c) if c.session.is_none() && c.device.is_some()));
+        assert_eq!(next, Handover::Done);
+        assert!(handover_step(&next, PageLoadEvent::Finished).0 == Step::Nothing);
+        // A missed `Started` seeds late and reloads the product, so the page
+        // registers with the identity it was handed rather than one it minted
+        // in the meantime.
+        let (step, next) = handover_step(&waiting, PageLoadEvent::Finished);
+        assert!(matches!(step, Step::SeedAndEnter(ref c) if c.device.is_some()));
+        assert_eq!(next, Handover::Done);
+        // Both carried: the cookie's two beats, with the device riding along.
+        let both = Carried {
+            session: Some("tok".to_owned()),
+            device: Some(Zeroizing::new("{}".to_owned())),
+        };
+        let (step, next) = handover_step(&Handover::Waiting(both.clone()), PageLoadEvent::Started);
+        assert!(step == Step::Seed(both));
+        assert_eq!(next, Handover::Seeded);
+    }
+
+    #[test]
     fn the_handover_script_sets_one_cookie_and_never_trusts_the_value() {
         assert!(handover_script(&Step::Nothing).is_none());
-        let seed = handover_script(&Step::Seed("abc.def".to_owned())).unwrap();
+        let seed = handover_script(&Step::Seed(session("abc.def"))).unwrap();
         assert_eq!(
             seed,
             "document.cookie = \"spawn_session=abc.def; path=/; max-age=604800; samesite=lax\";"
@@ -755,15 +926,70 @@ mod tests {
             handover_script(&Step::Enter).unwrap(),
             "location.replace('/app');"
         );
-        let both = handover_script(&Step::SeedAndEnter("abc.def".to_owned())).unwrap();
+        let both = handover_script(&Step::SeedAndEnter(session("abc.def"))).unwrap();
         assert!(both.starts_with(&seed) && both.ends_with("location.replace('/app');"));
         // A value carrying a quote is a value, not a statement: the quote is
         // escaped, so the literal it sits in still opens and closes exactly
         // once and nothing after it is ever read as code.
-        let hostile = handover_script(&Step::Seed("\";alert(1);//".to_owned())).unwrap();
+        let hostile = handover_script(&Step::Seed(session("\";alert(1);//"))).unwrap();
         assert!(hostile.contains(r#"\";alert(1);//"#));
         let unescaped = hostile.matches('"').count() - hostile.matches(r#"\""#).count();
         assert_eq!(unescaped, 2);
+    }
+
+    #[test]
+    fn the_handover_script_leaves_the_device_where_the_page_looks_for_it() {
+        let record = device_record(
+            "f02a4b8e-df36-4fea-a84a-bc7dacf4f679",
+            "f037a638-d9a7-42df-aeca-070600901ba5",
+            "Z4Pf82NUQyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "seedseedseedseedseedseedseedseedseedseedsee",
+        );
+        // Field for field what `desktop-device-handover.ts` parses.
+        let parsed: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(parsed["version"], 1);
+        assert_eq!(parsed["account_id"], "f02a4b8e-df36-4fea-a84a-bc7dacf4f679");
+        assert_eq!(parsed["device_id"], "f037a638-d9a7-42df-aeca-070600901ba5");
+        assert_eq!(
+            parsed["public_key"],
+            "Z4Pf82NUQyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
+        assert_eq!(
+            parsed["seed"],
+            "seedseedseedseedseedseedseedseedseedseedsee"
+        );
+
+        let script = handover_script(&Step::Seed(device(&record))).unwrap();
+        // One guarded statement, under the key the web app reads, holding the
+        // record as a string literal — the page parses it, the script never
+        // evaluates it.
+        assert!(script.starts_with("try{sessionStorage.setItem(\"spawn.desktop-device.v1\","));
+        assert!(script.ends_with(");}catch(_){}"));
+        assert!(!script.contains("document.cookie"));
+        assert!(!script.contains("location.replace"));
+        assert!(script.contains(r#"\"seed\":\"seedseed"#));
+        // A record carrying a quote stays a string.
+        let hostile = handover_script(&Step::Seed(device("\";alert(1);//"))).unwrap();
+        assert!(hostile.contains(r#"\";alert(1);//"#));
+        let unescaped = hostile.matches('"').count() - hostile.matches(r#"\""#).count();
+        assert_eq!(unescaped, 4); // the key's two and the record's two
+
+        // Device and cookie together: the device first, then the cookie, then
+        // the product.
+        let both = Carried {
+            session: Some("abc.def".to_owned()),
+            device: Some(Zeroizing::new(record.clone())),
+        };
+        let script = handover_script(&Step::SeedAndEnter(both.clone())).unwrap();
+        let device_at = script.find("sessionStorage.setItem").unwrap();
+        let cookie_at = script.find("document.cookie").unwrap();
+        let enter_at = script.find("location.replace('/app');").unwrap();
+        assert!(device_at < cookie_at && cookie_at < enter_at);
+        assert_eq!(
+            Step::SeedAndEnter(both).name(),
+            "cookie and device and enter"
+        );
+        assert_eq!(Step::Seed(device(&record)).name(), "device");
     }
 
     #[test]
