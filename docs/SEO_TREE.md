@@ -5,6 +5,37 @@ Source of truth for spawnd's organic-search catalogue. Registry entries
 Target: **~500 pages, designed before built.** Status: **DESIGN PHASE** —
 the 14 pages on `feat/seo-landing-pages` predate this bar and will be reworked.
 
+## Strategy
+
+spawnd straddles two categories, and the play differs by category:
+
+- **Remote terminal access** — old category, established queries, incumbents
+  everywhere. We *compete* here: comparison and machine pages harvest the
+  long tail with honesty-first content that outranks vendor copy.
+- **AI agent operations** — new category, exploding queries ("run claude code
+  in parallel", "vibe coding on phone"), almost no incumbent pages. We *own*
+  here: get the definitive page up before the category has a canon. This is
+  where the growth is; when in doubt, agent-ops pages come first.
+
+Funnel roles: comparisons and fix pages are bottom-funnel (searcher already
+has the problem and a shortlist); device/machine/job pages are mid; guides and
+vibe pages are top-of-funnel and brand-building. Every page names exactly one
+primary ICP and is written in that ICP's register.
+
+### ICPs
+
+| ICP | who they are | what they type into Google | register | families that serve them |
+|---|---|---|---|---|
+| **Agent power user** | runs 3–10 Claude Code/Codex sessions as a fleet; throughput-obsessed; away-from-desk anxiety | "run multiple claude code sessions", "claude code worktrees parallel", "keep codex running overnight", "claude code mission control" | dense, specific, zero hand-holding | job pages, pillars, device row, guides |
+| **Vibe coder** | prompt-first builder, maybe no terminal background; phone-native; ships side projects | "vibe coding setup", "vibe coding from phone", "build an app with ai from my phone", "code without a laptop" | zero infra jargon — ports, daemons, PTYs never appear un-explained; install reads as "one command, done" | vibe row, phone hub, guides |
+| **Homelab / self-hoster** | owns Pi/NAS/home server; r/selfhosted; privacy-first; loves open source and E2E claims | "raspberry pi remote access without port forwarding", "self hosted web terminal", "open source tailscale alternative" | trust-forward; threat model is a feature | machine row, self-host, comparisons |
+| **Pro dev with machines** | dev box + laptop + SSH muscle memory; evaluates by comparison table | "spawnd vs tailscale", "mosh alternative", "vs code tunnels vs ssh" | tables and tradeoffs; respects what they already use | comparisons, job pages, machine row |
+
+Notes: the GPU/local-AI owner is served as the overlap of homelab × power
+user (GPU machine page, parallel pages) rather than a fifth ICP. Vibe-coder
+pages deliberately avoid the comparison family — that ICP isn't shortlisting
+infrastructure, they're looking for a way in.
+
 ## Rules
 
 1. A page exists only where a distinct query exists AND the page can carry
@@ -22,8 +53,8 @@ the 14 pages on `feat/seo-landing-pages` predate this bar and will be reworked.
 6. Bespoke mechanically: signature section per family (phone vignette / network
    diagram / ledger table / numbered steps), custom-JSX escape hatch per page,
    no shared H2 phrasing between siblings.
-7. Waves: W1 build first · W2 after W1 ships · W3 quarry. GATED = named
-   verification required first.
+7. One primary ICP per page, written in that ICP's register (see table).
+8. GATED = named verification required before the page exists.
 
 ## URL policy
 
@@ -35,7 +66,7 @@ path segments. Family lives in the registry, not the URL.
 | agent pillar | `/{agent}` | `/claude-code` |
 | device | `/{agent}-on-your-phone`, `/code-on-…` | `/codex-on-your-phone` |
 | machine | descriptive | `/raspberry-pi-without-port-forwarding` |
-| job | descriptive | `/run-agents-in-parallel` |
+| job / vibe | descriptive | `/run-agents-in-parallel`, `/vibe-coding-setup` |
 | comparison | `/spawnd-vs-{x}` | `/spawnd-vs-tailscale-ssh` |
 | listicle | `/{x}-alternatives` | `/tmate-alternatives` |
 | guide | `/how-to-…` | `/how-to-run-claude-code-from-your-phone` |
@@ -45,7 +76,7 @@ path segments. Family lives in the registry, not the URL.
 Slugs must not collide with app routes (`/login`, `/app`, `/w`, `/hosts`, …);
 the registry test enforces a denylist.
 
-## On-page requirements (every page, checked before a wave ships)
+## On-page requirements (every page, checked before it ships)
 
 **Performance — verified with PageSpeed Insights (mobile):**
 - Performance score ≥ 95; Core Web Vitals green: LCP < 2.5s, CLS < 0.1,
@@ -94,80 +125,96 @@ the registry test enforces a denylist.
 
 Tier 0 (hand-built): `/` · `/security` · `/download`
 
-### Hubs (W1)
-
-`/use-cases` · `/agents` · `/comparisons` · `/guides` (W2) — real content
+**Hubs:** `/use-cases` · `/agents` · `/comparisons` · `/guides` — real content
 pages targeting category head terms, each racking its spokes.
 
-### Device row
+### Device row — primary ICP: power user (hub also serves vibe coders)
 
-| wave | slug |
-|---|---|
-| W1 | `/coding-agents-on-your-phone` (hub) |
-| W1 | `/claude-code-on-your-phone` · `/codex-on-your-phone` · `/aider-on-your-phone` · `/opencode-on-your-phone` |
-| W1 | `/code-on-an-ipad` |
-| W2 | `/code-on-a-chromebook` · `/code-on-an-android-tablet` (fold into iPad if not distinct) |
-| W3 | phone page per quarry agent |
+- `/coding-agents-on-your-phone` (hub)
+- `/claude-code-on-your-phone` · `/codex-on-your-phone` ·
+  `/aider-on-your-phone` · `/opencode-on-your-phone`
+- `/code-on-an-ipad`
+- `/code-on-a-chromebook` · `/code-on-an-android-tablet` (fold into iPad if
+  not distinct)
+- quarry: phone page per quarry agent
 
-### Machine row
+### Vibe row — primary ICP: vibe coder
 
-| wave | slug |
-|---|---|
-| W1 | `/web-terminal-for-your-home-server` · `/ai-agents-on-your-own-gpu` |
-| W1 | `/raspberry-pi-without-port-forwarding` · `/headless-mac-mini` |
-| W2 | `/vps-web-terminal` · `/old-laptop-as-an-agent-box` · `/wsl2` (GATED) |
-| W3 | mini-PC (N100/NUC) · gaming PC · Proxmox VM · Docker/LXC · Jetson · homelab hub · per-distro row (GATED per distro) |
+- `/vibe-coding-from-your-phone` (the ICP's front door; overlaps the phone hub
+  in topic, not in register — no terminal literacy assumed)
+- `/vibe-coding-setup` (the setup that runs itself: one box, one command,
+  every device becomes a window)
+- `/your-first-coding-agent` (the on-ramp: what an agent is, pick one, give it
+  a machine, talk to it from anywhere)
+- quarry: `/vibe-coding-with-{agent}` per quarry agent where searched
 
-### Job pages
+### Machine row — primary ICP: homelab / self-hoster
 
-| wave | slug |
-|---|---|
-| W1 | `/remote-access-without-open-ports` · `/keep-agents-running` |
-| W1 | `/run-agents-in-parallel` · `/self-host` |
-| W2 | `/monitor-your-agents` · `/agent-fleet-across-machines` |
+- `/web-terminal-for-your-home-server` · `/ai-agents-on-your-own-gpu`
+- `/raspberry-pi-without-port-forwarding` · `/headless-mac-mini`
+- `/vps-web-terminal` · `/old-laptop-as-an-agent-box` · `/wsl2` (GATED)
+- quarry: mini-PC (N100/NUC) · gaming PC · Proxmox VM · Docker/LXC · Jetson ·
+  homelab hub · per-distro row (GATED per distro)
 
-### Agent pillars
+### Job pages — primary ICP: power user
 
-| wave | slugs |
-|---|---|
-| W1 (rework) | `/claude-code` · `/codex` · `/aider` · `/opencode` |
-| W3 quarry | `/gemini-cli` · `/amp` · `/goose` · `/cline` · `/qwen-code` · `/cursor-cli` · `/copilot-cli` · `/crush` · `/plandex` · `/ra-aid` · `/droid` · `/grok-cli` · emerging (~20–30 total). Minting an agent = pillar + phone page + 2–3 guides, fact-checked. |
+- `/run-agents-in-parallel` (flagship: the workspace grid is the answer)
+- `/keep-agents-running` · `/overnight-agent-runs`
+- `/monitor-your-agents` (attention cues, the phone ping when an agent needs
+  a yes)
+- `/agent-fleet-across-machines` · `/ai-agent-command-center`
+- `/remote-access-without-open-ports` · `/self-host` (these two serve homelab)
 
-### Comparisons
+### Agent pillars — primary ICP: power user
 
-| wave | slugs |
-|---|---|
-| W1 (rework) | `/spawnd-vs-ssh-and-tmux` · `/spawnd-vs-vscode-remote-tunnels` · `/spawnd-vs-tmate` · `/spawnd-vs-coder` · `/spawnd-vs-tailscale-ssh` |
-| W1 | `/spawnd-vs-mosh` · `/spawnd-vs-mobile-ssh-apps` · `/spawnd-vs-self-hosted-web-terminals` · `/spawnd-vs-github-codespaces` · `/spawnd-vs-cloudflare-tunnel` |
-| W2 | `/spawnd-vs-remote-desktop` |
-| W3 quarry | tunnels: ngrok · frp · tailscale-funnel; mesh: zerotier · netbird · nebula · headscale; terminals: ttyd · wetty; persistence: zellij · screen · eternal-terminal; gateways: apache-guacamole · teleport; cloud IDEs: gitpod · replit · project-idx; desktop: rustdesk · chrome-remote-desktop; mobile SSH: blink-shell · termius |
-| W3 | listicles: `/tmate-alternatives` · `/ngrok-alternatives-for-ssh` · `/codespaces-alternatives` · `/port-forwarding-alternatives` · ~6 more |
+- `/claude-code` · `/codex` · `/aider` · `/opencode`
+- quarry (~20–30 with emerging): `/gemini-cli` · `/amp` · `/goose` · `/cline`
+  · `/qwen-code` · `/cursor-cli` · `/copilot-cli` · `/crush` · `/plandex` ·
+  `/ra-aid` · `/droid` · `/grok-cli`. Minting an agent = pillar + phone page
+  + 2–3 guides, fact-checked (see Gates).
 
-### Guides (W2 family)
+### Comparisons — primary ICP: pro dev
 
-W2: `/how-to-run-claude-code-from-your-phone` ·
-`/how-to-keep-claude-code-running-after-closing-your-laptop` ·
-`/how-to-run-claude-code-on-a-raspberry-pi` ·
-`/how-to-run-multiple-claude-code-sessions` ·
-`/how-to-access-a-home-server-without-port-forwarding`
+- `/spawnd-vs-ssh-and-tmux` · `/spawnd-vs-vscode-remote-tunnels` ·
+  `/spawnd-vs-tmate` · `/spawnd-vs-coder` · `/spawnd-vs-tailscale-ssh`
+- `/spawnd-vs-mosh` · `/spawnd-vs-mobile-ssh-apps` ·
+  `/spawnd-vs-self-hosted-web-terminals` · `/spawnd-vs-github-codespaces` ·
+  `/spawnd-vs-cloudflare-tunnel` · `/spawnd-vs-remote-desktop`
+- quarry: tunnels (ngrok · frp · tailscale-funnel), mesh (zerotier · netbird ·
+  nebula · headscale), terminals (ttyd · wetty), persistence (zellij · screen ·
+  eternal-terminal), gateways (apache-guacamole · teleport), cloud IDEs
+  (gitpod · replit · project-idx), desktop (rustdesk · chrome-remote-desktop),
+  mobile SSH (blink-shell · termius)
+- listicles: `/tmate-alternatives` · `/ngrok-alternatives-for-ssh` ·
+  `/codespaces-alternatives` · `/port-forwarding-alternatives` · ~6 more
 
-W3 quarry: agent × {phone, keep-running, machine, parallel, first-setup},
-~3–5 per quarry agent. Largest branch (~100–150 pages); a guide without the
-agent's real commands and one agent-specific troubleshooting section is not
-minted.
+### Guides — ICP split: power user (agent guides) and vibe coder (starter guides)
 
-### Fix pages (W3 family, template TBD)
+- `/how-to-run-claude-code-from-your-phone`
+- `/how-to-keep-claude-code-running-after-closing-your-laptop`
+- `/how-to-run-claude-code-on-a-raspberry-pi`
+- `/how-to-run-multiple-claude-code-sessions`
+- `/how-to-run-claude-code-in-parallel-with-worktrees` (heavily searched
+  power-user workflow; spawnd is where the worktree fleet becomes visible)
+- `/how-to-access-a-home-server-without-port-forwarding`
+- quarry: agent × {phone, keep-running, machine, parallel, first-setup},
+  ~3–5 per quarry agent. Largest branch (~100–150 pages); a guide without the
+  agent's real commands and one agent-specific troubleshooting section is not
+  minted.
 
-Symptom-verbatim slugs: `/claude-code-stops-when-laptop-sleeps` ·
-`/ssh-connection-drops-keep-session-alive` · `/tmux-session-lost-after-reboot`
-· `/codex-timed-out-overnight` · ~30–50 total. Template: diagnosis → general
-fixes → the structural fix. Lead with the honest cause, not the pitch.
+### Fix pages — ICP: whoever has the symptom (template TBD)
+
+- `/claude-code-stops-when-laptop-sleeps` ·
+  `/ssh-connection-drops-keep-session-alive` ·
+  `/tmux-session-lost-after-reboot` · `/codex-timed-out-overnight` · ~30–50
+  total. Template: diagnosis → general fixes → the structural fix. Lead with
+  the honest cause, not the pitch.
 
 ## Arithmetic
 
-hubs+tier0 6 · device ~30 · machine ~25 · jobs ~12 · pillars ~30 · vs ~45 ·
-listicles ~10 · guides ~150 · fix ~40 · emerging headroom ~50 → **~400–500**.
-Quarry overshoots on purpose; prune at minting, never pad.
+hubs+tier0 7 · device ~30 · vibe ~10 · machine ~25 · jobs ~14 · pillars ~30 ·
+vs ~45 · listicles ~10 · guides ~150 · fix ~40 · emerging headroom ~40 →
+**~400–500**. Quarry overshoots on purpose; prune at minting, never pad.
 
 ## Implementation notes
 
@@ -177,4 +224,4 @@ Quarry overshoots on purpose; prune at minting, never pad.
   redirects owed.
 - Registry gains: per-family signature sections, custom-JSX escape hatch, two
   new templates (guide, fix), automated OG images, Lighthouse CI budgets.
-- Rework the existing 14 to Rule 5 before minting anything new.
+- Rework the existing 14 to Rules 5–7 before minting anything new.
