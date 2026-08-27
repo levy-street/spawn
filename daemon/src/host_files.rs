@@ -1143,6 +1143,21 @@ impl HostFileService {
         }
         let components = self.relative_components(input)?;
         let (parent, name) = self.open_parent(&components)?;
+        #[cfg(windows)]
+        {
+            // Windows refuses a directory opened with ordinary file-read
+            // access before we can classify the resulting handle. Preserve
+            // the endpoint's `not_file` contract with a directory-entry
+            // preflight, then still re-check the opened handle below so a
+            // replacement race cannot make a non-file usable.
+            let metadata = parent.symlink_metadata(&name)?;
+            if metadata.file_type().is_symlink() {
+                return Err(symlink_error());
+            }
+            if !metadata.is_file() {
+                return Err(FsError::new("not_file", "path is not a regular file"));
+            }
+        }
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let mut file = parent
@@ -1254,6 +1269,16 @@ impl HostFileService {
         }
         let components = self.relative_components(input)?;
         let (parent, name) = self.open_parent(&components)?;
+        #[cfg(windows)]
+        {
+            let metadata = parent.symlink_metadata(&name)?;
+            if metadata.file_type().is_symlink() {
+                return Err(symlink_error());
+            }
+            if !metadata.is_file() {
+                return Err(FsError::new("not_file", "path is not a regular file"));
+            }
+        }
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         let mut file = parent
@@ -2693,9 +2718,10 @@ mod tests {
             service.list("../escape", 0).await.unwrap_err().code,
             "traversal_rejected"
         );
+        let rooted_traversal = service.root_display.join("..").join("escape");
         assert_eq!(
             service
-                .list(&format!("{}/../escape", temp.path().display()), 0)
+                .list(rooted_traversal.to_string_lossy().as_ref(), 0)
                 .await
                 .unwrap_err()
                 .code,

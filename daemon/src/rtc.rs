@@ -2968,8 +2968,8 @@ fn install_control_data_channel(
         let close = Arc::clone(&close);
         let uploads = uploads.clone();
         let viewer_id = viewer_id.clone();
-        let upload_deadline = close.initiate();
         Box::pin(async move {
+            let upload_deadline = close.initiate();
             uploads.cancel_viewer_now(session, &viewer_id);
             if let Some(close_tx) = close_tx.lock().await.take() {
                 let _ = close_tx.send(());
@@ -4820,8 +4820,27 @@ mod tests {
         fn install() -> Self {
             let old_dir = std::env::var_os("SPAWND_WORKER_DIR");
             let old_bin = std::env::var_os("SPAWND_WORKER_BIN");
+            #[cfg(unix)]
+            let dir = tempfile::Builder::new()
+                .prefix("spawn-rtc-")
+                .tempdir_in("/tmp")
+                .expect("short worker tempdir");
+            #[cfg(windows)]
             let dir = tempfile::tempdir().expect("worker tempdir");
-            std::env::set_var("SPAWND_WORKER_DIR", dir.path());
+            #[cfg(windows)]
+            let worker_dir = {
+                // The runner owns its TEMP root policy. Exercise the worker
+                // contract with a child carrying the exact owner-only DACL
+                // SPAWN D creates rather than weakening validation for the
+                // inherited runner directory.
+                let worker_dir = dir.path().join("workers");
+                crate::platform::create_private_dir_all(&worker_dir)
+                    .expect("protected worker tempdir");
+                worker_dir
+            };
+            #[cfg(not(windows))]
+            let worker_dir = dir.path();
+            std::env::set_var("SPAWND_WORKER_DIR", worker_dir);
             std::env::set_var("SPAWND_WORKER_BIN", built_worker_bin());
             Self {
                 old_dir,
@@ -5494,6 +5513,15 @@ mod tests {
             let gate = sessions.stall_sender_close(&signal_id, channel).await;
             let client =
                 connect_rtc_session(&sessions, &registry, session_id, &signal_id, generation).await;
+            let close = {
+                let peers = sessions.peers.lock().await;
+                Arc::clone(&peers.get(&signal_id).expect("active real peer").close)
+            };
+            assert_eq!(
+                close.initiated_deadline(),
+                None,
+                "installing real DataChannel handlers started the close deadline"
+            );
             tokio::time::timeout(Duration::from_secs(10), async {
                 while control.direct_sink_offset(&viewer).await.is_none() {
                     tokio::task::yield_now().await;
@@ -6061,6 +6089,11 @@ mod tests {
                 .wait_for_operations(tokio::time::Instant::now() + Duration::from_secs(5))
                 .await
         );
+        #[cfg(windows)]
+        // Windows webrtc-rs retains the server's graceful SCTP close until
+        // the remote peer settles; the stale browser fixture has finished all
+        // assertions, so let transport cleanup complete before counting tasks.
+        close_test_peer(&client.pc).await;
         tokio::time::timeout(Duration::from_secs(3), async {
             while sessions.peer_cleanup_task_count().await != 0 {
                 tokio::task::yield_now().await;
@@ -6102,6 +6135,17 @@ mod tests {
         assert!(!tmp.path().join("once.bin").exists());
 
         stale.ctl.close().await.expect("close stale real spawn.ctl");
+        #[cfg(windows)]
+        let stale_peer_close = {
+            // webrtc-rs can serialize the remote DataChannel close callback
+            // behind the deliberately paused message callback on Windows.
+            // Closing the peer supplies the independent endpoint-loss signal
+            // while retaining the test's paused final-commit race.
+            let pc = Arc::clone(&stale.pc);
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(10), pc.close()).await;
+            })
+        };
         let stale_disabled = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let active = sessions
@@ -6119,6 +6163,8 @@ mod tests {
         .await;
         sessions.uploads.release_commit_pause_for_test();
         stale_disabled.expect("stale control close did not disable endpoint effects");
+        #[cfg(windows)]
+        stale_peer_close.await.expect("close stale RTC peer");
         wait_for_resident_sessions(&sessions, 0).await;
         assert!(
             sessions
@@ -6403,12 +6449,29 @@ mod tests {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
         let _env = WorkerTestEnv::install();
         let session_id = Uuid::new_v4();
+        #[cfg(unix)]
         let argv = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
             "exec cat".to_string(),
         ];
+        #[cfg(windows)]
+        let argv = vec![
+            std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string()),
+            "/d".to_string(),
+        ];
+        #[cfg(unix)]
+        let cwd = "/".to_string();
+        #[cfg(windows)]
+        let cwd = std::env::current_dir()
+            .expect("current worker test directory")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(unix)]
         let mut env = std::collections::BTreeMap::new();
+        #[cfg(windows)]
+        let mut env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+        #[cfg(unix)]
         env.insert(
             "PATH".to_string(),
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
@@ -6417,7 +6480,7 @@ mod tests {
 
         let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
             session_id,
-            cwd: "/",
+            cwd: &cwd,
             cols: 80,
             rows: 24,
             argv: &argv,
@@ -6452,12 +6515,31 @@ mod tests {
         let _env_lock = crate::worker_backend::WORKER_TEST_ENV_LOCK.lock().await;
         let _env = WorkerTestEnv::install();
         let session_id = Uuid::new_v4();
+        #[cfg(unix)]
         let argv = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
             "printf 'rtc-worker-ready\\n'; exec cat".to_string(),
         ];
+        #[cfg(windows)]
+        let argv = vec![
+            std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string()),
+            "/d".to_string(),
+            "/k".to_string(),
+            "echo rtc-worker-ready".to_string(),
+        ];
+        #[cfg(unix)]
+        let cwd = "/".to_string();
+        #[cfg(windows)]
+        let cwd = std::env::current_dir()
+            .expect("current worker test directory")
+            .to_string_lossy()
+            .into_owned();
+        #[cfg(unix)]
         let mut env = std::collections::BTreeMap::new();
+        #[cfg(windows)]
+        let mut env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+        #[cfg(unix)]
         env.insert(
             "PATH".to_string(),
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
@@ -6466,7 +6548,7 @@ mod tests {
 
         let launched = crate::worker_backend::launch(crate::pty::LaunchSpec {
             session_id,
-            cwd: "/",
+            cwd: &cwd,
             cols: 80,
             rows: 24,
             argv: &argv,
