@@ -301,6 +301,31 @@ async def test_host_ws_closes_4010_when_subscription_is_not_ready(client, monkey
     assert ws.closed == (4010, "subscription lost")
 
 
+async def test_host_ws_lets_a_browser_gone_before_the_greeting_go_quietly(client, caplog):
+    """The page tore its socket down while the server was still setting up.
+
+    The greeting is the first write; on uvloop a transport the peer already
+    closed refuses it with a RuntimeError rather than a disconnect event. That
+    is not a crash, and it must not be logged as one.
+    """
+    user_id, token = await _signup(client, "host-ws-gone-early@example.com")
+    host_id = await _create_host(user_id, "gone-early")
+
+    class GoneWebSocket(FakeWebSocket):
+        async def send_text(self, value: str) -> None:
+            raise RuntimeError(
+                "unable to perform operation on <TCPTransport closed=True reading=False 0x1>; "
+                "the handler is closed"
+            )
+
+    ws = GoneWebSocket(authorization=f"Bearer {token}")
+    with caplog.at_level("ERROR"):
+        await asyncio.wait_for(host_ws(ws, host_id=host_id), timeout=5)  # type: ignore[arg-type]
+    assert ws.accepted_subprotocol == "spawn.host.v1"
+    assert ws.sent_text == []
+    assert "crashed" not in caplog.text
+
+
 async def test_zero_agent_host_signaling_is_bound_and_cleaned_up(client):
     user_id, token = await _signup(client, "host-rtc-zero@example.com")
     host_id = await _create_host(user_id, "zero-agents")
