@@ -551,7 +551,9 @@ async function endorseLiveDevice(page) {
   console.log(`live browser device ${device.id} endorsed by the pinned anchor`);
 }
 
-const browser = await chromium.launch();
+const browser = await chromium.launch({
+  args: ["--disable-features=WebRtcHideLocalIpsWithMdns"],
+});
 try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   await context.addInitScript(() => {
