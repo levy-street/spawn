@@ -16,6 +16,10 @@
 //! host — hence the module-scoped dead-code allowance.
 #![allow(dead_code)]
 
+mod control;
+mod windows_run;
+mod windows_task;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 /// Short per-config-root suffix, e.g. `-3f9ac3e1`, so each instance gets its
 /// own non-colliding unit/label. Derived from the canonical config root.
-fn instance_tag(config_dir: &Path) -> String {
+pub(super) fn instance_tag(config_dir: &Path) -> String {
     let canonical = std::fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
     let digest = Sha256::digest(canonical.as_os_str().as_encoded_bytes());
     format!(
@@ -54,6 +58,72 @@ fn state_dir(tag: &str) -> Result<PathBuf> {
 
 fn current_bin() -> Result<PathBuf> {
     std::env::current_exe().context("resolving the running spawnd binary path")
+}
+
+/// Local, non-roaming state for one account instance. Windows deliberately
+/// keeps live PIDs, launch records, helpers, and endpoints out of `%APPDATA%`.
+pub fn instance_state_path(config_dir: &Path) -> Result<PathBuf> {
+    #[cfg(windows)]
+    let base = dirs::data_local_dir()
+        .context("cannot resolve the local application data directory")?
+        .join("spawn")
+        .join("state");
+    #[cfg(not(windows))]
+    let base = dirs::state_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))
+        .context("cannot resolve a state directory")?
+        .join("spawn");
+    Ok(base.join(instance_name(config_dir)))
+}
+
+pub fn instance_state_dir(config_dir: &Path) -> Result<PathBuf> {
+    let dir = instance_state_path(config_dir)?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(windows)]
+    control::protect_path(&dir)?;
+    Ok(dir)
+}
+
+/// Per-instance daemon log directory. On Windows this is
+/// `%LOCALAPPDATA%\\spawn\\logs\\<tag>`.
+pub fn instance_log_path(config_dir: &Path) -> Result<PathBuf> {
+    #[cfg(windows)]
+    let base = dirs::data_local_dir()
+        .context("cannot resolve the local application data directory")?
+        .join("spawn")
+        .join("logs");
+    #[cfg(not(windows))]
+    let base = state_dir("")?.join("logs");
+    Ok(base.join(instance_name(config_dir)))
+}
+
+pub fn instance_log_dir(config_dir: &Path) -> Result<PathBuf> {
+    let dir = instance_log_path(config_dir)?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(windows)]
+    control::protect_path(&dir)?;
+    Ok(dir)
+}
+
+/// Purge only this instance's non-roaming Windows state and logs. Ordinary
+/// disconnect never calls this; exorcise/reset do so after manager/workers.
+pub fn purge_local_instance_data(config_dir: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        for path in [
+            instance_state_path(config_dir)?,
+            instance_log_path(config_dir)?,
+        ] {
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error).with_context(|| format!("removing {}", path.display()));
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = config_dir;
+    Ok(())
 }
 
 /// A conservative PATH so agent CLIs the daemon launches remain resolvable when
@@ -170,7 +240,7 @@ fn launchd_label(config_dir: &Path) -> String {
     }
 }
 
-fn xml_escape(value: &str) -> String {
+pub(super) fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -350,6 +420,10 @@ pub fn install(config_dir: &Path, server: &str) -> Result<()> {
     {
         return systemd_install(config_dir, server);
     }
+    #[cfg(windows)]
+    {
+        return install_with_mode(config_dir, server, preferred_mode(config_dir));
+    }
     #[allow(unreachable_code)]
     {
         let _ = (config_dir, server);
@@ -369,6 +443,15 @@ pub fn uninstall(config_dir: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         return systemd_uninstall(config_dir);
+    }
+    #[cfg(windows)]
+    {
+        // Remove both registrations. This also makes a mode switch recover
+        // cleanly if a prior installation was interrupted between managers.
+        let task = windows_task::uninstall(config_dir);
+        let run = windows_run::uninstall(config_dir);
+        task.and(run)?;
+        return Ok(());
     }
     #[allow(unreachable_code)]
     {
@@ -419,6 +502,28 @@ pub fn status(config_dir: &Path) -> ServiceStatus {
             name: format!("systemd {name}"),
         };
     }
+    #[cfg(windows)]
+    {
+        let mode = preferred_mode(config_dir);
+        let mut status = match mode {
+            ServiceMode::Task => windows_task::status(config_dir),
+            ServiceMode::Run => windows_run::status(config_dir),
+        };
+        if mode == ServiceMode::Task {
+            match crate::state::read(config_dir)
+                .ok()
+                .flatten()
+                .and_then(|state| state.task_breakaway_denied)
+            {
+                Some(true) => status
+                    .name
+                    .push_str(" — worker breakaway denied; Run watchdog available"),
+                None if status.installed => status.name.push_str(" — worker breakaway unconfirmed"),
+                _ => {}
+            }
+        }
+        return status;
+    }
     #[allow(unreachable_code)]
     ServiceStatus {
         installed: false,
@@ -466,6 +571,13 @@ pub fn reconnect(config_dir: &Path, server: &str) -> Result<()> {
         }
         return Ok(());
     }
+    #[cfg(windows)]
+    {
+        return match preferred_mode(config_dir) {
+            ServiceMode::Task => windows_task::reconnect(config_dir, server),
+            ServiceMode::Run => windows_run::reconnect(config_dir, server),
+        };
+    }
     #[cfg(target_os = "linux")]
     {
         let name = systemd_unit_name(config_dir);
@@ -476,6 +588,205 @@ pub fn reconnect(config_dir: &Path, server: &str) -> Result<()> {
     }
     #[allow(unreachable_code)]
     install(config_dir, server)
+}
+
+/// Windows background manager selected per account instance. The preference
+/// is persisted in the roaming config root so a later `possess`, `status`, or
+/// `exorcise` makes the same choice without a rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceMode {
+    Task,
+    Run,
+}
+
+impl ServiceMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Task => "Task Scheduler",
+            Self::Run => "Run watchdog",
+        }
+    }
+}
+
+impl std::str::FromStr for ServiceMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "task" => Ok(Self::Task),
+            "run" | "watchdog" => Ok(Self::Run),
+            _ => bail!("service mode must be `task` or `run`"),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ServicePreference {
+    mode: ServiceMode,
+}
+
+fn preference_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("service-mode.json")
+}
+
+pub fn preferred_mode(config_dir: &Path) -> ServiceMode {
+    std::fs::read(preference_path(config_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ServicePreference>(&raw).ok())
+        .map_or(ServiceMode::Task, |preference| preference.mode)
+}
+
+pub fn set_preferred_mode(config_dir: &Path, mode: ServiceMode) -> Result<()> {
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("creating {}", config_dir.display()))?;
+    let path = preference_path(config_dir);
+    let temporary = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let bytes = serde_json::to_vec(&ServicePreference { mode })?;
+    let result = (|| -> Result<()> {
+        std::fs::write(&temporary, bytes)
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        std::fs::rename(&temporary, &path)
+            .with_context(|| format!("installing {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+/// Install a specifically selected Windows manager and persist the selection.
+/// On Unix the caller-facing mode selector is intentionally unavailable.
+pub fn install_with_mode(config_dir: &Path, server: &str, mode: ServiceMode) -> Result<()> {
+    if service_disabled() {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let server = registered_server(config_dir, server);
+        set_preferred_mode(config_dir, mode)?;
+        match mode {
+            ServiceMode::Task => {
+                windows_run::uninstall(config_dir)?;
+                windows_task::install(config_dir, &server)
+            }
+            ServiceMode::Run => {
+                windows_task::uninstall(config_dir)?;
+                windows_run::install(config_dir, &server)
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (config_dir, server, mode);
+        bail!("selectable service modes are only available on Windows")
+    }
+}
+
+/// Whether the last task-start probe proved that Scheduler prevents workers
+/// from escaping its job. `possess` uses this to offer the watchdog fallback.
+pub fn needs_fallback_offer(config_dir: &Path) -> bool {
+    preferred_mode(config_dir) == ServiceMode::Task
+        && crate::state::read(config_dir)
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.task_breakaway_denied == Some(true))
+}
+
+/// Manager-specific drift reported by doctor without parsing localized tool
+/// output. `None` means the selected registration matches its canonical data.
+pub fn diagnostic(config_dir: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        if needs_fallback_offer(config_dir) {
+            return Some(
+                "Task Scheduler denied worker breakaway; SPAWN D cannot preserve sessions across daemon restarts"
+                    .into(),
+            );
+        }
+        if preferred_mode(config_dir) == ServiceMode::Task
+            && windows_task::status(config_dir).installed
+            && crate::state::read(config_dir)
+                .ok()
+                .flatten()
+                .and_then(|state| state.task_breakaway_denied)
+                .is_none()
+        {
+            return Some(
+                "Task Scheduler worker breakaway has not been confirmed by the startup probe"
+                    .into(),
+            );
+        }
+        return match preferred_mode(config_dir) {
+            ServiceMode::Task => windows_task::diagnostic(config_dir),
+            ServiceMode::Run => windows_run::diagnostic(config_dir),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = config_dir;
+        None
+    }
+}
+
+/// Start the per-instance Windows control listener. Unix continues to use its
+/// byte-identical SIGHUP transport and never creates this pipe.
+pub fn start_control_listener(
+    config_dir: &Path,
+    reconnect: &'static tokio::sync::Notify,
+    shutdown: &'static tokio::sync::Notify,
+) -> Result<()> {
+    control::start_listener(config_dir, reconnect, shutdown)
+}
+
+/// Open/rotate the daemon's own Windows service log when no console exists.
+pub fn prepare_background_log(config_dir: &Path) -> Result<()> {
+    windows_task::prepare_background_log(config_dir)
+}
+
+/// Probe Task Scheduler's job at task-root startup. `Some(false)` records a
+/// successful breakaway; `Some(true)` records denial; `None` means this was
+/// not a task launch or the probe was inconclusive.
+pub fn probe_task_breakaway(config_dir: &Path) -> Option<bool> {
+    windows_task::probe_breakaway(config_dir)
+}
+
+/// Internal Run-key watchdog entry point, dispatched by the Windows CLI mode.
+pub async fn run_watchdog(instance: &str) -> Result<()> {
+    windows_run::watchdog(instance).await
+}
+
+/// Resolve and open a watchdog instance log before tracing is initialized.
+pub fn prepare_watchdog_log(instance: &str) -> Result<()> {
+    windows_run::prepare_watchdog_log(instance)
+}
+
+/// Add SPAWN D's shared Local AppData bin directory to the current user's PATH.
+pub fn ensure_user_path() -> Result<()> {
+    windows_run::ensure_user_path()
+}
+
+/// Refresh this daemon process with the user's current Windows PATH additions.
+pub fn refresh_user_path() -> Result<()> {
+    windows_run::refresh_user_path()
+}
+
+/// Relaunch the selected manager after a Windows update helper has completed
+/// its swap. The Run watchdog performs this itself; Scheduler needs `/Run`.
+pub fn relaunch_after_update(config_dir: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return match preferred_mode(config_dir) {
+            ServiceMode::Task => windows_task::run_registered(config_dir),
+            ServiceMode::Run => windows_run::signal_update_ready(config_dir),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = config_dir;
+        bail!("Windows update relaunch requested on a non-Windows host")
+    }
 }
 
 #[cfg(test)]
@@ -580,5 +891,15 @@ mod tests {
         assert!(!same_origin("http://localhost:3000/", "https://spawnd.dev"));
         // Unparseable inputs defer to `run` rather than guessing.
         assert!(same_origin("not a url", "https://spawnd.dev"));
+    }
+
+    #[test]
+    fn service_mode_preference_defaults_to_task_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(preferred_mode(dir.path()), ServiceMode::Task);
+        set_preferred_mode(dir.path(), ServiceMode::Run).unwrap();
+        assert_eq!(preferred_mode(dir.path()), ServiceMode::Run);
+        assert_eq!("watchdog".parse::<ServiceMode>().unwrap(), ServiceMode::Run);
+        assert!("service".parse::<ServiceMode>().is_err());
     }
 }
