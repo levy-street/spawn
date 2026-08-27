@@ -22,7 +22,7 @@ import {
 
 const TITLE = "Run multiple Claude Code sessions in parallel";
 const DESCRIPTION =
-  "The worktree-per-agent pattern for parallel Claude Code sessions — how to run it in the terminal you have, where it breaks, and how to keep the fleet alive when you walk away.";
+  "How to run several Claude Code sessions at once — the worktree-and-panes setup, where it breaks, and how to manage the whole fleet from one place.";
 const PATH = "/run-agents-in-parallel";
 
 export const metadata: Metadata = {
@@ -101,7 +101,7 @@ export default function RunAgentsInParallelPage() {
       canonicalPath={PATH}
       hero={{
         title: { plain: "Run multiple Claude\u00A0Code sessions", accent: "in parallel" },
-        sub: "How to run a fleet of coding agents side by side — the worktree pattern, the terminal setup, and what it takes to keep the fleet alive after you stand up.",
+        sub: "How to run several coding agents at once — the setup that gets you there, and the management problem that shows up right after.",
         date: "spawnd · August 2026",
         ink: { video: "/brand/ink/grid-ink.mp4", poster: "/brand/ink/grid-ink.png" },
       }}
@@ -110,18 +110,13 @@ export default function RunAgentsInParallelPage() {
     >
       <JobSection className="pt-20 sm:pt-28">
         <JobProse>
-          <JobH2>One agent per worktree. One worktree per pane.</JobH2>
+          <JobH2>Starting several sessions is easy. Managing them is the job.</JobH2>
           <div className="mt-8 space-y-5">
             <p>
-              Claude&nbsp;Code runs one session per invocation, so parallelism is yours to arrange —
-              and the arrangement that matters is on the filesystem. Two agents in one checkout will
-              trip over the same index, the same build directory, and each other’s diffs. Git
-              worktrees end it: one checkout per branch, every branch off one clone.
-            </p>
-            <p>
-              Then give each worktree a terminal of its own. Split panes in iTerm2, tmux, or
-              whatever you already drive; start <span className="text-bone">claude</span> in each
-              lane.
+              Claude&nbsp;Code runs one session per invocation, so parallel is just more
+              invocations: give each session its own directory — one git worktree per branch keeps
+              them out of each other’s way — and open a pane per session in iTerm2, tmux, or
+              whatever you already drive.
             </p>
           </div>
           <div className="mt-10">
@@ -140,8 +135,11 @@ export default function RunAgentsInParallelPage() {
             </JobCodeFigure>
           </div>
           <p className="mt-10">
-            That’s a working fleet — three agents, three lanes, one screen — and it needs nothing
-            you don’t already have. At one machine, with the lid open, it’s genuinely enough.
+            What you’ve really built, though, is a second job: window manager for a small team of
+            agents. The work of parallel work isn’t writing code — it’s dispatching a task, noticing
+            the pane that stopped, answering it, and remembering which lane was doing what. At one
+            machine, with the lid open, that loop is manageable — and it needs nothing you don’t
+            already have.
           </p>
         </JobProse>
       </JobSection>
@@ -154,7 +152,7 @@ export default function RunAgentsInParallelPage() {
               items={[
                 {
                   title: "One screen",
-                  body: "The panes live in one terminal app on one machine. The GPU box’s agents need an SSH session and a second set of splits; a third machine, a third. The fleet has no single place to be.",
+                  body: "The panes live in one terminal app on one machine. The GPU box’s agents need an SSH session and a second set of splits; a third machine, a third. There is no roster — no one place that knows what’s running where.",
                 },
                 {
                   title: "Mortal sessions",
@@ -172,11 +170,12 @@ export default function RunAgentsInParallelPage() {
 
       <JobSection>
         <JobProse>
-          <JobH2>The same pattern, held by infrastructure.</JobH2>
+          <JobH2>Keep the workflow. Hand off the managing.</JobH2>
           <p className="mt-8">
-            spawnd keeps the workflow — worktrees, one real login shell per agent — and replaces
-            what carries it. A small daemon on each of your machines owns the sessions; your browser
-            holds them as one grid.
+            spawnd doesn’t change how the agents work — each still gets a real login shell in its
+            own directory. It changes how you run them. A small daemon on each of your machines owns
+            the sessions; your browser holds the whole fleet as one grid — a control room instead of
+            a pile of windows.
           </p>
         </JobProse>
         <div className="mx-auto mt-12 w-full max-w-5xl sm:mt-14">
@@ -186,16 +185,16 @@ export default function RunAgentsInParallelPage() {
           <JobPoints
             items={[
               {
-                title: "Every machine, one grid",
-                body: "Tiles on the dev box sit beside tiles on the rig and a five-dollar VPS — no SSH juggling, no second set of splits. The daemons dial out, and the grid is the single place the fleet lives.",
+                title: "The whole fleet at a glance",
+                body: "Every session is a live tile, and the grid is the roster: what’s running, what’s finished, what’s stuck — across the dev box, the rig, and a five-dollar VPS, with no SSH juggling between them.",
               },
               {
-                title: "Close the lid; nothing dies",
-                body: "Sessions are owned by worker processes on the host, not by your terminal app. They survive closed tabs, dropped wifi, even a restart of the daemon itself — scrollback intact.",
+                title: "The one that needs you is marked",
+                body: "A session waiting on an answer marks its tile, and the alert can reach your phone. Open the grid from any approved device and answer in the same live terminal — a yes is one keystroke, then you’re gone again.",
               },
               {
-                title: "The prompt finds you",
-                body: "A session that needs an answer marks its tile, and the alert can reach your phone. Any approved device opens the same live terminal — a yes is one keystroke.",
+                title: "Managed doesn’t mean watched",
+                body: "Sessions are owned by worker processes on the host, not by your terminal app or the browser tab. Close the lid; the fleet keeps working — and the grid picks up where it was, scrollback intact.",
               },
             ]}
           />
@@ -205,8 +204,8 @@ export default function RunAgentsInParallelPage() {
       <JobSection className="py-8 sm:py-10">
         <JobProse>
           <p className="text-[15px] leading-7">
-            Real PTYs owned by host workers. Hosts dial out — zero open ports. End-to-end encrypted
-            past our own server. Open source, MIT / Apache-2.0.{" "}
+            Real PTYs owned by host workers. Hosts dial out — zero open ports. Your browser talks to
+            each daemon peer-to-peer, end-to-end encrypted. Open source, MIT / Apache-2.0.{" "}
             <Link href="/security" className={JOB_LINK}>
               Read the threat model
             </Link>
