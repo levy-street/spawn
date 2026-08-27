@@ -505,7 +505,6 @@ impl Drop for HostFileOperationPermit {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum HostOperationKind {
     List,
     Stat,
@@ -517,11 +516,12 @@ pub(crate) enum HostOperationKind {
     WriteCommit,
     ReadRange,
     Preview,
+    #[cfg(target_os = "macos")]
     Desktop,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl HostOperationKind {
+    #[cfg(test)]
     const fn index(self) -> usize {
         self as usize
     }
@@ -1006,7 +1006,7 @@ impl HostFileService {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub async fn stat(&self, input: &str) -> FsResult<FileStat> {
         self.stat_in_session(
             input,
@@ -1576,7 +1576,7 @@ impl HostFileService {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub async fn mkdir(&self, input: &str) -> FsResult<String> {
         self.mkdir_in_session(
             input,

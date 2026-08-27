@@ -656,6 +656,22 @@ mod tests {
     use std::io::Read;
     use tempfile::tempdir;
 
+    fn log_dir(temporary: &tempfile::TempDir) -> PathBuf {
+        #[cfg(windows)]
+        {
+            // The runner owns its TEMP root policy. Exercise the production
+            // contract with a child whose canonical owner-only DACL SPAWN D
+            // creates itself instead of accepting or repairing that root.
+            let dir = temporary.path().join("scrollback");
+            crate::platform::create_private_dir_all(&dir).unwrap();
+            dir
+        }
+        #[cfg(not(windows))]
+        {
+            temporary.path().to_path_buf()
+        }
+    }
+
     fn new_log(dir: &Path, segment: u64, max: u64) -> ScrollbackLog {
         let key = secret::SecretBytes::random(32).unwrap();
         ScrollbackLog::with_limits(dir, &key, segment, max).unwrap()
@@ -663,8 +679,9 @@ mod tests {
 
     #[test]
     fn append_and_replay_round_trip() {
-        let dir = tempdir().unwrap();
-        let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
+        let mut log = new_log(&dir, 1024 * 1024, 8 * 1024 * 1024);
         log.append_history(b"hello \r\n").unwrap();
         log.append_history(b"world\r\n").unwrap();
         assert_eq!(log.total_logged(), 15);
@@ -674,8 +691,9 @@ mod tests {
 
     #[test]
     fn truncate_unlinks_every_segment_and_appends_continue() {
-        let dir = tempdir().unwrap();
-        let mut log = new_log(dir.path(), 64, 8 * 1024 * 1024);
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
+        let mut log = new_log(&dir, 64, 8 * 1024 * 1024);
         for i in 0..8 {
             log.append_history(format!("wiped-line-{i}\r\n").as_bytes())
                 .unwrap();
@@ -686,7 +704,7 @@ mod tests {
         assert_eq!(log.replay(1024).unwrap(), b"");
         // Nothing pre-truncate survives on disk, even encrypted length-wise:
         // exactly one empty segment file remains.
-        let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().flatten().collect();
+        let entries: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(fs::metadata(entries[0].path()).unwrap().len(), 0);
         // The log keeps working afterwards, and seq never regressed.
@@ -696,11 +714,12 @@ mod tests {
 
     #[test]
     fn plaintext_never_hits_disk() {
-        let dir = tempdir().unwrap();
-        let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
+        let mut log = new_log(&dir, 1024 * 1024, 8 * 1024 * 1024);
         let line_marker = b"SUPER-SECRET-MARKER-0451".as_slice();
         log.append_history(line_marker).unwrap();
-        for entry in fs::read_dir(dir.path()).unwrap().flatten() {
+        for entry in fs::read_dir(&dir).unwrap().flatten() {
             let mut contents = Vec::new();
             File::open(entry.path())
                 .unwrap()
@@ -719,9 +738,10 @@ mod tests {
 
     #[test]
     fn rotation_bounds_growth_and_keeps_replay_coherent() {
-        let dir = tempdir().unwrap();
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
         let max = 32 * 1024;
-        let mut log = new_log(dir.path(), 1024, max);
+        let mut log = new_log(&dir, 1024, max);
         let chunk = vec![b'x'; 512];
         let mut appended = 0u64;
         for _ in 0..32 {
@@ -734,7 +754,7 @@ mod tests {
         assert!(log.allocated_disk_bytes() <= max);
         assert!(log.segment_count() >= 1);
         // Only segment files that are tracked exist on disk.
-        let on_disk = fs::read_dir(dir.path()).unwrap().count();
+        let on_disk = fs::read_dir(&dir).unwrap().count();
         assert_eq!(on_disk, log.segment_count());
         // Replay decrypts cleanly and is pure retained content.
         let replay = log.replay(u64::MAX).unwrap();
@@ -744,9 +764,10 @@ mod tests {
 
     #[test]
     fn replay_budget_prefers_newest_segments() {
-        let dir = tempdir().unwrap();
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
         // Tiny segment budget: every batch rotates into its own segment.
-        let mut log = new_log(dir.path(), 8, 1024 * 1024);
+        let mut log = new_log(&dir, 8, 1024 * 1024);
         log.append_history(b"old-old-old!").unwrap();
         log.append_history(b"new-new-new!").unwrap();
         assert!(log.segment_count() >= 2);
@@ -758,8 +779,9 @@ mod tests {
 
     #[test]
     fn tampered_record_fails_closed() {
-        let dir = tempdir().unwrap();
-        let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
+        let mut log = new_log(&dir, 1024 * 1024, 8 * 1024 * 1024);
         log.append_history(b"authentic bytes").unwrap();
         let seg_path = log.segments.last().unwrap().path.clone();
         if let Some(active) = log.active.as_mut() {
@@ -774,11 +796,12 @@ mod tests {
 
     #[test]
     fn stale_segments_from_previous_run_are_unlinked() {
-        let dir = tempdir().unwrap();
-        fs::write(dir.path().join("seg-00000042.log"), b"dead ciphertext").unwrap();
-        let log = new_log(dir.path(), 1024, 16 * 1024);
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
+        fs::write(dir.join("seg-00000042.log"), b"dead ciphertext").unwrap();
+        let log = new_log(&dir, 1024, 16 * 1024);
         assert_eq!(log.segment_count(), 1);
-        assert!(!dir.path().join("seg-00000042.log").exists());
+        assert!(!dir.join("seg-00000042.log").exists());
     }
 
     #[test]
@@ -799,8 +822,9 @@ mod tests {
         // The reconnect-seed regression: a 64 KiB replay request against a
         // newest segment holding more than that wedged every attach. Budgets
         // now select whole batches newest-first and simply return less.
-        let dir = tempdir().unwrap();
-        let mut log = new_log(dir.path(), 1024 * 1024, 8 * 1024 * 1024);
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
+        let mut log = new_log(&dir, 1024 * 1024, 8 * 1024 * 1024);
         log.append_history(b"batch-one\r\n").unwrap();
         log.append_history(b"batch-two\r\n").unwrap();
         log.append_history(b"batch-three\r\n").unwrap();
@@ -821,9 +845,10 @@ mod tests {
 
     #[test]
     fn small_budget_takes_newest_suffix_across_segments() {
-        let dir = tempdir().unwrap();
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
         // Tiny segment budget: every batch rotates into its own segment.
-        let mut log = new_log(dir.path(), 8, 1024 * 1024);
+        let mut log = new_log(&dir, 8, 1024 * 1024);
         log.append_history(b"seg-a\r\n").unwrap();
         log.append_history(b"seg-b\r\n").unwrap();
         log.append_history(b"seg-c\r\n").unwrap();
@@ -834,9 +859,10 @@ mod tests {
 
     #[test]
     fn oversized_batch_beyond_total_budget_fails_closed() {
-        let dir = tempdir().unwrap();
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
         let max = 16 * 1024;
-        let mut log = new_log(dir.path(), 256, max);
+        let mut log = new_log(&dir, 256, max);
         log.append_history(b"still-valid\r\n").unwrap();
         let before = log.replay(1024).unwrap();
         let oversized = vec![b'X'; 32 * 1024];
@@ -847,9 +873,10 @@ mod tests {
 
     #[test]
     fn tiny_batch_flood_bounds_files_blocks_and_replay() {
-        let dir = tempdir().unwrap();
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
         let max = DEFAULT_MAX_LOG_BYTES;
-        let mut log = new_log(dir.path(), 1, max);
+        let mut log = new_log(&dir, 1, max);
 
         for index in 0..4096u16 {
             let byte = b'a' + (index % 26) as u8;
@@ -861,7 +888,7 @@ mod tests {
             }
         }
 
-        let on_disk = fs::read_dir(dir.path()).unwrap().count();
+        let on_disk = fs::read_dir(&dir).unwrap().count();
         assert_eq!(on_disk, log.segment_count());
         assert!(on_disk <= MAX_SEGMENTS);
         assert!(log.allocated_disk_bytes() > 0);
@@ -879,8 +906,9 @@ mod tests {
     fn truncate_flood_bounds_inodes() {
         // An adversary alternating tiny appends with ED 3 wipes must not grow
         // files or leak inodes.
-        let dir = tempdir().unwrap();
-        let mut log = new_log(dir.path(), 64, 16 * 1024);
+        let temporary = tempdir().unwrap();
+        let dir = log_dir(&temporary);
+        let mut log = new_log(&dir, 64, 16 * 1024);
         for i in 0..512u16 {
             log.append_history(format!("l{i}\r\n").as_bytes()).unwrap();
             if i.is_multiple_of(3) {
@@ -888,10 +916,7 @@ mod tests {
             }
         }
         assert!(log.segment_count() <= MAX_SEGMENTS);
-        assert_eq!(
-            fs::read_dir(dir.path()).unwrap().count(),
-            log.segment_count()
-        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), log.segment_count());
         assert!(log.budget_bytes() <= 16 * 1024);
     }
 }

@@ -191,14 +191,14 @@ impl Drop for WsOutbound {
 /// route to the current connection.
 pub type SessionSink = mpsc::Sender<WsOutbound>;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type DirectWipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Plaintext owned by a bounded direct-viewer queue. It wipes itself whether
 /// consumed normally, rejected by a full queue, or drained during teardown.
 pub struct DirectPayload {
     bytes: Vec<u8>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     wipe_probe: Option<DirectWipeProbe>,
 }
 
@@ -206,12 +206,12 @@ impl DirectPayload {
     pub(crate) fn new(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             wipe_probe: None,
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_wipe_probe(bytes: Vec<u8>, wipe_probe: DirectWipeProbe) -> Self {
         Self {
             bytes,
@@ -246,7 +246,7 @@ impl<const N: usize> PartialEq<&[u8; N]> for DirectPayload {
 impl Drop for DirectPayload {
     fn drop(&mut self) {
         self.bytes.as_mut_slice().zeroize();
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(probe) = self.wipe_probe.as_ref() {
             probe(&self.bytes);
         }
@@ -621,7 +621,7 @@ impl ForwarderControl {
     /// outside the throttle window, not suppressed, and carrying meaningful
     /// content. Records the emit time on success. Mirrors the former
     /// server-side classifier, now content-free on the wire.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn note_output_at(&self, now: Instant, chunk: &[u8]) -> bool {
         self.classify_output_at(now, chunk).activity
     }
@@ -902,7 +902,7 @@ impl ForwarderControl {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type ReplayWipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Decrypted replay owned by spawnd. The bytes wipe on every drop path,
@@ -914,7 +914,7 @@ pub struct WorkerReplay {
     /// worker streams history deltas. The offset ends on a batch boundary, so
     /// a delta with exactly this start offset appends seamlessly.
     history_anchor: Option<(u64, u64)>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     wipe_probe: Option<ReplayWipeProbe>,
 }
 
@@ -924,7 +924,7 @@ impl WorkerReplay {
             watermark,
             bytes,
             history_anchor: None,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             wipe_probe: None,
         }
     }
@@ -934,7 +934,7 @@ impl WorkerReplay {
             watermark,
             bytes,
             history_anchor: Some(anchor),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             wipe_probe: None,
         }
     }
@@ -951,7 +951,7 @@ impl WorkerReplay {
         &self.bytes
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_wipe_probe(
         watermark: u64,
         bytes: Vec<u8>,
@@ -979,7 +979,7 @@ impl std::fmt::Debug for WorkerReplay {
 impl Drop for WorkerReplay {
     fn drop(&mut self) {
         self.bytes.as_mut_slice().zeroize();
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(probe) = self.wipe_probe.as_ref() {
             probe(&self.bytes);
         }
