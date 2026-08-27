@@ -220,7 +220,19 @@ pub fn hard_link_noreplace_at(
 }
 
 pub fn fsync_dir(dir: &Dir) -> io::Result<()> {
-    dir.try_clone()?.into_std_file().sync_all()
+    // cap-std deliberately holds directories with O_PATH on Linux. Duplicating
+    // that descriptor preserves O_PATH, and fsync(2) rejects it with EBADF.
+    // Reopen the held directory itself as a real read-only directory handle;
+    // openat remains anchored to the capability even if the directory is
+    // concurrently renamed.
+    let sync_handle = rustix::fs::openat(
+        dir,
+        Path::new("."),
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    rustix::fs::fsync(sync_handle).map_err(io::Error::from)
 }
 
 pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
