@@ -25,7 +25,7 @@ spawn_server/
   schemas.py    pydantic request/response shapes
   main.py       app assembly, startup, route registration
   <concern>.py  one module per concern: auth, config, db, redis, mail, push,
-                release, invites, limits, rate_limit, trust_events,
+                web_push, release, invites, limits, rate_limit, trust_events,
                 host_status, …
 alembic/        migrations
 tests/          pytest; test_<module>.py mirrors the module it covers
@@ -37,7 +37,11 @@ tests/          pytest; test_<module>.py mirrors the module it covers
   response shapes in `schemas.py`, tests in `tests/test_<area>.py`.
 - A new websocket frame: the matching `ws/` module — daemon frames in
   `ws/daemon.py`, browser frames in `ws/browser.py`. The daemon side of the
-  wire lives in `daemon/src/`; change both sides in the same commit.
+  wire lives in `daemon/src/`; change both sides in the same commit. The
+  subprotocol names each module enforces (`spawn.control.v3`, `spawn.v3`,
+  `spawn.alerts.v1`) are the compatibility contract every deployed peer is held
+  to — adding a frame never touches them, and changing one is a fleet-wide
+  cutover: read "The wire protocols" in `docs/RELEASE.md` before you do.
 - A schema change: `models.py` plus an Alembic revision. Keep a single head —
   check `alembic heads` after any merge. Migrations run before the new server
   starts, so old code must tolerate the new schema (`docs/RELEASE.md`).

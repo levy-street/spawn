@@ -274,6 +274,84 @@ class PushDevice(Base):
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class WebPushSubscription(Base):
+    """One browser that has asked to be told about alerts while it is closed.
+
+    The same intent as `PushDevice` and deliberately not the same table. The
+    two rows agree on almost nothing that matters:
+
+    - **What addresses them.** A phone is a 255-character opaque token handed
+      to one service. A browser is a URL on a host the vendor chose, plus two
+      key blobs the user agent minted (`p256dh`, `auth`) that the server needs
+      in order to encrypt at all. `PushDevice.token` is `String(255)` and NOT
+      NULL, and no honest reading of it holds a URL plus two keys; sharing the
+      table means three new columns that are always NULL for a phone and one
+      column that is always NULL for a browser, plus a `platform` filter on
+      every query that touches either.
+    - **How they are sent.** Expo takes a hundred messages in one POST. Web
+      Push is one encrypted POST per subscription, to a different origin each
+      time, with per-subscription failure handling. There is no fan-out to
+      share.
+    - **What "gone" looks like.** Expo answers 200 with a per-message error;
+      a push service answers 404 or 410 on the request itself.
+
+    What they do share is the account, the advisory `browser_device_id`, and
+    the retirement rule below — three columns and a convention, which is not
+    a table.
+
+    The unique key is the endpoint, for the same reason `PushDevice` keys on
+    the token: it is what the push service actually addresses, and it is what
+    rotates. A browser re-subscribes on its own schedule (a service worker
+    update, a `pushsubscriptionchange`, storage cleared) and the endpoint it
+    comes back with may be new, so registration is idempotent on the endpoint
+    and an endpoint arriving under a different account moves rather than
+    duplicates.
+
+    `disabled_at` is set when the push service says the subscription is gone
+    (404/410), never on a transient failure, and the row is kept so a later
+    re-subscribe is an update. `retry_after` is the other half of that: a
+    service that answers 429 has asked to be left alone until a stated time,
+    and this is where that request is remembered between sends.
+    """
+
+    __tablename__ = "web_push_subscriptions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Text, not String(n): the endpoint is a URL on a host the browser vendor
+    # picked, and its length is theirs to change.
+    endpoint: Mapped[str] = mapped_column(Text, nullable=False)
+    # The subscription's public key (uncompressed P-256 point) and auth secret,
+    # both base64url as the browser serialized them. Stored verbatim so what
+    # goes into the key derivation is exactly what the browser produced.
+    p256dh: Mapped[str] = mapped_column(String(255), nullable=False)
+    auth: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Recognition only, for a future "signed-in devices" screen. Never trusted.
+    label: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The browser device (trust identity) this subscription belongs to, so a
+    # knock is never pushed back to the browser that made it. Advisory routing
+    # only: it decides who is NOT told, never who is admitted.
+    browser_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set from a 429's Retry-After. Until it passes, this subscription is
+    # skipped rather than hammered.
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        # A unique index rather than a unique column, so the name is ours and
+        # matches the one the migration creates.
+        Index("ix_web_push_subscriptions_endpoint", "endpoint", unique=True),
+    )
+
+
 class TrustBundle(Base):
     """The operator's sealed trust bundle: ciphertext the server cannot read.
 

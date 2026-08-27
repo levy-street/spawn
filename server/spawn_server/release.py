@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import schemas
-from .config import get_settings
+from .config import get_settings, is_local_deployment
 
 if TYPE_CHECKING:
     from .models import Host
@@ -33,6 +33,19 @@ SUPPORTED_DAEMON_TARGETS = (
     "linux-aarch64",
 )
 DESKTOP_PLATFORMS = ("darwin-aarch64", "darwin-x86_64")
+
+#: The one every download surface links to. `useDesktopRelease` in
+#: `web/src/hooks/useDesktopRelease.ts` builds the primary button's URL for
+#: Apple silicon regardless of what `platforms` says, so a block whose
+#: aarch64 image is missing is a 404 no matter how the list reads.
+PRIMARY_DESKTOP_PLATFORM = "darwin-aarch64"
+
+#: Where `scripts/publish-desktop.sh` uploads the notarized disk images and
+#: what nginx aliases `/desktop/` onto. Same value as that script's own
+#: `SPAWN_DESKTOP_DIR` default, and the same one
+#: `infra/nginx-spawnd.conf.example` tells the operator to create.
+DEFAULT_DESKTOP_DIR = Path("/var/www/spawnd/desktop")
+
 DAEMON_UPDATE_TIMEOUT = timedelta(minutes=3)
 
 _HEX_40 = re.compile(r"^[0-9a-f]{40}$")
@@ -40,6 +53,7 @@ _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _DAEMON_TREE = re.compile(r"^[0-9a-f]{40}(?:-dirty)?$")
 _sha256_cache: dict[tuple[Path, int, int], str] = {}
 _manifest_errors_logged: set[str] = set()
+_desktop_dir_warned = False
 
 
 @dataclass(frozen=True)
@@ -49,7 +63,11 @@ class _ReleaseIdentity:
     web_build_id: str | None
     mobile_tree: str | None
     mobile_runtime_version: str | None
-    desktop: schemas.ReleaseDesktop | None
+    # Identity only. Whether the images this names were ever published is a
+    # question about the static origin, not about the checkout, and it is
+    # asked per request — see `desktop_release`.
+    desktop_version: str | None
+    desktop_tree: str | None
 
 
 _identity: _ReleaseIdentity | None = None
@@ -165,21 +183,14 @@ def _compute_identity() -> _ReleaseIdentity:
     else:
         desktop_tree = None
 
-    desktop = None
-    if desktop_version is not None and desktop_tree is not None:
-        desktop = schemas.ReleaseDesktop(
-            version=desktop_version,
-            tree=desktop_tree,
-            platforms=list(DESKTOP_PLATFORMS),
-        )
-
     return _ReleaseIdentity(
         server_commit=server_commit,
         server_dirty=server_dirty,
         web_build_id=_read_web_build_id(),
         mobile_tree=mobile_tree,
         mobile_runtime_version=_read_mobile_runtime_version(),
-        desktop=desktop,
+        desktop_version=desktop_version,
+        desktop_tree=desktop_tree,
     )
 
 
@@ -189,10 +200,11 @@ _identity = _compute_identity()
 def refresh() -> None:
     """Refresh cached checkout identity after a test or deployment fixture changes."""
 
-    global _identity
+    global _identity, _desktop_dir_warned
     _identity = _compute_identity()
     _sha256_cache.clear()
     _manifest_errors_logged.clear()
+    _desktop_dir_warned = False
 
 
 def _current_identity() -> _ReleaseIdentity:
@@ -342,6 +354,112 @@ def read_prebuilt_manifest(
     )
 
 
+def desktop_image_name(version: str, platform: str) -> str:
+    """The filename `scripts/publish-desktop.sh` uploads, and the one
+    `desktopDownloadUrl` in `web/src/lib/platform.ts` builds a URL to. Held in
+    one place on this side so the check and the link cannot disagree."""
+    return f"SPAWN-D_{version}_{platform}.dmg"
+
+
+def desktop_release_dir() -> Path:
+    """The directory `/desktop/` is served from on this deployment.
+
+    Not derivable from the checkout: in production it is nginx's alias over
+    `/var/www/spawnd/desktop` (`infra/nginx-spawnd.conf.example`), which the
+    server's own tree knows nothing about. `SPAWN_DESKTOP_DIR` is the same
+    variable name `scripts/publish-desktop.sh` uses for the upload target, on
+    purpose — the publisher and the server are naming one directory.
+    """
+    configured = getattr(get_settings(), "desktop_dir", None)
+    return Path(configured) if configured is not None else DEFAULT_DESKTOP_DIR
+
+
+def published_desktop_platforms(version: str, *, root: Path | None = None) -> list[str] | None:
+    """Which Mac images this deployment can actually hand over.
+
+    `None` and `[]` are different answers and the distinction is the whole
+    point. `[]` means the release directory is right there and this version is
+    not in it — evidence, and the reason to stay quiet. `None` means there is
+    nowhere to look, which is evidence of nothing at all.
+    """
+    directory = root if root is not None else desktop_release_dir()
+    try:
+        if not directory.is_dir():
+            return None
+        return [
+            platform
+            for platform in DESKTOP_PLATFORMS
+            if (directory / desktop_image_name(version, platform)).is_file()
+        ]
+    except OSError:
+        return None
+
+
+def _warn_missing_desktop_dir_once(directory: Path) -> None:
+    global _desktop_dir_warned
+    if is_local_deployment(getattr(get_settings(), "public_url", "")):
+        # A laptop has no static release origin. `/desktop/` there is Next
+        # serving `web/public/desktop`, and `/desktop-build` already answers
+        # for it, so an absent `/var/www/...` means nothing worth saying.
+        return
+    if _desktop_dir_warned:
+        return
+    _desktop_dir_warned = True
+    log.error(
+        "desktop release directory %s does not exist, so /api/release advertises a "
+        "desktop version without proof that its disk image was ever published. Set "
+        "SPAWN_DESKTOP_DIR to the static root nginx serves at /desktop/ "
+        "(docs/RELEASE.md, The desktop app).",
+        directory,
+    )
+
+
+def desktop_release(identity: _ReleaseIdentity | None = None) -> schemas.ReleaseDesktop | None:
+    """The desktop block, advertised only for images that are really there.
+
+    The daemon block has been provable since it existed: `/api/release` names
+    a daemon only when `manifest.json` validates and every binary it lists is
+    on disk with the advertised hash. The desktop block was not, and the gap
+    had teeth — the version here is computed from the deployed checkout's
+    `tauri.conf.json`, `web/src/lib/platform.ts` builds the Mac download URL
+    straight out of it, and a deploy that lands before
+    `scripts/publish-desktop.sh` therefore points the download button at a
+    file that does not exist.
+
+    Two absences, deliberately not treated alike:
+
+    - **The release directory exists and the image is not in it.** That is a
+      release which has not been published yet. Say nothing, exactly as the
+      daemon block says nothing without a manifest. The download surfaces
+      already handle a null block: they fall through to `/desktop-build` and
+      then to "Coming soon".
+    - **The release directory does not exist.** Then nothing has been
+      established, and withholding the block would trade a 404 for a Mac
+      download that quietly disappears — which reads as a product decision
+      rather than a broken deploy, and would go unnoticed far longer. So it is
+      advertised exactly as before and the server says loudly, once, that it
+      could not check. Failing open is only defensible when it is not silent.
+    """
+    identity = _current_identity() if identity is None else identity
+    version, tree = identity.desktop_version, identity.desktop_tree
+    if version is None or tree is None:
+        return None
+
+    directory = desktop_release_dir()
+    published = published_desktop_platforms(version, root=directory)
+    if published is None:
+        _warn_missing_desktop_dir_once(directory)
+        return schemas.ReleaseDesktop(
+            version=version, tree=tree, platforms=list(DESKTOP_PLATFORMS)
+        )
+    if PRIMARY_DESKTOP_PLATFORM not in published:
+        return None
+    # Narrowed to what is on disk, so the Intel link on /download appears only
+    # when the Intel image does. A finished `publish-desktop.sh` uploads both
+    # or neither, so a real release still lists both.
+    return schemas.ReleaseDesktop(version=version, tree=tree, platforms=published)
+
+
 def release_info() -> schemas.ReleaseOut:
     identity = _current_identity()
     return schemas.ReleaseOut(
@@ -355,7 +473,7 @@ def release_info() -> schemas.ReleaseOut:
             tree=identity.mobile_tree,
             runtime_version=identity.mobile_runtime_version,
         ),
-        desktop=identity.desktop,
+        desktop=desktop_release(identity),
         protocols=schemas.ReleaseProtocolsOut(
             daemon="spawn.control.v3",
             browser="spawn.v3",

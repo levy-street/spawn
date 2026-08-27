@@ -4,7 +4,8 @@ set -euo pipefail
 # Put this machine back to "never had SPAWN D" so a local run of dev.sh can be
 # walked exactly the way a new production user walks it: every spawnd instance
 # on the device is stopped and wiped (services, credentials, workers, the
-# installed binaries), the local database is dropped and recreated, Redis is
+# installed binaries), the Mac app is quit and forgets it was ever signed in,
+# the local database is dropped and recreated, Redis is
 # flushed, and daemon/target/prebuilt/ is re-staged with a release build and a
 # manifest signed by the local release key so the install one-liner served by
 # the local server installs verified prebuilts instead of building from source.
@@ -52,6 +53,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
   bash -n "${BASH_SOURCE[0]}"
   # The launchd label filter must never match anything but spawnd units.
   grep -q 'app\.spawn\.spawnd' "${BASH_SOURCE[0]}"
+  # The app's state goes, so the wizard runs; its keychain items deliberately
+  # do not, because reading them back would prompt.
+  grep -q 'dev\.spawnd\.desktop' "${BASH_SOURCE[0]}"
   # The daemon build must stay visible: silencing it reads as a hang. This
   # exact form only holds while the build runs unredirected into a status
   # check, so re-silencing it fails here rather than in a confused terminal.
@@ -114,6 +118,26 @@ sleep 1
 pkill -9 -u "$uid" -f '(^|/)spawn-worker( |$)' >/dev/null 2>&1 || true
 pkill -9 -u "$uid" -f '(^|/)spawnd( |$)' >/dev/null 2>&1 || true
 rm -rf "$config_base" "$daemon_config_dir" "$daemon_worker_dir" /tmp/spawn-"$uid"* /tmp/spawn-dev-"$uid"
+
+# 2b. The Mac app remembers this machine too. Left alone it opens straight
+#     into the product for an account the dropped database no longer has, and
+#     the wizard — the half of onboarding this app is — never runs. Quit it
+#     first: a running copy holds these preferences in memory and writes them
+#     back. The keychain items it leaves behind are keyed by server origin and
+#     are overwritten at the next sign-in, so they are not worth a prompt.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  desktop_state="$HOME/Library/Application Support/dev.spawnd.desktop"
+  if pgrep -u "$uid" -f 'SPAWN D\.app/Contents/MacOS' >/dev/null 2>&1; then
+    osascript -e 'quit app "SPAWN D"' >/dev/null 2>&1 || true
+    sleep 1
+    pkill -u "$uid" -f 'SPAWN D\.app/Contents/MacOS' >/dev/null 2>&1 || true
+    say "quit the SPAWN D app"
+  fi
+  if [[ -d "$desktop_state" ]]; then
+    rm -rf "$desktop_state"
+    say "removed the SPAWN D app's memory of this machine"
+  fi
+fi
 for root in "${install_roots[@]}"; do
   for bin in spawnd spawn-worker; do
     if [[ -e "$root/bin/$bin" ]]; then

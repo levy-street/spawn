@@ -104,7 +104,7 @@ describe("ReleaseWatcher", () => {
     expect(updates.reloadAsync).toHaveBeenCalledTimes(1);
   });
 
-  it("turns a hard refusal with no OTA into a non-dismissible App Store prompt", async () => {
+  it("tells a stranded phone what to do and lets it out of the dialog", async () => {
     const updates = fakeUpdates(false);
     mockReleaseRefetch.mockResolvedValue({ data: release() });
     await render(
@@ -117,11 +117,15 @@ describe("ReleaseWatcher", () => {
     await act(async () => mockProtocolListener?.());
 
     await waitFor(() => expect(screen.getByText("Update SPAWN D")).toBeOnTheScreen());
+    // There is no listing yet, so there is no App Store to send anyone to —
+    // and a hard prompt with nowhere to go must not also be a locked door.
     expect(
       screen.getByText(
-        "This version of SPAWN D no longer works with the server. Update it from the App Store.",
+        "This version of SPAWN D no longer works with the server. It cannot update itself yet — SPAWN D is not in the App Store — so reinstall it from wherever you installed it.",
       ),
     ).toBeOnTheScreen();
+    expect(screen.queryByText("Open App Store")).toBeNull();
     expect(screen.queryByText("Later")).toBeNull();
+    expect(screen.getByText("Close")).toBeOnTheScreen();
   });
 });

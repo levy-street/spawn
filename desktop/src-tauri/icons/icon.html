@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>SPAWN D app icon</title>
+<style>
+  /* The macOS icon grid: a 1024 canvas, the plate inset to 824 with the
+     system's corner, and the trident centred on it — a touch below centre,
+     because the mark is three heavy prongs over a thin tail and geometric
+     centring reads high. */
+  :root {
+    --canvas: 1024px;
+    --plate: 824px;
+    --radius: 185px;
+    --hellfire: #e11e15;
+    /* The ink box the trident is fitted to, and how far below the plate's
+       centre it sits. Both are measured back out of the render. */
+    --mark-height: 552px;
+    --mark-drop: 16px;
+  }
+  html, body { margin: 0; background: transparent; }
+  .icon {
+    position: relative;
+    width: var(--canvas); height: var(--canvas);
+  }
+  .plate {
+    position: absolute; inset: calc((var(--canvas) - var(--plate)) / 2);
+    background: var(--hellfire);
+    border-radius: var(--radius);
+  }
+  .mark {
+    position: absolute; left: 50%; top: 50%;
+    transform: translate(-50%, calc(-50% + var(--mark-drop)));
+    height: var(--mark-height);
+    color: #000;
+  }
+  .mark svg { display: block; height: 100%; width: auto; fill: currentColor; }
+</style>
+<div class="icon">
+  <div class="plate"></div>
+  <div class="mark" data-art="../../src/assets/spawnd-icon.svg"></div>
+</div>

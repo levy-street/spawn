@@ -12,9 +12,10 @@ ceremony, a download page) says so in the commit message.
 ```
 src/
   app/            one directory per route (App Router)
-                  admin/ app/ device/ download/ forgot-password/ hosts/
-                  legion/ login/ onboarding/ reset-password/ security/
-                  sessions/ signup/ trust-ux-demo/ verify-email/ w/
+                  admin/ app/ desktop-build/ device/ download/
+                  forgot-password/ hosts/ legion/ login/ onboarding/
+                  reset-password/ security/ sessions/ signup/ trust-ux-demo/
+                  verify-email/ w/
   components/     UI grouped by product area
                   access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/ release/
                   onboarding/ profile/ session/ settings/ terminal/ trust/
@@ -39,6 +40,11 @@ public/           static assets
 - Logic that does not touch React: `src/lib/`, with a `*.test.ts` next to it.
   Unit tests colocate with the code they test; there is no parallel test tree.
 - A hook used by more than one area: `src/hooks/`.
+- A websocket change: the subprotocol names in `src/lib/ws.ts` and
+  `src/lib/alerts.ts` (`spawn.v3`, `spawn.alerts.v1`) are the compatibility
+  contract with the server, not a version — a server that requires a different
+  one refuses the socket, and the refusal is what raises the hard reload
+  prompt. Read "The wire protocols" in `docs/RELEASE.md` before changing one.
 
 ## Conventions
 
@@ -50,6 +56,13 @@ public/           static assets
   `SPAWN_API_PROXY_TARGET`. `scripts/next-with-proxy-target.mjs` wraps
   build/start and refuses a silent default outside `dev`. Never call the API
   cross-origin.
+- This app is also the macOS desktop app's product face, loaded into its
+  window. `useDesktopShell()` (`src/hooks/`) says so, read from the webview's
+  user agent in an effect — never during render, or the first client render
+  will not match the HTML it hydrates. Inside that window there is no address
+  bar and no way back, so anything that leads to the marketing site is a dead
+  end: a link to `/`, the masthead, the colophon, a brand mark that goes home.
+  New chrome that leaves the product has to answer for itself there.
 
 ## Before calling a change done
 

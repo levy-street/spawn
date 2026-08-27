@@ -4,11 +4,14 @@
 // git checkout (or without git on PATH) stamps the bare crate version rather
 // than failing the build.
 
+use std::path::Path;
 use std::process::Command;
 
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
     let pkg_version = std::env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
+
+    embed_info_plist(&manifest_dir, &pkg_version);
     let commit = Command::new("git")
         .current_dir(&manifest_dir)
         .args(["rev-parse", "--short=12", "HEAD"])
@@ -94,5 +97,53 @@ fn main() {
     }
     for path in ["src", "build.rs", "Cargo.toml", "Cargo.lock"] {
         println!("cargo:rerun-if-changed={path}");
+    }
+}
+
+/// Link `Info.plist` into both macOS binaries.
+///
+/// A bare Mach-O has nowhere to keep an Info.plist, so macOS asks for consent
+/// on behalf of a lower-case path with no product name and no explanation.
+/// `-sectcreate __TEXT __info_plist` gives the file one anyway: the same bytes
+/// an app bundle would keep beside its executable, sealed inside it, which is
+/// where TCC and codesign both look. See `Info.plist` for what those bytes say
+/// and why each key is there.
+fn embed_info_plist(manifest_dir: &str, pkg_version: &str) {
+    println!("cargo:rerun-if-changed=Info.plist");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    let source = Path::new(manifest_dir).join("Info.plist");
+    let Ok(template) = std::fs::read_to_string(&source) else {
+        // Never fail the build over presentation: a daemon that builds without
+        // its consent copy is worse-mannered, not broken.
+        println!("cargo:warning=daemon/Info.plist is missing; macOS consent dialogs will name the binary path instead of SPAWN D");
+        return;
+    };
+    // The version is stamped rather than kept in the file so the two cannot
+    // drift, the way SPAWND_BUILD_VERSION already is.
+    let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR");
+    let stamped = Path::new(&out_dir).join("Info.plist");
+    let rendered = template.replace("__SPAWND_VERSION__", pkg_version);
+    if let Err(error) = std::fs::write(&stamped, rendered) {
+        println!("cargo:warning=could not stage daemon/Info.plist ({error}); macOS consent dialogs will name the binary path instead of SPAWN D");
+        return;
+    }
+    // One `-Xlinker` per argument rather than a single comma-joined `-Wl,`:
+    // the path is a build directory nobody chose, and a comma or a space in it
+    // would silently truncate the section name under the `-Wl,` form.
+    for bin in ["spawnd", "spawn-worker"] {
+        for argument in [
+            "-Xlinker",
+            "-sectcreate",
+            "-Xlinker",
+            "__TEXT",
+            "-Xlinker",
+            "__info_plist",
+            "-Xlinker",
+            &stamped.to_string_lossy(),
+        ] {
+            println!("cargo:rustc-link-arg-bin={bin}={argument}");
+        }
     }
 }

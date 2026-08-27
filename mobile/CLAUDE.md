@@ -54,6 +54,11 @@ scripts/, docs/   build helpers and app-specific notes
   `data/queries/` with its key in `queryKeys.ts`. Components never fetch
   directly.
 - Client-only state: `data/stores/`.
+- Realtime: the subprotocol names in `data/realtime/` (`spawn.v3`,
+  `spawn.alerts.v1`) are the compatibility contract with the server, not a
+  version — a server that requires a different one refuses the socket with a
+  `protocol.required` frame, which is what routes into the update path. Read
+  "The wire protocols" in `docs/RELEASE.md` before changing one.
 - Tests colocate in the nearest `__tests__/` directory (jest).
 
 ## Conventions

@@ -92,6 +92,114 @@ metro_port_must_be_free() {
     'a Metro is already running — if it was started for production, the phone would reach that, not this machine'
 }
 
+# The Mac app is not started here — an onboarding run walks up to it the way a
+# person does, by downloading it from this server. But the disk image this
+# server hands out is whatever was last built into web/public/desktop, and an
+# old one is indistinguishable from the new: it looks like the app, it *is* the
+# app, it is just not this checkout's app. So an onboarding run rebuilds it.
+#
+# Only when something changed — this is a release build of a Tauri app, minutes
+# on a cold cache — and only on macOS, which is the only place it builds.
+# SPAWN_DEV_DESKTOP=0 skips it; =1 asks for it on a plain run too.
+desktop_dmg_path() {
+  local version arch
+  version="$(python3 -c 'import json,sys; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["version"])')"
+  case "$(uname -m)" in
+    arm64) arch="darwin-aarch64" ;;
+    x86_64) arch="darwin-x86_64" ;;
+    *) return 1 ;;
+  esac
+  printf 'web/public/desktop/SPAWN-D_%s_%s.dmg' "$version" "$arch"
+}
+
+desktop_app_is_stale() {
+  local staged="$1"
+  [[ -f "$staged" ]] || return 0
+  local newest
+  newest="$(find desktop/src desktop/src-tauri/src desktop/src-tauri/icons \
+    desktop/src-tauri/tauri.conf.json desktop/src-tauri/Cargo.toml desktop/package.json \
+    -newer "$staged" -print -quit 2>/dev/null)"
+  [[ -n "$newest" ]]
+}
+
+# Build the app and stage its disk image where the web app serves /desktop/
+# from — the same path nginx serves in production, so the download button on
+# the local site hands over this checkout's app.
+prepare_desktop_app() {
+  local staged
+  staged="$(desktop_dmg_path)" || {
+    printf 'spawn dev: this architecture has no SPAWN D build; skipping the Mac app\n'
+    return 0
+  }
+  if ! desktop_app_is_stale "$staged"; then
+    printf '%s\n' 'the staged SPAWN D disk image is current'
+    return 0
+  fi
+  # The full production path — Developer ID, notarized, stapled — when it is
+  # the download itself being tested. It is minutes slower and needs Apple, so
+  # it is asked for rather than assumed.
+  if [[ "${SPAWN_DEV_DESKTOP_SIGNED:-}" == "1" ]]; then
+    printf '%s\n' '== preparing the Mac app (signed and notarized; Apple is in the loop) =='
+    scripts/dev-desktop-signed.sh
+    install_desktop_app "desktop/src-tauri/target/release/bundle/macos/SPAWN D.app"
+    return 0
+  fi
+  printf '%s\n' '== preparing the Mac app (release build; minutes on a cold cache) =='
+  if [[ ! -d desktop/node_modules ]]; then
+    (cd desktop && npm install --no-audit --no-fund)
+  fi
+  # tauri.dev.conf.json adds the DMG target the default config leaves out, and
+  # signs the bundle ad-hoc. Without a signature of its own the app is only
+  # linker-signed, and macOS calls that *damaged* — a dialog whose only button
+  # is "Move to Bin" — rather than merely unnotarized.
+  (cd desktop && npx tauri build --config src-tauri/tauri.dev.conf.json)
+  local built app
+  built="$(ls -t desktop/src-tauri/target/release/bundle/dmg/*.dmg 2>/dev/null | head -1)"
+  app="desktop/src-tauri/target/release/bundle/macos/SPAWN D.app"
+  [[ -n "$built" ]] || {
+    printf 'spawn dev: the Mac app built no disk image\n' >&2
+    return 1
+  }
+  mkdir -p web/public/desktop
+  # One image at a time: the download page picks the build it can see, and two
+  # versions in there is how you install the wrong one.
+  rm -f web/public/desktop/SPAWN-D_*.dmg
+  cp "$built" "$staged"
+  printf 'staged %s\n' "$staged"
+  install_desktop_app "$app"
+}
+
+# Put the build on this Mac as well as on the download page.
+#
+# The page is the honest funnel and it now serves this checkout — but a browser
+# quarantines what it downloads, from localhost as much as anywhere, and a
+# local build carries no notarization to answer that with, so macOS refuses the
+# copy that comes back through it. The copy that never went through a browser
+# has nothing to answer for. This is the one deviation from walking it as a
+# user, and it is the difference between "the app on this Mac is this checkout"
+# being true and being a thing you remember to check.
+install_desktop_app() {
+  local app="$1"
+  local installed="/Applications/SPAWN D.app"
+  local built_id installed_id
+  [[ -d "$app" ]] || return 0
+  built_id="$(shasum -a 256 "$app/Contents/MacOS/spawn-desktop" 2>/dev/null | cut -c1-16)"
+  installed_id="$(shasum -a 256 "$installed/Contents/MacOS/spawn-desktop" 2>/dev/null | cut -c1-16)"
+  [[ -n "$built_id" && "$built_id" == "$installed_id" ]] && return 0
+  if pgrep -u "$(id -u)" -f 'SPAWN D\.app/Contents/MacOS' >/dev/null 2>&1; then
+    osascript -e 'quit app "SPAWN D"' >/dev/null 2>&1 || true
+    sleep 1
+    pkill -u "$(id -u)" -f 'SPAWN D\.app/Contents/MacOS' >/dev/null 2>&1 || true
+  fi
+  rm -rf "$installed"
+  # ditto, not cp: a signature copied by cp is a signature macOS will not read.
+  if ditto "$app" "$installed" 2>/dev/null; then
+    printf 'installed %s (build %s)\n' "$installed" "$built_id"
+  else
+    printf 'spawn dev: could not install %s — install it from the download page\n' "$installed" >&2
+  fi
+}
+
 # The phone reaches this machine by address, never by "localhost" — that word
 # means the phone. Everything handed to Expo Go is built from this.
 lan_address() {
@@ -170,6 +278,13 @@ if [[ "$mobile" == "1" ]]; then
     printf 'run `cd mobile && npm ci`, then try again\n' >&2
     exit 1
   }
+fi
+
+desktop_prepared=0
+if [[ "$(uname -s)" == "Darwin" && "${SPAWN_DEV_DESKTOP:-}" != "0" ]] \
+  && { [[ "$onboarding" == "1" ]] || [[ "${SPAWN_DEV_DESKTOP:-}" == "1" ]]; }; then
+  prepare_desktop_app
+  desktop_prepared=1
 fi
 
 # Onboarding installs the daemon from the signed prebuilts the local server
@@ -353,6 +468,18 @@ if [[ "$onboarding" == "1" ]]; then
   printf 'and registers a launchd service that spawnd manages itself.\n'
   printf 'Rust changes are deliberately not watched here — restart with plain\n'
   printf '`npm run dev` when you want the dev daemon back.\n'
+  if [[ "$desktop_prepared" == "1" ]]; then
+    printf '\nthe Mac app is this checkout, in /Applications and on %s/download.\n' "$public_url"
+    printf 'open it from /Applications — it is already the build this run made.\n'
+    # Downloading it is worth doing to test the page, and it is also where the
+    # quarantine bites: only a notarized build survives a browser, and this one
+    # is not one.
+    printf 'downloading it instead tests the page, and macOS will refuse that\n'
+    printf 'copy — a local build is not notarized — until you clear the mark:\n'
+    printf '  xattr -dr com.apple.quarantine ~/Downloads/SPAWN-D_*.dmg\n'
+    printf 'to walk the download exactly as a user does, with no prompt at all:\n'
+    printf '  SPAWN_DEV_DESKTOP_SIGNED=1 npm run dev --onboarding\n'
+  fi
   if [[ "$mobile" == "1" ]]; then
     printf '\nthen pick the same account up on your phone:\n'
     if [[ -n "${lan_ip:-}" ]]; then

@@ -1,4 +1,5 @@
-import { readdir, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { NextResponse } from "next/server";
 
@@ -54,8 +55,19 @@ export async function GET(): Promise<NextResponse> {
   }
   if (!newest) return new NextResponse(null, { status: 404 });
 
+  // The version is not an identity here. `npm run dev --onboarding` rebuilds
+  // the same version every time it runs, so a page that recognises builds by
+  // version would call every one of them the build you already have. The
+  // digest of the file is what actually changed.
+  const platforms = [...(platformsByVersion.get(newest.version) ?? [])].sort();
+  const image = path.join(dir, `SPAWN-D_${newest.version}_${platforms[0]}.dmg`);
+  const build = createHash("sha256")
+    .update(await readFile(image))
+    .digest("hex")
+    .slice(0, 16);
+
   return NextResponse.json(
-    { version: newest.version, platforms: [...(platformsByVersion.get(newest.version) ?? [])] },
+    { version: newest.version, platforms, build },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

@@ -408,7 +408,6 @@ input:disabled { color: var(--ash); border-color: var(--line-g); }
 .checklist li.current .mark { color: var(--bone); }
 .checklist li.pending .mark { color: var(--ash-55); }
 .checklist .aside { font-family: var(--font-sigil); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ash); }
-.checklist-head { margin: 0 0 8px; font-size: 14px; font-weight: 600; color: var(--bone); }
 .spin { animation: spin 900ms linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

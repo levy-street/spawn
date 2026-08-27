@@ -3,8 +3,9 @@
 import { Check, Copy, Loader2 } from "lucide-react";
 import Link from "next/link";
 import type { ReactNode, RefObject } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
+import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
@@ -132,6 +133,10 @@ function useMastheadScrub(): {
 export function Masthead({ current }: { current?: "security" | "download" }) {
   const { navRef, brandRef, markRef, wordRef } = useMastheadScrub();
   const { user } = useAuth();
+  // Inside the app every zone but the brand leads somewhere the window cannot
+  // come back from, and the brand itself has to lead the other way: whoever is
+  // reading this in there wants the product, not more of the site.
+  const inShell = useDesktopShell();
 
   const zoneLink = (active: boolean) =>
     cn("hidden transition-colors sm:inline", active ? "text-bone" : "text-ash hover:text-bone");
@@ -143,20 +148,24 @@ export function Masthead({ current }: { current?: "security" | "download" }) {
         className="mx-auto flex w-full max-w-[1440px] items-center justify-between gap-4 px-5 py-6 font-sigil text-[11px] tracking-[0.22em] uppercase sm:grid sm:grid-cols-[1fr_auto_1fr] sm:px-8 sm:text-[12px]"
       >
         <div className="hidden items-center gap-7 sm:flex sm:gap-10">
-          <Link
-            href="/security"
-            aria-current={current === "security" ? "page" : undefined}
-            className={zoneLink(current === "security")}
-          >
-            Security
-          </Link>
-          <a href={GITHUB_URL} target="_blank" rel="noreferrer" className={zoneLink(false)}>
-            Open&nbsp;source
-          </a>
+          {inShell ? null : (
+            <>
+              <Link
+                href="/security"
+                aria-current={current === "security" ? "page" : undefined}
+                className={zoneLink(current === "security")}
+              >
+                Security
+              </Link>
+              <a href={GITHUB_URL} target="_blank" rel="noreferrer" className={zoneLink(false)}>
+                Open&nbsp;source
+              </a>
+            </>
+          )}
         </div>
         <Link
-          href="/"
-          aria-label="spawnd home"
+          href={inShell ? "/app" : "/"}
+          aria-label={inShell ? "Back to SPAWN D" : "spawnd home"}
           ref={brandRef}
           className="flex flex-col items-center gap-2 text-hellfire"
         >
@@ -168,11 +177,11 @@ export function Masthead({ current }: { current?: "security" | "download" }) {
           </span>
         </Link>
         <div className="flex items-center justify-end gap-7 sm:gap-10">
-          {user ? (
+          {user || inShell ? (
             <Link
               href="/app"
               className="text-ember transition-colors hover:text-hellfire"
-              aria-label="Open spawnd"
+              aria-label="Open SPAWN D"
             >
               Enter&nbsp;→
             </Link>
@@ -197,21 +206,27 @@ export function Masthead({ current }: { current?: "security" | "download" }) {
 
 /** The colophon that closes every public page. */
 export function Colophon() {
+  // The rule still closes the page in the app; the routes it offers do not,
+  // because none of them is a place that window can be left.
+  const inShell = useDesktopShell();
+
   return (
     <footer className="border-line-g border-t px-5 py-10 sm:px-8">
       <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-4 font-sigil text-[11px] tracking-[0.14em] text-ash uppercase sm:flex-row">
         <span>consensual · auditable · revocable</span>
-        <div className="flex items-center gap-5">
-          <Link href="/security" className="transition-colors hover:text-bone">
-            Security
-          </Link>
-          <Link href="/download" className="transition-colors hover:text-bone">
-            Install
-          </Link>
-          <Link href="/login" className="transition-colors hover:text-bone">
-            Log in
-          </Link>
-        </div>
+        {inShell ? null : (
+          <div className="flex items-center gap-5">
+            <Link href="/security" className="transition-colors hover:text-bone">
+              Security
+            </Link>
+            <Link href="/download" className="transition-colors hover:text-bone">
+              Install
+            </Link>
+            <Link href="/login" className="transition-colors hover:text-bone">
+              Log in
+            </Link>
+          </div>
+        )}
         <span>Open source · MIT / Apache-2.0</span>
       </div>
     </footer>
@@ -248,20 +263,54 @@ function WindowsMark({ className }: { className?: string }) {
   );
 }
 
-/**
- * Hand a file over without leaving the page: a download, not a navigation.
- * Used for the press made before the build's name was known, which arrives
- * with no click of its own left to ride on.
- */
-function startDownload(url: string): void {
+/** How long the slab says "Downloaded" before settling into offering another. */
+const DOWNLOAD_ACK_MS = 4000;
+/** Where a browser remembers which build it has already been handed. */
+const DOWNLOADED_KEY = "spawn:desktop-downloaded";
+
+/** The build this browser downloaded last, or null. Storage can throw — a
+ * private window, a browser set to refuse it — and a download button is not
+ * worth failing over, so it answers null and the button reads as fresh. */
+function rememberedDownload(): string | null {
+  try {
+    return window.localStorage.getItem(DOWNLOADED_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function rememberDownload(version: string): void {
+  try {
+    window.localStorage.setItem(DOWNLOADED_KEY, version);
+  } catch {
+    // A download that happened is still a download that happened.
+  }
+}
+
+/** Hand a blob or a URL over as a file, without leaving the page. */
+function saveAs(url: string, filename: string): void {
   const link = document.createElement("a");
   link.href = url;
-  link.download = "";
+  link.download = filename;
   link.rel = "noopener";
   document.body.append(link);
   link.click();
   link.remove();
 }
+
+/** The file's own name, off the end of its URL. */
+function filenameOf(url: string): string {
+  const path = url.split("?")[0].split("#")[0];
+  return decodeURIComponent(path.slice(path.lastIndexOf("/") + 1)) || "SPAWN-D.dmg";
+}
+
+type DownloadPhase =
+  | { at: "offer" }
+  /** Pressed before the build was named: the press is held, not spent. */
+  | { at: "waiting" }
+  | { at: "running"; received: number; total: number | null }
+  | { at: "done" }
+  | { at: "failed" };
 
 /**
  * The Mac download, set the way the phone stores set theirs: the platform's
@@ -273,25 +322,43 @@ function startDownload(url: string): void {
  * the vendor's colour would put a second "click me" ink on the page and break
  * the one rule the palette carries.
  *
- * Three states, and only the first two are ordinary:
+ * It is also a *download button*, which means it answers for the download and
+ * not merely for the press: it fills as the file arrives, says when the file
+ * is here, and on the next visit says that this browser already has this
+ * build — offering another copy rather than pretending nothing happened. The
+ * bytes come through `fetch` so there is something true to report; a browser
+ * that cannot do that, or a fetch that fails, falls back to the plain link it
+ * still is underneath, so the file is never held hostage to the flourish.
  *
- * - a `href`: the file, handed over on the press.
- * - `pending`: the release manifest has not answered yet, which is the
+ * Three situations, and only the first two are ordinary:
+ *
+ * - a `href`: the file, fetched on the press.
+ * - `pending`: the release manifest has not named the build yet, which is the
  *   ordinary first paint. The slab presses like any other and holds the press
- *   — spinner in place of the mark — until the name arrives, then downloads.
- *   Sending that press to /download instead made the button a detour on every
- *   cold load, which is the one thing a download button must not be.
+ *   until the name arrives. Sending that press to /download instead made the
+ *   button a detour on every cold load, which is the one thing a download
+ *   button must not be.
  * - neither: nothing to hand out here, so /download, where the builds are
  *   listed with their versions.
  */
 export function MacDownloadButton({
   href,
+  version = null,
+  buildId = null,
   pending = false,
   className,
   label = "Download for macOS",
   platform = "mac",
 }: {
   href: string | null;
+  /** The build's version, for the words. */
+  version?: string | null;
+  /**
+   * What tells this build from the last one of the same version — the desktop
+   * tree, or the digest of the image. A rebuild changes it, and the button
+   * goes back to offering a download rather than claiming you have this one.
+   */
+  buildId?: string | null;
   /** The release manifest has not answered yet; a press waits on it. */
   pending?: boolean;
   className?: string;
@@ -299,44 +366,139 @@ export function MacDownloadButton({
   /** Which machine is being handed a download — the mark and the words follow. */
   platform?: "mac" | "windows";
 }) {
-  const [waiting, setWaiting] = useState(false);
+  const [phase, setPhase] = useState<DownloadPhase>({ at: "offer" });
+  const [had, setHad] = useState<string | null>(null);
+  // Read after mount, never during render: the server has no localStorage, and
+  // a first paint that disagreed with it would be a hydration mismatch.
+  useEffect(() => setHad(rememberedDownload()), []);
+
   const shell = cn(
-    "group inline-flex h-14 items-center justify-center gap-2.5 rounded-sm bg-bone px-7 font-sigil text-[13px] font-medium tracking-[0.14em] text-void uppercase transition-colors hover:bg-white",
+    "group relative isolate inline-flex h-14 items-center justify-center gap-2.5 overflow-hidden rounded-sm bg-bone px-7 font-sigil text-[13px] font-medium tracking-[0.14em] text-void uppercase transition-colors hover:bg-white",
     className,
   );
   const mark = platform === "windows" ? <WindowsMark /> : <AppleMark />;
   const words =
     platform === "windows" && label === "Download for macOS" ? "Download for Windows" : label;
+  /** This browser already has exactly this build — not merely its version. */
+  const stamp = buildId === null ? null : `${version ?? "?"}@${buildId}`;
+  const alreadyHas = stamp !== null && had === stamp;
 
+  const fetchIt = useCallback(
+    async (url: string) => {
+      setPhase({ at: "running", received: 0, total: null });
+      try {
+        const response = await fetch(url, { cache: "no-store" });
+        if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+        const length = Number(response.headers.get("Content-Length"));
+        const total = Number.isFinite(length) && length > 0 ? length : null;
+        const reader = response.body.getReader();
+        const chunks: BlobPart[] = [];
+        let received = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value as BlobPart);
+          received += value.byteLength;
+          setPhase({ at: "running", received, total });
+        }
+        const blob = new Blob(chunks, { type: "application/octet-stream" });
+        const objectUrl = URL.createObjectURL(blob);
+        saveAs(objectUrl, filenameOf(url));
+        // Long enough for the browser to have taken it; the blob is the only
+        // copy until it does.
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+        if (stamp !== null) {
+          rememberDownload(stamp);
+          setHad(stamp);
+        }
+        setPhase({ at: "done" });
+      } catch {
+        // Whatever went wrong with reading it ourselves, the browser can still
+        // be asked to fetch it the ordinary way.
+        saveAs(url, filenameOf(url));
+        setPhase({ at: "failed" });
+      }
+    },
+    [stamp],
+  );
+
+  // The held press, spent as soon as there is something to spend it on.
   useEffect(() => {
-    if (!waiting) return;
+    if (phase.at !== "waiting") return;
     if (href !== null) {
-      setWaiting(false);
-      startDownload(href);
+      void fetchIt(href);
       return;
     }
     // The manifest answered, and the answer was that there is no build here.
     if (!pending) {
-      setWaiting(false);
+      setPhase({ at: "offer" });
       window.location.assign("/download");
     }
-  }, [waiting, href, pending]);
+  }, [phase, href, pending, fetchIt]);
+
+  useEffect(() => {
+    if (phase.at !== "done" && phase.at !== "failed") return;
+    const timer = setTimeout(() => setPhase({ at: "offer" }), DOWNLOAD_ACK_MS);
+    return () => clearTimeout(timer);
+  }, [phase]);
+
+  const spinner = <Loader2 className="size-[22px] shrink-0 animate-spin" aria-hidden="true" />;
+  const face = (() => {
+    switch (phase.at) {
+      case "waiting":
+        return { icon: spinner, said: "Preparing download" };
+      case "running": {
+        const percent =
+          phase.total === null
+            ? null
+            : Math.min(99, Math.round((phase.received / phase.total) * 100));
+        return {
+          icon: spinner,
+          said: percent === null ? "Downloading" : `Downloading ${percent}%`,
+        };
+      }
+      case "done":
+        return {
+          icon: <Check className="size-[22px] shrink-0" aria-hidden="true" />,
+          said: "Downloaded",
+        };
+      case "failed":
+        return { icon: mark, said: "Download started" };
+      default:
+        // A build this browser already has is still offered — just honestly.
+        return { icon: mark, said: alreadyHas ? "Download again" : words };
+    }
+  })();
+  const percent =
+    phase.at === "running" && phase.total !== null
+      ? Math.min(100, (phase.received / phase.total) * 100)
+      : null;
+  const inner = (
+    <>
+      {percent !== null && (
+        // The slab fills as the file arrives: the part still to come is the
+        // part still shaded.
+        <span
+          aria-hidden="true"
+          className="absolute inset-y-0 right-0 -z-10 bg-void/15 transition-[left] duration-150 ease-out"
+          style={{ left: `${percent}%` }}
+        />
+      )}
+      {face.icon}
+      {face.said}
+    </>
+  );
 
   if (href === null && pending) {
     return (
       <button
         type="button"
-        onClick={() => setWaiting(true)}
-        aria-busy={waiting}
+        onClick={() => setPhase({ at: "waiting" })}
+        aria-busy={phase.at === "waiting" || phase.at === "running"}
         className={shell}
         data-testid="mac-download"
       >
-        {waiting ? (
-          <Loader2 className="size-[22px] shrink-0 animate-spin" aria-hidden="true" />
-        ) : (
-          mark
-        )}
-        {waiting ? "Preparing download" : words}
+        {inner}
       </button>
     );
   }
@@ -348,10 +510,23 @@ export function MacDownloadButton({
       </Link>
     );
   }
+  // A real link underneath, so a middle click, a right click and a keyboard
+  // all behave — the flourish belongs to the ordinary press alone.
   return (
-    <a href={href} download className={shell} data-testid="mac-download">
-      {mark}
-      {words}
+    <a
+      href={href}
+      download
+      onClick={(event) => {
+        if (event.defaultPrevented || event.button !== 0) return;
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        void fetchIt(href);
+      }}
+      aria-busy={phase.at === "running"}
+      className={shell}
+      data-testid="mac-download"
+    >
+      {inner}
     </a>
   );
 }

@@ -15,7 +15,7 @@ use models::{
     PossessionProgress,
 };
 use serde::Serialize;
-use tauri::RunEvent;
+use tauri::{Manager, RunEvent};
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -30,6 +30,79 @@ struct AppServices {
 /// credentials" rather than one half or the other.
 fn command_error(error: impl std::fmt::Display) -> String {
     format!("{error:#}")
+}
+
+/// How long the keychain sweep waits for a window to exist before giving up on
+/// one. Long enough for a cold launch on a slow disk, short enough that a
+/// machine which never shows a window still gets its (brief) sweep attempt.
+const WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether any window is actually on screen — not merely created.
+///
+/// `window::create` makes a window long before `surface` shows it, and macOS
+/// will not render a sheet on one that is not visible. Polled at a coarse
+/// interval because nothing here is racing: the caller is a detached thread
+/// whose only job is to wait.
+fn window_is_visible_within(app: &tauri::AppHandle, bound: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        if app
+            .webview_windows()
+            .values()
+            .any(|window| window.is_visible().unwrap_or(false))
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Whether to show the permissions screen — and, when the answer is yes, hold
+/// the daemon so it asks *after* the screen rather than over the top of it.
+///
+/// The hold is the point. macOS attributes consent to the responsible process,
+/// so the asking has to happen inside the installed service, and the service
+/// registers within seconds of approval — without a marker to wait on, the
+/// dialogs would routinely beat this screen onto the display and the screen
+/// would be explaining something that already happened.
+///
+/// Never touches TCC: it reads local state and writes a marker, nothing more.
+#[tauri::command]
+fn begin_permissions_gate() -> Result<bool, String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(false);
+    }
+    let Some(shared) = spawnd::permissions::shared_dir() else {
+        return Ok(false);
+    };
+    // Already answered on this machine, for this binary. The grant is not per
+    // account, so a second account must not re-ask for what was already given.
+    if spawnd::permissions::report_path(&shared).exists() {
+        return Ok(false);
+    }
+    // A dialog nobody can answer is auto-refused and the refusal kept, so a
+    // screen is worse than nothing when this is not the console session.
+    if !spawnd::permissions::someone_is_at_this_screen() {
+        return Ok(false);
+    }
+    spawnd::permissions::request_gate(&shared).map_err(command_error)?;
+    Ok(true)
+}
+
+/// The person's answer. `true` from Continue, `false` from Not now.
+///
+/// Returns as soon as the answer is durable rather than waiting for macOS:
+/// the dialogs belong to the daemon, and holding this call open would stall the
+/// wizard behind three system prompts it cannot see.
+#[tauri::command]
+fn answer_permissions(prime: bool) -> Result<(), String> {
+    let Some(shared) = spawnd::permissions::shared_dir() else {
+        return Ok(());
+    };
+    spawnd::permissions::write_consent(&shared, prime).map_err(command_error)
 }
 
 #[tauri::command]
@@ -273,6 +346,31 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppServices::default())
         .setup(|app| {
+            // Empty the keychain into the credential file at a moment that is
+            // the same every time, rather than from whichever secret read
+            // happens to land first — which could be mid-possession.
+            //
+            // **It waits for a window first, and that is the whole point.** A
+            // keychain prompt is a sheet, and a sheet needs something to attach
+            // to: with no visible window macOS never renders it and the read
+            // never returns — not slowly, never. Doing this in `setup` shipped
+            // an app that launched to nothing at all, no window and no error,
+            // because the sweep blocked before anything could be shown.
+            //
+            // So: wait for the window, then read with enough patience for a
+            // person to answer the sheet that can now actually appear. If no
+            // window arrives, sweep briefly anyway — it costs seconds and still
+            // succeeds on every machine where the ACL matches, which is every
+            // ordinary upgrade.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let patience = if window_is_visible_within(&handle, WINDOW_WAIT) {
+                    storage::PATIENT
+                } else {
+                    storage::BRIEF
+                };
+                storage::run_keychain_migration(patience);
+            });
             tray::install(app)?;
             window::create(app)?;
             // A sign-in that went out to the system browser comes back on the
@@ -316,6 +414,8 @@ pub fn run() {
             check_app_update,
             install_app_update,
             sign_out,
+            begin_permissions_gate,
+            answer_permissions,
             open_app,
             quit_app
         ])

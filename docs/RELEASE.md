@@ -1,10 +1,10 @@
 # Releasing SPAWN D
 
-Read this in full before deploying anything. A SPAWN D release has four moving
+Read this in full before deploying anything. A SPAWN D release has five moving
 pieces — the server + web app, the mobile JavaScript, the mobile native app,
-and the daemon binaries. Ship every piece the change touches, in the same
-release; a piece left behind leaves production running two versions of the
-same feature.
+the daemon binaries, and the macOS desktop app. Ship every piece the change
+touches, in the same release; a piece left behind leaves production running two
+versions of the same feature.
 
 ## Versions and compatibility
 
@@ -18,6 +18,10 @@ version remains `0.1.0`:
   `spawnd --version`
 - the mobile JavaScript is `git rev-parse <ref>:mobile`
 - the mobile native runtime is the app version in `mobile/app.json`
+- the desktop app is `git rev-parse <ref>:desktop`, plus the app version in
+  `desktop/src-tauri/tauri.conf.json` — which `/api/release` advertises from
+  the deployed checkout whether or not a matching artifact was published, so
+  the publish leads the deploy (see the checklist)
 
 Production publishes all expected identities at the public, uncacheable
 `GET /api/release` endpoint. Unknown and dirty development identities are left
@@ -56,6 +60,56 @@ binaries:
 Do not hand-edit this manifest. Its hashes come from the already-verified
 `SHA256SUMS` in `prebuilt-latest`, and it includes only target pairs actually
 copied to the host.
+
+## The wire protocols
+
+Version numbers decide nothing about whether two deployed pieces can talk. A
+named subprotocol does, and there are three:
+
+| between | name | declared in |
+| --- | --- | --- |
+| daemon and server | `spawn.control.v3` | `daemon/src/ws.rs`, `server/spawn_server/ws/daemon.py` |
+| browser and server | `spawn.v3` | `web/src/lib/ws.ts`, `server/spawn_server/ws/browser.py` |
+| alerts | `spawn.alerts.v1` | `web/src/lib/alerts.ts`, `mobile/src/data/realtime/alert-socket.ts`, `server/spawn_server/ws/alerts.py` |
+
+All three are published at `GET /api/release` under `protocols`. A 0.1.2 daemon
+and a much newer server interoperate for as long as both speak
+`spawn.control.v3`; releasing them in lockstep is neither required nor checked.
+
+**Bump one only when a peer speaking the old name would be wrong, not merely
+behind.** That means a frame or field removed or renamed that the peer relies
+on, changed semantics for a frame that already exists, or a change to the
+handshake itself. Additive frames and optional fields never bump it — every
+side validates frames field by field and ignores what it does not recognise, so
+an old peer misses the new thing and keeps working. A bump is a fleet-wide
+cutover, not a changelog entry: every deployed peer offering the old name is
+refused at the handshake, and bumping for a change they could have survived
+spends that cutover for nothing.
+
+What a bump then does is already built, end to end — do not re-derive it:
+
+- the server refuses any socket that does not offer the name. It accepts,
+  sends `{"type": "protocol.required", "protocol": …}`, and closes with
+  `WS_CLOSE_PROTOCOL_REQUIRED`, so the peer is told what is required rather
+  than left with a dead connection.
+- **the daemon heals itself.** A protocol refusal is the one failure that makes
+  `run.rs` self-update immediately: it fetches `/api/install/manifest.json`
+  over plain HTTP — not the socket that just refused it — verifies the hashes,
+  swaps the binaries and re-execs. A daemon that cannot self-update (an
+  unwritable install directory, self-update disabled) logs the exact reinstall
+  command hourly and retries every five minutes.
+- **the browser reloads.** The refusal raises `spawn:client-stale` with
+  `hard: true`, which is the release watcher's hard prompt: a short countdown,
+  then a reload.
+- **the phone** handles `protocol.required` on its sockets the same way and
+  routes it into the update path.
+
+So the order of operations for a bump is forced: the daemon prebuilts that
+speak the new protocol must be published **before or with** the server that
+requires it. The daemon's self-heal pulls from the manifest that server serves,
+so if the manifest still holds a build speaking the old name, every daemon in
+the field spends its retry loop downloading a build that is refused just the
+same.
 
 ## Signed daemon releases
 
@@ -190,6 +244,33 @@ curl -fsSL https://spawnd.dev/install.sh | sh
 Do not use the override merely because CI is slow. Wait for `prebuilt-latest`
 whenever possible. If `mobile/` changed between the old production commit and
 the new one, deploy also prints the matching `update-mobile-prod.sh` reminder.
+
+The deploy carries code, not secrets. Server configuration lives in the host's
+`server/.env` and is set once, by hand: see [EMAIL.md](EMAIL.md) for outbound
+mail and [PUSH.md](PUSH.md) for the VAPID key pair that gives browsers
+notifications while they are closed. Rotating the VAPID key invalidates every
+existing browser subscription, so it is a deliberate act, never a side effect
+of a release.
+
+Two of those values are checked rather than trusted. When `SPAWN_PUBLIC_URL`
+names anything the internet can reach, `spawn-server` refuses to start while
+`SPAWN_JWT_SECRET` is still the default published in this repository, or while
+`SPAWN_EMAIL_BACKEND` is `console` (which records mail and sends none, leaving
+signup unable to verify an address). It names the variable to fix and exits. A
+truncated env file used to boot happily and sign session tokens with a public
+secret. Loopback, private and link-local addresses are exempt, so local
+development and LAN testing against a phone keep every default they have.
+
+One more value is read rather than set: `SPAWN_DESKTOP_DIR`, the static root
+nginx serves at `/desktop/`. It defaults to `/var/www/spawnd/desktop` — the
+same directory `scripts/publish-desktop.sh` uploads to under the same variable
+name — and the server looks in it before advertising a desktop version, so
+`/api/release` names a Mac build only when that build's disk image is really
+there. A deploy that lands before the publish therefore says nothing about the
+desktop app rather than pointing the download button at a 404. If the
+directory does not exist at all the server cannot check, so it advertises the
+version anyway and logs an error naming this variable; a download that
+vanishes silently would be the harder failure to notice.
 
 ## The phone
 
@@ -344,6 +425,99 @@ against the public key committed at the selected ref. Use `--skip-desktop` only
 when intentionally verifying a release that predates the app or an environment
 where the static desktop origin is unavailable.
 
+## The macOS consent dialogs
+
+People judge SPAWN D by the permission dialogs it causes, so it is worth being
+exact about which of them a release removes and which are simply what the
+daemon is. Two different systems produce them and they have nothing to do with
+each other.
+
+**Gatekeeper — the two trips to Privacy & Security are a local-build artifact.**
+An unnotarized app is refused on first launch with no button but "Move to Bin",
+and clearing it means System Settings → Privacy & Security → Open Anyway. It
+happens *twice* for a locally built DMG because Gatekeeper judges the disk image
+and the app separately: once when the image is opened, once for the copy dragged
+to `/Applications`, which inherits `com.apple.quarantine` from the browser that
+downloaded it. Neither survives a real release — `desktop.yml` Developer ID
+signs and notarizes the app *and* staples the DMG, and a stapled DMG opens with
+no dialog at all while the app gets the ordinary one-click "downloaded from the
+Internet" confirmation every Mac app gets. To confirm a build is clean, use
+`syspolicy_check distribution "<app>"` and `xcrun stapler validate`, not
+`spctl --assess`, which reports "rejected" for good builds on some Macs. Nothing
+in the product can remove these locally: a browser quarantines what it
+downloads, and a local build has no notarization to answer with.
+
+**Keychain — gone, and it was most of the noise.** The app used to keep its
+session token and device seed in the macOS keychain, and a keychain item's ACL
+names the code signature that created it. When that signature stops matching —
+a development rebuild, or a build signed differently from the one that first
+stored the item — macOS asks on *every read*, and the app read the token on
+every authenticated request: six dialogs in fourteen seconds during one
+possession, all for the same two items. Those secrets now live in a mode-0600
+`credentials.json` in the app's Application Support directory
+(`desktop/src-tauri/src/storage.rs`), handled by `spawnd::secret_file`, and the
+app never asks for the keychain again. The trade-off is argued in that module's
+comment; the short version is that the daemon's more powerful credentials
+already live in such a file, so the keychain was a stronger door on the lesser
+prize, and the dialog cost more trust than it bought.
+
+Two things a release needs to know. **The migration runs once** and its cost
+depends on the signature: notarized app reading items a notarized app wrote is
+silent, so an ordinary upgrade asks nothing; a signature that changed since the
+item was written gets up to two dialogs, once, and never again.
+
+That an ordinary upgrade is silent is a property of the ACL, not an assumption.
+macOS records the requirement as `identifier "dev.spawnd.desktop" and anchor
+apple generic and certificate leaf[subject.OU] = "9RT4S4TGA3"` — scoped to the
+**team**, not to one certificate, so renewing or replacing the Developer ID cert
+within team `9RT4S4TGA3` (Dreamhome AI Limited, the identity
+`APPLE_SIGNING_IDENTITY` names) keeps satisfying it. The one change that would
+put an unexplained keychain dialog in front of every existing user is signing a
+release under a **different Apple team**; if that is ever on the table, expect
+it and say so in the release notes. **Items for
+origins and accounts an install no longer uses stay behind** — `keyring`
+addresses an item by name and cannot enumerate — and they are inert because
+nothing reads the keychain any more. `security delete-generic-password -s spawn`
+(repeat until it reports nothing) clears them if you want a clean machine.
+
+**TCC — inherent, but it should be asked once and in our own words.** The daemon
+reads the home directory, so macOS gates Desktop, Documents and Downloads, and
+it attributes the request to the *responsible* process. That is `spawnd`, even
+when the thing reading the folder was an agent the person started in a session:
+in the field every consent dialog on the machine named `spawnd`, including ones
+for the photo and music libraries that nothing in the daemon ever sets out to
+read. No release removes these. What a release controls is what they say:
+
+- `daemon/Info.plist` is linked into both binaries' `__TEXT,__info_plist`
+  section by `build.rs`, and carries `CFBundleName` plus one
+  `NS*UsageDescription` per gated location. Those strings are the second line of
+  the dialog, printed verbatim.
+- **They only take effect if the binary is re-signed.** The signature the linker
+  applies by itself seals nothing it did not write, and `codesign -dv` on such a
+  binary reports `Info.plist=not bound`. `prebuilt.yml` therefore re-signs all
+  four darwin binaries and fails the build unless `codesign -dv` afterwards
+  reports both `Identifier=dev.spawnd.daemon` and `Info.plist entries=`.
+- On first registration after possession the daemon asks for Desktop, Documents
+  and Downloads in that order and records the answers, so it never asks twice.
+  It asks only behind the desktop app's consent screen: the app leaves a request
+  marker, the daemon waits up to two minutes for the answer, and with no marker
+  it primes nothing — an `install.sh` or SSH possession keeps ordinary lazy
+  prompts and is never auto-refused. The markers and the report share one
+  `<config>/spawn/` directory because TCC grants the binary once, whoever it is
+  running for. `SPAWND_NO_PERMISSION_PRIME=1` turns it off. See
+  `daemon/src/permissions.rs`.
+
+**Making a grant survive a self-update** needs a Developer ID. TCC keys a grant
+on the signing identity, and an ad-hoc identity is a hash of the binary, so it
+changes with every release and every folder is asked for again. Setting the
+repository variable `SIGN_DAEMON_WITH_DEVELOPER_ID` to `true` makes
+`prebuilt.yml` sign with the certificate `desktop.yml` already holds. Turning it
+on is a one-time cost paid by every existing host — their ad-hoc-keyed grants do
+not transfer, so each is asked once more — and it should be done deliberately,
+with a release, rather than discovered. Verify afterwards with `codesign -dv
+--verbose=4` on a downloaded binary: `Authority=Developer ID Application: …`
+and `TeamIdentifier` set rather than `adhoc`.
+
 ## The daemon prebuilts
 
 Installers download daemon binaries from the production server, and the server
@@ -363,14 +537,33 @@ cd daemon
 # darwin, on an Apple-silicon Mac (x86_64 target via rustup)
 cargo build --release --locked --bin spawnd --bin spawn-worker
 cargo build --release --locked --target x86_64-apple-darwin --bin spawnd --bin spawn-worker
-# linux, via Docker; bullseye's glibc 2.31 keeps the compatibility floor low
+# linux, via Docker. ubuntu:22.04 because that is what CI builds on, and the
+# floor has to be the same either way — see "The Linux compatibility floor".
+linux_build='apt-get update -qq && apt-get install -y -qq curl build-essential git >/dev/null \
+  && curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable \
+  && . "$HOME/.cargo/env" && git config --global --add safe.directory /src \
+  && cd /src/daemon && cargo build --release --locked --bin spawnd --bin spawn-worker'
 docker run --rm --platform linux/arm64 -v "$(git rev-parse --show-toplevel)":/src \
-  -e CARGO_TARGET_DIR=/src/daemon/target-bullseye/arm64 rust:1-bullseye \
-  bash -c 'git config --global --add safe.directory /src && cd /src/daemon && cargo build --release --locked --bin spawnd --bin spawn-worker'
+  -e CARGO_TARGET_DIR=/src/daemon/target-jammy/arm64 ubuntu:22.04 \
+  bash -c "$linux_build"
 docker run --rm --platform linux/amd64 -v "$(git rev-parse --show-toplevel)":/src \
-  -e CARGO_TARGET_DIR=/src/daemon/target-bullseye/amd64 rust:1-bullseye \
-  bash -c 'git config --global --add safe.directory /src && cd /src/daemon && cargo build --release --locked --bin spawnd --bin spawn-worker'
+  -e CARGO_TARGET_DIR=/src/daemon/target-jammy/amd64 ubuntu:22.04 \
+  bash -c "$linux_build"
 ```
+
+### The Linux compatibility floor
+
+**glibc 2.35 — Ubuntu 22.04.** Hosts older than that get no prebuilt and fall
+back to a source install. It is set in one place, `.github/workflows/prebuilt.yml`
+(`runs-on: ubuntu-22.04`), because CI is what publishes the rolling release on
+every daemon change; the recipe above only exists for when CI cannot run, and it
+matches that base deliberately.
+
+Do not build the Linux binaries on an older base to "support more hosts". It
+works, and that is the problem: the hand-built release quietly admits hosts
+CI does not, they install and update happily, and the next ordinary CI build
+takes their prebuilt away again with nothing in the failure to explain why.
+Lowering the floor is a change to `prebuilt.yml` and to this section, together.
 
 Then assemble the assets the way the workflow's single publish job does — the
 four `spawnd-<triple>` + four `spawn-worker-<triple>` binaries, plus
@@ -460,18 +653,26 @@ IP or an SNI/TURN-aware router; it is not enabled in current production.
 1. Confirm the checkout is clean, the intended commit is pushed, daemon CI has
    finished when `daemon/` changed, and the local release-signing key is
    present and readable when prebuilts will be published.
-2. Run `scripts/deploy-prod.sh <ssh-host>`. Do not continue past a hard gate by
+2. If `desktop/` changed, publish the desktop app **before** the server deploy,
+   following "The desktop app" above through `scripts/publish-desktop.sh`.
+   The order is not a preference. `/api/release` advertises the version in the
+   *deployed checkout's* `desktop/src-tauri/tauri.conf.json` without checking
+   that an artifact for it exists, and the download page builds its URL from
+   that number — so a deploy that lands first points the Mac download button at
+   a 404 until the publish catches up. Confirm `/desktop/latest.json` names the
+   same version the checkout does before moving on.
+3. Run `scripts/deploy-prod.sh <ssh-host>`. Do not continue past a hard gate by
    habit; fix the release or record why the emergency prebuilt override is safe.
-3. If `mobile/` changed, run
+4. If `mobile/` changed, run
    `scripts/update-mobile-prod.sh -m "<same summary as the deploy>"`. If native
    code, configuration, entitlements, or the runtime version changed, publish a
    real store build as well.
-4. Exercise the changed user flow. For network or signalling changes, also run
+5. Exercise the changed user flow. For network or signalling changes, also run
    `scripts/health-check.sh` with the production `SPAWN_TURN_URLS`; this checks
    the public WebSocket upgrade and the configured UDP TURN listener. Keep the
    migration compatibility rule above in mind while the previous processes are
    still draining.
-5. Last, prove the independently shipped identities and served daemon bytes:
+6. Last, prove the independently shipped identities and served daemon bytes:
 
    ```bash
    scripts/verify-release.sh https://spawnd.dev

@@ -155,11 +155,8 @@ pub async fn run_with_ui(
     // why that is the ceremony's out-of-band host-key check.
     let approve_url = approval_url(&server, &start, &identity.public_key)?;
     let opener_available = browser_opener_available();
-    let browser_behavior = browser_behavior(
-        std::io::stdin().is_terminal(),
-        opener_available,
-        no_browser,
-    );
+    let browser_behavior =
+        browser_behavior(std::io::stdin().is_terminal(), opener_available, no_browser);
     ui.begin(1, "[ WAITING FOR YOU ]");
 
     // The QR carries the full URL including the locally-appended #k= fragment.
@@ -361,7 +358,10 @@ fn approval_panel(
     // force. An unwrapped row pushes the border out and the whole panel goes
     // ragged on a narrow terminal.
     let prose = |text: &str| -> Vec<String> {
-        wrap_words(text, inner).iter().map(|l| dim(l, true)).collect()
+        wrap_words(text, inner)
+            .iter()
+            .map(|l| dim(l, true))
+            .collect()
     };
     let lead = if browser_opened {
         "opened your browser. didn't open? use this link on any device:"
@@ -415,7 +415,10 @@ fn browser_fingerprint_panel(fingerprint: &str, width: usize) -> Vec<String> {
     use crate::tui::{dim, render_panel, wrap_words};
     let inner = width.saturating_sub(4);
     let prose = |text: &str| -> Vec<String> {
-        wrap_words(text, inner).iter().map(|l| dim(l, true)).collect()
+        wrap_words(text, inner)
+            .iter()
+            .map(|l| dim(l, true))
+            .collect()
     };
     let mut rows = vec![String::new()];
     rows.extend(prose(
@@ -454,7 +457,8 @@ fn approval_plain_lines(browser_opened: bool, approve_url: &str, qr: Option<&str
         .collect();
     lines.push(String::new());
     if let Some(qr) = qr {
-        lines.push("spawn:   Scan this with your phone, or open the link on any device:".to_owned());
+        lines
+            .push("spawn:   Scan this with your phone, or open the link on any device:".to_owned());
         lines.push(String::new());
         lines.extend(qr.trim_end_matches('\n').lines().map(str::to_owned));
         lines.push(String::new());
@@ -1503,12 +1507,20 @@ mod tests {
             let plain = strip_sgr(&panel.join("\n")).to_lowercase();
             assert!(plain.contains("open this link on any device"), "{plain}");
             assert!(plain.contains("device?ref=dif2cg14xj3maek4"), "{plain}");
-            assert!(!plain.contains("pairing code"), "a code to type is a second way in: {plain}");
-            assert!(!plain.contains("sha256"), "a fingerprint to compare is a third: {plain}");
+            assert!(
+                !plain.contains("pairing code"),
+                "a code to type is a second way in: {plain}"
+            );
+            assert!(
+                !plain.contains("sha256"),
+                "a fingerprint to compare is a third: {plain}"
+            );
             assert!(!plain.contains("key"), "{plain}");
             assert!(!plain.contains("no link"), "{plain}");
         }
-        let plain = approval_plain_lines(false, url, None).join("\n").to_lowercase();
+        let plain = approval_plain_lines(false, url, None)
+            .join("\n")
+            .to_lowercase();
         assert!(!plain.contains("pairing code"), "{plain}");
         assert!(!plain.contains("sha256"), "{plain}");
         assert!(!plain.contains("type"), "{plain}");
@@ -1536,7 +1548,10 @@ mod tests {
     fn the_opened_browser_variant_keeps_its_own_lead_lines() {
         let lines = approval_plain_lines(true, "https://x/y", None);
         assert_eq!(lines[0], "spawn: opened your browser to approve this host.");
-        assert_eq!(lines[1], "spawn:   didn't open? use this link on any device:");
+        assert_eq!(
+            lines[1],
+            "spawn:   didn't open? use this link on any device:"
+        );
         assert_eq!(lines[2], "spawn:   https://x/y");
     }
 
