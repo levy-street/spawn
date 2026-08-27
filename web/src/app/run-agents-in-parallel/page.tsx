@@ -1,11 +1,19 @@
 import type { Metadata } from "next";
 import { FleetCapture } from "@/components/seo/templates/FleetCapture";
-import { JobPage, JobPlate, JobSection, JobShellFigure } from "@/components/seo/templates/JobPage";
+import {
+  JobH2,
+  JobMechanics,
+  JobPage,
+  JobSection,
+  JobShellAside,
+  JobStart,
+  JobTrio,
+} from "@/components/seo/templates/JobPage";
 
 /*
- * The flagship job page: the person who runs three to ten agent sessions as a
- * fleet, whose real problem is that the fleet is invisible and interruptible.
- * Primary ICP: the agent power user — dense, specific, zero hand-holding.
+ * The flagship job page: the person who runs three to ten agent sessions as
+ * a fleet. Hero = heavy branding, minimal words; body = the general
+ * capability, one capture as an example, one CTA moment, a quiet FAQ.
  * Every claim survives a diff against docs/TRUST.md and README.md.
  */
 
@@ -92,135 +100,81 @@ export default function RunAgentsInParallelPage() {
       crumbs={[{ name: "Use cases", href: "/use" }]}
       pageName="Run agents in parallel"
       canonicalPath={PATH}
-      heading={{ plain: "Run multiple Claude Code sessions", accent: "in parallel." }}
-      lede={
-        <>
-          <p>
-            Six agents, three machines, one grid. Claude&nbsp;Code reworks auth in the first tile
-            and grinds the test suite in the third; Codex has the importer on the rig. When a tile
-            needs a yes, it glows. Everything else keeps running.
-          </p>
-          <p>
-            spawnd runs parallel Claude&nbsp;Code sessions — or Codex, opencode, aider, any CLI
-            agent — as one workspace of live terminals: real shells on machines you own, reachable
-            from any browser you’ve approved.
-          </p>
-        </>
-      }
-      vignette={<FleetCapture />}
+      hero={{
+        title: { plain: "Run multiple Claude Code sessions", accent: "in parallel." },
+        sub: "A grid of real terminals across the machines you own — every agent in its own shell, visible from anywhere.",
+        ink: { video: "/brand/ink/grid-ink.mp4", poster: "/brand/ink/grid-ink.png" },
+      }}
       faq={FAQ}
       related={RELATED}
-      closing={{
-        heading: { plain: "Your agents are already parallel.", accent: "See them." },
-        body: "One command possesses a host; one workspace holds the fleet. Open source, MIT and Apache-2.0 — and the server that introduces your devices can’t read a single tile.",
-      }}
     >
-      <JobSection
-        index="01"
-        eyebrow="The lanes"
-        heading={{ plain: "One worktree per agent.", accent: "One tile per worktree." }}
+      <JobSection marker="What this is">
+        <p className="max-w-[58ch] text-[clamp(18px,2.1vw,23px)] leading-[1.7] text-bone">
+          A workspace is a grid of live terminal sessions — real login shells on machines you own.{" "}
+          <span className="text-ash">
+            Any CLI agent runs in any tile —{" "}
+            <span className="font-sigil text-[0.82em]">claude · codex · opencode · aider</span> —
+            and the built-in shortcuts just type the visible command into the shell. One grid can
+            mix machines: tiles on the dev box sit beside tiles on the rig and a five-dollar VPS.
+          </span>
+        </p>
+        <div className="mt-16">
+          <FleetCapture caption="An example — a workspace: six sessions across three machines" />
+        </div>
+      </JobSection>
+
+      <JobSection marker="The three problems">
+        <JobH2 text={{ plain: "“Just open more terminals”", accent: "fails three ways." }} />
+        <div className="mt-14">
+          <JobTrio
+            items={[
+              {
+                title: "Isolation",
+                body: "Two agents in one checkout fight over the same index and the same build directory. Give every session a directory of its own — one git worktree per agent is the clean pattern — and the isolation is the filesystem’s, not a sandbox’s.",
+              },
+              {
+                title: "Attention",
+                body: "A session that needs an answer marks its tile, and the alert can reach your phone. Any device you’ve approved opens the same live terminal, mid-scrollback — a yes is one keystroke.",
+              },
+              {
+                title: "Persistence",
+                body: "Sessions are owned by worker processes on the host, not by a browser tab. They survive closed tabs, dropped connections, and restarts of the daemon itself — scrollback intact.",
+              },
+            ]}
+          />
+        </div>
+      </JobSection>
+
+      <JobMechanics
+        fragments={[
+          "Real PTYs owned by host workers",
+          "Hosts dial out — zero open ports",
+          "End-to-end encrypted past our own server",
+          "Open source, MIT / Apache-2.0",
+        ]}
+        link={{ label: "Read the threat model", href: "/security" }}
+      />
+
+      <JobStart
+        heading={{ plain: "One line on any host", accent: "you own." }}
         aside={
-          <JobShellFigure title="The lanes, cut in three commands">
+          <JobShellAside title="The clean pattern — one worktree per agent">
             <p className="whitespace-nowrap">
-              <span className="text-ember">$</span> git worktree add ../api.wt/auth -b agents/auth
+              <span className="text-ember">$</span> git worktree add ../wt/auth -b agents/auth
             </p>
             <p className="whitespace-nowrap">
-              <span className="text-ember">$</span> git worktree add ../api.wt/importer -b
+              <span className="text-ember">$</span> git worktree add ../wt/importer -b
               agents/importer
             </p>
             <p className="whitespace-nowrap">
-              <span className="text-ember">$</span> git worktree add ../api.wt/perf -b agents/perf
+              <span className="text-ember">$</span> git worktree add ../wt/perf -b agents/perf
             </p>
-            <p className="whitespace-nowrap pt-3 text-ash"># one session per directory, then —</p>
-            <p className="whitespace-nowrap">
-              <span className="text-ember">$</span> claude{" "}
-              <span className="text-ash"># tile 1 · dream</span>
+            <p className="whitespace-nowrap pt-2 text-ash">
+              # one directory per session, one agent per tile
             </p>
-            <p className="whitespace-nowrap">
-              <span className="text-ember">$</span> codex{" "}
-              <span className="text-ash"># tile 2 · rig</span>
-            </p>
-            <p className="whitespace-nowrap">
-              <span className="text-ember">$</span> claude{" "}
-              <span className="text-ash"># tile 3 · rig</span>
-            </p>
-          </JobShellFigure>
+          </JobShellAside>
         }
-      >
-        <p>
-          Parallel agents fail at the filesystem first: two sessions in one checkout fight over the
-          same index and the same build directory. Worktrees end it — one checkout per branch, all
-          off one clone. spawnd doesn’t wrap that workflow. A session is your login shell, started
-          in the directory you name, so one worktree per tile is just what naming directories gets
-          you.
-        </p>
-        <p>
-          Dispatch is typing. Open a session per lane and hit the claude shortcut in each — it types
-          the visible command, nothing more. The same tile takes{" "}
-          <code className="font-sigil text-[14px] text-bone">git diff</code>,{" "}
-          <code className="font-sigil text-[14px] text-bone">bun test</code>, and a hand-driven vim
-          rescue, because a tile isn’t a viewer pointed at the agent. It’s the shell the agent runs
-          in.
-        </p>
-      </JobSection>
-
-      <JobPlate
-        index="02"
-        eyebrow="The mechanics"
-        heading={{ plain: "Built for the hours you’re not watching." }}
-        lede="Not a dashboard bolted over your agents — the shell they already run in, held open while you’re elsewhere."
-        items={[
-          {
-            title: "Workers own the PTYs",
-            body: "Each session’s PTY belongs to a worker process on the host, not to a browser tab. Close the laptop, lose the wifi, restart the daemon itself — the shell keeps running, and the tile comes back with scrollback intact.",
-          },
-          {
-            title: "Hosts mix in one grid",
-            body: "A tile doesn’t care where it lives. The dev box, the GPU rig, and a five-dollar VPS sit side by side in one workspace, and every tile talks directly to its own host.",
-          },
-          {
-            title: "The ask finds you",
-            body: "A stalled agent marks its tile and the sidebar, and alerts can reach your phone. Any approved device opens the same grid, mid-scrollback — answering is typing, not remoting in.",
-          },
-          {
-            title: "The wire stays sealed",
-            body: "Terminal bytes run browser to daemon, end-to-end encrypted; the server cannot read a tile, and a forced relay forwards only ciphertext. Hosts dial out — ten agents deep, zero open ports.",
-          },
-        ]}
       />
-
-      <JobSection
-        index="03"
-        eyebrow="The bottleneck"
-        heading={{ plain: "Parallelism is an interrupt problem." }}
-        aside={
-          <JobShellFigure title="The three interrupts">
-            <div className="grid min-w-[520px] grid-cols-[auto_auto_minmax(0,1fr)] gap-x-6 gap-y-3">
-              <span className="text-ember">agent.awaiting_input</span>
-              <span className="text-bone">claude · dream</span>
-              <span className="text-ash">a permission prompt, holding for you</span>
-              <span className="text-ember">agent.finished</span>
-              <span className="text-bone">codex · rig</span>
-              <span className="text-ash">the run ended; the diff is ready</span>
-              <span className="text-ember">session.died</span>
-              <span className="text-bone">aider · mini</span>
-              <span className="text-ash">exit 137 now — not tomorrow morning</span>
-            </div>
-          </JobShellFigure>
-        }
-      >
-        <p>
-          The ceiling on a fleet was never compute — it’s how long a question waits for you. An
-          agent stalled on a permission prompt is a serial agent with extra steps. The grid inverts
-          it: the session raises the event, the event finds whichever device you’re holding, you
-          answer, it runs on.
-        </p>
-        <p>
-          Those three events are the product’s entire telemetry ambition. The server that routes
-          them sees that an agent stirred, never what it said — terminal content isn’t in its
-          vocabulary, by construction.
-        </p>
-      </JobSection>
     </JobPage>
   );
 }

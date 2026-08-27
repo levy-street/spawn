@@ -1,26 +1,28 @@
 import { ArrowRight } from "lucide-react";
+import Image from "next/image";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import {
   Colophon,
   CTA_QUIET,
   CTA_SLAB,
-  Eyebrow,
   Masthead,
   RegistrationMarks,
 } from "@/components/brand/press";
 import { InstallOneLiner } from "@/components/seo/InstallOneLiner";
+import { HeroInkVideo } from "@/components/seo/templates/HeroInkVideo";
 import { poster } from "@/lib/fonts";
 import { cn } from "@/lib/utils";
 
 /*
- * The job template: the page family for "the thing you are trying to do"
- * (/run-agents-in-parallel, /keep-agents-running, …), aimed at the agent
- * power user. It shares the pressroom's ink with every other public surface
- * but keeps its own structure: a left-set hero that runs straight into the
- * workspace-grid vignette, numbered plates with a heading rail beside the
- * evidence, and a bone closing sheet. Server component throughout — the only
- * client islands are the masthead and the install chip.
+ * The job template — the recipe every landing page reuses.
+ *
+ * Hero: heavy branding, minimal words. A dimmed full-bleed ink print under
+ * exactly two text elements (the keyword H1 and one subheading sentence),
+ * with the breadcrumb kept small above. No CTAs, no captures, no kickers.
+ * The body earns one rich visual (the product capture), one CTA moment, and
+ * a quiet FAQ; whitespace is the ornament. Every section shares the same
+ * rail (max-w-5xl) and the same hairline borders.
  */
 
 const SITE = "https://spawnd.dev";
@@ -42,22 +44,19 @@ export interface JobRelatedLink {
   href: string;
 }
 
-interface JobHeading {
+export interface JobHeading {
   plain: string;
   accent?: string;
 }
 
-function PosterHeading({
-  as: Tag,
-  text,
-  className,
-}: {
-  as: "h1" | "h2";
-  text: JobHeading;
-  className?: string;
-}) {
+export interface JobHeroInk {
+  video: string;
+  poster: string;
+}
+
+function HeadingText({ text }: { text: JobHeading }) {
   return (
-    <Tag className={cn(poster.className, "font-light uppercase [text-wrap:balance]", className)}>
+    <>
       {text.plain}
       {text.accent ? (
         <>
@@ -65,7 +64,7 @@ function PosterHeading({
           <em className="text-hellfire not-italic">{text.accent}</em>
         </>
       ) : null}
-    </Tag>
+    </>
   );
 }
 
@@ -120,146 +119,170 @@ function StructuredData({
   );
 }
 
+/** The small sigil label that opens a body section. */
+function Marker({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <p
+      className={cn(
+        "font-sigil text-[11px] font-medium tracking-[0.3em] text-hellfire uppercase",
+        className,
+      )}
+    >
+      {children}
+    </p>
+  );
+}
+
 /**
- * A numbered chapter: the heading rail on the left, the evidence beside it.
- * With no `aside` the prose takes the full measure.
+ * One body section on the shared rail: hairline border below, generous
+ * vertical air, an optional marker naming the plate.
  */
 export function JobSection({
-  index,
-  eyebrow,
-  heading,
-  children,
-  aside,
-}: {
-  index: string;
-  eyebrow: string;
-  heading: JobHeading;
-  children: ReactNode;
-  aside?: ReactNode;
-}) {
-  return (
-    <section className="border-line-g border-b px-5 py-20 sm:px-8 sm:py-24">
-      <div
-        className={cn(
-          "mx-auto grid w-full max-w-6xl min-w-0 gap-12",
-          aside ? "lg:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)] lg:gap-16" : "",
-        )}
-      >
-        <div className={aside ? undefined : "max-w-3xl"}>
-          <Eyebrow className="mb-5">
-            {index} · {eyebrow}
-          </Eyebrow>
-          <PosterHeading
-            as="h2"
-            text={heading}
-            className="mb-7 max-w-[18ch] text-[clamp(27px,3.8vw,44px)] leading-[1.05] text-bone"
-          />
-          <div className="space-y-5 text-[16px] leading-8 text-ash">{children}</div>
-        </div>
-        {aside ? <div className="min-w-0 lg:pt-14">{aside}</div> : null}
-      </div>
-    </section>
-  );
-}
-
-/** The red plate: one per page, carrying the mechanics in numbered strokes. */
-export function JobPlate({
-  index,
-  eyebrow,
-  heading,
-  lede,
-  items,
-}: {
-  index: string;
-  eyebrow: string;
-  heading: JobHeading;
-  lede?: string;
-  items: { title: string; body: string }[];
-}) {
-  return (
-    <section className="relative overflow-hidden bg-plate text-void">
-      <div className="relative mx-auto w-full max-w-6xl px-5 py-20 sm:px-8 sm:py-24">
-        <p className="mb-5 font-sigil text-[12px] font-medium tracking-[0.3em] uppercase">
-          {index} · {eyebrow}
-        </p>
-        <h2
-          className={cn(
-            poster.className,
-            "mb-5 max-w-[20ch] text-[clamp(28px,4.6vw,50px)] leading-[1.02] font-light uppercase",
-          )}
-        >
-          {heading.plain}
-          {heading.accent ? ` ${heading.accent}` : ""}
-        </h2>
-        {lede ? (
-          <p className="mb-14 max-w-[58ch] text-[16px] leading-7 text-void/80">{lede}</p>
-        ) : (
-          <div className="mb-14" />
-        )}
-        <div className="grid min-w-0 gap-y-12 sm:grid-cols-2 sm:gap-x-12 lg:gap-x-16">
-          {items.map((item, itemIndex) => (
-            <div key={item.title} className="border-t-2 border-void pt-5">
-              <h3 className="mb-3 flex items-baseline gap-3 font-sigil text-[12px] font-medium tracking-[0.22em] uppercase">
-                <span aria-hidden className="opacity-60">
-                  {String(itemIndex + 1).padStart(2, "0")}
-                </span>
-                {item.title}
-              </h3>
-              <p className="max-w-[46ch] text-[15px] leading-7">{item.body}</p>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  );
-}
-
-/** A shell figure on the char plate — commands and output the page vouches for. */
-export function JobShellFigure({
-  title,
+  marker,
   children,
   className,
 }: {
-  title: string;
+  marker?: string;
   children: ReactNode;
   className?: string;
 }) {
   return (
-    <figure className={cn("min-w-0 border border-line-strong bg-char", className)}>
-      <figcaption className="flex items-center justify-between gap-4 border-line-g border-b px-5 py-3.5 font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
-        <span>{title}</span>
+    <section className={cn("border-line-g border-b px-5 py-20 sm:px-8 sm:py-28", className)}>
+      <div className="mx-auto w-full max-w-5xl">
+        {marker ? <Marker className="mb-10">{marker}</Marker> : null}
+        {children}
+      </div>
+    </section>
+  );
+}
+
+/** A section heading in the poster face. */
+export function JobH2({ text, className }: { text: JobHeading; className?: string }) {
+  return (
+    <h2
+      className={cn(
+        poster.className,
+        "max-w-[24ch] text-[clamp(26px,3.6vw,42px)] leading-[1.06] font-light text-bone uppercase [text-wrap:balance]",
+        className,
+      )}
+    >
+      <HeadingText text={text} />
+    </h2>
+  );
+}
+
+/** Three problems, three columns: a rule, a word, a claim. */
+export function JobTrio({ items }: { items: { title: string; body: ReactNode }[] }) {
+  return (
+    <div className="grid gap-12 md:grid-cols-3 md:gap-8 lg:gap-12">
+      {items.map((item) => (
+        <div key={item.title} className="border-t border-line-strong pt-6">
+          <h3
+            className={cn(
+              poster.className,
+              "mb-4 text-[21px] leading-[1.1] font-light text-bone uppercase",
+            )}
+          >
+            {item.title}
+          </h3>
+          <p className="max-w-[46ch] text-[15px] leading-7 text-ash">{item.body}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Mechanics in one breath: a single quiet strip of fragments, one link out. */
+export function JobMechanics({
+  fragments,
+  link,
+}: {
+  fragments: string[];
+  link: { label: string; href: string };
+}) {
+  return (
+    <section className="border-line-g border-b px-5 py-14 sm:px-8 sm:py-16">
+      <div className="mx-auto w-full max-w-5xl">
+        <p className="flex flex-wrap items-baseline gap-x-4 gap-y-2.5 font-sigil text-[12px] tracking-[0.14em] text-bone uppercase sm:text-[13px]">
+          {fragments.map((fragment, index) => (
+            <span key={fragment} className="flex items-baseline gap-x-4">
+              {index > 0 ? (
+                <span aria-hidden className="text-hellfire">
+                  ·
+                </span>
+              ) : null}
+              <span>{fragment}</span>
+            </span>
+          ))}
+        </p>
+        <Link
+          href={link.href}
+          className="mt-6 inline-block font-sigil text-[11px] tracking-[0.18em] text-ash uppercase underline decoration-line-strong underline-offset-8 transition-colors hover:text-bone hover:decoration-ember"
+        >
+          {link.label}
+        </Link>
+      </div>
+    </section>
+  );
+}
+
+/** A small shell figure — commands the page vouches for, set quietly. */
+export function JobShellAside({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <figure className="min-w-0 border border-line-g bg-char">
+      <figcaption className="border-line-g border-b px-5 py-3 font-sigil text-[10px] tracking-[0.22em] text-ash uppercase">
+        {title}
       </figcaption>
-      <div className="min-w-0 overflow-x-auto px-5 py-5 font-sigil text-[12px] leading-7 text-bone sm:px-6 sm:text-[13px]">
+      <div className="min-w-0 overflow-x-auto px-5 py-4 font-sigil text-[12px] leading-7 text-bone">
         {children}
       </div>
     </figure>
   );
 }
 
-function FaqSection({
-  index,
-  heading,
-  faq,
-}: {
-  index: string;
-  heading: JobHeading;
-  faq: JobFaqItem[];
-}) {
+/** The page's single CTA moment: the one-liner, the slab, the quiet door. */
+export function JobStart({ heading, aside }: { heading: JobHeading; aside?: ReactNode }) {
+  return (
+    <JobSection marker="Start">
+      <div
+        className={cn(
+          "grid gap-14",
+          aside ? "lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)] lg:items-center" : "",
+        )}
+      >
+        <div>
+          <JobH2 text={heading} />
+          <InstallOneLiner className="mt-10" />
+          <div className="mt-9 flex flex-col items-start gap-6 sm:flex-row sm:items-center sm:gap-9">
+            <Link href="/signup" className={CTA_SLAB}>
+              Sign up free
+              <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
+            </Link>
+            <Link href="/download" className={CTA_QUIET}>
+              Install the daemon
+            </Link>
+          </div>
+        </div>
+        {aside ? <div className="min-w-0">{aside}</div> : null}
+      </div>
+    </JobSection>
+  );
+}
+
+/** The FAQ, kept visually quiet: small type, generous space, no ceremony. */
+function FaqQuiet({ faq }: { faq: JobFaqItem[] }) {
   if (faq.length === 0) return null;
   return (
     <section className="border-line-g border-b px-5 py-20 sm:px-8 sm:py-24">
-      <div className="mx-auto w-full max-w-6xl">
-        <Eyebrow className="mb-5">{index} · FAQ</Eyebrow>
-        <PosterHeading
-          as="h2"
-          text={heading}
-          className="mb-12 max-w-[20ch] text-[clamp(27px,3.8vw,44px)] leading-[1.05] text-bone"
-        />
-        <dl className="grid gap-x-16 gap-y-10 lg:grid-cols-2">
+      <div className="mx-auto w-full max-w-5xl">
+        <p className="mb-12 font-sigil text-[11px] font-medium tracking-[0.3em] text-ash uppercase">
+          Questions
+        </p>
+        <dl className="max-w-[72ch] space-y-10">
           {faq.map((item) => (
-            <div key={item.q} className="border-line-g border-t pt-6">
-              <dt className="mb-3 text-[17px] font-medium text-bone">{item.q}</dt>
-              <dd className="text-[15px] leading-7 text-ash">{item.a}</dd>
+            <div key={item.q}>
+              <dt className="mb-2.5 text-[15px] font-medium text-bone">{item.q}</dt>
+              <dd className="text-[14px] leading-7 text-ash">{item.a}</dd>
             </div>
           ))}
         </dl>
@@ -272,8 +295,10 @@ function RelatedRack({ related }: { related: JobRelatedLink[] }) {
   if (related.length === 0) return null;
   return (
     <section className="border-line-g border-b px-5 py-16 sm:px-8 sm:py-20">
-      <div className="mx-auto w-full max-w-6xl">
-        <Eyebrow className="mb-8">Adjacent pages</Eyebrow>
+      <div className="mx-auto w-full max-w-5xl">
+        <p className="mb-8 font-sigil text-[11px] font-medium tracking-[0.3em] text-ash uppercase">
+          Related
+        </p>
         <div className="border-line-g border-t">
           {related.map((entry) => (
             <Link
@@ -285,7 +310,7 @@ function RelatedRack({ related }: { related: JobRelatedLink[] }) {
                 {entry.family}
               </span>
               <span className="min-w-0">
-                <span className="font-medium text-[16px] text-bone">{entry.title}</span>{" "}
+                <span className="font-medium text-[15px] text-bone">{entry.title}</span>{" "}
                 <span className="text-[14px] text-ash">— {entry.blurb}</span>
               </span>
               <ArrowRight
@@ -300,34 +325,103 @@ function RelatedRack({ related }: { related: JobRelatedLink[] }) {
   );
 }
 
-function ClosingSheet({ heading, body }: { heading: JobHeading; body: string }) {
+/**
+ * The hero: a full-bleed ink print, dimmed hard, under exactly two text
+ * elements. The breadcrumb stays small at the top; the type hangs at the
+ * bottom of the frame so the print breathes through the middle.
+ */
+function HeroInk({
+  crumbs,
+  pageName,
+  title,
+  sub,
+  ink,
+}: {
+  crumbs: JobCrumb[];
+  pageName: string;
+  title: JobHeading;
+  sub: string;
+  ink: JobHeroInk;
+}) {
   return (
-    <section className="border-t-2 border-hellfire bg-bone text-void">
-      <div className="mx-auto flex w-full max-w-3xl flex-col items-center px-5 py-24 text-center sm:px-8">
-        <PosterHeading
-          as="h2"
-          text={heading}
-          className="mb-6 text-[clamp(30px,5.4vw,56px)] leading-[1.0]"
+    <header className="relative isolate overflow-hidden border-line-g border-b">
+      <div aria-hidden className="absolute inset-0">
+        <HeroInkVideo video={ink.video} poster={ink.poster} />
+        <Image
+          src={ink.poster}
+          alt=""
+          aria-hidden
+          fill
+          priority
+          sizes="100vw"
+          className="pointer-events-none hidden object-cover motion-reduce:block"
         />
-        <p className="mb-10 max-w-[56ch] text-[16px] leading-7 text-void/75">{body}</p>
-        <InstallOneLiner className="mb-9" />
-        <div className="flex flex-col items-center gap-6 sm:flex-row sm:gap-9">
-          <Link
-            href="/signup"
-            className="group inline-flex items-center justify-center gap-2 rounded-sm bg-void px-7 py-[15px] font-sigil text-[13px] font-medium tracking-[0.14em] text-bone uppercase transition-colors hover:bg-char"
+        {/* The dim: hard everywhere the type lives, easing only through the
+         * upper-middle band so the print shows without competing. */}
+        <div
+          className="absolute inset-0"
+          style={{
+            background:
+              "linear-gradient(180deg, rgba(0,0,0,.95) 0%, rgba(0,0,0,.72) 30%, rgba(0,0,0,.68) 48%, rgba(0,0,0,.9) 74%, rgba(0,0,0,.97) 100%)",
+          }}
+        />
+        {/* The hellfire glow, rising under the headline. */}
+        <div
+          className="absolute inset-0"
+          style={{
+            background:
+              "radial-gradient(ellipse 64% 58% at 16% 100%, rgba(225,30,21,.32), transparent 66%)",
+          }}
+        />
+      </div>
+      <RegistrationMarks />
+
+      <div className="relative z-10 mx-auto flex min-h-[84svh] w-full max-w-[1440px] flex-col items-start px-5 pt-5 pb-16 sm:px-8 sm:pt-7 sm:pb-20">
+        <nav aria-label="Breadcrumb">
+          <ol className="flex flex-wrap items-center gap-x-2.5 gap-y-1 font-sigil text-[11px] tracking-[0.18em] text-ash uppercase">
+            <li>
+              <Link href="/" className="transition-colors hover:text-bone">
+                spawnd
+              </Link>
+            </li>
+            {crumbs.map((crumb) => (
+              <li key={crumb.href} className="flex items-center gap-2.5">
+                <span aria-hidden className="text-line-strong">
+                  /
+                </span>
+                <Link href={crumb.href} className="transition-colors hover:text-bone">
+                  {crumb.name}
+                </Link>
+              </li>
+            ))}
+            <li aria-current="page" className="flex items-center gap-2.5">
+              <span aria-hidden className="text-line-strong">
+                /
+              </span>
+              <span className="text-ember">{pageName}</span>
+            </li>
+          </ol>
+        </nav>
+
+        <div className="mt-auto pt-28">
+          <h1
+            className={cn(
+              poster.className,
+              "max-w-[19ch] text-[clamp(34px,5.4vw,72px)] leading-[1.06] font-light text-bone uppercase [text-wrap:balance]",
+            )}
           >
-            Sign up free
-            <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
-          </Link>
-          <Link
-            href="/security"
-            className="inline-flex items-center justify-center gap-2 font-sigil text-[12px] tracking-[0.18em] text-void uppercase underline decoration-hellfire/70 underline-offset-8 transition-colors hover:text-hellfire"
-          >
-            Read the threat model
-          </Link>
+            {title.plain}
+            {title.accent ? (
+              // The accent takes its own line: the keyword lands as the punch.
+              <em className="block text-hellfire not-italic">{title.accent}</em>
+            ) : null}
+          </h1>
+          <p className="mt-6 max-w-[52ch] text-[clamp(16px,1.7vw,19px)] leading-8 text-ash">
+            {sub}
+          </p>
         </div>
       </div>
-    </section>
+    </header>
   );
 }
 
@@ -335,94 +429,33 @@ export function JobPage({
   crumbs,
   pageName,
   canonicalPath,
-  heading,
-  lede,
-  vignette,
+  hero,
   children,
   faq,
-  faqHeading = { plain: "The questions a fleet raises." },
-  faqIndex = "04",
   related,
-  closing,
 }: {
   crumbs: JobCrumb[];
   pageName: string;
   canonicalPath: string;
-  heading: JobHeading;
-  lede: ReactNode;
-  vignette: ReactNode;
+  hero: { title: JobHeading; sub: string; ink: JobHeroInk };
   children: ReactNode;
   faq: JobFaqItem[];
-  faqHeading?: JobHeading;
-  faqIndex?: string;
   related: JobRelatedLink[];
-  closing: { heading: JobHeading; body: string };
 }) {
   return (
     <main className="grimoire min-h-vv overflow-x-clip">
       <StructuredData crumbs={crumbs} pageName={pageName} canonicalPath={canonicalPath} faq={faq} />
       <Masthead />
-
-      <header className="relative isolate overflow-hidden border-line-g border-b px-5 pt-14 pb-16 sm:px-8 sm:pt-20 sm:pb-20">
-        <div
-          aria-hidden
-          className="absolute inset-0"
-          style={{
-            background:
-              "radial-gradient(ellipse 55% 60% at 18% 0%, rgba(225,30,21,.14), transparent 62%)",
-          }}
-        />
-        <RegistrationMarks />
-        <div className="relative z-10 mx-auto w-full max-w-6xl">
-          <nav aria-label="Breadcrumb" className="mb-8">
-            <ol className="flex flex-wrap items-center gap-x-2.5 gap-y-1 font-sigil text-[11px] tracking-[0.18em] text-ash uppercase">
-              <li>
-                <Link href="/" className="transition-colors hover:text-bone">
-                  spawnd
-                </Link>
-              </li>
-              {crumbs.map((crumb) => (
-                <li key={crumb.href} className="flex items-center gap-2.5">
-                  <span aria-hidden className="text-line-strong">
-                    /
-                  </span>
-                  <Link href={crumb.href} className="transition-colors hover:text-bone">
-                    {crumb.name}
-                  </Link>
-                </li>
-              ))}
-              <li aria-current="page" className="flex items-center gap-2.5">
-                <span aria-hidden className="text-line-strong">
-                  /
-                </span>
-                <span className="text-ember">{pageName}</span>
-              </li>
-            </ol>
-          </nav>
-          <PosterHeading
-            as="h1"
-            text={heading}
-            className="mb-7 max-w-[24ch] text-[clamp(33px,5.3vw,58px)] leading-[1.04] text-bone"
-          />
-          <div className="max-w-[60ch] space-y-5 text-[17px] leading-8 text-ash">{lede}</div>
-          <div className="mt-10 flex flex-col items-start gap-6 sm:flex-row sm:items-center sm:gap-9">
-            <Link href="/signup" className={CTA_SLAB}>
-              Sign up free
-              <ArrowRight className="size-4 transition-transform group-hover:translate-x-0.5" />
-            </Link>
-            <Link href="/download" className={CTA_QUIET}>
-              Install the daemon
-            </Link>
-          </div>
-          <div className="mt-16">{vignette}</div>
-        </div>
-      </header>
-
+      <HeroInk
+        crumbs={crumbs}
+        pageName={pageName}
+        title={hero.title}
+        sub={hero.sub}
+        ink={hero.ink}
+      />
       {children}
-
-      <FaqSection index={faqIndex} heading={faqHeading} faq={faq} />
+      <FaqQuiet faq={faq} />
       <RelatedRack related={related} />
-      <ClosingSheet heading={closing.heading} body={closing.body} />
       <Colophon />
     </main>
   );
