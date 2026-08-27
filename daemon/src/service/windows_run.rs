@@ -212,10 +212,14 @@ pub(super) fn status(config_dir: &Path) -> super::ServiceStatus {
             None => crate::state::pid_matches_current_daemon(pid, None),
         }
     });
+    let (stdout_log, stderr_log) = super::service_log_paths(config_dir);
     super::ServiceStatus {
         installed,
         running,
-        name: format!("Run watchdog {}", value_name(config_dir)),
+        name: value_name(config_dir),
+        manager: Some("run-watchdog".into()),
+        stdout_log,
+        stderr_log,
     }
 }
 
@@ -682,6 +686,8 @@ fn registry_set_string(path: &str, name: &str, value: &str, kind: Option<u32>) -
         .context("created registry key was not returned")?;
     let name = to_utf16(name);
     let words = to_utf16(value);
+    // SAFETY: words is a live contiguous UTF-16 allocation; the byte view has
+    // identical lifetime/alignment requirements and includes the NUL word.
     let bytes = unsafe {
         std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * size_of::<u16>())
     };

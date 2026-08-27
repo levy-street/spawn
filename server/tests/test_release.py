@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -38,6 +39,31 @@ def _stage_manifest(tmp_path, *, corrupt_worker: bool = False) -> dict:
     }
     (prebuilt / "manifest.json").write_text(json.dumps(manifest))
     return manifest
+
+
+def _stage_targets(tmp_path: Path, targets: list[str]) -> tuple[dict, Path]:
+    prebuilt = tmp_path / "daemon" / "target" / "prebuilt"
+    manifest_targets = {}
+    for target in targets:
+        target_dir = prebuilt / target
+        target_dir.mkdir(parents=True)
+        suffix = ".exe" if target.startswith("windows-") else ""
+        spawnd = f"verified-spawnd-{target}".encode()
+        worker = f"verified-worker-{target}".encode()
+        (target_dir / f"spawnd{suffix}").write_bytes(spawnd)
+        (target_dir / f"spawn-worker{suffix}").write_bytes(worker)
+        manifest_targets[target] = {
+            "spawnd_sha256": hashlib.sha256(spawnd).hexdigest(),
+            "spawn_worker_sha256": hashlib.sha256(worker).hexdigest(),
+        }
+    manifest = {
+        "commit": COMMIT,
+        "tree": DAEMON_TREE,
+        "version": "0.1.0+g111111111111",
+        "targets": manifest_targets,
+    }
+    (prebuilt / "manifest.json").write_text(json.dumps(manifest))
+    return manifest, prebuilt
 
 
 def _configure_release(monkeypatch, tmp_path) -> None:
@@ -181,6 +207,47 @@ def test_daemon_target_maps_windows_x64_aliases(arch):
 
 def test_windows_is_a_supported_daemon_manifest_target():
     assert "windows-x86_64" in release.SUPPORTED_DAEMON_TARGETS
+
+
+def test_windows_manifest_validates_the_canonical_exe_pair(tmp_path):
+    _stage_targets(tmp_path, ["windows-x86_64"])
+
+    manifest = release.read_prebuilt_manifest(repo_root=tmp_path)
+
+    assert manifest is not None
+    assert set(manifest.targets) == {"windows-x86_64"}
+
+
+def test_windows_manifest_rejects_extensionless_binaries(tmp_path):
+    _, prebuilt = _stage_targets(tmp_path, ["windows-x86_64"])
+    target = prebuilt / "windows-x86_64"
+    (target / "spawnd.exe").rename(target / "spawnd")
+    (target / "spawn-worker.exe").rename(target / "spawn-worker")
+
+    assert release.read_prebuilt_manifest(repo_root=tmp_path) is None
+
+
+@pytest.mark.parametrize("failure", ["missing-worker", "worker-hash"])
+def test_windows_manifest_rejects_an_incomplete_or_mismatched_pair(tmp_path, failure):
+    manifest, prebuilt = _stage_targets(tmp_path, ["windows-x86_64"])
+    if failure == "missing-worker":
+        (prebuilt / "windows-x86_64" / "spawn-worker.exe").unlink()
+    else:
+        manifest["targets"]["windows-x86_64"]["spawn_worker_sha256"] = "0" * 64
+        (prebuilt / "manifest.json").write_text(json.dumps(manifest))
+
+    assert release.read_prebuilt_manifest(repo_root=tmp_path) is None
+
+
+def test_an_unknown_sixth_target_invalidates_the_whole_manifest(tmp_path):
+    manifest, prebuilt = _stage_targets(tmp_path, list(release.SUPPORTED_DAEMON_TARGETS))
+    manifest["targets"]["windows-aarch64"] = {
+        "spawnd_sha256": "0" * 64,
+        "spawn_worker_sha256": "0" * 64,
+    }
+    (prebuilt / "manifest.json").write_text(json.dumps(manifest))
+
+    assert release.read_prebuilt_manifest(repo_root=tmp_path) is None
 
 
 def test_windows_host_update_state_and_payload_use_the_windows_target():

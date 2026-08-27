@@ -42,6 +42,7 @@ pub fn instance_name(config_dir: &Path) -> String {
     instance_tag(config_dir).trim_start_matches('-').to_string()
 }
 
+#[cfg(not(windows))]
 fn state_dir(tag: &str) -> Result<PathBuf> {
     let base = dirs::state_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))
@@ -465,6 +466,19 @@ pub struct ServiceStatus {
     pub installed: bool,
     pub running: bool,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manager: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout_log: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr_log: Option<String>,
+}
+
+fn service_log_paths(config_dir: &Path) -> (Option<String>, Option<String>) {
+    let log = instance_log_path(config_dir)
+        .ok()
+        .map(|path| path.join("spawnd.log").display().to_string());
+    (log.clone(), log)
 }
 
 /// Inspect the per-instance service without changing it.
@@ -484,6 +498,9 @@ pub fn status(config_dir: &Path) -> ServiceStatus {
             installed,
             running,
             name: format!("launchd {label}"),
+            manager: None,
+            stdout_log: None,
+            stderr_log: None,
         };
     }
     #[cfg(target_os = "linux")]
@@ -500,28 +517,18 @@ pub fn status(config_dir: &Path) -> ServiceStatus {
             installed,
             running,
             name: format!("systemd {name}"),
+            manager: None,
+            stdout_log: None,
+            stderr_log: None,
         };
     }
     #[cfg(windows)]
     {
         let mode = preferred_mode(config_dir);
-        let mut status = match mode {
+        let status = match mode {
             ServiceMode::Task => windows_task::status(config_dir),
             ServiceMode::Run => windows_run::status(config_dir),
         };
-        if mode == ServiceMode::Task {
-            match crate::state::read(config_dir)
-                .ok()
-                .flatten()
-                .and_then(|state| state.task_breakaway_denied)
-            {
-                Some(true) => status
-                    .name
-                    .push_str(" — worker breakaway denied; Run watchdog available"),
-                None if status.installed => status.name.push_str(" — worker breakaway unconfirmed"),
-                _ => {}
-            }
-        }
         return status;
     }
     #[allow(unreachable_code)]
@@ -529,6 +536,9 @@ pub fn status(config_dir: &Path) -> ServiceStatus {
         installed: false,
         running: false,
         name: "unsupported".into(),
+        manager: None,
+        stdout_log: None,
+        stderr_log: None,
     }
 }
 

@@ -464,7 +464,7 @@ async fn wait_for_credential_change_with(
 pub async fn run(server_cli: Option<String>, _args: RunArgs) -> Result<()> {
     install_sighup_handler();
     #[cfg(windows)]
-    crate::service::prepare_background_log(&crate::config::config_dir()?)?;
+    crate::service::refresh_user_path()?;
     crate::update::prepare_probation()?;
     crate::update::arm_probation_deadline();
     crate::update::refresh_worker_pair_status().await;

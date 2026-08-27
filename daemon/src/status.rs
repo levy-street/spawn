@@ -279,6 +279,9 @@ mod tests {
                     installed: true,
                     running: true,
                     name: "launchd app.spawn.spawnd.3f9ac3e1".into(),
+                    manager: None,
+                    stdout_log: None,
+                    stderr_log: None,
                 },
                 sessions: 2,
                 version: "0.4.2".into(),
@@ -298,5 +301,22 @@ mod tests {
         assert_eq!(json["instances"][0]["sessions"], 2);
         assert_eq!(json["instances"][0]["service"]["running"], true);
         assert_eq!(json["instances"][0]["browser_pins"], 3);
+    }
+
+    #[test]
+    fn windows_service_diagnostics_keep_exact_manager_name_and_log_fields() {
+        let service = crate::service::ServiceStatus {
+            installed: true,
+            running: true,
+            name: "SPAWN D spawnd-deadbeef".into(),
+            manager: Some("task-scheduler".into()),
+            stdout_log: Some(r"C:\Users\alice\AppData\Local\spawn\logs\deadbeef\spawnd.log".into()),
+            stderr_log: Some(r"C:\Users\alice\AppData\Local\spawn\logs\deadbeef\spawnd.log".into()),
+        };
+
+        let json = serde_json::to_value(service).unwrap();
+        assert_eq!(json["manager"], "task-scheduler");
+        assert_eq!(json["name"], "SPAWN D spawnd-deadbeef");
+        assert_eq!(json["stdout_log"], json["stderr_log"]);
     }
 }

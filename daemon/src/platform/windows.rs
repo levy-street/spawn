@@ -125,6 +125,8 @@ impl CurrentSid {
             || required == 0
             || io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
         {
+            // SAFETY: token is the owned handle returned above and has not yet
+            // been closed.
             unsafe {
                 CloseHandle(token);
             }
@@ -142,6 +144,8 @@ impl CurrentSid {
                 &mut required,
             )
         };
+        // SAFETY: token is the owned handle returned above and is closed
+        // exactly once after the final token query.
         unsafe {
             CloseHandle(token);
         }
@@ -174,6 +178,7 @@ impl CurrentSid {
         // SAFETY: the scan above established the initialized string length.
         let value = String::from_utf16(unsafe { std::slice::from_raw_parts(string_sid, len) })
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "current SID is not UTF-16"));
+        // SAFETY: ConvertSidToStringSidW allocated this exact pointer.
         unsafe {
             LocalFree(string_sid.cast());
         }
@@ -282,6 +287,8 @@ fn create_file_new(path: &Path) -> io::Result<File> {
 
 fn validate_handle(file: &File, directory: Option<bool>) -> io::Result<()> {
     let handle = file.as_raw_handle().cast();
+    // SAFETY: a zeroed BY_HANDLE_FILE_INFORMATION is valid output storage for
+    // GetFileInformationByHandle.
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
     // SAFETY: file owns a live handle and info is a correctly sized out value.
     if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
@@ -332,6 +339,8 @@ fn validate_handle_acl(handle: HANDLE, directory: bool) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(status as i32));
     }
     let descriptor = SecurityDescriptor(descriptor);
+    // SAFETY: owner belongs to the live security descriptor and current owns
+    // a valid current-token SID.
     if owner.is_null() || unsafe { EqualSid(owner, current.as_ptr()) } == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -356,6 +365,7 @@ fn validate_handle_acl(handle: HANDLE, directory: bool) -> io::Result<()> {
             "private path has no DACL",
         ));
     }
+    // SAFETY: a zeroed ACL_SIZE_INFORMATION is valid output storage.
     let mut acl_info: ACL_SIZE_INFORMATION = unsafe { zeroed() };
     // SAFETY: dacl belongs to the live descriptor and acl_info is correctly
     // sized for the requested information class.
@@ -383,6 +393,8 @@ fn validate_handle_acl(handle: HANDLE, directory: bool) -> io::Result<()> {
     }
     // ACCESS_ALLOWED_ACE_TYPE is zero. Avoid adding the broad SystemServices
     // feature solely for this stable Win32 ABI constant.
+    // SAFETY: GetAce returned a non-null pointer to the sole ACE in the live
+    // ACL; ACCESS_ALLOWED_ACE is the layout required by AceType zero.
     let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
     let ace_sid = (&ace.SidStart as *const u32).cast_mut().cast();
     let expected_flags = if directory {
@@ -390,11 +402,14 @@ fn validate_handle_acl(handle: HANDLE, directory: bool) -> io::Result<()> {
     } else {
         0
     };
+    // SAFETY: ace_sid points inside the live ACCESS_ALLOWED_ACE and current
+    // owns a valid current-token SID.
+    let ace_matches_current = unsafe { EqualSid(ace_sid, current.as_ptr()) } != 0;
     if ace.Header.AceType != 0
         || ace.Header.AceFlags != expected_flags
         || ace.Header.AceFlags & INHERITED_ACE as u8 != 0
         || ace.Mask != FILE_ALL_ACCESS
-        || unsafe { EqualSid(ace_sid, current.as_ptr()) } == 0
+        || !ace_matches_current
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -550,6 +565,8 @@ pub fn owned_by_current_user(file: &File) -> io::Result<bool> {
         return Err(io::Error::from_raw_os_error(status as i32));
     }
     let _descriptor = SecurityDescriptor(descriptor);
+    // SAFETY: owner belongs to the live descriptor and current owns a valid
+    // current-token SID.
     Ok(!owner.is_null() && unsafe { EqualSid(owner, current.as_ptr()) } != 0)
 }
 
@@ -635,6 +652,7 @@ pub fn fsync_dir(_dir: &Dir) -> io::Result<()> {
 }
 
 fn file_information(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+    // SAFETY: a zeroed BY_HANDLE_FILE_INFORMATION is valid output storage.
     let mut info = unsafe { zeroed() };
     // SAFETY: file owns a live handle and info is a valid out value.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
@@ -644,6 +662,7 @@ fn file_information(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
 }
 
 pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    // SAFETY: a zeroed FILE_ID_INFO is valid output storage for FileIdInfo.
     let mut info: FILE_ID_INFO = unsafe { zeroed() };
     // SAFETY: info has the exact size required for FileIdInfo.
     if unsafe {
@@ -754,11 +773,15 @@ pub fn enable_vt_output() -> Option<VtOutputGuard> {
         return None;
     }
     let mut saved = 0_u32;
+    // SAFETY: saved is a valid out value and handle is borrowed, not closed.
     if unsafe { GetConsoleMode(handle, &mut saved) } == 0 {
         return None;
     }
     let vt = vt_output_mode(saved);
+    // SAFETY: handle is a console output handle and saved is restored on Drop.
     if unsafe { SetConsoleMode(handle, vt) } == 0 {
+        // SAFETY: handle is the same borrowed console output handle and saved
+        // came from its successful GetConsoleMode call.
         let _ = unsafe { SetConsoleMode(handle, saved) };
         return None;
     }
@@ -783,11 +806,15 @@ impl Drop for VtOutputGuard {
 }
 
 pub fn terminal_size() -> Option<(u16, u16)> {
+    // SAFETY: GetStdHandle returns a borrowed console handle.
     let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return None;
     }
+    // SAFETY: a zeroed CONSOLE_SCREEN_BUFFER_INFO is valid output storage.
     let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { zeroed() };
+    // SAFETY: handle is a borrowed live console output handle and info is a
+    // correctly sized out value.
     if unsafe { GetConsoleScreenBufferInfo(handle, &mut info) } == 0 {
         return None;
     }
@@ -801,6 +828,8 @@ pub fn open_url(url: &str) -> io::Result<()> {
     std::thread::Builder::new()
         .name("spawnd-browser-opener".into())
         .spawn(move || {
+            // SAFETY: this thread has not initialized COM; the matching
+            // CoUninitialize is held by ComGuard on every successful path.
             let initialize = unsafe {
                 CoInitializeEx(
                     null(),
@@ -815,12 +844,16 @@ pub fn open_url(url: &str) -> io::Result<()> {
             struct ComGuard;
             impl Drop for ComGuard {
                 fn drop(&mut self) {
+                    // SAFETY: this guard exists only after successful COM
+                    // initialization on this same thread.
                     unsafe { CoUninitialize() };
                 }
             }
             let _com = ComGuard;
             let operation = wide(OsStr::new("open"));
             let url = wide(OsStr::new(&url));
+            // SAFETY: every string pointer is NUL-terminated and live for the
+            // synchronous call; null HWND/directory/parameters are permitted.
             let result = unsafe {
                 ShellExecuteW(
                     null_mut(),
@@ -858,6 +891,8 @@ pub fn process_alive(pid: u32) -> bool {
     }
     // SAFETY: handle is live and closed immediately after the nonblocking poll.
     let wait = unsafe { WaitForSingleObject(handle, 0) };
+    // SAFETY: handle is the owned OpenProcess handle and is closed exactly
+    // once after the poll.
     unsafe {
         CloseHandle(handle);
     }

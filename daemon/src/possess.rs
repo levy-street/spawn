@@ -154,6 +154,54 @@ enum ResumeAction {
     NewAccount,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum BreakawayAction {
+    UseRun,
+    NotNow,
+}
+
+fn breakaway_options() -> [(&'static str, &'static str); 2] {
+    [
+        (
+            "Use the Run watchdog",
+            "keeps sessions alive across daemon restarts",
+        ),
+        ("Not now", "leave this instance unchanged"),
+    ]
+}
+
+fn breakaway_choice(picked: usize) -> BreakawayAction {
+    if picked == 0 {
+        BreakawayAction::UseRun
+    } else {
+        BreakawayAction::NotNow
+    }
+}
+
+fn install_background(dir: &Path, server: &Url, mode: Option<service::ServiceMode>) -> Result<()> {
+    #[cfg(windows)]
+    service::ensure_user_path()?;
+    match mode {
+        Some(mode) => service::install_with_mode(dir, server.as_str(), mode),
+        None => service::install(dir, server.as_str()),
+    }
+}
+
+fn offer_breakaway_fallback(dir: &Path, server: &Url) -> Result<()> {
+    if !service::needs_fallback_offer(dir) {
+        return Ok(());
+    }
+    let picked = crate::tui::prompt_choice(
+        "TASK SCHEDULER CANNOT PRESERVE SESSIONS",
+        &breakaway_options(),
+        0,
+    );
+    if breakaway_choice(picked) == BreakawayAction::UseRun {
+        service::install_with_mode(dir, server.as_str(), service::ServiceMode::Run)?;
+    }
+    Ok(())
+}
+
 /// Ask what this run is for, instead of resuming and printing commands.
 ///
 /// Everything on this menu used to be a line of prose ending in a command to
@@ -210,7 +258,11 @@ fn resume_choice(picked: usize, single: bool) -> ResumeAction {
 }
 
 /// Leave the accounts as they are and make sure their daemons are running.
-async fn keep_possessed(existing: &[PathBuf], server_cli: Option<String>) -> Result<()> {
+async fn keep_possessed(
+    existing: &[PathBuf],
+    server_cli: Option<String>,
+    service_mode: Option<service::ServiceMode>,
+) -> Result<()> {
     if existing.len() == 1 {
         let dir = &existing[0];
         std::env::set_var("SPAWN_CONFIG_DIR", dir);
@@ -222,7 +274,9 @@ async fn keep_possessed(existing: &[PathBuf], server_cli: Option<String>) -> Res
                 .and_then(|creds| creds.server_url.as_deref()),
         )?;
         print_starting_step();
-        service::install(dir, server.as_str())
+        install_background(dir, &server, service_mode)
+            .map_err(|error| login::background_service_error(&error))?;
+        offer_breakaway_fallback(dir, &server)
             .map_err(|error| login::background_service_error(&error))?;
         println!("{}", resume_line(&instance_account(dir)));
         print_auth_note(dir);
@@ -248,10 +302,15 @@ fn possess_ui() -> crate::tui::Ui {
 pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()> {
     force_file_store();
     crate::tui::print_logo();
+    let service_mode = args
+        .service_mode
+        .as_deref()
+        .map(str::parse::<service::ServiceMode>)
+        .transpose()?;
 
     // Explicit --config-dir → that dir is the instance, no per-account derivation.
     if explicit_config_dir() {
-        return possess_dir(server_cli, args, &config::config_dir()?).await;
+        return possess_dir(server_cli, args, &config::config_dir()?, service_mode).await;
     }
 
     let base = default_base()?;
@@ -261,7 +320,7 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
     let stage_login = staged_login_required(existing.len(), args.new_account);
     if !existing.is_empty() && !stage_login {
         match resume_action(&existing) {
-            ResumeAction::Keep => return keep_possessed(&existing, server_cli).await,
+            ResumeAction::Keep => return keep_possessed(&existing, server_cli, service_mode).await,
             ResumeAction::Reauthorize => {
                 let dir = existing[0].clone();
                 std::env::set_var("SPAWN_CONFIG_DIR", &dir);
@@ -351,12 +410,14 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
 
     std::env::set_var("SPAWN_CONFIG_DIR", &final_dir);
     ui.begin(3, "[ RUNNING ]");
-    service::install(&final_dir, server.as_str()).map_err(|error| {
+    install_background(&final_dir, &server, service_mode).map_err(|error| {
         ui.fail(3, "not started");
         login::background_service_error(&error)
     })?;
     ui.complete(3, "running");
     ui.finish();
+    offer_breakaway_fallback(&final_dir, &server)
+        .map_err(|error| login::background_service_error(&error))?;
     print_possessed(&machine, &account);
     Ok(())
 }
@@ -436,7 +497,12 @@ fn possessed_plain_lines(machine: &str, account: &str) -> Vec<String> {
     lines
 }
 
-async fn possess_dir(server_cli: Option<String>, args: PossessArgs, dir: &Path) -> Result<()> {
+async fn possess_dir(
+    server_cli: Option<String>,
+    args: PossessArgs,
+    dir: &Path,
+    service_mode: Option<service::ServiceMode>,
+) -> Result<()> {
     // Unreadable credentials mean "not possessed" here, exactly as before:
     // the login flow rebuilds them.
     let stored = creds::load().ok();
@@ -472,7 +538,7 @@ async fn possess_dir(server_cli: Option<String>, args: PossessArgs, dir: &Path) 
             print_starting_step();
         }
     }
-    service::install(dir, server.as_str()).map_err(|error| {
+    install_background(dir, &server, service_mode).map_err(|error| {
         if let Some(ui) = &ui {
             ui.fail(3, "not started");
         }
@@ -482,6 +548,8 @@ async fn possess_dir(server_cli: Option<String>, args: PossessArgs, dir: &Path) 
         ui.complete(3, "running");
         ui.finish();
     }
+    offer_breakaway_fallback(dir, &server)
+        .map_err(|error| login::background_service_error(&error))?;
     if resumed {
         crate::tui::log_line(&format!(
             "possessed. daemon running in the background ({}).",
@@ -593,6 +661,9 @@ async fn exorcise_one(explicit: Option<&Url>, dir: &Path) {
         tracing::warn!(%error, "removing the background service");
     }
     let _ = creds::logout().await;
+    if let Err(error) = service::purge_local_instance_data(dir) {
+        tracing::warn!(%error, "removing local SPAWN D runtime state");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -862,6 +933,23 @@ mod tests {
         assert_eq!(resume_choice(0, false), ResumeAction::Keep);
         assert_eq!(resume_choice(1, false), ResumeAction::NewAccount);
         assert_eq!(resume_choice(2, false), ResumeAction::Update);
+    }
+
+    #[test]
+    fn the_breakaway_offer_maps_the_safe_default_and_decline() {
+        assert_eq!(
+            breakaway_options(),
+            [
+                (
+                    "Use the Run watchdog",
+                    "keeps sessions alive across daemon restarts"
+                ),
+                ("Not now", "leave this instance unchanged"),
+            ]
+        );
+        assert_eq!(breakaway_choice(0), BreakawayAction::UseRun);
+        assert_eq!(breakaway_choice(1), BreakawayAction::NotNow);
+        assert_eq!(breakaway_choice(usize::MAX), BreakawayAction::NotNow);
     }
 
     /// No terminal, no question: a re-run of the same install command with
