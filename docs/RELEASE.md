@@ -269,6 +269,20 @@ DMGs plus `.app.tar.gz` updater payloads. Its Apple credentials are
 `APPLE_API_PRIVATE_KEY`, `APPLE_API_KEY`, and `APPLE_API_ISSUER`. The workflow
 does not publish a release and it never receives the Tauri updater private key.
 
+`workflow_dispatch` only lists workflows that exist on the default branch, so
+until `desktop.yml` has been merged the run has to be made locally with the
+same inputs: a clean worktree at the release commit, the six credentials in
+the environment (`APPLE_API_KEY_PATH` pointing at the `.p8` on disk, the
+rustup toolchain's `bin` first on `PATH` where Homebrew's Rust shadows it),
+then in `desktop/`, for `aarch64-apple-darwin` and `x86_64-apple-darwin`:
+`npx tauri build --config src-tauri/tauri.ci.conf.json --target <triple>`,
+`xcrun notarytool submit --wait` and `xcrun stapler staple` on the DMG (Tauri
+signs it but does not notarize it), and
+`COPYFILE_DISABLE=1 tar -czf SPAWN-D_<version>_<platform>.app.tar.gz -C <bundle>/macos "SPAWN D.app"`.
+Then continue from step 1 below. Note that `spctl --assess` reports a
+notarized, stapled build as "rejected" on some Macs; `syspolicy_check
+distribution` and `xcrun stapler validate` are the checks to trust.
+
 Updater promotion is deliberately local and offline:
 
 1. Download both workflow artifacts and verify their checksums, code signatures,
