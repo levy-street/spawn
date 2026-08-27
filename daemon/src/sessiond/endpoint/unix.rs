@@ -13,9 +13,59 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use nix::fcntl::{fcntl, flock, FcntlArg, FdFlag, FlockArg};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf, SocketAddr};
+use tokio::net::{UnixDatagram, UnixListener, UnixStream};
+use tokio::time::Instant;
+use uuid::Uuid;
+
+use super::{Endpoint, LockAttempt};
+use crate::sessiond::wire;
+
+#[derive(Clone, Debug)]
+pub struct EndpointInner {
+    dir: PathBuf,
+    socket: PathBuf,
+    lifecycle: PathBuf,
+}
+
+impl EndpointInner {
+    pub(super) fn new(dir: &Path, _tag: &str, session_id: Uuid) -> Result<Self> {
+        let socket = dir.join(format!("{session_id}.sock"));
+        let lifecycle = socket.with_extension("lifecycle.sock");
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            socket,
+            lifecycle,
+        })
+    }
+
+    pub(super) fn main_arg(&self) -> &std::ffi::OsStr {
+        self.socket.as_os_str()
+    }
+
+    pub(super) fn lifecycle_arg(&self) -> &std::ffi::OsStr {
+        self.lifecycle.as_os_str()
+    }
+
+    pub(super) fn metadata_dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+pub type Reservation = WorkerLock;
+pub type RawReservation = RawFd;
+pub type WorkerSideStream = UnixStream;
+pub type SupervisorSideStream = UnixStream;
+pub type WorkerReadHalf = OwnedReadHalf;
+pub type WorkerWriteHalf = OwnedWriteHalf;
+pub type SupervisorReadHalf = OwnedReadHalf;
+pub type SupervisorWriteHalf = OwnedWriteHalf;
+pub type MainListener = UnixListener;
+pub type LifecycleListener = UnixDatagram;
 
 #[derive(Debug)]
 pub struct WorkerLock {
@@ -23,12 +73,6 @@ pub struct WorkerLock {
     // description is inherited by the worker, closing the supervisor's copy
     // must not release the lock held by the child.
     file: File,
-}
-
-#[derive(Debug)]
-pub enum LockAttempt {
-    Acquired(WorkerLock),
-    Busy,
 }
 
 #[derive(Clone, Debug)]
@@ -65,7 +109,7 @@ pub fn validate_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn try_reserve(socket: &Path) -> Result<LockAttempt> {
+fn try_reserve_path(socket: &Path) -> Result<LockAttempt> {
     let path = lock_path(socket);
     let file = OpenOptions::new()
         .read(true)
@@ -81,6 +125,21 @@ pub fn try_reserve(socket: &Path) -> Result<LockAttempt> {
         Err(nix::errno::Errno::EWOULDBLOCK) => Ok(LockAttempt::Busy),
         Err(error) => Err(error).context("locking worker endpoint reservation"),
     }
+}
+
+pub(super) fn try_reserve(endpoint: &Endpoint) -> Result<LockAttempt> {
+    try_reserve_path(&endpoint.inner.socket)
+}
+
+/// # Safety
+/// `raw` must be an owned descriptor inherited by this process.
+pub(super) unsafe fn adopt_reservation(
+    raw: RawReservation,
+    endpoint: &Endpoint,
+) -> Result<Reservation> {
+    // SAFETY: the caller transfers ownership; `from_inherited` validates the
+    // descriptor and its lock-path identity before returning it.
+    unsafe { WorkerLock::from_inherited(raw, &endpoint.inner.socket) }
 }
 
 impl WorkerLock {
@@ -202,6 +261,216 @@ pub fn validate_stream_peer(stream: &tokio::net::UnixStream) -> Result<()> {
     Ok(())
 }
 
+pub struct BoundWorkerEndpoints {
+    pub main: MainListener,
+    pub lifecycle: LifecycleListener,
+    pub identity: EndpointIdentitySet,
+}
+
+pub struct EndpointIdentitySet {
+    ordinary: EndpointIdentity,
+    lifecycle: EndpointIdentity,
+}
+
+impl EndpointIdentitySet {
+    pub fn cleanup(&self) -> Result<()> {
+        self.ordinary.cleanup()?;
+        self.lifecycle.cleanup()?;
+        Ok(())
+    }
+}
+
+pub(super) fn remove_stale(endpoint: &Endpoint, _held: &Reservation) -> Result<()> {
+    remove_stale_socket(&endpoint.inner.socket)?;
+    remove_stale_socket(&endpoint.inner.lifecycle)
+}
+
+pub(super) fn bind_worker(
+    endpoint: &Endpoint,
+    _held: &Reservation,
+    _instance_id: Uuid,
+) -> Result<BoundWorkerEndpoints> {
+    let main =
+        UnixListener::bind(&endpoint.inner.socket).context("binding ordinary worker endpoint")?;
+    let ordinary = secure_bound_socket(&endpoint.inner.socket)?;
+    let lifecycle = match UnixDatagram::bind(&endpoint.inner.lifecycle) {
+        Ok(listener) => listener,
+        Err(error) => {
+            drop(ordinary);
+            return Err(error).context("binding lifecycle worker endpoint");
+        }
+    };
+    let lifecycle_identity = secure_bound_socket(&endpoint.inner.lifecycle)?;
+    Ok(BoundWorkerEndpoints {
+        main,
+        lifecycle,
+        identity: EndpointIdentitySet {
+            ordinary,
+            lifecycle: lifecycle_identity,
+        },
+    })
+}
+
+pub(super) async fn accept_main(listener: &mut MainListener) -> Result<WorkerSideStream> {
+    let (stream, _) = listener.accept().await.context("accepting connection")?;
+    Ok(stream)
+}
+
+pub(super) async fn connect_main(
+    endpoint: &Endpoint,
+    deadline: Instant,
+) -> Result<SupervisorSideStream> {
+    loop {
+        match UnixStream::connect(&endpoint.inner.socket).await {
+            Ok(stream) => {
+                if validate_private_socket(&endpoint.inner.socket).is_ok()
+                    && validate_stream_peer(&stream).is_ok()
+                {
+                    return Ok(stream);
+                }
+                if Instant::now() >= deadline {
+                    return Err(anyhow!("worker endpoint validation failed"));
+                }
+            }
+            Err(_) if Instant::now() >= deadline => {
+                return Err(anyhow!("worker endpoint unreachable"));
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+pub(super) fn split_worker(stream: WorkerSideStream) -> (WorkerReadHalf, WorkerWriteHalf) {
+    stream.into_split()
+}
+
+pub(super) fn split_supervisor(
+    stream: SupervisorSideStream,
+) -> (SupervisorReadHalf, SupervisorWriteHalf) {
+    stream.into_split()
+}
+
+pub(super) fn validate_worker_peer(stream: &WorkerSideStream) -> Result<()> {
+    validate_stream_peer(stream)
+}
+
+pub(super) fn validate_supervisor_peer(stream: &SupervisorSideStream) -> Result<()> {
+    validate_stream_peer(stream)
+}
+
+pub(super) fn endpoint_exists(endpoint: &Endpoint) -> bool {
+    endpoint.inner.socket.exists()
+}
+
+pub(super) fn discover_ids(dir: &Path, _tag: &str) -> Vec<Uuid> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let stem = name.strip_suffix(".sock")?;
+            Uuid::parse_str(stem).ok()
+        })
+        .collect()
+}
+
+pub struct LifecycleExchange {
+    request: [u8; wire::LIFECYCLE_REQUEST_LEN + 1],
+    len: usize,
+    peer: SocketAddr,
+}
+
+impl LifecycleExchange {
+    pub fn request(&self) -> (&[u8], usize) {
+        (&self.request[..self.len], self.len)
+    }
+}
+
+pub(super) async fn receive_lifecycle(
+    listener: &mut LifecycleListener,
+) -> Result<LifecycleExchange> {
+    let mut request = [0u8; wire::LIFECYCLE_REQUEST_LEN + 1];
+    let (len, peer) = listener
+        .recv_from(&mut request)
+        .await
+        .context("receiving lifecycle request")?;
+    Ok(LifecycleExchange { request, len, peer })
+}
+
+pub(super) async fn acknowledge_lifecycle(
+    listener: &mut LifecycleListener,
+    exchange: LifecycleExchange,
+    ack: u8,
+) -> Result<()> {
+    let Some(peer_path) = exchange.peer.as_pathname() else {
+        return Ok(());
+    };
+    listener
+        .try_send_to(&[ack], peer_path)
+        .map(|_| ())
+        .context("acknowledging lifecycle request")
+}
+
+pub(super) async fn send_lifecycle(
+    endpoint: &Endpoint,
+    request: &[u8; wire::LIFECYCLE_REQUEST_LEN],
+    deadline: Instant,
+) -> Result<u8> {
+    loop {
+        if Instant::now() >= deadline {
+            bail!("worker lifecycle delivery deadline exceeded");
+        }
+        if validate_private_socket(&endpoint.inner.lifecycle).is_err() {
+            bail!("worker lifecycle endpoint validation failed");
+        }
+        let client_path = endpoint.inner.dir.join(format!(
+            ".lifecycle-client-{}-{}.sock",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let socket = UnixDatagram::bind(&client_path)
+            .map_err(|_| anyhow!("worker lifecycle client unavailable"))?;
+        let _client_identity = secure_bound_socket(&client_path)
+            .map_err(|_| anyhow!("worker lifecycle client validation failed"))?;
+        if socket.connect(&endpoint.inner.lifecycle).is_err() {
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                Instant::now() + Duration::from_millis(10),
+            ))
+            .await;
+            continue;
+        }
+        match tokio::time::timeout_at(deadline, socket.send(request)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    Instant::now() + Duration::from_millis(10),
+                ))
+                .await;
+                continue;
+            }
+            Err(_) => bail!("worker lifecycle delivery deadline exceeded"),
+        }
+        let mut ack = [0u8; 2];
+        let attempt_deadline = std::cmp::min(deadline, Instant::now() + Duration::from_millis(100));
+        let received = tokio::time::timeout_at(attempt_deadline, socket.recv(&mut ack)).await;
+        let Ok(Ok(1)) = received else {
+            tokio::time::sleep_until(std::cmp::min(
+                deadline,
+                Instant::now() + Duration::from_millis(10),
+            ))
+            .await;
+            continue;
+        };
+        return Ok(ack[0]);
+    }
+}
+
 impl EndpointIdentity {
     /// Unlink only if this pathname still names the exact socket we created.
     /// A delayed old worker therefore cannot remove a replacement endpoint.
@@ -291,14 +560,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         ensure_private_dir(root.path()).unwrap();
         let socket = root.path().join("session.sock");
-        let first = match try_reserve(&socket).unwrap() {
+        let first = match try_reserve_path(&socket).unwrap() {
             LockAttempt::Acquired(lock) => lock,
             LockAttempt::Busy => panic!("first reservation was busy"),
         };
-        assert!(matches!(try_reserve(&socket).unwrap(), LockAttempt::Busy));
+        assert!(matches!(
+            try_reserve_path(&socket).unwrap(),
+            LockAttempt::Busy
+        ));
         drop(first);
         assert!(matches!(
-            try_reserve(&socket).unwrap(),
+            try_reserve_path(&socket).unwrap(),
             LockAttempt::Acquired(_)
         ));
     }
