@@ -32,7 +32,7 @@
 //! is unreadable and is unlinked on the next start. docs/SESSIOND.md
 //! discusses host-key and device-sealed alternatives.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -130,13 +130,8 @@ impl ScrollbackLog {
                 DEFAULT_MAX_LOG_BYTES
             );
         }
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("chmod 700 {}", dir.display()))?;
-        }
+        crate::platform::create_private_dir_all(dir)
+            .with_context(|| format!("creating and validating {}", dir.display()))?;
         // A fresh worker means a fresh key: ciphertext from a previous run is
         // unreadable by construction. Unlink it rather than let it accrete.
         if let Ok(entries) = fs::read_dir(dir) {
@@ -399,16 +394,8 @@ impl ScrollbackLog {
             self.segments.remove(0);
         }
 
-        let file = OpenOptions::new()
-            .create_new(true)
-            .append(true)
-            .open(&path)
+        let file = crate::platform::create_private_file_new(&path)
             .with_context(|| format!("creating {}", path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
         let physical_charge = match segment_physical_charge(&path) {
             Ok(charge) => charge,
             Err(error) => {

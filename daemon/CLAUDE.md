@@ -16,6 +16,9 @@ src/
                  private to the binary
   bin/           spawn-worker.rs and cross-runtime-crypto.rs (vector
                  generator)
+  platform/      OS leaf operations shared by daemon features: private files,
+                 atomic moves, executable names, console modes, browser launch,
+                 process liveness, and file identity
   sessiond/      supervisor↔worker shared pieces: wire protocol, terminal
                  emulator, scrollback, worker runtime
   <feature>.rs   one module per concern: run.rs (register + main loop),
@@ -27,7 +30,8 @@ src/
                  (`Ui`), panels, logo, and the single-line `Spinner`
   state.rs       atomic local daemon heartbeat contract (`state.json`)
   status.rs      human/JSON status across local account instances
-  doctor.rs      the ordered 14-check local health report
+  doctor.rs      the ordered 14-check local health report, plus the Windows
+                 agent-shell dependency diagnostic
   lifecycle.rs   reconnect, disconnect, logout, and local reset commands
   version.rs     the version the daemon reports; build.rs stamps the source
                  commit into it (0.1.0+g<commit>)
@@ -45,6 +49,49 @@ vendor/          exact upstream crate sources for narrowly documented patches;
 - Wire changes: daemon frames must stay compatible with
   `server/spawn_server/ws/daemon.py` — change both sides in the same commit,
   and regenerate the `proto/` vectors when signed material changes.
+
+## Platform boundaries and Windows paths
+
+OS syscalls and security policy that a feature module should not have to
+understand live in `src/platform/`. Unix implementations preserve the existing
+mode, uid, nofollow, terminal, and rename contracts. Windows `unsafe` Win32
+calls stay concentrated in `platform/windows.rs`; feature modules operate on
+verified files/directories and opaque identities instead of raw handles.
+
+Windows storage is local, not roaming:
+
+- config and the default single instance: `%LOCALAPPDATA%\spawn`
+- account instances: `%LOCALAPPDATA%\spawn\<account_id>`
+- service state/runtime files: `%LOCALAPPDATA%\spawn\state`
+- installed command shims/binaries: `%LOCALAPPDATA%\spawn\bin`
+- user-home expansion: `%USERPROFILE%`
+- upload and preview staging: unique owner-DACL-protected children below
+  `%TEMP%`, held through verified directory capabilities
+
+`SPAWN_CONFIG_DIR` remains an exact override on every OS. Never fall back from
+`dirs::state_dir() == None` to `%USERPROFILE%\.local\state` on Windows, and
+reserve Roaming AppData for data deliberately designed to roam. Private
+Windows directories/files use a protected, canonical current-user-only DACL;
+existing objects are validated and never silently repaired, and reparse points
+or filesystems where ownership/DACLs cannot be proved fail closed.
+
+Paths sent over daemon frames remain native strings. Windows drive roots
+(`C:\`) and UNC roots (`\\server\share\`) are accepted where that feature is
+supported, compared case-insensitively for containment, and never converted by
+prepending `/`. Upload roots deliberately reject UNC and device namespaces in
+the first Windows release because their reparse, identity, hard-link, and
+atomic-move guarantees have not been established.
+
+Construct every installed binary name with `std::env::consts::EXE_SUFFIX` via
+the platform helpers. Tags precede the suffix: `spawnd.prev.exe`,
+`spawnd.tmp.<pid>.exe`, and `spawnd.failed.<pid>.exe`; `spawnd.updating` is data
+and has no executable suffix. Do not use `with_extension` for these names.
+
+Windows v1 intentionally does not provide host-side desktop reveal/open,
+Quick Look-style preview rendering, or Linux systemd/cgroup CPU focus scopes.
+Their advertised capabilities stay false/no-op. These are product limits, not
+reasons to make shared file staging, metrics, emulator, or crypto code
+Windows-incompatible.
 
 ## Terminal output
 

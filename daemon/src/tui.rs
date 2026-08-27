@@ -492,9 +492,13 @@ impl UiState {
 static ACTIVE: Mutex<Option<Arc<Mutex<UiState>>>> = Mutex::new(None);
 
 fn with_active<T>(edit: impl FnOnce(&mut UiState) -> T) -> Option<T> {
-    let active = ACTIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let active = ACTIVE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let state = active.as_ref()?;
-    let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if state.finished {
         return None;
     }
@@ -528,6 +532,7 @@ pub struct Ui {
     state: Option<Arc<Mutex<UiState>>>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    _vt: Option<crate::platform::VtOutputGuard>,
 }
 
 impl Ui {
@@ -541,8 +546,17 @@ impl Ui {
                 state: None,
                 stop: Arc::new(AtomicBool::new(true)),
                 thread: None,
+                _vt: None,
             };
         }
+        let Some(vt) = crate::platform::enable_vt_output() else {
+            return Self {
+                state: None,
+                stop: Arc::new(AtomicBool::new(true)),
+                thread: None,
+                _vt: None,
+            };
+        };
         let state = Arc::new(Mutex::new(UiState {
             title: title.to_owned(),
             steps: steps
@@ -584,12 +598,14 @@ impl Ui {
                 }
             })
         };
-        *ACTIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(Arc::clone(&state));
+        *ACTIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&state));
         Self {
             state: Some(state),
             stop,
             thread: Some(thread),
+            _vt: Some(vt),
         }
     }
 
@@ -989,35 +1005,10 @@ pub fn render_choice_row(
     let dots = width
         .saturating_sub(head_width + display_width(&detail) + 1)
         .max(1);
-    format!("{head}{dots_style}{}{dots_style:#} {tail}", g.dot.repeat(dots))
-}
-
-/// Put the terminal in raw mode for the duration, and restore it on every exit
-/// path — including a panic, since `Drop` still runs while unwinding.
-///
-/// Leaving a terminal raw is worse than any prompt failing: the shell that
-/// comes back has no echo and no line editing.
-struct RawMode {
-    saved: nix::sys::termios::Termios,
-}
-
-impl RawMode {
-    fn enter() -> Option<Self> {
-        use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
-        let stdin = std::io::stdin();
-        let saved = tcgetattr(&stdin).ok()?;
-        let mut raw = saved.clone();
-        cfmakeraw(&mut raw);
-        tcsetattr(&stdin, SetArg::TCSANOW, &raw).ok()?;
-        Some(Self { saved })
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        use nix::sys::termios::{tcsetattr, SetArg};
-        let _ = tcsetattr(std::io::stdin(), SetArg::TCSANOW, &self.saved);
-    }
+    format!(
+        "{head}{dots_style}{}{dots_style:#} {tail}",
+        g.dot.repeat(dots)
+    )
 }
 
 /// A pick list driven by the arrow keys, with Enter to confirm.
@@ -1029,10 +1020,13 @@ pub fn prompt_choice(title: &str, options: &[(&str, &str)], default_index: usize
     if !std::io::stdin().is_terminal() || options.is_empty() {
         return default_index;
     }
-    match RawMode::enter() {
-        Some(raw) => arrow_choice(title, options, default_index, raw),
-        None => numbered_choice(title, options, default_index),
-    }
+    let Some(raw) = crate::platform::enable_raw_mode() else {
+        return numbered_choice(title, options, default_index);
+    };
+    let Some(vt) = crate::platform::enable_vt_output() else {
+        return numbered_choice(title, options, default_index);
+    };
+    arrow_choice(title, options, default_index, raw, vt)
 }
 
 fn choice_frame(
@@ -1066,7 +1060,8 @@ fn arrow_choice(
     title: &str,
     options: &[(&str, &str)],
     default_index: usize,
-    raw: RawMode,
+    raw: crate::platform::RawModeGuard,
+    vt: crate::platform::VtOutputGuard,
 ) -> usize {
     use std::io::Read;
     let styled = styled_stdout();
@@ -1108,6 +1103,7 @@ fn arrow_choice(
             // Raw mode suppresses signal generation, so ^C arrives as a byte.
             b"\x03" => {
                 drop(raw);
+                drop(vt);
                 let mut out = anstream::stdout();
                 let _ = writeln!(out);
                 let _ = out.flush();
@@ -1125,6 +1121,7 @@ fn arrow_choice(
         }
     }
     drop(raw);
+    drop(vt);
     selected
 }
 
@@ -1168,18 +1165,8 @@ pub const MIN_FRAME_COLUMNS: usize = 60;
 /// Above this a frame stops reading as a unit on a wide monitor.
 const MAX_FRAME_COLUMNS: usize = 92;
 
-#[cfg(unix)]
 fn ioctl_columns() -> Option<usize> {
-    // COLUMNS is a shell variable and usually is not exported, so ask the tty.
-    use nix::libc;
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
-    (ok == 0 && size.ws_col > 0).then_some(size.ws_col as usize)
-}
-
-#[cfg(not(unix))]
-fn ioctl_columns() -> Option<usize> {
-    None
+    crate::platform::terminal_size().map(|(columns, _)| columns as usize)
 }
 
 fn utf8_locale() -> bool {
@@ -1338,12 +1325,22 @@ mod tests {
         };
         let row = roomy.frame_lines().pop().expect("a status row");
         assert!(row.contains("ctrl-c to stop"));
-        assert!(row.contains("min    "), "at least MIN_HINT_GAP columns between");
+        assert!(
+            row.contains("min    "),
+            "at least MIN_HINT_GAP columns between"
+        );
     }
 
     #[test]
     fn a_step_row_fills_the_width_with_leader_dots() {
-        let row = render_step(StepState::Running, 2, "Approve in browser", "[ WAIT ]", 60, false);
+        let row = render_step(
+            StepState::Running,
+            2,
+            "Approve in browser",
+            "[ WAIT ]",
+            60,
+            false,
+        );
         assert_eq!(display_width(&row), 60);
         assert!(row.contains("2. Approve in browser"));
         assert!(row.contains("[ WAIT ]"));
@@ -1406,7 +1403,10 @@ mod tests {
                 &[
                     String::new(),
                     dim("open this link on any device:", true),
-                    bold("http://localhost:3000/device?ref=dGfl0YzRgEM6YrY9JVVDVPaIRWu8", true),
+                    bold(
+                        "http://localhost:3000/device?ref=dGfl0YzRgEM6YrY9JVVDVPaIRWu8",
+                        true,
+                    ),
                     String::new(),
                     bold("press Enter to open it here", true),
                 ],
@@ -1442,7 +1442,8 @@ mod tests {
             "spawn.a-very-long-internal-hostname.example.test:8443",
         ] {
             for width in [40usize, 60, 72, 92] {
-                let row = render_choice_row(true, 1, label, "where this command came from", width, false);
+                let row =
+                    render_choice_row(true, 1, label, "where this command came from", width, false);
                 assert!(
                     display_width(&row) <= width,
                     "row {} wide in a {width} frame: {row:?}",
@@ -1455,13 +1456,22 @@ mod tests {
     #[test]
     fn word_wrapping_respects_the_width_and_breaks_an_oversized_word() {
         let wrapped = wrap_words("the link carries this key; your browser checks it", 20);
-        assert!(wrapped.iter().all(|line| display_width(line) <= 20), "{wrapped:?}");
-        assert_eq!(wrapped.join(" "), "the link carries this key; your browser checks it");
+        assert!(
+            wrapped.iter().all(|line| display_width(line) <= 20),
+            "{wrapped:?}"
+        );
+        assert_eq!(
+            wrapped.join(" "),
+            "the link carries this key; your browser checks it"
+        );
 
         // A word with no break opportunity must still be forced apart.
         let long = "x".repeat(50);
         let forced = wrap_words(&format!("see {long} now"), 20);
-        assert!(forced.iter().all(|line| display_width(line) <= 20), "{forced:?}");
+        assert!(
+            forced.iter().all(|line| display_width(line) <= 20),
+            "{forced:?}"
+        );
         assert!(forced.concat().contains(&long));
     }
 
@@ -1474,7 +1484,10 @@ mod tests {
         );
         // A narrow terminal must report its real width, not a padded one, or
         // every frame line wraps and the rewind math drifts.
-        assert!(MIN_FRAME_COLUMNS > 20, "the stand-down threshold must bite first");
+        assert!(
+            MIN_FRAME_COLUMNS > 20,
+            "the stand-down threshold must bite first"
+        );
     }
 
     #[test]
@@ -1488,7 +1501,10 @@ mod tests {
 
         // The unselected row recedes entirely: its label carries the same dim
         // colour as its detail, so nothing on it competes with the choice.
-        let grey = format!("{}", Style::new().fg_color(Some(AnsiColor::BrightBlack.into())));
+        let grey = format!(
+            "{}",
+            Style::new().fg_color(Some(AnsiColor::BrightBlack.into()))
+        );
         assert!(
             other.contains(&format!("{grey}2. Host yourself")),
             "the unselected label must be grey: {other:?}"
@@ -1497,7 +1513,10 @@ mod tests {
             !chosen.contains(&format!("{grey}1. spawnd.dev")),
             "the selected label must not be grey: {chosen:?}"
         );
-        assert!(chosen.contains(glyphs().running), "the marker is still there");
+        assert!(
+            chosen.contains(glyphs().running),
+            "the marker is still there"
+        );
     }
 
     #[test]

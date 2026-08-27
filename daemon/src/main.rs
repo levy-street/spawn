@@ -26,6 +26,7 @@ mod host_preview;
 mod host_signal;
 mod lifecycle;
 mod login;
+mod platform;
 mod possess;
 mod proto;
 mod pty;
