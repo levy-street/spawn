@@ -44,6 +44,31 @@ export function desktopReleaseFromPayload(payload: unknown): DesktopRelease | nu
   return { version: value.version, tree: value.tree, platforms: [...new Set(platforms)] };
 }
 
+export interface LocalDesktopBuild {
+  version: string;
+  platforms: DesktopPlatform[];
+  /** A digest of the image itself — what tells two builds of one version apart. */
+  build: string;
+}
+
+/**
+ * The `/desktop-build` answer: a disk image sitting in `public/desktop/`,
+ * reported by the development-only route of the same name. It carries no tree
+ * because there is nothing to prove — it is a file on disk, not a release.
+ */
+export function localDesktopBuildFromPayload(payload: unknown): LocalDesktopBuild | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const value = payload as Record<string, unknown>;
+  if (typeof value.version !== "string" || value.version.trim() === "") return null;
+  if (!Array.isArray(value.platforms)) return null;
+  const platforms = value.platforms.filter(
+    (item): item is DesktopPlatform => item === "darwin-aarch64" || item === "darwin-x86_64",
+  );
+  if (platforms.length === 0) return null;
+  if (typeof value.build !== "string" || value.build.trim() === "") return null;
+  return { version: value.version, platforms: [...new Set(platforms)], build: value.build };
+}
+
 export function desktopDownloadUrl(
   origin: string,
   version: string,
@@ -120,6 +145,30 @@ export function detectOS(platform: string, userAgent: string, maxTouchPoints = 0
 /** The phones, where the daemon install line is meaningless. */
 export function isMobileOS(os: PlatformOS): os is "ios" | "android" {
   return os === "ios" || os === "android";
+}
+
+/**
+ * The token SPAWN D's macOS app puts on the end of its webview's user agent
+ * (`desktop/src-tauri/src/window.rs`).
+ */
+export const DESKTOP_SHELL_TOKEN = "SpawnDesktop/";
+
+/**
+ * Whether this page is the desktop app's product face rather than a browser
+ * tab.
+ *
+ * Inside that window the marketing site is a dead end: there is no address bar
+ * and no way back, so a masthead, a colophon or a brand mark that goes to the
+ * lander walks someone out of the app and leaves them there. Everything that
+ * leads out is dropped when this is true.
+ *
+ * The agent carries the signal because it survives every navigation the
+ * product makes — a query parameter does not — and because the app cannot
+ * reach the page any other way: the product face is the web app, and it gets
+ * no IPC.
+ */
+export function isDesktopShell(userAgent: string): boolean {
+  return userAgent.includes(DESKTOP_SHELL_TOKEN);
 }
 
 /**

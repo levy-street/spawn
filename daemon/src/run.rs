@@ -1739,6 +1739,10 @@ async fn dispatch_loop(
                     *registered_at.lock().expect("registered timestamp lock") =
                         Some(Instant::now());
                     crate::update::registered(out_tx).await;
+                    // Spawned, never awaited: this can sit for two minutes
+                    // waiting on a person, and the dispatch loop is how every
+                    // other frame on this socket gets handled.
+                    tokio::spawn(prime_macos_permissions_once());
                     if let Some(access_token) = access_token {
                         let persisted = run_isolated_credential_blocking(move || {
                             creds::replace_access_token(&access_token)
@@ -3053,6 +3057,66 @@ async fn handle_session_create(
     register_attached(session_id, launched, registry, rtc_sessions, out_tx, true).await;
 }
 
+/// Ask macOS for the folders this daemon reads — once, here, and never again.
+///
+/// Here because registration is the first instant the daemon is a real host,
+/// and because this is the process whose grant it has to be: TCC files consent
+/// against the responsible process, so priming from a child of the desktop app
+/// would file it under the app and this daemon would be asked all over again
+/// the first time it read a folder.
+///
+/// It does not ask on its own initiative. A screen has to have said what is
+/// coming first, and the app says so by leaving a request marker before the
+/// service gets this far — without one, nobody is driving (an `install.sh`
+/// run, a possession over SSH) and the ordinary lazy prompts are left alone.
+/// See `permissions.rs` for the handshake and why it lives where it does.
+async fn prime_macos_permissions_once() {
+    if !cfg!(target_os = "macos") || std::env::var_os(spawnd::permissions::NO_PRIME_ENV).is_some() {
+        return;
+    }
+    let Some(shared) = spawnd::permissions::shared_dir() else {
+        return;
+    };
+    if spawnd::permissions::report_path(&shared).exists() {
+        return;
+    }
+    if !spawnd::permissions::request_path(&shared).exists() {
+        tracing::debug!("no consent screen is driving; leaving macOS folder consent to first use");
+        return;
+    }
+    if !spawnd::permissions::someone_is_at_this_screen() {
+        // A request marker from an app on somebody else's login, or left behind
+        // by one that is gone. A dialog nobody can answer is auto-refused and
+        // the refusal kept, which is the one outcome worth avoiding.
+        tracing::debug!("no console session; ignoring the consent request");
+        return;
+    }
+
+    let report = match spawnd::permissions::await_consent(&shared).await {
+        spawnd::permissions::Consent::Prime => spawnd::permissions::prime().await,
+        spawnd::permissions::Consent::Decline => spawnd::permissions::declined_report(),
+        spawnd::permissions::Consent::Unanswered => {
+            // The window was closed, or nobody chose. Nothing is asked and
+            // nothing is written, so the next possession may offer the gate
+            // again and the person keeps every prompt they would have had.
+            tracing::info!("consent screen went unanswered; nothing was asked");
+            spawnd::permissions::clear_gate(&shared);
+            return;
+        }
+    };
+
+    tracing::info!(
+        permissions = spawnd::permissions::summary(&report),
+        "asked macOS for the folders this daemon reads"
+    );
+    if let Err(error) = spawnd::permissions::write_report(&shared, &report) {
+        // Not fatal: the cost of failing to record is asking again next time,
+        // which is worse manners but not a broken host.
+        tracing::warn!(error = %error, "could not record the macOS consent answers");
+    }
+    spawnd::permissions::clear_gate(&shared);
+}
+
 /// The user's login shell: `$SHELL` from the daemon's environment when it
 /// names an executable file, else the platform default.
 fn resolve_login_shell(env: &BTreeMap<String, String>) -> String {
@@ -3420,7 +3484,10 @@ mod tests {
     fn the_proven_account_outranks_the_servers_word_for_chain_scope() {
         let local = account_id_bytes("9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f").expect("uuid");
         let server = "1f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f";
-        assert_eq!(resolve_daemon_account(Some(local), Some(server)), Some(local));
+        assert_eq!(
+            resolve_daemon_account(Some(local), Some(server)),
+            Some(local)
+        );
         assert_eq!(resolve_daemon_account(Some(local), None), Some(local));
         assert_eq!(
             resolve_daemon_account(None, Some(server)),

@@ -492,9 +492,13 @@ impl UiState {
 static ACTIVE: Mutex<Option<Arc<Mutex<UiState>>>> = Mutex::new(None);
 
 fn with_active<T>(edit: impl FnOnce(&mut UiState) -> T) -> Option<T> {
-    let active = ACTIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let active = ACTIVE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let state = active.as_ref()?;
-    let mut state = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if state.finished {
         return None;
     }
@@ -584,8 +588,9 @@ impl Ui {
                 }
             })
         };
-        *ACTIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(Arc::clone(&state));
+        *ACTIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&state));
         Self {
             state: Some(state),
             stop,
@@ -989,7 +994,10 @@ pub fn render_choice_row(
     let dots = width
         .saturating_sub(head_width + display_width(&detail) + 1)
         .max(1);
-    format!("{head}{dots_style}{}{dots_style:#} {tail}", g.dot.repeat(dots))
+    format!(
+        "{head}{dots_style}{}{dots_style:#} {tail}",
+        g.dot.repeat(dots)
+    )
 }
 
 /// Put the terminal in raw mode for the duration, and restore it on every exit
@@ -1338,12 +1346,22 @@ mod tests {
         };
         let row = roomy.frame_lines().pop().expect("a status row");
         assert!(row.contains("ctrl-c to stop"));
-        assert!(row.contains("min    "), "at least MIN_HINT_GAP columns between");
+        assert!(
+            row.contains("min    "),
+            "at least MIN_HINT_GAP columns between"
+        );
     }
 
     #[test]
     fn a_step_row_fills_the_width_with_leader_dots() {
-        let row = render_step(StepState::Running, 2, "Approve in browser", "[ WAIT ]", 60, false);
+        let row = render_step(
+            StepState::Running,
+            2,
+            "Approve in browser",
+            "[ WAIT ]",
+            60,
+            false,
+        );
         assert_eq!(display_width(&row), 60);
         assert!(row.contains("2. Approve in browser"));
         assert!(row.contains("[ WAIT ]"));
@@ -1406,7 +1424,10 @@ mod tests {
                 &[
                     String::new(),
                     dim("open this link on any device:", true),
-                    bold("http://localhost:3000/device?ref=dGfl0YzRgEM6YrY9JVVDVPaIRWu8", true),
+                    bold(
+                        "http://localhost:3000/device?ref=dGfl0YzRgEM6YrY9JVVDVPaIRWu8",
+                        true,
+                    ),
                     String::new(),
                     bold("press Enter to open it here", true),
                 ],
@@ -1442,7 +1463,8 @@ mod tests {
             "spawn.a-very-long-internal-hostname.example.test:8443",
         ] {
             for width in [40usize, 60, 72, 92] {
-                let row = render_choice_row(true, 1, label, "where this command came from", width, false);
+                let row =
+                    render_choice_row(true, 1, label, "where this command came from", width, false);
                 assert!(
                     display_width(&row) <= width,
                     "row {} wide in a {width} frame: {row:?}",
@@ -1455,13 +1477,22 @@ mod tests {
     #[test]
     fn word_wrapping_respects_the_width_and_breaks_an_oversized_word() {
         let wrapped = wrap_words("the link carries this key; your browser checks it", 20);
-        assert!(wrapped.iter().all(|line| display_width(line) <= 20), "{wrapped:?}");
-        assert_eq!(wrapped.join(" "), "the link carries this key; your browser checks it");
+        assert!(
+            wrapped.iter().all(|line| display_width(line) <= 20),
+            "{wrapped:?}"
+        );
+        assert_eq!(
+            wrapped.join(" "),
+            "the link carries this key; your browser checks it"
+        );
 
         // A word with no break opportunity must still be forced apart.
         let long = "x".repeat(50);
         let forced = wrap_words(&format!("see {long} now"), 20);
-        assert!(forced.iter().all(|line| display_width(line) <= 20), "{forced:?}");
+        assert!(
+            forced.iter().all(|line| display_width(line) <= 20),
+            "{forced:?}"
+        );
         assert!(forced.concat().contains(&long));
     }
 
@@ -1474,7 +1505,10 @@ mod tests {
         );
         // A narrow terminal must report its real width, not a padded one, or
         // every frame line wraps and the rewind math drifts.
-        assert!(MIN_FRAME_COLUMNS > 20, "the stand-down threshold must bite first");
+        assert!(
+            MIN_FRAME_COLUMNS > 20,
+            "the stand-down threshold must bite first"
+        );
     }
 
     #[test]
@@ -1488,7 +1522,10 @@ mod tests {
 
         // The unselected row recedes entirely: its label carries the same dim
         // colour as its detail, so nothing on it competes with the choice.
-        let grey = format!("{}", Style::new().fg_color(Some(AnsiColor::BrightBlack.into())));
+        let grey = format!(
+            "{}",
+            Style::new().fg_color(Some(AnsiColor::BrightBlack.into()))
+        );
         assert!(
             other.contains(&format!("{grey}2. Host yourself")),
             "the unselected label must be grey: {other:?}"
@@ -1497,7 +1534,10 @@ mod tests {
             !chosen.contains(&format!("{grey}1. spawnd.dev")),
             "the selected label must not be grey: {chosen:?}"
         );
-        assert!(chosen.contains(glyphs().running), "the marker is still there");
+        assert!(
+            chosen.contains(glyphs().running),
+            "the marker is still there"
+        );
     }
 
     #[test]

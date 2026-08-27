@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  DESKTOP_SHELL_TOKEN,
   detectOS,
   installCommand,
   installTargetForOS,
   installTargets,
+  isDesktopShell,
   isMobileOS,
   storeBadgeForOS,
   storeBadges,
@@ -98,5 +100,35 @@ describe("phones", () => {
       expect(badge.href).toBeNull();
       expect(badge.label.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("the desktop shell", () => {
+  // The agent the macOS app actually sets (desktop/src-tauri/src/window.rs):
+  // a WebKit agent with the product token last.
+  const shellAgent =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 " +
+    "(KHTML, like Gecko) Version/17.6 Safari/605.1.15 SpawnDesktop/0.1.2";
+
+  test("the app's own window is recognised, and a Mac browser is not", () => {
+    expect(isDesktopShell(shellAgent)).toBe(true);
+    expect(
+      isDesktopShell(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 " +
+          "(KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+      ),
+    ).toBe(false);
+    expect(isDesktopShell("")).toBe(false);
+  });
+
+  test("the shell still reads as the Mac it is", () => {
+    // The token replaces nothing: the app is still a WebKit browser on macOS,
+    // and every platform-sniffing surface has to keep working inside it.
+    expect(detectOS("MacIntel", shellAgent)).toBe("macos");
+  });
+
+  test("the token is the one the app builds its agent from", () => {
+    expect(shellAgent).toContain(DESKTOP_SHELL_TOKEN);
+    expect(DESKTOP_SHELL_TOKEN.endsWith("/")).toBe(true);
   });
 });

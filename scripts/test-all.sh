@@ -165,6 +165,30 @@ printf '%s\n' "== web lint + browser tests + build =="
   SPAWN_API_PROXY_TARGET="${SPAWN_API_PROXY_TARGET:-http://127.0.0.1:8001}" bun run build
 )
 
+printf '%s\n' "== mobile typecheck + lint + tests =="
+# The other frontend of the same product. Its own `npm run ci` is the contract
+# (typecheck, lint, jest); running it here is what makes the root CLAUDE.md's
+# claim about this script true, and what stops a change shipping to one
+# frontend and not the other.
+(cd mobile && npm run ci)
+
+printf '%s\n' "== desktop typecheck + lint + tests =="
+# macOS only: the app is a Tauri v2 bundle and its crate links the daemon, so
+# it neither builds nor means anything elsewhere. Skipping loudly beats a green
+# run that silently checked nothing.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  (
+    cd desktop
+    npx tsc --noEmit
+    cd src-tauri
+    cargo fmt --check
+    cargo clippy --locked -- -D warnings
+    cargo test --locked
+  )
+else
+  printf '%s\n' "not macOS — the desktop app is not built or checked here"
+fi
+
 printf '%s\n' "== diff hygiene =="
 git diff --check
 

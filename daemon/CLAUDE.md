@@ -11,9 +11,15 @@ it.
 src/
   main.rs        the spawnd binary; the module list lives here
   lib.rs         the deliberately small public surface (endorsements,
-                 sessiond, signed_signal, …) shared with spawn-worker,
-                 tests, and browser golden vectors — everything else stays
-                 private to the binary
+                 sessiond, signed_signal, secret_file, permissions, …) shared
+                 with spawn-worker, the desktop app, tests, and browser golden
+                 vectors — everything else stays private to the binary
+  permissions.rs the one macOS consent moment, and the on-disk handshake the
+                 desktop app uses to put a screen in front of it
+  secret_file.rs how a secret is put on disk: atomic 0600 write, owner and
+                 permission checks, NOFOLLOW open, cross-process lock. Used by
+                 creds.rs here and by the macOS app's storage.rs, which keeps a
+                 different record under identical handling
   bin/           spawn-worker.rs and cross-runtime-crypto.rs (vector
                  generator)
   sessiond/      supervisor↔worker shared pieces: wire protocol, terminal
@@ -31,6 +37,8 @@ src/
   lifecycle.rs   reconnect, disconnect, logout, and local reset commands
   version.rs     the version the daemon reports; build.rs stamps the source
                  commit into it (0.1.0+g<commit>)
+Info.plist       the sentences macOS prints in its consent dialogs; build.rs
+                 links it into both binaries' `__TEXT,__info_plist` section
 tests/           integration tests (worker_e2e.rs)
 examples/        golden-vector generators for proto/
 vendor/          exact upstream crate sources for narrowly documented patches;
@@ -44,7 +52,12 @@ vendor/          exact upstream crate sources for narrowly documented patches;
   need too: the `lib.rs` surface.
 - Wire changes: daemon frames must stay compatible with
   `server/spawn_server/ws/daemon.py` — change both sides in the same commit,
-  and regenerate the `proto/` vectors when signed material changes.
+  and regenerate the `proto/` vectors when signed material changes. The
+  subprotocol name `spawn.control.v3` (`src/ws.rs`) is the compatibility
+  contract, not the version: bump it only for a change a daemon speaking the
+  old name could not survive, and read "The wire protocols" in
+  `docs/RELEASE.md` first — a bump is a fleet-wide cutover with a forced
+  release order.
 
 ## Terminal output
 
@@ -137,6 +150,51 @@ To look at the frame without running a ceremony:
 ```bash
 script -q /dev/null cargo test --bin spawnd render_demo -- --ignored --nocapture
 ```
+
+## What macOS asks, and when
+
+The daemon reads the home directory, so macOS gates Desktop, Documents and
+Downloads — and it asks the *responsible* process, which is `spawnd` even when
+the thing that touched the file was an agent someone started in a session. That
+is not avoidable. Three rules keep it from reading as an app grabbing at things:
+
+- **`Info.plist` is the copy, and it only works signed.** `build.rs` links it
+  into `__TEXT,__info_plist` in both binaries, but the signature the linker
+  applies by itself seals nothing it did not write — `codesign -dv` says
+  `Info.plist=not bound` and the dialogs fall back to a per-build hash with no
+  product name and no sentence. A `codesign` pass fixes both at once
+  (`Identifier=dev.spawnd.daemon`, `Info.plist entries=`), which is why
+  `.github/workflows/prebuilt.yml` re-signs and fails if either is missing.
+  A local build is linker-signed, so re-sign before judging a dialog:
+  `codesign -f -s - target/release/spawnd`.
+- **Ask once, behind a screen, where a person can answer.** `permissions.rs`
+  asks for the three folders in order on the first registration after
+  possession, then records the answers and never asks again — a refusal is
+  sticky and only System Settings can lift it, so re-asking teaches people to
+  say no.
+
+  It never asks on its own initiative. The desktop app leaves a
+  `permissions.request` marker before showing its screen; the daemon waits up to
+  two minutes for the matching `permissions.consent`, and **with no request
+  marker it primes nothing at all** — an `install.sh` run or a possession over
+  SSH keeps the ordinary lazy prompts. All three files plus the
+  `permissions.json` report live in one shared `<config>/spawn/` directory
+  rather than per instance, because TCC grants the *binary*, once, whoever it is
+  running for; a per-instance answer would re-ask the same person the first time
+  they added a second account. `someone_is_at_this_screen()` still guards it,
+  because a dialog nobody can answer is auto-refused and the refusal kept.
+  `SPAWND_NO_PERMISSION_PRIME=1` turns it off.
+
+  The wait is why this is **spawned, never awaited**, from the `Registered`
+  handler: it can sit for two minutes on a person, and that handler is how every
+  other frame on the socket gets processed.
+- **Never prime what the daemon does not set out to read.** The photo and music
+  library prompts people saw came from an agent walking `$HOME`, not from us.
+  Adding one to `Location::ORDER` would put it in front of every new user, and
+  a test refuses that.
+
+`docs/RELEASE.md` has the release half: which dialogs notarization removes, and
+what it takes for a grant to survive a self-update.
 
 ## Before calling a change done
 

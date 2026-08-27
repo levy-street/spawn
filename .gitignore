@@ -70,3 +70,11 @@ spawn.log
 
 # Reference screenshots dropped in the repo root
 Screenshot *.png
+
+# Apple credentials and certificates belong in ~/.spawn/apple, never here. A
+# stray .cer at the root is how one gets swept into a `git add -A` — which is
+# exactly how aps.cer reached this history.
+/*.cer
+/*.p12
+/*.p8
+/*.mobileprovision

@@ -126,6 +126,8 @@ export default function DownloadPage() {
     release: desktopRelease,
     settled: releaseSettled,
     url: macBuildUrl,
+    version: macBuildVersion,
+    buildId: macBuildId,
   } = useDesktopRelease(platform.origin);
 
   useEffect(() => {
@@ -216,6 +218,8 @@ export default function DownloadPage() {
                       // nameplate.
                       <MacDownloadButton
                         href={href}
+                        version={mac ? macBuildVersion : null}
+                        buildId={mac ? macBuildId : null}
                         pending={waitingOnManifest}
                         className="h-14 px-6"
                       />

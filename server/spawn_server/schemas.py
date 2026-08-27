@@ -27,6 +27,7 @@ from .host_identity import (
 )
 from .host_pair_approval import APPROVAL_NONCE_B64URL_LENGTH, decode_approval_nonce
 from .host_pair_possession import DEVICE_CODE_B64URL_LENGTH, decode_device_code
+from .web_push import valid_subscription_key
 
 # ---------- auth ----------
 
@@ -303,6 +304,77 @@ class PushDeviceOut(BaseModel):
 
     id: str
     platform: str
+    label: str | None = None
+    created_at: datetime
+    last_seen_at: datetime
+
+
+class WebPushKeyOut(BaseModel):
+    """What a browser needs before it can subscribe at all.
+
+    `public_key` is the VAPID application server key, base64url and unpadded,
+    ready to be decoded into the `applicationServerKey` that
+    `pushManager.subscribe` demands. A server with no VAPID key configured
+    answers `enabled: false` and a null key rather than an error: no browser
+    channel is a supported deployment, and the web app's job is then to not
+    offer the toggle.
+    """
+
+    enabled: bool
+    public_key: str | None = None
+
+
+class WebPushSubscribeRequest(BaseModel):
+    """One `PushSubscription`, as `PushSubscription.toJSON()` serializes it.
+
+    Both keys are validated here rather than at send time. A subscription the
+    server cannot encrypt to is not a delivery failure to retire in three
+    days' time; it is a malformed request, and saying so at the door is the
+    only place the browser can still do something about it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Push services are HTTPS, always. The cap is far above any endpoint any
+    # vendor issues and exists so a request body cannot be used to write an
+    # unbounded string into the table.
+    endpoint: str = Field(min_length=8, max_length=2048)
+    # The subscription's P-256 public key: 65 bytes, uncompressed point.
+    p256dh: str = Field(min_length=8, max_length=255)
+    # The subscription's auth secret: 16 bytes.
+    auth: str = Field(min_length=8, max_length=64)
+    # Recognition only, for a future signed-in-devices screen. Never trusted.
+    label: str | None = Field(default=None, max_length=64)
+    # This browser's device id, so its own knock is not pushed back to it.
+    browser_device_id: str | None = Field(default=None, min_length=36, max_length=36)
+
+    @field_validator("endpoint")
+    @classmethod
+    def _https_endpoint(cls, value: str) -> str:
+        value = value.strip()
+        if not value.startswith("https://") or len(value.split("/", 3)[2]) == 0:
+            raise ValueError("endpoint must be an absolute https URL")
+        return value
+
+    @field_validator("p256dh")
+    @classmethod
+    def _p256dh_is_a_point(cls, value: str) -> str:
+        if not valid_subscription_key(value, length=65):
+            raise ValueError("p256dh must be a base64url P-256 point of 65 bytes")
+        return value.strip()
+
+    @field_validator("auth")
+    @classmethod
+    def _auth_is_a_secret(cls, value: str) -> str:
+        if not valid_subscription_key(value, length=16):
+            raise ValueError("auth must be a base64url secret of 16 bytes")
+        return value.strip()
+
+
+class WebPushSubscriptionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
     label: str | None = None
     created_at: datetime
     last_seen_at: datetime

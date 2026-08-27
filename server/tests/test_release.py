@@ -43,6 +43,12 @@ def _stage_manifest(tmp_path, *, corrupt_worker: bool = False) -> dict:
 def _configure_release(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    # A published desktop release, so the block below is the verified one and
+    # not whatever `/var/www/spawnd/desktop` happens to hold on the machine
+    # running these tests.
+    images = tmp_path / "www" / "desktop"
+    _publish_image(images, "darwin-aarch64")
+    _publish_image(images, "darwin-x86_64")
     monkeypatch.setattr(
         release,
         "get_settings",
@@ -51,6 +57,8 @@ def _configure_release(monkeypatch, tmp_path) -> None:
             mobile_tree=MOBILE_TREE,
             desktop_version=DESKTOP_VERSION,
             desktop_tree=DESKTOP_TREE,
+            desktop_dir=images,
+            public_url="https://spawnd.dev",
         ),
     )
     mobile = tmp_path / "mobile"
@@ -107,6 +115,11 @@ def _configure_computed_desktop(
 ) -> None:
     monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    # Published, so these tests are about what the checkout can prove and not
+    # about whether the image was uploaded — that is `TestDesktopBlockProvesItself`.
+    images = tmp_path / "www" / "desktop"
+    _publish_image(images, "darwin-aarch64")
+    _publish_image(images, "darwin-x86_64")
     monkeypatch.setattr(
         release,
         "get_settings",
@@ -115,6 +128,8 @@ def _configure_computed_desktop(
             mobile_tree=MOBILE_TREE,
             desktop_version=None,
             desktop_tree=None,
+            desktop_dir=images,
+            public_url="https://spawnd.dev",
         ),
     )
     monkeypatch.setattr(release, "_git_path_is_clean", lambda path: clean)
@@ -236,6 +251,8 @@ async def test_dirty_checkout_marks_server_dirty_and_hides_mobile_tree(
             mobile_tree=None,
             desktop_version=None,
             desktop_tree=None,
+            desktop_dir=tmp_path / "www" / "desktop",
+            public_url="https://spawnd.dev",
         ),
     )
     monkeypatch.setattr(
@@ -251,3 +268,184 @@ async def test_dirty_checkout_marks_server_dirty_and_hides_mobile_tree(
     assert response.json()["server"] == {"commit": COMMIT, "dirty": True}
     assert response.json()["mobile"]["tree"] is None
     assert response.json()["desktop"] is None
+
+
+def _configure_desktop_publication(
+    monkeypatch,
+    tmp_path,
+    *,
+    desktop_dir,
+    public_url: str = "https://spawnd.dev",
+    version: str = DESKTOP_VERSION,
+) -> None:
+    """A deployment whose desktop images live somewhere the server can look."""
+    monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(release, "MANIFEST_PATH", None)
+    monkeypatch.setattr(
+        release,
+        "get_settings",
+        lambda: SimpleNamespace(
+            release_commit=COMMIT,
+            mobile_tree=MOBILE_TREE,
+            desktop_version=version,
+            desktop_tree=DESKTOP_TREE,
+            desktop_dir=desktop_dir,
+            public_url=public_url,
+        ),
+    )
+    release.refresh()
+
+
+def _publish_image(directory, platform: str, version: str = DESKTOP_VERSION) -> None:
+    """Put a disk image where `scripts/publish-desktop.sh` would put it.
+
+    The filename is spelled out rather than built with
+    `release.desktop_image_name`, because the contract being pinned is the one
+    `desktopDownloadUrl` in `web/src/lib/platform.ts` builds a URL to — a test
+    that asked the implementation for the name would agree with it either way.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"SPAWN-D_{version}_{platform}.dmg").write_bytes(b"a notarized disk image")
+
+
+class TestDesktopBlockProvesItself:
+    """`/api/release` may name a Mac build only when its image is really there.
+
+    The daemon block has always worked this way. The desktop block did not,
+    and the download page builds its URL straight out of the version it
+    advertises — so a deploy that lands before `scripts/publish-desktop.sh`
+    used to point the Mac download button at a 404.
+    """
+
+    async def test_a_published_release_is_advertised(self, client, tmp_path, monkeypatch):
+        images = tmp_path / "www" / "desktop"
+        _configure_desktop_publication(monkeypatch, tmp_path, desktop_dir=images)
+        _publish_image(images, "darwin-aarch64")
+        _publish_image(images, "darwin-x86_64")
+
+        response = await client.get("/api/release")
+
+        assert response.json()["desktop"] == {
+            "version": DESKTOP_VERSION,
+            "tree": DESKTOP_TREE,
+            "platforms": ["darwin-aarch64", "darwin-x86_64"],
+        }
+
+    async def test_an_unpublished_release_is_not_advertised(self, client, tmp_path, monkeypatch):
+        """The trap, sprung: the directory is there and the image is not."""
+        images = tmp_path / "www" / "desktop"
+        images.mkdir(parents=True)
+        _configure_desktop_publication(monkeypatch, tmp_path, desktop_dir=images)
+
+        response = await client.get("/api/release")
+
+        assert response.json()["desktop"] is None
+
+    async def test_a_version_bump_stops_advertising_until_it_is_published(
+        self, client, tmp_path, monkeypatch
+    ):
+        """The exact shape of the bug: the deploy ships a new version while the
+        static origin still holds only the old one's image."""
+        images = tmp_path / "www" / "desktop"
+        _publish_image(images, "darwin-aarch64", version="0.1.0")
+        _publish_image(images, "darwin-x86_64", version="0.1.0")
+        _configure_desktop_publication(
+            monkeypatch, tmp_path, desktop_dir=images, version="0.2.0"
+        )
+
+        response = await client.get("/api/release")
+
+        assert response.json()["desktop"] is None
+
+    async def test_only_the_platforms_on_disk_are_named(self, client, tmp_path, monkeypatch):
+        """A half-published release must not offer the Intel link."""
+        images = tmp_path / "www" / "desktop"
+        _configure_desktop_publication(monkeypatch, tmp_path, desktop_dir=images)
+        _publish_image(images, "darwin-aarch64")
+
+        response = await client.get("/api/release")
+
+        assert response.json()["desktop"]["platforms"] == ["darwin-aarch64"]
+
+    async def test_an_intel_only_publication_is_not_advertised_at_all(
+        self, client, tmp_path, monkeypatch
+    ):
+        """Every download surface builds the primary button for Apple silicon
+        whatever `platforms` says, so an aarch64-less block is still a 404."""
+        images = tmp_path / "www" / "desktop"
+        _configure_desktop_publication(monkeypatch, tmp_path, desktop_dir=images)
+        _publish_image(images, "darwin-x86_64")
+
+        response = await client.get("/api/release")
+
+        assert response.json()["desktop"] is None
+
+    async def test_no_release_directory_fails_open_and_says_so(
+        self, client, tmp_path, monkeypatch, caplog
+    ):
+        """Nowhere to look is evidence of nothing.
+
+        Withholding here would trade a 404 for a Mac download that quietly
+        disappears — which reads as a product decision rather than a broken
+        deploy. So the block stands, and the server says it could not check.
+        """
+        _configure_desktop_publication(
+            monkeypatch, tmp_path, desktop_dir=tmp_path / "nowhere"
+        )
+
+        with caplog.at_level("ERROR", logger="spawn.release"):
+            response = await client.get("/api/release")
+
+        assert response.json()["desktop"] == {
+            "version": DESKTOP_VERSION,
+            "tree": DESKTOP_TREE,
+            "platforms": ["darwin-aarch64", "darwin-x86_64"],
+        }
+        assert "SPAWN_DESKTOP_DIR" in caplog.text
+
+    async def test_the_warning_is_not_repeated_on_every_request(
+        self, client, tmp_path, monkeypatch, caplog
+    ):
+        """`/api/release` is polled by every open tab and every daemon."""
+        _configure_desktop_publication(
+            monkeypatch, tmp_path, desktop_dir=tmp_path / "nowhere"
+        )
+
+        with caplog.at_level("ERROR", logger="spawn.release"):
+            for _ in range(3):
+                await client.get("/api/release")
+
+        assert caplog.text.count("SPAWN_DESKTOP_DIR") == 1
+
+    async def test_a_laptop_is_not_nagged_about_a_directory_it_should_not_have(
+        self, client, tmp_path, monkeypatch, caplog
+    ):
+        """Development has no static release origin — `/desktop/` there is Next
+        serving `public/desktop`, and `/desktop-build` already answers for it."""
+        _configure_desktop_publication(
+            monkeypatch,
+            tmp_path,
+            desktop_dir=tmp_path / "nowhere",
+            public_url="http://localhost:8000",
+        )
+
+        with caplog.at_level("ERROR", logger="spawn.release"):
+            response = await client.get("/api/release")
+
+        assert response.json()["desktop"] is not None
+        assert caplog.text == ""
+
+    def test_the_image_name_is_the_one_the_browser_asks_for(self):
+        """Pinned against `desktopDownloadUrl` in `web/src/lib/platform.ts`,
+        which builds `/desktop/SPAWN-D_<version>_<platform>.dmg`."""
+        assert (
+            release.desktop_image_name("0.1.0", "darwin-aarch64")
+            == "SPAWN-D_0.1.0_darwin-aarch64.dmg"
+        )
+
+    def test_nowhere_to_look_and_nothing_there_are_different_answers(self, tmp_path):
+        """The distinction the whole design rests on."""
+        assert release.published_desktop_platforms("0.1.0", root=tmp_path / "absent") is None
+        present = tmp_path / "present"
+        present.mkdir()
+        assert release.published_desktop_platforms("0.1.0", root=present) == []

@@ -1,4 +1,4 @@
-"""Delivery of attention alerts to app installs that are not connected.
+"""Delivery of attention alerts to clients that are not connected.
 
 `/ws/alerts` can only reach a client holding a socket, and on a phone that is
 the one client that does not need telling: the app is suspended or closed by
@@ -11,6 +11,14 @@ string that goes out is `command`, the foreground process basename the server
 already stores and already serves from `GET /api/sessions`. No terminal bytes,
 no argv, no cwd, no output. `session_id` travels in the data payload, which is
 not displayed, so the app can open the right session on tap.
+
+Two channels carry the same message. This module owns the Expo one, which
+fronts APNs and FCM for the app installs; `web_push.py` owns the browser one,
+which is VAPID straight to whichever push service a given browser named. They
+are separate because the wire is separate — one batched POST to one host
+versus one encrypted POST per subscription to several — and identical because
+the message is the same message. A browser closed on a laptop and a phone in
+a pocket are the same person not looking at the session.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import Settings, get_settings
 from .db import get_sessionmaker
 from .models import PushDevice
+from .web_push import send_web_push
 
 log = logging.getLogger("spawn.push")
 
@@ -139,7 +148,7 @@ async def send_alert_push(
     client: httpx.AsyncClient | None = None,
     settings: Settings | None = None,
 ) -> int:
-    """Push one alert to every live install of an account. Returns the count sent.
+    """Push one alert to every live install and browser. Returns the count sent.
 
     Never raises. An alert is a courtesy and this runs off the daemon socket's
     hot path — a push service having a bad afternoon must not surface as a
@@ -166,11 +175,12 @@ async def send_approval_push(
     client: httpx.AsyncClient | None = None,
     settings: Settings | None = None,
 ) -> int:
-    """Tell the account's phones a device is knocking. Returns the count sent.
+    """Tell the account a device is knocking. Returns the count sent.
 
-    The knocking device's own install is skipped: it registered its push token
-    with its browser device id, and "Approve spawn on iPhone?" arriving on that
-    same iPhone would only confuse. Never raises, same as the alert path.
+    The knocking device's own client is skipped: it registered its push token
+    (or its browser subscription) with its browser device id, and "Approve
+    SPAWN D on iPhone?" arriving on that same iPhone would only confuse. Never
+    raises, same as the alert path.
     """
     settings = settings or get_settings()
     if not settings.push_enabled:
@@ -228,6 +238,49 @@ async def _send_push(
     exclude_browser_device_id: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> int:
+    """Both channels, one message. Returns everything that was accepted.
+
+    Sequential rather than concurrent: the two halves share this `AsyncSession`
+    and it is not safe to use from two coroutines at once. Nothing is waiting
+    on either — every caller reaches here from a fire-and-forget task.
+    """
+    owned = client is None
+    http = client or httpx.AsyncClient(timeout=10)
+    try:
+        expo = await _send_expo_push(
+            session=session,
+            user_id=user_id,
+            message=message,
+            settings=settings,
+            exclude_browser_device_id=exclude_browser_device_id,
+            client=http,
+        )
+        web = await send_web_push(
+            session=session,
+            user_id=user_id,
+            title=message.title,
+            body=message.body,
+            data=message.data,
+            settings=settings,
+            exclude_browser_device_id=exclude_browser_device_id,
+            client=http,
+        )
+    finally:
+        if owned:
+            await http.aclose()
+    return expo + web
+
+
+async def _send_expo_push(
+    *,
+    session: AsyncSession,
+    user_id: str,
+    message: PushMessage,
+    settings: Settings,
+    exclude_browser_device_id: str | None,
+    client: httpx.AsyncClient,
+) -> int:
+    """The phones. One POST per hundred tokens to Expo, which fronts APNs/FCM."""
     try:
         devices = await _live_tokens(session, user_id)
     except Exception as e:  # noqa: BLE001
@@ -240,8 +293,7 @@ async def _send_push(
 
     sent = 0
     dead: list[str] = []
-    owned = client is None
-    http = client or httpx.AsyncClient(timeout=10)
+    http = client
     try:
         for start in range(0, len(devices), _MAX_BATCH):
             batch = devices[start : start + _MAX_BATCH]
@@ -280,9 +332,6 @@ async def _send_push(
                     log.warning("push send failed: %s", result.get("message"))
     except Exception as e:  # noqa: BLE001
         log.warning("push send failed: %s", e)
-    finally:
-        if owned:
-            await http.aclose()
 
     try:
         await _disable_tokens(session, dead)

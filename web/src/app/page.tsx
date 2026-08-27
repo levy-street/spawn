@@ -216,7 +216,12 @@ export default function LandingPage() {
   // The Mac build the hero hands out, named by the release manifest rather
   // than guessed at. Until it answers, the slab holds a press instead of
   // sending it to /download — see `MacDownloadButton`.
-  const { settled: releaseSettled, url: macBuildUrl } = useDesktopRelease(origin);
+  const {
+    settled: releaseSettled,
+    url: macBuildUrl,
+    version: macBuildVersion,
+    buildId: macBuildId,
+  } = useDesktopRelease(origin);
   /**
    * The install target the reader picked on the chip, once they have picked
    * one. The chip and the download beside it answer the same question, so
@@ -432,6 +437,8 @@ export default function LandingPage() {
                 ) : (
                   <MacDownloadButton
                     href={macBuildUrl}
+                    version={macBuildVersion}
+                    buildId={macBuildId}
                     pending={!releaseSettled}
                     className="h-14 grow rounded-[11px] whitespace-nowrap"
                   />

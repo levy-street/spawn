@@ -160,9 +160,26 @@ test("download page does not overflow on desktop or mobile", async ({ browser })
 
 /**
  * The hero slab is painted before `/api/release` names the build, and a press
- * in that window used to be spent walking to /download. It now waits and then
- * hands the file over — see `MacDownloadButton`.
+ * in that window used to be spent walking to /download. It now waits, then
+ * fetches the file and reports on it — see `MacDownloadButton`.
  */
+const A_BUILD = {
+  desktop: { version: "9.9.9", tree: "a".repeat(40), platforms: ["darwin-aarch64"] },
+};
+
+async function serveTheImage(page: Page): Promise<void> {
+  await page.route("**/desktop/*.dmg", (route) =>
+    route.fulfill({
+      status: 200,
+      headers: {
+        "content-type": "application/octet-stream",
+        "content-disposition": 'attachment; filename="SPAWN-D_9.9.9_darwin-aarch64.dmg"',
+      },
+      body: "not really a disk image",
+    }),
+  );
+}
+
 async function landingWithHeldRelease(
   browser: Browser,
   payload: Record<string, unknown>,
@@ -182,6 +199,9 @@ async function landingWithHeldRelease(
       body: JSON.stringify({ detail: "not authenticated" }),
     }),
   );
+  // The dev server really does serve a locally built disk image through
+  // /desktop-build; pin it so each test states the situation it is testing.
+  await page.route("**/desktop-build", (route) => route.fulfill({ status: 404, body: "" }));
   const gate = { open: () => {} };
   const answered = new Promise<void>((resolve) => {
     gate.open = resolve;
@@ -194,16 +214,7 @@ async function landingWithHeldRelease(
       body: JSON.stringify(payload),
     });
   });
-  await page.route("**/desktop/*.dmg", (route) =>
-    route.fulfill({
-      status: 200,
-      headers: {
-        "content-type": "application/octet-stream",
-        "content-disposition": 'attachment; filename="SPAWN-D_9.9.9_darwin-aarch64.dmg"',
-      },
-      body: "not really a disk image",
-    }),
-  );
+  await serveTheImage(page);
   await page.goto("/");
   return { context, page, answer: () => gate.open() };
 }
@@ -211,23 +222,22 @@ async function landingWithHeldRelease(
 test("the Mac slab holds a press made before the build is named, then downloads it", async ({
   browser,
 }) => {
-  const { context, page, answer } = await landingWithHeldRelease(browser, {
-    desktop: { version: "9.9.9", tree: "a".repeat(40), platforms: ["darwin-aarch64"] },
-  });
+  const { context, page, answer } = await landingWithHeldRelease(browser, A_BUILD);
 
   const slab = page.getByTestId("mac-download").first();
   await expect(slab).toHaveText(/Download for macOS/i);
   await slab.click();
   await expect(slab).toHaveText(/Preparing download/i);
 
-  // The browser hands downloads to its own machinery rather than the page, so
-  // the evidence that the press landed is the download event, not a request.
   const started = page.waitForEvent("download");
   answer();
-  expect((await started).url()).toContain("/desktop/SPAWN-D_9.9.9_darwin-aarch64.dmg");
-  // The file came to the reader; the reader did not go to a page about it.
+  // The bytes come through fetch, so what lands is a blob under the build's
+  // own name — the slab could not report progress on a plain navigation.
+  expect((await started).suggestedFilename()).toContain("SPAWN-D_9.9.9_darwin-aarch64.dmg");
+  // The file came to the reader; the reader did not go to a page about it,
+  // and the slab — not the browser's shelf in the far corner — says so.
   await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByTestId("mac-download").first()).toHaveText(/Download for macOS/i);
+  await expect(slab).toHaveText(/Downloaded/i);
 
   await context.close();
 });
@@ -242,6 +252,83 @@ test("a held press falls through to the download page when there is no build", a
   answer();
 
   await expect(page).toHaveURL(/\/download$/);
+
+  await context.close();
+});
+
+/** A lander whose build is named by whatever `/desktop-build` reports. */
+async function landingWithLocalBuild(
+  browser: Browser,
+  build: string,
+): Promise<{ context: Awaited<ReturnType<Browser["newContext"]>>; page: Page }> {
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "MacIntel",
+    userAgent: MAC_USER_AGENT,
+  });
+  await page.route("**/api/me", (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "not authenticated" }),
+    }),
+  );
+  // A checkout with uncommitted work in desktop/ — the ordinary development
+  // machine — cannot prove a desktop version, so the manifest names none.
+  await page.route("**/api/release", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "{}" }),
+  );
+  await page.route("**/desktop-build", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ version: "9.9.9", platforms: ["darwin-aarch64"], build }),
+    }),
+  );
+  await serveTheImage(page);
+  await page.goto("/");
+  return { context, page };
+}
+
+test("with no manifest to name it, the slab hands over the build on disk", async ({ browser }) => {
+  const { context, page } = await landingWithLocalBuild(browser, "abc123");
+
+  const started = page.waitForEvent("download");
+  await page.getByTestId("mac-download").first().click();
+  expect((await started).suggestedFilename()).toContain("SPAWN-D_9.9.9_darwin-aarch64.dmg");
+  await expect(page).toHaveURL(/\/$/);
+
+  await context.close();
+});
+
+test("the slab knows the build this browser already has, and when it is replaced", async ({
+  browser,
+}) => {
+  const { context, page } = await landingWithLocalBuild(browser, "abc123");
+
+  const slab = page.getByTestId("mac-download").first();
+  await expect(slab).toHaveText(/Download for macOS/i);
+  const started = page.waitForEvent("download");
+  await slab.click();
+  await started;
+  await expect(slab).toHaveText(/Downloaded/i);
+
+  // Come back to it: this browser has that build, and the slab says so rather
+  // than offering it as though nothing happened.
+  await page.reload();
+  await expect(page.getByTestId("mac-download").first()).toHaveText(/Download again/i);
+
+  // `npm run dev` rebuilds the same version — a new build of 9.9.9, which is
+  // not the one this browser has. The offer comes back.
+  await page.unroute("**/desktop-build");
+  await page.route("**/desktop-build", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ version: "9.9.9", platforms: ["darwin-aarch64"], build: "def456" }),
+    }),
+  );
+  await page.reload();
+  await expect(page.getByTestId("mac-download").first()).toHaveText(/Download for macOS/i);
 
   await context.close();
 });

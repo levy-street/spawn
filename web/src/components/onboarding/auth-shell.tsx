@@ -1,9 +1,12 @@
+"use client";
+
 import { ArrowLeft } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import type { ReactNode } from "react";
 import { RegistrationMarks } from "@/components/brand/press";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
+import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { poster } from "@/lib/fonts";
 import { cn } from "@/lib/utils";
 import { ONBOARDING_STEPS, type OnboardingStep } from "./step-machine";
@@ -49,6 +52,10 @@ export function AuthShell({
   cardClassName,
 }: AuthShellProps) {
   const rail = step ? <StepRail current={step} steps={steps} /> : null;
+  // Inside the app there is no marketing site to go back to — no address bar,
+  // no tabs, nothing behind this window — so the hatch out of the funnel is
+  // not an escape here, it is a trapdoor.
+  const inShell = useDesktopShell();
 
   return (
     <main className="grimoire pressroom relative isolate flex min-h-vv flex-col overflow-hidden bg-void pad-safe-x pad-safe-top pad-safe-bottom">
@@ -75,18 +82,20 @@ export function AuthShell({
 
       {/* The escape hatch, pinned to the top of the sheet and ranged with the
        * masthead below it. Out of flow so the columns can hang from one line. */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-20 mx-auto w-full max-w-6xl px-5 pt-4 lg:px-10 lg:pt-6">
-        <Link
-          href="/"
-          className="group pointer-events-auto inline-flex min-h-11 items-center gap-2 font-sigil text-[11px] tracking-[0.16em] text-ash uppercase transition-colors hover:text-bone focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ember"
-        >
-          <ArrowLeft
-            className="size-4 transition-transform group-hover:-translate-x-0.5"
-            aria-hidden
-          />
-          Back home
-        </Link>
-      </div>
+      {inShell ? null : (
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-20 mx-auto w-full max-w-6xl px-5 pt-4 lg:px-10 lg:pt-6">
+          <Link
+            href="/"
+            className="group pointer-events-auto inline-flex min-h-11 items-center gap-2 font-sigil text-[11px] tracking-[0.16em] text-ash uppercase transition-colors hover:text-bone focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ember"
+          >
+            <ArrowLeft
+              className="size-4 transition-transform group-hover:-translate-x-0.5"
+              aria-hidden
+            />
+            Back home
+          </Link>
+        </div>
+      )}
 
       {layout === "split" ? (
         // Centred in what is left of the page, with symmetric padding, rather
@@ -152,18 +161,37 @@ const PLATE =
   "w-full min-w-0 rounded-sm border border-line-g bg-char/85 shadow-2xl shadow-void/60 backdrop-blur-sm";
 
 function BrandLockup({ className }: { className?: string }) {
+  const inShell = useDesktopShell();
+  const shape = "flex min-h-11 w-fit items-center gap-3 text-hellfire";
+  const marks = (
+    <>
+      {/* The mark stands only a shade above the wordmark's cap height. */}
+      <Trident className="size-[26px]" />
+      <Wordmark aria-hidden className="h-5" />
+    </>
+  );
+
+  // In the app the lockup is a mark and nothing else. The only thing behind
+  // this sheet is the lander, and the window has no way back off it.
+  if (inShell) {
+    return (
+      <div role="img" aria-label="SPAWN D" className={cn(shape, className)}>
+        {marks}
+      </div>
+    );
+  }
+
   return (
     <Link
       href="/"
       aria-label="spawnd home"
       className={cn(
-        "flex min-h-11 w-fit items-center gap-3 text-hellfire transition-colors hover:text-ember focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ember",
+        shape,
+        "transition-colors hover:text-ember focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ember",
         className,
       )}
     >
-      {/* The mark stands only a shade above the wordmark's cap height. */}
-      <Trident className="size-[26px]" />
-      <Wordmark aria-hidden className="h-5" />
+      {marks}
     </Link>
   );
 }

@@ -16,10 +16,12 @@ import "./styles.css";
 
 type Screen =
   | "auth"
+  | "unsupported"
   | "server"
   | "verify"
   | "device"
   | "host"
+  | "permissions"
   | "done"
   | "settings"
   | "repair"
@@ -101,6 +103,9 @@ interface AppUpdate {
   endpoint: string;
 }
 
+/** How far the signed app channel has got with the question it was asked. */
+type UpdateCheck = "idle" | "checking" | "done" | "failed";
+
 const HOSTED_ORIGIN = "https://spawnd.dev";
 /** The native redirect the server hands a finished sign-in back to. */
 const OAUTH_CALLBACK = { host: "auth", path: "/oauth" } as const;
@@ -168,11 +173,30 @@ let copiedUntil = 0;
  * appeared to close itself the moment they went to read the command.
  */
 let terminalOpen: boolean | null = null;
+/** Whether this run's approval has been answered already. */
+let autoApproved = false;
+/**
+ * Whether this visit to the host gate has already started a run.
+ *
+ * The gate possesses on arrival, once. Never twice: a failure has to sit on
+ * its own card and wait to be answered, and a gate that restarted itself every
+ * time it was rendered would be a loop nobody could get out of.
+ */
+let hostRunStarted = false;
+/**
+ * The permissions gate's own error, kept out of `error` on purpose.
+ *
+ * The possession poll clears `error` on every successful tick, so a message
+ * left there while a run is going would vanish about a second later. This gate
+ * sits on top of a live run and has to be able to say something that stays.
+ */
+let permissionsError: string | null = null;
 const completedSteps = new Set<number>();
 let terminalCommand = `curl -fsSL ${HOSTED_ORIGIN}/install.sh | sh`;
 let status: LocalStatus | null = null;
 let statusLoading = false;
 let appUpdate: AppUpdate | null = null;
+let updateCheck: UpdateCheck = "idle";
 
 /* ── Copy ─────────────────────────────────────────────────────────────── */
 
@@ -346,14 +370,16 @@ function stacked(title: string, description: string | null, body: string): strin
     </div>`;
 }
 
-/** The masthead ranged against a wider plate — the onboarding gates. */
-function split(gate: Gate, title: string, description: string, body: string): string {
+/** The masthead ranged against a wider plate — the onboarding gates. A gate
+ * whose whole point is one paragraph keeps it together in the plate, where the
+ * buttons are, and passes null rather than splitting it across two columns. */
+function split(gate: Gate, title: string, description: string | null, body: string): string {
   return `
     <div class="split">
       <header class="split-head">
         ${LOCKUP}
         <h1>${title}</h1>
-        <p class="lead">${description}</p>
+        ${description ? `<p class="lead">${description}</p>` : ""}
         ${rail(gate)}
       </header>
       <section class="plate plate-padded">${body}</section>
@@ -414,10 +440,12 @@ function paceBar(label: string): string {
 function render(): void {
   const views: Record<Screen, () => string> = {
     auth: authView,
+    unsupported: unsupportedServerView,
     server: serverView,
     verify: verifyView,
     device: deviceView,
     host: hostView,
+    permissions: permissionsView,
     done: doneView,
     settings: settingsView,
     repair: repairView,
@@ -456,17 +484,6 @@ function authView(): string {
   const description = signup
     ? "Start with an account, then connect the machine where your agents work."
     : "Sign in to reach the shells running across your machines.";
-
-  if (serverSupported === false) {
-    return sheet(
-      hatchServer(),
-      stacked(
-        "That server is out of date",
-        `${escapeHtml(serverHost())} is running an older SPAWN D than this app needs.`,
-        `<div class="stack"><div class="inset"><p class="muted">Signing in here needs an endpoint this server does not have yet, and this Mac could not be possessed by it. Update the server to the current release, or point SPAWN D at another one.</p></div>${errorLine()}<div class="actions"><button class="btn btn-primary" data-action="choose-server">Choose another server</button><button class="btn btn-ghost" data-action="retry-config">Try again</button></div></div>`,
-      ),
-    );
-  }
 
   if (signup && configState === "error") {
     return sheet(
@@ -517,6 +534,82 @@ function authView(): string {
       }</p>
     </div>`;
   return sheet(hatchServer(), stacked(title, description, body));
+}
+
+/**
+ * What the signed app channel has said so far.
+ *
+ * Every state says something — a check under way as much as a settled answer.
+ * "Up to date" is a real answer and is said out loud: silence after a press
+ * reads as a broken button.
+ */
+function updateCheckLine(): string {
+  const said: Record<UpdateCheck, string> = {
+    idle: "",
+    checking: "",
+    done: "SPAWN D is up to date.",
+    failed: "The signed app channel couldn’t be reached, so nothing was installed.",
+  };
+  // Before an answer, the asking itself is the answer. Never a blank.
+  const line = said[updateCheck];
+  return line
+    ? `<p class="note">${escapeHtml(line)}</p>`
+    : paceBar("Checking the signed app channel…");
+}
+
+/**
+ * A server this app cannot finish a sign-in against.
+ *
+ * Not a dead end, and it must never look like one. It may not even be the
+ * server that is behind: this app rides its own updater channel, so it can be
+ * the older half of the pair. Two rules hold this screen:
+ *
+ * - It never appears without saying something is being done. The channel is
+ *   asked the moment `serverSupported` comes back false (`loadConfig`), and
+ *   the asking is on screen while it runs — not a wall of prose with two
+ *   buttons under it.
+ * - Every answer is said out loud: checking, a version to install, already
+ *   current, or a channel that could not be reached and what that leaves.
+ *   Silence after a press reads as a broken button.
+ *
+ * "Check for updates" therefore stays whatever the answer was, so it can be
+ * pressed again once the automatic check has settled. It is a second action
+ * beside the two that do not depend on the channel at all, never a
+ * replacement for them — and the bone slab stays the one thing to do.
+ */
+function unsupportedServerView(): string {
+  const ready = appUpdate?.available ?? false;
+  // `idle` is unreachable here — reaching this screen is what starts the check
+  // — and a blank where the answer goes is the one thing this screen must
+  // never show, so it reads as the beat before the first answer.
+  const settled = updateCheck === "done" || updateCheck === "failed";
+  let channel: string;
+  if (!settled) {
+    channel = paceBar("Checking for a newer SPAWN D…");
+  } else if (ready) {
+    channel = `<div class="inset" role="status"><p><strong>SPAWN D ${escapeHtml(appUpdate?.version ?? "")} is ready</strong></p><p class="muted">A newer app may already know the way round this. It comes from the signed app channel and restarts itself; the daemon on this Mac is not touched.</p></div>`;
+  } else if (updateCheck === "failed") {
+    channel = `<p class="status-line" role="status">${escapeHtml("The signed app channel couldn’t be reached, so whether a newer SPAWN D exists is unknown. Nothing on this Mac has changed.")}</p>`;
+  } else {
+    channel = `<p class="status-line" role="status">${escapeHtml("SPAWN D is already the current release — this server is the half that is behind.")}</p>`;
+  }
+
+  const actions = [
+    ready
+      ? `<button class="btn btn-primary" data-action="install-update" ${busy ? "disabled" : ""}>${busy ? "Installing…" : "Install and restart"}</button>`
+      : "",
+    `<button class="btn ${ready ? "btn-outline" : "btn-primary"}" data-action="choose-server">Choose another server</button>`,
+    '<button class="btn btn-ghost" data-action="retry-config">Try again</button>',
+    `<button class="btn btn-ghost" data-action="recheck-update" ${settled ? "" : "disabled"}>${settled ? "Check for updates" : "Checking…"}</button>`,
+  ].join("");
+  return sheet(
+    hatchServer(),
+    stacked(
+      "That server is out of date",
+      `${escapeHtml(serverHost())} is running an older SPAWN D than this app needs.`,
+      `<div class="stack"><div class="inset"><p class="muted">Signing in here needs an endpoint this server does not have yet, and this Mac could not be possessed by it. Update the server to the current release, point SPAWN D at another one — or update this app, in case it is the half that is behind.</p></div>${channel}${errorLine()}<div class="actions">${actions}</div></div>`,
+    ),
+  );
 }
 
 function serverView(): string {
@@ -600,32 +693,33 @@ function elapsedMs(): number {
   return waitStartedAt === null ? 0 : Date.now() - waitStartedAt;
 }
 
-function hostChecklist(): string {
-  const failed = possession?.status === "failed";
-  // Nothing has been started: the list is a plan, not a report. Every row is
-  // idle, none of them is "current", and the heading says which it is.
-  const idle = !runId;
-  const current = runId && !failed ? Math.min(completedSteps.size, HOST_STEPS.length - 1) : -1;
+/**
+ * Setup progress, one row per step.
+ *
+ * There is no idle state and no heading any more. The gate possesses the
+ * moment it is reached, so the first row is already the one under way from the
+ * first paint — there is no "before" for this list to describe, and a heading
+ * that turned from a plan into a report a beat later was only ever a flash.
+ * `stopped` is a failure of any kind: nothing is running, so no row spins.
+ */
+function hostChecklist(stopped: boolean): string {
+  const current = stopped ? -1 : Math.min(completedSteps.size, HOST_STEPS.length - 1);
   const waitsOnPerson = current === APPROVAL_STEP && possession?.review !== null && possession?.review !== undefined;
   const elapsed = elapsedMs();
-  const heading = idle ? "What this does" : "Setup progress";
   return `
-    <div>
-      <p class="checklist-head">${heading}</p>
-      <ol class="checklist${idle ? " idle" : ""}" aria-label="${heading}">
-        ${HOST_STEPS.map((step, index) => {
-          const complete = completedSteps.has(index);
-          const state = complete ? "complete" : index === current ? "current" : "pending";
-          const icon = complete ? ICON_CHECK : state === "current" && !waitsOnPerson ? ICON_SPINNER : ICON_CIRCLE;
-          const label = complete ? step.done : state === "current" ? step.active : step.todo;
-          const aside =
-            state === "current" && !waitsOnPerson && elapsed >= STILL_WAITING_MS && elapsed < STALLED_MS
-              ? '<span class="aside">Still waiting…</span>'
-              : "<span></span>";
-          return `<li class="${state}" data-state="${state}"><span class="mark" aria-hidden="true">${icon}</span><span>${escapeHtml(label)}</span>${aside}</li>`;
-        }).join("")}
-      </ol>
-    </div>`;
+    <ol class="checklist" aria-label="Setup progress">
+      ${HOST_STEPS.map((step, index) => {
+        const complete = completedSteps.has(index);
+        const state = complete ? "complete" : index === current ? "current" : "pending";
+        const icon = complete ? ICON_CHECK : state === "current" && !waitsOnPerson ? ICON_SPINNER : ICON_CIRCLE;
+        const label = complete ? step.done : state === "current" ? step.active : step.todo;
+        const aside =
+          state === "current" && !waitsOnPerson && elapsed >= STILL_WAITING_MS && elapsed < STALLED_MS
+            ? '<span class="aside">Still waiting…</span>'
+            : "<span></span>";
+        return `<li class="${state}" data-state="${state}"><span class="mark" aria-hidden="true">${icon}</span><span>${escapeHtml(label)}</span>${aside}</li>`;
+      }).join("")}
+    </ol>`;
 }
 
 function hostView(): string {
@@ -636,6 +730,9 @@ function hostView(): string {
   const serviceFailed = failure === "The daemon installed but its service didn't start.";
   const elapsed = elapsedMs();
   const stalled = runId && !failed && !review && elapsed >= STALLED_MS;
+  // Every end that is not progress, including the one review whose answer is
+  // no: nothing is running, so no row on the checklist may go on spinning.
+  const stopped = failure !== null || (review !== null && !review.exact_key_match);
 
   let action: string;
   if (refused) {
@@ -655,15 +752,24 @@ function hostView(): string {
           ? '<button class="btn btn-outline" data-action="show-repair">Repair</button>'
           : '<button class="btn btn-outline" data-action="try-again">Try again</button>'
       }</div>`;
-  } else if (review) {
+  } else if (review && !review.exact_key_match) {
+    // The one review that is still a question — and the answer is no. The key
+    // the server presented is not the one this Mac's daemon printed, so there
+    // is nothing to approve here, only something to walk away from.
     action = `
-      <div class="approve" data-testid="possess-approve-screen">
-        <h3>Approve ${escapeHtml(review.host_name)}</h3>
-        <p>SPAWN D verified this Mac’s identity against the link its daemon printed. Approving grants all your devices access to it.</p>
-        <div class="actions"><button class="btn btn-primary" data-action="approve-host" ${!review.exact_key_match || busy ? "disabled" : ""}>${busy ? "Approving…" : `Approve ${escapeHtml(review.host_name)}`}</button></div>
+      <div class="failure" data-testid="possess-refusal"><h3>This host could not be verified</h3><p>${escapeHtml(REFUSAL_MISMATCH)}</p></div>
+      <div class="actions"><button class="btn btn-outline" data-action="try-again">Start over</button></div>`;
+  } else if (review) {
+    // Approved without asking. The browser asks because it is a stranger to
+    // the machine in the link; this app *is* the machine — it ran the install,
+    // it holds the account, and it has just matched the key its own daemon
+    // printed. A prompt there asks you to confirm what you are watching.
+    action = `
+      <div class="inset" role="status" data-testid="possess-approve-screen">
+        <p><strong>Approving ${escapeHtml(review.host_name)}</strong></p>
+        <p class="muted">SPAWN D matched this Mac’s identity against the link its daemon printed. All your devices get access to it.</p>
+        ${paceBar(`Approving ${review.host_name}…`)}
       </div>`;
-  } else if (!runId) {
-    action = `<button class="btn btn-primary btn-block" data-action="possess" ${busy ? "disabled" : ""}>${busy ? "Starting…" : "Possess this Mac"}</button>`;
   } else if (possession?.status === "approved") {
     action = `<div class="inset"><p>Connecting</p><p class="muted">Approved. The daemon is starting up and calling home — this usually takes a few seconds.</p>${paceBar("Waiting for this Mac to come online…")}</div>`;
   } else {
@@ -690,7 +796,7 @@ function hostView(): string {
 
   const body = `
     <div class="stack-loose">
-      ${hostChecklist()}
+      ${hostChecklist(stopped)}
       ${action}
       ${hints}
       ${terminal}
@@ -710,16 +816,67 @@ function pairingFailureCopy(reason: string): string {
   return PAIRING_FAILURES[reason] ?? reason;
 }
 
+/**
+ * The beat before macOS interrupts, between Approved and Online.
+ *
+ * The daemon primes Desktop, Documents and Downloads once, on the first
+ * registration after possession, and never asks again — but a refusal is
+ * sticky, so the asking only happens with someone at the screen to answer it.
+ * This is that screen, and it exists to make three unexplained system dialogs
+ * into one thing the person chose a moment earlier.
+ *
+ * It is a gate, not a wall, and it is not a last chance either way:
+ *
+ * - "Not now" means "don't ask me in a batch", not "never". The host still
+ *   comes online, and a folder nobody granted asks for itself the first time
+ *   an agent touches it.
+ * - Walking away is also an answer. The daemon waits two minutes, then goes on
+ *   without priming and without recording a refusal, so the next possession
+ *   can offer this again. Nothing here says "now or never", because it isn't.
+ *
+ * The plate is deliberately bare — no checklist, no terminal panel. macOS is
+ * about to put three dialogs over this window, and the only thing worth
+ * reading first is what they are for.
+ */
+function permissionsView(): string {
+  const body = `
+    <div class="stack">
+      <div class="inset">
+        <p>macOS will ask three times — Desktop, Documents, Downloads. SPAWN D needs them to open the files you and your agents work on. Nothing is read until you ask for it.</p>
+      </div>
+      ${permissionsError ? `<p class="error" role="alert">${escapeHtml(permissionsError)}</p>` : ""}
+      <div class="actions">
+        <button class="btn btn-primary" data-action="permissions-continue" ${busy ? "disabled" : ""}>${busy ? "Asking…" : "Continue"}</button>
+        <button class="btn btn-ghost" data-action="permissions-skip" ${busy ? "disabled" : ""}>Not now</button>
+      </div>
+    </div>`;
+  // No masthead lead: the paragraph is one thought and stays whole, in the
+  // plate, beside the buttons — which is where someone is looking when they
+  // decide. Split across the two columns it read as two half-sentences.
+  return sheet(hatchAccount(), split("host", "Permissions", null, body));
+}
+
+/**
+ * The last gate, which nobody has to press through: it reads for a beat and
+ * then the window becomes the product. A button here only ever asked someone
+ * to confirm what was already happening — so the only control on this screen
+ * is the one that appears if the opening fails.
+ */
 function doneView(): string {
   const host = possession?.host_name ?? preferences.host_name ?? "This Mac";
   const body = `
     <div class="stack">
       <div class="inset">
         <p><strong>${escapeHtml(host)}</strong> is online. All your devices can reach it.</p>
-        <p class="muted">SPAWN D opens in a moment. It stays in your menu bar; the daemon keeps running on its own.</p>
+        <p class="muted">${
+          error
+            ? "The window couldn’t open the app — that is this app, not this Mac. Your host stays online and the daemon keeps running either way."
+            : "SPAWN D opens in a moment. It stays in your menu bar; the daemon keeps running on its own."
+        }</p>
+        ${busy ? paceBar("Opening SPAWN D…") : ""}
       </div>
       ${errorLine()}
-      <div class="actions"><button class="btn btn-primary" data-action="open-app">Open SPAWN D</button></div>
+      ${error ? '<div class="actions"><button class="btn btn-primary" data-action="open-app">Try again</button></div>' : ""}
     </div>`;
   return sheet(
     hatchAccount(),
@@ -795,9 +952,9 @@ function updateView(): string {
     </div>`
     : `
     <div class="stack">
-      <p class="note">${busy ? "Checking the signed app channel…" : "SPAWN D is up to date."}</p>
+      ${updateCheckLine()}
       ${errorLine()}
-      <div class="actions"><button class="btn btn-outline" data-action="settings">Close</button></div>
+      <div class="actions"><button class="btn btn-outline" data-action="recheck-update" ${updateCheck === "checking" ? "disabled" : ""}>${updateCheck === "checking" ? "Checking…" : "Check again"}</button><button class="btn btn-ghost" data-action="settings">Close</button></div>
     </div>`;
   return sheet("", stacked("Update SPAWN D", null, body));
 }
@@ -836,11 +993,18 @@ function bindActions(): void {
     event.preventDefault();
     void submitServer(new FormData(event.currentTarget as HTMLFormElement));
   });
-  document
-    .querySelector<HTMLDetailsElement>('details[data-panel="terminal"]')
-    ?.addEventListener("toggle", (event) => {
-      terminalOpen = (event.currentTarget as HTMLDetailsElement).open;
-    });
+  const terminalPanel = document.querySelector<HTMLDetailsElement>('details[data-panel="terminal"]');
+  // Both, and the click is the one that matters. A run re-renders this whole
+  // screen every second, and `toggle` arrives in a later task — late enough
+  // that the panel it was about is gone and the answer is lost, so the next
+  // render closed the panel a beat after it was opened. The click lands first,
+  // while the element is still the one that was pressed.
+  terminalPanel?.querySelector("summary")?.addEventListener("click", () => {
+    terminalOpen = !terminalPanel.open;
+  });
+  terminalPanel?.addEventListener("toggle", (event) => {
+    terminalOpen = (event.currentTarget as HTMLDetailsElement).open;
+  });
 }
 
 async function act(action: string): Promise<void> {
@@ -872,16 +1036,20 @@ async function act(action: string): Promise<void> {
     case "ask-again":
       await guarded(() => invoke("ask_for_device_approval"));
       break;
-    case "possess":
+    // "Try again" and "Start over" mean what they say: the gate runs again,
+    // because a press is the only thing that restarts it.
+    case "try-again":
     case "repair-reinstall":
       await startPossession();
       break;
-    case "try-again":
-      resetPossession();
-      render();
-      break;
     case "approve-host":
       await approveHost();
+      break;
+    case "permissions-continue":
+      await answerPermissions(true);
+      break;
+    case "permissions-skip":
+      await answerPermissions(false);
       break;
     case "copy-command":
       await navigator.clipboard.writeText(terminalCommand);
@@ -917,6 +1085,10 @@ async function act(action: string): Promise<void> {
       break;
     case "check-update":
       setScreen("update");
+      await checkUpdate();
+      break;
+    // The same question, asked from wherever the reader already is.
+    case "recheck-update":
       await checkUpdate();
       break;
     case "install-update":
@@ -974,6 +1146,17 @@ async function loadConfig(force = false): Promise<void> {
   serverSupported = await invoke<boolean>("server_supported", {
     origin: preferences.server_origin,
   }).catch(() => null);
+  // A server this app cannot finish a sign-in against may be the pair's newer
+  // half. Ask the app's own channel before the screen has to be read, so it
+  // arrives with the answer rather than another thing to press.
+  if (serverSupported === false) {
+    void checkUpdate();
+    if (!preferences.first_run_complete) setScreen("unsupported");
+  } else if (screen === "unsupported") {
+    // It answers now — the server was updated while this screen was up, or
+    // another one was chosen. Put the person back where they belong.
+    await advance();
+  }
   try {
     config = await invoke<AuthConfig>("auth_config", { origin: preferences.server_origin });
     configState = "ready";
@@ -1070,12 +1253,36 @@ async function advance(): Promise<void> {
     startDevicePoll();
     return;
   }
+  // The host gate is where an out-of-date server actually bites, and this is
+  // the only place a stored account ever passed. Without it, `initialize()`
+  // walked straight from a saved session into a possession that failed with a
+  // pairing error saying nothing about the server's age, and the screen that
+  // explains it — and offers the app update — was never reached at all.
+  //
+  // Here rather than in front of every gate, on purpose. `POST
+  // /api/auth/session/renew` is the sentinel, and it backs sign-in, the
+  // periodic renewal and the browser handover — not possession, which
+  // `install.rs` completes without it. So a stale server does not stop this
+  // Mac working; it stops the *ending* working, and the person still has real
+  // choices here because nothing is committed yet. A Mac that is already
+  // possessed never reaches this line, which is the point: taking a working
+  // machine away over a degraded handover would be the worse bug.
+  if (serverSupported === false && !preferences.first_run_complete) {
+    setScreen("unsupported");
+    return;
+  }
   setScreen("host");
+  // The gate has nothing to ask. This app holds the account, it runs the
+  // install itself, and it verifies the daemon's key against the link its own
+  // daemon printed — a button here was a question with one answer. Once per
+  // arrival, so a failure stays a failure until someone answers it.
+  if (!hostRunStarted) void startPossession();
 }
 
 async function signOut(): Promise<void> {
   stopPolls();
   resetPossession();
+  hostRunStarted = false;
   await guarded(() => invoke("sign_out"));
   preferences = await invoke<Preferences>("app_preferences");
   deviceGateRequired = false;
@@ -1095,6 +1302,9 @@ async function submitServer(data: FormData): Promise<void> {
   preferences = await invoke<Preferences>("app_preferences");
   terminalCommand = await invoke<string>("terminal_install_command");
   inviteRequiredFor = null;
+  // Another server is another possession; the gate gets a fresh arrival.
+  resetPossession();
+  hostRunStarted = false;
   setScreen("auth");
   await loadConfig(true);
 }
@@ -1167,6 +1377,8 @@ function startDevicePoll(): void {
 
 function resetPossession(): void {
   terminalOpen = null;
+  autoApproved = false;
+  permissionsError = null;
   possessionPoll = clearTimer(possessionPoll);
   ticker = clearTimer(ticker);
   runId = null;
@@ -1175,13 +1387,22 @@ function resetPossession(): void {
   completedSteps.clear();
 }
 
+/**
+ * Possess this Mac.
+ *
+ * The gate is on screen before the daemon is even asked for, so the wait for
+ * `begin_possession` is reported by the checklist's first row rather than by
+ * a button that says "Starting…" — and a repair that reinstalls arrives at the
+ * gate at once instead of a beat later.
+ */
 async function startPossession(): Promise<void> {
   resetPossession();
+  hostRunStarted = true;
+  setScreen("host");
   const id = await guarded(() => invoke<string>("begin_possession"));
   if (!id) return;
   runId = id;
   waitStartedAt = Date.now();
-  setScreen("host");
   startPossessionPoll();
   ticker = window.setInterval(() => {
     if (screen === "host" && runId) render();
@@ -1201,6 +1422,14 @@ function startPossessionPoll(): void {
         waitStartedAt = Date.now();
       }
       syncPossessionSteps(possession.status);
+      // The review is this app's to answer, and it has already checked the
+      // only thing the answer depends on. Once per run, never on a mismatch.
+      if (possession.review?.exact_key_match && !autoApproved) {
+        autoApproved = true;
+        await approveHost();
+        render();
+        return;
+      }
       if (possession.status === "online") {
         possessionPoll = clearTimer(possessionPoll);
         ticker = clearTimer(ticker);
@@ -1236,12 +1465,53 @@ function syncPossessionSteps(state: PossessionProgress["status"]): void {
   for (let index = 0; index < count; index += 1) completedSteps.add(index);
 }
 
+/**
+ * Answer the permissions gate, and go back to watching the run either way.
+ *
+ * Not `guarded`, for one reason: it writes to `error`, and the possession poll
+ * underneath this screen clears `error` on every tick — so a failure would
+ * flash and disappear. Everything else about it is the same shape.
+ *
+ * Neither answer is a dead end. The daemon releases as soon as the answer is
+ * durable rather than waiting on the dialogs, so the run continues and the
+ * poll carries the person to the done gate. If the answer cannot be delivered
+ * at all, both buttons stay pressable with the reason above them — and the
+ * daemon's own two-minute timeout means even doing nothing moves on.
+ */
+async function answerPermissions(prime: boolean): Promise<void> {
+  busy = true;
+  permissionsError = null;
+  render();
+  try {
+    await invoke("answer_permissions", { prime });
+    busy = false;
+    setScreen("host");
+  } catch (cause) {
+    permissionsError = describe(cause);
+    busy = false;
+    render();
+  }
+}
+
 async function approveHost(): Promise<void> {
   if (!runId) return;
   const result = await guarded(() => invoke<string>("approve_possession", { runId }));
-  if (result !== null) {
-    completedSteps.add(APPROVAL_STEP);
-    waitStartedAt = Date.now();
+  if (result === null) return;
+  completedSteps.add(APPROVAL_STEP);
+  waitStartedAt = Date.now();
+  // Approved is the moment, and this is the only place that knows it: the
+  // gate is something the app creates between approving and waiting for
+  // Online, not a state the daemon reports back. Asking also *holds* the
+  // daemon, so it is asked once and only where the answer can be given. A
+  // build whose daemon has no gate — or one that has already been answered —
+  // says no, and the run carries straight on to Online.
+  const gate = await invoke<boolean>("begin_permissions_gate").catch((cause) => {
+    console.warn("permissions gate unavailable:", describe(cause));
+    return false;
+  });
+  if (gate) {
+    permissionsError = null;
+    setScreen("permissions");
   }
 }
 
@@ -1260,9 +1530,25 @@ async function refreshStatus(includeDoctor: boolean): Promise<void> {
   }
 }
 
+/**
+ * Ask the signed app channel what it has.
+ *
+ * Not `guarded`: this runs on its own on a screen that is already reporting
+ * one problem, and a channel that cannot be reached is a second line of prose
+ * there, not a red alert over the first. `updateCheck` is what the screens
+ * read, so they can each say it in their own voice.
+ */
 async function checkUpdate(): Promise<void> {
-  const result = await guarded(() => invoke<AppUpdate>("check_app_update"));
-  if (result) appUpdate = result;
+  if (updateCheck === "checking") return;
+  updateCheck = "checking";
+  render();
+  try {
+    appUpdate = await invoke<AppUpdate>("check_app_update");
+    updateCheck = "done";
+  } catch (cause) {
+    updateCheck = "failed";
+    console.warn("app update check failed:", describe(cause));
+  }
   render();
 }
 
@@ -1295,6 +1581,12 @@ async function initialize(): Promise<void> {
     for (const url of urls) void handleDeepLink(url);
   });
 
+  // The move out of the keychain (`storage.rs`) is deliberately not announced
+  // here. It cannot know whether macOS will actually ask — finding that out
+  // means probing the keychain, which *is* the dialog — so a screen would have
+  // shown to everyone while only builds whose signature changed ever see a
+  // prompt. The sweep runs from the Rust `setup` hook at launch, so nothing
+  // here needs to call it.
   if (preferences.first_run_complete) {
     // The window is only the wizard here because the tray asked for one of
     // its surfaces by name while the product had it; the hash says which.

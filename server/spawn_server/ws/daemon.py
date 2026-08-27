@@ -1089,7 +1089,8 @@ _push_tasks: set[asyncio.Task[None]] = set()
 
 
 def _schedule_alert_push(owner_user_id: str, payload: dict[str, object]) -> None:
-    """Send the same alert to the account's phones, off this socket's hot path.
+    """Send the same alert to the account's phones and browsers, off this
+    socket's hot path.
 
     Deliberately fire-and-forget. The socket publish above has to stay quick —
     it sits in the daemon's read loop — and a push round-trip to an external

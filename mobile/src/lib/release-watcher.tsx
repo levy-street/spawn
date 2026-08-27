@@ -16,7 +16,16 @@ import { spacing } from "@/theme";
 
 const RELEASE_CHECK_MS = 15 * 60 * 1_000;
 const SOFT_SNOOZE_MS = 30 * 60 * 1_000;
-const APP_STORE_URL = "https://apps.apple.com/";
+/**
+ * The store listing, once there is one.
+ *
+ * Null until then, exactly as the browser has it
+ * (`web/src/lib/platform.ts`): neither store resolves yet, and a button to
+ * `apps.apple.com/` is a button to the storefront's front page — which, in a
+ * dialog the person cannot dismiss, is a trap rather than a way out. Filling
+ * this in is the only change needed to turn the words back into a button.
+ */
+const APP_STORE_URL: string | null = null;
 
 type UpdatePrompt = { kind: "restart" | "store"; hard: boolean };
 
@@ -124,12 +133,23 @@ export function ReleaseWatcher({
   };
 
   if (prompt?.kind === "store") {
+    // A hard prompt is normally undismissable, because the app really cannot
+    // go on. That only holds while there is somewhere to send the person: with
+    // no listing to update from, refusing to close the dialog leaves them
+    // holding a phone that can do nothing at all. Say what happened, and let
+    // them out.
+    const storeUrl = APP_STORE_URL;
+    const stranded = storeUrl === null;
     return (
       <Dialog
         footer={
           <>
-            <Button onPress={() => void Linking.openURL(APP_STORE_URL)}>Open App Store</Button>
-            {prompt.hard ? null : (
+            {storeUrl === null ? null : (
+              <Button onPress={() => void Linking.openURL(storeUrl)}>Open App Store</Button>
+            )}
+            {stranded ? (
+              <Button onPress={later}>Close</Button>
+            ) : prompt.hard ? null : (
               <Button onPress={later} variant="outline">
                 Later
               </Button>
@@ -143,7 +163,9 @@ export function ReleaseWatcher({
       >
         <View style={styles.content}>
           <Text color="mutedForeground">
-            This version of SPAWN D no longer works with the server. Update it from the App Store.
+            {stranded
+              ? "This version of SPAWN D no longer works with the server. It cannot update itself yet — SPAWN D is not in the App Store — so reinstall it from wherever you installed it."
+              : "This version of SPAWN D no longer works with the server. Update it from the App Store."}
           </Text>
         </View>
       </Dialog>

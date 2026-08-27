@@ -62,6 +62,7 @@ import { toast } from "@/components/ui/toast";
 import { RailTooltip } from "@/components/ui/tooltip";
 import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
 import { PANE_SCOPE_ATTR, paneRootAt } from "@/components/workspace/pane-scope";
+import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { hosts, sessions, type Workspace, workspaces } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
 import { type SplitSide, splitStore, useSplit } from "@/lib/split-store";
@@ -144,6 +145,9 @@ export function Sidebar({
   const router = useRouter();
   const queryClient = useQueryClient();
   const { user } = useAuth();
+  // In the desktop app the lander is not "home", it is a website this window
+  // cannot come back from — so the lockup there is a mark, not a door.
+  const inShell = useDesktopShell();
   const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   // Set only while a row is out on the canvas. Everything that changes on a
@@ -724,6 +728,14 @@ export function Sidebar({
                   />
                 </Button>
               </RailTooltip>
+            ) : inShell ? (
+              <div
+                role="img"
+                aria-label="SPAWN D"
+                className="grid size-9 shrink-0 place-items-center rounded-lg text-foreground"
+              >
+                <Trident className="size-5.5" />
+              </div>
             ) : (
               <Link
                 href="/"
@@ -740,20 +752,26 @@ export function Sidebar({
              * hellfire is the brand ink the trident is drawn in — the chrome
              * accent would swap it to the dark-theme ember and split the pair. */}
             <SidebarRowLabel collapsed={collapsed} className="ml-1.5 flex items-center">
-              <Link
-                href="/"
-                onClick={onNavigate}
-                aria-hidden
-                tabIndex={-1}
-                className={cn(
-                  "flex items-center text-hellfire",
-                  // Faded out on the rail, so it must not still be a target
-                  // sitting in the empty space beside the trident.
-                  collapsed && "pointer-events-none",
-                )}
-              >
-                <Wordmark className="h-[17px]" />
-              </Link>
+              {inShell ? (
+                <span aria-hidden className="flex items-center text-hellfire">
+                  <Wordmark className="h-[17px]" />
+                </span>
+              ) : (
+                <Link
+                  href="/"
+                  onClick={onNavigate}
+                  aria-hidden
+                  tabIndex={-1}
+                  className={cn(
+                    "flex items-center text-hellfire",
+                    // Faded out on the rail, so it must not still be a target
+                    // sitting in the empty space beside the trident.
+                    collapsed && "pointer-events-none",
+                  )}
+                >
+                  <Wordmark className="h-[17px]" />
+                </Link>
+              )}
             </SidebarRowLabel>
           </div>
           {showCollapseControl ? (

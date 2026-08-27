@@ -68,6 +68,67 @@ jobs:
         working-directory: daemon
         run: cargo build --release --locked --target x86_64-apple-darwin --bin spawnd --bin spawn-worker
 
+      # A Mach-O the linker signed by itself seals nothing it did not write:
+      # `codesign -dv` on such a binary says `Info.plist=not bound`, so the
+      # usage strings daemon/Info.plist embeds are ignored and every macOS
+      # consent dialog on the user's machine is headed by a per-build hash
+      # (`spawnd-fc29710558bd7071`) with no product name and no sentence. One
+      # re-sign binds them and adopts `dev.spawnd.daemon` as the identifier.
+      #
+      # Ad-hoc by default because it cannot fail and needs no secret. Setting
+      # the repository variable SIGN_DAEMON_WITH_DEVELOPER_ID to `true` uses the
+      # Developer ID certificate desktop.yml already holds, which is the only
+      # way a consent grant survives a daemon self-update: TCC keys the grant on
+      # the signing identity, and an ad-hoc identity is the binary's own hash,
+      # so it changes with every release and every folder is asked for again.
+      # Read "The macOS consent dialogs" in docs/RELEASE.md before turning it on
+      # — it changes what every existing host is asked, once.
+      - name: Sign the darwin binaries
+        env:
+          DEVELOPER_ID: ${{ vars.SIGN_DAEMON_WITH_DEVELOPER_ID }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -eu
+          identity="-"
+          if [ "${DEVELOPER_ID:-}" = "true" ] && [ -n "${APPLE_CERTIFICATE:-}" ]; then
+            keychain="$RUNNER_TEMP/spawnd-signing.keychain-db"
+            password="$(uuidgen)"
+            security create-keychain -p "$password" "$keychain"
+            security set-keychain-settings -lut 900 "$keychain"
+            security unlock-keychain -p "$password" "$keychain"
+            printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/daemon-cert.p12"
+            security import "$RUNNER_TEMP/daemon-cert.p12" -k "$keychain" \
+              -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: \
+              -s -k "$password" "$keychain" >/dev/null
+            security list-keychain -d user -s "$keychain" login.keychain-db
+            rm -f "$RUNNER_TEMP/daemon-cert.p12"
+            identity="$APPLE_SIGNING_IDENTITY"
+          else
+            echo "Signing ad-hoc: the dialogs read correctly, but every self-update asks again."
+          fi
+          for binary in \
+            daemon/target/release/spawnd \
+            daemon/target/release/spawn-worker \
+            daemon/target/x86_64-apple-darwin/release/spawnd \
+            daemon/target/x86_64-apple-darwin/release/spawn-worker
+          do
+            if [ "$identity" = "-" ]; then
+              codesign --force --sign - "$binary"
+            else
+              codesign --force --timestamp --sign "$identity" "$binary"
+            fi
+            codesign --verify --verbose=2 "$binary"
+            # The whole point of the step. If either line is missing the build
+            # would ship binaries that ask for consent anonymously, so fail
+            # here rather than find out from a user.
+            codesign -dv --verbose=2 "$binary" 2>&1 | tee /tmp/sig.txt
+            grep -q 'Identifier=dev\.spawnd\.daemon' /tmp/sig.txt
+            grep -q 'Info\.plist entries=' /tmp/sig.txt
+          done
+
       - name: Stage binaries
         run: |
           set -eu

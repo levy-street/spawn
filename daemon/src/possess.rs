@@ -115,11 +115,7 @@ enum ServerOffer {
     Unnamed,
 }
 
-fn server_offer(
-    server_cli: Option<&str>,
-    resolved: &Url,
-    interactive: bool,
-) -> ServerOffer {
+fn server_offer(server_cli: Option<&str>, resolved: &Url, interactive: bool) -> ServerOffer {
     // No terminal to ask at: take the resolved value.
     if !interactive {
         return ServerOffer::Settled(resolved.clone());
@@ -221,7 +217,9 @@ async fn keep_possessed(existing: &[PathBuf], server_cli: Option<String>) -> Res
         let stored = creds::load().ok();
         let server = config::server_url_for_instance(
             server_cli,
-            stored.as_ref().and_then(|creds| creds.server_url.as_deref()),
+            stored
+                .as_ref()
+                .and_then(|creds| creds.server_url.as_deref()),
         )?;
         print_starting_step();
         service::install(dir, server.as_str())
@@ -240,7 +238,11 @@ async fn keep_possessed(existing: &[PathBuf], server_cli: Option<String>) -> Res
 }
 
 fn possess_ui() -> crate::tui::Ui {
-    crate::tui::Ui::start(&login::ceremony_title(), &POSSESS_STEPS, login::WAITING_HINT)
+    crate::tui::Ui::start(
+        &login::ceremony_title(),
+        &POSSESS_STEPS,
+        login::WAITING_HINT,
+    )
 }
 
 pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()> {
@@ -266,7 +268,9 @@ pub async fn possess(server_cli: Option<String>, args: PossessArgs) -> Result<()
                 let stored = creds::load().ok();
                 let server = config::server_url_for_instance(
                     server_cli,
-                    stored.as_ref().and_then(|creds| creds.server_url.as_deref()),
+                    stored
+                        .as_ref()
+                        .and_then(|creds| creds.server_url.as_deref()),
                 )?;
                 login::run(
                     Some(server.to_string()),
@@ -763,11 +767,7 @@ mod tests {
     #[test]
     fn the_hosted_origin_is_not_offered_twice() {
         assert_eq!(
-            server_offer(
-                Some("https://spawnd.dev"),
-                &url("https://spawnd.dev"),
-                true
-            ),
+            server_offer(Some("https://spawnd.dev"), &url("https://spawnd.dev"), true),
             ServerOffer::Unnamed
         );
         // Nobody named one: the dev fallback is not a choice anyone made.
@@ -791,10 +791,16 @@ mod tests {
     #[test]
     fn an_origin_reads_as_a_person_would_write_it() {
         assert_eq!(origin_label(&url("https://spawnd.dev/")), "spawnd.dev");
-        assert_eq!(origin_label(&url("http://localhost:3000/")), "localhost:3000");
+        assert_eq!(
+            origin_label(&url("http://localhost:3000/")),
+            "localhost:3000"
+        );
         // Default ports stay implicit; a non-default one is part of the name.
         assert_eq!(origin_label(&url("http://example.test/")), "example.test");
-        assert_eq!(origin_label(&url("https://example.test:8443/")), "example.test:8443");
+        assert_eq!(
+            origin_label(&url("https://example.test:8443/")),
+            "example.test:8443"
+        );
     }
 
     /// The ceremony's last screen has one job: release the reader. Saying the
@@ -830,7 +836,9 @@ mod tests {
         assert!(text.contains("spawn: mac.local is possessed (bad19924)."));
         assert!(text.contains("close this terminal"));
         assert!(text.contains("spawnd status"));
-        assert!(lines.iter().all(|l| l.is_empty() || l.starts_with("spawn:")));
+        assert!(lines
+            .iter()
+            .all(|l| l.is_empty() || l.starts_with("spawn:")));
     }
 
     #[test]
@@ -862,7 +870,10 @@ mod tests {
     /// nobody watching stays the no-op it always was.
     #[test]
     fn an_unattended_run_is_never_asked() {
-        assert_eq!(resume_action(&[PathBuf::from("/tmp/a")]), ResumeAction::Keep);
+        assert_eq!(
+            resume_action(&[PathBuf::from("/tmp/a")]),
+            ResumeAction::Keep
+        );
     }
 
     #[test]

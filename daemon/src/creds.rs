@@ -13,7 +13,6 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -31,6 +30,7 @@ use spawnd::host_pair_approval::{self, HostPairApprovalTranscript};
 use spawnd::host_pair_possession::{
     sign_transcript, signature_to_wire, HostPairPossessionTranscript,
 };
+use spawnd::secret_file::{self, SecretFile};
 use spawnd::signed_signal::{public_key_from_wire, public_key_to_wire, SignedSignalTranscript};
 use spawnd::signed_signal_wire::{sign_rtc_signal_wire, RtcProtocol};
 
@@ -53,6 +53,17 @@ const CANONICAL_UUID_BYTES: usize = 36;
 const PUBLIC_KEY_WIRE_BYTES: usize = 43;
 const FINGERPRINT_WIRE_BYTES: usize = 23;
 const CREDENTIAL_LOCK_FILE: &str = ".credentials.lock";
+
+/// How this file is handled on disk. The rules live in `spawnd::secret_file`
+/// because the macOS companion keeps its own secrets under exactly the same
+/// ones; only the vocabulary below is ours. The temporary prefix in particular
+/// is a boundary, not a name: a writer sweeping stale temporaries must be able
+/// to tell its own from another program's sharing the directory.
+const CREDENTIAL_FILE: SecretFile = SecretFile::new(
+    "credential fallback",
+    ".credentials.",
+    MAX_CREDENTIALS_FILE_BYTES,
+);
 
 #[derive(Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1148,54 +1159,7 @@ fn with_credential_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
 
 fn with_credential_lock_at<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
     validate_credential_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
-    let file = open_credential_lock(path)?;
-    file.lock()
-        .with_context(|| format!("locking {}", path.display()))?;
-    let outcome = operation();
-    let unlock = file
-        .unlock()
-        .with_context(|| format!("unlocking {}", path.display()));
-    drop(file);
-    match outcome {
-        Ok(value) => {
-            unlock?;
-            Ok(value)
-        }
-        Err(error) => {
-            // Closing the file releases the OS lock even if explicit unlock
-            // itself failed; preserve the operation error as the primary cause.
-            let _ = unlock;
-            Err(error)
-        }
-    }
-}
-
-#[cfg(unix)]
-fn open_credential_lock(path: &Path) -> Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags};
-
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .with_context(|| format!("opening credential lock {}", path.display()))?;
-    let file = std::fs::File::from(fd);
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspecting credential lock {}", path.display()))?;
-    validate_unix_credentials_metadata(path, &metadata, rustix::process::geteuid().as_raw())?;
-    Ok(file)
-}
-
-#[cfg(not(unix))]
-fn open_credential_lock(path: &Path) -> Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(path)
-        .with_context(|| format!("opening credential lock {}", path.display()))
+    CREDENTIAL_FILE.lock(path, operation)
 }
 
 /// Load one complete credential generation. Backend records are never overlaid:
@@ -2151,242 +2115,21 @@ fn validate_credential_directory(path: &Path) -> Result<()> {
 }
 
 fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(path)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        // The Windows replacement primitive below requests write-through. Some
-        // other platforms cannot open directories as files, so there is no
-        // additional portable directory handle to flush here.
-        let _ = path;
-        Ok(())
-    }
+    secret_file::sync_parent_directory(path)
 }
 
 fn cleanup_stale_credential_temps(credentials_path: &Path) -> Result<()> {
     let parent = credentials_path.parent().unwrap_or_else(|| Path::new("."));
     validate_credential_directory(parent)?;
-    let mut removed = false;
-    for entry in std::fs::read_dir(parent)
-        .with_context(|| format!("enumerating credential directory {}", parent.display()))?
-    {
-        let entry = entry.with_context(|| format!("reading {}", parent.display()))?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some(record_id) = name
-            .strip_prefix(".credentials.")
-            .and_then(|name| name.strip_suffix(".tmp"))
-        else {
-            continue;
-        };
-        let Ok(parsed) = Uuid::parse_str(record_id) else {
-            continue;
-        };
-        if parsed.to_string() != record_id {
-            continue;
-        }
-        let path = entry.path();
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("inspecting {}", path.display()))
-            }
-        };
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if metadata.uid() != rustix::process::geteuid().as_raw()
-                || metadata.permissions().mode() & 0o777 != 0o600
-            {
-                continue;
-            }
-        }
-        std::fs::remove_file(&path)
-            .with_context(|| format!("removing stale credential temporary {}", path.display()))?;
-        removed = true;
-    }
-    if removed {
-        sync_parent_directory(parent)
-            .with_context(|| format!("syncing credential directory {}", parent.display()))?;
-    }
-    Ok(())
+    CREDENTIAL_FILE.cleanup_stale_temporaries(credentials_path)
 }
 
-#[cfg(unix)]
 fn read_credentials_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    use rustix::fs::{Mode, OFlags};
-
-    let fd = match rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
-    };
-    let mut file = std::fs::File::from(fd);
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspecting {}", path.display()))?;
-    validate_unix_credentials_metadata(path, &metadata, rustix::process::geteuid().as_raw())?;
-    if metadata.len() > MAX_CREDENTIALS_FILE_BYTES as u64 {
-        bail!("credential fallback is too large: {}", path.display())
-    }
-    let mut raw = Vec::with_capacity(metadata.len() as usize);
-    let read_result = Read::by_ref(&mut file)
-        .take((MAX_CREDENTIALS_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut raw)
-        .with_context(|| format!("reading {}", path.display()));
-    if let Err(error) = read_result {
-        raw.zeroize();
-        return Err(error);
-    }
-    if raw.len() > MAX_CREDENTIALS_FILE_BYTES {
-        raw.zeroize();
-        bail!("credential fallback is too large: {}", path.display())
-    }
-    Ok(Some(raw))
-}
-
-#[cfg(unix)]
-fn validate_unix_credentials_metadata(
-    path: &Path,
-    metadata: &std::fs::Metadata,
-    expected_uid: u32,
-) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    if !metadata.is_file() {
-        bail!(
-            "credential fallback is not a regular file: {}",
-            path.display()
-        )
-    }
-    if metadata.uid() != expected_uid {
-        bail!(
-            "credential fallback is not owned by the current user: {}",
-            path.display()
-        )
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        bail!(
-            "credential fallback has group or other permissions: {}",
-            path.display()
-        )
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn read_credentials_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("inspecting {}", path.display())),
-    };
-    if !metadata.is_file() {
-        bail!(
-            "credential fallback is not a regular file: {}",
-            path.display()
-        )
-    }
-    if metadata.len() > MAX_CREDENTIALS_FILE_BYTES as u64 {
-        bail!("credential fallback is too large: {}", path.display())
-    }
-    let mut raw = Vec::with_capacity(metadata.len() as usize);
-    let read_result = std::fs::File::open(path)?
-        .take((MAX_CREDENTIALS_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut raw);
-    if let Err(error) = read_result {
-        raw.zeroize();
-        return Err(error.into());
-    }
-    if raw.len() > MAX_CREDENTIALS_FILE_BYTES {
-        raw.zeroize();
-        bail!("credential fallback is too large: {}", path.display())
-    }
-    Ok(Some(raw))
+    CREDENTIAL_FILE.read(path)
 }
 
 fn write_secure(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    write_secure_with_parent_sync(path, data, sync_parent_directory)
-}
-
-fn write_secure_with_parent_sync<S>(path: &Path, data: &[u8], sync_parent: S) -> std::io::Result<()>
-where
-    S: Fn(&Path) -> std::io::Result<()>,
-{
-    // Write atomically: unique temp file in the same directory, then durable replace.
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = parent.to_path_buf();
-    tmp.push(format!(".credentials.{}.tmp", Uuid::new_v4()));
-    let result = (|| {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut f = options.open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-        durable_replace(&tmp, path)?;
-        sync_parent(parent)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        match std::fs::remove_file(&tmp) {
-            Ok(()) => {
-                let _ = sync_parent_directory(parent);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(std::io::Error::other(format!(
-                    "credential write failed and temporary cleanup also failed: {error}"
-                )))
-            }
-        }
-    }
-    result
-}
-
-#[cfg(not(windows))]
-fn durable_replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::rename(from, to)
-}
-
-#[cfg(windows)]
-fn durable_replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: both inputs are stable, NUL-terminated UTF-16 buffers for the
-    // duration of the call. Flags request atomic replacement and write-through.
-    let replaced = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if replaced == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    CREDENTIAL_FILE.write(path, data)
 }
 
 #[cfg(test)]
@@ -2394,6 +2137,9 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    // Only the tests hand-build files now; the module's own reads and writes go
+    // through `spawnd::secret_file`.
+    use std::io::Write;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -4217,11 +3963,12 @@ mod tests {
         let path = temp.path().join("credentials.json");
         std::fs::write(&path, b"old-secret").unwrap();
         let sync_called = Cell::new(false);
-        let error = write_secure_with_parent_sync(&path, b"new-secret", |_| {
-            sync_called.set(true);
-            Err(std::io::Error::other("injected directory sync failure"))
-        })
-        .unwrap_err();
+        let error = CREDENTIAL_FILE
+            .write_with_parent_sync(&path, b"new-secret", |_| {
+                sync_called.set(true);
+                Err(std::io::Error::other("injected directory sync failure"))
+            })
+            .unwrap_err();
         assert!(sync_called.get());
         assert!(error
             .to_string()
@@ -4406,7 +4153,9 @@ mod tests {
         save_file_at(&path, &fixed_creds()).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
         let wrong_uid = metadata.uid().wrapping_add(1);
-        let error = validate_unix_credentials_metadata(&path, &metadata, wrong_uid).unwrap_err();
+        let error = CREDENTIAL_FILE
+            .validate_metadata(&path, &metadata, wrong_uid)
+            .unwrap_err();
         assert!(format!("{error:#}").contains("not owned by the current user"));
     }
 
