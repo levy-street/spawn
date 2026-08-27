@@ -225,17 +225,17 @@ export default function LandingPage() {
   // The selected install target owns the adjacent desktop action. Before the
   // reader chooses, detected Windows asks for its EXE and macOS/unknown keeps
   // the historical Apple Silicon handoff on the hydration-safe first render.
+  // Both Windows targets ask for the EXE: the companion is published on its
+  // own, independently of the native daemon.
   const discoveryPlatform: DesktopPlatform | null =
-    chosenTarget === "windows"
+    chosenTarget === "windows" || chosenTarget === "windows-wsl"
       ? WINDOWS_DESKTOP_PLATFORM
-      : chosenTarget === "windows-wsl"
-        ? null
-        : (chosenTarget === "unix" || chosenTarget === null) &&
-            (detectedOS === "macos" || detectedOS === "unknown")
-          ? "darwin-aarch64"
-          : chosenTarget === null && detectedOS === "windows"
-            ? WINDOWS_DESKTOP_PLATFORM
-            : null;
+      : (chosenTarget === "unix" || chosenTarget === null) &&
+          (detectedOS === "macos" || detectedOS === "unknown")
+        ? "darwin-aarch64"
+        : chosenTarget === null && detectedOS === "windows"
+          ? WINDOWS_DESKTOP_PLATFORM
+          : null;
   const {
     settled: releaseSettled,
     url: discoveredBuildUrl,
@@ -293,15 +293,21 @@ export default function LandingPage() {
   // reader wants the app instead. Detection lands after mount, so the server
   // render keeps the install chip and a phone swaps to the badge.
   const phoneBadge = storeBadgeForOS(detectedOS);
-  // Linux and WSL targets do not have a native desktop artifact. Undetected
-  // browsers keep the Mac slab on the hydration-safe first render; the full
-  // inventory remains one press away on /download.
+  // Linux has no desktop artifact. Undetected browsers keep the Mac slab on
+  // the hydration-safe first render; the full inventory remains one press
+  // away on /download.
   const installTarget = chosenTarget ?? defaultTargetId;
   const windowsChosen = installTarget === "windows";
   const windowsWslChosen = installTarget === "windows-wsl";
   const requestedDownloadPlatform = discoveryPlatform;
   const selectedBuildUrl =
     requestedDownloadPlatform === discoveredPlatform ? discoveredBuildUrl : null;
+  // The WSL target offers the Windows companion too, wherever the EXE is
+  // published. Until the manifest answers, the walkthrough is the promise
+  // that cannot be broken — a slab that then vanished would have been bait.
+  const wslWithoutExe = windowsWslChosen && !(releaseSettled && selectedBuildUrl);
+  const windowsUnpublished = windowsChosen && releaseSettled && selectedBuildUrl === null;
+  const quietAction = wslWithoutExe || windowsUnpublished;
 
   return (
     <main className="grimoire min-h-vv overflow-x-clip">
@@ -436,11 +442,11 @@ export default function LandingPage() {
                   // badge is the download button on those platforms, and neither
                   // may be redrawn in someone else's house style.
                   <StoreBadges badges={[phoneBadge]} />
-                ) : windowsWslChosen ? (
+                ) : wslWithoutExe ? (
                   <Link href="/download" className={cn(CTA_QUIET, "h-14 grow whitespace-nowrap")}>
                     Windows setup through WSL →
                   </Link>
-                ) : windowsChosen && releaseSettled && selectedBuildUrl === null ? (
+                ) : windowsUnpublished ? (
                   <Link href="/download" className={cn(CTA_QUIET, "h-14 grow whitespace-nowrap")}>
                     Windows desktop build not published yet
                   </Link>
@@ -462,7 +468,7 @@ export default function LandingPage() {
                     className="h-14 grow rounded-[11px] whitespace-nowrap"
                   />
                 )}
-                {!windowsWslChosen && !(windowsChosen && releaseSettled && !selectedBuildUrl) && (
+                {!quietAction && (
                   <Link
                     href="/download"
                     className={cn(

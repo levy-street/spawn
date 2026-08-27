@@ -179,14 +179,25 @@ test("Windows with complete release metadata exposes native PowerShell and the E
   await expect(page.locator("code").filter({ hasText: "install.ps1" }).first()).toHaveText(
     `irm ${origin}/install.ps1 | iex`,
   );
-  await expect(page.getByText("Desktop · Windows")).toBeVisible();
-  await expect(page.getByText("Desktop · macOS")).toBeVisible();
-  await expect(page.getByText("iPhone and iPad")).toBeVisible();
-  await expect(page.getByText("Android")).toBeVisible();
-  await expect(page.getByRole("link", { name: "Windows x64" })).toHaveAttribute(
+  await expect(page.getByText("Download on desktop")).toBeVisible();
+  await expect(page.getByText("Download on mobile")).toBeVisible();
+  await expect(page.getByTestId("windows-download")).toHaveAttribute(
     "href",
     `${origin}/desktop/SPAWN-D_9.9.9_windows-x86_64-setup.exe`,
   );
+
+  // The menu beside the slab switches it to the builds it is not showing,
+  // and back.
+  const otherBuilds = page.getByRole("button", { name: "Choose a different desktop build" });
+  await otherBuilds.click();
+  await page.getByRole("menuitem", { name: "macOS · Intel" }).click();
+  await expect(page.getByTestId("mac-download")).toHaveAttribute(
+    "href",
+    `${origin}/desktop/SPAWN-D_9.9.9_darwin-x86_64.dmg`,
+  );
+  await expect(page.getByTestId("mac-download")).toHaveText(/Download for Intel Mac/i);
+  await otherBuilds.click();
+  await page.getByRole("menuitem", { name: "Windows", exact: true }).click();
 
   const started = page.waitForEvent("download");
   await page.getByTestId("windows-download").click();
@@ -271,6 +282,60 @@ test("Windows landing page uses a quiet WSL action when native artifacts are abs
   await expect(page.getByTestId("windows-download")).toHaveCount(0);
   await expect(page.getByRole("link", { name: "More download options" })).toHaveCount(0);
   await expectNoHorizontalOverflow(page);
+  await context.close();
+});
+
+test("Windows landing page offers the published EXE even when the daemon is WSL-only", async ({
+  browser,
+}) => {
+  const { context, page } = await newPlatformPage(browser, {
+    platform: "Win32",
+    userAgent: WINDOWS_USER_AGENT,
+  });
+  await page.route("**/api/me", (route) =>
+    route.fulfill({ status: 401, contentType: "application/json", body: "{}" }),
+  );
+  // The companion ships on its own: a manifest that names the Windows EXE but
+  // no native Windows daemon is exactly what a development checkout serves.
+  await page.route("**/api/release", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        daemon: { targets: { "darwin-aarch64": {} } },
+        desktop: {
+          version: "9.9.9",
+          tree: "a".repeat(40),
+          platforms: ["darwin-aarch64", "windows-x86_64"],
+        },
+      }),
+    }),
+  );
+  await page.route("**/desktop/*-setup.exe", (route) =>
+    route.fulfill({ status: 200, contentType: "application/octet-stream", body: "setup" }),
+  );
+  await page.goto("/");
+  const origin = new URL(page.url()).origin;
+
+  const hero = page.locator("section").filter({
+    has: page.getByRole("heading", { name: "A daemon on every host you own.", level: 1 }),
+  });
+  await expect(hero.getByRole("tab", { name: "Windows (WSL)" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  const slab = hero.getByTestId("windows-download");
+  await expect(slab).toHaveAttribute(
+    "href",
+    `${origin}/desktop/SPAWN-D_9.9.9_windows-x86_64-setup.exe`,
+  );
+  await expect(hero.getByRole("link", { name: "Windows setup through WSL →" })).toHaveCount(0);
+  await expect(hero.getByRole("link", { name: "More download options" })).toBeVisible();
+
+  const started = page.waitForEvent("download");
+  await slab.click();
+  expect((await started).suggestedFilename()).toContain("SPAWN-D_9.9.9_windows-x86_64-setup.exe");
+
   await context.close();
 });
 

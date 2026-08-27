@@ -542,7 +542,7 @@ export function DesktopDownloadButton({
 export interface StoreBadgeItem {
   id: string;
   label: string;
-  /** Null while the listing is not public; the badge then reads "Coming soon". */
+  /** Null while the listing is not public; the badge is then artwork, not a link. */
   href: string | null;
 }
 
@@ -556,9 +556,9 @@ export interface StoreBadgeItem {
  * is why its box is 60px tall where Apple's is 40 — that renders the two
  * *visible* badges at the same height.
  *
- * A listing that is not live yet keeps the badge intact and adds a caption
- * beneath instead of dimming it: the artwork stays compliant, and nobody taps
- * a link that 404s.
+ * A listing that is not live yet is the same artwork without the link: the
+ * badge stays compliant, and nothing is drawn around or under it — a backdrop
+ * or a caption made it a different object from the one beside it.
  */
 const STORE_ART: Record<string, { src: string; className: string; alt: string }> = {
   ios: {
@@ -619,19 +619,8 @@ export function StoreBadges({
             <StoreBadgeArt art={art} />
           </a>
         ) : (
-          // Not a link yet, so the badge sits on a backdrop that carries the
-          // date beneath it — one object rather than a badge with a caption
-          // floating near it, which over the hero artwork read as debris.
-          <span
-            key={badge.id}
-            className="inline-flex flex-col overflow-hidden rounded-[10px] bg-char"
-          >
-            <span className="flex items-center justify-center px-3.5 pt-3 pb-2">
-              <StoreBadgeArt art={art} />
-            </span>
-            <span className="px-3.5 pb-2.5 text-center font-sigil text-[10px] tracking-[0.22em] text-ember uppercase">
-              Coming soon
-            </span>
+          <span key={badge.id} className="inline-flex rounded-[10px]">
+            <StoreBadgeArt art={art} />
           </span>
         );
       })}

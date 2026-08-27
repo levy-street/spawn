@@ -1,25 +1,24 @@
 "use client";
 
-import { ArrowRight, CheckCircle2, Laptop, Smartphone } from "lucide-react";
+import { ArrowRight, Check, CheckCircle2, ChevronDown, Laptop, Smartphone } from "lucide-react";
 import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import {
   Colophon,
-  CTA_QUIET,
   CTA_SLAB,
   DesktopDownloadButton,
   Eyebrow,
   InstallCommand,
   Masthead,
   RegistrationMarks,
-  StoreBadgeMark,
+  StoreBadges,
 } from "@/components/brand/press";
+import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { useDesktopRelease } from "@/hooks/useDesktopRelease";
 import { poster } from "@/lib/fonts";
 import {
   type DesktopPlatform,
-  desktopDownloadUrl,
   desktopPlatformForOS,
   detectPlatform,
   type InstallTargetId,
@@ -117,28 +116,27 @@ const WSL_PHONE_COPY =
 const NATIVE_PHONE_COPY =
   "The daemon runs on macOS, Linux, or Windows — never on the phone. Get the app here, then install SPAWN D on the computer you want to possess.";
 
-const PLATFORM_CARDS = [
+/**
+ * The desktop builds the slab can be switched to, in menu order. `label` is
+ * the menu row, `name` the prose when the build is not published, and `slab`
+ * the words on the button where the default ("Download for macOS") would not
+ * say which Mac.
+ */
+const DESKTOP_BUILDS: {
+  platform: DesktopPlatform;
+  label: string;
+  name: string;
+  slab?: string;
+}[] = [
+  { platform: "darwin-aarch64", label: "macOS · Apple Silicon", name: "macOS" },
   {
-    id: "mac",
-    platform: "Desktop · macOS",
-    body: "Tray-first and signed. It verifies the daemon, possesses this Mac, then gets out of the way.",
+    platform: "darwin-x86_64",
+    label: "macOS · Intel",
+    name: "Intel Mac",
+    slab: "Download for Intel Mac",
   },
-  {
-    id: "windows",
-    platform: "Desktop · Windows",
-    body: "Tray-first and signed. It verifies the daemon, possesses this PC, then gets out of the way.",
-  },
-  {
-    id: "ios",
-    platform: "iPhone and iPad",
-    body: "The same seance as the browser, not a summary of it. Approve a host, watch an agent work, end a session.",
-  },
-  {
-    id: "android",
-    platform: "Android",
-    body: "Every possessed host in your pocket, with the terminal live — the daemon stays on your machine.",
-  },
-] as const;
+  { platform: WINDOWS_DESKTOP_PLATFORM, label: "Windows", name: "Windows" },
+];
 
 const OPTIONS = [
   {
@@ -162,16 +160,21 @@ const OPTIONS = [
 export default function DownloadPage() {
   const [platform, setPlatform] = useState(UNDETECTED_PLATFORM);
   const [chosenTarget, setChosenTarget] = useState<InstallTargetId | null>(null);
-  const requestedDesktopPlatform = desktopPlatformForOS(platform.os);
+  // The build the slab offers: the reader's pick from the menu beside it, else
+  // the one for the browser they are reading on, else Apple Silicon — someone
+  // on Linux or a phone is most often fetching a build for a Mac.
+  const [chosenDesktop, setChosenDesktop] = useState<DesktopPlatform | null>(null);
+  const desktopPlatform: DesktopPlatform =
+    chosenDesktop ?? desktopPlatformForOS(platform.os) ?? "darwin-aarch64";
+  const desktopBuild =
+    DESKTOP_BUILDS.find((build) => build.platform === desktopPlatform) ?? DESKTOP_BUILDS[0];
   const {
-    release: desktopRelease,
     settled: releaseSettled,
-    platform: discoveredPlatform,
-    url: discoveredBuildUrl,
-    version: discoveredBuildVersion,
-    buildId: discoveredBuildId,
+    url: desktopBuildUrl,
+    version: desktopBuildVersion,
+    buildId: desktopBuildId,
     nativeWindowsAvailable,
-  } = useDesktopRelease(platform.origin, requestedDesktopPlatform);
+  } = useDesktopRelease(platform.origin, desktopPlatform);
 
   useEffect(() => {
     setPlatform(detectPlatform());
@@ -197,25 +200,6 @@ export default function DownloadPage() {
     targets.find((target) => target.id === (chosenTarget ?? defaultTargetId)) ?? targets[0];
   const prebuiltCommand = activeTarget?.prebuiltCommand ?? platform.prebuiltInstallCommand;
   const showWslCaveats = activeTarget?.id === "windows-wsl";
-
-  const artifactUrl = (desktopPlatform: DesktopPlatform): string | null => {
-    if (desktopRelease?.platforms.includes(desktopPlatform)) {
-      return desktopDownloadUrl(platform.origin, desktopRelease.version, desktopPlatform);
-    }
-    return discoveredPlatform === desktopPlatform ? discoveredBuildUrl : null;
-  };
-  const artifactIdentity = (
-    desktopPlatform: DesktopPlatform,
-  ): { version: string | null; buildId: string | null } => {
-    if (desktopRelease?.platforms.includes(desktopPlatform)) {
-      return { version: desktopRelease.version, buildId: desktopRelease.tree };
-    }
-    return discoveredPlatform === desktopPlatform
-      ? { version: discoveredBuildVersion, buildId: discoveredBuildId }
-      : { version: null, buildId: null };
-  };
-  const macBuildUrl = artifactUrl("darwin-aarch64");
-  const windowsBuildUrl = artifactUrl(WINDOWS_DESKTOP_PLATFORM);
 
   // The one dot of colour on the detected plate: the brand ink says "good",
   // hellfire says "not here", ash says "we couldn't tell".
@@ -267,114 +251,80 @@ export default function DownloadPage() {
             these only look in on it.
           </p>
 
-          {/* Four platforms: identical cards on solid ground, with
-           * a fixed-height mark well so vendor artwork of different
-           * proportions still lines up. The plate behind is busy, so each card
-           * brings its own ground rather than floating on it. */}
-          <div className="mt-14 grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            {PLATFORM_CARDS.map((card) => {
-              const mac = card.id === "mac";
-              const windows = card.id === "windows";
-              const desktopPlatform: DesktopPlatform | null = mac
-                ? "darwin-aarch64"
-                : windows
-                  ? WINDOWS_DESKTOP_PLATFORM
-                  : null;
-              const href = mac
-                ? macBuildUrl
-                : windows
-                  ? windowsBuildUrl
-                  : (storeBadges().find((badge) => badge.id === card.id)?.href ?? null);
-              const waitingOnManifest = desktopPlatform !== null && !releaseSettled;
-              const identity = desktopPlatform
-                ? artifactIdentity(desktopPlatform)
-                : { version: null, buildId: null };
-              return (
-                <div
-                  key={card.id}
-                  className="flex min-w-0 flex-col rounded-[12px] bg-char px-6 pt-6 pb-5"
+          {/* Two doors: the desktop slab with a menu beside it for the builds
+           * it is not showing, and the phone stores in their own artwork. Side
+           * by side with a rule between them where the line has room for both;
+           * one under the other where it does not. The four cards this
+           * replaced said the same thing four times over; what a reader wants
+           * here is the button. */}
+          <div className="mt-14 flex min-w-0 flex-col gap-12 lg:flex-row lg:gap-0">
+            <div className="min-w-0 lg:pr-12">
+              <p className="font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
+                Download on desktop
+              </p>
+              {/* A split slab: the download on the left, the switch on the
+               * right, one shape. Full-width on a phone so the words never
+               * wrap inside the slab; its own width everywhere else. */}
+              <div className="mt-4 flex w-full max-w-full items-stretch sm:inline-flex sm:w-auto">
+                {desktopBuildUrl || !releaseSettled ? (
+                  <DesktopDownloadButton
+                    // A new build is a new button: a press held for the last
+                    // one is dropped rather than spent on this one.
+                    key={desktopPlatform}
+                    href={desktopBuildUrl}
+                    version={desktopBuildVersion}
+                    buildId={desktopBuildId}
+                    pending={!releaseSettled}
+                    platform={desktopPlatform}
+                    label={desktopBuild.slab}
+                    className="h-14 min-w-0 grow rounded-r-none px-6 sm:grow-0"
+                  />
+                ) : (
+                  <span className="inline-flex min-h-14 min-w-0 grow items-center rounded-sm rounded-r-none border border-r-0 border-line-strong px-6 py-3 font-sigil text-[12px] leading-5 tracking-[0.14em] text-ash uppercase sm:grow-0">
+                    {desktopBuild.name} desktop build not published yet
+                  </span>
+                )}
+                <DropdownMenu
+                  align="end"
+                  className="flex shrink-0"
+                  menuClassName="min-w-56 rounded-sm bg-char p-1.5"
+                  renderTrigger={(props) => (
+                    <button
+                      type="button"
+                      {...props}
+                      aria-label="Choose a different desktop build"
+                      className="inline-flex min-h-14 items-center justify-center self-stretch rounded-sm rounded-l-none border-l border-void/20 bg-bone px-3.5 text-void transition-colors hover:bg-white"
+                    >
+                      <ChevronDown className="size-4" aria-hidden />
+                    </button>
+                  )}
                 >
-                  <div className="flex h-14 items-center">
-                    {desktopPlatform && (href || waitingOnManifest || mac) ? (
-                      <DesktopDownloadButton
-                        href={href}
-                        version={identity.version}
-                        buildId={identity.buildId}
-                        pending={waitingOnManifest}
-                        platform={desktopPlatform}
-                        className="h-14 px-6"
-                      />
-                    ) : windows ? (
-                      <Link href="/download" className={CTA_QUIET}>
-                        Windows desktop build not published yet
-                      </Link>
-                    ) : (
-                      <StoreBadgeMark id={card.id} />
-                    )}
-                  </div>
-                  <p className="mt-6 font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
-                    {card.platform}
-                  </p>
-                  <p className="mt-3 flex-1 text-[15px] leading-7 text-ash">{card.body}</p>
-                  <p className="mt-6 border-line-g border-t pt-4 font-sigil text-[11px] tracking-[0.22em] uppercase">
-                    {href ? (
-                      <a
-                        href={href}
-                        download
-                        className="text-bone transition-colors hover:text-ember"
-                      >
-                        Download
-                      </a>
-                    ) : waitingOnManifest ? (
-                      <span className="text-ash">Checking for a build…</span>
-                    ) : windows ? (
-                      <Link href="/download" className="text-ash transition-colors hover:text-bone">
-                        Windows desktop build not published yet
-                      </Link>
-                    ) : (
-                      <span className="text-ember">Coming soon</span>
-                    )}
-                  </p>
-                </div>
-              );
-            })}
-          </div>
+                  {DESKTOP_BUILDS.map((build) => (
+                    <DropdownMenuItem
+                      key={build.platform}
+                      onSelect={() => setChosenDesktop(build.platform)}
+                      className="justify-between gap-4 rounded-sm px-3 py-2.5 font-sigil text-[12px] tracking-[0.14em] text-bone uppercase"
+                    >
+                      {build.label}
+                      {build.platform === desktopPlatform && (
+                        <Check className="size-4 shrink-0 text-ember" aria-hidden />
+                      )}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenu>
+              </div>
+            </div>
 
-          {desktopRelease && (
-            <p className="mt-6 font-sigil text-[11px] tracking-[0.18em] text-ash uppercase">
-              Desktop build {desktopRelease.version} · SHA {desktopRelease.tree.slice(0, 12)}
-              {desktopRelease.platforms.includes("darwin-x86_64") && (
-                <>
-                  {" · "}
-                  <a
-                    href={desktopDownloadUrl(
-                      platform.origin,
-                      desktopRelease.version,
-                      "darwin-x86_64",
-                    )}
-                    className="text-bone underline decoration-line-strong underline-offset-4 transition-colors hover:text-ember"
-                  >
-                    Intel Mac
-                  </a>
-                </>
-              )}
-              {desktopRelease.platforms.includes(WINDOWS_DESKTOP_PLATFORM) && (
-                <>
-                  {" · "}
-                  <a
-                    href={desktopDownloadUrl(
-                      platform.origin,
-                      desktopRelease.version,
-                      WINDOWS_DESKTOP_PLATFORM,
-                    )}
-                    className="text-bone underline decoration-line-strong underline-offset-4 transition-colors hover:text-ember"
-                  >
-                    Windows x64
-                  </a>
-                </>
-              )}
-            </p>
-          )}
+            <div className="min-w-0 lg:shrink-0 lg:border-l lg:border-line-strong lg:pl-12">
+              <p className="font-sigil text-[11px] tracking-[0.22em] text-ash uppercase">
+                Download on mobile
+              </p>
+              {/* The vendors' own badges, as supplied: on a phone the badge is
+               * the download button, and neither may be redrawn. A listing
+               * that is not live yet says so under the badge. */}
+              <StoreBadges badges={storeBadges()} className="mt-4" />
+            </div>
+          </div>
         </div>
       </section>
 
