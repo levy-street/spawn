@@ -47,4 +47,15 @@ mod tests {
         };
         assert_eq!(executable_variant(live, "prev").unwrap(), expected);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_accepts_a_capability_directory_handle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        fsync_dir(&directory).unwrap();
+    }
 }
