@@ -9,7 +9,44 @@ PREBUILT_TARGETS=(
   "darwin-x86_64:x86_64-apple-darwin"
   "linux-x86_64:x86_64-unknown-linux-gnu"
   "linux-aarch64:aarch64-unknown-linux-gnu"
+  "windows-x86_64:x86_64-pc-windows-msvc"
 )
+
+# Optional Linux arm runners may still be unavailable. Windows is a launched
+# platform and may never disappear silently from an otherwise valid release.
+PREBUILT_REQUIRED_TARGETS=("windows-x86_64")
+
+prebuilt_binary_suffix() { # public-target
+  if [[ "$1" == windows-* ]]; then
+    printf '%s\n' ".exe"
+  else
+    printf '\n'
+  fi
+}
+
+prebuilt_asset_name() { # public-target, rust-triple, kind
+  printf '%s-%s%s\n' "$3" "$2" "$(prebuilt_binary_suffix "$1")"
+}
+
+prebuilt_installed_name() { # public-target, kind
+  printf '%s%s\n' "$2" "$(prebuilt_binary_suffix "$1")"
+}
+
+prebuilt_file_mode() { # public-target; payloads are read by the Linux API host
+  if [[ "$1" == windows-* ]]; then
+    printf '%s\n' "0644"
+  else
+    printf '%s\n' "0755"
+  fi
+}
+
+prebuilt_target_is_required() { # public-target
+  local required
+  for required in "${PREBUILT_REQUIRED_TARGETS[@]}"; do
+    [[ "$1" == "$required" ]] && return 0
+  done
+  return 1
+}
 
 is_lower_hex() {
   local value="$1"
@@ -236,7 +273,7 @@ render_prebuilt_manifest() {
   for entry in "$@"; do
     IFS=: read -r target spawnd_sha worker_sha <<< "$entry"
     case "$target" in
-      darwin-aarch64|darwin-x86_64|linux-x86_64|linux-aarch64) ;;
+      darwin-aarch64|darwin-x86_64|linux-x86_64|linux-aarch64|windows-x86_64) ;;
       *) return 1 ;;
     esac
     is_lower_hex "$spawnd_sha" 64 || return 1
@@ -401,9 +438,13 @@ prepare_prebuilt_release() {
   for pair in "${PREBUILT_TARGETS[@]}"; do
     target="${pair%%:*}"
     triple="${pair##*:}"
-    spawnd_asset="spawnd-$triple"
-    worker_asset="spawn-worker-$triple"
+    spawnd_asset="$(prebuilt_asset_name "$target" "$triple" spawnd)"
+    worker_asset="$(prebuilt_asset_name "$target" "$triple" spawn-worker)"
     if [[ ! -f "$prebuilt_tmp/$spawnd_asset" || ! -f "$prebuilt_tmp/$worker_asset" ]]; then
+      if prebuilt_target_is_required "$target"; then
+        prebuilt_reason="prebuilt-latest lacks the required $target spawnd.exe/spawn-worker.exe pair"
+        return
+      fi
       continue
     fi
     spawnd_sha="$(checksum_for_asset "$prebuilt_tmp" "$spawnd_asset")"
@@ -454,12 +495,25 @@ PY
   signature_file="$tmp/manifest.json.sig"
   render_prebuilt_manifest \
     "$commit" "$tree" "0.1.0+g111111111111" 1700000000 "$key_id" \
-    "darwin-aarch64:$spawnd_sha:$worker_sha" > "$manifest_file" || return 1
+    "darwin-aarch64:$spawnd_sha:$worker_sha" \
+    "windows-x86_64:$spawnd_sha:$worker_sha" > "$manifest_file" || return 1
   manifest="$(<"$manifest_file")"
   [[ "$(manifest_tree_from_json "$manifest")" == "$tree" ]] || return 1
   grep -q '"release_counter": 1700000000' <<< "$manifest" || return 1
   grep -q "\"signing_key_id\": \"$key_id\"" <<< "$manifest" || return 1
   grep -q '"spawn_worker_sha256": "bbbbbbbb' <<< "$manifest" || return 1
+  grep -q '"windows-x86_64"' <<< "$manifest" || return 1
+
+  [[ "$(prebuilt_asset_name windows-x86_64 x86_64-pc-windows-msvc spawnd)" == \
+    "spawnd-x86_64-pc-windows-msvc.exe" ]] || return 1
+  [[ "$(prebuilt_asset_name linux-x86_64 x86_64-unknown-linux-gnu spawn-worker)" == \
+    "spawn-worker-x86_64-unknown-linux-gnu" ]] || return 1
+  [[ "$(prebuilt_installed_name windows-x86_64 spawn-worker)" == \
+    "spawn-worker.exe" ]] || return 1
+  [[ "$(prebuilt_file_mode windows-x86_64)" == "0644" ]] || return 1
+  [[ "$(prebuilt_file_mode darwin-aarch64)" == "0755" ]] || return 1
+  prebuilt_target_is_required windows-x86_64 || return 1
+  ! prebuilt_target_is_required linux-aarch64 || return 1
 
   sign_prebuilt_manifest "$manifest_file" "$signature_file" "$key" || return 1
   verify_prebuilt_manifest_signature \

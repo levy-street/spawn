@@ -93,6 +93,23 @@ ref_hash() {
   awk -v f="$1" '$2 == f || $2 == "*"f { print $1; exit }' "$tmp/SHA256SUMS"
 }
 
+manifest_hash() {
+  python3 - "$manifest" "$1" "$2" <<'PY'
+import json
+import sys
+
+path, target, kind = sys.argv[1:]
+field = "spawnd_sha256" if kind == "spawnd" else "spawn_worker_sha256"
+try:
+    value = json.load(open(path, encoding="utf-8"))["targets"][target][field]
+except (KeyError, OSError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(value, str):
+    raise SystemExit(1)
+print(value)
+PY
+}
+
 printf '\n%-22s %-14s %s\n' TARGET BINARY RESULT
 printf -- '---------------------------------------------------------------\n'
 
@@ -103,16 +120,38 @@ for pair in "${PREBUILT_TARGETS[@]}"; do
   target="${pair%%:*}"
   triple="${pair##*:}"
   for kind in spawnd spawn-worker; do
-    asset="$kind-$triple"
+    asset="$(prebuilt_asset_name "$target" "$triple" "$kind")"
     want="$(ref_hash "$asset" || true)"
     if [[ -z "$want" ]]; then
-      printf '%-22s %-14s %s\n' "$target" "$kind" "SKIP (not in release)"
+      if prebuilt_target_is_required "$target"; then
+        printf '%-22s %-14s %s\n' "$target" "$kind" \
+          "FAIL (required asset $asset is not in SHA256SUMS)"
+        fail=1
+      else
+        printf '%-22s %-14s %s\n' "$target" "$kind" "SKIP (not in release)"
+      fi
+      continue
+    fi
+    advertised="$(manifest_hash "$target" "$kind" 2>/dev/null || true)"
+    if [[ "$advertised" != "$want" ]]; then
+      printf '%-22s %-14s %s\n' "$target" "$kind" \
+        "FAIL (signed manifest hash does not match $asset)"
+      fail=1
       continue
     fi
     url="$SERVER/api/install/$kind/$target"
     out="$tmp/$asset.served"
-    if ! curl -fsSL "$url" -o "$out"; then
+    headers="$tmp/$asset.headers"
+    if ! curl -fsSL -D "$headers" "$url" -o "$out"; then
       printf '%-22s %-14s %s\n' "$target" "$kind" "FAIL (server 404/again: $url)"
+      fail=1
+      continue
+    fi
+    installed_name="$(prebuilt_installed_name "$target" "$kind")"
+    if ! tr -d '\r' < "$headers" |
+      grep -Eiq "^content-disposition:.*filename=\"?${installed_name//./\\.}\"?([;[:space:]]|$)"; then
+      printf '%-22s %-14s %s\n' "$target" "$kind" \
+        "FAIL (response filename is not $installed_name)"
       fail=1
       continue
     fi

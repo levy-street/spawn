@@ -1,4 +1,4 @@
-"""Hosted shell installer for `spawnd`."""
+"""Hosted Unix and Windows installers for `spawnd`."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import shlex
 import sys
 from pathlib import Path
 from textwrap import dedent
+from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -23,6 +25,7 @@ SUPPORTED_TARGETS = {
     "darwin-x86_64": "x86_64-apple-darwin",
     "linux-aarch64": "aarch64-unknown-linux-gnu",
     "linux-x86_64": "x86_64-unknown-linux-gnu",
+    "windows-x86_64": "x86_64-pc-windows-msvc",
 }
 
 
@@ -35,6 +38,8 @@ def _local_target() -> str | None:
         os_name = "darwin"
     elif sys.platform.startswith("linux"):
         os_name = "linux"
+    elif sys.platform == "win32":
+        os_name = "windows"
     else:
         return None
 
@@ -50,15 +55,21 @@ def _local_target() -> str | None:
     return f"{os_name}-{arch}"
 
 
-def _binary_candidates(target: str, name: str) -> list[Path]:
+def _binary_filename(kind: Literal["spawnd", "spawn-worker"], target: str) -> str:
+    suffix = ".exe" if target.startswith("windows-") else ""
+    return f"{kind}{suffix}"
+
+
+def _binary_candidates(target: str, name: Literal["spawnd", "spawn-worker"]) -> list[Path]:
     triple = SUPPORTED_TARGETS[target]
     root = _repo_root()
+    filename = _binary_filename(name, target)
     candidates = [
-        release.prebuilt_root(repo_root=root) / target / name,
-        root / "daemon" / "target" / triple / "release" / name,
+        release.prebuilt_root(repo_root=root) / target / filename,
+        root / "daemon" / "target" / triple / "release" / filename,
     ]
     if target == _local_target():
-        candidates.append(root / "daemon" / "target" / "release" / name)
+        candidates.append(root / "daemon" / "target" / "release" / filename)
     return candidates
 
 
@@ -79,9 +90,12 @@ def _prebuilt_sha256_cases() -> str:
     if manifest is not None:
         arms: list[str] = []
         for target, target_release in manifest.targets.items():
-            arms.append(f"        spawnd:{target}) printf %s {target_release.spawnd_sha256} ;;")
             arms.append(
-                f"        spawn-worker:{target}) printf %s {target_release.spawn_worker_sha256} ;;"
+                f"        spawnd:{target}) printf %s {target_release.spawnd_sha256.lower()} ;;"
+            )
+            arms.append(
+                "        spawn-worker:"
+                f"{target}) printf %s {target_release.spawn_worker_sha256.lower()} ;;"
             )
         return "\n".join(arms)
 
@@ -109,7 +123,7 @@ async def spawnd_binary(target: str) -> FileResponse:
     return FileResponse(
         binary,
         media_type="application/octet-stream",
-        filename="spawnd",
+        filename=_binary_filename("spawnd", target),
         headers={"Cache-Control": "no-store"},
     )
 
@@ -130,7 +144,7 @@ async def spawn_worker_binary(target: str) -> FileResponse:
     return FileResponse(
         binary,
         media_type="application/octet-stream",
-        filename="spawn-worker",
+        filename=_binary_filename("spawn-worker", target),
         headers={"Cache-Control": "no-store"},
     )
 
@@ -182,6 +196,322 @@ async def install_script() -> PlainTextResponse:
         media_type="text/x-shellscript; charset=utf-8",
         headers={"Cache-Control": "no-store"},
     )
+
+
+def _windows_prebuilt_hashes() -> tuple[str, str] | None:
+    manifest = release.read_prebuilt_manifest(repo_root=_repo_root())
+    if manifest is None:
+        return None
+    target = manifest.targets.get("windows-x86_64")
+    if target is None:
+        return None
+    spawnd_sha = target.spawnd_sha256.lower()
+    worker_sha = target.spawn_worker_sha256.lower()
+    if (
+        len(spawnd_sha) != 64
+        or len(worker_sha) != 64
+        or any(character not in "0123456789abcdef" for character in spawnd_sha + worker_sha)
+    ):
+        return None
+    return spawnd_sha, worker_sha
+
+
+def _powershell_single_quote(value: str) -> str:
+    return value.replace("'", "''")
+
+
+@router.get("/install.ps1", response_class=PlainTextResponse)
+async def install_powershell_script() -> PlainTextResponse:
+    """Return a hash-pinned native Windows installer."""
+
+    hashes = _windows_prebuilt_hashes()
+    if hashes is None:
+        raise HTTPException(status_code=503, detail="Windows daemon release is not available")
+
+    server = get_settings().public_url.rstrip("/") or "http://localhost:8000"
+    parsed = urlsplit(server)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or any(ord(character) < 32 for character in server)
+    ):
+        raise HTTPException(status_code=503, detail="public server URL is not an absolute HTTP URL")
+
+    script = INSTALL_PS1.replace("__DEFAULT_SERVER__", _powershell_single_quote(server))
+    script = script.replace("__WINDOWS_X86_64_SPAWND_SHA256__", hashes[0])
+    script = script.replace("__WINDOWS_X86_64_WORKER_SHA256__", hashes[1])
+    return PlainTextResponse(
+        script,
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+INSTALL_PS1 = dedent(
+    r"""
+    [CmdletBinding()]
+    param(
+        [string] $Server = '',
+        [string] $Repo = '',
+        [string] $Branch = '',
+        [switch] $NewAccount,
+        [switch] $NoService,
+        [switch] $Foreground,
+        [switch] $PrebuiltOnly,
+        [switch] $NoLogin,
+        [switch] $NoStart,
+        [string] $Setup = ''
+    )
+
+    $ErrorActionPreference = 'Stop'
+    Set-StrictMode -Version 2.0
+    $ProgressPreference = 'SilentlyContinue'
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+    $DefaultServer = '__DEFAULT_SERVER__'
+    $PinnedSpawndSha256 = '__WINDOWS_X86_64_SPAWND_SHA256__'
+    $PinnedWorkerSha256 = '__WINDOWS_X86_64_WORKER_SHA256__'
+    $Target = 'windows-x86_64'
+
+    function Write-Spawn([string] $Message) {
+        Write-Host "SPAWN D: $Message"
+    }
+
+    function Invoke-Native([scriptblock] $Command, [string] $Description) {
+        & $Command
+        if ($LASTEXITCODE -ne 0) {
+            throw "$Description failed with exit code $LASTEXITCODE"
+        }
+    }
+
+    function Get-NativeArchitecture {
+        try {
+            $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+            if ($architecture) { return $architecture.ToUpperInvariant() }
+        } catch {
+            # Windows PowerShell on an older .NET Framework: use the native-process hint.
+        }
+        if ($env:PROCESSOR_ARCHITEW6432) {
+            return $env:PROCESSOR_ARCHITEW6432.ToUpperInvariant()
+        }
+        if ($env:PROCESSOR_ARCHITECTURE) {
+            return $env:PROCESSOR_ARCHITECTURE.ToUpperInvariant()
+        }
+        return 'UNKNOWN'
+    }
+
+    function Get-Sha256([string] $Path) {
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+
+    function Assert-Sha256([string] $Path, [string] $Expected, [string] $Kind) {
+        $actual = Get-Sha256 $Path
+        if ($actual -ne $Expected.ToLowerInvariant()) {
+            throw "$Kind sha256 mismatch (want $Expected, got $actual)"
+        }
+    }
+
+    function Move-WithRetry([string] $Source, [string] $Destination) {
+        $lastError = $null
+        foreach ($attempt in 1..20) {
+            try {
+                Move-Item -LiteralPath $Source -Destination $Destination -Force
+                return
+            } catch {
+                $lastError = $_
+                Start-Sleep -Milliseconds 250
+            }
+        }
+        throw "could not rename $Source to $Destination after stopping SPAWN D: $lastError"
+    }
+
+    function Install-Pair(
+        [string] $StagedSpawnd,
+        [string] $StagedWorker,
+        [string] $SpawndPath,
+        [string] $WorkerPath,
+        [string] $ServerUrl
+    ) {
+        $spawndCurrent = (Test-Path -LiteralPath $SpawndPath) -and
+            ((Get-Sha256 $SpawndPath) -eq $PinnedSpawndSha256)
+        $workerCurrent = (Test-Path -LiteralPath $WorkerPath) -and
+            ((Get-Sha256 $WorkerPath) -eq $PinnedWorkerSha256)
+        if ($spawndCurrent -and $workerCurrent) {
+            Write-Spawn 'the current release daemon pair is already installed'
+            return
+        }
+
+        # A running Windows image may be locked. Ask the existing supervised daemon
+        # to stop, then retry same-volume renames. A still-locked image fails closed.
+        if (Test-Path -LiteralPath $SpawndPath) {
+            try {
+                & $SpawndPath --server $ServerUrl disconnect
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Spawn "the existing daemon returned exit code $LASTEXITCODE while disconnecting"
+                }
+            } catch {
+                Write-Spawn "the existing daemon did not disconnect cleanly: $_"
+            }
+        }
+
+        $nonce = [Guid]::NewGuid().ToString('N')
+        $spawndBackup = Join-Path (Split-Path $SpawndPath) "spawnd.$nonce.prev.exe"
+        $workerBackup = Join-Path (Split-Path $WorkerPath) "spawn-worker.$nonce.prev.exe"
+        $hadSpawnd = Test-Path -LiteralPath $SpawndPath
+        $hadWorker = Test-Path -LiteralPath $WorkerPath
+
+        try {
+            if ($hadSpawnd) { Move-WithRetry $SpawndPath $spawndBackup }
+            if ($hadWorker) { Move-WithRetry $WorkerPath $workerBackup }
+            Move-WithRetry $StagedSpawnd $SpawndPath
+            Move-WithRetry $StagedWorker $WorkerPath
+        } catch {
+            # Restore the complete old pair whenever its members were moved aside.
+            Remove-Item -LiteralPath $SpawndPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $WorkerPath -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $spawndBackup) {
+                Move-Item -LiteralPath $spawndBackup -Destination $SpawndPath -Force
+            }
+            if (Test-Path -LiteralPath $workerBackup) {
+                Move-Item -LiteralPath $workerBackup -Destination $WorkerPath -Force
+            }
+            throw
+        }
+
+        Remove-Item -LiteralPath $spawndBackup -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $workerBackup -Force -ErrorAction SilentlyContinue
+    }
+
+    function Add-UserPath([string] $Directory) {
+        if ($env:SPAWN_INSTALL_NO_PATH -eq '1') { return }
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        $entries = @()
+        if ($userPath) { $entries = @($userPath -split ';' | Where-Object { $_ }) }
+        $alreadyPresent = $entries | Where-Object {
+            $_.TrimEnd('\') -ieq $Directory.TrimEnd('\')
+        }
+        if (-not $alreadyPresent) {
+            $newPath = (@($Directory) + $entries) -join ';'
+            [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+            Write-Spawn "saved $Directory in the user PATH; this session is updated too"
+        }
+        $sessionEntries = @($env:Path -split ';')
+        if (-not ($sessionEntries | Where-Object {
+            $_.TrimEnd('\') -ieq $Directory.TrimEnd('\')
+        })) {
+            $env:Path = "$Directory;$env:Path"
+        }
+    }
+
+    if (-not $Server) { $Server = $DefaultServer }
+    $isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    if (-not $isWindows) { throw 'install.ps1 requires native Windows; use install.sh on Unix or WSL' }
+    $serverUri = $null
+    if (-not [Uri]::TryCreate($Server, [UriKind]::Absolute, [ref] $serverUri) -or
+        $serverUri.Scheme -notin @('http', 'https')) {
+        throw '-Server must be an absolute http:// or https:// URL'
+    }
+    $Server = $serverUri.AbsoluteUri.TrimEnd('/')
+
+    $architecture = Get-NativeArchitecture
+    if ($architecture -notin @('X64', 'AMD64', 'X86_64')) {
+        throw "native Windows architecture $architecture is not supported; v1 requires x86_64 Windows"
+    }
+    if ($PinnedSpawndSha256 -notmatch '^[0-9a-f]{64}$' -or
+        $PinnedWorkerSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw 'install.ps1 was rendered without valid Windows release hashes'
+    }
+    if ($Repo -or $Branch) {
+        throw '-Repo and -Branch are Unix source-build options; native Windows installation is prebuilt-only'
+    }
+    if ($Setup) {
+        Write-Spawn '-Setup is no longer needed; approval uses the link spawnd prints'
+    }
+    if ($PrebuiltOnly) {
+        Write-Spawn '-PrebuiltOnly is accepted; Windows installation is always prebuilt-only'
+    }
+
+    $installRoot = $env:SPAWN_INSTALL_ROOT
+    if (-not $installRoot) {
+        if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is not set' }
+        $installRoot = Join-Path $env:LOCALAPPDATA 'spawn'
+    }
+    $binDir = Join-Path $installRoot 'bin'
+    $spawndPath = Join-Path $binDir 'spawnd.exe'
+    $workerPath = Join-Path $binDir 'spawn-worker.exe'
+    New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+
+    # The live manifest must agree with the pins baked into the exact script that
+    # arrived over HTTPS. The daemon updater separately verifies manifest.sig.
+    $manifest = Invoke-RestMethod -UseBasicParsing -Uri "$Server/api/install/manifest.json"
+    $targetProperty = $manifest.targets.PSObject.Properties[$Target]
+    if (-not $targetProperty) { throw "release manifest has no $Target target" }
+    $manifestSpawnd = [string] $targetProperty.Value.spawnd_sha256
+    $manifestWorker = [string] $targetProperty.Value.spawn_worker_sha256
+    if ($manifestSpawnd.ToLowerInvariant() -ne $PinnedSpawndSha256 -or
+        $manifestWorker.ToLowerInvariant() -ne $PinnedWorkerSha256) {
+        throw 'the live manifest does not match the hashes baked into install.ps1; fetch the installer again'
+    }
+
+    $nonce = [Guid]::NewGuid().ToString('N')
+    $stagedSpawnd = Join-Path $binDir "spawnd.$nonce.new.exe"
+    $stagedWorker = Join-Path $binDir "spawn-worker.$nonce.new.exe"
+    try {
+        Write-Spawn "downloading the SPAWN D daemon pair for $Target"
+        Invoke-WebRequest -UseBasicParsing -Uri "$Server/api/install/spawnd/$Target" -OutFile $stagedSpawnd
+        Invoke-WebRequest -UseBasicParsing -Uri "$Server/api/install/spawn-worker/$Target" -OutFile $stagedWorker
+        Assert-Sha256 $stagedSpawnd $PinnedSpawndSha256 'spawnd.exe'
+        Assert-Sha256 $stagedWorker $PinnedWorkerSha256 'spawn-worker.exe'
+        Unblock-File -LiteralPath $stagedSpawnd -ErrorAction SilentlyContinue
+        Unblock-File -LiteralPath $stagedWorker -ErrorAction SilentlyContinue
+        Invoke-Native { & $stagedSpawnd --version } 'downloaded spawnd.exe validation'
+        Invoke-Native { & $stagedWorker --version } 'downloaded spawn-worker.exe validation'
+        Install-Pair $stagedSpawnd $stagedWorker $spawndPath $workerPath $Server
+    } finally {
+        Remove-Item -LiteralPath $stagedSpawnd -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stagedWorker -Force -ErrorAction SilentlyContinue
+    }
+
+    Assert-Sha256 $spawndPath $PinnedSpawndSha256 'installed spawnd.exe'
+    Assert-Sha256 $workerPath $PinnedWorkerSha256 'installed spawn-worker.exe'
+    Add-UserPath $binDir
+    Write-Spawn "installed SPAWN D at $spawndPath with $workerPath"
+
+    if ($NoLogin) {
+        Write-Spawn 'skipping login'
+        return
+    }
+    if ($NoStart) {
+        Invoke-Native { & $spawndPath --server $Server login --no-run } 'SPAWN D login'
+        Write-Spawn 'login complete; not starting the daemon because -NoStart was set'
+        return
+    }
+    if ($Foreground) {
+        Invoke-Native { & $spawndPath --server $Server login --no-run } 'SPAWN D login'
+        Invoke-Native { & $spawndPath --server $Server run } 'SPAWN D foreground run'
+        return
+    }
+    if ($NoService) {
+        Invoke-Native { & $spawndPath --server $Server login --no-run } 'SPAWN D login'
+        $stateDir = Join-Path $env:LOCALAPPDATA 'spawn\state'
+        New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+        Start-Process -FilePath $spawndPath -ArgumentList @('--server', $Server, 'run') `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $stateDir 'spawnd.stdout.log') `
+            -RedirectStandardError (Join-Path $stateDir 'spawnd.stderr.log') | Out-Null
+        Write-Spawn "started SPAWN D in the background; logs are in $stateDir"
+        return
+    }
+
+    # The call operator keeps possession/login prompts attached to this console.
+    if ($NewAccount) {
+        Invoke-Native { & $spawndPath --server $Server possess --new-account } 'SPAWN D possession'
+    } else {
+        Invoke-Native { & $spawndPath --server $Server possess } 'SPAWN D possession'
+    }
+    """
+).lstrip()
 
 
 INSTALL_SCRIPT = dedent(
@@ -479,6 +809,9 @@ INSTALL_SCRIPT = dedent(
       OS_NAME=$(uname -s 2>/dev/null || printf unknown)
       ARCH_NAME=$(uname -m 2>/dev/null || printf unknown)
       case "$OS_NAME:$ARCH_NAME" in
+        MINGW*:*|MSYS*:*|CYGWIN*:*)
+          return 2
+          ;;
         Darwin:arm64|Darwin:aarch64)
           printf '%s\n' darwin-aarch64
           ;;
@@ -531,7 +864,15 @@ INSTALL_SCRIPT = dedent(
     }
 
     install_prebuilt_spawnd() {
-      TARGET=$(host_target) || return 1
+      if TARGET=$(host_target); then
+        :
+      else
+        host_status=$?
+        if [ "$host_status" -eq 2 ]; then
+          die "native Windows uses PowerShell: irm ${SERVER%/}/install.ps1 | iex"
+        fi
+        return 1
+      fi
       need curl || return 1
       URL="${SERVER%/}/api/install/spawnd/$TARGET"
       WORKER_URL="${SERVER%/}/api/install/spawn-worker/$TARGET"
