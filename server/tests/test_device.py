@@ -37,6 +37,7 @@ from spawn_server.host_pair_possession import (
 from spawn_server.models import (
     BrowserDevice,
     DeviceCode,
+    EmailLog,
     Host,
     HostBrowserPin,
     HostKeyClaim,
@@ -338,6 +339,8 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
     assert success["browser_device_id"] == browser[0]["id"]
     assert success["browser_public_key"] == browser[0]["public_key"]
     assert "private" not in str(success).lower()
+
+
     assert "seed" not in str(success).lower()
 
     replay = await _poll(client, start, public_key)
@@ -356,6 +359,35 @@ async def test_device_code_happy_path_is_key_bound_and_one_shot(client):
         assert pin is not None
         assert pin.browser_public_key == browser[0]["public_key"]
         assert pin.browser_key_fingerprint == ed25519_key_fingerprint(browser[0]["public_key"])
+
+
+async def test_file_sqlite_email_logging_does_not_block_device_approval(
+    file_sqlite_client, monkeypatch, caplog
+):
+    """A verification audit write must not contend with the signup transaction."""
+
+    from spawn_server.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "email_backend", "console", raising=False)
+    user_id, auth = await _signup(file_sqlite_client, "sqlite-email-approval@example.com")
+    browser = await _register_browser(file_sqlite_client, user_id, auth)
+    public_key = _public_key(19)
+    start = await _start(file_sqlite_client, public_key, name="sqlite-email-approval")
+    review = await _review(file_sqlite_client, start, auth)
+
+    approval = await _approve(file_sqlite_client, start, user_id, auth, review, browser)
+    assert approval.status_code == 200, approval.text
+
+    async with get_sessionmaker()() as session:
+        entries = (
+            await session.execute(
+                select(EmailLog).where(EmailLog.to_email == "sqlite-email-approval@example.com")
+            )
+        ).scalars().all()
+    assert [(entry.kind, entry.status) for entry in entries] == [
+        ("email_verify", "not_delivered")
+    ]
+    assert "could not record email log entry" not in caplog.text
 
 
 async def test_host_possession_is_required_before_review_approval_or_token_issue(client):
