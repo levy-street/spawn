@@ -89,6 +89,17 @@ const RTC_DISCONNECTED_GRACE: Duration = Duration::from_secs(15);
 const REQUIRED_SESSION_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const REQUIRED_SESSION_CHANNEL_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the daemon waits for one obfuscated `<name>.local` candidate to
+/// resolve.
+///
+/// A hit is immediate once the responder has answered once, but the first
+/// query of a connection is a multicast round trip and was measured taking
+/// over a second and a half on a quiet LAN — a shorter bound than this threw
+/// away the first candidate of every connection and left ICE waiting for the
+/// client to try again. macOS gives up on a name nobody answers for after
+/// five seconds, so the cost of a miss is bounded either way, and the peer
+/// connection has [`RTC_CONNECT_TIMEOUT`] to spare.
+const MDNS_CANDIDATE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
 const DATA_CHANNEL_MESSAGE_BYTES: usize = 16 * 1024;
 const DATA_CHANNEL_BUFFER_LOW: usize = 64 * 1024;
 const DATA_CHANNEL_BUFFER_HIGH: usize = 512 * 1024;
@@ -1290,6 +1301,7 @@ impl RtcSessions {
             return;
         }
         if let Ok(candidate) = serde_json::from_value::<RTCIceCandidateInit>(candidate) {
+            let candidate = resolve_mdns_candidate(candidate).await;
             if let Err(error) = peer.pc.add_ice_candidate(candidate).await {
                 tracing::debug!(signal_id = %signal.signal_id, %error, "adding host rtc candidate failed");
             }
@@ -1585,6 +1597,7 @@ impl RtcSessions {
         let pc = peer.pc;
         match serde_json::from_value::<RTCIceCandidateInit>(candidate) {
             Ok(candidate) => {
+                let candidate = resolve_mdns_candidate(candidate).await;
                 if let Err(e) = pc.add_ice_candidate(candidate).await {
                     tracing::debug!(%signal_id, error = %e, "adding rtc candidate failed");
                 }
@@ -3606,9 +3619,111 @@ fn build_api() -> Result<webrtc::api::API> {
         .build())
 }
 
+/// The connection-address of an RFC 8828 obfuscated host candidate, if this
+/// is one.
+///
+/// Every browser hides the local IP of its host candidates behind an ephemeral
+/// `<uuid>.local` name and expects the peer to resolve it over mDNS. Only host
+/// candidates are ever obfuscated, and the name is always a single label, so
+/// anything else is left exactly as it arrived.
+fn mdns_candidate_host(candidate: &str) -> Option<&str> {
+    let line = candidate
+        .strip_prefix("a=")
+        .unwrap_or(candidate)
+        .strip_prefix("candidate:")?;
+    let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+    // foundation component transport priority address port typ type
+    if fields.len() < 8 || fields[6] != "typ" || fields[7] != "host" {
+        return None;
+    }
+    let address = fields[4];
+    let name = address.strip_suffix(".local")?;
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+    Some(address)
+}
+
+/// The same candidate with its obfuscated name replaced by the address it
+/// stands for. `None` when the line is not shaped the way it was measured.
+fn rewrite_candidate_host(candidate: &str, address: IpAddr) -> Option<String> {
+    let (prefix, line) = match candidate.strip_prefix("a=") {
+        Some(rest) => ("a=", rest),
+        None => ("", candidate),
+    };
+    let body = line.strip_prefix("candidate:")?;
+    let mut fields: Vec<&str> = body.split_ascii_whitespace().collect();
+    if fields.len() < 8 {
+        return None;
+    }
+    let resolved = address.to_string();
+    fields[4] = resolved.as_str();
+    Some(format!("{prefix}candidate:{}", fields.join(" ")))
+}
+
+/// Resolve an obfuscated candidate to an ordinary host candidate.
+///
+/// webrtc-rs can do this itself, but only in a multicast-DNS mode whose
+/// resolver task outlives the connection and spins forever on a name that
+/// never answers — which is most of them, since a browser's name only resolves
+/// on its own network. So mDNS stays off in the [`setting_engine`] and the
+/// lookup happens here instead, where it is bounded and ends with the
+/// connection: the OS resolver answers `.local` on macOS, and on Linux
+/// wherever nss-mdns or systemd-resolved is installed.
+///
+/// A name that does not resolve is passed through untouched, which is exactly
+/// what arrived before this existed — webrtc-rs logs it and ignores it.
+async fn resolve_mdns_candidate(init: RTCIceCandidateInit) -> RTCIceCandidateInit {
+    let Some(name) = mdns_candidate_host(&init.candidate) else {
+        return init;
+    };
+    let name = name.to_owned();
+    let lookup = tokio::time::timeout(
+        MDNS_CANDIDATE_RESOLVE_TIMEOUT,
+        tokio::net::lookup_host((name.as_str(), 0)),
+    )
+    .await;
+    let addresses = match lookup {
+        Ok(Ok(addresses)) => addresses,
+        Ok(Err(error)) => {
+            tracing::debug!(%name, %error, "resolving an mDNS ICE candidate failed");
+            return init;
+        }
+        Err(_) => {
+            tracing::debug!(%name, "resolving an mDNS ICE candidate timed out");
+            return init;
+        }
+    };
+    // IPv4 first: this daemon gathers no IPv6 candidate on a host without
+    // routable IPv6, and a pair needs both halves in the same family.
+    let mut fallback = None;
+    let mut chosen = None;
+    for address in addresses {
+        match address.ip() {
+            IpAddr::V4(ip) => {
+                chosen = Some(IpAddr::V4(ip));
+                break;
+            }
+            IpAddr::V6(ip) => fallback = fallback.or(Some(IpAddr::V6(ip))),
+        }
+    }
+    let Some(address) = chosen.or(fallback) else {
+        tracing::debug!(%name, "an mDNS ICE candidate resolved to no address");
+        return init;
+    };
+    let Some(candidate) = rewrite_candidate_host(&init.candidate, address) else {
+        return init;
+    };
+    tracing::debug!(%name, "resolved an mDNS ICE candidate");
+    RTCIceCandidateInit { candidate, ..init }
+}
+
 fn setting_engine() -> Result<SettingEngine> {
     let mut settings = SettingEngine::default();
-    // QueryOnly leaks a resolver task/socket per peer in webrtc-rs 0.17.
+    // QueryOnly leaks a resolver task/socket per peer in webrtc-rs 0.17: the
+    // query loops forever on a name that never answers, and closing the agent
+    // does not end it. Remote `.local` candidates are resolved in
+    // [`resolve_mdns_candidate`] instead, bounded and before they get here.
     settings.set_ice_multicast_dns_mode(MulticastDnsMode::Disabled);
     settings.set_interface_filter(Box::new(interface_is_allowed));
     settings.set_ip_filter(Box::new(ip_is_allowed));
@@ -3623,7 +3738,7 @@ fn setting_engine() -> Result<SettingEngine> {
         tracing::info!(
             udp_port_min = RTC_UDP_PORT_MIN,
             udp_port_max = RTC_UDP_PORT_MAX,
-            "LAN-direct WebRTC requires this inbound UDP firewall range; mDNS remains disabled"
+            "LAN-direct WebRTC requires this inbound UDP firewall range; remote mDNS candidates are resolved by the OS resolver"
         );
     }
     Ok(settings)
@@ -3906,6 +4021,95 @@ async fn send_json_dynamic(signaling: &RtcWsSender, frame: Outbound) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BROWSER_MDNS_CANDIDATE: &str =
+        "candidate:842163049 1 udp 1677729535 33cde59c-1be0-47b5-9ae5-786881bd0089.local 50123 typ host generation 0 ufrag Xk4b network-cost 999";
+
+    #[test]
+    fn an_obfuscated_browser_candidate_is_recognised_and_rewritten() {
+        // What every browser actually sends: the local IP replaced by an
+        // ephemeral name only its own network can answer for.
+        assert_eq!(
+            mdns_candidate_host(BROWSER_MDNS_CANDIDATE),
+            Some("33cde59c-1be0-47b5-9ae5-786881bd0089.local")
+        );
+        let rewritten =
+            rewrite_candidate_host(BROWSER_MDNS_CANDIDATE, "192.168.1.24".parse().unwrap())
+                .unwrap();
+        assert_eq!(
+            rewritten,
+            "candidate:842163049 1 udp 1677729535 192.168.1.24 50123 typ host generation 0 ufrag Xk4b network-cost 999"
+        );
+        // Only the address moved; everything ICE authenticates with is intact.
+        assert!(rewritten.contains("ufrag Xk4b"));
+        assert!(rewritten.contains("typ host"));
+        assert!(!rewritten.contains(".local"));
+        // The `a=` form some clients send keeps its prefix.
+        let prefixed = format!("a={BROWSER_MDNS_CANDIDATE}");
+        assert_eq!(
+            mdns_candidate_host(&prefixed),
+            Some("33cde59c-1be0-47b5-9ae5-786881bd0089.local")
+        );
+        assert!(
+            rewrite_candidate_host(&prefixed, "10.0.0.2".parse().unwrap())
+                .unwrap()
+                .starts_with("a=candidate:")
+        );
+    }
+
+    #[test]
+    fn nothing_else_is_touched() {
+        for candidate in [
+            // An ordinary host candidate.
+            "candidate:1 1 udp 2130706431 192.168.1.24 50123 typ host",
+            // Reflexive and relay candidates are never obfuscated, and their
+            // `raddr` must never be mistaken for the connection-address.
+            "candidate:2 1 udp 1694498815 203.0.113.7 50124 typ srflx raddr 192.168.1.24 rport 50123",
+            "candidate:3 1 udp 16777215 198.51.100.9 3478 typ relay raddr 0.0.0.0 rport 0",
+            // A multi-label name is not the RFC 8828 form: resolving it would
+            // send the daemon looking up whatever a peer asked it to.
+            "candidate:4 1 udp 1677729535 sneaky.internal.local 50123 typ host",
+            "candidate:5 1 udp 1677729535 .local 50123 typ host",
+            // Not a candidate line at all, and a truncated one.
+            "candidate:6 1 udp 1677729535 33cde59c.local 50123",
+            "v=0",
+            "",
+        ] {
+            assert_eq!(mdns_candidate_host(candidate), None, "{candidate}");
+        }
+        assert_eq!(
+            rewrite_candidate_host("v=0", "10.0.0.2".parse().unwrap()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_that_never_resolves_arrives_exactly_as_it_was_sent() {
+        // The failure path is the old behaviour: webrtc-rs receives the
+        // obfuscated candidate, says so, and ignores it. Nothing is dropped
+        // here and nothing waits longer than the bound.
+        let init = RTCIceCandidateInit {
+            candidate: BROWSER_MDNS_CANDIDATE.to_owned(),
+            sdp_mid: Some("0".to_owned()),
+            sdp_mline_index: Some(0),
+            username_fragment: None,
+        };
+        let started = tokio::time::Instant::now();
+        let resolved = resolve_mdns_candidate(init.clone()).await;
+        assert_eq!(resolved.candidate, init.candidate);
+        assert_eq!(resolved.sdp_mid, init.sdp_mid);
+        assert!(started.elapsed() < MDNS_CANDIDATE_RESOLVE_TIMEOUT + Duration::from_millis(750));
+
+        // A candidate that was never obfuscated is not delayed at all.
+        let plain = RTCIceCandidateInit {
+            candidate: "candidate:1 1 udp 2130706431 192.168.1.24 50123 typ host".to_owned(),
+            ..init
+        };
+        let started = tokio::time::Instant::now();
+        let untouched = resolve_mdns_candidate(plain.clone()).await;
+        assert_eq!(untouched.candidate, plain.candidate);
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
     use crate::host_files::{HostOperationKind, STREAM_CHUNK_BYTES};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use sha2::{Digest, Sha256};
