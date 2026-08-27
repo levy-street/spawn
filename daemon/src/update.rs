@@ -96,6 +96,8 @@ enum BlockReason {
     Unwritable,
     UnsupportedTarget,
     WorkerMissing,
+    #[cfg(windows)]
+    TaskBreakawayUnconfirmed,
 }
 
 impl BlockReason {
@@ -105,6 +107,8 @@ impl BlockReason {
             Self::Unwritable => "unwritable",
             Self::UnsupportedTarget => "unsupported_target",
             Self::WorkerMissing => "worker_missing",
+            #[cfg(windows)]
+            Self::TaskBreakawayUnconfirmed => "task_breakaway_unconfirmed",
         }
     }
 }
@@ -169,6 +173,8 @@ impl Drop for UpdatePermit<'_> {
 #[derive(Debug)]
 pub struct AppliedUpdate {
     daemon_path: PathBuf,
+    #[cfg(windows)]
+    config_dir: PathBuf,
     _permit: UpdatePermit<'static>,
 }
 
@@ -526,6 +532,9 @@ async fn apply_guarded(
     }
     Ok(AppliedUpdate {
         daemon_path: preconditions.daemon_path,
+        #[cfg(windows)]
+        config_dir: crate::config::config_dir()
+            .map_err(|_| UpdateFailure::new(UpdateStage::Precondition, "config_unavailable"))?,
         _permit: permit,
     })
 }
@@ -558,9 +567,10 @@ pub fn exec(applied: AppliedUpdate) -> UpdateFailure {
         {
             let AppliedUpdate {
                 daemon_path,
+                config_dir,
                 _permit: permit,
             } = applied;
-            let result = spawn_replacement(&daemon_path);
+            let result = spawn_update_handoff(&daemon_path, &config_dir);
             drop(permit);
             if result.is_ok() {
                 std::process::exit(0);
@@ -576,14 +586,68 @@ pub fn exec(applied: AppliedUpdate) -> UpdateFailure {
 }
 
 #[cfg(windows)]
-fn spawn_replacement(path: &Path) -> std::io::Result<()> {
-    let mut argv = std::env::args_os();
-    let _argv0 = argv.next();
-    // std::process::Command uses non-inheritable process/thread handles and
-    // passes only the configured stdio handles to the child on Windows.
-    let child = std::process::Command::new(path).args(argv).spawn()?;
+fn spawn_update_handoff(path: &Path, config_dir: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
+
+    if crate::service::preferred_mode(config_dir) == crate::service::ServiceMode::Task
+        && !task_breakaway_confirmed(config_dir)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Task Scheduler worker breakaway is not confirmed",
+        ));
+    }
+    let mut command = std::process::Command::new(path);
+    command
+        .arg("--config-dir")
+        .arg(config_dir)
+        .args(["__update-handoff", "--parent-pid"])
+        .arg(std::process::id().to_string())
+        .creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW);
+    let child = command.spawn()?;
     drop(child);
     Ok(())
+}
+
+#[cfg(windows)]
+pub fn relaunch_after_parent_exit(parent_pid: u32) -> Result<()> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+    // SAFETY: no handle inheritance is requested; the PID is used only for a
+    // bounded wait before the service manager starts the replacement daemon.
+    let parent = unsafe { OpenProcess(SYNCHRONIZE, 0, parent_pid) };
+    if parent.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32) {
+            return Err(error).context("opening the old spawnd process");
+        }
+    } else {
+        // SAFETY: parent is a live owned process handle until CloseHandle.
+        let wait = unsafe { WaitForSingleObject(parent, 120_000) };
+        // SAFETY: parent was returned by OpenProcess and is closed exactly once.
+        unsafe { CloseHandle(parent) };
+        match wait {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => anyhow::bail!("timed out waiting for the old spawnd process"),
+            WAIT_FAILED => {
+                return Err(std::io::Error::last_os_error())
+                    .context("waiting for the old spawnd process")
+            }
+            other => anyhow::bail!("unexpected old-process wait result {other}"),
+        }
+    }
+    let config_dir = crate::config::config_dir()?;
+    crate::service::relaunch_after_update(&config_dir)
+}
+
+#[cfg(not(windows))]
+pub fn relaunch_after_parent_exit(_parent_pid: u32) -> Result<()> {
+    anyhow::bail!("the update handoff is only available on Windows")
 }
 
 fn log_stage(stage: UpdateStage) {
@@ -865,7 +929,8 @@ fn exec_path(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn exec_path(path: &Path) -> Result<()> {
-    spawn_replacement(path).context("spawning reverted spawnd")?;
+    let config_dir = crate::config::config_dir()?;
+    spawn_update_handoff(path, &config_dir).context("handing reverted spawnd to its manager")?;
     std::process::exit(0)
 }
 
@@ -999,13 +1064,33 @@ fn evaluate_preconditions() -> Result<Preconditions, BlockReason> {
     let disabled = std::env::var_os("SPAWND_NO_SELF_UPDATE").is_some_and(|value| !value.is_empty());
     let daemon_path = std::env::current_exe().ok().and_then(resolve_file);
     let worker_path = resolve_program(crate::worker_backend::worker_bin());
-    classify_preconditions(
+    let preconditions = classify_preconditions(
         disabled,
         daemon_path,
         worker_path,
         target_for(std::env::consts::OS, std::env::consts::ARCH),
         probe_writable,
-    )
+    )?;
+    #[cfg(windows)]
+    {
+        let config_dir =
+            crate::config::config_dir().map_err(|_| BlockReason::TaskBreakawayUnconfirmed)?;
+        if crate::service::preferred_mode(&config_dir) == crate::service::ServiceMode::Task
+            && !task_breakaway_confirmed(&config_dir)
+        {
+            return Err(BlockReason::TaskBreakawayUnconfirmed);
+        }
+    }
+    Ok(preconditions)
+}
+
+#[cfg(windows)]
+fn task_breakaway_confirmed(config_dir: &Path) -> bool {
+    crate::state::heartbeat_is_fresh(config_dir, Duration::from_secs(90))
+        && crate::state::read(config_dir)
+            .ok()
+            .flatten()
+            .is_some_and(|state| state.task_breakaway_denied == Some(false))
 }
 
 fn classify_preconditions<F>(

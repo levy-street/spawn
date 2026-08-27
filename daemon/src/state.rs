@@ -138,7 +138,7 @@ pub fn state_path(config_dir: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         return crate::service::instance_state_path(config_dir)
-            .unwrap_or_else(|_| config_dir.to_path_buf())
+            .expect("Windows local application data directory must resolve")
             .join("state.json");
     }
     #[cfg(not(windows))]
@@ -183,7 +183,7 @@ fn write_atomic(path: &Path, state: &StateFile) -> Result<()> {
         let bytes = serde_json::to_vec(state)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
+        crate::platform::durable_replace(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {
@@ -193,26 +193,7 @@ fn write_atomic(path: &Path, state: &StateFile) -> Result<()> {
 }
 
 pub fn pid_is_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let Ok(pid) = i32::try_from(pid) else {
-            return false;
-        };
-        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
-            Ok(()) => true,
-            Err(nix::errno::Errno::EPERM) => true,
-            Err(_) => false,
-        }
-    }
-    #[cfg(windows)]
-    {
-        open_live_process(pid).is_some()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        false
-    }
+    crate::platform::process_alive(pid)
 }
 
 /// Stronger Windows daemon check used by status and doctor: the process is
@@ -274,11 +255,12 @@ fn open_live_process(pid: u32) -> Option<OwnedProcess> {
         return None;
     }
     let process = OwnedProcess(handle);
-    // SAFETY: process owns a valid process handle and exit_code is writable.
+    // SAFETY: process owns a valid process handle used for a nonblocking wait.
     if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_TIMEOUT {
         return None;
     }
     let mut exit_code = 0_u32;
+    // SAFETY: process owns a valid process handle and exit_code is writable.
     if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0
         || exit_code != STILL_ACTIVE as u32
     {

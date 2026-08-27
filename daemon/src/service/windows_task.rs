@@ -14,6 +14,21 @@ fn scheduler_binary() -> String {
     format!("schtasks{}", std::env::consts::EXE_SUFFIX)
 }
 
+#[cfg(windows)]
+fn scheduler_command() -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    let mut command = std::process::Command::new(scheduler_binary());
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(not(windows))]
+fn scheduler_command() -> std::process::Command {
+    std::process::Command::new(scheduler_binary())
+}
+
 fn quote_windows_argument(value: &str) -> String {
     if !value.is_empty()
         && !value
@@ -142,7 +157,7 @@ fn utf16le_document(xml: &str) -> Vec<u8> {
 
 #[cfg(windows)]
 fn schtasks(args: &[&str]) -> Result<std::process::ExitStatus> {
-    std::process::Command::new(scheduler_binary())
+    scheduler_command()
         .args(args)
         .status()
         .with_context(|| format!("running {} {}", scheduler_binary(), args.join(" ")))
@@ -150,7 +165,7 @@ fn schtasks(args: &[&str]) -> Result<std::process::ExitStatus> {
 
 #[cfg(windows)]
 fn schtasks_quiet(args: &[&str]) -> bool {
-    std::process::Command::new(scheduler_binary())
+    scheduler_command()
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -160,7 +175,7 @@ fn schtasks_quiet(args: &[&str]) -> bool {
 
 #[cfg(windows)]
 fn query_xml(config_dir: &Path) -> Option<String> {
-    let output = std::process::Command::new(scheduler_binary())
+    let output = scheduler_command()
         .args(["/Query", "/TN", &task_name(config_dir), "/XML"])
         .output()
         .ok()?;
@@ -331,10 +346,14 @@ pub(super) fn status(config_dir: &Path) -> super::ServiceStatus {
             None => crate::state::pid_matches_current_daemon(pid, None),
         }
     });
+    let (stdout_log, stderr_log) = super::service_log_paths(config_dir);
     super::ServiceStatus {
         installed,
         running,
-        name: format!("Task Scheduler {}", task_name(config_dir)),
+        name: task_name(config_dir),
+        manager: Some("task-scheduler".into()),
+        stdout_log,
+        stderr_log,
     }
 }
 
@@ -382,6 +401,7 @@ pub(super) fn prepare_background_log(config_dir: &Path) -> Result<()> {
 
     // A foreground `spawnd run` keeps its terminal. Scheduler/watchdog starts
     // have no console and must own their diagnostics before the first event.
+    // SAFETY: GetConsoleWindow takes no pointers and returns a borrowed HWND.
     if !unsafe { GetConsoleWindow() }.is_null() {
         return Ok(());
     }

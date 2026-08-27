@@ -334,6 +334,8 @@ pub fn current_user_sid() -> Result<String> {
     {
         return Err(std::io::Error::last_os_error()).context("reading the current user SID");
     }
+    // SAFETY: GetTokenInformation initialized the aligned buffer as TOKEN_USER
+    // and the referenced SID remains valid while buffer is live.
     let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
     let mut rendered = ptr::null_mut();
     // SAFETY: `user.User.Sid` is owned by the live token-information buffer.
@@ -347,6 +349,7 @@ pub fn current_user_sid() -> Result<String> {
             length += 1;
         }
     }
+    // SAFETY: the scan above established the initialized UTF-16 string length.
     let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(rendered, length) })
         .context("decoding the current user SID")?;
     // SAFETY: ConvertSidToStringSidW allocated this exact pointer.

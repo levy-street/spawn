@@ -13,7 +13,7 @@ ceremony, a download page) says so in the commit message.
 src/
   app/            one directory per route (App Router)
                   admin/ app/ device/ download/ forgot-password/ hosts/
-                  legion/ login/ onboarding/ reset-password/ security/
+                  desktop-build/ legion/ login/ onboarding/ reset-password/ security/
                   sessions/ signup/ trust-ux-demo/ verify-email/ w/
   components/     UI grouped by product area
                   access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/ release/

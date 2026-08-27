@@ -275,6 +275,11 @@ def manifest_signature_path(*, repo_root: Path | None = None) -> Path:
     return Path(f"{path}.sig")
 
 
+def _daemon_binary_filename(kind: str, target: str) -> str:
+    suffix = ".exe" if target.startswith("windows-") else ""
+    return f"{kind}{suffix}"
+
+
 def read_prebuilt_manifest(
     *,
     repo_root: Path | None = None,
@@ -336,8 +341,16 @@ def read_prebuilt_manifest(
             return None
 
         binaries = (
-            (prebuilt_root / target / "spawnd", spawnd_sha),
-            (prebuilt_root / target / "spawn-worker", worker_sha),
+            (
+                prebuilt_root / target / _daemon_binary_filename("spawnd", target),
+                spawnd_sha,
+            ),
+            (
+                prebuilt_root
+                / target
+                / _daemon_binary_filename("spawn-worker", target),
+                worker_sha,
+            ),
         )
         for binary, expected in binaries:
             actual = _sha256_file(binary)
@@ -409,6 +422,9 @@ def humanize_self_update_blocked(reason: str | None) -> str:
         "unwritable": "The daemon install directory is not writable",
         "unsupported_target": "This daemon target is unsupported",
         "worker_missing": "The SPAWN D worker binary is missing",
+        "task_breakaway_unconfirmed": (
+            "Task Scheduler has not confirmed that session workers survive updates"
+        ),
     }
     if reason in messages:
         return messages[reason]

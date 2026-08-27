@@ -407,10 +407,14 @@ the DMGs the download page links to (`SPAWN-D_<version>_<platform>.dmg`), the
 Detached `.sig` files are not public objects.
 
 Publish before deploying a commit whose `desktop/` tree is new. `GET
-/api/release` reports the `desktop` block — and the download page lights its
-platform links — from the deployed checkout alone, without checking that a DMG
-or EXE at that URL exists, so a deploy that precedes the publish hands out a
-404.
+/api/release` reports the two Mac platforms from the deployed checkout without
+proving their DMGs exist. Windows is advertised only when the canonical setup
+EXE is present and non-empty. Therefore
+`/var/www/spawnd/desktop/SPAWN-D_<version>_windows-x86_64-setup.exe` must be
+present and non-empty before the server starts or refreshes its release
+identity; restart or refresh the server after replacing that artifact. Publish
+all three desktop platforms before deploying so no advertised link can hand
+out a 404.
 
 The updater public key is committed in `desktop/updater.pubkey` and baked into
 `desktop/src-tauri/tauri.conf.json`. The private key stays on the release
@@ -702,9 +706,15 @@ standard-user accounts.
    `signtool verify /pa /all /v` exits zero. Confirm their post-signing hashes
    are the `.exe` lines in `SHA256SUMS` and the offline-signed five-target
    manifest.
-3. For a desktop release, apply the same Authenticode subject/timestamp gates
-   to the inner desktop executable and final NSIS setup EXE, then complete the
-   offline Tauri signing/publish procedure in “The desktop app”.
+3. For a desktop release, publish all three platform entries. The Windows row
+   must contain the canonical
+   `SPAWN-D_<version>_windows-x86_64-setup.exe` and its checksum; prove the
+   configured publisher and RFC 3161 timestamp on both the inner desktop EXE
+   and outer setup EXE; create the offline
+   `SPAWN-D_<version>_windows-x86_64-setup.exe.sig`; and require the exact
+   `windows-x86_64` URL-and-signature entry in `latest.json`. Then complete the
+   Mac signing/notarization and offline Tauri publish procedure in “The desktop
+   app”.
 4. On a clean Windows 11 x64 VM, test the public installer from Windows
    PowerShell 5.1 and PowerShell 7 as a standard user. Complete possession in
    the attached console, prove `%LOCALAPPDATA%\spawn\bin\{spawnd,spawn-worker}.exe`,

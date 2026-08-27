@@ -25,8 +25,9 @@ src/
                  ws.rs, update.rs + update_io.rs (verified daemon self-update;
                  focused tests live in update_tests.rs), release_key.rs (pinned
                  release trust roots), login.rs, creds.rs, rtc.rs, host_*.rs,
-                 upload.rs, sessions.rs, service.rs + service/ (Unix manager
-                 dispatch, Windows task/Run watchdog, control pipe), …
+                 upload.rs, sessions.rs, service.rs + service/ (launchd/systemd
+                 dispatch, Windows Task Scheduler/Run watchdog and control
+                 pipe), …
   tui.rs         shared TTY/NO_COLOR presentation: the live step frame
                  (`Ui`), panels, logo, and the single-line `Spinner`
   state.rs       atomic local daemon heartbeat contract (`state.json`)
@@ -63,7 +64,8 @@ Windows storage is local, not roaming:
 
 - config and the default single instance: `%LOCALAPPDATA%\spawn`
 - account instances: `%LOCALAPPDATA%\spawn\<account_id>`
-- service state/runtime files: `%LOCALAPPDATA%\spawn\state`
+- service state/runtime files: `%LOCALAPPDATA%\spawn\state\<instance>`
+- daemon/worker logs: `%LOCALAPPDATA%\spawn\logs\<instance>`
 - installed command shims/binaries: `%LOCALAPPDATA%\spawn\bin`
 - user-home expansion: `%USERPROFILE%`
 - upload and preview staging: unique owner-DACL-protected children below
@@ -196,9 +198,14 @@ cargo test --locked --bin spawnd <module>::
 Windows installs one persisted per-instance background mode: the primary
 least-privilege interactive-token Task Scheduler task, or the HKCU Run
 watchdog fallback when Scheduler denies worker breakaway. The task action is
-always an absolute `spawnd.exe` path. Its owner-only named control pipe handles
+always an absolute `spawnd.exe` path and invokes the hidden
+`run --background-service` mode; the Run registration invokes the hidden
+`__watchdog --instance <8hex>` mode. Those internal flags are service-owned and
+are not ordinary foreground commands. The owner-only named control pipe handles
 ping/reconnect/graceful shutdown; Unix SIGHUP and systemd `KillMode=process`
-stay unchanged. Windows CI must run `cargo test --locked --target
+stay unchanged. `possess --service-mode task|run` explicitly changes the
+persisted manager, and an interactive `possess` offers the safe Run fallback
+after a denied Task Scheduler breakaway probe. Windows CI must run `cargo test --locked --target
 x86_64-pc-windows-msvc` and the standard-user breakaway integration probe.
 
 Run `cargo clippy` and `cargo fmt` on what you touched. Shipping binaries to

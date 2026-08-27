@@ -69,6 +69,33 @@ Add the equivalent inbound rule to any host or cloud firewall in front of that
 machine; use a broader source only when direct Internet candidates are
 intended.
 
+## Windows Firewall
+
+On native Windows, `spawnd.exe` is the only SPAWN D program that binds the
+direct WebRTC candidate range, UDP 50000–50100. The per-user installer neither
+elevates nor silently creates a firewall rule. When inbound direct ICE is
+blocked, the daemon can still use ordinary outbound UDP to the configured TURN
+service.
+
+An administrator who explicitly wants direct candidates on a Private network
+may add this program-scoped rule for the installed daemon:
+
+```powershell
+$spawnd = Join-Path $env:LOCALAPPDATA 'spawn\bin\spawnd.exe'
+New-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)' `
+  -Direction Inbound -Action Allow -Profile Private -Program $spawnd `
+  -Protocol UDP -LocalPort 50000-50100
+
+# Uninstall or rollback:
+Remove-NetFirewallRule -DisplayName 'SPAWN D direct WebRTC (Private)'
+```
+
+Creating or removing that rule requires administrator authority. A standard
+user may see a first-listen Windows Security prompt but may be unable to approve
+the exception; declining, dismissing, or being blocked by policy leaves direct
+inbound ICE unavailable and TURN as the fallback. Never broaden the rule to
+the Public profile or to any program.
+
 When `SPAWN_TURN_URLS` is present in the health-check service environment,
 `scripts/health-check.sh` adds `coturn` to its systemd unit checks and sends a
 STUN Binding request to a configured UDP endpoint. The Binding request needs
