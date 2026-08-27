@@ -459,6 +459,19 @@ function paceBar(label: string): string {
 
 /* ── Screens ──────────────────────────────────────────────────────────── */
 
+/**
+ * The HTML currently on screen, so an unchanged screen can be left alone.
+ *
+ * The host screen re-renders on a one-second ticker, because "Still waiting…"
+ * has to appear the moment it is true. Writing `innerHTML` again — even the
+ * very same bytes — rebuilds every node under it, which restarts every CSS
+ * animation in it: the setup progress bar visibly snapped back to its start
+ * once a second, all the way through possession. Skipping the write when
+ * nothing changed is the whole fix; when something does change the render is
+ * exactly as it was.
+ */
+let painted: string | null = null;
+
 function render(): void {
   const views: Record<Screen, () => string> = {
     auth: authView,
@@ -475,7 +488,10 @@ function render(): void {
     update: updateView,
     quit: quitView,
   };
-  app.innerHTML = views[screen]();
+  const html = views[screen]();
+  if (html === painted) return;
+  painted = html;
+  app.innerHTML = html;
   bindActions();
 }
 
