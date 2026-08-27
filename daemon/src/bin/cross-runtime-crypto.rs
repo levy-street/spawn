@@ -615,7 +615,9 @@ fn decode_lower_hex(value: &str) -> Result<Vec<u8>> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let pair = std::str::from_utf8(pair).expect("hex is ASCII");
             u8::from_str_radix(pair, 16).context("decoding Ed25519 corpus hex")

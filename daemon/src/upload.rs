@@ -1755,7 +1755,7 @@ mod tests {
             assert_eq!(mode.mode() & 0o777, 0o600);
         }
         #[cfg(windows)]
-        crate::platform::open_private_file(&result.path, false)
+        crate::platform::open_private_file(Path::new(&result.path), false)
             .expect("uploaded file has a protected owner-only DACL");
         assert!(matches!(
             hub.start(

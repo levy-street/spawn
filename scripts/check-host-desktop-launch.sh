@@ -16,9 +16,10 @@
 #   3. Neither module may read the request payload at all. Payload parsing lives
 #      in host_control.rs, so argv cannot be fed from a client-supplied key by
 #      construction rather than by review.
-#   4. Ambient authority is consumed at exactly two sites: the home root and the
-#      private preview staging directory. A third would be a new escape from
-#      the capability sandbox.
+#   4. Ambient directory authority is consumed at four reviewed source sites:
+#      the host-file home root, the cfg-exclusive Unix/Windows upload roots, and
+#      the validated private-directory platform helper used for preview staging.
+#      Any other site would be a new escape from the capability sandbox.
 #
 # Deliberately a literal-source check, per docs/GUARD_POLICY.md: it greps for
 # markers, never prose.
@@ -81,10 +82,19 @@ if grep -qF 'payload_string(' "$DESKTOP" "$PREVIEW"; then
   fail "launch modules must not read request payloads"
 fi
 
-# 4. Ambient authority is consumed at exactly two reviewed sites.
-ambient="$(grep -rho 'open_ambient_dir' daemon/src --include='*.rs' | wc -l | tr -d ' ')"
-if [[ "$ambient" != "2" ]]; then
-  fail "expected exactly 2 open_ambient_dir sites in daemon/src, found $ambient"
+# 4. Ambient authority is consumed only at the exact reviewed sites.
+ambient="$(
+  rg -n --color never 'open_ambient_dir' daemon/src --glob '*.rs' \
+    | sed -E 's/^([^:]+):[0-9]+:/\1:/' \
+    | sort
+)"
+expected_ambient='daemon/src/host_files.rs:        let root = Dir::open_ambient_dir(&root_capability, ambient_authority())?;
+daemon/src/platform/unix.rs:    Dir::open_ambient_dir(path, ambient_authority())
+daemon/src/upload.rs:        CapDir::open_ambient_dir(Path::new("/"), ambient_authority())?,
+daemon/src/upload.rs:        let current = CapDir::open_ambient_dir(&root, ambient_authority())?;'
+if [[ "$ambient" != "$expected_ambient" ]]; then
+  printf 'host-desktop-launch: unexpected ambient directory authority sites:\n%s\n' "$ambient" >&2
+  fail "ambient directory authority escaped its reviewed inventory"
 fi
 
 # 5. The gates on `desktop.open` are all still present.
@@ -97,13 +107,18 @@ self_test() {
   fixture="$(mktemp -d)"
   trap 'rm -rf "$fixture"' RETURN
 
-  mkdir -p "$fixture/daemon/src"
+  mkdir -p "$fixture/daemon/src/platform"
   cp "$DESKTOP" "$PREVIEW" "$fixture/daemon/src/"
-  # The real tree has two; the fixture only copies the two launch modules, so
-  # stand in a file carrying both ambient sites.
-  printf '%s\n%s\n' 'open_ambient_dir' 'open_ambient_dir' >"$fixture/daemon/src/roots.rs"
-  # host_preview.rs already contains one; drop the fixture's extra.
-  printf '%s\n' 'open_ambient_dir' >"$fixture/daemon/src/roots.rs"
+  printf '%s\n' \
+    '        let root = Dir::open_ambient_dir(&root_capability, ambient_authority())?;' \
+    >"$fixture/daemon/src/host_files.rs"
+  printf '%s\n' \
+    '        CapDir::open_ambient_dir(Path::new("/"), ambient_authority())?,' \
+    '        let current = CapDir::open_ambient_dir(&root, ambient_authority())?;' \
+    >"$fixture/daemon/src/upload.rs"
+  printf '%s\n' \
+    '    Dir::open_ambient_dir(path, ambient_authority())' \
+    >"$fixture/daemon/src/platform/unix.rs"
 
   HOST_DESKTOP_LAUNCH_ROOT="$fixture" "$script_path" >/dev/null ||
     fail "self-test: an unmodified copy did not pass"
@@ -137,9 +152,9 @@ self_test() {
   fi
   printf '%s\n' "$original" >"$fixture/daemon/src/host_desktop.rs"
 
-  printf '%s\n' 'open_ambient_dir' >>"$fixture/daemon/src/roots.rs"
+  printf '%s\n' 'open_ambient_dir' >"$fixture/daemon/src/roots.rs"
   if HOST_DESKTOP_LAUNCH_ROOT="$fixture" "$script_path" >/dev/null 2>&1; then
-    fail "self-test: a third ambient-authority site passed"
+    fail "self-test: an extra ambient-authority site passed"
   fi
 
   printf '%s\n' "host-desktop-launch self-test passed"

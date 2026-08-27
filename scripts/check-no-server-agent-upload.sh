@@ -301,11 +301,16 @@ PY
   done
 
   local receivers expected_receivers
-  receivers="$(rg -o --color never '[A-Za-z_$][A-Za-z0-9_$?.]*\.send\(' "$web_file" | sort | uniq -c)"
+  receivers="$(
+    rg -o --color never '[A-Za-z_$][A-Za-z0-9_$?.]*\.send\(' "$web_file" \
+      | sort \
+      | uniq -c \
+      | awk '{$1 = $1; print}'
+  )"
   # ws.send( carries signalling only: the offer/answer/candidate frames, the
   # keepalive pong reply, and rtc.config.request (connection stream 8d2c960).
   # File bytes go over channel.send( / this.channel.send( — the direct data channel.
-  expected_receivers=$'      2 channel.send(\n      1 this.channel.send(\n      3 ws.send('
+  expected_receivers=$'2 channel.send(\n1 this.channel.send(\n3 ws.send('
   if [[ "$receivers" != "$expected_receivers" ]]; then
     printf 'no-server-agent-upload: web host-control send topology changed; review direct vs signaling channels:\n%s\n' \
       "$receivers" >&2
@@ -410,6 +415,14 @@ def matching_delimiter(text: str, start: int, opening: str, closing: str) -> int
             block_comment = 1
             index += 2
             continue
+        raw_string = re.match(r'(?:br|cr|r)(?P<hashes>#{0,255})"', text[index:])
+        if raw_string:
+            terminator = '"' + raw_string.group("hashes")
+            raw_end = text.find(terminator, index + raw_string.end())
+            if raw_end < 0:
+                return None
+            index = raw_end + len(terminator)
+            continue
         if char == '"':
             quote = char
             index += 1
@@ -431,16 +444,42 @@ def matching_delimiter(text: str, start: int, opening: str, closing: str) -> int
     return None
 
 
+def cfg_is_test_only(expression: str) -> bool:
+    expression = re.sub(r"\s+", "", expression)
+    if expression == "test":
+        return True
+    if not expression.startswith("all(") or not expression.endswith(")"):
+        return False
+    operands = []
+    current = []
+    depth = 0
+    for char in expression[4:-1]:
+        if char == "," and depth == 0:
+            operands.append("".join(current))
+            current = []
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        current.append(char)
+    operands.append("".join(current))
+    return "test" in operands
+
+
 def strip_rust_test_modules(text: str) -> str:
     pattern = re.compile(
-        r'#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{'
+        r'#\s*\[\s*cfg\s*\((?P<cfg>[^\]]*)\)\s*\]\s*'
+        r'(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{'
     )
     masked = list(text)
     for match in list(pattern.finditer(text)):
+        if not cfg_is_test_only(match.group("cfg")):
+            continue
         opening = text.find("{", match.start(), match.end())
         closing = matching_delimiter(text, opening, "{", "}")
         if closing is None:
-            raise SystemExit("no-server-agent-upload: unbalanced #[cfg(test)] module")
+            raise SystemExit("no-server-agent-upload: unbalanced test-only Rust module")
         for index in range(match.start(), closing + 1):
             if masked[index] != "\n":
                 masked[index] = " "
@@ -594,6 +633,19 @@ self_test() {
   cp "$source_root/daemon/src/host_control.rs" "$fixture/daemon/src/host_control.rs"
   cp "$source_root/daemon/src/host_direct.rs" "$fixture/daemon/src/host_direct.rs"
   cp "$source_root/daemon/src/host_signal.rs" "$fixture/daemon/src/host_signal.rs"
+  printf '%s\n' \
+    '#[cfg(test)]' \
+    'mod tests {' \
+    '  const RAW: &str = r#"C:\say "hello"\"#;' \
+    '  const FIELD: &str = concat!("bytes", "_b64");' \
+    '}' \
+    >"$fixture/daemon/src/raw_string_test.rs"
+  printf '%s\n' \
+    '#[cfg(all(test, windows))]' \
+    'mod windows_tests {' \
+    '  const FIELD: &str = concat!("bytes", "_b64");' \
+    '}' \
+    >"$fixture/daemon/src/windows_test.rs"
   printf '%s\n' 'export const ok = true;' >"$fixture/web/src/lib/api.ts"
   printf '%s\n' \
     'async writeStream() {' \

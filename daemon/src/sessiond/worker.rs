@@ -63,12 +63,12 @@ const MAX_PTY_INPUT_FRAME_BYTES: usize = 64 * 1024;
 const MAX_SHUTDOWN_FRAME_BYTES: usize = 64;
 const SUPERVISOR_HELLO_TIMEOUT: Duration = Duration::from_millis(500);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type WipeProbe = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 struct PlaintextChunk {
     bytes: Vec<u8>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     wipe_probe: Option<WipeProbe>,
 }
 
@@ -85,12 +85,12 @@ impl PlaintextChunk {
     fn new(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             wipe_probe: None,
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_wipe_probe(bytes: Vec<u8>, wipe_probe: WipeProbe) -> Self {
         Self {
             bytes,
@@ -110,7 +110,7 @@ impl std::ops::Deref for PlaintextChunk {
 impl Drop for PlaintextChunk {
     fn drop(&mut self) {
         self.bytes.zeroize();
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         if let Some(probe) = self.wipe_probe.as_ref() {
             probe(&self.bytes);
         }
@@ -148,7 +148,7 @@ fn inbound_frame_size_exact(frame_type: u8, len: usize) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn inbound_frame_size_allowed(frame_type: u8, len: usize) -> bool {
     inbound_frame_limit(frame_type).is_some_and(|limit| len <= limit)
         && inbound_frame_size_exact(frame_type, len)

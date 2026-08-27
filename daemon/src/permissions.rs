@@ -38,6 +38,7 @@ use std::time::Duration;
 /// How long one folder gets. The dialog has no timeout of its own, and an
 /// unanswered one must not hold registration open for ever; a person who walks
 /// away simply keeps the lazy prompt they would have had anyway.
+#[cfg(target_os = "macos")]
 const ASK_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Set to any value to never prime. For headless fleets that do have a console
@@ -69,10 +70,12 @@ impl Location {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn relative(self) -> &'static str {
         self.label()
     }
 
+    #[cfg(target_os = "macos")]
     fn path(self, home: &std::path::Path) -> PathBuf {
         home.join(self.relative())
     }
@@ -116,6 +119,7 @@ pub type Report = Vec<(Location, Grant)>;
 /// Reading a single entry is the whole test: it is what TCC gates, and it is
 /// the smallest thing that triggers the dialog. Nothing is read beyond the
 /// first name, and the name is discarded.
+#[cfg(any(target_os = "macos", test))]
 fn probe_blocking(path: &std::path::Path) -> Grant {
     match std::fs::read_dir(path) {
         Ok(mut entries) => match entries.next() {
@@ -128,6 +132,7 @@ fn probe_blocking(path: &std::path::Path) -> Grant {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn classify(error: &std::io::Error) -> Grant {
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => Grant::Refused,

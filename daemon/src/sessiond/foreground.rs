@@ -263,11 +263,11 @@ fn ignored_windows_process(node: &ProcessNode, worker_pid: u32) -> bool {
 }
 
 #[cfg(any(windows, test))]
-fn select_windows_foreground<'a>(
+fn select_windows_foreground(
     root_pid: u32,
     worker_pid: u32,
-    nodes: &'a [ProcessNode],
-) -> Option<&'a ProcessNode> {
+    nodes: &[ProcessNode],
+) -> Option<&ProcessNode> {
     let by_pid = nodes
         .iter()
         .map(|node| (node.pid, node))

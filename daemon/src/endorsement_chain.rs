@@ -729,7 +729,13 @@ mod tests {
     #[test]
     fn a_connecting_anchor_needs_no_edges() {
         let device = key(1);
-        find(&[device.clone()], &RevocationSet::new(), &device, &[]).expect("anchor admitted");
+        find(
+            std::slice::from_ref(&device),
+            &RevocationSet::new(),
+            &device,
+            &[],
+        )
+        .expect("anchor admitted");
     }
 
     #[test]

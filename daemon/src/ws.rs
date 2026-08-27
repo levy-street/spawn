@@ -542,6 +542,26 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tracing::instrument::WithSubscriber;
 
+    #[derive(Clone, Copy)]
+    struct SelectDaemonSubprotocol;
+
+    impl tokio_tungstenite::tungstenite::handshake::server::Callback for SelectDaemonSubprotocol {
+        fn on_request(
+            self,
+            _request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+            mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+        ) -> std::result::Result<
+            tokio_tungstenite::tungstenite::handshake::server::Response,
+            tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+        > {
+            response.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                HeaderValue::from_static(SUBPROTOCOL),
+            );
+            Ok(response)
+        }
+    }
+
     struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
 
     impl Write for CapturedLogWriter {
@@ -740,19 +760,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_hdr_async(
-                tcp,
-                |_: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                    response.headers_mut().insert(
-                        "Sec-WebSocket-Protocol",
-                        HeaderValue::from_static(SUBPROTOCOL),
-                    );
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(tcp, SelectDaemonSubprotocol)
+                .await
+                .unwrap();
             let text = socket
                 .next()
                 .await

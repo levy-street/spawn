@@ -405,8 +405,8 @@ INSTALL_PS1 = dedent(
     }
 
     if (-not $Server) { $Server = $DefaultServer }
-    $isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
-    if (-not $isWindows) { throw 'install.ps1 requires native Windows; use install.sh on Unix or WSL' }
+    $spawnPlatformIsWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    if (-not $spawnPlatformIsWindows) { throw 'install.ps1 requires native Windows; use install.sh on Unix or WSL' }
     $serverUri = $null
     if (-not [Uri]::TryCreate($Server, [UriKind]::Absolute, [ref] $serverUri) -or
         $serverUri.Scheme -notin @('http', 'https')) {

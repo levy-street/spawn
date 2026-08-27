@@ -16,6 +16,7 @@ use models::{
     PossessionProgress,
 };
 use serde::Serialize;
+#[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_updater::UpdaterExt;
@@ -375,16 +376,17 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building SPAWN D desktop");
-    app.run(|handle, event| {
+    app.run(|_handle, _event| {
         // Explicit Quit SPAWN D exits; closing the window only hides it and
         // leaves SPAWN D in the platform tray. Reopening brings the window
         // back as it was.
+        #[cfg(target_os = "macos")]
         if let RunEvent::Reopen {
             has_visible_windows: false,
             ..
-        } = event
+        } = _event
         {
-            let handle = handle.clone();
+            let handle = _handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = window::surface(&handle).await {
                     eprintln!("window: {error:#}");

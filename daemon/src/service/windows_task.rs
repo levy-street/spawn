@@ -192,7 +192,9 @@ fn decode_command_text(bytes: &[u8]) -> String {
     if little_endian {
         let offset = usize::from(bytes.starts_with(&[0xff, 0xfe])) * 2;
         let words = bytes[offset..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect::<Vec<_>>();
         String::from_utf16_lossy(&words)
@@ -547,7 +549,9 @@ mod tests {
         assert_eq!(&encoded[..2], &[0xff, 0xfe]);
         let decoded = String::from_utf16(
             &encoded[2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
                 .collect::<Vec<_>>(),
         )
