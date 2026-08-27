@@ -62,9 +62,9 @@ Public landing pages (`/use/*`, `/for/*`, `/vs/*`) are data, not JSX: one
 typed entry per page in `src/lib/seo/{use-cases,agents,comparisons}.ts`,
 rendered by `src/components/seo/SeoLandingPage.tsx` in the pressroom
 vocabulary (`components/brand/press.tsx`). The per-family templates that will
-replace it live in `src/components/seo/templates/` (job template +
-workspace-grid vignette so far; `app/run-agents-in-parallel/` is the
-prototype page). Adding a page = adding an entry;
+replace it live in `src/components/seo/templates/` (job template + the
+live fleet capture in `public/product/` so far; `app/run-agents-in-parallel/`
+is the prototype page). Adding a page = adding an entry;
 the sitemap (`app/sitemap.ts`), family indexes, and cross-links follow from
 the registry. `src/lib/seo/registry.test.ts` holds the invariants (unique
 slugs, snippet-length budgets, resolvable cross-links). Titles and H1s stay
