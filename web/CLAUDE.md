@@ -13,10 +13,13 @@ ceremony, a download page) says so in the commit message.
 src/
   app/            one directory per route (App Router)
                   admin/ app/ device/ download/ for/ forgot-password/ hosts/
-                  legion/ login/ onboarding/ reset-password/ security/
-                  sessions/ signup/ trust-ux-demo/ use/ verify-email/ vs/ w/
+                  legion/ login/ onboarding/ reset-password/
+                  run-agents-in-parallel/ security/ sessions/ signup/
+                  trust-ux-demo/ use/ verify-email/ vs/ w/
                   (for/, use/, vs/ are the SEO landing-page families, rendered
-                  from the registry in lib/seo/ — see "SEO landing pages")
+                  from the registry in lib/seo/ — see "SEO landing pages";
+                  run-agents-in-parallel/ is the flat-URL job-template
+                  prototype from docs/SEO_TREE.md)
   components/     UI grouped by product area
                   access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/
                   onboarding/ profile/ seo/ session/ settings/ terminal/
@@ -58,7 +61,10 @@ public/           static assets
 Public landing pages (`/use/*`, `/for/*`, `/vs/*`) are data, not JSX: one
 typed entry per page in `src/lib/seo/{use-cases,agents,comparisons}.ts`,
 rendered by `src/components/seo/SeoLandingPage.tsx` in the pressroom
-vocabulary (`components/brand/press.tsx`). Adding a page = adding an entry;
+vocabulary (`components/brand/press.tsx`). The per-family templates that will
+replace it live in `src/components/seo/templates/` (job template +
+workspace-grid vignette so far; `app/run-agents-in-parallel/` is the
+prototype page). Adding a page = adding an entry;
 the sitemap (`app/sitemap.ts`), family indexes, and cross-links follow from
 the registry. `src/lib/seo/registry.test.ts` holds the invariants (unique
 slugs, snippet-length budgets, resolvable cross-links). Titles and H1s stay
