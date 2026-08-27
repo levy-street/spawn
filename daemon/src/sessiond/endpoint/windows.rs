@@ -865,24 +865,37 @@ fn start_lifecycle_listener(name: OsString, first: NamedPipeServer) -> Lifecycle
     let (sender, receiver) = mpsc::channel(LIFECYCLE_HANDLER_SLOTS);
     let task = tokio::spawn(async move {
         let semaphore = Arc::new(Semaphore::new(LIFECYCLE_HANDLER_SLOTS));
+        let (recycle_sender, mut recycle_receiver) = mpsc::channel(LIFECYCLE_HANDLER_SLOTS);
         let mut next = first;
         loop {
             let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
                 break;
             };
-            if next.connect().await.is_err() || validate_worker_peer(&next).is_err() {
-                match create_pipe(&name, PipeMode::Message, LIFECYCLE_PIPE_INSTANCES, false) {
-                    Ok(replacement) => next = replacement,
-                    Err(_) => break,
+            if next.connect().await.is_err() {
+                next = match lifecycle_replacement(&name, &mut recycle_receiver).await {
+                    Some(replacement) => replacement,
+                    None => break,
+                };
+                continue;
+            }
+            if validate_worker_peer(&next).is_err() {
+                // The same server instance can accept again after an explicit
+                // disconnect, without consuming another finite instance slot.
+                if next.disconnect().is_err() {
+                    next = match lifecycle_replacement(&name, &mut recycle_receiver).await {
+                        Some(replacement) => replacement,
+                        None => break,
+                    };
                 }
                 continue;
             }
             let connected = next;
-            next = match create_pipe(&name, PipeMode::Message, LIFECYCLE_PIPE_INSTANCES, false) {
-                Ok(replacement) => replacement,
-                Err(_) => break,
+            next = match lifecycle_replacement(&name, &mut recycle_receiver).await {
+                Some(replacement) => replacement,
+                None => break,
             };
             let exchange_sender = sender.clone();
+            let recycle_sender = recycle_sender.clone();
             tokio::spawn(async move {
                 let mut server = connected;
                 let mut request = [0u8; wire::LIFECYCLE_REQUEST_LEN + 1];
@@ -900,8 +913,11 @@ fn start_lifecycle_listener(name: OsString, first: NamedPipeServer) -> Lifecycle
                         // A client handle alone keeps a named-pipe instance
                         // alive. Explicitly disconnect timed-out/failed clients
                         // so seven silent peers cannot retain every instance
-                        // slot after their server handles are closed.
+                        // slot, then recycle this server handle. Closing it
+                        // would leave a client-only instance alive until that
+                        // client cooperated by closing its own handle.
                         let _ = server.disconnect();
+                        let _ = recycle_sender.send(server).await;
                         return;
                     }
                 };
@@ -916,6 +932,29 @@ fn start_lifecycle_listener(name: OsString, first: NamedPipeServer) -> Lifecycle
         }
     });
     LifecycleListener { receiver, task }
+}
+
+async fn lifecycle_replacement(
+    name: &OsStr,
+    recycled: &mut mpsc::Receiver<NamedPipeServer>,
+) -> Option<NamedPipeServer> {
+    loop {
+        match create_pipe(name, PipeMode::Message, LIFECYCLE_PIPE_INSTANCES, false) {
+            Ok(replacement) => return Some(replacement),
+            // A disconnected client must still close its handle, and until
+            // then its pipe instance continues to count toward max_instances.
+            // Reuse a disconnected server instance when one is available;
+            // otherwise keep observing creation so an ordinary handled client
+            // closing its instance also wakes the listener back up.
+            Err(error) if has_raw_os_error(&error, ERROR_PIPE_BUSY) => {
+                tokio::select! {
+                    Some(replacement) = recycled.recv() => return Some(replacement),
+                    _ = tokio::time::sleep(RETRY_DELAY) => {}
+                }
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 pub(super) async fn receive_lifecycle(
@@ -1448,6 +1487,14 @@ fn is_not_found(error: &anyhow::Error) -> bool {
     })
 }
 
+fn has_raw_os_error(error: &anyhow::Error, code: u32) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(code as i32))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,6 +1519,23 @@ mod tests {
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
                 Err(error) => panic!("opening test named pipe failed: {error}"),
+            }
+        }
+    }
+
+    async fn create_first_test_pipe(name: &OsStr, mode: PipeMode) -> NamedPipeServer {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match create_pipe(name, mode, MAIN_PIPE_INSTANCES, true) {
+                Ok(server) => return server,
+                Err(error)
+                    if has_raw_os_error(&error, ERROR_ACCESS_DENIED)
+                        && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep_until(std::cmp::min(deadline, Instant::now() + RETRY_DELAY))
+                        .await;
+                }
+                Err(error) => panic!("creating fresh first test pipe failed: {error:#}"),
             }
         }
     }
@@ -1553,14 +1617,15 @@ mod tests {
         assert_eq!(frame_type, wire::T_REDRAW);
         assert_eq!(payload, b"roll");
 
-        // Disconnect is the documented server teardown before CloseHandle;
-        // it releases the client from this instance before the test proves a
-        // fresh first-instance reservation can take the same name.
+        // Disconnect then close both ends in the documented order. Windows
+        // can expose the old pipe name briefly after those closes, so the
+        // helper observes first-instance creation until the bounded deadline
+        // instead of assuming synchronous object-manager teardown.
         server.disconnect().unwrap();
         drop(client);
         drop(server);
         drop(listener);
-        create_pipe(&name, PipeMode::Byte, MAIN_PIPE_INSTANCES, true).unwrap();
+        create_first_test_pipe(&name, PipeMode::Byte).await;
     }
 
     #[tokio::test]
