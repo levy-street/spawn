@@ -618,6 +618,7 @@ pub(crate) struct WriteLifecycleTestHooks {
     publication_send_finished: Notify,
     shutdown_started: Notify,
     shutdown_returned: Notify,
+    write_delay_entered: Notify,
     blocking: [BlockingPause; 11],
     effect_boundary: [BlockingPause; 11],
     temporary_cleanup: BlockingPause,
@@ -750,6 +751,14 @@ impl WriteLifecycleTestHooks {
 
     pub(crate) fn notify_shutdown_returned(&self) {
         self.shutdown_returned.notify_one();
+    }
+
+    pub(crate) fn notify_write_delay_entered(&self) {
+        self.write_delay_entered.notify_one();
+    }
+
+    pub(crate) async fn wait_write_delay_entered(&self) {
+        self.write_delay_entered.notified().await;
     }
 }
 
@@ -2745,14 +2754,31 @@ mod tests {
                 service.list(r"C:\Windows", 0).await.unwrap_err().code,
                 "outside_root"
             );
-            assert!(service
-                .list(temp.path().to_string_lossy().as_ref(), 0)
+            service
+                .list(service.root_display.to_string_lossy().as_ref(), 0)
                 .await
-                .is_ok());
-            let link = temp.path().join("link");
+                .expect("the canonical advertised root is accepted as absolute input");
+
+            // A junction is a directory reparse point standard users can make
+            // without Developer Mode. Keep this case mandatory even when the
+            // runner cannot create a true directory symlink.
+            let junction = temp.path().join("junction");
+            let status = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&junction)
+                .arg(temp.path().join("safe"))
+                .status()
+                .expect("cmd.exe must be available on Windows CI");
+            assert!(status.success(), "mklink /J failed with {status}");
+            assert_eq!(
+                service.list("junction", 0).await.unwrap_err().code,
+                "symlink_rejected"
+            );
+
+            let link = temp.path().join("directory-symlink");
             match std::os::windows::fs::symlink_dir(temp.path().join("safe"), &link) {
                 Ok(()) => assert_eq!(
-                    service.list("link", 0).await.unwrap_err().code,
+                    service.list("directory-symlink", 0).await.unwrap_err().code,
                     "symlink_rejected"
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}

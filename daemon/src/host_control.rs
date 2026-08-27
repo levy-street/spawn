@@ -1539,6 +1539,9 @@ impl Context {
         };
         #[cfg(test)]
         if let Some(delay_ms) = object.get("test_delay_ms").and_then(Value::as_u64) {
+            self.files
+                .write_lifecycle_test_hooks()
+                .notify_write_delay_entered();
             tokio::select! {
                 _ = slot.cancelled.cancelled() => {
                     drop(write_guard);
