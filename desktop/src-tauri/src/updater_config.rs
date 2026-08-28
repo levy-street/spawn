@@ -1,12 +1,28 @@
 pub const STABLE_ENDPOINT: &str = "https://spawnd.dev/desktop/latest.json";
 pub const BETA_ENDPOINT: &str = "https://spawnd.dev/desktop/beta/latest.json";
 
-pub fn configured_endpoint() -> &'static str {
-    if cfg!(feature = "beta-updates") {
+/// The updater channel this build may take an app from, if any.
+///
+/// `None` when the build points at a server other than the vendor's. The
+/// endpoint in `tauri.conf.json` is the vendor's and is signed by the vendor's
+/// offline key, so a build made for a dev deployment would sit there checking
+/// production and, the first time production went ahead of it, quietly replace
+/// itself with the production app. Nobody asked it to change fleets.
+///
+/// Such a build is updated by whoever built it — by installing the next one.
+pub fn configured_endpoint() -> Option<&'static str> {
+    endpoint_for(crate::models::HOSTED_ORIGIN)
+}
+
+fn endpoint_for(origin: &str) -> Option<&'static str> {
+    if origin != crate::models::VENDOR_ORIGIN {
+        return None;
+    }
+    Some(if cfg!(feature = "beta-updates") {
         BETA_ENDPOINT
     } else {
         STABLE_ENDPOINT
-    }
+    })
 }
 
 #[cfg(test)]
@@ -41,10 +57,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_build_pointed_elsewhere_takes_no_vendor_updates() {
+        // Asserted against the origin rather than whichever one this build
+        // chose, so the test holds for a dev build too.
+        assert_eq!(
+            endpoint_for(crate::models::VENDOR_ORIGIN),
+            Some(STABLE_ENDPOINT)
+        );
+        for elsewhere in [
+            "https://dev.spawnd.dev:8330",
+            "http://localhost:3000",
+            "https://spawnd.dev.evil.test",
+            "https://spawnd.dev:8443",
+        ] {
+            assert_eq!(
+                endpoint_for(elsewhere),
+                None,
+                "{elsewhere} is not the vendor"
+            );
+        }
+    }
+
+    #[test]
     fn stable_and_beta_channels_remain_vendor_pinned() {
         assert_eq!(STABLE_ENDPOINT, "https://spawnd.dev/desktop/latest.json");
         assert_eq!(BETA_ENDPOINT, "https://spawnd.dev/desktop/beta/latest.json");
-        assert!(configured_endpoint().starts_with("https://spawnd.dev/desktop/"));
+        assert!(endpoint_for(crate::models::VENDOR_ORIGIN)
+            .expect("the vendor origin keeps its channel")
+            .starts_with("https://spawnd.dev/desktop/"));
     }
 
     #[test]

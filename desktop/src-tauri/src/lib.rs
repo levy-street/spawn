@@ -205,6 +205,11 @@ async fn approve_possession(
 }
 
 #[tauri::command]
+fn hosted_origin() -> &'static str {
+    models::HOSTED_ORIGIN
+}
+
+#[tauri::command]
 fn terminal_install_command() -> Result<String, String> {
     let preferences = storage::load_preferences().map_err(command_error)?;
     Ok(install::installer_command(&preferences.server_origin))
@@ -247,11 +252,23 @@ async fn stop_possessing() -> Result<String, String> {
 struct AppUpdateStatus {
     available: bool,
     version: Option<String>,
-    endpoint: &'static str,
+    /// `None` when this build takes no updates from the vendor's channel.
+    endpoint: Option<&'static str>,
 }
 
 #[tauri::command]
 async fn check_app_update(app: tauri::AppHandle) -> Result<AppUpdateStatus, String> {
+    let Some(endpoint) = updater_config::configured_endpoint() else {
+        // Pointed at somebody's own server. Asking the vendor's channel what
+        // it has would be asking the wrong question, and taking the answer
+        // would move this machine to another fleet.
+        tray::set_app_update_available(&app, false);
+        return Ok(AppUpdateStatus {
+            available: false,
+            version: None,
+            endpoint: None,
+        });
+    };
     let update = app
         .updater()
         .map_err(command_error)?
@@ -262,12 +279,15 @@ async fn check_app_update(app: tauri::AppHandle) -> Result<AppUpdateStatus, Stri
     Ok(AppUpdateStatus {
         available: update.is_some(),
         version: update.map(|value| value.version),
-        endpoint: updater_config::configured_endpoint(),
+        endpoint: Some(endpoint),
     })
 }
 
 #[tauri::command]
 async fn install_app_update(app: tauri::AppHandle) -> Result<bool, String> {
+    if updater_config::configured_endpoint().is_none() {
+        return Ok(false);
+    }
     let Some(update) = app
         .updater()
         .map_err(command_error)?
@@ -355,6 +375,7 @@ pub fn run() {
             begin_possession,
             poll_possession,
             approve_possession,
+            hosted_origin,
             terminal_install_command,
             local_status,
             possession_log_tail,
