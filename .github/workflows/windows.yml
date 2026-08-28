@@ -84,14 +84,18 @@ jobs:
   # UNSIGNED: it is a validation build, never a release artifact, and
   # publish-desktop.sh refuses a setup EXE with no certificate table.
   #
-  # Packaging is a release build of the whole application, so it does not run on
-  # every push: master, a manual dispatch, or `[package]` in the commit subject
-  # (the escape hatch that matters while `workflow_dispatch` cannot see this
-  # workflow off the default branch).
+  # Packaging is a release build of the whole application, so it is asked for
+  # rather than automatic: a manual dispatch, or `[package]` in the commit
+  # subject. `prebuilt.yml` gates its Windows build for the same reason — these
+  # minutes are billed and doubled. Running it on every master push would buy
+  # very little: `desktop.yml` hard-fails on a packaging regression at release
+  # time anyway, and the rehearsal's real job is to prove the path and hand out
+  # a test installer before a release, both of which are deliberate acts.
+  # `[package]` is what reaches it from a branch, since `workflow_dispatch`
+  # cannot see this workflow off the default branch.
   windows-package:
     name: windows-package (unsigned rehearsal)
     if: >-
-      github.ref == 'refs/heads/master' ||
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.head_commit.message, '[package]')
     runs-on: windows-latest

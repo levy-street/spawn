@@ -250,10 +250,11 @@ output is `NotSigned`, names it `...-setup.UNSIGNED.exe`, and uploads it for
 seven days. That installer exists so the Windows handoff matrix can be run
 before the signing identity does, and it is never a release artifact:
 `publish-desktop.sh` refuses any Windows setup EXE with no Authenticode
-certificate table, whatever it is called. Packaging is a full release build, so
-it runs only on `master`, on a manual dispatch, or when the commit subject
-contains `[package]` — the last of those being the only way to reach it from a
-branch while `workflow_dispatch` cannot see the workflow off the default branch.
+certificate table, whatever it is called. Packaging is a full release build on
+billed, doubled Windows minutes, so it is asked for rather than automatic: a
+manual dispatch, or `[package]` in the commit subject — the latter being the
+only way to reach it from a branch while `workflow_dispatch` cannot see the
+workflow off the default branch.
 
 The private key is a 32-byte Ed25519 seed stored as one line of unpadded
 base64url at
