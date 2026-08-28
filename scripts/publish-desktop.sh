@@ -27,9 +27,11 @@ Usage: scripts/publish-desktop.sh [ssh-host] <artifact-dir>
 Before anything is uploaded the script proves that latest.json names exactly
 that version and all three platforms, that every URL points into this origin's
 desktop tree at the payload being uploaded, that each embedded signature is the
-matching .sig file, and that each signature verifies its payload against the
-committed desktop/updater.pubkey. Then the payloads and DMGs go up, latest.json
-goes up last through a rename, and every URL is fetched back over HTTPS.
+matching .sig file, that each signature verifies its payload against the
+committed desktop/updater.pubkey, and that the Windows setup EXE carries an
+Authenticode certificate table at all. Then the payloads and DMGs go up,
+latest.json goes up last through a rename, and every URL is fetched back over
+HTTPS.
 
 Environment:
   SPAWN_DEPLOY_HOST      SSH host alias/name. Overridden by [ssh-host].
@@ -120,6 +122,7 @@ if ! UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/spawn-release-uv-cache}" \
 import base64
 import hashlib
 import json
+import struct
 import sys
 from pathlib import Path
 
@@ -138,6 +141,39 @@ updater_suffixes = {
 def fail(message: str) -> None:
     print(f"publish-desktop: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def require_authenticode(path: Path) -> None:
+    """Refuse a Windows payload that carries no embedded certificate table.
+
+    Chain, subject and RFC 3161 timestamp are proved on Windows in CI, where
+    signtool exists. This is the floor underneath that: an unsigned build --
+    the windows-package rehearsal installer, or a local `tauri build` -- can
+    never be promoted to the public origin from this machine, however
+    convincingly it is named.
+    """
+    data = path.read_bytes()
+    if data[:2] != b"MZ":
+        raise ValueError("is not a PE image")
+    (pe_offset,) = struct.unpack_from("<I", data, 0x3C)
+    if data[pe_offset : pe_offset + 4] != b"PE\0\0":
+        raise ValueError("has no PE header")
+    optional = pe_offset + 24
+    (magic,) = struct.unpack_from("<H", data, optional)
+    if magic == 0x10B:
+        directories = optional + 96
+    elif magic == 0x20B:
+        directories = optional + 112
+    else:
+        raise ValueError(f"has an unrecognised PE optional header magic {magic:#x}")
+    (count,) = struct.unpack_from("<I", data, directories - 4)
+    if count < 5:
+        raise ValueError("has no certificate data directory")
+    offset, size = struct.unpack_from("<II", data, directories + 4 * 8)
+    if offset == 0 or size == 0:
+        raise ValueError("is not Authenticode-signed")
+    if offset + size > len(data):
+        raise ValueError("has a certificate table running past the end of the file")
 
 
 def decode64(value: str) -> bytes:
@@ -206,6 +242,12 @@ for platform in expected_platforms:
         verify((Path(artifact_dir) / name).read_bytes(), on_disk, public_outer)
     except (InvalidSignature, OSError, UnicodeError, ValueError) as error:
         fail(f"{platform}: signature does not verify against desktop/updater.pubkey ({error})")
+    if platform.startswith("windows-"):
+        try:
+            require_authenticode(Path(artifact_dir) / name)
+        except (OSError, ValueError, struct.error) as error:
+            fail(f"{platform}: {name} {error}")
+        print(f"publish-desktop: {platform}: Authenticode certificate table present")
     print(f"publish-desktop: {platform}: signature verified")
 PY
 then

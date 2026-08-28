@@ -3,6 +3,7 @@ name: Windows
 "on":
   push:
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: windows-${{ github.ref }}
@@ -13,22 +14,17 @@ jobs:
     name: windows-check
     runs-on: windows-latest
     timeout-minutes: 60
-    # Migration scaffold: remove every continue-on-error below once this lane
-    # is green on master, then require the stable `windows-check` status.
     steps:
       - name: Check out repository
-        continue-on-error: true
         uses: actions/checkout@v4
 
       - name: Install Rust (stable MSVC)
-        continue-on-error: true
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
           targets: x86_64-pc-windows-msvc
 
       - name: Cache cargo
-        continue-on-error: true
         uses: actions/cache@v4
         with:
           path: |
@@ -41,34 +37,28 @@ jobs:
             cargo-check-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Check daemon binaries
-        continue-on-error: true
         working-directory: daemon
         run: cargo check --locked --target x86_64-pc-windows-msvc --bin spawnd --bin spawn-worker
 
       - name: Clippy daemon
-        continue-on-error: true
         working-directory: daemon
         run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 
       - name: Test daemon
-        continue-on-error: true
         working-directory: daemon
         run: cargo test --locked --target x86_64-pc-windows-msvc
 
       # A plain crate check does not invoke tauri-cli or bundle an application;
       # WebView2 SDK installation belongs to the separate packaging workflow.
       - name: Check desktop crate
-        continue-on-error: true
         working-directory: desktop/src-tauri
         run: cargo check --locked --target x86_64-pc-windows-msvc
 
       - name: Build daemon binaries for installer smoke
-        continue-on-error: true
         working-directory: daemon
         run: cargo build --release --locked --target x86_64-pc-windows-msvc --bin spawnd --bin spawn-worker
 
       - name: Install uv
-        continue-on-error: true
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -76,16 +66,110 @@ jobs:
           prune-cache: false
 
       - name: Install server dependencies
-        continue-on-error: true
         working-directory: server
         run: |
           uv python install 3.13
           uv sync --frozen
 
       - name: Exercise Windows installer surface
-        continue-on-error: true
         shell: pwsh
         run: |
           & ./scripts/smoke-install-prebuilt.ps1 `
             -SpawndPath daemon/target/x86_64-pc-windows-msvc/release/spawnd.exe `
             -WorkerPath daemon/target/x86_64-pc-windows-msvc/release/spawn-worker.exe
+
+  # Everything `desktop.yml` does on Windows except the signing, so the release
+  # path is proved before the Artifact Signing identity exists and an installer
+  # exists to run the handoff matrix against. What comes out is deliberately
+  # UNSIGNED: it is a validation build, never a release artifact, and
+  # publish-desktop.sh refuses a setup EXE with no certificate table.
+  #
+  # Packaging is a release build of the whole application, so it does not run on
+  # every push: master, a manual dispatch, or `[package]` in the commit subject
+  # (the escape hatch that matters while `workflow_dispatch` cannot see this
+  # workflow off the default branch).
+  windows-package:
+    name: windows-package (unsigned rehearsal)
+    if: >-
+      github.ref == 'refs/heads/master' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[package]')
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install Rust (stable MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop/src-tauri/target
+          key: cargo-package-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            cargo-package-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Check generated icons and build the wizard
+        working-directory: desktop
+        run: |
+          npm run icons:check
+          npm run build
+
+      - name: Test the Windows desktop crate
+        working-directory: desktop
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --target x86_64-pc-windows-msvc
+
+      - name: Build the unbundled Windows application
+        working-directory: desktop
+        run: npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
+
+      - name: Bundle with NSIS
+        working-directory: desktop
+        run: npm run tauri -- bundle --bundles nsis --target x86_64-pc-windows-msvc
+
+      - name: Name the unsigned installer and prove it is unsigned
+        shell: pwsh
+        run: |
+          $bundle = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis'
+          $files = @(Get-ChildItem $bundle -Filter '*-setup.exe')
+          if ($files.Count -ne 1) { throw "Expected one NSIS installer, found $($files.Count)" }
+          $version = (Get-Content '${{ github.workspace }}\desktop\src-tauri\tauri.conf.json' | ConvertFrom-Json).version
+          $output = '${{ github.workspace }}\desktop\windows-rehearsal'
+          New-Item -ItemType Directory -Force $output | Out-Null
+          # The canonical release name is deliberately NOT used: nothing here may
+          # be mistaken for, or promoted as, a release artifact.
+          $name = "SPAWN-D_${version}_windows-x86_64-setup.UNSIGNED.exe"
+          $canonical = Join-Path $output $name
+          Move-Item $files[0].FullName $canonical
+          $signature = Get-AuthenticodeSignature $canonical
+          if ($signature.Status -ne 'NotSigned') {
+            throw "This lane holds no signing identity, so the installer must be NotSigned; got $($signature.Status)"
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 $canonical).Hash.ToLowerInvariant()
+          Set-Content -Encoding utf8NoBOM (Join-Path $output 'SHA256SUMS') "$hash  $name"
+          Write-Host "Unsigned rehearsal installer: $name ($hash)"
+
+      - name: Upload the unsigned rehearsal installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: SPAWN-D-windows-x86_64-UNSIGNED-do-not-publish
+          path: desktop/windows-rehearsal/*
+          retention-days: 7
+          if-no-files-found: error
