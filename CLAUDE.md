@@ -16,7 +16,8 @@ scripts/  deploy, health, smoke, and guard scripts; test-all.sh runs the lot
 infra/    docker-compose and nginx examples
 docs/     design docs, and docs/RELEASE.md — the release process
 tools/    development utilities
-.github/  CI workflows: tests and the rolling daemon prebuilts
+.github/  CI workflows: tests and the rolling daemon prebuilts; readme/ holds
+          the README's press art, struck from web/public/brand/ink
 ```
 
 Each product folder has its own `CLAUDE.md` (with an `AGENTS.md` symlink
