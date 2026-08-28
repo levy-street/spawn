@@ -259,6 +259,21 @@ export const DESKTOP_SHELL_TOKEN = "SpawnDesktop/";
  * reach the page any other way: the product face is the web app, and it gets
  * no IPC.
  */
+/**
+ * The mark `logout()` puts on the lander URL inside the desktop shell.
+ *
+ * The shell has to tell two arrivals at `/` apart. One is signing out, which
+ * should forget the account on the device and reopen the door. The other is a
+ * stale link — `next.config.ts` still redirects `/hosts`, `/settings` and the
+ * rest of the retired nav there — which should strand nobody and forget
+ * nothing. Inferring it from the path alone would sign a person out for
+ * clicking an old bookmark.
+ *
+ * A query parameter rather than a path so that a shell which somehow does not
+ * intercept it still lands somewhere real, exactly as a browser does.
+ */
+export const DESKTOP_SIGNED_OUT_MARKER = "signed-out";
+
 export function isDesktopShell(userAgent: string): boolean {
   return userAgent.includes(DESKTOP_SHELL_TOKEN);
 }
