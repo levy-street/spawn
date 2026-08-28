@@ -483,6 +483,14 @@ notarized DMGs plus `.app.tar.gz` updater payloads. The Windows artifact is the
 canonical `SPAWN-D_<version>_windows-x86_64-setup.exe`; the same EXE is both the
 public download and updater payload. The workflow produces no MSI.
 
+A release build leaves `SPAWN_DESKTOP_SERVER_ORIGIN` unset, which is what makes
+it point at `https://spawnd.dev` and what keeps it on the signed app channel. A
+build that sets it — one made for a dev deployment — defaults to that server
+instead and takes no updates at all, so it can never quietly replace itself
+with the production app. Setting it during a release is therefore a way to ship
+an app that talks to the wrong fleet and cannot be updated out of it; leave it
+alone unless that is the point (`desktop/CLAUDE.md`).
+
 The Apple credentials are
 `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
 `APPLE_API_PRIVATE_KEY`, `APPLE_API_KEY`, and `APPLE_API_ISSUER`. The workflow

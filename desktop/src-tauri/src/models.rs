@@ -12,10 +12,20 @@ pub struct DesktopPreferences {
     pub host_name: Option<String>,
 }
 
+/// The server this build points at until someone chooses another, fixed at
+/// build time by `SPAWN_DESKTOP_SERVER_ORIGIN` (see `build.rs`). It is also
+/// what the wizard calls "hosted", so a build made for one deployment does not
+/// offer another one's name as the easy option.
+pub const HOSTED_ORIGIN: &str = env!("SPAWN_DESKTOP_SERVER_ORIGIN");
+
+/// The origin a release build points at. A build pointing anywhere else is
+/// somebody's own, and must not take updates from the vendor's channel.
+pub const VENDOR_ORIGIN: &str = env!("SPAWN_DESKTOP_VENDOR_ORIGIN");
+
 impl Default for DesktopPreferences {
     fn default() -> Self {
         Self {
-            server_origin: "https://spawnd.dev".into(),
+            server_origin: HOSTED_ORIGIN.into(),
             account_id: None,
             account_email: None,
             device_id: None,

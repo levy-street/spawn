@@ -189,6 +189,31 @@ npm run icons:check
 cd src-tauri && cargo fmt && cargo build && cargo test && cargo clippy -- -D warnings
 ```
 
+### Which server a build points at
+
+`SPAWN_DESKTOP_SERVER_ORIGIN` fixes it at build time, and is the same question
+`mobile/eas.json` answers per profile with `EXPO_PUBLIC_API_URL`. Unset means
+`https://spawnd.dev`, so a release build needs no ceremony:
+
+```bash
+SPAWN_DESKTOP_SERVER_ORIGIN=https://dev.spawnd.dev:8330 npm run tauri -- build
+```
+
+It becomes the default `server_origin`, and the origin the wizard offers as
+"hosted" — read through `models::HOSTED_ORIGIN` and the `hosted_origin`
+command, so the Rust side and the wizard cannot disagree about it. `build.rs`
+rejects a value that is not an http(s) origin, ends in a slash, or holds
+whitespace: a bad one is only visible at runtime as an app that reaches no
+server at all.
+
+A build pointed anywhere but `https://spawnd.dev` also takes **no updates**
+from the signed app channel. That channel carries the app for the vendor's
+server, signed by the offline updater key, so a build made for a dev deployment
+would check production on launch and — the first time production went ahead of
+it — replace itself with the production app, moving the machine to another
+fleet. Such a build is updated by whoever built it, and its update surface says
+so.
+
 `scripts/dev.sh --onboarding` (`npm run dev --onboarding`) rebuilds this app
 when anything under `src/`, `src-tauri/src/`, the icons or the configs is newer
 than the staged image. It does two things with the result: puts the DMG in

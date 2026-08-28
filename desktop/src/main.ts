@@ -100,13 +100,23 @@ interface LocalStatus {
 interface AppUpdate {
   available: boolean;
   version: string | null;
-  endpoint: string;
+  /** `null` when this build takes no updates from the signed app channel. */
+  endpoint: string | null;
 }
 
 /** How far the signed app channel has got with the question it was asked. */
 type UpdateCheck = "idle" | "checking" | "done" | "failed";
 
-const HOSTED_ORIGIN = "https://spawnd.dev";
+/**
+ * The server this build points at unless someone chooses another.
+ *
+ * Read from the app rather than written here, so there is exactly one
+ * definition of it — `SPAWN_DESKTOP_SERVER_ORIGIN` at build time, reaching the
+ * wizard through `models::HOSTED_ORIGIN`. The literal below is only what the
+ * first paint uses before `initialize` has asked; every screen that reads it
+ * renders after that.
+ */
+let HOSTED_ORIGIN = "https://spawnd.dev";
 /** The native redirect the server hands a finished sign-in back to. */
 const OAUTH_CALLBACK = { host: "auth", path: "/oauth" } as const;
 const VERIFY_POLL_MS = 5_000;
@@ -999,7 +1009,13 @@ function updateView(): string {
       ${errorLine()}
       <div class="actions"><button class="btn btn-primary" data-action="install-update" ${busy ? "disabled" : ""}>${busy ? "Installing…" : "Install and restart"}</button><button class="btn btn-ghost" data-action="settings">Not now</button></div>
     </div>`
-    : `
+    : appUpdate !== null && appUpdate.endpoint === null
+      ? `
+    <div class="stack">
+      <p class="note">This build of SPAWN D was made for ${escapeHtml(HOSTED_ORIGIN)}, so it takes nothing from the signed app channel — that channel carries the app for spawnd.dev, and installing from it would move ${OS_COPY.thisComputer} to another fleet. Whoever built this one hands out the next one.</p>
+      <div class="actions"><button class="btn btn-ghost" data-action="settings">Close</button></div>
+    </div>`
+      : `
     <div class="stack">
       ${updateCheckLine()}
       ${errorLine()}
@@ -1610,6 +1626,7 @@ function stopPolls(): void {
 
 async function initialize(): Promise<void> {
   preferences = await invoke<Preferences>("app_preferences");
+  HOSTED_ORIGIN = await invoke<string>("hosted_origin");
   terminalCommand = await invoke<string>("terminal_install_command");
   serverChoice = preferences.server_origin === HOSTED_ORIGIN ? "hosted" : "self";
   await listen<{ index: number }>("possess-step", (event) => {
