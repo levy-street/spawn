@@ -148,6 +148,12 @@ Ed25519 manifest, but it can request publisher-valid PE signatures.
 
 ### Provisioning the Artifact Signing identity
 
+When someone else holds the Azure account, hand them
+[AZURE_SIGNING_SETUP.md](AZURE_SIGNING_SETUP.md) — this section rewritten for a
+person with no SPAWN D context, including what to hand back and why none of it
+is secret. The rest of this section is the same process for whoever already
+knows the release.
+
 Identity validation is the long pole and it is portal-only, so start it first
 and do everything else while it is pending. In the Azure portal, under the
 signing account, request an identity validation for the legal entity that will
