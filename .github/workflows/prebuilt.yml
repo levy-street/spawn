@@ -2,8 +2,8 @@ name: prebuilt
 
 # Build + test the daemon on real macOS, Linux, and Windows runners and publish
 # every supported target as a single rolling prerelease that deploy-prod.sh
-# pulls onto the server. Windows PEs are Authenticode-signed when the protected
-# Artifact Signing identity is configured. One workflow owns the rolling
+# pulls onto the server. Windows PEs are Authenticode-signed with the protected
+# Dreamhome AI Key Vault certificate. One workflow owns the rolling
 # `prebuilt-latest` release: the per-platform build jobs upload artifacts and a
 # single publish job assembles them, so the jobs never race to delete+recreate
 # the same release. Gated to daemon changes so it rarely spends macOS/arm minutes
@@ -214,7 +214,7 @@ jobs:
             out/spawn-worker-x86_64-pc-windows-msvc.exe
 
       # An entirely absent credential set intentionally leaves branch-protected
-      # builds unsigned while Artifact Signing is being provisioned. A partial
+      # builds unsigned while Key Vault signing is being provisioned. A partial
       # configuration is an error; once provisioned, signing and verification
       # below are hard gates and happen before checksums are constructed.
       - name: Configure Authenticode signing
@@ -224,9 +224,9 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
-          AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
-          AZURE_ARTIFACT_SIGNING_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL }}
+          AZURE_KEY_VAULT_CERTIFICATE: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE }}
+          CODE_SIGN_TIMESTAMP_URL: ${{ vars.CODE_SIGN_TIMESTAMP_URL }}
           WINDOWS_SIGNING_SUBJECT: ${{ vars.WINDOWS_SIGNING_SUBJECT }}
         run: |
           $secrets = @(
@@ -235,9 +235,9 @@ jobs:
             $env:AZURE_SUBSCRIPTION_ID
           )
           $required = $secrets + @(
-            $env:AZURE_ARTIFACT_SIGNING_ENDPOINT,
-            $env:AZURE_ARTIFACT_SIGNING_ACCOUNT,
-            $env:AZURE_ARTIFACT_SIGNING_PROFILE,
+            $env:AZURE_KEY_VAULT_URL,
+            $env:AZURE_KEY_VAULT_CERTIFICATE,
+            $env:CODE_SIGN_TIMESTAMP_URL,
             $env:WINDOWS_SIGNING_SUBJECT
           )
           if (($secrets | Where-Object { $_ }).Count -eq 0) {
@@ -259,27 +259,28 @@ jobs:
 
       - name: Authenticode-sign daemon pair
         if: steps.signing-config.outputs.enabled == 'true'
-        uses: azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
-          files: |
-            ${{ github.workspace }}\out\spawnd-x86_64-pc-windows-msvc.exe
-            ${{ github.workspace }}\out\spawn-worker-x86_64-pc-windows-msvc.exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
-          exclude-environment-credential: true
-          exclude-workload-identity-credential: true
-          exclude-managed-identity-credential: true
-          exclude-shared-token-cache-credential: true
-          exclude-visual-studio-credential: true
-          exclude-visual-studio-code-credential: true
-          exclude-azure-cli-credential: false
-          exclude-azure-powershell-credential: true
-          exclude-azure-developer-cli-credential: true
-          exclude-interactive-browser-credential: true
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL }}
+          AZURE_KEY_VAULT_CERTIFICATE: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE }}
+          CODE_SIGN_TIMESTAMP_URL: ${{ vars.CODE_SIGN_TIMESTAMP_URL }}
+        run: |
+          dotnet tool install --global AzureSignTool --version 7.0.1
+          $files = @(
+            '${{ github.workspace }}\out\spawnd-x86_64-pc-windows-msvc.exe',
+            '${{ github.workspace }}\out\spawn-worker-x86_64-pc-windows-msvc.exe'
+          )
+          foreach ($file in $files) {
+            azuresigntool sign `
+              -kvu $env:AZURE_KEY_VAULT_URL `
+              -kvm `
+              -kvc $env:AZURE_KEY_VAULT_CERTIFICATE `
+              -fd sha256 `
+              -tr $env:CODE_SIGN_TIMESTAMP_URL `
+              -td sha256 `
+              $file
+            if ($LASTEXITCODE -ne 0) { throw "AzureSignTool failed for $file" }
+          }
 
       - name: Verify Authenticode signatures
         if: steps.signing-config.outputs.enabled == 'true'
