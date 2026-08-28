@@ -83,6 +83,22 @@ contains "$tmp_dir/install.sh" "/api/install/spawnd/"
 contains "$tmp_dir/install.sh" "enable-linger"
 contains "$tmp_dir/install.sh" "LaunchAgent"
 
+# The Windows installer is rendered by the server and 503s until a Windows
+# release exists, so its body is not assertable here — but reaching the server
+# at all is. A 404 means the single-origin proxy never forwarded the path and
+# the published `irm .../install.ps1 | iex` one-liner is dead, which is exactly
+# how this shipped once.
+ps1_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --location \
+  --max-time "${SPAWN_HTTP_SMOKE_TIMEOUT:-20}" "$base_url/install.ps1")"
+case "$ps1_status" in
+  200) printf 'smoke-http-surface: /install.ps1 is served\n' ;;
+  503) printf 'smoke-http-surface: /install.ps1 reaches the server; no Windows release yet\n' ;;
+  *)
+    printf 'smoke-http-surface: GET /install.ps1 returned %s; expected 200 or 503\n' "$ps1_status" >&2
+    exit 1
+    ;;
+esac
+
 if target="$(host_target)"; then
   binary="$tmp_dir/spawnd"
   fetch "/api/install/spawnd/$target" >"$binary"
