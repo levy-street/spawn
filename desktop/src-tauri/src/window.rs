@@ -101,6 +101,7 @@ pub fn create(app: &App) -> Result<WebviewWindow> {
     let home = wizard_home(app);
     let allowed_home = home.clone();
     let opener = app.handle().clone();
+    let leaving = app.handle().clone();
     let popup_opener = app.handle().clone();
     let (width, height) = window_size(app.handle());
     let builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
@@ -118,6 +119,26 @@ pub fn create(app: &App) -> Result<WebviewWindow> {
         // anywhere else — docs, GitHub, a provider's sign-in — belongs in the
         // system browser, which also keeps third-party pages out of this view.
         .on_navigation(move |url| {
+            if let Some(arrival) = chosen_lander_arrival(url) {
+                // Signing out of the web app sends it to the lander. In a
+                // browser that is right — signing out is leaving, and the
+                // marketing site is somewhere to leave to. Here it is a room
+                // with no door: no address bar, no back, and the wizard owns
+                // sign-in anyway. Either way the window goes back to the
+                // wizard; only a real sign-out forgets the account.
+                let app = leaving.clone();
+                tauri::async_runtime::spawn(async move {
+                    if arrival == Lander::SignedOut {
+                        if let Err(error) = storage::forget_account() {
+                            eprintln!("{LOG}: could not forget the account on sign-out: {error:#}");
+                        }
+                    }
+                    if let Err(error) = show_wizard(&app, None) {
+                        eprintln!("{LOG}: could not return to the wizard: {error:#}");
+                    }
+                });
+                return false;
+            }
             if stays_inside(url, &allowed_home) {
                 return true;
             }
@@ -640,6 +661,56 @@ fn fit(available_width: f64, available_height: f64) -> (f64, f64) {
 
 /// Navigations that keep the window: the wizard's own pages and the chosen
 /// server, read at the moment of navigation so a server switch takes effect.
+/// Whether this navigation is the product face leaving the product.
+///
+/// The one path on the chosen origin the shell never sends the window to: it
+/// opens the product at `/app`, or the origin's sign-in page when it is
+/// carrying a session. `/` is the marketing lander, and inside this window
+/// that page is a dead end — the same reason `isDesktopShell` in the web app
+/// drops every link that leads to it. Arriving there means the web app has
+/// signed out.
+#[derive(Debug, PartialEq, Eq)]
+enum Lander {
+    /// `logout()` in the web app, wearing [`SIGNED_OUT_MARKER`].
+    SignedOut,
+    /// A stale link: `next.config.ts` still redirects the retired nav — and
+    /// `/hosts`, `/settings`, `/trust` are exactly the paths a daemon printed
+    /// or a person bookmarked — to the lander. Nobody signed out.
+    DeadEnd,
+}
+
+/// The mark `logout()` puts on the URL; `web/src/lib/platform.ts` sets it.
+const SIGNED_OUT_MARKER: &str = "signed-out";
+
+/// Why the product face arrived at the chosen origin's root.
+///
+/// `/` is the one path there the shell never navigates to itself — it opens
+/// the product at `/app`, or the sign-in door when carrying a session — so
+/// arriving is always the page's own doing. Both answers end at the wizard,
+/// because in this window the lander has no way out, but only one of them
+/// forgets the account: reading a stale bookmark as a sign-out would throw
+/// away a session for a mis-click.
+fn lander_arrival(url: &Url, origin: &Url) -> Option<Lander> {
+    if url.path() != "/" || !same_origin(url, origin) {
+        return None;
+    }
+    Some(
+        if url.query_pairs().any(|(key, _)| key == SIGNED_OUT_MARKER) {
+            Lander::SignedOut
+        } else {
+            Lander::DeadEnd
+        },
+    )
+}
+
+/// [`lander_arrival`] against the origin this device has chosen.
+fn chosen_lander_arrival(url: &Url) -> Option<Lander> {
+    storage::load_preferences()
+        .ok()
+        .and_then(|preferences| Url::parse(&preferences.server_origin).ok())
+        .and_then(|origin| lander_arrival(url, &origin))
+}
+
 fn stays_inside(url: &Url, home: &Url) -> bool {
     if matches!(url.scheme(), "about" | "blob" | "data") || same_origin(url, home) {
         return true;
@@ -749,6 +820,48 @@ mod tests {
             &Url::parse("http://localhost:3000/app").unwrap(),
             &local
         ));
+    }
+
+    #[test]
+    fn only_the_lander_hands_the_window_back_to_the_wizard() {
+        let origin = Url::parse("https://dev.spawnd.dev:8330").unwrap();
+        let arrival = |path: &str| {
+            lander_arrival(
+                &Url::parse(&format!("https://dev.spawnd.dev:8330{path}")).unwrap(),
+                &origin,
+            )
+        };
+
+        // Signing out is marked, and is the only thing that forgets an account.
+        assert_eq!(arrival("/?signed-out"), Some(Lander::SignedOut));
+        assert_eq!(arrival("/?signed-out=1"), Some(Lander::SignedOut));
+        // The retired nav still redirects here. It must strand nobody and
+        // forget nothing.
+        assert_eq!(arrival("/"), Some(Lander::DeadEnd));
+        assert_eq!(arrival("/?utm_source=x"), Some(Lander::DeadEnd));
+
+        // Everything the shell itself opens must survive untouched: it goes to
+        // `/app`, or to the sign-in door when it carries a session.
+        for inside in ["/app", "/login", "/w/1", "/sessions/1", "/download"] {
+            assert_eq!(arrival(inside), None, "{inside} is inside the product");
+        }
+
+        // Another origin's root is somebody else's lander; it leaves by the
+        // ordinary route, into the system browser.
+        assert_eq!(
+            lander_arrival(&Url::parse("https://spawnd.dev/").unwrap(), &origin),
+            None
+        );
+        // The wizard's own home is a root path too, and must not be mistaken
+        // for the product signing out of itself.
+        assert_eq!(lander_arrival(&wizard_home_for_tests(), &origin), None);
+    }
+
+    fn wizard_home_for_tests() -> Url {
+        #[cfg(target_os = "windows")]
+        return Url::parse("http://tauri.localhost/").unwrap();
+        #[cfg(not(target_os = "windows"))]
+        Url::parse("tauri://localhost/").unwrap()
     }
 
     #[test]

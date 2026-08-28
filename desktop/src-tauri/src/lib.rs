@@ -289,13 +289,7 @@ async fn install_app_update(app: tauri::AppHandle) -> Result<bool, String> {
 
 #[tauri::command]
 fn sign_out() -> Result<(), String> {
-    let mut preferences = storage::load_preferences().map_err(command_error)?;
-    storage::clear_token(&preferences.server_origin).map_err(command_error)?;
-    preferences.account_id = None;
-    preferences.account_email = None;
-    preferences.device_id = None;
-    preferences.device_approved = false;
-    storage::save_preferences(&preferences).map_err(command_error)
+    storage::forget_account().map_err(command_error)
 }
 
 #[tauri::command]

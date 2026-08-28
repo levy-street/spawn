@@ -238,6 +238,22 @@ pub fn token(origin: &str) -> Result<Zeroizing<String>> {
         .context("no SPAWN D session is stored for this server")
 }
 
+/// Forget the account signed in on this device.
+///
+/// Both the wizard's own "sign out" and the product face leaving the product
+/// end here, so the two cannot drift: a device that has no token must not go
+/// on remembering which account it belonged to, or the next launch offers a
+/// signed-in shell over a session the server has already dropped.
+pub fn forget_account() -> Result<()> {
+    let mut preferences = load_preferences()?;
+    clear_token(&preferences.server_origin)?;
+    preferences.account_id = None;
+    preferences.account_email = None;
+    preferences.device_id = None;
+    preferences.device_approved = false;
+    save_preferences(&preferences)
+}
+
 pub fn clear_token(origin: &str) -> Result<()> {
     commit(|secrets| {
         if let Some(mut token) = secrets.tokens.remove(origin) {

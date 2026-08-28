@@ -1630,7 +1630,7 @@ async function initialize(): Promise<void> {
     for (const url of urls) void handleDeepLink(url);
   });
 
-  if (preferences.first_run_complete) {
+  if (preferences.first_run_complete && preferences.account_id) {
     // The window is only the wizard here because the tray asked for one of
     // its surfaces by name while the product had it; the hash says which.
     const requested = window.location.hash.slice(1) as Screen;
@@ -1660,6 +1660,10 @@ async function initialize(): Promise<void> {
       render();
     }
   } else {
+    // No account on this device. Either nothing has happened here yet, or the
+    // product face just signed out and handed the window back — and a finished
+    // first run does not make a settings screen the honest answer when there
+    // is no session behind it. Both want the same screen: the door.
     render();
     await loadConfig();
   }
