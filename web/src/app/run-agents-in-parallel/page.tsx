@@ -230,7 +230,7 @@ export default function RunAgentsInParallelPage() {
           media={
             <JobShot
               src="/product/features/attention.png"
-              width={1780}
+              width={1408}
               height={1320}
               alt="A Claude Code session holding a permission prompt: the tile is marked and the workspace row carries an amber badge"
               caption="agent.awaiting_input: the tile, the tab, and the workspace row all mark it."
