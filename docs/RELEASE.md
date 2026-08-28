@@ -924,6 +924,10 @@ then start depending on them in the next.
 For a Windows launch or any release that changes the native Windows handoff,
 ship in this order:
 
+0. Close [WINDOWS_VALIDATION.md](WINDOWS_VALIDATION.md) — the 61-row gate that
+   proves the port on a real Windows 11 machine, since a runner can only prove
+   it compiles. Most of it needs no signing identity: the `windows-package` job
+   produces an unsigned installer for exactly that purpose.
 1. Observe a successful native `windows-check` lane. Build the Windows daemon
    pair and desktop app on `windows-latest`; Authenticode-sign and timestamp
    every PE, including the final NSIS setup EXE, and verify the configured
@@ -993,7 +997,8 @@ standard-user accounts.
 
 1. Confirm the checkout is clean and pushed. When daemon or Windows code
    changed, require the native `windows-check` check/clippy/test and PowerShell
-   smoke to pass, plus the existing Unix suite. When prebuilts will be
+   smoke to pass, plus the existing Unix suite. For a first Windows launch,
+   [WINDOWS_VALIDATION.md](WINDOWS_VALIDATION.md) must be closed first. When prebuilts will be
    published, confirm the local offline daemon release-signing key is present
    and readable.
 2. Confirm the rolling release contains all five target pairs. For both Windows
