@@ -448,7 +448,7 @@ export default function LandingPage() {
                   </Link>
                 ) : windowsUnpublished ? (
                   <Link href="/download" className={cn(CTA_QUIET, "h-14 grow whitespace-nowrap")}>
-                    Windows desktop build not published yet
+                    Windows desktop app coming soon
                   </Link>
                 ) : detectedOS === "linux" ? (
                   <Link

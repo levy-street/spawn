@@ -500,17 +500,45 @@ else
   fi
   check_row "desktop.latest.version" "$expected_desktop_version" \
     "$actual_desktop_latest_version"
-  expected_desktop_platforms="darwin-aarch64,darwin-x86_64,windows-x86_64"
-  check_row "desktop.latest.platforms" "$expected_desktop_platforms" \
-    "$actual_desktop_latest_platforms"
-  check_row "desktop.release.platforms" "$expected_desktop_platforms" \
+  # A release proves the platforms it claims, not a fixed list. The Mac pair is
+  # always claimed; Windows appears here the day it launches, and until then its
+  # absence is the product state every download surface already renders. What is
+  # still checked hard: the two manifests agree, and everything claimed verifies.
+  required_desktop_platforms="darwin-aarch64,darwin-x86_64"
+  for required_desktop_platform in ${required_desktop_platforms//,/ }; do
+    case ",$actual_desktop_latest_platforms," in
+      *",$required_desktop_platform,"*) ;;
+      *)
+        print_row "desktop.latest.platforms" "must include $required_desktop_platform" \
+          "$actual_desktop_latest_platforms" "FAIL"
+        fail=1
+        ;;
+    esac
+  done
+  check_row "desktop.release.platforms" "$actual_desktop_latest_platforms" \
     "$actual_desktop_release_platforms"
+  if [[ "$actual_desktop_latest_platforms" != *"windows-x86_64"* ]]; then
+    print_row "desktop.windows" "published, or not launched yet" \
+      "not in this release" "SKIP"
+  fi
 
-  for desktop_platform in darwin-aarch64 darwin-x86_64 windows-x86_64; do
+  # This list now comes off the wire, so it is data rather than something this
+  # script chose: a name it does not recognise is a bad release to report, not
+  # an internal error to abort on, and a failed fetch iterates nothing.
+  verifiable_desktop_platforms=""
+  if [[ "$desktop_latest_available" == "1" ]]; then
+    verifiable_desktop_platforms="${actual_desktop_latest_platforms//,/ }"
+  fi
+  for desktop_platform in $verifiable_desktop_platforms; do
     case "$desktop_platform" in
-      darwin-*) desktop_suffix=".app.tar.gz" ;;
+      darwin-aarch64 | darwin-x86_64) desktop_suffix=".app.tar.gz" ;;
       windows-x86_64) desktop_suffix="-setup.exe" ;;
-      *) die "internal desktop platform map is incomplete" ;;
+      *)
+        print_row "desktop.$desktop_platform" "a platform this release can serve" \
+          "unknown platform in latest.json" "FAIL"
+        fail=1
+        continue
+        ;;
     esac
     expected_desktop_name="SPAWN-D_${expected_desktop_version}_${desktop_platform}${desktop_suffix}"
     expected_desktop_url="$server/desktop/$expected_desktop_name"
@@ -541,8 +569,10 @@ else
       fail=1
     fi
   done
-  print_row "desktop.windows Authenticode" "Valid inner EXE and setup EXE" \
-    "verify in Windows CI/manual QA" "MANUAL"
+  if [[ "$actual_desktop_latest_platforms" == *"windows-x86_64"* ]]; then
+    print_row "desktop.windows Authenticode" "Valid inner EXE and setup EXE" \
+      "verify in Windows CI/manual QA" "MANUAL"
+  fi
 fi
 
 if [[ "$skip_mobile" == "1" ]]; then

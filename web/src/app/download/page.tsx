@@ -281,7 +281,12 @@ export default function DownloadPage() {
                   />
                 ) : (
                   <span className="inline-flex min-h-14 min-w-0 grow items-center rounded-sm rounded-r-none border border-r-0 border-line-strong px-6 py-3 font-sigil text-[12px] leading-5 tracking-[0.14em] text-ash uppercase sm:grow-0">
-                    {desktopBuild.name} desktop build not published yet
+                    {/* Windows has not launched, so it is coming rather than
+                     * merely missing; a Mac build absent from a release is the
+                     * second thing and should not borrow the first one's words. */}
+                    {desktopPlatform === WINDOWS_DESKTOP_PLATFORM
+                      ? `${desktopBuild.name} desktop app coming soon`
+                      : `${desktopBuild.name} desktop build not published yet`}
                   </span>
                 )}
                 <DropdownMenu

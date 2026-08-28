@@ -542,6 +542,11 @@ class TestDesktopBlockProvesItself:
         Withholding here would trade a 404 for a Mac download that quietly
         disappears — which reads as a product decision rather than a broken
         deploy. So the block stands, and the server says it could not check.
+
+        It stands only for platforms that have shipped. Windows has not, so
+        claiming it would not make the fault louder: it would offer a download
+        that never existed and silence the "coming soon" every surface reads
+        from this block. Windows returns here the day it launches.
         """
         _configure_desktop_publication(monkeypatch, tmp_path, desktop_dir=tmp_path / "nowhere")
 
@@ -551,7 +556,7 @@ class TestDesktopBlockProvesItself:
         assert response.json()["desktop"] == {
             "version": DESKTOP_VERSION,
             "tree": DESKTOP_TREE,
-            "platforms": ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"],
+            "platforms": ["darwin-aarch64", "darwin-x86_64"],
         }
         assert "SPAWN_DESKTOP_DIR" in caplog.text
 

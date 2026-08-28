@@ -12,9 +12,14 @@ PREBUILT_TARGETS=(
   "windows-x86_64:x86_64-pc-windows-msvc"
 )
 
-# Optional Linux arm runners may still be unavailable. Windows is a launched
-# platform and may never disappear silently from an otherwise valid release.
-PREBUILT_REQUIRED_TARGETS=("windows-x86_64")
+# A target listed here may never disappear silently from an otherwise valid
+# release. Windows belonged here in anticipation of a launch that has not
+# happened: until it has a signing identity it publishes nothing, and a hard
+# requirement on it blocks every Mac and Linux release too. Its absence is not
+# silent — the daemon manifest omits the target, and both frontends read that
+# and offer WSL instead of a native Windows install. Put it back the day it
+# launches; that is what makes the promise real rather than aspirational.
+PREBUILT_REQUIRED_TARGETS=()
 
 prebuilt_binary_suffix() { # public-target
   if [[ "$1" == windows-* ]]; then
@@ -42,6 +47,9 @@ prebuilt_file_mode() { # public-target; payloads are read by the Linux API host
 
 prebuilt_target_is_required() { # public-target
   local required
+  # An empty array under `set -u` is an error to expand on bash 3.2, which is
+  # still what /bin/bash is on a Mac.
+  [[ "${#PREBUILT_REQUIRED_TARGETS[@]}" -eq 0 ]] && return 1
   for required in "${PREBUILT_REQUIRED_TARGETS[@]}"; do
     [[ "$1" == "$required" ]] && return 0
   done
@@ -512,7 +520,9 @@ PY
     "spawn-worker.exe" ]] || return 1
   [[ "$(prebuilt_file_mode windows-x86_64)" == "0644" ]] || return 1
   [[ "$(prebuilt_file_mode darwin-aarch64)" == "0755" ]] || return 1
-  prebuilt_target_is_required windows-x86_64 || return 1
+  # Nothing is required while Windows is pre-launch; the day it launches this
+  # becomes `prebuilt_target_is_required windows-x86_64 || return 1` again.
+  ! prebuilt_target_is_required windows-x86_64 || return 1
   ! prebuilt_target_is_required linux-aarch64 || return 1
 
   sign_prebuilt_manifest "$manifest_file" "$signature_file" "$key" || return 1
