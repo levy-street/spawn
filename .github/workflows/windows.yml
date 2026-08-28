@@ -120,6 +120,14 @@ jobs:
       contains(github.event.head_commit.message, '[package]')
     runs-on: windows-latest
     timeout-minutes: 60
+    env:
+      # A rehearsal build is for a dev deployment, so it must point at one.
+      # Left unset it would default to production — an installer downloaded
+      # from a dev server that talks to the live fleet, which is the exact
+      # trap `SPAWN_DESKTOP_SERVER_ORIGIN` exists to close. Pointing it
+      # elsewhere also takes it off the signed app channel, so it can never
+      # update itself into the production app either.
+      SPAWN_DESKTOP_SERVER_ORIGIN: ${{ vars.DEV_SERVER_ORIGIN || 'https://dev.spawnd.dev:8330' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -179,6 +187,7 @@ jobs:
           New-Item -ItemType Directory -Force $output | Out-Null
           # The canonical release name is deliberately NOT used: nothing here may
           # be mistaken for, or promoted as, a release artifact.
+          Write-Host "This build points at $env:SPAWN_DESKTOP_SERVER_ORIGIN"
           $name = "SPAWN-D_${version}_windows-x86_64-setup.UNSIGNED.exe"
           $canonical = Join-Path $output $name
           Move-Item $files[0].FullName $canonical

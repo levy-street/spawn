@@ -196,7 +196,13 @@ export function installTargets(origin: string, nativeWindowsAvailable = false): 
       prebuiltCommand: command,
       prompt: "PS>",
     });
+    return targets;
   }
+  // WSL is the fallback it always was, not a second Windows. Offering both at
+  // once asks a Windows user to know that one possesses their machine and the
+  // other possesses a Linux environment inside it — a distinction the labels
+  // cannot carry and nobody should have to make on a download page. Once a
+  // native build exists it is the answer; until then this is.
   targets.push({
     id: "windows-wsl",
     label: "Windows (WSL)",

@@ -99,7 +99,11 @@ pub struct PossessionManager {
 }
 
 impl PossessionManager {
-    pub async fn begin(&self, app: &AppHandle) -> Result<String> {
+    /// Possess this computer. `new_account` registers an isolated instance
+    /// alongside whatever is already here rather than resuming it — the
+    /// daemon's own `--new-account`, which its terminal menu offers and which
+    /// this app could previously only describe in prose.
+    pub async fn begin(&self, app: &AppHandle, new_account: bool) -> Result<String> {
         let preferences = storage::load_preferences()?;
         if !preferences.device_approved {
             bail!("Approve this device before possessing this computer")
@@ -124,6 +128,7 @@ impl PossessionManager {
             run_id.clone(),
             bin_dir.join(binary_filename("spawnd")),
             preferences.server_origin,
+            new_account,
         )
         .await
         .map_err(|_| anyhow::anyhow!("The daemon installed but its service didn't start."))?;
@@ -137,13 +142,19 @@ impl PossessionManager {
         run_id: String,
         spawnd: PathBuf,
         origin: String,
+        new_account: bool,
     ) -> Result<()> {
-        let mut child = Command::new(spawnd)
+        let mut command = Command::new(spawnd);
+        command
             .arg("--server")
             .arg(origin)
             .arg("possess")
             .arg("--no-browser")
-            .arg("--no-qr")
+            .arg("--no-qr");
+        if new_account {
+            command.arg("--new-account");
+        }
+        let mut child = command
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -494,23 +505,50 @@ fn new_run_id() -> Result<String> {
 /// — there is simply no ceremony here to wait for, and which account it named
 /// decides what to offer next.
 fn finished_without_ceremony(output: &[String], account_id: Option<&str>) -> String {
-    let Some(account) = resumed_account(output) else {
+    let accounts = resumed_accounts(output);
+    if accounts.is_empty() {
         return NO_CEREMONY.into();
-    };
-    match account_id {
-        Some(ours) if sanitize_account(ours) == account => ALREADY_POSSESSED_HERE.into(),
+    }
+    let ours = account_id.map(sanitize_account);
+    match ours {
+        // One of the instances is the account signed in here, so this machine
+        // really is already possessed for whoever is looking at it — even if
+        // it carries other accounts alongside.
+        Some(ours) if accounts.contains(&ours) => ALREADY_POSSESSED_HERE.into(),
         _ => ALREADY_POSSESSED_OTHER.into(),
     }
 }
 
 /// The account named by the daemon's own resume line, which is the instance
 /// directory it kept — `spawn: already possessed (<account>); …`.
-fn resumed_account(output: &[String]) -> Option<String> {
-    output.iter().rev().find_map(|line| {
-        let rest = line.split_once("already possessed (")?.1;
-        let account = rest.split_once(')')?.0.trim();
-        (!account.is_empty()).then(|| account.to_string())
-    })
+/// The instances `spawnd possess` said it resumed, in the order it named them.
+///
+/// It has two ways of saying it and this has to read both, which it did not:
+/// one instance gets `already possessed (<account>); daemon running in the
+/// background.`, several get `already possessed for <a>, <b>, <c>.`. Reading
+/// only the first meant every machine carrying more than one instance fell
+/// through to "the daemon finished without saying why" — the vaguest of the
+/// three things this can report, on the one machine that had the most to say.
+fn resumed_accounts(output: &[String]) -> Vec<String> {
+    output
+        .iter()
+        .rev()
+        .find_map(|line| {
+            if let Some(rest) = line.split_once("already possessed (") {
+                let account = rest.1.split_once(')')?.0.trim();
+                return (!account.is_empty()).then(|| vec![account.to_string()]);
+            }
+            let rest = line.split_once("already possessed for ")?.1;
+            let accounts: Vec<String> = rest
+                .trim_end()
+                .trim_end_matches('.')
+                .split(',')
+                .map(|account| account.trim().to_string())
+                .filter(|account| !account.is_empty())
+                .collect();
+            (!accounts.is_empty()).then_some(accounts)
+        })
+        .unwrap_or_default()
 }
 
 /// The daemon's own instance-directory naming (`possess::sanitize_account`),
@@ -884,6 +922,35 @@ mod tests {
         // is nothing to claim about whose machine this is.
         assert_eq!(
             finished_without_ceremony(&ours, None),
+            ALREADY_POSSESSED_OTHER
+        );
+        // Several instances: the daemon says it differently, and reading only
+        // the single-instance wording sent the machine with the most going on
+        // to the vaguest message this can show.
+        let many = vec![concat!(
+            "spawn: already possessed for 9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f, ",
+            "be04b644-59f2-4101-b4de-6935a44914a6, a9fe1ff6-3d0d-421a-8368-ad1af69a21b6."
+        )
+        .to_string()];
+        assert_eq!(
+            resumed_accounts(&many),
+            vec![
+                "9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f",
+                "be04b644-59f2-4101-b4de-6935a44914a6",
+                "a9fe1ff6-3d0d-421a-8368-ad1af69a21b6"
+            ]
+        );
+        // The account signed in here is one of several on the machine.
+        assert_eq!(
+            finished_without_ceremony(&many, Some("be04b644-59f2-4101-b4de-6935a44914a6")),
+            ALREADY_POSSESSED_HERE
+        );
+        assert_eq!(
+            finished_without_ceremony(&many, Some("11111111-2222-3333-4444-555555555555")),
+            ALREADY_POSSESSED_OTHER
+        );
+        assert_eq!(
+            finished_without_ceremony(&many, None),
             ALREADY_POSSESSED_OTHER
         );
         assert_eq!(

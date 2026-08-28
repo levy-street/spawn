@@ -118,7 +118,9 @@ test("Windows defaults the shared gate to native after release proof is complete
   await expect(page.locator("code").filter({ hasText: "install.ps1" }).first()).toContainText(
     expected,
   );
-  await expect(page.getByRole("tab", { name: "Windows (WSL)" })).toBeVisible();
+  // WSL is the fallback, not a second Windows: with a native daemon published
+  // the PC is offered one route, not two.
+  await expect(page.getByRole("tab", { name: "Windows (WSL)" })).toHaveCount(0);
 });
 
 test("the legion formats a Windows x64 host without changing its generic fleet row", async ({

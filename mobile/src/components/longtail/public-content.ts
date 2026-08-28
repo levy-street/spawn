@@ -96,7 +96,11 @@ export function installTargetsForBaseUrl(
     stepHeading: "Open PowerShell on your PC",
     stepDescription: "On a Windows PC with WSL, open PowerShell and run:",
   };
-  return nativeWindowsAvailable ? [unix, windows, windowsWsl] : [unix, windowsWsl];
+  // WSL is the fallback it always was, not a second Windows. Offering both
+  // asks a Windows user to know that one possesses their PC and the other
+  // possesses a Linux environment inside it — a distinction the labels cannot
+  // carry. Mirrors `installTargets` in web/src/lib/platform.ts.
+  return nativeWindowsAvailable ? [unix, windows] : [unix, windowsWsl];
 }
 
 export function nativeWindowsAvailableFromRelease(

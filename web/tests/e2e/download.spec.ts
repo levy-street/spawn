@@ -203,8 +203,11 @@ test("Windows with complete release metadata exposes native PowerShell and the E
   await page.getByTestId("windows-download").click();
   expect((await started).suggestedFilename()).toContain("SPAWN-D_9.9.9_windows-x86_64-setup.exe");
 
-  await page.getByRole("tab", { name: "Windows (WSL)" }).click();
-  await expect(page.getByText("Enable the service manager")).toBeVisible();
+  // WSL is the fallback, so a server with a native Windows daemon does not
+  // also offer the route through a Linux environment inside Windows. The WSL
+  // tab and its systemd guidance are covered by the test above, where native
+  // Windows is genuinely unavailable.
+  await expect(page.getByRole("tab", { name: "Windows (WSL)" })).toHaveCount(0);
   await context.close();
 });
 

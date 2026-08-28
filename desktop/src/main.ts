@@ -281,21 +281,39 @@ const VERIFICATION_REFUSAL = "This host could not be verified.";
  * app used to sit on a spinner waiting for one; these say what happened and
  * what the next move is.
  */
+/**
+ * What `spawnd possess` found already here, and what can be done about it.
+ *
+ * The daemon asks this as a menu when it has a terminal — keep what is here,
+ * register another account beside it, re-approve, update. This app gives the
+ * child no stdin, so the daemon takes the only safe unattended answer (keep)
+ * and exits, and the app used to answer the question with a sentence telling
+ * you to go and type `--new-account` somewhere else. The daemon's own note on
+ * that menu is the argument against it: a line of prose ending in a command to
+ * copy is a worse answer than doing it, because the reader is already in front
+ * of the program that can. So these are buttons.
+ */
 const RESUMED: Record<string, { title: string; body: string; action: string }> = {
   already_possessed_here: {
     title: `${OS_COPY.thisComputerCapitalized} is already possessed`,
     body: "It already runs SPAWN D for this account, so nothing was changed — its daemon is running in the background and every device you own can reach it.",
-    action: '<button class="btn btn-primary" data-action="open-app">Open SPAWN D</button>',
+    action:
+      '<button class="btn btn-primary" data-action="open-app">Open SPAWN D</button>' +
+      '<button class="btn btn-ghost" data-action="possess-new-account">Add another account</button>',
   },
   already_possessed_other: {
     title: `${OS_COPY.thisComputerCapitalized} already runs SPAWN D`,
-    body: `It is signed in to a different account, and nothing was changed. To run it for this account as well, use the ${OS_COPY.shell} line below with --new-account — the two instances stay separate.`,
-    action: '<button class="btn btn-outline" data-action="try-again">Try again</button>',
+    body: "It is signed in to a different account, and nothing was changed. Adding this account registers a second instance beside it; the two stay separate and neither can see the other.",
+    action:
+      '<button class="btn btn-primary" data-action="possess-new-account">Add this account</button>' +
+      '<button class="btn btn-ghost" data-action="try-again">Try again</button>',
   },
   no_ceremony: {
     title: "Nothing to approve",
-    body: `The daemon finished without asking for approval, and nothing was changed. Try again, or run the ${OS_COPY.shell} line below and approve from the link it prints.`,
-    action: '<button class="btn btn-outline" data-action="try-again">Try again</button>',
+    body: "The daemon finished without asking for approval, and nothing was changed. Trying again is safe; registering this account separately skips whatever it decided to resume.",
+    action:
+      '<button class="btn btn-outline" data-action="try-again">Try again</button>' +
+      '<button class="btn btn-ghost" data-action="possess-new-account">Add this account separately</button>',
   },
 };
 const REFUSAL_MISMATCH =
@@ -1107,6 +1125,9 @@ async function act(action: string): Promise<void> {
     case "repair-reinstall":
       await startPossession();
       break;
+    case "possess-new-account":
+      await startPossession(true);
+      break;
     case "approve-host":
       await approveHost();
       break;
@@ -1460,11 +1481,11 @@ function resetPossession(): void {
  * a button that says "Starting…" — and a repair that reinstalls arrives at the
  * gate at once instead of a beat later.
  */
-async function startPossession(): Promise<void> {
+async function startPossession(newAccount = false): Promise<void> {
   resetPossession();
   hostRunStarted = true;
   setScreen("host");
-  const id = await guarded(() => invoke<string>("begin_possession"));
+  const id = await guarded(() => invoke<string>("begin_possession", { newAccount }));
   if (!id) return;
   runId = id;
   waitStartedAt = Date.now();

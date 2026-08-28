@@ -174,8 +174,13 @@ async fn ask_for_device_approval() -> Result<(), String> {
 async fn begin_possession(
     app: tauri::AppHandle,
     services: tauri::State<'_, AppServices>,
+    new_account: Option<bool>,
 ) -> Result<String, String> {
-    services.possession.begin(&app).await.map_err(command_error)
+    services
+        .possession
+        .begin(&app, new_account.unwrap_or(false))
+        .await
+        .map_err(command_error)
 }
 
 #[tauri::command]
