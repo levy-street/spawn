@@ -3916,6 +3916,13 @@ mod tests {
         assert_eq!(&*events.lock().await, &["b1", "a1", "a2"]);
     }
 
+    /// A liveness bound, not an assertion about timing: it exists so a hung
+    /// handshake fails the test instead of hanging it, and nothing is proved by
+    /// making it tight. On a Windows CI runner it cannot be tight — handshakes
+    /// that take milliseconds on this laptop have stalled past a second there,
+    /// with nothing wrong. Being generous costs a slow failure at worst.
+    const HANDSHAKE_LIVENESS: Duration = Duration::from_secs(10);
+
     async fn receive_std_signal(
         receiver: &std_mpsc::Receiver<()>,
         bound: Duration,
@@ -5719,7 +5726,7 @@ mod tests {
                 &mut daemon_revoked,
             );
             tokio::pin!(connection);
-            tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::time::timeout(HANDSHAKE_LIVENESS, async {
                 tokio::select! {
                     observed = observed_rx => observed.expect("server refusal observation"),
                     result = &mut connection => {
@@ -6014,7 +6021,7 @@ mod tests {
                 &mut daemon_revoked,
             );
             tokio::pin!(connection);
-            tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::time::timeout(HANDSHAKE_LIVENESS, async {
                 tokio::select! {
                     registered = registered_rx => {
                         registered.expect("daemon registration sender");
@@ -6029,7 +6036,7 @@ mod tests {
             tokio::select! {
                 _ = receive_std_signal(
                     &stall_rx,
-                    Duration::from_secs(1),
+                    HANDSHAKE_LIVENESS,
                     "cleanup-race loader stall",
                 ) => {}
                 result = &mut connection => {
