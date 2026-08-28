@@ -141,7 +141,7 @@ describe("onboarding security states", () => {
     await screen.unmount();
   });
 
-  it("selects native Windows and WSL with contextual PowerShell copy", async () => {
+  it("selects native Windows with contextual PowerShell copy", async () => {
     const onCommandCopied = jest.fn();
     const targets = installTargetsForBaseUrl("https://spawn.example/api", true);
     const screen = await render(
@@ -152,7 +152,9 @@ describe("onboarding security states", () => {
     expect(screen.getByText("Choose the computer you're installing on.")).toBeOnTheScreen();
     expect(screen.getByRole("radio", { name: "macOS / Linux" })).toBeChecked();
     expect(screen.getByRole("radio", { name: "Windows" })).not.toBeChecked();
-    expect(screen.getByRole("radio", { name: "Windows (WSL)" })).not.toBeChecked();
+    // WSL is the fallback, so a server with a native Windows daemon does not
+    // also offer the route through a Linux environment inside Windows.
+    expect(screen.queryByRole("radio", { name: "Windows (WSL)" })).toBeNull();
 
     await fireEvent.press(screen.getByRole("radio", { name: "Windows" }));
     expect(screen.getByText("Open PowerShell on your PC")).toBeOnTheScreen();
@@ -162,10 +164,9 @@ describe("onboarding security states", () => {
       "irm https://spawn.example/install.ps1 | iex",
     );
 
-    await fireEvent.press(screen.getByRole("radio", { name: "Windows (WSL)" }));
     await fireEvent.press(screen.getByRole("button", { name: "Share install command" }));
     expect(presentShareSheet).toHaveBeenLastCalledWith({
-      message: 'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
+      message: "irm https://spawn.example/install.ps1 | iex",
     });
     expect(onCommandCopied).toHaveBeenCalledTimes(2);
     await screen.unmount();
@@ -211,7 +212,6 @@ describe("onboarding security states", () => {
     ).toEqual([
       "curl -fsSL https://spawn.example/install.sh | sh",
       "irm https://spawn.example/install.ps1 | iex",
-      'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
     ]);
   });
 

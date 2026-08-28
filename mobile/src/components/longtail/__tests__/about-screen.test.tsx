@@ -63,7 +63,6 @@ describe("about and public content", () => {
     ).toEqual([
       ["unix", "macOS / Linux", "$"],
       ["windows", "Windows", "PS>"],
-      ["windows-wsl", "Windows (WSL)", "PS>"],
     ]);
   });
 
@@ -91,20 +90,12 @@ describe("about and public content", () => {
         "irm https://spawn.example/install.ps1 | iex",
       ),
     );
-    await fireEvent.press(screen.getByRole("button", { name: "Copy Windows WSL install command" }));
-    await waitFor(() =>
-      expect(Clipboard.setStringAsync).toHaveBeenCalledWith(
-        'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
-      ),
-    );
-    await fireEvent.press(
-      screen.getByRole("button", { name: "Copy Windows WSL prebuilt-only command" }),
-    );
-    await waitFor(() =>
-      expect(Clipboard.setStringAsync).toHaveBeenCalledWith(
-        'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh -s -- --prebuilt-only"',
-      ),
-    );
+    // WSL is the fallback, so a machine with a native Windows build is not
+    // also offered the route through a Linux environment inside it.
+    expect(screen.queryByRole("button", { name: "Copy Windows WSL install command" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Copy Windows WSL prebuilt-only command" }),
+    ).toBeNull();
     await fireEvent.press(screen.getByRole("button", { name: "Share" }));
     expect(presentShareSheet).toHaveBeenCalledWith({
       message: [
@@ -115,9 +106,6 @@ describe("about and public content", () => {
         "",
         "Windows:",
         "irm https://spawn.example/install.ps1 | iex",
-        "",
-        "Windows (WSL):",
-        'wsl -- bash -c "curl -fsSL https://spawn.example/install.sh | sh"',
         "",
         "After installation, run spawnd possess on that machine.",
       ].join("\n"),

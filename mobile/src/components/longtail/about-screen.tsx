@@ -102,7 +102,7 @@ export function AboutScreen({
     try {
       await presentShareSheet({
         message: hasNativeWindows
-          ? `Install spawnd on a machine you control.\n\nmacOS / Linux:\n${commands.standard}\n\nWindows:\n${commands.windows}\n\nWindows (WSL):\n${commands.windowsWsl}\n\nAfter installation, run spawnd possess on that machine.`
+          ? `Install spawnd on a machine you control.\n\nmacOS / Linux:\n${commands.standard}\n\nWindows:\n${commands.windows}\n\nAfter installation, run spawnd possess on that machine.`
           : `Install spawnd on a machine you control.\n\nmacOS / Linux:\n${commands.standard}\n\nWindows (WSL):\n${commands.windowsWsl}\n\nAfter installation, run spawnd possess on that machine.`,
       });
     } catch (error) {
@@ -234,36 +234,45 @@ export function AboutScreen({
           </SettingsBlock>
         ) : null}
 
-        <SettingsBlock>
-          <Text variant="label">{hasNativeWindows ? "Windows (WSL)" : "Windows (via WSL)"}</Text>
-          <View
-            style={[
-              styles.commandWell,
-              {
-                backgroundColor: theme.colors.muted,
-                borderColor: theme.colors.border,
-                borderRadius: theme.radii.md,
-              },
-            ]}
-          >
-            <Text selectable variant="mono">
-              {commands.windowsWsl}
-            </Text>
-          </View>
-          <Button
-            accessibilityLabel="Copy Windows WSL install command"
-            onPress={() => void copyCommand("windows-wsl", commands.windowsWsl)}
-            size="sm"
-            variant="outline"
-          >
-            <Icon
-              color="foreground"
-              name={copied === "windows-wsl" ? "Check" : "Copy"}
-              size={spacing[4]}
-            />
-            {copied === "windows-wsl" ? "Copied" : "Copy command"}
-          </Button>
-        </SettingsBlock>
+        {/*
+         * WSL is the fallback it always was, not a second Windows. Offering
+         * both asks a Windows user to know that one possesses their machine
+         * and the other possesses a Linux environment inside it — a
+         * distinction the labels cannot carry. Matches `installTargets` in
+         * web/src/lib/platform.ts.
+         */}
+        {hasNativeWindows ? null : (
+          <SettingsBlock>
+            <Text variant="label">Windows (via WSL)</Text>
+            <View
+              style={[
+                styles.commandWell,
+                {
+                  backgroundColor: theme.colors.muted,
+                  borderColor: theme.colors.border,
+                  borderRadius: theme.radii.md,
+                },
+              ]}
+            >
+              <Text selectable variant="mono">
+                {commands.windowsWsl}
+              </Text>
+            </View>
+            <Button
+              accessibilityLabel="Copy Windows WSL install command"
+              onPress={() => void copyCommand("windows-wsl", commands.windowsWsl)}
+              size="sm"
+              variant="outline"
+            >
+              <Icon
+                color="foreground"
+                name={copied === "windows-wsl" ? "Check" : "Copy"}
+                size={spacing[4]}
+              />
+              {copied === "windows-wsl" ? "Copied" : "Copy command"}
+            </Button>
+          </SettingsBlock>
+        )}
 
         <SettingsBlock>
           <Text variant="label">Prebuilt-only smoke test · macOS / Linux</Text>
@@ -296,38 +305,40 @@ export function AboutScreen({
           </Button>
         </SettingsBlock>
 
-        <SettingsBlock>
-          <Text variant="label">Prebuilt-only smoke test · Windows (WSL)</Text>
-          <View
-            style={[
-              styles.commandWell,
-              {
-                backgroundColor: theme.colors.muted,
-                borderColor: theme.colors.border,
-                borderRadius: theme.radii.md,
-              },
-            ]}
-          >
-            <Text selectable variant="mono">
-              {commands.windowsWslPrebuiltOnly}
-            </Text>
-          </View>
-          <Button
-            accessibilityLabel="Copy Windows WSL prebuilt-only command"
-            onPress={() =>
-              void copyCommand("windows-wsl-prebuilt", commands.windowsWslPrebuiltOnly)
-            }
-            size="sm"
-            variant="outline"
-          >
-            <Icon
-              color="foreground"
-              name={copied === "windows-wsl-prebuilt" ? "Check" : "Copy"}
-              size={spacing[4]}
-            />
-            {copied === "windows-wsl-prebuilt" ? "Copied" : "Copy command"}
-          </Button>
-        </SettingsBlock>
+        {hasNativeWindows ? null : (
+          <SettingsBlock>
+            <Text variant="label">Prebuilt-only smoke test · Windows (WSL)</Text>
+            <View
+              style={[
+                styles.commandWell,
+                {
+                  backgroundColor: theme.colors.muted,
+                  borderColor: theme.colors.border,
+                  borderRadius: theme.radii.md,
+                },
+              ]}
+            >
+              <Text selectable variant="mono">
+                {commands.windowsWslPrebuiltOnly}
+              </Text>
+            </View>
+            <Button
+              accessibilityLabel="Copy Windows WSL prebuilt-only command"
+              onPress={() =>
+                void copyCommand("windows-wsl-prebuilt", commands.windowsWslPrebuiltOnly)
+              }
+              size="sm"
+              variant="outline"
+            >
+              <Icon
+                color="foreground"
+                name={copied === "windows-wsl-prebuilt" ? "Check" : "Copy"}
+                size={spacing[4]}
+              />
+              {copied === "windows-wsl-prebuilt" ? "Copied" : "Copy command"}
+            </Button>
+          </SettingsBlock>
+        )}
       </SettingsSection>
 
       <SettingsSection title="Links">

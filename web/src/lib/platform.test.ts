@@ -37,16 +37,14 @@ describe("install targets", () => {
     expect(installTargetForOS("windows")).toBe("windows-wsl");
   });
 
-  test("the proven native stage inserts Windows and defaults Windows browsers to it", () => {
+  test("the proven native stage replaces WSL rather than sitting beside it", () => {
     const targets = installTargets("https://spawnd.dev///", true);
     expect(targets.map(({ id, label, prompt }) => ({ id, label, prompt }))).toEqual([
       { id: "unix", label: "macOS / Linux", prompt: "$" },
       { id: "windows", label: "Windows", prompt: "PS>" },
-      { id: "windows-wsl", label: "Windows (WSL)", prompt: "PS>" },
     ]);
     expect(installTargetForOS("windows", true)).toBe("windows");
     expect(targets[1]?.command).toBe("irm https://spawnd.dev/install.ps1 | iex");
-    expect(targets[2]?.command).toContain("wsl --");
   });
 
   test("every command uses the supplied origin with trailing slashes removed", () => {
