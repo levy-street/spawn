@@ -27,6 +27,11 @@ const listings: Record<string, ReturnType<typeof fileListing>> = {
       fileEntry({ name: "spawn", path: "/Users/tester/projects/spawn", is_dir: true, size: null }),
     ],
   }),
+  "/Users/tester/projects/spawn": fileListing({
+    path: "/Users/tester/projects/spawn",
+    parent: "/Users/tester/projects",
+    entries: [],
+  }),
 };
 
 async function openPicker(page: Page) {
@@ -60,6 +65,34 @@ test("dot-folders stay hidden until the options menu turns them on", async ({ pa
 test("clicking a folder opens it", async ({ page }) => {
   const dialog = await openPicker(page);
   await dialog.getByRole("option", { name: "projects" }).click();
+  await expect(
+    dialog.getByRole("listbox", { name: "Folders in /Users/tester/projects" }),
+  ).toBeVisible();
+});
+
+test("drilling in scrolls the strip so the new column is in frame", async ({ page }) => {
+  const dialog = await openPicker(page);
+  // The panel frames two columns. The first drill fills the second slot; the
+  // second overflows the strip, which must scroll itself — not wait for a
+  // drag — to reveal the column that just opened.
+  await dialog.getByRole("option", { name: "projects" }).click();
+  await dialog.getByRole("option", { name: "spawn" }).click();
+  await expect(
+    dialog.getByRole("listbox", { name: "Folders in /Users/tester/projects/spawn" }),
+  ).toBeInViewport({ ratio: 0.9 });
+  // The column it came from stays beside it — the trail, not just the leaf.
+  await expect(
+    dialog.getByRole("listbox", { name: "Folders in /Users/tester/projects", exact: true }),
+  ).toBeInViewport({ ratio: 0.9 });
+});
+
+test("arrow keys walk the folders without a click first", async ({ page }) => {
+  const dialog = await openPicker(page);
+  // The trailing column is focused on open, so the keyboard works straight
+  // away: ArrowDown selects the first sibling, opening its column.
+  await expect(dialog.getByRole("listbox", { name: "Folders in /Users/tester" })).toBeFocused();
+  await page.keyboard.press("ArrowDown");
+  await expect(dialog.getByRole("option", { name: "projects", selected: true })).toBeVisible();
   await expect(
     dialog.getByRole("listbox", { name: "Folders in /Users/tester/projects" }),
   ).toBeVisible();
