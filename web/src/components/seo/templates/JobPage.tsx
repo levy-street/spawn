@@ -129,6 +129,64 @@ export function JobH2({ children, className }: { children: ReactNode; className?
   return <h2 className={cn(H2_CLASS, className)}>{children}</h2>;
 }
 
+/** A product shot in the editorial frame: rounded, ringed, quietly captioned. */
+export function JobShot({
+  src,
+  width,
+  height,
+  alt,
+  caption,
+  className,
+}: {
+  src: string;
+  width: number;
+  height: number;
+  alt: string;
+  caption?: string;
+  className?: string;
+}) {
+  return (
+    <figure className={cn("min-w-0", className)}>
+      <div className="overflow-hidden rounded-xl bg-void ring-1 ring-line-g">
+        <Image src={src} width={width} height={height} alt={alt} className="block h-auto w-full" />
+      </div>
+      {caption ? (
+        <figcaption className="mt-3 text-[13px] leading-6 text-ash">{caption}</figcaption>
+      ) : null}
+    </figure>
+  );
+}
+
+/**
+ * A feature section: prose beside one media column, on the wide rail. The
+ * media keeps its natural aspect; `flip` puts it on the left.
+ */
+export function JobSplit({
+  children,
+  media,
+  flip = false,
+  mediaClassName,
+}: {
+  children: ReactNode;
+  media: ReactNode;
+  flip?: boolean;
+  mediaClassName?: string;
+}) {
+  return (
+    <div className="mx-auto grid w-full max-w-5xl items-center gap-12 lg:grid-cols-2 lg:gap-16">
+      <div
+        className={cn(
+          "min-w-0 max-w-[58ch] text-[16px] leading-8 text-ash",
+          flip ? "lg:order-2" : "",
+        )}
+      >
+        {children}
+      </div>
+      <div className={cn("min-w-0", flip ? "lg:order-1" : "", mediaClassName)}>{media}</div>
+    </div>
+  );
+}
+
 /**
  * Compact sub-blocks in the column — a short bone lead, a claim under it.
  * No cards, no rules; space alone groups them.
