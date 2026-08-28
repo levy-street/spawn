@@ -537,6 +537,142 @@ describe("SessionTransport connect failures", () => {
     transport.close();
   });
 
+  test("re-reads the endorsement chain after the host refuses an offer", async () => {
+    jest.useFakeTimers();
+    try {
+      const bridge = new FakeBridge();
+      const signal = new FakeSignal();
+      let edges: readonly CarriedEndorsement[] = [];
+      const loadCarriedEndorsements = jest.fn(async () => edges);
+      const transport = createSessionTransport({
+        sessionId: "00112233-4455-6677-8899-aabbccddeeff",
+        hostIdentityPublicKey: "host-key",
+        initialSize: { cols: 80, rows: 24 },
+        theme: terminalDark,
+        bridge,
+        openSignal: () => signal,
+        hostId: "b3ae000c-1da3-4c6c-aeda-23a37ecb01ac",
+        // The server says this device is pinned. The host is about to disagree,
+        // which is the whole case: the approval that settles it lands as an
+        // edge seconds later, and the offer has to carry it.
+        probeTrustResult: async () => ({ status: "trusted" as const, directlyPinned: true }),
+        loadCarriedEndorsements,
+      });
+      const opening = transport.open().catch(() => undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+      signal.emit({
+        type: "rtc.config",
+        enabled: true,
+        binding_nonce_required: true,
+        ice_servers: [],
+      });
+      const connect = bridge.sent.find(
+        (message): message is Extract<NativeToWorkerMessage, { type: "connect" }> =>
+          message.type === "connect",
+      );
+      expect(loadCarriedEndorsements).not.toHaveBeenCalled();
+
+      signal.emit({
+        type: "rtc.status",
+        status: "failed",
+        message: "This host has not approved this device.",
+        session_id: connect?.rtcSessionId,
+        binding_nonce: connect?.bindingNonce,
+      });
+      // What the worker does with a refusal: name the daemon's reason and ask
+      // for another attempt.
+      bridge.emit({
+        v: 1,
+        type: "error",
+        code: "channel_closed",
+        message: "This host has not approved this device.",
+        retryable: true,
+      });
+      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+      expect(transport.state).toBe("reconnecting");
+
+      // The approval lands between the refusal and the retry.
+      edges = [CARRIED_EDGE];
+      jest.advanceTimersByTime(2_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(loadCarriedEndorsements).toHaveBeenCalled();
+
+      bridge.emit({
+        v: 1,
+        type: "sign-request",
+        requestId: "sign-after-refusal",
+        transcript: {
+          signalKind: "offer",
+          protocolVersion: 2,
+          sessionId: "11112222-3333-4444-8888-9999aaaabbbb",
+          scopeType: "session",
+          scopeId: "00112233-4455-6677-8899-aabbccddeeff",
+          senderRole: "browser",
+          intendedPeerIdentityPublicKey: "host-key",
+          sdp: "v=0",
+        },
+      });
+      for (let step = 0; step < 10; step += 1) await Promise.resolve();
+      expect(
+        bridge.sent.find(
+          (message) =>
+            message.type === "sign-response" && message.requestId === "sign-after-refusal",
+        ),
+      ).toMatchObject({ carriedEndorsements: [CARRIED_EDGE] });
+      transport.close();
+      await opening;
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("a pending reconnect never resurrects a transport that has since failed", async () => {
+    jest.useFakeTimers();
+    try {
+      const bridge = new FakeBridge();
+      const signal = new FakeSignal();
+      const transport = createSessionTransport({
+        sessionId: "00112233-4455-6677-8899-aabbccddeeff",
+        hostIdentityPublicKey: "host-key",
+        initialSize: { cols: 80, rows: 24 },
+        theme: terminalDark,
+        bridge,
+        openSignal: () => signal,
+      });
+      const opening = transport.open().catch(() => undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+      signal.emit({
+        type: "rtc.config",
+        enabled: true,
+        binding_nonce_required: true,
+        ice_servers: [],
+      });
+      bridge.emit({ v: 1, type: "state", state: "reconnecting" });
+      expect(transport.state).toBe("reconnecting");
+
+      bridge.emit({
+        v: 1,
+        type: "error",
+        code: "worker_capability",
+        message: "This WebView cannot open a DataChannel.",
+        retryable: false,
+      });
+      expect(transport.state).toBe("failed");
+
+      const before = bridge.sent.length;
+      jest.advanceTimersByTime(30_000);
+      expect(transport.state).toBe("failed");
+      expect(bridge.sent).toHaveLength(before);
+      transport.close();
+      await opening;
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test("fails a stalled connect on the watchdog rather than spinning forever", async () => {
     jest.useFakeTimers();
     try {

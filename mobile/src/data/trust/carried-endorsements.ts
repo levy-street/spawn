@@ -35,6 +35,18 @@ const defaultApi: CarriedEndorsementApi = {
 const ENDORSEMENT_CACHE_MS = 30_000;
 let defaultCache: { at: number; promise: Promise<CarriedEndorsement[]> } | null = null;
 
+/**
+ * Drop the memoized edges.
+ *
+ * The edge that admits a refused device is written moments after the refusal,
+ * so a set cached from before it is the one set that cannot work. Called
+ * wherever an approval may have just landed — see [invalidateDeviceHostTrust],
+ * which drops this alongside the verdicts it memoizes.
+ */
+export function invalidateCarriedEndorsements(): void {
+  defaultCache = null;
+}
+
 /** Share the offer-side HTTP work across reconnects for a short, bounded window. */
 export function loadMemoizedCarriedEndorsements(): Promise<CarriedEndorsement[]> {
   const now = Date.now();
