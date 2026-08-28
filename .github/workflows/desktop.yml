@@ -102,6 +102,7 @@ jobs:
   windows:
     name: Windows · x86_64-pc-windows-msvc
     runs-on: windows-latest
+    environment: windows-code-signing
 
     steps:
       - uses: actions/checkout@v4
@@ -137,23 +138,33 @@ jobs:
         working-directory: desktop
         run: npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
 
-      - name: Authenticate to Azure Artifact Signing
+      - name: Authenticate to Azure Key Vault
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Install AzureSignTool
+        run: dotnet tool install --global AzureSignTool --version 7.0.1
+
       - name: Sign SPAWN D executable
-        uses: azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
-          files: ${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL }}
+          AZURE_KEY_VAULT_CERTIFICATE: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE }}
+          CODE_SIGN_TIMESTAMP_URL: ${{ vars.CODE_SIGN_TIMESTAMP_URL }}
+        run: |
+          $path = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe'
+          azuresigntool sign `
+            -kvu $env:AZURE_KEY_VAULT_URL `
+            -kvm `
+            -kvc $env:AZURE_KEY_VAULT_CERTIFICATE `
+            -fd sha256 `
+            -tr $env:CODE_SIGN_TIMESTAMP_URL `
+            -td sha256 `
+            $path
+          if ($LASTEXITCODE -ne 0) { throw "AzureSignTool failed for $path" }
 
       - name: Verify the signed inner executable
         shell: pwsh
@@ -162,9 +173,11 @@ jobs:
           $signature = Get-AuthenticodeSignature $path
           if ($signature.Status -ne 'Valid') { throw "Inner SPAWN D signature is $($signature.Status): $($signature.StatusMessage)" }
           if ($null -eq $signature.TimeStamperCertificate) { throw 'Inner SPAWN D signature has no RFC 3161 timestamp' }
-          $publisher = '${{ vars.AZURE_ARTIFACT_SIGNING_PUBLISHER }}'
-          if ([string]::IsNullOrWhiteSpace($publisher)) { throw 'AZURE_ARTIFACT_SIGNING_PUBLISHER is not configured' }
-          if ($signature.SignerCertificate.Subject -notlike "*$publisher*") { throw "Unexpected signer $($signature.SignerCertificate.Subject)" }
+          $expectedSubject = '${{ vars.WINDOWS_SIGNING_SUBJECT }}'
+          if ([string]::IsNullOrWhiteSpace($expectedSubject)) { throw 'WINDOWS_SIGNING_SUBJECT is not configured' }
+          if ($signature.SignerCertificate.Subject -ne $expectedSubject) {
+            throw "Unexpected signer '$($signature.SignerCertificate.Subject)', expected '$expectedSubject'"
+          }
 
       - name: Bundle the signed executable with NSIS
         working-directory: desktop
@@ -180,27 +193,45 @@ jobs:
           "installer=$($files[0].FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Sign NSIS installer
-        uses: azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
-          files: ${{ steps.nsis.outputs.installer }}
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL }}
+          AZURE_KEY_VAULT_CERTIFICATE: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE }}
+          CODE_SIGN_TIMESTAMP_URL: ${{ vars.CODE_SIGN_TIMESTAMP_URL }}
+        run: |
+          $path = '${{ steps.nsis.outputs.installer }}'
+          azuresigntool sign `
+            -kvu $env:AZURE_KEY_VAULT_URL `
+            -kvm `
+            -kvc $env:AZURE_KEY_VAULT_CERTIFICATE `
+            -fd sha256 `
+            -tr $env:CODE_SIGN_TIMESTAMP_URL `
+            -td sha256 `
+            $path
+          if ($LASTEXITCODE -ne 0) { throw "AzureSignTool failed for $path" }
 
       - name: Verify, canonically name and checksum Windows artifacts
         shell: pwsh
         run: |
           $inner = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe'
           $installer = '${{ steps.nsis.outputs.installer }}'
+          $expectedSubject = '${{ vars.WINDOWS_SIGNING_SUBJECT }}'
+          if ([string]::IsNullOrWhiteSpace($expectedSubject)) { throw 'WINDOWS_SIGNING_SUBJECT is not configured' }
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Filter signtool.exe -File -Recurse |
+            Where-Object FullName -Match '\\x64\\' |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signTool) { throw 'Windows SDK signtool.exe was not found' }
           foreach ($path in @($inner, $installer)) {
             $signature = Get-AuthenticodeSignature $path
             if ($signature.Status -ne 'Valid') { throw "$path signature is $($signature.Status): $($signature.StatusMessage)" }
             if ($null -eq $signature.TimeStamperCertificate) { throw "$path has no RFC 3161 timestamp" }
-            $publisher = '${{ vars.AZURE_ARTIFACT_SIGNING_PUBLISHER }}'
-            if ($signature.SignerCertificate.Subject -notlike "*$publisher*") { throw "Unexpected signer $($signature.SignerCertificate.Subject)" }
+            if ($signature.SignerCertificate.Subject -ne $expectedSubject) {
+              throw "$path publisher is '$($signature.SignerCertificate.Subject)', expected '$expectedSubject'"
+            }
+            & $signTool.FullName verify /pa /all /v $path
+            if ($LASTEXITCODE -ne 0) { throw "signtool verification failed for $path" }
           }
           $version = (Get-Content '${{ github.workspace }}\desktop\src-tauri\tauri.conf.json' | ConvertFrom-Json).version
           $output = '${{ github.workspace }}\desktop\desktop-artifacts'
