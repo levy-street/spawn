@@ -35,6 +35,15 @@ SUPPORTED_DAEMON_TARGETS = (
 )
 DESKTOP_PLATFORMS = ("darwin-aarch64", "darwin-x86_64", "windows-x86_64")
 
+#: What an unreadable desktop directory may still claim. Failing open is
+#: defensible for a platform that has shipped: the 404s it produces are the
+#: point, and they make a broken mount loud instead of letting it look like a
+#: quiet release. It is not defensible for one that has not shipped — claiming
+#: Windows before it launches invents a download rather than exposing a fault,
+#: and every surface that reads this would stop saying "coming soon" and start
+#: offering a file that has never existed. Windows joins this the day it ships.
+FAIL_OPEN_DESKTOP_PLATFORMS = ("darwin-aarch64", "darwin-x86_64")
+
 #: The one every download surface links to. `useDesktopRelease` in
 #: `web/src/hooks/useDesktopRelease.ts` builds the primary button's URL for
 #: Apple silicon regardless of what `platforms` says, so a block whose
@@ -470,7 +479,9 @@ def desktop_release(identity: _ReleaseIdentity | None = None) -> schemas.Release
     published = published_desktop_platforms(version, root=directory)
     if published is None:
         _warn_missing_desktop_dir_once(directory)
-        return schemas.ReleaseDesktop(version=version, tree=tree, platforms=list(DESKTOP_PLATFORMS))
+        return schemas.ReleaseDesktop(
+            version=version, tree=tree, platforms=list(FAIL_OPEN_DESKTOP_PLATFORMS)
+        )
     if PRIMARY_DESKTOP_PLATFORM not in published:
         return None
     # Narrowed to what is on disk, so the Intel link on /download appears only

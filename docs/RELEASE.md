@@ -557,9 +557,11 @@ distribution` and `xcrun stapler validate` are the checks to trust.
 
 Updater promotion is deliberately local and offline:
 
-1. Download all three workflow artifacts and verify their checksums, versions,
-   both Mac code signatures/notarization tickets, and the Windows Authenticode
-   evidence for both the inner app and outer setup EXE. On Windows,
+1. Download every workflow artifact this release has — the two Mac ones
+   always, the Windows one once Windows has launched — and verify their
+   checksums, versions, both Mac code signatures/notarization tickets, and,
+   when present, the Windows Authenticode evidence for both the inner app and
+   outer setup EXE. On Windows,
    `Get-AuthenticodeSignature` must report `Valid` and a timestamp certificate
    for each signed file. Never alter or Authenticode-sign the setup EXE after
    this point.
@@ -603,8 +605,18 @@ the whole desktop block until the non-empty Apple-silicon DMG exists, and then
 lists only the non-empty Intel DMG and canonical Windows setup EXE that are
 also present. When the directory itself is absent it deliberately fails open
 with all expected platforms and logs loudly, because a silently vanished
-download surface would hide the broken mount. Publish all three desktop
-platforms before deploying so every advertised link resolves immediately.
+download surface would hide the broken mount. Publish every platform this
+release claims before deploying, so each advertised link resolves immediately.
+
+Until Windows launches, a release is the Mac pair alone, and that is a complete
+release rather than a degraded one: `publish-desktop.sh` requires the two Mac
+platforms and treats Windows as optional, `/api/release` advertises only what is
+mounted, and both frontends read that and say Windows is coming soon. What is
+still refused is a half-published platform — name one of a platform's files and
+all of them must be present, signed, and in the manifest. The day Windows
+launches it moves into `REQUIRED_PLATFORMS` in that script and into
+`PREBUILT_REQUIRED_TARGETS` in `scripts/release-lib.sh`, and its absence becomes
+a release blocker again.
 
 The updater public key is committed in `desktop/updater.pubkey` and baked into
 `desktop/src-tauri/tauri.conf.json`. The private key stays on the release
@@ -623,15 +635,17 @@ Production exposes it from `GET /api/release` only when known and clean:
   "desktop": {
     "version": "0.1.0",
     "tree": "40hex desktop tree",
-    "platforms": ["darwin-aarch64", "darwin-x86_64", "windows-x86_64"]
+    "platforms": ["darwin-aarch64", "darwin-x86_64"]
   }
 }
 ```
 
 Unknown or dirty desktop identities are `null`, as for the other release
 pieces. `scripts/verify-release.sh` compares this block, the served
-`/desktop/latest.json`, all three served updater artifacts and their Tauri
-signatures against the public key committed at the selected ref. Authenticode
+`/desktop/latest.json`, every served updater artifact the release claims and
+their Tauri signatures against the public key committed at the selected ref. It
+requires the Mac pair and reports an unclaimed Windows as a skip rather than a
+failure. Authenticode
 chain/SmartScreen validation remains a Windows CI and release-QA check; the
 Unix verifier proves byte identity and the offline updater trust root. Use
 `--skip-desktop` only
@@ -758,7 +772,8 @@ Unix filenames remain extensionless. The Windows release assets and
 `prebuilt/windows-x86_64/spawnd.exe` and `spawn-worker.exe`. The HTTP API paths
 remain logical and extensionless at `/api/install/spawnd/windows-x86_64` and
 `/api/install/spawn-worker/windows-x86_64`, with `.exe` in each response's
-download filename. Windows is required; unlike the existing best-effort Linux
+download filename. Windows will be required once it launches; unlike the
+existing best-effort Linux
 ARM target, a missing half of its pair blocks release preparation.
 
 Signing and hashing order is immutable: stage both Windows PEs, Authenticode-
@@ -1008,24 +1023,27 @@ standard-user accounts.
    [WINDOWS_VALIDATION.md](WINDOWS_VALIDATION.md) must be closed first. When prebuilts will be
    published, confirm the local offline daemon release-signing key is present
    and readable.
-2. Confirm the rolling release contains all five target pairs. For both Windows
-   daemon files, verify `Get-AuthenticodeSignature` is `Valid`, its subject is
+2. Confirm the rolling release contains every target pair it claims — four
+   until Windows launches, five after. When the Windows pair is present, verify
+   for both files that `Get-AuthenticodeSignature` is `Valid`, its subject is
    exactly `WINDOWS_SIGNING_SUBJECT`, an RFC 3161 timestamp is present, and
-   `signtool verify /pa /all /v` exits zero. Confirm their post-signing hashes
-   are the `.exe` lines in `SHA256SUMS` and the offline-signed five-target
-   manifest.
+   `signtool verify /pa /all /v` exits zero; then confirm their post-signing
+   hashes are the `.exe` lines in `SHA256SUMS` and in the offline-signed
+   manifest. An unsigned Windows pair is never promoted: publish without it
+   instead, which is a Mac and Linux release rather than a broken one.
 3. If `desktop/` changed, publish the desktop app **before** the server deploy,
    following "The desktop app" above through `scripts/publish-desktop.sh` and
-   publishing all three platform entries. The Windows row
-   must contain the canonical
+   publishing every platform entry this release claims. When Windows is one of
+   them, its row must contain the canonical
    `SPAWN-D_<version>_windows-x86_64-setup.exe` and its checksum; prove the
    configured publisher and RFC 3161 timestamp on both the inner desktop EXE
    and outer setup EXE; create the offline
    `SPAWN-D_<version>_windows-x86_64-setup.exe.sig`; and require the exact
-   `windows-x86_64` URL-and-signature entry in `latest.json`. Then complete the
+   `windows-x86_64` URL-and-signature entry in `latest.json`. Complete the
    Mac signing/notarization and offline Tauri publish procedure in “The desktop
-   app”. Confirm the two non-empty DMGs and non-empty setup EXE are in
-   `SPAWN_DESKTOP_DIR`, and `/desktop/latest.json` names the checkout's version.
+   app” either way. Confirm the two non-empty DMGs — and the non-empty setup EXE
+   when Windows is included — are in `SPAWN_DESKTOP_DIR`, and
+   `/desktop/latest.json` names the checkout's version.
    Publishing first ensures `/api/release` can prove every platform rather than
    withholding missing artifacts; an absent desktop directory fails open only
    to make a broken production mount loud.

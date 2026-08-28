@@ -20,12 +20,19 @@ Usage: scripts/publish-desktop.sh [ssh-host] <artifact-dir>
   SPAWN-D_V_darwin-aarch64.dmg                SPAWN-D_V_darwin-x86_64.dmg
   SPAWN-D_V_darwin-aarch64.app.tar.gz         SPAWN-D_V_darwin-x86_64.app.tar.gz
   SPAWN-D_V_darwin-aarch64.app.tar.gz.sig     SPAWN-D_V_darwin-x86_64.app.tar.gz.sig
-  SPAWN-D_V_windows-x86_64-setup.exe
-  SPAWN-D_V_windows-x86_64-setup.exe.sig
   latest.json
 
+and, once Windows has launched, its two as well:
+
+  SPAWN-D_V_windows-x86_64-setup.exe
+  SPAWN-D_V_windows-x86_64-setup.exe.sig
+
+Windows is optional until then: leave both out and the release is Mac-only,
+which every download surface already renders as coming soon. Leave only one of
+them out and the publish is refused.
+
 Before anything is uploaded the script proves that latest.json names exactly
-that version and all three platforms, that every URL points into this origin's
+that version and exactly the platforms staged beside it, that every URL points into this origin's
 desktop tree at the payload being uploaded, that each embedded signature is the
 matching .sig file, that each signature verifies its payload against the
 committed desktop/updater.pubkey, and that the Windows setup EXE carries an
@@ -78,11 +85,27 @@ version="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["ver
   "$repo_root/desktop/src-tauri/tauri.conf.json")" || die "could not read the desktop version"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || die "unexpected desktop version: $version"
 
+# The Mac pair is the release. Windows is optional here only until it launches
+# — an absent Windows build is a platform that has not shipped yet, which every
+# download surface already reads from the manifest and renders as coming soon.
+# What is never allowed is a half-published platform: name any one of a
+# platform's files and all of them must be present, signed and in the manifest.
+# When Windows launches, move it into REQUIRED_PLATFORMS and this becomes the
+# three-platform rule again.
 platform_specs=(
   "darwin-aarch64:dmg:app.tar.gz"
   "darwin-x86_64:dmg:app.tar.gz"
   "windows-x86_64:-setup.exe:-setup.exe"
 )
+REQUIRED_PLATFORMS=("darwin-aarch64" "darwin-x86_64")
+
+platform_is_required() { # platform
+  local required
+  for required in "${REQUIRED_PLATFORMS[@]}"; do
+    [[ "$1" == "$required" ]] && return 0
+  done
+  return 1
+}
 
 artifact_name() {
   local platform="$1"
@@ -95,13 +118,32 @@ artifact_name() {
 }
 
 payloads=()
+published_platforms=()
 for spec in "${platform_specs[@]}"; do
   IFS=: read -r platform download_suffix updater_suffix <<< "$spec"
   download_name="$(artifact_name "$platform" "$download_suffix")"
   updater_name="$(artifact_name "$platform" "$updater_suffix")"
+
+  present=()
+  for name in "$download_name" "$updater_name" "$updater_name.sig"; do
+    [[ -s "$artifact_dir/$name" ]] && present+=("$name")
+  done
+
+  if [[ "${#present[@]}" -eq 0 ]]; then
+    if platform_is_required "$platform"; then
+      die "missing or empty: $artifact_dir/$download_name"
+    fi
+    printf 'publish-desktop: %s: not in this release\n' "$platform"
+    continue
+  fi
+
+  # A platform that is here at all is here completely. Publishing two of its
+  # three files strands an updater on a payload it cannot verify.
   [[ -s "$artifact_dir/$download_name" ]] || die "missing or empty: $artifact_dir/$download_name"
   [[ -s "$artifact_dir/$updater_name" ]] || die "missing or empty: $artifact_dir/$updater_name"
   [[ -s "$artifact_dir/$updater_name.sig" ]] || die "missing or empty: $artifact_dir/$updater_name.sig"
+
+  published_platforms+=("$platform")
   payloads+=("$download_name")
   if [[ "$updater_name" != "$download_name" ]]; then
     payloads+=("$updater_name")
@@ -118,7 +160,8 @@ printf 'publish-desktop: checking %s for %s %s -> %s/\n' "$artifact_dir" "$versi
 # fact, run before anything leaves this machine.
 if ! UV_CACHE_DIR="${UV_CACHE_DIR:-${TMPDIR:-/tmp}/spawn-release-uv-cache}" \
   uv run --project "$repo_root/server" --frozen python - \
-    "$manifest" "$version" "$url_base" "$artifact_dir" "$repo_root/desktop/updater.pubkey" <<'PY'
+    "$manifest" "$version" "$url_base" "$artifact_dir" "$repo_root/desktop/updater.pubkey" \
+    "$(IFS=,; printf '%s' "${published_platforms[*]}")" <<'PY'
 import base64
 import hashlib
 import json
@@ -129,8 +172,12 @@ from pathlib import Path
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-manifest_path, version, url_base, artifact_dir, pubkey_path = sys.argv[1:6]
-expected_platforms = ("darwin-aarch64", "darwin-x86_64", "windows-x86_64")
+manifest_path, version, url_base, artifact_dir, pubkey_path, platform_list = sys.argv[1:7]
+# The platforms actually staged for this release, decided by what is on disk.
+# latest.json must name exactly these: an entry for a payload we are not
+# uploading points an updater at a 404, and a payload with no entry is a file
+# nobody can reach.
+expected_platforms = tuple(sorted(p for p in platform_list.split(",") if p))
 updater_suffixes = {
     "darwin-aarch64": ".app.tar.gz",
     "darwin-x86_64": ".app.tar.gz",
