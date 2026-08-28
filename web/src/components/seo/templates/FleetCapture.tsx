@@ -9,11 +9,11 @@ import Image from "next/image";
  * the video attributes do all the work.
  */
 
-const WIDTH = 1540;
-const HEIGHT = 950;
+const WIDTH = 1600;
+const HEIGHT = 1020;
 
 const ALT =
-  "A spawnd workspace: a grid of six live terminal sessions running CLI agents across three machines";
+  "The spawnd app: a sidebar of workspaces and hosts beside a grid of live terminal sessions running CLI agents across three machines, switching between workspaces";
 
 export function FleetCapture({ caption }: { caption: string }) {
   return (
