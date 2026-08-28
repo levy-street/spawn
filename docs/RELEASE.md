@@ -146,12 +146,114 @@ expected distinguished name). Revoke the federated credential/profile quickly
 if a permitted CI run is compromised: it still cannot mint the offline
 Ed25519 manifest, but it can request publisher-valid PE signatures.
 
+### Provisioning the Artifact Signing identity
+
+Identity validation is the long pole and it is portal-only, so start it first
+and do everything else while it is pending. In the Azure portal, under the
+signing account, request an identity validation for the legal entity that will
+appear as the publisher; Microsoft verifies it out of band and the certificate
+profile cannot be created until it is `Completed`. Confirm the current
+eligibility rules when you apply — a business-history requirement on
+organization validation has historically added weeks, and it, not the
+engineering, sets the Windows launch date.
+
+The rest is scriptable. Resource names below are placeholders:
+
+```bash
+az login
+az account set --subscription "<subscription-id>"
+az provider register --namespace Microsoft.CodeSigning
+az extension add --name trustedsigning
+
+az group create -n spawn-signing -l westeurope
+az trustedsigning create -g spawn-signing -n spawn-signing-account \
+  -l westeurope --sku Basic
+
+# Only after identity validation reports Completed:
+az trustedsigning certificate-profile create -g spawn-signing \
+  --account-name spawn-signing-account -n spawn-desktop \
+  --profile-type PublicTrust --identity-validation-id "<validation-id>"
+```
+
+The service has been renamed from Azure Trusted Signing to Microsoft Artifact
+Signing and the CLI extension, role and command names have lagged the rename at
+various points. Do not trust the spelling here over the tooling: resolve the
+signer role by listing it rather than assuming, and use whichever of
+`Trusted Signing Certificate Profile Signer` /
+`Artifact Signing Certificate Profile Signer` your tenant actually returns.
+
+```bash
+az role definition list --query "[?contains(roleName, 'Certificate Profile Signer')].roleName" -o tsv
+```
+
+CI authenticates as a federated identity, so no secret ever holds a credential
+that works outside a permitted run. The federated subject must name the
+environment, which is why both Windows jobs declare
+`environment: windows-code-signing`:
+
+```bash
+app_id="$(az ad app create --display-name spawn-windows-signing --query appId -o tsv)"
+az ad sp create --id "$app_id"
+az ad app federated-credential create --id "$app_id" --parameters '{
+  "name": "spawn-windows-code-signing",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:levy-street/spawn:environment:windows-code-signing",
+  "audiences": ["api://AzureADTokenExchange"]
+}'
+
+profile_id="$(az trustedsigning certificate-profile show -g spawn-signing \
+  --account-name spawn-signing-account -n spawn-desktop --query id -o tsv)"
+az role assignment create --assignee "$app_id" \
+  --role "<the signer role name resolved above>" --scope "$profile_id"
+```
+
+Then the GitHub side. `master` carries no branch protection rule, so an
+environment restricted to `protected_branches` would match nothing and block
+every Windows job; the equivalent that actually works is a custom branch policy
+naming `master`. Revisit this the day `master` gains a protection rule.
+
+```bash
+gh api -X PUT repos/levy-street/spawn/environments/windows-code-signing --input - <<'JSON'
+{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+JSON
+gh api -X POST repos/levy-street/spawn/environments/windows-code-signing/deployment-branch-policies \
+  -f name=master -f type=branch
+
+env=(--env windows-code-signing -R levy-street/spawn)
+gh secret set AZURE_CLIENT_ID "${env[@]}"        # the app registration's appId
+gh secret set AZURE_TENANT_ID "${env[@]}"
+gh secret set AZURE_SUBSCRIPTION_ID "${env[@]}"
+gh variable set AZURE_ARTIFACT_SIGNING_ENDPOINT "${env[@]}"   # https://<region>.codesigning.azure.net/
+gh variable set AZURE_ARTIFACT_SIGNING_ACCOUNT "${env[@]}"    # spawn-signing-account
+gh variable set AZURE_ARTIFACT_SIGNING_PROFILE "${env[@]}"    # spawn-desktop
+gh variable set WINDOWS_SIGNING_SUBJECT "${env[@]}"           # the complete DN, copied from a real signature
+```
+
+`WINDOWS_SIGNING_SUBJECT` is compared for exact equality by both workflows, so
+take it from a signature rather than typing it: sign anything once, read
+`(Get-AuthenticodeSignature <file>).SignerCertificate.Subject`, and store that
+string verbatim.
+
 The Windows prebuilt job deliberately remains buildable while Artifact Signing
 is being provisioned: when all three Azure secrets are absent it uploads an
 unsigned Actions artifact, while a partial signing configuration is a hard
 failure. An unsigned Windows pair must not be treated as release-ready or
 promoted in Windows-facing UI. Once credentials exist, signing, exact subject,
 timestamp and SignTool verification are hard gates before artifact upload.
+
+`desktop.yml` is deliberately not tolerant that way — a release build of the app
+either signs or fails. The buildability it gives up is covered instead by the
+`windows-package` job in `.github/workflows/windows.yml`, which does everything
+`desktop.yml` does on Windows except sign: icons check, wizard build, desktop
+crate tests, the unbundled release build and the NSIS bundle. It asserts its own
+output is `NotSigned`, names it `...-setup.UNSIGNED.exe`, and uploads it for
+seven days. That installer exists so the Windows handoff matrix can be run
+before the signing identity does, and it is never a release artifact:
+`publish-desktop.sh` refuses any Windows setup EXE with no Authenticode
+certificate table, whatever it is called. Packaging is a full release build, so
+it runs only on `master`, on a manual dispatch, or when the commit subject
+contains `[package]` — the last of those being the only way to reach it from a
+branch while `workflow_dispatch` cannot see the workflow off the default branch.
 
 The private key is a 32-byte Ed25519 seed stored as one line of unpadded
 base64url at
@@ -422,10 +524,10 @@ The Apple credentials are
 `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
 `APPLE_API_PRIVATE_KEY`, `APPLE_API_KEY`, and `APPLE_API_ISSUER`. The workflow
 uses GitHub OIDC for Azure Artifact Signing with secrets `AZURE_CLIENT_ID`,
-`AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID`, plus repository variables
+`AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID`, plus environment variables
 `AZURE_ARTIFACT_SIGNING_ENDPOINT`, `AZURE_ARTIFACT_SIGNING_ACCOUNT`, and
-`AZURE_ARTIFACT_SIGNING_PROFILE`, plus the expected certificate-subject fragment
-`AZURE_ARTIFACT_SIGNING_PUBLISHER`. It signs and RFC 3161 timestamps the inner
+`AZURE_ARTIFACT_SIGNING_PROFILE`, plus the complete expected certificate subject
+`WINDOWS_SIGNING_SUBJECT`. It signs and RFC 3161 timestamps the inner
 `spawn-desktop.exe`, bundles that exact file with per-user NSIS, then signs and
 timestamps the final setup EXE. The workflow does not publish a release and it
 never receives `SPAWN_DESKTOP_UPDATER_KEY`.
