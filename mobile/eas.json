@@ -15,6 +15,14 @@
       "channel": "development",
       "developmentClient": true
     },
+    "dev-server": {
+      "extends": "base",
+      "distribution": "internal",
+      "channel": "dev-server",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://dev.spawnd.dev:8330"
+      }
+    },
     "preview": {
       "extends": "base",
       "distribution": "internal",
