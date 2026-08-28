@@ -124,124 +124,80 @@ published target. `deploy-prod.sh` publishes the manifest atomically and then
 the signature atomically, last; a daemon never installs from an unsigned or
 badly signed manifest.
 
-Windows adds a separate, layered publisher proof. CI uses Microsoft Artifact
-Signing through GitHub OIDC to Authenticode-sign and RFC 3161 timestamp
-`spawnd-x86_64-pc-windows-msvc.exe` and
+Windows adds a separate, layered publisher proof. CI Authenticode-signs and
+RFC 3161 timestamps `spawnd-x86_64-pc-windows-msvc.exe` and
 `spawn-worker-x86_64-pc-windows-msvc.exe` before `SHA256SUMS` is created.
 Authenticode proves the Windows publisher and PE integrity; it does not
 authorize a daemon update. The detached Ed25519 manifest still authorizes the
 exact version, targets and post-Authenticode hashes accepted by `spawnd`.
-Artifact Signing keeps its private key in Microsoft's HSM and CI receives only
-a short-lived OIDC authorization for the certificate profile. The offline
+
+The signer is Dreamhome AI Limited's existing RSA-HSM certificate in Azure Key
+Vault, driven by AzureSignTool after a GitHub OIDC login. Microsoft Artifact
+Signing was the earlier plan and was dropped: it meant a new signing account, a
+new monthly charge, and a portal-only identity validation that sets its own
+calendar — to obtain a second certificate for a company that already holds one.
+The private key is non-exportable and never leaves the HSM; CI receives only a
+short-lived OIDC authorization to request signatures with it. The offline
 daemon release key and offline Tauri updater key never enter CI.
 
-Protect the `windows-code-signing` GitHub environment to `master`, scope the
-federated credential to that environment, and grant its service principal only
-`Artifact Signing Certificate Profile Signer` on the chosen profile. The named
-secrets are `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and
-`AZURE_SUBSCRIPTION_ID`; the variables are
-`AZURE_ARTIFACT_SIGNING_ENDPOINT`, `AZURE_ARTIFACT_SIGNING_ACCOUNT`,
-`AZURE_ARTIFACT_SIGNING_PROFILE`, and `WINDOWS_SIGNING_SUBJECT` (the complete
-expected distinguished name). Revoke the federated credential/profile quickly
-if a permitted CI run is compromised: it still cannot mint the offline
-Ed25519 manifest, but it can request publisher-valid PE signatures.
+Protect the `windows-code-signing` GitHub environment to `master` and scope the
+federated credential to that environment. The named secrets are
+`AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID`; the variables
+are `AZURE_KEY_VAULT_URL`, `AZURE_KEY_VAULT_CERTIFICATE`,
+`CODE_SIGN_TIMESTAMP_URL` and `WINDOWS_SIGNING_SUBJECT` (the complete expected
+distinguished name). Revoke the federated credential quickly if a permitted CI
+run is compromised: it still cannot mint the offline Ed25519 manifest, but
+until it is gone it can request publisher-valid PE signatures.
 
-### Provisioning the Artifact Signing identity
+### The Windows signing identity
 
-When someone else holds the Azure account, hand them
-[AZURE_SIGNING_SETUP.md](AZURE_SIGNING_SETUP.md) — this section rewritten for a
-person with no SPAWN D context, including what to hand back and why none of it
-is secret. The rest of this section is the same process for whoever already
-knows the release.
+Provisioned on 2026-08-28; this is the record, not a to-do. Nothing below is a
+credential — every value is an identifier, and the one secret involved never
+leaves Azure.
 
-Identity validation is the long pole and it is portal-only, so start it first
-and do everything else while it is pending. In the Azure portal, under the
-signing account, request an identity validation for the legal entity that will
-appear as the publisher; Microsoft verifies it out of band and the certificate
-profile cannot be created until it is `Completed`. Confirm the current
-eligibility rules when you apply — a business-history requirement on
-organization validation has historically added weeks, and it, not the
-engineering, sets the Windows launch date.
+| | |
+|---|---|
+| Certificate | `dreamhomeai-code-signing` in `kv-dreamhome-prod` (`rg-dreamhome-codesign-prod`) |
+| Key | RSA-HSM 4096, non-exportable, code-signing EKU `1.3.6.1.5.5.7.3.3` |
+| Thumbprint | `982B6765F17F6EDF4395E96AE5ED6F89345AC101` |
+| Expires | 2027-07-16 |
+| Subject | `E=hello@levystreet.com, CN=Dreamhome AI Limited, O=Dreamhome AI Limited, L=Wellington, S=Wellington, C=NZ` |
+| Entra app | `spawn-windows-signing`, client id `cb2a7373-57b7-4b84-98e2-8105dfe754fc` |
+| Federated subject | `repo:levy-street/spawn:environment:windows-code-signing` |
 
-The rest is scriptable. Resource names below are placeholders:
+The service principal holds `Key Vault Certificate User` on that certificate
+and `Key Vault Crypto User` on its key, and nothing else — no subscription,
+resource-group or vault-wide scope, and no access to any other repository's
+signing. The same certificate signed the World of ClaudeCraft 0.40.1 Windows
+installers on 2026-08-26 and Windows reported both signatures `Valid`, so the
+mechanism is proven; what is unproven for SPAWN D is only this repository's
+wiring to it.
 
-```bash
-az login
-az account set --subscription "<subscription-id>"
-az provider register --namespace Microsoft.CodeSigning
-az extension add --name trustedsigning
+Three things about this arrangement that will cost an afternoon if forgotten.
 
-az group create -n spawn-signing -l westeurope
-az trustedsigning create -g spawn-signing -n spawn-signing-account \
-  -l westeurope --sku Basic
+`master` carries no branch protection rule, so an environment restricted to
+`protected_branches` would match nothing and block every Windows job. What is
+configured, and what actually works, is a custom branch policy naming `master`.
+Revisit the day `master` gains a protection rule.
 
-# Only after identity validation reports Completed:
-az trustedsigning certificate-profile create -g spawn-signing \
-  --account-name spawn-signing-account -n spawn-desktop \
-  --profile-type PublicTrust --identity-validation-id "<validation-id>"
-```
-
-The service has been renamed from Azure Trusted Signing to Microsoft Artifact
-Signing and the CLI extension, role and command names have lagged the rename at
-various points. Do not trust the spelling here over the tooling: resolve the
-signer role by listing it rather than assuming, and use whichever of
-`Trusted Signing Certificate Profile Signer` /
-`Artifact Signing Certificate Profile Signer` your tenant actually returns.
-
-```bash
-az role definition list --query "[?contains(roleName, 'Certificate Profile Signer')].roleName" -o tsv
-```
-
-CI authenticates as a federated identity, so no secret ever holds a credential
-that works outside a permitted run. The federated subject must name the
-environment, which is why both Windows jobs declare
-`environment: windows-code-signing`:
-
-```bash
-app_id="$(az ad app create --display-name spawn-windows-signing --query appId -o tsv)"
-az ad sp create --id "$app_id"
-az ad app federated-credential create --id "$app_id" --parameters '{
-  "name": "spawn-windows-code-signing",
-  "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:levy-street/spawn:environment:windows-code-signing",
-  "audiences": ["api://AzureADTokenExchange"]
-}'
-
-profile_id="$(az trustedsigning certificate-profile show -g spawn-signing \
-  --account-name spawn-signing-account -n spawn-desktop --query id -o tsv)"
-az role assignment create --assignee "$app_id" \
-  --role "<the signer role name resolved above>" --scope "$profile_id"
-```
-
-Then the GitHub side. `master` carries no branch protection rule, so an
-environment restricted to `protected_branches` would match nothing and block
-every Windows job; the equivalent that actually works is a custom branch policy
-naming `master`. Revisit this the day `master` gains a protection rule.
-
-```bash
-gh api -X PUT repos/levy-street/spawn/environments/windows-code-signing --input - <<'JSON'
-{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
-JSON
-gh api -X POST repos/levy-street/spawn/environments/windows-code-signing/deployment-branch-policies \
-  -f name=master -f type=branch
-
-env=(--env windows-code-signing -R levy-street/spawn)
-gh secret set AZURE_CLIENT_ID "${env[@]}"        # the app registration's appId
-gh secret set AZURE_TENANT_ID "${env[@]}"
-gh secret set AZURE_SUBSCRIPTION_ID "${env[@]}"
-gh variable set AZURE_ARTIFACT_SIGNING_ENDPOINT "${env[@]}"   # https://<region>.codesigning.azure.net/
-gh variable set AZURE_ARTIFACT_SIGNING_ACCOUNT "${env[@]}"    # spawn-signing-account
-gh variable set AZURE_ARTIFACT_SIGNING_PROFILE "${env[@]}"    # spawn-desktop
-gh variable set WINDOWS_SIGNING_SUBJECT "${env[@]}"           # the complete DN, copied from a real signature
-```
+That restriction also means **the signing path cannot be exercised from a
+branch**. A Windows job on any other ref never reaches `azure/login`, so the
+merge to `master` is the first run that can prove it end to end. Plan to watch
+that run rather than assume it.
 
 `WINDOWS_SIGNING_SUBJECT` is compared for exact equality by both workflows, so
 take it from a signature rather than typing it: sign anything once, read
 `(Get-AuthenticodeSignature <file>).SignerCertificate.Subject`, and store that
-string verbatim.
+string verbatim. Both workflows pass it through a step `env:` rather than
+interpolating it into the PowerShell body — a distinguished name is full of
+punctuation, and a value containing a quote should not be able to end the
+string it sits in.
 
-The Windows prebuilt job deliberately remains buildable while Artifact Signing
-is being provisioned: when all three Azure secrets are absent it uploads an
+To provision this from nothing — a new tenant, or a rotated certificate — see
+[AZURE_SIGNING_SETUP.md](AZURE_SIGNING_SETUP.md).
+
+The Windows prebuilt job deliberately remains buildable while signing is
+being provisioned: when all three Azure secrets are absent it uploads an
 unsigned Actions artifact, while a partial signing configuration is a hard
 failure. An unsigned Windows pair must not be treated as release-ready or
 promoted in Windows-facing UI. Once credentials exist, signing, exact subject,
@@ -530,10 +486,10 @@ public download and updater payload. The workflow produces no MSI.
 The Apple credentials are
 `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,
 `APPLE_API_PRIVATE_KEY`, `APPLE_API_KEY`, and `APPLE_API_ISSUER`. The workflow
-uses GitHub OIDC for Azure Artifact Signing with secrets `AZURE_CLIENT_ID`,
+uses GitHub OIDC for Azure Key Vault with secrets `AZURE_CLIENT_ID`,
 `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID`, plus environment variables
-`AZURE_ARTIFACT_SIGNING_ENDPOINT`, `AZURE_ARTIFACT_SIGNING_ACCOUNT`, and
-`AZURE_ARTIFACT_SIGNING_PROFILE`, plus the complete expected certificate subject
+`AZURE_KEY_VAULT_URL`, `AZURE_KEY_VAULT_CERTIFICATE`, and
+`CODE_SIGN_TIMESTAMP_URL`, plus the complete expected certificate subject
 `WINDOWS_SIGNING_SUBJECT`. It signs and RFC 3161 timestamps the inner
 `spawn-desktop.exe`, bundles that exact file with per-user NSIS, then signs and
 timestamps the final setup EXE. The workflow does not publish a release and it
@@ -832,55 +788,46 @@ cargo test --locked --target x86_64-pc-windows-msvc
 cargo build --release --locked --target x86_64-pc-windows-msvc --bin spawnd --bin spawn-worker
 ```
 
-Stage the two exact `.exe` asset names, sign them through Artifact Signing (or
-the pre-approved HSM fallback), and run the same subject, timestamp, SignTool,
+Stage the two exact `.exe` asset names, sign them with the Key Vault
+certificate, and run the same subject, timestamp, SignTool,
 hash, and `scripts/smoke-install-prebuilt.ps1` gates as CI. There is no
 project-supported Docker or Wine substitute for native Windows runtime,
 locking, service and installer validation. `cargo-xwin` is an emergency
 compilation aid only; its output must still pass through a real Windows signing
 and validation host before publication.
 
-When only GitHub runner capacity is unavailable and Artifact Signing itself is
-healthy, use Microsoft's local SignTool/dlib integration on that Windows host:
+When only GitHub runner capacity is unavailable and Key Vault itself is
+healthy, sign on that Windows host with the same tool CI uses:
 
 ```powershell
-winget install -e --id Microsoft.Azure.ArtifactSigningClientTools
 winget install -e --id Microsoft.AzureCLI
+dotnet tool install --global AzureSignTool --version 7.0.1
+
+# An identity holding Key Vault Certificate User on the certificate and
+# Key Vault Crypto User on its key. AzureSignTool's -kvm resolves the ambient
+# Azure credential, which after this is the signed-in CLI account.
 az login
-
-@'
-{
-  "Endpoint": "https://<region>.codesigning.azure.net/",
-  "CodeSigningAccountName": "<account>",
-  "CertificateProfileName": "<profile>"
-}
-'@ | Set-Content -LiteralPath .\metadata.json -Encoding ascii
-
-$signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
-  -Filter signtool.exe -File -Recurse | Where-Object FullName -Match '\\x64\\' |
-  Sort-Object FullName -Descending | Select-Object -First 1
-$dlib = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft\ArtifactSigningClientTools" `
-  -Filter Azure.CodeSigning.Dlib.dll -File -Recurse |
-  Where-Object FullName -Match '\\x64\\' | Select-Object -First 1
-if (-not $signTool -or -not $dlib) { throw 'Artifact Signing SignTool/dlib was not found' }
 
 foreach ($file in @(
   '.\spawnd-x86_64-pc-windows-msvc.exe',
   '.\spawn-worker-x86_64-pc-windows-msvc.exe'
 )) {
-  & $signTool.FullName sign /v /debug /fd SHA256 `
-    /tr http://timestamp.acs.microsoft.com /td SHA256 `
-    /dlib $dlib.FullName /dmdf .\metadata.json $file
-  if ($LASTEXITCODE -ne 0) { throw "Artifact Signing failed for $file" }
+  azuresigntool sign `
+    -kvu https://kv-dreamhome-prod.vault.azure.net/ `
+    -kvm `
+    -kvc dreamhomeai-code-signing `
+    -fd sha256 `
+    -tr http://timestamp.digicert.com `
+    -td sha256 `
+    $file
+  if ($LASTEXITCODE -ne 0) { throw "AzureSignTool failed for $file" }
 }
-Remove-Item .\metadata.json
 ```
 
-The local identity needs the same certificate-profile Signer role. Use Windows
-SDK SignTool 10.0.2261.755 or later, .NET 8, and the matching x64 dlib; then run
-the configured-subject/timestamp verifier and smoke before uploading. If
-Artifact Signing itself is unavailable, use the pre-approved HSM vendor—never
-an ad-hoc or self-signed production certificate.
+Then run the configured-subject/timestamp verifier and the smoke before
+uploading. If Key Vault itself is unavailable, wait for it — never an ad-hoc or
+self-signed production certificate, and never a second certificate obtained in
+a hurry.
 
 Then assemble the assets the way the workflow's single publish job does — the
 five `spawnd-<triple>[.exe]` plus five `spawn-worker-<triple>[.exe]` binaries,

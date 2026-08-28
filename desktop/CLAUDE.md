@@ -242,8 +242,8 @@ npm run tauri -- bundle --bundles nsis --target x86_64-pc-windows-msvc
 ```
 
 The public Windows artifact is exactly
-`SPAWN-D_<version>_windows-x86_64-setup.exe`. Azure Artifact Signing covers
-the inner EXE before NSIS and the final installer after bundling. The offline
+`SPAWN-D_<version>_windows-x86_64-setup.exe`. The Azure Key Vault certificate
+covers the inner EXE before NSIS and the final installer after bundling. The offline
 Tauri updater signature covers the final, canonically named setup EXE last.
 
 The wizard can be driven in a plain browser by faking the Tauri bridge

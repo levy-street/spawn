@@ -79,8 +79,9 @@ jobs:
             -WorkerPath daemon/target/x86_64-pc-windows-msvc/release/spawn-worker.exe
 
   # Everything `desktop.yml` does on Windows except the signing, so the release
-  # path is proved before the Artifact Signing identity exists and an installer
-  # exists to run the handoff matrix against. What comes out is deliberately
+  # path is proved from a branch at all — the signing environment permits only
+  # `master`, so `desktop.yml` cannot run here — and so that an installer exists
+  # to run the handoff matrix against. What comes out is deliberately
   # UNSIGNED: it is a validation build, never a release artifact, and
   # publish-desktop.sh refuses a setup EXE with no certificate table.
   #
