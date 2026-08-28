@@ -4,6 +4,7 @@ import {
   DEVICE_NOT_TRUSTED_CODE,
   DEVICE_NOT_TRUSTED_MESSAGE,
   type DeviceHostTrustResult,
+  invalidateDeviceHostTrust,
   probeDeviceHostTrustResult,
 } from "@/data/trust/device-trust";
 import { randomBytes } from "@/lib/crypto/bootstrap";
@@ -161,6 +162,8 @@ class WebViewHostTransport implements StreamingHostTransport {
   #reconnectAttempt = 0;
   #reconnectStartedAt: number | null = null;
   #hasEverReady = false;
+  /** True once this host has refused an offer from this device. */
+  #refused = false;
   #connectTimer: ReturnType<typeof setTimeout> | null = null;
   #resolveOpen: (() => void) | null = null;
   #rejectOpen: ((error: Error) => void) | null = null;
@@ -195,14 +198,7 @@ class WebViewHostTransport implements StreamingHostTransport {
     if (this.#prepared) return;
     this.#prepared = true;
     this.#setState("signalling");
-    const trust = this.#preflightTrust();
-    this.#endorsements = trust
-      .then((result) =>
-        result.directlyPinned
-          ? []
-          : (this.options.loadCarriedEndorsements ?? loadMemoizedCarriedEndorsements)(),
-      )
-      .catch(() => []);
+    this.#loadEndorsements(this.#preflightTrust());
     this.#startSignal();
     this.#preparePromise = browserIdentityWire().then((browserKey) => {
       this.#browserKey = browserKey;
@@ -741,6 +737,7 @@ class WebViewHostTransport implements StreamingHostTransport {
         clearTimeout(this.#resumeTimer ?? undefined);
         this.#resumeTimer = null;
       }
+      if (matchesActiveBinding && frame["status"] === "failed") this.#handleRtcRefusal();
     }
     try {
       const verified = verifyAnswerFrame(
@@ -1049,9 +1046,33 @@ class WebViewHostTransport implements StreamingHostTransport {
       if (this.#state === "closed" || this.#state === "failed") return;
       this.#capabilities = null;
       this.#setState("signalling");
+      this.#loadEndorsements(this.#preflightTrust());
       this.#armConnectWatchdog();
       this.#startSignal();
     }, delay);
+  }
+
+  /**
+   * The endorsement edges the next offer will carry, read once per attempt.
+   * Mirrors the session transport: a set frozen when the channel opened is the
+   * set from before the refusal, and the edge that admits this device is
+   * written by the approval that follows it.
+   */
+  #loadEndorsements(trust: Promise<DeviceHostTrustResult>): void {
+    this.#endorsements = trust
+      .then((result) =>
+        result.directlyPinned && !this.#refused
+          ? []
+          : (this.options.loadCarriedEndorsements ?? loadMemoizedCarriedEndorsements)(),
+      )
+      .catch(() => []);
+  }
+
+  /** A refusal makes both memoized views of this device's admission wrong: the
+   * verdict, and the edges the next offer carries. */
+  #handleRtcRefusal(): void {
+    this.#refused = true;
+    invalidateDeviceHostTrust(this.hostId);
   }
 
   /** Mirrors the session transport: a host that never pinned this device drops

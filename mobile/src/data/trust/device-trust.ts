@@ -1,6 +1,7 @@
 import { listBrowserDevices } from "@/data/api/endpoints/devices";
 import { getHost } from "@/data/api/endpoints/hosts";
 import { listAccountEndorsements, listHostPins } from "@/data/api/endpoints/trust";
+import { invalidateCarriedEndorsements } from "@/data/trust/carried-endorsements";
 import { chainReachableFrom } from "@/data/trust/chain-reach";
 import { encodeBase64Url } from "@/lib/crypto/bytes";
 import { deviceIdentity } from "@/lib/crypto/identity";
@@ -79,10 +80,18 @@ function sharedRead<T>(load: () => Promise<T>, nowMs: number): Promise<T> {
   return promise;
 }
 
-/** Drop memoized verdicts so a fresh approval takes effect immediately. */
+/**
+ * Drop memoized verdicts so a fresh approval takes effect immediately.
+ *
+ * The edges an offer carries are dropped with them. Every caller here means
+ * the same thing — an approval may have just landed — and a verdict refreshed
+ * against edges still cached from before it is a device that is told it is
+ * trusted while it goes on offering the proof that was already refused.
+ */
 export function invalidateDeviceHostTrust(hostId?: string): void {
   if (hostId === undefined) cache.clear();
   else cache.delete(hostId);
+  invalidateCarriedEndorsements();
 }
 
 async function resolveTrust(

@@ -4,6 +4,7 @@ import {
   DEVICE_NOT_TRUSTED_CODE,
   DEVICE_NOT_TRUSTED_MESSAGE,
   type DeviceHostTrustResult,
+  invalidateDeviceHostTrust,
   probeDeviceHostTrustResult,
 } from "@/data/trust/device-trust";
 import { randomBytes } from "@/lib/crypto/bootstrap";
@@ -117,6 +118,8 @@ class WebViewSessionTransport implements SessionTransport {
     readonly import("@/data/trust/carried-endorsements").CarriedEndorsement[]
   > = Promise.resolve([]);
   #hasEverReady = false;
+  /** True once this host has refused an offer from this device. */
+  #refused = false;
   #reconnectStartedAt: number | null = null;
   #configWaiters = new Set<() => void>();
   #pendingInput: Uint8Array[] = [];
@@ -152,14 +155,7 @@ class WebViewSessionTransport implements SessionTransport {
     this.#prepared = true;
     this.#machine = reduceConnection(this.#machine, { type: "open" });
     this.#setState(this.#machine.phase);
-    const trust = this.#preflightTrust();
-    this.#endorsements = trust
-      .then((result) =>
-        result.directlyPinned
-          ? []
-          : (this.options.loadCarriedEndorsements ?? loadMemoizedCarriedEndorsements)(),
-      )
-      .catch(() => []);
+    this.#loadEndorsements(this.#preflightTrust());
     this.#startSignal();
     this.#preparePromise = browserIdentityWire().then((browserKey) => {
       this.#browserKey = browserKey;
@@ -231,8 +227,7 @@ class WebViewSessionTransport implements SessionTransport {
 
   close(): void {
     if (this.#state === "closed") return;
-    clearTimeout(this.#reconnectTimer ?? undefined);
-    this.#reconnectTimer = null;
+    this.#clearReconnect();
     this.#clearConnectWatchdog();
     clearTimeout(this.#resumeTimer ?? undefined);
     this.#resumeTimer = null;
@@ -441,6 +436,7 @@ class WebViewSessionTransport implements SessionTransport {
         clearTimeout(this.#resumeTimer ?? undefined);
         this.#resumeTimer = null;
       }
+      if (matchesActiveBinding && frame["status"] === "failed") this.#handleRtcRefusal();
     }
     try {
       const verified = verifyAnswerFrame(
@@ -694,8 +690,13 @@ class WebViewSessionTransport implements SessionTransport {
     const delay = this.#machine.reconnectDelayMs ?? reconnectDelay(0);
     this.#reconnectTimer = setTimeout(() => {
       this.#reconnectTimer = null;
+      // A transport that failed or closed while this was pending is done: it
+      // has no surface listening, and reopening signalling here would race the
+      // one that replaced it.
+      if (this.#state === "failed" || this.#state === "closed") return;
       this.#machine = reduceConnection(this.#machine, { type: "retry" });
       this.#setState("signalling");
+      this.#loadEndorsements(this.#preflightTrust());
       this.#armConnectWatchdog();
       this.#startSignal();
     }, delay);
@@ -726,6 +727,52 @@ class WebViewSessionTransport implements SessionTransport {
     this.#connectTimer = null;
   }
 
+  #clearReconnect(): void {
+    if (this.#reconnectTimer === null) return;
+    clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = null;
+  }
+
+  /**
+   * The endorsement edges the next offer will carry.
+   *
+   * Read once per attempt, not once per transport. The edge that admits a
+   * refused device is written by the approval that *follows* the refusal, so a
+   * set frozen when the terminal opened is the one set that can never work:
+   * every reconnect re-sent the same empty proof, the host refused it again,
+   * and the terminal only recovered when the operator left the session and
+   * came back to build a fresh transport.
+   *
+   * A directly pinned device needs no edges at all — until a host refuses it
+   * anyway, which is exactly the moment the host's view of this device and the
+   * server's have diverged, and the chain is the only thing left that can
+   * close the gap.
+   */
+  #loadEndorsements(trust: Promise<DeviceHostTrustResult>): void {
+    this.#endorsements = trust
+      .then((result) =>
+        result.directlyPinned && !this.#refused
+          ? []
+          : (this.options.loadCarriedEndorsements ?? loadMemoizedCarriedEndorsements)(),
+      )
+      .catch(() => []);
+  }
+
+  /**
+   * The host answered a signed offer, and the answer was no.
+   *
+   * Both memoized views of this device's own admission are wrong the moment
+   * that lands: the verdict the screen is showing, and the edges the next
+   * offer would carry. Dropping them is what lets an approval granted seconds
+   * later take effect on the next attempt — and re-probing is what turns a
+   * device that really is unapproved into the approval ceremony instead of an
+   * indefinite "Reconnecting".
+   */
+  #handleRtcRefusal(): void {
+    this.#refused = true;
+    invalidateDeviceHostTrust(this.options.hostId);
+  }
+
   /**
    * Runs alongside signalling rather than gating it: a trusted device pays no
    * latency, and an unapproved one gets the real reason in a few hundred
@@ -754,6 +801,7 @@ class WebViewSessionTransport implements SessionTransport {
   #fail(code: string, message: string): void {
     if (this.#state === "failed" || this.#state === "closed") return;
     this.#clearConnectWatchdog();
+    this.#clearReconnect();
     const error = { code, message, retryable: false } satisfies TransportError;
     this.#emitError(error);
     this.#machine = reduceConnection(this.#machine, { type: "fail" });
