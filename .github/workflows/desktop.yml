@@ -102,8 +102,9 @@ jobs:
   windows:
     name: Windows · x86_64-pc-windows-msvc
     runs-on: windows-latest
-    # The Artifact Signing federated credential is scoped to this environment;
-    # without it the OIDC subject does not match and azure/login is refused.
+    # The Key Vault federated credential is scoped to this environment; without
+    # it the OIDC subject does not match and azure/login is refused. The
+    # environment permits only `master`, so this job cannot sign from a branch.
     environment: windows-code-signing
     permissions:
       contents: read

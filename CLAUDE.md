@@ -16,7 +16,8 @@ scripts/  deploy, health, smoke, and guard scripts; test-all.sh runs the lot
 infra/    docker-compose and nginx examples
 docs/     design docs; docs/RELEASE.md — the release process,
           docs/WINDOWS_VALIDATION.md — the Windows evidence gate, and
-          docs/AZURE_SIGNING_SETUP.md — Windows signing, for whoever holds Azure
+          docs/AZURE_SIGNING_SETUP.md — the Windows signing identity, for
+          whoever holds Azure
 tools/    development utilities
 .github/  CI workflows: tests, the rolling daemon prebuilts, the Windows check
           and its unsigned packaging rehearsal, and the signed desktop

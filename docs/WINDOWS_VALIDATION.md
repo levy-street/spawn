@@ -355,7 +355,7 @@ certificate table, whatever the file is called.
 
 - [ ] **Authenticode + hashes**
   - **Do:** For both daemon assets run Get-AuthenticodeSignature, signtool.exe verify /pa /all /v and Get-FileHash -Algorithm SHA256; repeat for inner desktop EXE and outer setup EXE.
-  - **Expect:** Status=Valid; daemon subject exactly WINDOWS_SIGNING_SUBJECT; desktop subject contains AZURE_ARTIFACT_SIGNING_PUBLISHER; all timestamped; hashes cover post-signing bytes; one-byte mutation breaks proof.
+  - **Expect:** Status=Valid; daemon subject exactly WINDOWS_SIGNING_SUBJECT; desktop subject exactly WINDOWS_SIGNING_SUBJECT; all timestamped; hashes cover post-signing bytes; one-byte mutation breaks proof.
   - **Source:** I-dist.md, I-desktop.md, workflow files
 
 - [ ] **Signed-pair smoke**
