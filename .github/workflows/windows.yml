@@ -78,6 +78,25 @@ jobs:
             -SpawndPath daemon/target/x86_64-pc-windows-msvc/release/spawnd.exe `
             -WorkerPath daemon/target/x86_64-pc-windows-msvc/release/spawn-worker.exe
 
+      # The release pair this job already built, kept rather than discarded, so a
+      # dev deployment can serve `/install.ps1` before Windows is a real release.
+      # `prebuilt.yml` owns the published Windows daemon and is gated to `master`
+      # because that is where the signing environment is reachable; these are
+      # deliberately NOT that. They carry no Authenticode signature and must
+      # never be promoted into a release.
+      - name: Keep the unsigned daemon pair for dev staging
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          contains(github.event.head_commit.message, '[package]')
+        uses: actions/upload-artifact@v4
+        with:
+          name: spawn-daemon-windows-x86_64-UNSIGNED-do-not-publish
+          path: |
+            daemon/target/x86_64-pc-windows-msvc/release/spawnd.exe
+            daemon/target/x86_64-pc-windows-msvc/release/spawn-worker.exe
+          retention-days: 7
+          if-no-files-found: error
+
   # Everything `desktop.yml` does on Windows except the signing, so the release
   # path is proved from a branch at all — the signing environment permits only
   # `master`, so `desktop.yml` cannot run here — and so that an installer exists
