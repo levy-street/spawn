@@ -143,23 +143,33 @@ jobs:
         working-directory: desktop
         run: npm run tauri -- build --no-bundle --target x86_64-pc-windows-msvc
 
-      - name: Authenticate to Azure Artifact Signing
+      - name: Authenticate to Azure Key Vault
         uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Install AzureSignTool
+        run: dotnet tool install --global AzureSignTool --version 7.0.1
+
       - name: Sign SPAWN D executable
-        uses: azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
-          files: ${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL }}
+          AZURE_KEY_VAULT_CERTIFICATE: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE }}
+          CODE_SIGN_TIMESTAMP_URL: ${{ vars.CODE_SIGN_TIMESTAMP_URL }}
+        run: |
+          $path = '${{ github.workspace }}\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\spawn-desktop.exe'
+          azuresigntool sign `
+            -kvu $env:AZURE_KEY_VAULT_URL `
+            -kvm `
+            -kvc $env:AZURE_KEY_VAULT_CERTIFICATE `
+            -fd sha256 `
+            -tr $env:CODE_SIGN_TIMESTAMP_URL `
+            -td sha256 `
+            $path
+          if ($LASTEXITCODE -ne 0) { throw "AzureSignTool failed for $path" }
 
       - name: Verify the signed inner executable
         shell: pwsh
@@ -190,15 +200,22 @@ jobs:
           "installer=$($files[0].FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Sign NSIS installer
-        uses: azure/artifact-signing-action@v2
-        with:
-          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
-          signing-account-name: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
-          files: ${{ steps.nsis.outputs.installer }}
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL }}
+          AZURE_KEY_VAULT_CERTIFICATE: ${{ vars.AZURE_KEY_VAULT_CERTIFICATE }}
+          CODE_SIGN_TIMESTAMP_URL: ${{ vars.CODE_SIGN_TIMESTAMP_URL }}
+        run: |
+          $path = '${{ steps.nsis.outputs.installer }}'
+          azuresigntool sign `
+            -kvu $env:AZURE_KEY_VAULT_URL `
+            -kvm `
+            -kvc $env:AZURE_KEY_VAULT_CERTIFICATE `
+            -fd sha256 `
+            -tr $env:CODE_SIGN_TIMESTAMP_URL `
+            -td sha256 `
+            $path
+          if ($LASTEXITCODE -ne 0) { throw "AzureSignTool failed for $path" }
 
       - name: Verify, canonically name and checksum Windows artifacts
         shell: pwsh
