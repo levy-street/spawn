@@ -181,7 +181,7 @@ export default function RunAgentsInParallelPage() {
           </p>
         </JobProse>
         <div className="mx-auto mt-12 w-full max-w-5xl sm:mt-14">
-          <FleetCapture caption="A workspace: six sessions — four projects, three machines." />
+          <FleetCapture caption="Three workspaces across three machines — switching is a click, and nothing stops." />
         </div>
         <JobProse className="mt-12 sm:mt-16">
           <JobPoints
