@@ -12,12 +12,8 @@ describe("offline terminal worker", () => {
     expect(TERMINAL_WORKER_HTML).toContain(
       'const forwardTerminalLink = (_event, uri) => api.post({ type: "link", url: uri })',
     );
-    expect(TERMINAL_WORKER_HTML).toContain(
-      "linkHandler: { activate: forwardTerminalLink }",
-    );
-    expect(TERMINAL_WORKER_HTML).toContain(
-      "new WebLinksAddon.WebLinksAddon(forwardTerminalLink)",
-    );
+    expect(TERMINAL_WORKER_HTML).toContain("linkHandler: { activate: forwardTerminalLink }");
+    expect(TERMINAL_WORKER_HTML).toContain("new WebLinksAddon.WebLinksAddon(forwardTerminalLink)");
   });
 
   test("contains exact xterm parity configuration and addons", () => {
