@@ -118,7 +118,7 @@ export default function RunAgentsInParallelPage() {
       faq={FAQ}
       related={RELATED}
     >
-      <JobSection className="pt-20 sm:pt-28">
+      <JobSection refId="s1" className="pt-20 sm:pt-28">
         <JobProse>
           <JobH2>Starting several sessions is easy. Managing them is the job.</JobH2>
           <div className="mt-8 space-y-5">
@@ -131,7 +131,7 @@ export default function RunAgentsInParallelPage() {
             </p>
           </div>
           <div className="mt-10">
-            <JobCodeFigure caption="Three projects, three sessions.">
+            <JobCodeFigure refId="a1" caption="Three projects, three sessions.">
               <p className="whitespace-nowrap">
                 <span className="text-ash">$</span> cd ~/work/api && claude
               </p>
@@ -156,7 +156,7 @@ export default function RunAgentsInParallelPage() {
         </JobProse>
       </JobSection>
 
-      <JobSection>
+      <JobSection refId="s2">
         <JobProse>
           <JobH2>The splits work until you stand up.</JobH2>
           <div className="mt-10">
@@ -180,7 +180,7 @@ export default function RunAgentsInParallelPage() {
         </JobProse>
       </JobSection>
 
-      <JobSection>
+      <JobSection refId="s3">
         <JobProse>
           <JobH2>Keep the workflow. Hand off the managing.</JobH2>
           <p className="mt-8 max-w-[58ch]">
@@ -191,14 +191,18 @@ export default function RunAgentsInParallelPage() {
           </p>
         </JobProse>
         <div className="mx-auto mt-12 w-full max-w-5xl sm:mt-14">
-          <FleetCapture caption="A workspace per project — switching is a click, and nothing stops." />
+          <FleetCapture
+            refId="a2"
+            caption="A workspace per project — switching is a click, and nothing stops."
+          />
         </div>
       </JobSection>
 
-      <JobSection>
+      <JobSection refId="s4">
         <JobSplit
           media={
             <JobShot
+              refId="a3"
               src="/product/features/roster-sidebar.png"
               width={660}
               height={2040}
@@ -225,10 +229,11 @@ export default function RunAgentsInParallelPage() {
         </JobSplit>
       </JobSection>
 
-      <JobSection>
+      <JobSection refId="s5">
         <JobSplit
           media={
             <JobShot
+              refId="a4"
               src="/product/features/attention.png"
               width={1930}
               height={1320}
@@ -252,10 +257,11 @@ export default function RunAgentsInParallelPage() {
         </JobSplit>
       </JobSection>
 
-      <JobSection>
+      <JobSection refId="s6">
         <JobSplit
           media={
             <JobShot
+              refId="a5"
               src="/product/features/phone.png"
               width={1170}
               height={2532}
@@ -281,11 +287,12 @@ export default function RunAgentsInParallelPage() {
         </JobSplit>
       </JobSection>
 
-      <JobSection>
+      <JobSection refId="s7">
         <JobSplit
           media={
             <div className="space-y-6">
               <JobShot
+                refId="a6"
                 src="/product/features/launcher.png"
                 width={736}
                 height={804}
@@ -293,6 +300,7 @@ export default function RunAgentsInParallelPage() {
                 caption="The launcher: agents as visible commands."
               />
               <JobShot
+                refId="a7"
                 src="/product/features/host-picker.png"
                 width={560}
                 height={660}
@@ -319,7 +327,7 @@ export default function RunAgentsInParallelPage() {
         </JobSplit>
       </JobSection>
 
-      <JobSection>
+      <JobSection refId="s8">
         <JobProse>
           <JobH2>Managed doesn’t mean watched.</JobH2>
           <p className="mt-6 max-w-[58ch]">
@@ -331,6 +339,7 @@ export default function RunAgentsInParallelPage() {
         </JobProse>
         <div className="mx-auto mt-12 w-full max-w-5xl">
           <JobShot
+            refId="a8"
             src="/product/fleet-close.png"
             width={2540}
             height={1920}
@@ -340,7 +349,7 @@ export default function RunAgentsInParallelPage() {
         </div>
       </JobSection>
 
-      <JobSection className="py-8 sm:py-10">
+      <JobSection refId="s9" className="py-8 sm:py-10">
         <JobProse>
           <p className="text-[15px] leading-7">
             Real PTYs owned by host workers. Hosts dial out — zero open ports. Your browser talks to

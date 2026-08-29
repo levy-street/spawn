@@ -19,6 +19,22 @@ import { cn } from "@/lib/utils";
 
 const SITE = "https://spawnd.dev";
 
+/**
+ * Review reference chips: visible only on the dev server, so a reviewer can
+ * name any section or image unambiguously ("S5", "A4"). Production builds
+ * render just the invisible anchor id.
+ */
+const SHOW_REFS = process.env.NODE_ENV !== "production";
+
+export function RefTag({ id }: { id: string }) {
+  if (!SHOW_REFS) return null;
+  return (
+    <span className="pointer-events-none absolute top-2 right-3 z-20 rounded bg-hellfire/80 px-1.5 py-0.5 font-sigil text-[10px] tracking-[0.1em] text-bone uppercase select-none">
+      {id}
+    </span>
+  );
+}
+
 export interface JobCrumb {
   name: string;
   href: string;
@@ -108,8 +124,24 @@ function StructuredData({
  * One body section: horizontal padding and generous vertical air, nothing
  * else. No borders, no markers — the whitespace is the separator.
  */
-export function JobSection({ children, className }: { children: ReactNode; className?: string }) {
-  return <section className={cn("px-5 py-14 sm:px-8 sm:py-24", className)}>{children}</section>;
+export function JobSection({
+  children,
+  className,
+  refId,
+}: {
+  children: ReactNode;
+  className?: string;
+  refId?: string;
+}) {
+  return (
+    <section
+      id={refId}
+      className={cn("relative scroll-mt-24 px-5 py-14 sm:px-8 sm:py-24", className)}
+    >
+      {refId ? <RefTag id={refId} /> : null}
+      {children}
+    </section>
+  );
 }
 
 /**
@@ -137,6 +169,7 @@ export function JobShot({
   alt,
   caption,
   className,
+  refId,
 }: {
   src: string;
   width: number;
@@ -144,9 +177,11 @@ export function JobShot({
   alt: string;
   caption?: string;
   className?: string;
+  refId?: string;
 }) {
   return (
-    <figure className={cn("min-w-0", className)}>
+    <figure id={refId} className={cn("relative min-w-0 scroll-mt-24", className)}>
+      {refId ? <RefTag id={refId} /> : null}
       <div className="overflow-hidden rounded-xl bg-void ring-1 ring-line-g">
         <Image src={src} width={width} height={height} alt={alt} className="block h-auto w-full" />
       </div>
@@ -208,9 +243,18 @@ export function JobPoints({ items }: { items: { title: string; body: ReactNode }
  * A code figure: rounded, char ground, clean mono. No title bar, no chrome —
  * one quiet caption under it if the commands need naming.
  */
-export function JobCodeFigure({ caption, children }: { caption?: string; children: ReactNode }) {
+export function JobCodeFigure({
+  caption,
+  children,
+  refId,
+}: {
+  caption?: string;
+  children: ReactNode;
+  refId?: string;
+}) {
   return (
-    <figure className="min-w-0">
+    <figure id={refId} className="relative min-w-0 scroll-mt-24">
+      {refId ? <RefTag id={refId} /> : null}
       <div className="overflow-x-auto rounded-xl bg-char px-6 py-5 font-sigil text-[13px] leading-7 text-bone">
         {children}
       </div>
@@ -227,7 +271,7 @@ export function JobCodeFigure({ caption, children }: { caption?: string; childre
  */
 export function JobStart({ heading }: { heading: string }) {
   return (
-    <JobSection>
+    <JobSection refId="start">
       <div className="mx-auto w-full max-w-3xl rounded-2xl bg-char px-7 py-10 sm:px-12 sm:py-12">
         <h2 className={H2_CLASS}>{heading}</h2>
         <InstallOneLiner className="mt-8 rounded-lg border-line-strong" />
@@ -254,13 +298,18 @@ export function JobStart({ heading }: { heading: string }) {
 function FaqQuiet({ faq }: { faq: JobFaqItem[] }) {
   if (faq.length === 0) return null;
   return (
-    <JobSection>
+    <JobSection refId="faq">
       <JobProse>
         <h2 className={H2_CLASS}>Questions</h2>
         <dl className="mt-10 space-y-9">
-          {faq.map((item) => (
+          {faq.map((item, index) => (
             <div key={item.q}>
-              <dt className="mb-1.5 text-[16px] leading-7 font-semibold text-bone">{item.q}</dt>
+              <dt className="mb-1.5 text-[16px] leading-7 font-semibold text-bone">
+                {SHOW_REFS ? (
+                  <span className="mr-2 font-sigil text-[11px] text-hellfire">Q{index + 1}</span>
+                ) : null}
+                {item.q}
+              </dt>
               <dd className="text-[15px] leading-7">{item.a}</dd>
             </div>
           ))}
@@ -274,7 +323,7 @@ function FaqQuiet({ faq }: { faq: JobFaqItem[] }) {
 function RelatedQuiet({ related }: { related: JobRelatedLink[] }) {
   if (related.length === 0) return null;
   return (
-    <JobSection className="pb-24 sm:pb-32">
+    <JobSection refId="related" className="pb-24 sm:pb-32">
       <JobProse>
         <h2 className={H2_CLASS}>Related</h2>
         <ul className="mt-8 space-y-4">
@@ -312,7 +361,8 @@ function HeroInk({
   ink: JobHeroInk;
 }) {
   return (
-    <header className="relative isolate overflow-hidden">
+    <header id="hero" className="relative isolate scroll-mt-24 overflow-hidden">
+      <RefTag id="hero" />
       <div aria-hidden className="absolute inset-0">
         <HeroInkVideo video={ink.video} poster={ink.poster} />
         <Image

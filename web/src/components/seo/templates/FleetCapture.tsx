@@ -1,4 +1,5 @@
 import Image from "next/image";
+import { RefTag } from "@/components/seo/templates/JobPage";
 
 /*
  * The one product capture a job page shows: a real workspace recorded from
@@ -15,9 +16,10 @@ const HEIGHT = 1020;
 const ALT =
   "The spawnd app: a sidebar of workspaces and hosts beside a grid of live terminal sessions running CLI agents across three machines, switching between workspaces";
 
-export function FleetCapture({ caption }: { caption: string }) {
+export function FleetCapture({ caption, refId }: { caption: string; refId?: string }) {
   return (
-    <figure className="min-w-0">
+    <figure id={refId} className="relative min-w-0 scroll-mt-24">
+      {refId ? <RefTag id={refId} /> : null}
       <div className="overflow-hidden rounded-xl bg-void ring-1 ring-line-g">
         {/* Motion-safe: the recording. Reduced motion: the identical still. */}
         <video
