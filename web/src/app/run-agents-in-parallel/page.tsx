@@ -191,7 +191,7 @@ export default function RunAgentsInParallelPage() {
           </p>
         </JobProse>
         <div className="mx-auto mt-12 w-full max-w-5xl sm:mt-14">
-          <FleetCapture caption="Three workspaces across three machines — switching is a click, and nothing stops." />
+          <FleetCapture caption="A workspace per project — switching is a click, and nothing stops." />
         </div>
       </JobSection>
 
@@ -230,7 +230,7 @@ export default function RunAgentsInParallelPage() {
           media={
             <JobShot
               src="/product/features/attention.png"
-              width={1408}
+              width={1930}
               height={1320}
               alt="A Claude Code session holding a permission prompt: the tile is marked and the workspace row carries an amber badge"
               caption="agent.awaiting_input: the tile, the tab, and the workspace row all mark it."
@@ -287,15 +287,15 @@ export default function RunAgentsInParallelPage() {
             <div className="space-y-6">
               <JobShot
                 src="/product/features/launcher.png"
-                width={900}
-                height={960}
+                width={736}
+                height={804}
                 alt="The session launcher: shell, claude-code, codex, opencode, aider, and a file explorer"
                 caption="The launcher: agents as visible commands."
               />
               <JobShot
                 src="/product/features/host-picker.png"
-                width={1120}
-                height={560}
+                width={560}
+                height={660}
                 alt="The host picker listing three machines, all online"
                 caption="Any pane, on any machine you own."
               />
@@ -332,10 +332,10 @@ export default function RunAgentsInParallelPage() {
         <div className="mx-auto mt-12 w-full max-w-5xl">
           <JobShot
             src="/product/fleet-close.png"
-            width={3080}
-            height={1900}
-            alt="The workspace grid up close: six live sessions across a storefront, a dashboard, a blog, and an API"
-            caption="The grid, up close: one afternoon across four projects."
+            width={2540}
+            height={1920}
+            alt="The storefront workspace up close: the agent holding an edit, the cart tests, the dev server, and the diff"
+            caption="One project’s workspace, up close: the agent, its tests, the dev server, the diff."
           />
         </div>
       </JobSection>
