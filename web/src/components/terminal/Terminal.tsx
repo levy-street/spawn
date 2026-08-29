@@ -27,6 +27,7 @@ import {
 import { ConnectingOverlay } from "@/components/terminal/ConnectingOverlay";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
 import { PostRenderLiveWriteBuffer } from "@/components/terminal/live-write-buffer";
+import { openTerminalLink } from "@/components/terminal/terminal-link";
 import { type UploadTrack, uploadRatio } from "@/components/terminal/upload-progress";
 import { UploadProgressBar } from "@/components/terminal/upload-progress-bar";
 import { useSessionSocket } from "@/components/terminal/useSessionSocket";
@@ -1473,6 +1474,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (!terminalViewportRef.current || !terminalSurfaceRef.current || !containerRef.current) {
       return;
     }
+    const activateTerminalLink = (_event: MouseEvent, uri: string): void => {
+      openTerminalLink(uri);
+    };
     const term = new XTerm({
       ...XTERM_EMULATION_OPTIONS,
       cursorBlink: true,
@@ -1486,9 +1490,10 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
       scrollOnUserInput: true,
       smoothScrollDuration: 0,
       theme: { ...terminalTheme(getResolvedTheme()) },
+      linkHandler: { activate: activateTerminalLink },
     });
     const fit = new FitAddon();
-    const links = new WebLinksAddon();
+    const links = new WebLinksAddon(activateTerminalLink);
     const clipboard = new ClipboardAddon();
     const serialize = new SerializeAddon();
     term.loadAddon(fit);
