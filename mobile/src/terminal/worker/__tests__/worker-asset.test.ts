@@ -8,9 +8,15 @@ describe("offline terminal worker", () => {
     expect(TERMINAL_WORKER_HTML).not.toMatch(/<link[^>]+href=/i);
   });
 
-  test("forwards xterm links through the native bridge", () => {
+  test("forwards plain-text and OSC 8 xterm links through the native bridge", () => {
     expect(TERMINAL_WORKER_HTML).toContain(
-      'new WebLinksAddon.WebLinksAddon((_event, uri) => api.post({ type: "link", url: uri }))',
+      'const forwardTerminalLink = (_event, uri) => api.post({ type: "link", url: uri })',
+    );
+    expect(TERMINAL_WORKER_HTML).toContain(
+      "linkHandler: { activate: forwardTerminalLink }",
+    );
+    expect(TERMINAL_WORKER_HTML).toContain(
+      "new WebLinksAddon.WebLinksAddon(forwardTerminalLink)",
     );
   });
 
