@@ -1,5 +1,61 @@
+import { type MenuAnchor, type MenuPlacement, placeMenu } from "@/components/ui/menu-position";
 import type { HostDirEntry, HostDirList } from "@/lib/hostControl";
 import { normalizeAbsolutePath, parentDir, trimTrailingSlash } from "@/lib/paths";
+
+/** Gutter the centred panel keeps from the viewport edge — `placeMenu`'s own. */
+const PANEL_MARGIN = 8;
+
+/**
+ * Where the picker panel goes.
+ *
+ * Anchored like a menu when it has a control to hang off; centred in the
+ * viewport when it has none. The third case is the one that earns this
+ * function: an anchor that is an *area* rather than a control — the grid's
+ * "Add a window" opening can be most of the canvas — leaves `placeMenu` no
+ * side worth having, and its cap squashed the panel into the sliver above the
+ * opening: a breadcrumb row with the whole browser crushed out of it. A panel
+ * that cannot get at least half its preferred height beside its anchor is
+ * better off centred over it.
+ */
+export function placePickerPanel({
+  anchor,
+  width,
+  height,
+  preferredHeight,
+  viewportWidth,
+  viewportHeight,
+}: {
+  /** The control the panel hangs off, or null to centre. */
+  anchor: MenuAnchor | null;
+  /** The panel's current rendered size. */
+  width: number;
+  height: number;
+  /** What the panel wants to be — the yardstick squashing is measured by. */
+  preferredHeight: number;
+  viewportWidth: number;
+  viewportHeight: number;
+}): MenuPlacement {
+  if (anchor) {
+    const placed = placeMenu({
+      anchor,
+      menuWidth: width,
+      menuHeight: height,
+      align: "start",
+      viewportWidth,
+      viewportHeight,
+    });
+    if (placed.maxHeight >= preferredHeight / 2) return placed;
+  }
+  return {
+    position: "fixed",
+    left: Math.max(PANEL_MARGIN, (viewportWidth - width) / 2),
+    top: Math.max(PANEL_MARGIN, (viewportHeight - height) / 2),
+    maxHeight: viewportHeight - PANEL_MARGIN * 2,
+    maxWidth: viewportWidth - PANEL_MARGIN * 2,
+    // Nothing usable to grow out of, so it grows from its own middle.
+    transformOrigin: "center",
+  };
+}
 
 export function joinDirectory(parent: string, child: string): string {
   return normalizeAbsolutePath(`${trimTrailingSlash(parent)}/${child}`);

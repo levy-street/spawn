@@ -15,7 +15,7 @@ import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { type MenuPlacement, measureMenu, placeMenu } from "@/components/ui/menu-position";
+import { type MenuPlacement, measureMenu } from "@/components/ui/menu-position";
 import { useHostControl } from "@/hooks/useHostControl";
 import type { Host } from "@/lib/api";
 import { HostControlError } from "@/lib/hostControl";
@@ -30,6 +30,7 @@ import {
   joinDirectory,
   listAllEntries,
   parentWithinHome,
+  placePickerPanel,
   visibleDirectories,
 } from "./folder-picker-helpers";
 
@@ -181,8 +182,10 @@ export function FolderPicker({
 
   // Anchored like a menu, with the same viewport-aware placement: the panel is
   // large, so which side it opens to matters more here than anywhere else.
-  // Without an anchor — opened from a cascade that has already closed, so there
-  // is no control left to hang off — it centres instead.
+  // `placePickerPanel` centres it without an anchor — opened from a cascade
+  // that has already closed, so there is no control left to hang off — and
+  // over an anchor too big to leave it a usable side, which is what the
+  // grid's "Add a window" opening is: an area, not a control.
   useLayoutEffect(() => {
     if (!open) {
       setCoords(null);
@@ -190,25 +193,12 @@ export function FolderPicker({
     }
     const place = () => {
       const { width, height } = measureMenu(panelRef.current, PANEL_WIDTH);
-      const anchor = anchorRef?.current?.getBoundingClientRect();
-      if (!anchor) {
-        setCoords({
-          position: "fixed",
-          left: Math.max(8, (window.innerWidth - width) / 2),
-          top: Math.max(8, (window.innerHeight - height) / 2),
-          maxHeight: window.innerHeight - 16,
-          maxWidth: window.innerWidth - 16,
-          // Nothing to grow out of, so it grows from its own middle.
-          transformOrigin: "center",
-        });
-        return;
-      }
       setCoords(
-        placeMenu({
-          anchor,
-          menuWidth: width,
-          menuHeight: height,
-          align: "start",
+        placePickerPanel({
+          anchor: anchorRef?.current?.getBoundingClientRect() ?? null,
+          width,
+          height,
+          preferredHeight: PANEL_HEIGHT,
           viewportWidth: window.innerWidth,
           viewportHeight: window.innerHeight,
         }),
