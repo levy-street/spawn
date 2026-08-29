@@ -10,10 +10,7 @@ function openBlankWindow(): TerminalLinkWindow | null {
 }
 
 /** Opens terminal-authored links without exposing the current page as an opener. */
-export function openTerminalLink(
-  url: string,
-  openWindow: OpenBlankWindow = openBlankWindow,
-): void {
+export function openTerminalLink(url: string, openWindow: OpenBlankWindow = openBlankWindow): void {
   try {
     const protocol = new URL(url).protocol;
     if (protocol !== "https:" && protocol !== "http:") return;
@@ -26,8 +23,7 @@ export function openTerminalLink(
   try {
     openedWindow.opener = null;
   } catch {
-    // Some embedded browsers expose a read-only opener; navigation is still safe
-    // in the regular browser path where the property was cleared successfully.
+    return;
   }
   openedWindow.location.href = url;
 }
