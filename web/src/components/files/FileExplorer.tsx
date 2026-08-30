@@ -38,6 +38,7 @@ import {
 import { FileIcon } from "@/components/files/file-icon";
 import { FilePreviewCard } from "@/components/files/file-preview-card";
 import { FileViewerDialog } from "@/components/files/file-viewer-dialog";
+import { type PreviewPlacement, previewPlacement } from "@/components/files/preview-placement";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -47,7 +48,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useHoverIntent } from "@/components/ui/hover-intent";
 import {
-  type MenuAnchor,
   type MenuPlacement,
   measureMenu,
   placeMenu,
@@ -354,30 +354,28 @@ export const FileExplorer = forwardRef<
     return entryRows.find((row) => row.entry.path === path)?.entry ?? null;
   }, [hover.value, entryRows]);
 
-  // The anchor deliberately mixes two rects: the row supplies the vertical
-  // extent so the card tracks what it describes, and the panel supplies the
-  // horizontal edges so it does not slide sideways as the pointer moves down.
-  const [hoverAnchor, setHoverAnchor] = useState<MenuAnchor | null>(null);
+  // Where the card hangs from, and whether it is lying over the panel to get
+  // there — `previewPlacement` owns both, from the row's box and the panel's.
+  const [hoverPlacement, setHoverPlacement] = useState<PreviewPlacement | null>(null);
   useLayoutEffect(() => {
     const path = hover.value?.path;
     const container = containerRef.current;
     if (!path || !container) {
-      setHoverAnchor(null);
+      setHoverPlacement(null);
       return;
     }
     const row = container.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`);
     if (!row) {
-      setHoverAnchor(null);
+      setHoverPlacement(null);
       return;
     }
-    const rowRect = row.getBoundingClientRect();
-    const panel = container.getBoundingClientRect();
-    setHoverAnchor({
-      top: rowRect.top,
-      bottom: rowRect.bottom,
-      left: panel.left,
-      right: panel.right,
-    });
+    setHoverPlacement(
+      previewPlacement(
+        row.getBoundingClientRect(),
+        container.getBoundingClientRect(),
+        window.innerWidth,
+      ),
+    );
   }, [hover.value]);
 
   /**
@@ -1333,12 +1331,14 @@ export const FileExplorer = forwardRef<
 
       {/* Hover preview. Anchored to the panel's edges but the row's vertical
           extent, so it tracks the row without sliding sideways as the pointer
-          runs down the list. */}
+          runs down the list — and pinned to the right when it is lying over
+          the panel, where a flip would carry it onto the sidebar. */}
       <Popover
         open={hoverEntry !== null}
-        anchor={hoverAnchor}
+        anchor={hoverPlacement?.anchor ?? null}
         side="right"
         align="start"
+        flip={!hoverPlacement?.overlay}
         interactive
         id="file-preview-card"
         ariaLabel={hoverEntry ? `${hoverEntry.name} preview` : undefined}

@@ -3,9 +3,11 @@
 import { Loader2, Maximize2 } from "lucide-react";
 import { formatSize } from "@/components/files/FileExplorer";
 import { FileIcon } from "@/components/files/file-icon";
+import { PREVIEW_CARD_WIDTH_PX } from "@/components/files/preview-placement";
 import {
   CodeLines,
   ImagePreview,
+  MarkdownPreview,
   MetadataCard,
   previewErrorNote,
 } from "@/components/files/preview-renderers";
@@ -49,7 +51,10 @@ export function FilePreviewCard({
   const relativeTime = formatWhen(entry.modified_at);
 
   return (
-    <div className="w-[34rem] max-w-[min(34rem,calc(100vw-2rem))]">
+    // Width from the constant the explorer measures its panel against, so the
+    // two cannot drift; `max-w-full` is what lets the popover's own cap shrink
+    // the card when it is lying over a panel that has less room than that.
+    <div style={{ width: PREVIEW_CARD_WIDTH_PX }} className="max-w-full">
       <div className="flex items-center gap-2 border-b border-popover-border px-3 py-2">
         <FileIcon
           name={entry.name}
@@ -145,6 +150,15 @@ function PreviewBody({
         }
       />
     );
+  }
+
+  // Set the same way the viewer sets it. A glance at a README is a glance at
+  // the document, not at its punctuation — and a card that showed the source
+  // where the dialog one keystroke later shows headings and lists reads as two
+  // different files. Everything heavier stays the viewer's: this card renders
+  // a poster where the dialog runs a player.
+  if (info.kind === "markdown" && preview.text !== null) {
+    return <MarkdownPreview text={preview.text} compact />;
   }
 
   if (isTextKind(info.kind) && preview.text !== null) {
