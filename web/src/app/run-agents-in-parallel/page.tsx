@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import Link from "next/link";
 import { FleetCapture } from "@/components/seo/templates/FleetCapture";
 import {
@@ -26,6 +26,13 @@ const TITLE = "Run multiple Claude Code sessions in parallel";
 const DESCRIPTION =
   "How to run several Claude Code sessions at once — the worktree-and-panes setup, where it breaks, and how to manage the whole fleet from one place.";
 const PATH = "/run-agents-in-parallel";
+
+// Marketing pages let readers zoom; the app's locked viewport stays app-side.
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  themeColor: "#000000",
+};
 
 export const metadata: Metadata = {
   title: TITLE,
@@ -113,7 +120,7 @@ export default function RunAgentsInParallelPage() {
         title: { plain: "Run multiple Claude Code sessions", accent: "in parallel" },
         sub: "How to run several coding agents at once — the setup that gets you there, and the management problem that shows up right after.",
         date: "spawnd · August 2026",
-        ink: { video: "/brand/ink/grid-ink.mp4", poster: "/brand/ink/grid-ink.png" },
+        ink: { video: "/brand/ink/grid-ink.mp4", poster: "/brand/ink/grid-ink-poster.webp" },
       }}
       faq={FAQ}
       related={RELATED}

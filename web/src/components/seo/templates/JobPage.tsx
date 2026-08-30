@@ -1,7 +1,9 @@
 import Image from "next/image";
 import Link from "next/link";
 import type { ReactNode } from "react";
-import { Colophon, Masthead } from "@/components/brand/press";
+import { preload } from "react-dom";
+import { Colophon, GITHUB_URL } from "@/components/brand/press";
+import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { InstallOneLiner } from "@/components/seo/InstallOneLiner";
 import { HeroInkVideo } from "@/components/seo/templates/HeroInkVideo";
 import { cn } from "@/lib/utils";
@@ -183,7 +185,14 @@ export function JobShot({
     <figure id={refId} className={cn("relative min-w-0 scroll-mt-24", className)}>
       {refId ? <RefTag id={refId} /> : null}
       <div className="overflow-hidden rounded-xl bg-void ring-1 ring-line-g">
-        <Image src={src} width={width} height={height} alt={alt} className="block h-auto w-full" />
+        <Image
+          src={src}
+          width={width}
+          height={height}
+          alt={alt}
+          sizes="(min-width: 1024px) 32rem, 100vw"
+          className="block h-auto w-full"
+        />
       </div>
       {caption ? (
         <figcaption className="mt-3 text-[13px] leading-6 text-ash">{caption}</figcaption>
@@ -349,6 +358,52 @@ function RelatedQuiet({ related }: { related: JobRelatedLink[] }) {
  * three text elements only — a small grey date line, the sentence-case H1,
  * and one subheading sentence. No breadcrumb UI, no CTAs.
  */
+/**
+ * The masthead for SEO pages: same chrome as the pressroom's, minus the
+ * session probe — a marketing page greets strangers, and a 401 in the
+ * console is a poor greeting. Server-rendered, zero client JS.
+ */
+function MastheadStatic() {
+  return (
+    <header className="sticky top-0 z-40 border-line-g border-b bg-void/85 backdrop-blur-md">
+      <nav className="mx-auto flex w-full max-w-[1440px] items-center justify-between gap-4 px-5 py-4 font-sigil text-[11px] tracking-[0.22em] uppercase sm:grid sm:grid-cols-[1fr_auto_1fr] sm:px-8 sm:text-[12px]">
+        <div className="hidden items-center gap-7 sm:flex sm:gap-10">
+          <Link href="/security" className="text-ash transition-colors hover:text-bone">
+            Security
+          </Link>
+          <a
+            href={GITHUB_URL}
+            target="_blank"
+            rel="noreferrer"
+            className="text-ash transition-colors hover:text-bone"
+          >
+            Open&nbsp;source
+          </a>
+        </div>
+        <Link href="/" aria-label="spawnd home" className="flex items-center gap-2 text-hellfire">
+          <span className="block size-7">
+            <Trident className="size-full" />
+          </span>
+          <span className="hidden sm:block">
+            <Wordmark aria-hidden className="h-4" />
+          </span>
+        </Link>
+        <div className="flex items-center justify-end gap-7 sm:gap-10">
+          <Link
+            href="/login"
+            className="hidden text-ash transition-colors hover:text-bone sm:inline"
+          >
+            Log&nbsp;in
+          </Link>
+          <Link href="/signup" className="text-ember transition-colors hover:text-hellfire">
+            Sign&nbsp;up&nbsp;→
+          </Link>
+        </div>
+      </nav>
+    </header>
+  );
+}
+
 function HeroInk({
   title,
   sub,
@@ -360,6 +415,7 @@ function HeroInk({
   date: string;
   ink: JobHeroInk;
 }) {
+  preload(ink.poster, { as: "image", fetchPriority: "high" });
   return (
     <header id="hero" className="relative isolate scroll-mt-24 overflow-hidden">
       <RefTag id="hero" />
@@ -424,7 +480,7 @@ export function JobPage({
   return (
     <main className="grimoire min-h-vv overflow-x-clip">
       <StructuredData crumbs={crumbs} pageName={pageName} canonicalPath={canonicalPath} faq={faq} />
-      <Masthead />
+      <MastheadStatic />
       <HeroInk title={hero.title} sub={hero.sub} date={hero.date} ink={hero.ink} />
       {children}
       <FaqQuiet faq={faq} />
