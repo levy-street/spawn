@@ -26,6 +26,10 @@ const TITLE = "Run multiple Claude Code sessions in parallel";
 const DESCRIPTION =
   "How to run several Claude Code sessions at once — the worktree-and-panes setup, where it breaks, and how to manage the whole fleet from one place.";
 const PATH = "/run-agents-in-parallel";
+const OG_IMAGE = "/og/run-agents-in-parallel.jpg";
+// Kept honest: when the page shipped, and when its content last changed.
+const DATE_PUBLISHED = "2026-08-27";
+const DATE_MODIFIED = "2026-08-30";
 
 // Marketing pages let readers zoom; the app's locked viewport stays app-side.
 export const viewport: Viewport = {
@@ -47,11 +51,15 @@ export const metadata: Metadata = {
     url: PATH,
     siteName: "spawnd",
     type: "article",
+    publishedTime: DATE_PUBLISHED,
+    modifiedTime: DATE_MODIFIED,
+    images: [{ url: OG_IMAGE, width: 2400, height: 1260, alt: TITLE }],
   },
   twitter: {
     card: "summary_large_image",
     title: TITLE,
     description: DESCRIPTION,
+    images: [OG_IMAGE],
   },
 };
 
@@ -127,6 +135,13 @@ export default function RunAgentsInParallelPage() {
       }}
       faq={FAQ}
       related={RELATED}
+      article={{
+        headline: TITLE,
+        description: DESCRIPTION,
+        image: OG_IMAGE,
+        datePublished: DATE_PUBLISHED,
+        dateModified: DATE_MODIFIED,
+      }}
     >
       <JobSection refId="s1" className="pt-20 sm:pt-28">
         <JobProse>

@@ -103,9 +103,12 @@ the registry test enforces a denylist.
 **Structured data (JSON-LD, validated with Google's Rich Results Test):**
 - Site-wide: `Organization` + `SoftwareApplication` (on `/` and hubs).
 - All pages: `BreadcrumbList` (root → hub → page).
-- Q&A sections: `FAQPage`. Guides: `HowTo` + `Article` with
-  `datePublished`/`dateModified` kept honest. Comparisons: no `Review` schema
-  (we are not a neutral reviewer); plain content.
+- Q&A sections: `FAQPage`. Dated editorial pages (jobs, guides): `Article`;
+  guides add `HowTo`. `datePublished`/`dateModified` kept honest. Comparisons:
+  no `Review` schema (we are not a neutral reviewer); plain content.
+  Expectation check: Google no longer shows FAQ rich results for ordinary
+  sites and retired HowTo rich results entirely — this markup is for
+  machine-readability (including AI answers), not SERP decoration.
 
 **Content & semantics:**
 - Exactly one `<h1>`, primary phrase in title + H1 + first ~100 words, proper
@@ -239,7 +242,7 @@ shared rail and hairline borders. Reference implementation:
 | device | phone pages, iPad, Chromebook | phone-frame terminal vignette (an agent moment: permission prompt, diff) | Breadcrumb, FAQ | new |
 | vibe | vibe row | device template base, softer chrome; jargon-free register enforced editorially | Breadcrumb, FAQ | new (variant) |
 | machine | machine row | outbound-only network diagram | Breadcrumb, FAQ | new |
-| job | job pages | workspace-grid vignette (the parallel fleet, live) | Breadcrumb, FAQ | new |
+| job | job pages | workspace-grid vignette (the parallel fleet, live) | Breadcrumb, FAQ, Article (honest dates) | flagship built (`/run-agents-in-parallel`) |
 | pillar | agent pillars | agent fact card + spoke rack | Breadcrumb, FAQ | new |
 | comparison | /spawnd-vs-* | ledger table + honest verdict | Breadcrumb, FAQ, **no Review** | exists; rework to copy bar |
 | listicle | /{x}-alternatives | ranked options w/ mini-ledgers, real tools listed honestly | Breadcrumb, FAQ | new |

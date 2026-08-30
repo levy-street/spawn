@@ -13,6 +13,14 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { url: `${ORIGIN}/`, changeFrequency: "weekly", priority: 1 },
     { url: `${ORIGIN}/security`, changeFrequency: "monthly", priority: 0.8 },
     { url: `${ORIGIN}/download`, changeFrequency: "monthly", priority: 0.8 },
+    // Flat-slug job pages (docs/SEO_TREE.md). The [slug] router will make
+    // this a map over the flat-page registry; until then, by hand.
+    {
+      url: `${ORIGIN}/run-agents-in-parallel`,
+      lastModified: new Date("2026-08-30"),
+      changeFrequency: "monthly",
+      priority: 0.9,
+    },
     { url: `${ORIGIN}/use`, changeFrequency: "weekly", priority: 0.6 },
     { url: `${ORIGIN}/for`, changeFrequency: "weekly", priority: 0.6 },
     { url: `${ORIGIN}/vs`, changeFrequency: "weekly", priority: 0.6 },
