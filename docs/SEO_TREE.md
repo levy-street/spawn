@@ -4,6 +4,8 @@ Source of truth for spawnd's organic-search catalogue. Registry entries
 (`web/src/lib/seo/`) are minted from this file, never ahead of it.
 Target: **~500 pages, designed before built.** Status: **DESIGN PHASE** —
 the 14 pages on `feat/seo-landing-pages` predate this bar and will be reworked.
+The build process and quality bar live in `docs/SEO_RUNBOOK.md`, with
+`/run-agents-in-parallel` as the canonical example.
 
 ## Strategy
 
