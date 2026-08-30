@@ -529,6 +529,7 @@
   }
 
   function initializeTerminal(message) {
+    const forwardTerminalLink = (_event, uri) => api.post({ type: "link", url: uri });
     const terminal = new Terminal({
       allowProposedApi: true,
       convertEol: false,
@@ -541,6 +542,7 @@
       scrollOnUserInput: true,
       smoothScrollDuration: 0,
       theme: { ...message.theme },
+      linkHandler: { activate: forwardTerminalLink },
     });
     const fitAddon = new FitAddon.FitAddon();
     const unicodeAddon = new Unicode11Addon.Unicode11Addon();
@@ -549,9 +551,7 @@
     terminal.loadAddon(unicodeAddon);
     terminal.unicode.activeVersion = "11";
     terminal.loadAddon(serializeAddon);
-    terminal.loadAddon(
-      new WebLinksAddon.WebLinksAddon((_event, uri) => api.post({ type: "link", url: uri })),
-    );
+    terminal.loadAddon(new WebLinksAddon.WebLinksAddon(forwardTerminalLink));
     terminal.loadAddon(
       new ClipboardAddon.ClipboardAddon(undefined, {
         readText: async () => String(await clipboardRequest("clipboard-read")),
