@@ -23,6 +23,7 @@
    * an iPad with a Magic Keyboard is the case that matters.
    */
   const APPLE_MODIFIERS = /^(Mac|iPad|iPhone|iPod)/.test(navigator.platform || "");
+  const DELETE = "\u007f";
   const state = {
     mode: null,
     scopeId: null,
@@ -192,6 +193,64 @@
     const textarea = document.querySelector(".xterm-helper-textarea");
     if (textarea && document.activeElement === textarea) textarea.blur();
     terminal.focus();
+  }
+
+  /**
+   * Turns an edit to xterm's hidden textarea into terminal keystrokes.
+   *
+   * Android keyboards can autocorrect by replacing any suffix of the textarea,
+   * even though that suffix has already gone to the PTY. xterm 5.5 assumes every
+   * IME change is an append and sends the entire accumulated textarea when that
+   * assumption fails. Rewind only the changed suffix, then type its replacement.
+   */
+  function textareaEditSequence(previous, next) {
+    const previousCharacters = Array.from(previous);
+    const nextCharacters = Array.from(next);
+    let unchanged = 0;
+    while (
+      unchanged < previousCharacters.length &&
+      unchanged < nextCharacters.length &&
+      previousCharacters[unchanged] === nextCharacters[unchanged]
+    ) {
+      unchanged += 1;
+    }
+    return (
+      DELETE.repeat(previousCharacters.length - unchanged) +
+      nextCharacters.slice(unchanged).join("")
+    );
+  }
+
+  /**
+   * Replaces xterm 5.5's lossy keyCode=229 fallback on Android WebView.
+   *
+   * This deliberately leaves xterm's normal composition path alone. It only
+   * substitutes `_handleAnyTextareaChanges`, which xterm calls for Android IME
+   * edits delivered outside a composition. The pending baseline is shared by
+   * overlapping events so fast input cannot make an earlier timer resend or
+   * drop its neighbour.
+   */
+  function installAndroidTextareaDiff(terminal) {
+    if (!/Android/i.test(navigator.userAgent)) return;
+    const textarea = terminal.textarea;
+    const compositionHelper = terminal._core?._compositionHelper;
+    if (!textarea || !compositionHelper) return;
+
+    let pendingPrevious = null;
+    let pendingTimer = null;
+    compositionHelper._handleAnyTextareaChanges = () => {
+      if (pendingPrevious === null) pendingPrevious = textarea.value;
+      if (pendingTimer !== null) clearTimeout(pendingTimer);
+      pendingTimer = setTimeout(() => {
+        pendingTimer = null;
+        const previous = pendingPrevious;
+        pendingPrevious = null;
+        if (previous === null || compositionHelper._isComposing) return;
+
+        const input = textareaEditSequence(previous, textarea.value);
+        compositionHelper._dataAlreadySent = "";
+        if (input.length > 0) terminal.input(input, true);
+      }, 0);
+    };
   }
 
   function configureTextarea() {
@@ -551,6 +610,7 @@
     document.addEventListener("selectionchange", () => {
       api.post({ type: "native-selection", active: documentSelection().length > 0 });
     });
+    installAndroidTextareaDiff(terminal);
     configureTextarea();
     applyTheme(message.theme);
     api.post({ type: "ready", renderer: state.renderer });
