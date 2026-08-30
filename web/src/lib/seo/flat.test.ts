@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { FLAT_PAGES, findFlatPage, flatPageHref } from "./flat";
+import { FLAT_PAGES, findFlatPage, flatPageContent, flatPageHref } from "./flat";
 
 /*
  * Invariants for the flat-slug catalogue — most importantly the denylist:
@@ -47,7 +47,7 @@ describe("flat-slug page catalogue", () => {
 
   it("keeps titles and descriptions inside search-snippet budgets", () => {
     for (const page of FLAT_PAGES) {
-      const { title, description } = page.comparison;
+      const { title, description } = flatPageContent(page);
       expect(title.length, `${page.slug} title: ${title}`).toBeLessThanOrEqual(60);
       expect(title.length, `${page.slug} title`).toBeGreaterThan(0);
       expect(description.length, `${page.slug} description`).toBeGreaterThanOrEqual(110);
@@ -57,9 +57,9 @@ describe("flat-slug page catalogue", () => {
     }
   });
 
-  it("keeps dates honest ISO and cards filled", () => {
+  it("keeps dates honest ISO, cards filled, and questions answered", () => {
     for (const page of FLAT_PAGES) {
-      const c = page.comparison;
+      const c = flatPageContent(page);
       expect(c.datePublished, page.slug).toMatch(/^\d{4}-\d{2}-\d{2}$/);
       expect(c.dateModified, page.slug).toMatch(/^\d{4}-\d{2}-\d{2}$/);
       expect(c.dateModified >= c.datePublished, `${page.slug} modified before published`).toBe(
@@ -67,11 +67,13 @@ describe("flat-slug page catalogue", () => {
       );
       expect(c.cardTitle, page.slug).not.toBe("");
       expect(c.cardBlurb, page.slug).not.toBe("");
+      expect(c.faq.length, page.slug).toBeGreaterThanOrEqual(2);
     }
   });
 
   it("gives every comparison its full editorial shape", () => {
     for (const page of FLAT_PAGES) {
+      if (page.template !== "comparison") continue;
       const c = page.comparison;
       expect(c.intro.paragraphs.length, page.slug).toBeGreaterThan(0);
       expect(c.framing.paragraphs.length, page.slug).toBeGreaterThan(0);
@@ -79,14 +81,32 @@ describe("flat-slug page catalogue", () => {
       expect(c.verdict.paragraphs.length, page.slug).toBeGreaterThan(0);
       expect(c.verdict.choose.spawnd.length, page.slug).toBeGreaterThan(0);
       expect(c.verdict.choose.other.items.length, page.slug).toBeGreaterThan(0);
-      expect(c.faq.length, page.slug).toBeGreaterThanOrEqual(2);
+    }
+  });
+
+  it("gives every device page real captures that exist on disk", () => {
+    for (const page of FLAT_PAGES) {
+      if (page.template !== "device") continue;
+      const d = page.device;
+      expect(d.intro.paragraphs.length, page.slug).toBeGreaterThan(0);
+      expect(d.shape.paragraphs.length, page.slug).toBeGreaterThan(0);
+      expect(d.away.paragraphs.length, page.slug).toBeGreaterThan(0);
+      const captures = [d.grid, ...d.moments.vignettes];
+      for (const vignette of captures) {
+        expect(vignette.alt.length, `${page.slug} ${vignette.src} alt`).toBeGreaterThan(20);
+        expect(
+          existsSync(join(PUBLIC_DIR, vignette.src)),
+          `${page.slug}: capture missing on disk: ${vignette.src}`,
+        ).toBe(true);
+      }
     }
   });
 
   it("cross-links only to site-relative pages, never to itself", () => {
     for (const page of FLAT_PAGES) {
-      expect(page.comparison.related.length, page.slug).toBeGreaterThan(0);
-      for (const link of page.comparison.related) {
+      const { related } = flatPageContent(page);
+      expect(related.length, page.slug).toBeGreaterThan(0);
+      for (const link of related) {
         expect(link.href.startsWith("/"), `${page.slug} → ${link.href}`).toBe(true);
         expect(link.href, `${page.slug} links to itself`).not.toBe(flatPageHref(page));
         // A single-segment href must be a real flat page or a static route.

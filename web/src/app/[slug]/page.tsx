@@ -1,7 +1,8 @@
 import type { Metadata, Viewport } from "next";
 import { notFound } from "next/navigation";
 import { ComparisonPage } from "@/components/seo/templates/ComparisonPage";
-import { FLAT_PAGES, findFlatPage } from "@/lib/seo/flat";
+import { DevicePage } from "@/components/seo/templates/DevicePage";
+import { FLAT_PAGES, findFlatPage, flatPageContent } from "@/lib/seo/flat";
 
 /*
  * The flat-slug router (docs/SEO_TREE.md URL policy): every landing page is
@@ -35,27 +36,27 @@ export async function generateMetadata({
   const { slug } = await params;
   const page = findFlatPage(slug);
   if (!page) return {};
-  const { comparison } = page;
+  const content = flatPageContent(page);
   const path = `/${page.slug}`;
   const ogImage = `/og/${page.slug}.jpg`;
   return {
-    title: comparison.title,
-    description: comparison.description,
+    title: content.title,
+    description: content.description,
     alternates: { canonical: path },
     openGraph: {
-      title: comparison.title,
-      description: comparison.description,
+      title: content.title,
+      description: content.description,
       url: path,
       siteName: "spawnd",
       type: "article",
-      publishedTime: comparison.datePublished,
-      modifiedTime: comparison.dateModified,
-      images: [{ url: ogImage, width: 2400, height: 1260, alt: comparison.title }],
+      publishedTime: content.datePublished,
+      modifiedTime: content.dateModified,
+      images: [{ url: ogImage, width: 2400, height: 1260, alt: content.title }],
     },
     twitter: {
       card: "summary_large_image",
-      title: comparison.title,
-      description: comparison.description,
+      title: content.title,
+      description: content.description,
       images: [ogImage],
     },
   };
@@ -68,5 +69,7 @@ export default async function FlatSlugPage({ params }: { params: Promise<{ slug:
   switch (page.template) {
     case "comparison":
       return <ComparisonPage entry={page.comparison} />;
+    case "device":
+      return <DevicePage entry={page.device} />;
   }
 }

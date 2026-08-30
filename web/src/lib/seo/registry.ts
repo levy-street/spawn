@@ -1,5 +1,5 @@
 import { AGENTS } from "./agents";
-import { findFlatPage, flatPageCard } from "./flat";
+import { FLAT_FAMILY_TITLES, findFlatPage, flatPageCard } from "./flat";
 import type { SeoFamily, SeoPage } from "./types";
 import { USE_CASES } from "./use-cases";
 
@@ -78,7 +78,12 @@ export function resolveRelatedCard(key: string): RelatedCard | undefined {
     const flat = findFlatPage(key.slice(1));
     if (!flat) return undefined;
     const card = flatPageCard(flat);
-    return { href: card.href, familyTitle: "Compared", title: card.title, blurb: card.blurb };
+    return {
+      href: card.href,
+      familyTitle: FLAT_FAMILY_TITLES[flat.template],
+      title: card.title,
+      blurb: card.blurb,
+    };
   }
   const page = findSeoPageByKey(key);
   if (!page) return undefined;

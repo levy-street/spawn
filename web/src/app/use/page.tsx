@@ -15,6 +15,12 @@ export default function UseIndexPage() {
             "The worktree-and-panes setup, where it honestly runs out, and how to manage the whole fleet from one place.",
           href: "/run-agents-in-parallel",
         },
+        {
+          title: "Claude Code on your phone",
+          blurb:
+            "The routes that work today, and the one where the phone becomes a console for sessions on your own machines.",
+          href: "/claude-code-on-your-phone",
+        },
       ]}
     />
   );

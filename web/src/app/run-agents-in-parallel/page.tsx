@@ -117,7 +117,7 @@ const RELATED = [
   {
     title: "Claude Code on your phone",
     blurb: "the device that answers the permission prompt",
-    href: "/use/claude-code-on-your-phone",
+    href: "/claude-code-on-your-phone",
   },
 ];
 

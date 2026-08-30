@@ -25,9 +25,51 @@ export interface LedgerRow {
   other: string;
 }
 
-export interface ComparisonProse {
+export interface FlatProse {
   heading: string;
   paragraphs: string[];
+}
+
+/** @deprecated alias kept while comparisons predate the generic name. */
+export type ComparisonProse = FlatProse;
+
+/** One phone-frame capture: a real session moment from the live app. */
+export interface DeviceVignette {
+  src: string;
+  alt: string;
+  caption: string;
+}
+
+/**
+ * One device page (the device template): teach-first intro, what spawnd
+ * makes of the device, the signature agent moments in phone frames, and
+ * the away-from-desk close. Captures are real sessions, per the runbook.
+ */
+export interface DeviceEntry {
+  slug: string;
+  title: string;
+  description: string;
+  datePublished: string;
+  dateModified: string;
+  hero: { plain: string; accent: string; sub: string };
+  /** Teach-first: the honest routes that exist without spawnd. */
+  intro: FlatProse;
+  /** What spawnd makes of the device. */
+  shape: FlatProse;
+  /** The whole app on the device — media for the shape section. */
+  grid: DeviceVignette;
+  /** The signature: two agent moments, side by side in phone frames. */
+  moments: {
+    heading: string;
+    lead: string;
+    vignettes: [DeviceVignette, DeviceVignette];
+  };
+  /** The away-from-desk close: persistence and attention. */
+  away: FlatProse;
+  faq: FlatFaq[];
+  related: FlatRelatedLink[];
+  cardTitle: string;
+  cardBlurb: string;
 }
 
 /**
@@ -70,8 +112,6 @@ export interface ComparisonEntry {
   cardBlurb: string;
 }
 
-export type FlatPage = {
-  template: "comparison";
-  slug: string;
-  comparison: ComparisonEntry;
-};
+export type FlatPage =
+  | { template: "comparison"; slug: string; comparison: ComparisonEntry }
+  | { template: "device"; slug: string; device: DeviceEntry };
