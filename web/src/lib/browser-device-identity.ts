@@ -26,6 +26,16 @@ export const BROWSER_DEVICE_IDENTITY_STORAGE_VERSION = 1;
 export const BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS = 32;
 export const BROWSER_DEVICE_IDENTITY_STORE_NAME = "device-identities";
 export const BROWSER_DEVICE_IDENTITY_DATABASE_NAME = "spawn-browser-device-identity";
+/**
+ * How stale a record's last-used stamp may get before a load refreshes it.
+ *
+ * The stamp exists only to order eviction, so it is written about as rarely as
+ * it can be while still telling recently-used identities from abandoned ones.
+ * Registration reconciles every 90 seconds on every open page; stamping each of
+ * those would be a write per page per minute for a value nothing reads that
+ * often.
+ */
+export const BROWSER_DEVICE_IDENTITY_TOUCH_INTERVAL_MS = 60 * 60_000;
 
 const CANONICAL_ACCOUNT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -33,6 +43,12 @@ const SELF_CHECK_SESSION_ID = "00000000-0000-4000-8000-000000000001";
 const SELF_CHECK_SCOPE_ID = "00000000-0000-4000-8000-000000000002";
 const SELF_CHECK_SDP = "v=0\r\ns=spawn-browser-device-identity-self-check\r\n";
 const RECORD_KEYS = ["accountId", "privateKey", "publicKey", "publicKeyWire", "version"] as const;
+/**
+ * Keys a record may carry but is never wrong to be without. Only the eviction
+ * stamp qualifies: it is a hint about ordering, not key material, so a record
+ * written before it existed stays perfectly valid (and sorts oldest).
+ */
+const OPTIONAL_RECORD_KEYS: ReadonlySet<string> = new Set(["lastUsedAt"]);
 const privateIdentityRecords = new WeakMap<BrowserDeviceIdentity, StoredDeviceIdentityV1>();
 
 interface StoredDeviceIdentityV1 {
@@ -41,6 +57,8 @@ interface StoredDeviceIdentityV1 {
   publicKey: CryptoKey;
   publicKeyWire: string;
   version: 1;
+  /** When this identity was last loaded or minted; absent on older records. */
+  lastUsedAt?: number;
 }
 
 export interface BrowserDeviceIdentity {
@@ -284,19 +302,33 @@ function assertCryptoKeyMetadata(
   }
 }
 
+/** Absent is fine; present has to be a real point in time. */
+function validLastUsedAt(value: unknown): boolean {
+  return value === undefined || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+}
+
+function lastUsedAt(record: unknown): number {
+  if (typeof record !== "object" || record === null) return 0;
+  const value = (record as { lastUsedAt?: unknown }).lastUsedAt;
+  return validLastUsedAt(value) && typeof value === "number" ? value : 0;
+}
+
 function assertStoredRecordShape(value: unknown, accountId: string): StoredDeviceIdentityV1 {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new BrowserDeviceIdentityError("corrupt_record", "stored identity is not a record");
   }
   const record = value as Partial<StoredDeviceIdentityV1>;
-  const keys = Object.keys(record).sort();
+  const keys = Object.keys(record)
+    .filter((key) => !OPTIONAL_RECORD_KEYS.has(key))
+    .sort();
   if (
     keys.length !== RECORD_KEYS.length ||
     RECORD_KEYS.some((key, index) => key !== keys[index]) ||
     record.version !== BROWSER_DEVICE_IDENTITY_STORAGE_VERSION ||
     record.accountId !== accountId ||
     typeof record.publicKeyWire !== "string" ||
-    record.publicKeyWire.length !== ED25519_PUBLIC_KEY_WIRE_CHARS
+    record.publicKeyWire.length !== ED25519_PUBLIC_KEY_WIRE_CHARS ||
+    !validLastUsedAt(record.lastUsedAt)
   ) {
     throw new BrowserDeviceIdentityError(
       "corrupt_record",
@@ -361,7 +393,61 @@ async function createCandidate(accountId: string): Promise<StoredDeviceIdentityV
     publicKey: keyPair.publicKey,
     publicKeyWire: await exportEd25519PublicKeyWire(keyPair.publicKey),
     version: BROWSER_DEVICE_IDENTITY_STORAGE_VERSION,
+    lastUsedAt: Date.now(),
   };
+}
+
+/**
+ * Free `room` slots by dropping the identities used longest ago.
+ *
+ * The cap is here so a browser cannot be made to hold unbounded key material.
+ * It was never meant to declare a browser finished, which is what it did:
+ * reaching it failed registration for good, on every account, with a message
+ * offering a reload that could not possibly help. A machine that signs into
+ * many accounts reaches it eventually, and a developer's — where every reset
+ * database mints another account — reaches it in a fortnight.
+ *
+ * Eviction costs the evicted account exactly what a removal already costs it:
+ * its next visit registers a fresh key and appears as an unapproved device,
+ * the seamless path registration already owns. The account being registered
+ * now is never a candidate — it has no record yet, which is why we are here.
+ *
+ * Records too damaged to read a stamp from sort oldest, so junk goes first.
+ */
+async function evictLeastRecentlyUsed(store: IDBObjectStore, room: number): Promise<number> {
+  const stored: unknown[] = await requestResult(store.getAll());
+  const ranked = stored
+    .map((record) => ({
+      accountId: (record as { accountId?: unknown }).accountId,
+      usedAt: lastUsedAt(record),
+    }))
+    .filter((entry): entry is { accountId: string; usedAt: number } => {
+      return typeof entry.accountId === "string";
+    })
+    // Oldest first, then by account so two identical stamps still evict in an
+    // order every tab agrees on.
+    .sort(
+      (left, right) => left.usedAt - right.usedAt || left.accountId.localeCompare(right.accountId),
+    )
+    .slice(0, room);
+  for (const entry of ranked) {
+    await requestResult(store.delete(entry.accountId));
+  }
+  return ranked.length;
+}
+
+/** Drop the oldest identities until this account's record has somewhere to go. */
+async function makeRoomForOneMore(store: IDBObjectStore): Promise<void> {
+  const count = await requestResult(store.count());
+  if (count < BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS) return;
+  const room = count - BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS + 1;
+  if ((await evictLeastRecentlyUsed(store, room)) >= room) return;
+  // Nothing evictable and no room: the store disagrees with itself. Refusing is
+  // the only honest answer left, and it is not a state a reload will change.
+  throw new BrowserDeviceIdentityError(
+    "capacity_exceeded",
+    `browser device identity storage is limited to ${BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS} accounts`,
+  );
 }
 
 async function addCandidateOrLoadWinner(
@@ -383,12 +469,9 @@ async function addCandidateOrLoadWinner(
       await completion;
       return winner;
     }
-    const count = await requestResult(store.count());
-    if (count >= BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS) {
-      const error = new BrowserDeviceIdentityError(
-        "capacity_exceeded",
-        `browser device identity storage is limited to ${BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS} accounts`,
-      );
+    try {
+      await makeRoomForOneMore(store);
+    } catch (error) {
       await abortTransaction(transaction, completion);
       throw error;
     }
@@ -423,12 +506,9 @@ async function replaceRecord(
     const store = transaction.objectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME);
     const previous = await requestResult(store.get(accountId));
     if (previous === undefined) {
-      const count = await requestResult(store.count());
-      if (count >= BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS) {
-        const error = new BrowserDeviceIdentityError(
-          "capacity_exceeded",
-          `browser device identity storage is limited to ${BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS} accounts`,
-        );
+      try {
+        await makeRoomForOneMore(store);
+      } catch (error) {
         await abortTransaction(transaction, completion);
         throw error;
       }
@@ -440,6 +520,35 @@ async function replaceRecord(
     await completion.catch(() => undefined);
     if (error instanceof BrowserDeviceIdentityError) throw error;
     throw storageFailure("browser device identity write failed");
+  }
+}
+
+/**
+ * Refresh this record's eviction stamp, at most once every touch interval.
+ *
+ * Best effort by design: the stamp orders eviction and nothing else, so a
+ * browser that cannot write it — a full disk, a tab that got there first — has
+ * a working identity all the same and must not be told otherwise.
+ */
+async function touchRecord(database: IDBDatabase, record: StoredDeviceIdentityV1): Promise<void> {
+  const now = Date.now();
+  if (now - lastUsedAt(record) < BROWSER_DEVICE_IDENTITY_TOUCH_INTERVAL_MS) return;
+  try {
+    const transaction = database.transaction(BROWSER_DEVICE_IDENTITY_STORE_NAME, "readwrite");
+    const completion = transactionResult(transaction);
+    const store = transaction.objectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME);
+    const current = await requestResult(store.get(record.accountId));
+    if (claimedPublicKeyWire(current) !== record.publicKeyWire) {
+      // Another tab replaced this identity between the read and here. Stamping
+      // the copy in hand would put the key it replaced back.
+      await abortTransaction(transaction, completion);
+      return;
+    }
+    await requestResult(store.put({ ...record, lastUsedAt: now }));
+    await completion;
+  } catch {
+    // The stamp is a hint about eviction order, never authority. Failing to
+    // write it changes nothing this call owes its caller.
   }
 }
 
@@ -797,7 +906,12 @@ export async function loadOrCreateBrowserDeviceIdentity(
   try {
     const stored = await getStoredRecord(database, accountId);
     if (stored !== undefined) {
-      return publicIdentity(await validateStoredRecord(stored, accountId));
+      const record = await validateStoredRecord(stored, accountId);
+      // Being loaded is what "used" means for an identity, and the stamp is
+      // what keeps an account in daily use from being evicted for one that was
+      // signed into once, months ago.
+      await touchRecord(database, record);
+      return publicIdentity(record);
     }
 
     // Key generation cannot be awaited inside an IndexedDB transaction: the
@@ -841,6 +955,7 @@ export async function adoptBrowserDeviceIdentity(
         publicKey,
         publicKeyWire: carried.publicKeyWire,
         version: BROWSER_DEVICE_IDENTITY_STORAGE_VERSION,
+        lastUsedAt: Date.now(),
       },
       accountId,
     );

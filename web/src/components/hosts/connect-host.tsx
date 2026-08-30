@@ -15,7 +15,10 @@ import {
   createHostPairApprovalProof,
   loadBrowserDeviceIdentity,
 } from "@/lib/browser-device-identity";
-import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
+import {
+  describeBrowserDeviceRegistrationFailure,
+  useBrowserDeviceRegistration,
+} from "@/lib/browser-device-registration";
 import {
   approveBrowserHostPin,
   type BrowserHostPinState,
@@ -972,6 +975,10 @@ export function HostApprovalForm({
 
   const deviceLabel =
     registration.data?.status === "ready" ? (registration.data.device.label ?? null) : null;
+  // What actually went wrong, so the one line on screen is worth reading: a
+  // browser that cannot make the key and one that lost a request need
+  // different things from the reader, and only one of them is a reload.
+  const registrationFailure = describeBrowserDeviceRegistrationFailure(registration.error);
   // Displayed fingerprint for this browser's own key, derived locally (mesh
   // B5) — the registration response carries the key alone.
   const readyBrowserKey =
@@ -1095,8 +1102,9 @@ export function HostApprovalForm({
       ) : null}
       {registration.isError && (
         <p className="text-sm text-destructive" role="alert">
-          This browser&apos;s identity registration failed, so it cannot approve hosts. Reload to
-          retry.
+          {registrationFailure.reason} It cannot approve hosts.
+          {registrationFailure.remedy === null ? "" : ` ${registrationFailure.remedy}`}
+          {registrationFailure.canRetry ? " Reload to retry." : ""}
         </p>
       )}
       {registration.data && registration.data.status !== "ready" && (

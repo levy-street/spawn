@@ -25,6 +25,7 @@ import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
 import { useDeviceCeremony } from "@/data/trust/ceremony";
 import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
+import { describeDeviceRegistrationFailure } from "@/data/trust/registration";
 import { haptics } from "@/lib/haptics";
 import { spacing, useTheme } from "@/theme";
 
@@ -73,6 +74,9 @@ export function DeviceApprovalCeremony({
   const signedInAs = me.data?.user.email ? ` as ${me.data.user.email}` : "";
   const phoneQuery = useRegisteredPhone(accountId);
   const phone = phoneQuery.data;
+  // Why this device has no identity, rather than the internal sentence that
+  // threw: only some of these causes answer a Try again.
+  const registrationFailure = describeDeviceRegistrationFailure(phoneQuery.error);
   const devices = useAccountDevices(phoneQuery.isSuccess);
   const endorsements = usePendingEndorsements(accountId ?? "", phone?.id ?? null);
   const approvals = useDeviceHostApprovals(true);
@@ -230,13 +234,14 @@ export function DeviceApprovalCeremony({
       {phase === "identity-blocked" ? (
         <View style={[styles.section, { gap: theme.space(3) }]}>
           <Text accessibilityRole="alert" color="destructive" variant="caption">
-            {phoneQuery.error instanceof Error
-              ? phoneQuery.error.message
-              : "Device registration failed."}
+            {registrationFailure.reason}
+            {registrationFailure.remedy === null ? "" : ` ${registrationFailure.remedy}`}
           </Text>
-          <Button onPress={() => void phoneQuery.refetch()} size="sm" variant="outline">
-            Try again
-          </Button>
+          {registrationFailure.canRetry ? (
+            <Button onPress={() => void phoneQuery.refetch()} size="sm" variant="outline">
+              Try again
+            </Button>
+          ) : null}
         </View>
       ) : null}
 

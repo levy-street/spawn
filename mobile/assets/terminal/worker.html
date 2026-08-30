@@ -274,6 +274,11 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
   const FLING_MAX_VELOCITY = 6;
   /** How much of the screen one synthesised page key is worth. */
   const PAGE_KEY_FRACTION = 0.5;
+  /**
+   * Whether ⌥ and ⌘ are on the hardware keyboard attached to this device —
+   * an iPad with a Magic Keyboard is the case that matters.
+   */
+  const APPLE_MODIFIERS = /^(Mac|iPad|iPhone|iPod)/.test(navigator.platform || "");
   const state = {
     mode: null,
     scopeId: null,
@@ -389,6 +394,27 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     if (scroll.atBottom) state.newOutputWhileAway = false;
     api.telemetry({ type: "scroll-state", scroll });
   };
+
+  /**
+   * The bytes a Mac keyboard's ⌥ or ⌘ arrow owes the shell, or null. The same
+   * table the browser app keeps in `web/src/lib/keyboard-chords.ts`, and for
+   * the same two reasons: xterm decides ⌥ from its own `isMac`, which is
+   * false on an iPad, so ⌥← comes out as the Windows spelling no shell here
+   * binds; and it drops every ⌘ chord unread, so the ends of the line were
+   * simply missing. `ESC b` / `ESC f` and Ctrl-A / Ctrl-E are what readline,
+   * zsh, fish and the TUI prompts people run all understand.
+   */
+  function appleArrowBytes(event) {
+    if (event.ctrlKey || event.shiftKey || event.altKey === event.metaKey) return null;
+    if (event.altKey) {
+      if (event.key === "ArrowLeft") return "\u001bb";
+      if (event.key === "ArrowRight") return "\u001bf";
+      return null;
+    }
+    if (event.key === "ArrowLeft") return "\u0001";
+    if (event.key === "ArrowRight") return "\u0005";
+    return null;
+  }
 
   function clipboardRequest(operation, text) {
     const requestId = `clipboard-${++state.clipboardSequence}`;
@@ -749,6 +775,21 @@ html,body,#terminal{position:fixed;inset:0;width:100%;height:100%;margin:0;paddi
     const container = document.getElementById("terminal");
     watchSurfaceSize(container);
     if (container) installTouchScroll(container);
+    terminal.attachCustomKeyEventHandler((event) => {
+      const arrow = APPLE_MODIFIERS ? appleArrowBytes(event) : null;
+      if (!arrow) return true;
+      // Suppress every event of the press, not just the keydown: returning
+      // false does not preventDefault on its own, and a second path through
+      // the same press would send the sequence twice.
+      if (event.type === "keydown") {
+        event.preventDefault();
+        if (api.sessionReady?.()) {
+          terminal.scrollToBottom();
+          api.sendPty?.(encoder.encode(arrow));
+        }
+      }
+      return false;
+    });
     terminal.onData((data) => {
       if (!api.sessionReady?.()) return;
       const filtered = data.replace(/\u001b\[(?:\?|>)[0-9;]*c/g, "");

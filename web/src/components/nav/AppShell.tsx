@@ -18,6 +18,7 @@ import { BrowserDeviceRegistrationStatus } from "@/components/auth/BrowserDevice
 import { HostPinUndeliveredAlerts } from "@/components/hosts/host-pin-undelivered-alerts";
 import { Wordmark } from "@/components/icons/BrandMark";
 import { Sidebar } from "@/components/nav/Sidebar";
+import { WorkspaceCarryOverlay } from "@/components/nav/workspace-carry";
 import { ProfileDialog } from "@/components/profile/ProfileDialog";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { DeviceApprovalPrompt } from "@/components/trust/DeviceApprovalPrompt";
@@ -289,6 +290,11 @@ export function AppShell({
           />
         </Drawer>
       )}
+      {/* One overlay for the whole app, not one per surface that can start a
+          carry: a workspace can be picked up from the rail, from the drawer's
+          copy of it, or off its own name in a split's tab strip, and all three
+          draw the same ghost over the same canvas. */}
+      <WorkspaceCarryOverlay />
       <ConfirmHost />
       <ToastHost />
       <SettingsDialog />

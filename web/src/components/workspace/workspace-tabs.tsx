@@ -84,7 +84,7 @@ import { FolderPicker } from "./folder-picker";
 import { NewSessionMenu } from "./new-session-menu";
 import { queryInPane, useOptionalPaneScope } from "./pane-scope";
 import { pendingLaunch } from "./pending-launch";
-import { type SplitChrome, SplitWorkspaceLabel, UnsplitButton } from "./split-chrome";
+import { type SplitChrome, SplitWorkspaceMenu, UnsplitButton } from "./split-chrome";
 import { useTabHome } from "./tab-home";
 import { type MergeDrop, type MergeRefusal, planMerge, WHOLE_CANVAS } from "./tab-merge";
 import { dockZoneAt, freeRects, wantsDuplicate } from "./workspace-grid-helpers";
@@ -1081,6 +1081,18 @@ export function WorkspaceTabs({
     if (name) saveTemplateM.mutate(name.slice(0, 128));
   };
 
+  /**
+   * Where to go once this workspace has been archived or deleted. Only the
+   * half the address bar is about has anywhere to be: the other half of a
+   * split is not the page you are on, and the arrangement it was in is
+   * dissolved by the workspace list refresh above, which leaves the workspace
+   * you were actually working in filling the window.
+   */
+  const leaveAfterRemoval = () => {
+    if (paneScope && !paneScope.routed) return;
+    router.replace("/app");
+  };
+
   const deleteWorkspace = async () => {
     const sessionCount = allTiles(workspace.layout).filter((tile) => !tile.widget).length;
     const accepted = await confirm({
@@ -1101,7 +1113,7 @@ export function WorkspaceTabs({
     }
     queryClient.invalidateQueries({ queryKey: ["workspaces"] });
     queryClient.invalidateQueries({ queryKey: ["sessions"] });
-    router.replace("/app");
+    leaveAfterRemoval();
   };
 
   const submitWorkspaceRename = (event?: FormEvent) => {
@@ -1157,7 +1169,7 @@ export function WorkspaceTabs({
     }
     queryClient.invalidateQueries({ queryKey: ["workspaces"] });
     queryClient.invalidateQueries({ queryKey: ["sessions"] });
-    router.replace("/app");
+    leaveAfterRemoval();
   };
 
   return (
@@ -1178,7 +1190,16 @@ export function WorkspaceTabs({
       className="flex h-11 shrink-0 items-end gap-1.5 overflow-x-auto bg-shell pr-1.5 pb-1.5"
     >
       {splitChrome && (
-        <SplitWorkspaceLabel name={splitChrome.workspaceName} icon={splitChrome.workspaceIcon} />
+        <SplitWorkspaceMenu
+          chrome={splitChrome}
+          onRename={() => {
+            setWorkspaceNameDraft(workspace.name);
+            setRenameWorkspaceOpen(true);
+          }}
+          onChangeIcon={() => setIconOpen(true)}
+          onArchive={() => void archiveWorkspace()}
+          onDelete={() => void deleteWorkspace()}
+        />
       )}
       {orderedTabs.map((tab) => {
         const active = tab.id === activeTabId;

@@ -13,14 +13,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import {
-  type PointerEvent as ReactPointerEvent,
-  type RefObject,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-import { createPortal } from "react-dom";
+import { type PointerEvent as ReactPointerEvent, useMemo, useState } from "react";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { LegionStrip } from "@/components/legion/LegionStrip";
 import { SidebarArchivedSection } from "@/components/nav/SidebarArchivedSection";
@@ -31,23 +24,15 @@ import {
   SidebarRowLabel,
   SidebarSearch,
   sidebarRowClass,
-  WorkspaceAvatar,
 } from "@/components/nav/sidebar-parts";
+import { createWorkspaceCarry, type WorkspaceCarry } from "@/components/nav/workspace-carry";
 import {
-  type Arrangement,
-  arrangementAfter,
   type DragMode,
-  type DropZone,
   dragModeAt,
-  dropZones,
-  type PaneTarget,
   pairRows,
   reorderShift,
   reorderTargetIndex,
   reorderWrites,
-  sideOf,
-  splitDropPlan,
-  zoneAt,
 } from "@/components/nav/workspace-drag";
 import { openProfile } from "@/components/profile/profile-dialog-store";
 import { openSettings } from "@/components/settings/settings-dialog-store";
@@ -61,73 +46,16 @@ import {
 import { toast } from "@/components/ui/toast";
 import { RailTooltip } from "@/components/ui/tooltip";
 import { NewWorkspaceMenu } from "@/components/workspace/new-workspace-menu";
-import { PANE_SCOPE_ATTR, paneRootAt } from "@/components/workspace/pane-scope";
 import { useDesktopShell } from "@/hooks/useDesktopShell";
 import { hosts, sessions, type Workspace, workspaces } from "@/lib/api";
 import { logout, useAuth } from "@/lib/auth";
-import { type SplitSide, splitStore, useSplit } from "@/lib/split-store";
+import { memberSide, splitStore, useSplit } from "@/lib/split-store";
 import { cn } from "@/lib/utils";
 import {
   filterWorkspacesByName,
   workspaceAttentionCount,
   workspaceLiveSessionCount,
 } from "@/lib/workspaces";
-
-/**
- * The halves of the window as they stand right now. Measured fresh whenever
- * the answer is used rather than cached with the drag: a split that has just
- * been opened is still widening, and a drop has to land in the window the
- * user can see rather than the one that was there when they picked the row up.
- */
-function measurePanes(): PaneTarget[] {
-  return Array.from(
-    document.querySelectorAll<HTMLElement>(`[${PANE_SCOPE_ATTR}]`),
-    (root): PaneTarget => {
-      // Copied edge by edge out of the DOMRect: it is handed to pure helpers
-      // that build new rects from it, and a DOMRect cannot be spread — its
-      // edges live on the prototype, so `{...rect}` is empty.
-      const { left, top, right, bottom } = root.getBoundingClientRect();
-      return {
-        side: root.dataset.splitSide === "secondary" ? "secondary" : "primary",
-        rect: { left, top, right, bottom },
-      };
-    },
-  );
-}
-
-/** A workspace row in flight, and the halves it may be released into. */
-interface CarriedWorkspace {
-  workspace: Workspace;
-  /**
-   * Where a release lands — and, drawn, the panels the preview is composed
-   * of. Deliberately the same rectangles for both: the boundary the pointer
-   * flips at has to be the boundary the user can see.
-   */
-  zones: DropZone[];
-  /**
-   * Every workspace that can appear in the preview: the one being carried,
-   * plus whichever are on screen now. One panel is rendered per member and
-   * then moved between halves, rather than panels being built and thrown away
-   * per arrangement — a panel that persists can travel, and travelling is what
-   * shows that two workspaces swapped rather than that one blinked.
-   */
-  cast: Workspace[];
-  /** What is on screen at the moment the carry begins. */
-  arrangement: Arrangement;
-  /**
-   * The row's resting box, with no drag applied. The travel is the ghost's
-   * transform and only its transform — folding it in here as well counted it
-   * twice, and the ghost pulled away from the cursor at double rate.
-   */
-  origin: { left: number; top: number; width: number; height: number };
-  /**
-   * The travel at the moment the carry began, rendered as the ghost's opening
-   * transform. `trackCarry` cannot reach the element until the commit after
-   * this one, so without it the ghost would draw one frame back at the row it
-   * came from and then jump to the pointer.
-   */
-  offset: { x: number; y: number };
-}
 
 export function Sidebar({
   pathname,
@@ -150,13 +78,6 @@ export function Sidebar({
   const inShell = useDesktopShell();
   const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
-  // Set only while a row is out on the canvas. Everything that changes on a
-  // per-frame basis inside a carry — the ghost's transform, where each preview
-  // panel sits — is written straight to the DOM through these refs, so React
-  // renders the overlay once per carry rather than once per pointer move.
-  const [carried, setCarried] = useState<CarriedWorkspace | null>(null);
-  const carryGhostRef = useRef<HTMLDivElement>(null);
-  const carryPreviewRef = useRef<HTMLDivElement>(null);
 
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
@@ -207,12 +128,12 @@ export function Sidebar({
   );
   const onlineHosts = (hostsQ.data ?? []).filter((host) => host.status === "online");
   const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
-  // The workspace beside the routed one. It is on screen just as much as the
-  // routed one is, so the rail has to say so — a row that reads as unvisited
-  // while its workspace fills half the window is simply wrong. The *rendered*
-  // one, not the stored pair: a window too narrow to draw a split is showing
-  // one workspace, whatever arrangement it is holding for when it widens.
-  const { renderedSecondaryId, activeSide } = useSplit();
+  // The arrangement, and whether it is the window in front of you. The pair
+  // outlives the route — opening a third workspace parks a split rather than
+  // eating half of it — so the rail keeps listing it as a pair either way,
+  // and `renderedSecondaryId` is only what decides how lit its halves are.
+  const { pair, renderedSecondaryId, activeSide } = useSplit();
+  const splitOnScreen = renderedSecondaryId !== null;
   // What the tree draws, row by row: normally one workspace each, but a split
   // draws as a single paired row so the rail is a picture of the window
   // rather than a list that happens to contain it. The collapsed rail opts
@@ -222,10 +143,10 @@ export function Sidebar({
     () =>
       pairRows(
         visibleWorkspaces.map((workspace) => workspace.id),
-        collapsed ? null : currentWorkspaceId,
-        collapsed ? null : renderedSecondaryId,
+        collapsed ? null : (pair?.primaryId ?? null),
+        collapsed ? null : (pair?.secondaryId ?? null),
       ),
-    [collapsed, currentWorkspaceId, renderedSecondaryId, visibleWorkspaces],
+    [collapsed, pair, visibleWorkspaces],
   );
 
   const refresh = () => {
@@ -289,13 +210,14 @@ export function Sidebar({
     onSuccess: (_result, id) => {
       setActionError(null);
       refresh();
-      // A workspace on the right of a split is not the page it is on, so the
-      // correction is to close that half. Routing away would take the
-      // workspace on the left — which nothing happened to — with it. The
-      // stored pair, not the rendered one: a deleted workspace must not be
-      // left queued up to reappear when the window widens.
-      if (splitStore.get().secondaryId === id) splitStore.close();
-      else if (currentWorkspaceId === id) router.push("/app");
+      // A deleted workspace takes the whole arrangement with it: half a pair
+      // is not a split. The stored pair, not the rendered one — a workspace
+      // that no longer exists must not be left queued up to reappear the next
+      // time one of its neighbours is opened.
+      if (memberSide(splitStore.get().pair, id)) splitStore.clear();
+      // Only the page you are on has to go somewhere. A half you were not
+      // routed at closing is not a reason to move the address bar.
+      if (currentWorkspaceId === id) router.push("/app");
     },
     onError: (error) => setActionError(error instanceof Error ? error.message : String(error)),
   });
@@ -308,16 +230,14 @@ export function Sidebar({
       // Said out loud, because the row leaves the list under your cursor and
       // the only other evidence is a drawer that is probably closed.
       toast(`Archived ${name}`);
-      // Archived out of the right of a split: that half closes and the window
-      // goes back to one workspace. Nothing about the left half changed, so
-      // nothing about it should move. The stored pair again — an archived
-      // workspace must not come back with the next widening.
-      if (splitStore.get().secondaryId === id) {
-        splitStore.close();
-        return;
-      }
+      // Archived out of a split: the arrangement goes with it and the window
+      // comes back to one workspace. The stored pair again — an archived
+      // workspace must not come back the next time its neighbour is opened.
+      if (memberSide(splitStore.get().pair, id)) splitStore.clear();
       // And carry on next door: the workspace you were looking at is stopped
-      // now, so the useful place to be is the one that took its slot.
+      // now, so the useful place to be is the one that took its slot. A half
+      // you were not routed at is not the page you are on, so it moves
+      // nothing.
       if (currentWorkspaceId === id) {
         router.push(nextId ? `/w/${nextId}` : "/app");
         onNavigate?.();
@@ -371,7 +291,8 @@ export function Sidebar({
     const startX = event.clientX;
     let dragging = false;
     let mode: DragMode = "reorder";
-    let litSide: SplitSide | null = null;
+    /** Built the first time the row leaves the rail, and reused after that. */
+    let carry: WorkspaceCarry | null = null;
     let capturedPointer: number | null = null;
     // Geometry is captured up front: rows shift with transforms mid-drag, so
     // both the target index and the shift math must use the resting rects.
@@ -416,119 +337,30 @@ export function Sidebar({
       // the pointer: pulling the element out of flow would close the list up
       // under it and invalidate the very rects the reorder half measures from.
       rowElement.style.opacity = "0.4";
-      const { ratio, renderedSecondaryId: rendered } = splitStore.get();
-      const arrangement: Arrangement = { primary: currentWorkspaceId, secondary: rendered };
-      setCarried({
+      carry ??= createWorkspaceCarry({
         workspace,
-        zones: dropZones(measurePanes(), ratio),
-        // The carried workspace first, so a preview built while the workspace
-        // list is still loading at least has the thing being dragged in it.
-        cast: [workspace.id, arrangement.primary, arrangement.secondary]
-          .filter((id, index, all): id is string => Boolean(id) && all.indexOf(id) === index)
-          .map((id) => workspaceById.get(id))
-          .filter((member): member is Workspace => Boolean(member)),
-        arrangement,
+        routedId: currentWorkspaceId,
+        lookup: (id) => workspaceById.get(id),
         origin: {
           left: fromRect?.left ?? 0,
           top: fromRect?.top ?? 0,
           width: fromRect?.width ?? 0,
           height: fromRect?.height ?? 0,
         },
-        offset: { x: clientX - startX, y: clientY - startY },
+        start: { x: startX, y: startY },
+        navigate: (id) => {
+          router.push(`/w/${id}`);
+          onNavigate?.();
+        },
       });
+      carry.show(clientX, clientY);
     };
 
     const enterReorder = () => {
       rowElement.style.transition = "";
       rowElement.style.opacity = "";
       lift(true);
-      litSide = null;
-      setCarried(null);
-    };
-
-    /**
-     * Which half the pointer is offering to drop into. `paneRootAt` first, so
-     * a pointer over something stacked above the canvas — a dialog, an open
-     * menu — does not read as a drop into the half behind it.
-     */
-    const sideUnder = (clientX: number, clientY: number): SplitSide | null => {
-      if (!paneRootAt(clientX, clientY)) return null;
-      const zones = dropZones(measurePanes(), splitStore.get().ratio);
-      return zoneAt(clientX, clientY, zones)?.side ?? null;
-    };
-
-    /**
-     * Redraw the preview as the window it would leave behind. Each panel is a
-     * workspace rather than a slot, so a workspace that changes halves travels
-     * there and one that is being displaced fades where it stands — which is
-     * the whole answer to "what happens if I let go here".
-     */
-    const showArrangement = (side: SplitSide | null) => {
-      const layer = carryPreviewRef.current;
-      if (!layer) return;
-      // Off the canvas the preview withdraws but keeps its last arrangement,
-      // so leaving reads as the preview fading rather than as it rearranging
-      // itself into something nobody asked for on the way out.
-      layer.dataset.live = String(side !== null);
-      if (!side) return;
-      const { ratio, renderedSecondaryId: rendered } = splitStore.get();
-      const zones = dropZones(measurePanes(), ratio);
-      const next = arrangementAfter(
-        splitDropPlan(side, workspace.id, currentWorkspaceId, rendered),
-        currentWorkspaceId,
-        rendered,
-      );
-      for (const panel of layer.querySelectorAll<HTMLElement>("[data-preview-panel]")) {
-        const memberId = panel.dataset.previewPanel ?? "";
-        const zone = zones.find((candidate) => candidate.side === sideOf(memberId, next));
-        panel.dataset.shown = String(Boolean(zone));
-        panel.dataset.lit = String(memberId === workspace.id);
-        if (!zone) continue;
-        panel.style.transform = `translate(${zone.rect.left}px, ${zone.rect.top}px)`;
-        panel.style.width = `${zone.rect.right - zone.rect.left}px`;
-        panel.style.height = `${zone.rect.bottom - zone.rect.top}px`;
-      }
-    };
-
-    const trackCarry = (clientX: number, clientY: number) => {
-      const ghost = carryGhostRef.current;
-      // The overlay is one render behind the move that started the carry. It
-      // renders itself already in position, so there is nothing to correct
-      // until it exists — and `litSide` must not advance without it, or the
-      // arrangement it names would never be drawn.
-      if (!ghost || !carryPreviewRef.current) return;
-      ghost.style.transform = `translate(${clientX - startX}px, ${clientY - startY}px)`;
-      const side = sideUnder(clientX, clientY);
-      if (side === litSide) return;
-      litSide = side;
-      showArrangement(side);
-    };
-
-    const drop = (clientX: number, clientY: number) => {
-      const side = sideUnder(clientX, clientY);
-      if (!side) return;
-      // Judged against the half that is *rendered*, because that is what the
-      // zones were drawn from: a window too narrow to draw a split offers the
-      // two halves of its one pane, and reading the stored pair here would
-      // answer a drop on those halves as though a split were already up.
-      const plan = splitDropPlan(
-        side,
-        workspace.id,
-        currentWorkspaceId,
-        splitStore.get().renderedSecondaryId,
-      );
-      // Null is the drop that asks for the arrangement already on screen —
-      // released onto the half the workspace is in. Ending here rather than
-      // reasserting it is what keeps that from flickering.
-      if (!plan) return;
-      // The pair is set before the route changes, so the reconcile that
-      // follows navigation sees the arrangement this drop asked for rather
-      // than the one it is replacing.
-      if (plan.setSecondary) splitStore.open(plan.setSecondary, plan.routeTo ?? currentWorkspaceId);
-      if (plan.routeTo) {
-        router.push(`/w/${plan.routeTo}`);
-        onNavigate?.();
-      }
+      carry?.hide();
     };
 
     const onMove = (moveEvent: PointerEvent) => {
@@ -564,7 +396,7 @@ export function Sidebar({
         else enterReorder();
       }
       if (mode === "carry") {
-        trackCarry(moveEvent.clientX, moveEvent.clientY);
+        carry?.track(moveEvent.clientX, moveEvent.clientY);
         return;
       }
       rowElement.style.transform = `translateY(${moveEvent.clientY - startY}px)`;
@@ -592,7 +424,6 @@ export function Sidebar({
       }
       lift(false);
       rowElement.style.opacity = "";
-      setCarried(null);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       if (!dragging) return;
@@ -605,11 +436,11 @@ export function Sidebar({
         () => document.removeEventListener("click", swallowClick, { capture: true }),
         0,
       );
-      if (!commit) return;
-      if (mode === "carry") {
-        drop(clientX, clientY);
-        return;
-      }
+      if (commit && mode === "carry") carry?.drop(clientX, clientY);
+      // The ghost comes down whichever mode the drag ended in, and whether or
+      // not the release landed anywhere.
+      carry?.end();
+      if (!commit || mode === "carry") return;
       const target = reorderTargetIndex(clientY, restingRects, from);
       if (target === from) return;
       // The whole row moves, however many workspaces it holds: a split was
@@ -864,11 +695,27 @@ export function Sidebar({
                   key={ids.join("+")}
                   primary={workspace}
                   secondary={partner}
-                  activeSide={activeSide}
+                  // Null while the arrangement is parked behind some other
+                  // workspace: the row still says these two are a split, but
+                  // neither half is the window you are looking at, so neither
+                  // wears the selection.
+                  activeSide={splitOnScreen ? activeSide : null}
                   primaryAttention={workspaceAttentionCount(workspace, sessionsById)}
                   secondaryAttention={workspaceAttentionCount(partner, sessionsById)}
-                  onActivate={(side) => splitStore.setActiveSide(side)}
-                  onUnsplit={() => splitStore.close()}
+                  onOpen={(side, id) => {
+                    // Already in this window: pressing a half is a request to
+                    // work in it, not to go anywhere. Otherwise it is exactly
+                    // a navigation — arriving at either member is what puts
+                    // the pair back on screen.
+                    splitStore.setActiveSide(side);
+                    if (id === currentWorkspaceId) return;
+                    router.push(`/w/${id}`);
+                    onNavigate?.();
+                  }}
+                  onUnsplit={() => {
+                    const destination = splitStore.unsplit(workspace.id, currentWorkspaceId);
+                    if (destination) router.push(`/w/${destination}`);
+                  }}
                   onRowPointerDown={
                     searching
                       ? undefined
@@ -892,7 +739,11 @@ export function Sidebar({
                 key={workspace.id}
                 workspace={workspace}
                 active={currentWorkspaceId === workspace.id}
-                beside={renderedSecondaryId === workspace.id}
+                beside={
+                  splitOnScreen &&
+                  currentWorkspaceId !== workspace.id &&
+                  memberSide(pair, workspace.id) !== null
+                }
                 collapsed={collapsed}
                 attentionCount={workspaceAttentionCount(workspace, sessionsById)}
                 busy={workspaceBusy}
@@ -1004,129 +855,6 @@ export function Sidebar({
           </DropdownMenuItem>
         </DropdownMenu>
       </div>
-
-      {carried && (
-        <WorkspaceCarryOverlay
-          carried={carried}
-          ghostRef={carryGhostRef}
-          previewRef={carryPreviewRef}
-        />
-      )}
     </div>
-  );
-}
-
-/**
- * A workspace row on its way out of the rail: the row itself, lifted, and a
- * live picture of the window it is about to make.
- *
- * The preview is one panel per workspace, not one per half. A panel is a
- * workspace's own box that moves to whichever half it will occupy, so a drop
- * that swaps two workspaces is drawn as two boxes trading places and a drop
- * that displaces one is drawn as its box fading where it stood. Panels keyed
- * by half instead would only ever be able to cut from one label to another,
- * which says that something changed without saying what.
- *
- * Portalled to the body because the shell is a container query, and a
- * container establishes the containing block for `fixed` descendants — an
- * overlay rendered inside it would be positioned against the shell rather
- * than the viewport. It also keeps this out of the workspace tree entirely,
- * which is somebody else's file.
- *
- * Nothing here re-renders during the drag. The ghost's transform and every
- * panel's position are written to the DOM by the gesture through the two
- * refs; React's style prop holds only the opening values, so a sidebar
- * re-render (the session poll fires every five seconds) re-applies identical
- * values and therefore writes nothing.
- *
- * The ghost is dressed as an expanded row unconditionally: the collapsed rail
- * draws its workspaces as tiles that carry no `data-workspace-row`, so no drag
- * ever starts there and there is no rail-width ghost to draw.
- */
-function WorkspaceCarryOverlay({
-  carried,
-  ghostRef,
-  previewRef,
-}: {
-  carried: CarriedWorkspace;
-  ghostRef: RefObject<HTMLDivElement | null>;
-  previewRef: RefObject<HTMLDivElement | null>;
-}) {
-  const zoneFor = (side: SplitSide | null) =>
-    carried.zones.find((zone) => zone.side === side) ?? carried.zones[0];
-  return createPortal(
-    <div aria-hidden className="pointer-events-none fixed inset-0 z-[105]">
-      <div
-        ref={previewRef}
-        data-live="false"
-        className="opacity-0 transition-opacity duration-120 ease-swift data-[live=true]:opacity-100"
-      >
-        {carried.cast.map((member) => {
-          const side = sideOf(member.id, carried.arrangement);
-          // A member with nowhere to be yet — the carried workspace, which is
-          // still in the rail — waits at the half it would most likely take,
-          // so its first move is a short slide rather than a flight in from
-          // the corner an unset transform would start it at.
-          const zone = zoneFor(side);
-          return (
-            <div
-              key={member.id}
-              data-preview-panel={member.id}
-              data-shown={String(side !== null)}
-              data-lit="false"
-              style={{
-                transform: zone ? `translate(${zone.rect.left}px, ${zone.rect.top}px)` : undefined,
-                width: zone ? zone.rect.right - zone.rect.left : undefined,
-                height: zone ? zone.rect.bottom - zone.rect.top : undefined,
-              }}
-              className={cn(
-                "fixed left-0 top-0 flex flex-col items-center justify-center gap-2.5 p-4",
-                "rounded-xl border-2 border-dashed border-border bg-foreground/5",
-                "backdrop-blur-[2px] text-center",
-                "transition-[transform,width,height,opacity,border-color,background-color]",
-                "duration-120 ease-swift",
-                // Displaced: it is not in the window this drop would make.
-                "data-[shown=false]:opacity-0",
-                // The half the carried workspace lands in, in the same ink the
-                // tab strip's duplicate ghost uses for the same promise.
-                "data-[lit=true]:border-solid data-[lit=true]:border-ring data-[lit=true]:bg-ring/10",
-              )}
-            >
-              <WorkspaceAvatar
-                name={member.name}
-                icon={member.icon}
-                rail
-                className="size-12 rounded-xl text-sm"
-              />
-              <span className="max-w-full truncate text-sm font-medium text-foreground">
-                {member.name}
-              </span>
-            </div>
-          );
-        })}
-      </div>
-      <div
-        ref={ghostRef}
-        style={{
-          left: carried.origin.left,
-          top: carried.origin.top,
-          width: carried.origin.width,
-          height: carried.origin.height,
-          transform: `translate(${carried.offset.x}px, ${carried.offset.y}px)`,
-        }}
-        className={cn(
-          "fixed z-[110] flex items-center rounded-lg bg-shell text-sm text-foreground",
-          "shadow-[0_6px_16px_rgb(0_0_0/0.35)]",
-        )}
-      >
-        <SidebarIconSlot>
-          <WorkspaceAvatar name={carried.workspace.name} icon={carried.workspace.icon} />
-        </SidebarIconSlot>
-        <SidebarRowLabel collapsed={false} className="font-medium">
-          {carried.workspace.name}
-        </SidebarRowLabel>
-      </div>
-    </div>,
-    document.body,
   );
 }

@@ -5,8 +5,15 @@ import { useSyncExternalStore } from "react";
 /**
  * Split view — two workspaces side by side in the one main window.
  *
- * The routed workspace (`/w/[id]`) is always the primary, on the left; a
- * second workspace can be set beside it and the seam between them dragged.
+ * The arrangement is a *pair*: two workspace ids, left and right, held
+ * independently of whatever `/w/[id]` currently names. A route onto either
+ * member draws the pair; a route onto a third workspace draws that workspace
+ * alone and leaves the pair standing, ready for the next time one of its
+ * members is opened. That is the whole reason the pair is stored as two ids
+ * rather than as "the routed one, plus a second": the earlier shape could not
+ * survive its own primary being navigated away from, so visiting a third
+ * workspace silently ate half the split.
+ *
  * The pair is per-device state, not workspace data: it is the same kind of
  * fact as the sidebar's width or a workspace's last-open tab, and like both
  * of those it lives in localStorage and never touches the server. Nothing in
@@ -28,26 +35,36 @@ export const SPLIT_STORAGE_KEY = "spawn.workspaces.split";
 /** Which half of a split a component belongs to. Unsplit is all `primary`. */
 export type SplitSide = "primary" | "secondary";
 
+/**
+ * The two workspaces of a split, in the order they are drawn. Both ends are
+ * named, so the pair means the same thing whichever of them the URL is about
+ * — or whether it is about either of them at all.
+ */
+export interface SplitPair {
+  primaryId: string;
+  secondaryId: string;
+}
+
 export interface SplitState {
   /**
-   * The workspace shown beside the routed one, or null when the window holds
-   * a single workspace. Never equal to the routed workspace — `open` refuses
-   * that, and `reconcile` clears it if navigation makes it so.
+   * The workspaces arranged side by side, or null when there is no split.
+   * Kept across navigation to a third workspace: the arrangement is a thing
+   * the user built, and opening something else is not a request to dismantle
+   * it. `reconcile` is what clears it, and only when a member stops existing.
    */
-  secondaryId: string | null;
+  pair: SplitPair | null;
   /**
    * The second workspace actually on screen — which is not the same fact as
-   * the pair above. Below the width a split needs, the container renders the
-   * primary alone and this stays null while `secondaryId` keeps the
-   * arrangement for when the window widens again.
+   * the pair above. On a page that is not a workspace, or on a route onto a
+   * workspace outside the pair, this is null while the pair keeps standing.
    *
-   * Anything *drawing* the split wants this one: the sidebar marking a row as
-   * shown-beside, a half's own chrome, the grid asking whether it has half a
-   * window to lay out in. Only the container itself wants the stored pair.
+   * Anything *drawing* the split wants this one: the sidebar asking whether
+   * the arrangement it lists is the window in front of you, a half's own
+   * chrome, the drop rules asking how many halves a release can land in.
    *
    * Published by the container rather than derived here, because the answer
-   * depends on a measured element and this module cannot see the DOM. It is
-   * session-only, like `activeSide` — a reload re-measures.
+   * depends on what is mounted and this module cannot see the DOM. It is
+   * session-only, like `activeSide` — a reload re-renders.
    */
   renderedSecondaryId: string | null;
   /** The primary's share of the canvas width, 0..1, clamped to the bounds. */
@@ -62,16 +79,16 @@ export interface SplitState {
 }
 
 /**
- * How narrow a half may get. Below a quarter the grid has nothing left to say
- * — a 24-column canvas at 4-column minimum needs real width to be a grid at
- * all — and the seam stops being draggable back.
+ * How narrow a half may get, as a share of the canvas. A quarter is where the
+ * seam stops being draggable back; the window's own width is not policed at
+ * all, because a split the user asked for is a split they get.
  */
 export const MIN_RATIO = 0.25;
 export const MAX_RATIO = 0.75;
 export const DEFAULT_RATIO = 0.5;
 
 const DEFAULT_STATE: SplitState = {
-  secondaryId: null,
+  pair: null,
   renderedSecondaryId: null,
   ratio: DEFAULT_RATIO,
   activeSide: "primary",
@@ -82,18 +99,48 @@ export function clampRatio(ratio: number): number {
   return Math.min(MAX_RATIO, Math.max(MIN_RATIO, ratio));
 }
 
+/** A pair of two real, different workspaces, or null for anything else. */
+function toPair(primaryId: unknown, secondaryId: unknown): SplitPair | null {
+  if (typeof primaryId !== "string" || typeof secondaryId !== "string") return null;
+  if (!primaryId || !secondaryId || primaryId === secondaryId) return null;
+  return { primaryId, secondaryId };
+}
+
+/** Which half of `pair` a workspace occupies, or null when it is in neither. */
+export function memberSide(pair: SplitPair | null, workspaceId: string | null): SplitSide | null {
+  if (!pair || !workspaceId) return null;
+  if (pair.primaryId === workspaceId) return "primary";
+  if (pair.secondaryId === workspaceId) return "secondary";
+  return null;
+}
+
+/**
+ * The pair a given route draws, or null when that route draws one workspace.
+ *
+ * The single rule the whole feature turns on: a split is on screen when the
+ * URL names one of its members, and the arrangement is the pair's own, not
+ * the URL's. Opening a third workspace therefore parks the split rather than
+ * consuming a half of it.
+ */
+export function splitFor(pair: SplitPair | null, routedId: string | null): SplitPair | null {
+  return memberSide(pair, routedId) ? pair : null;
+}
+
 /** Coerce anything that came out of storage into a usable split. */
 export function normalizeSplit(value: unknown): SplitState {
   if (typeof value !== "object" || value === null) return { ...DEFAULT_STATE };
   const raw = value as Record<string, unknown>;
   return {
-    secondaryId: typeof raw.secondaryId === "string" && raw.secondaryId ? raw.secondaryId : null,
-    // Never restored: whether a half is on screen is a measurement, and
-    // nothing has been measured yet at the moment storage is read.
+    // A value written by the older shape carried only the second workspace,
+    // which names no arrangement on its own; it normalises to no split, and
+    // the next one the user builds overwrites it.
+    pair: toPair(raw.primaryId, raw.secondaryId),
+    // Never restored: whether a half is on screen is a fact about what is
+    // mounted, and nothing is mounted at the moment storage is read.
     renderedSecondaryId: null,
     ratio: clampRatio(typeof raw.ratio === "number" ? raw.ratio : DEFAULT_RATIO),
     // Never restored: which half you were last typing in is a fact about a
-    // session, and a reload starts at the routed workspace by definition.
+    // session, and a reload starts at whichever half the URL names.
     activeSide: "primary",
   };
 }
@@ -132,23 +179,33 @@ function persist(): void {
   try {
     window.localStorage.setItem(
       SPLIT_STORAGE_KEY,
-      JSON.stringify({ secondaryId: state.secondaryId, ratio: state.ratio }),
+      JSON.stringify({
+        primaryId: state.pair?.primaryId ?? null,
+        secondaryId: state.pair?.secondaryId ?? null,
+        ratio: state.ratio,
+      }),
     );
   } catch {
     // Storage refused; the arrangement still holds for this session.
   }
 }
 
+function samePair(a: SplitPair | null, b: SplitPair | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.primaryId === b.primaryId && a.secondaryId === b.secondaryId;
+}
+
 function set(next: SplitState): void {
   if (
-    next.secondaryId === state.secondaryId &&
+    samePair(next.pair, state.pair) &&
     next.renderedSecondaryId === state.renderedSecondaryId &&
     next.ratio === state.ratio &&
     next.activeSide === state.activeSide
   ) {
     return;
   }
-  const persistable = next.secondaryId !== state.secondaryId || next.ratio !== state.ratio;
+  const persistable = !samePair(next.pair, state.pair) || next.ratio !== state.ratio;
   state = next;
   if (persistable) persist();
   emit();
@@ -169,46 +226,47 @@ export const splitStore = {
   },
 
   /**
-   * Show `workspaceId` beside the routed one. `routedId` is passed so the
-   * store can refuse the one arrangement that means nothing — a workspace
-   * beside itself — rather than leaving every caller to check.
+   * Arrange these two workspaces side by side, left first. Refuses the one
+   * arrangement that means nothing — a workspace beside itself — rather than
+   * leaving every caller to check.
    *
-   * Opening onto an already-split window replaces the second workspace and
-   * keeps the seam where it is: the window's shape is the user's, and only
-   * its contents were asked to change.
+   * Rearranging an existing split keeps the seam where it is: the window's
+   * shape is the user's, and only its contents were asked to change.
    */
-  open(workspaceId: string, routedId: string | null): void {
+  setPair(primaryId: string | null, secondaryId: string | null): void {
     ensureInitialised();
-    if (!workspaceId || workspaceId === routedId) return;
-    set({ ...state, secondaryId: workspaceId });
+    const pair = toPair(primaryId, secondaryId);
+    if (!pair) return;
+    set({ ...state, pair });
   },
 
-  /** Back to one workspace, keeping the routed one. */
-  close(): void {
+  /** No split at all, whichever workspace the window ends up showing. */
+  clear(): void {
     ensureInitialised();
-    set({ ...state, secondaryId: null, activeSide: "primary" });
+    set({ ...state, pair: null, activeSide: "primary" });
   },
 
   /**
-   * Back to one workspace, keeping the *second* one — the "close the left
-   * half" gesture. Clears the split and returns the workspace the caller now
-   * has to navigate to, or null when there was nothing to promote. Navigation
-   * stays with the caller: this module owns no router.
+   * End the split, keeping `keepId` — the "close the other half" gesture,
+   * wherever it is offered from. Returns the workspace the caller now has to
+   * navigate to, or null when the route already lands somewhere sensible:
+   * either it is already on the half being kept, or it was never on this
+   * split at all and nothing about the current page changed. Navigation stays
+   * with the caller; this module owns no router.
    */
-  promoteSecondary(): string | null {
+  unsplit(keepId: string, routedId: string | null): string | null {
     ensureInitialised();
-    const promoted = state.secondaryId;
-    if (!promoted) return null;
-    set({ ...state, secondaryId: null, activeSide: "primary" });
-    return promoted;
+    const side = memberSide(state.pair, routedId);
+    set({ ...state, pair: null, activeSide: "primary" });
+    return side && routedId !== keepId ? keepId : null;
   },
 
   /**
    * Report which second workspace is actually mounted, or null when the
-   * window is showing one. The container is the only caller: it owns the
-   * measurement, and it holds the outgoing half mounted through its collapse,
-   * so this stays set for the length of a close and the surfaces reading it
-   * do not reflow while the geometry is still moving.
+   * window is showing one. The container is the only caller: it holds the
+   * outgoing half mounted through its collapse, so this stays set for the
+   * length of a close and the surfaces reading it do not reflow while the
+   * geometry is still moving.
    */
   setRendered(workspaceId: string | null): void {
     ensureInitialised();
@@ -221,36 +279,39 @@ export const splitStore = {
     set({ ...state, ratio: clampRatio(ratio) });
   },
 
-  /** Which half owns the global gestures now. No-op when not split. */
+  /** Which half owns the global gestures now. No-op when there is no split. */
   setActiveSide(side: SplitSide): void {
     ensureInitialised();
-    if (!state.secondaryId) return;
+    if (!state.pair) return;
     set({ ...state, activeSide: side });
   },
 
   /**
-   * Reconcile the stored pair against the workspaces that actually exist and
-   * the one currently routed. Called by the split container on every
-   * workspace list change, and it is what makes the arrangement survive an
-   * archive, a delete, or navigating to the workspace already on the right.
+   * Hand the gestures to the half the URL is about. Called when the route
+   * changes rather than on every render: within a split the active half is
+   * the user's own — clicking into the other pane moves it, and nothing
+   * should move it back until they go somewhere.
+   */
+  followRoute(routedId: string | null): void {
+    ensureInitialised();
+    set({ ...state, activeSide: memberSide(state.pair, routedId) ?? "primary" });
+  },
+
+  /**
+   * Reconcile the pair against the workspaces that actually exist. Called by
+   * the split container on every workspace list change, and it is what makes
+   * an archive or a delete take its half of the arrangement with it.
    *
    * `knownIds` null means "the list has not loaded yet" — the pair is left
    * alone rather than being cleared against an empty list, which would drop
-   * the second workspace on every cold load.
+   * the arrangement on every cold load.
    */
-  reconcile(routedId: string | null, knownIds: ReadonlySet<string> | null): void {
+  reconcile(knownIds: ReadonlySet<string> | null): void {
     ensureInitialised();
-    const secondary = state.secondaryId;
-    if (!secondary) return;
-    if (secondary === routedId) {
-      // Navigated to the workspace that was already beside this one; it is
-      // the whole window now.
-      set({ ...state, secondaryId: null, activeSide: "primary" });
-      return;
-    }
-    if (knownIds && !knownIds.has(secondary)) {
-      set({ ...state, secondaryId: null, activeSide: "primary" });
-    }
+    const pair = state.pair;
+    if (!pair || !knownIds) return;
+    if (knownIds.has(pair.primaryId) && knownIds.has(pair.secondaryId)) return;
+    set({ ...state, pair: null, activeSide: "primary" });
   },
 };
 
@@ -261,8 +322,8 @@ export function useSplit(): SplitState {
 
 /**
  * Whether two workspaces are on screen right now — the drawn fact, not the
- * stored one. A window too narrow to hold a split reads false here while
- * keeping its pair for when it widens.
+ * stored one. A parked pair, held for the next time one of its members is
+ * opened, reads false here.
  */
 export function useIsSplit(): boolean {
   return useSplit().renderedSecondaryId !== null;

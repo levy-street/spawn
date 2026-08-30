@@ -3,7 +3,10 @@
 import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/lib/auth";
-import { useBrowserDeviceRegistration } from "@/lib/browser-device-registration";
+import {
+  describeBrowserDeviceRegistrationFailure,
+  useBrowserDeviceRegistration,
+} from "@/lib/browser-device-registration";
 
 export function BrowserDeviceRegistrationStatus() {
   const { user } = useAuth();
@@ -12,17 +15,24 @@ export function BrowserDeviceRegistrationStatus() {
   if (!user || registration.isLoading || registration.data?.status === "ready") return null;
 
   if (registration.isError) {
+    // The same failure line for every cause taught readers to ignore it, and
+    // offered a retry to browsers no retry could ever help. Say what happened,
+    // and offer the button only where pressing it could change the answer.
+    const failure = describeBrowserDeviceRegistrationFailure(registration.error);
     return (
       <div className="border-destructive/50 border-b bg-destructive/10 px-4 py-3" role="alert">
         <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3">
           <p className="text-sm">
-            Browser identity registration failed. Identity-dependent connections are disabled;
-            account recovery and revocation remain available.
+            {failure.reason} Identity-dependent connections are disabled; account recovery and
+            revocation remain available.
+            {failure.remedy === null ? "" : ` ${failure.remedy}`}
           </p>
           <div className="flex gap-2">
-            <Button size="sm" variant="secondary" onClick={() => void registration.refetch()}>
-              Retry registration
-            </Button>
+            {failure.canRetry ? (
+              <Button size="sm" variant="secondary" onClick={() => void registration.refetch()}>
+                Retry registration
+              </Button>
+            ) : null}
             <Button size="sm" variant="outline" onClick={() => openSettings("access")}>
               Open Access settings
             </Button>

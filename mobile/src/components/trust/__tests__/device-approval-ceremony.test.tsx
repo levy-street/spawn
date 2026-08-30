@@ -5,6 +5,7 @@ import {
   APPROVED_DWELL_MS,
   DeviceApprovalCeremony,
 } from "@/components/trust/device-approval-ceremony";
+import { DeviceIdentityError } from "@/lib/crypto/identity";
 import { ThemeProvider } from "@/theme";
 
 const HOST_ID = "00000000-0000-4000-8000-00000000aaaa";
@@ -123,20 +124,40 @@ describe("device approval ceremony", () => {
     expect(screen.getByText(/this device is approved/i)).toBeOnTheScreen();
   });
 
-  test("a failed registration is said out loud, with a way to retry", async () => {
+  test("a failed registration is said in the reader's terms, with a way to retry", async () => {
     const refetch = jest.fn();
     mockPhoneQuery = {
       data: undefined,
       isPending: false,
       isSuccess: false,
       isError: true,
-      error: new Error("Device identity could not be stored"),
+      error: new DeviceIdentityError(
+        "IDENTITY_STORAGE_UNAVAILABLE",
+        "Device identity could not be stored",
+      ),
       refetch,
     };
     await renderCeremony();
     expect(mockRequestApproval).not.toHaveBeenCalled();
     expect(screen.getByText(/no identity yet/i)).toBeOnTheScreen();
-    expect(screen.getByText(/Device identity could not be stored/)).toBeOnTheScreen();
+    // The cause, not the internal sentence that threw.
+    expect(screen.getByText(/could not save SPAWN D's key/i)).toBeOnTheScreen();
+    expect(screen.getByText(/try again/i)).toBeOnTheScreen();
+  });
+
+  test("a cause no retry can answer is not offered one", async () => {
+    mockPhoneQuery = {
+      data: undefined,
+      isPending: false,
+      isSuccess: false,
+      isError: true,
+      error: new DeviceIdentityError("IDENTITY_CORRUPT", "Device identity record is not an object"),
+      refetch: jest.fn(),
+    };
+    await renderCeremony();
+    expect(screen.getByText(/unreadable/i)).toBeOnTheScreen();
+    // Pressing Try again would run the same read into the same damaged record.
+    expect(screen.queryByText(/try again/i)).toBeNull();
   });
 
   test("a matched number is never contradicted while the host catches up", async () => {

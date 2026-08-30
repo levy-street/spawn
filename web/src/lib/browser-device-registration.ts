@@ -5,12 +5,14 @@ import { useEffect } from "react";
 import { ApiError, type BrowserDevice, browserDevices } from "./api";
 import {
   adoptBrowserDeviceIdentity,
+  BrowserDeviceIdentityError,
   createBrowserDeviceRegistrationProof,
   deleteBrowserDeviceIdentity,
   loadBrowserDeviceIdentity,
   loadOrCreateBrowserDeviceIdentity,
 } from "./browser-device-identity";
 import { takeDesktopDeviceHandover } from "./desktop-device-handover";
+import { CryptoUnavailableError } from "./signed-signal";
 
 const REVOCATION_MARKER_PREFIX = "spawn.browser-device.revocation.v1.";
 
@@ -245,6 +247,89 @@ export function browserIdentityConnectionsAllowed(
   state: BrowserDeviceRegistrationState | undefined,
 ): boolean {
   return state?.status === "ready";
+}
+
+/**
+ * Why registration failed, said in a way the reader can do something about.
+ *
+ * Every failure used to read the same line — registration failed, reload to
+ * retry — which is true of a dropped request and a flat lie about a browser
+ * that cannot make the key at all, or a saved key that has become unreadable.
+ * Reloading those runs the same code into the same wall for ever, and the one
+ * sentence on screen is the only place a reader can learn otherwise.
+ *
+ * The cause is separated from the remedy so each surface can put its own
+ * consequence between them, and `canRetry` says whether running registration
+ * again could plausibly land differently.
+ */
+export interface BrowserDeviceRegistrationFailure {
+  /** What went wrong, as a complete sentence. */
+  readonly reason: string;
+  /** What would change it, where anything the reader controls would. */
+  readonly remedy: string | null;
+  /** Whether registering again could succeed without the reader doing anything. */
+  readonly canRetry: boolean;
+}
+
+export function describeBrowserDeviceRegistrationFailure(
+  error: unknown,
+): BrowserDeviceRegistrationFailure {
+  if (error instanceof CryptoUnavailableError) {
+    return {
+      reason: "This browser cannot create the Ed25519 key SPAWN D signs with.",
+      remedy: "A current Chrome, Safari, Edge or Firefox can.",
+      canRetry: false,
+    };
+  }
+  if (error instanceof BrowserDeviceIdentityError) {
+    switch (error.code) {
+      case "storage_unavailable":
+        return {
+          reason: "This browser has nowhere to keep SPAWN D's key.",
+          remedy: "A private window, or site data turned off for this site, does that.",
+          canRetry: false,
+        };
+      case "storage_failure":
+        return {
+          reason: "This browser could not save SPAWN D's key.",
+          remedy: null,
+          canRetry: true,
+        };
+      case "corrupt_record":
+        return {
+          reason: "The key this browser saved for SPAWN D is unreadable.",
+          remedy: "Clearing this site's data lets it mint a new one.",
+          canRetry: false,
+        };
+      case "capacity_exceeded":
+        return {
+          reason: "This browser is holding keys for too many accounts.",
+          remedy: "Clearing this site's data lets it mint a new one.",
+          canRetry: false,
+        };
+      case "invalid_account":
+      case "key_mismatch":
+        return {
+          reason: "The key this browser holds does not belong to this account.",
+          remedy: null,
+          canRetry: false,
+        };
+    }
+  }
+  if (error instanceof ApiError) {
+    return {
+      reason: `The server refused this browser's identity: ${error.message}`,
+      remedy: null,
+      // A refusal on the merits stays a refusal; only an overloaded or broken
+      // server is worth asking again.
+      canRetry: error.status >= 500 || error.status === 429,
+    };
+  }
+  return {
+    reason: "This browser's identity could not be registered.",
+    remedy: null,
+    canRetry: true,
+  };
 }
 
 export function browserDeviceRegistrationQueryKey(userId: string) {

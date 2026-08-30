@@ -7,13 +7,12 @@ import {
   type PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import { workspaces } from "@/lib/api";
-import { MAX_RATIO, MIN_RATIO, splitStore, useSplit } from "@/lib/split-store";
+import { MAX_RATIO, MIN_RATIO, splitFor, splitStore, useSplit } from "@/lib/split-store";
 import { cn } from "@/lib/utils";
 import { WorkspaceView } from "./workspace-view";
 
@@ -25,29 +24,19 @@ const OPEN_MS = 220;
 const CLOSE_MS = 180;
 /** How far one arrow press moves the seam, as a share of the canvas. */
 const RATIO_STEP = 0.02;
-/**
- * How much canvas a split needs before it is worth having. The grid's own
- * split-aware threshold is 560px, under which it stacks its panes into a
- * mobile list, so two halves at the default even seam want ~1120px before
- * either is a real grid; 1024 is the round number just below that, and the
- * seam's `MIN_RATIO` is what covers the rest — a deliberately lopsided split
- * at this width still gives its wide half 768px.
- *
- * Measured on the container rather than the viewport because those are not
- * the same number: the sidebar in front of it is resizable between 216 and
- * 420px and collapses to a rail, so the same window sits on either side of
- * this gate depending only on how wide the rail is. Answered in JS rather
- * than by hiding the second half in CSS, because a hidden half is still a
- * mounted grid with its own queries and its own terminals.
- */
-const SPLIT_MIN_CONTAINER_PX = 1024;
 
 /**
- * The routed workspace, and optionally a second one beside it.
+ * The routed workspace, or the pair it belongs to.
  *
  * The arrangement is `splitStore`'s; this is the only place that turns it into
  * layout. Both halves are the same component, so the single-workspace window
  * is not a separate code path — it is this one with nothing on the right.
+ *
+ * The URL names a workspace, not a side: a split is drawn whenever the route
+ * lands on either of the pair's members, in the pair's own left-to-right
+ * order. So opening the right-hand workspace from the rail keeps the window
+ * exactly as it was and simply moves which half the address bar is about,
+ * and opening a third workspace draws it alone with the pair left standing.
  */
 export function WorkspaceSplit({
   workspaceId,
@@ -55,15 +44,20 @@ export function WorkspaceSplit({
   tabParam,
 }: {
   workspaceId: string;
-  /** `?focus=` / `?tab=`, which reach the primary only — see `WorkspaceView`. */
+  /** `?focus=` / `?tab=`, which reach the routed half only — see `WorkspaceView`. */
   focusParam: string | null;
   tabParam: string | null;
 }) {
   const router = useRouter();
   const containerRef = useRef<HTMLDivElement>(null);
-  const { secondaryId, ratio, activeSide } = useSplit();
-  const [wide, setWide] = useState(false);
+  const { pair, ratio, activeSide } = useSplit();
   const [resizing, setResizing] = useState(false);
+
+  /** The pair this route draws, or null when it draws one workspace. */
+  const drawn = splitFor(pair, workspaceId);
+  const primaryId = drawn ? drawn.primaryId : workspaceId;
+  const secondaryId = drawn ? drawn.secondaryId : null;
+
   /**
    * The workspace mounted on the right, which outlives `secondaryId` for the
    * length of the close: unmounting on the same tick would make the half
@@ -81,8 +75,8 @@ export function WorkspaceSplit({
   /*
    * Null while the list is in flight. `reconcile` reads that as "no opinion
    * yet" and leaves the pair alone; handing it an empty set instead would drop
-   * the second workspace on every cold load, before the list had said anything
-   * about whether it still exists.
+   * the arrangement on every cold load, before the list had said anything
+   * about whether its workspaces still exist.
    */
   const knownIds = useMemo(
     () => (workspacesQ.data ? new Set(workspacesQ.data.map((workspace) => workspace.id)) : null),
@@ -90,24 +84,17 @@ export function WorkspaceSplit({
   );
 
   useEffect(() => {
-    splitStore.reconcile(workspaceId, knownIds);
-  }, [knownIds, workspaceId]);
+    splitStore.reconcile(knownIds);
+  }, [knownIds]);
 
   /*
-   * Measured before the first paint rather than from the observer's first
-   * callback: a restored split that had to wait for that callback would show
-   * one frame of full-width primary before the second half appeared.
+   * Arriving somewhere hands that half the keyboard. Keyed on the route
+   * alone: within a split the active half is the user's own — clicking into
+   * the other pane moves it — and only going somewhere should move it back.
    */
-  useLayoutEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-    setWide(container.getBoundingClientRect().width >= SPLIT_MIN_CONTAINER_PX);
-    const observer = new ResizeObserver(([entry]) => {
-      setWide((entry?.contentRect.width ?? 0) >= SPLIT_MIN_CONTAINER_PX);
-    });
-    observer.observe(container);
-    return () => observer.disconnect();
-  }, []);
+  useEffect(() => {
+    splitStore.followRoute(workspaceId);
+  }, [workspaceId]);
 
   useEffect(() => {
     if (secondaryId) {
@@ -122,34 +109,32 @@ export function WorkspaceSplit({
     return () => window.clearTimeout(timer);
   }, [secondaryId]);
 
-  /** The workspace on the right, or null on a window too narrow to hold one. */
-  const secondaryView = wide ? mounted : null;
+  /** The workspace on the right, held through its own collapse. */
+  const secondaryView = mounted;
   /*
    * Geometry and the arrangement disagree for the length of a close, so they
    * get a flag each.
    *
    * `split` is what is on screen, and everything that measures or clips reads
    * it: the halves' widths, the primary's clip, and — through `PaneScope` —
-   * the grid's own narrow-canvas threshold. Reading the store there would
-   * tell the surviving half it was alone while its canvas was still
-   * half-width, long enough for the grid to fall into its stacked layout and
-   * reflow back out of it inside a 180ms animation.
+   * the grid's own layout. Reading the store there would tell the surviving
+   * half it was alone while its canvas was still half-width, long enough for
+   * the grid to reflow twice inside a 180ms animation.
    */
   const split = secondaryView !== null;
   /*
-   * `paired` is what the store says, and the unsplit affordance reads it, so
-   * the control goes on the click rather than lingering on a window the user
+   * `paired` is what the store says, and the unsplit affordances read it, so
+   * a control goes on the click rather than lingering on a window the user
    * has already dismissed. `onUnsplit` is how it reaches the tab strip —
    * "null when not split" is already its contract, so no second prop is
    * needed to say this.
    */
-  const paired = wide && secondaryId !== null;
+  const paired = drawn !== null;
 
   /*
    * The measurement only this component can make, published for the surfaces
-   * that draw the split from outside it — the sidebar marking a row as
-   * shown-beside, most of all, which has no other way to know that a window
-   * too narrow for a second half is showing one workspace.
+   * that draw the split from outside it — the sidebar asking whether the
+   * arrangement it lists is the window in front of you, most of all.
    *
    * In an effect rather than in render, because a store write during render
    * tears: the listeners fire while React is still deciding what this tree
@@ -162,13 +147,19 @@ export function WorkspaceSplit({
     return () => splitStore.setRendered(null);
   }, [secondaryView]);
 
-  const closeSplit = useCallback(() => {
-    splitStore.close();
-  }, []);
-  const keepSecondary = useCallback(() => {
-    const promoted = splitStore.promoteSecondary();
-    if (promoted) router.push(`/w/${promoted}`);
-  }, [router]);
+  /** End the split, keeping one half — and follow it if the route must. */
+  const keepOnly = useCallback(
+    (keepId: string) => {
+      const destination = splitStore.unsplit(keepId, workspaceId);
+      if (destination) router.push(`/w/${destination}`);
+    },
+    [router, workspaceId],
+  );
+  const keepPrimary = useCallback(() => keepOnly(primaryId), [keepOnly, primaryId]);
+  const keepSecondary = useCallback(
+    () => (secondaryId ? keepOnly(secondaryId) : undefined),
+    [keepOnly, secondaryId],
+  );
   const activatePrimary = useCallback(() => {
     splitStore.setActiveSide("primary");
   }, []);
@@ -250,15 +241,17 @@ export function WorkspaceSplit({
         }}
       >
         <WorkspaceView
-          key={workspaceId}
-          workspaceId={workspaceId}
+          key={primaryId}
+          workspaceId={primaryId}
           side="primary"
           split={split}
+          routedId={workspaceId}
           active={!split || activeSide === "primary"}
-          focusParam={focusParam}
-          tabParam={tabParam}
+          focusParam={primaryId === workspaceId ? focusParam : null}
+          tabParam={primaryId === workspaceId ? tabParam : null}
           onActivate={activatePrimary}
-          onUnsplit={paired ? closeSplit : null}
+          onUnsplit={paired ? keepPrimary : null}
+          onRemoveFromSplit={paired ? keepSecondary : null}
         />
       </div>
 
@@ -277,7 +270,12 @@ export function WorkspaceSplit({
               title="Resize split"
               onPointerDown={startSeamResize}
               onKeyDown={nudgeSeam}
-              className="group absolute inset-y-0 -left-1 z-20 w-2 cursor-col-resize focus-visible:outline-none"
+              // Above the strip chrome, not level with it: the workspace menu
+              // pinned to the far half's left edge is sticky at z-20 with an
+              // opaque plate, and being later in the DOM it wins that tie and
+              // punches its own height out of the seam. The seam is one line
+              // down the whole window or it is not a seam.
+              className="group absolute inset-y-0 -left-1 z-30 w-2 cursor-col-resize focus-visible:outline-none"
             >
               <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border transition-colors group-hover:bg-ring/60 group-focus-visible:bg-ring" />
             </button>
@@ -299,11 +297,13 @@ export function WorkspaceSplit({
               workspaceId={secondaryView}
               side="secondary"
               split={split}
+              routedId={workspaceId}
               active={split && activeSide === "secondary"}
-              focusParam={null}
-              tabParam={null}
+              focusParam={secondaryView === workspaceId ? focusParam : null}
+              tabParam={secondaryView === workspaceId ? tabParam : null}
               onActivate={activateSecondary}
               onUnsplit={paired ? keepSecondary : null}
+              onRemoveFromSplit={paired ? keepPrimary : null}
             />
           </div>
         </>

@@ -1,8 +1,23 @@
 "use client";
 
-import { PanelLeftClose, PanelRightClose } from "lucide-react";
+import {
+  Archive,
+  ChevronDown,
+  ImagePlus,
+  PanelLeftClose,
+  PanelRightClose,
+  Pencil,
+  Trash2,
+  Unlink,
+} from "lucide-react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { WorkspaceAvatar } from "@/components/nav/sidebar-parts";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import type { SplitSide } from "@/lib/split-store";
 import { cn } from "@/lib/utils";
 
@@ -20,6 +35,14 @@ export interface SplitChrome {
   side: SplitSide;
   /** Back to one workspace, keeping the half this strip belongs to. */
   onUnsplit: () => void;
+  /** Back to one workspace, keeping the *other* half — this one steps out. */
+  onRemoveFromSplit: () => void;
+  /**
+   * Pick this workspace up off its own name and carry it to a half of the
+   * window — the sidebar's carry gesture, started from here, so rearranging a
+   * split is the same act wherever a workspace is grabbed from.
+   */
+  onCarry: (event: ReactPointerEvent<HTMLElement>) => void;
 }
 
 /**
@@ -47,24 +70,94 @@ const PINNED = "sticky z-20 shrink-0 bg-shell";
 export const PINNED_RIGHT = "right-0";
 
 /**
- * Which workspace this half is. Two strips side by side carry tab names that
- * say nothing about whose tabs they are, and this is the only thing on screen
- * that answers that — but it is a label and not a target, so it stays quieter
- * than the tabs it introduces and truncates rather than crowding them out.
+ * Which workspace this half is, and everything you can do to it from here.
+ *
+ * Two strips side by side carry tab names that say nothing about whose tabs
+ * they are, and this is the only thing on screen that answers that — so it
+ * introduces the strip rather than competing with it, and truncates rather
+ * than crowding the tabs out. It is also the workspace's own handle in this
+ * window: a menu on click, and a grip on drag, which carries the workspace to
+ * either half exactly as dragging its row out of the rail does.
  */
-export function SplitWorkspaceLabel({ name, icon }: { name: string; icon: string | null }) {
+export function SplitWorkspaceMenu({
+  chrome,
+  onRename,
+  onChangeIcon,
+  onArchive,
+  onDelete,
+}: {
+  chrome: SplitChrome;
+  /*
+   * The workspace's own actions, which are the strip's already — the ⋯ menu
+   * at the far end offers every one of them. They are repeated here because
+   * this is where the workspace's *name* is, and a name is what you reach for
+   * when you want to rename, re-mark or put away the thing it names.
+   */
+  onRename: () => void;
+  onChangeIcon: () => void;
+  onArchive: () => void;
+  onDelete: () => void;
+}) {
+  const { workspaceName, workspaceIcon, onRemoveFromSplit, onCarry } = chrome;
   return (
-    <div
-      // The strip's own accessible name already carries the workspace, so to a
-      // screen reader this would be the same fact read twice; it is here for
-      // the eye, which is what has two strips to tell apart.
-      aria-hidden
-      title={name}
-      className={cn(PINNED, "left-0 flex h-8 items-center gap-1.5 pl-0.5 pr-2")}
+    <DropdownMenu
+      align="start"
+      // Inset from the panel's left edge, so the mark is not sitting on the
+      // seam of the window it belongs to.
+      className={cn(PINNED, "left-0 flex h-8 items-center pl-2")}
+      menuClassName="w-56"
+      renderTrigger={(props) => (
+        <button
+          {...props}
+          type="button"
+          // A drag off this button is the workspace being carried somewhere;
+          // a plain press still opens the menu, because the gesture swallows
+          // the click only once it has passed its threshold.
+          onPointerDown={onCarry}
+          onDragStart={(event) => event.preventDefault()}
+          aria-label={`${workspaceName} workspace`}
+          title={workspaceName}
+          className={cn(
+            "flex h-7 min-w-0 items-center gap-1.5 rounded-md pl-0.5 pr-1.5 transition-colors",
+            "text-muted-foreground hover:bg-accent hover:text-foreground",
+            "aria-expanded:bg-accent aria-expanded:text-foreground",
+          )}
+        >
+          <WorkspaceAvatar name={workspaceName} icon={workspaceIcon} />
+          <span className="max-w-28 truncate text-xs font-medium">{workspaceName}</span>
+          <ChevronDown className="size-3.5 shrink-0 opacity-70" aria-hidden />
+        </button>
+      )}
     >
-      <WorkspaceAvatar name={name} icon={icon} />
-      <span className="max-w-28 truncate text-xs font-medium text-muted-foreground">{name}</span>
-    </div>
+      {/* The split first: it is the only item here that is about the window
+          rather than about the workspace, and it is the one this menu grew
+          out of. */}
+      <DropdownMenuItem onSelect={onRemoveFromSplit}>
+        <Unlink className="size-4" aria-hidden />
+        Remove from split
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
+      <DropdownMenuItem onSelect={onRename}>
+        <Pencil className="size-4" aria-hidden />
+        Rename workspace
+      </DropdownMenuItem>
+      {/* Directly under Rename: both answer "what is this workspace called",
+          one in letters and one in a picture. */}
+      <DropdownMenuItem onSelect={onChangeIcon}>
+        <ImagePlus className="size-4" aria-hidden />
+        Change icon…
+      </DropdownMenuItem>
+      {/* Above the separator: archiving is the reversible one. */}
+      <DropdownMenuItem onSelect={onArchive}>
+        <Archive className="size-4" aria-hidden />
+        Archive
+      </DropdownMenuItem>
+      <DropdownMenuSeparator />
+      <DropdownMenuItem destructive onSelect={onDelete}>
+        <Trash2 className="size-4" aria-hidden />
+        Delete
+      </DropdownMenuItem>
+    </DropdownMenu>
   );
 }
 
