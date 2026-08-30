@@ -319,13 +319,15 @@ export function JobStart({ heading }: { heading: string }) {
         <h2 className={H2_CLASS}>{heading}</h2>
         <InstallOneLiner className="mt-8 rounded-lg border-line-strong" />
         <div className="mt-8 flex flex-col items-start gap-5 sm:flex-row sm:items-center sm:gap-7">
-          <Link prefetch={false}
+          <Link
+            prefetch={false}
             href="/signup"
             className="inline-flex items-center justify-center rounded-full bg-bone px-6 py-2.5 text-[14px] leading-6 font-medium text-void transition-colors hover:bg-white"
           >
             Sign up free
           </Link>
-          <Link prefetch={false}
+          <Link
+            prefetch={false}
             href="/download"
             className="text-[14px] leading-6 text-ash underline decoration-line-strong underline-offset-4 transition-colors hover:text-bone hover:decoration-bone"
           >
@@ -372,7 +374,8 @@ function RelatedQuiet({ related }: { related: JobRelatedLink[] }) {
         <ul className="mt-8 space-y-4">
           {related.map((entry) => (
             <li key={entry.href} className="text-[15px] leading-7">
-              <Link prefetch={false}
+              <Link
+                prefetch={false}
                 href={entry.href}
                 className="font-medium text-bone underline decoration-line-strong underline-offset-4 transition-colors hover:decoration-ember"
               >
@@ -402,7 +405,11 @@ function MastheadStatic() {
     <header className="sticky top-0 z-40 border-line-g border-b bg-void/85 backdrop-blur-md">
       <nav className="mx-auto flex w-full max-w-[1440px] items-center justify-between gap-4 px-5 py-4 font-sigil text-[11px] tracking-[0.22em] uppercase sm:grid sm:grid-cols-[1fr_auto_1fr] sm:px-8 sm:text-[12px]">
         <div className="hidden items-center gap-7 sm:flex sm:gap-10">
-          <Link prefetch={false} href="/security" className="text-ash transition-colors hover:text-bone">
+          <Link
+            prefetch={false}
+            href="/security"
+            className="text-ash transition-colors hover:text-bone"
+          >
             Security
           </Link>
           <a
@@ -414,7 +421,12 @@ function MastheadStatic() {
             Open&nbsp;source
           </a>
         </div>
-        <Link prefetch={false} href="/" aria-label="spawnd home" className="flex items-center gap-2 text-hellfire">
+        <Link
+          prefetch={false}
+          href="/"
+          aria-label="spawnd home"
+          className="flex items-center gap-2 text-hellfire"
+        >
           <span className="block size-7">
             <Trident className="size-full" />
           </span>
@@ -423,13 +435,18 @@ function MastheadStatic() {
           </span>
         </Link>
         <div className="flex items-center justify-end gap-7 sm:gap-10">
-          <Link prefetch={false}
+          <Link
+            prefetch={false}
             href="/login"
             className="hidden text-ash transition-colors hover:text-bone sm:inline"
           >
             Log&nbsp;in
           </Link>
-          <Link prefetch={false} href="/signup" className="text-ember transition-colors hover:text-hellfire">
+          <Link
+            prefetch={false}
+            href="/signup"
+            className="text-ember transition-colors hover:text-hellfire"
+          >
             Sign&nbsp;up&nbsp;→
           </Link>
         </div>

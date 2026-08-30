@@ -11,7 +11,12 @@ import {
 } from "@/components/brand/press";
 import { InstallOneLiner } from "@/components/seo/InstallOneLiner";
 import { poster } from "@/lib/fonts";
-import { findSeoPageByKey, SEO_FAMILIES, seoPageHref } from "@/lib/seo/registry";
+import {
+  type RelatedCard,
+  resolveRelatedCard,
+  SEO_FAMILIES,
+  seoPageHref,
+} from "@/lib/seo/registry";
 import type { Accent, Panel, Section, SeoPage } from "@/lib/seo/types";
 import { cn } from "@/lib/utils";
 
@@ -323,25 +328,25 @@ function FaqSection({ page }: { page: SeoPage }) {
 
 function RelatedSection({ page }: { page: SeoPage }) {
   const related = page.related
-    .map((key) => findSeoPageByKey(key))
-    .filter((entry): entry is SeoPage => entry !== undefined);
+    .map((key) => resolveRelatedCard(key))
+    .filter((card): card is RelatedCard => card !== undefined);
   if (related.length === 0) return null;
   return (
     <SectionShell>
       <div className="mx-auto w-full max-w-6xl">
         <Eyebrow className="mb-10">Keep reading</Eyebrow>
         <div className="grid min-w-0 gap-6 sm:grid-cols-3">
-          {related.map((entry) => (
+          {related.map((card) => (
             <Link
-              key={seoPageHref(entry)}
-              href={seoPageHref(entry)}
+              key={card.href}
+              href={card.href}
               className="group rounded-sm border border-line-strong bg-char p-6 transition-colors hover:border-bone/40"
             >
               <p className="mb-2 font-sigil text-[10px] tracking-[0.22em] text-hellfire uppercase">
-                {SEO_FAMILIES[entry.family].title}
+                {card.familyTitle}
               </p>
-              <h3 className="mb-2 text-[16px] font-medium text-bone">{entry.cardTitle}</h3>
-              <p className="mb-4 text-[14px] leading-6 text-ash">{entry.cardBlurb}</p>
+              <h3 className="mb-2 text-[16px] font-medium text-bone">{card.title}</h3>
+              <p className="mb-4 text-[14px] leading-6 text-ash">{card.blurb}</p>
               <span className={cn(CTA_QUIET, "text-[11px]")}>
                 Read{" "}
                 <ArrowRight className="size-3.5 transition-transform group-hover:translate-x-0.5" />

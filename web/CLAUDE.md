@@ -12,14 +12,15 @@ ceremony, a download page) says so in the commit message.
 ```
 src/
   app/            one directory per route (App Router)
-                  admin/ app/ device/ download/ for/ forgot-password/ hosts/
-                  legion/ login/ onboarding/ reset-password/
+                  [slug]/ admin/ app/ device/ download/ for/ forgot-password/
+                  hosts/ legion/ login/ onboarding/ reset-password/
                   run-agents-in-parallel/ security/ sessions/ signup/
                   trust-ux-demo/ use/ verify-email/ vs/ w/
-                  (for/, use/, vs/ are the SEO landing-page families, rendered
-                  from the registry in lib/seo/ — see "SEO landing pages";
-                  run-agents-in-parallel/ is the flat-URL job-template
-                  prototype from docs/SEO_TREE.md)
+                  ([slug]/ is the flat-URL landing-page router — see "SEO
+                  landing pages"; for/ and use/ are the legacy registry
+                  families; vs/ is the comparisons hub, its spokes now flat;
+                  run-agents-in-parallel/ is the hand-built flagship from
+                  docs/SEO_TREE.md)
   components/     UI grouped by product area
                   access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/
                   onboarding/ profile/ seo/ session/ settings/ terminal/
@@ -58,18 +59,27 @@ public/           static assets
 
 ## SEO landing pages
 
-Public landing pages (`/use/*`, `/for/*`, `/vs/*`) are data, not JSX: one
-typed entry per page in `src/lib/seo/{use-cases,agents,comparisons}.ts`,
-rendered by `src/components/seo/SeoLandingPage.tsx` in the pressroom
-vocabulary (`components/brand/press.tsx`). The per-family templates that will
-replace it live in `src/components/seo/templates/` (job template + the
-live fleet capture in `public/product/` so far; `app/run-agents-in-parallel/`
-is the prototype page). Adding a page = adding an entry;
-the sitemap (`app/sitemap.ts`), family indexes, and cross-links follow from
-the registry. `src/lib/seo/registry.test.ts` holds the invariants (unique
-slugs, snippet-length budgets, resolvable cross-links). Titles and H1s stay
-plain-language for search; the demon voice lives in body copy. Every claim
-must survive a diff against `docs/TRUST.md`.
+Landing pages are data, not JSX. Two generations coexist during the
+rework (`docs/SEO_TREE.md` is the page catalogue, `docs/SEO_RUNBOOK.md` the
+process):
+
+- **Flat slugs (current)**: one entry per page in `src/lib/seo/` template
+  files (`comparisons.ts` so far), catalogued by `src/lib/seo/flat.ts` and
+  rendered by `app/[slug]/` through the templates in
+  `src/components/seo/templates/` (job frame, comparison, the live fleet
+  capture in `public/product/`). `src/lib/seo/flat.test.ts` holds the
+  invariants, including the denylist that keeps flat slugs off static
+  routes. `app/run-agents-in-parallel/` is the hand-built flagship on the
+  job template.
+- **Legacy registry**: `/use/*` and `/for/*` entries in
+  `src/lib/seo/{use-cases,agents}.ts`, rendered by
+  `src/components/seo/SeoLandingPage.tsx`; `registry.test.ts` holds their
+  invariants. They migrate to flat slugs at rework time.
+
+The sitemap (`app/sitemap.ts`), hubs, and cross-links follow from both
+catalogues (`related` keys starting with "/" resolve against the flat one).
+Titles and H1s stay plain-language for search; the demon voice lives in body
+copy. Every claim must survive a diff against `docs/TRUST.md`.
 
 ## Before calling a change done
 
