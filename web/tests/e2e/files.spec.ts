@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 import { fileEntry, fileListing, HOST_ID, host, mockApp, session, windowsHost } from "./app-mocks";
 
 const OTHER_HOST_ID = "00000000-0000-4000-8000-000000000009";
@@ -390,4 +390,73 @@ test("a file explorer is added to the workspace as its own pane", async ({ page 
   await expect(pane).toBeVisible();
   await expect(pane.getByRole("tree", { name: "Files" })).toBeVisible();
   await expect.poll(() => requested.length).toBeGreaterThan(0);
+});
+
+/** Enough shapes that a rendered view is unmistakably not the source. */
+const README = `# SPAWN D
+
+A **bold** claim and some _emphasis_.
+
+- one thing
+- another thing
+
+## Getting started
+
+Run \`spawnd login\` and follow the prompts.
+`;
+
+/** A file explorer pane filling the window, holding a README to hover. */
+async function openWideExplorer(page: Page) {
+  const { WORKSPACE_ID, workspace } = await import("./app-mocks");
+  await page.setViewportSize({ width: 1160, height: 900 });
+  await mockApp(page, {
+    sessions: [],
+    workspaces: [workspace({ host_id: HOST_ID, cwd: "/Users/tester/spawn" })],
+    files: (_hostId, path) =>
+      fileListing({
+        path: path ?? "/Users/tester/spawn",
+        entries: [
+          fileEntry({ name: "infra", path: "/Users/tester/spawn/infra", is_dir: true, size: null }),
+          fileEntry({ name: "README.md", path: "/Users/tester/spawn/README.md", size: 240 }),
+        ],
+      }),
+    fileRead: () => README,
+  });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  await page.getByRole("button", { name: "Add a window" }).hover();
+  await page.getByRole("button", { name: "New file explorer window" }).click();
+  const pane = page.getByRole("region", { name: /^Files — / });
+  await expect(pane.getByRole("tree", { name: "Files" })).toBeVisible();
+  await pane.getByRole("treeitem").filter({ hasText: "README.md" }).hover();
+  await expect(page.locator("#file-preview-card")).toBeVisible();
+  return pane;
+}
+
+test("a full-width explorer keeps its hover preview over itself, clear of the tree", async ({
+  page,
+}) => {
+  const pane = await openWideExplorer(page);
+  const card = page.locator("#file-preview-card");
+
+  const paneBox = (await pane.boundingBox()) ?? null;
+  const cardBox = (await card.boundingBox()) ?? null;
+  if (!paneBox || !cardBox) throw new Error("no boxes");
+
+  // Over its own panel, not flipped across the window onto the sidebar.
+  expect(cardBox.x).toBeGreaterThan(paneBox.x);
+  expect(cardBox.x + cardBox.width).toBeLessThanOrEqual(paneBox.x + paneBox.width + 1);
+  // And far enough in that the rows it is about are still readable beside it.
+  expect(cardBox.x - paneBox.x).toBeGreaterThanOrEqual(200);
+  await expect(pane.getByRole("treeitem").filter({ hasText: "infra" })).toBeVisible();
+});
+
+test("the hover preview renders markdown, the way the viewer does", async ({ page }) => {
+  await openWideExplorer(page);
+  const card = page.locator("#file-preview-card");
+  // Rendered, not shown as source: headings, a list and inline code.
+  await expect(card.getByRole("heading", { name: "SPAWN D" })).toBeVisible();
+  await expect(card.getByRole("heading", { name: "Getting started" })).toBeVisible();
+  await expect(card.locator("li")).toHaveCount(2);
+  await expect(card.locator("code")).toHaveText("spawnd login");
+  await expect(card.locator("strong")).toHaveText("bold");
 });

@@ -267,7 +267,7 @@ export function MediaPreview({
  * right, and file content is fully untrusted. `rehype-raw` must never be added
  * here: it would reopen exactly the hole this choice closes.
  */
-export function MarkdownPreview({ text }: { text: string }) {
+export function MarkdownPreview({ text, compact = false }: { text: string; compact?: boolean }) {
   const [loaded, setLoaded] = useState<{
     Markdown: ComponentType<Record<string, unknown>>;
     gfm: unknown;
@@ -293,7 +293,7 @@ export function MarkdownPreview({ text }: { text: string }) {
     };
   }, []);
 
-  if (failed) return <CodeLines text={text} language="markdown" />;
+  if (failed) return <CodeLines text={text} language="markdown" showLineNumbers={!compact} />;
   if (!loaded) {
     return (
       <div className="space-y-2 p-4">
@@ -306,7 +306,14 @@ export function MarkdownPreview({ text }: { text: string }) {
 
   const { Markdown, gfm } = loaded;
   return (
-    <div className="prose-preview px-6 py-5 text-[13px] leading-relaxed text-foreground">
+    <div
+      className={cn(
+        "prose-preview leading-relaxed text-foreground",
+        // The hover card is half the dialog's width and a third of its height,
+        // so the same margins would leave it showing a paragraph and a half.
+        compact ? "px-4 py-3 text-[12px]" : "px-6 py-5 text-[13px]",
+      )}
+    >
       <Markdown
         remarkPlugins={[gfm]}
         // Only schemes that cannot execute. This is what stops
