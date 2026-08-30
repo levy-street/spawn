@@ -39,7 +39,7 @@ export const SEO_FAMILIES: Record<
     blurb: "Where spawnd stands among the alternatives.",
     indexTitle: "spawnd, compared to the alternatives",
     indexDescription:
-      "Honest comparisons against SSH + tmux, VS Code Remote Tunnels, tmate, Coder, and Tailscale SSH — including when the other tool is the right choice.",
+      "Honest comparisons against SSH + tmux, Tailscale, mosh, Cloudflare Tunnel, Codespaces, and the rest of the field — including when the other tool is the right choice.",
   },
 };
 
