@@ -236,9 +236,9 @@ export default function RunAgentsInParallelPage() {
               refId="a4"
               src="/product/features/attention.png"
               width={1320}
-              height={900}
+              height={1020}
               alt="The sidebar's amber badges counting sessions that need attention, beside a finished agent whose tile is marked"
-              caption="The amber counts are the sessions that need you — on the workspace, the tab, and the tile."
+              caption="The amber counts are the sessions that need you — per workspace in the sidebar, per tab in the strip."
             />
           }
         >
@@ -295,15 +295,15 @@ export default function RunAgentsInParallelPage() {
                 refId="a6"
                 src="/product/features/launcher.png"
                 width={736}
-                height={804}
+                height={820}
                 alt="The session launcher: shell, claude-code, codex, opencode, aider, and a file explorer"
                 caption="The launcher: agents as visible commands."
               />
               <JobShot
                 refId="a7"
                 src="/product/features/host-picker.png"
-                width={560}
-                height={660}
+                width={520}
+                height={460}
                 alt="The host picker listing three machines, all online"
                 caption="Any pane, on any machine you own."
               />
