@@ -667,4 +667,789 @@ export const COMPARISONS: ComparisonEntry[] = [
     cardTitle: "vs Tailscale SSH",
     cardBlurb: "A private network versus a deaf channel — and why some run both.",
   },
+  {
+    slug: "spawnd-vs-mosh",
+    name: "mosh",
+    title: "spawnd vs mosh",
+    description:
+      "mosh fixed the flaky-connection problem for SSH — roaming, instant echo, UDP resilience. What it left unfixed, and where spawnd picks up the thread.",
+    datePublished: "2026-08-30",
+    dateModified: "2026-08-30",
+    hero: {
+      plain: "spawnd vs",
+      accent: "mosh",
+      sub: "The mobile shell solved the dying connection — and stopped there. Sessions, phones, and the zero-inbound host are a different project.",
+    },
+    intro: {
+      heading: "mosh fixed the right problem, brilliantly.",
+      paragraphs: [
+        "mosh exists because SSH dies when the network does: close the laptop, switch from Wi-Fi to cellular, ride a train — the TCP connection is gone and the session with it. mosh authenticates over SSH, then switches to its own encrypted UDP channel that survives roaming and packet loss, and its predictive local echo makes a bad link feel instant. For a laptop that moves through networks all day, it remains a genuine quality-of-life upgrade over bare SSH.",
+        "Its boundaries are equally clear, and its own documentation is honest about them: the server must have a UDP port range reachable (typically 60000–61000), which rules out the sealed-firewall host; scrollback isn't supported, so tmux rides inside anyway; and a dropped device still means a dead session — mosh survives the network changing, not the client disappearing. Persistence was never its job.",
+      ],
+    },
+    framing: {
+      heading: "Surviving the network versus surviving everything else.",
+      paragraphs: [
+        "spawnd starts from the piece mosh set aside: the session itself lives on the host, owned by a worker process, so it survives the closed tab, the dead phone battery, and a restart of the daemon — scrollback intact, because the host keeps it. Reconnection isn't a channel trick; there's simply nothing to lose.",
+        "The network model inverts too. mosh needs inbound UDP; spawnd's daemon dials out and nothing listens. And the client requirement drops to a browser: the same terminal on the desk, the phone, and the borrowed machine, each device approved once and revocable — end-to-end encrypted to each host's own daemon.",
+      ],
+    },
+    ledger: {
+      heading: "The channel versus the session.",
+      rows: [
+        {
+          label: "Survives",
+          spawnd: "Network loss, closed tab, device death, daemon restart",
+          other: "Network loss and roaming — the connection, not the session",
+        },
+        {
+          label: "Network requirement",
+          spawnd: "None inbound — the daemon dials out",
+          other: "SSH for auth plus a reachable UDP range (60000–61000 typical)",
+        },
+        {
+          label: "Scrollback",
+          spawnd: "Kept on the host; reattach and it's there",
+          other: "Not supported — run tmux inside for history",
+        },
+        {
+          label: "From a phone",
+          spawnd: "Any browser, installable as a web app",
+          other: "A mosh-capable client app (Blink, Termius), per device",
+        },
+        {
+          label: "Feel on a bad link",
+          spawnd: "Live terminal over a resilient encrypted channel",
+          other: "Superb — predictive echo is mosh's signature",
+        },
+        {
+          label: "Auth and revocation",
+          spawnd: "Approve a device once; revoke with one click everywhere",
+          other: "SSH keys, same as ever, per host",
+        },
+        {
+          label: "Provenance",
+          spawnd: "Open source, MIT/Apache-2.0",
+          other: "Open source, a landmark design — slow but steady releases",
+        },
+      ],
+    },
+    capture: {
+      caption:
+        "What persistence-as-structure looks like: agent sessions across three machines that survive any client coming or going, scrollback kept by the hosts.",
+    },
+    verdict: {
+      heading: "Keep mosh where mosh shines.",
+      paragraphs: [
+        "If your workflow is a moving laptop and a reachable server, mosh plus tmux remains a fine rig — the roaming is seamless and the predictive echo still feels like magic on hotel Wi-Fi. Nothing here takes that away.",
+        "spawnd earns the switch when the session matters more than the channel: agent runs that must outlive every device you own, hosts that can't open a UDP range, phones that shouldn't need a client app, and scrollback you expect to find where you left it. mosh keeps a connection alive; spawnd makes the connection optional.",
+      ],
+      choose: {
+        spawnd: [
+          "Sessions must survive devices, not just networks",
+          "Hosts present zero inbound surface, UDP included",
+          "Phones and borrowed machines are first-class",
+          "Scrollback and reattach must be structural",
+        ],
+        other: {
+          title: "Stay with mosh when",
+          items: [
+            "A moving laptop and one reachable server is the shape",
+            "Predictive echo on bad links is the killer feature",
+            "You're happy with tmux for persistence and history",
+            "An SSH-based toolchain is a hard requirement",
+          ],
+        },
+      },
+    },
+    faq: [
+      {
+        q: "Does spawnd have mosh-style predictive echo?",
+        a: "No — spawnd sends real keystrokes over a low-latency encrypted channel rather than predicting locally. On most links the difference isn't noticeable; on truly terrible ones, mosh's prediction still feels smoother. What spawnd guarantees instead is that the session and its scrollback survive the link dying entirely.",
+      },
+      {
+        q: "Can I run mosh inside a spawnd session?",
+        a: "You can run anything in a spawnd session — it's a real shell. But mosh's job (surviving the client's network) is already covered: the session lives on the host regardless of what happens to your device.",
+      },
+      {
+        q: "Why does mosh need open UDP ports and spawnd doesn't?",
+        a: "mosh's server waits for the client's datagrams, so something must be reachable. spawnd's daemon only dials out — to the control plane, and peer-to-peer to your browser — so the host can sit behind a sealed firewall or CGNAT.",
+      },
+    ],
+    related: [
+      {
+        title: "spawnd vs SSH + tmux",
+        blurb: "the classic rig mosh usually rides with",
+        href: "/spawnd-vs-ssh-and-tmux",
+      },
+      {
+        title: "spawnd vs mobile SSH apps",
+        blurb: "the clients that speak mosh on a phone",
+        href: "/spawnd-vs-mobile-ssh-apps",
+      },
+      {
+        title: "Keep agents running",
+        blurb: "sessions that outlive every device",
+        href: "/use/keep-agents-running",
+      },
+      {
+        title: "Run agents in parallel",
+        blurb: "what the persistent fleet is for",
+        href: "/run-agents-in-parallel",
+      },
+    ],
+    cardTitle: "vs mosh",
+    cardBlurb: "Surviving the network versus surviving everything else.",
+  },
+
+  {
+    slug: "spawnd-vs-mobile-ssh-apps",
+    name: "Termius / Blink",
+    title: "spawnd vs mobile SSH apps",
+    description:
+      "Termius and Blink are genuinely good SSH clients for the phone. The real comparison is the shape: an SSH client app versus terminals with no client at all.",
+    datePublished: "2026-08-30",
+    dateModified: "2026-08-30",
+    hero: {
+      plain: "spawnd vs",
+      accent: "mobile SSH apps",
+      sub: "Termius, Blink, and their kin made SSH livable on a phone. The question is whether the phone needs an SSH client at all.",
+    },
+    intro: {
+      heading: "The good ones are genuinely good.",
+      paragraphs: [
+        "Blink is the keyboard-first power tool of iOS terminals — hardware-keyboard bindings, themes, native mosh for connection resilience, a yearly price a professional doesn't blink at. Termius trades depth for reach: one client across phone and desktop, hosts and keys synced everywhere, teams and AI conveniences layered on a subscription. Both have earned their reputations, and both now ride mosh, so the flaky-cellular problem is largely solved inside them.",
+        "What they can't change is the shape they inherit: they are SSH clients. The server must be reachable — a port, a VPN, a tailnet; the keys must get onto each device and off it again when the device goes; and the session's persistence is still tmux's job on the far end. The app polishes the window; the plumbing behind it is unchanged.",
+      ],
+    },
+    framing: {
+      heading: "spawnd removes the client, not just the friction.",
+      paragraphs: [
+        "On spawnd the phone needs nothing installed: the browser is the terminal, installable as a web app, built for touch and the virtual keyboard. There is no key to provision — the device is approved once against a short code, and revoked with one click that every host honors.",
+        "And what you reach isn't a socket, it's your standing sessions: the agent that's been running since morning, scrollback intact, the same grid you left on the desk. End-to-end encrypted from the phone's browser to each host's own daemon, with nothing on any host listening for it.",
+      ],
+    },
+    ledger: {
+      heading: "The app versus no app.",
+      rows: [
+        {
+          label: "On the phone",
+          spawnd: "The browser — installable web app, nothing else",
+          other: "A client app per platform, configured per device",
+        },
+        {
+          label: "Reaching the host",
+          spawnd: "Daemon dials out; works behind sealed firewalls and CGNAT",
+          other: "Host must be reachable: port, VPN, or tailnet",
+        },
+        {
+          label: "Credentials",
+          spawnd: "One approval per device; one-click revocation everywhere",
+          other: "Keys managed per device (or synced through a vendor account)",
+        },
+        {
+          label: "Session persistence",
+          spawnd: "Structural — sessions live on the host with scrollback",
+          other: "mosh keeps the channel; tmux keeps the session, as ever",
+        },
+        {
+          label: "Beyond terminals",
+          spawnd: "Terminals and file transfer — deliberately narrow",
+          other: "SFTP, port forwarding, snippets, any SSH target anywhere",
+        },
+        {
+          label: "Cost and provenance",
+          spawnd: "Open source, MIT/Apache-2.0",
+          other: "Polished proprietary apps; subscription or yearly license",
+        },
+      ],
+    },
+    capture: {
+      caption:
+        "What the phone opens onto: not a socket to configure but the standing grid — the same sessions, the same scrollback, every device approved by name.",
+    },
+    verdict: {
+      heading: "An excellent client for the old shape.",
+      paragraphs: [
+        "If your world is many arbitrary SSH endpoints — client boxes, jump hosts, servers you don't control — a first-class SSH app is the right tool, and Blink or Termius will serve you well. spawnd can't reach a host that doesn't run its daemon, and doesn't try to.",
+        "For the machines that are yours, the calculus flips: install one daemon per host once, and every device you'll ever approve gets persistent terminals with none of the key ceremony, reachability plumbing, or tmux discipline. The agent asking permission at 9pm is answered from the sofa in the same session it asked in.",
+      ],
+      choose: {
+        spawnd: [
+          "The hosts are yours and run the daemon",
+          "No client installs, no keys on phones",
+          "Sessions and scrollback must persist by construction",
+          "Hosts stay sealed — nothing reachable to configure",
+        ],
+        other: {
+          title: "Use an SSH app when",
+          items: [
+            "You reach arbitrary servers you don't control",
+            "SFTP and port forwarding are daily tools",
+            "Hardware-keyboard depth on iPad is the priority",
+            "Your fleet's access is already SSH-standardised",
+          ],
+        },
+      },
+    },
+    faq: [
+      {
+        q: "Is a browser terminal really usable on a phone?",
+        a: "spawnd's terminal is built for touch: a modifier bar for keys phones don't have, virtual-keyboard handling that doesn't fight the viewport, and sessions sized for the screen. It's a first-class surface, not a desktop page squeezed down.",
+      },
+      {
+        q: "Can spawnd reach a server that doesn't run its daemon?",
+        a: "No. spawnd is standing access to machines you possess, not a general SSH client. For one-off connections to arbitrary hosts, keep an SSH app — many people run both.",
+      },
+      {
+        q: "What about SFTP and port forwarding?",
+        a: "spawnd does terminals and file transfer. Port forwarding and the wider SSH toolbox aren't the product — if those are daily needs, an SSH client remains the right tool beside it.",
+      },
+    ],
+    related: [
+      {
+        title: "spawnd vs mosh",
+        blurb: "the protocol those apps ride for resilience",
+        href: "/spawnd-vs-mosh",
+      },
+      {
+        title: "Claude Code on your phone",
+        blurb: "the phone as a first-class agent console",
+        href: "/use/claude-code-on-your-phone",
+      },
+      {
+        title: "spawnd vs SSH + tmux",
+        blurb: "the plumbing the apps inherit, examined",
+        href: "/spawnd-vs-ssh-and-tmux",
+      },
+      {
+        title: "Run agents in parallel",
+        blurb: "the grid waiting behind the phone",
+        href: "/run-agents-in-parallel",
+      },
+    ],
+    cardTitle: "vs mobile SSH apps",
+    cardBlurb: "Termius and Blink polish the window; spawnd removes the client.",
+  },
+
+  {
+    slug: "spawnd-vs-self-hosted-web-terminals",
+    name: "ttyd / WeTTY",
+    title: "spawnd vs self-hosted web terminals",
+    description:
+      "ttyd and WeTTY put a terminal in the browser a decade ago. The difference is everything around it: exposure, encryption, persistence, and more than one machine.",
+    datePublished: "2026-08-30",
+    dateModified: "2026-08-30",
+    hero: {
+      plain: "spawnd vs",
+      accent: "ttyd & WeTTY",
+      sub: "The browser terminal isn't the hard part — the projects that proved it also show where the real work begins.",
+    },
+    intro: {
+      heading: "The pioneers proved the idea.",
+      paragraphs: [
+        "ttyd is a small, sharp C program: point it at a command, and xterm.js serves that command's terminal to a browser over WebSocket. WeTTY does the same by spawning ssh, inheriting SSH's authentication. Both are open source, both self-hosted, and both settled the question of whether a browser can be a real terminal years ago. For a quick terminal on one box on a trusted network, they're honest, minimal tools.",
+        "Everything around the terminal is left to you, and their own guidance says so: bind to localhost, put a reverse proxy in front, bring your own TLS, auth, and hardening — because what you're standing up is a listener that serves a shell. That's per host, and it's your name on the exposure.",
+      ],
+    },
+    framing: {
+      heading: "spawnd is what the wrapper never became.",
+      paragraphs: [
+        "Same browser, same xterm lineage — inverted plumbing. spawnd's daemon dials out, so there is no listener, no reverse proxy, no certificate, and no exposure homework on any host. Sessions are owned by worker processes, so they persist with scrollback instead of living and dying with a tab. Devices are approved and revoked account-wide instead of guarded by whatever auth you wired in front.",
+        "And it's a fleet, not a box: every host's sessions in one grid, each tile end-to-end encrypted from your browser to that host's own daemon — the server that introduces them never hears a word. The browser terminal was the easy part; the product is everything the wrapper left as an exercise.",
+      ],
+    },
+    ledger: {
+      heading: "A wrapper versus a system.",
+      rows: [
+        {
+          label: "Network model",
+          spawnd: "Outbound-only daemon; nothing listens anywhere",
+          other: "A listener per host — proxy, TLS, and auth are your homework",
+        },
+        {
+          label: "Encryption",
+          spawnd: "End-to-end, browser to daemon; relay sees ciphertext",
+          other: "TLS to your proxy; inside, it's your architecture",
+        },
+        {
+          label: "Sessions",
+          spawnd: "Persist on the host with scrollback; reattach anywhere",
+          other: "Live and die with the browser tab (bring tmux)",
+        },
+        {
+          label: "Many machines",
+          spawnd: "One grid, sessions from every host side by side",
+          other: "One deployment per host, one tab per host",
+        },
+        {
+          label: "Access control",
+          spawnd: "Named devices, approved once, revoked one click everywhere",
+          other: "Basic auth or SSH login — whatever you configured, per host",
+        },
+        {
+          label: "Provenance",
+          spawnd: "Open source, MIT/Apache-2.0, active",
+          other: "Open source, minimal by design, slow-cadence maintenance",
+        },
+      ],
+    },
+    capture: {
+      caption:
+        "The system the wrapper hints at: three hosts' sessions in one grid, no listener on any of them, every tile its own encrypted channel.",
+    },
+    verdict: {
+      heading: "Minimal is a feature — until it's your attack surface.",
+      paragraphs: [
+        "On a trusted LAN, for one box, ttyd is a perfectly good answer — a terminal in a tab with nothing to buy and nothing to sign up for. If that's the whole need, it's the simpler tool and you should use it.",
+        "The calculus changes the moment the terminal must cross the internet, survive the tab, or cover a second machine. Then the wrapper's to-do list — proxy, TLS, auth, hardening, per host, forever — is the product spawnd already is, with a stronger property than a well-guarded listener: no listener at all, and encryption the infrastructure can't look through.",
+      ],
+      choose: {
+        spawnd: [
+          "Terminals must cross the internet safely",
+          "Sessions must outlive tabs, devices, and restarts",
+          "More than one machine belongs in the picture",
+          "Nobody wants to own proxy-and-TLS homework per host",
+        ],
+        other: {
+          title: "Use ttyd or WeTTY when",
+          items: [
+            "One box, one trusted network, one tab",
+            "You want a zero-account, zero-service tool",
+            "Embedding a terminal in something else is the goal",
+            "You enjoy owning the whole stack yourself",
+          ],
+        },
+      },
+    },
+    faq: [
+      {
+        q: "Isn't spawnd just ttyd with an account system?",
+        a: "The browser terminal is the shared ancestor; the rest is different plumbing. ttyd serves a shell from a listener you must guard. spawnd's hosts listen on nothing, sessions persist with scrollback, devices are approved and revoked account-wide, and terminal content is end-to-end encrypted past the server that connects you.",
+      },
+      {
+        q: "Can I self-host spawnd like I'd self-host WeTTY?",
+        a: "Yes — the control plane is open source and self-hostable, and the daemons don't care whose control plane introduces them. The E2E property holds either way: even your own server only ever forwards ciphertext.",
+      },
+      {
+        q: "Do my ttyd sessions survive a closed tab?",
+        a: "Not by themselves — the process lives while the connection does, so the usual pattern is tmux inside it. spawnd sessions are owned by a worker process on the host, so the tab is just a viewer.",
+      },
+    ],
+    related: [
+      {
+        title: "spawnd vs Coder & code-server",
+        blurb: "the other self-hosted browser-tool comparison",
+        href: "/spawnd-vs-coder",
+      },
+      {
+        title: "Web terminal for a home server",
+        blurb: "the closet machine, done without a listener",
+        href: "/use/web-terminal-for-your-home-server",
+      },
+      {
+        title: "No open ports",
+        blurb: "the outbound-only network model, in full",
+        href: "/use/remote-access-without-open-ports",
+      },
+      {
+        title: "spawnd vs Cloudflare Tunnel",
+        blurb: "the other way to serve without listening",
+        href: "/spawnd-vs-cloudflare-tunnel",
+      },
+    ],
+    cardTitle: "vs ttyd & WeTTY",
+    cardBlurb: "The browser terminal was the easy part.",
+  },
+
+  {
+    slug: "spawnd-vs-github-codespaces",
+    name: "GitHub Codespaces",
+    title: "spawnd vs GitHub Codespaces",
+    description:
+      "Codespaces rents you a fresh machine per branch; spawnd possesses the machines you already own. Different economics, different trust, different agent story.",
+    datePublished: "2026-08-30",
+    dateModified: "2026-08-30",
+    hero: {
+      plain: "spawnd vs",
+      accent: "GitHub Codespaces",
+      sub: "A rented machine that vanishes when you stop paying attention, versus your own machines that never stop — the agent era makes the difference sharp.",
+    },
+    intro: {
+      heading: "A fresh machine per branch is a real superpower.",
+      paragraphs: [
+        "Codespaces gives you a disposable dev machine in GitHub's cloud: click, and a devcontainer builds itself around the branch — toolchain, extensions, secrets — reachable from VS Code or a browser tab anywhere. For onboarding, one-off contributions, and keeping laptops out of production credentials, it's genuinely excellent, and the free tier's monthly core-hours cover casual use.",
+        "Its economics and rhythms are a cloud product's: metered per core-hour past the free allowance, storage billed monthly, and an idle timeout — thirty minutes by default — that stops the machine when you stop touching it. Sensible for browsers-and-humans; expensive habits for anything that runs while you sleep.",
+      ],
+    },
+    framing: {
+      heading: "Agents change what a dev machine is for.",
+      paragraphs: [
+        "A coding agent's best hours are unattended: the refactor dispatched at six, still grinding at nine, finished overnight. On rented compute that pattern fights both the meter and the idle timeout; on your own hardware it's free and nobody stops it. The GPU rig, the Mac Studio, the home server — the machines you already own are better agent hosts than any rental, if you can reach them.",
+        "Reaching them is spawnd's whole product: persistent terminals on every host you possess, from any approved browser, end-to-end encrypted past the server that introduces them. Your code never moves to someone else's computer, because the computer was yours all along.",
+      ],
+    },
+    ledger: {
+      heading: "Rented versus possessed.",
+      rows: [
+        {
+          label: "The machine",
+          spawnd: "Yours — dev box, GPU rig, home server, laptop",
+          other: "GitHub's — a devcontainer VM built per branch",
+        },
+        {
+          label: "Economics",
+          spawnd: "Open source; your hardware, your power bill",
+          other: "Free core-hours monthly, then metered per core-hour + storage",
+        },
+        {
+          label: "Long unattended runs",
+          spawnd: "Native — sessions persist until you end them",
+          other: "Idle timeout stops the machine (30 min default); the meter runs while it doesn't",
+        },
+        {
+          label: "Where code lives",
+          spawnd: "On your machines; sessions E2E-encrypted past the server",
+          other: "In GitHub's cloud, inside your GitHub account's trust",
+        },
+        {
+          label: "Environment reproducibility",
+          spawnd: "Whatever your machines are — spawnd doesn't provision",
+          other: "Devcontainers rebuild identically every time — the headline feature",
+        },
+        {
+          label: "GPU and local models",
+          spawnd: "Your GPU is a first-class host",
+          other: "Machine types are GitHub's menu, priced accordingly",
+        },
+      ],
+    },
+    capture: {
+      caption:
+        "The owned fleet at work: agent sessions across three machines that were already paid for, running as long as the work takes.",
+    },
+    verdict: {
+      heading: "Rent for reproducibility, own for endurance.",
+      paragraphs: [
+        "If the problem is environments — onboarding someone by lunch, reviewing a stranger's PR without trusting your laptop to it, keeping toolchains identical across a team — Codespaces is built for exactly that, and owning hardware doesn't solve it. Keep it for what it is: the best disposable machine in the business.",
+        "If the problem is the agent era's actual workload — long runs, big checkouts, your own GPU, sessions you answer from a phone at night — the rented machine's meter and timeout are working against you. spawnd turns the hardware you already own into the fleet those workloads want, with a trust model where your terminal content is yours alone.",
+      ],
+      choose: {
+        spawnd: [
+          "Agents run for hours on machines you own",
+          "The GPU rig and home server are the compute",
+          "Code and terminal content stay on your hardware",
+          "No meter should decide when work stops",
+        ],
+        other: {
+          title: "Use Codespaces when",
+          items: [
+            "Reproducible per-branch environments are the point",
+            "Onboarding and one-off contributions dominate",
+            "Untrusted code needs a disposable sandbox",
+            "You want zero hardware to own or maintain",
+          ],
+        },
+      },
+    },
+    faq: [
+      {
+        q: "Can I use spawnd and Codespaces together?",
+        a: "Naturally — they don't compete for the same machine. Some people prototype in a codespace and run the long agent work on their own rig through spawnd; the daemon doesn't care what else your workflow includes.",
+      },
+      {
+        q: "Does spawnd give me reproducible environments?",
+        a: "No — spawnd deliberately provisions nothing. Your machines are whatever you've made them; devcontainers and Nix solve reproducibility, and they run fine on hosts spawnd reaches.",
+      },
+      {
+        q: "Is a codespace private from GitHub?",
+        a: "A codespace runs on GitHub's infrastructure under your account, governed by GitHub's terms and controls. spawnd's claim is structural rather than contractual: sessions are end-to-end encrypted from your browser to your host's daemon, and the introducing server carries only ciphertext.",
+      },
+    ],
+    related: [
+      {
+        title: "spawnd vs Coder & code-server",
+        blurb: "the self-hosted flavour of provisioned environments",
+        href: "/spawnd-vs-coder",
+      },
+      {
+        title: "AI agents on your own GPU",
+        blurb: "the rig as a first-class host",
+        href: "/use/ai-agents-on-your-own-gpu",
+      },
+      {
+        title: "Keep agents running",
+        blurb: "runs that no meter or timeout interrupts",
+        href: "/use/keep-agents-running",
+      },
+      {
+        title: "Run agents in parallel",
+        blurb: "the owned fleet, working",
+        href: "/run-agents-in-parallel",
+      },
+    ],
+    cardTitle: "vs GitHub Codespaces",
+    cardBlurb: "Rent for reproducibility, own for endurance.",
+  },
+
+  {
+    slug: "spawnd-vs-cloudflare-tunnel",
+    name: "Cloudflare Tunnel",
+    title: "spawnd vs Cloudflare Tunnel",
+    description:
+      "cloudflared dials out just like spawnd's daemon — the closest cousin in the field. The fork in the road is who can read the session, and what a terminal owes you.",
+    datePublished: "2026-08-30",
+    dateModified: "2026-08-30",
+    hero: {
+      plain: "spawnd vs",
+      accent: "Cloudflare Tunnel",
+      sub: "Two outbound-only connectors, one real fork: whether the infrastructure in the middle can read what flows through it.",
+    },
+    intro: {
+      heading: "The network model is the same, and that's a compliment.",
+      paragraphs: [
+        "Cloudflare Tunnel got the architecture right: cloudflared makes a persistent outbound connection to Cloudflare's edge, and inbound traffic rides it back — no open ports, no public IP, DDoS protection for free. Put Access in front and you get real authentication policies over anything you serve. For exposing a web app from a homelab, or giving a team SSH gated by SSO, it's a deservedly popular answer.",
+        "Terminals are where its shape shows. The polished path — the browser-rendered terminal — has Cloudflare's edge render the session, which makes Cloudflare a party to the plaintext; the client-side path keeps SSH end-to-end but reinstates everything SSH asks: cloudflared on every device, keys or short-lived certs, and tmux for anything that must survive. The tunnel moves packets superbly; it has no opinion about sessions.",
+      ],
+    },
+    framing: {
+      heading: "Same doorway, different rooms.",
+      paragraphs: [
+        "spawnd's daemon dials out the same way — and then delivers a different product. Sessions are the unit: they live on the host with scrollback, show up in one grid across all your machines, and reattach from any approved browser, phone included, with no per-device client or key ceremony.",
+        "And the middle stays deaf by construction: your browser talks to each daemon peer-to-peer, end-to-end encrypted, and when a relay is unavoidable it forwards ciphertext it cannot read. Not a policy promise from an operator — a property you can verify in open source.",
+      ],
+    },
+    ledger: {
+      heading: "The tunnel versus the terminal.",
+      rows: [
+        {
+          label: "Connector",
+          spawnd: "Outbound-only daemon — same architecture, honestly",
+          other: "Outbound-only cloudflared — the pattern done at scale",
+        },
+        {
+          label: "Who can read a session",
+          spawnd: "You and the host — E2E past the introducer, verifiable in source",
+          other:
+            "Browser-rendered: Cloudflare's edge renders it. Client-side SSH: end-to-end, with client setup back",
+        },
+        {
+          label: "What it serves",
+          spawnd: "Terminals as the product: sessions, agents, grids",
+          other: "Anything TCP/HTTP — terminals are one tenant among many",
+        },
+        {
+          label: "Session persistence",
+          spawnd: "Structural, with scrollback on the host",
+          other: "Not the tunnel's job — tmux, as ever",
+        },
+        {
+          label: "From a phone",
+          spawnd: "First-class touch terminal, no apps",
+          other: "Browser-rendered works; client-side path wants cloudflared per device",
+        },
+        {
+          label: "Operator and account",
+          spawnd: "Open source end to end; self-hostable control plane",
+          other: "Cloudflare's service and dashboard; generous free tier, closed control plane",
+        },
+      ],
+    },
+    capture: {
+      caption:
+        "What the doorway opens onto here: standing sessions across three machines in one grid, each tile encrypted to its own host — the middle carries only ciphertext.",
+    },
+    verdict: {
+      heading: "For services, hard to beat. For terminals, the long way.",
+      paragraphs: [
+        "If you're exposing web apps, APIs, or a whole homelab's services to the internet with authentication in front, Cloudflare Tunnel is excellent and spawnd is no substitute — spawnd serves terminals, not your Jellyfin. Teams already living in Cloudflare Zero Trust have every reason to route SSH through it too.",
+        "But if what you need is terminals on your own machines, the tunnel path makes you choose between convenience and confidentiality: the browser terminal that Cloudflare can read, or the end-to-end path that brings back per-device clients and tmux. spawnd refuses that trade — browser convenience and end-to-end encryption in the same product, with sessions that persist because that's what the product is.",
+      ],
+      choose: {
+        spawnd: [
+          "Terminals are the need, sessions the unit",
+          "No intermediary may be able to read content",
+          "Phones need first-class access with no client",
+          "Persistence must not depend on tmux discipline",
+        ],
+        other: {
+          title: "Use Cloudflare Tunnel when",
+          items: [
+            "Web apps and services need public exposure",
+            "Access/SSO policies over many apps are the point",
+            "You're already invested in Cloudflare Zero Trust",
+            "One vendor fronting everything is a feature",
+          ],
+        },
+      },
+    },
+    faq: [
+      {
+        q: "Cloudflare's browser terminal — can Cloudflare really see my session?",
+        a: "In browser-rendered mode the terminal is rendered at Cloudflare's edge, which means the session exists there in readable form; that's inherent to the design, not a flaw they hide. Their client-side SSH path avoids it by keeping SSH end-to-end. spawnd's browser terminal is end-to-end encrypted to the host's own daemon — the convenience without the trade.",
+      },
+      {
+        q: "Isn't spawnd's outbound-only model just Cloudflare Tunnel's?",
+        a: "The connector pattern is the same, and it's the right pattern. The difference is what rides it and who can read it: spawnd carries only terminal sessions, encrypted past its own infrastructure, with the whole stack open source.",
+      },
+      {
+        q: "Can I run both?",
+        a: "A very natural split: Cloudflare Tunnel for the services you serve to the world, spawnd for the terminals you keep to yourself. The daemons coexist happily on one host.",
+      },
+    ],
+    related: [
+      {
+        title: "spawnd vs Tailscale SSH",
+        blurb: "the other infrastructure giant, compared",
+        href: "/spawnd-vs-tailscale-ssh",
+      },
+      {
+        title: "No open ports",
+        blurb: "the outbound-only model, in full",
+        href: "/use/remote-access-without-open-ports",
+      },
+      {
+        title: "spawnd vs self-hosted web terminals",
+        blurb: "the listener-shaped way to a browser terminal",
+        href: "/spawnd-vs-self-hosted-web-terminals",
+      },
+      {
+        title: "Run agents in parallel",
+        blurb: "the standing fleet behind the doorway",
+        href: "/run-agents-in-parallel",
+      },
+    ],
+    cardTitle: "vs Cloudflare Tunnel",
+    cardBlurb: "Same doorway, different rooms — and a deaf middle.",
+  },
+
+  {
+    slug: "spawnd-vs-remote-desktop",
+    name: "Remote desktop",
+    title: "spawnd vs remote desktop",
+    description:
+      "RustDesk and Chrome Remote Desktop ship your screen as video. For terminal work that's the wrong unit — here's the honest boundary between pixels and text.",
+    datePublished: "2026-08-30",
+    dateModified: "2026-08-30",
+    hero: {
+      plain: "spawnd vs",
+      accent: "remote desktop",
+      sub: "When the job is a GUI, ship the screen. When the job is a terminal, shipping the screen is the heaviest possible way to move text.",
+    },
+    intro: {
+      heading: "Sometimes you really do need the pixels.",
+      paragraphs: [
+        "Remote desktop earns its keep wherever the work is graphical: a DAW, a CAD session, a browser you must click through, a parent's machine that needs fixing. RustDesk does it open source with end-to-end encryption and a self-hostable relay — a genuinely strong trust story — and Chrome Remote Desktop does it free with nothing but a Google account. For desktops, these are the right tools.",
+        "Their unit of exchange is the screen: the host renders a display, encodes it as video, and streams it. That means a GUI session must exist to capture, bandwidth is spent on every pixel, latency lives between your keystroke and its echo, and a phone shows you a desktop the size of a postage stamp with a mouse emulated under your thumb.",
+      ],
+    },
+    framing: {
+      heading: "Terminal work wants text, not video of text.",
+      paragraphs: [
+        "A terminal session is a few kilobytes of text and control codes. spawnd moves exactly that — real terminal I/O, end-to-end encrypted from your browser to the host's own daemon — so it's crisp on hotel Wi-Fi, native on a phone, and runs fine against a headless box that has never rendered a desktop in its life.",
+        "Sessions are also the right unit for the agent era: they persist on the host with scrollback, sit side by side in one grid across machines, and reattach from anything you've approved. A desktop stream shows you one machine's screen; the grid shows you the fleet's work.",
+      ],
+    },
+    ledger: {
+      heading: "Pixels versus text.",
+      rows: [
+        {
+          label: "What travels",
+          spawnd: "Terminal I/O — kilobytes of text, E2E-encrypted",
+          other: "The screen, encoded as video, continuously",
+        },
+        {
+          label: "Host requirement",
+          spawnd: "A daemon; headless is native",
+          other: "A GUI session to capture (or one stood up for the purpose)",
+        },
+        {
+          label: "On a phone",
+          spawnd: "A terminal shaped for the screen and touch",
+          other: "A desktop squeezed onto it, cursor under a fingertip",
+        },
+        {
+          label: "Bad networks",
+          spawnd: "Text degrades gracefully; sessions survive drops entirely",
+          other: "Compression artifacts, lag, reconnect roulette",
+        },
+        {
+          label: "Many machines",
+          spawnd: "One grid of sessions across the fleet",
+          other: "One window per machine's screen",
+        },
+        {
+          label: "Trust model",
+          spawnd: "E2E past the introducer; open source, self-hostable",
+          other: "RustDesk: E2E, self-hostable — credit where due. CRD: rides your Google account",
+        },
+      ],
+    },
+    capture: {
+      caption:
+        "The fleet as text: agent sessions from three machines in one grid — kilobytes moving where a desktop stream would ship megabits of pixels.",
+    },
+    verdict: {
+      heading: "Ship the screen for GUIs. Not for shells.",
+      paragraphs: [
+        "If the work is graphical, use the right tool: RustDesk if you want open source and your own relay, Chrome Remote Desktop if you want free and effortless. Nothing terminal-shaped substitutes for a real desktop when a real desktop is the job.",
+        'But an enormous amount of "I need to get to that machine" is terminal work wearing a desktop costume — a shell reached by streaming an entire screen to click on a terminal emulator inside it. For that, spawnd is the honest shape: the text itself, encrypted end to end, persistent on the host, in a grid with every other machine you own, from any browser including the one in your pocket.',
+      ],
+      choose: {
+        spawnd: [
+          "The work is shells, agents, and logs",
+          "Hosts are headless or should be",
+          "Phones must be genuinely usable",
+          "The fleet belongs in one view",
+        ],
+        other: {
+          title: "Use remote desktop when",
+          items: [
+            "The work is genuinely graphical",
+            "You're supporting someone else's screen",
+            "One machine's full desktop is the target",
+            "A GUI app has no terminal equivalent",
+          ],
+        },
+      },
+    },
+    faq: [
+      {
+        q: "Isn't RustDesk also end-to-end encrypted and self-hostable?",
+        a: "Yes — RustDesk's encryption and self-hosted relay are real strengths, and this page doesn't pretend otherwise. The comparison is the unit of work: it ships screens, spawnd ships terminal sessions, and for terminal work the session is the better primitive on every axis from bandwidth to phones to persistence.",
+      },
+      {
+        q: "Can I run a terminal inside a remote desktop session?",
+        a: "Of course — that's how many people work today. You're paying video bandwidth and latency to move text, the host must keep a desktop rendered, and the session still dies with the stream. It works; it's just the long way round.",
+      },
+      {
+        q: "What about the occasional GUI need on a spawnd host?",
+        a: "Keep a remote desktop tool beside spawnd for it — they coexist fine. The point isn't that pixels are bad; it's that terminals shouldn't ride them.",
+      },
+    ],
+    related: [
+      {
+        title: "spawnd vs SSH + tmux",
+        blurb: "the text-native classic, compared",
+        href: "/spawnd-vs-ssh-and-tmux",
+      },
+      {
+        title: "Web terminal for a home server",
+        blurb: "the headless box, reached as text",
+        href: "/use/web-terminal-for-your-home-server",
+      },
+      {
+        title: "Claude Code on your phone",
+        blurb: "what a phone-shaped terminal actually looks like",
+        href: "/use/claude-code-on-your-phone",
+      },
+      {
+        title: "Run agents in parallel",
+        blurb: "the grid a desktop stream can't show",
+        href: "/run-agents-in-parallel",
+      },
+    ],
+    cardTitle: "vs remote desktop",
+    cardBlurb: "Pixels versus text — and why terminals shouldn't ride video.",
+  },
 ];
