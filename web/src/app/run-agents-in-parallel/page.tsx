@@ -235,10 +235,10 @@ export default function RunAgentsInParallelPage() {
             <JobShot
               refId="a4"
               src="/product/features/attention.png"
-              width={1930}
-              height={1320}
-              alt="A Claude Code session holding a permission prompt: the tile is marked and the workspace row carries an amber badge"
-              caption="agent.awaiting_input: the tile, the tab, and the workspace row all mark it."
+              width={1320}
+              height={900}
+              alt="The sidebar's amber badges counting sessions that need attention, beside a finished agent whose tile is marked"
+              caption="The amber counts are the sessions that need you — on the workspace, the tab, and the tile."
             />
           }
         >
@@ -341,10 +341,10 @@ export default function RunAgentsInParallelPage() {
           <JobShot
             refId="a8"
             src="/product/fleet-close.png"
-            width={2540}
-            height={1920}
-            alt="The spawn workspace up close: Claude Code and Codex sessions working across web, server, daemon, and mobile, beside the test suite and htop"
-            caption="Up close: four agents at work on one repo, beside the project’s own test suite and htop."
+            width={1030}
+            height={1200}
+            alt="A finished agent session: rustdoc examples verified with the crate's own doctests, completed at 4:03 AM"
+            caption="Done at 4:03 AM, verified with the crate’s own doctests — while nobody watched."
           />
         </div>
       </JobSection>
