@@ -57,6 +57,17 @@ export interface JobHeading {
   accent?: string;
 }
 
+export interface JobArticleInfo {
+  /** The page's H1/title, not the short breadcrumb name. */
+  headline: string;
+  description: string;
+  /** Site-relative path to the page's OG image. */
+  image?: string;
+  /** ISO dates, kept honest: when the page shipped, when it last changed. */
+  datePublished: string;
+  dateModified: string;
+}
+
 export interface JobHeroInk {
   video: string;
   /** A tiny blurred still (~1KB): paints instantly, reads as atmosphere under
@@ -79,11 +90,13 @@ function StructuredData({
   pageName,
   canonicalPath,
   faq,
+  article,
 }: {
   crumbs: JobCrumb[];
   pageName: string;
   canonicalPath: string;
   faq: JobFaqItem[];
+  article?: JobArticleInfo;
 }) {
   const data: object[] = [
     {
@@ -115,6 +128,25 @@ function StructuredData({
         name: item.q,
         acceptedAnswer: { "@type": "Answer", text: item.a },
       })),
+    });
+  }
+  if (article) {
+    data.push({
+      "@context": "https://schema.org",
+      "@type": "Article",
+      headline: article.headline,
+      description: article.description,
+      ...(article.image ? { image: [`${SITE}${article.image}`] } : {}),
+      datePublished: article.datePublished,
+      dateModified: article.dateModified,
+      author: [{ "@type": "Organization", name: "SPAWN D", url: SITE }],
+      publisher: {
+        "@type": "Organization",
+        name: "SPAWN D",
+        url: SITE,
+        logo: { "@type": "ImageObject", url: `${SITE}/icon-512.png` },
+      },
+      mainEntityOfPage: { "@type": "WebPage", "@id": `${SITE}${canonicalPath}` },
     });
   }
   const json = JSON.stringify(data).replace(/</g, "\\u003c");
@@ -469,6 +501,7 @@ export function JobPage({
   children,
   faq,
   related,
+  article,
 }: {
   crumbs: JobCrumb[];
   pageName: string;
@@ -477,10 +510,17 @@ export function JobPage({
   children: ReactNode;
   faq: JobFaqItem[];
   related: JobRelatedLink[];
+  article?: JobArticleInfo;
 }) {
   return (
     <main className="grimoire min-h-vv overflow-x-clip">
-      <StructuredData crumbs={crumbs} pageName={pageName} canonicalPath={canonicalPath} faq={faq} />
+      <StructuredData
+        crumbs={crumbs}
+        pageName={pageName}
+        canonicalPath={canonicalPath}
+        faq={faq}
+        article={article}
+      />
       <MastheadStatic />
       <HeroInk title={hero.title} sub={hero.sub} date={hero.date} ink={hero.ink} />
       {children}

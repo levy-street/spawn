@@ -7,17 +7,40 @@ import {
   Masthead,
   RegistrationMarks,
 } from "@/components/brand/press";
+import { SiteStructuredData } from "@/components/seo/SiteStructuredData";
 import { poster } from "@/lib/fonts";
 import { SEO_FAMILIES, seoPageHref, seoPagesByFamily } from "@/lib/seo/registry";
 import type { SeoFamily } from "@/lib/seo/types";
 import { cn } from "@/lib/utils";
 
+/** A flat-slug page surfaced on a family index ahead of the registry rack. */
+export interface SeoFeaturedCard {
+  title: string;
+  blurb: string;
+  href: string;
+}
+
 /** The index plate for one landing-page family: a titled rack of cards. */
-export function SeoFamilyIndex({ family }: { family: SeoFamily }) {
+export function SeoFamilyIndex({
+  family,
+  featured = [],
+}: {
+  family: SeoFamily;
+  featured?: SeoFeaturedCard[];
+}) {
   const meta = SEO_FAMILIES[family];
   const pages = seoPagesByFamily(family);
+  const cards = [
+    ...featured,
+    ...pages.map((page) => ({
+      title: page.cardTitle,
+      blurb: page.cardBlurb,
+      href: seoPageHref(page),
+    })),
+  ];
   return (
     <main className="grimoire min-h-vv overflow-x-clip">
+      <SiteStructuredData />
       <Masthead />
 
       <header className="relative isolate overflow-hidden border-line-g border-b px-5 py-24 sm:px-8">
@@ -48,14 +71,14 @@ export function SeoFamilyIndex({ family }: { family: SeoFamily }) {
 
       <section className="px-5 py-20 sm:px-8 sm:py-24">
         <div className="mx-auto grid w-full max-w-6xl min-w-0 gap-6 sm:grid-cols-2 lg:grid-cols-3">
-          {pages.map((page) => (
+          {cards.map((card) => (
             <Link
-              key={page.slug}
-              href={seoPageHref(page)}
+              key={card.href}
+              href={card.href}
               className="group flex flex-col rounded-sm border border-line-strong bg-char p-7 transition-colors hover:border-bone/40"
             >
-              <h2 className="mb-3 text-[18px] font-medium text-bone">{page.cardTitle}</h2>
-              <p className="mb-6 flex-1 text-[15px] leading-7 text-ash">{page.cardBlurb}</p>
+              <h2 className="mb-3 text-[18px] font-medium text-bone">{card.title}</h2>
+              <p className="mb-6 flex-1 text-[15px] leading-7 text-ash">{card.blurb}</p>
               <span className={cn(CTA_QUIET, "self-start text-[11px]")}>
                 Read{" "}
                 <ArrowRight className="size-3.5 transition-transform group-hover:translate-x-0.5" />
