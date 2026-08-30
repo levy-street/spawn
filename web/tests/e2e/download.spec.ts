@@ -139,7 +139,9 @@ test("a verified Windows daemon keeps native setup when the desktop EXE is absen
   await expect(page.locator("code").filter({ hasText: "install.ps1" }).first()).toHaveText(
     `irm ${origin}/install.ps1 | iex`,
   );
-  await expect(page.getByText("Windows desktop build not published yet").first()).toBeVisible();
+  // Windows has not launched, so the slab says the build is coming rather than
+  // that a released platform is missing one — see the wording in download/page.tsx.
+  await expect(page.getByText("Windows desktop app coming soon").first()).toBeVisible();
   await expect(page.getByTestId("windows-download")).toHaveCount(0);
 
   await context.close();

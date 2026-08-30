@@ -3,6 +3,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "next/navigation";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startCarryDrag } from "@/components/nav/workspace-carry";
 import { Spinner } from "@/components/ui/spinner";
 import { toast } from "@/components/ui/toast";
 import { useWorkspaceIconAutoFill } from "@/hooks/useWorkspaceIconAutoFill";
@@ -34,22 +35,31 @@ export const WorkspaceView = memo(function WorkspaceView({
   workspaceId,
   side,
   split,
+  routedId,
   active,
   focusParam,
   tabParam,
   onActivate,
   onUnsplit,
+  onRemoveFromSplit,
 }: {
   workspaceId: string;
   side: SplitSide;
   /** True only when the window actually holds two workspaces. */
   split: boolean;
+  /**
+   * The workspace the address bar is about. Either half of a split can be it
+   * — the URL names a workspace and the pair decides the order, so the routed
+   * half is not always the left one — and a carry started from this half's
+   * own name needs to know which, to tell whether a drop displaces the route.
+   */
+  routedId: string;
   /** Whether this half owns the document-level gestures. */
   active: boolean;
   /**
-   * `?focus=` and `?tab=`, which the container hands to the primary only. The
-   * address bar names one workspace, and honouring its session in both halves
-   * would drag the second one's view somewhere its URL never asked for.
+   * `?focus=` and `?tab=`, which the container hands to the routed half only.
+   * The address bar names one workspace, and honouring its session in both
+   * halves would drag the other one's view somewhere its URL never asked for.
    */
   focusParam: string | null;
   tabParam: string | null;
@@ -57,7 +67,10 @@ export const WorkspaceView = memo(function WorkspaceView({
   onActivate: () => void;
   /** "Keep this half", from this half's own strip. Null when not split. */
   onUnsplit: (() => void) | null;
+  /** "This half steps out", from its own menu. Null when not split. */
+  onRemoveFromSplit: (() => void) | null;
 }) {
+  const routed = routedId === workspaceId;
   const router = useRouter();
   const queryClient = useQueryClient();
   const rootRef = useRef<HTMLDivElement>(null);
@@ -88,6 +101,12 @@ export const WorkspaceView = memo(function WorkspaceView({
     queryFn: () => workspaces.list(),
     staleTime: 10_000,
   });
+  // Only the carry needs this, and only to name the workspaces its drop
+  // preview draws — the one being carried is already in hand.
+  const workspaceById = useMemo(
+    () => new Map((workspacesQ.data ?? []).map((item) => [item.id, item])),
+    [workspacesQ.data],
+  );
   const sessionsQ = useQuery({
     queryKey: ["sessions"],
     queryFn: () => sessions.list(),
@@ -98,9 +117,9 @@ export const WorkspaceView = memo(function WorkspaceView({
     // Only the routed half records where the user was. A cold start opens one
     // workspace, so if both halves wrote this the next one would be whichever
     // of the two happened to mount last rather than the one being worked in.
-    if (side !== "primary") return;
+    if (!routed) return;
     window.localStorage.setItem("spawn.workspaces.last", workspaceId);
-  }, [side, workspaceId]);
+  }, [routed, workspaceId]);
 
   // Archived from somewhere else (this device's sidebar, another tab): the
   // lists it belongs to have changed even though this page can still show it,
@@ -117,15 +136,15 @@ export const WorkspaceView = memo(function WorkspaceView({
     // A vanished second workspace leaves the arrangement instead: the refresh
     // above is what reaches `splitStore.reconcile`. Letting it navigate as
     // well would send the half the user is still working in somewhere else.
-    if (side !== "primary") return;
+    if (!routed) return;
     const remaining = [...(workspacesQ.data ?? [])]
       .filter((workspace) => workspace.id !== workspaceId)
       .sort((a, b) => a.position - b.position);
     router.replace(remaining[0] ? `/w/${remaining[0].id}` : "/app");
   }, [
     queryClient,
+    routed,
     router,
-    side,
     workspaceId,
     workspaceQ.error,
     workspacesQ.data,
@@ -194,6 +213,7 @@ export const WorkspaceView = memo(function WorkspaceView({
       workspaceId={workspaceId}
       side={side}
       split={split}
+      routed={routed}
       active={active}
       rootRef={rootRef}
     >
@@ -228,12 +248,25 @@ export const WorkspaceView = memo(function WorkspaceView({
               // instead of standing on a window the user has dismissed while
               // the halves finish moving.
               splitChrome={
-                onUnsplit
+                onUnsplit && onRemoveFromSplit
                   ? {
                       workspaceName: workspace.name,
                       workspaceIcon: workspace.icon,
                       side,
                       onUnsplit,
+                      onRemoveFromSplit,
+                      // The rail's gesture, started from the strip: a
+                      // workspace is picked up by its name and dropped into
+                      // whichever half it should occupy, which is how a split
+                      // is rearranged without going near the sidebar.
+                      onCarry: (event) =>
+                        startCarryDrag({
+                          event,
+                          workspace,
+                          routedId,
+                          lookup: (id) => workspaceById.get(id),
+                          navigate: (id) => router.push(`/w/${id}`),
+                        }),
                     }
                   : null
               }
@@ -264,10 +297,10 @@ export const WorkspaceView = memo(function WorkspaceView({
                 onPreviewTiles={setPreviewTiles}
                 onCreated={({ sessionId }) => {
                   // Routing is how the routed half focuses a fresh session.
-                  // The same push from the second half would make that
-                  // workspace the routed one and collapse the split, so the
-                  // right half lets the pane arrive where the grid places it.
-                  if (sessionId && side === "primary") {
+                  // The same push from the other half would move the address
+                  // bar to a workspace the user did not ask to go to, so that
+                  // half lets the pane arrive where the grid places it.
+                  if (sessionId && routed) {
                     router.push(`/w/${workspace.id}?focus=${sessionId}`);
                   }
                 }}

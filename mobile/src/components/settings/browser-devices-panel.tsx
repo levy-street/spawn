@@ -30,7 +30,11 @@ import { useConnectionStore } from "@/data/stores/connection";
 import { createDeviceEndorsement } from "@/data/trust/endorsement";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { removeLocalTrustAccount } from "@/data/trust/local-account";
-import { ensureDeviceRegistered, revokeThisDevice } from "@/data/trust/registration";
+import {
+  deviceRegistrationFailureLine,
+  ensureDeviceRegistered,
+  revokeThisDevice,
+} from "@/data/trust/registration";
 import { spacing, useTheme } from "@/theme";
 
 interface HostDeviceTrust {
@@ -78,9 +82,7 @@ export function BrowserDevicesPanel(): React.JSX.Element {
       setRevokedCurrent(false);
       await queryClient.invalidateQueries({ queryKey: qk.browserDevices() });
     } catch (cause) {
-      setRegistrationError(
-        cause instanceof Error ? cause.message : "This device's identity registration failed.",
-      );
+      setRegistrationError(deviceRegistrationFailureLine(cause));
     }
   }, [accountId, queryClient]);
 

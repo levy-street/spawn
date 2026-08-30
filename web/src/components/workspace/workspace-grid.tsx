@@ -40,6 +40,7 @@ import {
   type TileWidget,
   validate,
 } from "@/lib/grid";
+import { detectAppleModifiers, gridShortcut, keystrokeBelongsToText } from "@/lib/keyboard-chords";
 import { runningAgent, sessionTitle } from "@/lib/sessions";
 import {
   type LayoutV3,
@@ -84,16 +85,13 @@ import {
  * How much canvas the real grid needs; narrower than this the panes stack into
  * the mobile layout instead.
  *
- * A half of a split is held to a lower bar. Two halves of a 1440-wide laptop
- * come out around 600px each, so keeping them to 768 would turn both into
- * phone stacks the moment the window split — the feature would look broken on
- * the most ordinary machine there is. 560 is low enough that every laptop
- * splits into two real grids, and high enough that the halves of a genuinely
- * small window still stack, where side-by-side panes would be narrower than a
- * terminal has any use for.
+ * A half of a split is not measured at all. The stacked layout is an answer
+ * to a *phone*, and a half of a window on a desktop is not one — a split that
+ * dropped its panes into a scrolling list the moment the seam moved past some
+ * number would be rearranging work the user had laid out, for a shape they
+ * chose deliberately. A split half stays a grid at whatever width it is given.
  */
 const WIDE_CONTAINER_PX = 768;
-const WIDE_CONTAINER_SPLIT_PX = 560;
 /**
  * Where the first window of an empty tab lands: the left half, full height.
  * Auto-placing would hand it the whole canvas, and a full canvas has nowhere
@@ -369,7 +367,7 @@ export function WorkspaceGrid({
   const queryClient = useQueryClient();
   // This half of the window: whether it shares the screen with a second
   // workspace, and whether it is the half the keyboard is meant for.
-  const { active: paneActive, split, rootRef: paneRootRef } = usePaneScope();
+  const { active: paneActive, split, routed, rootRef: paneRootRef } = usePaneScope();
   const areaRef = useRef<HTMLDivElement>(null);
   const ghostRef = useRef<HTMLDivElement>(null);
   const tileElementsRef = useRef(new Map<string, HTMLDivElement>());
@@ -493,11 +491,17 @@ export function WorkspaceGrid({
   }, [saving, workspace]);
 
   useLayoutEffect(() => {
+    // A half of a split keeps its grid whatever it is measured at, so there
+    // is nothing to watch: the stacked layout answers a phone, not a narrow
+    // pane the user made narrow on purpose.
+    if (split) {
+      setWide(true);
+      return;
+    }
     const area = areaRef.current;
     if (!area) return;
-    const threshold = split ? WIDE_CONTAINER_SPLIT_PX : WIDE_CONTAINER_PX;
     const observer = new ResizeObserver(([entry]) => {
-      setWide((entry?.contentRect.width ?? 0) >= threshold);
+      setWide((entry?.contentRect.width ?? 0) >= WIDE_CONTAINER_PX);
     });
     observer.observe(area);
     return () => observer.disconnect();
@@ -1468,12 +1472,20 @@ export function WorkspaceGrid({
     // whole window is the active half when it holds a single workspace, so
     // this is the same registration it has always been.
     if (!paneActive) return;
+    // Which chord this is depends on the keyboard in front of the person, not
+    // on the pane: on a Mac ⌥ is how the shell moves a word at a time, so the
+    // app asks for ⌃⌥ or ⌘⌥ wherever something is typing. `@/lib/keyboard-chords`
+    // holds the whole rule and why.
+    const apple = detectAppleModifiers();
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
-      const digit = /^Digit([1-9])$/u.exec(event.code)?.[1];
-      if (digit) {
+      const shortcut = gridShortcut(event, {
+        apple,
+        textHasKey: keystrokeBelongsToText(event.target),
+      });
+      if (!shortcut) return;
+      if (shortcut.kind === "workspace") {
         const ordered = [...(allWorkspacesQ.data ?? [])].sort((a, b) => a.position - b.position);
-        const target = ordered[Number(digit) - 1];
+        const target = ordered[shortcut.position - 1];
         if (target && target.id !== workspace.id) {
           event.preventDefault();
           event.stopPropagation();
@@ -1481,14 +1493,14 @@ export function WorkspaceGrid({
         }
         return;
       }
-      const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
-      const backward = event.key === "ArrowLeft" || event.key === "ArrowUp";
-      if ((!forward && !backward) || orderedIds.length === 0) return;
+      if (orderedIds.length === 0) return;
       event.preventDefault();
       event.stopPropagation();
       const current = focusedId ? orderedIds.indexOf(focusedId) : -1;
       const index =
-        current < 0 ? 0 : (current + (forward ? 1 : orderedIds.length - 1)) % orderedIds.length;
+        current < 0
+          ? 0
+          : (current + (shortcut.forward ? 1 : orderedIds.length - 1)) % orderedIds.length;
       setFocus(orderedIds[index] ?? null, true);
     };
     document.addEventListener("keydown", onKeyDown, true);
@@ -1891,7 +1903,12 @@ export function WorkspaceGrid({
                     placement={FIRST_WINDOW}
                     className="max-w-xl"
                     onCreated={({ sessionId }) => {
-                      router.push(`/w/${workspace.id}?focus=${sessionId}`);
+                      // Only the half the address bar is about may move it.
+                      // The same push from the other half of a split would
+                      // send the URL to a workspace nobody asked to open, and
+                      // the pane it just made would arrive there instead.
+                      if (routed) router.push(`/w/${workspace.id}?focus=${sessionId}`);
+                      else setFocus(sessionId, true);
                     }}
                   />
                 </div>

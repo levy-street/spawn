@@ -46,6 +46,7 @@ import {
 import { hosts, sessions, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { CarriedEndorsement } from "@/lib/hostControl";
+import { appleArrowBytes, detectAppleModifiers } from "@/lib/keyboard-chords";
 import { DirectSessionUploadError } from "@/lib/session-ctl";
 import { resolveSignedRtcTrust, type SignedRtcTrustDecision } from "@/lib/signed-rtc-trust";
 import { getResolvedTheme, subscribeToTheme } from "@/lib/theme";
@@ -1525,6 +1526,9 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     if (!terminalViewportRef.current || !terminalSurfaceRef.current || !containerRef.current) {
       return;
     }
+    // Whether ⌘ is on this keyboard at all. Read once here rather than per
+    // press: the keyboard does not change under a mounted terminal.
+    const appleModifiers = detectAppleModifiers();
     const term = new XTerm({
       ...XTERM_EMULATION_OPTIONS,
       cursorBlink: true,
@@ -2215,6 +2219,20 @@ export const Terminal = forwardRef<TerminalHandle, TerminalProps>(function Termi
     };
 
     term.attachCustomKeyEventHandler((event) => {
+      // A Mac's ⌥ and ⌘ arrows: a word at a time, and the ends of the line.
+      // xterm.js spells the first one for the wrong platform in this bundle
+      // and does not send the second at all, so both are stated in
+      // `appleArrowBytes`. Suppress the whole press rather than just the
+      // keydown, for the reason spelled out under Shift+Enter below.
+      const arrow = appleModifiers ? appleArrowBytes(event) : null;
+      if (arrow && rawInputRef.current) {
+        if (event.type === "keydown") {
+          event.preventDefault();
+          snapToLiveEdge();
+          socketRef.current.sendBinary(arrow);
+        }
+        return false;
+      }
       if (event.key !== "Enter" && event.key !== "Return") return true;
       // Plain terminals can't distinguish Shift+Enter from Enter; send the
       // ESC+CR sequence TUIs like Claude Code bind to "insert newline" (the
@@ -4093,8 +4111,19 @@ function filesFromDataTransfer(data: DataTransfer): File[] {
     .filter((file): file is File => file !== null);
 }
 
+/**
+ * Is a drag carrying files, asked while it is still in the air?
+ *
+ * Three signals rather than one, because mid-drag every engine withholds
+ * something: `files` is empty until the drop in Chrome, and WebKit — which is
+ * the whole of the macOS desktop app — can hand back an `items` list it will
+ * not let anything be read from. `types` is the one every engine fills on
+ * `dragenter`, and getting this wrong costs the drop hint that tells someone
+ * the terminal will take what they are holding.
+ */
 function hasFileTransfer(data: DataTransfer): boolean {
   return (
+    Array.from(data.types).includes("Files") ||
     Array.from(data.files).some((file) => file.size > 0 || file.name !== "") ||
     Array.from(data.items).some((item) => item.kind === "file")
   );

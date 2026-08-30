@@ -26,6 +26,13 @@ export interface PaneScope {
   /** True only when the window actually holds two workspaces. */
   split: boolean;
   /**
+   * Whether this half is the one the address bar is about. Either half of a
+   * split can be — the URL names a workspace, not a side — and the surfaces
+   * that push a route (a first window opening with `?focus=`) are the ones
+   * that need to know, so the other half never navigates on their behalf.
+   */
+  routed: boolean;
+  /**
    * Whether this half owns the document-level gestures — keyboard focus
    * movement, the workspace digit shortcuts. Always true when unsplit.
    */
@@ -44,13 +51,14 @@ export function PaneScopeProvider({
   workspaceId,
   side,
   split,
+  routed,
   active,
   rootRef,
   children,
 }: PaneScope & { children: ReactNode }) {
   const value = useMemo<PaneScope>(
-    () => ({ workspaceId, side, split, active, rootRef }),
-    [active, rootRef, side, split, workspaceId],
+    () => ({ workspaceId, side, split, routed, active, rootRef }),
+    [active, rootRef, routed, side, split, workspaceId],
   );
   return <PaneScopeContext.Provider value={value}>{children}</PaneScopeContext.Provider>;
 }

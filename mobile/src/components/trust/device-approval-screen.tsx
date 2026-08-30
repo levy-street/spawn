@@ -29,6 +29,7 @@ import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
 import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
+import { describeDeviceRegistrationFailure } from "@/data/trust/registration";
 import { haptics } from "@/lib/haptics";
 import { fontSize, spacing } from "@/theme";
 
@@ -66,6 +67,10 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
   const accountId = me.data?.user.id;
   const phoneQuery = useRegisteredPhone(accountId);
   const phone = phoneQuery.data;
+  // What actually went wrong: a keychain that refused the key and a server
+  // that refused the device need different things from the reader, and only
+  // one of them is a Try again.
+  const registrationFailure = describeDeviceRegistrationFailure(phoneQuery.error);
   const devicesQuery = useAccountDevices(phoneQuery.isSuccess);
   const endorsements = usePendingEndorsements(accountId ?? "", phone?.id ?? null);
   const approvals = useDeviceHostApprovals(true);
@@ -188,13 +193,14 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
       {phoneQuery.isError ? (
         <View style={styles.section}>
           <Text accessibilityRole="alert" color="destructive" variant="body">
-            {phoneQuery.error instanceof Error
-              ? `This device could not register its identity: ${phoneQuery.error.message}`
-              : "This device could not register its identity."}
+            {registrationFailure.reason} It cannot approve devices.
+            {registrationFailure.remedy === null ? "" : ` ${registrationFailure.remedy}`}
           </Text>
-          <Button onPress={() => void phoneQuery.refetch()} size="sm" variant="outline">
-            Try again
-          </Button>
+          {registrationFailure.canRetry ? (
+            <Button onPress={() => void phoneQuery.refetch()} size="sm" variant="outline">
+              Try again
+            </Button>
+          ) : null}
         </View>
       ) : null}
 

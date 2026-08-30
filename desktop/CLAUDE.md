@@ -82,7 +82,7 @@ second window; a second copy of the app (single-instance) fronts the first
 and exits. Nothing of the web build is bundled here, so the app can never
 drift from the server it talks to.
 
-Three things about that face are contracts with `web/`, not implementation
+Four things about that face are contracts with `web/`, not implementation
 details:
 
 - The webview's user agent ends in `SpawnDesktop/<version>`, and the web app
@@ -115,6 +115,16 @@ details:
   possessed then arrive trusted on the app's own signed introductions. The key
   travels in-process only; the server never sees it and could not have forged
   the handover.
+- Dropping a file on this window is the page's gesture, not the shell's, so
+  the window is built with `disable_drag_drop_handler()`. Left alone, Tauri
+  answers the OS itself and forwards the paths over IPC — and forwarding is
+  all it does: the drag is swallowed, `dragenter` and `drop` never reach the
+  page, and every drop target in the product goes dead. Dragging a screenshot
+  onto a terminal is ordinary in a browser tab and did nothing whatsoever in
+  here. There is nothing on this side to receive those paths anyway — the
+  product page has no IPC by design — and the files are the page's to read and
+  upload exactly as a tab does. WebView2 needs this to see HTML5 drag and drop
+  at all; WKWebView falls back to its own native handling without it.
 
 The rules that palette carries are load-bearing:
 

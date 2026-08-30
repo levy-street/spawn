@@ -6,6 +6,7 @@ import {
   BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS,
   BROWSER_DEVICE_IDENTITY_STORAGE_VERSION,
   BROWSER_DEVICE_IDENTITY_STORE_NAME,
+  BROWSER_DEVICE_IDENTITY_TOUCH_INTERVAL_MS,
   BrowserDeviceIdentityError,
   createBrowserDeviceRegistrationProof,
   deleteBrowserDeviceIdentity,
@@ -399,7 +400,7 @@ describe("browser device identity", () => {
     );
   });
 
-  test("requires canonical account UUIDs and bounds total stored account records", async () => {
+  test("requires canonical account UUIDs and keeps stored account records bounded", async () => {
     const factory = new IDBFactory();
     const storage = options(factory);
     for (const invalid of [
@@ -415,23 +416,111 @@ describe("browser device identity", () => {
       );
     }
 
-    await loadOrCreateBrowserDeviceIdentity(accountUuid(100), storage);
-    const database = await requestResult(factory.open(BROWSER_DEVICE_IDENTITY_DATABASE_NAME));
-    const transaction = database.transaction(BROWSER_DEVICE_IDENTITY_STORE_NAME, "readwrite");
-    const completion = transactionResult(transaction);
-    const store = transaction.objectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME);
-    for (let index = 1; index < BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS; index += 1) {
-      store.add({ accountId: accountUuid(100 + index) });
-    }
-    await completion;
-    database.close();
+    const inUse = accountUuid(100);
+    const inUseIdentity = await loadOrCreateBrowserDeviceIdentity(inUse, storage);
+    await fillStoreToCap(factory, 101);
+    expect(await storedAccountCount(factory)).toBe(BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS);
 
-    await expectIdentityError(
-      loadOrCreateBrowserDeviceIdentity(accountUuid(200), storage),
-      "capacity_exceeded",
-    );
+    // A full store is not the end of this browser: the account arriving now
+    // gets an identity, the cap still holds, and what went was a record with
+    // no stamp at all rather than the one this browser is signing with.
+    const arrived = await loadOrCreateBrowserDeviceIdentity(accountUuid(200), storage);
+    expect(arrived.publicKeyWire).toHaveLength(43);
+    expect(await storedAccountCount(factory)).toBe(BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS);
+    expect(
+      await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, accountUuid(101)),
+    ).toBeUndefined();
+    const survivor = await loadBrowserDeviceIdentity(inUse, storage);
+    expect(survivor?.publicKeyWire).toBe(inUseIdentity.publicKeyWire);
+  });
+
+  test("eviction takes the identity used longest ago", async () => {
+    const factory = new IDBFactory();
+    const storage = options(factory);
+    await loadOrCreateBrowserDeviceIdentity(accountUuid(400), storage);
+    // Stamped fillers, oldest first: 401 was used longest ago, 431 most
+    // recently, and all of them before the identity minted a moment ago.
+    const base = Date.now() - 10 * 60_000;
+    for (let index = 1; index < BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS; index += 1) {
+      await putRawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, {
+        accountId: accountUuid(400 + index),
+        lastUsedAt: base + index,
+      });
+    }
+
+    await loadOrCreateBrowserDeviceIdentity(accountUuid(500), storage);
+    expect(
+      await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, accountUuid(401)),
+    ).toBeUndefined();
+    for (const kept of [accountUuid(400), accountUuid(402), accountUuid(500)]) {
+      expect(await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, kept)).toBeDefined();
+    }
+  });
+
+  test("a load refreshes a stale eviction stamp and leaves a fresh one alone", async () => {
+    const factory = new IDBFactory();
+    const storage = options(factory);
+    const accountId = accountUuid(600);
+    const identity = await loadOrCreateBrowserDeviceIdentity(accountId, storage);
+    const minted = await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, accountId);
+    expect(typeof minted?.lastUsedAt).toBe("number");
+
+    // A second load inside the interval is not worth a write.
+    await loadOrCreateBrowserDeviceIdentity(accountId, storage);
+    expect(
+      (await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, accountId))?.lastUsedAt,
+    ).toBe(minted?.lastUsedAt);
+
+    const stale = Date.now() - 2 * BROWSER_DEVICE_IDENTITY_TOUCH_INTERVAL_MS;
+    await putRawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, {
+      ...(minted as Record<string, unknown>),
+      lastUsedAt: stale,
+    });
+    const reloaded = await loadOrCreateBrowserDeviceIdentity(accountId, storage);
+    expect(reloaded.publicKeyWire).toBe(identity.publicKeyWire);
+    const refreshed = await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, accountId);
+    expect(refreshed?.lastUsedAt as number).toBeGreaterThan(stale);
+    expect(refreshed?.publicKeyWire).toBe(identity.publicKeyWire);
+  });
+
+  test("a record written before stamps existed still loads, and sorts oldest", async () => {
+    const factory = new IDBFactory();
+    const storage = options(factory);
+    const legacyAccount = accountUuid(700);
+    const identity = await loadOrCreateBrowserDeviceIdentity(legacyAccount, storage);
+    const record = await rawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, legacyAccount);
+    const { lastUsedAt: _dropped, ...legacy } = record as Record<string, unknown>;
+    await putRawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, legacy);
+
+    const loaded = await loadBrowserDeviceIdentity(legacyAccount, storage);
+    expect(loaded?.publicKeyWire).toBe(identity.publicKeyWire);
   });
 });
+
+/** Fill the store to its cap with records nothing in this browser has used. */
+async function fillStoreToCap(factory: IDBFactory, firstSuffix: number): Promise<void> {
+  const filled = await storedAccountCount(factory);
+  for (let index = 0; index < BROWSER_DEVICE_IDENTITY_MAX_ACCOUNTS - filled; index += 1) {
+    await putRawRecord(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME, {
+      accountId: accountUuid(firstSuffix + index),
+    });
+  }
+}
+
+async function storedAccountCount(factory: IDBFactory): Promise<number> {
+  const database = await openExisting(factory, BROWSER_DEVICE_IDENTITY_DATABASE_NAME);
+  try {
+    const transaction = database.transaction(BROWSER_DEVICE_IDENTITY_STORE_NAME, "readonly");
+    const completion = transactionResult(transaction);
+    const count = await requestResult(
+      transaction.objectStore(BROWSER_DEVICE_IDENTITY_STORE_NAME).count(),
+    );
+    await completion;
+    return count;
+  } finally {
+    database.close();
+  }
+}
 
 /** A seed and its public key, the way the desktop app holds them. */
 async function carriedIdentity(): Promise<{ seed: Uint8Array; publicKeyWire: string }> {

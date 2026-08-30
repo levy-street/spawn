@@ -57,6 +57,29 @@ const PANEL_WIDTH = COLUMN_WIDTH * VISIBLE_COLUMNS + PANEL_CHROME;
 const PANEL_HEIGHT = 440;
 
 /**
+ * Bring the trail's selected row into view *vertically*, and only vertically.
+ *
+ * `scrollIntoView` cannot do this: `inline` defaults to "nearest" whatever
+ * `block` is set to, and it walks every scrollable ancestor — so a call meant
+ * to nudge one row down its own column also scrolled the column strip
+ * sideways, instantly, cancelling the smooth horizontal scroll that had just
+ * been started a line above. The visible symptom was a picker whose reveal ran
+ * exactly one drill behind: opening a folder scrolled to where the *previous*
+ * one had wanted to be, because the row it had just highlighted was what the
+ * strip ended up chasing.
+ */
+function revealSelectedRow(row: HTMLElement | null): void {
+  const column = row?.closest<HTMLElement>('[role="listbox"]');
+  if (!row || !column) return;
+  const top = row.offsetTop;
+  const bottom = top + row.offsetHeight;
+  if (top < column.scrollTop) column.scrollTop = top;
+  else if (bottom > column.scrollTop + column.clientHeight) {
+    column.scrollTop = bottom - column.clientHeight;
+  }
+}
+
+/**
  * The folder picker: a Finder column browser in an anchored dropdown.
  *
  * Choosing a folder does not replace the list: its own column opens to the
@@ -105,6 +128,14 @@ export function FolderPicker({
   // False until the strip has been parked once, which separates "opened at a
   // folder" from "drilled into one" — the two want opposite scroll positions.
   const settled = useRef(false);
+  /**
+   * Bumped by every navigation, so the reveal is driven by the act rather than
+   * by the path it produced. Pressing the folder you are already in is a
+   * request to see inside it — the most natural way to ask, from the column
+   * where it sits highlighted — and that leaves the path exactly as it was, so
+   * a reveal keyed on the path alone would answer it with nothing at all.
+   */
+  const [revealNonce, setRevealNonce] = useState(0);
   const leafColumnRef = useRef<HTMLDivElement>(null);
   const [coords, setCoords] = useState<MenuPlacement | null>(null);
 
@@ -194,6 +225,7 @@ export function FolderPicker({
         : normalizeCwdForHost("~", homeDir, pathFlavor),
     );
     setFilter("");
+    setRevealNonce((value) => value + 1);
   };
 
   // Anchored like a menu, with the same viewport-aware placement: the panel is
@@ -288,7 +320,7 @@ export function FolderPicker({
   }, [open]);
 
   // Park the strip as the trail changes.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: listedPath is the change being tracked
+  // biome-ignore lint/correctness/useExhaustiveDependencies: listedPath and revealNonce are the changes being tracked
   useEffect(() => {
     if (!open) {
       settled.current = false;
@@ -314,10 +346,10 @@ export function FolderPicker({
         strip.scrollTo({ left, behavior: settled.current ? "smooth" : "auto" });
         settled.current = true;
       }
-      selectedRef.current?.scrollIntoView({ block: "nearest" });
+      revealSelectedRow(selectedRef.current);
     });
     return () => cancelAnimationFrame(id);
-  }, [open, homeDir, listedPath]);
+  }, [open, homeDir, listedPath, revealNonce]);
 
   const mkdirM = useMutation({
     mutationFn: (name: string) => client!.mkdir(joinDirectory(listedPath, name, pathFlavor)),

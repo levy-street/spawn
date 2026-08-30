@@ -109,7 +109,20 @@ pub fn create(app: &App) -> Result<WebviewWindow> {
         .inner_size(width, height)
         .min_inner_size(WINDOW_MIN_SIZE.0, WINDOW_MIN_SIZE.1)
         .center()
-        .visible(false);
+        // Dropping a file on this app is a *page* gesture, not a window one,
+        // so the webview keeps its own drag and drop. Left alone, Tauri
+        // installs a handler that answers the OS first and forwards the
+        // dropped paths over IPC — and forwarding them is all it does: it
+        // swallows the drag, so `dragenter` and `drop` never reach the page
+        // and every drop target in the product goes dead. Dragging a
+        // screenshot onto a terminal is ordinary in a browser tab and did
+        // nothing whatsoever in here. There was never a Rust side waiting for
+        // those paths either; the product page has no IPC by design, and the
+        // files belong to the page, which reads and uploads them exactly as a
+        // tab does. WebView2 requires this to see HTML5 drag and drop at all,
+        // and WKWebView falls back to its own native handling without it.
+        .visible(false)
+        .disable_drag_drop_handler();
     // WebView2 must keep the runtime's real Edge identity. Its platform helper
     // reads that live agent and appends our token after the webview exists.
     #[cfg(not(target_os = "windows"))]

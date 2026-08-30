@@ -63,6 +63,37 @@ export const agentDefinition = {
   yolo: false,
 };
 
+/**
+ * Which keyboard the page believes is in front of it.
+ *
+ * The terminal and the app split the modifiers differently per platform — ⌥ is
+ * the shell's word key on a Mac and the app's pane key everywhere else — so a
+ * spec about chords has to state the keyboard rather than inherit whichever
+ * machine is running the suite. `navigator.platform` settles both halves at
+ * once: `src/lib/keyboard-chords.ts` reads it through `detectOS`, and xterm's
+ * own `isMac` reads it directly. The agent goes with it because `detectOS`
+ * falls back to the agent, and a Mac's agent says "Mac OS X" whatever the
+ * platform claims.
+ */
+export async function pinKeyboard(page: Page, keyboard: "apple" | "pc") {
+  const pinned =
+    keyboard === "apple"
+      ? {
+          platform: "MacIntel",
+          userAgent:
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        }
+      : {
+          platform: "Win32",
+          userAgent:
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        };
+  await page.addInitScript((values) => {
+    Object.defineProperty(navigator, "platform", { get: () => values.platform });
+    Object.defineProperty(navigator, "userAgent", { get: () => values.userAgent });
+  }, pinned);
+}
+
 export function session(overrides: Record<string, unknown> = {}) {
   return {
     id: SESSION_ID,

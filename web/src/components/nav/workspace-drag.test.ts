@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  arrangementAfter,
   dragModeAt,
   dropZones,
   type PaneTarget,
@@ -11,7 +10,7 @@ import {
   reorderTargetIndex,
   reorderWrites,
   sideOf,
-  splitDropPlan,
+  splitDrop,
   zoneAt,
 } from "./workspace-drag";
 
@@ -191,85 +190,55 @@ describe("zoneAt", () => {
   });
 });
 
-describe("splitDropPlan", () => {
-  test("unsplit, dropped left: the dragged one takes the front and the current moves across", () => {
-    expect(splitDropPlan("primary", "b", "a", null)).toEqual({ routeTo: "b", setSecondary: "a" });
+describe("splitDrop", () => {
+  /** One workspace on the canvas, and two, as `splitDrop` is handed them. */
+  const alone = { primary: "a", secondary: null };
+  const split = { primary: "a", secondary: "b" };
+
+  test("one workspace, dropped left: the dragged one takes the front and it moves across", () => {
+    expect(splitDrop("primary", "b", alone)).toEqual({ primary: "b", secondary: "a" });
   });
 
-  test("unsplit, dropped right: the split opens beside the workspace already up", () => {
-    expect(splitDropPlan("secondary", "b", "a", null)).toEqual({
-      routeTo: null,
-      setSecondary: "b",
-    });
+  test("one workspace, dropped right: the split opens beside the one already up", () => {
+    expect(splitDrop("secondary", "b", alone)).toEqual({ primary: "a", secondary: "b" });
   });
 
-  test("unsplit, dropping the workspace already on screen changes nothing", () => {
-    expect(splitDropPlan("primary", "a", "a", null)).toBeNull();
-    expect(splitDropPlan("secondary", "a", "a", null)).toBeNull();
-  });
-
-  test("split, dropped left: the left half is replaced and the right is left alone", () => {
-    expect(splitDropPlan("primary", "c", "a", "b")).toEqual({ routeTo: "c", setSecondary: null });
-  });
-
-  test("split, dropped right: the right half is replaced and the route holds", () => {
-    expect(splitDropPlan("secondary", "c", "a", "b")).toEqual({
-      routeTo: null,
-      setSecondary: "c",
-    });
-  });
-
-  test("split, dropped on the half it is already in: nothing to do", () => {
-    expect(splitDropPlan("primary", "a", "a", "b")).toBeNull();
-    expect(splitDropPlan("secondary", "b", "a", "b")).toBeNull();
-  });
-
-  test("split, dropped on the other half: the two swap sides", () => {
-    expect(splitDropPlan("primary", "b", "a", "b")).toEqual({ routeTo: "b", setSecondary: "a" });
-    expect(splitDropPlan("secondary", "a", "a", "b")).toEqual({ routeTo: "b", setSecondary: "a" });
-  });
-
-  test("nothing routed means there is nothing to split against", () => {
-    expect(splitDropPlan("primary", "b", null, null)).toBeNull();
-    expect(splitDropPlan("secondary", "b", null, null)).toBeNull();
-  });
-});
-
-describe("arrangementAfter", () => {
-  test("no plan leaves the window exactly as it is", () => {
-    expect(arrangementAfter(null, "a", "b")).toEqual({ primary: "a", secondary: "b" });
-    expect(arrangementAfter(null, "a", null)).toEqual({ primary: "a", secondary: null });
-  });
-
-  test("unsplit, dropped left: the dragged one takes the front, the current moves across", () => {
-    const plan = splitDropPlan("primary", "b", "a", null);
-    expect(arrangementAfter(plan, "a", null)).toEqual({ primary: "b", secondary: "a" });
-  });
-
-  test("unsplit, dropped right: the split opens beside", () => {
-    const plan = splitDropPlan("secondary", "b", "a", null);
-    expect(arrangementAfter(plan, "a", null)).toEqual({ primary: "a", secondary: "b" });
+  test("one workspace, dropping the workspace already on screen changes nothing", () => {
+    expect(splitDrop("primary", "a", alone)).toBeNull();
+    expect(splitDrop("secondary", "a", alone)).toBeNull();
   });
 
   test("split, dropped left: the left occupant is displaced and the right holds", () => {
-    const plan = splitDropPlan("primary", "c", "a", "b");
-    expect(arrangementAfter(plan, "a", "b")).toEqual({ primary: "c", secondary: "b" });
+    expect(splitDrop("primary", "c", split)).toEqual({ primary: "c", secondary: "b" });
   });
 
   test("split, dropped right: the right occupant is displaced and the left holds", () => {
-    const plan = splitDropPlan("secondary", "c", "a", "b");
-    expect(arrangementAfter(plan, "a", "b")).toEqual({ primary: "a", secondary: "c" });
+    expect(splitDrop("secondary", "c", split)).toEqual({ primary: "a", secondary: "c" });
+  });
+
+  test("split, dropped on the half it is already in: nothing to do", () => {
+    expect(splitDrop("primary", "a", split)).toBeNull();
+    expect(splitDrop("secondary", "b", split)).toBeNull();
   });
 
   test("split, dropped on the other half: the two swap and nobody is displaced", () => {
-    expect(arrangementAfter(splitDropPlan("primary", "b", "a", "b"), "a", "b")).toEqual({
-      primary: "b",
-      secondary: "a",
+    expect(splitDrop("primary", "b", split)).toEqual({ primary: "b", secondary: "a" });
+    expect(splitDrop("secondary", "a", split)).toEqual({ primary: "b", secondary: "a" });
+  });
+
+  test("the arrangement is read off the canvas, not off the route", () => {
+    // A pair whose right-hand workspace is the one the URL is about: the drop
+    // still lands where it was aimed, and the left half is still the left one.
+    expect(splitDrop("secondary", "c", { primary: "a", secondary: "b" })).toEqual({
+      primary: "a",
+      secondary: "c",
     });
-    expect(arrangementAfter(splitDropPlan("secondary", "a", "a", "b"), "a", "b")).toEqual({
-      primary: "b",
-      secondary: "a",
-    });
+  });
+
+  test("nothing on screen means there is nothing to split against", () => {
+    expect(splitDrop("primary", "b", { primary: null, secondary: null })).toBeNull();
+    expect(splitDrop("secondary", "b", { primary: null, secondary: null })).toBeNull();
+    expect(splitDrop("primary", "", alone)).toBeNull();
   });
 });
 
