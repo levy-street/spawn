@@ -150,7 +150,8 @@ that HTTPS passes.
 - JSON-LD by template (schema column in SEO_TREE's template table):
   `BreadcrumbList` on everything; `FAQPage` where there's a Q&A section;
   `Article` with honest `datePublished`/`dateModified` on dated editorial
-  pages (jobs, guides — the `article` prop on `JobPage`); `HowTo` on guides;
+  pages (jobs, comparisons, guides — the `article` prop on `JobPage`);
+  `HowTo` on guides;
   `Organization` + `SoftwareApplication` on `/` and the hubs only
   (`SiteStructuredData.tsx`); **no `Review`** on comparisons.
 - Dates are kept honest or not shown. `og:type=article` pages carry matching

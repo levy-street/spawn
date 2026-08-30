@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { FLAT_PAGES } from "./flat";
 import {
-  findSeoPageByKey,
+  resolveRelatedCard,
   SEO_FAMILIES,
   SEO_PAGES,
   seoPageHref,
@@ -19,9 +20,13 @@ describe("seo landing-page registry", () => {
     }
   });
 
-  it("populates every family", () => {
+  it("populates every family (vs lives on flat slugs)", () => {
     for (const family of Object.keys(SEO_FAMILIES) as (keyof typeof SEO_FAMILIES)[]) {
-      expect(seoPagesByFamily(family).length, family).toBeGreaterThan(0);
+      const count =
+        family === "vs"
+          ? FLAT_PAGES.filter((page) => page.template === "comparison").length
+          : seoPagesByFamily(family).length;
+      expect(count, family).toBeGreaterThan(0);
     }
   });
 
@@ -50,8 +55,8 @@ describe("seo landing-page registry", () => {
     for (const page of SEO_PAGES) {
       expect(page.related.length, page.slug).toBeGreaterThan(0);
       for (const key of page.related) {
-        const target = findSeoPageByKey(key);
-        expect(target, `${page.slug} → ${key}`).toBeDefined();
+        const card = resolveRelatedCard(key);
+        expect(card, `${page.slug} → ${key}`).toBeDefined();
         expect(`${page.family}/${page.slug}`, `${page.slug} links to itself`).not.toBe(key);
       }
     }

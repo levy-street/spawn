@@ -105,9 +105,9 @@ const RELATED = [
     href: "/use/keep-agents-running",
   },
   {
-    title: "AI agents on your own GPU",
-    blurb: "the rig as a first-class host in the grid",
-    href: "/use/ai-agents-on-your-own-gpu",
+    title: "spawnd vs Tailscale SSH",
+    blurb: "a private network versus a deaf channel — and why some run both",
+    href: "/spawnd-vs-tailscale-ssh",
   },
   {
     title: "Claude Code",

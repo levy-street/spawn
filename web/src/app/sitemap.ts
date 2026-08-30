@@ -1,4 +1,5 @@
 import type { MetadataRoute } from "next";
+import { FLAT_PAGES, flatPageHref } from "@/lib/seo/flat";
 import { SEO_PAGES, seoPageHref } from "@/lib/seo/registry";
 
 const ORIGIN = "https://spawnd.dev";
@@ -13,8 +14,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { url: `${ORIGIN}/`, changeFrequency: "weekly", priority: 1 },
     { url: `${ORIGIN}/security`, changeFrequency: "monthly", priority: 0.8 },
     { url: `${ORIGIN}/download`, changeFrequency: "monthly", priority: 0.8 },
-    // Flat-slug job pages (docs/SEO_TREE.md). The [slug] router will make
-    // this a map over the flat-page registry; until then, by hand.
+    // Flat-slug pages outside the catalogue (hand-built routes).
     {
       url: `${ORIGIN}/run-agents-in-parallel`,
       lastModified: new Date("2026-08-30"),
@@ -30,5 +30,11 @@ export default function sitemap(): MetadataRoute.Sitemap {
     changeFrequency: "monthly",
     priority: 0.7,
   }));
-  return [...marketing, ...landing];
+  const flat: MetadataRoute.Sitemap = FLAT_PAGES.map((page) => ({
+    url: `${ORIGIN}${flatPageHref(page)}`,
+    lastModified: new Date(page.comparison.dateModified),
+    changeFrequency: "monthly",
+    priority: 0.8,
+  }));
+  return [...marketing, ...landing, ...flat];
 }

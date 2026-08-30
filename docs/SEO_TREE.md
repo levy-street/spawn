@@ -105,9 +105,9 @@ the registry test enforces a denylist.
 **Structured data (JSON-LD, validated with Google's Rich Results Test):**
 - Site-wide: `Organization` + `SoftwareApplication` (on `/` and hubs).
 - All pages: `BreadcrumbList` (root → hub → page).
-- Q&A sections: `FAQPage`. Dated editorial pages (jobs, guides): `Article`;
-  guides add `HowTo`. `datePublished`/`dateModified` kept honest. Comparisons:
-  no `Review` schema (we are not a neutral reviewer); plain content.
+- Q&A sections: `FAQPage`. Dated editorial pages (jobs, comparisons, guides):
+  `Article`; guides add `HowTo`. `datePublished`/`dateModified` kept honest.
+  Comparisons: no `Review` schema (we are not a neutral reviewer).
   Expectation check: Google no longer shows FAQ rich results for ordinary
   sites and retired HowTo rich results entirely — this markup is for
   machine-readability (including AI answers), not SERP decoration.
@@ -246,7 +246,7 @@ shared rail and hairline borders. Reference implementation:
 | machine | machine row | outbound-only network diagram | Breadcrumb, FAQ | new |
 | job | job pages | workspace-grid vignette (the parallel fleet, live) | Breadcrumb, FAQ, Article (honest dates) | flagship built (`/run-agents-in-parallel`) |
 | pillar | agent pillars | agent fact card + spoke rack | Breadcrumb, FAQ | new |
-| comparison | /spawnd-vs-* | ledger table + honest verdict | Breadcrumb, FAQ, **no Review** | exists; rework to copy bar |
+| comparison | /spawnd-vs-* | ledger table + honest verdict | Breadcrumb, FAQ, Article (honest dates), **no Review** | rebuilt on flat slugs: 5 live (tier-1 quarry pending) |
 | listicle | /{x}-alternatives | ranked options w/ mini-ledgers, real tools listed honestly | Breadcrumb, FAQ | new |
 | guide | /how-to-* | numbered steps, code blocks, troubleshooting | HowTo, Article (honest dates), Breadcrumb | new |
 | fix | symptom pages | diagnosis → general fixes → structural fix | Breadcrumb, FAQ | new |
@@ -264,10 +264,11 @@ vs ~45 · listicles ~10 · guides ~150 · fix ~40 · emerging headroom ~40 →
 
 ## Implementation notes
 
-- Flat URLs: one root-level `[slug]` catch-all beside the static app routes
-  (Next prefers static matches); registry denylist test guards collisions.
-  Existing `/use|/for|/vs` routes migrate at rework time — dev-only today, no
-  redirects owed.
+- Flat URLs: `web/src/app/[slug]` renders the flat catalogue
+  (`web/src/lib/seo/flat.ts`); `flat.test.ts` is the denylist guarding
+  collisions with static routes. `/vs` spokes migrated 2026-08-30 (hub
+  remains, racking flat cards); `/use|/for` migrate at their rework — dev-only
+  today, no redirects owed.
 - Registry gains: per-family signature sections, custom-JSX escape hatch, two
   new templates (guide, fix), automated OG images, Lighthouse CI budgets.
 - Rework the existing 14 to Rules 5–7 before minting anything new.
