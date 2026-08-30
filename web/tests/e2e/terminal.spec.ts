@@ -1436,7 +1436,7 @@ test("emoji occupy two cells (Unicode 11 width tables)", async ({ page }) => {
   expect(widths.emoji / widths.x).toBeCloseTo(2, 1);
 });
 
-test("OSC 8 hyperlinks render underlined without leaking the URL", async ({ page }) => {
+test("OSC 8 hyperlinks render and open without a JavaScript warning", async ({ page }) => {
   await openTerminalWithMockSocket(page, {
     history: "\x1b]8;;https://example.com\x1b\\LINKTEXT\x1b]8;;\x1b\\ plain\r\n",
   });
@@ -1456,6 +1456,36 @@ test("OSC 8 hyperlinks render underlined without leaking the URL", async ({ page
     .first()
     .evaluate((node) => getComputedStyle(node).textDecorationLine);
   expect(plainDecoration).not.toContain("underline");
+
+  await page.evaluate(() => {
+    const openedUrls: string[] = [];
+    Object.assign(globalThis, { __terminalOpenedUrls: openedUrls });
+    window.open = (() => {
+      const openedWindow = { opener: window, location: {} };
+      Object.defineProperty(openedWindow.location, "href", {
+        set: (url: string) => openedUrls.push(url),
+      });
+      return openedWindow as unknown as Window;
+    }) as typeof window.open;
+  });
+  const dialogs: string[] = [];
+  page.on("dialog", (dialog) => {
+    dialogs.push(dialog.message());
+    void dialog.dismiss();
+  });
+
+  await linkSpan.click();
+
+  expect(dialogs).toEqual([]);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (globalThis as typeof globalThis & { __terminalOpenedUrls?: string[] })
+            .__terminalOpenedUrls ?? [],
+      ),
+    )
+    .toEqual(["https://example.com"]);
 });
 
 test("DECSCUSR switches the rendered cursor shape", async ({ page }) => {
