@@ -86,6 +86,25 @@ test("drilling in reveals what is inside the folder", async ({ page }) => {
   expect(deep.left).toBe(deep.max);
 });
 
+test("arrow keys walk the folders without a click first", async ({ page }) => {
+  await mockApp(page, { workspaces: [workspace()], sessions: [], files });
+  await page.goto(`/w/${WORKSPACE_ID}`);
+  await page
+    .getByRole("toolbar", { name: "Add a window" })
+    .getByRole("button", { name: "Shell", exact: true })
+    .click();
+  const dialog = page.getByRole("dialog", { name: "Select a folder on Mac" });
+
+  // The trailing column takes focus on open, so the keyboard works straight
+  // away: ArrowDown selects the first sibling, and its column opens.
+  await expect(dialog.getByRole("listbox", { name: "Folders in /Users/tester" })).toBeFocused();
+  await page.keyboard.press("ArrowDown");
+  await expect(dialog.getByRole("option", { name: "Desktop", selected: true })).toBeVisible();
+  await expect(
+    dialog.getByRole("listbox", { name: "Folders in /Users/tester/Desktop" }),
+  ).toBeVisible();
+});
+
 test("opened at a folder shows it in context, and pressing it reveals", async ({ page }) => {
   await mockApp(page, {
     // A workspace already pointed somewhere three columns deep.
