@@ -31,7 +31,7 @@ export function FleetCapture({ caption, refId }: { caption: string; refId?: stri
           loop
           playsInline
           preload="metadata"
-          poster="/product/fleet-grid.png"
+          poster="/product/fleet-grid-poster.webp"
           aria-label={ALT}
         >
           <source src="/product/fleet-grid.mp4" type="video/mp4" />
@@ -39,6 +39,7 @@ export function FleetCapture({ caption, refId }: { caption: string; refId?: stri
         <Image
           className="hidden h-auto w-full motion-reduce:block"
           src="/product/fleet-grid.png"
+          sizes="(min-width: 1024px) 64rem, 100vw"
           width={WIDTH}
           height={HEIGHT}
           alt={ALT}
