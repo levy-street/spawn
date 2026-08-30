@@ -306,6 +306,13 @@ async def create_session(
             db, user, workspaces_routes.parse_workspace_layout(workspace.layout)
         )
         workspace.layout = _append_tile(layout, session_id=session_row.id, tile=body.tile)
+        # A workspace without a home — a pre-0047 row whose sessions were gone
+        # at backfill time, or one whose home host was deleted — adopts the
+        # first session created in it, so every window after this one opens
+        # there instead of asking again.
+        if workspace.host_id is None or workspace.cwd is None:
+            workspace.host_id = host.id
+            workspace.cwd = body.cwd
         workspace.updated_at = _utcnow()
 
     await db.commit()

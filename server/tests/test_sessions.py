@@ -252,6 +252,45 @@ async def test_session_create_appends_workspace_tile(client):
     }
 
 
+async def test_session_create_adopts_home_for_a_homeless_workspace(client):
+    """A workspace with no home takes the first session's host and folder.
+
+    Pre-0047 workspaces whose original sessions were gone missed the home
+    backfill, and nothing after creation wrote one — so every "add a window"
+    asked where, forever. The first session created in such a workspace now
+    settles it; the second one must not move it again.
+    """
+    token = await _signup(client, "adopt-home@example.com")
+    auth = {"Authorization": f"Bearer {token}"}
+    host_id = await _create_host("adopt-home@example.com")
+
+    ws = await client.post("/api/workspaces", json={"name": "old-timer"}, headers=auth)
+    assert ws.status_code == 201, ws.text
+    workspace_id = ws.json()["workspace"]["id"]
+    assert ws.json()["workspace"]["host_id"] is None
+    assert ws.json()["workspace"]["cwd"] is None
+
+    r = await client.post(
+        "/api/sessions",
+        json={"host_id": host_id, "cwd": "/repo/adopted", "workspace_id": workspace_id},
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    workspace = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()
+    assert workspace["host_id"] == host_id
+    assert workspace["cwd"] == "/repo/adopted"
+
+    # The home is settled: a later session somewhere else does not move it.
+    r = await client.post(
+        "/api/sessions",
+        json={"host_id": host_id, "cwd": "/elsewhere", "workspace_id": workspace_id},
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    workspace = (await client.get(f"/api/workspaces/{workspace_id}", headers=auth)).json()
+    assert workspace["cwd"] == "/repo/adopted"
+
+
 async def test_session_create_explicit_tile_validation(client):
     token = await _signup(client, "tile-explicit@example.com")
     auth = {"Authorization": f"Bearer {token}"}
