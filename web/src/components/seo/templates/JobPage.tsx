@@ -1,7 +1,6 @@
 import Image from "next/image";
 import Link from "next/link";
 import type { ReactNode } from "react";
-import { preload } from "react-dom";
 import { Colophon, GITHUB_URL } from "@/components/brand/press";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { InstallOneLiner } from "@/components/seo/InstallOneLiner";
@@ -415,21 +414,23 @@ function HeroInk({
   date: string;
   ink: JobHeroInk;
 }) {
-  preload(ink.poster, { as: "image", fetchPriority: "high" });
   return (
     <header id="hero" className="relative isolate scroll-mt-24 overflow-hidden">
       <RefTag id="hero" />
       <div aria-hidden className="absolute inset-0">
-        <HeroInkVideo video={ink.video} poster={ink.poster} />
+        {/* The still is the base layer and the LCP; the film lays over it
+         * after load, desktop only. Behind the dim, quality 35 is invisible. */}
         <Image
           src={ink.poster}
           alt=""
           aria-hidden
           fill
           priority
+          quality={35}
           sizes="100vw"
-          className="pointer-events-none hidden object-cover motion-reduce:block"
+          className="pointer-events-none object-cover"
         />
+        <HeroInkVideo video={ink.video} />
         {/* The dim: darkest through the middle band where the type sits, so
          * the print breathes at the edges without competing with it. */}
         <div
