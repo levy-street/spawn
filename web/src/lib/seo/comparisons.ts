@@ -270,7 +270,7 @@ export const COMPARISONS: ComparisonEntry[] = [
       {
         title: "Claude Code on your phone",
         blurb: "the device that answers the permission prompt",
-        href: "/use/claude-code-on-your-phone",
+        href: "/claude-code-on-your-phone",
       },
     ],
     cardTitle: "vs VS Code Tunnels",
@@ -656,7 +656,7 @@ export const COMPARISONS: ComparisonEntry[] = [
       {
         title: "Claude Code on your phone",
         blurb: "the phone as a first-class console",
-        href: "/use/claude-code-on-your-phone",
+        href: "/claude-code-on-your-phone",
       },
       {
         title: "Run agents in parallel",
@@ -915,7 +915,7 @@ export const COMPARISONS: ComparisonEntry[] = [
       {
         title: "Claude Code on your phone",
         blurb: "the phone as a first-class agent console",
-        href: "/use/claude-code-on-your-phone",
+        href: "/claude-code-on-your-phone",
       },
       {
         title: "spawnd vs SSH + tmux",
@@ -1441,7 +1441,7 @@ export const COMPARISONS: ComparisonEntry[] = [
       {
         title: "Claude Code on your phone",
         blurb: "what a phone-shaped terminal actually looks like",
-        href: "/use/claude-code-on-your-phone",
+        href: "/claude-code-on-your-phone",
       },
       {
         title: "Run agents in parallel",

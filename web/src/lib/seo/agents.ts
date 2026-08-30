@@ -81,7 +81,7 @@ export const AGENTS: SeoPage[] = [
         a: "Install the daemon on each. Every approved device reaches all of them, and sessions on different hosts sit side by side in one view.",
       },
     ],
-    related: ["use/claude-code-on-your-phone", "use/keep-agents-running", "for/codex"],
+    related: ["/claude-code-on-your-phone", "use/keep-agents-running", "for/codex"],
     cardTitle: "For Claude Code",
     cardBlurb: "Anthropic’s CLI agent on your machines, reachable from any browser.",
   },

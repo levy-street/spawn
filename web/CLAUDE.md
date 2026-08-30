@@ -64,7 +64,7 @@ rework (`docs/SEO_TREE.md` is the page catalogue, `docs/SEO_RUNBOOK.md` the
 process):
 
 - **Flat slugs (current)**: one entry per page in `src/lib/seo/` template
-  files (`comparisons.ts` so far), catalogued by `src/lib/seo/flat.ts` and
+  files (`comparisons.ts`, `devices.ts`), catalogued by `src/lib/seo/flat.ts` and
   rendered by `app/[slug]/` through the templates in
   `src/components/seo/templates/` (job frame, comparison, the live fleet
   capture in `public/product/`). `src/lib/seo/flat.test.ts` holds the

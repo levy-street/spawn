@@ -10,93 +10,6 @@ import type { SeoPage } from "./types";
 export const USE_CASES: SeoPage[] = [
   {
     family: "use",
-    slug: "claude-code-on-your-phone",
-    title: "Run Claude Code from your phone",
-    description:
-      "Start, steer, and review Claude Code sessions from your phone’s browser. The agent runs on your machine at home; the session survives every disconnect.",
-    eyebrow: "Use case",
-    h1: { plain: "Run Claude Code", accent: "from your phone." },
-    lede: "The agent runs on your machine — your dev box, your home server, your GPU rig. Your phone is just a window onto it. Close the tab at dinner, reopen it on the couch: the session is exactly where you left it, scrollback intact.",
-    sections: [
-      {
-        kind: "grid",
-        eyebrow: "Why this works",
-        heading: { plain: "A real terminal,", accent: "not a remote screen." },
-        lede: "spawnd doesn’t stream video of a desktop. Your phone gets a first-class terminal, sized for the glass it’s on.",
-        items: [
-          {
-            title: "The session lives on the host",
-            body: "Claude Code runs in a real login shell on your machine. Your phone attaches to it and detaches from it; the work never depends on the phone staying awake.",
-          },
-          {
-            title: "Built for the small screen",
-            body: "spawnd is an installable web app with a terminal that respects the virtual keyboard, reflows on rotate, and keeps touch scrolling and copy working like they should.",
-          },
-          {
-            title: "Survives the walk to the train",
-            body: "Networks drop; sessions don’t. The daemon’s workers own the terminal, so a lost connection — or even a daemon restart — costs you nothing but the reconnect.",
-          },
-          {
-            title: "End-to-end encrypted",
-            body: "Terminal traffic is encrypted from your phone’s browser to the daemon on your host. The server that introduces them cannot read a byte of it — by architecture, not policy.",
-          },
-        ],
-      },
-      {
-        kind: "steps",
-        eyebrow: "The ritual",
-        heading: { plain: "Three steps to a pocket terminal." },
-        items: [
-          {
-            title: "Possess the machine",
-            body: "Run one command on the host where Claude Code should live. The daemon dials out to the server — no inbound ports, no VPN, no router config.",
-          },
-          {
-            title: "Approve your phone",
-            body: "Open spawnd in your phone’s browser and confirm a short pairing code. One approval admits the device to every machine you own.",
-          },
-          {
-            title: "Summon the agent",
-            body: "Open a session and tap the Claude Code shortcut. It types the visible claude command into your shell — your login, your config, your subscription, untouched.",
-          },
-        ],
-        installCommand: true,
-      },
-      {
-        kind: "prose",
-        eyebrow: "The honest part",
-        heading: { plain: "What a phone is actually for." },
-        paragraphs: [
-          "Nobody writes a module on a phone, and we won’t pretend you will. What you actually do from a phone: kick off a long task before you leave, answer the permission prompt the agent has been waiting on, read the diff it produced, and tell it to keep going. That loop is the whole job, and a phone does it perfectly when the terminal underneath is real.",
-          "When you’re back at a desk, the same session is waiting in the same browser app — bigger glass, same scrollback, nothing to re-establish.",
-        ],
-      },
-    ],
-    faq: [
-      {
-        q: "Do I need to install an app on my phone?",
-        a: "No. spawnd runs in the browser and can be installed to your home screen as a web app. Your phone needs a browser; the machine running Claude Code needs the daemon.",
-      },
-      {
-        q: "What happens to the session when my phone loses signal?",
-        a: "Nothing. The session runs on your host, owned by a worker process there. When your phone reconnects, it reattaches to the live session with scrollback intact.",
-      },
-      {
-        q: "Does my Anthropic login or API key go through spawnd’s servers?",
-        a: "Never. Claude Code runs on your machine with the credentials already on it. spawnd’s server carries introductions and encrypted traffic it cannot read — it never holds agent credentials.",
-      },
-      {
-        q: "Can I use an agent other than Claude Code?",
-        a: "Yes. Codex, OpenCode, Aider, and any custom CLI are launchable the same way — an agent in spawnd is a visible command shortcut, not a lock-in.",
-      },
-    ],
-    related: ["use/keep-agents-running", "for/claude-code", "use/ai-agents-on-your-own-gpu"],
-    cardTitle: "Claude Code on your phone",
-    cardBlurb: "Steer sessions from the couch; the agent never leaves your machine.",
-  },
-
-  {
-    family: "use",
     slug: "ai-agents-on-your-own-gpu",
     title: "Run AI coding agents on your own GPU",
     description:
@@ -196,7 +109,7 @@ export const USE_CASES: SeoPage[] = [
     related: [
       "use/web-terminal-for-your-home-server",
       "/spawnd-vs-coder",
-      "use/claude-code-on-your-phone",
+      "/claude-code-on-your-phone",
     ],
     cardTitle: "Agents on your own GPU",
     cardBlurb: "The rig you own, reachable from any browser, with no open ports.",
@@ -490,7 +403,7 @@ export const USE_CASES: SeoPage[] = [
       },
     ],
     related: [
-      "use/claude-code-on-your-phone",
+      "/claude-code-on-your-phone",
       "/spawnd-vs-ssh-and-tmux",
       "use/ai-agents-on-your-own-gpu",
     ],

@@ -1,5 +1,5 @@
 import type { MetadataRoute } from "next";
-import { FLAT_PAGES, flatPageHref } from "@/lib/seo/flat";
+import { FLAT_PAGES, flatPageContent, flatPageHref } from "@/lib/seo/flat";
 import { SEO_PAGES, seoPageHref } from "@/lib/seo/registry";
 
 const ORIGIN = "https://spawnd.dev";
@@ -32,7 +32,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
   }));
   const flat: MetadataRoute.Sitemap = FLAT_PAGES.map((page) => ({
     url: `${ORIGIN}${flatPageHref(page)}`,
-    lastModified: new Date(page.comparison.dateModified),
+    lastModified: new Date(flatPageContent(page).dateModified),
     changeFrequency: "monthly",
     priority: 0.8,
   }));
