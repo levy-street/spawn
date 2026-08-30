@@ -313,11 +313,16 @@ export function FolderPicker({
 
   // Focus the column you landed in, so the arrow keys work without a click
   // first. The filter box is one Tab away for anyone who would rather type.
+  // Not until the home directory lands: the columns are rebuilt (re-keyed)
+  // then, so an earlier focus sits on an element about to unmount and falls
+  // back to the body. preventScroll because the parking effect below owns the
+  // strip's position — a focus scroll would drag the leaf into frame when the
+  // park deliberately leaves it one scroll further right.
   useEffect(() => {
-    if (!open) return;
-    const id = requestAnimationFrame(() => leafColumnRef.current?.focus());
+    if (!open || !homeDir) return;
+    const id = requestAnimationFrame(() => leafColumnRef.current?.focus({ preventScroll: true }));
     return () => cancelAnimationFrame(id);
-  }, [open]);
+  }, [open, homeDir]);
 
   // Park the strip as the trail changes.
   // biome-ignore lint/correctness/useExhaustiveDependencies: listedPath and revealNonce are the changes being tracked
@@ -665,6 +670,7 @@ export function FolderPicker({
                 entries={entries}
                 selectedPath={column.selectedChild}
                 selectedRef={index === trailIndex ? selectedRef : undefined}
+                columnRef={index === leafIndex ? leafColumnRef : undefined}
                 pending={chrome || (query?.isPending ?? true)}
                 errorMessage={query?.isError ? listErrorMessage(query.error) : null}
                 empty={emptyState(index, hiddenCount)}
