@@ -193,7 +193,7 @@ export default function RunAgentsInParallelPage() {
         <div className="mx-auto mt-12 w-full max-w-5xl sm:mt-14">
           <FleetCapture
             refId="a2"
-            caption="A workspace per project — switching is a click, and nothing stops."
+            caption="A workspace per project — here, spawnd building spawnd: Claude Code and Codex across web, server, daemon, and mobile. Switching is a click, and nothing stops."
           />
         </div>
       </JobSection>
@@ -343,8 +343,8 @@ export default function RunAgentsInParallelPage() {
             src="/product/fleet-close.png"
             width={2540}
             height={1920}
-            alt="The storefront workspace up close: the agent holding an edit, the cart tests, the dev server, and the diff"
-            caption="One project’s workspace, up close: the agent, its tests, the dev server, the diff."
+            alt="The spawn workspace up close: Claude Code and Codex sessions working across web, server, daemon, and mobile, beside the test suite and htop"
+            caption="Up close: four agents at work on one repo, beside the project’s own test suite and htop."
           />
         </div>
       </JobSection>
