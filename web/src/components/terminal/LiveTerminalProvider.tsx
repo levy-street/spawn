@@ -2,7 +2,9 @@
 
 import {
   createContext,
+  lazy,
   type ReactNode,
+  Suspense,
   useCallback,
   useContext,
   useEffect,
@@ -12,8 +14,15 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import type { SessionConnectionInfo } from "@/components/terminal/ConnectionChip";
-import { Terminal, type TerminalHandle } from "@/components/terminal/Terminal";
+import type { TerminalHandle } from "@/components/terminal/Terminal";
 import type { DisplayControlState } from "@/lib/ws";
+
+// The terminal stack (xterm, WebRTC glue) loads only when a session actually
+// mounts a terminal. Routes with no sessions — landing pages, login — never
+// fetch it, and the provider costs them nothing but this file.
+const Terminal = lazy(() =>
+  import("@/components/terminal/Terminal").then((mod) => ({ default: mod.Terminal })),
+);
 
 // Insert a prompt newline for mobile Return (same as the agent page/panes).
 const MOBILE_PROMPT_NEWLINE = "\x1b[200~\n\x1b[201~";
@@ -215,18 +224,20 @@ function PooledTerminal({
 }) {
   return createPortal(
     <div className="size-full @container/term">
-      <Terminal
-        ref={handleRef}
-        sessionId={sessionId}
-        rawInput
-        mobileReturnMode="newline"
-        mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
-        imagePasteMode="bracketed-path"
-        active={active}
-        autoTakeControl={active}
-        onConnectionInfo={(info) => onInfo(sessionId, info)}
-        onDisplayControl={(state) => onDisplay(sessionId, state)}
-      />
+      <Suspense fallback={null}>
+        <Terminal
+          ref={handleRef}
+          sessionId={sessionId}
+          rawInput
+          mobileReturnMode="newline"
+          mobileReturnBytes={MOBILE_PROMPT_NEWLINE}
+          imagePasteMode="bracketed-path"
+          active={active}
+          autoTakeControl={active}
+          onConnectionInfo={(info) => onInfo(sessionId, info)}
+          onDisplayControl={(state) => onDisplay(sessionId, state)}
+        />
+      </Suspense>
     </div>,
     host,
   );

@@ -123,7 +123,7 @@ export default function RunAgentsInParallelPage() {
         title: { plain: "Run multiple Claude Code sessions", accent: "in parallel" },
         sub: "How to run several coding agents at once — the setup that gets you there, and the management problem that shows up right after.",
         date: "spawnd · August 2026",
-        ink: { video: "/brand/ink/grid-ink.mp4", poster: "/brand/ink/grid-ink-poster.webp" },
+        ink: { video: "/brand/ink/grid-ink.mp4", still: "/brand/ink/grid-ink-still.webp" },
       }}
       faq={FAQ}
       related={RELATED}
@@ -364,7 +364,7 @@ export default function RunAgentsInParallelPage() {
           <p className="text-[15px] leading-7">
             Real PTYs owned by host workers. Hosts dial out — zero open ports. Your browser talks to
             each daemon peer-to-peer, end-to-end encrypted. Open source, MIT / Apache-2.0.{" "}
-            <Link href="/security" className={JOB_LINK}>
+            <Link prefetch={false} href="/security" className={JOB_LINK}>
               Read the threat model
             </Link>
             .
