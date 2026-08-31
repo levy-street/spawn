@@ -888,10 +888,30 @@ Doing the release *before* the Stripe call means a failed payment leaves them on
 the old plan with fewer hosts — recoverable and honest — rather than on a
 cheaper plan while still over its limit.
 
-Additionally, set the subscription to **schedule decreasing changes at period
-end**. Then a downgrade takes effect when the paid period ends, which gives the
-user the remainder of the period at their old limit, and makes step 2 a
-scheduled obligation rather than an ambush.
+**Downgrades apply immediately, not at period end.** Deferring them looks kinder
+and is a trap: scheduling a decrease creates a subscription schedule, and
+*"customers can't update or cancel subscriptions that currently have an update
+scheduled with a subscription schedule"* — so a user who downgrades would be
+locked out of **all** self-service changes, including cancelling, for up to a
+month. That is a support incident generator and a consumer-law problem, and it
+buys nothing here: the host-selection step in step 2 already resolves the
+over-limit question at the moment of the change, so there is no deferral to
+gain from.
+
+> Verify in the sandbox before relying on either behaviour: confirm whether the
+> portal's `schedule_at_period_end` actually materialises a schedule object, and
+> confirm that an immediate downgrade leaves the subscription fully
+> self-serviceable. This is a ten-minute experiment and it governs the flow.
+
+**Detecting a downgrade: diff against our own stored `host_limit`, never against
+the event's `previous_attributes`.** That field is real and does carry the old
+items array, but it is **absent on `customer.subscription.deleted`** — and a
+cancellation is a downgrade — and absent when the reconciliation job (§4.6.3)
+finds drift. Two detection paths that can disagree is how an account silently
+keeps a limit it no longer pays for. Comparing the freshly-fetched limit to the
+one in our row is idempotent, ordering-independent, and identical on every path.
+Exactly one event fires on an immediate portal downgrade:
+`customer.subscription.updated`.
 
 ### 5.7 When the account is over its limit anyway
 
