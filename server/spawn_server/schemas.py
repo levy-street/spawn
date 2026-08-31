@@ -1295,7 +1295,7 @@ class SessionCreate(BaseModel):
     skill_ids: list[str] | None = None
     # Optional: transactionally append a tile for this session to a workspace.
     workspace_id: str | None = None
-    # Only meaningful with workspace_id; omitted -> server auto-places (§4.4).
+    # Only meaningful with workspace_id; omitted -> server auto-places.
     tile: TilePlacement | None = None
 
 

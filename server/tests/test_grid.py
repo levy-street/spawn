@@ -1,4 +1,4 @@
-"""Unit tests for the pure grid algebra (docs/OVERHAUL.md §4.4).
+"""Unit tests for the pure grid algebra (proto/README.md, "Layout schema v3").
 
 The Python and TypeScript implementations must stay identical; the shared
 fixture suite ``proto/layout-v3-fixtures.json`` is authoritative and every
