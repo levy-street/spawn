@@ -3,7 +3,7 @@ import { usePathname, useRouter } from "expo-router";
 import type { ReactNode } from "react";
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
-import { readHostSkipped } from "@/components/onboarding/onboarding-state";
+import { readHostSkipped, subscribeHostSkipped } from "@/components/onboarding/onboarding-state";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Text } from "@/components/ui/text";
@@ -47,6 +47,29 @@ export function resolveAuthGateDestination({
 export interface OnceRedirect {
   redirect(): void;
   reset(): void;
+}
+
+export interface OnboardingRedirectTracker {
+  shouldRedirect(accountId: string, pathname: string): boolean;
+  reset(): void;
+}
+
+/** Marks onboarding as introduced once per signed-in account for this launch. */
+export function createOnboardingRedirectTracker(): OnboardingRedirectTracker {
+  let introducedAccountId: string | null = null;
+  return {
+    shouldRedirect(accountId, pathname) {
+      if (introducedAccountId === accountId) return false;
+      introducedAccountId = accountId;
+      return !(
+        pathname === AUTH_GATE_DESTINATIONS.onboarding ||
+        pathname.startsWith(`${AUTH_GATE_DESTINATIONS.onboarding}/`)
+      );
+    },
+    reset() {
+      introducedAccountId = null;
+    },
+  };
 }
 
 export function createUnauthenticatedRedirect(
@@ -175,18 +198,29 @@ export function useAuthBootstrap(refreshKey = "launch"): BootstrapState {
   useEffect(() => {
     if (!hasToken) return;
     let active = true;
+    let liveRevision = 0;
     setHostSkipState({ status: "loading", requestId });
+    const unsubscribe = subscribeHostSkipped((skipped) => {
+      if (!active) return;
+      liveRevision += 1;
+      setHostSkipState({ status: "ready", skipped, requestId });
+    });
     readHostSkipped().then(
       (skipped) => {
-        if (active) setHostSkipState({ status: "ready", skipped, requestId });
+        if (active && liveRevision === 0) {
+          setHostSkipState({ status: "ready", skipped, requestId });
+        }
       },
       () => {
         // If account-local preferences cannot be read, keep the safer first-run gate.
-        if (active) setHostSkipState({ status: "ready", skipped: false, requestId });
+        if (active && liveRevision === 0) {
+          setHostSkipState({ status: "ready", skipped: false, requestId });
+        }
       },
     );
     return () => {
       active = false;
+      unsubscribe();
     };
   }, [hasToken, requestId]);
 
@@ -282,14 +316,10 @@ export function shouldRenderAuthPath(
   }
   if (destination === AUTH_GATE_DESTINATIONS.login) return pathname === destination;
   if (destination === AUTH_GATE_DESTINATIONS.verifyEmail) return pathname === destination;
-  if (destination === AUTH_GATE_DESTINATIONS.onboarding) {
-    return pathname === destination || pathname.startsWith(`${destination}/`);
-  }
-  return (
-    pathname !== "/" &&
-    !SIGNED_OUT_PUBLIC_PATHS.has(pathname) &&
-    !pathname.startsWith(AUTH_GATE_DESTINATIONS.onboarding)
-  );
+  // Onboarding is an introduction, not an authorization boundary. Once a
+  // signed-in account has been sent there, back/deep links and the setup-complete
+  // screen remain usable until the person chooses where to go next.
+  return pathname !== "/" && !SIGNED_OUT_PUBLIC_PATHS.has(pathname);
 }
 
 function GateLoading() {
@@ -338,6 +368,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
       router.replace(destination);
     });
   }
+  const onboardingRedirectRef = useRef<OnboardingRedirectTracker | null>(null);
+  if (onboardingRedirectRef.current === null) {
+    onboardingRedirectRef.current = createOnboardingRedirectTracker();
+  }
 
   useEffect(() => authToken.subscribe(accountBinding.clear), [accountBinding]);
   useEffect(
@@ -360,10 +394,17 @@ export function AuthGate({ children }: { children: ReactNode }) {
     shouldRenderAuthPath(pathname, bootstrap.destination, bootstrap.hasToken);
 
   useEffect(() => {
-    if (bootstrap.status === "ready" && !shouldRender) {
-      router.replace(bootstrap.destination);
+    if (bootstrap.status !== "ready") return;
+    if (!bootstrap.hasToken) {
+      onboardingRedirectRef.current?.reset();
+    } else if (bootstrap.destination === AUTH_GATE_DESTINATIONS.onboarding) {
+      const firstIntroduction =
+        onboardingRedirectRef.current?.shouldRedirect(bootstrap.accountId, pathname) ?? false;
+      if (firstIntroduction || !shouldRender) router.replace(bootstrap.destination);
+      return;
     }
-  }, [bootstrap, router, shouldRender]);
+    if (!shouldRender) router.replace(bootstrap.destination);
+  }, [bootstrap, pathname, router, shouldRender]);
 
   // The navigator stays mounted in every state. Swapping it out for a loading
   // view unmounts the Stack, which resets Expo Router to "/" and re-triggers

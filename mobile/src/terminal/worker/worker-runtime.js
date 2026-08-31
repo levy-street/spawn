@@ -60,6 +60,8 @@
     search: null,
     disconnectTimer: null,
     restartTimer: null,
+    restartInFlight: false,
+    queuedRestart: null,
     statsTimer: null,
     pendingRestartRequests: new Set(),
     stopped: false,

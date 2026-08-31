@@ -29,8 +29,12 @@ import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
 import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
-import { describeDeviceRegistrationFailure } from "@/data/trust/registration";
+import {
+  describeDeviceRegistrationFailure,
+  startFreshDeviceIdentity,
+} from "@/data/trust/registration";
 import { haptics } from "@/lib/haptics";
+import { useSignOut } from "@/lib/use-sign-out";
 import { fontSize, spacing } from "@/theme";
 
 /**
@@ -60,9 +64,16 @@ export function DeviceApprovalScreen({
  * The body without a screen frame, so setup can present the same ceremony as a
  * step rather than duplicating it.
  */
-export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.Element {
+export function DeviceApprovalBody({
+  hostId,
+  onExit,
+}: {
+  hostId?: string;
+  onExit?: () => void;
+}): React.JSX.Element {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const signOut = useSignOut();
   const me = useMeSettingsQuery();
   const accountId = me.data?.user.id;
   const phoneQuery = useRegisteredPhone(accountId);
@@ -89,11 +100,15 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
       ? undefined
       : approvals.approvals.find((entry) => entry.host.id === hostId);
   const settled = approvals.resolved && !phoneQuery.isPending;
-  const done = settled && (target ? target.trust === "trusted" : approvals.awaiting.length === 0);
+  const registrationBlocked = phoneQuery.isError;
+  const done =
+    settled &&
+    !registrationBlocked &&
+    (target ? target.trust === "trusted" : approvals.awaiting.length === 0);
   const otherDeviceCount =
     devicesQuery.data?.filter((device) => device.id !== phone?.id && device.revoked_at === null)
       .length ?? 0;
-  const waiting = settled && !done && otherDeviceCount > 0;
+  const waiting = settled && !registrationBlocked && !done && otherDeviceCount > 0;
 
   const knock = useMutation({
     mutationFn: (deviceId: string) => requestDeviceApproval(deviceId),
@@ -101,6 +116,21 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
       setError(
         "Could not tell your other devices that this one is waiting. Approve it from one of them, or connect a host from this phone below.",
       ),
+  });
+
+  const startFresh = useMutation({
+    mutationFn: async () => {
+      if (accountId === undefined) throw new Error("Your account is still loading.");
+      await startFreshDeviceIdentity(accountId);
+      await queryClient.resetQueries({ queryKey: qk.browserDeviceRegistration(accountId) });
+    },
+    onError: (cause: unknown) => {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "SPAWN D could not create a fresh identity on this phone.",
+      );
+    },
   });
 
   // Raise the knock as soon as this device is registered and known to need one.
@@ -154,7 +184,7 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
         <View style={styles.status}>
           {settled && !waiting ? (
             <Icon
-              color={done ? "success" : "warning"}
+              color={done ? "success" : registrationBlocked ? "destructive" : "warning"}
               name={done ? "ShieldCheck" : "ShieldAlert"}
               size={spacing[6]}
             />
@@ -165,20 +195,24 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
             <Text variant="label">
               {!settled
                 ? "Checking which hosts trust this device…"
-                : done
-                  ? "This device is approved"
-                  : waiting
-                    ? "Waiting for approval"
-                    : target
-                      ? `${target.host.name} has not approved this device`
-                      : "No host has approved this device yet"}
+                : registrationBlocked
+                  ? registrationFailure.title
+                  : done
+                    ? "This device is approved"
+                    : waiting
+                      ? "Waiting for approval"
+                      : target
+                        ? `${target.host.name} has not approved this device`
+                        : "No host has approved this device yet"}
             </Text>
             <Text color="mutedForeground" variant="caption">
-              {done
-                ? "You can go back and open a terminal. This screen keeps watching in case that changes."
-                : waiting
-                  ? "Open SPAWN D on a device that already works. A prompt is waiting there."
-                  : "A host only answers devices whose key it has pinned, and no other device is registered to vouch for this one. Connect a host from this phone below."}
+              {registrationBlocked
+                ? "SPAWN D could not finish setting up this phone's identity."
+                : done
+                  ? "You can go back and open a terminal. This screen keeps watching in case that changes."
+                  : waiting
+                    ? "Open SPAWN D on a device that already works. A prompt is waiting there."
+                    : "No other approved device is available. Connect a host from this phone below."}
             </Text>
           </View>
         </View>
@@ -193,42 +227,77 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
       {phoneQuery.isError ? (
         <View style={styles.section}>
           <Text accessibilityRole="alert" color="destructive" variant="body">
-            {registrationFailure.reason} It cannot approve devices.
+            {registrationFailure.reason}
             {registrationFailure.remedy === null ? "" : ` ${registrationFailure.remedy}`}
           </Text>
           {registrationFailure.canRetry ? (
-            <Button onPress={() => void phoneQuery.refetch()} size="sm" variant="outline">
+            <Button
+              onPress={() => {
+                if (accountId !== undefined) {
+                  void queryClient.resetQueries({
+                    queryKey: qk.browserDeviceRegistration(accountId),
+                  });
+                }
+              }}
+              size="sm"
+              variant="outline"
+            >
               Try again
+            </Button>
+          ) : null}
+          {registrationFailure.canStartFresh ? (
+            <Button loading={startFresh.isPending} onPress={() => startFresh.mutate()} size="sm">
+              Start fresh on this phone
+            </Button>
+          ) : null}
+          {registrationFailure.canSignOut ? (
+            <Button
+              loading={signOut.signingOut}
+              onPress={() => void signOut.signOut()}
+              size="sm"
+              variant="ghost"
+            >
+              Sign out
             </Button>
           ) : null}
         </View>
       ) : null}
 
-      <View style={styles.section}>
-        <SectionHeader title="This device" />
-        <ListBlock>
-          <View style={styles.identity}>
-            <Text color="mutedForeground" variant="caption">
-              {phone?.label ?? "This device"}
-            </Text>
-            <Text selectable style={styles.fingerprint} variant="mono">
-              {phone ? formatHostFingerprint(phone.public_key) : "…"}
-            </Text>
-            <Text color="mutedForeground" variant="caption">
-              The approving device shows a fingerprint too. They must match — that comparison is the
-              whole of what makes this safe.
-            </Text>
-            <Button
-              disabled={!phone}
-              onPress={() => void copyFingerprint()}
-              size="sm"
-              variant="outline"
-            >
-              {copied ? "Copied" : "Copy fingerprint"}
-            </Button>
-          </View>
-        </ListBlock>
-      </View>
+      {phone?.identityRecovery === "device_key_revoked" ? (
+        <Text accessibilityLiveRegion="polite" color="mutedForeground" variant="body">
+          This phone's old key was revoked, so SPAWN D created a fresh identity — approve it from
+          another device.
+        </Text>
+      ) : null}
+
+      {onExit === undefined ? null : (
+        <Button onPress={onExit} variant="ghost">
+          Skip for now
+        </Button>
+      )}
+
+      {phone ? (
+        <View style={styles.section}>
+          <SectionHeader title="This device" />
+          <ListBlock>
+            <View style={styles.identity}>
+              <Text color="mutedForeground" variant="caption">
+                {phone.label ?? "This device"}
+              </Text>
+              <Text selectable style={styles.fingerprint} variant="mono">
+                {formatHostFingerprint(phone.public_key)}
+              </Text>
+              <Text color="mutedForeground" variant="caption">
+                The approving device shows a fingerprint too. They must match — that comparison is
+                the whole of what makes this safe.
+              </Text>
+              <Button onPress={() => void copyFingerprint()} size="sm" variant="outline">
+                {copied ? "Copied" : "Copy fingerprint"}
+              </Button>
+            </View>
+          </ListBlock>
+        </View>
+      ) : null}
 
       {waiting ? (
         <View style={styles.section}>
@@ -281,15 +350,14 @@ export function DeviceApprovalBody({ hostId }: { hostId?: string }): React.JSX.E
         </View>
       ) : null}
 
-      {settled && !done ? (
+      {phone && settled && !done ? (
         <View style={styles.section}>
           <SectionHeader title="Or pair from this device" />
           <ListBlock>
             <View style={styles.steps}>
               <Text color="mutedForeground" variant="body">
-                Possess a host directly: run the command it gives you on that machine, then open the
-                link its terminal prints on this phone — scan the QR it can show, or open the link
-                here. Approving from this phone trusts it without another device.
+                Or connect a host from this phone: install SPAWN D on the machine, run spawnd
+                possess there, and open the link it prints on this phone (the QR code works too).
               </Text>
               <Button onPress={() => router.push("/onboarding/host")} variant="outline">
                 Connect a host

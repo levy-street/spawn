@@ -5,6 +5,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 const mockBack = jest.fn();
 const mockCanGoBack = jest.fn(() => true);
 const mockReplace = jest.fn();
+const mockQueryClear = jest.fn();
 const mockRefetch = jest.fn(async () => undefined);
 const mockHostPairingStep = jest.fn((_props: unknown) => null);
 let mockSearchParams: Record<string, string> = {};
@@ -39,6 +40,7 @@ jest.mock("react-native-keyboard-controller", () => {
 
 jest.mock("@tanstack/react-query", () => ({
   useQuery: () => mockMeQuery,
+  useQueryClient: () => ({ clear: mockQueryClear }),
 }));
 
 jest.mock("@/components/onboarding/host-pairing-step", () => ({
@@ -71,6 +73,7 @@ describe("PairingScreen", () => {
     mockCanGoBack.mockReset();
     mockCanGoBack.mockReturnValue(true);
     mockReplace.mockClear();
+    mockQueryClear.mockClear();
     mockHostPairingStep.mockClear();
     mockSearchParams = {};
     mockMeQuery = {
@@ -85,7 +88,7 @@ describe("PairingScreen", () => {
     const screen = await render(<PairingScreen />, { wrapper });
 
     expect(screen.getAllByRole("header")).toHaveLength(1);
-    expect(screen.getByRole("header", { name: "Connect a host" })).toBeOnTheScreen();
+    expect(screen.getByRole("header", { name: "Connect a computer" })).toBeOnTheScreen();
     expect(screen.getByTestId("pairing-screen")).toHaveStyle({
       backgroundColor: lightTheme.colors.background,
     });

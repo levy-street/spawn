@@ -396,6 +396,34 @@ describe("session-scoped signalling", () => {
     await harness.handleTransportMessage?.({ type: "close" });
   });
 
+  test("supersedes a pending restart with the latest network configuration", async () => {
+    const harness = createHarness("session");
+    await connect(harness);
+    await signOffer(harness);
+    const pc = FakePeerConnection.last;
+
+    await harness.handleTransportMessage?.({
+      type: "network-changed",
+      iceServers: [{ urls: "stun:first-network.example" }],
+      iceTransportPolicy: "all",
+    });
+    await harness.handleTransportMessage?.({
+      type: "network-changed",
+      iceServers: [{ urls: "turn:latest-network.example" }],
+      iceTransportPolicy: "relay",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(pc?.restartIce).toHaveBeenCalledTimes(2);
+    expect(pc?.setConfiguration).toHaveBeenLastCalledWith({
+      iceServers: [{ urls: "turn:latest-network.example" }],
+      iceTransportPolicy: "relay",
+    });
+    expect(pc?.offerOptions.slice(-2)).toEqual([{ iceRestart: true }, { iceRestart: true }]);
+    await harness.handleTransportMessage?.({ type: "close" });
+  });
+
   test("carries endorsements on the outer offer only", async () => {
     const harness = createHarness("session");
     await connect(harness);

@@ -5,6 +5,8 @@
   const state = api.state;
   const CHANNEL_OPTIONS = Object.freeze({ ordered: true });
   state.restartTimer ??= null;
+  state.restartInFlight ??= false;
+  state.queuedRestart ??= null;
   state.statsTimer ??= null;
   state.pendingRestartRequests ??= new Set();
 
@@ -111,34 +113,69 @@
     }, 5_000);
   }
 
+  function runQueuedRestart() {
+    const queued = state.queuedRestart;
+    if (!queued || state.stopped || !state.pc) return;
+    state.queuedRestart = null;
+    void restartPeer(queued.message, queued.cause);
+  }
+
   async function restartPeer(message = {}, cause = "connection lost") {
     const pc = state.pc;
-    if (!pc || pc.connectionState === "closed" || state.restartTimer !== null) {
+    if (!pc || pc.connectionState === "closed") {
       if (!pc) channelFailed("RTCPeerConnection");
+      return;
+    }
+    if (state.restartInFlight || state.restartTimer !== null) {
+      // Interface changes can arrive in a burst (wifi disappears, then the
+      // cellular route settles). Keep only the newest ICE configuration and
+      // run it after the current restart resolves instead of losing it for the
+      // full watchdog interval.
+      if (cause === "network changed") {
+        state.queuedRestart = { message, cause };
+        if (!state.restartInFlight) {
+          clearTimeout(state.restartTimer);
+          state.restartTimer = null;
+          runQueuedRestart();
+        }
+      }
       return;
     }
     clearTimeout(state.disconnectTimer);
     state.disconnectTimer = null;
-    if (Array.isArray(message.iceServers) && typeof pc.setConfiguration === "function") {
-      const relayOnly = message.iceTransportPolicy === "relay";
-      pc.setConfiguration({
-        iceServers: message.iceServers,
-        iceTransportPolicy: relayOnly ? "relay" : "all",
-      });
-    }
-    pc.restartIce?.();
-    await requestSignedOffer(pc, true);
-    state.restartTimer = setTimeout(() => {
-      state.restartTimer = null;
-      if (state.pc?.connectionState !== "connected") {
-        channelFailed(
-          "ICE restart",
-          cause === "network changed"
-            ? "The network changed and the terminal connection could not be restored."
-            : "The host connection was lost and could not be restored.",
-        );
+    state.restartInFlight = true;
+    try {
+      if (Array.isArray(message.iceServers) && typeof pc.setConfiguration === "function") {
+        const relayOnly = message.iceTransportPolicy === "relay";
+        pc.setConfiguration({
+          iceServers: message.iceServers,
+          iceTransportPolicy: relayOnly ? "relay" : "all",
+        });
       }
-    }, 10_000);
+      pc.restartIce?.();
+      await requestSignedOffer(pc, true);
+      if (state.pc !== pc || pc.connectionState === "closed") return;
+      state.restartTimer = setTimeout(() => {
+        state.restartTimer = null;
+        if (state.pc?.connectionState !== "connected") {
+          channelFailed(
+            "ICE restart",
+            cause === "network changed"
+              ? "The network changed and the terminal connection could not be restored."
+              : "The host connection was lost and could not be restored.",
+          );
+          return;
+        }
+        runQueuedRestart();
+      }, 10_000);
+    } finally {
+      state.restartInFlight = false;
+      if (state.queuedRestart !== null) {
+        clearTimeout(state.restartTimer);
+        state.restartTimer = null;
+      }
+      if (state.restartTimer === null) runQueuedRestart();
+    }
   }
 
   function configureChannel(channel, kind) {
@@ -206,6 +243,7 @@
         clearTimeout(state.restartTimer);
         state.restartTimer = null;
         scheduleStats();
+        runQueuedRestart();
       }
     };
     api.post({ type: "state", state: "connecting" });
@@ -320,6 +358,8 @@
     clearTimeout(state.statsTimer);
     state.disconnectTimer = null;
     state.restartTimer = null;
+    state.restartInFlight = false;
+    state.queuedRestart = null;
     state.statsTimer = null;
     for (const channel of [state.pty, state.ctl]) {
       if (!channel) continue;

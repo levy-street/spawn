@@ -77,11 +77,11 @@ export function InstallInstructions({
     <View style={styles.container}>
       <View style={styles.heading}>
         <Text accessibilityRole="header" variant="title">
-          Connect your first host
+          Connect your first computer
         </Text>
         <Text color="mutedForeground">
-          Install the daemon on a machine you control, then approve it from the link spawnd possess
-          prints. It appears here once it's online.
+          A host is a computer SPAWN D opens terminals on — usually your own Mac, Linux, or Windows
+          machine.
         </Text>
       </View>
 
@@ -111,8 +111,10 @@ export function InstallInstructions({
           </Text>
         </View>
         <View style={styles.instructionCopy}>
-          <Text weight="medium">{activeTarget.stepHeading}</Text>
-          <Text color="mutedForeground">{activeTarget.stepDescription}</Text>
+          <Text weight="medium">On that computer, paste this into a terminal</Text>
+          <Text color="mutedForeground">
+            This installs SPAWN D and starts the computer-side service.
+          </Text>
         </View>
       </View>
 
@@ -166,9 +168,9 @@ export function InstallInstructions({
           </Text>
         </View>
         <View style={styles.instructionCopy}>
-          <Text weight="medium">Start pairing</Text>
+          <Text weight="medium">Approve it from this phone</Text>
           <Text color="mutedForeground">
-            After installation, run spawnd possess on that machine.
+            When the install finishes it prints a link. Open it on this phone or scan the QR code.
           </Text>
         </View>
       </View>

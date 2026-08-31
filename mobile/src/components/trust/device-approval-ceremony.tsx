@@ -25,8 +25,12 @@ import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
 import { useDeviceCeremony } from "@/data/trust/ceremony";
 import { invalidateDeviceHostTrust } from "@/data/trust/device-trust";
-import { describeDeviceRegistrationFailure } from "@/data/trust/registration";
+import {
+  describeDeviceRegistrationFailure,
+  startFreshDeviceIdentity,
+} from "@/data/trust/registration";
 import { haptics } from "@/lib/haptics";
+import { useSignOut } from "@/lib/use-sign-out";
 import { spacing, useTheme } from "@/theme";
 
 /** How long the approved card stays up before the sheet closes itself. */
@@ -80,6 +84,7 @@ export function DeviceApprovalCeremony({
   const devices = useAccountDevices(phoneQuery.isSuccess);
   const endorsements = usePendingEndorsements(accountId ?? "", phone?.id ?? null);
   const approvals = useDeviceHostApprovals(true);
+  const signOut = useSignOut();
   const [serverOrigin, setServerOrigin] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -99,8 +104,23 @@ export function DeviceApprovalCeremony({
     mutationFn: (deviceId: string) => requestDeviceApproval(deviceId),
     onError: () =>
       setActionError(
-        "The knock did not reach your other devices. Ask again, or connect a host from this phone below.",
+        "The approval request did not reach your other devices. Ask again, or connect a host from this phone below.",
       ),
+  });
+
+  const startFresh = useMutation({
+    mutationFn: async () => {
+      if (accountId === undefined) throw new Error("Your account is still loading.");
+      await startFreshDeviceIdentity(accountId);
+      await queryClient.resetQueries({ queryKey: qk.browserDeviceRegistration(accountId) });
+    },
+    onError: (cause: unknown) => {
+      setActionError(
+        cause instanceof Error
+          ? cause.message
+          : "SPAWN D could not create a fresh identity on this phone.",
+      );
+    },
   });
 
   // Knock as soon as this device can be vouched for. The prompt this raises on
@@ -210,9 +230,9 @@ export function DeviceApprovalCeremony({
                 : phase === "settling"
                   ? "Finishing up"
                   : phase === "identity-blocked"
-                    ? "This device has no identity yet"
+                    ? registrationFailure.title
                     : phase === "waiting"
-                      ? `${hostName} is waiting on your say-so`
+                      ? `${hostName} is waiting for approval`
                       : `${hostName} has not approved this device`}
           </Text>
           <Text color="mutedForeground" style={styles.centered} variant="caption">
@@ -221,11 +241,11 @@ export function DeviceApprovalCeremony({
               : phase === "settling"
                 ? `The number matched. ${hostName} is picking up the approval now.`
                 : phase === "identity-blocked"
-                  ? "It could not register the key that hosts pin, so nothing can vouch for it yet."
+                  ? "SPAWN D could not finish setting up this phone's identity."
                   : phase === "waiting"
-                    ? `A prompt is up on every screen already signed in${signedInAs} — including your Mac's browser. Approve it from one this host already trusts and a number appears here to type there.`
+                    ? `A request is waiting on every screen already signed in${signedInAs}. Open one where terminals already work, approve this phone, then type the number shown here.`
                     : phase === "pair-only"
-                      ? "Nothing else is signed in to answer for it. Connect a host from this phone instead."
+                      ? "No other approved device is available. Connect a host from this phone instead."
                       : ""}
           </Text>
         </View>
@@ -238,11 +258,43 @@ export function DeviceApprovalCeremony({
             {registrationFailure.remedy === null ? "" : ` ${registrationFailure.remedy}`}
           </Text>
           {registrationFailure.canRetry ? (
-            <Button onPress={() => void phoneQuery.refetch()} size="sm" variant="outline">
+            <Button
+              onPress={() => {
+                if (accountId !== undefined) {
+                  void queryClient.resetQueries({
+                    queryKey: qk.browserDeviceRegistration(accountId),
+                  });
+                }
+              }}
+              size="sm"
+              variant="outline"
+            >
               Try again
             </Button>
           ) : null}
+          {registrationFailure.canStartFresh ? (
+            <Button loading={startFresh.isPending} onPress={() => startFresh.mutate()} size="sm">
+              Start fresh on this phone
+            </Button>
+          ) : null}
+          {registrationFailure.canSignOut ? (
+            <Button
+              loading={signOut.signingOut}
+              onPress={() => void signOut.signOut()}
+              size="sm"
+              variant="ghost"
+            >
+              Sign out
+            </Button>
+          ) : null}
         </View>
+      ) : null}
+
+      {phone?.identityRecovery === "device_key_revoked" ? (
+        <Text accessibilityLiveRegion="polite" color="mutedForeground" variant="caption">
+          This phone's old key was revoked, so SPAWN D created a fresh identity — approve it from
+          another device.
+        </Text>
       ) : null}
 
       {check !== null && phase !== "done" ? (
@@ -312,9 +364,8 @@ export function DeviceApprovalCeremony({
           </View>
           <View style={[styles.section, { gap: theme.space(2) }]}>
             <Text color="mutedForeground" style={styles.centered} variant="caption">
-              Possess a host directly: run the command it gives you on that machine, then open the
-              link its terminal prints on this phone — scan the QR it can show, or open the link
-              here. Approving from this phone trusts it without another device.
+              Or connect a host from this phone: install SPAWN D on the machine, run spawnd possess
+              there, and open the link it prints on this phone (the QR code works too).
             </Text>
             <Button
               onPress={() => {

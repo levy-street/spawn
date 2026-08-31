@@ -36,7 +36,12 @@ import {
 import { useRelease } from "@/data/queries/release";
 import { qk } from "@/data/queryKeys";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
+import {
+  describeDeviceRegistrationFailure,
+  startFreshDeviceIdentity,
+} from "@/data/trust/registration";
 import { haptics } from "@/lib/haptics";
+import { useSignOut } from "@/lib/use-sign-out";
 import { spacing } from "@/theme";
 
 type HostStage = "instructions" | "review" | "failure" | "success";
@@ -60,6 +65,7 @@ export function HostPairingStep({
   onSkip,
 }: HostPairingStepProps) {
   const queryClient = useQueryClient();
+  const signOut = useSignOut();
   const phoneQuery = useRegisteredPhone(accountId);
   const devicesQuery = useAccountDevices(phoneQuery.isSuccess);
   const endorsementsQuery = usePendingEndorsements(accountId, phoneQuery.data?.id ?? null);
@@ -76,6 +82,20 @@ export function HostPairingStep({
     result: PairingApprovalResult;
     requiresPhoneComparison: boolean;
   } | null>(null);
+  const registrationFailure = describeDeviceRegistrationFailure(phoneQuery.error);
+  const identityRecoveryNotice =
+    phoneQuery.data?.identityRecovery === "device_key_revoked" ? (
+      <Text accessibilityLiveRegion="polite" color="mutedForeground" variant="body">
+        This phone's old key was revoked, so SPAWN D created a fresh identity — approve it from
+        another device.
+      </Text>
+    ) : null;
+  const startFreshRegistration = useMutation({
+    mutationFn: async () => {
+      await startFreshDeviceIdentity(accountId);
+      await queryClient.resetQueries({ queryKey: qk.browserDeviceRegistration(accountId) });
+    },
+  });
   const initialLookupStarted = useRef(false);
   const waitingHostIds = useRef<Set<string> | null>(null);
   const installTargets = installTargetsForBaseUrl(
@@ -214,18 +234,49 @@ export function HostPairingStep({
   }
   if (phoneQuery.isError) {
     return (
-      <TrustFailureState
-        failure={toPairingFailure(phoneQuery.error)}
-        onAction={() => {
-          // Reset before refetching. A query that has already failed keeps its
-          // error, and `retry: false` means nothing re-runs on its own — so a
-          // bare refetch can leave the same message on screen with no request
-          // ever leaving the device, which is exactly how this button came to
-          // look broken.
-          queryClient.resetQueries({ queryKey: qk.browserDeviceRegistration(accountId) });
-          void phoneQuery.refetch();
-        }}
-        {...(onSkip === undefined ? {} : { onSkip })}
+      <EmptyState
+        action={
+          <View style={styles.failureActions}>
+            {registrationFailure.canRetry ? (
+              <Button
+                onPress={() =>
+                  void queryClient.resetQueries({
+                    queryKey: qk.browserDeviceRegistration(accountId),
+                  })
+                }
+              >
+                Try again
+              </Button>
+            ) : null}
+            {registrationFailure.canStartFresh ? (
+              <Button
+                loading={startFreshRegistration.isPending}
+                onPress={() => startFreshRegistration.mutate()}
+              >
+                Start fresh on this phone
+              </Button>
+            ) : null}
+            {registrationFailure.canSignOut ? (
+              <Button
+                loading={signOut.signingOut}
+                onPress={() => void signOut.signOut()}
+                variant="ghost"
+              >
+                Sign out
+              </Button>
+            ) : null}
+            {onSkip === undefined ? null : (
+              <Button onPress={onSkip} variant="ghost">
+                Set this up later
+              </Button>
+            )}
+          </View>
+        }
+        description={`${registrationFailure.reason}${
+          registrationFailure.remedy === null ? "" : ` ${registrationFailure.remedy}`
+        }`}
+        icon="ShieldAlert"
+        title={registrationFailure.title}
       />
     );
   }
@@ -255,21 +306,23 @@ export function HostPairingStep({
     if (newHost !== null && onExit !== undefined) {
       return (
         <View style={styles.hostStep}>
+          {identityRecoveryNotice}
           <EmptyState
             action={
               <Button onPress={pairAnother} variant="outline">
-                Connect another host
+                Connect another computer
               </Button>
             }
-            description={`${newHost.name} is connected. It will appear as soon as its daemon comes online.`}
+            description={`${newHost.name} is connected. It will appear as soon as SPAWN D comes online there.`}
             icon="ShieldCheck"
-            title="Host approved"
+            title="Computer approved"
           />
         </View>
       );
     }
     return (
       <View style={styles.hostStep}>
+        {identityRecoveryNotice}
         <InstallInstructions
           onCommandCopied={() => {
             waitingHostIds.current ??= new Set(hostsQuery.data?.map((host) => host.id) ?? []);
@@ -297,6 +350,7 @@ export function HostPairingStep({
   if (stage === "review" && ceremony !== null) {
     return (
       <View style={styles.hostStep}>
+        {identityRecoveryNotice}
         {machineWait}
         <FingerprintReview
           approving={approveMutation.isPending}
@@ -323,6 +377,7 @@ export function HostPairingStep({
     if (success.requiresPhoneComparison) {
       return (
         <View style={styles.hostStep}>
+          {identityRecoveryNotice}
           {machineWait}
           <PairingSuccess
             hostName={success.result.hostName}
@@ -340,16 +395,17 @@ export function HostPairingStep({
     }
     return (
       <View style={styles.hostStep}>
+        {identityRecoveryNotice}
         {machineWait}
         <EmptyState
           action={
             <Button onPress={pairAnother} variant="outline">
-              Connect another host
+              Connect another computer
             </Button>
           }
-          description={`${success.result.hostName} is connected. It will appear as soon as its daemon comes online.`}
+          description={`${success.result.hostName} is connected. It will appear as soon as SPAWN D comes online there.`}
           icon="ShieldCheck"
-          title="Host approved"
+          title="Computer approved"
         />
       </View>
     );
@@ -383,6 +439,10 @@ export function HostPairingStep({
 }
 
 const styles = StyleSheet.create({
+  failureActions: {
+    gap: spacing[2],
+    width: "100%",
+  },
   hostStep: {
     gap: spacing[8],
   },
