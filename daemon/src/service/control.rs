@@ -204,23 +204,19 @@ pub fn send(config_dir: &Path, command: ControlCommand) -> Result<u32> {
     let name = pipe_name(config_dir)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
-        match send_once(&name, deadline) {
-            Ok(pipe) => match exchange(pipe, command) {
-                Ok(pid) => return Ok(pid),
-                // The listener serves one client per pipe instance and
-                // recycles the instance between clients, and DisconnectNamedPipe
-                // discards a framed reply the client has not read yet. That
-                // surfaces here as "no process is on the other end of the
-                // pipe" (233) or a broken pipe mid-exchange. Every control
-                // command is idempotent, so run the whole exchange again
-                // rather than surfacing a reply the server already sent.
-                Err(error)
-                    if is_recycled_instance(&error) && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Err(error) => return Err(error),
-            },
+        let pipe = send_once(&name, deadline)?;
+        match exchange(pipe, command) {
+            Ok(pid) => return Ok(pid),
+            // The listener serves one client per pipe instance and
+            // recycles the instance between clients, and DisconnectNamedPipe
+            // discards a framed reply the client has not read yet. That
+            // surfaces here as "no process is on the other end of the
+            // pipe" (233) or a broken pipe mid-exchange. Every control
+            // command is idempotent, so run the whole exchange again
+            // rather than surfacing a reply the server already sent.
+            Err(error) if is_recycled_instance(&error) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
             Err(error) => return Err(error),
         }
     }
