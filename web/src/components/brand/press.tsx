@@ -6,7 +6,7 @@ import type { ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Trident, Wordmark } from "@/components/icons/BrandMark";
 import { useDesktopShell } from "@/hooks/useDesktopShell";
-import { useAuth } from "@/lib/auth";
+import { useAuth, useAuthConfig } from "@/lib/auth";
 import { type DesktopPlatform, WINDOWS_DESKTOP_PLATFORM } from "@/lib/platform";
 import { cn } from "@/lib/utils";
 
@@ -124,6 +124,24 @@ function useMastheadScrub(): {
 }
 
 /**
+ * Whether this deployment sells anything, and may therefore offer a pricing
+ * link. Fails **closed**: until something says otherwise the answer is no, so a
+ * self-hosted install never advertises a shop it does not have.
+ *
+ * `serverAnswer` is what the page's own server render already knew — a public
+ * page that read `GET /api/auth/config` server-side passes it down, so the link
+ * is in the first paint rather than popping in. The browser then reads the same
+ * endpoint and takes over: same source of truth, just later. On the first
+ * client render that query has nothing yet, so the answer is the prop, which is
+ * exactly what the server rendered — the same care `useDesktopShell` takes when
+ * it reads the user agent in an effect instead of during render.
+ */
+function useBillingLink(serverAnswer: boolean): boolean {
+  const { config } = useAuthConfig();
+  return config ? config.billing.enabled : serverAnswer;
+}
+
+/**
  * The masthead: three zones with the brand at the centre, pinned, collapsing as
  * you scroll. The session changes only the right-hand pair — no account, the two
  * doors in (log in, sign up); an account, the one door back (`/app`).
@@ -131,9 +149,17 @@ function useMastheadScrub(): {
  * `current` inks the link for the page you're already on rather than hiding it,
  * so the row never changes width between surfaces.
  */
-export function Masthead({ current }: { current?: "security" | "download" }) {
+export function Masthead({
+  current,
+  billingEnabled = false,
+}: {
+  current?: "security" | "download" | "pricing";
+  /** What the page's server render knew about billing. See `useBillingLink`. */
+  billingEnabled?: boolean;
+}) {
   const { navRef, brandRef, markRef, wordRef } = useMastheadScrub();
   const { user } = useAuth();
+  const showPricing = useBillingLink(billingEnabled);
   // Inside the app every zone but the brand leads somewhere the window cannot
   // come back from, and the brand itself has to lead the other way: whoever is
   // reading this in there wants the product, not more of the site.
@@ -151,6 +177,15 @@ export function Masthead({ current }: { current?: "security" | "download" }) {
         <div className="hidden items-center gap-7 sm:flex sm:gap-10">
           {inShell ? null : (
             <>
+              {showPricing && (
+                <Link
+                  href="/pricing"
+                  aria-current={current === "pricing" ? "page" : undefined}
+                  className={zoneLink(current === "pricing")}
+                >
+                  Pricing
+                </Link>
+              )}
               <Link
                 href="/security"
                 aria-current={current === "security" ? "page" : undefined}
@@ -205,23 +240,41 @@ export function Masthead({ current }: { current?: "security" | "download" }) {
   );
 }
 
-/** The colophon that closes every public page. */
-export function Colophon() {
+/**
+ * The colophon that closes every public page.
+ *
+ * Terms and Privacy are not billing-conditional: they are legal pages and they
+ * exist on every deployment, self-hosted included. Pricing is, and fails closed
+ * — see `useBillingLink`.
+ */
+export function Colophon({ billingEnabled = false }: { billingEnabled?: boolean }) {
   // The rule still closes the page in the app; the routes it offers do not,
   // because none of them is a place that window can be left.
   const inShell = useDesktopShell();
+  const showPricing = useBillingLink(billingEnabled);
 
   return (
     <footer className="border-line-g border-t px-5 py-10 sm:px-8">
       <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-4 font-sigil text-[11px] tracking-[0.14em] text-ash uppercase sm:flex-row">
         <span>consensual · auditable · revocable</span>
         {inShell ? null : (
-          <div className="flex items-center gap-5">
+          <div className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2">
+            {showPricing && (
+              <Link href="/pricing" className="transition-colors hover:text-bone">
+                Pricing
+              </Link>
+            )}
             <Link href="/security" className="transition-colors hover:text-bone">
               Security
             </Link>
             <Link href="/download" className="transition-colors hover:text-bone">
               Install
+            </Link>
+            <Link href="/terms" className="transition-colors hover:text-bone">
+              Terms
+            </Link>
+            <Link href="/privacy" className="transition-colors hover:text-bone">
+              Privacy
             </Link>
             <Link href="/login" className="transition-colors hover:text-bone">
               Log in
