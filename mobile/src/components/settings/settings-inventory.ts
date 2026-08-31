@@ -2,6 +2,7 @@ import type { IconName } from "@/components/ui/icon";
 
 export type SettingsPanelKey =
   | "account"
+  | "subscription"
   | "appearance"
   | "notifications"
   | "agents"
@@ -36,6 +37,18 @@ export const SETTINGS_PANELS = [
       "Permanently delete",
       "Cancel",
     ],
+  },
+  // Status, and nothing else. The mobile apps never sell anything, so this
+  // panel carries no price, no purchase control and no route off-platform —
+  // `controls` names the copy it does carry. docs/BILLING.md §6.4. The row is
+  // hidden entirely on a deployment with billing off.
+  {
+    key: "subscription",
+    label: "Subscription",
+    description: "Your plan, how many hosts it includes, and when it renews",
+    icon: "Flame",
+    route: "/settings/subscription",
+    controls: ["Plan"],
   },
   {
     key: "appearance",
@@ -129,4 +142,4 @@ export const SETTINGS_PANELS = [
   },
 ] as const satisfies readonly SettingsPanelDefinition[];
 
-export const SETTINGS_PANEL_COUNT = 8;
+export const SETTINGS_PANEL_COUNT = 9;

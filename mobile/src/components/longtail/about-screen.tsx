@@ -5,7 +5,6 @@ import { Linking, StyleSheet, View } from "react-native";
 
 import { BrandMark } from "@/components/brand/brand-mark";
 import {
-  DOWNLOAD_URL,
   installCommandsForBaseUrl,
   nativeWindowsAvailableFromRelease,
   SECURITY_URL,
@@ -341,18 +340,27 @@ export function AboutScreen({
         )}
       </SettingsSection>
 
+      {/*
+       * There is no "Download & install" row here, and that is deliberate.
+       *
+       * Every install command it used to lead to is already on this screen,
+       * above, with copy and share — so the link only ever offered a longer
+       * road to the same text. Meanwhile spawnd.dev now sells subscriptions,
+       * and an in-app tappable link into a site that sells them is exactly the
+       * shape a reviewer reads as steering under App Store guideline 3.1.1.
+       * The mobile apps never sell anything (docs/BILLING.md §6.1); this keeps
+       * that true of the links as well as of the copy.
+       *
+       * Do not re-add it. If a download page must be reachable from here, it
+       * has to be a URL with no route to pricing — which the shared marketing
+       * chrome does not currently give us.
+       */}
       <SettingsSection title="Links">
         <SettingsLinkRow
           accessibilityHint="Opens the SPAWN D security page in your browser"
           icon="ShieldCheck"
           label="Security"
           onPress={() => void openExternal("Security", SECURITY_URL)}
-        />
-        <SettingsLinkRow
-          accessibilityHint="Opens host download information in your browser"
-          icon="Download"
-          label="Download & install"
-          onPress={() => void openExternal("Download & install", DOWNLOAD_URL)}
         />
         <SettingsLinkRow
           accessibilityHint="Opens the source repository in your browser"

@@ -9,11 +9,14 @@ import type { ProfileOut } from "@/data/api/schemas/legion";
 import type { WorkspaceTemplateOut } from "@/data/api/schemas/templates";
 
 describe("settings inventory", () => {
-  test("ships exactly the eight reference panels with a documented control inventory", () => {
+  test("ships exactly the nine reference panels with a documented control inventory", () => {
     expect(SETTINGS_PANELS).toHaveLength(SETTINGS_PANEL_COUNT);
-    // No Hosts panel: machines are the Legion tab's, not a setting.
+    // No Hosts panel: machines are the Legion tab's, not a setting. Subscription
+    // is in the inventory but drawn only where the server has billing, so a
+    // self-hosted deployment shows eight of these nine.
     expect(SETTINGS_PANELS.map((panel) => panel.label)).toEqual([
       "Account",
+      "Subscription",
       "Appearance",
       "Notifications",
       "Agents",

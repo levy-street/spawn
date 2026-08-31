@@ -48,6 +48,7 @@ const FAILURE_TITLES = {
   "host-not-ready": "Host proof is still pending",
   "approval-incomplete": "Server approval did not complete",
   "endorsement-invalid": "Endorsement could not be verified",
+  "host-limit": "Host limit reached",
   "pairing-rejected": "Host approval was blocked",
 } as const satisfies Record<PairingFailureKind, string>;
 

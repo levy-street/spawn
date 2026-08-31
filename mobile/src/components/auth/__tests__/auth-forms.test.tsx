@@ -87,6 +87,7 @@ describe("auth form wiring", () => {
       providers: [{ id: "google", name: "Google" }],
       email_verification_required: false,
       invite_only: false,
+      billing: { enabled: false, free_host_limit: 1, mobile_upgrade_link: false },
     });
   });
 

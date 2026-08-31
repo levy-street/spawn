@@ -1,6 +1,10 @@
 export const SECURITY_URL = "https://spawnd.dev/security";
-export const DOWNLOAD_URL = "https://spawnd.dev/download";
 export const SOURCE_URL = "https://github.com/levy-street/spawn";
+// No DOWNLOAD_URL. The download page is where the marketing site's own chrome
+// leads to pricing, and an in-app tappable link into a site selling
+// subscriptions is what App Store guideline 3.1.1 calls steering. Every install
+// command it carried is already in the About screen, so nothing was lost with
+// it. See the comment beside the Links section in `about-screen.tsx`.
 
 export const DEFAULT_INSTALL_ORIGIN = "https://spawnd.dev";
 export const WINDOWS_PLATFORM_ID = "windows-x86_64";

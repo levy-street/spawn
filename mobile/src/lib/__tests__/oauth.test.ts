@@ -15,6 +15,9 @@ const token = {
     created_at: "2026-08-24T00:00:00Z",
     email_verified_at: null,
     is_admin: false,
+    // Null is what a deployment without billing sends, and the shape both
+    // sign-in paths seed the me-cache from.
+    billing: null,
   },
 };
 

@@ -34,6 +34,7 @@ import {
   useRegisteredPhone,
 } from "@/data/queries/pairing";
 import { useRelease } from "@/data/queries/release";
+import { useMeSettingsQuery } from "@/data/queries/settings";
 import { qk } from "@/data/queryKeys";
 import { formatHostFingerprint } from "@/data/trust/host-pins";
 import { haptics } from "@/lib/haptics";
@@ -65,6 +66,9 @@ export function HostPairingStep({
   const endorsementsQuery = usePendingEndorsements(accountId, phoneQuery.data?.id ?? null);
   const hostsQuery = useHostsQuery();
   const releaseQuery = useRelease();
+  // The same `qk.me()` entry Settings and the Legion header already read, so
+  // the plan state costs nothing here. Null on a deployment with billing off.
+  const meQuery = useMeSettingsQuery();
   const [stage, setStage] = useState<HostStage>("instructions");
   const [baseUrl, setBaseUrl] = useState<string | null>(null);
   const [serverOrigin, setServerOrigin] = useState<string | null>(null);
@@ -163,6 +167,8 @@ export function HostPairingStep({
       setStage("success");
       void setHostSkipped(false);
       void queryClient.invalidateQueries({ queryKey: qk.hosts() });
+      // The plan's host count just moved. Same cache entry Settings reads.
+      void queryClient.invalidateQueries({ queryKey: qk.me() });
       void queryClient.invalidateQueries({ queryKey: qk.trustLocalPins(accountId) });
     },
     onError: (error) => {
@@ -196,6 +202,7 @@ export function HostPairingStep({
       });
       setStage("success");
       void queryClient.invalidateQueries({ queryKey: qk.hosts() });
+      void queryClient.invalidateQueries({ queryKey: qk.me() });
       void queryClient.invalidateQueries({ queryKey: qk.trustLocalPins(accountId) });
     },
     onError: (error) => {
@@ -271,6 +278,7 @@ export function HostPairingStep({
     return (
       <View style={styles.hostStep}>
         <InstallInstructions
+          billing={meQuery.data?.user.billing ?? null}
           onCommandCopied={() => {
             waitingHostIds.current ??= new Set(hostsQuery.data?.map((host) => host.id) ?? []);
             setCommandCopied(true);
