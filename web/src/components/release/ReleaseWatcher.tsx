@@ -17,6 +17,8 @@ type StalePrompt = "none" | "soft" | "hard";
 const CHECK_INTERVAL_MS = 5 * 60_000;
 const SNOOZE_MS = 30 * 60_000;
 const SNOOZE_KEY = "spawn.release.snoozedUntil";
+const FORCED_RELOAD_KEY = "spawn.release.forcedReload";
+const FORCED_RELOAD_WINDOW_MS = 2 * 60_000;
 
 let prompt: StalePrompt = "none";
 let checkTimer: number | null = null;
@@ -115,7 +117,55 @@ function snooze(): void {
   for (const listener of listeners) listener();
 }
 
+/**
+ * Whether this tab has already reloaded for a required update and come back
+ * running the same build.
+ *
+ * The forced path is a countdown to `location.reload()`, and the refusal that
+ * triggers it repeats on the next page's very first socket. So when the reload
+ * does not actually change the build — a service worker still serving the old
+ * bundle, a cache that will not budge, a deploy that has not finished — the tab
+ * reloads every ten seconds forever, and takes anything in flight with it each
+ * time.
+ *
+ * The build id is what makes this precise rather than a guess: it is the
+ * identity of the bundle currently executing. If the reload worked it has
+ * changed, the latch does not match, and a later refusal is free to reload
+ * again. If it is the same id within the window, the reload demonstrably did
+ * not take, and doing it faster will not help — so stop, and ask the person.
+ */
+function forcedReloadDidNotTake(): boolean {
+  try {
+    const raw = window.sessionStorage.getItem(FORCED_RELOAD_KEY);
+    if (!raw) return false;
+    const record: unknown = JSON.parse(raw);
+    if (typeof record !== "object" || record === null) return false;
+    const { buildId, at } = record as { buildId?: unknown; at?: unknown };
+    return (
+      buildId === clientBuildId() &&
+      typeof at === "number" &&
+      Number.isFinite(at) &&
+      Date.now() - at < FORCED_RELOAD_WINDOW_MS
+    );
+  } catch {
+    return false;
+  }
+}
+
+function markForcedReload(): void {
+  try {
+    window.sessionStorage.setItem(
+      FORCED_RELOAD_KEY,
+      JSON.stringify({ buildId: clientBuildId(), at: Date.now() }),
+    );
+  } catch {
+    // A privacy mode may deny storage. Without the latch this behaves as it
+    // did before: the reload still happens, it just cannot be counted.
+  }
+}
+
 async function reloadClient(): Promise<void> {
+  markForcedReload();
   try {
     await navigator.serviceWorker?.getRegistration().then((registration) => registration?.update());
   } catch {
@@ -129,9 +179,16 @@ async function reloadClient(): Promise<void> {
 export function ReleaseWatcher() {
   const stalePrompt = useSyncExternalStore(subscribe, getPrompt, () => "none");
   const [seconds, setSeconds] = useState(10);
+  const [reloadStalled, setReloadStalled] = useState(false);
 
   useEffect(() => {
     if (stalePrompt !== "hard") return;
+    if (forcedReloadDidNotTake()) {
+      // Already tried, still the same build. Reloading again would only start
+      // the loop; hand it to the person instead.
+      setReloadStalled(true);
+      return;
+    }
     setSeconds(10);
     const timer = window.setInterval(() => {
       setSeconds((current) => {
@@ -152,7 +209,7 @@ export function ReleaseWatcher() {
   // cannot talk to the server any more. There is nothing to weigh up and no
   // "later" that works, so it takes the whole screen and gets on with it.
   if (stalePrompt === "hard") {
-    return <ForcedUpdateOverlay seconds={seconds} />;
+    return <ForcedUpdateOverlay seconds={seconds} stalled={reloadStalled} />;
   }
 
   return (
@@ -197,7 +254,7 @@ export function ReleaseWatcher() {
  * The bar is time against the countdown, which is a real quantity — how long
  * until this tab reloads — rather than an invented download percentage.
  */
-function ForcedUpdateOverlay({ seconds }: { seconds: number }) {
+function ForcedUpdateOverlay({ seconds, stalled }: { seconds: number; stalled: boolean }) {
   const total = 10;
   const elapsed = Math.max(0, Math.min(total, total - seconds));
   const percent = Math.round((elapsed / total) * 100);
@@ -214,26 +271,31 @@ function ForcedUpdateOverlay({ seconds }: { seconds: number }) {
           SPAWN D needs to update
         </h2>
         <p id="forced-update-body" className="mt-2 text-sm text-muted-foreground">
-          This version can no longer talk to the server. Updating now — open terminals reconnect on
-          their own.
+          {stalled
+            ? "This version can no longer talk to the server, and reloading brought back the same one. Your browser may be serving a cached copy — try a hard refresh, or check back shortly if a deploy is still finishing."
+            : "This version can no longer talk to the server. Updating now — open terminals reconnect on their own."}
         </p>
-        <div
-          role="progressbar"
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={percent}
-          className="mt-5 h-1.5 w-full overflow-hidden rounded-full bg-muted"
-        >
+        {stalled ? null : (
           <div
-            className="h-full rounded-full bg-primary transition-[width] duration-1000 ease-linear"
-            style={{ width: `${percent}%` }}
-          />
-        </div>
-        <p className="mt-3 text-xs tabular-nums text-muted-foreground" role="status">
-          Reloading in {seconds} s…
-        </p>
+            role="progressbar"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={percent}
+            className="mt-5 h-1.5 w-full overflow-hidden rounded-full bg-muted"
+          >
+            <div
+              className="h-full rounded-full bg-primary transition-[width] duration-1000 ease-linear"
+              style={{ width: `${percent}%` }}
+            />
+          </div>
+        )}
+        {stalled ? null : (
+          <p className="mt-3 text-xs tabular-nums text-muted-foreground" role="status">
+            Reloading in {seconds} s…
+          </p>
+        )}
         <Button type="button" size="sm" className="mt-5" onClick={() => void reloadClient()}>
-          Reload now
+          {stalled ? "Try again" : "Reload now"}
         </Button>
       </div>
     </div>

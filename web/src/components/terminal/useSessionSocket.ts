@@ -1,6 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  getBrowserHostPinRevision,
+  subscribeToBrowserHostPinChanges,
+} from "@/lib/browser-host-pins";
 import type { CarriedEndorsement } from "@/lib/hostControl";
 import {
   DirectSessionUploadError,
@@ -285,6 +289,20 @@ export function useSessionSocket({
   // must inform the NEXT offer, not tear down a live connection.
   const resolveSignedRtcTrustRef = useRef(resolveSignedRtcTrust);
   resolveSignedRtcTrustRef.current = resolveSignedRtcTrust;
+  // A trust refusal stops reconnecting on purpose — retrying against an
+  // unverifiable host would be the wrong kind of persistence. But the copy on
+  // screen tells the reader that re-possessing the host brings the pane back,
+  // and with the warm terminal pool keeping panes mounted across navigation,
+  // nothing here ever noticed that they had. Local trust changes now move a
+  // revision, and this connect effect lists it as a dependency: approving a
+  // pin tears the effect down and runs it again with a fresh
+  // `reconnectStopped`, so the pane reconnects instead of waiting for a
+  // full page reload.
+  const hostPinRevision = useSyncExternalStore(
+    subscribeToBrowserHostPinChanges,
+    getBrowserHostPinRevision,
+    () => 0,
+  );
   const loadCarriedEndorsementsRef = useRef(loadCarriedEndorsements);
   loadCarriedEndorsementsRef.current = loadCarriedEndorsements;
   const initialSizeRef = useRef(initialSize);
@@ -337,6 +355,10 @@ export function useSessionSocket({
     schedule();
   }, []);
 
+  // `hostPinRevision` is a re-run trigger, not a value this effect reads: local
+  // trust changed, so the connection has to be decided again — including the
+  // refusal that set `reconnectStopped` and would otherwise never be revisited.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: re-run trigger, not a read
   useEffect(() => {
     const sessionGeneration = sessionGenerationRef.current + 1;
     sessionGenerationRef.current = sessionGeneration;
@@ -2004,7 +2026,14 @@ export function useSessionSocket({
       pendingInputExpiryTimerRef.current = null;
       if (isCurrentSessionGeneration()) activeSessionIdRef.current = null;
     };
-  }, [sessionId, enabled, settleUploadReadiness, armPendingInputExpiry, updateQueuedInputState]);
+  }, [
+    sessionId,
+    enabled,
+    hostPinRevision,
+    settleUploadReadiness,
+    armPendingInputExpiry,
+    updateQueuedInputState,
+  ]);
 
   const [pageVisible, setPageVisible] = useState(
     () => typeof document === "undefined" || !document.hidden,

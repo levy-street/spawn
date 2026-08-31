@@ -1,5 +1,21 @@
 # SPAWN D MASTERPLAN — the daemon experience, end to end
 
+> **Historical working notes, not a live plan.** This is the brief as it stood
+> on 2026-08-25, kept because the reasoning behind the daemon-experience work
+> is worth having and because `docs/masterplan/` cites it. It is *not*
+> maintained against the shipped code, and it does not bind anyone: where it
+> disagrees with the tree, the tree is right, and the durable documents are
+> `docs/RELEASE.md`, `docs/TRUST.md`, `docs/NETWORK.md` and the `CLAUDE.md`
+> files. The "How to use this document" ground rules below addressed the
+> session that executed it — in particular its blanket "never deploy" — and
+> have no authority over later work. Read this for *why*; read the tree and
+> those documents for *what is true now*.
+>
+> Known drift: the `curl … --setup TOKEN` claim flow it describes was built and
+> then replaced within this same branch by link-based approval (migrations 0064
+> and 0065 are its fossils), so those passages describe a path that no longer
+> exists.
+
 This is the working master document for making the SPAWN D daemon experience
 clean, flawless, and impossible to regress: versioning and self-update across
 every piece, connection speed and durability, the install/onboarding UX, the

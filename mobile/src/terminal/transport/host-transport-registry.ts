@@ -49,7 +49,20 @@ export function retainHostTransport(
     ownerId,
     subscribeOwnership(listener) {
       shared.ownershipListeners.set(ownerId, listener);
-      listener(shared.owner === ownerId);
+      // A seat can be vacant here. Retaining a lease and subscribing to it are
+      // two steps, and when a consumer is swapped for another in the same
+      // commit the newcomer retains before the outgoing one releases — so the
+      // release finds no listener to hand ownership to and leaves `owner`
+      // null. Nothing else ever fills it: every later subscriber would just be
+      // told `false` and wait for an owner who is never coming, and the shared
+      // worker would stay closed for a host that plainly has a consumer.
+      // Whoever notices the vacancy takes it.
+      if (shared.owner === null) {
+        shared.owner = ownerId;
+        publishOwnership(shared);
+      } else {
+        listener(shared.owner === ownerId);
+      }
       return () => shared.ownershipListeners.delete(ownerId);
     },
     release() {
