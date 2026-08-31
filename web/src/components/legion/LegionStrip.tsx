@@ -124,6 +124,59 @@ export function LegionStrip({
   const summary = summarizeLegion(hosts, sessions);
   const hoveredRow = summary.rows.find((row) => row.host.id === hover.value?.hostId) ?? null;
 
+  /**
+   * The card closes on geometry, never on a countdown — the rule the file
+   * explorer's preview lives by (see FileExplorer.tsx). While one is open the
+   * live region is the host list, the card, and a narrow bridge across the
+   * gap between them, so travelling from a row onto the card — to click a
+   * session — keeps it up, and it goes the instant the pointer is somewhere
+   * else. A close timer would run while the pointer was still on its way.
+   */
+  useEffect(() => {
+    if (hover.value === null) return;
+    /** Slack on the corridor between the list and the card — and only there. */
+    const BRIDGE = 20;
+    const within = (
+      box: { left: number; right: number; top: number; bottom: number },
+      x: number,
+      y: number,
+    ) => x >= box.left && x <= box.right && y >= box.top && y <= box.bottom;
+    const outside = (x: number, y: number) => {
+      const panel = listRef.current?.getBoundingClientRect() ?? null;
+      const card = document.getElementById("legion-host-card")?.getBoundingClientRect() ?? null;
+      if (!panel && !card) return true;
+      if (panel && within(panel, x, y)) return false;
+      if (card) {
+        const cardOnRight = panel
+          ? (card.left + card.right) / 2 >= (panel.left + panel.right) / 2
+          : true;
+        const padded = {
+          left: card.left - (cardOnRight ? BRIDGE : 0),
+          right: card.right + (cardOnRight ? 0 : BRIDGE),
+          top: card.top,
+          bottom: card.bottom,
+        };
+        if (within(padded, x, y)) return false;
+      }
+      return true;
+    };
+    const onMove = (event: PointerEvent) => {
+      if (outside(event.clientX, event.clientY)) hover.cancel();
+    };
+    // Leaving the window entirely counts as leaving the region.
+    const onWindowOut = (event: PointerEvent) => {
+      if (event.relatedTarget === null) hover.cancel();
+    };
+    window.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerout", onWindowOut);
+    window.addEventListener("blur", hover.cancel);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerout", onWindowOut);
+      window.removeEventListener("blur", hover.cancel);
+    };
+  }, [hover.value, hover.cancel]);
+
   const toggle = () => {
     setOpen((current) => {
       remembered.open = !current;
@@ -190,7 +243,16 @@ export function LegionStrip({
        * focusable. */}
       <Collapse open={open && !collapsed}>
         <div className="space-y-1 pt-1">
-          <ul ref={listRef} className="space-y-1" onPointerLeave={hover.cancel}>
+          {/* Leaving the list only abandons a *pending* open — a sweep that
+           * never rested. An open card is closed by the geometric watcher
+           * above, so the pointer can travel onto it. */}
+          <ul
+            ref={listRef}
+            className="space-y-1"
+            onPointerLeave={() => {
+              if (hover.value === null) hover.cancel();
+            }}
+          >
             {shown.map((row) => (
               <HostRow
                 key={row.host.id}
@@ -213,10 +275,12 @@ export function LegionStrip({
         </div>
       </Collapse>
 
-      {/* Non-interactive on purpose: the card must not be able to steal the
-       * hover that opened it, and everything in it is also on the host page
-       * the row navigates to. */}
+      {/* Interactive: the sessions in the card are links, so the pointer has
+       * to be able to land on it. The geometric watcher above keeps it open
+       * for exactly that trip and closes it anywhere else. */}
       <Popover
+        id="legion-host-card"
+        interactive
         open={hoveredRow !== null && open && !collapsed}
         anchor={hoverAnchor}
         side="right"
@@ -227,7 +291,17 @@ export function LegionStrip({
         align="end"
         ariaLabel={hoveredRow ? `${hoveredRow.host.name} details` : undefined}
       >
-        {hoveredRow && <LegionHostDetail row={hoveredRow} />}
+        {hoveredRow && (
+          <LegionHostDetail
+            row={hoveredRow}
+            onNavigate={() => {
+              // The click is a departure: close the card with it, and let the
+              // shell close the mobile drawer the way every nav row does.
+              hover.cancel();
+              onNavigate?.();
+            }}
+          />
+        )}
       </Popover>
     </div>
   );

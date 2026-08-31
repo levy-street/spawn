@@ -1,5 +1,6 @@
 import { agentDisplayName, commandBasename, stripExecutableSuffix } from "@/lib/agent-identity";
-import type { Agent, Session } from "@/lib/api";
+import type { Agent, Session, Workspace } from "@/lib/api";
+import { tabOfSession } from "@/lib/tabs";
 
 /**
  * Pure derivation helpers for sessions: display titles, activity labels and
@@ -124,6 +125,22 @@ export function sessionAtShell(session: Session): boolean {
  * "claude", and an exact match would call that pane a plain shell — which is
  * how duplicating a Claude Code pane on Windows used to produce an empty one.
  */
+/**
+ * Where opening a session should land: the workspace tab holding it, focused
+ * on it — or the standalone session page, which exists even for a session no
+ * workspace references. Same rule the alert toasts navigate by.
+ */
+export function sessionHref(
+  sessionId: string,
+  workspaces: readonly Pick<Workspace, "id" | "layout">[],
+): string {
+  for (const workspace of workspaces) {
+    const tab = tabOfSession(workspace.layout, sessionId);
+    if (tab) return `/w/${workspace.id}?tab=${tab.id}&focus=${sessionId}`;
+  }
+  return `/sessions/${sessionId}`;
+}
+
 export function runningAgent<T extends Pick<Agent, "command">>(
   session: Pick<Session, "foreground_command"> | undefined,
   agents: readonly T[],
