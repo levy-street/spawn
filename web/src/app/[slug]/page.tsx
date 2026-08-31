@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { notFound } from "next/navigation";
 import { ComparisonPage } from "@/components/seo/templates/ComparisonPage";
 import { DevicePage } from "@/components/seo/templates/DevicePage";
+import { HubPage } from "@/components/seo/templates/HubPage";
 import { FLAT_PAGES, findFlatPage, flatPageContent } from "@/lib/seo/flat";
 
 /*
@@ -71,5 +72,7 @@ export default async function FlatSlugPage({ params }: { params: Promise<{ slug:
       return <ComparisonPage entry={page.comparison} />;
     case "device":
       return <DevicePage entry={page.device} />;
+    case "hub":
+      return <HubPage entry={page.hub} />;
   }
 }

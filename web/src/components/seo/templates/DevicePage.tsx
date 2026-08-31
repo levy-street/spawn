@@ -18,11 +18,9 @@ import type { DeviceEntry, DeviceVignette } from "@/lib/seo/flat-types";
  * away-from-desk close.
  */
 
-const PHONE_W = 1170;
-const PHONE_H = 2532;
-
-/** A real capture in a quiet device frame: bezel ring, no skeuomorphism. */
-function PhoneVignette({
+/** A real capture in a quiet device frame: bezel ring, no skeuomorphism.
+ * Portrait captures get the phone's tight radius; landscape gets a screen's. */
+function DeviceFrame({
   vignette,
   sizes,
   refId,
@@ -31,13 +29,20 @@ function PhoneVignette({
   sizes: string;
   refId?: string;
 }) {
+  const portrait = vignette.height > vignette.width;
   return (
     <figure id={refId} className="relative min-w-0 scroll-mt-24">
-      <div className="overflow-hidden rounded-[2rem] bg-void ring-1 ring-line-strong">
+      <div
+        className={
+          portrait
+            ? "overflow-hidden rounded-[2rem] bg-void ring-1 ring-line-strong"
+            : "overflow-hidden rounded-xl bg-void ring-1 ring-line-strong"
+        }
+      >
         <Image
           src={vignette.src}
-          width={PHONE_W}
-          height={PHONE_H}
+          width={vignette.width}
+          height={vignette.height}
           alt={vignette.alt}
           sizes={sizes}
           className="block h-auto w-full"
@@ -64,7 +69,7 @@ function Prose({ heading, paragraphs }: { heading: string; paragraphs: string[] 
 export function DevicePage({ entry }: { entry: DeviceEntry }) {
   return (
     <JobPage
-      crumbs={[{ name: "Use cases", href: "/use" }]}
+      crumbs={[{ name: "On your phone", href: "/coding-agents-on-your-phone" }]}
       pageName={entry.cardTitle}
       canonicalPath={`/${entry.slug}`}
       hero={{
@@ -90,9 +95,13 @@ export function DevicePage({ entry }: { entry: DeviceEntry }) {
       <JobSection refId="s2">
         <JobSplit
           media={
-            <div className="mx-auto w-full max-w-[19rem]">
-              <PhoneVignette vignette={entry.grid} sizes="19rem" />
-            </div>
+            entry.grid.height > entry.grid.width ? (
+              <div className="mx-auto w-full max-w-[19rem]">
+                <DeviceFrame vignette={entry.grid} sizes="19rem" />
+              </div>
+            ) : (
+              <DeviceFrame vignette={entry.grid} sizes="(min-width: 1024px) 32rem, 100vw" />
+            )
           }
         >
           <JobH2>{entry.shape.heading}</JobH2>
@@ -105,20 +114,32 @@ export function DevicePage({ entry }: { entry: DeviceEntry }) {
       </JobSection>
 
       <JobSection refId="a1">
-        <div className="mx-auto w-full max-w-3xl">
+        <div className="mx-auto w-full max-w-4xl">
           <div className="mx-auto max-w-[58ch] text-center">
             <JobH2 className="mx-auto">{entry.moments.heading}</JobH2>
             <p className="mt-6 text-[16px] leading-8 text-ash">{entry.moments.lead}</p>
           </div>
-          <div className="mx-auto mt-14 grid max-w-[42rem] gap-10 sm:grid-cols-2">
-            {entry.moments.vignettes.map((vignette) => (
-              <PhoneVignette
-                key={vignette.src}
-                vignette={vignette}
-                sizes="(min-width: 640px) 20rem, 80vw"
-              />
-            ))}
-          </div>
+          {entry.moments.vignettes.every((v) => v.height > v.width) ? (
+            <div className="mx-auto mt-14 grid max-w-[42rem] gap-10 sm:grid-cols-2">
+              {entry.moments.vignettes.map((vignette) => (
+                <DeviceFrame
+                  key={vignette.src}
+                  vignette={vignette}
+                  sizes="(min-width: 640px) 20rem, 80vw"
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="mx-auto mt-14 max-w-4xl space-y-14">
+              {entry.moments.vignettes.map((vignette) => (
+                <DeviceFrame
+                  key={vignette.src}
+                  vignette={vignette}
+                  sizes="(min-width: 1024px) 56rem, 100vw"
+                />
+              ))}
+            </div>
+          )}
         </div>
       </JobSection>
 
