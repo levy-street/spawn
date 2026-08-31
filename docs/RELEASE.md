@@ -484,12 +484,38 @@ canonical `SPAWN-D_<version>_windows-x86_64-setup.exe`; the same EXE is both the
 public download and updater payload. The workflow produces no MSI.
 
 A release build leaves `SPAWN_DESKTOP_SERVER_ORIGIN` unset, which is what makes
-it point at `https://spawnd.dev` and what keeps it on the signed app channel. A
-build that sets it — one made for a dev deployment — defaults to that server
-instead and takes no updates at all, so it can never quietly replace itself
-with the production app. Setting it during a release is therefore a way to ship
-an app that talks to the wrong fleet and cannot be updated out of it; leave it
-alone unless that is the point (`desktop/CLAUDE.md`).
+it point at `https://spawnd.dev` and what keeps it on the vendor's signed app
+channel. A build that sets it — one made for a dev deployment — defaults to
+that server instead **and takes its updates from that server too**, never from
+production, so it can never quietly replace itself with the production app.
+Setting it during a release is therefore a way to ship an app that talks to the
+wrong fleet and updates from it; leave it alone unless that is the point
+(`desktop/CLAUDE.md`).
+
+### Serving a deployment's own app channel
+
+A deployment that hands out desktop apps should serve the channel those apps
+read, or they never hear about a fix. The layout is the vendor's, under that
+deployment's `/desktop/`:
+
+- `SPAWN-D_<version>_<platform>.app.tar.gz` — the macOS updater payload, made
+  with `COPYFILE_DISABLE=1 tar -czf … -C bundle/macos "SPAWN D.app"`. The DMG
+  is the *download*; the tarball is the *update*, and both must be published.
+- `SPAWN-D_<version>_windows-x86_64-setup.exe` — on Windows one file is both.
+- `latest.json` — `{version, notes, pub_date, platforms{<platform>{signature,
+  url}}}`, where `signature` is the contents of the payload's `.sig` and `url`
+  is absolute, on that deployment's origin.
+
+Every payload is signed with the offline updater key
+(`npx tauri signer sign -f ~/.tauri/spawn-desktop.key <payload>`, password in
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, never on argv). The app verifies against
+the pubkey compiled into `tauri.conf.json`, which is the same on every channel,
+so a dev channel is a different audience rather than a lower bar: an
+unsigned or wrongly-signed payload is refused there exactly as in production.
+
+Write `latest.json` last. A payload with no manifest entry is invisible, which
+is safe; a manifest naming a payload that is not there yet is an update every
+app will try and fail to take.
 
 The Apple credentials are
 `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`,

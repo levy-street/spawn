@@ -1,28 +1,44 @@
 pub const STABLE_ENDPOINT: &str = "https://spawnd.dev/desktop/latest.json";
 pub const BETA_ENDPOINT: &str = "https://spawnd.dev/desktop/beta/latest.json";
 
+/// The channel of the deployment this build was made for, fixed at build time
+/// beside the origin itself so the two can never drift apart.
+pub const OWN_ENDPOINT: &str = concat!(env!("SPAWN_DESKTOP_SERVER_ORIGIN"), "/desktop/latest.json");
+
 /// The updater channel this build may take an app from, if any.
 ///
-/// `None` when the build points at a server other than the vendor's. The
-/// endpoint in `tauri.conf.json` is the vendor's and is signed by the vendor's
-/// offline key, so a build made for a dev deployment would sit there checking
-/// production and, the first time production went ahead of it, quietly replace
-/// itself with the production app. Nobody asked it to change fleets.
+/// A build takes updates from the deployment it points at, and only from that
+/// one. The rule it enforces is that no update ever moves a machine between
+/// fleets: a build made for a dev deployment must never check the vendor's
+/// channel, because the first time production went ahead of it, it would
+/// quietly replace itself with the production app. Nobody asked it to change
+/// fleets. Reading its *own* deployment's channel is the opposite of that
+/// mistake — it is how a dev deployment ships a fix to the apps it handed out.
 ///
-/// Such a build is updated by whoever built it — by installing the next one.
+/// What keeps a channel trustworthy is not its hostname but the offline
+/// updater key compiled into this app: every payload on every channel carries
+/// a detached signature made with that key, so an origin that serves an
+/// update it did not have signed is refused. Publishing to a dev channel
+/// therefore needs the same key a release does.
+///
+/// `None` for a plain-HTTP origin. An update is code, and a local development
+/// origin is not somewhere to fetch code from with no transport authentication
+/// at all; such a build is updated by whoever built it, by installing the next.
 pub fn configured_endpoint() -> Option<&'static str> {
-    endpoint_for(crate::models::HOSTED_ORIGIN)
+    endpoint_for(crate::models::HOSTED_ORIGIN, OWN_ENDPOINT)
 }
 
-fn endpoint_for(origin: &str) -> Option<&'static str> {
-    if origin != crate::models::VENDOR_ORIGIN {
-        return None;
+/// `own` is the endpoint baked for `origin`; it is a parameter rather than a
+/// constant so this stays a pure function the tests can drive with any origin.
+fn endpoint_for(origin: &str, own: &'static str) -> Option<&'static str> {
+    if origin == crate::models::VENDOR_ORIGIN {
+        return Some(if cfg!(feature = "beta-updates") {
+            BETA_ENDPOINT
+        } else {
+            STABLE_ENDPOINT
+        });
     }
-    Some(if cfg!(feature = "beta-updates") {
-        BETA_ENDPOINT
-    } else {
-        STABLE_ENDPOINT
-    })
+    origin.starts_with("https://").then_some(own)
 }
 
 #[cfg(test)]
@@ -56,33 +72,68 @@ pub fn parse_latest_manifest(bytes: &[u8]) -> anyhow::Result<(String, Vec<String
 mod tests {
     use super::*;
 
+    /// The endpoint a build for `origin` would bake, mirroring `OWN_ENDPOINT`'s
+    /// `concat!` so the tests can talk about origins this build was not made
+    /// for. Leaked deliberately: a mismatch here would be a test that passes
+    /// while the shipped constant says something else.
+    const DEV_OWN: &str = "https://dev.spawnd.dev:8330/desktop/latest.json";
+
     #[test]
-    fn a_build_pointed_elsewhere_takes_no_vendor_updates() {
+    fn a_build_pointed_elsewhere_takes_that_deployments_updates_not_the_vendors() {
         // Asserted against the origin rather than whichever one this build
         // chose, so the test holds for a dev build too.
         assert_eq!(
-            endpoint_for(crate::models::VENDOR_ORIGIN),
-            Some(STABLE_ENDPOINT)
+            endpoint_for(crate::models::VENDOR_ORIGIN, DEV_OWN),
+            Some(STABLE_ENDPOINT),
+            "the vendor's own build stays on the vendor's channel"
         );
+        // Every one of these is somebody's own deployment, and each takes
+        // updates from itself. None of them may be handed the vendor's.
         for elsewhere in [
             "https://dev.spawnd.dev:8330",
-            "http://localhost:3000",
             "https://spawnd.dev.evil.test",
             "https://spawnd.dev:8443",
         ] {
             assert_eq!(
-                endpoint_for(elsewhere),
-                None,
-                "{elsewhere} is not the vendor"
+                endpoint_for(elsewhere, DEV_OWN),
+                Some(DEV_OWN),
+                "{elsewhere} updates from itself"
+            );
+            assert_ne!(
+                endpoint_for(elsewhere, DEV_OWN),
+                Some(STABLE_ENDPOINT),
+                "{elsewhere} must never reach the vendor's channel"
             );
         }
+    }
+
+    #[test]
+    fn a_plain_http_build_takes_no_updates_at_all() {
+        // An update is code. A loopback development origin has no transport
+        // authentication to fetch it over, so this build is updated by hand.
+        for insecure in ["http://localhost:3000", "http://127.0.0.1:8010"] {
+            assert_eq!(
+                endpoint_for(insecure, DEV_OWN),
+                None,
+                "{insecure} is not somewhere to fetch code from"
+            );
+        }
+    }
+
+    #[test]
+    fn the_baked_own_endpoint_is_this_builds_origin() {
+        assert_eq!(
+            OWN_ENDPOINT,
+            format!("{}/desktop/latest.json", crate::models::HOSTED_ORIGIN),
+            "OWN_ENDPOINT must name the origin this build actually points at"
+        );
     }
 
     #[test]
     fn stable_and_beta_channels_remain_vendor_pinned() {
         assert_eq!(STABLE_ENDPOINT, "https://spawnd.dev/desktop/latest.json");
         assert_eq!(BETA_ENDPOINT, "https://spawnd.dev/desktop/beta/latest.json");
-        assert!(endpoint_for(crate::models::VENDOR_ORIGIN)
+        assert!(endpoint_for(crate::models::VENDOR_ORIGIN, DEV_OWN)
             .expect("the vendor origin keeps its channel")
             .starts_with("https://spawnd.dev/desktop/"));
     }

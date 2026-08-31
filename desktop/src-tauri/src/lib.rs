@@ -257,16 +257,33 @@ async fn stop_possessing() -> Result<String, String> {
 struct AppUpdateStatus {
     available: bool,
     version: Option<String>,
-    /// `None` when this build takes no updates from the vendor's channel.
+    /// `None` when this build takes no updates at all.
     endpoint: Option<&'static str>,
+}
+
+/// An updater pointed at this build's own channel.
+///
+/// `tauri.conf.json` pins the vendor's endpoint, which is right for a release
+/// build and wrong for every other one — asking the vendor's channel what it
+/// has would move this machine to another fleet. The signing key is the
+/// config's either way, so a payload still has to be signed with the offline
+/// updater key whichever channel served it.
+fn updater_for(
+    app: &tauri::AppHandle,
+    endpoint: &str,
+) -> Result<tauri_plugin_updater::Updater, String> {
+    let url = endpoint.parse().map_err(command_error)?;
+    app.updater_builder()
+        .endpoints(vec![url])
+        .map_err(command_error)?
+        .build()
+        .map_err(command_error)
 }
 
 #[tauri::command]
 async fn check_app_update(app: tauri::AppHandle) -> Result<AppUpdateStatus, String> {
     let Some(endpoint) = updater_config::configured_endpoint() else {
-        // Pointed at somebody's own server. Asking the vendor's channel what
-        // it has would be asking the wrong question, and taking the answer
-        // would move this machine to another fleet.
+        // A plain-HTTP origin: no channel to ask, and an update is code.
         tray::set_app_update_available(&app, false);
         return Ok(AppUpdateStatus {
             available: false,
@@ -274,9 +291,7 @@ async fn check_app_update(app: tauri::AppHandle) -> Result<AppUpdateStatus, Stri
             endpoint: None,
         });
     };
-    let update = app
-        .updater()
-        .map_err(command_error)?
+    let update = updater_for(&app, endpoint)?
         .check()
         .await
         .map_err(command_error)?;
@@ -290,12 +305,10 @@ async fn check_app_update(app: tauri::AppHandle) -> Result<AppUpdateStatus, Stri
 
 #[tauri::command]
 async fn install_app_update(app: tauri::AppHandle) -> Result<bool, String> {
-    if updater_config::configured_endpoint().is_none() {
+    let Some(endpoint) = updater_config::configured_endpoint() else {
         return Ok(false);
-    }
-    let Some(update) = app
-        .updater()
-        .map_err(command_error)?
+    };
+    let Some(update) = updater_for(&app, endpoint)?
         .check()
         .await
         .map_err(command_error)?
