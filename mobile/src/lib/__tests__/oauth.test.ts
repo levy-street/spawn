@@ -11,8 +11,8 @@ jest.mock("expo-crypto", () => {
   const nodeCrypto = require("node:crypto");
   return {
     CryptoDigestAlgorithm: { SHA256: "SHA-256" },
-    getRandomValues: (array) => nodeCrypto.randomFillSync(array),
-    digest: async (_algorithm, data) =>
+    getRandomValues: (array: Uint8Array) => nodeCrypto.randomFillSync(array),
+    digest: async (_algorithm: string, data: Uint8Array) =>
       nodeCrypto.createHash("sha256").update(Buffer.from(data)).digest().buffer,
   };
 });
@@ -100,15 +100,17 @@ describe("signInWithProvider", () => {
 
     await signInWithProvider("google", { browser });
 
-    const { codeChallenge } = jest.mocked(getOAuthStartUrl).mock.calls[0][1] ?? {};
-    const { code_verifier: verifier } = jest.mocked(exchangeOAuthCode).mock.calls[0][0];
+    const codeChallenge = jest.mocked(getOAuthStartUrl).mock.calls[0]?.[1]?.codeChallenge;
+    const verifier = jest.mocked(exchangeOAuthCode).mock.calls[0]?.[0]?.code_verifier;
     // Only the challenge crossed the network on the way out; the verifier is
     // what proves this app is the one that asked. An attacker who lures a code
     // from their own sign-in onto this device has neither.
     expect(verifier).toBeDefined();
     expect(verifier).not.toEqual(codeChallenge);
     expect(codeChallenge).toEqual(
-      createHash("sha256").update(verifier ?? "", "ascii").digest("base64url"),
+      createHash("sha256")
+        .update(verifier ?? "", "ascii")
+        .digest("base64url"),
     );
   });
 

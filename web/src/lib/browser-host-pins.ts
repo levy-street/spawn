@@ -693,6 +693,44 @@ function mergeHostIds(existing: readonly string[], seed: readonly string[]): str
  * This is the only operation allowed to reactivate an exact revoked key, and
  * callers must invoke it only from a fresh explicit user-confirmed ceremony.
  */
+/**
+ * A monotonic counter that moves whenever this page changes local host trust.
+ *
+ * Trust lives in IndexedDB, which announces nothing. A surface that refused to
+ * connect because no pin matched has no way to learn that the operator has
+ * since re-possessed the host — so it stays dead while the copy on screen tells
+ * the reader that re-possessing will bring it back. Callers subscribe to this
+ * and re-run their trust decision when it moves.
+ *
+ * Deliberately page-local: it reports what *this* page did, which is the case
+ * the warm terminal pool keeps mounted across navigation. Another tab's
+ * approval is not observed here, and reloading still picks it up.
+ */
+let hostPinRevision = 0;
+const hostPinListeners = new Set<() => void>();
+
+export function getBrowserHostPinRevision(): number {
+  return hostPinRevision;
+}
+
+export function subscribeToBrowserHostPinChanges(listener: () => void): () => void {
+  hostPinListeners.add(listener);
+  return () => {
+    hostPinListeners.delete(listener);
+  };
+}
+
+function announceBrowserHostPinChange(): void {
+  hostPinRevision += 1;
+  for (const listener of [...hostPinListeners]) {
+    try {
+      listener();
+    } catch {
+      // A bad subscriber must not stop the others from hearing about it.
+    }
+  }
+}
+
 export async function approveBrowserHostPin(
   input: ApproveBrowserHostPinInput,
   options: BrowserHostPinStorageOptions = {},
@@ -703,7 +741,7 @@ export async function approveBrowserHostPin(
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
-    return await compareAndWrite(database, (records) => {
+    const approved = await compareAndWrite(database, (records) => {
       const existing = recordsInScope(records, input.accountId, input.origin).find(
         (record) => record.hostPublicKey === identity.hostPublicKey,
       );
@@ -763,6 +801,8 @@ export async function approveBrowserHostPin(
       };
       return { nextRecord: created, result: publicPin(created) };
     });
+    announceBrowserHostPinChange();
+    return approved;
   } finally {
     database.close();
   }
@@ -881,7 +921,7 @@ export async function revokeBrowserHostPin(
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
-    return await compareAndWrite(database, (records) => {
+    const revokedPin = await compareAndWrite(database, (records) => {
       const scoped = recordsInScope(records, input.accountId, input.origin);
       const bound = scoped.find((record) => record.hostIds.includes(input.targetHostId));
       if (bound === undefined) {
@@ -912,6 +952,8 @@ export async function revokeBrowserHostPin(
       };
       return { nextRecord: revoked, result: publicPin(revoked) };
     });
+    announceBrowserHostPinChange();
+    return revokedPin;
   } finally {
     database.close();
   }
@@ -940,7 +982,7 @@ export async function forgetActiveBrowserHostPins(
   const factory = resolveIndexedDB(options);
   const database = await openDatabase(factory);
   try {
-    return await compareAndWrite(database, (records) => {
+    const outcome = await compareAndWrite(database, (records) => {
       const active = recordsInScope(records, input.accountId, input.origin).filter(
         (record) => record.state === "active",
       );
@@ -949,6 +991,8 @@ export async function forgetActiveBrowserHostPins(
         result: { forgotten: active.length },
       };
     });
+    if (outcome.forgotten > 0) announceBrowserHostPinChange();
+    return outcome;
   } finally {
     database.close();
   }
