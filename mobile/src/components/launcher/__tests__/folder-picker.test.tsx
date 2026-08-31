@@ -66,3 +66,58 @@ describe("FolderPicker Windows paths", () => {
     await view.unmount();
   });
 });
+
+describe("FolderPicker connection states", () => {
+  test("names the host while its transport is connecting", async () => {
+    await render(
+      <ThemeProvider>
+        <FolderPicker
+          hostName="office-mac"
+          onSelect={jest.fn()}
+          recentDirectories={[]}
+          transport={null}
+          transportState="connecting"
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Connecting to office-mac…")).toBeOnTheScreen();
+    expect(screen.getByLabelText("Connecting to office-mac")).toBeOnTheScreen();
+  });
+
+  test("restarts a terminally failed transport from the error state", async () => {
+    const close = jest.fn();
+    const open = jest.fn(async () => undefined);
+    const transport: HostTransport = {
+      hostId: "host-failed",
+      state: "failed",
+      open,
+      close,
+      request: jest.fn() as HostTransport["request"],
+      cancel: jest.fn(),
+      on: jest.fn(() => () => undefined) as HostTransport["on"],
+    };
+    const onRetry = jest.fn();
+
+    await render(
+      <ThemeProvider>
+        <FolderPicker
+          connectionError="The host stopped answering."
+          hostName="office-mac"
+          onRetry={onRetry}
+          onSelect={jest.fn()}
+          recentDirectories={[]}
+          transport={transport}
+          transportState="failed"
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Couldn’t connect to office-mac")).toBeOnTheScreen();
+    expect(screen.getByText("The host stopped answering.")).toBeOnTheScreen();
+    fireEvent.press(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+});

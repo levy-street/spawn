@@ -65,6 +65,11 @@ export function LegionHostCard({
 
   const capacity = capacityPresentation(host, liveEnabled ? metrics : null);
   const canProbe = liveEnabled && probeEnabled && online && host.host_public_key !== null;
+  const connecting =
+    canProbe &&
+    transportState !== "ready" &&
+    transportState !== "failed" &&
+    transportState !== "closed";
   const liveUnavailable =
     liveEnabled &&
     online &&
@@ -90,9 +95,9 @@ export function LegionHostCard({
         >
           <View style={styles.heading}>
             <StatusDot
-              accessibilityLabel={online ? "Online" : "Offline"}
-              pulse={false}
-              tone={online ? "active" : "offline"}
+              accessibilityLabel={connecting ? "Connecting" : online ? "Online" : "Offline"}
+              pulse={connecting}
+              tone={connecting ? "waiting" : online ? "active" : "offline"}
             />
             <View style={styles.headingCopy}>
               <Text numberOfLines={1} variant="label">
@@ -118,9 +123,9 @@ export function LegionHostCard({
             </Text>
           ) : null}
           {online ? <CapacityMeter capacity={capacity} /> : null}
-          {liveEnabled && online && metrics === null && !liveUnavailable ? (
+          {connecting && metrics === null && !liveUnavailable ? (
             <Text color="mutedForeground" variant="caption">
-              Connecting live capacity…
+              {`Connecting to ${host.name}…`}
             </Text>
           ) : null}
           {liveUnavailable ? (

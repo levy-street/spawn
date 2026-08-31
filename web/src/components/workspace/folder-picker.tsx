@@ -1,7 +1,17 @@
 "use client";
 
 import { useMutation, useQueries, useQuery } from "@tanstack/react-query";
-import { ArrowLeft, Ellipsis, Eye, FolderPlus, Home, Search, X } from "lucide-react";
+import {
+  ArrowLeft,
+  Ellipsis,
+  Eye,
+  FolderPlus,
+  Home,
+  LoaderCircle,
+  Search,
+  WifiOff,
+  X,
+} from "lucide-react";
 import {
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -114,7 +124,10 @@ export function FolderPicker({
   onOpenChange: (open: boolean) => void;
   onSelect: (path: string) => void;
 }) {
-  const { client, state } = useHostControl(host?.id ?? null, open && host?.status === "online");
+  const { client, retry, state } = useHostControl(
+    host?.id ?? null,
+    open && host?.status === "online",
+  );
   const pathFlavor = pathFlavorForHostOS(host?.os);
   const [path, setPath] = useState(initialPath || "~");
   const [filter, setFilter] = useState("");
@@ -377,8 +390,26 @@ export function FolderPicker({
 
   // Null at the home root: there is no rung above it.
   const parentPath = homeDir === null ? null : parentWithinHome(listedPath, homeDir, pathFlavor);
-  const selectable = homeDir !== null && isWithinHome(listedPath, homeDir, pathFlavor);
-  const chrome = state !== "ready" || homeQ.isLoading;
+  const selectable =
+    state === "ready" && homeDir !== null && isWithinHome(listedPath, homeDir, pathFlavor);
+  const connectionFailed = state === "error" || state === "unauthorized" || state === "closed";
+  const homeFailed = state === "ready" && homeQ.isError;
+  const pickerUnavailable = connectionFailed || homeFailed;
+  const connecting = !pickerUnavailable && (state !== "ready" || homeQ.isLoading);
+  const chrome = !pickerUnavailable && (state !== "ready" || homeQ.isLoading);
+
+  const retryPicker = () => {
+    if (connectionFailed) retry();
+    else void homeQ.refetch();
+  };
+
+  const failureDetail = homeFailed
+    ? listErrorMessage(homeQ.error)
+    : state === "unauthorized"
+      ? "The host refused this browser’s credentials."
+      : state === "closed"
+        ? "The folder connection closed before it was ready."
+        : "The secure folder channel could not be established.";
 
   /** Move the selection among its siblings — the column view's up/down. */
   const step = (delta: 1 | -1) => {
@@ -640,36 +671,67 @@ export function FolderPicker({
           </div>
         </div>
 
+        {connecting && (
+          <div
+            className="flex shrink-0 items-center gap-2 px-1 text-xs text-muted-foreground"
+            role="status"
+            aria-live="polite"
+          >
+            <LoaderCircle className="size-3.5 animate-spin" aria-hidden />
+            <span>Connecting to {host?.name ?? "host"}…</span>
+          </div>
+        )}
+
         <div
           ref={stripRef}
           className="flex min-h-0 flex-1 overflow-x-auto rounded-lg border border-border bg-card/35"
         >
-          {columns.map((column, index) => {
-            const query = columnQueries[index];
-            const entries = columnEntries[index] ?? [];
-            const all = query?.data?.entries ?? [];
-            const hiddenCount = showHidden
-              ? 0
-              : all.filter((entry) => entry.is_dir && entry.name.startsWith(".")).length;
-            return (
-              <FolderColumn
-                key={column.path}
-                first={index === 0}
-                tabIndex={index === leafIndex ? 0 : -1}
-                folderPath={column.path}
-                entries={entries}
-                selectedPath={column.selectedChild}
-                selectedRef={index === trailIndex ? selectedRef : undefined}
-                columnRef={index === leafIndex ? leafColumnRef : undefined}
-                pending={chrome || (query?.isPending ?? true)}
-                errorMessage={query?.isError ? listErrorMessage(query.error) : null}
-                empty={emptyState(index, hiddenCount)}
-                truncated={query?.data?.truncated ?? false}
-                onSelect={navigate}
-                onKeyDown={onColumnKeyDown}
-              />
-            );
-          })}
+          {pickerUnavailable ? (
+            <div
+              className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-8 text-center"
+              role="alert"
+            >
+              <span className="flex size-9 items-center justify-center rounded-full bg-destructive-soft text-destructive">
+                <WifiOff className="size-4" aria-hidden />
+              </span>
+              <div className="space-y-1">
+                <p className="text-sm font-medium">Couldn’t connect to {host?.name ?? "host"}</p>
+                <p className="max-w-72 text-xs leading-relaxed text-muted-foreground">
+                  {failureDetail}
+                </p>
+              </div>
+              <Button type="button" variant="outline" size="sm" onClick={retryPicker}>
+                Retry
+              </Button>
+            </div>
+          ) : (
+            columns.map((column, index) => {
+              const query = columnQueries[index];
+              const entries = columnEntries[index] ?? [];
+              const all = query?.data?.entries ?? [];
+              const hiddenCount = showHidden
+                ? 0
+                : all.filter((entry) => entry.is_dir && entry.name.startsWith(".")).length;
+              return (
+                <FolderColumn
+                  key={column.path}
+                  first={index === 0}
+                  tabIndex={index === leafIndex ? 0 : -1}
+                  folderPath={column.path}
+                  entries={entries}
+                  selectedPath={column.selectedChild}
+                  selectedRef={index === trailIndex ? selectedRef : undefined}
+                  columnRef={index === leafIndex ? leafColumnRef : undefined}
+                  pending={chrome || (query?.isPending ?? true)}
+                  errorMessage={query?.isError ? listErrorMessage(query.error) : null}
+                  empty={emptyState(index, hiddenCount)}
+                  truncated={query?.data?.truncated ?? false}
+                  onSelect={navigate}
+                  onKeyDown={onColumnKeyDown}
+                />
+              );
+            })
+          )}
         </div>
 
         {creatingFolder && (

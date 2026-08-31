@@ -14,6 +14,7 @@ import { useHoverIntent } from "@/components/ui/hover-intent";
 import type { MenuAnchor } from "@/components/ui/menu-position";
 import { Popover } from "@/components/ui/popover";
 import { RailTooltip } from "@/components/ui/tooltip";
+import { useHostControlPresence } from "@/hooks/useHostControlPresence";
 import type { Host, Session } from "@/lib/api";
 import {
   bucketFill,
@@ -253,6 +254,8 @@ function HostRow({
   onHoverEnd?: () => void;
 }) {
   const charted = row.host.status === "online" && row.cpuBucket !== null;
+  const controlPresence = useHostControlPresence(row.host.id);
+  const connecting = row.host.status === "online" && controlPresence === "connecting";
 
   return (
     <li data-legion-host={row.host.id}>
@@ -267,12 +270,16 @@ function HostRow({
           // row is a card, and a card that only appears under the pointer
           // leaves the list looking like loose text between two rules. Hover
           // then steps up a shade from there rather than arriving from nothing.
-          "flex flex-col justify-center gap-2.5 rounded-lg bg-accent/50 px-2 text-sm transition-colors hover:bg-accent",
+          "relative flex flex-col justify-center gap-2.5 overflow-hidden rounded-lg bg-accent/50 px-2 text-sm transition-colors hover:bg-accent",
           charted ? "py-2" : "h-(--row-h)",
         )}
       >
         <span className="flex items-center gap-2">
-          <LegionDot tone={row.tone} label={hostToneLabel(row)} pulse={row.tone === "active"} />
+          <LegionDot
+            tone={row.tone}
+            label={connecting ? "Connecting" : hostToneLabel(row)}
+            pulse={!connecting && row.tone === "active"}
+          />
           <span
             className={cn(
               "min-w-0 flex-1 truncate text-[13px] leading-tight",
@@ -293,6 +300,14 @@ function HostRow({
           <span className="flex items-center gap-1">
             <CapacityBar fill={bucketFill(row.cpuBucket)} label="CPU" className="min-w-0 flex-1" />
             <CapacityBar fill={bucketFill(row.memBucket)} label="MEM" className="min-w-0 flex-1" />
+          </span>
+        )}
+        {connecting && (
+          <span
+            aria-hidden
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-px overflow-hidden"
+          >
+            <span className="host-connecting-sweep block h-full w-1/3" />
           </span>
         )}
       </Link>

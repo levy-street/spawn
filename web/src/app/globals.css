@@ -597,6 +597,24 @@ body {
   animation: upload-sheen 1.2s linear infinite;
 }
 
+/* A host can be present at the server before its direct control channel is
+ * usable. This indeterminate hairline crosses the bottom edge of passive host
+ * rows while another surface negotiates that channel. Reduced-motion freezes
+ * it as a short, centred signal through the global rule below. */
+@keyframes host-connecting-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+.host-connecting-sweep {
+  background-image: linear-gradient(90deg, transparent, var(--tone-active), transparent);
+  transform: translateX(100%);
+  animation: host-connecting-sweep 1.2s linear infinite;
+}
+
 /* The connecting terminal's channel line: dashes drifting toward the padlock
  * between the two endpoints, so a pane that is still negotiating reads as
  * working rather than hung. One dash period of travel per cycle, which makes

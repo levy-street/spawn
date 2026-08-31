@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { hosts, trust } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -110,9 +110,17 @@ export function useHostControl(hostId: string | null, enabled = true) {
   }, [client, enabled, signalingReady]);
 
   const signedRtcRefusal = state === "error" ? (client?.getSignedRtcRefusal() ?? null) : null;
+  const retry = useCallback(() => {
+    if (!client || !enabled || !signalingReady) return;
+    // Error/unauthorized states are terminal for the current generation.
+    // Closing first also makes connect() re-entrant for an explicit retry.
+    client.close();
+    client.connect();
+  }, [client, enabled, signalingReady]);
   return {
     client,
     state,
+    retry,
     capabilities: snapshot.capabilities,
     /** Host platform, for wording only — never for gating a capability. */
     os: hostQuery.data?.os ?? null,

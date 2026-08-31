@@ -142,7 +142,10 @@ export function WorkspaceFolderSheet({
           )
         ) : (
           <FolderPicker
+            connectionError={error}
+            hostName={host.name}
             initialPath={initial?.hostId === host.id ? initial.path : null}
+            onRetry={() => setError(null)}
             onSelect={(path) => {
               haptics.selection();
               onPick({ hostId: host.id, hostName: host.name, path });
@@ -156,7 +159,7 @@ export function WorkspaceFolderSheet({
             transportState={transportState}
           />
         )}
-        {error ? (
+        {error && host === null ? (
           <Text
             accessibilityRole="alert"
             color="destructive"

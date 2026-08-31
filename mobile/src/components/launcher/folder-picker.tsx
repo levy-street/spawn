@@ -36,20 +36,26 @@ const SHOW_HIDDEN_STORAGE_KEY = "spawn.folderPicker.showHidden";
 export interface FolderPickerProps {
   transport: HostTransport | null;
   transportState: TransportState;
+  hostName?: string;
+  connectionError?: string | null;
   initialPath?: string | null;
   pathFlavor?: PathFlavor;
   recentError?: string | null;
   recentDirectories: readonly RecentDirOut[];
+  onRetry?: () => void;
   onSelect(path: string): void;
 }
 
 export function FolderPicker({
   transport,
   transportState,
+  hostName,
+  connectionError,
   initialPath,
   pathFlavor = "posix",
   recentError,
   recentDirectories,
+  onRetry,
   onSelect,
 }: FolderPickerProps): React.JSX.Element {
   const theme = useTheme();
@@ -159,15 +165,50 @@ export function FolderPicker({
       recentDirectories.length > 0,
   );
   const canSelect = Boolean(homeDir && currentPath && !isLoading && !error);
+  const connectionFailed = transportState === "failed" || transportState === "closed";
+  const homeFailed = transportState === "ready" && !homeDir && error !== null;
+
+  const retryConnection = useCallback(() => {
+    requestGeneration.current += 1;
+    setHomeDir(null);
+    setCurrentPath("");
+    setTypedPath("");
+    setEntries([]);
+    setTruncated(false);
+    setIsLoading(false);
+    setError(null);
+    onRetry?.();
+    if (!transport) return;
+    // Failed transports are terminal until closed. The mounted surface keeps
+    // its worker, so reopening this same transport is a real fresh attempt.
+    transport.close();
+    void transport.open().catch((cause: unknown) => setError(folderErrorMessage(cause)));
+  }, [onRetry, transport]);
+
+  if (connectionFailed || homeFailed) {
+    return (
+      <View accessibilityRole="alert" style={styles.centered}>
+        <Icon color="destructive" name="Unplug" size={spacing[6]} />
+        <Text style={styles.centeredText} variant="label">
+          {`Couldn’t connect to ${hostName ?? "this host"}`}
+        </Text>
+        <Text color="mutedForeground" style={styles.centeredText} variant="caption">
+          {connectionError ?? error ?? "The secure folder connection could not be established."}
+        </Text>
+        <Button disabled={!transport} onPress={retryConnection} size="sm" variant="outline">
+          Retry
+        </Button>
+      </View>
+    );
+  }
 
   if (transportState !== "ready" || !homeDir) {
     return (
       <View style={styles.centered}>
-        <Spinner size={spacing[6]} />
+        <Spinner label={`Connecting to ${hostName ?? "host"}`} size={spacing[6]} />
         <Text color="mutedForeground" variant="caption">
-          Connecting to host…
+          {`Connecting to ${hostName ?? "host"}…`}
         </Text>
-        {error ? <Text color="destructive">{error}</Text> : null}
       </View>
     );
   }
@@ -345,6 +386,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     padding: spacing[6],
   },
+  centeredText: { textAlign: "center" },
   container: {
     flex: 1,
     gap: spacing[3],

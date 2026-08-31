@@ -151,4 +151,21 @@ describe("Legion fleet surface", () => {
       expect.objectContaining({ enabled: false, hostId: onlineHost.id }),
     );
   });
+
+  test("names a live host while its direct transport is connecting", async () => {
+    await render(
+      <ThemeProvider>
+        <LegionHostCard
+          agents={[]}
+          host={onlineHost}
+          liveEnabled
+          onOpen={jest.fn()}
+          sessions={[]}
+        />
+      </ThemeProvider>,
+    );
+
+    expect(screen.getByText("Connecting to office-mac…")).toBeOnTheScreen();
+    expect(screen.getByRole("image", { name: "Connecting" })).toBeOnTheScreen();
+  });
 });

@@ -1,3 +1,4 @@
+import { dropHostControlClient, reportHostControlState } from "@/lib/host-control-presence";
 import { parseCapabilities } from "@/lib/preview/capabilities";
 import { hashStream, Sha256 } from "@/lib/sha256";
 import { SignedRtcLiveSession } from "@/lib/signed-rtc-live";
@@ -301,6 +302,7 @@ export interface HostControlClientOptions {
 }
 
 export class HostControlClient {
+  private readonly presenceClientId = Symbol("host-control-client");
   private state: HostControlState = "idle";
   private ws: WebSocket | null = null;
   private pc: RTCPeerConnection | null = null;
@@ -436,6 +438,7 @@ export class HostControlClient {
     }
     this.rejectPending(new Error("Host control connection closed"));
     this.setState("closed");
+    dropHostControlClient(this.hostId, this.presenceClientId);
   }
 
   request<T = unknown>(
@@ -2330,6 +2333,7 @@ export class HostControlClient {
   private setState(state: HostControlState): void {
     if (this.state === state) return;
     this.state = state;
+    reportHostControlState(this.hostId, this.presenceClientId, state);
     for (const listener of this.listeners) listener(state);
   }
 }
