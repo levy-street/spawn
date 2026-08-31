@@ -1396,6 +1396,48 @@ test.describe("mobile terminal touch", () => {
 
     await expect.poll(() => stack.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
   });
+
+  // A card's reading height is a floor, not a size: a stack short of the fold
+  // grows its panes to spend the whole column. A lone pane perched above a
+  // void wastes half the phone and leaves the void swallowing scroll gestures
+  // it cannot answer.
+  test("a lone pane fills the stack instead of perching above a void", async ({ page }) => {
+    await installSessionRtcMock(page, [], { history: "ready\r\n$ " });
+    await mockApp(page, {
+      sessions: [session()],
+      workspaces: [
+        workspace({
+          layout: { version: 3, tiles: [{ session_id: SESSION_ID, x: 0, y: 0, w: 24, h: 24 }] },
+        }),
+      ],
+    });
+    await page.routeWebSocket(/\/ws\/browser/, async (ws) => {
+      ws.onMessage((message) => handleSessionRtcSignal(ws, message));
+      ws.send(
+        JSON.stringify({
+          type: "rtc.config",
+          enabled: true,
+          ice_servers: [],
+          binding_nonce_required: true,
+        }),
+      );
+      ws.send(JSON.stringify({ type: "session.status", status: "running" }));
+    });
+
+    await page.goto(`/w/${WORKSPACE_ID}`);
+    await expect(liveTerminalRows(page)).toContainText("ready");
+
+    const stack = page.locator("[data-pane-stack]");
+    const card = stack.locator("> div").first();
+    const stackBox = await stack.boundingBox();
+    const cardBox = await card.boundingBox();
+    if (!stackBox || !cardBox) throw new Error("stack geometry unavailable");
+    // The card's bottom edge reaches the stack's, give or take the stack's
+    // own padding — no dead canvas below.
+    expect(stackBox.y + stackBox.height - (cardBox.y + cardBox.height)).toBeLessThan(16);
+    // And nothing overflowed doing it: a single card is not what scrolls.
+    expect(await stack.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeLessThan(2);
+  });
 });
 
 test("connection chip opens a details popover", async ({ page }) => {
