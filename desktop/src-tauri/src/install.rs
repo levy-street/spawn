@@ -221,6 +221,16 @@ impl PossessionManager {
         {
             let detail =
                 finished_without_ceremony(&snapshot.output, preferences.account_id.as_deref());
+            // Resuming this account's own instance is a finished first run,
+            // not a failure: the machine is possessed and its daemon is
+            // running. Record that, or every launch walks this wizard again —
+            // a resume mints no approval, so the Online observation below
+            // (the only other place this is written) never runs for it.
+            if detail == ALREADY_POSSESSED_HERE && !preferences.first_run_complete {
+                let mut updated = preferences;
+                updated.first_run_complete = true;
+                storage::save_preferences(&updated)?;
+            }
             self.fail_run(run_id, detail).await;
             snapshot = self.snapshot(run_id).await?;
             return Ok(possession_progress(run_id, snapshot, None));

@@ -294,13 +294,9 @@ const VERIFICATION_REFUSAL = "This host could not be verified.";
  * of the program that can. So these are buttons.
  */
 const RESUMED: Record<string, { title: string; body: string; action: string }> = {
-  already_possessed_here: {
-    title: `${OS_COPY.thisComputerCapitalized} is already possessed`,
-    body: "It already runs SPAWN D for this account, so nothing was changed — its daemon is running in the background and every device you own can reach it.",
-    action:
-      '<button class="btn btn-primary" data-action="open-app">Open SPAWN D</button>' +
-      '<button class="btn btn-ghost" data-action="possess-new-account">Add another account</button>',
-  },
+  // `already_possessed_here` is deliberately absent: resuming this account's
+  // own instance is a finished first run, and the possession poll opens the
+  // product instead of asking anyone to confirm it.
   already_possessed_other: {
     title: `${OS_COPY.thisComputerCapitalized} already runs SPAWN D`,
     body: "It is signed in to a different account, and nothing was changed. Adding this account registers a second instance beside it; the two stay separate and neither can see the other.",
@@ -855,7 +851,7 @@ function hostView(): string {
 
   const copied = Date.now() < copiedUntil;
   const terminal = `
-    <details ${(terminalOpen ?? ((failure && !refused && failure !== "already_possessed_here") || stalled)) ? "open" : ""} data-panel="terminal">
+    <details ${(terminalOpen ?? ((failure && !refused) || stalled)) ? "open" : ""} data-panel="terminal">
       <summary>Use ${OS_COPY.shell} instead</summary>
       <div class="stack-tight">
         <div class="chip"><span class="dollar">$</span><code>${escapeHtml(terminalCommand)}</code><button type="button" class="${copied ? "done" : ""}" data-action="copy-command" aria-label="Copy install command">${copied ? "Copied" : "Copy"}</button></div>
@@ -1528,6 +1524,22 @@ function startPossessionPoll(): void {
           // gate has been read.
           window.setTimeout(() => void guarded(() => invoke("open_app")), DONE_BEAT_MS);
         }, SUCCESS_BEAT_MS);
+        return;
+      }
+      if (possession.status === "failed" && possession.error === "already_possessed_here") {
+        // Not a failure. The daemon resumed this account's own instance:
+        // this machine is possessed, the Rust side has just recorded the
+        // finished first run, and the product is the point — the card that
+        // used to sit here only asked someone to confirm what was already
+        // true, on every launch. (A *different* account's instance keeps its
+        // card: registering a second account beside it is a real choice.)
+        possessionPoll = clearTimer(possessionPoll);
+        ticker = clearTimer(ticker);
+        possession = { ...possession, status: "online", error: null };
+        syncPossessionSteps("online");
+        preferences = await invoke<Preferences>("app_preferences");
+        render();
+        window.setTimeout(() => void guarded(() => invoke("open_app")), SUCCESS_BEAT_MS);
         return;
       }
       if (possession.status === "failed") {
