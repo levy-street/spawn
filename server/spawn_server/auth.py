@@ -161,6 +161,10 @@ async def current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="user gone")
     _assert_current_epoch(payload, user)
     _schedule_session_renewal(request, payload, user)
+    # For the data-event response hook: who a successful mutation should be
+    # fanned out to. Left only after the epoch check, so a revoked session
+    # never broadcasts.
+    request.state.data_event_user_id = user.id
     return user
 
 

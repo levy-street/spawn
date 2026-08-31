@@ -28,6 +28,7 @@ import { ConfirmHost } from "@/components/ui/confirm";
 import { Drawer } from "@/components/ui/drawer";
 import { ToastHost } from "@/components/ui/toast";
 import { NewSessionMenu } from "@/components/workspace/new-session-menu";
+import { useLiveData } from "@/hooks/useLiveData";
 import { useSessionAlerts } from "@/hooks/useSessionAlerts";
 import { workspaces } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -87,6 +88,9 @@ export function AppShell({
    * would drop the events it exists to deliver.
    */
   useSessionAlerts();
+  // The same socket also carries data-changed frames; this turns them into
+  // cache invalidations so every open client shows the same account.
+  useLiveData();
   const { user } = useAuth();
   const currentWorkspaceId = /^\/w\/([^/?]+)/u.exec(pathname)?.[1] ?? null;
   const currentWorkspaceName = useMemo(

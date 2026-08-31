@@ -1,5 +1,6 @@
 import type { ZodType } from "zod";
 import { authToken } from "@/data/api/auth-token";
+import { CLIENT_INSTANCE_ID } from "@/data/api/client-instance";
 import { getBaseUrl } from "@/data/api/config";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -100,6 +101,9 @@ export async function api<T>(path: string, init: ApiRequestInit<T> = {}): Promis
     if (token !== null) unauthenticatedEmitted = false;
     const headers = new Headers(requestedHeaders);
     if (!headers.has("Accept")) headers.set("Accept", "application/json");
+    // Echoed as `origin` on the data-changed frames a mutation fans out, so
+    // this launch can tell its own echo from another client's change.
+    if (!headers.has("X-Spawn-Client")) headers.set("X-Spawn-Client", CLIENT_INSTANCE_ID);
     if (!headers.has("Content-Type") && shouldSetContentType(requestInit.body)) {
       headers.set("Content-Type", "application/json");
     }
