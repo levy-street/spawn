@@ -2,7 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { closeAlertSocket } from "@/lib/alert-socket";
-import { ApiError, type AuthConfig, auth, type User } from "@/lib/api";
+import { ApiError, type AuthConfig, AuthConfigSchema, auth, type User } from "@/lib/api";
 import { DESKTOP_SIGNED_OUT_MARKER, isDesktopShell } from "@/lib/platform";
 
 /**
@@ -34,21 +34,58 @@ export function useAuth() {
 }
 
 /**
+ * The last config this browser saw, so the sign-in buttons paint with the form
+ * instead of popping in after the fetch. Parsed through the schema on the way
+ * out — a stale or hand-edited entry falls back to nothing rather than
+ * rendering garbage buttons.
+ */
+const AUTH_CONFIG_CACHE_KEY = "spawn.auth-config.v1";
+
+function readCachedAuthConfig(): AuthConfig | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const raw = window.localStorage.getItem(AUTH_CONFIG_CACHE_KEY);
+    if (!raw) return undefined;
+    return AuthConfigSchema.parse(JSON.parse(raw));
+  } catch {
+    return undefined;
+  }
+}
+
+function writeCachedAuthConfig(config: AuthConfig): void {
+  try {
+    window.localStorage.setItem(AUTH_CONFIG_CACHE_KEY, JSON.stringify(config));
+  } catch {
+    // Storage full or blocked: the cache is a paint-speed nicety, nothing owed.
+  }
+}
+
+/**
  * `useAuthConfig()` resolves `GET /api/auth/config`: OAuth providers plus the
  * gates the server actually enforces (email verification, invite-only).
  * Public endpoint — safe to call signed out (login/signup/onboarding).
+ *
+ * The last-seen config serves as placeholder data while the fetch is in
+ * flight, so a returning visitor gets their sign-in options on first paint;
+ * the answer replaces it the moment it lands. `loading` is true only when
+ * there is nothing at all to show.
  */
 export function useAuthConfig() {
   const q = useQuery<AuthConfig>({
     queryKey: ["auth-config"],
-    queryFn: () => auth.config(),
+    queryFn: async () => {
+      const config = await auth.config();
+      writeCachedAuthConfig(config);
+      return config;
+    },
+    placeholderData: readCachedAuthConfig,
     staleTime: 5 * 60_000,
     retry: 1,
   });
 
   return {
     config: q.data ?? null,
-    loading: q.isLoading,
+    loading: q.isLoading && q.data === undefined,
     error: q.error,
     refetch: q.refetch,
   };
