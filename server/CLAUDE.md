@@ -24,9 +24,9 @@ spawn_server/
   models.py     SQLAlchemy models — the schema of record
   schemas.py    pydantic request/response shapes
   main.py       app assembly, startup, route registration
-  <concern>.py  one module per concern: auth, config, db, redis, mail, push,
-                web_push, release, invites, limits, rate_limit, trust_events,
-                host_status, …
+  <concern>.py  one module per concern: auth, billing, config, db, redis,
+                mail, push, web_push, release, invites, limits, rate_limit,
+                trust_events, host_status, …
 alembic/        migrations
 tests/          pytest; test_<module>.py mirrors the module it covers
 ```
