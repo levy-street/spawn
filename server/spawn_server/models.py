@@ -196,6 +196,10 @@ class AuthProviderState(Base):
     # sitting in the database would be a usable credential; the invite table is
     # keyed on the same hash, so nothing is lost.
     invite_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # PKCE, carried across the provider round trip for native sign-ins. The
+    # client that opens the browser proves at redemption that it is the same
+    # client, so a code lured onto someone else's machine is useless there.
+    code_challenge: Mapped[str | None] = mapped_column(String(128), nullable=True)
     user_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
@@ -223,6 +227,9 @@ class AuthProviderExchange(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
     code_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    # Copied from the state row that minted this code. Non-NULL means the
+    # redeeming client must present the matching verifier.
+    code_challenge: Mapped[str | None] = mapped_column(String(128), nullable=True)
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )

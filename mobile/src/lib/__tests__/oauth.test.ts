@@ -1,7 +1,21 @@
+import { createHash } from "node:crypto";
+
 import { exchangeOAuthCode, getOAuthStartUrl } from "@/data/api/endpoints/auth";
 import { NATIVE_REDIRECT_URI, readCallbackCode, signInWithProvider } from "@/lib/oauth";
 
 jest.mock("expo-web-browser", () => ({ openAuthSessionAsync: jest.fn() }));
+// jest-expo's expo-crypto stub hands back zeroed buffers, which would make a
+// PKCE assertion prove nothing. Use the real primitives so the binding between
+// the challenge sent out and the verifier redeemed is actually tested.
+jest.mock("expo-crypto", () => {
+  const nodeCrypto = require("node:crypto");
+  return {
+    CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+    getRandomValues: (array) => nodeCrypto.randomFillSync(array),
+    digest: async (_algorithm, data) =>
+      nodeCrypto.createHash("sha256").update(Buffer.from(data)).digest().buffer,
+  };
+});
 jest.mock("@/data/api/endpoints/auth", () => ({
   getOAuthStartUrl: jest.fn(),
   exchangeOAuthCode: jest.fn(),
@@ -60,6 +74,7 @@ describe("signInWithProvider", () => {
     expect(getOAuthStartUrl).toHaveBeenCalledWith("google", {
       redirectUri: NATIVE_REDIRECT_URI,
       invite: null,
+      codeChallenge: expect.any(String),
     });
     // The redirect passed to the web view must match the one the URL was built
     // with, or the session never closes on the callback.
@@ -67,8 +82,34 @@ describe("signInWithProvider", () => {
       "https://spawnd.dev/api/auth/oauth/google/start",
       NATIVE_REDIRECT_URI,
     );
-    expect(exchangeOAuthCode).toHaveBeenCalledWith({ code: "one-time-code" });
+    expect(exchangeOAuthCode).toHaveBeenCalledWith({
+      code: "one-time-code",
+      code_verifier: expect.any(String),
+    });
     expect(outcome).toEqual({ status: "signed-in", token });
+  });
+
+  it("redeems with the verifier that opens the challenge it sent", async () => {
+    const browser = {
+      openAuthSessionAsync: jest.fn().mockResolvedValue({
+        type: "success",
+        url: "spawn://auth/oauth?code=one-time-code",
+      }),
+    };
+    jest.mocked(exchangeOAuthCode).mockResolvedValue(token);
+
+    await signInWithProvider("google", { browser });
+
+    const { codeChallenge } = jest.mocked(getOAuthStartUrl).mock.calls[0][1] ?? {};
+    const { code_verifier: verifier } = jest.mocked(exchangeOAuthCode).mock.calls[0][0];
+    // Only the challenge crossed the network on the way out; the verifier is
+    // what proves this app is the one that asked. An attacker who lures a code
+    // from their own sign-in onto this device has neither.
+    expect(verifier).toBeDefined();
+    expect(verifier).not.toEqual(codeChallenge);
+    expect(codeChallenge).toEqual(
+      createHash("sha256").update(verifier ?? "", "ascii").digest("base64url"),
+    );
   });
 
   it.each(["dismiss", "cancel", "locked"])(
@@ -124,6 +165,7 @@ describe("signInWithProvider", () => {
     expect(getOAuthStartUrl).toHaveBeenCalledWith("google", {
       redirectUri: NATIVE_REDIRECT_URI,
       invite: "an-invite-code",
+      codeChallenge: expect.any(String),
     });
   });
 
