@@ -262,6 +262,8 @@ fn validate_record(record: &LaunchRecord) -> Result<()> {
 
 #[cfg(windows)]
 pub(super) async fn watchdog(instance: &str) -> Result<()> {
+    use std::process::Stdio;
+
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
     let record_path = launch_record_path_for_instance(instance)?;
@@ -283,6 +285,12 @@ pub(super) async fn watchdog(instance: &str) -> Result<()> {
             .args(["--config-dir"])
             .arg(&record.config_dir)
             .args(["--server", &record.server, "run", "--background-service"])
+            // The watchdog may have detached a console allocated by the Run
+            // key before reaching here. Never inherit those now-invalid
+            // handles: CreateProcess rejects them with ERROR_NOT_SUPPORTED.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .creation_flags(CREATE_NO_WINDOW);
         let result = match command.spawn() {
             Ok(mut child) => {
