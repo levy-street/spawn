@@ -39,6 +39,11 @@ jobs:
     name: what does this owe
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # EXPO_TOKEN is an environment secret, and the fingerprint check needs it;
+    # without an environment the mobile row would silently read "unknown" and
+    # a release that owed a store build would quietly not do one. The policy
+    # permits only master, which is also what this workflow runs on.
+    environment: production
     outputs:
       deploy: ${{ steps.plan.outputs.deploy }}
       daemon_prebuilts: ${{ steps.plan.outputs.daemon_prebuilts }}
@@ -153,6 +158,15 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: mobile/package-lock.json
+
+      # The manifest is signed through the server project's pinned crypto, and
+      # the OTA proves its bake with `npx expo config` — so both toolchains
+      # have to be here, not just ssh.
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Install mobile dependencies
+        working-directory: mobile
+        run: npm ci
 
       - name: Authorise SSH to the production host
         env:

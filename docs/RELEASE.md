@@ -476,42 +476,42 @@ finishes in seconds and a daemon-only push deploys without touching the phone.
 The order inside it is the forced one described above: prebuilts land before
 the server that advertises them, and the OTA goes after the server is up.
 
-It is wired but **not armed**, and that is deliberate, because arming it is a
-security decision only the person holding the keys can make.
+It is **armed**, as of 2026-08-31. What that means, precisely, is worth stating
+once rather than rediscovering during an incident.
 
 Everything above says the offline keys never enter CI: the Ed25519 daemon
-release key and the Tauri updater key live on the operator's Mac, and that
-split is what stops one compromised CI run from shipping a daemon to every
-machine in the fleet. A fully automatic master release cannot honour that
-split, because publishing prebuilts *means* signing a manifest. So:
+release key and the Tauri updater key live on the operator's Mac, and that split
+is what stops one compromised CI run from shipping a daemon to every machine in
+the fleet. A fully automatic master release cannot honour that split, because
+publishing prebuilts *means* signing a manifest. So the daemon release key is
+now a secret in the `production` environment, and the consequence is exact:
 
-| `SPAWN_RELEASE_SIGNING_KEY` | what you get | what you accept |
-| --- | --- | --- |
-| unset (today) | the deploy job fails fast and says so; releases are run by hand from the operator Mac | nothing changes |
-| set | a push to master deploys, publishes the signed manifest and the OTA with no human step | GitHub becomes a root of trust for daemon auto-update — anything that can run a workflow on `master` can sign a build that every host installs and runs as a service |
+**anything that can run a workflow on `master` can sign a daemon build that
+every host installs and runs as a service.** That is a deliberate trade for a
+zero-human-step release, not an oversight. Treat the key as CI-exposed: rotate
+it on any suspicion, keep the environment's branch policy at `master`, and
+remember that the daemon's pinned key list in `release_key.rs` is what makes
+rotation possible at all.
 
-That is not an argument against setting it. It is the thing to have decided on
-purpose rather than discovered later. If you set it, treat the key as
-CI-exposed: rotate it on any suspicion, keep the `production` environment's
-branch policy to `master`, and remember that the daemon's pinned key list in
-`release_key.rs` is what makes rotation possible at all.
+The Tauri updater key is **not** in CI, and desktop publication stays with a
+person, because `latest.json` is assembled from artifacts someone has looked at.
+That job prints exactly what to run.
 
-Desktop publication is deliberately left to a person even when the key question
-is settled, because `latest.json` is assembled from artifacts a human has
-looked at. The job prints exactly what to run.
+What is configured, so it can be audited rather than guessed:
 
-The pipeline needs these, none of which exist yet:
+| `production` environment | branch policy `master` (custom policy — `protected_branches` matches nothing here) |
+| --- | --- |
+| `EXPO_TOKEN` | Expo access token, note "github-actions release.yml (spawn) verified". Local runs need none because `~/.expo/state.json` holds a session; CI has no session. |
+| `SPAWN_DEPLOY_SSH_KEY` | A dedicated ed25519 deploy key, `github-actions-release@spawn` in the prod `authorized_keys`. Revoke by deleting that line. |
+| `SPAWN_DEPLOY_KNOWN_HOSTS` | The pinned prod host key. The workflow never runs `ssh-keyscan`: trusting a host key on first connection is the one thing a production deploy must not do. |
+| `SPAWN_RELEASE_SIGNING_KEY` | The offline daemon release key, per the trade above. |
+| vars `SPAWN_DEPLOY_HOSTNAME`, `SPAWN_DEPLOY_USER` | The prod host and account. |
 
-- a `production` GitHub environment with its deployment branch policy set to
-  `master` (the same custom-branch-policy shape the signing environments use —
-  `protected_branches` matches nothing here, see the note above)
-- `EXPO_TOKEN` — an Expo access token. Local runs need none because
-  `~/.expo/state.json` holds a session; CI has no session.
-- `SPAWN_DEPLOY_SSH_KEY` and `SPAWN_DEPLOY_KNOWN_HOSTS` — a deploy key for the
-  production host and its pinned host key. The workflow never scans: trusting a
-  host key on first connection is the one thing a production deploy must not do.
-- repository variables `SPAWN_DEPLOY_HOSTNAME` and `SPAWN_DEPLOY_USER`
-- `SPAWN_RELEASE_SIGNING_KEY`, per the table above
+**The pipeline has never run.** `workflow_dispatch` cannot see a workflow that
+is not on the default branch, so `release.yml` cannot be exercised before the
+merge that puts it there — the first real run is the merge itself, and it wants
+watching rather than assuming. The same is true of `desktop.yml` and
+`windows.yml`.
 
 ### Things that will bite you off master
 
