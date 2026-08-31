@@ -21,19 +21,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, release, schemas
 from ..db import get_session, get_sessionmaker
+from ..host_identity import ed25519_key_fingerprint
 from ..host_key_claims import lock_host_key_claim
 from ..host_status import derived_host_status, stamp_stale_disconnect
+from ..hygiene import sweep_expired_state
 from ..models import (
     Agent,
+    BrowserDevice,
+    DeviceApprovalRequest,
     DeviceCode,
+    DeviceEndorsement,
     Host,
     HostAgentPolicy,
     HostBrowserPin,
+    HostKeyClaim,
     RecentDir,
     Session,
     User,
 )
+from ..pin_liveness import live_browser_device_id_set
+from ..trust_events import approval_resolved_payload, publish_trust_event
 from ..ws.broker import get_broker
+from ..ws.daemon import push_browser_pins
 
 router = APIRouter(prefix="/api/hosts", tags=["hosts"])
 log = logging.getLogger("spawn.routes.hosts")
@@ -41,6 +50,7 @@ AUTO_UPDATE_THROTTLE = timedelta(minutes=30)
 AUTO_UPDATE_CHECK_INTERVAL_SECONDS = 10 * 60
 AUTO_UPDATE_SHUTDOWN_DRAIN_SECONDS = 5.0
 MAX_RECENT_DIRS = 8
+MAX_BROWSER_PINS_PER_HOST = 32
 _AUTO_UPDATE_IN_FLIGHT: set[tuple[str, str, str]] = set()
 _AUTO_UPDATE_TASKS: set[asyncio.Task[None]] = set()
 _AUTO_UPDATE_CHECK_TASK: asyncio.Task[None] | None = None
@@ -129,6 +139,86 @@ async def _get_owned_host(session: AsyncSession, host_id: str, user: User) -> Ho
     if host is None or host.owner_user_id != user.id:
         raise HTTPException(status_code=404, detail="host not found")
     return host
+
+
+async def _push_authoritative_pins(host_id: str) -> None:
+    try:
+        await push_browser_pins(host_id)
+    except Exception as exc:  # noqa: BLE001 - the committed DB view remains authoritative
+        log.warning("could not push browser pins after host management host=%s: %s", host_id, exc)
+
+
+async def _remove_host_pins(
+    session: AsyncSession, host: Host, *, pin_id: str | None = None
+) -> None:
+    statement = delete(HostBrowserPin).where(HostBrowserPin.host_id == host.id)
+    if pin_id is not None:
+        statement = statement.where(HostBrowserPin.browser_device_id == pin_id)
+    await session.execute(statement.execution_options(synchronize_session=False))
+    await session.commit()
+    await _push_authoritative_pins(host.id)
+
+
+async def _host_admission_snapshot(
+    session: AsyncSession, host: Host
+) -> tuple[set[str], set[str], set[str]]:
+    """Return direct, transitively admitted, and stranded device ids."""
+
+    live_pin_ids = await live_browser_device_id_set(session, host.id)
+    pin_rows = (
+        (
+            await session.execute(
+                select(HostBrowserPin).where(HostBrowserPin.host_id == host.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    direct_ids = {
+        pin.browser_device_id
+        for pin in pin_rows
+        if pin.endorser_device_id is None and pin.browser_device_id in live_pin_ids
+    }
+
+    active_ids = set(
+        (
+            await session.execute(
+                select(BrowserDevice.id).where(
+                    BrowserDevice.owner_user_id == host.owner_user_id,
+                    BrowserDevice.revoked_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    edges = (
+        await session.execute(
+            select(
+                DeviceEndorsement.endorser_device_id,
+                DeviceEndorsement.endorsed_device_id,
+            ).where(DeviceEndorsement.owner_user_id == host.owner_user_id)
+        )
+    ).all()
+    active_edges = [
+        (row.endorser_device_id, row.endorsed_device_id)
+        for row in edges
+        if row.endorser_device_id in active_ids and row.endorsed_device_id in active_ids
+    ]
+
+    admitted_ids = set(live_pin_ids)
+    changed = True
+    while changed:
+        changed = False
+        for endorser_id, endorsed_id in active_edges:
+            if endorser_id in admitted_ids and endorsed_id not in admitted_ids:
+                admitted_ids.add(endorsed_id)
+                changed = True
+
+    recorded_ids = {pin.browser_device_id for pin in pin_rows}
+    recorded_ids.update(endorsed_id for _, endorsed_id in active_edges)
+    stranded_ids = recorded_ids - admitted_ids
+    return direct_ids, admitted_ids, stranded_ids
 
 
 async def _list_accessible_agents(session: AsyncSession, user: User) -> list[Agent]:
@@ -439,11 +529,226 @@ async def stop_auto_update_checker() -> None:
     await asyncio.gather(*pending, return_exceptions=True)
 
 
+@router.get("/self", response_model=schemas.HostSelfOut)
+async def get_self(
+    session: AsyncSession = Depends(get_session),
+    host: Host = Depends(auth.daemon_principal),
+) -> schemas.HostSelfOut:
+    await sweep_expired_state(session)
+    user = await session.get(User, host.owner_user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="account not found")
+    return schemas.HostSelfOut(
+        host_id=host.id,
+        name=host.name,
+        account=schemas.HostSelfAccountOut(
+            id=user.id,
+            email=user.email,
+            # There is no account display-name column yet. Keep the contracted
+            # string field stable and let consumers fall back to email.
+            display_name="",
+        ),
+    )
+
+
+@router.get("/self/pins", response_model=schemas.HostPinsResponse)
+async def list_self_pins(
+    session: AsyncSession = Depends(get_session),
+    host: Host = Depends(auth.daemon_principal),
+) -> schemas.HostPinsResponse:
+    live_ids = await live_browser_device_id_set(session, host.id)
+    if not live_ids:
+        return schemas.HostPinsResponse(pins=[])
+    rows = (
+        await session.execute(
+            select(HostBrowserPin, BrowserDevice)
+            .join(BrowserDevice, BrowserDevice.id == HostBrowserPin.browser_device_id)
+            .where(
+                HostBrowserPin.host_id == host.id,
+                HostBrowserPin.browser_device_id.in_(live_ids),
+            )
+            .order_by(HostBrowserPin.created_at, HostBrowserPin.browser_device_id)
+        )
+    ).all()
+    return schemas.HostPinsResponse(
+        pins=[
+            schemas.HostPinOut(
+                # HostBrowserPin's stable host-scoped identifier is its
+                # browser-device half of the composite primary key.
+                pin_id=pin.browser_device_id,
+                device_id=pin.browser_device_id,
+                name=device.label,
+                platform=None,
+                kind=(
+                    "root"
+                    if device.is_root
+                    else "direct"
+                    if pin.endorser_device_id is None
+                    else "endorsed"
+                ),
+                created_at=pin.created_at,
+                last_seen=device.last_seen_at,
+            )
+            for pin, device in rows
+        ]
+    )
+
+
+@router.get("/self/approvals", response_model=schemas.HostApprovalsResponse)
+async def list_self_approvals(
+    session: AsyncSession = Depends(get_session),
+    host: Host = Depends(auth.daemon_principal),
+) -> schemas.HostApprovalsResponse:
+    now = _utcnow()
+    rows = (
+        await session.execute(
+            select(DeviceApprovalRequest, BrowserDevice)
+            .join(BrowserDevice, BrowserDevice.id == DeviceApprovalRequest.browser_device_id)
+            .where(
+                DeviceApprovalRequest.owner_user_id == host.owner_user_id,
+                DeviceApprovalRequest.status == "pending",
+                DeviceApprovalRequest.expires_at > now,
+                BrowserDevice.revoked_at.is_(None),
+            )
+            .order_by(DeviceApprovalRequest.created_at, DeviceApprovalRequest.id)
+        )
+    ).all()
+    direct_ids, admitted_ids, stranded_ids = await _host_admission_snapshot(session, host)
+    approvals: list[schemas.HostApprovalOut] = []
+    for request, device in rows:
+        if device.id in direct_ids:
+            admission = "direct"
+        elif device.id in admitted_ids:
+            admission = "endorsed"
+        elif device.id in stranded_ids:
+            admission = "no_chain_to_anchor"
+        else:
+            admission = "not_admitted"
+        approvals.append(
+            schemas.HostApprovalOut(
+                request_id=request.id,
+                device_name=device.label,
+                platform=None,
+                requested_at=request.created_at,
+                expires_at=request.expires_at,
+                admission=admission,
+            )
+        )
+    return schemas.HostApprovalsResponse(approvals=approvals)
+
+
+@router.post("/self/pins", status_code=status.HTTP_204_NO_CONTENT)
+async def create_self_pin(
+    body: schemas.HostPinCreateRequest,
+    session: AsyncSession = Depends(get_session),
+    host: Host = Depends(auth.daemon_principal),
+) -> None:
+    now = _utcnow()
+    requested: DeviceApprovalRequest | None = None
+    if body.request_id is not None:
+        requested = await session.get(DeviceApprovalRequest, body.request_id)
+        if (
+            requested is None
+            or requested.owner_user_id != host.owner_user_id
+            or requested.status != "pending"
+        ):
+            raise HTTPException(status_code=404, detail="approval request not found")
+        if _aware(requested.expires_at) <= now:
+            raise HTTPException(status_code=409, detail="approval request has expired")
+        device_id = requested.browser_device_id
+    else:
+        device_id = body.device_id
+
+    device = await session.get(BrowserDevice, device_id)
+    if device is None or device.owner_user_id != host.owner_user_id:
+        raise HTTPException(status_code=404, detail="browser device not found")
+    if device.revoked_at is not None:
+        raise HTTPException(status_code=409, detail="revoked browser devices cannot be admitted")
+
+    live_ids = await live_browser_device_id_set(session, host.id)
+    pin = await session.get(HostBrowserPin, (host.id, device.id))
+    if pin is None:
+        if len(live_ids) >= MAX_BROWSER_PINS_PER_HOST:
+            raise HTTPException(status_code=409, detail="host browser pin capacity is exhausted")
+        session.add(
+            HostBrowserPin(
+                host_id=host.id,
+                browser_device_id=device.id,
+                browser_key_algorithm="ed25519",
+                browser_public_key=device.public_key,
+                browser_key_fingerprint=ed25519_key_fingerprint(device.public_key),
+                delivered_at=now,
+                created_at=now,
+            )
+        )
+    else:
+        if (
+            pin.browser_key_algorithm != "ed25519"
+            or pin.browser_public_key != device.public_key
+        ):
+            raise HTTPException(status_code=409, detail="host browser pin conflicts with device")
+        # A daemon direct-admit is possess-grade authority. Upgrade an older
+        # endorsement snapshot rather than leaving it dependent on an endorser.
+        if device.id not in live_ids and len(live_ids) >= MAX_BROWSER_PINS_PER_HOST:
+            raise HTTPException(status_code=409, detail="host browser pin capacity is exhausted")
+        pin.endorser_device_id = None
+        pin.endorsement_signature = None
+        pin.delivered_at = now
+        pin.undelivered_reason = None
+
+    pending_requests = (
+        (
+            await session.execute(
+                select(DeviceApprovalRequest).where(
+                    DeviceApprovalRequest.owner_user_id == host.owner_user_id,
+                    DeviceApprovalRequest.browser_device_id == device.id,
+                    DeviceApprovalRequest.status == "pending",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for request in pending_requests:
+        request.status = "approved"
+        request.resolved_at = now
+        request.resolved_by_device_id = None
+    await session.commit()
+
+    for request in pending_requests:
+        try:
+            await publish_trust_event(
+                host.owner_user_id,
+                approval_resolved_payload(request.id, device.id, "approved"),
+            )
+        except Exception as exc:  # noqa: BLE001 - the admission already committed
+            log.warning("could not publish approval resolution request=%s: %s", request.id, exc)
+    await _push_authoritative_pins(host.id)
+
+
+@router.delete("/self/pins/{pin_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_self_pin(
+    pin_id: str,
+    session: AsyncSession = Depends(get_session),
+    host: Host = Depends(auth.daemon_principal),
+) -> None:
+    await _remove_host_pins(session, host, pin_id=pin_id)
+
+
+@router.delete("/self/pins", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_all_self_pins(
+    session: AsyncSession = Depends(get_session),
+    host: Host = Depends(auth.daemon_principal),
+) -> None:
+    await _remove_host_pins(session, host)
+
+
 @router.get("", response_model=list[schemas.HostOut])
 async def list_hosts(
     session: AsyncSession = Depends(get_session),
     user: User = Depends(auth.current_user),
 ) -> list[schemas.HostOut]:
+    await sweep_expired_state(session)
     rows = (
         (await session.execute(select(Host).where(Host.owner_user_id == user.id))).scalars().all()
     )
@@ -701,7 +1006,28 @@ async def deregister_self(
     """A daemon revokes its OWN host registration — used by `spawnd exorcise`
     and the possess re-identify dedup. Authenticated by the daemon token, so a
     host can only remove itself; no owning-user session is required."""
-    await _revoke_host(session, host)
+    await _revoke_host(session, host, release_claim=True)
+
+
+@router.delete("/{host_id}/pins/{pin_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_host_pin(
+    host_id: str,
+    pin_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> None:
+    host = await _get_owned_host(session, host_id, user)
+    await _remove_host_pins(session, host, pin_id=pin_id)
+
+
+@router.delete("/{host_id}/pins", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_all_host_pins(
+    host_id: str,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(auth.current_user),
+) -> None:
+    host = await _get_owned_host(session, host_id, user)
+    await _remove_host_pins(session, host)
 
 
 @router.delete("/{host_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -714,7 +1040,9 @@ async def delete_host(
     await _revoke_host(session, h)
 
 
-async def _revoke_host(session: AsyncSession, h: Host) -> None:
+async def _revoke_host(
+    session: AsyncSession, h: Host, *, release_claim: bool = False
+) -> None:
     """Durable revocation cascade shared by the user- and daemon-authenticated
     delete routes: drop the host's device codes and browser pins inside the same
     transaction as the Host row, then disconnect any live daemon."""
@@ -730,11 +1058,20 @@ async def _revoke_host(session: AsyncSession, h: Host) -> None:
             # be deleted because that would release the key fail-open.
             raise HTTPException(status_code=409, detail="host key ownership claim is invalid")
 
-        # Start, approval, and poll take the retained claim before touching a
-        # DeviceCode. Keep that order here so either the ceremony commits first
-        # and revocation removes its resulting authority, or deletion commits
-        # first and the ceremony loses its code. The claim itself is retained:
-        # only this same owner can intentionally pair the stable key again.
+        # Start, approval, and poll take the claim before touching a DeviceCode.
+        # Keep that order here so either the ceremony commits first and
+        # revocation removes its resulting authority, or deletion commits first
+        # and the ceremony loses its code. A user-token deletion retains the
+        # anti-hijack claim; explicit daemon-authenticated exorcise proves
+        # control of the machine and releases it for account handover.
+        if release_claim:
+            await session.execute(
+                delete(HostKeyClaim).where(
+                    HostKeyClaim.host_key_algorithm == h.host_key_algorithm,
+                    HostKeyClaim.host_public_key == h.host_public_key,
+                    HostKeyClaim.owner_user_id == h.owner_user_id,
+                )
+            )
         await session.execute(
             delete(DeviceCode)
             .where(

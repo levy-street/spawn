@@ -86,6 +86,15 @@ def test_health_self_test_covers_connection_parsing_without_network_calls(tmp_pa
     assert not forbidden_log.exists()
 
 
+def test_health_check_probes_authenticated_turn_allocation_and_relay_traffic():
+    source = HEALTH_SCRIPT.read_text()
+
+    assert "turnutils_uclient -y -c -n 1" in source
+    assert "SPAWN_TURN_SECRET is unavailable" in source
+    assert "tot_send_bytes ~ [1-9][0-9]*, tot_recv_bytes ~ [1-9][0-9]*" in source
+    assert "allocated and relayed client-to-client traffic" in source
+
+
 def test_health_websocket_mode_passes_the_public_origin_to_the_probe(tmp_path: Path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

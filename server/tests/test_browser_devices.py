@@ -53,6 +53,11 @@ async def _signup(client, email: str) -> tuple[str, str]:
     return body["user"]["id"], body["access_token"]
 
 
+def _assert_refusal(response, *, status: int, detail: str, code: str) -> None:
+    assert response.status_code == status, response.text
+    assert response.json() == {"detail": detail, "code": code}
+
+
 def test_shared_registration_vectors_pin_bytes_and_reject_mutations_and_malformed_wire():
     vectors = json.loads(VECTORS_PATH.read_text())
     positive = vectors["positive"]
@@ -128,6 +133,186 @@ def test_shared_registration_vectors_pin_bytes_and_reject_mutations_and_malforme
     for malformed in vectors["malformed_signatures"]:
         with pytest.raises(HTTPException, match="invalid Ed25519 signature"):
             decode_ed25519_signature(malformed)
+
+
+async def test_registration_refusals_keep_detail_and_add_stable_codes(client):
+    user_id, token = await _signup(client, "refusal-codes@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    malformed_signature = _proof(user_id, Ed25519PrivateKey.generate())
+    malformed_signature["signature"] = "!" * 86
+    refused = await client.post(
+        "/api/browser-devices/register", json=malformed_signature, headers=headers
+    )
+    _assert_refusal(
+        refused,
+        status=422,
+        detail="invalid Ed25519 signature",
+        code="registration_proof_invalid",
+    )
+
+    wrong_proof = _proof(user_id, Ed25519PrivateKey.generate())
+    wrong_proof["signature"] = _proof(
+        user_id, Ed25519PrivateKey.generate()
+    )["signature"]
+    refused = await client.post(
+        "/api/browser-devices/register", json=wrong_proof, headers=headers
+    )
+    _assert_refusal(
+        refused,
+        status=422,
+        detail="browser registration proof is invalid",
+        code="registration_proof_invalid",
+    )
+
+    device_key = Ed25519PrivateKey.generate()
+    device_proof = _proof(user_id, device_key)
+    registered = await client.post(
+        "/api/browser-devices/register", json=device_proof, headers=headers
+    )
+    assert registered.status_code == 200, registered.text
+
+    refused = await client.post(
+        "/api/browser-devices/register",
+        json=_proof(user_id, device_key, is_root=True),
+        headers=headers,
+    )
+    _assert_refusal(
+        refused,
+        status=409,
+        detail="browser public key is already registered with a different root designation",
+        code="root_designation_mismatch",
+    )
+
+    root_key = Ed25519PrivateKey.generate()
+    root = await client.post(
+        "/api/browser-devices/register",
+        json=_proof(user_id, root_key, is_root=True),
+        headers=headers,
+    )
+    assert root.status_code == 200, root.text
+    refused = await client.post(
+        "/api/browser-devices/register",
+        json=_proof(user_id, Ed25519PrivateKey.generate(), is_root=True),
+        headers=headers,
+    )
+    _assert_refusal(
+        refused,
+        status=409,
+        detail="account already has a root",
+        code="root_already_exists",
+    )
+
+    other_id, other_token = await _signup(client, "refusal-codes-other@example.com")
+    refused = await client.post(
+        "/api/browser-devices/register",
+        json=_proof(other_id, device_key),
+        headers={"Authorization": f"Bearer {other_token}"},
+    )
+    _assert_refusal(
+        refused,
+        status=409,
+        detail="browser public key is unavailable",
+        code="device_key_owned_by_other_account",
+    )
+
+    revoked = await client.post(
+        f"/api/browser-devices/{registered.json()['id']}/revoke",
+        json={"expected_public_key": device_proof["public_key"]},
+        headers=headers,
+    )
+    assert revoked.status_code == 200, revoked.text
+    refused = await client.post(
+        "/api/browser-devices/register", json=device_proof, headers=headers
+    )
+    _assert_refusal(
+        refused,
+        status=409,
+        detail="revoked browser public keys cannot be registered again",
+        code="device_key_revoked",
+    )
+
+    pruned = await client.post("/api/browser-devices/prune", headers=headers)
+    assert pruned.status_code == 200, pruned.text
+    refused = await client.post(
+        "/api/browser-devices/register", json=device_proof, headers=headers
+    )
+    _assert_refusal(
+        refused,
+        status=409,
+        detail="revoked browser public keys cannot be registered again",
+        code="device_key_revoked",
+    )
+
+
+async def test_browser_device_lookup_reports_account_scoped_identity_state(client):
+    user_id, token = await _signup(client, "lookup@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    key = Ed25519PrivateKey.generate()
+    proof = _proof(user_id, key)
+
+    client.cookies.clear()
+    anonymous = await client.post(
+        "/api/browser-devices/lookup", json={"public_key": proof["public_key"]}
+    )
+    assert anonymous.status_code == 401
+
+    unregistered = await client.post(
+        "/api/browser-devices/lookup",
+        json={"public_key": proof["public_key"]},
+        headers=headers,
+    )
+    assert unregistered.json() == {"status": "unregistered"}
+
+    registered = await client.post(
+        "/api/browser-devices/register", json=proof, headers=headers
+    )
+    assert registered.status_code == 200, registered.text
+    active = await client.post(
+        "/api/browser-devices/lookup",
+        json={"public_key": proof["public_key"]},
+        headers=headers,
+    )
+    assert active.json() == {"status": "active"}
+
+    other_id, other_token = await _signup(client, "lookup-other@example.com")
+    other_headers = {"Authorization": f"Bearer {other_token}"}
+    other_account = await client.post(
+        "/api/browser-devices/lookup",
+        json={"public_key": proof["public_key"]},
+        headers=other_headers,
+    )
+    assert other_account.json() == {"status": "other_account"}
+
+    revoked = await client.post(
+        f"/api/browser-devices/{registered.json()['id']}/revoke",
+        json={"expected_public_key": proof["public_key"]},
+        headers=headers,
+    )
+    assert revoked.status_code == 200, revoked.text
+    tombstone = await client.post(
+        "/api/browser-devices/lookup",
+        json={"public_key": proof["public_key"]},
+        headers=headers,
+    )
+    assert tombstone.json() == {"status": "revoked"}
+
+    pruned = await client.post("/api/browser-devices/prune", headers=headers)
+    assert pruned.status_code == 200, pruned.text
+    post_prune = await client.post(
+        "/api/browser-devices/lookup",
+        json={"public_key": proof["public_key"]},
+        headers=headers,
+    )
+    assert post_prune.json() == {"status": "revoked"}
+
+    never_registered = _proof(user_id, Ed25519PrivateKey.generate())["public_key"]
+    missing = await client.post(
+        "/api/browser-devices/lookup",
+        json={"public_key": never_registered},
+        headers=headers,
+    )
+    assert missing.json() == {"status": "unregistered"}
 
 
 async def test_root_claim_must_match_the_signed_proof_and_the_stored_row(client):

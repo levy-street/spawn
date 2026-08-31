@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from spawn_server.host_status import derived_host_status, stamp_stale_disconnect
 from spawn_server.routes import hosts as hosts_routes
@@ -17,6 +20,11 @@ async def _signup(client, email: str) -> str:
     r = await client.post("/api/auth/signup", json={"email": email, "password": "passpasspass"})
     assert r.status_code == 200
     return r.json()["access_token"]
+
+
+def _browser_public_key() -> str:
+    raw = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
 @dataclass
@@ -1074,6 +1082,221 @@ async def test_auto_update_shutdown_cancels_after_drain_and_clears_inflight(clie
     assert not hosts_routes._AUTO_UPDATE_TASKS
 
 
+async def test_daemon_host_management_inventory_admission_and_authoritative_unpins(
+    client, monkeypatch
+):
+    from sqlalchemy import select
+
+    from spawn_server import auth
+    from spawn_server.db import get_sessionmaker
+    from spawn_server.host_identity import ed25519_key_fingerprint
+    from spawn_server.models import (
+        BrowserDevice,
+        DeviceApprovalRequest,
+        DeviceEndorsement,
+        Host,
+        HostBrowserPin,
+        User,
+    )
+
+    token = await _signup(client, "host-management@example.com")
+    user_headers = {"Authorization": f"Bearer {token}"}
+    await _signup(client, "host-management-other@example.com")
+    now = datetime.now(UTC)
+    sm = get_sessionmaker()
+    async with sm() as session:
+        user = (
+            await session.execute(
+                select(User).where(User.email == "host-management@example.com")
+            )
+        ).scalar_one()
+        host = Host(owner_user_id=user.id, name="managed-box", status="offline")
+        devices = [
+            BrowserDevice(
+                owner_user_id=user.id,
+                key_algorithm="ed25519",
+                public_key=_browser_public_key(),
+                label=label,
+                last_seen_at=now - timedelta(minutes=index),
+            )
+            for index, label in enumerate(
+                ["Phone", "Laptop", "Waiting", "Stranded", "Already admitted"]
+            )
+        ]
+        session.add(host)
+        session.add_all(devices)
+        await session.flush()
+        direct, endorsed, waiting, stranded, already = devices
+        session.add_all(
+            [
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=direct.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=direct.public_key,
+                    browser_key_fingerprint=ed25519_key_fingerprint(direct.public_key),
+                    delivered_at=now,
+                    created_at=now - timedelta(minutes=3),
+                ),
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=endorsed.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=endorsed.public_key,
+                    browser_key_fingerprint=ed25519_key_fingerprint(endorsed.public_key),
+                    endorser_device_id=direct.id,
+                    endorsement_signature="e" * 86,
+                    created_at=now - timedelta(minutes=2),
+                ),
+                HostBrowserPin(
+                    host_id=host.id,
+                    browser_device_id=already.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=already.public_key,
+                    browser_key_fingerprint=ed25519_key_fingerprint(already.public_key),
+                    delivered_at=now,
+                    created_at=now - timedelta(minutes=1),
+                ),
+                DeviceEndorsement(
+                    owner_user_id=user.id,
+                    endorser_device_id=waiting.id,
+                    endorsed_device_id=stranded.id,
+                    signature="s" * 86,
+                    created_at=now,
+                ),
+            ]
+        )
+        requests = [
+            DeviceApprovalRequest(
+                owner_user_id=user.id,
+                browser_device_id=device.id,
+                status="pending",
+                created_at=now + timedelta(seconds=index),
+                expires_at=now + timedelta(minutes=30),
+            )
+            for index, device in enumerate([waiting, stranded, already])
+        ]
+        session.add_all(requests)
+        await session.commit()
+        host_id, user_id = host.id, user.id
+        device_ids = [device.id for device in devices]
+        request_ids = [request.id for request in requests]
+
+    daemon_headers = {
+        "Authorization": f"Bearer {auth.issue_daemon_token(host_id, user_id)}"
+    }
+    pushed: list[str] = []
+
+    async def record_push(pushed_host_id: str) -> bool:
+        pushed.append(pushed_host_id)
+        return True
+
+    monkeypatch.setattr(hosts_routes, "push_browser_pins", record_push)
+
+    identity = await client.get("/api/hosts/self", headers=daemon_headers)
+    assert identity.status_code == 200, identity.text
+    assert identity.json() == {
+        "host_id": host_id,
+        "name": "managed-box",
+        "account": {
+            "id": user_id,
+            "email": "host-management@example.com",
+            "display_name": "",
+        },
+    }
+    assert (await client.get("/api/hosts/self", headers=user_headers)).status_code == 401
+
+    pins = await client.get("/api/hosts/self/pins", headers=daemon_headers)
+    assert pins.status_code == 200, pins.text
+    by_device = {pin["device_id"]: pin for pin in pins.json()["pins"]}
+    assert set(by_device) == {device_ids[0], device_ids[1], device_ids[4]}
+    assert by_device[device_ids[0]]["pin_id"] == device_ids[0]
+    assert by_device[device_ids[0]]["name"] == "Phone"
+    assert by_device[device_ids[0]]["platform"] is None
+    assert by_device[device_ids[0]]["kind"] == "direct"
+    assert by_device[device_ids[1]]["kind"] == "endorsed"
+    assert by_device[device_ids[4]]["last_seen"] is not None
+
+    approvals = await client.get("/api/hosts/self/approvals", headers=daemon_headers)
+    assert approvals.status_code == 200, approvals.text
+    by_request = {
+        approval["request_id"]: approval for approval in approvals.json()["approvals"]
+    }
+    assert by_request[request_ids[0]]["admission"] == "not_admitted"
+    assert by_request[request_ids[1]]["admission"] == "no_chain_to_anchor"
+    assert by_request[request_ids[2]]["admission"] == "direct"
+    assert by_request[request_ids[0]]["device_name"] == "Waiting"
+    assert by_request[request_ids[0]]["platform"] is None
+
+    invalid = await client.post(
+        "/api/hosts/self/pins",
+        headers=daemon_headers,
+        json={"request_id": request_ids[0], "device_id": device_ids[2]},
+    )
+    assert invalid.status_code == 422
+
+    admitted_by_request = await client.post(
+        "/api/hosts/self/pins",
+        headers=daemon_headers,
+        json={"request_id": request_ids[0]},
+    )
+    admitted_by_device = await client.post(
+        "/api/hosts/self/pins",
+        headers=daemon_headers,
+        json={"device_id": device_ids[3]},
+    )
+    assert admitted_by_request.status_code == 204, admitted_by_request.text
+    assert admitted_by_device.status_code == 204, admitted_by_device.text
+
+    async with sm() as session:
+        for request_id in request_ids[:2]:
+            request = await session.get(DeviceApprovalRequest, request_id)
+            assert request is not None
+            assert request.status == "approved"
+            assert request.resolved_at is not None
+        for device_id in device_ids[2:4]:
+            pin = await session.get(HostBrowserPin, (host_id, device_id))
+            assert pin is not None
+            assert pin.endorser_device_id is None
+
+    removed_self = await client.delete(
+        f"/api/hosts/self/pins/{device_ids[0]}", headers=daemon_headers
+    )
+    removed_user = await client.delete(
+        f"/api/hosts/{host_id}/pins/{device_ids[1]}", headers=user_headers
+    )
+    assert removed_self.status_code == removed_user.status_code == 204
+    cleared_self = await client.delete("/api/hosts/self/pins", headers=daemon_headers)
+    assert cleared_self.status_code == 204
+
+    async with sm() as session:
+        assert (
+            await session.execute(
+                select(HostBrowserPin).where(HostBrowserPin.host_id == host_id)
+            )
+        ).scalars().all() == []
+        first = await session.get(BrowserDevice, device_ids[0])
+        second = await session.get(BrowserDevice, device_ids[1])
+        assert first is not None and second is not None
+        session.add_all(
+            [
+                HostBrowserPin(
+                    host_id=host_id,
+                    browser_device_id=device.id,
+                    browser_key_algorithm="ed25519",
+                    browser_public_key=device.public_key,
+                    browser_key_fingerprint=ed25519_key_fingerprint(device.public_key),
+                )
+                for device in (first, second)
+            ]
+        )
+        await session.commit()
+
+    cleared_user = await client.delete(f"/api/hosts/{host_id}/pins", headers=user_headers)
+    assert cleared_user.status_code == 204
+    assert pushed == [host_id] * 6
+
+
 async def test_daemon_deregisters_its_own_host(client):
     # `spawnd exorcise` / the possess dedup revoke via DELETE /api/hosts/self,
     # authenticated by the daemon token — a host can only remove itself.
@@ -1081,7 +1304,7 @@ async def test_daemon_deregisters_its_own_host(client):
 
     from spawn_server import auth
     from spawn_server.db import get_sessionmaker
-    from spawn_server.models import Host, User
+    from spawn_server.models import Host, HostKeyClaim, User
 
     await _signup(client, "deregister-self@example.com")
     sm = get_sessionmaker()
@@ -1089,8 +1312,22 @@ async def test_daemon_deregisters_its_own_host(client):
         user = (
             await session.execute(select(User).where(User.email == "deregister-self@example.com"))
         ).scalar_one()
-        host = Host(owner_user_id=user.id, name="self-box", status="offline")
+        public_key = "R" * 43
+        host = Host(
+            owner_user_id=user.id,
+            name="self-box",
+            status="offline",
+            host_key_algorithm="ed25519",
+            host_public_key=public_key,
+        )
         session.add(host)
+        session.add(
+            HostKeyClaim(
+                host_key_algorithm="ed25519",
+                host_public_key=public_key,
+                owner_user_id=user.id,
+            )
+        )
         await session.commit()
         host_id, user_id = host.id, user.id
 
@@ -1102,7 +1339,9 @@ async def test_daemon_deregisters_its_own_host(client):
 
     async with sm() as session:
         gone = (await session.execute(select(Host).where(Host.id == host_id))).scalar_one_or_none()
+        released_claim = await session.get(HostKeyClaim, ("ed25519", public_key))
     assert gone is None
+    assert released_claim is None
 
     # The token now resolves to no host — a second call is unauthorized.
     r2 = await client.delete("/api/hosts/self", headers=headers)

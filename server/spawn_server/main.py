@@ -6,13 +6,15 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import auth
 from .agents_builtin import seed_builtin_agents
+from .browser_registration import BrowserRegistrationRefusal
 from .config import get_settings
 from .data_events import DataEventMiddleware
 from .db import dispose_engine, get_sessionmaker, init_engine
@@ -108,6 +110,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="spawn-server", version="0.1.0", lifespan=lifespan)
+
+    @app.exception_handler(BrowserRegistrationRefusal)
+    async def browser_registration_refusal(
+        _request: Request, exc: BrowserRegistrationRefusal
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail, "code": exc.code},
+            headers=exc.headers,
+        )
 
     settings = get_settings()
     app.add_middleware(SessionRenewalMiddleware)

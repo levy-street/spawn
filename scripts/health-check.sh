@@ -52,6 +52,98 @@ run_connection_probe() {
   return 1
 }
 
+turn_udp_endpoint() {
+  local urls="$1"
+  local candidate endpoint host port tail
+  local parts=()
+  IFS=',' read -r -a parts <<< "$urls"
+  for candidate in "${parts[@]}"; do
+    candidate="${candidate#"${candidate%%[![:space:]]*}"}"
+    candidate="${candidate%"${candidate##*[![:space:]]}"}"
+    [[ "$candidate" == turn:* ]] || continue
+    [[ "$candidate" == *'?transport=tcp' ]] && continue
+    endpoint="${candidate#turn:}"
+    endpoint="${endpoint%%\?*}"
+    port=3478
+    if [[ "$endpoint" == \[*\]* ]]; then
+      host="${endpoint#\[}"
+      host="${host%%\]*}"
+      tail="${endpoint#*\]}"
+      [[ -z "$tail" ]] || port="${tail#:}"
+    elif [[ "$endpoint" == *:* ]]; then
+      host="${endpoint%:*}"
+      port="${endpoint##*:}"
+    else
+      host="$endpoint"
+    fi
+    [[ -n "$host" && "$port" =~ ^[0-9]+$ ]] || continue
+    printf '%s\t%s\n' "$host" "$port"
+    return 0
+  done
+  return 1
+}
+
+# Authenticated Allocate plus client-to-client traffic through two relay
+# allocations. A STUN Binding can succeed while the cloud firewall still drops
+# coturn's UDP relay range; this exercises the path users actually need.
+run_turn_relay_probe() {
+  local urls="$1"
+  local secret="$2"
+  local parsed host port username password output
+  if ! command -v turnutils_uclient >/dev/null 2>&1; then
+    warn "turnutils_uclient is unavailable; cannot run the TURN relay probe"
+    return 2
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    warn "timeout is unavailable; cannot bound the TURN relay probe"
+    return 2
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 is unavailable; cannot mint a TURN relay probe credential"
+    return 2
+  fi
+  if [[ -z "$secret" ]]; then
+    fail "SPAWN_TURN_SECRET is unavailable; cannot authenticate the TURN relay probe"
+    return 1
+  fi
+  if ! parsed="$(turn_udp_endpoint "$urls")"; then
+    fail "configured TURN URLs contain no UDP turn: endpoint for the relay probe"
+    return 1
+  fi
+  IFS=$'\t' read -r host port <<< "$parsed"
+
+  # Put only this short-lived credential, never the static secret, in the
+  # turnutils process arguments visible to ps.
+  username="$(( $(date +%s) + 300 )):health-check"
+  password="$(SPAWN_HEALTH_TURN_SECRET="$secret" python3 - "$username" <<'PY'
+import base64
+import hashlib
+import hmac
+import os
+import sys
+
+digest = hmac.new(
+    os.environ["SPAWN_HEALTH_TURN_SECRET"].encode(),
+    sys.argv[1].encode(),
+    hashlib.sha1,
+).digest()
+print(base64.b64encode(digest).decode("ascii"))
+PY
+)"
+
+  if output="$(timeout 15s turnutils_uclient -y -c -n 1 -p "$port" \
+    -u "$username" -w "$password" "$host" 2>&1)"; then
+    if grep -Eq 'tot_send_bytes ~ [1-9][0-9]*, tot_recv_bytes ~ [1-9][0-9]*' <<< "$output"; then
+      note "turn relay $host:$port/udp allocated and relayed client-to-client traffic"
+      return 0
+    fi
+    fail "TURN relay probe at $host:$port/udp exchanged no client-to-client traffic"
+    return 1
+  fi
+  fail "TURN relay allocation or client-to-client traffic failed at $host:$port/udp"
+  return 1
+}
+
 if [[ "${1:-}" == "--self-test" ]]; then
   [[ "$#" -eq 1 ]] || {
     echo "usage: scripts/health-check.sh --self-test" >&2
@@ -68,6 +160,13 @@ if [[ "${1:-}" == "--self-test" ]]; then
     "spawn-server spawn-web redis-server coturn" ]] || exit 1
   [[ "$(units_with_turn 'spawn-server coturn' 'turn:example:3478')" == \
     "spawn-server coturn" ]] || exit 1
+  [[ "$(turn_udp_endpoint 'turn:relay.example:3478?transport=udp')" == \
+    $'relay.example\t3478' ]] || exit 1
+  [[ "$(turn_udp_endpoint 'turn:relay.example?transport=udp')" == \
+    $'relay.example\t3478' ]] || exit 1
+  [[ "$(turn_udp_endpoint 'turns:relay.example:443?transport=tcp, turn:[2001:db8::1]:3479')" == \
+    $'2001:db8::1\t3479' ]] || exit 1
+  ! turn_udp_endpoint 'turn:relay.example:3478?transport=tcp' >/dev/null || exit 1
   note "self-test ok"
   exit 0
 fi
@@ -95,6 +194,7 @@ WEB_URL="${SPAWN_HEALTH_WEB_URL:-http://127.0.0.1:3001/}"
 WEB_API_URL="${SPAWN_HEALTH_WEB_API_URL:-http://127.0.0.1:3001/healthz}"
 PUBLIC_ORIGIN="${SPAWN_HEALTH_PUBLIC_ORIGIN:-https://spawnd.dev}"
 TURN_URLS="${SPAWN_TURN_URLS:-}"
+TURN_SECRET="${SPAWN_TURN_SECRET:-}"
 BACKUP_DIR="${SPAWN_BACKUP_DIR:-/opt/spawn-backups}"
 DISK_PATH="${SPAWN_HEALTH_DISK_PATH:-/}"
 DISK_WARN_PCT="${SPAWN_HEALTH_DISK_WARN_PCT:-85}"
@@ -161,6 +261,14 @@ if [[ -n "$TURN_URLS" ]]; then
   stun_probe_status=$?
   if [[ "$stun_probe_status" -eq 2 ]]; then
     warn "configured TURN path was not verified"
+  fi
+fi
+
+if [[ -n "$TURN_URLS" ]]; then
+  run_turn_relay_probe "$TURN_URLS" "$TURN_SECRET"
+  turn_relay_probe_status=$?
+  if [[ "$turn_relay_probe_status" -eq 2 ]]; then
+    warn "configured TURN relay path was not verified"
   fi
 fi
 

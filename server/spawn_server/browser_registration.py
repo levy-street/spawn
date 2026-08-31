@@ -24,6 +24,14 @@ ED25519_SIGNATURE_BYTES = 64
 ED25519_SIGNATURE_B64URL_LENGTH = 86
 
 
+class BrowserRegistrationRefusal(HTTPException):
+    """Registration refusal with a stable machine-readable reason code."""
+
+    def __init__(self, *, status_code: int, detail: str, code: str) -> None:
+        super().__init__(status_code=status_code, detail=detail)
+        self.code = code
+
+
 def encode_browser_registration_transcript(
     user_id: str, public_key: bytes, *, is_root: bool
 ) -> bytes:
@@ -51,14 +59,26 @@ def decode_ed25519_signature(encoded: str) -> bytes:
     """Decode an exact canonical fixed-width unpadded base64url Ed25519 signature."""
 
     if len(encoded) != ED25519_SIGNATURE_B64URL_LENGTH or "=" in encoded:
-        raise HTTPException(status_code=422, detail="invalid Ed25519 signature")
+        raise BrowserRegistrationRefusal(
+            status_code=422,
+            detail="invalid Ed25519 signature",
+            code="registration_proof_invalid",
+        )
     try:
         raw = base64.b64decode(encoded + "==", altchars=b"-_", validate=True)
     except (ValueError, binascii.Error) as exc:
-        raise HTTPException(status_code=422, detail="invalid Ed25519 signature") from exc
+        raise BrowserRegistrationRefusal(
+            status_code=422,
+            detail="invalid Ed25519 signature",
+            code="registration_proof_invalid",
+        ) from exc
     canonical = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
     if len(raw) != ED25519_SIGNATURE_BYTES or canonical != encoded:
-        raise HTTPException(status_code=422, detail="invalid Ed25519 signature")
+        raise BrowserRegistrationRefusal(
+            status_code=422,
+            detail="invalid Ed25519 signature",
+            code="registration_proof_invalid",
+        )
     return raw
 
 
@@ -79,6 +99,8 @@ def verify_browser_registration_proof(
     try:
         Ed25519PublicKey.from_public_bytes(public_key).verify(signature, transcript)
     except InvalidSignature as exc:
-        raise HTTPException(
-            status_code=422, detail="browser registration proof is invalid"
+        raise BrowserRegistrationRefusal(
+            status_code=422,
+            detail="browser registration proof is invalid",
+            code="registration_proof_invalid",
         ) from exc

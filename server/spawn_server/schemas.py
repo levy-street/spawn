@@ -179,6 +179,22 @@ class BrowserDevicePruneResponse(BaseModel):
     pruned: int
 
 
+class BrowserDeviceLookupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    public_key: str = Field(min_length=43, max_length=43)
+
+    @field_validator("public_key")
+    @classmethod
+    def validate_public_key(cls, value: str) -> str:
+        decode_ed25519_public_key(value)
+        return value
+
+
+class BrowserDeviceLookupResponse(BaseModel):
+    status: Literal["active", "revoked", "unregistered", "other_account"]
+
+
 class PasswordResetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -908,6 +924,58 @@ class HostOut(BaseModel):
     cpu_bucket: int | None = None
     mem_bucket: int | None = None
     capacity_at: datetime | None = None
+
+
+class HostSelfAccountOut(BaseModel):
+    id: str
+    email: EmailStr
+    display_name: str = ""
+
+
+class HostSelfOut(BaseModel):
+    host_id: str
+    name: str
+    account: HostSelfAccountOut
+
+
+class HostPinOut(BaseModel):
+    pin_id: str
+    device_id: str
+    name: str | None = None
+    platform: str | None = None
+    kind: Literal["direct", "endorsed", "root"]
+    created_at: datetime
+    last_seen: datetime | None = None
+
+
+class HostPinsResponse(BaseModel):
+    pins: list[HostPinOut]
+
+
+class HostApprovalOut(BaseModel):
+    request_id: str
+    device_name: str | None = None
+    platform: str | None = None
+    requested_at: datetime
+    expires_at: datetime
+    admission: Literal["direct", "endorsed", "no_chain_to_anchor", "not_admitted"]
+
+
+class HostApprovalsResponse(BaseModel):
+    approvals: list[HostApprovalOut]
+
+
+class HostPinCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str | None = Field(default=None, min_length=36, max_length=36)
+    device_id: str | None = Field(default=None, min_length=36, max_length=36)
+
+    @model_validator(mode="after")
+    def exactly_one_identifier(self) -> HostPinCreateRequest:
+        if (self.request_id is None) == (self.device_id is None):
+            raise ValueError("provide exactly one of request_id or device_id")
+        return self
 
 
 class HostUpdateResponse(BaseModel):

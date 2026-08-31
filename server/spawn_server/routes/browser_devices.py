@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import auth, schemas
-from ..browser_registration import verify_browser_registration_proof
+from ..browser_registration import BrowserRegistrationRefusal, verify_browser_registration_proof
 from ..db import get_session
 from ..models import BrowserDevice, Host, HostBrowserPin, RevokedBrowserKey, User
 from ..ws.daemon import push_browser_pins
@@ -38,11 +38,16 @@ def _registration_result(
     device: BrowserDevice, user_id: str, claimed_is_root: bool
 ) -> schemas.BrowserDeviceOut:
     if device.owner_user_id != user_id:
-        raise HTTPException(status_code=409, detail="browser public key is unavailable")
+        raise BrowserRegistrationRefusal(
+            status_code=409,
+            detail="browser public key is unavailable",
+            code="device_key_owned_by_other_account",
+        )
     if device.revoked_at is not None:
-        raise HTTPException(
+        raise BrowserRegistrationRefusal(
             status_code=409,
             detail="revoked browser public keys cannot be registered again",
+            code="device_key_revoked",
         )
     if device.is_root != claimed_is_root:
         # A key is minted as either the account root or an ordinary device and
@@ -50,9 +55,10 @@ def _registration_result(
         # other designation, so a mismatch is confusion or mischief — refuse
         # rather than silently answering with a row whose authority differs
         # from what the proof attested.
-        raise HTTPException(
+        raise BrowserRegistrationRefusal(
             status_code=409,
             detail="browser public key is already registered with a different root designation",
+            code="root_designation_mismatch",
         )
     return _to_out(device)
 
@@ -107,9 +113,10 @@ async def register_browser_device(
         )
     ).scalar_one_or_none()
     if permanently_revoked is not None:
-        raise HTTPException(
+        raise BrowserRegistrationRefusal(
             status_code=409,
             detail="revoked browser public keys cannot be registered again",
+            code="device_key_revoked",
         )
 
     if body.is_root:
@@ -125,7 +132,11 @@ async def register_browser_device(
             )
         ).scalar_one_or_none()
         if already_root is not None:
-            raise HTTPException(status_code=409, detail="account already has a root")
+            raise BrowserRegistrationRefusal(
+                status_code=409,
+                detail="account already has a root",
+                code="root_already_exists",
+            )
 
     device = BrowserDevice(
         id=str(uuid.uuid4()),
@@ -168,15 +179,46 @@ async def register_browser_device(
                     )
                 ).scalar_one_or_none()
                 if concurrent_root is not None:
-                    raise HTTPException(
-                        status_code=409, detail="account already has a root"
+                    raise BrowserRegistrationRefusal(
+                        status_code=409,
+                        detail="account already has a root",
+                        code="root_already_exists",
                     ) from None
-            raise HTTPException(
-                status_code=409, detail="browser public key is unavailable"
+            raise BrowserRegistrationRefusal(
+                status_code=409,
+                detail="browser public key is unavailable",
+                code="device_key_owned_by_other_account",
             ) from None
         return _registration_result(winner, user_id, body.is_root)
     await session.refresh(device)
     return _to_out(device)
+
+
+@router.post("/lookup", response_model=schemas.BrowserDeviceLookupResponse)
+async def lookup_browser_device(
+    body: schemas.BrowserDeviceLookupRequest,
+    user: User = Depends(auth.current_user),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.BrowserDeviceLookupResponse:
+    device = (
+        await session.execute(
+            select(BrowserDevice).where(
+                BrowserDevice.key_algorithm == "ed25519",
+                BrowserDevice.public_key == body.public_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if device is not None:
+        if device.owner_user_id != user.id:
+            return schemas.BrowserDeviceLookupResponse(status="other_account")
+        return schemas.BrowserDeviceLookupResponse(
+            status="revoked" if device.revoked_at is not None else "active"
+        )
+
+    permanently_revoked = await session.get(RevokedBrowserKey, (user.id, body.public_key))
+    return schemas.BrowserDeviceLookupResponse(
+        status="revoked" if permanently_revoked is not None else "unregistered"
+    )
 
 
 @router.get("", response_model=list[schemas.BrowserDeviceOut])

@@ -1153,7 +1153,11 @@ def test_old_daemon_session_offers_never_carry_ice_transport_policy():
     """
     from spawn_server.ws.browser import _offer_ice
 
-    assert set(_offer_ice("user-1")) == {"ice_servers"}
+    daemon = DaemonConn("host", "user", FakeDaemonWebSocket())  # type: ignore[arg-type]
+    daemon.session_ice_policy = False
+    offer_ice = _offer_ice("user-1", daemon)
+    assert set(offer_ice) == {"ice_servers"}
+    assert "ice_transport_policy" not in offer_ice
 
 
 def test_session_ice_policy_capability_adds_policy_to_session_offer():
