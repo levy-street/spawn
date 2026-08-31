@@ -17,7 +17,7 @@ export interface BrandMarkProps {
 
 /** The canonical wet-ink trident. Its default ink is fixed across themes. */
 export function BrandMark({
-  accessibilityLabel = "spawnd mark",
+  accessibilityLabel = "SPAWN D mark",
   color = pressroomColors.hellfire,
   size = spacing[6.5],
   testID,
@@ -45,7 +45,7 @@ export interface WordmarkProps {
 
 /** The canonical drawn lowercase wordmark; this is artwork, not typeset copy. */
 export function Wordmark({
-  accessibilityLabel = "spawnd",
+  accessibilityLabel = "SPAWN D",
   color = pressroomColors.hellfire,
   height = spacing[5],
   testID,

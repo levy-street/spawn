@@ -298,7 +298,7 @@ function ShareLegion({ profile }: { profile: Profile }) {
       className="h-7 gap-1.5 px-2 text-[11px]"
       onClick={async () => {
         try {
-          await navigator.clipboard.writeText(`${line} — spawnd`);
+          await navigator.clipboard.writeText(`${line} — SPAWN D`);
           setCopied(true);
           window.setTimeout(() => setCopied(false), 2000);
         } catch {

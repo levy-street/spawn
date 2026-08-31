@@ -22,5 +22,5 @@ export function profileStatsLine(profile: ProfileOut): string {
     ...(profile.totals.memory_bytes > 0 ? [formatProfileMemory(profile.totals.memory_bytes)] : []),
     `${profile.agents.reduce((total, agent) => total + agent.count, 0)} agent runs`,
   ];
-  return `${parts.join(" · ")} · spawnd`;
+  return `${parts.join(" · ")} · SPAWN D`;
 }
