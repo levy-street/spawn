@@ -14,6 +14,7 @@ import {
   RegistrationMarks,
 } from "@/components/brand/press";
 import { Wordmark } from "@/components/icons/BrandMark";
+import { SiteStructuredData } from "@/components/seo/SiteStructuredData";
 import { poster } from "@/lib/fonts";
 import { cn } from "@/lib/utils";
 
@@ -209,6 +210,7 @@ export default function LandingPage() {
 
   return (
     <main className="grimoire min-h-vv overflow-x-clip">
+      <SiteStructuredData />
       <Masthead />
 
       {/* ── The living hero: full-bleed ink video, type top-left ── */}

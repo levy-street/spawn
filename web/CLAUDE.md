@@ -12,13 +12,19 @@ ceremony, a download page) says so in the commit message.
 ```
 src/
   app/            one directory per route (App Router)
-                  admin/ app/ device/ download/ forgot-password/ hosts/
-                  legion/ login/ onboarding/ reset-password/ security/
-                  sessions/ signup/ trust-ux-demo/ verify-email/ w/
+                  [slug]/ admin/ app/ device/ download/ for/ forgot-password/
+                  hosts/ legion/ login/ onboarding/ reset-password/
+                  run-agents-in-parallel/ security/ sessions/ signup/
+                  trust-ux-demo/ use/ verify-email/ vs/ w/
+                  ([slug]/ is the flat-URL landing-page router — see "SEO
+                  landing pages"; for/ and use/ are the legacy registry
+                  families; vs/ is the comparisons hub, its spokes now flat;
+                  run-agents-in-parallel/ is the hand-built flagship from
+                  docs/SEO_TREE.md)
   components/     UI grouped by product area
                   access/ auth/ brand/ files/ hosts/ icons/ legion/ nav/
-                  onboarding/ profile/ session/ settings/ terminal/ trust/
-                  ui/ workspace/
+                  onboarding/ profile/ seo/ session/ settings/ terminal/
+                  trust/ ui/ workspace/
   hooks/          React hooks shared across areas (useHostControl, …)
   lib/            framework-free logic: API client, crypto, ceremonies,
                   alerts — with colocated *.test.ts files
@@ -50,6 +56,30 @@ public/           static assets
   `SPAWN_API_PROXY_TARGET`. `scripts/next-with-proxy-target.mjs` wraps
   build/start and refuses a silent default outside `dev`. Never call the API
   cross-origin.
+
+## SEO landing pages
+
+Landing pages are data, not JSX. Two generations coexist during the
+rework (`docs/SEO_TREE.md` is the page catalogue, `docs/SEO_RUNBOOK.md` the
+process):
+
+- **Flat slugs (current)**: one entry per page in `src/lib/seo/` template
+  files (`comparisons.ts`, `devices.ts`), catalogued by `src/lib/seo/flat.ts` and
+  rendered by `app/[slug]/` through the templates in
+  `src/components/seo/templates/` (job frame, comparison, the live fleet
+  capture in `public/product/`). `src/lib/seo/flat.test.ts` holds the
+  invariants, including the denylist that keeps flat slugs off static
+  routes. `app/run-agents-in-parallel/` is the hand-built flagship on the
+  job template.
+- **Legacy registry**: `/use/*` and `/for/*` entries in
+  `src/lib/seo/{use-cases,agents}.ts`, rendered by
+  `src/components/seo/SeoLandingPage.tsx`; `registry.test.ts` holds their
+  invariants. They migrate to flat slugs at rework time.
+
+The sitemap (`app/sitemap.ts`), hubs, and cross-links follow from both
+catalogues (`related` keys starting with "/" resolve against the flat one).
+Titles and H1s stay plain-language for search; the demon voice lives in body
+copy. Every claim must survive a diff against `docs/TRUST.md`.
 
 ## Before calling a change done
 

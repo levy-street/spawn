@@ -192,12 +192,24 @@ export function Colophon() {
     <footer className="border-line-g border-t px-5 py-10 sm:px-8">
       <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-4 font-sigil text-[11px] tracking-[0.14em] text-ash uppercase sm:flex-row">
         <span>consensual · auditable · revocable</span>
-        <div className="flex items-center gap-5">
+        <div className="flex flex-wrap items-center justify-center gap-5">
           <Link href="/security" className="transition-colors hover:text-bone">
             Security
           </Link>
           <Link href="/download" className="transition-colors hover:text-bone">
             Install
+          </Link>
+          <Link href="/run-agents-in-parallel" className="transition-colors hover:text-bone">
+            Parallel&nbsp;agents
+          </Link>
+          <Link href="/use" className="transition-colors hover:text-bone">
+            Use&nbsp;cases
+          </Link>
+          <Link href="/for" className="transition-colors hover:text-bone">
+            Agents
+          </Link>
+          <Link href="/vs" className="transition-colors hover:text-bone">
+            Compared
           </Link>
           <Link href="/login" className="transition-colors hover:text-bone">
             Log in
