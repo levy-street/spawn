@@ -18,7 +18,15 @@ export type SettingsTab =
   | "agents"
   | "access"
   | "skills"
-  | "templates";
+  | "templates"
+  /**
+   * Only on a deployment that has billing. `SettingsDialog` drops the tab
+   * where there is none, so a self-hoster never sees it — and an
+   * `openSettings("subscription")` that reaches one anyway (a stale caller, or
+   * a call made before the config landed) falls back to Account rather than
+   * opening an empty panel.
+   */
+  | "subscription";
 
 /**
  * Old bookmarks and copy said "Browser devices" / "Device trust"; both now

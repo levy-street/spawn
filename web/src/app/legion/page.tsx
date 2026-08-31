@@ -8,6 +8,7 @@ import { ConnectHostSection } from "@/components/hosts/connect-host";
 import { LegionHostCard } from "@/components/legion/LegionHostCard";
 import { Stat } from "@/components/legion/legion-parts";
 import { AppShell } from "@/components/nav/AppShell";
+import { openSettings } from "@/components/settings/settings-dialog-store";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -17,7 +18,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useBilling } from "@/hooks/useBilling";
 import { hosts, sessions } from "@/lib/api";
+import { atCapacity, hostLimitLabel, hostsUsedLabel } from "@/lib/billing";
 import { formatBytes, summarizeLegion, summaryLine } from "@/lib/legion";
 
 /**
@@ -53,6 +56,12 @@ function LegionBody() {
   const summary = summarizeLegion(hostsQ.data ?? [], sessionsQ.data ?? []);
   const memory = formatBytes(summary.memoryBytes);
   const loading = hostsQ.isLoading;
+  // Soft state only (docs/BILLING.md §5.5). The page already knows the host
+  // count; the plan is the other half of the same sentence, and saying it here
+  // is cheaper than letting somebody find out at the end of a ceremony.
+  const { enabled: billingEnabled, account } = useBilling();
+  const plan = billingEnabled ? account : null;
+  const full = plan !== null && atCapacity(plan);
 
   return (
     // The shell's <main> is `overflow-hidden` on desktop, so a page taller than
@@ -66,6 +75,15 @@ function LegionBody() {
             <p className="mt-0.5 text-sm text-muted-foreground">
               {loading ? "Counting your machines…" : summaryLine(summary)}
             </p>
+            {/* The button below stays live. A disabled control with no
+             * explanation is worse than a click that explains itself — and
+             * this says the thing that control would have had to. */}
+            {full && plan !== null && (
+              <p className="mt-1 text-sm" data-testid="legion-at-capacity">
+                <span className="font-medium tabular-nums">{hostsUsedLabel(plan)}</span> —{" "}
+                {plan.tier_name} is full. Adding another needs a released machine or a bigger plan.
+              </p>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Button type="button" size="sm" onClick={() => setAddMachineOpen(true)}>
@@ -94,6 +112,17 @@ function LegionBody() {
           className="grid grid-cols-2 gap-4 rounded-xl border border-border bg-card p-4 sm:grid-cols-3 lg:grid-cols-5"
         >
           <Stat value={`${summary.hostsOnline}/${summary.hosts}`} label="hosts online" />
+          {plan !== null && (
+            <Stat
+              value={
+                plan.host_limit === null
+                  ? String(plan.host_count)
+                  : `${plan.host_count}/${plan.host_limit}`
+              }
+              label="hosts on plan"
+              accent={full}
+            />
+          )}
           {summary.cores > 0 && <Stat value={summary.cores} label="cores possessed" />}
           {memory && <Stat value={memory} label="memory" />}
           <Stat value={summary.sessions} label="live sessions" />
@@ -118,7 +147,12 @@ function LegionBody() {
           </div>
         ) : summary.rows.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border px-5 py-10 text-center">
-            <p className="text-sm text-muted-foreground">No hosts possessed yet.</p>
+            <p className="text-sm text-muted-foreground">
+              No hosts possessed yet.
+              {full && plan !== null
+                ? ` Your plan admits ${hostLimitLabel(plan.host_limit)}, and every slot is already spoken for.`
+                : ""}
+            </p>
             <Button
               type="button"
               variant="outline"
@@ -148,6 +182,9 @@ function LegionBody() {
                 aria-hidden
               />
               <span className="text-sm">Add a machine</span>
+              {/* Still a live slot at capacity — it opens the same dialog,
+               * which says what the limit is and offers the way past it. */}
+              {full && <span className="text-xs">Your plan is full</span>}
             </button>
           </div>
         )}
@@ -161,6 +198,34 @@ function LegionBody() {
               </DialogDescription>
             </DialogHeader>
             <div className="overflow-y-auto px-4 pb-4">
+              {full && plan !== null && (
+                // What the still-live button owed the reader. The ceremony
+                // below is left intact on purpose: releasing a machine in
+                // another tab, or changing plan from here, makes it work.
+                <div
+                  className="mb-4 space-y-2 rounded-lg border border-warning/50 bg-warning/5 p-3"
+                  data-testid="legion-capacity-notice"
+                >
+                  <p className="text-sm font-medium">
+                    {plan.tier_name} is full at{" "}
+                    <span className="tabular-nums">{hostsUsedLabel(plan)}</span>
+                  </p>
+                  <p className="text-sm leading-6 text-muted-foreground">
+                    A new machine will be refused at the end of this ceremony. Release one from the
+                    fleet behind this dialog, or move to a plan with more room first.
+                  </p>
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => {
+                      setAddMachineOpen(false);
+                      openSettings("subscription");
+                    }}
+                  >
+                    Change plan
+                  </Button>
+                </div>
+              )}
               <ConnectHostSection frameless />
             </div>
           </DialogContent>

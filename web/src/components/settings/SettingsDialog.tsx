@@ -3,6 +3,7 @@
 import {
   Bell,
   Bot,
+  CreditCard,
   ExternalLink,
   LayoutTemplate,
   Palette,
@@ -19,6 +20,7 @@ import { AgentsPanel } from "@/components/settings/AgentsPanel";
 import { AppearancePanel } from "@/components/settings/AppearancePanel";
 import { NotificationsPanel } from "@/components/settings/NotificationsPanel";
 import { SkillsPanel } from "@/components/settings/SkillsPanel";
+import { SubscriptionPanel } from "@/components/settings/SubscriptionPanel";
 import {
   closeSettings,
   openSettings,
@@ -28,21 +30,25 @@ import {
 import { TemplatesPanel } from "@/components/settings/TemplatesPanel";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import { useBilling } from "@/hooks/useBilling";
 import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
-/**
- * Identity first, then the resources a workspace draws on, then Access —
- * which is the one tab about who may reach those resources at all, and so
- * reads as the floor under the rest rather than another resource beside them.
- * "Browser devices" and "Device trust" were two tabs before the mesh; both
- * now live on Access (docs/TRUST_UX.md).
- */
-const TABS: Array<{
+interface SettingsTabDef {
   key: SettingsTab;
   label: string;
   icon: ComponentType<{ className?: string }>;
-}> = [
+}
+
+/**
+ * Identity first — the account, and then what it pays for, which is a fact
+ * about the account and not a resource — then the resources a workspace draws
+ * on, then Access, which is the one tab about who may reach those resources at
+ * all and so reads as the floor under the rest rather than another resource
+ * beside them. "Browser devices" and "Device trust" were two tabs before the
+ * mesh; both now live on Access (docs/TRUST_UX.md).
+ */
+const TABS: SettingsTabDef[] = [
   { key: "account", label: "Account", icon: User },
   { key: "appearance", label: "Appearance", icon: Palette },
   { key: "notifications", label: "Notifications", icon: Bell },
@@ -52,15 +58,33 @@ const TABS: Array<{
   { key: "access", label: "Access", icon: ShieldCheck },
 ];
 
+const SUBSCRIPTION_TAB: SettingsTabDef = {
+  key: "subscription",
+  label: "Subscription",
+  icon: CreditCard,
+};
+
 export function SettingsDialog() {
   const tab = useSettingsDialog();
   const { user } = useAuth();
+  // A deployment with no billing has no Subscription tab at all — a
+  // self-hoster sees exactly the seven they saw before this existed
+  // (docs/BILLING.md §5.3).
+  const { enabled: billingEnabled } = useBilling();
+  const tabs = billingEnabled ? [TABS[0], SUBSCRIPTION_TAB, ...TABS.slice(1)] : TABS;
+  // A stale deep link, or a client that asked for the tab before the config
+  // arrived, must not land on a blank panel.
+  const active = tab === "subscription" && !billingEnabled ? "account" : tab;
 
   return (
     <Dialog open={tab !== null} onOpenChange={(open) => (open ? undefined : closeSettings())}>
       <DialogContent size="full-mobile" data-testid="settings-dialog" className="md:flex-row">
+        {/* Enumerates the sections, so it has to track the tab list — a
+            screen reader hearing six of seven is being lied to. */}
         <DialogDescription className="sr-only">
-          Manage your account, appearance, notifications, agents, skills, templates, and access.
+          {billingEnabled
+            ? "Manage your account, subscription, appearance, notifications, agents, skills, templates, and access."
+            : "Manage your account, appearance, notifications, agents, skills, templates, and access."}
         </DialogDescription>
 
         <nav
@@ -70,17 +94,17 @@ export function SettingsDialog() {
           <DialogTitle className="hidden px-2 pb-2 pt-1 text-sm font-semibold md:block">
             Settings
           </DialogTitle>
-          {TABS.map(({ key, label, icon: Icon }) => (
+          {tabs.map(({ key, label, icon: Icon }) => (
             <Button
               key={key}
               type="button"
               variant="ghost"
               size="sm"
               onClick={() => openSettings(key)}
-              aria-current={tab === key ? "page" : undefined}
+              aria-current={active === key ? "page" : undefined}
               className={cn(
                 "h-9 shrink-0 justify-start px-2.5",
-                tab === key
+                active === key
                   ? "bg-accent text-accent-foreground"
                   : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
               )}
@@ -106,13 +130,14 @@ export function SettingsDialog() {
 
         <div className="@container/settings min-w-0 flex-1 overflow-y-auto">
           <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 p-4 pt-5 md:p-6">
-            {tab === "account" && <AccountPanel />}
-            {tab === "appearance" && <AppearancePanel />}
-            {tab === "notifications" && <NotificationsPanel />}
-            {tab === "agents" && <AgentsPanel />}
-            {tab === "skills" && <SkillsPanel />}
-            {tab === "templates" && <TemplatesPanel />}
-            {tab === "access" && <AccessPanel />}
+            {active === "account" && <AccountPanel />}
+            {active === "subscription" && <SubscriptionPanel />}
+            {active === "appearance" && <AppearancePanel />}
+            {active === "notifications" && <NotificationsPanel />}
+            {active === "agents" && <AgentsPanel />}
+            {active === "skills" && <SkillsPanel />}
+            {active === "templates" && <TemplatesPanel />}
+            {active === "access" && <AccessPanel />}
           </div>
         </div>
       </DialogContent>

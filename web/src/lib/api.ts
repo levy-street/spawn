@@ -892,6 +892,15 @@ export const AdminUserSchema = z.object({
   host_count: z.number().int().default(0),
   session_count: z.number().int().default(0),
   browser_device_count: z.number().int().default(0),
+  /** `User.host_limit_override`, verbatim: null = no override, 0 = unlimited,
+   *  any other integer = that many hosts. Never write it without reading that
+   *  sentence twice — `0` means the opposite of what it looks like. */
+  host_limit_override: z.number().int().nullable().default(null),
+  /** What the account is *sold*: the subscription row's tier, or "free". A
+   *  comped account legitimately differs from what it is allowed. */
+  billing_tier: z.string().default("free"),
+  /** What is actually enforced. null = unlimited. */
+  effective_host_limit: z.number().int().nullable().default(null),
 });
 export type AdminUser = z.infer<typeof AdminUserSchema>;
 
@@ -949,6 +958,21 @@ export const admin = {
     }),
   revokeInvite: (id: string) =>
     api(`/api/admin/invites/${id}/revoke`, { method: "POST", schema: AdminInviteSchema }),
+  /**
+   * Comp an account, or stop comping it — how internal accounts never pay.
+   *
+   * `null` clears the override and hands the account back to its subscription;
+   * `0` is UNLIMITED, not zero hosts; any other integer is that many. The
+   * override outranks any subscription and needs no Stripe call, which is the
+   * point: comping is our decision about our own product, not a discount
+   * someone has to remember to cancel in a dashboard.
+   */
+  setHostLimitOverride: (userId: string, hostLimitOverride: number | null) =>
+    api(`/api/admin/users/${userId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ host_limit_override: hostLimitOverride }),
+      schema: AdminUserSchema,
+    }),
 };
 
 export const profile = {
