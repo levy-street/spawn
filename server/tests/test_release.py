@@ -477,11 +477,73 @@ class TestDesktopBlockProvesItself:
     async def test_a_version_bump_stops_advertising_until_it_is_published(
         self, client, tmp_path, monkeypatch
     ):
-        """The exact shape of the bug: the deploy ships a new version while the
-        static origin still holds only the old one's image."""
+        """The deploy ships a new version while the static origin still holds
+        only the old one's image — and no `latest.json` to vouch for it, so
+        there is no published build to fall back to."""
         images = tmp_path / "www" / "desktop"
         _publish_image(images, "darwin-aarch64", version="0.1.0")
         _publish_image(images, "darwin-x86_64", version="0.1.0")
+        _configure_desktop_publication(monkeypatch, tmp_path, desktop_dir=images, version="0.2.0")
+
+        response = await client.get("/api/release")
+
+        assert response.json()["desktop"] is None
+
+    async def test_a_publish_gap_advertises_the_previous_published_build(
+        self, client, tmp_path, monkeypatch
+    ):
+        """The 40-minute window that went user-visible: the deploy carries
+        0.2.0 while the static origin still holds the published 0.1.0. The
+        updater manifest names the old version, its images prove themselves,
+        and the block advertises them with no tree — the old build's tree is
+        unknowable from disk."""
+        images = tmp_path / "www" / "desktop"
+        _publish_image(images, "darwin-aarch64", version="0.1.0")
+        _publish_image(images, "darwin-x86_64", version="0.1.0")
+        (images / "latest.json").write_text(
+            json.dumps(
+                {
+                    "version": "0.1.0",
+                    "notes": "SPAWN D 0.1.0",
+                    "pub_date": "2026-08-30T12:00:00Z",
+                    "platforms": {},
+                }
+            )
+        )
+        _configure_desktop_publication(monkeypatch, tmp_path, desktop_dir=images, version="0.2.0")
+
+        response = await client.get("/api/release")
+
+        assert response.json()["desktop"] == {
+            "version": "0.1.0",
+            "tree": None,
+            "platforms": ["darwin-aarch64", "darwin-x86_64"],
+        }
+
+    @pytest.mark.parametrize(
+        "manifest",
+        ["{", '"0.1.0"', json.dumps({"notes": "no version"}), json.dumps({"version": 3})],
+    )
+    async def test_a_malformed_latest_json_stays_quiet(
+        self, client, tmp_path, monkeypatch, manifest
+    ):
+        images = tmp_path / "www" / "desktop"
+        _publish_image(images, "darwin-aarch64", version="0.1.0")
+        _publish_image(images, "darwin-x86_64", version="0.1.0")
+        (images / "latest.json").write_text(manifest)
+        _configure_desktop_publication(monkeypatch, tmp_path, desktop_dir=images, version="0.2.0")
+
+        response = await client.get("/api/release")
+
+        assert response.json()["desktop"] is None
+
+    async def test_a_latest_json_whose_images_are_gone_stays_quiet(
+        self, client, tmp_path, monkeypatch
+    ):
+        """The fallback trusts `latest.json` for a version, never for images."""
+        images = tmp_path / "www" / "desktop"
+        images.mkdir(parents=True)
+        (images / "latest.json").write_text(json.dumps({"version": "0.1.0", "platforms": {}}))
         _configure_desktop_publication(monkeypatch, tmp_path, desktop_dir=images, version="0.2.0")
 
         response = await client.get("/api/release")
