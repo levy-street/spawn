@@ -953,7 +953,9 @@ class MobileReleaseOut(BaseModel):
 
 class ReleaseDesktop(BaseModel):
     version: str
-    tree: str
+    # None when a publish gap falls back to the previously published build,
+    # whose tree is unknowable from the static directory alone.
+    tree: str | None = None
     platforms: list[str]
 
 

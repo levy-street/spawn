@@ -30,7 +30,8 @@ export interface DesktopReleaseState {
 type ResolvedBuild = {
   version: string;
   platforms: DesktopPlatform[];
-  buildId: string;
+  /** Null when the release block advertises a fallback build with no tree. */
+  buildId: string | null;
 };
 
 /**

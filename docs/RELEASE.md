@@ -631,8 +631,11 @@ same directory `scripts/publish-desktop.sh` uploads to under the same variable
 name — and the server looks in it before advertising a desktop version. The
 primary Apple-silicon DMG gates the block, and its platform list is narrowed to
 the non-empty Apple DMGs and Windows setup EXE actually present. A deploy that
-lands before the publish therefore says nothing about the desktop app rather
-than pointing the download button at a 404. If the directory does not exist at
+lands before the publish therefore keeps advertising the previously published
+build — the version the directory's own `latest.json` names, with a null tree
+since the old build's tree is unknowable from disk — rather than pointing the
+download button at a 404. Only with no readable `latest.json`, or one whose
+images are also gone, does it say nothing about the desktop app. If the directory does not exist at
 all the server cannot check, so it fails open with all expected platforms and
 logs an error naming this variable; a download that vanishes silently would be
 the harder failure to notice.

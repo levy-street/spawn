@@ -122,6 +122,26 @@ describe("desktop artifacts", () => {
     ).toBeNull();
   });
 
+  test("release parsing accepts a treeless fallback block but not a corrupt tree", () => {
+    // A publish gap advertises the previously published build, whose tree the
+    // server cannot know. Version and platforms stay required.
+    expect(
+      desktopReleaseFromPayload({
+        desktop: { version: "0.1.0", tree: null, platforms: ["darwin-aarch64"] },
+      }),
+    ).toEqual({ version: "0.1.0", tree: null, platforms: ["darwin-aarch64"] });
+    expect(
+      desktopReleaseFromPayload({
+        desktop: { version: "0.1.0", platforms: ["darwin-aarch64"] },
+      }),
+    ).toEqual({ version: "0.1.0", tree: null, platforms: ["darwin-aarch64"] });
+    expect(
+      desktopReleaseFromPayload({
+        desktop: { version: "0.1.0", tree: "not-a-tree", platforms: ["darwin-aarch64"] },
+      }),
+    ).toBeNull();
+  });
+
   test("local payload parsing needs a version and at least one exact platform", () => {
     expect(
       localDesktopBuildFromPayload({
