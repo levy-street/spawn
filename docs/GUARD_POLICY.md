@@ -14,9 +14,10 @@ markers are present or absent.
 
 The interrupted complex guard experiments are retained for audit history on
 `backup/p2-data-guard-interrupted-20260716` and
-`backup/p2-host-guard-interrupted-20260716`. Those backup branches, and the
-complex guard commits on `review/p2-data-design`, are intentionally not merge or
-cherry-pick candidates. Useful design prose must be salvaged selectively without
+`backup/p2-host-guard-interrupted-20260716`, both still on origin. Those
+branches are intentionally not merge or cherry-pick candidates. The
+`review/p2-data-design` branch that carried the same complex guard commits has
+since been deleted; the two backup branches are the surviving copy. Useful design prose must be salvaged selectively without
 the Python prose parser, generated inventory, or parser dependencies.
 
 The permanent tmux-removal boundary is unchanged. Production tmux execution,
