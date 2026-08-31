@@ -28,7 +28,7 @@ router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
 FIRST_SESSION_TILE = {"x": 0, "y": 0, "w": grid.GRID_COLS, "h": grid.GRID_ROWS}
 _WORKSPACE_NAME_PATTERN = re.compile(r"\AWorkspace (\d+)\Z")
 
-# Layout schema v3 (docs/OVERHAUL.md §4.4-tabs): the stored/wire layout is an
+# Layout schema v3 (proto/README.md, "Layout schema v3"): the stored/wire layout is an
 # envelope of named tabs, each holding one v2 tile grid. The v2 algebra and
 # its conformance fixtures are untouched; tabs sit above it. The deterministic
 # id/name below are what a bare v2 layout upgrades into (migration 0033 and
