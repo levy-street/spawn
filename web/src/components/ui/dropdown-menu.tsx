@@ -215,6 +215,8 @@ const ITEM_CLASS =
 export function DropdownMenuItem({
   onSelect,
   href,
+  external = false,
+  newTab = false,
   checked,
   destructive = false,
   disabled = false,
@@ -223,6 +225,13 @@ export function DropdownMenuItem({
 }: {
   onSelect?: () => void;
   href?: string;
+  /**
+   * Render `href` as a plain anchor instead of a route `Link`: for a file the
+   * browser should download (a .dmg is not a route) or another site entirely.
+   */
+  external?: boolean;
+  /** With `external`: open in a new tab (a store listing, not a download). */
+  newTab?: boolean;
   /** Pass to make the item a toggle: renders a checkbox showing its state. */
   checked?: boolean;
   destructive?: boolean;
@@ -235,6 +244,18 @@ export function DropdownMenuItem({
     destructive && "text-destructive hover:bg-destructive/10 focus-visible:bg-destructive/10",
     className,
   );
+  if (href && external) {
+    return (
+      <a
+        role="menuitem"
+        href={href}
+        className={classes}
+        {...(newTab ? { target: "_blank", rel: "noreferrer" } : {})}
+      >
+        {children}
+      </a>
+    );
+  }
   if (href) {
     return (
       <Link role="menuitem" href={href} className={classes}>
