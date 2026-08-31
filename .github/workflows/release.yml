@@ -243,7 +243,9 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "${EXPO_TOKEN:-}" ] || { echo "::error::EXPO_TOKEN is not set" >&2; exit 1; }
-          npx eas build --platform all --profile production --non-interactive --auto-submit
+          # eas-cli is not one of mobile's devDependencies, so npx must be told
+          # to fetch it — a bare `npx eas` cannot determine an executable.
+          npx --yes eas-cli build --platform all --profile production --non-interactive --auto-submit
 
   # desktop.yml builds and signs the app on the same push. Promoting those
   # artifacts needs the offline Tauri updater key, which signs latest.json.
