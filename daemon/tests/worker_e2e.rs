@@ -1327,4 +1327,99 @@ mod windows {
             }
         }
     }
+
+    #[tokio::test]
+    async fn real_worker_keeps_windows_powershell_interactive() {
+        let temp = tempfile::tempdir().unwrap();
+        let worker_dir = temp.path().join("workers");
+        endpoint::ensure_private_dir(&worker_dir).unwrap();
+
+        let session_id = Uuid::new_v4();
+        let launched = launch_and_connect(&worker_dir, session_id).await;
+        let (_worker, _worker_endpoint, mut stream) = match launched {
+            Ok(launched) => launched,
+            Err(error) if test_runner_denied_worker_breakaway(&error) => {
+                eprintln!(
+                    "skipping real PowerShell end-to-end case: the test runner job denies worker breakaway"
+                );
+                return;
+            }
+            Err(error) => panic!("launch worker fixture: {error:#}"),
+        };
+        let (frame_type, payload) = read_frame(&mut stream).await;
+        assert_eq!(frame_type, wire::T_HELLO);
+        let hello: wire::Hello = wire::decode_json(&payload).unwrap();
+        assert_eq!(hello.state, "awaiting_start");
+
+        // Production's login-shell resolver sends a canonical verbatim path;
+        // the worker must convert that identity-safe spelling at the final
+        // CreateProcess boundary so Windows PowerShell stays alive in ConPTY.
+        let powershell = std::fs::canonicalize(
+            Path::new(&std::env::var_os("SystemRoot").unwrap())
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe"),
+        )
+        .unwrap();
+        let spec = wire::StartSpec {
+            cwd: temp.path().to_string_lossy().into_owned(),
+            argv: vec![powershell.to_string_lossy().into_owned(), "-NoLogo".into()],
+            env: std::env::vars().collect(),
+            cols: 80,
+            rows: 24,
+        };
+        wire::write_json_frame(&mut stream, wire::T_START, &spec)
+            .await
+            .unwrap();
+        let (frame_type, payload) = read_frame(&mut stream).await;
+        assert_eq!(frame_type, wire::T_STARTED);
+        let started: wire::Started = wire::decode_json(&payload).unwrap();
+        assert!(started.pid > 1);
+
+        // Keep the marker split in the input so terminal echo cannot satisfy
+        // the assertion; only PowerShell executing the command can join it.
+        wire::write_frame(
+            &mut stream,
+            wire::T_INPUT,
+            b"Write-Output ([string]::Concat('SPAWN-','POWERSHELL-ALIVE'))\r",
+        )
+        .await
+        .unwrap();
+        let mut output = Vec::new();
+        while !output
+            .windows(b"SPAWN-POWERSHELL-ALIVE".len())
+            .any(|window| window == b"SPAWN-POWERSHELL-ALIVE")
+        {
+            let (frame_type, payload) = read_frame(&mut stream).await;
+            match frame_type {
+                wire::T_OUTPUT => {
+                    let (_, bytes) = wire::decode_output(&payload).unwrap();
+                    output.extend_from_slice(bytes);
+                }
+                wire::T_FOREGROUND => {}
+                wire::T_EXIT => panic!(
+                    "PowerShell exited before processing input: {:?}",
+                    wire::decode_json::<wire::ExitInfo>(&payload).unwrap()
+                ),
+                other => panic!("unexpected worker frame {other}"),
+            }
+        }
+
+        wire::write_frame(&mut stream, wire::T_INPUT, b"exit\r")
+            .await
+            .unwrap();
+        loop {
+            let (frame_type, payload) = read_frame(&mut stream).await;
+            match frame_type {
+                wire::T_EXIT => {
+                    let exit: wire::ExitInfo = wire::decode_json(&payload).unwrap();
+                    assert_eq!(exit.exit_code, Some(0));
+                    break;
+                }
+                wire::T_OUTPUT | wire::T_FOREGROUND => {}
+                other => panic!("unexpected worker frame {other}"),
+            }
+        }
+    }
 }
