@@ -17,6 +17,7 @@ const DOCUMENTED_URLS = [
   "/device-approval",
   "/settings",
   "/settings/account",
+  "/settings/subscription",
   "/settings/appearance",
   "/settings/notifications",
   "/settings/agents",

@@ -12,14 +12,24 @@ import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { Text } from "@/components/ui/text";
+import type { UserBilling } from "@/data/api/schemas/auth";
+import { atHostLimit, HOST_LIMIT_TITLE, hostLimitDescription } from "@/data/selectors/billing";
 import { presentShareSheet } from "@/lib/share";
-import { chrome, duration, spacing, useTheme } from "@/theme";
+import { borderWidth, chrome, duration, spacing, useTheme } from "@/theme";
 
 export interface InstallInstructionsProps {
   defaultTargetId?: InstallTargetId;
   onCommandCopied?: () => void;
   onSkip?: () => void;
   targets?: readonly InstallTarget[];
+  /**
+   * The account's plan state, so a full plan says so *before* somebody walks to
+   * another machine and installs a daemon that will be refused.
+   *
+   * Null on a deployment with billing off, which is every self-hosted install,
+   * and the notice then never appears.
+   */
+  billing?: UserBilling | null;
 }
 
 function defaultInstallTarget(): InstallTarget {
@@ -29,6 +39,7 @@ function defaultInstallTarget(): InstallTarget {
 }
 
 export function InstallInstructions({
+  billing = null,
   defaultTargetId = "unix",
   onCommandCopied,
   onSkip,
@@ -75,6 +86,28 @@ export function InstallInstructions({
 
   return (
     <View style={styles.container}>
+      {/* Said here rather than only after the refusal: the alternative is
+          someone walking to another machine, installing a daemon and finding
+          out at the approval. Account state and an action available in this
+          app — no price, no venue, no verb pointed off-platform. §6.3. */}
+      {atHostLimit(billing) ? (
+        <View
+          accessibilityRole="alert"
+          style={[
+            styles.limitNotice,
+            {
+              backgroundColor: theme.colors.muted,
+              borderColor: theme.colors.border,
+              borderRadius: theme.radii.md,
+            },
+          ]}
+          testID="host-limit-notice"
+        >
+          <Text variant="label">{HOST_LIMIT_TITLE}</Text>
+          <Text color="mutedForeground">{hostLimitDescription(billing.host_limit)}</Text>
+        </View>
+      ) : null}
+
       <View style={styles.heading}>
         <Text accessibilityRole="header" variant="title">
           Connect your first host
@@ -222,6 +255,11 @@ const styles = StyleSheet.create({
   instructionCopy: {
     flex: 1,
     gap: spacing[1],
+  },
+  limitNotice: {
+    borderWidth: borderWidth.hairline,
+    gap: spacing[1],
+    padding: spacing[3],
   },
   number: {
     alignItems: "center",

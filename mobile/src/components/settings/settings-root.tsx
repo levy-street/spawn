@@ -5,6 +5,7 @@ import { SettingsLinkRow } from "@/components/settings/settings-row";
 import { SettingsScreen } from "@/components/settings/settings-screen";
 import { SettingsSection } from "@/components/settings/settings-section";
 import { useMeSettingsQuery } from "@/data/queries/settings";
+import { billingActive } from "@/data/selectors/billing";
 import { spacing } from "@/theme";
 
 /**
@@ -13,7 +14,7 @@ import { spacing } from "@/theme";
  * headings rather than nine identical rows.
  */
 const PANEL_GROUPS = [
-  { title: "General", keys: ["account", "appearance", "notifications"] },
+  { title: "General", keys: ["account", "subscription", "appearance", "notifications"] },
   // Machines are the Legion tab's, not a setting: connecting, renaming and
   // removing one all happen there, so Settings keeps to what runs on them.
   { title: "Agents", keys: ["agents", "skills", "templates"] },
@@ -26,6 +27,11 @@ export function SettingsRoot(): React.JSX.Element {
   const router = useRouter();
   const me = useMeSettingsQuery();
   const user = me.data?.user;
+  // Billing off means no billing surface at all — the row goes with it, exactly
+  // as `is_admin` decides the Admin row below. The account's plan block is null
+  // on a deployment without billing, which is the same condition the server
+  // enforces, so a row is never drawn for a panel with nothing behind it.
+  const showsBilling = billingActive(user?.billing);
 
   return (
     <SettingsScreen root testID="settings-root" title="Settings">
@@ -39,6 +45,7 @@ export function SettingsRoot(): React.JSX.Element {
             {group.keys.map((key) => {
               const panel = PANELS_BY_KEY.get(key);
               if (panel === undefined) return null;
+              if (panel.key === "subscription" && !showsBilling) return null;
               return (
                 <SettingsLinkRow
                   icon={panel.icon}

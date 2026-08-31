@@ -113,6 +113,25 @@ describe("about and public content", () => {
     await screen.unmount();
   });
 
+  // spawnd.dev sells subscriptions now, and its own chrome reaches pricing from
+  // every page. An in-app tappable link into it is the shape App Store
+  // guideline 3.1.1 calls steering, so the download row is gone — everything it
+  // led to is on this screen already. docs/BILLING.md §6.1.
+  test("offers the install commands here rather than a link to the download page", async () => {
+    const screen = await render(
+      <ThemeProvider>
+        <AboutScreen baseUrl="https://spawn.example" nativeWindowsAvailable version="2.4.0" />
+      </ThemeProvider>,
+    );
+
+    expect(screen.queryByText("Download & install")).toBeNull();
+    expect(screen.getByText("curl -fsSL https://spawn.example/install.sh | sh")).toBeOnTheScreen();
+    // The Links section survives; it is the one row into a page that sells
+    // something that does not.
+    expect(screen.getByText("Open source")).toBeOnTheScreen();
+    await screen.unmount();
+  });
+
   test("keeps the WSL-only About state truthful before native availability", async () => {
     const screen = await render(
       <ThemeProvider>

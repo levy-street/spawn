@@ -67,6 +67,19 @@ const mockUser = {
   created_at: "2026-01-01T00:00:00Z",
   email_verified_at: "2026-01-01T00:00:00Z",
   is_admin: false,
+  // Null is what a deployment without billing sends, and what most of this file
+  // exercises: no plan block, so no Subscription row.
+  billing: null as {
+    enabled: boolean;
+    tier: string;
+    tier_name: string;
+    host_limit: number | null;
+    host_count: number;
+    over_limit: boolean;
+    status: string | null;
+    current_period_end: string | null;
+    cancel_at_period_end: boolean;
+  } | null,
 };
 
 jest.mock("@/data/queries/settings", () => ({
@@ -141,16 +154,19 @@ describe("settings panel behavior", () => {
   test("settings root renders the documented panels plus connectivity", async () => {
     const screen = await render(<SettingsRoot />, { wrapper });
 
-    expect(SETTINGS_PANELS).toHaveLength(8);
+    expect(SETTINGS_PANELS).toHaveLength(9);
     // Machines belong to the Legion tab, so Settings never lists a Hosts panel.
     expect(screen.queryByTestId("settings-panel-hosts")).toBeNull();
     for (const panel of SETTINGS_PANELS) {
+      // Billing is off in this fixture, so Subscription is deliberately absent
+      // — see the test below.
+      if (panel.key === "subscription") continue;
       expect(screen.getByTestId(`settings-panel-${panel.key}`)).toBeOnTheScreen();
     }
     // Server and About are not inventory panels but the root still owns them.
     expect(screen.getByTestId("settings-panel-server")).toBeOnTheScreen();
     expect(screen.getByTestId("settings-panel-about")).toBeOnTheScreen();
-    expect(screen.getAllByTestId(/^settings-panel-/)).toHaveLength(SETTINGS_PANELS.length + 2);
+    expect(screen.getAllByTestId(/^settings-panel-/)).toHaveLength(SETTINGS_PANELS.length + 1);
     // Hosts and Settings are bottom-nav roots and are not linked from any header;
     // Admin is a row in the list rather than a header icon, and a non-admin
     // account does not get the row at all.
@@ -161,6 +177,36 @@ describe("settings panel behavior", () => {
     expect(screen.queryByText("Terminal")).toBeNull();
     expect(screen.queryByText("Sessions")).toBeNull();
     expect(screen.queryByText("Security")).toBeNull();
+  });
+
+  // Billing off means no billing surface at all, exactly as `is_admin` decides
+  // the Admin row. A self-hosted deployment sends no plan block and gets no
+  // Subscription row; a hosted one does. docs/BILLING.md §6.4.
+  test("the Subscription row appears only where the server has billing", async () => {
+    const off = await render(<SettingsRoot />, { wrapper });
+    expect(off.queryByTestId("settings-panel-subscription")).toBeNull();
+    await off.unmount();
+
+    mockUser.billing = {
+      enabled: true,
+      tier: "coven",
+      tier_name: "Coven",
+      host_limit: 3,
+      host_count: 2,
+      over_limit: false,
+      status: "active",
+      current_period_end: "2026-09-24T00:00:00Z",
+      cancel_at_period_end: false,
+    };
+    try {
+      const on = await render(<SettingsRoot />, { wrapper });
+      const row = on.getByTestId("settings-panel-subscription");
+      expect(row).toBeOnTheScreen();
+      await fireEvent.press(row);
+      expect(mockPush).toHaveBeenCalledWith("/settings/subscription");
+    } finally {
+      mockUser.billing = null;
+    }
   });
 
   test("an admin reaches admin from a list row, never from the header", async () => {
