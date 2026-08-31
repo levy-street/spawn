@@ -339,6 +339,10 @@ mod tests {
         assert!(take_pkce_verifier().is_none());
     }
 
+    // The guard is held across the await on purpose: it serializes the
+    // process-global `PENDING_OAUTH` against the other tests in this module,
+    // which is the whole point of taking it, and no other task contends for it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_code_for_a_flow_that_started_elsewhere_is_never_exchanged() {
         let _guard = oauth_test_guard();
