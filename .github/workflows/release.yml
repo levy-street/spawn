@@ -182,7 +182,10 @@ jobs:
           # is the one place a first connection must not be trusted blindly.
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
-          printf 'Host spawnd-prod\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id_ed25519\n' \
+          # Keepalives are load-bearing: the runner's NAT drops a connection
+          # that goes quiet, and a deploy has minutes-long silent phases. The
+          # first release hung for forty minutes on exactly this.
+          printf 'Host spawnd-prod\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id_ed25519\n  ServerAliveInterval 15\n  ServerAliveCountMax 8\n' \
             "${{ vars.SPAWN_DEPLOY_HOSTNAME }}" "${{ vars.SPAWN_DEPLOY_USER }}" > ~/.ssh/config
           chmod 600 ~/.ssh/config
 

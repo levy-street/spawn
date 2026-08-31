@@ -86,6 +86,13 @@ quote_env() {
   printf '%s=%q ' "$name" "$value"
 }
 
+# A deploy spends whole minutes in phases that send nothing over the wire, and
+# a NAT between a CI runner and the host silently drops a connection that goes
+# quiet — which is how one release hung for forty minutes with the site half
+# served. Keepalives make every connection either alive or loudly dead.
+ssh() { command ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=8 "$@"; }
+scp() { command scp -o ServerAliveInterval=15 -o ServerAliveCountMax=8 "$@"; }
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=release-lib.sh
 source "$script_dir/release-lib.sh"
@@ -317,7 +324,14 @@ env_prefix="$(
   quote_env SPAWN_DEPLOY_PUBLIC_ORIGIN "$public_origin"
 )"
 
-ssh "$host" "${env_prefix}bash -se" <<'REMOTE'
+# The remote script used to be streamed to `bash -se` over stdin, so a dropped
+# connection starved bash of the rest of its own script and it stopped wherever
+# the stream ended — once, after the build and before the restart, with the old
+# assets already gone. Deliver the whole file first: how far the script runs no
+# longer depends on the connection that carried it.
+remote_script="$(ssh "$host" 'mktemp /tmp/spawn-remote-deploy.XXXXXX')" ||
+  die "could not stage the remote deploy script"
+ssh "$host" "cat > '$remote_script'" <<'REMOTE'
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
@@ -375,11 +389,17 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
   fi
 
   if command -v bun >/dev/null 2>&1; then
+    # The build lands in a staging directory and is swapped in just before the
+    # restart. Building straight into web/.next deletes the running server's
+    # own assets at build start, and every visitor gets HTML whose chunks 400
+    # until the restart — which is minutes away, not milliseconds, because the
+    # daemon compile below sits in between.
+    rm -rf web/.next.staged
     # V8 caps its own heap well below this host's RAM+swap, so a growing app
     # eventually dies with "Reached heap limit" on a machine that still has
     # memory to give. Raise the cap explicitly rather than discovering it
     # again as a failed deploy.
-    (cd web && bun install --frozen-lockfile && NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=2048}" SPAWN_API_PROXY_TARGET="$SPAWN_API_PROXY_TARGET" SPAWN_BUILD_ID="$build_id" bun run build)
+    (cd web && bun install --frozen-lockfile && NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=2048}" SPAWN_API_PROXY_TARGET="$SPAWN_API_PROXY_TARGET" SPAWN_BUILD_ID="$build_id" SPAWN_NEXT_DIST_DIR=.next.staged bun run build)
   else
     die "bun is required for web dependency sync and build"
   fi
@@ -387,7 +407,7 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
   # The build is only as good as the target it baked. Read it back out of the
   # manifest and compare: this runs BEFORE any restart, so a wrong target aborts
   # the deploy while the previous build is still the one being served.
-  manifest="web/.next/routes-manifest.json"
+  manifest="web/.next.staged/routes-manifest.json"
   [[ -f "$manifest" ]] || die "no $manifest after the web build"
   baked="$(grep -o '"destination": *"https\?://[^/"]*' "$manifest" | sed 's/.*"//' | sort -u)"
   if [[ -z "$baked" ]]; then
@@ -410,6 +430,16 @@ if [[ "$SPAWN_DEPLOY_BUILD" != "0" ]]; then
       die "cargo is required to build the hosted spawnd binary"
     fi
   fi
+
+  # Everything slow is done. The switch itself is two renames, so the running
+  # server loses its assets for milliseconds, not for a compile. The previous
+  # build stays at web/.next.prev — the rollback is one swap back.
+  rm -rf web/.next.prev
+  if [[ -d web/.next ]]; then
+    mv web/.next web/.next.prev
+  fi
+  mv web/.next.staged web/.next
+  printf 'remote deploy: swapped in the staged web build (previous kept at web/.next.prev)\n'
 fi
 
 for service in $SPAWN_DEPLOY_SERVICES; do
@@ -471,6 +501,7 @@ fi
 
 printf 'remote deploy: services updated\n'
 REMOTE
+ssh "$host" "${env_prefix}bash '$remote_script'; rc=\$?; rm -f '$remote_script'; exit \$rc"
 
 # Publish the exact release snapshot verified before deployment. Binaries land
 # through temporary names. The manifest and detached signature are copied to

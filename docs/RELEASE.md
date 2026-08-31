@@ -575,9 +575,18 @@ The script refuses to run when the release would not be what it looks like:
 
 And it checks its own work:
 
+- the web build lands in `web/.next.staged` and is swapped into `web/.next` by
+  two renames immediately before the restart, so the previous build serves
+  untouched through the whole build (including the daemon compile) and the
+  visible switch is milliseconds. The displaced build stays at
+  `web/.next.prev`; rolling back is one swap back plus a restart.
+- the remote script is delivered to a file on the host and executed from it,
+  never streamed over ssh stdin — a dropped connection now fails the deploy
+  loudly instead of silently ending the script mid-run — and every ssh/scp
+  connection carries keepalives so a NAT cannot wedge a quiet phase.
 - after the web build and **before any restart**, the proxy target actually
-  baked into `.next/routes-manifest.json` is compared against the requested
-  one; a mismatch aborts with the previous build still serving
+  baked into `.next.staged/routes-manifest.json` is compared against the
+  requested one; a mismatch aborts with the previous build still serving
 - after the restart, `/healthz` is fetched **through the web app's rewrite**,
   then an anonymous `spawn.alerts.v1` WebSocket must upgrade through the public
   origin and close with the expected 1008 auth policy code. Together they
