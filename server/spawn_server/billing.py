@@ -248,11 +248,25 @@ async def lock_account(session: AsyncSession, user_id: str) -> None:
     not against a different machine being paired by the same person a
     millisecond later.
 
-    SQLAlchemy's SQLite dialect emits no FOR UPDATE, which is correct rather
-    than a gap: the in-memory database the suite runs against has one
-    connection and cannot exhibit the race.
+    `FOR NO KEY UPDATE`, not `FOR UPDATE`, and the difference is the whole
+    function working. The transaction that asks this question has already
+    inserted into `host_key_claims`, whose foreign key makes PostgreSQL take
+    `FOR KEY SHARE` on this same `users` row — so a plain `FOR UPDATE` waits
+    on the key share every *other* concurrent pairing is holding, and two
+    daemons pairing at once deadlock outright. `FOR NO KEY UPDATE` does not
+    conflict with `FOR KEY SHARE`, and still conflicts with itself, which is
+    exactly the mutual exclusion this exists for. It is also the honest lock:
+    nothing here modifies the row's key.
+
+    SQLAlchemy's SQLite dialect emits no locking clause at all, which is
+    correct rather than a gap: the in-memory database the suite runs against
+    has one connection and cannot exhibit the race. It also means this line
+    cannot be checked by the default test run — see the PostgreSQL half of the
+    pair in `tests/test_billing_enforcement.py`.
     """
-    await session.execute(select(User.id).where(User.id == user_id).with_for_update())
+    await session.execute(
+        select(User.id).where(User.id == user_id).with_for_update(key_share=True)
+    )
 
 
 async def may_add_host(
