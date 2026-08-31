@@ -1898,7 +1898,11 @@ export function WorkspaceGrid({
           return (
             <div
               key={sessionId}
-              className="min-h-[55dvh] w-full shrink-0 overflow-hidden rounded-md border border-pane-divider"
+              // Reading height is a floor, not a size: a stack short of the
+              // fold grows to spend the whole column, so a lone pane runs
+              // full-height instead of perching above a void. Past the fold
+              // the floor wins and the stack scrolls.
+              className="min-h-[55dvh] w-full shrink-0 grow overflow-hidden rounded-md border border-pane-divider"
             >
               {widget ? (
                 <WidgetPane
