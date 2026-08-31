@@ -1,8 +1,25 @@
 name: Windows
 
+# windows-check builds the Windows daemon for real (cargo check/clippy/test plus
+# a release build and a desktop crate check) on windows-latest, which bills at
+# 2x. It used to run on an unfiltered `push:` *and* `pull_request:`, so every
+# feature-branch push spent those minutes twice — once for each event — and did
+# it even when the change was a README.
+#
+# Filtering by path rather than by branch is deliberate. Gating to `master`
+# would be cheaper still, but it would also take the Windows signal after the
+# merge rather than before it, and it would break `windows-package`: that job
+# reads `github.event.head_commit.message` for `[package]`, which exists only on
+# a push event, and it is the only way to reach the rehearsal from a branch
+# because `workflow_dispatch` cannot see this workflow off the default branch.
+# Dropping `pull_request:` removes the double-run; a PR branch still gets full
+# pre-merge coverage from its own pushes.
 "on":
   push:
-  pull_request:
+    paths:
+      - "daemon/**"
+      - "desktop/**"
+      - ".github/workflows/windows.yml"
   workflow_dispatch:
 
 concurrency:

@@ -1133,7 +1133,10 @@ standard-user accounts.
 
 1. Confirm the checkout is clean and pushed. When daemon or Windows code
    changed, require the native `windows-check` check/clippy/test and PowerShell
-   smoke to pass, plus the existing Unix suite. For a first Windows launch,
+   smoke to pass, plus the existing Unix suite. `windows-check` triggers on
+   pushes touching `daemon/**`, `desktop/**` or its own workflow, so a release
+   whose last commit changed neither will show no run — that is the filter
+   working, not a missing gate; dispatch it if you want one anyway. For a first Windows launch,
    [WINDOWS_VALIDATION.md](WINDOWS_VALIDATION.md) must be closed first. When prebuilts will be
    published, confirm the local offline daemon release-signing key is present
    and readable.
