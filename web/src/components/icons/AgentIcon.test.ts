@@ -7,6 +7,7 @@ describe("resolveAgentIcon", () => {
     expect(resolveAgentIcon("codex").icon).toBe("codex");
     expect(resolveAgentIcon("opencode").icon).toBe("opencode");
     expect(resolveAgentIcon("aider-sonnet").icon).toBe("aider");
+    expect(resolveAgentIcon("hermes").icon).toBe("hermes");
   });
 
   test("kind wins over command", () => {
@@ -16,6 +17,7 @@ describe("resolveAgentIcon", () => {
   test("falls back to command basename", () => {
     expect(resolveAgentIcon(undefined, "/usr/local/bin/claude").icon).toBe("claude-code");
     expect(resolveAgentIcon(null, "aider --model sonnet").icon).toBe("aider");
+    expect(resolveAgentIcon(null, "hermes --yolo").icon).toBe("hermes");
   });
 
   test("skips env-prefix tokens in commands", () => {
@@ -54,6 +56,7 @@ describe("agentDisplayName", () => {
   test("names known agents by brand", () => {
     expect(agentDisplayName("claude")).toBe("Claude Code");
     expect(agentDisplayName("/usr/local/bin/codex")).toBe("Codex");
+    expect(agentDisplayName("hermes")).toBe("Hermes Agent");
   });
 
   test("nothing running reads as a shell", () => {

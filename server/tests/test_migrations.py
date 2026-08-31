@@ -19,6 +19,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
+from spawn_server.agents_builtin import BUILTIN_AGENTS
 from spawn_server.db import Base
 
 SERVER_ROOT = Path(__file__).resolve().parents[1]
@@ -315,10 +316,12 @@ asyncio.run(main())
                 install
                 == "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
             )
+            # The startup seed is exactly the declared set: migrated rows plus
+            # built-ins added after 0001 (e.g. hermes, which has no migration).
             count = conn.execute(
                 text("select count(*) from agents where owner_user_id is null")
             ).scalar_one()
-            assert count == 4
+            assert count == len(BUILTIN_AGENTS)
     finally:
         engine.dispose()
 

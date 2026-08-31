@@ -2,8 +2,8 @@
 
 The `spawn` daemon. Runs on a host you control, dials WSS out to a spawn
 server, and lets that server spin up shell sessions on the host. Agent CLIs
-(claude code, codex, opencode, aider, …) are commands the UI types into those
-shells.
+(claude code, codex, opencode, aider, hermes, …) are commands the UI types
+into those shells.
 
 ## Build
 
