@@ -425,6 +425,31 @@ question about **which tree changed**, because that is what the identities at
 | `server/`, `web/` | a deploy | `deploy-prod.sh` |
 | a protocol name | all of the above, in the order below | see "The wire protocols" |
 
+`scripts/release-plan.sh` is that table executed. Given two commits it reports
+which rows are owed, so a pipeline can decide instead of a person remembering:
+
+```bash
+scripts/release-plan.sh --from <deployed commit> --to <commit being released>
+scripts/release-plan.sh --json          # for a workflow to branch on
+scripts/release-plan.sh --no-fingerprint  # offline; mobile_native becomes "unknown"
+```
+
+It compares **subtree hashes**, not paths, because a subtree hash is exactly
+the identity `/api/release` publishes for that piece — no path glob to get
+subtly wrong.
+
+The mobile row is the one worth understanding, because "did `mobile/` change"
+is the wrong question. An OTA carries JavaScript and assets, never native code,
+and it only reaches installs whose `runtimeVersion` matches — which under this
+project's `appVersion` policy means the version in `mobile/app.json`. So the
+real question is whether the tree still fits the native shell already on
+people's phones, and Expo answers it exactly: `eas fingerprint:compare` against
+the last finished production build. Matching fingerprints mean an OTA is
+enough. Differing ones mean a store build is owed — and shipping the OTA alone
+would either be refused by every install or, worse, hand them JavaScript that
+calls native code their shell does not have. Most releases do not need one;
+this is how a release knows it is one of the ones that does.
+
 Three of those rows say "you", and that is not an omission to be automated
 away later. **The offline keys never enter CI** — the Ed25519 daemon release
 key and the Tauri updater key both live on the operator Mac, and CI holds only
