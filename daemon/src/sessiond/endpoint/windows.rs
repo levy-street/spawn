@@ -52,7 +52,7 @@ use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPip
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
     InitializeProcThreadAttributeList, OpenProcess, OpenProcessToken, TerminateProcess,
-    UpdateProcThreadAttribute, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW,
+    UpdateProcThreadAttribute, CREATE_BREAKAWAY_FROM_JOB, DETACHED_PROCESS,
     EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
@@ -1235,7 +1235,13 @@ pub fn spawn_worker(
     startup.StartupInfo.hStdError = raw_handle(&nul_err);
     startup.lpAttributeList = attribute_list;
     let mut process = PROCESS_INFORMATION::default();
-    let flags = CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT;
+    // CREATE_NO_WINDOW still gives a console-subsystem worker its own classic
+    // conhost on current Windows 11 builds. It has no lasting visible window,
+    // but its creation flashes one before the worker opens the session's
+    // separate headless ConPTY. DETACHED_PROCESS prevents that first console
+    // from being allocated at all; the explicit NUL handles remain the
+    // worker's complete standard-I/O contract.
+    let flags = CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS | EXTENDED_STARTUPINFO_PRESENT;
     // SAFETY: application/command-line buffers and STARTUPINFOEX (including
     // its handle list) remain live and writable for the complete call.
     let created = unsafe {

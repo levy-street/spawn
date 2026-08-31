@@ -101,11 +101,12 @@ spawnd (host supervisor, one per host)
 - On Unix the worker is spawned with `process_group(0)`. Under systemd,
   spawnd's unit needs `KillMode=process` or workers are killed with the cgroup
   on restart. On Windows it is launched with `CREATE_BREAKAWAY_FROM_JOB` and
-  `CREATE_NO_WINDOW`; failure to break away is fatal rather than silently
-  weakening session survival. It then puts itself and subsequently created
-  ConPTY descendants in an unnamed kill-on-close Job Object. On both platforms
-  its fate is tied to the session PTY, **not** to spawnd, so supervisor restarts
-  leave the session running.
+  `DETACHED_PROCESS`; detaching prevents a classic console host from flashing
+  before the worker creates the session's headless ConPTY, and failure to break
+  away is fatal rather than silently weakening session survival. It then puts
+  itself and subsequently created ConPTY descendants in an unnamed
+  kill-on-close Job Object. On both platforms its fate is tied to the session
+  PTY, **not** to spawnd, so supervisor restarts leave the session running.
 - Worker runtime cost is scoped per session: a tokio runtime pinned to 2 threads,
   two blocking PTY I/O threads, and headless primary/alternate screen grids
   whose size follows the current terminal geometry. It does not retain a

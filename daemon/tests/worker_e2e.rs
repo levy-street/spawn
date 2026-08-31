@@ -1127,14 +1127,62 @@ cat
 mod windows {
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::OsStringExt;
     use std::path::Path;
     use std::time::Duration;
 
     use spawnd::sessiond::{endpoint, wire, worker};
     use uuid::Uuid;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
 
     const WORKER_BIN: &str = env!("CARGO_BIN_EXE_spawn-worker");
     const STEP_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn direct_child_process_names(parent_pid: u32) -> Vec<OsString> {
+        // SAFETY: the snapshot has no borrowed inputs and is closed below.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        assert_ne!(
+            snapshot,
+            INVALID_HANDLE_VALUE,
+            "creating process snapshot failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: `entry` has the documented size and remains live for the
+        // complete enumeration; `snapshot` is a live process snapshot.
+        let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) };
+        if has_entry == 0 {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: `snapshot` is owned by this function and still live.
+            unsafe { CloseHandle(snapshot) };
+            panic!("reading process snapshot failed: {error}");
+        }
+
+        let mut names = Vec::new();
+        while has_entry != 0 {
+            if entry.th32ParentProcessID == parent_pid {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                names.push(OsString::from_wide(&entry.szExeFile[..end]));
+            }
+            // SAFETY: same initialized entry and live snapshot as above.
+            has_entry = unsafe { Process32NextW(snapshot, &mut entry) };
+        }
+        // SAFETY: `snapshot` is owned by this function and closed exactly once.
+        unsafe { CloseHandle(snapshot) };
+        names
+    }
 
     fn test_runner_denied_worker_breakaway(error: &anyhow::Error) -> bool {
         let breakaway_denied = error
@@ -1336,7 +1384,7 @@ mod windows {
 
         let session_id = Uuid::new_v4();
         let launched = launch_and_connect(&worker_dir, session_id).await;
-        let (_worker, _worker_endpoint, mut stream) = match launched {
+        let (worker, _worker_endpoint, mut stream) = match launched {
             Ok(launched) => launched,
             Err(error) if test_runner_denied_worker_breakaway(&error) => {
                 eprintln!(
@@ -1376,6 +1424,20 @@ mod windows {
         assert_eq!(frame_type, wire::T_STARTED);
         let started: wire::Started = wire::decode_json(&payload).unwrap();
         assert!(started.pid > 1);
+
+        // CreatePseudoConsole intentionally starts one headless conhost for
+        // the remote terminal. A second conhost is the worker's own classic
+        // console, which briefly presents a local window during session.create.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let children = direct_child_process_names(worker.pid);
+        let console_hosts = children
+            .iter()
+            .filter(|name| name.eq_ignore_ascii_case(OsStr::new("conhost.exe")))
+            .count();
+        assert!(
+            console_hosts <= 1,
+            "detached worker created a classic console host beside ConPTY: {children:?}"
+        );
 
         // Keep the marker split in the input so terminal echo cannot satisfy
         // the assertion; only PowerShell executing the command can join it.
