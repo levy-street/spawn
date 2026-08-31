@@ -468,6 +468,51 @@ a printed reminder, which is a step that gets skipped on exactly the release
 where it mattered, and fails silently — the two frontends drift while
 everything looks fine.
 
+### The master pipeline, and the one decision it puts in front of you
+
+`.github/workflows/release.yml` runs on every push to `master`. It calls
+`release-plan.sh` first and gates every job on the answer, so a docs-only push
+finishes in seconds and a daemon-only push deploys without touching the phone.
+The order inside it is the forced one described above: prebuilts land before
+the server that advertises them, and the OTA goes after the server is up.
+
+It is wired but **not armed**, and that is deliberate, because arming it is a
+security decision only the person holding the keys can make.
+
+Everything above says the offline keys never enter CI: the Ed25519 daemon
+release key and the Tauri updater key live on the operator's Mac, and that
+split is what stops one compromised CI run from shipping a daemon to every
+machine in the fleet. A fully automatic master release cannot honour that
+split, because publishing prebuilts *means* signing a manifest. So:
+
+| `SPAWN_RELEASE_SIGNING_KEY` | what you get | what you accept |
+| --- | --- | --- |
+| unset (today) | the deploy job fails fast and says so; releases are run by hand from the operator Mac | nothing changes |
+| set | a push to master deploys, publishes the signed manifest and the OTA with no human step | GitHub becomes a root of trust for daemon auto-update — anything that can run a workflow on `master` can sign a build that every host installs and runs as a service |
+
+That is not an argument against setting it. It is the thing to have decided on
+purpose rather than discovered later. If you set it, treat the key as
+CI-exposed: rotate it on any suspicion, keep the `production` environment's
+branch policy to `master`, and remember that the daemon's pinned key list in
+`release_key.rs` is what makes rotation possible at all.
+
+Desktop publication is deliberately left to a person even when the key question
+is settled, because `latest.json` is assembled from artifacts a human has
+looked at. The job prints exactly what to run.
+
+The pipeline needs these, none of which exist yet:
+
+- a `production` GitHub environment with its deployment branch policy set to
+  `master` (the same custom-branch-policy shape the signing environments use —
+  `protected_branches` matches nothing here, see the note above)
+- `EXPO_TOKEN` — an Expo access token. Local runs need none because
+  `~/.expo/state.json` holds a session; CI has no session.
+- `SPAWN_DEPLOY_SSH_KEY` and `SPAWN_DEPLOY_KNOWN_HOSTS` — a deploy key for the
+  production host and its pinned host key. The workflow never scans: trusting a
+  host key on first connection is the one thing a production deploy must not do.
+- repository variables `SPAWN_DEPLOY_HOSTNAME` and `SPAWN_DEPLOY_USER`
+- `SPAWN_RELEASE_SIGNING_KEY`, per the table above
+
 ### Things that will bite you off master
 
 `workflow_dispatch` only sees workflows that exist on the **default branch**.
