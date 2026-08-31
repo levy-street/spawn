@@ -202,6 +202,16 @@ fn error_detail(status: StatusCode, bytes: &[u8]) -> String {
         .and_then(|value| value.get("detail").cloned())
         .map(|value| match value {
             serde_json::Value::String(text) => text,
+            // A refusal the server states as a machine code and some numbers
+            // rather than as prose — the billing ones. It does that precisely
+            // so the client owns every word a person reads, and the code is the
+            // whole of what it means; rendering the raw JSON object would put
+            // `{"code":"host_limit","tier":…}` on screen.
+            serde_json::Value::Object(ref fields) => fields
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string()),
             other => other.to_string(),
         })
         .filter(|text| !text.trim().is_empty())
@@ -217,5 +227,43 @@ fn error_detail(status: StatusCode, bytes: &[u8]) -> String {
         format!("too many requests: {detail}")
     } else {
         detail
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_prose_detail_is_shown_as_the_server_wrote_it() {
+        let seen = error_detail(
+            StatusCode::FORBIDDEN,
+            br#"{"detail": "that invite has been used"}"#,
+        );
+        assert_eq!(seen, "that invite has been used");
+    }
+
+    #[test]
+    fn a_structured_refusal_reads_as_its_machine_code() {
+        // `POST /api/auth/device/approve` refuses a host past the account's
+        // limit with a code and three numbers, deliberately carrying no prose:
+        // the wizard writes the sentence, from the code.
+        let seen = error_detail(
+            StatusCode::PAYMENT_REQUIRED,
+            br#"{"detail": {"code": "host_limit", "tier": "free", "host_limit": 1, "host_count": 1}}"#,
+        );
+        assert_eq!(seen, "host_limit");
+    }
+
+    #[test]
+    fn a_rate_limit_stays_recognisable() {
+        let seen = error_detail(StatusCode::TOO_MANY_REQUESTS, br#"{"detail": "slow down"}"#);
+        assert_eq!(seen, "too many requests: slow down");
+    }
+
+    #[test]
+    fn a_body_with_no_detail_at_all_still_says_something() {
+        let seen = error_detail(StatusCode::BAD_GATEWAY, b"");
+        assert!(seen.contains("502"), "unexpected: {seen}");
     }
 }
