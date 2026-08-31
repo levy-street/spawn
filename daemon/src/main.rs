@@ -50,6 +50,7 @@ use cli::{Cli, Command};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    detach_background_console();
     if cli::print_top_help_if_requested() {
         return Ok(());
     }
@@ -122,6 +123,35 @@ async fn main() -> anyhow::Result<()> {
     }
     result
 }
+
+#[cfg(windows)]
+fn detach_background_console() {
+    use std::ffi::OsStr;
+    use windows_sys::Win32::System::Console::FreeConsole;
+
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let internal_background = args
+        .iter()
+        .any(|arg| arg == OsStr::new("__watchdog") || arg == OsStr::new("__update-handoff"));
+    let background_run = args.iter().any(|arg| arg == OsStr::new("run"))
+        && args
+            .iter()
+            .any(|arg| arg == OsStr::new("--background-service"));
+    if internal_background || background_run {
+        // Run-key and interactive-token Task Scheduler launches may allocate a
+        // console before Rust starts. Detach immediately; prepare_background_log
+        // then observes that there is no console and redirects diagnostics to
+        // the protected per-instance log.
+        // SAFETY: FreeConsole takes no pointers. Failure only means this process
+        // was already detached, which is the desired state.
+        unsafe {
+            FreeConsole();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn detach_background_console() {}
 
 fn init_tracing(verbose: u8) {
     use tracing_subscriber::{fmt, EnvFilter};
