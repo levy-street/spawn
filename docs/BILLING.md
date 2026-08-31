@@ -1005,6 +1005,23 @@ not "Apple forbids it":
 with no App Store resubmission — and flipping it back turns it off the same day,
 which matters more, because a binary already in the store cannot be recalled.
 
+> **As built, the flag is advertised and parsed, and nothing consults it,
+> because no upgrade affordance ships at all.** That is a deliberate departure
+> from the paragraph above and it is the stronger reading of its own argument.
+> The half that matters is being able to turn the link *off* the same day; with
+> no link in the binary there is nothing to turn off, and a dormant purchase
+> path sitting inside a shipped app buys nothing until the day it is wanted.
+> This is an Expo app, so adding the affordance is a JavaScript change that
+> reaches phones through `eas update` — still no App Store resubmission, which
+> is the requirement the flag existed to satisfy. The flag stays in
+> `/api/auth/config` and stays parsed so the contract is ready; the day the law
+> settles, the affordance and the flag land together.
+>
+> `BillingConfigSchema` in `mobile/` also **omits `tiers` deliberately**. Zod
+> strips what it does not name, so the catalogue — and therefore every price —
+> never enters the app's memory at all. The bright line below is then a
+> property of the data model rather than a rule someone has to keep.
+
 **The bright line, in code review terms:** no string in `mobile/` contains a
 price, and no `Linking.openURL` / `expo-web-browser` call in a billing context
 targets a checkout or pricing URL, while `mobile_upgrade_link` is false.
@@ -1523,7 +1540,7 @@ The checklist. Every surface that touches this feature, and what it does.
 | `components/hosts/connect-host.tsx:1069` | **the hard block + CTA** (all 3 routes) |
 | `lib/pairing-errors.ts:3,10,24` | `host_limit` code + copy |
 | `app/legion/page.tsx:70,92,122,141` | soft at-capacity states |
-| plan-change + host-selection flow *(new)* | §5.6 |
+| plan-change + host-selection flow *(new)* | §5.6 — shipped as `components/settings/plan-change-dialog.tsx` with `components/hosts/host-keep-picker.tsx` and `components/hosts/host-limit-reconciliation.tsx`, all in directories `web/CLAUDE.md` already names |
 | `app/admin` | comp control |
 | `tests/e2e/app-mocks.ts:1848`, `settings-modal.spec.ts:3` | eight tabs; rename the spec |
 
@@ -1535,7 +1552,7 @@ The checklist. Every surface that touches this feature, and what it does.
 | `app/(drawer)/_layout.tsx:23` | `APP_ROUTE_MAP` |
 | `components/onboarding/host-pairing-step.tsx:254` | limit copy |
 | `components/onboarding/install-instructions.tsx:76` | pre-empt copy |
-| `data/api/schemas/auth.ts:50` | `billing_enabled` **with `.default(false)`** |
+| `data/api/schemas/auth.ts:50` | the billing block **with `.default(false)`**; `tiers` deliberately not parsed |
 | `UserOut` schema | optional subscription fields (launch-path safety) |
 | `__tests__/route-map.test.ts`, `panel-behavior.test.tsx` | updated |
 
