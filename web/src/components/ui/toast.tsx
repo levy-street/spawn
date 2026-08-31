@@ -22,6 +22,25 @@ import { cn } from "@/lib/utils";
  */
 export type ToastKind = "info" | "error";
 
+/** A button on the notice itself, for a notice that asks rather than tells. */
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+  /** `primary` is the one the notice is recommending. */
+  variant?: "primary" | "secondary";
+}
+
+/**
+ * How far along, when a notice is reporting work rather than an event.
+ *
+ * `"indeterminate"` is a bar that moves without claiming a position, and is
+ * the honest answer nearly everywhere: the daemon reports update *state* and
+ * no byte counts, and `expo-updates` exposes no progress at all. A number is
+ * only ever passed where something real is being counted — the desktop app's
+ * updater, which hands us bytes downloaded against a content length.
+ */
+export type ToastProgress = "indeterminate" | number;
+
 export interface ToastOptions {
   /** Second line, dimmer — context rather than outcome. */
   detail?: string;
@@ -34,6 +53,17 @@ export interface ToastOptions {
   onClick?: () => void;
   /** Accessible name for that action, e.g. "Open Claude Code". */
   actionLabel?: string;
+  /**
+   * Stays until something dismisses it. For a notice about a *condition*
+   * rather than an event — an update waiting to be taken is still waiting
+   * five seconds later, and a notice that expires on its own has told the
+   * person nothing they can act on.
+   */
+  persistent?: boolean;
+  /** Buttons on the notice. Rendered under the text, primary last. */
+  actions?: ToastAction[];
+  /** Draws a progress bar under the text. */
+  progress?: ToastProgress;
 }
 
 type Toast = {
@@ -44,6 +74,9 @@ type Toast = {
   icon?: ReactNode;
   onClick?: () => void;
   actionLabel?: string;
+  persistent?: boolean;
+  actions?: ToastAction[];
+  progress?: ToastProgress;
   expiresAt: number;
   /** Playing its exit animation; removed a beat later. */
   leaving?: boolean;
@@ -72,11 +105,13 @@ function durationFor(kind: ToastKind, options?: ToastOptions): number {
   return kind === "error" ? ERROR_MS : INFO_MS;
 }
 
-function push(kind: ToastKind, message: string, options?: ToastOptions) {
+function push(kind: ToastKind, message: string, options?: ToastOptions): number {
   const text = message.trim();
-  if (!text) return;
+  if (!text) return 0;
   const now = Date.now();
   const ttl = durationFor(kind, options);
+  // A persistent notice never expires, so it carries no deadline to refresh.
+  const expiresAt = options?.persistent ? Number.POSITIVE_INFINITY : now + ttl;
   const duplicate = toasts.find(
     (item) =>
       !item.leaving &&
@@ -86,9 +121,9 @@ function push(kind: ToastKind, message: string, options?: ToastOptions) {
   );
   if (duplicate) {
     // Refresh rather than repeat: the same event keeps one toast alive.
-    toasts = toasts.map((item) => (item === duplicate ? { ...item, expiresAt: now + ttl } : item));
+    toasts = toasts.map((item) => (item === duplicate ? { ...item, expiresAt } : item));
     emit();
-    return;
+    return duplicate.id;
   }
   const entry: Toast = {
     id: nextId++,
@@ -98,20 +133,33 @@ function push(kind: ToastKind, message: string, options?: ToastOptions) {
     icon: options?.icon,
     onClick: options?.onClick,
     actionLabel: options?.actionLabel,
-    expiresAt: now + ttl,
+    persistent: options?.persistent,
+    actions: options?.actions,
+    progress: options?.progress,
+    expiresAt,
   };
   // Keep the newest MAX_VISIBLE. Anything already on its way out does not
   // count against the budget, so a burst never shows a half-faded corpse in
   // place of a live notice.
+  //
+  // Persistent notices are held back from eviction first. One of them is a
+  // condition someone still has to answer — an update waiting to be taken —
+  // and losing it to a burst of five transient notices would silently drop
+  // the only notice on screen that was asking a question.
   const live = toasts.filter((item) => !item.leaving);
   const leaving = toasts.filter((item) => item.leaving);
-  const kept = [...live, entry].slice(-MAX_VISIBLE);
+  const candidates = [...live, entry];
+  const sticky = candidates.filter((item) => item.persistent);
+  const transient = candidates.filter((item) => !item.persistent);
+  const room = Math.max(0, MAX_VISIBLE - sticky.length);
+  const kept = [...sticky, ...transient.slice(-room)];
   const evicted = live
     .filter((item) => !kept.includes(item))
     .map((item) => ({ ...item, leaving: true }));
   toasts = [...leaving, ...evicted, ...kept];
   emit();
   for (const item of evicted) scheduleRemoval(item.id);
+  return entry.id;
 }
 
 /** Begin the exit animation; the row leaves the DOM after EXIT_MS. */
@@ -130,11 +178,30 @@ function scheduleRemoval(id: number) {
   }, EXIT_MS);
 }
 
-export function toast(message: string, options?: ToastOptions): void {
-  push("info", message, options);
+/** Returns the notice's id, which a persistent one needs to update or drop. */
+export function toast(message: string, options?: ToastOptions): number {
+  return push("info", message, options);
 }
-toast.error = (message: string, options?: ToastOptions): void => {
-  push("error", message, options);
+toast.error = (message: string, options?: ToastOptions): number => {
+  return push("error", message, options);
+};
+/**
+ * Change a notice already on screen, in place.
+ *
+ * A notice that is reporting work has to be able to move — "update available"
+ * becomes "updating…" with a bar, and then goes away — and re-pushing would
+ * animate a new row in beside the old one rather than changing this one.
+ * Unknown ids are ignored: the notice may have been dismissed by hand while
+ * the work that owns it was still running.
+ */
+toast.update = (id: number, patch: Partial<Omit<ToastOptions, "durationMs">>): void => {
+  const target = toasts.find((item) => item.id === id && !item.leaving);
+  if (!target) return;
+  toasts = toasts.map((item) => (item.id === id ? { ...item, ...patch } : item));
+  emit();
+};
+toast.dismiss = (id: number): void => {
+  dismiss(id);
 };
 
 function subscribe(listener: () => void): () => void {
@@ -151,7 +218,12 @@ export function ToastHost() {
   const items = useSyncExternalStore(subscribe, snapshot, snapshot);
 
   useEffect(() => {
-    const live = items.filter((item) => !item.leaving);
+    // A persistent notice has an infinite deadline, so it is not merely
+    // skipped here — it must not be the one the timer is scheduled against,
+    // or setTimeout would be handed Infinity and nothing would ever expire.
+    const live = items.filter(
+      (item) => !item.leaving && item.expiresAt !== Number.POSITIVE_INFINITY,
+    );
     if (live.length === 0) return;
     const soonest = Math.min(...live.map((item) => item.expiresAt));
     const timer = window.setTimeout(
@@ -224,6 +296,26 @@ export function ToastHost() {
                   {item.detail}
                 </p>
               ) : null}
+              {item.progress !== undefined ? <ToastProgressBar progress={item.progress} /> : null}
+              {item.actions?.length ? (
+                <div className="mt-2 flex flex-wrap justify-end gap-1.5">
+                  {item.actions.map((action) => (
+                    <button
+                      key={action.label}
+                      type="button"
+                      onClick={action.onClick}
+                      className={cn(
+                        "rounded-md px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                        action.variant === "primary"
+                          ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                          : "border border-border text-muted-foreground hover:bg-accent hover:text-foreground",
+                      )}
+                    >
+                      {action.label}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
             </div>
           )}
           <button
@@ -236,6 +328,48 @@ export function ToastHost() {
           </button>
         </div>
       ))}
+    </div>
+  );
+}
+
+/**
+ * The bar under a notice that is reporting work.
+ *
+ * Indeterminate is a stripe that travels the track: it says "still going"
+ * without claiming a position, which is all we honestly know for a daemon
+ * update (the daemon reports state, never byte counts) or a mobile OTA.
+ * A number is only passed where something real is counted, and is clamped
+ * because a content-length that disagrees with the bytes actually delivered
+ * should not paint outside the track.
+ */
+export function ToastProgressBar({ progress }: { progress: ToastProgress }) {
+  const determinate = typeof progress === "number";
+  const percent = determinate ? Math.max(0, Math.min(100, Math.round(progress))) : undefined;
+  return (
+    <div className="mt-2 flex items-center gap-2">
+      <div
+        role="progressbar"
+        aria-valuemin={determinate ? 0 : undefined}
+        aria-valuemax={determinate ? 100 : undefined}
+        aria-valuenow={percent}
+        aria-valuetext={determinate ? `${percent}%` : "in progress"}
+        className="relative h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted"
+      >
+        {determinate ? (
+          <div
+            className="h-full rounded-full bg-primary transition-[width] duration-300 ease-swift"
+            style={{ width: `${percent}%` }}
+          />
+        ) : (
+          // Reduced motion keeps a still, part-filled track: the notice's own
+          // text is what carries the meaning, and a frozen stripe reads as
+          // stalled (DESIGN.md rule 6 — nothing depends on the animation).
+          <div className="h-full w-1/3 rounded-full bg-primary motion-safe:animate-toast-progress motion-reduce:w-1/2" />
+        )}
+      </div>
+      {determinate ? (
+        <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{percent}%</span>
+      ) : null}
     </div>
   );
 }

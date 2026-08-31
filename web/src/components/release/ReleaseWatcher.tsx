@@ -146,6 +146,15 @@ export function ReleaseWatcher() {
 
   if (stalePrompt === "none") return null;
 
+  // A hard prompt is not a suggestion. It only ever comes from the server
+  // refusing this client at the handshake — `protocol.required`, the
+  // fleet-wide cutover in docs/RELEASE.md — which means this tab genuinely
+  // cannot talk to the server any more. There is nothing to weigh up and no
+  // "later" that works, so it takes the whole screen and gets on with it.
+  if (stalePrompt === "hard") {
+    return <ForcedUpdateOverlay seconds={seconds} />;
+  }
+
   return (
     <Dialog open>
       <DialogContent
@@ -159,23 +168,74 @@ export function ReleaseWatcher() {
           <DialogDescription>
             Reload to pick up the new version. Open terminals reconnect on their own.
           </DialogDescription>
-          {stalePrompt === "hard" && (
-            <p className="pt-2 text-xs font-medium tabular-nums text-foreground" role="status">
-              Reloading in {seconds} s…
-            </p>
-          )}
         </DialogHeader>
         <DialogFooter>
-          {stalePrompt === "soft" && (
-            <Button type="button" variant="outline" size="sm" onClick={snooze}>
-              Later
-            </Button>
-          )}
+          <Button type="button" variant="outline" size="sm" onClick={snooze}>
+            Later
+          </Button>
           <Button type="button" size="sm" onClick={() => void reloadClient()}>
             Reload
           </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/**
+ * The whole screen, while a required update is taken.
+ *
+ * This is the one update the person does not get to decline. It appears only
+ * on a protocol refusal: the server has closed the socket saying it will not
+ * speak this client's version, so every other surface in the app is already
+ * dead — a dismissible notice over a broken app would be a lie about what
+ * still works.
+ *
+ * It is deliberately not a Dialog. A dialog implies something behind it that
+ * you could go back to, and there isn't.
+ *
+ * The bar is time against the countdown, which is a real quantity — how long
+ * until this tab reloads — rather than an invented download percentage.
+ */
+function ForcedUpdateOverlay({ seconds }: { seconds: number }) {
+  const total = 10;
+  const elapsed = Math.max(0, Math.min(total, total - seconds));
+  const percent = Math.round((elapsed / total) * 100);
+  return (
+    <div
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="forced-update-title"
+      aria-describedby="forced-update-body"
+      className="fixed inset-0 z-[200] grid place-items-center bg-background/95 p-6 backdrop-blur-sm"
+    >
+      <div className="w-full max-w-sm text-center">
+        <h2 id="forced-update-title" className="text-base font-medium text-foreground">
+          SPAWN D needs to update
+        </h2>
+        <p id="forced-update-body" className="mt-2 text-sm text-muted-foreground">
+          This version can no longer talk to the server. Updating now — open terminals reconnect on
+          their own.
+        </p>
+        <div
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={percent}
+          className="mt-5 h-1.5 w-full overflow-hidden rounded-full bg-muted"
+        >
+          <div
+            className="h-full rounded-full bg-primary transition-[width] duration-1000 ease-linear"
+            style={{ width: `${percent}%` }}
+          />
+        </div>
+        <p className="mt-3 text-xs tabular-nums text-muted-foreground" role="status">
+          Reloading in {seconds} s…
+        </p>
+        <Button type="button" size="sm" className="mt-5" onClick={() => void reloadClient()}>
+          Reload now
+        </Button>
+      </div>
+    </div>
   );
 }
