@@ -242,7 +242,7 @@ fn send_once(name: &str, deadline: std::time::Instant) -> Result<std::fs::File> 
         match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&name)
+            .open(name)
         {
             Ok(pipe) => break pipe,
             Err(error)
