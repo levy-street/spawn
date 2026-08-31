@@ -134,7 +134,12 @@ jobs:
     # The Key Vault federated credential is scoped to this environment; without
     # it the OIDC subject does not match and azure/login is refused. The
     # environment permits only `master`, so this job cannot sign from a branch.
+    # The `if` is not redundant with that: without it a branch dispatch *fails*
+    # here rather than skipping, which reads as a broken pipeline instead of a
+    # job that had nothing to do. The macOS job above says the same thing the
+    # same way.
     environment: windows-code-signing
+    if: github.ref == 'refs/heads/master'
     permissions:
       contents: read
       id-token: write
