@@ -226,9 +226,11 @@ async fn finish_auth(origin: &str, response: TokenResponse) -> Result<AuthOutcom
     {
         bail!("Registered device does not match the local identity")
     }
-    let approval_required = before
-        .iter()
-        .any(|device| device.id != registered.id && device.revoked_at.is_none() && !device.is_root);
+    let hosts: serde_json::Value = api
+        .authenticated_get("/api/hosts")
+        .await
+        .context("checking this account's hosts")?;
+    let approval_required = approval_is_required(&before, &registered.id, &hosts);
     if approval_required {
         let _: serde_json::Value = api
             .authenticated_json(
@@ -274,6 +276,60 @@ async fn finish_auth(origin: &str, response: TokenResponse) -> Result<AuthOutcom
         approval_required,
         email_verified: response.user.email_verified_at.is_some(),
     })
+}
+
+/// Whether registering this device must wait on another device's approval.
+///
+/// Only when one is grantable: an approval is granted from a device a host
+/// trusts, so an account with zero hosts has nobody who could answer, and the
+/// gate would deadlock a fresh install. Nothing is lost by skipping it there —
+/// with no hosts there is nothing an approval protects, and the first
+/// possession pins the possessing device directly, exactly how the web
+/// bootstraps.
+fn approval_is_required(
+    devices: &[BrowserDevice],
+    registered_id: &str,
+    hosts: &serde_json::Value,
+) -> bool {
+    any_hosts(hosts)
+        && devices.iter().any(|device| {
+            device.id != registered_id && device.revoked_at.is_none() && !device.is_root
+        })
+}
+
+/// `/api/hosts` answers a bare array today; read the wrapped form too, as
+/// `install.rs` does when it watches for the pinned host.
+fn any_hosts(hosts: &serde_json::Value) -> bool {
+    hosts
+        .as_array()
+        .or_else(|| hosts.get("hosts").and_then(serde_json::Value::as_array))
+        .is_some_and(|entries| !entries.is_empty())
+}
+
+/// The device gate, re-asked for an install that is already signed in.
+///
+/// An earlier release required approval whenever another device existed, even
+/// when no host could grant one, and recorded that in `device_approved` — so a
+/// deadlocked install stays deadlocked across updates unless the question is
+/// asked again. When approval is not grantable, record the device as approved,
+/// as `finish_auth` now decides at sign-in, and let the wizard move on.
+pub async fn device_gate_needed() -> Result<bool> {
+    let preferences = storage::load_preferences()?;
+    if preferences.device_approved {
+        return Ok(false);
+    }
+    let api = ApiClient::new(&preferences.server_origin)?;
+    let hosts: serde_json::Value = api
+        .authenticated_get("/api/hosts")
+        .await
+        .context("checking this account's hosts")?;
+    if any_hosts(&hosts) {
+        return Ok(true);
+    }
+    let mut updated = preferences;
+    updated.device_approved = true;
+    storage::save_preferences(&updated)?;
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -384,6 +440,55 @@ mod tests {
         assert_eq!(parsed.providers.len(), 2);
         assert_eq!(parsed.providers[1].id, "apple");
         assert!(parsed.email_verification_required && parsed.invite_only);
+    }
+
+    #[test]
+    fn approval_is_only_required_when_a_host_could_grant_it() {
+        let device = |id: &str, revoked: bool, is_root: bool| BrowserDevice {
+            id: id.into(),
+            key_algorithm: "ed25519".into(),
+            public_key: "k".into(),
+            label: None,
+            revoked_at: revoked.then(|| "2026-01-01T00:00:00Z".into()),
+            is_root,
+        };
+        let devices = vec![device("other", false, false), device("this", false, false)];
+        let hosts = serde_json::json!([{ "id": "host-1" }]);
+        assert!(approval_is_required(&devices, "this", &hosts));
+        // Zero hosts: nobody could grant an approval, so none is asked for —
+        // requiring one anyway deadlocked every fresh install on such an
+        // account.
+        assert!(!approval_is_required(
+            &devices,
+            "this",
+            &serde_json::json!([])
+        ));
+        assert!(!approval_is_required(
+            &devices,
+            "this",
+            &serde_json::json!({ "hosts": [] })
+        ));
+        assert!(approval_is_required(
+            &devices,
+            "this",
+            &serde_json::json!({ "hosts": [{}] })
+        ));
+        // Only another live, non-root device counts as an approver.
+        assert!(!approval_is_required(
+            &[device("this", false, false)],
+            "this",
+            &hosts
+        ));
+        assert!(!approval_is_required(
+            &[device("other", true, false), device("this", false, false)],
+            "this",
+            &hosts
+        ));
+        assert!(!approval_is_required(
+            &[device("other", false, true), device("this", false, false)],
+            "this",
+            &hosts
+        ));
     }
 
     #[test]
