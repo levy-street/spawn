@@ -9,6 +9,7 @@ import {
   sanitizeIceServers,
   sessionRtcTuple,
   socketCloseAction,
+  watchSuspendResume,
 } from "./ws";
 
 const SESSION_ID = "00000000-0000-4000-8000-000000000001";
@@ -103,6 +104,36 @@ describe("rtcBindingFrameMatches", () => {
 });
 
 describe("connection reliability helpers", () => {
+  test("suspend watcher fires only when the clock provably jumped", async () => {
+    // The helper no-ops without a window (SSR); this file runs without a DOM.
+    (globalThis as { window?: object }).window ??= {};
+    let now = 1_000_000;
+    let resumed = 0;
+    const stop = watchSuspendResume(
+      () => {
+        resumed += 1;
+      },
+      5,
+      45_000,
+      () => now,
+    );
+    // Ordinary ticks: the clock moves with the timer, no jump.
+    await Bun.sleep(20);
+    expect(resumed).toBe(0);
+    // The machine slept: the next tick sees far more wall clock than the
+    // interval could explain.
+    now += 120_000;
+    await Bun.sleep(20);
+    expect(resumed).toBe(1);
+    // One suspend fires once, not once per tick after it.
+    await Bun.sleep(20);
+    expect(resumed).toBe(1);
+    stop();
+    now += 240_000;
+    await Bun.sleep(20);
+    expect(resumed).toBe(1);
+  });
+
   test("keeps jitter inside the documented bounds and applies the cap", () => {
     expect(backoffDelay(0, { base: 500, cap: 30_000 }, () => 0)).toBe(350);
     expect(backoffDelay(0, { base: 500, cap: 30_000 }, () => 1)).toBeCloseTo(650);
