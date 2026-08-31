@@ -10,6 +10,7 @@ describe("pairing error catalogue", () => {
       "key_conflict",
       "pin_conflict",
       "pin_limit",
+      "host_limit",
     ] as const) {
       expect(pairingFailureMessage(new ApiError(409, code, code))).toBe(PAIRING_FAILURE_COPY[code]);
     }
@@ -27,6 +28,40 @@ describe("pairing error catalogue", () => {
     expect(
       pairingFailureCode(new ApiError(409, "http_409", "Conflict", { error: "key_conflict" })),
     ).toBe("key_conflict");
+  });
+
+  test("reads host_limit out of the 402's structured body", () => {
+    // What `billing.limit_error_detail` sends: a machine code and three
+    // numbers, arriving as FastAPI's `detail` object rather than a string.
+    const error = new ApiError(402, "http_402", "Payment Required", {
+      code: "host_limit",
+      tier: "coven",
+      host_limit: 3,
+      host_count: 3,
+    });
+    expect(pairingFailureCode(error)).toBe("host_limit");
+    expect(pairingFailureMessage(error)).toBe(PAIRING_FAILURE_COPY.host_limit);
+  });
+
+  test("reads host_limit out of the daemon poll's bare error shape", () => {
+    expect(
+      pairingFailureCode(new ApiError(400, "http_400", "Bad Request", { error: "host_limit" })),
+    ).toBe("host_limit");
+  });
+
+  test("never confuses the two codes ending in limit", () => {
+    // Both contain "limit", and the catalogue matches on substrings — so the
+    // needle has to be the whole code. A browser cap must never read as a
+    // plan cap, or a person would be sold a subscription to fix the wrong
+    // problem.
+    expect(pairingFailureCode(new ApiError(409, "http_409", "refused: host_limit"))).toBe(
+      "host_limit",
+    );
+    expect(pairingFailureCode(new ApiError(409, "http_409", "refused: pin_limit"))).toBe(
+      "pin_limit",
+    );
+    // A bare "limit" is neither, and guessing would be worse than silence.
+    expect(pairingFailureCode(new ApiError(409, "http_409", "over the limit"))).toBeNull();
   });
 
   test("leaves unrelated network and validation errors alone", () => {

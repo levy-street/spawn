@@ -319,6 +319,11 @@ export function OnboardingFlow() {
                 onHostOnline={onHostOnline}
                 frameless
                 autoLoadFromUrl={approvalFromLink}
+                // No paywall here, ever (docs/BILLING.md §5.8). The first host
+                // is free on every tier, so this wall cannot honestly be hit —
+                // and meeting one before your first machine is even online
+                // would be the worst possible introduction to the product.
+                billingBlock={false}
                 onPairingApproved={() => {
                   // The ceremony is spent. Leaving `?ref=` on the URL means any
                   // later remount auto-loads a consumed approval, which fails

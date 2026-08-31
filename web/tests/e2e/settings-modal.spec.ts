@@ -1,24 +1,45 @@
 import { expect, test } from "@playwright/test";
 import { agent, host, mockApp, openSettings, USER_ID, user, windowsHost } from "./app-mocks";
 
-test("all seven settings tabs open", async ({ page }) => {
-  await mockApp(page);
+// "Browser devices" and "Device trust" were two tabs before the mesh; both
+// now live on the single Access tab (docs/TRUST_UX.md).
+const TABS_WITHOUT_BILLING = [
+  ["Account", "Account"],
+  ["Appearance", "Appearance"],
+  ["Notifications", "Notifications"],
+  ["Agents", "Agents"],
+  ["Skills", "Skills"],
+  ["Templates", "Workspace templates"],
+  ["Access", "Access"],
+] as const;
+
+test("all eight settings tabs open where the server sells plans", async ({ page }) => {
+  await mockApp(page, { billing: { tier: "coven", tier_name: "Coven", host_limit: 3 } });
   await openSettings(page);
-  // "Browser devices" and "Device trust" were two tabs before the mesh; both
-  // now live on the single Access tab (docs/TRUST_UX.md).
-  const cases = [
+  for (const [tab, heading] of [
     ["Account", "Account"],
-    ["Appearance", "Appearance"],
-    ["Notifications", "Notifications"],
-    ["Agents", "Agents"],
-    ["Skills", "Skills"],
-    ["Templates", "Workspace templates"],
-    ["Access", "Access"],
-  ] as const;
-  for (const [tab, heading] of cases) {
+    ["Subscription", "Subscription"],
+    ...TABS_WITHOUT_BILLING.slice(1),
+  ] as const) {
     await page.getByRole("button", { name: tab, exact: true }).click();
     await expect(page.getByRole("heading", { name: heading, exact: true }).last()).toBeVisible();
   }
+});
+
+test("a self-hosted server shows seven tabs and no Subscription", async ({ page }) => {
+  // `mockApp` leaves billing off, which is what a self-hosted install
+  // advertises. The app must then be byte-for-byte the one that existed
+  // before billing did (docs/BILLING.md §5.3).
+  await mockApp(page);
+  await openSettings(page);
+  for (const [tab, heading] of TABS_WITHOUT_BILLING) {
+    await page.getByRole("button", { name: tab, exact: true }).click();
+    await expect(page.getByRole("heading", { name: heading, exact: true }).last()).toBeVisible();
+  }
+  await expect(page.getByRole("button", { name: "Subscription", exact: true })).toHaveCount(0);
+  await expect(
+    page.getByRole("navigation", { name: "Settings sections" }).getByRole("button"),
+  ).toHaveCount(TABS_WITHOUT_BILLING.length);
 });
 
 test("switching tabs changes the panel without navigating", async ({ page }) => {
