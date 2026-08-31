@@ -848,14 +848,23 @@ fn create_pipe(
 }
 
 pub(super) async fn accept_main(listener: &mut MainListener) -> Result<WorkerSideStream> {
-    let server = listener
+    // Keep the listening instance in `MainListener` until ConnectNamedPipe
+    // completes. This future is polled inside the worker's select loop and is
+    // routinely cancelled when a frame or PTY event wins. Taking the handle
+    // before the await made that cancellation drop the replacement pipe; the
+    // next loop then failed with "worker main listener is unavailable" and
+    // exited before processing Start.
+    listener
         .next
-        .take()
-        .context("worker main listener is unavailable")?;
-    server
+        .as_mut()
+        .context("worker main listener is unavailable")?
         .connect()
         .await
         .context("accepting named-pipe connection")?;
+    let server = listener
+        .next
+        .take()
+        .expect("connected worker main listener remains installed");
     let replacement = create_pipe(&listener.name, PipeMode::Byte, MAIN_PIPE_INSTANCES, false)?;
     listener.next = Some(replacement);
     Ok(server)
@@ -1621,6 +1630,41 @@ mod tests {
         // can expose the old pipe name briefly after those closes, so the
         // helper observes first-instance creation until the bounded deadline
         // instead of assuming synchronous object-manager teardown.
+        server.disconnect().unwrap();
+        drop(client);
+        drop(server);
+        drop(listener);
+        create_first_test_pipe(&name, PipeMode::Byte).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_main_accept_preserves_the_replacement_pipe() {
+        let (_temp, dir) = protected_tempdir();
+        let endpoint = super::super::endpoint_for(&dir, "", Uuid::new_v4()).unwrap();
+        let name = endpoint.inner.main_name.clone();
+        let first = create_pipe(&name, PipeMode::Byte, MAIN_PIPE_INSTANCES, true).unwrap();
+        let mut listener = MainListener {
+            next: Some(first),
+            name: name.clone(),
+        };
+
+        // The worker's select loop cancels an outstanding accept whenever an
+        // existing connection delivers a frame. Cancellation must not consume
+        // the instance that should accept the following supervisor.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), accept_main(&mut listener))
+                .await
+                .is_err()
+        );
+
+        let client = open_test_client(&name, PipeMode::Byte).await;
+        let server = tokio::time::timeout(Duration::from_secs(2), accept_main(&mut listener))
+            .await
+            .expect("accept timed out after cancellation")
+            .expect("accept failed after cancellation");
+        validate_worker_peer(&server).unwrap();
+        validate_supervisor_peer(&client).unwrap();
+
         server.disconnect().unwrap();
         drop(client);
         drop(server);
