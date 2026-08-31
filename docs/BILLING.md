@@ -748,6 +748,33 @@ Neither exists today; the `Colophon` currently offers only Security, Install and
 Log in. Both are **blocking** (§2.1) and both are needed three times over:
 Stripe activation, App Store Connect submission, and Google Play listing.
 
+> **This is worse than a billing blocker, and it is not caused by billing.**
+> There is no privacy policy anywhere in the repo — no `/privacy` route, no
+> privacy link in the mobile About screen, no matching file repo-wide. Apple
+> 5.1.1(i) requires the link **in App Store Connect metadata *and* inside the
+> app**. So the mobile app **cannot be submitted to either store today**,
+> billing or no billing. This outranks everything else in this document.
+
+Three further obligations that are already overdue and are not optional:
+
+1. **A privacy link inside the mobile app**, not only on the website — Apple
+   5.1.1(i). The About screen is the place.
+2. **A web account-deletion request URL**, reachable without installing the app.
+   Google requires this separately from in-app deletion. In-app deletion already
+   exists (`account-panel.tsx` → `deleteAccount`, with a test), so Apple 5.1.1(v)
+   is satisfied; Google's web route is not.
+3. **The EU withdrawal button** — Consumer Rights Directive Art 11a, mandatory
+   since **19 June 2026**. It binds non-EU traders selling to EU consumers and
+   carries penalties up to 4% of turnover. Any page where a consumer can enter a
+   subscription needs it, so it lands with `/pricing` and Checkout.
+
+> **A live risk this feature creates.** The mobile About screen already has a
+> **tappable** `spawnd.dev/download` link. That is harmless today. The moment
+> that site grows a `/pricing` page, a reviewer can read an in-app tappable link
+> to a site selling subscriptions as a 3.1.1 steering violation. Either make that
+> link non-tappable text, point it at a path with no route to pricing, or remove
+> it — **decide this in the same commit that ships `/pricing`.**
+
 Same pressroom server-component shape as `/security`. Content needs your
 sign-off; the plan provides the structure and the legally-required elements:
 
@@ -872,20 +899,35 @@ Three paths reach this state without passing through §5.6: cancellation via the
 portal, a subscription that lapses to `unpaid`, and an admin removing an
 override.
 
-The account then holds more hosts than its limit. Per §1.2 rule 2, **nothing is
-suspended and nothing is deleted**. What happens:
+The account then holds more hosts than its limit, and **the user must choose
+which to keep — or keep none.** The choice is mandatory, not an invitation.
 
-- every existing host keeps running;
-- **no new host can be added** (§4.5 enforces this regardless of UI);
-- a persistent banner and an email invite them to choose which hosts to keep,
-  reusing the §5.6 selection UI;
-- `/api/profile` reports `over_limit: true` so every surface can show it.
+- `/api/profile` reports `over_limit: true`, the new limit, and the current
+  count, so every client can act on it.
+- On next load, **web and desktop present a reconciliation modal that cannot be
+  dismissed until a choice is made.** It lists every host with name, OS and last
+  seen, and requires selecting **at most** the new limit — selecting zero is a
+  valid answer and must be offered plainly, not buried.
+- On confirm, the unselected hosts are released through the ordinary
+  `DELETE /api/hosts/{id}` path (`routes/hosts.py:707`), which frees each slot
+  synchronously, retains the `HostKeyClaim` so those machines can only ever
+  return to this account, and closes each live daemon socket with
+  `4001 "host revoked"` — behaviour the daemon already handles.
+- Until they choose, existing hosts keep running and **no new host can be
+  added** (§4.5 enforces that regardless of UI). Nothing is suspended and
+  nothing is deleted without the user's explicit selection.
+- **Mobile shows this too, and must.** Releasing hosts is host management, not
+  commerce — there is no price, no venue and no purchase verb in it, so it is
+  fully compliant and the phone is a legitimate place to resolve it. A user
+  whose only device is a phone must not be stuck.
+- An email accompanies it, explaining the state and that the machines keep
+  running until they decide.
 
-> **Open decision — see §11.1.** This design lets a cancelled Pandemonium
-> account keep 50 hosts running indefinitely for free, as long as it never adds
-> another. Closing that needs either a deterministic forced release (a
-> data-loss-shaped action taken on a billing signal) or a suspend state the
-> schema does not have. I have not chosen one for you.
+The forced choice is what closes the revenue hole: a cancelled Pandemonium
+account cannot sit on 50 hosts, because the next time anyone opens the app they
+must reduce to the free limit or release everything. And because the release
+only ever happens on an explicit human selection, the server never deletes
+someone's host on a billing signal.
 
 ### 5.8 Where billing must NOT appear
 
@@ -935,6 +977,31 @@ which matters more, because a binary already in the store cannot be recalled.
 **The bright line, in code review terms:** no string in `mobile/` contains a
 price, and no `Linking.openURL` / `expo-web-browser` call in a billing context
 targets a checkout or pricing URL, while `mobile_upgrade_link` is false.
+
+> **A server string can breach anti-steering with no mobile code involved.**
+> `mobile/src/components/trust/trust-failure-state.tsx:140-152` renders
+> `ApiError.message` **verbatim**. So a server-side billing error reading
+> *"Upgrade at spawnd.dev"* would appear inside the iOS app, with no string in
+> `mobile/` containing it and no mobile test catching it.
+>
+> **Therefore: no error message the server can emit on a billing path may
+> contain a URL, a price, or a purchase verb.** The server sends a stable
+> machine code (`host_limit`) plus neutral prose; each client owns its own copy.
+> This is a server-side constraint enforced for a mobile-store reason, which is
+> exactly the kind of rule that gets broken later by someone improving an error
+> message — so it belongs in the test suite (§9.1), not just here.
+
+**Apple polices the verb; Google polices the link.** Reviewer guidance is that a
+*non-tappable* "Go to our website" still fails, and that the fix is to phrase it
+declaratively — while Google's own published example of **approved** copy is the
+imperative *"Go to our website to upgrade your subscription to Premium"*. So
+write to Apple's rule and Google is covered for free:
+
+- ✅ "Billing is managed on the web." — declarative, no verb aimed at the user
+- ❌ "Manage your plan on the web." — imperative, fails Apple's stated test
+
+This is why §6.4's copy reads the way it does. Do not "improve" it into an
+instruction.
 
 There is already a precedent for words-without-a-link in this codebase: the App
 Store URL is deliberately null in the download copy. Follow it.
@@ -1327,25 +1394,29 @@ the flag exists in this shape.
 
 ## 11. Open decisions and deliberate omissions
 
-### 11.1 The one thing I have not decided for you
+### 11.1 Cancelling while over the limit — decided
 
-**What happens to an account that cancels while over its limit.** As specified,
-a cancelled Pandemonium account keeps its 50 hosts running indefinitely, free,
-as long as it never adds another. Closing that needs one of:
+**The user must select which hosts to keep, or keep none.** Settled by the
+owner; specified in §5.7.
 
-- **a forced release** after a grace period (deterministic, e.g. keep the oldest
-  N) — but that is a data-loss-shaped action taken on a billing signal, and this
-  codebase deletes a host only when a human asks;
-- **a suspend state** — a `Host.suspended_at` column plus a refusal path. Cheapest
-  honest version puts the check at session creation (`routes/sessions.py`)
-  rather than in `ws/daemon.py`, whose connection fencing is the highest-risk
-  code in the server;
-- **accepting it**, on the grounds that cancelling users mostly stop using the
-  product anyway, and revisiting if the data says otherwise.
+The reconciliation modal is non-dismissible until a choice is made, and it ships
+on web, desktop **and mobile** — releasing hosts is host management, not
+commerce, so there is no store-policy obstacle and no user is stranded on a
+phone.
 
-I have built the plan so all three remain available: the enforcement point,
-`over_limit` state and reconciliation UI are the same either way. This needs
-your call before §5.7 is implemented.
+Two properties this buys, worth preserving through any future refactor:
+
+1. **No host is ever deleted except by an explicit human selection.** The server
+   never releases a machine on a billing signal alone, which keeps billing out
+   of the one code path in this product that destroys something a person
+   depends on.
+2. **No suspend state is needed** — no `Host.suspended_at`, no quota refusal in
+   `ws/daemon.py`, and therefore no new WebSocket close code (§8.1). The excess
+   is resolved by the user, not by the server holding machines hostage.
+
+The cost is that an account which never opens the app again keeps its hosts
+running. That is bounded and acceptable: the moment anyone touches any client,
+the choice is forced.
 
 ### 11.2 Deliberately not built
 
