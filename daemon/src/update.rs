@@ -295,10 +295,12 @@ async fn verify_release_manifest(
         signature.as_deref(),
         request,
         target,
-        allow_unsigned,
-        &keys,
-        crate::version::build_counter(),
-        downgrade_authorized,
+        &VerifyPolicy {
+            allow_unsigned,
+            public_keys: &keys,
+            build_counter: crate::version::build_counter(),
+            downgrade_authorized,
+        },
     )
 }
 
@@ -337,16 +339,30 @@ fn local_downgrade_consent() -> bool {
     armed
 }
 
+/// What this daemon judges a manifest *against*, as opposed to the bytes being
+/// judged. Grouped because they travel together and are all properties of the
+/// running build and its local state, not of the release being offered.
+struct VerifyPolicy<'a> {
+    allow_unsigned: bool,
+    public_keys: &'a [&'a str],
+    build_counter: Option<u64>,
+    /// The server asked for a downgrade *and* the host consented locally.
+    downgrade_authorized: bool,
+}
+
 fn verify_manifest_bytes(
     manifest_bytes: &[u8],
     signature_bytes: Option<&[u8]>,
     request: &UpdateRequest,
     target: &str,
-    allow_unsigned: bool,
-    public_keys: &[&str],
-    build_counter: Option<u64>,
-    downgrade_authorized: bool,
+    policy: &VerifyPolicy<'_>,
 ) -> Result<(), UpdateFailure> {
+    let VerifyPolicy {
+        allow_unsigned,
+        public_keys,
+        build_counter,
+        downgrade_authorized,
+    } = *policy;
     let manifest: SignedReleaseManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|_| UpdateFailure::new(UpdateStage::Verify, "manifest_mismatch"))?;
 
