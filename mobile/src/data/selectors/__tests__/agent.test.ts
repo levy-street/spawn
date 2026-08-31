@@ -79,6 +79,22 @@ describe("agent identity", () => {
     expect(commandBasename("A=1 B=2")).toBeNull();
     expect(commandBasename("  ")).toBeNull();
   });
+
+  it("reads a Windows host's .exe suffix as the same program", () => {
+    // Windows reports "claude.exe" for the definition spelled "claude"; an
+    // exact match would call that pane a plain shell and a duplicate of it
+    // would come back empty.
+    expect(runningAgent("claude.exe", BUILT_INS)?.id).toBe("claude");
+    expect(identifyAgent("CODEX.EXE", BUILT_INS)).toMatchObject({
+      displayName: "Codex",
+      logoKey: "codex",
+    });
+    expect(identifyAgent("powershell.exe", BUILT_INS)).toMatchObject({
+      displayName: "Shell",
+      logoKey: "shell",
+    });
+    expect(runningAgent("pwsh.exe", BUILT_INS)).toBeNull();
+  });
 });
 
 describe("agent launch commands", () => {

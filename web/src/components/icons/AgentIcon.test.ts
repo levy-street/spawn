@@ -23,12 +23,17 @@ describe("resolveAgentIcon", () => {
   });
 
   test("shell names get the terminal glyph, labeled by shell", () => {
-    for (const shell of ["bash", "zsh", "fish", "sh", "dash"]) {
+    for (const shell of ["bash", "zsh", "fish", "sh", "dash", "powershell", "pwsh", "cmd"]) {
       const resolved = resolveAgentIcon(undefined, `/bin/${shell}`);
       expect(resolved.icon).toBe("shell");
       expect(resolved.label).toBe(shell);
     }
     expect(resolveAgentIcon("zsh").icon).toBe("shell");
+  });
+
+  test("a Windows .exe suffix neither hides a brand nor un-shells a shell", () => {
+    expect(resolveAgentIcon(undefined, "claude.exe").icon).toBe("claude-code");
+    expect(resolveAgentIcon(undefined, "pwsh.exe").icon).toBe("shell");
   });
 
   test("unknown kinds become monograms with the first letter", () => {

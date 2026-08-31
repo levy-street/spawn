@@ -3,7 +3,17 @@
  * to draw, and what to call the thing in prose. Lives in `lib` so both the
  * icon component and the session-title helpers can read it.
  */
-const SHELL_RE = /^(bash|zsh|fish|sh|dash)$/;
+const SHELL_RE = /^(bash|zsh|fish|sh|dash|powershell|pwsh|cmd)$/;
+
+/**
+ * The daemon reports the kernel's own name for the foreground process, and on
+ * Windows that carries the executable extension — "claude.exe", "pwsh.exe" —
+ * which no agent definition or shell list spells out. Strip it before any
+ * comparison so the same program reads the same on every platform.
+ */
+export function stripExecutableSuffix(name: string): string {
+  return name.replace(/\.(exe|com|bat|cmd|ps1)$/i, "");
+}
 
 export type ResolvedAgentIcon = {
   icon: "claude-code" | "codex" | "opencode" | "aider" | "shell" | "monogram";
@@ -23,7 +33,7 @@ export function commandBasename(command: string): string {
 }
 
 function matchName(name: string): ResolvedAgentIcon | null {
-  const lower = name.toLowerCase();
+  const lower = stripExecutableSuffix(name.toLowerCase());
   if (lower.includes("claude")) return { icon: "claude-code", label: "Claude Code" };
   if (lower.includes("codex")) return { icon: "codex", label: "Codex" };
   if (lower.includes("opencode")) return { icon: "opencode", label: "OpenCode" };
