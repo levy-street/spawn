@@ -111,7 +111,10 @@ export function SidebarWorkspaceRow({
               )}
             />
             {attentionCount > 0 && (
-              <span className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-card bg-warning" />
+              // Astride the tile's top-right corner, ringed in the rail's own
+              // ground (bg-shell, not card) so the gap reads as the sidebar
+              // showing through — an inset dot, not a haloed one.
+              <span className="absolute -right-1 -top-1 size-3 rounded-full border-2 border-shell bg-warning" />
             )}
           </Link>
         </RailTooltip>
