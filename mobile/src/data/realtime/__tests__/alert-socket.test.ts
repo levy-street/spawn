@@ -87,6 +87,39 @@ describe("parseAlertFrame", () => {
     expect(parseAlertFrame(JSON.stringify(input))).toMatchObject(input);
   });
 
+  it("parses a data-changed frame and refuses one it could not act on", () => {
+    expect(
+      parseAlertFrame(
+        JSON.stringify({
+          type: "data",
+          resource: "workspaces",
+          id: "w-1",
+          origin: "tab-1",
+          at: "2026-08-31T00:00:00Z",
+        }),
+      ),
+    ).toEqual({
+      type: "data",
+      resource: "workspaces",
+      id: "w-1",
+      origin: "tab-1",
+      at: "2026-08-31T00:00:00Z",
+    });
+    expect(
+      parseAlertFrame(JSON.stringify({ type: "data", resource: "sessions", id: null })),
+    ).toMatchObject({ type: "data", resource: "sessions", id: null, origin: null });
+    for (const bad of [
+      { type: "data" },
+      { type: "data", resource: "" },
+      { type: "data", resource: 7 },
+      { type: "data", resource: "x".repeat(65) },
+      { type: "data", resource: "workspaces", id: 9 },
+      { type: "data", resource: "workspaces", origin: "x".repeat(65) },
+    ]) {
+      expect(parseAlertFrame(JSON.stringify(bad))).toBeNull();
+    }
+  });
+
   it("parses keepalive and protocol rejection frames", () => {
     expect(parseAlertFrame('{"type":"alerts.ping"}')).toEqual({ type: "alerts.ping" });
     expect(

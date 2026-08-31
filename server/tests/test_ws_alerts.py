@@ -147,7 +147,13 @@ async def _create_session_row(user_id: str, host_id: str, *, status: str = "runn
 
 
 class _AlertCollector:
-    """Subscribes to an owner's alert channel for the length of a `with`."""
+    """Subscribes to an owner's alert channel for the length of a `with`.
+
+    `events` holds only the `alert` family. The channel also carries trust
+    and data-changed frames now, and this file asserts alert *semantics* —
+    counting a data frame here would fail every "exactly one alert" claim
+    for the wrong reason.
+    """
 
     def __init__(self, user_id: str) -> None:
         self._user_id = user_id
@@ -174,7 +180,9 @@ class _AlertCollector:
         async with get_backend().subscribe_channel(user_alert_channel(self._user_id)) as stream:
             self._ready.set()
             async for raw in stream:
-                self.events.append(json.loads(raw))
+                event = json.loads(raw)
+                if event.get("type") == "alert":
+                    self.events.append(event)
 
 
 async def _run_daemon(token: str, frames: list[dict[str, Any]]) -> FakeDaemonWebSocket:

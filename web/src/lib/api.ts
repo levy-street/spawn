@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { CLIENT_INSTANCE_ID } from "@/lib/client-instance";
 import type { GridLayout, Tile, TileWidget } from "@/lib/grid";
 import { type ReleaseInfo, ReleaseSchema } from "@/lib/release";
 import type { LayoutV3, WorkspaceTab } from "@/lib/tabs";
@@ -42,6 +43,9 @@ export async function api<T>(
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
+      // Echoed as `origin` on the data-changed frames a mutation fans out,
+      // so this tab can tell its own echo from another client's change.
+      "X-Spawn-Client": CLIENT_INSTANCE_ID,
       ...headers,
     },
     ...rest,

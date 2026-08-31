@@ -3,6 +3,7 @@
 import {
   ALERTS_WS_SUBPROTOCOL,
   type AlertEvent,
+  type DataEvent,
   parseAlertFrame,
   type TrustEvent,
 } from "@/lib/alerts";
@@ -34,6 +35,7 @@ export type AlertSocketState = "idle" | "connecting" | "open" | "closed" | "unau
 
 type AlertListener = (event: AlertEvent) => void;
 type TrustListener = (event: TrustEvent) => void;
+type DataListener = (event: DataEvent) => void;
 
 const RECONNECT_MIN_MS = 1_000;
 const RECONNECT_MAX_MS = 15_000;
@@ -47,11 +49,12 @@ const LINGER_MS = 15_000;
 
 const listeners = new Set<AlertListener>();
 const trustListeners = new Set<TrustListener>();
+const dataListeners = new Set<DataListener>();
 const stateListeners = new Set<() => void>();
 
-/** Alerts and trust events share one socket, so either family keeps it alive. */
+/** All three families share one socket, so any of them keeps it alive. */
 function hasSubscribers(): boolean {
-  return listeners.size > 0 || trustListeners.size > 0;
+  return listeners.size > 0 || trustListeners.size > 0 || dataListeners.size > 0;
 }
 
 let socket: WebSocket | null = null;
@@ -138,6 +141,17 @@ function connect(): void {
       for (const listener of [...trustListeners]) {
         try {
           listener(trustEvent);
+        } catch {
+          // One bad consumer must not stop the others hearing about it.
+        }
+      }
+      return;
+    }
+    if (frame.type === "data") {
+      const { type: _dataType, ...dataEvent } = frame;
+      for (const listener of [...dataListeners]) {
+        try {
+          listener(dataEvent);
         } catch {
           // One bad consumer must not stop the others hearing about it.
         }
@@ -252,6 +266,14 @@ export function subscribeToTrustEvents(listener: TrustListener): () => void {
   return subscribe(
     () => trustListeners.add(listener),
     () => trustListeners.delete(listener),
+  );
+}
+
+/** Data-changed frames, for the cache invalidation in AppShell. */
+export function subscribeToDataEvents(listener: DataListener): () => void {
+  return subscribe(
+    () => dataListeners.add(listener),
+    () => dataListeners.delete(listener),
   );
 }
 
