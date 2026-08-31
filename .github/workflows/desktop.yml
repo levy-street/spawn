@@ -1,6 +1,21 @@
 name: Desktop artifacts
 
+# Builds, signs and notarizes the app. It does NOT publish: the offline Tauri
+# updater key is deliberately absent from CI (see the note at the foot of this
+# file), so an operator signs the promoted archives and assembles latest.json
+# locally. What this automates is everything up to that signature.
+#
+# Gated to `desktop/**` on master for the same reason `prebuilt.yml` is gated to
+# `daemon/**`: these are billed macOS and doubled Windows minutes, and a release
+# that did not touch the app does not need a new app. A dispatch still builds
+# any ref on demand.
 on:
+  push:
+    branches:
+      - master
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop.yml"
   workflow_dispatch:
 
 permissions:

@@ -41,6 +41,13 @@ Environment:
   SPAWN_DEPLOY_SMOKE_ATTEMPTS
                           Probes before the smoke check gives up (2s apart).
                           Default: 20.
+  SPAWN_DEPLOY_MOBILE     Publish the mobile OTA when mobile/ changed.
+                          Default: 1. Set to 0 to print the command instead.
+  SPAWN_DEPLOY_MOBILE_CHANNEL
+                          EAS channel for that OTA. Inferred as `production`
+                          only for master deploys of https://spawnd.dev; any
+                          other origin must name it, because publishing a dev
+                          build to the production channel reaches every phone.
   SPAWN_DEPLOY_PREBUILTS Publish the verified prebuilt-latest binaries and
                           manifest. Default: 1. Set to 0 only as an explicit
                           emergency override; daemons will not auto-update.
@@ -603,9 +610,46 @@ if [[ -n "$expected_daemon_tree" ]]; then
 fi
 printf '\n'
 
+# The phone ships with the deploy, not after someone remembers it.
+#
+# This used to print a reminder. A reminder is a step that gets skipped on the
+# release where it mattered, and the failure is silent and asymmetric: phones
+# keep running the JavaScript they were built with, so the two frontends drift
+# apart while everything looks fine. Publishing it here is also the only place
+# the *order* is guaranteed — the server is already up, so the bundle phones
+# fetch is never newer than the API it talks to. A workflow firing on a push to
+# master could not promise that.
+#
+# The channel is never guessed. Publishing a dev build to the production
+# channel would push it to every phone in the field, so an origin this script
+# does not recognise prints the command instead of running it.
 if git cat-file -e "$host_current_commit^{commit}" 2>/dev/null &&
   ! git diff --quiet "$host_current_commit" "$target_commit" -- mobile; then
-  printf "%s\n" "mobile/ changed — run scripts/update-mobile-prod.sh -m '<same message>'"
+  mobile_channel="${SPAWN_DEPLOY_MOBILE_CHANNEL:-}"
+  if [[ -z "$mobile_channel" && "$public_origin" == "https://spawnd.dev" && "$branch" == "master" ]]; then
+    mobile_channel="production"
+  fi
+  mobile_message="$(git log -1 --format=%s "$target_commit")"
+  mobile_args=(-m "$mobile_message" --api-url "$public_origin" --branch "$mobile_channel")
+  [[ "$branch" == "master" ]] || mobile_args+=(--allow-branch)
+
+  if [[ "${SPAWN_DEPLOY_MOBILE:-1}" == "0" ]]; then
+    printf 'deploy-prod: mobile/ changed; publishing skipped (SPAWN_DEPLOY_MOBILE=0)\n'
+    printf "  scripts/update-mobile-prod.sh %s\n" "${mobile_args[*]}"
+  elif [[ -z "$mobile_channel" ]]; then
+    printf 'deploy-prod: mobile/ changed, but no EAS channel is known for %s.\n' "$public_origin" >&2
+    printf '  Set SPAWN_DEPLOY_MOBILE_CHANNEL, or publish it yourself:\n' >&2
+    printf "    scripts/update-mobile-prod.sh -m %q --api-url %q --branch <channel>\n" \
+      "$mobile_message" "$public_origin" >&2
+  else
+    printf 'deploy-prod: mobile/ changed — publishing the OTA to the %s channel\n' "$mobile_channel"
+    if ! "$repo_root/scripts/update-mobile-prod.sh" "${mobile_args[@]}"; then
+      die "the server and web app ARE deployed, but the mobile OTA failed.
+  Phones are still on the previous bundle, which is the safe half of the split.
+  Publish it once the cause is fixed:
+    scripts/update-mobile-prod.sh ${mobile_args[*]}"
+    fi
+  fi
 fi
 
 printf 'deploy-prod: complete\n'
