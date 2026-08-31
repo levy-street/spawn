@@ -170,6 +170,13 @@ async fn ask_for_device_approval() -> Result<(), String> {
     trust::raise_knock().await.map_err(command_error)
 }
 
+/// Whether the device gate is still worth showing — and, when no host could
+/// grant the approval it waits for, the heal that lets a stuck install pass.
+#[tauri::command]
+async fn device_gate_needed() -> Result<bool, String> {
+    auth::device_gate_needed().await.map_err(command_error)
+}
+
 #[tauri::command]
 async fn begin_possession(
     app: tauri::AppHandle,
@@ -390,6 +397,7 @@ pub fn run() {
             renew_session,
             poll_device_approval,
             ask_for_device_approval,
+            device_gate_needed,
             begin_possession,
             poll_possession,
             approve_possession,

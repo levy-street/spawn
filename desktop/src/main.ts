@@ -171,6 +171,8 @@ let configOrigin: string | null = null;
 /** The provider that got as far as the callback on an invite-only server. */
 let inviteRequiredFor: string | null = null;
 let lastProvider: string | null = null;
+/** The provider whose sign-in is out in the system browser right now. */
+let pendingProvider: string | null = null;
 let serverChoice: "hosted" | "self" = "hosted";
 let error: string | null = null;
 let notice: string | null = null;
@@ -541,6 +543,27 @@ function providerButtons(): string {
 }
 
 function authView(): string {
+  // A sign-in that went out to the system browser: without this, the idle form
+  // sat there as if the press had done nothing at all.
+  if (pendingProvider) {
+    const name = providerName(pendingProvider);
+    const body = `
+      <div class="stack">
+        <div class="inset">
+          <p>Finish signing in with <strong>${escapeHtml(name)}</strong> there. This screen moves on by itself when you come back.</p>
+          ${paceBar(`Waiting for ${name}…`)}
+        </div>
+        <div class="actions"><button class="btn btn-outline" data-action="cancel-oauth">Back to sign-in</button></div>
+      </div>`;
+    return sheet(
+      hatchServer(),
+      stacked(
+        "Finish in your browser",
+        `${escapeHtml(name)} sign-in continues in the browser SPAWN D just opened.`,
+        body,
+      ),
+    );
+  }
   const signup = authMode === "signup";
   const title = signup ? "Create your account" : "Welcome back";
   const description = signup
@@ -811,8 +834,13 @@ function hostView(): string {
       <div class="inset" role="status"><p><strong>${escapeHtml(resumed.title)}</strong></p><p class="muted">${escapeHtml(resumed.body)}</p></div>
       <div class="actions">${resumed.action}</div>`;
   } else if (failure) {
+    // `begin_possession` downloads, installs and starts the daemon before a
+    // run exists, so a failure with no run — or one that never completed a
+    // step — is the install's, not the ceremony's. "Not approved" over a
+    // download error blamed the wrong step.
+    const installFailed = !runId || completedSteps.size === 0;
     action = `
-      <div class="failure" role="alert"><h3>This machine was not approved</h3><p>${escapeHtml(pairingFailureCopy(failure))}</p></div>
+      <div class="failure" role="alert"><h3>${installFailed ? "The daemon couldn’t be set up" : "This machine was not approved"}</h3><p>${escapeHtml(pairingFailureCopy(failure))}</p></div>
       <div class="actions">${
         serviceFailed
           ? '<button class="btn btn-outline" data-action="show-repair">Repair</button>'
@@ -1100,6 +1128,12 @@ async function act(action: string): Promise<void> {
     case "back-to-auth":
       setScreen("auth");
       break;
+    // The browser flow may still land; abandoning the wait only means the form
+    // comes back, and a late callback is handled as it always was.
+    case "cancel-oauth":
+      pendingProvider = null;
+      render();
+      break;
     case "retry-config":
       await loadConfig(true);
       break;
@@ -1197,6 +1231,7 @@ function setScreen(next: Screen): void {
   screen = next;
   error = null;
   notice = null;
+  pendingProvider = null;
   render();
 }
 
@@ -1273,7 +1308,16 @@ async function beginOAuth(provider: string): Promise<void> {
   const url = await guarded(() =>
     invoke<string>("oauth_start_url", { origin: preferences.server_origin, provider, invite }),
   );
-  if (url) await openUrl(url);
+  if (!url) return;
+  try {
+    await openUrl(url);
+  } catch (cause) {
+    error = describe(cause);
+    render();
+    return;
+  }
+  pendingProvider = provider;
+  render();
 }
 
 async function handleDeepLink(value: string): Promise<void> {
@@ -1284,6 +1328,9 @@ async function handleDeepLink(value: string): Promise<void> {
     return;
   }
   if (url.protocol !== "spawn:" || url.hostname !== OAUTH_CALLBACK.host || url.pathname !== OAUTH_CALLBACK.path) return;
+  // Whatever the browser answered, the wait for it is over.
+  pendingProvider = null;
+  render();
   const oauthError = url.searchParams.get("error");
   if (oauthError === "invite_required") {
     // The provider signed the person in, but the server wants a code before it
@@ -1331,9 +1378,17 @@ async function advance(): Promise<void> {
     return;
   }
   if (deviceGateRequired && !preferences.device_approved) {
-    setScreen("device");
-    startDevicePoll();
-    return;
+    // An approval is granted from a device a host trusts, so an account with
+    // no hosts has nobody who could answer one — a gate shown there waits for
+    // ever. Ask again before waiting: the command records the heal itself, and
+    // an unreachable server keeps the gate rather than waving it through.
+    if (await invoke<boolean>("device_gate_needed").catch(() => true)) {
+      setScreen("device");
+      startDevicePoll();
+      return;
+    }
+    deviceGateRequired = false;
+    preferences = await invoke<Preferences>("app_preferences");
   }
   // The host gate is where an out-of-date server actually bites, and this is
   // the only place a stored account ever passed. Without it, `initialize()`
