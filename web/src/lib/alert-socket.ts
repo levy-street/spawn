@@ -12,6 +12,7 @@ import {
   buildAlertsWsUrl,
   notifySocketUnauthorized,
   socketCloseAction,
+  watchSuspendResume,
 } from "@/lib/ws";
 
 /**
@@ -216,9 +217,33 @@ function wake(): void {
   // half-open socket gets discovered, so retry immediately rather than
   // waiting out the backoff.
   if (!hasSubscribers() || stopped || protocolRequired) return;
-  if (socket && socket.readyState === WebSocket.OPEN) return;
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    // pagehide dropped the watchdog; without one a socket the sleep
+    // half-opened would stay a silent corpse forever. Re-armed, the missing
+    // server pings cull it within the watchdog window.
+    if (watchdogTimer === null) armWatchdog();
+    return;
+  }
   attempt = 0;
   connect();
+}
+
+function suspendResumed(): void {
+  // The machine provably slept. Whatever readyState claims, the TCP side of
+  // an idle socket rarely survives that; closing it hands recovery to the
+  // ordinary reconnect path instead of waiting out the watchdog.
+  if (!hasSubscribers() || stopped || protocolRequired) return;
+  const current = socket;
+  if (current && current.readyState === WebSocket.OPEN) {
+    attempt = 0;
+    try {
+      current.close();
+    } catch {
+      // onclose schedules the redial either way.
+    }
+    return;
+  }
+  wake();
 }
 
 function installGlobalListeners(): void {
@@ -229,6 +254,9 @@ function installGlobalListeners(): void {
   });
   window.addEventListener("online", wake);
   window.addEventListener("pageshow", wake);
+  // The desktop shell's webview sleeps and wakes with the machine without
+  // firing visibilitychange, online, or pageshow; the clock jump arrives.
+  watchSuspendResume(suspendResumed);
   window.addEventListener("pagehide", () => {
     // Bfcache: let the socket go rather than restoring a corpse.
     watchdogTimer = clearTimer(watchdogTimer);

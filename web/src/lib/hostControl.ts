@@ -7,8 +7,11 @@ import {
   buildHostWsUrl,
   iceServersNeedRefresh,
   notifySocketUnauthorized,
+  RTC_LATCH_TIMEOUT_MS,
+  SIGNAL_SILENCE_SUSPECT_MS,
   sanitizeIceServers,
   socketCloseAction,
+  watchSuspendResume,
 } from "@/lib/ws";
 
 export const HOST_CONTROL_PROTOCOL = "spawn.host.ctl";
@@ -284,6 +287,9 @@ export interface HostControlClientOptions {
   watchdogMs?: number;
   resumeTimeoutMs?: number;
   iceRestartTimeoutMs?: number;
+  /** How long a claimed-OPEN socket may be silent before wake() presumes it a
+   * corpse and redials. Deterministic tests shorten it. */
+  silenceSuspectMs?: number;
   /** Primarily useful for bounded clients and deterministic timeout tests. */
   streamTimeoutMs?: number;
   /** Resolve, per RTC generation, whether this host requires signed signaling,
@@ -313,7 +319,11 @@ export class HostControlClient {
   private rtcConfigRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private rtcConfigRefreshResolve: (() => void) | null = null;
   private iceRestartInFlight = false;
+  private iceRestartLatchedAt = 0;
   private resumeInFlight = false;
+  /** When the server was last heard on the current socket; see wake(). */
+  private lastSignalFrameAt = 0;
+  private stopSuspendWatch: (() => void) | null = null;
   private latestIceServers: RTCIceServer[] | null = null;
   private latestIceTransportPolicy: RTCIceTransportPolicy = "all";
   private localCandidateGate: { block: () => void; release: () => void } | null = null;
@@ -1112,10 +1122,12 @@ export class HostControlClient {
     };
     ws.onopen = () => {
       if (!this.isCurrentWebSocket(ws, attempt)) return;
+      this.lastSignalFrameAt = Date.now();
       if (!this.hasHealthyRtc()) this.setState("open");
     };
     ws.onmessage = (event) => {
       if (!this.isCurrentWebSocket(ws, attempt)) return;
+      this.lastSignalFrameAt = Date.now();
       if (typeof event.data !== "string") {
         if (this.signedRtcSession !== null) this.failRtc();
         return;
@@ -1558,13 +1570,19 @@ export class HostControlClient {
   private async restartIce(_reason: "disconnected" | "failed" | "wake"): Promise<void> {
     const pc = this.pc;
     const sessionId = this.sessionId;
-    if (this.iceRestartInFlight || !pc || !sessionId) return;
+    // A restart still "in flight" past its deadline is frozen mid-await, not
+    // slow — honouring the latch would make every later retry a no-op.
+    if (this.iceRestartInFlight && Date.now() - this.iceRestartLatchedAt < RTC_LATCH_TIMEOUT_MS) {
+      return;
+    }
+    if (!pc || !sessionId) return;
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     if (!this.bindingNonce || this.bindingGeneration === null) {
       this.fallBackToFreshRtc(sessionId);
       return;
     }
     this.iceRestartInFlight = true;
+    this.iceRestartLatchedAt = Date.now();
     await this.refreshRtcConfigIfStale();
     if (this.pc !== pc || this.sessionId !== sessionId || !this.latestIceServers) {
       this.clearRtcIceRestartTimer();
@@ -2224,26 +2242,40 @@ export class HostControlClient {
     resolve?.();
   }
 
+  private redialNow(): void {
+    const ws = this.ws;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
+    if (ws) {
+      this.ws = null;
+      this.detachWebSocket(ws);
+      try {
+        ws.close();
+      } catch {
+        // A replacement socket is opened below either way.
+      }
+    }
+    this.openWebSocket();
+  }
+
   private wake(): void {
     if (this.stopped || this.terminalReason !== null || this.signedRtcRefusal !== null) return;
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-      this.reconnectAttempt = 0;
-      if (ws) {
-        this.ws = null;
-        this.detachWebSocket(ws);
-        try {
-          ws.close();
-        } catch {
-          // A replacement socket is opened below either way.
-        }
-      }
-      this.openWebSocket();
+      this.redialNow();
       return;
     }
     if (this.pc?.connectionState === "connected") return;
+    const silenceSuspectMs = this.options.silenceSuspectMs ?? SIGNAL_SILENCE_SUSPECT_MS;
+    if (Date.now() - this.lastSignalFrameAt > silenceSuspectMs) {
+      // OPEN is the socket's claim, not the network's: a sleep leaves
+      // half-open sockets that never fire onclose, and the server pings
+      // every 25 s, so a live one is never this quiet. Redial — the fresh
+      // socket also carries fresh TURN credentials in on its rtc.config.
+      this.redialNow();
+      return;
+    }
     if (this.pc) {
       void this.restartIce("wake");
     } else if (this.latestIceServers) {
@@ -2257,6 +2289,9 @@ export class HostControlClient {
     document.addEventListener("visibilitychange", this.onVisibilityChange);
     window.addEventListener("online", this.onWake);
     window.addEventListener("pageshow", this.onWake);
+    // The desktop shell's webview sleeps and wakes with the machine without
+    // firing any of the three events above; the clock jump always arrives.
+    this.stopSuspendWatch = watchSuspendResume(this.onWake);
   }
 
   private uninstallGlobalListeners(): void {
@@ -2265,6 +2300,8 @@ export class HostControlClient {
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
     window.removeEventListener("online", this.onWake);
     window.removeEventListener("pageshow", this.onWake);
+    this.stopSuspendWatch?.();
+    this.stopSuspendWatch = null;
   }
 
   private isCurrentWebSocket(ws: WebSocket, attempt: number): boolean {
