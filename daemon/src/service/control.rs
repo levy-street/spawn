@@ -201,15 +201,48 @@ pub fn start_listener(
 
 #[cfg(windows)]
 pub fn send(config_dir: &Path, command: ControlCommand) -> Result<u32> {
-    use std::io::{BufRead, Read, Write};
+    let name = pipe_name(config_dir)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match send_once(&name, deadline) {
+            Ok(pipe) => match exchange(pipe, command) {
+                Ok(pid) => return Ok(pid),
+                // The listener serves one client per pipe instance and
+                // recycles the instance between clients, and DisconnectNamedPipe
+                // discards a framed reply the client has not read yet. That
+                // surfaces here as "no process is on the other end of the
+                // pipe" (233) or a broken pipe mid-exchange. Every control
+                // command is idempotent, so run the whole exchange again
+                // rather than surfacing a reply the server already sent.
+                Err(error)
+                    if is_recycled_instance(&error) && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => return Err(error),
+            },
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_recycled_instance(error: &anyhow::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
+    error.downcast_ref::<std::io::Error>().is_some_and(|io| {
+        io.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED as i32)
+            || io.kind() == std::io::ErrorKind::BrokenPipe
+    })
+}
+
+#[cfg(windows)]
+fn send_once(name: &str, deadline: std::time::Instant) -> Result<std::fs::File> {
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
     use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_READMODE_MESSAGE};
 
-    let name = pipe_name(config_dir)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    let mut pipe = loop {
+    let pipe = loop {
         match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -239,6 +272,13 @@ pub fn send(config_dir: &Path, command: ControlCommand) -> Result<u32> {
     {
         return Err(std::io::Error::last_os_error()).context("setting control pipe message mode");
     }
+    Ok(pipe)
+}
+
+#[cfg(windows)]
+fn exchange(mut pipe: std::fs::File, command: ControlCommand) -> Result<u32> {
+    use std::io::{BufRead, Read, Write};
+
     let mut request = serde_json::to_vec(&ControlRequest { v: 1, command })?;
     request.push(b'\n');
     pipe.write_all(&request)?;

@@ -195,9 +195,7 @@ fn systemd_quote(value: &str) -> String {
 /// `Description=` is free text rather than an argument list, so it is not
 /// quoted — but it still expands specifiers and still ends at a newline.
 fn systemd_description(value: &str) -> String {
-    value
-        .replace('%', "%%")
-        .replace(['\n', '\r'], " ")
+    value.replace('%', "%%").replace(['\n', '\r'], " ")
 }
 
 fn systemd_unit_contents(config_dir: &Path, bin: &Path, server: &str) -> String {
